@@ -1,0 +1,34 @@
+[workspace]
+members = ["crates/evo-core", "crates/evo-storage", "crates/evo-engine", "crates/evo-mcp", "crates/evo-http", "apps/rsia"]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rmcp = { version = "=3.3.0", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = { version = "0.5", features = ["util", "limit"] }
+tower-http = { version = "0.6", features = ["limit", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,77 @@
+name: Rust CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show && rustc --version && cargo --version
+      - name: Resolve dependencies
+        run: |
+          mkdir -p out
+          if [ -f Cargo.lock ]; then cargo fetch --locked; else cargo generate-lockfile; fi
+          rustc --version > out/toolchain.txt
+          git rev-parse HEAD > out/source-commit.txt
+      - name: Format check
+        id: format
+        continue-on-error: true
+        run: cargo fmt --all -- --check > out/fmt.txt 2>&1
+      - name: Check
+        id: check
+        continue-on-error: true
+        run: cargo check --workspace --all-targets --locked > out/check.txt 2>&1
+      - name: Tests
+        id: tests
+        continue-on-error: true
+        run: cargo test --workspace --locked > out/tests.txt 2>&1
+      - name: Clippy
+        id: clippy
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings > out/clippy.txt 2>&1
+      - name: Protocol smoke
+        id: smoke
+        continue-on-error: true
+        run: |
+          if [ -f scripts/smoke.py ]; then
+            cargo build --locked -p rsia && python3 scripts/smoke.py target/debug/rsia > out/smoke.txt 2>&1
+          else
+            echo 'NOT_IMPLEMENTED' > out/smoke.txt
+            exit 1
+          fi
+      - name: Collect source and reports
+        if: always()
+        run: |
+          mkdir -p out
+          cargo fmt --all || true
+          tar --exclude=.git --exclude=target --exclude=out -czf out/source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verification-${{ github.sha }}
+          path: out/
+          retention-days: 14
+      - name: Quality gate
+        if: always()
+        env:
+          FORMAT: ${{ steps.format.outcome }}
+          CHECK: ${{ steps.check.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+          CLIPPY: ${{ steps.clippy.outcome }}
+          SMOKE: ${{ steps.smoke.outcome }}
+        run: |
+          test "$FORMAT" = success
+          test "$CHECK" = success
+          test "$TESTS" = success
+          test "$CLIPPY" = success
+          test "$SMOKE" = success

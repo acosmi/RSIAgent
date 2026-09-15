@@ -1,0 +1,14 @@
+/target/
+/data/
+/out/
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.pem
+*.key
+*.log
+__pycache__/
