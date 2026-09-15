@@ -1,17 +1,17 @@
 [package]
-name = "evo-storage"
-version.workspace = true
-edition.workspace = true
-publish.workspace = true
+name="evo-storage"
+version.workspace=true
+edition.workspace=true
+publish.workspace=true
 [dependencies]
-evo-core = { path = "../evo-core" }
-serde.workspace = true
-serde_json.workspace = true
-sqlx.workspace = true
-tokio.workspace = true
-fs2.workspace = true
-sha2.workspace = true
+evo-core={path="../evo-core"}
+serde.workspace=true
+serde_json.workspace=true
+sqlx.workspace=true
+tokio.workspace=true
+tracing.workspace=true
+uuid.workspace=true
 [dev-dependencies]
-tempfile.workspace = true
+tempfile.workspace=true
 [lints]
-workspace = true
+workspace=true
