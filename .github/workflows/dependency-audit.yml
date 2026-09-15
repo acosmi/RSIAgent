@@ -1,0 +1,50 @@
+name: Dependency audit
+on:
+  push:
+    branches: [main]
+    paths: ['Cargo.lock', 'Cargo.toml', '**/Cargo.toml', '.github/workflows/dependency-audit.yml']
+  pull_request:
+    paths: ['Cargo.lock', 'Cargo.toml', '**/Cargo.toml', '.github/workflows/dependency-audit.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare report
+        run: |
+          mkdir -p audit-report
+          git rev-parse HEAD > audit-report/source-commit.txt
+          rustc --version > audit-report/toolchain.txt
+          if [ -f Cargo.lock ]; then cargo fetch --locked; else cargo generate-lockfile; fi
+          cp Cargo.lock audit-report/Cargo.lock
+      - name: Install pinned audit tool
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit exact lock file
+        id: audit
+        continue-on-error: true
+        run: cargo audit --json > audit-report/rustsec.json
+      - name: License metadata inventory
+        run: |
+          cargo metadata --locked --format-version 1 > audit-report/metadata.json
+          python3 - <<'PY'
+          import json
+          from collections import Counter
+          p=json.load(open('audit-report/metadata.json'))['packages']
+          rows=[{'name':x['name'],'version':x['version'],'license':x.get('license'),'source':x.get('source'),'license_file':x.get('license_file')} for x in p]
+          json.dump({'packages':sorted(rows,key=lambda x:(x['name'],x['version'])),'license_counts':dict(Counter(x['license'] or 'UNDECLARED' for x in rows)),'notice':'Metadata inventory is not legal clearance. The project owner must select the project license before redistribution.'},open('audit-report/licenses.json','w'),ensure_ascii=False,indent=2)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-audit-${{ github.sha }}
+          path: audit-report/
+          retention-days: 14
+      - name: Vulnerability gate
+        if: always()
+        env:
+          OUTCOME: ${{ steps.audit.outcome }}
+        run: test "$OUTCOME" = success
