@@ -1,0 +1,32 @@
+name: V3 offline dependency kit
+on:
+  push:
+    branches: [implementation/v3-source-completion-20260916]
+    paths: [.github/workflows/v3-dependency-kit.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve exact canonicalization dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal
+          mkdir -p /tmp/rsia-jcs-kit/src out
+          printf '[package]\nname="rsia-jcs-kit"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nserde_jcs="=0.2.0"\n' > /tmp/rsia-jcs-kit/Cargo.toml
+          printf 'fn main() {}\n' > /tmp/rsia-jcs-kit/src/main.rs
+          cargo +1.98.1 fetch --manifest-path /tmp/rsia-jcs-kit/Cargo.toml
+          cp /tmp/rsia-jcs-kit/Cargo.lock out/jcs-Cargo.lock
+          tar -C "$HOME/.cargo" -czf out/registry.tar.gz registry
+          sha256sum out/registry.tar.gz > out/SHA256SUMS
+          git rev-parse HEAD > out/source-commit.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rsia-v3-dependency-kit
+          path: out/
+          retention-days: 7
