@@ -1,0 +1,21 @@
+name: H00 source reconciliation
+on:
+  push:
+    branches: [implementation/v3-h00-reconcile-20260916]
+    paths: [.delivery/h00/READY]
+permissions:
+  contents: write
+concurrency:
+  group: h00-source-reconciliation
+  cancel-in-progress: false
+jobs:
+  reconcile:
+    if: github.repository == 'acosmi/RSIAgent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - name: Verify sealed payload and import source on this branch only
+        run: python3 .delivery/h00/reconstruct.py

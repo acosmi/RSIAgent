@@ -15,45 +15,32 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain
-        run: rustup show && rustc --version && cargo --version
-      - name: Resolve dependencies
+      - name: Exact toolchain and locked inputs
         run: |
           mkdir -p out
-          if [ -f Cargo.lock ]; then cargo fetch --locked; else cargo generate-lockfile; fi
-          rustc --version > out/toolchain.txt
+          rustup show
+          rustc -Vv | tee out/toolchain.txt
           git rev-parse HEAD > out/source-commit.txt
-      - name: Format check
-        id: format
-        continue-on-error: true
-        run: cargo fmt --all -- --check > out/fmt.txt 2>&1
+          test -f Cargo.lock
+          cargo fetch --locked
+      - name: Format
+        run: cargo fmt --all -- --check
       - name: Check
-        id: check
-        continue-on-error: true
-        run: cargo check --workspace --all-targets --locked > out/check.txt 2>&1
+        run: cargo check --workspace --all-targets --locked
       - name: Tests
-        id: tests
-        continue-on-error: true
-        run: cargo test --workspace --locked > out/tests.txt 2>&1
+        run: cargo test --workspace --locked
       - name: Clippy
-        id: clippy
-        continue-on-error: true
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings > out/clippy.txt 2>&1
-      - name: Protocol smoke
-        id: smoke
-        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Actual CLI and stdio protocol
         run: |
-          if [ -f scripts/smoke.py ]; then
-            cargo build --locked -p rsia && python3 scripts/smoke.py target/debug/rsia > out/smoke.txt 2>&1
-          else
-            echo 'NOT_IMPLEMENTED' > out/smoke.txt
-            exit 1
-          fi
-      - name: Collect source and reports
+          cargo build --locked -p rsia
+          python3 scripts/smoke.py target/debug/rsia | tee out/smoke.json
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Preserve exact source, not a reformatted working tree
         if: always()
         run: |
           mkdir -p out
-          cargo fmt --all || true
+          git diff --exit-code
           tar --exclude=.git --exclude=target --exclude=out -czf out/source.tar.gz .
       - uses: actions/upload-artifact@v4
         if: always()
@@ -61,17 +48,3 @@ jobs:
           name: verification-${{ github.sha }}
           path: out/
           retention-days: 14
-      - name: Quality gate
-        if: always()
-        env:
-          FORMAT: ${{ steps.format.outcome }}
-          CHECK: ${{ steps.check.outcome }}
-          TESTS: ${{ steps.tests.outcome }}
-          CLIPPY: ${{ steps.clippy.outcome }}
-          SMOKE: ${{ steps.smoke.outcome }}
-        run: |
-          test "$FORMAT" = success
-          test "$CHECK" = success
-          test "$TESTS" = success
-          test "$CLIPPY" = success
-          test "$SMOKE" = success
