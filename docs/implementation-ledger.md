@@ -48,8 +48,8 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | E16.2 | 资产导入/分享与隐私门禁 | implemented_not_verified | PR #21 merged `1431d174e1ee4e4540e568425cf5321e259a62ee`。 |
 | E16.3 | 内置种子与本地修改保护 | implemented_not_verified | PR #22 merged `117629751fd45c6281dd08ddd4ba34bec3ca20eb`。 |
 | E16.4 | 额外真实宿主与配置面漂移 | blocked | PR #23 merged `afd49bbbfff64be4f6cf5e7c9f16dd1367af13fd`。Claude Code 未安装，保持 blocked。 |
-| E16.5 | 持久恢复、容量、依赖与部署安全 | implemented_not_verified | MVP 上限 1000 runs / 10000 events / 1000 skills / 5 prepare；超限拒绝新派生。代码执行仍 disabled。公网 TLS/OAuth 未做。 |
-| E16.6 | 发行、证据台账与唯一真源交接 | planned | 前置本次声明范围。 |
+| E16.5 | 持久恢复、容量、依赖与部署安全 | implemented_not_verified | PR #24 merged `e18cbaae761236671d50f44da0e83bb26b76d602`。 |
+| E16.6 | 发行、证据台账与唯一真源交接 | implemented_not_verified | `reports/support-scope.json` 声明 subset_only；不报全量完成；T001–T126 仍 legacy_equivalence_unverified。 |
 | E17 | 可选：开发代理评分器演化 | planned | 默认关闭。前置 E15。 |
 | E18 | 可选：自动提出代码修改 | planned | 默认关闭。前置 E04,E06,E15。无隔离与人工批准保持 disabled。 |
 
