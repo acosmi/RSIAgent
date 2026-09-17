@@ -10,6 +10,7 @@ pub mod evidence;
 pub mod executor;
 pub mod exploration;
 pub mod meta;
+pub mod meta_experiment;
 pub mod monitoring;
 pub mod releases;
 pub mod replay;
