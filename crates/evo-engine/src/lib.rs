@@ -9,3 +9,4 @@ pub mod evidence;
 pub mod executor;
 pub mod exploration;
 pub mod releases;
+pub mod replay;
