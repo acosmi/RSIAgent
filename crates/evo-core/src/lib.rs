@@ -9,6 +9,7 @@ pub mod contract;
 pub mod curriculum;
 pub mod evaluation;
 pub mod evidence;
+pub mod features;
 pub mod strategy;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

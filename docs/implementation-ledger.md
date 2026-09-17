@@ -49,9 +49,9 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | E16.3 | 内置种子与本地修改保护 | implemented_not_verified | PR #22 merged `117629751fd45c6281dd08ddd4ba34bec3ca20eb`。 |
 | E16.4 | 额外真实宿主与配置面漂移 | blocked | PR #23 merged `afd49bbbfff64be4f6cf5e7c9f16dd1367af13fd`。Claude Code 未安装，保持 blocked。 |
 | E16.5 | 持久恢复、容量、依赖与部署安全 | implemented_not_verified | PR #24 merged `e18cbaae761236671d50f44da0e83bb26b76d602`。 |
-| E16.6 | 发行、证据台账与唯一真源交接 | implemented_not_verified | `reports/support-scope.json` 声明 subset_only；不报全量完成；T001–T126 仍 legacy_equivalence_unverified。 |
-| E17 | 可选：开发代理评分器演化 | planned | 默认关闭。前置 E15。 |
-| E18 | 可选：自动提出代码修改 | planned | 默认关闭。前置 E04,E06,E15。无隔离与人工批准保持 disabled。 |
+| E16.6 | 发行、证据台账与唯一真源交接 | implemented_not_verified | PR #25 merged `5c74aff0bdd908b8f25f84fbd18c1799b7f2b1f6`。 |
+| E17 | 可选：开发代理评分器演化 | implemented_not_verified | 默认关闭；`enable_agent_scorer_evolution(true)` 拒绝。未修订方案不得打开。 |
+| E18 | 可选：自动提出代码修改 | implemented_not_verified | 默认关闭；`enable_automatic_code_prs(true)` 拒绝。 |
 
 ## B01–B10
 
