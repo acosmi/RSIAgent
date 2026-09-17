@@ -45,8 +45,8 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | E14 | 受限改进器自身的继承控制器 | implemented_not_verified | PR #18 merged `d6f5742922eee76971356be56e80b609e0dccbf2`。 |
 | E15 | 后继质量与跨代收益实验 | implemented_not_verified | PR #19 merged `3ef355138815c4920ac4d414ad11a041392d9f4a`。 |
 | E16.1 | 来源导入与版本化读取器 | implemented_not_verified | PR #20 merged `c45eaebc9cd3eae9dd8f18c1a40d4ff4dd0a3334`。 |
-| E16.2 | 资产导入/分享与隐私门禁 | implemented_not_verified | 路径穿越/绝对路径/脚本/体积/压缩比拒绝；隐私门；外来审批不产生本地权限。 |
-| E16.3 | 内置种子与本地修改保护 | planned | 前置 E02,E06,E16.2。 |
+| E16.2 | 资产导入/分享与隐私门禁 | implemented_not_verified | PR #21 merged `1431d174e1ee4e4540e568425cf5321e259a62ee`。 |
+| E16.3 | 内置种子与本地修改保护 | implemented_not_verified | B/L/U 分类；未修改本地副本也不能自动激活上游；同名不同 publisher 不合并。 |
 | E16.4 | 额外真实宿主与配置面漂移 | planned | 前置 E02,E06,E07。无真实宿主则 blocked，不换成 mock。 |
 | E16.5 | 持久恢复、容量、依赖与部署安全 | planned | 前置 E04,E08 及实际启用的 E16.1–E16.4。 |
 | E16.6 | 发行、证据台账与唯一真源交接 | planned | 前置本次声明范围。 |
