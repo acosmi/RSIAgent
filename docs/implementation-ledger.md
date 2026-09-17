@@ -29,7 +29,7 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | 编号 | 范围 | 状态 | 证据 / 退出条件 |
 |---|---|---|---|
 | E00 | 归并真实源码与可重建输入 | implemented_not_verified | PR #3 squash-merged `5e40b0b5cba4e06cb89981d68be778107c292967`。本地门禁退出码 0。GitHub Actions 因账号 billing lock 未启动，远程 CI 记 blocked，不把未运行当通过。增量与原包仍 blocked。 |
-| E01 | 冻结实验、任务分区和预算可行性 | planned | 前置 E00。V010–V013。无资金授权时只准备脚本。 |
+| E01 | 冻结实验、任务分区和预算可行性 | implemented_not_verified | `docs/evaluation.md`、`evo-core::evaluation`、`tests/statistics`、`scripts/estimate_sample_size.py`。本地 evo-core 32+5 与 workspace 测试退出码 0。付费小试未授权。 |
 | E02 | 最小版本化契约与宿主能力边界 | planned | 前置 E00,E01。V002/V003/V005/V009/V043–V048/V060/V062/V078/V079。 |
 | E03 | 跨任务证据接入生成消费者 | planned | 前置 E02。V004–V006/V017/V051/V052/V054–V058。 |
 | E04 | 可信执行、隔离与根资源预算 | planned | 前置 E02。V007/V008/V009/V038。 |
@@ -77,6 +77,10 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | V072@E00 | implemented_not_verified | 清点 20 项（evo-core 15、evo-storage 5）。无 T 编号。`legacy_equivalence_unverified`。 |
 | V073@E00 | blocked | 原包与增量包缺失，不认证来源、不默认复制、不从方案复造。独立实现可继续。 |
 | V080@E00 | implemented_not_verified | 映射写入本台账；计划/来源/静态测试 ≠ 已实现/已运行。 |
+| V010@E01 | implemented_not_verified | 计划冻结后才能绑候选、开查询账本；失败/取消不退还新种子。 |
+| V011@E01 | implemented_not_verified | raw hash、规范化近重复、family 跨 development/acceptance 均 Conflict。 |
+| V012@E01 | implemented_not_verified | n<2、NaN、重复簇、单次 alpha 分配、边界 micros。v1 `evaluate` 保留。 |
+| V013@E01 | implemented_not_verified | 固定零效应不得 Improved；已知退化 Regressed；估算不可行时不降阈值。仿真不是产品收益。 |
 
 ## 历史映射（仅追踪）
 
