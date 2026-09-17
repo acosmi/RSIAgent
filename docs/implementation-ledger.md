@@ -32,8 +32,8 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | E01 | 冻结实验、任务分区和预算可行性 | implemented_not_verified | PR #5 merged `a62451a20e16b8f5cf58ca0200afb90676237058`。付费小试未授权。远程 CI billing-locked。 |
 | E02 | 最小版本化契约与宿主能力边界 | implemented_not_verified | PR #6 merged `991d47efb35bd044c629df4548b9d97d943b1773`。远程 CI billing-locked。 |
 | E03 | 跨任务证据接入生成消费者 | implemented_not_verified | PR #7 merged `fec2f32b3c4ff860fb845a08a3864a723c87b30a`。 |
-| E04 | 可信执行、隔离与根资源预算 | implemented_not_verified | RootBudget 预留/dispatch/finalize/uncertain、lease fence、隔离逃逸拒绝、code execution disabled、无沙箱不回退 shell。 |
-| E05 | 独立验收器与有边界统计判定 | planned | 前置 E01,E03,E04。V010–V013/V028。 |
+| E04 | 可信执行、隔离与根资源预算 | implemented_not_verified | PR #8 merged `fb5f50e12437a817e7fe51f1098474589d22ce50`。 |
+| E05 | 独立验收器与有边界统计判定 | implemented_not_verified | Evaluator 仅 Evaluator 角色；ReplayReport 不能转 FormalEvaluation；缺行失败不退查询额度；零效应不得 Improved。 |
 | E06 | 组合发布、实际应用与最小撤销闭环 | planned | 前置 E02,E05。V014–V017 及 V047/V049/V050/V059/V064/V070/V075/V077/V078。 |
 | E07 | 第一个最小可验证真实闭环 | planned | 前置 E03–E06。真实链；mock 不得冒充模型能力。 |
 | E08 | 可恢复的撤销、保留和备份链 | planned | 前置 E06。 |
@@ -108,6 +108,10 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | V008@E04 | implemented_not_verified | 同 billing_scope 不能拆根；超时 uncertain 不释放不重发；旧 lease fence。 |
 | V009@E04 | implemented_not_verified | 未授权模型出站拒绝。 |
 | V038@E04 | implemented_not_verified | sandbox_unavailable 且禁止宿主 shell 兜底。 |
+| V010@E05 | implemented_not_verified | 冻结计划后扣查询；不完整执行 fail ticket 且不退还。 |
+| V012@E05 | implemented_not_verified | 正式结论走 empirical_bernstein.v2。 |
+| V013@E05 | implemented_not_verified | 零效应 FormalEvaluation 不得 Improved。 |
+| V028@E05 | implemented_not_verified | ReplayReport 不能转换为 FormalEvaluation。 |
 
 ## 历史映射（仅追踪）
 
