@@ -43,8 +43,8 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | E12 | 学习者条件化的经验自主获取 | implemented_not_verified | PR #16 merged `b9cb2c1fc0ffe0e2c52a5a1547c5d75552988b0a`。 |
 | E13 | 长期部署适应与能力保留监测 | implemented_not_verified | PR #17 merged `df44cb8b4b90556d1ce32fe4889a8ff7b37eaf49`。 |
 | E14 | 受限改进器自身的继承控制器 | implemented_not_verified | PR #18 merged `d6f5742922eee76971356be56e80b609e0dccbf2`。 |
-| E15 | 后继质量与跨代收益实验 | implemented_not_verified | 三流三轮只证明编排；不宣称功效或 L5。正式 n 因预算 0 未冻结。 |
-| E16.1 | 来源导入与版本化读取器 | planned | 前置 E02,E03。 |
+| E15 | 后继质量与跨代收益实验 | implemented_not_verified | PR #19 merged `3ef355138815c4920ac4d414ad11a041392d9f4a`。 |
+| E16.1 | 来源导入与版本化读取器 | implemented_not_verified | RSIA/RSIH-Pi/Claude fixture；Codex unsupported；导入 attestation=unverified_import；空文件不是空历史成功。 |
 | E16.2 | 资产导入/分享与隐私门禁 | planned | 前置 E02,E06,E08。 |
 | E16.3 | 内置种子与本地修改保护 | planned | 前置 E02,E06,E16.2。 |
 | E16.4 | 额外真实宿主与配置面漂移 | planned | 前置 E02,E06,E07。无真实宿主则 blocked，不换成 mock。 |
