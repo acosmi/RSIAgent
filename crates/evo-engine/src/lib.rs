@@ -6,3 +6,4 @@ pub mod dispatch;
 pub mod evaluator;
 pub mod evidence;
 pub mod executor;
+pub mod releases;

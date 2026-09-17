@@ -33,8 +33,8 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | E02 | 最小版本化契约与宿主能力边界 | implemented_not_verified | PR #6 merged `991d47efb35bd044c629df4548b9d97d943b1773`。远程 CI billing-locked。 |
 | E03 | 跨任务证据接入生成消费者 | implemented_not_verified | PR #7 merged `fec2f32b3c4ff860fb845a08a3864a723c87b30a`。 |
 | E04 | 可信执行、隔离与根资源预算 | implemented_not_verified | PR #8 merged `fb5f50e12437a817e7fe51f1098474589d22ce50`。 |
-| E05 | 独立验收器与有边界统计判定 | implemented_not_verified | Evaluator 仅 Evaluator 角色；ReplayReport 不能转 FormalEvaluation；缺行失败不退查询额度；零效应不得 Improved。 |
-| E06 | 组合发布、实际应用与最小撤销闭环 | planned | 前置 E02,E05。V014–V017 及 V047/V049/V050/V059/V064/V070/V075/V077/V078。 |
+| E05 | 独立验收器与有边界统计判定 | implemented_not_verified | PR #9 merged `d2d32c63a82322738be562e0b47a2bd696a192f8`。 |
+| E06 | 组合发布、实际应用与最小撤销闭环 | implemented_not_verified | CAS 一胜、Admin 批准、撤销停止新使用、回执校验 bundle_digest、副作用不随回滚消失。 |
 | E07 | 第一个最小可验证真实闭环 | planned | 前置 E03–E06。真实链；mock 不得冒充模型能力。 |
 | E08 | 可恢复的撤销、保留和备份链 | planned | 前置 E06。 |
 | E09 | 生成/探索解耦与有状态在线探索 | planned | 前置 E03,E04,E07。 |
@@ -112,6 +112,10 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | V012@E05 | implemented_not_verified | 正式结论走 empirical_bernstein.v2。 |
 | V013@E05 | implemented_not_verified | 零效应 FormalEvaluation 不得 Improved。 |
 | V028@E05 | implemented_not_verified | ReplayReport 不能转换为 FormalEvaluation。 |
+| V014@E06 | implemented_not_verified | 同父 CAS 一胜一冲突。 |
+| V015@E06 | implemented_not_verified | 仅 Admin 可批准；Evaluator 不能自批。 |
+| V016@E06 | implemented_not_verified | 撤销后新回执拒绝；副作用声明保留。 |
+| V047@E06 | implemented_not_verified | Tool-only 回执不得报 used。 |
 
 ## 历史映射（仅追踪）
 
