@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 pub type Result<T> = std::result::Result<T, Error>;
 pub mod contract;
 pub mod evaluation;
+pub mod evidence;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid input: {0}")]
