@@ -17,3 +17,4 @@ pub mod packages;
 pub mod releases;
 pub mod replay;
 pub mod replay_experiment;
+pub mod seeds;
