@@ -1,1 +1,3 @@
-fn main() { println!("cargo:rerun-if-changed=migrations"); }
+fn main() {
+    println!("cargo:rerun-if-changed=migrations");
+}

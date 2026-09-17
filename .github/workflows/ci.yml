@@ -39,21 +39,22 @@ jobs:
         id: clippy
         continue-on-error: true
         run: cargo clippy --workspace --all-targets --locked -- -D warnings > out/clippy.txt 2>&1
-      - name: Protocol smoke
+      - name: Workspace smoke
+        id: smoke_workspace
+        continue-on-error: true
+        run: python3 scripts/smoke_workspace.py > out/smoke-workspace.txt 2>&1
+      - name: CLI smoke
         id: smoke
         continue-on-error: true
         run: |
-          if [ -f scripts/smoke.py ]; then
-            cargo build --locked -p rsia && python3 scripts/smoke.py target/debug/rsia > out/smoke.txt 2>&1
-          else
-            echo 'NOT_IMPLEMENTED' > out/smoke.txt
-            exit 1
-          fi
+          cargo build --locked -p rsia
+          python3 scripts/smoke_cli.py target/debug/rsia > out/smoke-cli.txt 2>&1
       - name: Collect source and reports
         if: always()
         run: |
           mkdir -p out
           cargo fmt --all || true
+          python3 scripts/inventory_baseline_tests.py > out/baseline-tests.json || echo 'INVENTORY_FAILED' > out/baseline-tests.json
           tar --exclude=.git --exclude=target --exclude=out -czf out/source.tar.gz .
       - uses: actions/upload-artifact@v4
         if: always()
@@ -68,10 +69,12 @@ jobs:
           CHECK: ${{ steps.check.outcome }}
           TESTS: ${{ steps.tests.outcome }}
           CLIPPY: ${{ steps.clippy.outcome }}
+          SMOKE_WORKSPACE: ${{ steps.smoke_workspace.outcome }}
           SMOKE: ${{ steps.smoke.outcome }}
         run: |
           test "$FORMAT" = success
           test "$CHECK" = success
           test "$TESTS" = success
           test "$CLIPPY" = success
+          test "$SMOKE_WORKSPACE" = success
           test "$SMOKE" = success

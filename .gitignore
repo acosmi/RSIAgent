@@ -12,3 +12,8 @@
 *.key
 *.log
 __pycache__/
+.DS_Store
+
+# Engineering plans and their physical archive stay local. Remote receives source only.
+/RSIAgent-*.md
+/archive/
