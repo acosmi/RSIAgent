@@ -38,8 +38,8 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | E07 | 第一个最小可验证真实闭环 | implemented_not_verified | PR #11 merged `38b4f39eeee6ece7b28324d0d915eda0ceab9ab4`。真实模型仍 blocked。 |
 | E08 | 可恢复的撤销、保留和备份链 | implemented_not_verified | PR #12 merged `cfc6a542cec4779ffce500c917d1fbf656d0e71e`。 |
 | E09 | 生成/探索解耦与有状态在线探索 | implemented_not_verified | PR #13 merged `adf431959cadb0d41bd6b1978873fe964494a098`。 |
-| E10 | 不可变世界池与纯查表回放 | implemented_not_verified | 迁移 `0004_replay_worlds.sql`（跳过 0003 以免冒占增量包号）；回放只查表，不能转正式评测。 |
-| E11 | 验证回放优化的真实经济收益 | planned | 前置 E05,E07,E10。 |
+| E10 | 不可变世界池与纯查表回放 | implemented_not_verified | PR #14 merged `9b76d6e2f5112b70b2d6ac2ce167ec7f3144c540`。 |
+| E11 | 验证回放优化的真实经济收益 | implemented_not_verified | 回放变好且在线回归则不发布；成本必须含采集/生成/回放/验收/审阅。真实配对实验未跑（无资金）。 |
 | E12 | 学习者条件化的经验自主获取 | planned | 前置 E07,E08,E09。 |
 | E13 | 长期部署适应与能力保留监测 | planned | 前置 E07,E08。 |
 | E14 | 受限改进器自身的继承控制器 | planned | 前置 E07,E09。 |
