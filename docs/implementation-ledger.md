@@ -28,7 +28,7 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 
 | 编号 | 范围 | 状态 | 证据 / 退出条件 |
 |---|---|---|---|
-| E00 | 归并真实源码与可重建输入 | implemented_not_verified | 本地 fmt/check/test/clippy/build 与两组 smoke 退出码 0（20 项现有回归）。增量与原包仍 blocked。待 PR CI 与合并 SHA。 |
+| E00 | 归并真实源码与可重建输入 | implemented_not_verified | PR #3 squash-merged `5e40b0b5cba4e06cb89981d68be778107c292967`。本地门禁退出码 0。GitHub Actions 因账号 billing lock 未启动，远程 CI 记 blocked，不把未运行当通过。增量与原包仍 blocked。 |
 | E01 | 冻结实验、任务分区和预算可行性 | planned | 前置 E00。V010–V013。无资金授权时只准备脚本。 |
 | E02 | 最小版本化契约与宿主能力边界 | planned | 前置 E00,E01。V002/V003/V005/V009/V043–V048/V060/V062/V078/V079。 |
 | E03 | 跨任务证据接入生成消费者 | planned | 前置 E02。V004–V006/V017/V051/V052/V054–V058。 |
@@ -107,6 +107,21 @@ python3 scripts/inventory_baseline_tests.py
 | `python3 scripts/inventory_baseline_tests.py` | 0 | 20 tests |
 
 回滚点：丢弃本分支；main 仍为 `6e83d12`。合并后走回退 PR，不强推历史。
+
+## E00 合并记录
+
+| 字段 | 值 |
+|---|---|
+| plan_version | v3.3 |
+| 方案正文 SHA-256 | `1b5870341be7c027c369a08c6e6bfd8f06dc494fc7174fff8930f42ae247294a` |
+| source_sha（PR head） | `4b36f1681589c04de882f89252bf9d0e42b685f3` |
+| PR | https://github.com/acosmi/RSIAgent/pull/3 |
+| merged_sha | `5e40b0b5cba4e06cb89981d68be778107c292967` |
+| 测试入口 | `cargo test --workspace --locked`；`python3 scripts/smoke_workspace.py`；`python3 scripts/smoke_cli.py` |
+| 本地退出码 | fmt/check/test/clippy/build/smoke 均为 0 |
+| 远程 CI | blocked：`The job was not started because your account is locked due to a billing issue.` |
+| 支持范围 | 当前远程树可重建；增量包/原包未归并 |
+| 回滚点 | 回退 PR 到 `6e83d1285b778a62243446bbe0a1eb14809de4f3`，不强推 |
 
 ## 环境与变更记录
 
