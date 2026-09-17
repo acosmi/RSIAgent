@@ -9,6 +9,7 @@ pub mod evaluator;
 pub mod evidence;
 pub mod executor;
 pub mod exploration;
+pub mod monitoring;
 pub mod releases;
 pub mod replay;
 pub mod replay_experiment;

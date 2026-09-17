@@ -40,8 +40,8 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | E09 | 生成/探索解耦与有状态在线探索 | implemented_not_verified | PR #13 merged `adf431959cadb0d41bd6b1978873fe964494a098`。 |
 | E10 | 不可变世界池与纯查表回放 | implemented_not_verified | PR #14 merged `9b76d6e2f5112b70b2d6ac2ce167ec7f3144c540`。 |
 | E11 | 验证回放优化的真实经济收益 | implemented_not_verified | PR #15 merged `8ef4c8d37bf2323061021c82465163af66c1c8b2`。真实配对未跑。 |
-| E12 | 学习者条件化的经验自主获取 | implemented_not_verified | LearnerState 改变下一题；课程题不能进 holdout；无 oracle 隔离；费用来自根预算。 |
-| E13 | 长期部署适应与能力保留监测 | planned | 前置 E07,E08。 |
+| E12 | 学习者条件化的经验自主获取 | implemented_not_verified | PR #16 merged `b9cb2c1fc0ffe0e2c52a5a1547c5d75552988b0a`。 |
+| E13 | 长期部署适应与能力保留监测 | implemented_not_verified | 环境指纹漂移使旧收益失效；有害立即停用；长时稳定性未实测。 |
 | E14 | 受限改进器自身的继承控制器 | planned | 前置 E07,E09。 |
 | E15 | 后继质量与跨代收益实验 | planned | 前置 E05,E07,E14。 |
 | E16.1 | 来源导入与版本化读取器 | planned | 前置 E02,E03。 |
