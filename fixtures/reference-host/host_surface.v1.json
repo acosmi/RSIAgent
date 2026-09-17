@@ -1,0 +1,30 @@
+{
+  "schema_version": "rsia.host_surface.v1",
+  "host": "reference",
+  "host_version": "0.1.0",
+  "adapter_version": "0.1.0",
+  "source_digest": "reference_host_surface_v1",
+  "items": [
+    {
+      "name": "instruction",
+      "coverage": "supported",
+      "mapped_field": "skill.content",
+      "consumer": "compiler",
+      "reason": "run-level instruction projection"
+    },
+    {
+      "name": "model",
+      "coverage": "runtime_owned",
+      "mapped_field": null,
+      "consumer": null,
+      "reason": "model identity is host-declared"
+    },
+    {
+      "name": "theme",
+      "coverage": "unsupported",
+      "mapped_field": null,
+      "consumer": null,
+      "reason": "UI theme is out of scope"
+    }
+  ]
+}

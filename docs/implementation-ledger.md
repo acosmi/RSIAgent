@@ -29,8 +29,8 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | 编号 | 范围 | 状态 | 证据 / 退出条件 |
 |---|---|---|---|
 | E00 | 归并真实源码与可重建输入 | implemented_not_verified | PR #3 squash-merged `5e40b0b5cba4e06cb89981d68be778107c292967`。本地门禁退出码 0。GitHub Actions 因账号 billing lock 未启动，远程 CI 记 blocked，不把未运行当通过。增量与原包仍 blocked。 |
-| E01 | 冻结实验、任务分区和预算可行性 | implemented_not_verified | `docs/evaluation.md`、`evo-core::evaluation`、`tests/statistics`、`scripts/estimate_sample_size.py`。本地 evo-core 32+5 与 workspace 测试退出码 0。付费小试未授权。 |
-| E02 | 最小版本化契约与宿主能力边界 | planned | 前置 E00,E01。V002/V003/V005/V009/V043–V048/V060/V062/V078/V079。 |
+| E01 | 冻结实验、任务分区和预算可行性 | implemented_not_verified | PR #5 merged `a62451a20e16b8f5cf58ca0200afb90676237058`。付费小试未授权。远程 CI billing-locked。 |
+| E02 | 最小版本化契约与宿主能力边界 | implemented_not_verified | FieldContract、三态补丁、ResolvedBundle、HostSurface、四工具/管理面分离、参考宿主 fixture。本地 clippy/test 0。 |
 | E03 | 跨任务证据接入生成消费者 | planned | 前置 E02。V004–V006/V017/V051/V052/V054–V058。 |
 | E04 | 可信执行、隔离与根资源预算 | planned | 前置 E02。V007/V008/V009/V038。 |
 | E05 | 独立验收器与有边界统计判定 | planned | 前置 E01,E03,E04。V010–V013/V028。 |
@@ -81,6 +81,19 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | V011@E01 | implemented_not_verified | raw hash、规范化近重复、family 跨 development/acceptance 均 Conflict。 |
 | V012@E01 | implemented_not_verified | n<2、NaN、重复簇、单次 alpha 分配、边界 micros。v1 `evaluate` 保留。 |
 | V013@E01 | implemented_not_verified | 固定零效应不得 Improved；已知退化 Regressed；估算不可行时不降阈值。仿真不是产品收益。 |
+| V002@E02 | implemented_not_verified | v1 五项 deny_unknown_fields 仍拒绝伪造身份字段；四工具名称固定。 |
+| V003@E02 | implemented_not_verified | offered⊇attached⊇used⊇verified_benefit；Tool-only 不得报 attached/used。 |
+| V009@E02 | implemented_not_verified | 管理/评测操作不在模型工具列表；HTTP body 不能自造 actor/role。 |
+| V043@E02 | implemented_not_verified | inherit / reset_to_baseline / set（含显式空串）语义不同；裸 null 拒绝。 |
+| V044@E02 | implemented_not_verified | FieldContract 静态表；无消费者字段与候选写保护核心均拒绝。 |
+| V045@E02 | implemented_not_verified | 缺省 inherit；reset 读 B 不是宿主当前默认。 |
+| V046@E02 | implemented_not_verified | 未知 settings 透传拒绝。 |
+| V047@E02 | implemented_not_verified | 关闭进化时投影不改宿主工具列表、不注入指令。 |
+| V048@E02 | implemented_not_verified | 同槽位多写者 conflicting_writers。 |
+| V060@E02 | implemented_not_verified | 参考宿主 fixture 分类 supported/runtime_owned/unsupported。 |
+| V062@E02 | implemented_not_verified | supported 无 consumer 拒绝；空提取失败。 |
+| V078@E02 | implemented_not_verified | 撤销依赖使 reset/inherit 结果仍拒绝。 |
+| V079@E02 | implemented_not_verified | 相同 P/B/补丁得到相同 bundle digest。 |
 
 ## 历史映射（仅追踪）
 
