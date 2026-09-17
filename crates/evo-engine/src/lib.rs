@@ -13,6 +13,7 @@ pub mod import;
 pub mod meta;
 pub mod meta_experiment;
 pub mod monitoring;
+pub mod packages;
 pub mod releases;
 pub mod replay;
 pub mod replay_experiment;

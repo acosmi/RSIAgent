@@ -44,8 +44,8 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | E13 | 长期部署适应与能力保留监测 | implemented_not_verified | PR #17 merged `df44cb8b4b90556d1ce32fe4889a8ff7b37eaf49`。 |
 | E14 | 受限改进器自身的继承控制器 | implemented_not_verified | PR #18 merged `d6f5742922eee76971356be56e80b609e0dccbf2`。 |
 | E15 | 后继质量与跨代收益实验 | implemented_not_verified | PR #19 merged `3ef355138815c4920ac4d414ad11a041392d9f4a`。 |
-| E16.1 | 来源导入与版本化读取器 | implemented_not_verified | RSIA/RSIH-Pi/Claude fixture；Codex unsupported；导入 attestation=unverified_import；空文件不是空历史成功。 |
-| E16.2 | 资产导入/分享与隐私门禁 | planned | 前置 E02,E06,E08。 |
+| E16.1 | 来源导入与版本化读取器 | implemented_not_verified | PR #20 merged `c45eaebc9cd3eae9dd8f18c1a40d4ff4dd0a3334`。 |
+| E16.2 | 资产导入/分享与隐私门禁 | implemented_not_verified | 路径穿越/绝对路径/脚本/体积/压缩比拒绝；隐私门；外来审批不产生本地权限。 |
 | E16.3 | 内置种子与本地修改保护 | planned | 前置 E02,E06,E16.2。 |
 | E16.4 | 额外真实宿主与配置面漂移 | planned | 前置 E02,E06,E07。无真实宿主则 blocked，不换成 mock。 |
 | E16.5 | 持久恢复、容量、依赖与部署安全 | planned | 前置 E04,E08 及实际启用的 E16.1–E16.4。 |
