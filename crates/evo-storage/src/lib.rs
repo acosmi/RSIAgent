@@ -331,6 +331,86 @@ impl Session {
             .join(" OR ");
         sqlx::query_scalar("SELECT candidate_id FROM skill_fts WHERE skill_fts MATCH ? AND namespace=? ORDER BY bm25(skill_fts),candidate_id LIMIT 64").bind(expression).bind(ctx.namespace()).fetch_all(&mut *self.tx).await.map_err(internal)
     }
+    pub async fn put_edge(
+        &mut self,
+        ctx: &Context,
+        src_kind: &str,
+        src_id: &str,
+        dst_kind: &str,
+        dst_id: &str,
+    ) -> Result<()> {
+        identifier(src_id)?;
+        identifier(dst_id)?;
+        sqlx::query("INSERT OR IGNORE INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id) VALUES(?,?,?,?,?)")
+            .bind(ctx.namespace())
+            .bind(src_kind)
+            .bind(src_id)
+            .bind(dst_kind)
+            .bind(dst_id)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+        Ok(())
+    }
+
+    pub async fn dependents(
+        &mut self,
+        ctx: &Context,
+        dst_kind: &str,
+        dst_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        identifier(dst_id)?;
+        let rows = sqlx::query("SELECT src_kind,src_id FROM dependencies WHERE namespace=? AND dst_kind=? AND dst_id=?")
+            .bind(ctx.namespace())
+            .bind(dst_kind)
+            .bind(dst_id)
+            .fetch_all(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push((
+                row.try_get("src_kind").map_err(internal)?,
+                row.try_get("src_id").map_err(internal)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    pub async fn bump_watermark(&mut self, ctx: &Context, digest: &str) -> Result<i64> {
+        identifier(digest)?;
+        let prev: i64 = sqlx::query_scalar("SELECT seq FROM revoke_watermark WHERE namespace=?")
+            .bind(ctx.namespace())
+            .fetch_optional(&mut *self.tx)
+            .await
+            .map_err(internal)?
+            .unwrap_or(0);
+        let seq = prev + 1;
+        sqlx::query("INSERT INTO revoke_watermark(namespace,seq,digest) VALUES(?,?,?) ON CONFLICT(namespace) DO UPDATE SET seq=excluded.seq,digest=excluded.digest")
+            .bind(ctx.namespace())
+            .bind(seq)
+            .bind(digest)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+        Ok(seq)
+    }
+
+    pub async fn watermark(&mut self, ctx: &Context) -> Result<Option<(i64, String)>> {
+        let row = sqlx::query("SELECT seq,digest FROM revoke_watermark WHERE namespace=?")
+            .bind(ctx.namespace())
+            .fetch_optional(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+        match row {
+            Some(r) => Ok(Some((
+                r.try_get("seq").map_err(internal)?,
+                r.try_get("digest").map_err(internal)?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
     pub async fn commit(self) -> Result<()> {
         self.tx.commit().await.map_err(internal)
     }
@@ -412,5 +492,25 @@ mod tests {
         let restored = Store::open(&backup.join("rsia.sqlite3")).await.unwrap();
         assert_eq!(restored.verify_audit(&c).await.unwrap(), 1);
         assert_eq!(restored.integrity().await.unwrap(), "ok");
+    }
+    #[tokio::test]
+    async fn revoke_edge_blocks_dependents_and_watermark_is_required() {
+        let (_d, s) = db().await;
+        let c = Context::new("n", "a", Role::Admin).unwrap();
+        let mut t = s.session().await.unwrap();
+        t.put_edge(&c, "job", "j1", "run", "run2").await.unwrap();
+        t.commit().await.unwrap();
+        let mut t = s.session().await.unwrap();
+        let deps = t.dependents(&c, "run", "run2").await.unwrap();
+        assert_eq!(deps, vec![("job".into(), "j1".into())]);
+        let seq = t.bump_watermark(&c, "wm1").await.unwrap();
+        assert_eq!(seq, 1);
+        t.commit().await.unwrap();
+        let mut t = s.session().await.unwrap();
+        assert!(t.watermark(&c).await.unwrap().is_some());
+        t.commit().await.unwrap();
+        let mut other = s.session().await.unwrap();
+        let b = Context::new("other", "a", Role::Admin).unwrap();
+        assert!(other.watermark(&b).await.unwrap().is_none());
     }
 }
