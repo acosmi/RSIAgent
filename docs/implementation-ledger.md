@@ -36,8 +36,8 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 | E05 | 独立验收器与有边界统计判定 | implemented_not_verified | PR #9 merged `d2d32c63a82322738be562e0b47a2bd696a192f8`。 |
 | E06 | 组合发布、实际应用与最小撤销闭环 | implemented_not_verified | PR #10 merged `18057b4fd81def2a76566c5d1f8c691f578f5b18`。 |
 | E07 | 第一个最小可验证真实闭环 | implemented_not_verified | PR #11 merged `38b4f39eeee6ece7b28324d0d915eda0ceab9ab4`。真实模型仍 blocked。 |
-| E08 | 可恢复的撤销、保留和备份链 | implemented_not_verified | 迁移 `0002_revoke_graph.sql`；依赖边与 revoke watermark；无水位不得挂载；`scripts/restore_backup.py`。下一空号 0003，仍禁止 `0003_exploration_worlds.sql`。 |
-| E09 | 生成/探索解耦与有状态在线探索 | planned | 前置 E03,E04,E07。 |
+| E08 | 可恢复的撤销、保留和备份链 | implemented_not_verified | PR #12 merged `cfc6a542cec4779ffce500c917d1fbf656d0e71e`。 |
+| E09 | 生成/探索解耦与有状态在线探索 | implemented_not_verified | GenerationStrategy 与 ExplorationPolicy 分离；W=1；search_parent≠approved_parent；中间节点不发布。 |
 | E10 | 不可变世界池与纯查表回放 | planned | 前置 E08,E09。迁移号在合并基线后分配，不重用 0003。 |
 | E11 | 验证回放优化的真实经济收益 | planned | 前置 E05,E07,E10。 |
 | E12 | 学习者条件化的经验自主获取 | planned | 前置 E07,E08,E09。 |
