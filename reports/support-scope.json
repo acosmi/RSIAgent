@@ -1,0 +1,30 @@
+{
+  "plan_version": "v3.3",
+  "plan_sha256": "1b5870341be7c027c369a08c6e6bfd8f06dc494fc7174fff8930f42ae247294a",
+  "declaration": "subset_only",
+  "not_full_route_complete": true,
+  "legacy_equivalence_unverified": true,
+  "dimensions": {
+    "engineering": "implemented_not_verified_locally",
+    "host": "reference_host_structural_only",
+    "model": "blocked_no_credentials",
+    "effect": "not_claimed",
+    "deploy": "loopback_local_only"
+  },
+  "blocked": [
+    "original_local_package",
+    "increment_zip",
+    "github_actions_billing_lock",
+    "real_model_credentials",
+    "claude_code_extra_host",
+    "paid_experiments"
+  ],
+  "explicitly_out_of_scope_until_revised": [],
+  "optional_disabled": ["E17", "E18"],
+  "b01_b10": {
+    "spec": "included",
+    "implementation": "partial_structural",
+    "verification": "local_tests_not_ci",
+    "effect": "not_claimed"
+  }
+}
