@@ -61,9 +61,17 @@ def main() -> int:
     if delivery.exists():
         return fail(".delivery reconstruction artifacts must not ship")
 
+    numbers = []
+    for name in names:
+        prefix = name.split("_", 1)[0]
+        if prefix.isdigit():
+            numbers.append(int(prefix))
+    nxt = 1
+    while nxt in numbers:
+        nxt += 1
     print("SMOKE_WORKSPACE_OK")
     print(f"migrations={','.join(names)}")
-    print("next_free_migration=0002")
+    print(f"next_free_migration={nxt:04d}")
     return 0
 
 
