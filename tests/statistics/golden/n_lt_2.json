@@ -1,0 +1,7 @@
+{
+  "name": "n_less_than_two",
+  "n": 1,
+  "d": 1.0,
+  "alpha_i": 0.05,
+  "expect_verdict": "invalid"
+}

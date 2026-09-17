@@ -1,0 +1,8 @@
+{
+  "name": "fixed_seed_zero_effect",
+  "n": 60,
+  "d": 0.0,
+  "alpha_i": 0.05,
+  "expect_verdict_not": "improved",
+  "note": "implementation check; not product-gain evidence"
+}
