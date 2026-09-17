@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub mod contract;
+pub mod curriculum;
 pub mod evaluation;
 pub mod evidence;
 pub mod strategy;
