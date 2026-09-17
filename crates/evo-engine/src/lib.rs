@@ -10,3 +10,4 @@ pub mod executor;
 pub mod exploration;
 pub mod releases;
 pub mod replay;
+pub mod replay_experiment;
