@@ -4,3 +4,4 @@ pub const DEFAULT_WORKER_CONCURRENCY: usize = 1;
 pub mod compiler;
 pub mod dispatch;
 pub mod evidence;
+pub mod executor;
