@@ -411,6 +411,47 @@ impl Session {
         }
     }
 
+    pub async fn put_world(
+        &mut self,
+        ctx: &Context,
+        id: &str,
+        sealed: bool,
+        manifest: &Value,
+    ) -> Result<()> {
+        identifier(id)?;
+        sqlx::query("INSERT INTO replay_worlds(namespace,id,sealed,manifest) VALUES(?,?,?,?) ON CONFLICT(namespace,id) DO UPDATE SET sealed=excluded.sealed,manifest=excluded.manifest")
+            .bind(ctx.namespace())
+            .bind(id)
+            .bind(i64::from(sealed))
+            .bind(manifest.to_string())
+            .execute(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+        Ok(())
+    }
+
+    pub async fn get_world(&mut self, ctx: &Context, id: &str) -> Result<Option<(bool, Value)>> {
+        identifier(id)?;
+        let row =
+            sqlx::query("SELECT sealed,manifest FROM replay_worlds WHERE namespace=? AND id=?")
+                .bind(ctx.namespace())
+                .bind(id)
+                .fetch_optional(&mut *self.tx)
+                .await
+                .map_err(internal)?;
+        match row {
+            Some(r) => {
+                let sealed: i64 = r.try_get("sealed").map_err(internal)?;
+                let manifest: String = r.try_get("manifest").map_err(internal)?;
+                Ok(Some((
+                    sealed != 0,
+                    serde_json::from_str(&manifest).map_err(internal)?,
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub async fn commit(self) -> Result<()> {
         self.tx.commit().await.map_err(internal)
     }
@@ -512,5 +553,19 @@ mod tests {
         let mut other = s.session().await.unwrap();
         let b = Context::new("other", "a", Role::Admin).unwrap();
         assert!(other.watermark(&b).await.unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn sealed_world_roundtrip() {
+        let (_d, s) = db().await;
+        let c = Context::new("n", "a", Role::Admin).unwrap();
+        let mut t = s.session().await.unwrap();
+        t.put_world(&c, "w1", true, &json!({"k":"v"}))
+            .await
+            .unwrap();
+        t.commit().await.unwrap();
+        let mut t = s.session().await.unwrap();
+        let got = t.get_world(&c, "w1").await.unwrap().unwrap();
+        assert!(got.0);
+        assert_eq!(got.1["k"], "v");
     }
 }
