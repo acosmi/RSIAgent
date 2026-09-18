@@ -41,11 +41,11 @@ def main() -> int:
                     "source_sha256": file_sha,
                     "t_number": None,
                     "legacy_equivalence": "unverified",
-                    "note": "enumerated from source; T001-T126 assertions were not provided in v3.3",
+                    "note": "enumerated from source; T001-T126 assertions were not provided by v3.3, and v4 does not re-fabricate them",
                 }
             )
     payload = {
-        "plan_version": "v3.3",
+        "plan_version": "v4",
         "count": len(tests),
         "tests": tests,
         "historical_counts_not_reused": {"rust": 90, "python": 15, "old_smoke": 12, "new_smoke": 8},
