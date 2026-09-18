@@ -30,7 +30,7 @@ v3.3（SHA-256 `1b587034…e247294a`）及更早方案自 v4 起在规范意义�
 
 | 编号 | 范围 | 状态 | 证据 / 退出条件 |
 |---|---|---|---|
-| E00 | 归并真实源码与可重建输入 | implemented_not_verified | v3.3：PR #3 merged `5e40b0b…`。v4：复核记录见下方「v4 E00 复核」节；§1.4 六条缺口全部确认仍存在；本地门禁退出码全 0（126 测试）；远程 CI billing-locked 沿用历史记录。增量与原包仍 blocked_not_found。v4 PR 待开。 |
+| E00 | 归并真实源码与可重建输入 | verified（核心基线）/ blocked（历史归并子项） | v4：PR #27 merged `90b4069`（squash），CI verify pass，本地门禁全 0（126 测试）；§1.4 六条缺口全部确认仍存在，v4 全部升级义务 planned。V073 历史包归并仍 blocked_not_found，不隐藏该限制。v3.3：PR #3 merged `5e40b0b…`。 |
 | E01 | 冻结实验、任务分区和预算可行性 | implemented_not_verified | PR #5 merged `a62451a20e16b8f5cf58ca0200afb90676237058`。付费小试未授权。远程 CI billing-locked。 |
 | E02 | 最小版本化契约与宿主能力边界 | implemented_not_verified | PR #6 merged `991d47efb35bd044c629df4548b9d97d943b1773`。远程 CI billing-locked。 |
 | E03 | 跨任务证据接入生成消费者 | implemented_not_verified | PR #7 merged `fec2f32b3c4ff860fb845a08a3864a723c87b30a`。 |
