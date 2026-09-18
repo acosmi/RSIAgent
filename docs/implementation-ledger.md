@@ -1,9 +1,11 @@
 # RSIAgent 实施台账
 
-规范入口（本地，不进远程）：`RSIAgent-v3.3-工程实施方案-2026-09-17.md`。
-plan_version：v3.3。本台账只索引该规范的任务与验收，不能独立修改门禁。
+规范入口（本地，不进远程）：`RSIAgent-v4定稿-工程实施方案-2026-09-17.md`。
+plan_version：v4。规范正文 SHA-256：`d26ab3506736849f3ec1d286b49fcfa581a09c8be2243681fcc8e93b758f9d6d`。
+本台账只索引该规范的任务与验收，不能独立修改门禁。
+v3.3（SHA-256 `1b587034…e247294a`）及更早方案自 v4 起在规范意义上被替代，原件复制归档于 `archive/2026-09-17-pre-v4/`（本机，gitignored），历史事实保留但无执行权。
 
-仓库：`acosmi/RSIAgent`。日期：2026-09-17 UTC。
+仓库：`acosmi/RSIAgent`。日期：2026-09-18 UTC（v4 切换；下表早期行仍记录 v3.3 时代的动作）。
 
 状态值：`planned` / `in_progress` / `blocked` / `implemented_not_verified` / `verified` / `explicitly_out_of_scope`。
 `verified` 不表示效果 improved。效果结论和部署支持另列。
@@ -28,7 +30,7 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 
 | 编号 | 范围 | 状态 | 证据 / 退出条件 |
 |---|---|---|---|
-| E00 | 归并真实源码与可重建输入 | implemented_not_verified | PR #3 squash-merged `5e40b0b5cba4e06cb89981d68be778107c292967`。本地门禁退出码 0。GitHub Actions 因账号 billing lock 未启动，远程 CI 记 blocked，不把未运行当通过。增量与原包仍 blocked。 |
+| E00 | 归并真实源码与可重建输入 | implemented_not_verified | v3.3：PR #3 merged `5e40b0b…`。v4：复核记录见下方「v4 E00 复核」节；§1.4 六条缺口全部确认仍存在；本地门禁退出码全 0（126 测试）；远程 CI billing-locked 沿用历史记录。增量与原包仍 blocked_not_found。v4 PR 待开。 |
 | E01 | 冻结实验、任务分区和预算可行性 | implemented_not_verified | PR #5 merged `a62451a20e16b8f5cf58ca0200afb90676237058`。付费小试未授权。远程 CI billing-locked。 |
 | E02 | 最小版本化契约与宿主能力边界 | implemented_not_verified | PR #6 merged `991d47efb35bd044c629df4548b9d97d943b1773`。远程 CI billing-locked。 |
 | E03 | 跨任务证据接入生成消费者 | implemented_not_verified | PR #7 merged `fec2f32b3c4ff860fb845a08a3864a723c87b30a`。 |
@@ -72,11 +74,11 @@ plan_version：v3.3。本台账只索引该规范的任务与验收，不能独�
 
 | 场景 | 状态 | 说明 |
 |---|---|---|
-| V001@E00 | implemented_not_verified | 输入 HEAD `6e83d12`；先记录再跑。本地：fmt 0、check 0、test 0（15+5）、clippy 0、build 0。CI 待跑。 |
-| V071@E00 | implemented_not_verified | 本地入口 v3.3 SHA-256 `1b587034…e247294a`；`archive/2026-09-17-pre-v3.3/` 只读归档；`.gitignore` 阻止方案与 archive 进远程。 |
-| V072@E00 | implemented_not_verified | 清点 20 项（evo-core 15、evo-storage 5）。无 T 编号。`legacy_equivalence_unverified`。 |
-| V073@E00 | blocked | 原包与增量包缺失，不认证来源、不默认复制、不从方案复造。独立实现可继续。 |
-| V080@E00 | implemented_not_verified | 映射写入本台账；计划/来源/静态测试 ≠ 已实现/已运行。 |
+| V001@E00 | implemented_not_verified | v3.3：HEAD `6e83d12`，本地门禁 0。v4：HEAD `559d4da`，fmt/check/test(126)/clippy/build/smoke×2 全 0，日志在 `out/e00-v4/`；远程 CI 沿用 billing-locked 记录。 |
+| V071@E00 | implemented_not_verified | v4：台账入口切换为 `RSIAgent-v4定稿-工程实施方案-2026-09-17.md`（SHA-256 `d26ab350…58f9d6d`）；v3.3 原字节复制归档至 `archive/2026-09-17-pre-v4/`（含 manifest）；`.gitignore` 继续阻止方案与 archive 进远程；无需要求回读旧方案的跳转。 |
+| V072@E00 | implemented_not_verified | v3.3：清点 20 项。v4：清点 112 项实际测试，全部无 T 编号、`legacy_equivalence_unverified`；未删断言。 |
+| V073@E00 | blocked | 原包与增量包缺失，不认证来源、不默认复制、不从方案复造。独立实现可继续。v3.3 与 v4 结论相同。 |
+| V080@E00 | implemented_not_verified | v4：映射写入本台账；§1.4 六缺口逐项复核仍存在；B01–B10/U01–U08 与 E/V 链的 v4 增量义务全部 planned；计划/来源/静态测试 ≠ 已实现/已运行。 |
 | V010@E01 | implemented_not_verified | 计划冻结后才能绑候选、开查询账本；失败/取消不退还新种子。 |
 | V011@E01 | implemented_not_verified | raw hash、规范化近重复、family 跨 development/acceptance 均 Conflict。 |
 | V012@E01 | implemented_not_verified | n<2、NaN、重复簇、单次 alpha 分配、边界 micros。v1 `evaluate` 保留。 |
@@ -152,6 +154,46 @@ python3 scripts/inventory_baseline_tests.py
 | `python3 scripts/inventory_baseline_tests.py` | 0 | 20 tests |
 
 回滚点：丢弃本分支；main 仍为 `6e83d12`。合并后走回退 PR，不强推历史。
+
+## v4 E00 复核（plan_version=v4，base `559d4da2f3c9ffd0e34a442bccd1d444214f69f5`）
+
+### §1.4 逐项复核结果（本轮直接读取上述六个文件确认，不是沿用 v3.3 结论）
+
+| 定位 | 结论 | 证据 |
+|---|---|---|
+| `evo-engine/src/exploration.rs` + `evo-core/src/strategy.rs` | 缺口仍存在 | `Coordinator::decide()`（exploration.rs:64-66）只 advance Observed→Selected；`PrefixView`（strategy.rs:86-90）仅 search_parent/approved_parent/depth，无质量/失败/预算字段；无 LegalActions/BudgetView/批次动作/真实 dispatch 消费者。 |
+| `evo-engine/src/replay.rs` | 缺口仍存在 | `lookup()`（replay.rs:24-34）用 `policy:seed` 查 BTreeMap 取单个动作；`OBJECTIVE` 常量存在但无 AUC 计算；OOS/censored 合并成同一默认结果。 |
+| `evo-core/src/curriculum.rs` | 缺口仍存在 | `LearnerState` 仅 checkpoint/failure_clusters（:8-11）；`next_task`（:51-63）在空 failure_clusters 时返回错误。 |
+| 同上 `proposal_from_text` | 缺口仍存在 | curriculum.rs:65-76 文本校验后直接 `oracle_ok: true`。 |
+| `evo-engine/src/curriculum.rs` | 缺口仍存在 | `step`（:6-14）先 reserve 再选题，选题错误归一为 `Error::NotFound`。 |
+| `evo-engine/src/evaluator.rs` | 缺口仍存在 | `grade`（:80-103）对 `outputs_complete=false` 直接判 invalid，无计划内早停/连续前缀/终止证书路径。 |
+
+v4 新增项（HoldoutManifest/ExposureLedger、normal-mixture 置信序列、EarlyStopCertificate、ExplorationCaps/ElasticPolicy/RecoveryEntry、ReplaySimulationProfile/ReplayReportV2、rsia.pareto_attainment.v2、PlateauSignal/CoverageProbeDecision、TestProposal/ValidityReport 独立 oracle）在 `crates/` 中无任何对应实现（文本检索确认 0 命中）。**结论：v4 相对 v3.3 的全部升级义务在本基线均为 planned，不因 v3.3 时代已有 PR 推定完成。**
+
+### v4 E00 本地命令记录
+
+输入 HEAD：`559d4da2f3c9ffd0e34a442bccd1d444214f69f5`（分支 implementation/host-cli-http-mcp-20260917，工作树已确认与 559d4da 内容一致）。toolchain：rustc 1.98.1 stable。
+
+| 命令 | 退出码 | 日志 |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | 基线本已格式化 |
+| `cargo check --workspace --all-targets --locked` | 0 | `out/e00-v4/check.txt` |
+| `cargo test --workspace --locked` | 0（126 项通过） | `out/e00-v4/test.txt` |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 0 | `out/e00-v4/clippy.txt` |
+| `cargo build --locked -p rsia` | 0 | `out/e00-v4/build.txt` |
+| `python3 scripts/smoke_workspace.py` | 0；migrations=0001/0002/0004，next_free=0003 | 0003 保持为空号，未被占用 |
+| `python3 scripts/smoke_cli.py target/debug/rsia` | 0 | `SMOKE_CLI_OK` |
+| `python3 scripts/smoke.py` | 1 | 脚本需要二进制参数；等价内容由 smoke_workspace.py + smoke_cli.py 覆盖，不伪造通过 |
+| `python3 scripts/inventory_baseline_tests.py` | 0；112 项实际测试 | 全部 `legacy_equivalence=unverified`，无 T 编号，不编造 |
+
+远程 CI：GitHub 账号 billing lock 状态本轮未复测，沿用历史 blocked 记录；后续 PR 合并以本地真实退出码 + 代码审阅为准并如实登记。
+
+### v4 E00 范围裁决
+
+- **唯一真源切换与 §18.2 归档（V071@E00）**：本轮已执行——台账入口切换为 v4 并登记内容摘要；v3.3 原件按原字节复制（非移动）到 `archive/2026-09-17-pre-v4/`，manifest 含原/新路径、SHA-256、原因与 superseded_by；旧归档目录保留不动。
+- **历史包归并子项（V073）**：仍 blocked_not_found（原包与增量包均不存在），不重建、不推定。
+- **可重建基线与 §1.4 复核（V001/V072）**：implemented_not_verified（PR 待开）。
+- **WIP 处理**：`implementation/host-cli-http-mcp-20260917` 分支上的未提交改动（387 行 host CLI/HTTP/MCP 接线）已完整保存为 git stash；因其把 `evo_engine::service::HostService` 实际接入 HTTP/MCP/CLI（属 v4 产品面新交付），不与 E00 基线 PR 混合，待 E00 合并后按单一负责人审阅单独处理。
 
 ## E00 合并记录
 
