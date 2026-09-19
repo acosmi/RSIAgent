@@ -1,6 +1,7 @@
 //! Controlled improvement and independent evaluation.
 pub const DEFAULT_WORKER_CONCURRENCY: usize = 1;
 
+pub mod broker;
 pub mod capacity;
 pub mod closed_loop;
 pub mod compiler;
