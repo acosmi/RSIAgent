@@ -15,7 +15,7 @@ use evo_core::skill_edit::{
     CompiledSkillEdit, ProtectedTextRange, SkillEditBatch, TrustedEditContext,
 };
 use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, identifier};
-use evo_storage::Store;
+use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -581,6 +581,234 @@ pub struct StoreOptimizationJournal {
     store: Store,
     context: Context,
     owner: String,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct VerifiedDevelopmentTaskOutcome {
+    pub task_id: String,
+    pub parent_family: String,
+    pub parent_score_micros: u32,
+    pub candidate_score_micros: u32,
+    pub parent_passed: bool,
+    pub candidate_passed: bool,
+    pub parent_execution_id: String,
+    pub candidate_execution_id: String,
+    pub grader_receipt_digest: String,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct VerifiedDevelopmentObservationView {
+    pub episode_id: String,
+    pub step: u32,
+    pub attempt: u32,
+    pub request_id: String,
+    pub manifest_digest: String,
+    pub environment_digest: String,
+    pub grader_digest: String,
+    pub outcomes: Vec<VerifiedDevelopmentTaskOutcome>,
+}
+
+pub(crate) async fn verified_development_observation_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    request_fact_id: &str,
+    observed_fact_id: &str,
+) -> Result<VerifiedDevelopmentObservationView> {
+    ctx.require(&[Role::Admin, Role::Worker])?;
+    for id in [request_fact_id, observed_fact_id] {
+        identifier(id)?;
+    }
+    let request_fact: StageFact = session.need(ctx, "artifact", request_fact_id).await?;
+    let observed_fact: StageFact = session.need(ctx, "artifact", observed_fact_id).await?;
+    request_fact.validate()?;
+    observed_fact.validate()?;
+    if request_fact.stage != OptimizationJournalStage::Development
+        || request_fact.kind != StageFactKind::DevelopmentRequestPrepared
+        || observed_fact.stage != OptimizationJournalStage::Development
+        || observed_fact.kind != StageFactKind::DevelopmentObserved
+        || request_fact.namespace != ctx.namespace()
+        || observed_fact.namespace != ctx.namespace()
+        || request_fact.episode_id != observed_fact.episode_id
+        || request_fact.step != observed_fact.step
+        || request_fact.attempt != observed_fact.attempt
+    {
+        return Err(Error::Conflict(
+            "development request/observation facts do not form one stage".into(),
+        ));
+    }
+    let request: DevelopmentRunRequest = serde_json::from_value(request_fact.payload.clone())
+        .map_err(|_| Error::Invalid("development request fact payload is invalid".into()))?;
+    let report: DevelopmentRunReport = serde_json::from_value(observed_fact.payload.clone())
+        .map_err(|_| Error::Invalid("development report fact payload is invalid".into()))?;
+    let _selection = select_development(&request, &report)?;
+    if request_fact.request_id != request.request_id
+        || observed_fact.request_id != request.request_id
+        || request_fact.input_digest != request.manifest.digest
+        || observed_fact.input_digest != request.manifest.digest
+    {
+        return Err(Error::Conflict(
+            "development facts differ from request/report identity".into(),
+        ));
+    }
+    let expected_dependencies = report
+        .results
+        .iter()
+        .flat_map(|result| {
+            [
+                ("execution", result.parent_execution_id.as_str()),
+                ("execution", result.candidate_execution_id.as_str()),
+                ("grader", result.grader_receipt_digest.as_str()),
+            ]
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual_dependencies = observed_fact
+        .dependencies
+        .iter()
+        .map(|dependency| (dependency.kind.as_str(), dependency.id.as_str()))
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual_dependencies != expected_dependencies {
+        return Err(Error::Conflict(
+            "development observation dependency closure differs from report".into(),
+        ));
+    }
+    if report.provenance != DevelopmentExecutionProvenance::IsolatedRunner {
+        return Err(Error::Forbidden);
+    }
+    // E03 currently stores opaque execution/grader IDs but defines no trusted
+    // typed receipt schema for them. Do not upgrade those IDs into evidence.
+    Err(Error::Invalid(
+        "trusted development execution/grader receipt schema is unavailable".into(),
+    ))
+}
+
+#[cfg(test)]
+mod verified_development_tests {
+    use super::*;
+    use evo_core::hash;
+
+    #[tokio::test]
+    async fn fixture_development_facts_cannot_become_verified_cycle_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("verified-development.sqlite3"))
+            .await
+            .unwrap();
+        let context = Context::new("n", "admin", Role::Admin).unwrap();
+        let manifest = DevelopmentManifest::build(
+            "manifest",
+            vec![DevelopmentTask {
+                id: "task".into(),
+                parent_family: "family".into(),
+                input_digest: hash(b"task"),
+            }],
+        )
+        .unwrap();
+        let request = DevelopmentRunRequest {
+            request_id: "development-request".into(),
+            namespace: "n".into(),
+            purpose: Purpose::Development,
+            episode_id: "episode".into(),
+            step: 1,
+            attempt: 1,
+            manifest: manifest.clone(),
+            parent_bundle_digest: hash(b"parent"),
+            candidate_bundle_digest: hash(b"candidate"),
+            environment_digest: hash(b"environment"),
+            grader_digest: hash(b"grader"),
+            rules_digest: hash(b"rules"),
+            tools_digest: hash(b"tools"),
+            revoke_watermark: 1,
+            idempotency_key: "development-idempotency".into(),
+        };
+        let report = DevelopmentRunReport {
+            request_id: request.request_id.clone(),
+            manifest_digest: manifest.digest.clone(),
+            parent_bundle_digest: request.parent_bundle_digest.clone(),
+            candidate_bundle_digest: request.candidate_bundle_digest.clone(),
+            environment_digest: request.environment_digest.clone(),
+            grader_digest: request.grader_digest.clone(),
+            results: vec![PairedTaskResult {
+                task_id: "task".into(),
+                parent_score_micros: 500_000,
+                candidate_score_micros: 600_000,
+                parent_passed: true,
+                candidate_passed: true,
+                parent_execution_id: "parent-execution".into(),
+                candidate_execution_id: "candidate-execution".into(),
+                grader_receipt_digest: hash(b"grade"),
+            }],
+            execution_receipt_id: "fixture-execution".into(),
+            usage_record_ids: vec!["fixture-usage".into()],
+            provenance: DevelopmentExecutionProvenance::Fixture,
+        };
+        let request_fact = StageFact {
+            schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+            artifact_id: String::new(),
+            namespace: "n".into(),
+            episode_id: "episode".into(),
+            step: 1,
+            attempt: 1,
+            stage: OptimizationJournalStage::Development,
+            kind: StageFactKind::DevelopmentRequestPrepared,
+            request_id: request.request_id.clone(),
+            input_digest: manifest.digest.clone(),
+            output_digest: None,
+            dependencies: vec![],
+            payload: serde_json::to_value(&request).unwrap(),
+        }
+        .seal()
+        .unwrap();
+        let observed_fact = StageFact {
+            schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+            artifact_id: String::new(),
+            namespace: "n".into(),
+            episode_id: "episode".into(),
+            step: 1,
+            attempt: 1,
+            stage: OptimizationJournalStage::Development,
+            kind: StageFactKind::DevelopmentObserved,
+            request_id: request.request_id.clone(),
+            input_digest: manifest.digest,
+            output_digest: None,
+            dependencies: vec![
+                StageDependency {
+                    kind: "execution".into(),
+                    id: "parent-execution".into(),
+                },
+                StageDependency {
+                    kind: "execution".into(),
+                    id: "candidate-execution".into(),
+                },
+                StageDependency {
+                    kind: "grader".into(),
+                    id: hash(b"grade"),
+                },
+            ],
+            payload: serde_json::to_value(report).unwrap(),
+        }
+        .seal()
+        .unwrap();
+        let mut session = store.session().await.unwrap();
+        for fact in [&request_fact, &observed_fact] {
+            session
+                .put(&context, "artifact", &fact.artifact_id, "admin", fact)
+                .await
+                .unwrap();
+        }
+        session.commit().await.unwrap();
+        let mut session = store.session().await.unwrap();
+        assert!(matches!(
+            verified_development_observation_in_session(
+                &context,
+                &mut session,
+                &request_fact.artifact_id,
+                &observed_fact.artifact_id,
+            )
+            .await,
+            Err(Error::Forbidden)
+        ));
+    }
 }
 
 impl StoreOptimizationJournal {

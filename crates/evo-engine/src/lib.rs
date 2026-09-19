@@ -6,6 +6,7 @@ pub mod capacity;
 pub mod closed_loop;
 pub mod compiler;
 pub mod curriculum;
+pub mod curriculum_profiles;
 pub mod dispatch;
 pub mod evaluator;
 pub mod evidence;
