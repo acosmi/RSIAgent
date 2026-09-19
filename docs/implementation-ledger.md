@@ -466,6 +466,52 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - 本项目声明 subset_only，不将父任务全绿，未在真实付费生产环境中声称实际经济收益；
 - 历史 v3.3/v4 在规范上已被替代，物理归档据实保留，未提供的旧测试断言保持 legacy_equivalence_unverified。
 
+### CP-001 / 修复 support-scope.json 伪造路径与 support_scope.rs 空心门禁（Copilot 桌面实施，队列第一项）
+
+- 任务号：CP-001
+- E 归属：E16.6（对 AG-007 / PR #49 的直接修复，不新增 E 范畴）
+- 状态：`implemented_not_verified`（待 Codex 主控独立验收；本任务不自行标记 verified，不填写 merged_sha）
+- base 分支：`wrokbot/ag-006-e16-5-capacity-recovery`
+- head 分支：`wrokbot/ag-007-e16-6-release-ledger`（在 AG-007 已推送提交之上追加本任务提交，非另开分支）
+- PR：更新既有 [PR #49](https://github.com/acosmi/RSIAgent/pull/49)（草稿，不合并）
+- merged_sha: null
+
+问题背景：主控独立复核发现 AG-007 提交的 `reports/support-scope.json` 中，`e_scopes.E00/E03/E05/E06/E07/E08/E11/E13` 八个条目合计 12 处 `impl_files`/`test_files` 路径实际在磁盘上不存在（详见下表），而原 `crates/evo-core/tests/support_scope.rs` 仅对 E16.1–E16.6 六个子范畴做存在性校验、对 B/U/K/SO/V 仅做数组长度比较，未覆盖 E00–E15，导致该缺陷未被自动化测试拦截。CP-001 的范围严格限定为修正这一元数据缺陷本身，不修改任何 crates 运行时源码、不新增公开契约。
+
+伪造路径 → 真实路径核对表（均以真实文件内容/模块引用逐一核实，非按文件名猜测）：
+
+| 范畴 | 字段 | 原（伪造） | 修正后（已用 grep 核实模块引用匹配） |
+|---|---|---|---|
+| E00 | test_files/test_command | `crates/evo-core/tests/evidence.rs`（不存在）| `crates/evo-core/src/evidence.rs`（测试内嵌于 `#[cfg(test)] mod tests`，改用 `--lib evidence::tests`） |
+| E03 | test_files/test_command | `crates/evo-engine/tests/optimization_v41.rs`（不存在）| `crates/evo-engine/tests/optimization.rs`（内容确认 `use evo_engine::optimization::*`、`evo_engine::model::*`） |
+| E05 | test_files/test_command | `crates/evo-engine/tests/evaluator_v41.rs`（不存在）| `crates/evo-engine/tests/streaming_evaluator.rs`（内容确认 `use evo_engine::streaming_evaluator::*`） |
+| E06 | impl_files/test_files/test_command | `crates/evo-engine/src/release.rs`、`tests/release_v41.rs`（均不存在）| `crates/evo-engine/src/release_store.rs`、`tests/release_store.rs`（内容确认 `use evo_engine::release_store::*`） |
+| E07 | impl_files | `crates/evo-engine/src/dispatch_management.rs`（不存在）| `crates/evo-engine/src/dispatch.rs`（既有 `tests/dispatch_management.rs` 内容确认 `use evo_engine::dispatch::*`，该测试文件本身无需改动） |
+| E08 | impl_files/test_files/test_command | `crates/evo-storage/src/sqlite.rs`、`tests/sqlite.rs`（均不存在）| `crates/evo-storage/src/lifecycle.rs`、`tests/lifecycle.rs`（内容确认 `use evo_storage::lifecycle::*`） |
+| E11 | impl_files/test_files/test_command | `crates/evo-core/src/economic.rs`、`tests/economic.rs`（均不存在）| `crates/evo-core/src/replay_economics.rs`、`tests/replay_economics.rs`（内容确认 `use evo_core::replay_economics::*`） |
+| E13 | impl_files/test_files/test_command | `crates/evo-engine/src/long_running.rs`、`tests/long_running_v41.rs`（均不存在）| `crates/evo-engine/src/monitoring.rs`、`tests/monitoring.rs`（内容确认 `use evo_engine::monitoring::*`） |
+
+文件白名单修改（严格未超出 TASK-CP001 白名单）：
+1. `reports/support-scope.json`：仅修正上表 12 处路径/命令字段值；`declaration`、`not_full_route_complete`、`legacy_equivalence_unverified`、`dimensions`、B01–B10/U01–U08/K01–K10/SO01–SO18/V001–V098 全量追踪链、其余 14 个 e_scopes 条目均未改动。
+2. `crates/evo-core/tests/support_scope.rs`：重写为返回 `Result` 的校验函数并扩大覆盖面：
+   - `validate_e_scope_entry` 对 **全部** `e_scopes`（E00–E18，而非仅 E16.x）校验 impl_files/test_files 磁盘存在性，且新增 `status == "planned"` 的证据豁免（仅 E14/E15 命中）；
+   - `validate_id_set`/`validate_so_sources` 对 B/U/K/SO/V 五类追踪链做**精确集合**比对（含前缀+定宽编号、去重、补集/差集报告），不再是仅比较 `.len()`；
+   - 新增 `resolve_test_command_target` 解析 `--test <name>` 与 `--lib <module>::tests` 两种命令形式，校验其解析出的目标文件必须同时存在于 `test_files` 声明中且在磁盘上真实存在；
+   - 新增 9 个负向合成用例（均为内存构造的 `serde_json::json!` 夹具，未触碰仓库任何真实文件），覆盖任务卡要求的四类缺陷：不存在路径（1 例）、重复/残缺 ID（4 例，含普通字符串数组与 SO 对象数组两种形态）、伪造测试目标（2 例，含"文件本不存在"与"目标未在 test_files 中声明"两种子类）、verified 却无证据（1 例，另附 1 例验证 planned 状态豁免不误伤）。
+3. `docs/implementation-ledger.md`：新增本条目（不改动 AG-007 原记录，如实并列存档）。
+
+自测证据（均在独立工作树 `cp001-local-work` 分支执行，`CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`，全部 exit 0）：
+- `cargo test --locked --offline -p evo-core --test support_scope`：11 项全部通过（2 项重写后的原有测试 + 9 项新增负向用例）。
+- `rustfmt --edition 2024 --check crates/evo-core/tests/support_scope.rs`：格式检查通过（未执行 `cargo fmt --all`）。
+- `cargo clippy --locked --offline -p evo-core --test support_scope -- -D warnings`：检查通过，无 warning。
+- 复核后 `reports/support-scope.json` 全部 22 个 `e_scopes` 条目的 impl_files/test_files 路径已用脚本二次核实，磁盘存在性 100% 通过（0 缺失）。
+
+未完成项与边界（如实记录，不夸大范围）：
+- 本任务仅修正元数据自身与其自动化校验测试，**未重新独立执行** E00–E13 各自的 `test_command`（如 `-p evo-engine --test release_store` 等）；路径/模块对应关系已逐一用源码内 `use` 引用静态核实（见上表),且与 `docs/implementation-ledger.md` 中此前各 E 任务 PR（#34–#42 等）已记录的主控验收测试通过历史一致，但本轮未重复跑那些测试，不在此声称"本轮已执行并通过"；
+- 未扩大声明范围：E11 关联的 `evo-storage` 侧 replay/SQLite 集成测试（台账历史提及"SQLite integration 3"）未被纳入本次修正，因任务卡仅明确列出 12 处伪造引用，未要求扩展 E11 的 impl/test 文件集合；
+- SO01–SO18 的 commit/blob_sha/license 状态未做新的远程重验证，继续保持 `unverified`/`reference_pins_only` 既有声明不变；
+- 本任务未触碰任何 `crates/*/src` 运行时代码、未新增公开契约、未触碰主控正在返修的 `wrokbot/controller-e16-repairs-20260919`。
+
 
 
 

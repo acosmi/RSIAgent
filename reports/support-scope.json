@@ -54,9 +54,9 @@
         "crates/evo-core/src/evidence.rs"
       ],
       "test_files": [
-        "crates/evo-core/tests/evidence.rs"
+        "crates/evo-core/src/evidence.rs"
       ],
-      "test_command": "cargo test --locked --offline -p evo-core --test evidence",
+      "test_command": "cargo test --locked --offline -p evo-core --lib evidence::tests",
       "scenarios": ["V001", "V071", "V072"]
     },
     "E01": {
@@ -94,9 +94,9 @@
         "crates/evo-engine/src/evidence.rs"
       ],
       "test_files": [
-        "crates/evo-engine/tests/optimization_v41.rs"
+        "crates/evo-engine/tests/optimization.rs"
       ],
-      "test_command": "cargo test --locked --offline -p evo-engine --test optimization_v41",
+      "test_command": "cargo test --locked --offline -p evo-engine --test optimization",
       "scenarios": ["V005", "V006", "V017"]
     },
     "E04": {
@@ -121,21 +121,21 @@
         "crates/evo-engine/src/streaming_evaluator.rs"
       ],
       "test_files": [
-        "crates/evo-engine/tests/evaluator_v41.rs"
+        "crates/evo-engine/tests/streaming_evaluator.rs"
       ],
-      "test_command": "cargo test --locked --offline -p evo-engine --test evaluator_v41",
+      "test_command": "cargo test --locked --offline -p evo-engine --test streaming_evaluator",
       "scenarios": ["V084", "V085"]
     },
     "E06": {
       "title": "Release Gate, CAS, Snapshot & Real-time Revocation",
       "status": "verified_release_gate_subset",
       "impl_files": [
-        "crates/evo-engine/src/release.rs"
+        "crates/evo-engine/src/release_store.rs"
       ],
       "test_files": [
-        "crates/evo-engine/tests/release_v41.rs"
+        "crates/evo-engine/tests/release_store.rs"
       ],
-      "test_command": "cargo test --locked --offline -p evo-engine --test release_v41",
+      "test_command": "cargo test --locked --offline -p evo-engine --test release_store",
       "scenarios": ["V017", "V075"]
     },
     "E07": {
@@ -143,7 +143,7 @@
       "status": "verified_protocol_subset",
       "impl_files": [
         "crates/evo-http/src/lib.rs",
-        "crates/evo-engine/src/dispatch_management.rs"
+        "crates/evo-engine/src/dispatch.rs"
       ],
       "test_files": [
         "crates/evo-http/tests/service.rs",
@@ -156,12 +156,12 @@
       "title": "Persistent Revocation, Cleanup, Backup & Trusted Anchor Recovery",
       "status": "verified_recovery_subset",
       "impl_files": [
-        "crates/evo-storage/src/sqlite.rs"
+        "crates/evo-storage/src/lifecycle.rs"
       ],
       "test_files": [
-        "crates/evo-storage/tests/sqlite.rs"
+        "crates/evo-storage/tests/lifecycle.rs"
       ],
-      "test_command": "cargo test --locked --offline -p evo-storage --test sqlite",
+      "test_command": "cargo test --locked --offline -p evo-storage --test lifecycle",
       "scenarios": ["V017", "V018"]
     },
     "E09": {
@@ -192,12 +192,12 @@
       "title": "Economic Experiment Contract, Full Cost, Blocking Report",
       "status": "verified_economic_contract",
       "impl_files": [
-        "crates/evo-core/src/economic.rs"
+        "crates/evo-core/src/replay_economics.rs"
       ],
       "test_files": [
-        "crates/evo-core/tests/economic.rs"
+        "crates/evo-core/tests/replay_economics.rs"
       ],
-      "test_command": "cargo test --locked --offline -p evo-core --test economic",
+      "test_command": "cargo test --locked --offline -p evo-core --test replay_economics",
       "scenarios": ["V096"]
     },
     "E12": {
@@ -217,12 +217,12 @@
       "title": "Persistent Monitoring, Consolidation Trigger, Root Budget & Recovery",
       "status": "verified_monitoring_subset",
       "impl_files": [
-        "crates/evo-engine/src/long_running.rs"
+        "crates/evo-engine/src/monitoring.rs"
       ],
       "test_files": [
-        "crates/evo-engine/tests/long_running_v41.rs"
+        "crates/evo-engine/tests/monitoring.rs"
       ],
-      "test_command": "cargo test --locked --offline -p evo-engine --test long_running_v41",
+      "test_command": "cargo test --locked --offline -p evo-engine --test monitoring",
       "scenarios": ["V018"]
     },
     "E14": {
