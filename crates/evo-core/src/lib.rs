@@ -13,6 +13,7 @@ pub mod features;
 pub mod holdout;
 pub mod optimization;
 pub mod replay;
+pub mod replay_economics;
 pub mod sequential;
 pub mod skill_edit;
 pub mod strategy;
