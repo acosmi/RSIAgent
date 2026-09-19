@@ -1,0 +1,385 @@
+//! Comprehensive test suite for E16.3: Built-in Seeds, B/L/U Comparison,
+//! Local Modification Protection, and Safe Reset Gates.
+//!
+//! Covers scenario families:
+//! - V014: Seed-Baseline-Immutability (corrupt/missing baseline rejected)
+//! - V018: Revocation-Watermark-Anchor (watermark advancement blocks reset)
+//! - V038: Interruption-Clean-Rollback (session abort preserves Active)
+//! - V063: BLU-Classification-Complete (all §11.1 comparison branches)
+//! - V064: Unmodified-Upstream-Staged-Only (no auto-activation)
+//! - V065: Three-Way-Diff-Conflicts (conflict annotation, no auto-merge to active)
+//! - V078: Reset-Safety-Gates (revocation, regression, corrupt baseline rejected)
+//! - V091: All-Effective-Content-Gated
+//! - V092: No-Auto-Elevation
+//! - V098: Audit-Traceability
+
+use evo_core::{Error, hash};
+use evo_engine::seeds::{
+    DiffCategory, SeedClass, SeedInstallRecord, SeedStatus, SeedTriple, StagingSession,
+    auto_activate, classify, compute_three_way_diff, safe_reset_to_baseline,
+};
+
+fn sample_digest(content: &str) -> String {
+    hash(content.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// V063: BLU-Classification-Complete (all §11.1 comparison branches)
+// ---------------------------------------------------------------------------
+#[test]
+fn test_v063_blu_all_branches() {
+    let b = sample_digest("baseline content");
+    let l_edited = sample_digest("local edited content");
+    let u_newer = sample_digest("upstream newer content");
+
+    // 1. U = B, L = B -> Unmodified
+    let t_unmod = SeedTriple {
+        bundled: Some(b.clone()),
+        local: Some(b.clone()),
+        upstream: Some(b.clone()),
+        local_marked: true,
+        publisher_bundled: "org.rsia".into(),
+        publisher_local: "org.rsia".into(),
+        asset_id_bundled: Some("skill_01".into()),
+        asset_id_local: Some("skill_01".into()),
+        kind_bundled: Some("skill".into()),
+        kind_local: Some("skill".into()),
+    };
+    assert_eq!(classify(&t_unmod), SeedClass::Unmodified);
+
+    // 2. U = B, L != B -> LocallyEdited
+    let t_local_edited = SeedTriple {
+        bundled: Some(b.clone()),
+        local: Some(l_edited.clone()),
+        upstream: Some(b.clone()),
+        local_marked: true,
+        publisher_bundled: "org.rsia".into(),
+        publisher_local: "org.rsia".into(),
+        asset_id_bundled: Some("skill_01".into()),
+        asset_id_local: Some("skill_01".into()),
+        kind_bundled: Some("skill".into()),
+        kind_local: Some("skill".into()),
+    };
+    assert_eq!(classify(&t_local_edited), SeedClass::LocallyEdited);
+
+    // 3. U != B, L = B -> UpstreamNewer
+    let t_upstream_newer = SeedTriple {
+        bundled: Some(b.clone()),
+        local: Some(b.clone()),
+        upstream: Some(u_newer.clone()),
+        local_marked: true,
+        publisher_bundled: "org.rsia".into(),
+        publisher_local: "org.rsia".into(),
+        asset_id_bundled: Some("skill_01".into()),
+        asset_id_local: Some("skill_01".into()),
+        kind_bundled: Some("skill".into()),
+        kind_local: Some("skill".into()),
+    };
+    assert_eq!(classify(&t_upstream_newer), SeedClass::UpstreamNewer);
+
+    // 4. U != B, L != B, U != L -> BothChanged
+    let t_both_changed = SeedTriple {
+        bundled: Some(b.clone()),
+        local: Some(l_edited.clone()),
+        upstream: Some(u_newer.clone()),
+        local_marked: true,
+        publisher_bundled: "org.rsia".into(),
+        publisher_local: "org.rsia".into(),
+        asset_id_bundled: Some("skill_01".into()),
+        asset_id_local: Some("skill_01".into()),
+        kind_bundled: Some("skill".into()),
+        kind_local: Some("skill".into()),
+    };
+    assert_eq!(classify(&t_both_changed), SeedClass::BothChanged);
+
+    // 5. L = U, but L != B -> IdenticalToUpstream
+    let t_ident_upstream = SeedTriple {
+        bundled: Some(b.clone()),
+        local: Some(u_newer.clone()),
+        upstream: Some(u_newer.clone()),
+        local_marked: true,
+        publisher_bundled: "org.rsia".into(),
+        publisher_local: "org.rsia".into(),
+        asset_id_bundled: Some("skill_01".into()),
+        asset_id_local: Some("skill_01".into()),
+        kind_bundled: Some("skill".into()),
+        kind_local: Some("skill".into()),
+    };
+    assert_eq!(classify(&t_ident_upstream), SeedClass::IdenticalToUpstream);
+
+    // 6. Same name but different publisher -> SameNameDifferentPublisher
+    let t_diff_pub = SeedTriple {
+        bundled: Some(b.clone()),
+        local: Some(b.clone()),
+        upstream: Some(u_newer.clone()),
+        local_marked: true,
+        publisher_bundled: "org.rsia".into(),
+        publisher_local: "foreign.corp".into(),
+        asset_id_bundled: Some("skill_01".into()),
+        asset_id_local: Some("skill_01".into()),
+        kind_bundled: Some("skill".into()),
+        kind_local: Some("skill".into()),
+    };
+    assert_eq!(classify(&t_diff_pub), SeedClass::SameNameDifferentPublisher);
+
+    // 7. Same name but different asset_id -> SameNameDifferentPublisher
+    let t_diff_id = SeedTriple {
+        bundled: Some(b.clone()),
+        local: Some(b.clone()),
+        upstream: Some(u_newer.clone()),
+        local_marked: true,
+        publisher_bundled: "org.rsia".into(),
+        publisher_local: "org.rsia".into(),
+        asset_id_bundled: Some("skill_01".into()),
+        asset_id_local: Some("skill_02".into()),
+        kind_bundled: Some("skill".into()),
+        kind_local: Some("skill".into()),
+    };
+    assert_eq!(classify(&t_diff_id), SeedClass::SameNameDifferentPublisher);
+
+    // 8. Missing marker -> MissingMarker
+    let mut t_missing_marker = t_unmod.clone();
+    t_missing_marker.local_marked = false;
+    assert_eq!(classify(&t_missing_marker), SeedClass::MissingMarker);
+
+    // 9. Corrupt baseline -> CorruptBaseline
+    let mut t_corrupt = t_unmod.clone();
+    t_corrupt.bundled = None;
+    assert_eq!(classify(&t_corrupt), SeedClass::CorruptBaseline);
+
+    let mut t_corrupt_str = t_unmod;
+    t_corrupt_str.bundled = Some("not_a_valid_64_hex_hash_for_sure_1234567890".into());
+    assert_eq!(classify(&t_corrupt_str), SeedClass::CorruptBaseline);
+}
+
+// ---------------------------------------------------------------------------
+// V064 & V091: Unmodified-Upstream-Staged-Only & Never Auto-Activate
+// ---------------------------------------------------------------------------
+#[test]
+fn test_v064_auto_activate_is_always_forbidden() {
+    let classes = [
+        SeedClass::Unmodified,
+        SeedClass::LocallyEdited,
+        SeedClass::UpstreamNewer,
+        SeedClass::BothChanged,
+        SeedClass::IdenticalToUpstream,
+        SeedClass::SameNameDifferentPublisher,
+        SeedClass::MissingMarker,
+        SeedClass::CorruptBaseline,
+        SeedClass::Unknown,
+    ];
+
+    for class in classes {
+        let res = auto_activate(class);
+        assert!(
+            res.is_err(),
+            "auto_activate must fail for class {:?}",
+            class
+        );
+        match res {
+            Err(Error::Conflict(msg)) => {
+                assert!(
+                    msg.contains("cannot auto-activate")
+                        || msg.contains("staging, evaluation, and approval")
+                );
+            }
+            other => panic!("Expected Error::Conflict, got {:?}", other),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// V065: Three-Way-Diff-Conflicts & Conflict Markers
+// ---------------------------------------------------------------------------
+#[test]
+fn test_v065_three_way_diff_clean_and_conflicts() {
+    let baseline = "fn execute() {\n    step1();\n    step2();\n}\n";
+    let local_clean = baseline;
+    let upstream_clean = "fn execute() {\n    step1();\n    step2();\n    step3();\n}\n";
+
+    // 1. Upstream modified, local unmodified: clean diff
+    let diff_upstream_only = compute_three_way_diff(
+        "org.rsia",
+        "my_skill",
+        baseline,
+        local_clean,
+        upstream_clean,
+    );
+    assert_eq!(
+        diff_upstream_only.category,
+        DiffCategory::UpstreamOnlyModified
+    );
+    assert!(!diff_upstream_only.has_conflicts);
+    assert!(diff_upstream_only.requires_new_evaluation);
+    assert!(!diff_upstream_only.auto_activated);
+
+    // 2. Local modified, upstream unmodified: local only
+    let local_mod = "fn execute() {\n    step1();\n    step_custom();\n}\n";
+    let diff_local_only =
+        compute_three_way_diff("org.rsia", "my_skill", baseline, local_mod, baseline);
+    assert_eq!(diff_local_only.category, DiffCategory::LocalOnlyModified);
+    assert!(!diff_local_only.has_conflicts);
+    assert!(!diff_local_only.requires_new_evaluation);
+
+    // 3. Both modified with identical new content
+    let diff_both_ident = compute_three_way_diff(
+        "org.rsia",
+        "my_skill",
+        baseline,
+        upstream_clean,
+        upstream_clean,
+    );
+    assert_eq!(
+        diff_both_ident.category,
+        DiffCategory::BothModifiedIdentical
+    );
+    assert!(!diff_both_ident.has_conflicts);
+    assert!(diff_both_ident.requires_new_evaluation);
+
+    // 4. Both modified differently: CONFLICT
+    let diff_conflict =
+        compute_three_way_diff("org.rsia", "my_skill", baseline, local_mod, upstream_clean);
+    assert_eq!(diff_conflict.category, DiffCategory::Conflict);
+    assert!(diff_conflict.has_conflicts);
+    assert!(diff_conflict.requires_new_evaluation);
+    assert!(!diff_conflict.auto_activated);
+
+    let preview = diff_conflict.merged_preview.unwrap();
+    assert!(preview.contains("<<<<<<< LOCAL (user modified)"));
+    assert!(preview.contains("======="));
+    assert!(preview.contains(">>>>>>> UPSTREAM (new upstream)"));
+}
+
+// ---------------------------------------------------------------------------
+// V078, V014, V018: Reset-Safety-Gates, Immutability & Revocation Watermarks
+// ---------------------------------------------------------------------------
+#[test]
+fn test_v078_safe_reset_to_baseline_gates() {
+    let baseline_str = "original baseline instruction\n";
+    let b_digest = sample_digest(baseline_str);
+    let l_digest = sample_digest("modified user copy\n");
+
+    let record = SeedInstallRecord {
+        publisher: "org.rsia".into(),
+        asset_id: "reasoning_seed".into(),
+        kind: "skill".into(),
+        baseline_digest: b_digest.clone(),
+        local_digest: l_digest,
+        upstream_digest: None,
+        installed_at: 1000,
+        status: SeedStatus::Installed,
+        quarantine_reason: None,
+        revocation_watermark: 5,
+    };
+
+    // Case 1: Missing baseline content
+    let res_missing = safe_reset_to_baseline(&record, None, |_dig| false, 5, |_dig| false);
+    assert!(
+        matches!(res_missing, Err(Error::Invalid(msg)) if msg.contains("missing_baseline_content"))
+    );
+
+    // Case 2: Corrupt baseline content (digest mismatch)
+    let res_corrupt = safe_reset_to_baseline(
+        &record,
+        Some("corrupted baseline content that differs"),
+        |_dig| false,
+        5,
+        |_dig| false,
+    );
+    assert!(matches!(res_corrupt, Err(Error::Invalid(msg)) if msg.contains("corrupt_baseline")));
+
+    // Case 3: Revocation watermark advanced since install (V018)
+    let res_watermark = safe_reset_to_baseline(
+        &record,
+        Some(baseline_str),
+        |_dig| false,
+        6, // watermark 6 > 5
+        |_dig| false,
+    );
+    assert!(matches!(res_watermark, Err(Error::Conflict(msg)) if msg.contains("baseline_revoked")));
+
+    // Case 4: Baseline source has been revoked
+    let res_revoked = safe_reset_to_baseline(
+        &record,
+        Some(baseline_str),
+        |dig| dig == b_digest, // baseline source is revoked
+        5,
+        |_dig| false,
+    );
+    assert!(matches!(res_revoked, Err(Error::Conflict(msg)) if msg.contains("baseline_revoked")));
+
+    // Case 5: Resetting to baseline causes critical regression
+    let res_regression = safe_reset_to_baseline(
+        &record,
+        Some(baseline_str),
+        |_dig| false,
+        5,
+        |_dig| true, // regression detected
+    );
+    assert!(
+        matches!(res_regression, Err(Error::Conflict(msg)) if msg.contains("regression_blocked"))
+    );
+
+    // Case 6: Safe reset succeeds into STAGED reset (NEVER Active)
+    let staged_reset =
+        safe_reset_to_baseline(&record, Some(baseline_str), |_dig| false, 5, |_dig| false)
+            .expect("Safe reset should succeed");
+
+    assert_eq!(staged_reset.target_digest, b_digest);
+    assert!(staged_reset.requires_evaluation);
+    assert!(!staged_reset.is_active, "Reset must NEVER auto-activate!");
+}
+
+// ---------------------------------------------------------------------------
+// V038 & V098: Interruption-Clean-Rollback & Staging Session Audit
+// ---------------------------------------------------------------------------
+#[test]
+fn test_v038_staging_session_commit_and_abort() {
+    let session = StagingSession::new("org.rsia", "skill_staging", "digest_1234")
+        .expect("Valid session creation");
+
+    assert!(!session.committed);
+    assert!(!session.rolled_back);
+    assert!(!session.active_overwritten);
+
+    // Abort session (e.g. simulated disk failure, cancellation, or error)
+    let aborted = session.abort();
+    assert!(aborted.rolled_back);
+    assert!(!aborted.committed);
+    assert!(!aborted.active_overwritten);
+
+    // Attempting to commit a rolled-back session must fail
+    assert!(aborted.commit().is_err());
+
+    // Fresh session commit
+    let session2 = StagingSession::new("org.rsia", "skill_staging", "digest_5678")
+        .expect("Valid session creation");
+    let committed = session2.commit().expect("Commit should succeed");
+    assert!(committed.committed);
+    assert!(!committed.rolled_back);
+    // Even when committed into staging, Active is NOT overwritten!
+    assert!(!committed.active_overwritten);
+}
+
+// =========================================================================
+// F05 Adversarial Regression (from controller review)
+// =========================================================================
+#[test]
+fn test_f05_review_seed_reset_requires_consistent_current_watermark() {
+    let record = SeedInstallRecord {
+        publisher: "p".into(),
+        asset_id: "a".into(),
+        kind: "skill".into(),
+        baseline_digest: hash(b"baseline"),
+        local_digest: hash(b"local"),
+        upstream_digest: None,
+        installed_at: 1,
+        status: SeedStatus::Installed,
+        quarantine_reason: None,
+        revocation_watermark: 10,
+    };
+    assert!(
+        safe_reset_to_baseline(&record, Some("baseline"), |_| false, 1, |_| false).is_err(),
+        "seed reset accepted a current watermark older than installation"
+    );
+}

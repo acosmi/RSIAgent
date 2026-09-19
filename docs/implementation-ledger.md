@@ -355,4 +355,36 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - 隐私扫描通过记录明确免责声明（`PRIVACY_DISCLAIMER`），不声称绝对无泄漏，禁止项不可通过“忽略告警”放行；
 - 撤销感知记录保留真实历史事实，不声称远程擦除第三方已下载副本。
 
+### AG-004 / E16.3 内置种子、B/L/U三方对账与本地修改保护实施与自测
+
+- 任务号：AG-004
+- E 归属：E16.3
+- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- base 分支：`wrokbot/ag-003-e16-2-asset-package`
+- head 分支：`wrokbot/ag-004-e16-3-seed-blu`
+- PR：[PR #46](https://github.com/acosmi/RSIAgent/pull/46)
+- merged_sha: null
+
+依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §11.1、§13.1 E16.3 及 V014, V018, V038, V063, V064, V065, V078, V091, V092, V098 场景族。
+文件白名单修改：
+1. `crates/evo-engine/src/seeds.rs`: 完整落实 §11.1 表格全部 B/L/U 分支分类逻辑（`Unmodified`, `LocallyEdited`, `UpstreamNewer`, `BothChanged`, `IdenticalToUpstream`, `SameNameDifferentPublisher`, `MissingMarker`, `CorruptBaseline`）；强制 `auto_activate` 对任何类别均返回失败（未修改本地副本绝不自动升级 Active，必须经过 staging、评估与审批）；新增 `SeedInstallRecord` 记录安装基线 B、本地用户副本 L、上游 U、撤销水位及隔离状态；新增三方差异计算与冲突标记 `compute_three_way_diff`（区分未改动/单侧改动/同向改动/冲突，自动生成 `<<<<<<< LOCAL ... ======= ... >>>>>>> UPSTREAM` 冲突标注并强制重新评估，`auto_activated` 恒为 false）；实现重置安全门禁 `safe_reset_to_baseline`（基线缺失/损坏拒绝、基线撤销拒绝、撤销水位前移拒绝、触发关键回归拒绝，安全重置仅生成 StagedReset，绝不直接替换 Active）；实现 `StagingSession` 中断/回滚保护（会话中止保持旧 Active 完好可用，不标记更新完成）。
+2. `crates/evo-engine/tests/seeds_v41.rs`: 新增集成测试套件，全面覆盖 V014, V018, V038, V063, V064, V065, V078, V091, V092, V098 全部测试场景。
+
+自测证据（全部 exit 0）：
+- `cargo test --locked --offline -p evo-engine --test seeds_v41`: 6 项全部通过（含主控对抗缺陷 F05 种子重置单调水位门禁回归测试）。
+- `cargo test --locked --offline -p evo-engine --lib seeds::tests`: 1 项全部通过。
+- `cargo test --locked --offline -p evo-engine --test packages_v41`: 14 项全部通过。
+- `cargo test --locked --offline -p evo-engine`: 全量测试全部通过。
+- `cargo clippy --locked --offline -p evo-engine --all-targets -- -D warnings`: 检查通过，无 warning。
+- `cargo fmt --all -- --check`: 格式化检查通过。
+
+主控审阅缺陷整改记录（PR #46）：
+- **F05（种子重置单调水位一致性校验）**：在 `safe_reset_to_baseline` 中增加对 `current_watermark < record.revocation_watermark` 的严格拦截（返回 `Error::Conflict("stale_watermark: current watermark is older than installation")`），保证撤销水位的绝对单调性，拒绝以旧于安装时的过期水位请求基线重置。
+
+未完成项与边界：
+- E16.4–E16.6、E14、E15 仍为 planned；
+- 种子或上游更新即使与基线完全同源，也绝不自动激活活跃版本，必须生成 staging 并经独立验收；
+- 人工解决冲突后的合并内容作为新候选处理，重新验收，不以文字合并自动继承任何前期通过记录。
+
+
 
