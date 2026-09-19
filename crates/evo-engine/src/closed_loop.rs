@@ -1,7 +1,11 @@
-//! Minimum G1 closed loop. Mock success is not model capability.
+//! Structural fixture for the closed loop shape.
+//!
+//! This module does not prove a real model call, independent evaluation,
+//! approval, application or benefit. Production entry points live in
+//! `service`; this fixture cannot promote a release.
 use crate::evaluator::{Evaluator, ExecutionReport, GradeRequest};
 use crate::evidence::ingest_trusted_runs;
-use crate::releases::{ProfilePointer, Release, activate, apply_receipt, approve, revoke};
+use crate::releases::Release;
 use evo_core::contract::{
     AppliedReceipt, CapabilityLevel, CompileParts, HostCapabilities, ImproverPatch, Profile,
     SkillPatch, SkillSnapshot, compile_bundle,
@@ -36,11 +40,10 @@ pub struct LoopTrace {
 }
 
 pub fn require_real_model(credentials_present: bool) -> Result<()> {
-    if credentials_present {
-        Ok(())
-    } else {
-        Err(Error::Budget)
-    }
+    let _ = credentials_present;
+    Err(Error::Invalid(
+        "credential presence does not prove a configured real model transport".into(),
+    ))
 }
 
 pub fn mock_cannot_prove_model() -> bool {
@@ -52,7 +55,6 @@ pub fn run_structural_loop(
     credentials_present: bool,
 ) -> Result<(LoopTrace, Release, AppliedReceipt)> {
     let host = Context::new("n", "host", Role::Host)?;
-    let admin = Context::new("n", "admin", Role::Admin)?;
     let eval = Context::new("n", "eval", Role::Evaluator)?;
     let sel = SourceSelection {
         roots: vec!["/authorized".into()],
@@ -141,29 +143,18 @@ pub fn run_structural_loop(
             safety_ok: true,
         },
     )?;
-    let auto_promote = credentials_present && formal.verdict == Verdict::Improved;
-    let mut release = if credentials_present
-        && (formal.verdict == Verdict::Improved || formal.verdict == Verdict::Noninferior)
-    {
-        approve(&admin, &bundle, formal.verdict, &formal.id)?
-    } else {
-        Release {
-            id: "rel-hold".into(),
-            bundle_digest: bundle.digest.clone(),
-            evaluation_id: formal.id.clone(),
-            parent_pointer: bundle.parent_digest.clone(),
-            state: crate::releases::ReleaseState::Evaluated,
-            approved_by: None,
-        }
+    // `credentials_present` is retained only for source compatibility with the
+    // old example. It is not transport evidence and grants no authority.
+    let _ = credentials_present;
+    let auto_promote = false;
+    let release = Release {
+        id: "rel-fixture-hold".into(),
+        bundle_digest: bundle.digest.clone(),
+        evaluation_id: formal.id.clone(),
+        parent_pointer: bundle.parent_digest.clone(),
+        state: crate::releases::ReleaseState::Evaluated,
+        approved_by: None,
     };
-    let mut pointer = ProfilePointer {
-        profile_id: "p1".into(),
-        active: None,
-        epoch: 0,
-    };
-    if release.state == crate::releases::ReleaseState::Approved {
-        activate(&admin, &mut release, &mut pointer, 0)?;
-    }
     let receipt = AppliedReceipt {
         offered: vec!["evo_prepare".into()],
         attached: Vec::new(),
@@ -175,10 +166,6 @@ pub fn run_structural_loop(
         truncated: false,
         attested_by: host.actor().into(),
     };
-    if release.state == crate::releases::ReleaseState::Active {
-        apply_receipt(&host, &release, &receipt)?;
-        revoke(&admin, &mut release, &mut pointer)?;
-    }
     let _ = routing;
     Ok((
         LoopTrace {
@@ -188,13 +175,10 @@ pub fn run_structural_loop(
                 LoopStep::Route,
                 LoopStep::Compile,
                 LoopStep::Evaluate,
-                LoopStep::Approve,
-                LoopStep::Apply,
-                LoopStep::Revoke,
             ],
             route_class: RouteClass::Procedural,
             verdict: Some(formal.verdict),
-            used_real_model: credentials_present,
+            used_real_model: false,
             auto_promote,
         },
         release,
@@ -231,5 +215,24 @@ mod tests {
         let (trace, rel, _) = run_structural_loop(Verdict::Improved, false).unwrap();
         assert!(!trace.auto_promote);
         assert_ne!(rel.state, crate::releases::ReleaseState::Active);
+    }
+
+    #[test]
+    fn credentials_flag_never_proves_real_model_or_promotes() {
+        assert!(require_real_model(true).is_err());
+        let (trace, release, _) = run_structural_loop(Verdict::Improved, true).unwrap();
+        assert!(!trace.used_real_model);
+        assert!(!trace.auto_promote);
+        assert_eq!(
+            trace.steps,
+            vec![
+                LoopStep::FailedRun,
+                LoopStep::Aggregate,
+                LoopStep::Route,
+                LoopStep::Compile,
+                LoopStep::Evaluate,
+            ]
+        );
+        assert_eq!(release.state, crate::releases::ReleaseState::Evaluated);
     }
 }

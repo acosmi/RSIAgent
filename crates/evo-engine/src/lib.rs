@@ -24,4 +24,5 @@ pub mod releases;
 pub mod replay;
 pub mod replay_experiment;
 pub mod seeds;
+pub mod service;
 pub mod streaming_evaluator;
