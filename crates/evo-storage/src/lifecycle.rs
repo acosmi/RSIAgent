@@ -139,6 +139,16 @@ struct ResourceEvidenceWire {
     calls: Vec<crate::budget::BudgetCallRecord>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayCleanupEnvelope<T> {
+    schema_version: String,
+    id: String,
+    namespace: String,
+    record_kind: String,
+    payload: T,
+}
+
 impl LifecycleStore {
     pub async fn begin_revoke(
         ctx: &Context,
@@ -1197,6 +1207,330 @@ fn minimal_budget_artifact(artifact: &crate::budget::BudgetArtifact) -> serde_js
     })
 }
 
+async fn redact_replay_store_envelope(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ctx: &Context,
+    job_id: &str,
+    node: &TypedObjectRef,
+    body: &str,
+    value: &serde_json::Value,
+    now: i64,
+) -> Result<()> {
+    let record_kind = value
+        .get("record_kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let metadata = match record_kind {
+        crate::replay::REPLAY_POOL_RECORD_KIND => {
+            let wire: ReplayCleanupEnvelope<evo_core::replay::ReplayPoolManifestV1> =
+                match serde_json::from_value(value.clone()) {
+                    Ok(wire) => wire,
+                    Err(_) => {
+                        return mark_unknown_scope(
+                            tx,
+                            ctx,
+                            job_id,
+                            node,
+                            "blocked_unknown_scope:replay_pool_wire",
+                            now,
+                        )
+                        .await;
+                    }
+                };
+            if !valid_replay_cleanup_envelope(
+                ctx,
+                node,
+                &wire.schema_version,
+                &wire.id,
+                &wire.namespace,
+                &wire.record_kind,
+                crate::replay::REPLAY_POOL_RECORD_KIND,
+            ) || wire.payload.validate_identity().is_err()
+                || wire.id != format!("replay-pool-{}", wire.payload.pool_digest)
+            {
+                return mark_unknown_scope(
+                    tx,
+                    ctx,
+                    job_id,
+                    node,
+                    "blocked_unknown_scope:replay_pool_identity",
+                    now,
+                )
+                .await;
+            }
+            json!({
+                "record_kind": wire.record_kind,
+                "pool_digest": wire.payload.pool_digest,
+                "compatibility": wire.payload.compatibility,
+                "members": wire.payload.members,
+            })
+        }
+        crate::replay::REPLAY_REPORT_RECORD_KIND => {
+            let wire: ReplayCleanupEnvelope<evo_core::replay::StoredReplayReportV1> =
+                match serde_json::from_value(value.clone()) {
+                    Ok(wire) => wire,
+                    Err(_) => {
+                        return mark_unknown_scope(
+                            tx,
+                            ctx,
+                            job_id,
+                            node,
+                            "blocked_unknown_scope:stored_replay_report_wire",
+                            now,
+                        )
+                        .await;
+                    }
+                };
+            if !valid_replay_cleanup_envelope(
+                ctx,
+                node,
+                &wire.schema_version,
+                &wire.id,
+                &wire.namespace,
+                &wire.record_kind,
+                crate::replay::REPLAY_REPORT_RECORD_KIND,
+            ) || !valid_stored_report_without_pool(&wire.payload)
+                || wire.id != wire.payload.report_id
+            {
+                return mark_unknown_scope(
+                    tx,
+                    ctx,
+                    job_id,
+                    node,
+                    "blocked_unknown_scope:stored_replay_report_identity",
+                    now,
+                )
+                .await;
+            }
+            let pool_id = format!("replay-pool-{}", wire.payload.pool_digest);
+            let pool_body: Option<String> = sqlx::query_scalar(
+                "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+            )
+            .bind(ctx.namespace())
+            .bind(&pool_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(internal)?;
+            let Some(pool_body) = pool_body else {
+                return mark_unknown_scope(
+                    tx,
+                    ctx,
+                    job_id,
+                    node,
+                    "blocked_unknown_scope:stored_replay_report_pool_missing",
+                    now,
+                )
+                .await;
+            };
+            let pool_manifest = replay_pool_from_cleanup_body(ctx, &pool_id, &pool_body);
+            if !matches!(
+                pool_manifest.as_ref(),
+                Ok(pool) if wire.payload.validate_static(pool).is_ok()
+            ) {
+                return mark_unknown_scope(
+                    tx,
+                    ctx,
+                    job_id,
+                    node,
+                    "blocked_unknown_scope:stored_replay_report_pool_binding",
+                    now,
+                )
+                .await;
+            }
+            let usage = wire
+                .payload
+                .member_reports
+                .iter()
+                .map(|member| {
+                    json!({
+                        "world_id":member.world_id,
+                        "world_digest":member.world_digest,
+                        "historical_usage":member.report.historical_usage,
+                        "probes":member.report.probes,
+                        "simulated_rounds":member.report.simulated_rounds,
+                        "replay_cpu_nanos":member.report.replay_cpu_nanos,
+                        "coverage":member.report.coverage,
+                        "terminal":member.report.terminal,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "record_kind": wire.record_kind,
+                "report_id": wire.payload.report_id,
+                "pool_digest": wire.payload.pool_digest,
+                "partition": wire.payload.partition,
+                "policy_digest": wire.payload.policy_digest,
+                "profile_digest": wire.payload.profile_digest,
+                "caps_digest": wire.payload.caps_digest,
+                "reports_body_digest": wire.payload.reports_body_digest,
+                "semantic_reports_digest": wire.payload.semantic_reports_digest,
+                "irreversible_usage": usage,
+                "report_invalidated": true,
+            })
+        }
+        _ => {
+            return mark_unknown_scope(
+                tx,
+                ctx,
+                job_id,
+                node,
+                "blocked_unknown_scope:replay_store_record_kind",
+                now,
+            )
+            .await;
+        }
+    };
+    let redacted = json!({
+        "id":node.id,
+        "schema_version":"rsia.redacted.v1",
+        "state":"source_revoked",
+        "original_kind":node.kind,
+        "original_schema":crate::replay::REPLAY_STORE_ENVELOPE_SCHEMA,
+        "original_digest":evo_core::hash(body.as_bytes()),
+        "metadata":metadata,
+    });
+    sqlx::query(
+        "UPDATE objects SET body=?,revision=revision+1 WHERE namespace=? AND kind=? AND id=?",
+    )
+    .bind(redacted.to_string())
+    .bind(ctx.namespace())
+    .bind(&node.kind)
+    .bind(&node.id)
+    .execute(&mut **tx)
+    .await
+    .map_err(internal)?;
+    insert_cleanup_event(
+        tx,
+        ctx.namespace(),
+        job_id,
+        Some(node),
+        "replay_content_redacted",
+        now,
+        json!({"record_kind":record_kind}),
+    )
+    .await
+}
+
+fn replay_pool_from_cleanup_body(
+    ctx: &Context,
+    pool_id: &str,
+    body: &str,
+) -> Result<evo_core::replay::ReplayPoolManifestV1> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(internal)?;
+    if value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        == Some(crate::replay::REPLAY_STORE_ENVELOPE_SCHEMA)
+    {
+        let wire: ReplayCleanupEnvelope<evo_core::replay::ReplayPoolManifestV1> =
+            serde_json::from_value(value).map_err(internal)?;
+        if !valid_replay_cleanup_envelope(
+            ctx,
+            &TypedObjectRef {
+                kind: "artifact".into(),
+                id: pool_id.into(),
+            },
+            &wire.schema_version,
+            &wire.id,
+            &wire.namespace,
+            &wire.record_kind,
+            crate::replay::REPLAY_POOL_RECORD_KIND,
+        ) {
+            return Err(Error::Conflict("invalid replay pool envelope".into()));
+        }
+        wire.payload.validate_identity()?;
+        return Ok(wire.payload);
+    }
+    let object = value.as_object().ok_or(Error::Internal)?;
+    let expected = [
+        "id",
+        "schema_version",
+        "state",
+        "original_kind",
+        "original_schema",
+        "original_digest",
+        "metadata",
+    ];
+    if object.len() != expected.len()
+        || !expected.iter().all(|key| object.contains_key(*key))
+        || value["id"] != pool_id
+        || value["schema_version"] != "rsia.redacted.v1"
+        || value["state"] != "source_revoked"
+        || value["original_kind"] != "artifact"
+        || value["original_schema"] != crate::replay::REPLAY_STORE_ENVELOPE_SCHEMA
+    {
+        return Err(Error::Conflict("invalid redacted replay pool".into()));
+    }
+    let metadata = value["metadata"].as_object().ok_or(Error::Internal)?;
+    let metadata_keys = ["record_kind", "pool_digest", "compatibility", "members"];
+    if metadata.len() != metadata_keys.len()
+        || !metadata_keys.iter().all(|key| metadata.contains_key(*key))
+        || value["metadata"]["record_kind"] != crate::replay::REPLAY_POOL_RECORD_KIND
+    {
+        return Err(Error::Conflict(
+            "invalid redacted replay pool metadata".into(),
+        ));
+    }
+    let manifest = evo_core::replay::ReplayPoolManifestV1 {
+        schema_version: evo_core::replay::REPLAY_POOL_SCHEMA.into(),
+        compiler_version: evo_core::replay::REPLAY_POOL_COMPILER_VERSION.into(),
+        pool_digest: serde_json::from_value(value["metadata"]["pool_digest"].clone())
+            .map_err(internal)?,
+        compatibility: serde_json::from_value(value["metadata"]["compatibility"].clone())
+            .map_err(internal)?,
+        members: serde_json::from_value(value["metadata"]["members"].clone()).map_err(internal)?,
+    };
+    manifest.validate_identity()?;
+    if manifest.pool_digest != pool_id.strip_prefix("replay-pool-").unwrap_or("") {
+        return Err(Error::Conflict("redacted replay pool id mismatch".into()));
+    }
+    Ok(manifest)
+}
+
+fn valid_replay_cleanup_envelope(
+    ctx: &Context,
+    node: &TypedObjectRef,
+    schema_version: &str,
+    id: &str,
+    namespace: &str,
+    record_kind: &str,
+    expected_kind: &str,
+) -> bool {
+    schema_version == crate::replay::REPLAY_STORE_ENVELOPE_SCHEMA
+        && id == node.id
+        && namespace == ctx.namespace()
+        && record_kind == expected_kind
+}
+
+fn valid_stored_report_without_pool(report: &evo_core::replay::StoredReplayReportV1) -> bool {
+    if report.schema_version != evo_core::replay::STORED_REPLAY_REPORT_SCHEMA
+        || report.replay_engine_version != evo_core::replay::REPLAY_ENGINE_VERSION
+        || report.purpose != evo_core::evidence::Purpose::Development
+        || report.policy.validate().is_err()
+        || report.profile.validate(&report.caps).is_err()
+    {
+        return false;
+    }
+    let body_digest = fingerprint(&report.member_reports).ok();
+    let semantic_digest =
+        evo_core::replay::replay_report_semantic_digest(&report.member_reports).ok();
+    let report_id = evo_core::replay::replay_report_id(
+        &report.namespace,
+        report.partition,
+        &report.pool_digest,
+        &report.policy_digest,
+        &report.profile_digest,
+        &report.caps_digest,
+    )
+    .ok();
+    report.policy_digest == fingerprint(&report.policy).unwrap_or_default()
+        && report.profile_digest == fingerprint(&report.profile).unwrap_or_default()
+        && report.caps_digest == fingerprint(&report.caps).unwrap_or_default()
+        && body_digest.as_deref() == Some(report.reports_body_digest.as_str())
+        && semantic_digest.as_deref() == Some(report.semantic_reports_digest.as_str())
+        && report_id.as_deref() == Some(report.report_id.as_str())
+}
+
 async fn cleanup_node_content(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     ctx: &Context,
@@ -1321,6 +1655,9 @@ async fn cleanup_node_content(
         .get("record_kind")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    if node.kind == "artifact" && schema == crate::replay::REPLAY_STORE_ENVELOPE_SCHEMA {
+        return redact_replay_store_envelope(tx, ctx, job_id, node, &body, &value, now).await;
+    }
     if matches!(
         (node.kind.as_str(), schema, record_kind),
         (

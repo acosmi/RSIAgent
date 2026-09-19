@@ -2,6 +2,7 @@
 //! This crate never connects to a model or executes candidate content.
 pub mod budget;
 pub mod lifecycle;
+pub mod replay;
 
 use evo_core::{Context, Error, Result, fingerprint, hash, identifier, now, search_tokens};
 use serde::{Serialize, de::DeserializeOwned};
@@ -400,6 +401,19 @@ impl Session {
         manifest: &Value,
     ) -> Result<()> {
         identifier(id)?;
+        if let Some((existing_sealed, existing_manifest)) = self.get_world(ctx, id).await? {
+            if existing_sealed {
+                if sealed && existing_manifest == *manifest {
+                    return Ok(());
+                }
+                return Err(Error::Conflict(
+                    "sealed replay world cannot be changed or reopened".into(),
+                ));
+            }
+            if !sealed && existing_manifest == *manifest {
+                return Ok(());
+            }
+        }
         sqlx::query("INSERT INTO replay_worlds(namespace,id,sealed,manifest) VALUES(?,?,?,?) ON CONFLICT(namespace,id) DO UPDATE SET sealed=excluded.sealed,manifest=excluded.manifest")
             .bind(ctx.namespace())
             .bind(id)
