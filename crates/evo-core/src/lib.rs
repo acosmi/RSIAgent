@@ -12,6 +12,7 @@ pub mod evidence;
 pub mod features;
 pub mod holdout;
 pub mod sequential;
+pub mod skill_edit;
 pub mod strategy;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
