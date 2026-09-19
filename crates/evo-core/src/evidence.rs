@@ -135,6 +135,7 @@ impl SourceCoverage {
             && self.permission_denied == 0
             && self.missing == 0
             && self.unsupported_format == 0
+            && self.zero_records == 0
             && self.event_truncated == 0
             && self.char_truncated == 0
             && self.excerpt_truncated == 0
@@ -378,7 +379,7 @@ pub struct ModelEvidenceRequest {
 
 impl ModelEvidenceRequest {
     pub fn from_set(set: &EvidenceSet, excerpts: Vec<String>) -> Result<Self> {
-        if set.members.len() < 2 {
+        if set.members.len() < 2 || set.independent_clusters.len() < 2 {
             return Err(Error::Invalid(
                 "generator request needs at least two authorized independent sources".into(),
             ));
@@ -457,6 +458,29 @@ mod tests {
             )],
             SourceCoverage::default(),
             ["c1".into()].into(),
+        )
+        .unwrap();
+        assert!(ModelEvidenceRequest::from_set(&set, vec![]).is_err());
+    }
+
+    #[test]
+    fn copied_sources_in_one_cluster_are_not_cross_task_evidence() {
+        let set = EvidenceSet::build(
+            "es1",
+            vec![
+                member(
+                    "copy1",
+                    TaskOrigin::ImportedHistory,
+                    ExecutionAttestation::UnverifiedImport,
+                ),
+                member(
+                    "copy2",
+                    TaskOrigin::ImportedHistory,
+                    ExecutionAttestation::UnverifiedImport,
+                ),
+            ],
+            SourceCoverage::default(),
+            ["content_same".into()].into(),
         )
         .unwrap();
         assert!(ModelEvidenceRequest::from_set(&set, vec![]).is_err());
@@ -563,5 +587,18 @@ mod tests {
         let modified = b"line1: safe code\nline2: modified text\nline3: end";
         let err = locator.verify_and_extract(modified).unwrap_err();
         assert!(matches!(err, Error::Conflict(msg) if msg == "source_changed"));
+    }
+
+    #[test]
+    fn zero_record_sources_keep_coverage_partial() {
+        let mut coverage = SourceCoverage {
+            discovery_exhausted: true,
+            files_known: true,
+            ..SourceCoverage::default()
+        };
+        assert!(coverage.complete());
+        coverage.zero_records = 1;
+        assert!(!coverage.complete());
+        assert_eq!(coverage.as_label(), "partial");
     }
 }
