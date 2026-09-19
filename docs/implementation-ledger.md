@@ -5,12 +5,33 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 本台账是实施与证据索引，不另立规范；历史 PR、测试和旧台账不决定当前规则。
 用户于 2026-09-19 明确确认 v4.1 替代 v4，并授权将本台账上传远程；方案正文、内部合同、归档及 QA 原始材料只保留本地。用户最新授权 Antigravity 按第一真源持续实施，每个任务自测完成后提交、推送并提出独立PR，随即继续下一项，不自行合并；Codex负责最终独立验收，并在通过后按依赖顺序合并。Actions派发、付费运行和部署/发布未授权。
 
+## 2026-09-19 主控独立验收与合并结论（当前状态）
+
+本批未全量通过。Antigravity提交的原测试由主控在冻结副本重跑：380 passed，Clippy/fmt exit0；主控补充9个反例，9个均实际失败。完整源码输入为 `c78e05c2f9518aa73cee3d0b50671f3042e2b3fb`，日志和反例仅本地 `out/review-antigravity-20260919/`。自测数量不能代替实际消费者、安全边界和完整场景验收。
+
+| 任务 / PR | 主控结论 | 依据/未完成项 | merged_sha |
+|---|---|---|---|
+| AG-001 / [#43](https://github.com/acosmi/RSIAgent/pull/43) | verified（回放管理子范围），已合并 | 对精确head `0aef9345679e674988e67e4208c60aba63b5271b` 独立26项管理/回放＋3项真实HTTP、clippy/fmt通过；包含持久报告、幂等恢复、身份和撤销读取门 | `59afd1663a0d5f5212077dd92beaaf7920cde0ff` |
+| AG-002 / [#44](https://github.com/acosmi/RSIAgent/pull/44) | implemented_not_verified，退回 | 未知格式/版本被猜测接收；UTF-8探测及默认事件截断panic；新locator无法回读未变源。导入持久学习/撤销消费者亦未完成 | null |
+| AG-003 / [#45](https://github.com/acosmi/RSIAgent/pull/45) | implemented_not_verified，退回 | manifest元数据可绕过隐私扫描；staging/导出及撤销持久消费者未接通 | null |
+| AG-004 / [#46](https://github.com/acosmi/RSIAgent/pull/46) | implemented_not_verified，退回 | 过旧当前撤销水位仍允许重置；StagingSession仅内存bool，无持久中断恢复链 | null |
+| AG-005 / [#47](https://github.com/acosmi/RSIAgent/pull/47) | implemented_not_verified，退回 | Offered＋自报VerifiedBenefit可通过回执gate；未消费可信使用/评测闭包；实际额外宿主仍blocked | null |
+| AG-006 / [#48](https://github.com/acosmi/RSIAgent/pull/48) | implemented_not_verified，退回 | sandbox布尔＋不存在的锚库路径通过安全校验；容量/恢复接口未接实际运行入口 | null |
+| AG-007 / [#49](https://github.com/acosmi/RSIAgent/pull/49) | implemented_not_verified，退回 | 编号/数组长度不等于完整作用域证据映射，SO已核验声明缺实际commit/path/blob/许可落点支持 | null |
+| AG-008 / [#50](https://github.com/acosmi/RSIAgent/pull/50) | 关闭/拒绝子范围已复验，合并blocked | E17仍关闭；依赖栈含未通过PR，不带入main，不代表真实评分器演化通过 | null |
+| AG-009 / [#51](https://github.com/acosmi/RSIAgent/pull/51) | 关闭/拒绝子范围已复验，合并blocked | E18仍关闭；依赖栈含未通过PR，不带入main，不接受bool/token作为未来真实隔离或授权证据 | null |
+
+原E00–E13的14个已验PR源码再次核对无变化，并与AG-001一起按依赖顺序合并（#29–#43）。台账冲突仅在隔离工作树解决，每次核查非台账源码与已验head相同，并以expected_head_sha固定合并。合并后的代码main `59afd1663a0d5f5212077dd92beaaf7920cde0ff` 与独立测试PR #43的非台账源码逐文件一致。未通过的新代码未进入main，未派发Actions/付费调用/发布。
+
+详细本地结论 `REVIEW.md`、返修交接 `RETURN-TO-ANTIGRAVITY.md`、反例 `controller_adversarial.rs` 和实际合并列表 `verified-merges.json` 均位于本轮review目录。修复后需按新head再次验收。下文早期draft/未合并/null及实施方覆盖声明是当时记录；当前结论以本节及实际merged_sha为准，不能把历史自报作为当前验收。
+
 ## 当前基线与保护
 
 | 字段 | 当前事实 |
 |---|---|
 | 核对时间 | 2026-09-19 UTC |
-| source_sha / 实时远程 main | `9d4ef199c64275a0d4025cfa410f6475f635b0cd`；通过 git ls-remote 实查 |
+| 原始固定 source_sha | `9d4ef199c64275a0d4025cfa410f6475f635b0cd` |
+| 本轮代码合并后 main | `59afd1663a0d5f5212077dd92beaaf7920cde0ff`；2026-09-19 19:46 UTC已fetch并逐文件核对；后续仅台账提交另记 |
 | 初始分支 | `implementation/v4-e01-sequential-reject-holdout-20260918` |
 | 初始未提交文件 | `evaluation.rs` 已修改；`holdout.rs`、`sequential.rs` 未跟踪；已逐文件和 diff 保存本地快照 |
 | 既有 stash | `wip-host-cli-http-mcp: uncommitted at v4 E00 start`；已只读备份，未 apply/drop |
@@ -23,24 +44,24 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 
 ## 单任务 PR 顺序
 
-每个任务独立审阅；下表保留已交付E任务PR，后续增量用独立任务号并标明E归属。实施方先自测提PR，主控最终验收后合并。以下同时登记任务顺序与实际 GitHub PR；采用依赖栈，每个 PR 只审阅本任务差异。已推送不等于已合并，merged_sha 均为空。
+每个任务独立审阅；下表保留已交付E任务PR，后续增量用独立任务号并标明E归属。实施方先自测提PR，主控最终验收后合并。以下同时登记任务顺序与实际 GitHub PR；采用依赖栈，每个 PR 只审阅本任务差异。当前实际合并状态见下表；未通过或受依赖阻塞的后续PR仍保持未合并。
 
 | 顺序 | 任务 | 范围与依赖 | 负责人/修改白名单 | 状态 | PR / source_sha / merged_sha |
 |---|---|---|---|---|---|
-| 01 | E00 | 固定基线、真源切换、历史/当前证据范围；无依赖 | 子代理复验；主控已核对源码与原始日志并定向重测 | verified（固定基线与治理脚本局部） | [PR #29](https://github.com/acosmi/RSIAgent/pull/29) draft；源码 `ef8244d` 已推送；未合并 |
-| 02 | E01 | 统计与独立留出静态合同；依赖 E00 核心基线 | sol/high实施，主控独立验收 | verified（静态合同）/ blocked（真实小试） | [PR #30](https://github.com/acosmi/RSIAgent/pull/30) draft；源码 `c5ac47d` 已推送；未合并 |
-| 03 | E02 | 有界原子 Skill 编辑纯编译作用域；依赖 E01 合同验收 | sol/high实施，主控独立验收 | verified（编译子范围） | [PR #31](https://github.com/acosmi/RSIAgent/pull/31) draft；源码 `79af6c5` 已推送；未合并 |
-| 04 | E03 | 真实应用诊断、小批反思、建议来源与开发消费者；依赖 E02 | sol；core/engine optimization、model、evidence及定向测试 | verified（程序消费者/恢复子范围） | [PR #32](https://github.com/acosmi/RSIAgent/pull/32) draft；源码 `727e9cc` 已推送；未合并 |
-| 05 | E04 | 持久根预算、broker、取消/对账；依赖 E02 | sol/high；storage budget、0005_root_budget、engine broker/executor及定向测试 | verified（根预算/broker子范围） | [PR #33](https://github.com/acosmi/RSIAgent/pull/33) draft；源码 `f02e535` 已推送；未合并 |
-| 06 | E05 | 独立评测/留出、连续前缀与早停证书；依赖 E01/E03/E04 | sol/high；engine evaluator/streaming_evaluator及定向测试 | verified（持久评测程序子范围）/ blocked（真实评测） | [PR #34](https://github.com/acosmi/RSIAgent/pull/34) draft；源码 `86e53b9` 已推送；未合并 |
-| 07 | E06 | 组合发布门禁、CAS、实际应用快照与实时撤销；依赖 E02/E05 | sol/high实施；主控代码复读、修复回退与读取旁路后隔离复验 | verified（持久门禁/拒绝路径）/ blocked（真实发布） | [PR #35](https://github.com/acosmi/RSIAgent/pull/35) draft；源码 `071c54d` 已推送；未合并 |
-| 08 | E07 | HostService、HTTP/MCP/CLI与参考宿主；依赖E03–E06 | sol/high实施；主控独立代码与实际进程验收 | verified（本地协议/E05管理子范围）/ blocked（真实G1） | [PR #36](https://github.com/acosmi/RSIAgent/pull/36) draft；源码 `0ed5ec9` 已推送；未合并 |
-| 09 | E08 | 持久撤销、内容清理、备份与可信锚恢复；依赖E06 | sol实施、Astra/low恢复修复；主控独立验收 | verified（当前对象/本机离线恢复） | [PR #37](https://github.com/acosmi/RSIAgent/pull/37) draft；源码 `644d95d` 已推送；未合并 |
-| 10 | E09 | 受限策略/持久探索/E03真实消费者；依赖E03/E04/E07 | sol/high实施，主控独立验收 | verified（程序协调子范围）/ blocked（真实G2及恢复场景） | [PR #38](https://github.com/acosmi/RSIAgent/pull/38) draft；源码 `c71db74` 已推送；未合并 |
-| 11 | E10 | 不可变观察/世界池/纯回放/持久报告；依赖E08/E09 | sol/high实施，主控独立验收 | verified（程序回放子范围） | [PR #39](https://github.com/acosmi/RSIAgent/pull/39) draft；源码 `77177cd` 已推送；未合并 |
-| 12 | E11 | 经济实验合同/全成本/持久阻塞报告；依赖E05/E07/E10 | sol/high实施，主控独立验收 | verified（静态与持久准备）/ blocked（真实经济实验） | [PR #40](https://github.com/acosmi/RSIAgent/pull/40) draft；源码 `289d920` 已推送；未合并 |
-| 13 | E12 | 零预算课程/固定纯函数/可信事实拒绝门；依赖E04/E07/E08/E09 | sol/high实施，主控独立验收 | verified（离线子范围）/ blocked（真实学习闭环） | [PR #41](https://github.com/acosmi/RSIAgent/pull/41) draft；源码 `e612fcb` 已推送；未合并 |
-| 14 | E13 | 持久监测/巩固触发/根预算与恢复；依赖E07/E08 | sol/high实施，主控独立验收 | verified（程序监测子范围）/ blocked（长期实测） | [PR #42](https://github.com/acosmi/RSIAgent/pull/42) draft；源码 `2c79608` 已推送；未合并 |
+| 01 | E00 | 固定基线、真源切换、历史/当前证据范围；无依赖 | 子代理复验；主控已核对源码与原始日志并定向重测 | verified（固定基线与治理脚本局部） | [PR #29](https://github.com/acosmi/RSIAgent/pull/29) 已合并；源码 `ef8244d` 已推送；merged_sha `28f892c3d68591d201a8029345257f051fb123ef` |
+| 02 | E01 | 统计与独立留出静态合同；依赖 E00 核心基线 | sol/high实施，主控独立验收 | verified（静态合同）/ blocked（真实小试） | [PR #30](https://github.com/acosmi/RSIAgent/pull/30) 已合并；源码 `c5ac47d` 已推送；merged_sha `faec991036f03f27cf6d2ad3db86f841815fc828` |
+| 03 | E02 | 有界原子 Skill 编辑纯编译作用域；依赖 E01 合同验收 | sol/high实施，主控独立验收 | verified（编译子范围） | [PR #31](https://github.com/acosmi/RSIAgent/pull/31) 已合并；源码 `79af6c5` 已推送；merged_sha `dfc861ce7572f8f9f49a8aaf9f0cc1687cba57f9` |
+| 04 | E03 | 真实应用诊断、小批反思、建议来源与开发消费者；依赖 E02 | sol；core/engine optimization、model、evidence及定向测试 | verified（程序消费者/恢复子范围） | [PR #32](https://github.com/acosmi/RSIAgent/pull/32) 已合并；源码 `727e9cc` 已推送；merged_sha `9b13237af884c525652813ea508eb8c5f100d6f8` |
+| 05 | E04 | 持久根预算、broker、取消/对账；依赖 E02 | sol/high；storage budget、0005_root_budget、engine broker/executor及定向测试 | verified（根预算/broker子范围） | [PR #33](https://github.com/acosmi/RSIAgent/pull/33) 已合并；源码 `f02e535` 已推送；merged_sha `c1cf6a2e91253218033b5883a11baa02c85a5d43` |
+| 06 | E05 | 独立评测/留出、连续前缀与早停证书；依赖 E01/E03/E04 | sol/high；engine evaluator/streaming_evaluator及定向测试 | verified（持久评测程序子范围）/ blocked（真实评测） | [PR #34](https://github.com/acosmi/RSIAgent/pull/34) 已合并；源码 `86e53b9` 已推送；merged_sha `63824fff2e8d0cd0767d31140d064972542f6b53` |
+| 07 | E06 | 组合发布门禁、CAS、实际应用快照与实时撤销；依赖 E02/E05 | sol/high实施；主控代码复读、修复回退与读取旁路后隔离复验 | verified（持久门禁/拒绝路径）/ blocked（真实发布） | [PR #35](https://github.com/acosmi/RSIAgent/pull/35) 已合并；源码 `071c54d` 已推送；merged_sha `c017e6a32da3cdf692c3321dd29d6510edada0c4` |
+| 08 | E07 | HostService、HTTP/MCP/CLI与参考宿主；依赖E03–E06 | sol/high实施；主控独立代码与实际进程验收 | verified（本地协议/E05管理子范围）/ blocked（真实G1） | [PR #36](https://github.com/acosmi/RSIAgent/pull/36) 已合并；源码 `0ed5ec9` 已推送；merged_sha `794cf0f517a57e48166ef2ad44cb5762f3a61d5e` |
+| 09 | E08 | 持久撤销、内容清理、备份与可信锚恢复；依赖E06 | sol实施、Astra/low恢复修复；主控独立验收 | verified（当前对象/本机离线恢复） | [PR #37](https://github.com/acosmi/RSIAgent/pull/37) 已合并；源码 `644d95d` 已推送；merged_sha `b0662ca1b7a2fe27d4a4622918679eed4934e214` |
+| 10 | E09 | 受限策略/持久探索/E03真实消费者；依赖E03/E04/E07 | sol/high实施，主控独立验收 | verified（程序协调子范围）/ blocked（真实G2及恢复场景） | [PR #38](https://github.com/acosmi/RSIAgent/pull/38) 已合并；源码 `c71db74` 已推送；merged_sha `7a8a35908a2f7cc72ed601cbc902a2e4b49120bf` |
+| 11 | E10 | 不可变观察/世界池/纯回放/持久报告；依赖E08/E09 | sol/high实施，主控独立验收 | verified（程序回放子范围） | [PR #39](https://github.com/acosmi/RSIAgent/pull/39) 已合并；源码 `77177cd` 已推送；merged_sha `96e62412809610a72d2ab593aaca59a8bcebd6d2` |
+| 12 | E11 | 经济实验合同/全成本/持久阻塞报告；依赖E05/E07/E10 | sol/high实施，主控独立验收 | verified（静态与持久准备）/ blocked（真实经济实验） | [PR #40](https://github.com/acosmi/RSIAgent/pull/40) 已合并；源码 `289d920` 已推送；merged_sha `09b3ebe8bad12d59bd3c2f926d3050802372e96f` |
+| 13 | E12 | 零预算课程/固定纯函数/可信事实拒绝门；依赖E04/E07/E08/E09 | sol/high实施，主控独立验收 | verified（离线子范围）/ blocked（真实学习闭环） | [PR #41](https://github.com/acosmi/RSIAgent/pull/41) 已合并；源码 `e612fcb` 已推送；merged_sha `b1127a228c4a40248631ed417aba0ad7ea1a0884` |
+| 14 | E13 | 持久监测/巩固触发/根预算与恢复；依赖E07/E08 | sol/high实施，主控独立验收 | verified（程序监测子范围）/ blocked（长期实测） | [PR #42](https://github.com/acosmi/RSIAgent/pull/42) 已合并；源码 `2c79608` 已推送；merged_sha `2e209dcea36d63610c59d3797e039f35d063ec89` |
 
 后续依真源依赖图按 E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
 
@@ -57,24 +78,24 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | E04 | 可信执行、隔离与根资源预算 | in_progress（根预算/broker已verified） | 主控预算15（含10001调用）、broker9、executor6项及fmt/clippy通过；group完整分页停止修复已追加PR #33；真实提供商、进程隔离尚未验。 |
 | E05 | 独立验收器与有边界的统计判定 | in_progress（持久控制/早停已verified） | 主控12流式+6旧评测+13core共31项及fmt/clippy通过；晚到回执、输出不可变、Exposure时间/终态/未知费用保留已修；真实提供商、进程隔离、完整成本及逐依赖撤销仍未验，fixture禁止晋级。 |
 | E06 | 组合发布、实际应用与最小撤销闭环 | in_progress（持久门禁已verified） | 主控7集成+4单元+12 E05回归及fmt/clippy通过；审批防回退、Host完整报告闭包、所有快照读入口已验；真实生产批准/组合应用/回滚受E05证据阻塞。 |
-| E07 | 第一个最小可验证真实闭环 | in_progress（协议子范围已verified）/ blocked（真实闭环） | 主控协议21项与管理增量27项、真实HTTP/MCP/CLI、参考宿主及fmt/clippy/build通过；E05注册/票据管理已接线。exploration/replay/curriculum/meta管理适配仍缺；真实模型、独立数据与支付授权未取得。 |
+| E07 | 第一个最小可验证真实闭环 | in_progress（协议子范围已verified）/ blocked（真实闭环） | 主控协议21项与管理增量27项、真实HTTP/MCP/CLI、参考宿主及fmt/clippy/build通过；E05注册/票据管理已接线。exploration/curriculum/meta管理适配仍缺，replay.run已由AG-001接通并验收；真实模型、独立数据与支付授权未取得。 |
 | E08 | 可恢复的撤销、保留和备份链 | in_progress（当前对象/本机恢复已verified） | 主控47项及clippy/fmt通过；当前可信SQLite锚由操作者指定，不声称辨别假冒旧库。Linux/生产演练及后续新增对象清理另验。 |
 | E09 | 生成/探索解耦与有状态在线探索 | in_progress（程序协调已verified） | 主控25项及clippy/fmt通过；完整输入幂等、两节点StoreJournal链、源水位、整批资源已验；实际产生可修复故障的E03链、真实G2及全多组/实践范围仍待完成。 |
-| E10 | 不可变世界池与纯查表回放 | in_progress（程序回放/池/报告已verified） | 主控57项、clippy/fmt通过；观察正文绑定实际共同输入和来源，q0/辅助来源篡改拒绝；世界/池/报告持久与实时撤销已验。真实观测与管理适配仍未完成，不声称经济收益。 |
+| E10 | 不可变世界池与纯查表回放 | in_progress（程序回放/池/报告已verified） | 主控57项、clippy/fmt通过；观察正文绑定实际共同输入和来源，q0/辅助来源篡改拒绝；世界/池/报告持久与实时撤销已验。replay.run管理适配经AG-001验收并合并；真实观测仍缺，不声称经济收益。 |
 | E11 | 验证回放优化的真实经济收益 | in_progress（合同/持久准备已verified） | 主控10项及clippy/fmt通过；单票配对、九类成本、实际预算绑定/最终回执不可变、并发取消/晚到账/报告CAS已验。可信在线配对回执消费者尚未实现；真实经济实验未运行，不声称节省。 |
 | E12 | 学习者条件化的经验自主获取 | in_progress（离线子范围已verified） | 主控21项和参考宿主3个进程用例、clippy/fmt通过；控制注册、精确平台期、冷却/零预算终态、事实拒绝门已验。E03可信执行/评分回执schema仍缺，真实隔离、应用正例及持久学习改变下轮选题仍未验，不启用G3。 |
 | E13 | 长期部署适应与能力保留监测 | in_progress（程序监测已verified） | 主控22项及clippy/fmt通过；两周期触发、单claim、真实根绑定前置校验、异常/撤销持久终态和漂移已验。仅程序fixture，真实提供商、连续轮次保留/长期效果仍未取得。 |
 | E14 | 受限改进器自身的继承控制器 | planned（本地合同建议已交接） | 未开始代码；单机制候选、真实下一作业及身份边界仍须主控定版；不启用G4。 |
 | E15 | 后继质量与跨代收益实验 | planned | 真实后继实验未运行。 |
 | E16 | 产品支持范围与最终交付门禁 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
-| E16.1 | 来源导入与版本化读取器 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
-| E16.2 | 资产导入／分享与隐私门禁 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
-| E16.3 | 内置种子与本地修改保护 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
-| E16.4 | 额外真实宿主与配置面漂移 | planned | 额外宿主需要本轮实查，历史 blocked 不自动升级。 |
-| E16.5 | 持久恢复、容量、依赖与部署安全 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
-| E16.6 | 发行、证据台账与唯一真源交接 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
-| E17 | 可选：开发代理评分器演化 | planned | 默认关闭；仅拒绝路径待本轮验证。 |
-| E18 | 可选：自动提出代码修改，不自动部署 | planned | 默认关闭；仅拒绝路径待本轮验证。 |
+| E16.1 | 来源导入与版本化读取器 | implemented_not_verified（主控退回） | PR #44未合并；具体缺陷与返修条件见页首主控结论。已提交代码不代表完整E/V场景通过。 |
+| E16.2 | 资产导入／分享与隐私门禁 | implemented_not_verified（主控退回） | PR #45未合并；具体缺陷与返修条件见页首主控结论。已提交代码不代表完整E/V场景通过。 |
+| E16.3 | 内置种子与本地修改保护 | implemented_not_verified（主控退回） | PR #46未合并；具体缺陷与返修条件见页首主控结论。已提交代码不代表完整E/V场景通过。 |
+| E16.4 | 额外真实宿主与配置面漂移 | implemented_not_verified（主控退回） | PR #47未合并；具体缺陷与返修条件见页首主控结论。已提交代码不代表完整E/V场景通过。 |
+| E16.5 | 持久恢复、容量、依赖与部署安全 | implemented_not_verified（主控退回） | PR #48未合并；具体缺陷与返修条件见页首主控结论。已提交代码不代表完整E/V场景通过。 |
+| E16.6 | 发行、证据台账与唯一真源交接 | implemented_not_verified（主控退回） | PR #49未合并；具体缺陷与返修条件见页首主控结论。已提交代码不代表完整E/V场景通过。 |
+| E17 | 可选：开发代理评分器演化 | in_progress（关闭/拒绝子范围已复验） | PR #50因前置未通过暂不合并；默认关闭，不代表真实扩展运行通过。 |
+| E18 | 可选：自动提出代码修改，不自动部署 | in_progress（关闭/拒绝子范围已复验） | PR #51因前置未通过暂不合并；默认关闭，不代表真实扩展运行通过。 |
 
 ## 追踪范围
 
@@ -246,7 +267,7 @@ V010–13/V084/V085仅在冻结合同、程序fixture、持久票据/账本和�
 
 ### 在途收口与当前进度
 
-E07管理增量、E10–E13已按上述子范围验收、提交、推送并分别归入原任务PR。远程实查E00–E13共14个独立草稿PR（#29–#42），均open/draft，merged_sha=null。25个台账节点中14个已有已验子范围交付，属于56%的任务覆盖率，不能写成后端完成56%；本轮未宣称任一研究阶段的真实全链全部完成。
+E07管理增量、E10–E13已按上述子范围验收、提交、推送并分别归入原任务PR。上一轮收口时E00–E13共14个独立草稿PR；现已在本轮主控阶段按表合并，实际merged_sha见当前记录。25个台账节点中14个已有已验子范围交付，属于56%的任务覆盖率，不能写成后端完成56%；本轮未宣称任一研究阶段的真实全链全部完成。
 
 主控最终在隔离副本对整合源码 `c9b85b88d11190bbc83d6361904a91c3ede63a4c` 运行 `cargo test --locked --offline -p evo-core -p evo-storage -p evo-engine`，301项通过；对应all-targets Clippy -D warnings与fmt exit0。实际输入/命令/日志哈希保存在本地 `controller-closure-integrated-acceptance.json`。Cargo.lock仅构建清理引起reqwest/rmcp列表排序差异，依赖/版本/checksum逐项相同；仓库锁文件未改。
 
@@ -262,15 +283,17 @@ E07管理增量、E10–E13已按上述子范围验收、提交、推送并分�
 
 AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基线建立独立增量PR，以E13交付分支为base。这样不把已有E11–E13代码混入旧E10 PR #39；PR通过前不合并，提PR后连续处理下一任务。
 
+**以下AG实施/自测文字为实施方交付记录；其中“完整实现/全面覆盖/端到端”不构成主控通过结论，当前验收与返修以页首为准。**
+
 ### AG-001 / E10 现有 replay.run 管理消费者实施与自测
 
 - 任务号：AG-001
 - E 归属：E10
-- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- 状态：`verified`（仅本任务回放管理子范围，经主控独立验收）
 - base 分支：`wrokbot/v4.1-pr-e13-monitoring`
 - head 分支：`wrokbot/ag-001-e10-replay-management`
 - PR：[PR #43](https://github.com/acosmi/RSIAgent/pull/43)
-- merged_sha: null
+- merged_sha: `59afd1663a0d5f5212077dd92beaaf7920cde0ff`
 
 依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150` 与 `AG-001-E10-replay-management.md` 冻结最小合同。
 文件白名单修改：
@@ -490,9 +513,30 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - E17 为可选扩展且默认关闭，最终裁决权不向候选开放；
 - 本轮仅实现并验证其安全拒绝路径，不开启真实在线代理评分器自我演化。
 
+### AG-009 / E18 可选代码修改PR默认关闭与安全拒绝门禁实施与自测
 
+- 任务号：AG-009
+- E 归属：E18
+- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- base 分支：`wrokbot/ag-008-e17-scorer-rejection`
+- head 分支：`wrokbot/ag-009-e18-code-pr-rejection`
+- PR：[PR #51](https://github.com/acosmi/RSIAgent/pull/51)
+- merged_sha: null
 
+依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §10、§12、§13.2 E18 及 V041 场景族。
+文件白名单修改：
+1. `crates/evo-core/src/features.rs`: 严格保持 E18 扩展为默认关闭（`enable_automatic_code_prs(true)` 恒定返回拒绝错误）；定义 `CodePatchProposal` 补丁提案结构与 `MAX_CODE_PATCH_DIFF_BYTES`（500KB）安全上限；实现 `is_protected_code_path` 严格识别与拦截受保护路径（包含验收、评分、评测、安全、审批、凭据、私钥、沙箱、隔离、预算、账本、Cargo.toml/Cargo.lock/build.rs/Makefile/Dockerfile、路径穿越 `..`、系统绝对路径与 Docker socket）；实现 V041 代码修改 PR 安全拒绝门禁 `validate_e18_code_pr_gates`（严格拒绝修改受保护文件、拒绝未单独安全审计的依赖或构建脚本修改、绝对禁止自动合并 `auto_merge`、绝对禁止自动部署或运行中核心替换 `auto_deploy`、强制要求在一次性隔离沙箱中构建测试、强制要求人工审批 token、超限 diff 拒绝、扩展默认关闭拒绝）。
+2. `crates/evo-core/tests/e18_rejection_v41.rs`: 新增集成测试套件，全面覆盖 V041 全部 12 项场景族与拒绝路径。
 
+自测证据（全部 exit 0）：
+- `cargo test --locked --offline -p evo-core --test e18_rejection_v41`: 12 项全部通过。
+- `crates/evo-core/src/features.rs`: 单元测试 3 项全部通过（含 `v041_code_pr_rejection_gates`）。
+- `cargo test --locked --offline -p evo-core`: 全量测试全部通过。
+- `cargo test --locked --offline -p evo-core -p evo-storage -p evo-engine -p evo-http`: 全工作空间测试全部通过。
+- `cargo clippy --locked --offline -p evo-core --all-targets -- -D warnings`: 检查通过，无 warning。
+- `cargo fmt --all -- --check`: 格式化检查通过。
 
-
-
+未完成项与边界：
+- E14、E15 仍为 planned（E14 需主控冻结单一机制且无源码实施；E15 真实后继实验未运行并受前置阻塞）；
+- E18 作为可选扩展严格保持默认关闭，禁止自动自合并、自部署或自换核心；
+- 本轮仅实现并全量验证其安全拒绝路径（V041），不开启真实自动代码 PR 派生。
