@@ -9,7 +9,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use evo_core::{Context, Error, Feedback, Inspect, Prepare, Proposal, Role, hash, identifier};
 use evo_engine::evidence::StoredTraceAuthority;
@@ -80,6 +80,14 @@ impl AuthRegistry {
         !self.identities.is_empty()
     }
 
+    pub fn management_contexts(&self) -> evo_core::Result<Vec<Context>> {
+        self.identities
+            .values()
+            .filter(|identity| matches!(identity.role, Role::Admin | Role::Evaluator))
+            .map(AuthIdentity::context)
+            .collect()
+    }
+
     fn authenticate(&self, headers: &HeaderMap) -> std::result::Result<Context, HttpError> {
         if !self.is_configured() {
             return Err(HttpError::new(
@@ -116,6 +124,7 @@ pub struct HttpState {
     pub service: HostService,
     pub prepare_config: HostPrepareConfig,
     pub auth: AuthRegistry,
+    pub management: evo_engine::dispatch::ManagementDispatcher,
 }
 
 pub fn router(state: HttpState) -> Router {
@@ -128,6 +137,8 @@ pub fn router(state: HttpState) -> Router {
         .route("/v1/host/snapshot", post(read_snapshot))
         .route("/v1/host/application", post(record_application))
         .route("/v1/manage/{operation}", post(management))
+        .route("/v1/manage/jobs/{job_id}", get(management_status))
+        .route("/v1/manage/jobs/{job_id}/cancel", post(management_cancel))
         .layer(RequestBodyLimitLayer::new(MAX_HTTP_BODY_BYTES))
         .with_state(state)
 }
@@ -264,17 +275,34 @@ async fn management(
     let caller = state.auth.authenticate(&headers)?;
     let body = parse_unique_value(&body, "invalid_management_payload")?;
     reject_body_identity(&body)?;
-    caller.require(&[Role::Admin])?;
-    if !evo_core::contract::admin_ops().contains(&operation.as_str()) {
+    to_json(state.management.submit(&caller, &operation, body).await?)
+}
+
+async fn management_status(
+    State(state): State<HttpState>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Value>, HttpError> {
+    let caller = state.auth.authenticate(&headers)?;
+    to_json(state.management.status(&caller, &job_id).await?)
+}
+
+async fn management_cancel(
+    State(state): State<HttpState>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> std::result::Result<Json<Value>, HttpError> {
+    let caller = state.auth.authenticate(&headers)?;
+    let value = parse_unique_value(&body, "invalid_management_cancel_payload")?;
+    reject_body_identity(&value)?;
+    if value != json!({}) {
         return Err(HttpError::new(
-            StatusCode::NOT_FOUND,
-            "unknown_management_operation",
+            StatusCode::BAD_REQUEST,
+            "invalid_management_cancel_payload",
         ));
     }
-    Err(HttpError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "unsupported_pending_real_evaluation_backend",
-    ))
+    to_json(state.management.cancel(&caller, &job_id).await?)
 }
 
 fn reject_body_identity(body: &Value) -> std::result::Result<(), HttpError> {

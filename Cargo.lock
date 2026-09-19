@@ -1741,6 +1741,7 @@ dependencies = [
  "evo-storage",
  "fs2",
  "rmcp",
+ "reqwest",
  "serde_json",
  "tokio",
  "tokio-util",

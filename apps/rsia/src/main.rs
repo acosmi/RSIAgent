@@ -10,7 +10,6 @@ use evo_engine::service::{HostPrepareConfig, HostService};
 use evo_http::{AuthIdentity, AuthRegistry, DEFAULT_BIND, HttpState};
 use evo_storage::Store;
 use fs2::FileExt;
-use serde_json::json;
 use std::{
     collections::BTreeSet,
     fs::{File, OpenOptions},
@@ -40,12 +39,16 @@ enum Command {
         namespace: String,
         #[arg(long, default_value = "http-agent")]
         actor: String,
+        #[arg(long, default_value = "evaluator")]
+        evaluator_actor: String,
         #[arg(long, env = "RSIA_HTTP_TOKEN", hide_env_values = true)]
         auth_token: Option<String>,
         #[arg(long, env = "RSIA_HOST_TOKEN", hide_env_values = true)]
         host_token: Option<String>,
         #[arg(long, env = "RSIA_ADMIN_TOKEN", hide_env_values = true)]
         admin_token: Option<String>,
+        #[arg(long, env = "RSIA_EVALUATOR_TOKEN", hide_env_values = true)]
+        evaluator_token: Option<String>,
     },
     /// Run the four MCP tools over stdio with a startup-fixed Agent identity.
     Mcp {
@@ -56,8 +59,18 @@ enum Command {
         #[arg(long, default_value = "stdio-agent")]
         actor: String,
     },
-    /// Report bounded management availability. Real evaluation remains pending.
-    Manage { operation: String },
+    /// Submit or inspect authenticated management jobs through the HTTP service.
+    Manage {
+        operation: String,
+        #[arg(long, default_value = "http://127.0.0.1:7788")]
+        url: String,
+        #[arg(long, env = "RSIA_MANAGEMENT_TOKEN", hide_env_values = true)]
+        auth_token: String,
+        #[arg(long)]
+        request_file: Option<PathBuf>,
+        #[arg(long)]
+        job_id: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -69,9 +82,11 @@ async fn main() -> Result<()> {
             data,
             namespace,
             actor,
+            evaluator_actor,
             auth_token,
             host_token,
             admin_token,
+            evaluator_token,
         } => {
             let _data_lock = DataDirectoryLock::acquire(&data)?;
             let (service, prepare_config) = bootstrap(&data, &namespace).await?;
@@ -91,7 +106,18 @@ async fn main() -> Result<()> {
                     AuthIdentity::new(&namespace, "service-admin", Role::Admin)?,
                 ));
             }
+            if let Some(token) = evaluator_token {
+                entries.push((
+                    token,
+                    AuthIdentity::new(&namespace, &evaluator_actor, Role::Evaluator)?,
+                ));
+            }
             let auth = AuthRegistry::from_plaintext(entries)?;
+            let management = evo_engine::dispatch::ManagementDispatcher::new(
+                service.store().clone(),
+                auth.management_contexts()?,
+            )?;
+            management.recover_pending().await?;
             if !auth.is_configured() {
                 eprintln!("authentication is not configured; sensitive routes will return 503");
             }
@@ -105,6 +131,7 @@ async fn main() -> Result<()> {
                     service,
                     prepare_config,
                     auth,
+                    management,
                 }),
             )
             .await?;
@@ -122,27 +149,62 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
-        Command::Manage { operation } => {
-            if evo_core::contract::admin_ops().contains(&operation.as_str()) {
-                eprintln!(
-                    "{}",
-                    json!({
-                        "operation": operation,
-                        "status": "unsupported",
-                        "reason": "pending_real_evaluation_backend"
-                    })
-                );
-                bail!("management operation is pending a real evaluation backend");
+        Command::Manage {
+            operation,
+            url,
+            auth_token,
+            request_file,
+            job_id,
+        } => {
+            let client = reqwest::Client::new();
+            let base = url.trim_end_matches('/');
+            let response = match operation.as_str() {
+                "job.status" => {
+                    let job_id = job_id.context("--job-id is required for job.status")?;
+                    client
+                        .get(format!("{base}/v1/manage/jobs/{job_id}"))
+                        .bearer_auth(&auth_token)
+                        .send()
+                        .await?
+                }
+                "job.cancel" => {
+                    let job_id = job_id.context("--job-id is required for job.cancel")?;
+                    client
+                        .post(format!("{base}/v1/manage/jobs/{job_id}/cancel"))
+                        .bearer_auth(&auth_token)
+                        .json(&serde_json::json!({}))
+                        .send()
+                        .await?
+                }
+                _ => {
+                    if !evo_core::contract::admin_ops().contains(&operation.as_str()) {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "operation": operation,
+                                "status": "unsupported",
+                                "reason": "unknown_management_operation"
+                            })
+                        );
+                        bail!("unknown management operation");
+                    }
+                    let path = request_file.context("--request-file is required")?;
+                    let body = tokio::fs::read(path).await?;
+                    client
+                        .post(format!("{base}/v1/manage/{operation}"))
+                        .bearer_auth(&auth_token)
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .send()
+                        .await?
+                }
+            };
+            let status = response.status();
+            let body = response.text().await?;
+            println!("{body}");
+            if !status.is_success() {
+                bail!("management request failed with HTTP {status}");
             }
-            eprintln!(
-                "{}",
-                json!({
-                    "operation": operation,
-                    "status": "unsupported",
-                    "reason": "unknown_management_operation"
-                })
-            );
-            bail!("unknown management operation");
         }
     }
     Ok(())

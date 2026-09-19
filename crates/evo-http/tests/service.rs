@@ -16,6 +16,7 @@ const AGENT_A_TOKEN: &str = "agent-a-token-0123456789";
 const AGENT_B_TOKEN: &str = "agent-b-token-0123456789";
 const ADMIN_TOKEN: &str = "admin-token-01234567890";
 const HOST_TOKEN: &str = "host-token-0123456789";
+const EVALUATOR_TOKEN: &str = "evaluator-token-0123456789";
 
 fn d(label: &str) -> String {
     hash(label.as_bytes())
@@ -67,12 +68,19 @@ async fn state(auth: AuthRegistry) -> (tempfile::TempDir, HttpState) {
         evolution_enabled: true,
         capability_level: CapabilityLevel::ToolOnly,
     };
+    let service = HostService::new(store, host).unwrap();
+    let management = evo_engine::dispatch::ManagementDispatcher::new(
+        service.store().clone(),
+        auth.management_contexts().unwrap(),
+    )
+    .unwrap();
     (
         dir,
         HttpState {
-            service: HostService::new(store, host).unwrap(),
+            service,
             prepare_config,
             auth,
+            management,
         },
     )
 }
@@ -94,6 +102,10 @@ fn registry() -> AuthRegistry {
         (
             HOST_TOKEN.into(),
             AuthIdentity::new("tenant-a", "gateway-host", Role::Host).unwrap(),
+        ),
+        (
+            EVALUATOR_TOKEN.into(),
+            AuthIdentity::new("tenant-a", "evaluator", Role::Evaluator).unwrap(),
         ),
     ])
     .unwrap()
@@ -137,6 +149,26 @@ async fn raw_post(
         .send()
         .await
         .unwrap()
+}
+
+async fn wait_job(client: &reqwest::Client, base: &str, token: &str, job_id: &str) -> Value {
+    for _ in 0..100 {
+        let response = client
+            .get(format!("{base}/v1/manage/jobs/{job_id}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        let job: Value = response.json().await.unwrap();
+        if matches!(
+            job["state"].as_str(),
+            Some("succeeded" | "failed" | "cancelled" | "blocked")
+        ) {
+            return job;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    panic!("management job did not finish");
 }
 
 #[tokio::test]
@@ -185,6 +217,41 @@ async fn real_http_process_enforces_auth_identity_and_idempotency() {
         .status(),
         StatusCode::FORBIDDEN
     );
+    let missing_status = post(
+        &client,
+        &base,
+        "/v1/manage/evaluation.status",
+        Some(EVALUATOR_TOKEN),
+        json!({"schema_version":"rsia.management.evaluation_status.v1","request_key":"status-missing","ticket_id":"missing-ticket"}),
+    )
+    .await;
+    assert_eq!(missing_status.status(), StatusCode::OK);
+    let missing_status: Value = missing_status.json().await.unwrap();
+    let missing_job_id = missing_status["id"].as_str().unwrap();
+    let failed = wait_job(&client, &base, EVALUATOR_TOKEN, missing_job_id).await;
+    assert_eq!(failed["state"], "failed");
+    assert_eq!(failed["error_code"], "not_found");
+    let failed_text = serde_json::to_string(&failed).unwrap();
+    assert!(!failed_text.contains("missing-ticket"));
+    assert!(!failed_text.contains("rsia.management.evaluation_status.v1"));
+    let live_missing = client
+        .get(format!("{base}/v1/manage/jobs/{missing_job_id}"))
+        .bearer_auth(EVALUATOR_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live_missing.status(), StatusCode::OK);
+    let live_missing: Value = live_missing.json().await.unwrap();
+    assert_eq!(live_missing["state"], "failed");
+    assert_eq!(live_missing["error_code"], "not_found");
+    assert_eq!(live_missing["step"], failed["step"]);
+    let absent_job = client
+        .get(format!("{base}/v1/manage/jobs/job-does-not-exist"))
+        .bearer_auth(EVALUATOR_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(absent_job.status(), StatusCode::NOT_FOUND);
     assert_eq!(
         post(
             &client,
@@ -318,8 +385,38 @@ async fn real_http_process_enforces_auth_identity_and_idempotency() {
         )
         .await
         .status(),
-        StatusCode::NOT_IMPLEMENTED
+        StatusCode::FORBIDDEN
     );
+    let blocked = post(
+        &client,
+        &base,
+        "/v1/manage/replay.run",
+        Some(ADMIN_TOKEN),
+        json!({"schema_version":"rsia.management.replay_run.v1","request_key":"blocked-1"}),
+    )
+    .await;
+    assert_eq!(blocked.status(), StatusCode::OK);
+    let blocked: Value = blocked.json().await.unwrap();
+    let blocked = wait_job(&client, &base, ADMIN_TOKEN, blocked["id"].as_str().unwrap()).await;
+    assert_eq!(blocked["state"], "blocked");
+    let job_id = blocked["id"].as_str().unwrap();
+    let status = client
+        .get(format!("{base}/v1/manage/jobs/{job_id}"))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let cancel = post(
+        &client,
+        &base,
+        &format!("/v1/manage/jobs/{job_id}/cancel"),
+        Some(ADMIN_TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(cancel.status(), StatusCode::OK);
+    assert_eq!(cancel.json::<Value>().await.unwrap()["state"], "blocked");
     task.abort();
 }
 
