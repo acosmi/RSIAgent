@@ -46,6 +46,9 @@ impl RootBudget {
         if limit < 0 {
             return Err(Error::Invalid("budget limit must be >= 0".into()));
         }
+        let lease_until = now
+            .checked_add(60)
+            .ok_or_else(|| Error::Invalid("lease time overflow".into()))?;
         Ok(Self {
             id,
             billing_scope,
@@ -54,7 +57,7 @@ impl RootBudget {
             spent: 0,
             phase: BudgetPhase::Reserved,
             lease_token,
-            lease_until: now + 60,
+            lease_until,
         })
     }
 
@@ -65,10 +68,15 @@ impl RootBudget {
         if amount <= 0 {
             return Err(Error::Invalid("reservation must be positive".into()));
         }
-        if self.reserved + self.spent + amount > self.limit {
+        let committed = self
+            .reserved
+            .checked_add(self.spent)
+            .and_then(|value| value.checked_add(amount))
+            .ok_or(Error::Budget)?;
+        if committed > self.limit {
             return Err(Error::Budget);
         }
-        self.reserved += amount;
+        self.reserved = self.reserved.checked_add(amount).ok_or(Error::Budget)?;
         Ok(())
     }
 
@@ -89,7 +97,7 @@ impl RootBudget {
         if actual < 0 || actual > self.reserved {
             return Err(Error::Invalid("actual usage out of reservation".into()));
         }
-        self.spent += actual;
+        self.spent = self.spent.checked_add(actual).ok_or(Error::Budget)?;
         self.reserved = 0;
         self.phase = BudgetPhase::Finalized;
         Ok(())
@@ -265,5 +273,14 @@ mod tests {
         assert!(broker_model_call(true, "https://api.example", &allow).is_ok());
         assert!(broker_model_call(true, "https://evil", &allow).is_err());
         assert!(broker_model_call(false, "https://api.example", &allow).is_err());
+    }
+
+    #[test]
+    fn root_budget_arithmetic_overflow_is_rejected_without_panicking() {
+        let mut budget = RootBudget::open("b1", "scope-a", i64::MAX, "lease1", 0).unwrap();
+        budget.reserve(i64::MAX).unwrap();
+        assert!(matches!(budget.reserve(1), Err(Error::Budget)));
+        assert_eq!(budget.reserved, i64::MAX);
+        assert!(RootBudget::open("b2", "scope-b", 1, "lease2", i64::MAX).is_err());
     }
 }

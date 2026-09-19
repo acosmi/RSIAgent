@@ -1,5 +1,7 @@
 //! Transactional typed documents, idempotency, audit and disposable FTS5 indexes.
 //! This crate never connects to a model or executes candidate content.
+pub mod budget;
+
 use evo_core::{Context, Error, Result, fingerprint, hash, identifier, now, search_tokens};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
