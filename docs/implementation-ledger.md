@@ -415,3 +415,15 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 
 
 
+
+
+### CTRL-E16.4-R2 / PR #47：可信宿主回执与支持注册的独立复核
+
+- 任务归属：原 AG-005 / E16.4 返修，追加原 [PR #47](https://github.com/acosmi/RSIAgent/pull/47)，不另造已完成任务。PR 保持草稿、未合并；`merged_sha: null`。
+- 真源：`plan_version: v4.1`；`plan_sha256: 45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`。
+- 固定输入：原 PR head `ff17969b153f298db3ee3f190f6981d3c60d9176`；本次已核对源码提交 `source_sha: 9d04c679bd7f3cb6b3ab74fead60068adf29264d`；本地输入清单 `out/controller-final-e16-20260919/pr47-source-input.json`，SHA-256 `b0ce49bb802a5313a37f5df67eb73bbc77ed46118d7f888822cef7a416215738`。提交前后逐文件摘要相同，台账更新不改源码。
+- 改动：验证者按真实 run ID 重载活 E06 snapshot、HostApplicationRecord 和 TrustedHostExecutionReceipt，核对 request/bundle/environment/surface/实际 used IDs；不接收调用者自填 used/benefit 结论。缺同次独立因果收益事实时 `benefit_verified=false`。真实 Store 拒绝注册未核验 Claude target，改写 fixture 版本字符串不能绕过。
+- 主控亲自运行（全部 `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`；非子代理自报）：`cargo test --locked --offline -p evo-engine --test hosts_v41 --test release_store`，13 passed / exit 0；`cargo test --locked --offline -p evo-engine --lib hosts::tests`，2 passed / exit 0；相同两项集成目标的 clippy `-D warnings` 与 workspace `cargo fmt --all -- --check` 均 exit 0。
+- 原始日志仅本地：`out/controller-final-e16-20260919/pr47-directed-0.log` 至 `pr47-directed-3.log`；命令/退出码记录 `pr47-directed-results.json`。没有上传方案、原始 QA，未运行 cargo xtask ci、Actions 或付费调用。
+- 验收作用域：真实 Store 的拒绝门、可信记录重载与结构校验子范围通过独立复核；**E16.4 整项仍 blocked**，尚无固定真实 Claude Code 版本、握手、四工具真实 smoke/重连取消结果，不声明该宿主实际支持、正向 used/benefit 或部署验证通过。此前仅靠 fixture/路径/自填回执的声明不能作为现行证据。
+- 风险与回滚：有意拒绝未取得真实证据的 Claude 注册；保留首个参考宿主已验子范围。撤回本任务只通过独立回退 PR；当前回滚基线为上述原 PR head，不回退费用/撤销事实。最终统一验收及按依赖合并仍待主控执行。
