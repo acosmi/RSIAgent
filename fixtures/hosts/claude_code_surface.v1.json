@@ -1,0 +1,58 @@
+{
+  "schema_version": "rsia.host_surface.v1",
+  "host": "claude-code-mcp-tool-only",
+  "host_version": "1.0.0",
+  "adapter_version": "0.2.0",
+  "source_digest": "claude_code_mcp_tool_only_v1_fixed_spec",
+  "items": [
+    {
+      "name": "evo_prepare",
+      "coverage": "supported",
+      "mapped_field": "skill.required_capabilities",
+      "consumer": "runner",
+      "reason": "prepare tool exposed via MCP tools endpoint"
+    },
+    {
+      "name": "evo_feedback",
+      "coverage": "supported",
+      "mapped_field": "skill.counterexample",
+      "consumer": "runner",
+      "reason": "feedback tool exposed via MCP tools endpoint"
+    },
+    {
+      "name": "evo_propose",
+      "coverage": "supported",
+      "mapped_field": "skill.content",
+      "consumer": "runner",
+      "reason": "propose tool exposed via MCP tools endpoint"
+    },
+    {
+      "name": "evo_inspect",
+      "coverage": "supported",
+      "mapped_field": "skill.applicability",
+      "consumer": "runner",
+      "reason": "inspect tool exposed via MCP tools endpoint"
+    },
+    {
+      "name": "shell_tool",
+      "coverage": "unsupported",
+      "mapped_field": null,
+      "consumer": null,
+      "reason": "Claude Code internal shell execution is out of scope for tool-only mode"
+    },
+    {
+      "name": "web_search",
+      "coverage": "unsupported",
+      "mapped_field": null,
+      "consumer": null,
+      "reason": "external web search is unverified and out of scope"
+    },
+    {
+      "name": "model_selection",
+      "coverage": "runtime_owned",
+      "mapped_field": null,
+      "consumer": null,
+      "reason": "model selection is host-controlled runtime property"
+    }
+  ]
+}

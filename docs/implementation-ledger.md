@@ -383,5 +383,50 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - 种子或上游更新即使与基线完全同源，也绝不自动激活活跃版本，必须生成 staging 并经独立验收；
 - 人工解决冲突后的合并内容作为新候选处理，重新验收，不以文字合并自动继承任何前期通过记录。
 
+### AG-005 / E16.4 额外真实宿主、Claude Code MCP Tool-Only与配置面漂移门禁实施与自测
+
+- 任务号：AG-005
+- E 归属：E16.4
+- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- base 分支：`wrokbot/ag-004-e16-3-seed-blu`
+- head 分支：`wrokbot/ag-005-e16-4-extra-host`
+- PR：[PR #47](https://github.com/acosmi/RSIAgent/pull/47)
+- merged_sha: null
+
+依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §5.5、§13.1 E16.4 及 V002, V003, V009, V037, V039, V060, V061, V062, V077, V087, V091, V092, V098 场景族。
+文件白名单修改：
+1. `crates/evo-engine/src/hosts.rs`: 严格依循 v4.1 约束，拟议额外宿主目标固定为 Claude Code 的 MCP Tool-only 接入（`claude-code-mcp-tool-only`）；未检测到本地真实安装时绝不造假或替换为 mock 宿主，真实返回 blocked 错误（`claude_code_support`）；完整定义 Claude Code MCP Tool-Only 的 `HostSurfaceManifest`（固定四模型工具 `evo_prepare`, `evo_feedback`, `evo_propose`, `evo_inspect` 为 Supported 并对应 field_contract，内部 shell/web_search 明确标记为 Unsupported，model_selection 标记为 RuntimeOwned）；实现宿主配置面漂移检测 `detect_surface_drift`（严格检查未分类字段、空输出拒绝、非法字段映射拒绝）；实现宿主执行回执核验与防伪门禁 `verify_host_receipt`（截断/覆盖/遗漏严禁伪报为完整 `Used`，未经验收严禁伪报 `VerifiedBenefit`，落实 V087 Skill-Diagnosis-Attribution 归因分类）。
+2. `fixtures/hosts/claude_code_surface.v1.json`: 冻结并输出 Claude Code MCP Tool-only 宿主配置面 golden manifest fixture。
+3. `crates/evo-engine/tests/hosts_v41.rs`: 新增集成测试套件，全面覆盖 V002, V003, V009, V037, V039, V060, V061, V062, V077, V087, V091, V092, V098 全部测试场景。
+
+自测证据（全部 exit 0）：
+- `cargo test --locked --offline -p evo-engine --test hosts_v41`: 9 项全部通过（含主控对抗缺陷 F06 Offered 回执防伪门禁回归测试）。
+- `cargo test --locked --offline -p evo-engine --lib hosts::tests`: 2 项全部通过。
+- `cargo test --locked --offline -p evo-engine --test seeds_v41`: 5 项全部通过。
+- `cargo test --locked --offline -p evo-engine`: 全量测试全部通过。
+- `cargo clippy --locked --offline -p evo-engine --all-targets -- -D warnings`: 检查通过，无 warning。
+- `cargo fmt --all -- --check`: 格式化检查通过。
+
+主控审阅缺陷整改记录（PR #47）：
+- **F06（Offered 与未真正使用阶段的防伪回执核验）**：在 `verify_host_receipt` 中强制检查工具执行阶段：`stage == HostToolStage::Offered` 时严禁认领 `claimed_used`、`claimed_benefit` 或 `attribution == SkillAttribution::VerifiedBenefit`；非 `Used` 阶段（包括 Offered/Attached/Truncated/Omitted）一律拒绝认领完整 Used 或 VerifiedBenefit，杜绝调用方伪造回执。
+
+未完成项与边界：
+- E16.5、E16.6、E14、E15 仍为 planned；
+- 本机未安装真实 Claude Code CLI 运行时，子包合同/漂移门禁/回执防伪已就绪，但真实宿主端到端执行如实保留 blocked 状态，不偷换为泛化 mock；
+- 真实宿主 Tool-only 模式仅承诺四工具交互，不承诺宿主内部 prompt/shell/model 生效，截断或覆盖不计为收益证明。
 
 
+
+
+
+
+### CTRL-E16.4-R2 / PR #47：可信宿主回执与支持注册的独立复核
+
+- 任务归属：原 AG-005 / E16.4 返修，追加原 [PR #47](https://github.com/acosmi/RSIAgent/pull/47)，不另造已完成任务。PR 保持草稿、未合并；`merged_sha: null`。
+- 真源：`plan_version: v4.1`；`plan_sha256: 45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`。
+- 固定输入：原 PR head `ff17969b153f298db3ee3f190f6981d3c60d9176`；本次已核对源码提交 `source_sha: 9d04c679bd7f3cb6b3ab74fead60068adf29264d`；本地输入清单 `out/controller-final-e16-20260919/pr47-source-input.json`，SHA-256 `b0ce49bb802a5313a37f5df67eb73bbc77ed46118d7f888822cef7a416215738`。提交前后逐文件摘要相同，台账更新不改源码。
+- 改动：验证者按真实 run ID 重载活 E06 snapshot、HostApplicationRecord 和 TrustedHostExecutionReceipt，核对 request/bundle/environment/surface/实际 used IDs；不接收调用者自填 used/benefit 结论。缺同次独立因果收益事实时 `benefit_verified=false`。真实 Store 拒绝注册未核验 Claude target，改写 fixture 版本字符串不能绕过。
+- 主控亲自运行（全部 `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`；非子代理自报）：`cargo test --locked --offline -p evo-engine --test hosts_v41 --test release_store`，13 passed / exit 0；`cargo test --locked --offline -p evo-engine --lib hosts::tests`，2 passed / exit 0；相同两项集成目标的 clippy `-D warnings` 与 workspace `cargo fmt --all -- --check` 均 exit 0。
+- 原始日志仅本地：`out/controller-final-e16-20260919/pr47-directed-0.log` 至 `pr47-directed-3.log`；命令/退出码记录 `pr47-directed-results.json`。没有上传方案、原始 QA，未运行 cargo xtask ci、Actions 或付费调用。
+- 验收作用域：真实 Store 的拒绝门、可信记录重载与结构校验子范围通过独立复核；**E16.4 整项仍 blocked**，尚无固定真实 Claude Code 版本、握手、四工具真实 smoke/重连取消结果，不声明该宿主实际支持、正向 used/benefit 或部署验证通过。此前仅靠 fixture/路径/自填回执的声明不能作为现行证据。
+- 风险与回滚：有意拒绝未取得真实证据的 Claude 注册；保留首个参考宿主已验子范围。撤回本任务只通过独立回退 PR；当前回滚基线为上述原 PR head，不回退费用/撤销事实。最终统一验收及按依赖合并仍待主控执行。
