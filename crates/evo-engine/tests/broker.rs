@@ -236,6 +236,34 @@ async fn disabled_transport_never_reserves_or_dispatches() {
 }
 
 #[tokio::test]
+async fn budget_binding_is_read_only_and_namespace_scoped() {
+    let (_dir, store) = store().await;
+    authorize(&store).await;
+    let broker = PersistentModelBroker::with_clock(
+        store.clone(),
+        DisabledModelTransport,
+        config(),
+        fixed_clock(),
+    )
+    .unwrap();
+    let binding = broker.budget_binding("ns-a").await.unwrap();
+    assert_eq!(binding.billing_scope, "scope-1");
+    assert_eq!(binding.root_budget_id, "root-1");
+    assert!(broker.budget_binding("other-namespace").await.is_err());
+    assert!(
+        store
+            .budget_call(
+                &Context::new("ns-a", "admin", Role::Admin).unwrap(),
+                "scope-1",
+                "uncreated-call"
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn successful_fixture_is_billed_once_and_receipt_matches_persistent_facts() {
     let (_dir, store) = store().await;
     authorize(&store).await;

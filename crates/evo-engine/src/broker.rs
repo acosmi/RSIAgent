@@ -33,6 +33,12 @@ pub struct BrokerConfig {
     pub lease_seconds: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetPortBinding {
+    pub billing_scope: String,
+    pub root_budget_id: String,
+}
+
 impl BrokerConfig {
     fn validate(&self) -> Result<()> {
         identifier(&self.billing_scope)?;
@@ -175,6 +181,21 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
             transport,
             config,
             clock,
+        })
+    }
+
+    /// Returns the persistent billing root this trusted broker will use before
+    /// any model dispatch. This is configuration/accounting identity only.
+    pub async fn budget_binding(&self, namespace: &str) -> Result<BudgetPortBinding> {
+        identifier(namespace)?;
+        let root = self
+            .store
+            .root_budget(&self.broker_context(namespace)?, &self.config.billing_scope)
+            .await?
+            .ok_or(Error::Budget)?;
+        Ok(BudgetPortBinding {
+            billing_scope: self.config.billing_scope.clone(),
+            root_budget_id: root.root_budget_id,
         })
     }
 
