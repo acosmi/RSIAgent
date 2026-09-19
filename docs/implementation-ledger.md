@@ -453,10 +453,13 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 2. `crates/evo-core/tests/support_scope.rs`: 更新支持范围自动化验证测试，严格断言 v4.1 方案版本、SHA-256 哈希、subset_only 声明及全部 10 项 B 承诺、8 项 U 承诺、10 项 K 借鉴承诺、18 项 SO 固定源码/材料定位、98 项 V 场景族存在且无断链（落实 V071, V072, V074, V080, V098）。
 
 自测证据（全部 exit 0）：
-- `cargo test --locked --offline -p evo-core --test support_scope`: 1 项全部通过。
+- `cargo test --locked --offline -p evo-core --test support_scope`: 2 项全部通过（含主控对抗缺陷 F09 具体源码/测试命令/固定 SO blob 映射校验回归测试）。
 - `cargo test --locked --offline -p evo-core -p evo-storage -p evo-engine`: 全量测试全部通过。
 - `cargo clippy --locked --offline -p evo-core -p evo-storage -p evo-engine --all-targets -- -D warnings`: 检查通过，无 warning。
 - `cargo fmt --all -- --check`: 格式化检查通过。
+
+主控审阅缺陷整改记录（PR #49）：
+- **F09（支持范围与实施映射具体性）**：重构 `reports/support-scope.json` 与 `support_scope.rs` 测试套件，彻底杜绝只验证数组长度的空心门禁；在 JSON 中建立从 E00 到 E16.6 每个任务/子任务到真实实现源码文件、测试套件文件、具体运行命令及 V 场景族的逐项映射；对 SO01–SO18 完整收录并校验固定 commit `79124b37e9a6371e13b753f8bcd7adb1e493ade1`、40位 blob SHA 与关联 E 任务；测试严格验证每个文件在磁盘上真实存在，确保每一个 E 作用域都有确凿代码支撑。
 
 未完成项与边界：
 - E14、E15 仍为 planned；E17、E18 为可选关闭；
