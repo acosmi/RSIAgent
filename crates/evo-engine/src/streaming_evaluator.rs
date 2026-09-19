@@ -929,7 +929,68 @@ pub struct VerifiedFormalReportView {
 
 pub struct IndependentEvaluationControl;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationProgress {
+    pub control_digest: Option<String>,
+    pub holdout_digest: Option<String>,
+}
+
 impl IndependentEvaluationControl {
+    pub async fn registration_progress(
+        ctx: &Context,
+        store: &Store,
+        control_id: &str,
+        holdout_id: &str,
+    ) -> Result<RegistrationProgress> {
+        ctx.require(&[Role::Evaluator])?;
+        identifier(control_id)?;
+        identifier(holdout_id)?;
+        let mut session = store.session().await?;
+        let control =
+            get_record::<RegisteredEvaluationControl>(&mut session, ctx, CONTROL_KIND, control_id)
+                .await?;
+        let holdout =
+            get_record::<ProtectedHoldoutRecord>(&mut session, ctx, HOLDOUT_KIND, holdout_id)
+                .await?;
+        let progress = match (control, holdout) {
+            (None, None) => RegistrationProgress {
+                control_digest: None,
+                holdout_digest: None,
+            },
+            (None, Some(_)) => {
+                return Err(Error::Conflict(
+                    "holdout exists without its registered control".into(),
+                ));
+            }
+            (Some(control), holdout) => {
+                control.validate()?;
+                if control.id != control_id || control.evaluator_actor != ctx.actor() {
+                    return Err(Error::Forbidden);
+                }
+                let control_digest = control.digest()?;
+                let holdout_digest = match holdout {
+                    Some(holdout) => {
+                        if holdout.id != holdout_id || holdout.registration_id != control_id {
+                            return Err(Error::Conflict(
+                                "holdout registration binding differs".into(),
+                            ));
+                        }
+                        holdout.validate_against(&control)?;
+                        Some(holdout.digest(&control)?)
+                    }
+                    None => None,
+                };
+                RegistrationProgress {
+                    control_digest: Some(control_digest),
+                    holdout_digest,
+                }
+            }
+        };
+        session.commit().await?;
+        Ok(progress)
+    }
+
     pub async fn register_control(
         ctx: &Context,
         store: &Store,
