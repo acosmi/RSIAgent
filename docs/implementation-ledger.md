@@ -437,6 +437,33 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - 本版仅承诺 MVP 明确受限规模（runs<=1000, events<=10000, nodes<=500, worlds<=100），不作无界横向扩展性能承诺；
 - 恢复演练确保历史事实、撤销水位及账单不可逆，不伪造远程擦除或自动恢复缺失的沙箱。
 
+### AG-007 / E16.6 发行索引、唯一真源v4.1绑定与全量可追踪性交接实施与自测
+
+- 任务号：AG-007
+- E 归属：E16.6
+- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- base 分支：`wrokbot/ag-006-e16-5-capacity-recovery`
+- head 分支：`wrokbot/ag-007-e16-6-release-ledger`
+- PR：[PR #49](https://github.com/acosmi/RSIAgent/pull/49)
+- merged_sha: null
+
+依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §1.4、§11.2、§13.1 E16.6 及 V071, V072, V073, V074, V080, V098 场景族。
+文件白名单修改：
+1. `reports/support-scope.json`: 显式切换唯一方案索引至 v4.1 定稿规范及其 SHA-256 哈希 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`；声明 `subset_only` 与 `not_full_route_complete: true`；登记 `legacy_equivalence_unverified: true`，明确不虚构或伪造历史 T001–T126 断言；登记五维支持范围；收录完整的 B01–B10、U01–U08、K01–K10、SO01–SO18 以及 V001–V098 全量追踪链。
+2. `crates/evo-core/tests/support_scope.rs`: 更新支持范围自动化验证测试，严格断言 v4.1 方案版本、SHA-256 哈希、subset_only 声明及全部 10 项 B 承诺、8 项 U 承诺、10 项 K 借鉴承诺、18 项 SO 固定源码/材料定位、98 项 V 场景族存在且无断链（落实 V071, V072, V074, V080, V098）。
+
+自测证据（全部 exit 0）：
+- `cargo test --locked --offline -p evo-core --test support_scope`: 1 项全部通过。
+- `cargo test --locked --offline -p evo-core -p evo-storage -p evo-engine`: 全量测试全部通过。
+- `cargo clippy --locked --offline -p evo-core -p evo-storage -p evo-engine --all-targets -- -D warnings`: 检查通过，无 warning。
+- `cargo fmt --all -- --check`: 格式化检查通过。
+
+未完成项与边界：
+- E14、E15 仍为 planned；E17、E18 为可选关闭；
+- 本项目声明 subset_only，不将父任务全绿，未在真实付费生产环境中声称实际经济收益；
+- 历史 v3.3/v4 在规范上已被替代，物理归档据实保留，未提供的旧测试断言保持 legacy_equivalence_unverified。
+
+
 
 
 
