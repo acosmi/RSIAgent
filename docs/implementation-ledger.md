@@ -586,3 +586,14 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - 主控在隔离源码上实际运行 `cargo test --locked --offline -p evo-core --test support_scope`，10 passed / exit 0；相同目标clippy `-D warnings`及workspace格式检查exit 0。环境 `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`。原始日志仅本地 `out/controller-final-e16-20260919/cp001-final-[0-2].log`；命令记录 `cp001-final-results.json`。
 - 本轮通过范围仅为该派生索引的结构、规范映射和已记录元数据校核；不替代当前业务执行、宿主、模型、效果或部署验收。整E16.6及全路线仍未完成；CP-002/PR #53检查器须适配此v2并修复主控7个漏检反例，当前未验收。
 - 回滚：通过独立回退PR撤回派生索引；保留全部历史证据/费用/撤销状态。不改变唯一真源。未运行 cargo xtask ci、Actions、付费调用或发布；最终统一合并仍由主控执行。
+
+
+### CTRL-CP002-R2 / 原PR #53：独立检查器主控验收
+
+- 归属原CP-002/E16.6，继续使用 [PR #53](https://github.com/acosmi/RSIAgent/pull/53)，草稿未合并；`merged_sha: null`。其PR49依赖已在本地分支整合为 `b0f419b365762f0cb87b38762e28eb8672854dc4`，这不是main/PR合并。
+- 唯一第一真源 `v4.1` / SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`；实际已测源码 `source_sha: bab9c2a9da89ce2d0b17e18ee19d4d54d7547de1`。输入清单 `out/controller-final-e16-20260919/cp002-final-v2-input.json`，SHA-256 `9d88b8429d18508a46c9b359fa6e393edf704dbf2f982cf2768a4271f2b9887c`；两脚本提交前后摘要一致。
+- 检查器按support-scope.v2验证25个E、完整规范映射/SO pins、状态与证据相容性、真实Cargo目标、安全路径和无悬空引用。静态常量只绑定真源；当前任务状态/文件列表/证据ID/PR/merge事实不再写死成另一套事实源，合法新增工作可以登记。
+- `exit_code`必须严格整数0，False/0.0/101均拒绝。JSON重复键、错误但合法长度SO hash、缺E父/扩展、伪目标/额外命令、路径/目录symlink和缺输入证明的verified被拒。所有命令只解析，不运行子进程、不联网、不写仓库。
+- 主控亲自运行30项unittest（exit0）以及另外14项正/负反例，均符合预期；7个原漏检全部拒绝，合法文件调序/真实compiler消费者加入、新证据、合法状态进展通过。真实索引CLI exit0，structure_valid=true、plan_binding_available=true、input_binding_available=false（该隔离工作树无内部QA清单），未假称输入/执行/许可/合并关系已自动认证。
+- 原始QA仅本地：`out/controller-final-e16-20260919/cp002-final-v2-[0-1].log`、`cp002-controller-final-cases.json`；初次失败和错误放行证据也保留，不上传。
+- 通过范围：只读结构检查器及上述边界。既有实际Git/执行/宿主/模型/效果/部署事实仍需主控独立验证，结构exit0不是合并授权；全路线未完成。当前不自动改变任何状态或PR。回滚通过独立PR撤回两个脚本，保留索引及既有验收/费用/撤销事实。
