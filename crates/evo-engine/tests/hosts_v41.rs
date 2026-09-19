@@ -1,232 +1,225 @@
-//! Comprehensive test suite for E16.4: Extra Real Hosts, Claude Code MCP Tool-Only,
-//! Configuration Surface Drift, and Execution Attribution.
-//!
-//! Covers scenario families:
-//! - V002, V003, V009, V037, V039: Contract checks, host boundary, zero regression
-//! - V060: Surface drift detection (unclassified fields block validation)
-//! - V061: Empty extraction rejection (empty extraction != success)
-//! - V062: Supported fields require consumers and valid field contracts
-//! - V077: Host truncation / override cannot claim full used
-//! - V087: Skill-Diagnosis-Attribution (proper attribution, no fake receipts)
-//! - V091: All-Effective-Content-Gated
-//! - V092: No-Auto-Elevation
-//! - V098: Audit-Traceability & Fixture Roundtrip
-
-use evo_core::contract::{HostSurfaceManifest, SURFACE_SCHEMA};
-use evo_engine::hosts::{
-    CLAUDE_CODE_TARGET, HostExecutionReceipt, HostToolStage, SkillAttribution, claude_code_support,
-    claude_code_surface_manifest, detect_surface_drift, verify_host_receipt,
+//! E16.4 host authority tests. Structural fixtures never mint use or benefit.
+use evo_core::contract::{
+    AppliedReceipt, CapabilityLevel, HostCapabilities, HostSurfaceManifest, SurfaceCoverage,
+    SystemSnapshot,
 };
+use evo_core::{Context, Error, Role, hash};
+use evo_engine::hosts::{
+    CLAUDE_CODE_TARGET, VerifiedHostStage, claude_code_support, detect_surface_drift,
+    unverified_claude_code_surface_candidate, verify_host_receipt,
+};
+use evo_engine::release_store::{
+    HOST_APPLICATION_SCHEMA, HostApplicationRecord, PrepareRunRequest, ReleaseStore,
+};
+use evo_storage::Store;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// ---------------------------------------------------------------------------
-// Missing Claude Code Binary Is Blocked (No Mock Host)
-// ---------------------------------------------------------------------------
-#[test]
-fn test_missing_claude_code_binary_is_blocked() {
-    let res_none = claude_code_support(None);
-    assert!(
-        res_none.is_err(),
-        "Missing Claude Code binary must return error"
-    );
-    let msg = format!("{:?}", res_none.unwrap_err());
-    assert!(msg.contains("Claude Code is not installed; not substituting a mock host"));
-
-    let non_existent = PathBuf::from("/non/existent/path/to/claude");
-    let res_missing_file = claude_code_support(Some(&non_existent));
-    assert!(res_missing_file.is_err());
-}
-
-// ---------------------------------------------------------------------------
-// V060 & V061: Surface Drift Detection & Empty Extraction Rejection
-// ---------------------------------------------------------------------------
-#[test]
-fn test_v060_unclassified_extracted_field_blocks_validation() {
-    let manifest = claude_code_surface_manifest();
-
-    // Upstream Claude Code added a new field 'agent_autonomy_mode' that is not in manifest
-    let mut extracted: Vec<String> = manifest.items.iter().map(|i| i.name.clone()).collect();
-    extracted.push("agent_autonomy_mode".into());
-
-    let res = detect_surface_drift(&manifest, &extracted);
-    assert!(res.is_err(), "Unclassified field must block validation");
-    let err_msg = format!("{:?}", res.unwrap_err());
-    assert!(err_msg.contains("agent_autonomy_mode is unclassified"));
+fn context(actor: &str, role: Role) -> Context {
+    Context::new("tenant-host", actor, role).unwrap()
 }
 
 #[test]
-fn test_v061_empty_extraction_is_rejected() {
-    let manifest = claude_code_surface_manifest();
-    let empty_extracted: Vec<String> = vec![];
-
-    let res = detect_surface_drift(&manifest, &empty_extracted);
-    assert!(res.is_err(), "Empty extraction must be rejected");
-    let err_msg = format!("{:?}", res.unwrap_err());
-    assert!(err_msg.contains("empty extraction is not a successful cover"));
+fn claude_code_remains_blocked_without_fixed_version_handshake_and_smoke() {
+    assert!(claude_code_support(None).is_err());
+    assert!(claude_code_support(Some(&PathBuf::from("/nonexistent/claude"))).is_err());
+    let executable_looking_file = tempfile::NamedTempFile::new().unwrap();
+    let error = claude_code_support(Some(executable_looking_file.path())).unwrap_err();
+    assert!(format!("{error}").contains("fixed version, handshake, and real smoke"));
 }
 
-// ---------------------------------------------------------------------------
-// V062: Supported Fields Require Consumers and Valid Field Contracts
-// ---------------------------------------------------------------------------
 #[test]
-fn test_v062_supported_items_require_mapped_field_and_consumer() {
-    let mut invalid_manifest = claude_code_surface_manifest();
-
-    // Invalidate an item: mark as Supported but without a consumer
-    invalid_manifest.items[0].consumer = None;
-
-    let extracted: Vec<String> = invalid_manifest
+fn structural_surface_checks_do_not_change_blocked_support() {
+    let manifest = unverified_claude_code_surface_candidate();
+    let fields: Vec<String> = manifest
         .items
         .iter()
-        .map(|i| i.name.clone())
+        .map(|item| item.name.clone())
         .collect();
-    let res = detect_surface_drift(&invalid_manifest, &extracted);
-    assert!(res.is_err());
-    let err_msg = format!("{:?}", res.unwrap_err());
-    assert!(err_msg.contains("supported item needs a consumer"));
+    assert!(detect_surface_drift(&manifest, &fields).is_ok());
+    assert!(manifest.host_version.starts_with("unverified-"));
 
-    // Invalidate an item: mark as Unsupported but assign a mapped field
-    let mut invalid_manifest2 = claude_code_surface_manifest();
-    invalid_manifest2.items[4].mapped_field = Some("skill.content".into());
-    let res2 = detect_surface_drift(&invalid_manifest2, &extracted);
-    assert!(res2.is_err());
-    let err_msg2 = format!("{:?}", res2.unwrap_err());
-    assert!(err_msg2.contains("cannot map candidate fields"));
-}
+    let mut drifted = fields.clone();
+    drifted.push("agent_autonomy_mode".into());
+    assert!(detect_surface_drift(&manifest, &drifted).is_err());
 
-// ---------------------------------------------------------------------------
-// V077 & V087: Host Truncation, Skill Attribution and Fake Receipt Rejection
-// ---------------------------------------------------------------------------
-#[test]
-fn test_v077_host_truncation_cannot_claim_full_used() {
-    let receipt = HostExecutionReceipt {
-        host_id: CLAUDE_CODE_TARGET.into(),
-        run_id: "run_42".into(),
-        stage: HostToolStage::Truncated,
-        attribution: SkillAttribution::Truncated,
-        is_truncated: true,
-        is_overridden: false,
-        claimed_used: true, // Forgery! Claiming used when truncated
-        claimed_benefit: false,
-    };
-
-    let res = verify_host_receipt(&receipt);
-    assert!(
-        res.is_err(),
-        "Cannot claim 'used' when host content was truncated"
-    );
-    let msg = format!("{:?}", res.unwrap_err());
-    assert!(msg.contains("cannot claim full 'used' when host content was truncated"));
+    let mut missing_consumer = manifest;
+    missing_consumer.items[0].consumer = None;
+    assert!(detect_surface_drift(&missing_consumer, &fields).is_err());
 }
 
 #[test]
-fn test_v077_host_override_cannot_claim_used() {
-    let receipt = HostExecutionReceipt {
-        host_id: CLAUDE_CODE_TARGET.into(),
-        run_id: "run_43".into(),
-        stage: HostToolStage::Attached,
-        attribution: SkillAttribution::NotAttached,
-        is_truncated: false,
-        is_overridden: true, // Host overrode skill
-        claimed_used: true,  // Forgery!
-        claimed_benefit: false,
-    };
-
-    let res = verify_host_receipt(&receipt);
-    assert!(
-        res.is_err(),
-        "Cannot claim 'used' when host overrides skill content"
-    );
-}
-
-#[test]
-fn test_v087_skill_diagnosis_attribution_and_unverified_benefit() {
-    // Valid honest truncated receipt
-    let honest_truncated = HostExecutionReceipt {
-        host_id: CLAUDE_CODE_TARGET.into(),
-        run_id: "run_44".into(),
-        stage: HostToolStage::Truncated,
-        attribution: SkillAttribution::Truncated,
-        is_truncated: true,
-        is_overridden: false,
-        claimed_used: false,
-        claimed_benefit: false,
-    };
-    assert!(verify_host_receipt(&honest_truncated).is_ok());
-
-    // Valid honest execution omitted receipt
-    let honest_omitted = HostExecutionReceipt {
-        host_id: CLAUDE_CODE_TARGET.into(),
-        run_id: "run_45".into(),
-        stage: HostToolStage::Omitted,
-        attribution: SkillAttribution::ExecutionOmitted,
-        is_truncated: false,
-        is_overridden: false,
-        claimed_used: false,
-        claimed_benefit: false,
-    };
-    assert!(verify_host_receipt(&honest_omitted).is_ok());
-
-    // Claiming benefit without independent attestation
-    let fake_benefit = HostExecutionReceipt {
-        host_id: CLAUDE_CODE_TARGET.into(),
-        run_id: "run_46".into(),
-        stage: HostToolStage::Used,
-        attribution: SkillAttribution::Uncertain, // Not VerifiedBenefit
-        is_truncated: false,
-        is_overridden: false,
-        claimed_used: true,
-        claimed_benefit: true, // Forgery!
-    };
-    let res = verify_host_receipt(&fake_benefit);
-    assert!(res.is_err());
-    let msg = format!("{:?}", res.unwrap_err());
-    assert!(msg.contains("cannot claim verified benefit without independent verification"));
-}
-
-// ---------------------------------------------------------------------------
-// V098: Fixture Roundtrip & Manifest Integrity
-// ---------------------------------------------------------------------------
-#[test]
-fn test_v098_claude_code_surface_fixture_roundtrip() {
+fn checked_in_claude_fixture_is_only_an_untrusted_structural_fixture() {
     let fixture_path = Path::new("../../fixtures/hosts/claude_code_surface.v1.json");
     let content = if fixture_path.exists() {
         fs::read_to_string(fixture_path).unwrap()
     } else {
         fs::read_to_string("fixtures/hosts/claude_code_surface.v1.json").unwrap()
     };
-
-    let manifest: HostSurfaceManifest =
-        serde_json::from_str(&content).expect("Host surface fixture must parse cleanly");
-
-    assert_eq!(manifest.schema_version, SURFACE_SCHEMA);
+    let manifest: HostSurfaceManifest = serde_json::from_str(&content).unwrap();
     assert_eq!(manifest.host, CLAUDE_CODE_TARGET);
-    assert_eq!(manifest.items.len(), 7);
-
-    let extracted: Vec<String> = manifest.items.iter().map(|i| i.name.clone()).collect();
-    manifest
-        .validate_against_extraction(&extracted)
-        .expect("Fixture manifest must validate against its extracted items");
+    let extracted: Vec<String> = manifest
+        .items
+        .iter()
+        .map(|item| item.name.clone())
+        .collect();
+    assert!(manifest.validate_against_extraction(&extracted).is_ok());
+    assert!(claude_code_support(None).is_err());
 }
 
-// =========================================================================
-// F06 Adversarial Regression (from controller review)
-// =========================================================================
-#[test]
-fn test_f06_review_offered_receipt_cannot_claim_used_or_verified_benefit() {
-    let receipt = HostExecutionReceipt {
-        host_id: "unverified".into(),
-        run_id: "invented".into(),
-        stage: HostToolStage::Offered,
-        attribution: SkillAttribution::VerifiedBenefit,
-        is_truncated: false,
-        is_overridden: false,
-        claimed_used: true,
-        claimed_benefit: true,
-    };
+#[tokio::test]
+async fn unverified_claude_surface_cannot_enter_the_real_registration_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("registration.sqlite3"))
+        .await
+        .unwrap();
+    let admin = context("admin", Role::Admin);
+    let manifest = unverified_claude_code_surface_candidate();
+    let extracted = manifest
+        .items
+        .iter()
+        .map(|item| item.name.clone())
+        .collect();
+    assert!(matches!(
+        ReleaseStore::register_host_surface(
+            &admin,
+            &store,
+            "unverified-claude-surface",
+            manifest,
+            extracted,
+        )
+        .await,
+        Err(Error::Invalid(_))
+    ));
+    let mut session = store.session().await.unwrap();
     assert!(
-        verify_host_receipt(&receipt).is_err(),
-        "caller-authored Offered receipt was accepted as Used with VerifiedBenefit"
+        session
+            .get::<serde_json::Value>(&admin, "artifact", "unverified-claude-surface")
+            .await
+            .unwrap()
+            .is_none()
     );
+    session.commit().await.unwrap();
+
+    let mut relabelled = unverified_claude_code_surface_candidate();
+    relabelled.host_version = "1.0.0".into();
+    let extracted = relabelled
+        .items
+        .iter()
+        .map(|item| item.name.clone())
+        .collect();
+    assert!(
+        ReleaseStore::register_host_surface(
+            &admin,
+            &store,
+            "relabelled-claude-surface",
+            relabelled,
+            extracted,
+        )
+        .await
+        .is_err()
+    );
+}
+
+async fn baseline_store() -> (tempfile::TempDir, Store, Context, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("host.sqlite3")).await.unwrap();
+    let admin = context("admin", Role::Admin);
+    let host = context("gateway", Role::Host);
+    let mut manifest = unverified_claude_code_surface_candidate();
+    manifest.host = "reference-host".into();
+    manifest.host_version = "1.0.0-fixed-fixture".into();
+    for item in &mut manifest.items {
+        if item.coverage == SurfaceCoverage::Supported {
+            item.consumer = Some("reference-fixture".into());
+        }
+    }
+    let extracted = manifest
+        .items
+        .iter()
+        .map(|item| item.name.clone())
+        .collect();
+    ReleaseStore::register_host_surface(&admin, &store, "surface", manifest, extracted)
+        .await
+        .unwrap();
+    let run_id = "run-authority".to_string();
+    ReleaseStore::prepare_run(
+        &host,
+        &store,
+        PrepareRunRequest {
+            run_id: run_id.clone(),
+            profile_id: "profile".into(),
+            system_snapshot: SystemSnapshot {
+                schema_version: "rsia.system_snapshot.v2".into(),
+                profile_id: "profile".into(),
+                host_id: "reference-host".into(),
+                host_version: "1.0.0-fixed-fixture".into(),
+                model_id: "disabled".into(),
+                tools: vec!["evo_prepare".into()],
+                mandatory_context_digest: hash(b"mandatory"),
+            },
+            host_surface_id: "surface".into(),
+            host_capabilities: HostCapabilities {
+                available: Default::default(),
+                granted: Default::default(),
+            },
+            task_input_digest: hash(b"task"),
+            evolution_enabled: false,
+            capability_level: CapabilityLevel::ToolOnly,
+        },
+    )
+    .await
+    .unwrap();
+    (dir, store, host, run_id)
+}
+
+#[tokio::test]
+async fn caller_authored_used_and_benefit_cannot_mint_authority() {
+    let (_dir, store, host, run_id) = baseline_store().await;
+    let snapshot = ReleaseStore::read_run_snapshot(&host, &store, &run_id)
+        .await
+        .unwrap();
+    let forged = HostApplicationRecord {
+        id: format!("host-application-{run_id}"),
+        schema_version: HOST_APPLICATION_SCHEMA.into(),
+        run_id: run_id.clone(),
+        release_id: None,
+        actual_request_digest: snapshot.request_digest.clone(),
+        execution_receipt_id: None,
+        receipt: Some(AppliedReceipt {
+            offered: vec!["invented".into()],
+            attached: vec!["invented".into()],
+            used: vec!["invented".into()],
+            verified_benefit: vec!["invented".into()],
+            bundle_digest: hash(b"invented-bundle"),
+            request_digest: snapshot.request_digest,
+            capability_level: CapabilityLevel::Attached,
+            truncated: false,
+            attested_by: "self".into(),
+        }),
+    };
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&host, "receipt", &forged.id, host.actor(), &forged)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+
+    let result = verify_host_receipt(&host, &store, &run_id).await;
+    assert!(matches!(result, Err(Error::Conflict(_))));
+}
+
+#[tokio::test]
+async fn verifier_requires_a_real_persisted_application_and_trusted_role() {
+    let (_dir, store, host, run_id) = baseline_store().await;
+    assert!(matches!(
+        verify_host_receipt(&host, &store, &run_id).await,
+        Err(Error::NotFound)
+    ));
+    let agent = context("agent", Role::Agent);
+    assert!(matches!(
+        verify_host_receipt(&agent, &store, &run_id).await,
+        Err(Error::Forbidden)
+    ));
+    let _ = VerifiedHostStage::Used;
 }
