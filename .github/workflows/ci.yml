@@ -54,7 +54,7 @@ jobs:
         run: |
           mkdir -p out
           cargo fmt --all || true
-          python3 scripts/inventory_baseline_tests.py > out/baseline-tests.json || echo 'INVENTORY_FAILED' > out/baseline-tests.json
+          python3 scripts/inventory_baseline_tests.py --ledger docs/implementation-ledger.md --source-sha "$GITHUB_SHA" --test-log out/tests.txt > out/baseline-tests.json || echo 'INVENTORY_FAILED' > out/baseline-tests.json
           tar --exclude=.git --exclude=target --exclude=out -czf out/source.tar.gz .
       - uses: actions/upload-artifact@v4
         if: always()
