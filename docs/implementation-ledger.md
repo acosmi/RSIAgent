@@ -490,6 +490,35 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - E17 为可选扩展且默认关闭，最终裁决权不向候选开放；
 - 本轮仅实现并验证其安全拒绝路径，不开启真实在线代理评分器自我演化。
 
+### AG-009 / E18 可选代码修改PR默认关闭与安全拒绝门禁实施与自测
+
+- 任务号：AG-009
+- E 归属：E18
+- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- base 分支：`wrokbot/ag-008-e17-scorer-rejection`
+- head 分支：`wrokbot/ag-009-e18-code-pr-rejection`
+- PR：待推送并创建
+- merged_sha: null
+
+依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §10、§12、§13.2 E18 及 V041 场景族。
+文件白名单修改：
+1. `crates/evo-core/src/features.rs`: 严格保持 E18 扩展为默认关闭（`enable_automatic_code_prs(true)` 恒定返回拒绝错误）；定义 `CodePatchProposal` 补丁提案结构与 `MAX_CODE_PATCH_DIFF_BYTES`（500KB）安全上限；实现 `is_protected_code_path` 严格识别与拦截受保护路径（包含验收、评分、评测、安全、审批、凭据、私钥、沙箱、隔离、预算、账本、Cargo.toml/Cargo.lock/build.rs/Makefile/Dockerfile、路径穿越 `..`、系统绝对路径与 Docker socket）；实现 V041 代码修改 PR 安全拒绝门禁 `validate_e18_code_pr_gates`（严格拒绝修改受保护文件、拒绝未单独安全审计的依赖或构建脚本修改、绝对禁止自动合并 `auto_merge`、绝对禁止自动部署或运行中核心替换 `auto_deploy`、强制要求在一次性隔离沙箱中构建测试、强制要求人工审批 token、超限 diff 拒绝、扩展默认关闭拒绝）。
+2. `crates/evo-core/tests/e18_rejection_v41.rs`: 新增集成测试套件，全面覆盖 V041 全部 12 项场景族与拒绝路径。
+
+自测证据（全部 exit 0）：
+- `cargo test --locked --offline -p evo-core --test e18_rejection_v41`: 12 项全部通过。
+- `crates/evo-core/src/features.rs`: 单元测试 3 项全部通过（含 `v041_code_pr_rejection_gates`）。
+- `cargo test --locked --offline -p evo-core`: 全量测试全部通过。
+- `cargo test --locked --offline -p evo-core -p evo-storage -p evo-engine -p evo-http`: 全工作空间测试全部通过。
+- `cargo clippy --locked --offline -p evo-core --all-targets -- -D warnings`: 检查通过，无 warning。
+- `cargo fmt --all -- --check`: 格式化检查通过。
+
+未完成项与边界：
+- E14、E15 仍为 planned（E14 需主控冻结单一机制且无源码实施；E15 真实后继实验未运行并受前置阻塞）；
+- E18 作为可选扩展严格保持默认关闭，禁止自动自合并、自部署或自换核心；
+- 本轮仅实现并全量验证其安全拒绝路径（V041），不开启真实自动代码 PR 派生。
+
+
 
 
 
