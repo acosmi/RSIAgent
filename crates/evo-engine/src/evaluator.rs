@@ -79,26 +79,43 @@ impl Evaluator {
 
     pub fn grade(ctx: &Context, req: GradeRequest<'_>) -> Result<FormalEvaluation> {
         ctx.require(&[Role::Evaluator])?;
+        if req.exec.ticket_id != req.ticket_id {
+            req.book.fail(req.ticket_id)?;
+            return Err(Error::Conflict(
+                "execution report is bound to a different ticket".into(),
+            ));
+        }
         if !req.exec.outputs_complete {
             req.book.fail(req.ticket_id)?;
             return Err(Error::Invalid("incomplete execution is invalid".into()));
         }
-        req.book.complete(req.ticket_id)?;
-        let raw = empirical_bernstein(req.rows, req.alpha_i)?;
-        let report = decide(req.plan, raw, req.cost_ratio, req.p95_ratio, req.safety_ok)?;
-        let candidate = req
-            .plan
-            .candidate_digest
-            .clone()
-            .ok_or_else(|| Error::Invalid("candidate unbound".into()))?;
-        Ok(FormalEvaluation {
-            id: format!("ev-{}", req.ticket_id),
-            plan_digest: req.plan.digest()?,
-            candidate_digest: candidate,
-            stats_version: report.stats_version.clone(),
-            verdict: report.verdict,
-            report,
-        })
+        let evaluated = (|| {
+            let raw = empirical_bernstein(req.rows, req.alpha_i)?;
+            let report = decide(req.plan, raw, req.cost_ratio, req.p95_ratio, req.safety_ok)?;
+            let candidate = req
+                .plan
+                .candidate_digest
+                .clone()
+                .ok_or_else(|| Error::Invalid("candidate unbound".into()))?;
+            Ok(FormalEvaluation {
+                id: format!("ev-{}", req.ticket_id),
+                plan_digest: req.plan.digest()?,
+                candidate_digest: candidate,
+                stats_version: report.stats_version.clone(),
+                verdict: report.verdict,
+                report,
+            })
+        })();
+        match evaluated {
+            Ok(formal) => {
+                req.book.complete(req.ticket_id)?;
+                Ok(formal)
+            }
+            Err(error) => {
+                req.book.fail(req.ticket_id)?;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -171,6 +188,80 @@ mod tests {
                     ticket_id: "t1",
                     exec: &exec,
                     rows: &[],
+                    alpha_i: 0.05,
+                    cost_ratio: 1.0,
+                    p95_ratio: 1.0,
+                    safety_ok: true,
+                }
+            )
+            .is_err()
+        );
+        assert!(book.reserve(ticket).is_err());
+    }
+
+    #[test]
+    fn mismatched_execution_ticket_fails_without_consumed_success() {
+        let ctx = Context::new("n", "e", Role::Evaluator).unwrap();
+        let (mut plan, mut book, ticket) = frozen();
+        Evaluator::start(&ctx, &mut plan, "cand", ticket.clone(), &mut book).unwrap();
+        let exec = ExecutionReport {
+            ticket_id: "forged-ticket".into(),
+            environment_digest: "env".into(),
+            outputs_complete: true,
+            units: 1,
+        };
+        assert!(
+            Evaluator::grade(
+                &ctx,
+                GradeRequest {
+                    plan: &plan,
+                    book: &mut book,
+                    ticket_id: "t1",
+                    exec: &exec,
+                    rows: &[],
+                    alpha_i: 0.05,
+                    cost_ratio: 1.0,
+                    p95_ratio: 1.0,
+                    safety_ok: true,
+                }
+            )
+            .is_err()
+        );
+        assert!(book.reserve(ticket).is_err());
+    }
+
+    #[test]
+    fn invalid_statistics_fail_before_ticket_completion() {
+        let ctx = Context::new("n", "e", Role::Evaluator).unwrap();
+        let (mut plan, mut book, ticket) = frozen();
+        Evaluator::start(&ctx, &mut plan, "cand", ticket.clone(), &mut book).unwrap();
+        let exec = ExecutionReport {
+            ticket_id: "t1".into(),
+            environment_digest: "env".into(),
+            outputs_complete: true,
+            units: 1,
+        };
+        let rows = [
+            ClusterObservation {
+                cluster_id: "c0".into(),
+                d: 0.0,
+                weight: 1.0,
+            },
+            ClusterObservation {
+                cluster_id: "c0".into(),
+                d: 0.0,
+                weight: 1.0,
+            },
+        ];
+        assert!(
+            Evaluator::grade(
+                &ctx,
+                GradeRequest {
+                    plan: &plan,
+                    book: &mut book,
+                    ticket_id: "t1",
+                    exec: &exec,
+                    rows: &rows,
                     alpha_i: 0.05,
                     cost_ratio: 1.0,
                     p95_ratio: 1.0,

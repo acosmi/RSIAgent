@@ -595,6 +595,7 @@ pub struct EarlyStopCertificate {
     early_stop_plan_digest: String,
     alpha_plan_digest: String,
     manifest_digest: String,
+    slice_id: String,
     candidate_digest: String,
     baseline_digest: String,
     grader_digest: String,
@@ -603,12 +604,68 @@ pub struct EarlyStopCertificate {
     lcb: Option<String>,
     ucb: Option<String>,
     completed_prefix_digest: String,
+    member_terminal_digest: String,
     stop_reason: EarlyStopDecision,
+    stopped_at_unix_ms: i64,
+    stop_sequence: u64,
     usage_uncertain: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct EarlyStopCertificateParts {
+    pub ticket_id: String,
+    pub v1_plan_snapshot_digest: String,
+    pub early_stop_plan_digest: String,
+    pub alpha_plan_digest: String,
+    pub manifest_digest: String,
+    pub slice_id: String,
+    pub candidate_digest: String,
+    pub baseline_digest: String,
+    pub grader_digest: String,
+    pub issuer_receipt_digest: String,
+    pub k: u32,
+    pub lcb: Option<String>,
+    pub ucb: Option<String>,
+    pub completed_prefix_digest: String,
+    pub member_terminal_digest: String,
+    pub stop_reason: EarlyStopDecision,
+    pub stopped_at_unix_ms: i64,
+    pub stop_sequence: u64,
+    pub usage_uncertain: bool,
 }
 
 impl EarlyStopCertificate {
     pub const SCHEMA: &'static str = "rsia.early_stop_certificate.v1";
+
+    /// Constructs the immutable certificate shape after the engine has checked
+    /// trusted Store evidence. This validates bytes only and grants no formal
+    /// authority; E05 must re-check the persisted issuer/ticket/receipt closure.
+    pub fn from_verified_parts(parts: EarlyStopCertificateParts) -> Result<Self> {
+        let certificate = Self {
+            schema_version: Self::SCHEMA.into(),
+            ticket_id: parts.ticket_id,
+            v1_plan_snapshot_digest: parts.v1_plan_snapshot_digest,
+            early_stop_plan_digest: parts.early_stop_plan_digest,
+            alpha_plan_digest: parts.alpha_plan_digest,
+            manifest_digest: parts.manifest_digest,
+            slice_id: parts.slice_id,
+            candidate_digest: parts.candidate_digest,
+            baseline_digest: parts.baseline_digest,
+            grader_digest: parts.grader_digest,
+            issuer_receipt_digest: parts.issuer_receipt_digest,
+            k: parts.k,
+            lcb: parts.lcb,
+            ucb: parts.ucb,
+            completed_prefix_digest: parts.completed_prefix_digest,
+            member_terminal_digest: parts.member_terminal_digest,
+            stop_reason: parts.stop_reason,
+            stopped_at_unix_ms: parts.stopped_at_unix_ms,
+            stop_sequence: parts.stop_sequence,
+            usage_uncertain: parts.usage_uncertain,
+        };
+        certificate.validate_shape()?;
+        Ok(certificate)
+    }
 
     pub fn validate_shape(&self) -> Result<()> {
         if self.schema_version != Self::SCHEMA {
@@ -617,6 +674,7 @@ impl EarlyStopCertificate {
             ));
         }
         identifier(&self.ticket_id)?;
+        identifier(&self.slice_id)?;
         for (value, name) in [
             (&self.v1_plan_snapshot_digest, "v1_plan_snapshot_digest"),
             (&self.early_stop_plan_digest, "early_stop_plan_digest"),
@@ -627,12 +685,18 @@ impl EarlyStopCertificate {
             (&self.grader_digest, "grader_digest"),
             (&self.issuer_receipt_digest, "issuer_receipt_digest"),
             (&self.completed_prefix_digest, "completed_prefix_digest"),
+            (&self.member_terminal_digest, "member_terminal_digest"),
         ] {
             digest(value, name)?;
         }
         if !self.stop_reason.is_early_stop() {
             return Err(Error::Invalid(
                 "certificate requires a reject-only stop reason".into(),
+            ));
+        }
+        if self.stopped_at_unix_ms < 0 || self.stop_sequence == 0 {
+            return Err(Error::Invalid(
+                "certificate requires a valid stop time and sequence".into(),
             ));
         }
         match (self.stop_reason, self.k, &self.lcb, &self.ucb) {
@@ -655,5 +719,66 @@ impl EarlyStopCertificate {
 
     pub fn is_promotable(&self) -> bool {
         false
+    }
+
+    pub fn ticket_id(&self) -> &str {
+        &self.ticket_id
+    }
+
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
+
+    pub fn v1_plan_snapshot_digest(&self) -> &str {
+        &self.v1_plan_snapshot_digest
+    }
+
+    pub fn alpha_plan_digest(&self) -> &str {
+        &self.alpha_plan_digest
+    }
+
+    pub fn candidate_digest(&self) -> &str {
+        &self.candidate_digest
+    }
+
+    pub fn baseline_digest(&self) -> &str {
+        &self.baseline_digest
+    }
+
+    pub fn grader_digest(&self) -> &str {
+        &self.grader_digest
+    }
+
+    pub fn slice_id(&self) -> &str {
+        &self.slice_id
+    }
+
+    pub fn issuer_receipt_digest(&self) -> &str {
+        &self.issuer_receipt_digest
+    }
+
+    pub fn member_terminal_digest(&self) -> &str {
+        &self.member_terminal_digest
+    }
+
+    pub fn stop_reason(&self) -> EarlyStopDecision {
+        self.stop_reason
+    }
+
+    pub fn k(&self) -> u32 {
+        self.k
+    }
+
+    pub fn usage_uncertain(&self) -> bool {
+        self.usage_uncertain
+    }
+
+    /// Returns a new certificate view after E05 has reconciled every
+    /// dispatched call. The original stop reason, prefix and sequence remain
+    /// immutable; this method does not itself prove that reconciliation.
+    pub fn with_usage_reconciled(mut self) -> Result<Self> {
+        self.usage_uncertain = false;
+        self.validate_shape()?;
+        Ok(self)
     }
 }
