@@ -1,4 +1,12 @@
-use evo_core::{Context, Role, hash};
+use evo_core::evidence::Purpose;
+use evo_core::replay::{
+    HistoricalUsage, PrefixCoverageV1, REPLAY_MANIFEST_SCHEMA, REPLAY_REPORT_SCHEMA,
+    REPLAY_WORLD_SCHEMA, ReplayActionSpecV1, ReplayCoverage, ReplayPoolManifestV1, ReplayReportV2,
+    ReplaySimulationProfile, ReplaySourceRef, ReplayTerminal, ReplayTransitionOutcome,
+    ReplayTransitionV2, ReplayWorldManifestV2, ReplayWorldV2, StoredReplayReportV1, WorldPartition,
+};
+use evo_core::strategy::{ActionKindV1, ElasticPolicyV1, ExplorationCapsV1, ObservedStatus};
+use evo_core::{Context, Role, fingerprint, hash};
 use evo_storage::Store;
 use evo_storage::budget::{
     BudgetArtifact, BudgetCallFence, BudgetCallReservation, BudgetCallState,
@@ -6,6 +14,7 @@ use evo_storage::budget::{
     UsageCharge,
 };
 use evo_storage::lifecycle::{BackupManifest, CleanupState, LifecycleStore, TypedObjectRef};
+use evo_storage::replay::{put_replay_report, register_replay_pool, seal_replay_world};
 use serde_json::json;
 use std::process::Command;
 
@@ -33,6 +42,137 @@ async fn put_source(store: &Store, id: &str, marker: &str) {
         .await
         .unwrap();
     session.commit().await.unwrap();
+}
+
+fn lifecycle_replay_world(id: &str, cluster: &str, partition: WorldPartition) -> ReplayWorldV2 {
+    let transition = ReplayTransitionV2 {
+        record_id: "replay-record".into(),
+        record_seq: 1,
+        generation_signature: hash(b"replay-generation"),
+        parent_context_signature: hash(b"replay-parent-context"),
+        action_kind: ActionKindV1::Widen { root_slot: 1 },
+        next_context_signature: hash(b"replay-next"),
+        outcome: ReplayTransitionOutcome::Observed {
+            status: ObservedStatus::Valid {
+                quality_micros: 600_000,
+            },
+        },
+        actual_usage: HistoricalUsage {
+            input_tokens: 2,
+            output_tokens: 3,
+            cost_micros: Some(7),
+            latency_millis: Some(11),
+        },
+        source_ids: vec![format!("replay-observation-{id}"), "replay-source-2".into()],
+        observation_source_id: format!("replay-observation-{id}"),
+    };
+    let mut world = ReplayWorldV2 {
+        schema_version: REPLAY_WORLD_SCHEMA.into(),
+        manifest: ReplayWorldManifestV2 {
+            schema_version: REPLAY_MANIFEST_SCHEMA.into(),
+            world_id: id.into(),
+            cluster_id: cluster.into(),
+            partition,
+            purpose: Purpose::Development,
+            generation_signature: hash(b"replay-generation"),
+            world_context_signature: hash(format!("workspace-{id}").as_bytes()),
+            baseline_context_signature: hash(b"replay-parent-context"),
+            approved_parent_digest: hash(b"replay-parent"),
+            model_digest: hash(b"replay-model"),
+            tools_digest: hash(b"replay-tools"),
+            scorer_digest: hash(b"replay-scorer"),
+            guidance_digest: hash(b"replay-guidance"),
+            repair_template_digest: hash(b"replay-repair"),
+            input_order_digest: hash(format!("order-{id}").as_bytes()),
+            initial_baseline_quality_micros: 100_000,
+            baseline_observation_source_id: format!("replay-baseline-{id}"),
+            source_closure: vec![
+                ReplaySourceRef {
+                    source_id: format!("replay-observation-{id}"),
+                    content_digest: String::new(),
+                },
+                ReplaySourceRef {
+                    source_id: "replay-source-2".into(),
+                    content_digest: hash(b"REPLAY-SOURCE-SECRET"),
+                },
+                ReplaySourceRef {
+                    source_id: format!("replay-baseline-{id}"),
+                    content_digest: hash(b"pending-replay-baseline"),
+                },
+            ],
+            revoke_watermark: 1,
+            prefix_coverage: vec![PrefixCoverageV1 {
+                context_signature: hash(b"replay-next"),
+                exhausted: true,
+            }],
+            action_catalog: vec![ReplayActionSpecV1 {
+                record_seq: 1,
+                generation_signature: hash(b"replay-generation"),
+                parent_context_signature: hash(b"replay-parent-context"),
+                branch_seq: 1,
+                target_depth: 1,
+                action_kind: ActionKindV1::Widen { root_slot: 1 },
+                estimated_cost_upper_micros: Some(7),
+                writes_shared_workspace: false,
+            }],
+        },
+        transitions: vec![transition],
+        sealed_digest: None,
+    };
+    world.manifest.source_closure[2].content_digest =
+        evo_core::replay::replay_baseline_observation_digest(&world.manifest).unwrap();
+    world.manifest.source_closure[0].content_digest =
+        evo_core::replay::replay_observation_digest(&world.manifest, &world.transitions[0])
+            .unwrap();
+    world.seal().unwrap();
+    world
+}
+
+fn lifecycle_replay_report(
+    world: &ReplayWorldV2,
+    policy: &ElasticPolicyV1,
+    profile: &ReplaySimulationProfile,
+    secret: &str,
+) -> ReplayReportV2 {
+    ReplayReportV2 {
+        schema_version: REPLAY_REPORT_SCHEMA.into(),
+        world_id: world.manifest.world_id.clone(),
+        world_digest: world.sealed_digest.clone().unwrap(),
+        cluster_id: world.manifest.cluster_id.clone(),
+        partition: world.manifest.partition,
+        policy_digest: fingerprint(policy).unwrap(),
+        profile_digest: fingerprint(profile).unwrap(),
+        objective_version: profile.objective.version().into(),
+        batches: vec![],
+        probe_best_quality_micros: vec![600_000],
+        round_best_quality_micros: vec![600_000],
+        final_quality_micros: 600_000,
+        probes: 1,
+        simulated_rounds: 1,
+        parallel_penalty: None,
+        no_probe: false,
+        attainment_auc_micros: Some(600_000),
+        q_auc_sim_micros: Some(600_000),
+        score_v2_micros: Some(500_000),
+        historical_usage: HistoricalUsage {
+            input_tokens: 2,
+            output_tokens: 3,
+            cost_micros: Some(7),
+            latency_millis: Some(11),
+        },
+        replay_cpu_nanos: 13,
+        coverage: ReplayCoverage {
+            attempted_actions: 1,
+            observed_actions: 1,
+            censored_actions: 0,
+            out_of_support_actions: 0,
+            complete_support: true,
+        },
+        terminal: ReplayTerminal::PolicyStop,
+        terminal_reason: secret.into(),
+        development_only: true,
+        revealed_prefix: None,
+    }
 }
 
 fn reservation(call_id: &str, marker: &str) -> BudgetCallReservation {
@@ -493,6 +633,138 @@ async fn cleanup_recognizes_real_e06_kinds_and_redacts_nested_e05_budget_bodies(
     assert!(resource["metadata"]["formal_closure_invalidated"] == true);
     assert!(!rendered.contains(marker));
     assert!(!rendered.contains("lease-secret-not-retained"));
+    session.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_redacts_replay_pool_and_report_but_keeps_irreversible_usage() {
+    let (_dir, store) = database().await;
+    let admin = ctx("admin", Role::Admin);
+    let train = lifecycle_replay_world("cleanup-train", "cleanup-c1", WorldPartition::Train);
+    let select = lifecycle_replay_world("cleanup-select", "cleanup-c2", WorldPartition::Select);
+    let train_observation_body =
+        evo_core::replay::replay_observation_bytes(&train.manifest, &train.transitions[0]).unwrap();
+    let select_observation_body =
+        evo_core::replay::replay_observation_bytes(&select.manifest, &select.transitions[0])
+            .unwrap();
+    let second_body = b"REPLAY-SOURCE-SECRET".to_vec();
+    let train_baseline_body =
+        evo_core::replay::replay_baseline_observation_bytes(&train.manifest).unwrap();
+    let select_baseline_body =
+        evo_core::replay::replay_baseline_observation_bytes(&select.manifest).unwrap();
+    let mut session = store.session().await.unwrap();
+    for (id, body) in [
+        (
+            train.transitions[0].observation_source_id.clone(),
+            train_observation_body,
+        ),
+        (
+            select.transitions[0].observation_source_id.clone(),
+            select_observation_body,
+        ),
+        ("replay-source-2".to_string(), second_body),
+        (
+            train.manifest.baseline_observation_source_id.clone(),
+            train_baseline_body,
+        ),
+        (
+            select.manifest.baseline_observation_source_id.clone(),
+            select_baseline_body,
+        ),
+    ] {
+        session
+            .put(
+                &admin,
+                "run",
+                &id,
+                admin.actor(),
+                &json!({
+                    "schema_version":"rsia.optimization.source.v1",
+                    "record":{"id":id,"body":body,"parent_family":format!("family-{id}"),"task_origin":"trusted_run","execution_attestation":"trusted_host","purpose":"development"},
+                    "trace":{"run_id":id,"parent_family":format!("family-{id}"),"source_digest":hash(&body),"purpose":"development","outcome":"success","diagnosis":null,"excerpt":String::from_utf8(body.clone()).unwrap(),"seed":1},
+                    "excerpt_start":0,"excerpt_end":body.len()
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    session
+        .bump_watermark(&admin, &hash(b"replay-watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    seal_replay_world(&admin, &store, &train).await.unwrap();
+    seal_replay_world(&admin, &store, &select).await.unwrap();
+    let pool: ReplayPoolManifestV1 = register_replay_pool(
+        &admin,
+        &store,
+        &["cleanup-train".into(), "cleanup-select".into()],
+    )
+    .await
+    .unwrap();
+    let policy = ElasticPolicyV1::default();
+    let profile = ReplaySimulationProfile::default_v2(1, pool.pool_digest.clone());
+    let report = StoredReplayReportV1::build(
+        "n",
+        WorldPartition::Train,
+        &pool,
+        policy.clone(),
+        profile.clone(),
+        ExplorationCapsV1::online(),
+        vec![lifecycle_replay_report(
+            &train,
+            &policy,
+            &profile,
+            "REPLAY-SOURCE-SECRET",
+        )],
+    )
+    .unwrap();
+    put_replay_report(&admin, &store, &report).await.unwrap();
+    let mut status = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: "replay-source-2".into(),
+        },
+        "erase replay source",
+        20,
+    )
+    .await
+    .unwrap();
+    for now in 21..100 {
+        if status.state == CleanupState::Complete {
+            break;
+        }
+        status = LifecycleStore::cleanup_step(&admin, &store, &status.job_id, 32, now)
+            .await
+            .unwrap();
+    }
+    assert_eq!(status.state, CleanupState::Complete);
+    let mut session = store.session().await.unwrap();
+    let pool_value: serde_json::Value = session
+        .need(
+            &admin,
+            "artifact",
+            &format!("replay-pool-{}", pool.pool_digest),
+        )
+        .await
+        .unwrap();
+    let report_value: serde_json::Value = session
+        .need(&admin, "artifact", &report.report_id)
+        .await
+        .unwrap();
+    assert_eq!(pool_value["schema_version"], "rsia.redacted.v1");
+    assert_eq!(report_value["schema_version"], "rsia.redacted.v1");
+    assert_eq!(
+        report_value["metadata"]["irreversible_usage"][0]["historical_usage"]["cost_micros"],
+        7
+    );
+    assert_eq!(
+        report_value["metadata"]["irreversible_usage"][0]["probes"],
+        1
+    );
+    assert!(!report_value.to_string().contains("REPLAY-SOURCE-SECRET"));
     session.commit().await.unwrap();
 }
 
