@@ -10,7 +10,11 @@ evo-engine = { path = "../evo-engine" }
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 [lints]
 workspace = true
+[dev-dependencies]
+tempfile.workspace = true
+rmcp = { workspace = true, features = ["client"] }
