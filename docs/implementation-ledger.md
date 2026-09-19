@@ -40,7 +40,9 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | 11 | E10 | 不可变观察/世界池/纯回放/持久报告；依赖E08/E09 | sol/high实施，主控独立验收 | verified（程序回放子范围） | [PR #39](https://github.com/acosmi/RSIAgent/pull/39) draft；源码 `77177cd` 已推送；未合并 |
 | 12 | E11 | 经济实验合同/全成本/持久阻塞报告；依赖E05/E07/E10 | sol/high实施，主控独立验收 | verified（静态与持久准备）/ blocked（真实经济实验） | [PR #40](https://github.com/acosmi/RSIAgent/pull/40) draft；源码 `289d920` 已推送；未合并 |
 | 13 | E12 | 零预算课程/固定纯函数/可信事实拒绝门；依赖E04/E07/E08/E09 | sol/high实施，主控独立验收 | verified（离线子范围）/ blocked（真实学习闭环） | [PR #41](https://github.com/acosmi/RSIAgent/pull/41) draft；源码 `e612fcb` 已推送；未合并 |
-后续依真源依赖图按 E13、E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
+| 14 | E13 | 持久监测/巩固触发/根预算与恢复；依赖E07/E08 | sol/high实施，主控独立验收 | verified（程序监测子范围）/ blocked（长期实测） | [PR #42](https://github.com/acosmi/RSIAgent/pull/42) draft；源码 `2c79608` 已推送；未合并 |
+
+后续依真源依赖图按 E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
 
 ## 当前 v4.1 主任务状态
 
@@ -61,8 +63,8 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | E10 | 不可变世界池与纯查表回放 | in_progress（程序回放/池/报告已verified） | 主控57项、clippy/fmt通过；观察正文绑定实际共同输入和来源，q0/辅助来源篡改拒绝；世界/池/报告持久与实时撤销已验。真实观测与管理适配仍未完成，不声称经济收益。 |
 | E11 | 验证回放优化的真实经济收益 | in_progress（合同/持久准备已verified） | 主控10项及clippy/fmt通过；单票配对、九类成本、实际预算绑定/最终回执不可变、并发取消/晚到账/报告CAS已验。可信在线配对回执消费者尚未实现；真实经济实验未运行，不声称节省。 |
 | E12 | 学习者条件化的经验自主获取 | in_progress（离线子范围已verified） | 主控21项和参考宿主3个进程用例、clippy/fmt通过；控制注册、精确平台期、冷却/零预算终态、事实拒绝门已验。E03可信执行/评分回执schema仍缺，真实隔离、应用正例及持久学习改变下轮选题仍未验，不启用G3。 |
-| E13 | 长期部署适应与能力保留监测 | implemented_not_verified | 持久周期/巩固消费者已交付，主控尚未验收；真实长时证据未取得。 |
-| E14 | 受限改进器自身的继承控制器 | in_progress（合同审查） | 正冻结单机制候选与下一作业真实使用合同；未实施或启用G4。 |
+| E13 | 长期部署适应与能力保留监测 | in_progress（程序监测已verified） | 主控22项及clippy/fmt通过；两周期触发、单claim、真实根绑定前置校验、异常/撤销持久终态和漂移已验。仅程序fixture，真实提供商、连续轮次保留/长期效果仍未取得。 |
+| E14 | 受限改进器自身的继承控制器 | planned（本地合同建议已交接） | 未开始代码；单机制候选、真实下一作业及身份边界仍须主控定版；不启用G4。 |
 | E15 | 后继质量与跨代收益实验 | planned | 真实后继实验未运行。 |
 | E16 | 产品支持范围与最终交付门禁 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
 | E16.1 | 来源导入与版本化读取器 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
@@ -235,3 +237,19 @@ V010–13/V084/V085仅在冻结合同、程序fixture、持久票据/账本和�
 [PR #41](https://github.com/acosmi/RSIAgent/pull/41)，base=`wrokbot/v4.1-pr-e11-replay-economics`；本地 `6fd4f5eb644e59d944eab86a39f4b2d3b8ae25fc`，推送源码 `e612fcb9563c8e320e011e6d06f026b9730f561c`；除台账外源码一致，merged_sha=null。主控core 5、engine课程3、E09回归4、E03回归7、可信helper拒绝1、legacy 1，共21项；clippy all-targets -D warnings、fmt exit0。直接rustc编译参考宿主，clamp正例/非法域/code禁用3个实际进程用例通过。
 
 输入 `controller-e12-final-input.json`，结论 `controller-e12-acceptance.json`，日志 `controller-e12-*.log` 与 `controller-e12-reference.json` 仅本地。禁止用Fixture或Admin自报摘要形成完成周期；目前可信执行/评分回执schema仍未实现，实际学习改变下次选题的正链未验。来源撤销/预算事实不因回滚恢复；回滚点为前一已验源码。
+
+### E13 程序监测子范围独立验收与 PR
+
+[PR #42](https://github.com/acosmi/RSIAgent/pull/42)，base=`wrokbot/v4.1-pr-e12-curriculum`；本地 `c9b85b88d11190bbc83d6361904a91c3ede63a4c`，推送源码 `2c79608fb1d30f7592b742e972c209cb9208fabc`；除台账外源码一致，merged_sha=null。主控monitoring 5、broker 10、E03 regression 7，共22项；clippy all-targets -D warnings、fmt exit0。输入 `controller-e13-input.json`，结论 `controller-e13-acceptance.json`，日志 `controller-e13-*.log` 仅本地。
+
+真实StoreJournal程序路径覆盖每两开发周期唯一claim、来源2撤销、隐藏域拒绝、漂移、根预算错配零派发、Running后故障/撤销保留不可重发终态。未获得真实长期测量和收益证明；fixture provenance保留，不能当生产证据。回滚点为前一已验源码；实际账单与撤销事实保留。
+
+### 在途收口与当前进度
+
+E07管理增量、E10–E13已按上述子范围验收、提交、推送并分别归入原任务PR。远程实查E00–E13共14个独立草稿PR（#29–#42），均open/draft，merged_sha=null。25个台账节点中14个已有已验子范围交付，属于56%的任务覆盖率，不能写成后端完成56%；本轮未宣称任一研究阶段的真实全链全部完成。
+
+主控最终在隔离副本对整合源码 `c9b85b88d11190bbc83d6361904a91c3ede63a4c` 运行 `cargo test --locked --offline -p evo-core -p evo-storage -p evo-engine`，301项通过；对应all-targets Clippy -D warnings与fmt exit0。实际输入/命令/日志哈希保存在本地 `controller-closure-integrated-acceptance.json`。Cargo.lock仅构建清理引起reqwest/rmcp列表排序差异，依赖/版本/checksum逐项相同；仓库锁文件未改。
+
+剩余工程：E07探索/回放/课程/meta管理handler；E03可信开发执行/评分回执schema；E05真实独立执行/完整成本与逐依赖闭包；E09实际恢复/多组/实践消费者；E11完整在线配对回执消费者；E12实际学习改变下轮选题；E13真实长期保留链；E14–E18及E16六子包的本轮完整验收。外部条件另列：真实模型/样本与支付授权、合格隔离环境、历史原包/T映射。不能把尚未实现的工程全部归为外部阻塞。
+
+下一轮由Antigravity在隔离工作树实施，Codex负责唯一真源裁决、合同冻结、代码/测试/实际结果独立验收、PR和台账；未派发新代码任务。后续旧任务补齐仍使用对应任务PR，由主控整理依赖，不由实施方合并/推送。方案、内部交接和QA仅本地，本台账允许远程。
