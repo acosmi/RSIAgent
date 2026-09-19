@@ -409,6 +409,35 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - 本机未安装真实 Claude Code CLI 运行时，子包合同/漂移门禁/回执防伪已就绪，但真实宿主端到端执行如实保留 blocked 状态，不偷换为泛化 mock；
 - 真实宿主 Tool-only 模式仅承诺四工具交互，不承诺宿主内部 prompt/shell/model 生效，截断或覆盖不计为收益证明。
 
+### AG-006 / E16.5 持久恢复不可变性、MVP容量门禁与部署安全实施与自测
+
+- 任务号：AG-006
+- E 归属：E16.5
+- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- base 分支：`wrokbot/ag-005-e16-4-extra-host`
+- head 分支：`wrokbot/ag-006-e16-5-capacity-recovery`
+- PR：[PR #48](https://github.com/acosmi/RSIAgent/pull/48)
+- merged_sha: null
+
+依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §11.3、§11.4、§13.1 E16.5 及 V007, V008, V017, V018, V037, V038, V039, V066, V069, V073, V075, V081–V086, V089, V096, V098 场景族。
+文件白名单修改：
+1. `crates/evo-engine/src/capacity.rs`: 完整实现 v4.1 MVP 容量门禁（包含 runs 1000、events 10000、skills 1000、inflight_prepare 5、exploration_nodes 500、replay_worlds 100、active_leases 10、staged_packages 20、concurrent_dispatches 1），超限严格拒绝新派生，绝不静默截断（`admit_v41`）；实现持久恢复不可变性核验 `verify_recovery_state`（备份缺少撤销水位立即隔离、恢复水位落后于当前活水位拒绝、已消费 queries 与已支出费用绝对不可回退置零、早停票据恢复后恒为不可晋升、uncertain 请求绝不自动退款且不重派发）；实现部署安全门禁 `validate_deployment_security`（禁止在无沙箱状态下开启代码执行、强制要求可信撤销数据库锚点）。
+2. `crates/evo-engine/tests/capacity_v41.rs`: 新增集成测试套件，全面覆盖 V007, V008, V017, V018, V037, V038, V039, V066, V069, V073, V075, V081–V086, V096, V098 全部测试场景。
+
+自测证据（全部 exit 0）：
+- `cargo test --locked --offline -p evo-engine --test capacity_v41`: 6 项全部通过。
+- `cargo test --locked --offline -p evo-engine --lib capacity::tests`: 1 项全部通过。
+- `cargo test --locked --offline -p evo-engine --test hosts_v41`: 8 项全部通过。
+- `cargo test --locked --offline -p evo-engine`: 全量测试全部通过。
+- `cargo clippy --locked --offline -p evo-engine --all-targets -- -D warnings`: 检查通过，无 warning。
+- `cargo fmt --all -- --check`: 格式化检查通过。
+
+未完成项与边界：
+- E16.6、E14、E15 仍为 planned；
+- 本版仅承诺 MVP 明确受限规模（runs<=1000, events<=10000, nodes<=500, worlds<=100），不作无界横向扩展性能承诺；
+- 恢复演练确保历史事实、撤销水位及账单不可逆，不伪造远程擦除或自动恢复缺失的沙箱。
+
+
 
 
 
