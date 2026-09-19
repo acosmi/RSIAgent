@@ -209,3 +209,24 @@ fn test_v098_claude_code_surface_fixture_roundtrip() {
         .validate_against_extraction(&extracted)
         .expect("Fixture manifest must validate against its extracted items");
 }
+
+// =========================================================================
+// F06 Adversarial Regression (from controller review)
+// =========================================================================
+#[test]
+fn test_f06_review_offered_receipt_cannot_claim_used_or_verified_benefit() {
+    let receipt = HostExecutionReceipt {
+        host_id: "unverified".into(),
+        run_id: "invented".into(),
+        stage: HostToolStage::Offered,
+        attribution: SkillAttribution::VerifiedBenefit,
+        is_truncated: false,
+        is_overridden: false,
+        claimed_used: true,
+        claimed_benefit: true,
+    };
+    assert!(
+        verify_host_receipt(&receipt).is_err(),
+        "caller-authored Offered receipt was accepted as Used with VerifiedBenefit"
+    );
+}
