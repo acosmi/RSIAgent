@@ -1,6 +1,6 @@
 //! MVP capacity, persistent recovery verification, and deployment safety gates.
 //! Exceeding capacity limits refuses new derive; it never silent-truncates.
-use evo_core::{Error, Result, identifier};
+use evo_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_RUNS: u64 = 1_000;
@@ -193,21 +193,56 @@ pub struct DeploymentSecurityConfig {
     pub trusted_revocations_db_path: Option<String>,
 }
 
-pub fn validate_deployment_security(cfg: &DeploymentSecurityConfig) -> Result<()> {
-    if cfg.allow_code_execution && !cfg.sandbox_enabled {
-        return Err(Error::Forbidden);
+pub fn probe_sandbox_capability() -> bool {
+    // In this offline/MVP phase, no verified sandbox runtime daemon or container wrapper exists.
+    // Qualified sandbox requires an isolated runtime environment (e.g. bubblewrap, gVisor, or container daemon).
+    // An explicit environment override RSIA_SANDBOX_CAPABILITY_VERIFIED can signal capability for testing/staging.
+    if let Ok(val) = std::env::var("RSIA_SANDBOX_CAPABILITY_VERIFIED") {
+        return val == "1" || val.eq_ignore_ascii_case("true");
     }
-    if cfg.trusted_revocations_db_path.is_none() {
+    false
+}
+
+pub fn validate_deployment_security(cfg: &DeploymentSecurityConfig) -> Result<()> {
+    if cfg.allow_code_execution {
+        if !cfg.sandbox_enabled {
+            return Err(Error::Forbidden);
+        }
+        if !probe_sandbox_capability() {
+            return Err(Error::Invalid(
+                "deployment_rejected: sandbox capability not verified on this host; code execution must remain disabled".into(),
+            ));
+        }
+    }
+
+    let db_path = cfg.trusted_revocations_db_path.as_deref().ok_or_else(|| {
+        Error::Invalid("deployment_rejected: trusted revocations database is required".into())
+    })?;
+
+    if db_path.trim().is_empty() {
+        return Err(Error::Invalid("empty trusted revocations db path".into()));
+    }
+
+    let p = std::path::Path::new(db_path);
+    if !p.exists() || !p.is_file() {
+        return Err(Error::Invalid(format!(
+            "deployment_rejected: trusted revocations db does not exist or is not a file: {db_path}"
+        )));
+    }
+
+    // Verify file header / readability
+    let header_bytes = std::fs::read(p).map_err(|e| {
+        Error::Invalid(format!(
+            "deployment_rejected: cannot read revocations db: {e}"
+        ))
+    })?;
+    if header_bytes.len() < 16 || &header_bytes[..16] != b"SQLite format 3\0" {
         return Err(Error::Invalid(
-            "deployment_rejected: trusted revocations database is required".into(),
+            "deployment_rejected: trusted revocations db is not a valid SQLite format 3 file"
+                .into(),
         ));
     }
-    if let Some(ref path) = cfg.trusted_revocations_db_path {
-        if path.trim().is_empty() {
-            return Err(Error::Invalid("empty trusted revocations db path".into()));
-        }
-        identifier("trusted_revocations_db")?;
-    }
+
     Ok(())
 }
 
