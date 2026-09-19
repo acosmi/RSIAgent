@@ -339,12 +339,15 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 3. `crates/evo-engine/tests/packages_v41.rs`: 新增端到端集成测试套件，全面覆盖 V017, V039, V066, V067, V068, V069, V070, V075, V091, V092, V098 全部 14 项测试场景。
 
 自测证据（全部 exit 0）：
-- `cargo test --locked --offline -p evo-engine --test packages_v41`: 14 项全部通过。
+- `cargo test --locked --offline -p evo-engine --test packages_v41`: 16 项全部通过（含主控对抗缺陷 F04 导出元数据/包清单隐私扫描门禁等 2 项回归测试）。
 - `cargo test --locked --offline -p evo-engine --lib packages::tests`: 4 项全部通过。
 - `cargo test --locked --offline -p evo-engine --test import_v41`: 13 项全部通过。
 - `cargo test --locked --offline -p evo-core -p evo-storage -p evo-engine`: 全量测试全部通过。
 - `cargo clippy --locked --offline -p evo-core -p evo-storage -p evo-engine --all-targets -- -D warnings`: 检查通过，无 warning。
 - `cargo fmt --all -- --check`: 格式化检查通过。
+
+主控审阅缺陷整改记录（PR #45）：
+- **F04（导出元数据与清单描述隐私扫描门禁）**：在 `export_package` 与 `validate_manifest` 中对 `description`、`name`、`publisher`、`license`、`version`、`asset_id`、依赖项属性以及跨安装域不可信元数据执行全量 `scan_privacy` 与 `privacy_block` 检查，彻底阻止敏感标记（如私钥标记 `BEGIN PRIVATE KEY`、Token等）借道元数据绕过隐私门禁。
 
 未完成项与边界：
 - E16.3–E16.6、E14、E15 仍为 planned；

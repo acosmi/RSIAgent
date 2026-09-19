@@ -598,3 +598,49 @@ fn test_v098_golden_manifest_fixture_roundtrip() {
     let reparsed: AssetPackageManifest = serde_json::from_str(&serialized).unwrap();
     assert_eq!(manifest, reparsed);
 }
+
+// =========================================================================
+// F04 Adversarial Regression (from controller review)
+// =========================================================================
+#[test]
+fn test_f04_review_export_metadata_must_pass_privacy_scan() {
+    let req = ExportRequest {
+        kind: PackageKind::Skill,
+        publisher: "p".into(),
+        asset_id: "a".into(),
+        name: "safe".into(),
+        version: "1".into(),
+        description: "-----BEGIN PRIVATE KEY----- example-test-only".into(),
+        license: "MIT".into(),
+        files: BTreeMap::from([("skill.md".into(), b"safe content".to_vec())]),
+        dependencies: vec![],
+        referenced_source_ids: vec!["s".into()],
+        export_started_watermark: 1,
+    };
+    assert!(
+        export_package(&req, |_| false, 1).is_err(),
+        "private-key marker in exported manifest description bypassed privacy scan"
+    );
+}
+
+#[test]
+fn test_f04_manifest_validation_blocks_sensitive_metadata() {
+    let mut manifest = valid_base_manifest();
+    manifest.description = "Contains secret ghp_abcdef123456789".into();
+    assert!(
+        validate_manifest(&manifest).is_err(),
+        "secret token in manifest description bypassed validate_manifest"
+    );
+
+    let mut manifest2 = valid_base_manifest();
+    manifest2.dependencies.push(PackageDependency {
+        publisher: "org.rsia".into(),
+        asset_id: "dep1".into(),
+        kind: "skill".into(),
+        version_req: "1.0-sk-1234567890abcdef".into(),
+    });
+    assert!(
+        validate_manifest(&manifest2).is_err(),
+        "secret token in dependency bypassed validate_manifest"
+    );
+}

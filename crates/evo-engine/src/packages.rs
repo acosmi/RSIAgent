@@ -438,6 +438,34 @@ pub fn validate_manifest(manifest: &AssetPackageManifest) -> Result<()> {
         return Err(Error::Forbidden);
     }
 
+    // Privacy scan manifest metadata
+    privacy_block(&manifest.description)?;
+    privacy_block(&manifest.name)?;
+    privacy_block(&manifest.publisher)?;
+    privacy_block(&manifest.license)?;
+    for dep in &manifest.dependencies {
+        privacy_block(&dep.publisher)?;
+        privacy_block(&dep.asset_id)?;
+        privacy_block(&dep.kind)?;
+        privacy_block(&dep.version_req)?;
+    }
+    if let Some(fm) = &manifest.foreign_metadata {
+        if let Some(ns) = &fm.external_namespace {
+            privacy_block(ns)?;
+        }
+        if let Some(pid) = &fm.external_parent_id {
+            privacy_block(pid)?;
+        }
+        for eval in &fm.formal_evaluations {
+            privacy_block(&eval.notes)?;
+            privacy_block(&eval.evaluator_identity)?;
+        }
+        for app in &fm.approvals {
+            privacy_block(&app.notes)?;
+            privacy_block(&app.approver_identity)?;
+        }
+    }
+
     let members: Vec<PackageMember> = manifest
         .entries
         .iter()
@@ -772,9 +800,54 @@ pub fn export_package(
         }
     }
 
+    // Validate metadata privacy scan
+    let mut all_findings = Vec::new();
+    let metadata_fields = [
+        ("description", req.description.as_str()),
+        ("name", req.name.as_str()),
+        ("publisher", req.publisher.as_str()),
+        ("license", req.license.as_str()),
+        ("version", req.version.as_str()),
+        ("asset_id", req.asset_id.as_str()),
+    ];
+    for (field_name, field_val) in metadata_fields {
+        let report = scan_privacy(field_val);
+        if report.status == RedactionStatus::Blocked {
+            return Err(Error::Invalid(format!(
+                "privacy_gate: sensitive content detected in metadata field '{field_name}'"
+            )));
+        }
+        all_findings.extend(report.findings);
+    }
+    for dep in &req.dependencies {
+        let dep_fields = [
+            ("dependency.publisher", dep.publisher.as_str()),
+            ("dependency.asset_id", dep.asset_id.as_str()),
+            ("dependency.kind", dep.kind.as_str()),
+            ("dependency.version_req", dep.version_req.as_str()),
+        ];
+        for (field_name, field_val) in dep_fields {
+            let report = scan_privacy(field_val);
+            if report.status == RedactionStatus::Blocked {
+                return Err(Error::Invalid(format!(
+                    "privacy_gate: sensitive content detected in metadata field '{field_name}'"
+                )));
+            }
+            all_findings.extend(report.findings);
+        }
+    }
+    for src in &req.referenced_source_ids {
+        let report = scan_privacy(src);
+        if report.status == RedactionStatus::Blocked {
+            return Err(Error::Invalid(
+                "privacy_gate: sensitive content detected in referenced_source_id".into(),
+            ));
+        }
+        all_findings.extend(report.findings);
+    }
+
     // Validate files and privacy scan
     let mut entries = Vec::new();
-    let mut all_findings = Vec::new();
 
     for (path, content) in &req.files {
         let member = PackageMember {
