@@ -3,7 +3,7 @@
 唯一规范入口（方案正文仅本地）：`RSIAgent-v4.1定稿-工程实施方案-2026-09-19.md`。
 plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`。
 本台账是实施与证据索引，不另立规范；历史 PR、测试和旧台账不决定当前规则。
-用户于 2026-09-19 明确确认 v4.1 替代 v4，并授权将本台账上传远程；方案正文、内部合同、归档及 QA 原始材料只保留本地。源码推送、Actions 派发和发布本轮未获授权。
+用户于 2026-09-19 明确确认 v4.1 替代 v4，并授权将本台账上传远程；方案正文、内部合同、归档及 QA 原始材料只保留本地。用户后续明确要求验收通过即逐任务推送和建立 PR；当前按此执行。Actions 派发、合并和发布未授权。
 
 ## 当前基线与保护
 
@@ -23,16 +23,16 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 
 ## 单任务 PR 顺序
 
-每个 E 任务独立审阅；先验收再整合。以下是顺序号，不是假造 GitHub PR 编号。代码尚未推送，不能填 merged_sha。
+每个 E 任务独立审阅；先验收再整合。以下同时登记任务顺序与实际 GitHub PR；采用依赖栈，每个 PR 只审阅本任务差异。已推送不等于已合并，merged_sha 均为空。
 
 | 顺序 | 任务 | 范围与依赖 | 负责人/修改白名单 | 状态 | PR / source_sha / merged_sha |
 |---|---|---|---|---|---|
-| 01 | E00 | 固定基线、真源切换、历史/当前证据范围；无依赖 | 子代理复验；主控已核对源码与原始日志并定向重测 | verified（固定基线与治理脚本局部） | [PR #29](https://github.com/acosmi/RSIAgent/pull/29) draft，仅台账；本地源码 `c71b9ca` 未推送；未合并 |
-| 02 | E01 | 统计与独立留出静态合同；依赖 E00 核心基线 | sol/high实施，主控独立验收 | verified（静态合同）/ blocked（真实小试） | 本地 `bfbed849e4b16d82e4bd088b4cc7cc01e3d3a64f`；PR待源码推送授权；未合并 |
-| 03 | E02 | 有界原子 Skill 编辑纯编译作用域；依赖 E01 合同验收 | sol/high实施，主控独立验收 | verified（编译子范围） | 本地 `b7b3f1f278612ebaebfbca15d743255b89ed746e`；PR待源码推送授权；未合并 |
-| 04 | E03 | 真实应用诊断、小批反思、建议来源与开发消费者；依赖 E02 | sol；core/engine optimization、model、evidence及定向测试 | in_progress | 本地实施；未推送/未合并 |
-| 05 | E04 | 持久根预算、broker、取消/对账；依赖 E02 | sol/high；storage budget、0005_root_budget、engine broker/executor及定向测试 | in_progress | 本地实施；未推送/未合并 |
-| 06 | E05 | 独立评测/留出、连续前缀与早停证书；依赖 E01/E03/E04 | sol/high；engine evaluator/streaming_evaluator及定向测试 | in_progress | 本地准备；E03/E04真实消费者待整合；未推送/未合并 |
+| 01 | E00 | 固定基线、真源切换、历史/当前证据范围；无依赖 | 子代理复验；主控已核对源码与原始日志并定向重测 | verified（固定基线与治理脚本局部） | [PR #29](https://github.com/acosmi/RSIAgent/pull/29) draft；源码 `ef8244d` 已推送；未合并 |
+| 02 | E01 | 统计与独立留出静态合同；依赖 E00 核心基线 | sol/high实施，主控独立验收 | verified（静态合同）/ blocked（真实小试） | [PR #30](https://github.com/acosmi/RSIAgent/pull/30) draft；源码 `c5ac47d` 已推送；未合并 |
+| 03 | E02 | 有界原子 Skill 编辑纯编译作用域；依赖 E01 合同验收 | sol/high实施，主控独立验收 | verified（编译子范围） | [PR #31](https://github.com/acosmi/RSIAgent/pull/31) draft；源码 `79af6c5` 已推送；未合并 |
+| 04 | E03 | 真实应用诊断、小批反思、建议来源与开发消费者；依赖 E02 | sol；core/engine optimization、model、evidence及定向测试 | verified（程序消费者/恢复子范围） | [PR #32](https://github.com/acosmi/RSIAgent/pull/32) draft；源码 `727e9cc` 已推送；未合并 |
+| 05 | E04 | 持久根预算、broker、取消/对账；依赖 E02 | sol/high；storage budget、0005_root_budget、engine broker/executor及定向测试 | verified（根预算/broker子范围） | [PR #33](https://github.com/acosmi/RSIAgent/pull/33) draft；源码 `c14f462` 已推送；未合并 |
+| 06 | E05 | 独立评测/留出、连续前缀与早停证书；依赖 E01/E03/E04 | sol/high；engine evaluator/streaming_evaluator及定向测试 | in_progress | 主控复核中；早停晚到审计及大group停止缺陷正在修复复验；未推送/未合并 |
 后续依真源依赖图按 E06、E07、E08、E09、E10、E11、E12、E13、E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
 
 ## 当前 v4.1 主任务状态
@@ -122,7 +122,7 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 - T001–T126 原始断言未提供；实际源码回归按路径和测试名登记，保持 `legacy_equivalence_unverified`，不虚构 T 映射。
 - 付费预算缺省0；本轮没有真实模型小试、真实收益、Linux隔离或容量性能证据。相应门禁不得标通过。
 - 旧实现的 bootstrap、状态推进、按 policy 名查表、bool oracle/模型使用等问题按当前源码逐项复核；不借历史PR标题标绿。
-- 远程仅本台账上传已授权；源码PR推送、Actions手动派发和发布仍待授权。
+- 验收通过的任务源码与台账逐任务推送并建立 PR；Actions 派发、合并和发布仍未授权。
 
 ## 本地证据索引
 
@@ -143,8 +143,22 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 
 | 任务 | 主控验收 | 本地源码提交 | 远程状态/仍未完成 |
 |---|---|---|---|
-| E00治理脚本 | 保留号/迁移checksum拒绝、未绑定/歧义台账拒绝、固定输入112日志观察、代码或fixture变化全部unverified；10项正负检查通过 | `c71b9ca05fd4652b7935a6c74997a4baabea2969` | 源码未推送；PR #29仅台账；历史归并仍blocked |
+| E00治理脚本 | 保留号/迁移checksum拒绝、未绑定/歧义台账拒绝、固定输入112日志观察、代码或fixture变化全部unverified；10项正负检查通过 | `c71b9ca05fd4652b7935a6c74997a4baabea2969` | 源码已推送至 PR #29；历史归并仍blocked |
 | E01静态合同 | 隔离副本75项core测试（13项新增），fmt/clippy均0；独立80位参考k12/13/14和固定种子仿真通过；输入文件hash复核无变化 | `bfbed849e4b16d82e4bd088b4cc7cc01e3d3a64f` | 无真实小试/正式数据/付款授权，不声称E01全部完成 |
 | E02纯编译 | 14新测+1旧宿主契约；fmt/clippy最终0；所有修正由主控复读 | `b7b3f1f278612ebaebfbca15d743255b89ed746e` | 上下文Token计量、真实宿主、后续消费者另验 |
 
-E01原始日志：`controller-e01-tests.log`、`controller-e01-fmt.log`、`controller-e01-clippy.log`、`controller-e01-reference.log`、`controller-e01-input.json`，均位于本轮本地证据目录。数值外扩1e-12，当前参考扫描最大裸差约2.24e-16；此为程序参考检查，不是全平台数值证明或产品效果。E03/E04/E05进行中，不用当前局部测试计数标记全量后端完成。
+E01原始日志：`controller-e01-tests.log`、`controller-e01-fmt.log`、`controller-e01-clippy.log`、`controller-e01-reference.log`、`controller-e01-input.json`，均位于本轮本地证据目录。数值外扩1e-12，当前参考扫描最大裸差约2.24e-16；此为程序参考检查，不是全平台数值证明或产品效果。E03/E04已完成所列子范围的主控验收与源码推送；E05仍在复验，不用局部测试计数标记全量后端完成。
+
+## 2026-09-19 逐任务远程交付
+
+已纠正此前仅本地提交、未逐任务推送的问题。每个源码提交的 [skip ci] 交付副本与原主控验收版本逐文件比较，除台账外完全一致；不包含工作树中未验收的后续任务。以下提交是源码输入绑定点，后续台账提交不改变该源码。各 PR 均为 draft，merged_sha=null。
+
+| 任务 | PR | 原验收提交 | 已推送源码提交 | base |
+|---|---|---|---|---|
+| E00 | [#29](https://github.com/acosmi/RSIAgent/pull/29) | `c71b9ca05fd4652b7935a6c74997a4baabea2969` | `ef8244dae4b5dd173987e78915500cc997dcd9b0` | `main` |
+| E01 | [#30](https://github.com/acosmi/RSIAgent/pull/30) | `bfbed849e4b16d82e4bd088b4cc7cc01e3d3a64f` | `c5ac47d506a98a9feb0b65fac6815e80087c8f49` | `wrokbot/v4.1-e00-baseline-ledger` |
+| E02 | [#31](https://github.com/acosmi/RSIAgent/pull/31) | `b7b3f1f278612ebaebfbca15d743255b89ed746e` | `79af6c515b3afdf36778ee57ba2f140a22a3c0e0` | `wrokbot/v4.1-pr-e01-evaluation` |
+| E03 | [#32](https://github.com/acosmi/RSIAgent/pull/32) | `3d043c9f0a79e418656699952421c0aab3d5c804` | `727e9cca8d4118dd207b1ad5ab043c2b6229fef7` | `wrokbot/v4.1-pr-e02-atomic-edits` |
+| E04 | [#33](https://github.com/acosmi/RSIAgent/pull/33) | `9736d9f7e78b0532141be63db21d4438896aa33a` | `c14f46266939fe4e5d94ce3db4b1236f90e04ccd` | `wrokbot/v4.1-pr-e03-optimization` |
+
+主控新增验收证据：E03输入 `controller-e03-final-input.json`，`cargo test --locked --offline -p evo-core -p evo-engine` 共144项通过，fmt/clippy exit0；日志 `controller-e03-final-tests.log`、`controller-e03-final-fmt.log`、`controller-e03-final-clippy.log`。E04输入 `controller-e04-session-input.json`，预算14/broker9/executor6项定向测试通过，fmt/clippy exit0；日志 `controller-e04-session-tests.log`、`controller-e04-session-clippy.log`。以上均仅存本地证据目录。回滚点为各任务上一源码提交；撤销水位、已派发费用和已消费查询不能回退。
