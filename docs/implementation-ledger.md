@@ -308,13 +308,18 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 4. `crates/evo-engine/tests/import_v41.rs`: 新增集成测试套件，全面覆盖 V005, V006, V017, V051, V052, V053, V054, V055, V056, V076, V087, V090, V098 全部 13 项场景族。
 
 自测证据（全部 exit 0）：
-- `cargo test --locked --offline -p evo-engine --test import_v41`: 13 项全部通过。
+- `cargo test --locked --offline -p evo-engine --test import_v41`: 18 项全部通过（含主控审阅缺陷 F01 未知版本拒绝/不根据用户文本瞎猜、F02 UTF-8 边界安全切片截断、F03 原始字节摘录与无损往返提取等 5 项对抗回归测试）。
 - `cargo test --locked --offline -p evo-engine --lib import::tests`: 3 项全部通过。
 - `cargo test --locked --offline -p evo-core --lib evidence::tests`: 8 项全部通过。
 - `cargo test --locked --offline -p evo-engine --test dispatch_management --test replay_v41`: 13 + 13 = 26 项回归通过。
 - `cargo test --locked --offline -p evo-http --test service`: 3 项回归通过。
 - `cargo clippy --locked --offline -p evo-core -p evo-engine --all-targets -- -D warnings`: 检查通过，无 warning。
 - `cargo fmt --all -- --check`: 格式化检查通过。
+
+主控审阅缺陷整改记录（PR #44）：
+- **F01（未知版本/格式探测拒绝）**：重构 `detect_format_from_bytes`，采用结构化 JSON 探测检查 `schema_version`/`format`，未知版本（如 `rsia.trace.v999`、`unknown.v99`）一律报错拒绝，不再依据用户正文包含的 `"role":"user"` 臆断为 Claude；`parse_rsia_trace`/`parse_rsih_pi`/`parse_claude_fixture` 同步严格校验版本。
+- **F02（UTF-8 边界安全截断）**：`detect_format_from_bytes` 与 `ingest_imported_sources` 中的长度截断全部增加 `is_char_boundary` 安全校验，防止在多字节 UTF-8 字符（如中文 `'中'`）内部切片引发 panic。
+- **F03（原始字节定位器往返提取）**：在流式 JSON 解析时精准记录事件在 `raw_bytes` 中的原始字节跨度 `[byte_start..byte_end]`，`EvidenceLocator::build` 直接基于原始切片计算 `excerpt_digest`，确保 `locator.verify_and_extract(body)` 零差错准确提取原始切片。
 
 未完成项与边界：
 - E16.2–E16.6、E14、E15 仍为 planned；

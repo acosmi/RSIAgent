@@ -16,8 +16,8 @@ use evo_core::skill_edit::{
     compile_skill_edit_batch, skill_snapshot_digest,
 };
 use evo_engine::import::{
-    ImportForensicLimits, SourceFormat, detect_format, ingest_imported_sources, parse_fixture,
-    tool_result_is_not_preference,
+    ImportForensicLimits, SourceFormat, detect_format, detect_format_from_bytes,
+    ingest_imported_sources, parse_fixture, tool_result_is_not_preference,
 };
 
 fn authorized_selection(roots: Vec<String>, run_ids: Vec<String>) -> SourceSelection {
@@ -535,4 +535,70 @@ fn test_v098_traceability_and_clean_reader_failure_isolation() {
             || res.aggregate_summary.coverage.unsupported_format > 0
     );
     assert_eq!(res.aggregate_summary.coverage.as_label(), "partial");
+}
+
+// =========================================================================
+// F01, F02, F03 Adversarial Regressions (from controller review)
+// =========================================================================
+#[test]
+fn test_f01_unknown_trace_version_must_be_rejected() {
+    let body = r#"{"schema_version":"rsia.trace.v999","events":[{"role":"user","content":"x"}]}"#;
+    assert!(
+        parse_fixture(SourceFormat::RsiaTraceV1, body).is_err(),
+        "unknown trace schema was accepted"
+    );
+}
+
+#[test]
+fn test_f01_probe_must_not_guess_format_from_user_words() {
+    let body = br#"{"schema_version":"unknown.v99","role":"user","content":"hello"}"#;
+    assert!(
+        detect_format_from_bytes(body).is_err(),
+        "unknown product format was guessed as Claude from role=user"
+    );
+}
+
+#[test]
+fn test_f02_probe_must_not_panic_inside_utf8() {
+    let mut body = " ".repeat(evo_core::evidence::MAX_HEADER_PROBE_BYTES - 1);
+    body.push('中');
+    assert!(
+        std::panic::catch_unwind(|| detect_format_from_bytes(body.as_bytes())).is_ok(),
+        "probe panics at a valid UTF-8 boundary crossing"
+    );
+}
+
+#[test]
+fn test_f02_event_truncation_must_not_panic_inside_utf8() {
+    let selection = authorized_selection(vec!["/selected".into()], vec![]);
+    let content = "x".repeat(evo_core::evidence::MAX_EVENT_BYTES - 1) + "中";
+    let encoded = serde_json::to_string(&content).unwrap();
+    let body = [
+        r#"{"schema_version":"rsia.trace.v1","events":[{"role":"user","content":"#,
+        encoded.as_str(),
+        r#"}]}"#,
+    ]
+    .concat()
+    .into_bytes();
+    assert!(
+        std::panic::catch_unwind(|| {
+            ingest_imported_sources(&selection, &[("/selected/one", body.as_slice())], None)
+        })
+        .is_ok(),
+        "default event limit truncates inside UTF-8"
+    );
+}
+
+#[test]
+fn test_f03_generated_locator_must_extract_unchanged_source() {
+    let selection = authorized_selection(vec!["/selected".into()], vec![]);
+    let body =
+        br#"{"schema_version":"rsia.trace.v1","events":[{"role":"user","content":"hello"}]}"#;
+    let result = ingest_imported_sources(&selection, &[("/selected/one", body)], None).unwrap();
+    assert!(!result.locators.is_empty());
+    let extracted = result.locators[0].verify_and_extract(body);
+    assert!(
+        extracted.is_ok(),
+        "freshly generated locator cannot reread the unchanged source: {extracted:?}"
+    );
 }

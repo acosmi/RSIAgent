@@ -81,28 +81,207 @@ pub fn detect_format(label: &str) -> Result<SourceFormat> {
     }
 }
 
+pub fn find_json_array_element_spans(text: &str, array_key: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let key_pattern = format!("\"{}\"", array_key);
+    let key_pos = match text.find(&key_pattern) {
+        Some(pos) => pos + key_pattern.len(),
+        None => return spans,
+    };
+    let array_start = match text[key_pos..].find('[') {
+        Some(pos) => key_pos + pos + 1,
+        None => return spans,
+    };
+
+    let bytes = text.as_bytes();
+    let mut idx = array_start;
+    let len = bytes.len();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut depth = 0;
+    let mut elem_start = 0;
+
+    while idx < len {
+        let b = bytes[idx];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' => {
+                    if depth == 0 {
+                        elem_start = idx;
+                    }
+                    depth += 1;
+                }
+                b'}' => {
+                    if depth > 0 {
+                        depth -= 1;
+                        if depth == 0 {
+                            spans.push((elem_start, idx + 1));
+                        }
+                    }
+                }
+                b']' if depth == 0 => break,
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+    spans
+}
+
+pub fn find_top_level_json_array_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let array_start = match text.find('[') {
+        Some(pos) => pos + 1,
+        None => return spans,
+    };
+    let bytes = text.as_bytes();
+    let mut idx = array_start;
+    let len = bytes.len();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut depth = 0;
+    let mut elem_start = 0;
+
+    while idx < len {
+        let b = bytes[idx];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' => {
+                    if depth == 0 {
+                        elem_start = idx;
+                    }
+                    depth += 1;
+                }
+                b'}' => {
+                    if depth > 0 {
+                        depth -= 1;
+                        if depth == 0 {
+                            spans.push((elem_start, idx + 1));
+                        }
+                    }
+                }
+                b']' if depth == 0 => break,
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+    spans
+}
+
 pub fn detect_format_from_bytes(bytes: &[u8]) -> Result<SourceFormat> {
     let s = std::str::from_utf8(bytes).map_err(|_| Error::Invalid("invalid_utf8".into()))?;
-    let probe_len = s.len().min(MAX_HEADER_PROBE_BYTES);
+    let mut probe_len = s.len().min(MAX_HEADER_PROBE_BYTES);
+    while !s.is_char_boundary(probe_len) {
+        probe_len -= 1;
+    }
     let probe = &s[..probe_len];
 
-    if probe.contains("codex") {
-        return Err(Error::Invalid("unsupported_format:codex".into()));
+    // Structured JSON parsing on probe slice
+    let first_val = serde_json::Deserializer::from_str(probe)
+        .into_iter::<serde_json::Value>()
+        .next()
+        .and_then(|r| r.ok());
+
+    if let Some(val) = first_val {
+        if let Some(obj) = val.as_object() {
+            // Check schema_version first
+            if let Some(ver) = obj.get("schema_version").and_then(|v| v.as_str()) {
+                match ver {
+                    "rsia.trace.v1" | "rsia.optimization.source.v1" => {
+                        return Ok(SourceFormat::RsiaTraceV1);
+                    }
+                    "rsih.pi.fixture" => return Ok(SourceFormat::RsihPiFixture),
+                    "claude.fixture" => return Ok(SourceFormat::ClaudeFixture),
+                    v if v.contains("codex") => {
+                        return Err(Error::Invalid("unsupported_format:codex".into()));
+                    }
+                    other => {
+                        return Err(Error::Invalid(format!("unknown schema_version: {}", other)));
+                    }
+                }
+            }
+
+            // Check format field
+            if let Some(fmt) = obj.get("format").and_then(|v| v.as_str()) {
+                match fmt {
+                    "rsia.trace.v1" | "rsia.optimization.source.v1" => {
+                        return Ok(SourceFormat::RsiaTraceV1);
+                    }
+                    "rsih.pi.fixture" => return Ok(SourceFormat::RsihPiFixture),
+                    "claude.fixture" => return Ok(SourceFormat::ClaudeFixture),
+                    v if v.contains("codex") => {
+                        return Err(Error::Invalid("unsupported_format:codex".into()));
+                    }
+                    other => return Err(Error::Invalid(format!("unsupported_format: {}", other))),
+                }
+            }
+
+            // Check product or origin field
+            if obj
+                .get("product")
+                .or_else(|| obj.get("origin"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|p| p.contains("codex"))
+            {
+                return Err(Error::Invalid("unsupported_format:codex".into()));
+            }
+
+            // If it has "events" array without explicit allowed schema_version, reject
+            if obj.contains_key("events") {
+                return Err(Error::Invalid(
+                    "missing or invalid schema_version for rsia.trace".into(),
+                ));
+            }
+
+            // If it has "prompts" array, it is RSIH Pi
+            if obj.contains_key("prompts") {
+                return Ok(SourceFormat::RsihPiFixture);
+            }
+
+            // If it has "role" and ("content" or "text")
+            if obj.contains_key("role") && (obj.contains_key("content") || obj.contains_key("text"))
+            {
+                if obj.contains_key("kind") {
+                    return Ok(SourceFormat::RsiaTraceV1);
+                }
+                return Ok(SourceFormat::ClaudeFixture);
+            }
+        } else if let Some(first_elem) = val
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_object())
+        {
+            if first_elem.contains_key("text") || first_elem.contains_key("prompts") {
+                return Ok(SourceFormat::RsihPiFixture);
+            }
+            if first_elem.contains_key("kind") {
+                return Ok(SourceFormat::RsiaTraceV1);
+            }
+            if first_elem.contains_key("role") {
+                return Ok(SourceFormat::ClaudeFixture);
+            }
+        }
     }
-    if probe.contains("rsih.pi.fixture") {
-        return Ok(SourceFormat::RsihPiFixture);
-    }
-    if probe.contains("rsia.trace.v1") || probe.contains("rsia.optimization.source.v1") {
-        return Ok(SourceFormat::RsiaTraceV1);
-    }
-    if probe.contains("claude.fixture")
-        || probe.contains("\"role\":\"user\"")
-        || probe.contains("\"role\": \"user\"")
-        || probe.contains("\"role\":\"assistant\"")
-        || probe.contains("\"role\": \"assistant\"")
-    {
-        return Ok(SourceFormat::ClaudeFixture);
-    }
+
     Err(Error::Invalid("unsupported_format".into()))
 }
 
@@ -149,25 +328,106 @@ fn parse_rsih_pi(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<Impor
     let parsed: serde_json::Value =
         serde_json::from_str(body).map_err(|_| Error::Invalid("parse_error".into()))?;
 
-    let mut events = Vec::new();
-    let prompts = if let Some(arr) = parsed.get("prompts").and_then(|v| v.as_array()) {
-        arr.clone()
-    } else if let Some(arr) = parsed.as_array() {
-        arr.clone()
-    } else {
-        vec![parsed]
-    };
+    if let Some(schema_ver) = parsed
+        .get("schema_version")
+        .and_then(|v| v.as_str())
+        .filter(|&ver| ver != "rsih.pi.fixture")
+    {
+        return Err(Error::Invalid(format!(
+            "unknown schema_version: {}",
+            schema_ver
+        )));
+    }
+    if let Some(fmt) = parsed
+        .get("format")
+        .and_then(|v| v.as_str())
+        .filter(|&f| f != "rsih.pi.fixture")
+    {
+        return Err(Error::Invalid(format!("unknown format: {}", fmt)));
+    }
 
-    let mut current_offset = 0;
-    for (idx, item) in prompts.iter().enumerate() {
-        let role = item
+    let mut events = Vec::new();
+    if let Some(arr) = parsed.get("prompts").and_then(|v| v.as_array()) {
+        let spans = find_json_array_element_spans(body, "prompts");
+        for (idx, item) in arr.iter().enumerate() {
+            let (byte_start, byte_end) = spans.get(idx).copied().unwrap_or((0, body.len()));
+            let role = item
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("user")
+                .to_string();
+            let content_raw = item
+                .get("text")
+                .or_else(|| item.get("content"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+
+            let kind = if content_raw.contains("tool_result") {
+                "tool_result".to_string()
+            } else {
+                "chat".to_string()
+            };
+
+            let content = content_raw.to_string();
+
+            events.push(ImportedEvent {
+                origin_name: "rsih_pi".into(),
+                role,
+                format: SourceFormat::RsihPiFixture,
+                task_origin: TaskOrigin::ImportedHistory,
+                attestation: ExecutionAttestation::UnverifiedImport,
+                kind,
+                content,
+                event_index: idx,
+                byte_start,
+                byte_end,
+            });
+        }
+    } else if let Some(arr) = parsed.as_array() {
+        let spans = find_top_level_json_array_spans(body);
+        for (idx, item) in arr.iter().enumerate() {
+            let (byte_start, byte_end) = spans.get(idx).copied().unwrap_or((0, body.len()));
+            let role = item
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("user")
+                .to_string();
+            let content_raw = item
+                .get("text")
+                .or_else(|| item.get("content"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+
+            let kind = if content_raw.contains("tool_result") {
+                "tool_result".to_string()
+            } else {
+                "chat".to_string()
+            };
+
+            let content = content_raw.to_string();
+
+            events.push(ImportedEvent {
+                origin_name: "rsih_pi".into(),
+                role,
+                format: SourceFormat::RsihPiFixture,
+                task_origin: TaskOrigin::ImportedHistory,
+                attestation: ExecutionAttestation::UnverifiedImport,
+                kind,
+                content,
+                event_index: idx,
+                byte_start,
+                byte_end,
+            });
+        }
+    } else {
+        let role = parsed
             .get("role")
             .and_then(|v| v.as_str())
             .unwrap_or("user")
             .to_string();
-        let content_raw = item
+        let content_raw = parsed
             .get("text")
-            .or_else(|| item.get("content"))
+            .or_else(|| parsed.get("content"))
             .and_then(|v| v.as_str())
             .unwrap_or_default();
 
@@ -177,9 +437,6 @@ fn parse_rsih_pi(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<Impor
             "chat".to_string()
         };
 
-        let byte_len = content_raw.len();
-        let content = content_raw.to_string();
-
         events.push(ImportedEvent {
             origin_name: "rsih_pi".into(),
             role,
@@ -187,12 +444,11 @@ fn parse_rsih_pi(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<Impor
             task_origin: TaskOrigin::ImportedHistory,
             attestation: ExecutionAttestation::UnverifiedImport,
             kind,
-            content,
-            event_index: idx,
-            byte_start: current_offset,
-            byte_end: current_offset + byte_len,
+            content: content_raw.to_string(),
+            event_index: 0,
+            byte_start: 0,
+            byte_end: body.len(),
         });
-        current_offset += byte_len + 1;
     }
 
     if events.is_empty() {
@@ -206,10 +462,26 @@ fn parse_rsih_pi(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<Impor
 fn parse_rsia_trace(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<ImportedEvent>> {
     // Check if JSON object or JSONL
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(schema_ver) = parsed
+            .get("schema_version")
+            .and_then(|v| v.as_str())
+            .filter(|&ver| ver != "rsia.trace.v1" && ver != "rsia.optimization.source.v1")
+        {
+            return Err(Error::Invalid(format!(
+                "unknown schema_version: {}",
+                schema_ver
+            )));
+        }
         if let Some(events_arr) = parsed.get("events").and_then(|v| v.as_array()) {
+            if parsed.get("schema_version").is_none() {
+                return Err(Error::Invalid(
+                    "missing schema_version for rsia.trace".into(),
+                ));
+            }
+            let spans = find_json_array_element_spans(body, "events");
             let mut events = Vec::new();
-            let mut current_offset = 0;
             for (idx, item) in events_arr.iter().enumerate() {
+                let (byte_start, byte_end) = spans.get(idx).copied().unwrap_or((0, body.len()));
                 let role = item
                     .get("role")
                     .and_then(|v| v.as_str())
@@ -224,7 +496,6 @@ fn parse_rsia_trace(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<Im
                     .get("content")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                let byte_len = content_raw.len();
                 let content = content_raw.to_string();
 
                 events.push(ImportedEvent {
@@ -236,15 +507,24 @@ fn parse_rsia_trace(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<Im
                     kind,
                     content,
                     event_index: idx,
-                    byte_start: current_offset,
-                    byte_end: current_offset + byte_len,
+                    byte_start,
+                    byte_end,
                 });
-                current_offset += byte_len + 1;
             }
             if !events.is_empty() {
                 return Ok(events);
             }
         } else if parsed.is_object() {
+            if let Some(schema_ver) = parsed
+                .get("schema_version")
+                .and_then(|v| v.as_str())
+                .filter(|&ver| ver != "rsia.trace.v1" && ver != "rsia.optimization.source.v1")
+            {
+                return Err(Error::Invalid(format!(
+                    "unknown schema_version: {}",
+                    schema_ver
+                )));
+            }
             // Single object fixture fallback
             let role = parsed
                 .get("role")
@@ -255,32 +535,53 @@ fn parse_rsia_trace(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<Im
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or(body);
-            let byte_len = content.len();
+            let kind = parsed
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("chat")
+                .to_string();
             return Ok(vec![ImportedEvent {
                 origin_name: "rsia_trace".into(),
                 role,
                 format: SourceFormat::RsiaTraceV1,
                 task_origin: TaskOrigin::ImportedHistory,
                 attestation: ExecutionAttestation::UnverifiedImport,
-                kind: "chat".into(),
+                kind,
                 content: content.to_string(),
                 event_index: 0,
                 byte_start: 0,
-                byte_end: byte_len,
+                byte_end: body.len(),
             }]);
         }
     }
 
     // Line-delimited JSONL
     let mut events = Vec::new();
-    let mut current_offset = 0;
-    for (idx, line) in body.lines().enumerate() {
-        let trimmed = line.trim();
+    let mut offset = 0;
+    for (idx, line) in body.split_inclusive('\n').enumerate() {
+        let trimmed_end = line.trim_end_matches(&['\r', '\n'][..]);
+        let ws_offset = trimmed_end.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+        let trimmed = trimmed_end.trim();
         if trimmed.is_empty() {
+            offset += line.len();
             continue;
         }
+        let byte_start = offset + ws_offset;
+        let byte_end = byte_start + trimmed.len();
+        offset += line.len();
+
         let item: serde_json::Value =
             serde_json::from_str(trimmed).map_err(|_| Error::Invalid("parse_error".into()))?;
+        if let Some(schema_ver) = item
+            .get("schema_version")
+            .and_then(|v| v.as_str())
+            .filter(|&ver| ver != "rsia.trace.v1" && ver != "rsia.optimization.source.v1")
+        {
+            return Err(Error::Invalid(format!(
+                "unknown schema_version: {}",
+                schema_ver
+            )));
+        }
         let role = item
             .get("role")
             .and_then(|v| v.as_str())
@@ -295,7 +596,6 @@ fn parse_rsia_trace(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<Im
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        let byte_len = content_raw.len();
         let content = content_raw.to_string();
 
         events.push(ImportedEvent {
@@ -307,10 +607,9 @@ fn parse_rsia_trace(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<Im
             kind,
             content,
             event_index: idx,
-            byte_start: current_offset,
-            byte_end: current_offset + byte_len,
+            byte_start,
+            byte_end,
         });
-        current_offset += line.len() + 1;
     }
 
     if events.is_empty() {
@@ -323,15 +622,36 @@ fn parse_rsia_trace(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<Im
 
 fn parse_claude_fixture(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<ImportedEvent>> {
     let mut events = Vec::new();
-    let mut current_offset = 0;
+    let mut offset = 0;
 
-    for (idx, line) in body.lines().enumerate() {
-        let trimmed = line.trim();
+    for (idx, line) in body.split_inclusive('\n').enumerate() {
+        let trimmed_end = line.trim_end_matches(&['\r', '\n'][..]);
+        let ws_offset = trimmed_end.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+        let trimmed = trimmed_end.trim();
         if trimmed.is_empty() {
+            offset += line.len();
             continue;
         }
+        let byte_start = offset + ws_offset;
+        let byte_end = byte_start + trimmed.len();
+        offset += line.len();
+
         let item: serde_json::Value =
             serde_json::from_str(trimmed).map_err(|_| Error::Invalid("parse_error".into()))?;
+
+        if let Some(schema_ver) = item.get("schema_version").and_then(|v| v.as_str())
+            && schema_ver != "claude.fixture"
+        {
+            return Err(Error::Invalid(format!(
+                "unknown schema_version: {}",
+                schema_ver
+            )));
+        }
+        if let Some(fmt) = item.get("format").and_then(|v| v.as_str())
+            && fmt != "claude.fixture"
+        {
+            return Err(Error::Invalid(format!("unknown format: {}", fmt)));
+        }
 
         let role = item
             .get("role")
@@ -363,7 +683,6 @@ fn parse_claude_fixture(body: &str, _limits: &ImportForensicLimits) -> Result<Ve
             String::new()
         };
 
-        let byte_len = content_raw.len();
         let content = content_raw;
 
         events.push(ImportedEvent {
@@ -375,10 +694,9 @@ fn parse_claude_fixture(body: &str, _limits: &ImportForensicLimits) -> Result<Ve
             kind,
             content,
             event_index: idx,
-            byte_start: current_offset,
-            byte_end: current_offset + byte_len,
+            byte_start,
+            byte_end,
         });
-        current_offset += line.len() + 1;
     }
 
     if events.is_empty() {
@@ -506,7 +824,11 @@ pub fn ingest_imported_sources(
             if ev.content.len() > limits.max_event_bytes {
                 coverage.char_truncated += 1;
                 coverage.event_truncated += 1;
-                ev.content.truncate(limits.max_event_bytes);
+                let mut trunc_len = limits.max_event_bytes;
+                while !ev.content.is_char_boundary(trunc_len) {
+                    trunc_len -= 1;
+                }
+                ev.content.truncate(trunc_len);
             }
 
             if ev.kind == "tool_result"
@@ -530,15 +852,21 @@ pub fn ingest_imported_sources(
                 counter_examples.push(format!("{}:{}", member_id, ev.event_index));
             }
 
-            if selection.allow_model_excerpts && all_locators.len() < limits.max_excerpts {
-                let excerpt = ev.content.as_bytes();
-                let excerpt_len = excerpt.len().min(limits.max_total_excerpt_bytes);
-                let excerpt_digest = evo_core::hash(&excerpt[..excerpt_len]);
+            if selection.allow_model_excerpts
+                && all_locators.len() < limits.max_excerpts
+                && ev.byte_end <= raw_bytes.len()
+                && ev.byte_start < ev.byte_end
+            {
+                let max_len = (ev.byte_end - ev.byte_start).min(limits.max_total_excerpt_bytes);
+                let excerpt_start = ev.byte_start;
+                let excerpt_end = ev.byte_start + max_len;
+                let excerpt = &raw_bytes[excerpt_start..excerpt_end];
+                let excerpt_digest = evo_core::hash(excerpt);
                 if let Ok(loc) = EvidenceLocator::build(
                     &member_id,
                     &content_digest,
-                    ev.byte_start,
-                    ev.byte_end.max(ev.byte_start + excerpt_len),
+                    excerpt_start,
+                    excerpt_end,
                     ev.event_index,
                     &excerpt_digest,
                 ) {
