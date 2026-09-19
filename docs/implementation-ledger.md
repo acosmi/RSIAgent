@@ -261,3 +261,32 @@ E07管理增量、E10–E13已按上述子范围验收、提交、推送并分�
 每项先登记任务号、E归属、范围、文件白名单、依赖和验收条件。未冻结合同或外部条件准确登记，只阻塞依赖项，其他工作继续。实施方自测完成记implemented_not_verified，不能自报主控verified。现有14个PR的未合并状态不因本次授权而自动改变。
 
 AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基线建立独立增量PR，以E13交付分支为base。这样不把已有E11–E13代码混入旧E10 PR #39；PR通过前不合并，提PR后连续处理下一任务。
+
+### AG-001 / E10 现有 replay.run 管理消费者实施与自测
+
+- 任务号：AG-001
+- E 归属：E10
+- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- base 分支：`wrokbot/v4.1-pr-e13-monitoring`
+- head 分支：`wrokbot/ag-001-e10-replay-management`
+- PR：草稿 PR（待通过 gh pr create 建立独立 PR）
+- merged_sha: null
+
+依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150` 与 `AG-001-E10-replay-management.md` 冻结最小合同。
+文件白名单修改：
+1. `crates/evo-storage/src/replay.rs`: 仅将既有 `replay_pool_storage_id` 暴露为 `pub` 只读 helper，供 dispatch 构造依赖边复用，未修改任何内部存储语义。
+2. `crates/evo-engine/src/dispatch.rs`: 新增 `ManagementResult::ReplayStored { report_id, pool_digest, semantic_reports_digest }`、`ReplayRunRequest`、`ParsedRequest::ReplayRun`；在 `validate_request_authority` 限制仅 Admin 启动；在 `private_dependencies` 追加 `job -> private_input -> pool` 依赖边；通过 `checkpoint_claim` 校验租约与取消后调用既有 `run_and_persist_pool_replay`；在 `status` 针对成功结果调用 `verified_replay_report_view` 严加核验（若来源撤销、缺池/报告、水位变更则拒绝返回成功结果，历史取消/失败状态不因缺失产物复活）。
+3. `crates/evo-engine/tests/dispatch_management.rs`: 将原有 blocked 测试代表替换为 `curriculum.step`；新增真实 SQLite sealed Train+Select pool fixture 下的 `replay.run` 完整生命周期测试（Admin 异步提交即刻返回 queued、后台执行 succeeded 与 ReplayStored 字段核对、依赖边断言、幂等性、异输入同 key 冲突、角色拒绝、未知字段/版本拒绝、缺池失败、来源撤销阻断 status、进程崩溃恢复复用确定性报告等）。
+4. `crates/evo-http/tests/service.rs`: 原 blocked 路由测试调整为 `curriculum.step`；新增真实 listener 的 `authenticated_async_replay_flow_and_role_rejection` 测试，覆盖未认证 401、非 Admin（Agent/Evaluator）403、认证 Admin 200 返回 queued job、后台执行至 succeeded 以及 GET `/v1/manage/jobs/{id}` 校验与非 owner 拒绝。
+
+自测证据（全部 exit 0）：
+- `cargo test --locked --offline -p evo-engine --test dispatch_management --test replay_v41`: 13 + 13 = 26 项通过。
+- `cargo test --locked --offline -p evo-http --test service`: 3 项通过。
+- `cargo clippy --locked --offline -p evo-engine -p evo-http -p evo-storage --all-targets -- -D warnings`: 检查通过，无 warning。
+- `cargo fmt --all -- --check`: 格式化检查通过。
+
+未完成项与边界：
+- 管理接口中 `exploration.start` / `curriculum.step` / `meta.start` 仍为 `blocked_feature`；
+- E03 可信执行/评分回执 schema 与真实周期更新仍待实现；
+- 真实模型调用预算仍为 0，W_sim=1/2/4 仅限纯数据仿真语义，不冒充真实生产或正式验收。
+
