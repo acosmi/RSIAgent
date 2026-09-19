@@ -1,6 +1,7 @@
 //! Transactional typed documents, idempotency, audit and disposable FTS5 indexes.
 //! This crate never connects to a model or executes candidate content.
 pub mod budget;
+pub mod lifecycle;
 
 use evo_core::{Context, Error, Result, fingerprint, hash, identifier, now, search_tokens};
 use serde::{Serialize, de::DeserializeOwned};
@@ -11,13 +12,16 @@ use sqlx::{
 };
 use std::{
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
+use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
     root: PathBuf,
+    blob_lock: Arc<RwLock<()>>,
 }
 pub struct Session {
     tx: Transaction<'static, Sqlite>,
@@ -49,7 +53,11 @@ impl Store {
             .run(&pool)
             .await
             .map_err(internal)?;
-        Ok(Self { pool, root })
+        Ok(Self {
+            pool,
+            root,
+            blob_lock: Arc::new(RwLock::new(())),
+        })
     }
     pub async fn session(&self) -> Result<Session> {
         Ok(Session {
@@ -66,38 +74,7 @@ impl Store {
             .map_err(internal)
     }
     pub async fn backup(&self, destination: &Path) -> Result<()> {
-        if destination.exists() {
-            return Err(Error::Conflict("backup destination already exists".into()));
-        }
-        tokio::fs::create_dir_all(destination)
-            .await
-            .map_err(internal)?;
-        let target = destination.join("rsia.sqlite3");
-        sqlx::query("VACUUM INTO ?")
-            .bind(target.to_string_lossy().as_ref())
-            .execute(&self.pool)
-            .await
-            .map_err(internal)?;
-        let source = self.root.join("blobs");
-        if source.exists() {
-            let mut dirs = tokio::fs::read_dir(source).await.map_err(internal)?;
-            while let Some(entry) = dirs.next_entry().await.map_err(internal)? {
-                if !entry.file_type().await.map_err(internal)?.is_dir() {
-                    continue;
-                }
-                let dst = destination.join("blobs").join(entry.file_name());
-                tokio::fs::create_dir_all(&dst).await.map_err(internal)?;
-                let mut files = tokio::fs::read_dir(entry.path()).await.map_err(internal)?;
-                while let Some(f) = files.next_entry().await.map_err(internal)? {
-                    if f.file_type().await.map_err(internal)?.is_file() {
-                        tokio::fs::copy(f.path(), dst.join(f.file_name()))
-                            .await
-                            .map_err(internal)?;
-                    }
-                }
-            }
-        }
-        Ok(())
+        crate::lifecycle::backup_consistent(self, destination).await
     }
     /// Caller must register the returned digest and owner through a trusted host operation.
     pub async fn put_blob(&self, ctx: &Context, bytes: &[u8]) -> Result<String> {
@@ -105,6 +82,7 @@ impl Store {
         if bytes.is_empty() || bytes.len() > 1024 * 1024 {
             return Err(Error::Invalid("blob must be 1..=1048576 bytes".into()));
         }
+        let _guard = self.blob_lock.write().await;
         let digest = hash(bytes);
         let dir = self
             .root
@@ -123,6 +101,7 @@ impl Store {
         if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(Error::Invalid("invalid content digest".into()));
         }
+        let _guard = self.blob_lock.write().await;
         let path = self
             .root
             .join("blobs")
@@ -528,6 +507,9 @@ mod tests {
         let c = Context::new("n", "a", Role::Admin).unwrap();
         let mut t = s.session().await.unwrap();
         t.audit(&c, "test", "x").await.unwrap();
+        t.bump_watermark(&c, &hash(b"initial-watermark"))
+            .await
+            .unwrap();
         t.commit().await.unwrap();
         assert_eq!(s.verify_audit(&c).await.unwrap(), 1);
         let backup = d.path().join("backup");

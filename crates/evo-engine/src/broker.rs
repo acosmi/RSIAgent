@@ -308,6 +308,42 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         call: BudgetCallRecord,
     ) -> Result<ModelResponse> {
         if let Some(artifact) = call.response_artifact.clone() {
+            if artifact.schema_version == "rsia.redacted.v1" {
+                if let (
+                    Some(dispatch_id),
+                    Some(provider_request_id),
+                    Some(usage_record_id),
+                    Some(provenance),
+                ) = (
+                    call.dispatch_id.clone(),
+                    call.provider_request_id.clone(),
+                    call.usage_record_id.clone(),
+                    call.execution_provenance,
+                ) {
+                    return Ok(ModelResponse::Rejected {
+                        request_id: request.request_id.clone(),
+                        kind: ModelRejectionKind::CancelledAfterDispatch,
+                        reason: "model response content was revoked and cannot be reused".into(),
+                        dispatch: RejectedDispatch::Dispatched {
+                            receipt: ModelExecutionReceipt {
+                                call_id: call.call_id.clone(),
+                                dispatch_id,
+                                root_budget_id: root.root_budget_id.clone(),
+                                provider_request_id,
+                                usage_record_id,
+                                provenance: engine_provenance(provenance),
+                            },
+                        },
+                    });
+                }
+                return Ok(ModelResponse::Uncertain {
+                    request_id: request.request_id.clone(),
+                    dispatch_id: call.dispatch_id.clone().ok_or(Error::Internal)?,
+                    root_budget_id: root.root_budget_id.clone(),
+                    provider_request_id: call.provider_request_id,
+                    usage_record_id: call.usage_record_id,
+                });
+            }
             if !call.execution_closed {
                 let dispatch_id = call.dispatch_id.as_deref().ok_or(Error::Internal)?;
                 self.store
@@ -419,7 +455,16 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
             lease_until,
             now,
         };
-        let mut call = match self.store.reserve_budget_call(&ctx, &reservation).await {
+        let source_ids = request
+            .source_closure
+            .iter()
+            .map(|source| source.id.clone())
+            .collect::<Vec<_>>();
+        let mut call = match self
+            .store
+            .reserve_budget_call_with_sources(&ctx, &reservation, &source_ids)
+            .await
+        {
             Ok(call) => call,
             Err(error) => {
                 return Ok(ModelResponse::Rejected {
@@ -736,6 +781,13 @@ fn storage_provenance(value: ModelExecutionProvenance) -> BudgetExecutionProvena
     match value {
         ModelExecutionProvenance::Fixture => BudgetExecutionProvenance::Fixture,
         ModelExecutionProvenance::ExternalProvider => BudgetExecutionProvenance::ExternalProvider,
+    }
+}
+
+fn engine_provenance(value: BudgetExecutionProvenance) -> ModelExecutionProvenance {
+    match value {
+        BudgetExecutionProvenance::Fixture => ModelExecutionProvenance::Fixture,
+        BudgetExecutionProvenance::ExternalProvider => ModelExecutionProvenance::ExternalProvider,
     }
 }
 
