@@ -512,6 +512,63 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - SO01–SO18 的 commit/blob_sha/license 状态未做新的远程重验证，继续保持 `unverified`/`reference_pins_only` 既有声明不变；
 - 本任务未触碰任何 `crates/*/src` 运行时代码、未新增公开契约、未触碰主控正在返修的 `wrokbot/controller-e16-repairs-20260919`。
 
+### CP-002 / 新增 support-scope.json 独立复核脚本 check_support_scope.py（Copilot 桌面实施，队列第二项）
+
+- 任务号：CP-002
+- E 归属：E16.6 配套工具（不新增/不修改 E 任务范畴本身）
+- 状态：`implemented_not_verified`（待 Codex 主控独立验收；本任务不自行标记 verified，不填写 merged_sha）
+- base 分支：`wrokbot/ag-007-e16-6-release-ledger`（在 CP-001 实际推送的 head 提交 `de71b7d` 之上新开分支，非重新分叉 AG-007 原始提交）
+- head 分支：`wrokbot/copilot-cp002-scope-checker`
+- PR：新开独立草稿 PR（不合并；base=`wrokbot/ag-007-e16-6-release-ledger`）
+- merged_sha: null
+
+任务目标：提供一个只读、无第三方依赖的独立命令行工具，对 `reports/support-scope.json` 做结构化复核 —— 校验路径安全（拒绝绝对路径/`..`逃逸/软链接组件）、B/U/K/SO/V 五类追踪链精确集合校验（而非仅长度比较）、`test_command` 与 `test_files` 一致性解析、CP-001 冻结的 `plan_version`/`plan_sha256`/`declaration` 等标识核对，且明确不构成主控验收或合并授权。
+
+文件白名单修改（严格未超出 TASK-CP002 白名单）：
+1. `scripts/check_support_scope.py`（新增，约19KB）：只读检查器，仅使用 Python 标准库（`argparse`/`dataclasses`/`hashlib`/`json`/`re`/`pathlib`/`typing`），不执行 `test_command`、不发起网络请求、不写任何文件，仅向 stdout 输出 JSON 报告。
+2. `scripts/test_check_support_scope.py`（新增，约15KB）：`unittest` 自测套件，全部使用 `tempfile.TemporaryDirectory` 构造隔离夹具，不触碰仓库真实文件（除最后一项显式对真实清单只读运行的用例）。
+3. `docs/implementation-ledger.md`：新增本条目（不改动 CP-001/AG-007 原记录，如实并列存档）。
+4. 未修改 `reports/support-scope.json`：核实检查器无需清单自身声明任何 schema/入口引用即可运行，故未触碰该文件，避免超出必要范围。
+
+关键设计决策（供主控复核依据，均在代码注释中同步留痕）：
+- `--source-of-truth` 参数**不**做仓库根目录内路径逃逸限制（与清单声明路径、`--manifest` 参数本身的处理不同），因其设计定位是仓库外部的本地方案原文引用文件，依据 RULES.md「方案原文与内部合同仅本地保留、不入库」的明确要求，判定其本就应指向仓库之外。
+- `so_sources` 的 `commit`/`blob_sha` 仅做**格式校验**（40位十六进制），不锁定为当前特定提交值，以保持工具跨版本可复用；与 `support_scope.rs` 集成测试里锁定当前清单具体值的严格程度有意区分（后者是回归测试，前者是通用结构检查器）。
+- `plan_version`（`v4.1`）、`plan_sha256`（见下）、`declaration`（`subset_only`）等作为 CP-001 冻结基线**硬编码**在脚本中，视为本轮不可变的验收前提。
+- `REQUIRED_E_SCOPE_KEYS` 按"下限子集"而非"精确相等"校验，容忍未来新增 E17/E18 而无需改动脚本。
+- 退出码：0=结构有效，1=发现任意结构性问题（统一处理，便于测试断言）；2 保留给 `argparse` 自身的用法错误处理，未手动占用。
+
+自测证据（均在独立工作树 `wrokbot/copilot-cp002-scope-checker` 分支执行，Python 3.14.5，仅标准库，无第三方依赖）：
+- `python3 -m py_compile scripts/check_support_scope.py scripts/test_check_support_scope.py`：通过，无语法错误。
+- `python3 -m unittest scripts.test_check_support_scope -v`：17 项全部通过（exit 0），分布：
+  - `ValidManifestTests`（4 项）：合法清单结构校验通过；source-of-truth 哈希匹配/不匹配/缺失三种分支行为正确；
+  - `RejectionTests`（8 项）：重复 ID、长度正确但成员错误的 ID 集合、不存在的 impl 文件、非法 SO 哈希格式、伪造测试目标（含"文件不存在"与"未在 test_files 声明"两个子类）、`verified` 无证据、`planned` 状态豁免不误伤，均按预期拒绝/放行。
+  - `PathSafetyTests`（4 项）：绝对路径、`..`逃逸、软链接组件、`--manifest` 参数自身逃逸仓库根目录，均按预期拒绝。
+  - `RealRepositoryTests`（1 项）：对本工作树内真实的 `reports/support-scope.json`（即 CP-001 已修正版本）只读运行，如实记录观测结果（见下），不预设通过/失败。
+- 对真实清单的端到端直接调用（`python3 scripts/check_support_scope.py --repo-root <repo> --manifest reports/support-scope.json --source-of-truth <本地方案原文路径>`），捕获的实际输出：
+  ```json
+  {
+    "structure_valid": true,
+    "input_binding_available": true,
+    "errors": [],
+    "needs_verification": [
+      "test_command targets were parsed and confirmed to exist; none were executed by this checker, so pass/fail of the underlying test suite is not itself confirmed by this run",
+      "so_sources commit/blob_sha were format-validated only; upstream reachability, content, and license status were not re-verified"
+    ],
+    "plan_version": "v4.1",
+    "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150"
+  }
+  ```
+  exit code: 0（本地方案原文文件的 SHA-256 与脚本内冻结常量一致，`input_binding_available=true`）。
+- `python3 -c "..."` 粗粒度未用导入扫描：确认两个新文件均无死代码导入（已移除一处未使用的 `Iterable` 导入）。
+- 复核确认：运行过程未在真实仓库中留下任何临时/残留文件（`git status --porcelain` 仅显示两个新增脚本本身）。
+
+未完成项与边界（如实记录，不夸大范围）：
+- 本脚本**不执行**任何 `test_command`，仅解析并核实其目标文件存在性与声明一致性；底层 Rust/其他测试套件本身是否通过，不由本工具确认，脚本自身的 JSON 输出中已包含此免责声明（`disclaimer` 字段）。
+- `so_sources` 的 commit/blob_sha 未做上游可达性、内容或许可证的重新核验，仍是格式层面的静态校验。
+- `structure_valid=true` 或 exit 0 不构成、也不代表 Codex 主控验收、合并授权或生产就绪判断；这一点已写入工具自身输出的 `disclaimer` 字段与本条目标题，避免被误用为通过凭证。
+- 未新增任何 `reports/support-scope.json` schema 变更；若后续主控认为需要在清单中声明"入口脚本"引用，需另行开卡处理，本任务未擅自扩展。
+- 未触碰任何 `crates/*/src` 运行时代码、未触碰主控正在返修的 `wrokbot/controller-e16-repairs-20260919`。
+
 
 
 
