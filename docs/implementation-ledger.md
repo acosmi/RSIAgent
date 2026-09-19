@@ -497,7 +497,7 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
 - base 分支：`wrokbot/ag-008-e17-scorer-rejection`
 - head 分支：`wrokbot/ag-009-e18-code-pr-rejection`
-- PR：待推送并创建
+- PR：[PR #51](https://github.com/acosmi/RSIAgent/pull/51)
 - merged_sha: null
 
 依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §10、§12、§13.2 E18 及 V041 场景族。
