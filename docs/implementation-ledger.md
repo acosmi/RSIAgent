@@ -463,6 +463,34 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - 本项目声明 subset_only，不将父任务全绿，未在真实付费生产环境中声称实际经济收益；
 - 历史 v3.3/v4 在规范上已被替代，物理归档据实保留，未提供的旧测试断言保持 legacy_equivalence_unverified。
 
+### AG-008 / E17 开发代理评分器演化默认关闭与安全拒绝门禁实施与自测
+
+- 任务号：AG-008
+- E 归属：E17
+- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- base 分支：`wrokbot/ag-007-e16-6-release-ledger`
+- head 分支：`wrokbot/ag-008-e17-scorer-rejection`
+- PR：[PR #50](https://github.com/acosmi/RSIAgent/pull/50)
+- merged_sha: null
+
+依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §10、§13.2 E17 及 V040 场景族。
+文件白名单修改：
+1. `crates/evo-core/src/features.rs`: 严格锁定 E17 状态为默认关闭（`enable_agent_scorer_evolution(true)` 强行返回拒绝错误，最终裁决权不可由候选修改）；实现 V040 评分器演化安全拒绝门禁 `validate_e17_scorer_gates`（严禁候选试图修改 final_acceptance_grader / acceptance_policy / independent_evaluator、严禁候选自批自身成绩、严禁在缺乏外部锚定与重测的情况下跨 epoch 直接混用或平均评分）。
+2. `crates/evo-core/tests/e17_rejection_v41.rs`: 新增集成测试套件，全面覆盖 V040 拒绝路径（功能开关关闭、修改最终验收器拒绝、自批自评拒绝、跨 epoch 混合分数拒绝）。
+
+自测证据（全部 exit 0）：
+- `cargo test --locked --offline -p evo-core --test e17_rejection_v41`: 4 项全部通过。
+- `cargo test --locked --offline -p evo-core --lib features::tests`: 2 项全部通过。
+- `cargo test --locked --offline -p evo-core`: 全量测试全部通过。
+- `cargo clippy --locked --offline -p evo-core --all-targets -- -D warnings`: 检查通过，无 warning。
+- `cargo fmt --all -- --check`: 格式化检查通过。
+
+未完成项与边界：
+- E18、E14、E15 仍为 planned；
+- E17 为可选扩展且默认关闭，最终裁决权不向候选开放；
+- 本轮仅实现并验证其安全拒绝路径，不开启真实在线代理评分器自我演化。
+
+
 
 
 
