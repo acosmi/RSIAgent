@@ -1974,14 +1974,8 @@ fn decode_outcome(value: serde_json::Value) -> Result<OptimizationStepOutcome> {
     }
 }
 
-pub async fn run_optimization_step(
-    model: Option<&dyn ModelPort>,
-    runner: Option<&dyn DevRunner>,
-    journal: Option<&dyn OptimizationJournal>,
-    request: OptimizationStepRequest<'_>,
-) -> Result<OptimizationStepOutcome> {
-    let journal = journal.ok_or(Error::NotFound)?;
-    let input = serde_json::json!({"evidence":request.evidence, "selection":request.source_selection,
+fn optimization_request_input(request: &OptimizationStepRequest<'_>) -> serde_json::Value {
+    serde_json::json!({"evidence":request.evidence, "selection":request.source_selection,
         "bindings":request.source_bindings.iter().map(|b| (&b.source_id,&b.source_digest,&b.parent_family)).collect::<Vec<_>>(),
         "traces":request.traces, "context":request.model_context, "parent":request.parent_skill,
         "trusted_edit_context":format!("{:?}",request.edit_context), "edit_template":request.edit_batch_template,
@@ -1989,14 +1983,28 @@ pub async fn run_optimization_step(
         "baseline":request.bundle_context.baseline,"parent_strategy":request.bundle_context.parent_strategy,
         "baseline_strategy":request.bundle_context.baseline_strategy,"improver":request.bundle_context.improver_patch,
         "caps":request.bundle_context.caps,"revoked":request.bundle_context.revoked,
-        "development":request.development_request,"allow_rank":request.allow_rank_call});
+        "development":request.development_request,"allow_rank":request.allow_rank_call})
+}
+
+pub(crate) fn optimization_request_digest(request: &OptimizationStepRequest<'_>) -> Result<String> {
+    fingerprint(&optimization_request_input(request))
+}
+
+pub async fn run_optimization_step(
+    model: Option<&dyn ModelPort>,
+    runner: Option<&dyn DevRunner>,
+    journal: Option<&dyn OptimizationJournal>,
+    request: OptimizationStepRequest<'_>,
+) -> Result<OptimizationStepOutcome> {
+    let journal = journal.ok_or(Error::NotFound)?;
+    let input = optimization_request_input(&request);
     let context = request.model_context.clone();
     let prepared = recovery_fact(
         &context,
         OptimizationJournalStage::Merge,
         StageFactKind::StepPrepared,
         context.request_id.clone(),
-        fingerprint(&input)?,
+        optimization_request_digest(&request)?,
         input,
     )?;
     let mut terminal = recovery_fact(
