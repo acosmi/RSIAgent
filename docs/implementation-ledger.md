@@ -574,3 +574,15 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 
 
 
+
+
+### CTRL-CP001-R1 / 原PR #49：全链索引返修与主控独立复核
+
+- 唯一第一真源 `v4.1` / SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`。本条修复原CP-001/AG-007，仍使用 [PR #49](https://github.com/acosmi/RSIAgent/pull/49)，草稿未合并，`merged_sha: null`。
+- 已测源码 `source_sha: 45f0e76e4e50830ddc1408827c0f8985857c1871`；输入基线 `de71b7d0ea58039051b4825b5a244d334d1d1949`。本地清单 `out/controller-final-e16-20260919/cp001-final-input.json`，SHA-256 `04c2dc650000fe91edc136f999ec7e6fec8873e7c381dd7440af0fff5ff537c8`；代码提交前后两个白名单文件hash逐项相同。
+- 修复：support-scope.v2精确保留19个E主任务及6子包；执行场景与全链索引责任分开，V范围展开；B/U/K规范纳入/实现/验证/效果四列及SO固定仓库/commit/path/blob/许可/本地参考落点均完整，不把reference pins称上游复验。
+- 父E的工程欠缺、外部条件、未验证范围分别保留；已验子范围单列真实source/PR/每项实际merge SHA/输入清单hash/命令/exit/日志/结果/风险与回滚点，不能仅凭文件存在或测试命令字符串升级verified。非零exit、缺证据、断链、假target/额外命令及任一symlink组件拒绝。
+- 主控亲自核对：16条历史/当前验收记录的本地输入清单摘要、日志存在性、源码commit存在性，以及已合并项source→对应merged commit祖先关系；18条SO与28条B/U/K的E/V映射独立对照第一真源。没有上传这些内部输入/原始日志。
+- 主控在隔离源码上实际运行 `cargo test --locked --offline -p evo-core --test support_scope`，10 passed / exit 0；相同目标clippy `-D warnings`及workspace格式检查exit 0。环境 `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`。原始日志仅本地 `out/controller-final-e16-20260919/cp001-final-[0-2].log`；命令记录 `cp001-final-results.json`。
+- 本轮通过范围仅为该派生索引的结构、规范映射和已记录元数据校核；不替代当前业务执行、宿主、模型、效果或部署验收。整E16.6及全路线仍未完成；CP-002/PR #53检查器须适配此v2并修复主控7个漏检反例，当前未验收。
+- 回滚：通过独立回退PR撤回派生索引；保留全部历史证据/费用/撤销状态。不改变唯一真源。未运行 cargo xtask ci、Actions、付费调用或发布；最终统一合并仍由主控执行。
