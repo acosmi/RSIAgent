@@ -139,10 +139,26 @@ pub fn verify_host_receipt(receipt: &HostExecutionReceipt) -> Result<()> {
             "receipt_forgery: cannot claim 'used' when execution omitted tool invocation".into(),
         ));
     }
+    if receipt.stage == HostToolStage::Offered
+        && (receipt.claimed_used
+            || receipt.claimed_benefit
+            || receipt.attribution == SkillAttribution::VerifiedBenefit)
+    {
+        return Err(Error::Invalid(
+            "receipt_forgery: offered stage cannot claim used, benefit, or verified benefit".into(),
+        ));
+    }
     if receipt.attribution != SkillAttribution::VerifiedBenefit && receipt.claimed_benefit {
         return Err(Error::Invalid(
             "receipt_forgery: cannot claim verified benefit without independent verification"
                 .into(),
+        ));
+    }
+    if receipt.stage != HostToolStage::Used
+        && (receipt.claimed_used || receipt.attribution == SkillAttribution::VerifiedBenefit)
+    {
+        return Err(Error::Invalid(
+            "receipt_forgery: cannot claim used or verified benefit when stage is not Used".into(),
         ));
     }
     Ok(())

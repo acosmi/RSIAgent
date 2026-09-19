@@ -397,12 +397,15 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 3. `crates/evo-engine/tests/hosts_v41.rs`: 新增集成测试套件，全面覆盖 V002, V003, V009, V037, V039, V060, V061, V062, V077, V087, V091, V092, V098 全部测试场景。
 
 自测证据（全部 exit 0）：
-- `cargo test --locked --offline -p evo-engine --test hosts_v41`: 8 项全部通过。
+- `cargo test --locked --offline -p evo-engine --test hosts_v41`: 9 项全部通过（含主控对抗缺陷 F06 Offered 回执防伪门禁回归测试）。
 - `cargo test --locked --offline -p evo-engine --lib hosts::tests`: 2 项全部通过。
 - `cargo test --locked --offline -p evo-engine --test seeds_v41`: 5 项全部通过。
 - `cargo test --locked --offline -p evo-engine`: 全量测试全部通过。
 - `cargo clippy --locked --offline -p evo-engine --all-targets -- -D warnings`: 检查通过，无 warning。
 - `cargo fmt --all -- --check`: 格式化检查通过。
+
+主控审阅缺陷整改记录（PR #47）：
+- **F06（Offered 与未真正使用阶段的防伪回执核验）**：在 `verify_host_receipt` 中强制检查工具执行阶段：`stage == HostToolStage::Offered` 时严禁认领 `claimed_used`、`claimed_benefit` 或 `attribution == SkillAttribution::VerifiedBenefit`；非 `Used` 阶段（包括 Offered/Attached/Truncated/Omitted）一律拒绝认领完整 Used 或 VerifiedBenefit，杜绝调用方伪造回执。
 
 未完成项与边界：
 - E16.5、E16.6、E14、E15 仍为 planned；
