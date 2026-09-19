@@ -1,30 +1,4132 @@
 {
-  "plan_version": "v3.3",
-  "plan_sha256": "1b5870341be7c027c369a08c6e6bfd8f06dc494fc7174fff8930f42ae247294a",
+  "schema_version": "rsia.support_scope.v2",
+  "plan_version": "v4.1",
+  "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+  "derived_index_notice": "This file is a checked derivative; the pinned v4.1 plan remains the sole normative source.",
   "declaration": "subset_only",
   "not_full_route_complete": true,
   "legacy_equivalence_unverified": true,
   "dimensions": {
-    "engineering": "implemented_not_verified_locally",
-    "host": "reference_host_structural_only",
+    "engineering": "controller_verified_subscopes_with_incomplete_parent_tasks",
+    "host": "reference_host_structural_only; claude_code_blocked",
     "model": "blocked_no_credentials",
     "effect": "not_claimed",
     "deploy": "loopback_local_only"
   },
   "blocked": [
-    "original_local_package",
-    "increment_zip",
-    "github_actions_billing_lock",
     "real_model_credentials",
     "claude_code_extra_host",
-    "paid_experiments"
+    "paid_experiments",
+    "historical_t001_t126_reconciliation",
+    "e14_improver_inheritance_frozen_mechanism",
+    "e15_cross_gen_real_experiment"
   ],
   "explicitly_out_of_scope_until_revised": [],
-  "optional_disabled": ["E17", "E18"],
-  "b01_b10": {
-    "spec": "included",
-    "implementation": "partial_structural",
-    "verification": "local_tests_not_ci",
-    "effect": "not_claimed"
+  "optional_disabled": [
+    "E17",
+    "E18"
+  ],
+  "overall_remaining": [
+    "E14 and E15 research work",
+    "real provider credentials and paid experiments",
+    "real Claude Code extra-host verification",
+    "production deployment and effect evidence",
+    "historical T001-T126 assertion reconciliation"
+  ],
+  "e_scopes": {
+    "E00": {
+      "title": "Fixed Baseline, Source Reconciliation, Scope Boundaries",
+      "status": "implemented_not_verified",
+      "status_reason": "historical T001-T126 assertions were not supplied; legacy equivalence remains unverified",
+      "implementation_files": [
+        "scripts/smoke_workspace.py",
+        "scripts/inventory_baseline_tests.py",
+        "crates/evo-engine/src/evaluator.rs"
+      ],
+      "scenarios": [
+        "V001",
+        "V071",
+        "V072",
+        "V073",
+        "V080",
+        "V098"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E00.controller_acceptance",
+          "description": "fixed baseline directed regression only",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "ef8244dae4b5dd173987e78915500cc997dcd9b0",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/29",
+          "merged_sha": "28f892c3d68591d201a8029345257f051fb123ef",
+          "test_entry": "crates/evo-engine/src/evaluator.rs",
+          "command": "cargo test --locked --offline -p evo-engine --lib evaluator::tests",
+          "input_digest": "e4a0a35dd9ee7b9194892387fd61f1934ee653d127f4dae9f442b6f8a0a1def7",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e00-directed-test.log",
+          "actual_result": "1 evaluator regression passed",
+          "scope": "fixed baseline directed regression only",
+          "risk": "historical T001-T126 assertions were not supplied; legacy equivalence remains unverified",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e00.json"
+        }
+      ],
+      "remaining": [
+        "historical T001-T126 assertions were not supplied; legacy equivalence remains unverified"
+      ]
+    },
+    "E01": {
+      "title": "Statistical & Holdout Contract",
+      "status": "blocked",
+      "status_reason": "real independent holdout execution and paid formal experiment remain unverified",
+      "implementation_files": [
+        "crates/evo-core/src/evaluation.rs",
+        "crates/evo-core/src/holdout.rs",
+        "crates/evo-core/src/sequential.rs"
+      ],
+      "scenarios": [
+        "V010",
+        "V011",
+        "V012",
+        "V013",
+        "V084",
+        "V085",
+        "V096",
+        "V097"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E01.controller_acceptance",
+          "description": "statistical and holdout contract subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "c5ac47d506a98a9feb0b65fac6815e80087c8f49",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/30",
+          "merged_sha": "faec991036f03f27cf6d2ad3db86f841815fc828",
+          "test_entry": "crates/evo-core/tests/evaluation_v41.rs",
+          "command": "cargo test --locked --offline -p evo-core --test evaluation_v41",
+          "input_digest": "e30d77b22db111ec01676b6bcc93df70eee042484316644bda85d0e2d00edc92",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e01-tests.log",
+          "actual_result": "13 evaluation_v41 tests passed",
+          "scope": "statistical and holdout contract subset",
+          "risk": "real independent holdout execution and paid formal experiment remain unverified",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e01-input.json"
+        }
+      ],
+      "remaining": [
+        "real independent holdout execution and paid formal experiment remain unverified"
+      ]
+    },
+    "E02": {
+      "title": "Bounded Atomic Skill Edit Pure Compiler Scope",
+      "status": "in_progress",
+      "status_reason": "full host application and multi-skill production behavior remain unverified",
+      "implementation_files": [
+        "crates/evo-core/src/skill_edit.rs",
+        "crates/evo-engine/src/compiler.rs"
+      ],
+      "scenarios": [
+        "V002",
+        "V003",
+        "V005",
+        "V009",
+        "V043",
+        "V044",
+        "V045",
+        "V046",
+        "V047",
+        "V048",
+        "V060",
+        "V062",
+        "V078",
+        "V079",
+        "V081",
+        "V082",
+        "V083",
+        "V084",
+        "V085",
+        "V086",
+        "V087",
+        "V088",
+        "V089",
+        "V090",
+        "V091",
+        "V092",
+        "V093",
+        "V094",
+        "V095",
+        "V096"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E02.controller_acceptance",
+          "description": "bounded atomic edit/compiler subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "79af6c515b3afdf36778ee57ba2f140a22a3c0e0",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/31",
+          "merged_sha": "dfc861ce7572f8f9f49a8aaf9f0cc1687cba57f9",
+          "test_entry": "crates/evo-core/tests/skill_edit.rs",
+          "command": "cargo test --locked --offline -p evo-core --test skill_edit",
+          "input_digest": "0885dd7d111c1368fcdc3be7f7ab98bdea6c1b370ff230ae2b30564158c45dec",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e02-tests.log",
+          "actual_result": "14 skill_edit tests passed",
+          "scope": "bounded atomic edit/compiler subset",
+          "risk": "full host application and multi-skill production behavior remain unverified",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e02-formatted-input.json"
+        }
+      ],
+      "remaining": [
+        "full host application and multi-skill production behavior remain unverified"
+      ]
+    },
+    "E03": {
+      "title": "Real Application Diagnosis, Small-batch Reflection, Model Consumers",
+      "status": "in_progress",
+      "status_reason": "engineering: verified_development_observation_in_session still rejects because a trusted execution/grader receipt schema is unavailable",
+      "implementation_files": [
+        "crates/evo-core/src/optimization.rs",
+        "crates/evo-engine/src/optimization.rs",
+        "crates/evo-engine/src/model.rs",
+        "crates/evo-engine/src/evidence.rs"
+      ],
+      "scenarios": [
+        "V004",
+        "V005",
+        "V006",
+        "V017",
+        "V051",
+        "V052",
+        "V054",
+        "V055",
+        "V056",
+        "V057",
+        "V058",
+        "V087",
+        "V088",
+        "V089",
+        "V090",
+        "V094",
+        "V096"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E03.controller_acceptance",
+          "description": "program-fixture optimization consumer subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "727e9cca8d4118dd207b1ad5ab043c2b6229fef7",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/32",
+          "merged_sha": "9b13237af884c525652813ea508eb8c5f100d6f8",
+          "test_entry": "crates/evo-engine/tests/optimization.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test optimization",
+          "input_digest": "61f6e470ac3a2488ded8fde15786b1f6f327fe7fca3c2b93fbde62b2a939ebec",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e03-final-tests.log",
+          "actual_result": "7 optimization integration tests passed",
+          "scope": "program-fixture optimization consumer subset",
+          "risk": "real provider execution and production G1 effect remain unverified",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e03-final-input.json"
+        }
+      ],
+      "remaining": [
+        "engineering: verified_development_observation_in_session still rejects because a trusted execution/grader receipt schema is unavailable",
+        "external: real provider, independent process and production G1 effect evidence are unavailable"
+      ]
+    },
+    "E04": {
+      "title": "Persistent Root Budget, Broker, Cancellation & Reconciliation",
+      "status": "in_progress",
+      "status_reason": "engineering: no actual provider transport or qualified isolated runner is wired to the accepted budget/broker subset",
+      "implementation_files": [
+        "crates/evo-storage/src/budget.rs",
+        "crates/evo-engine/src/broker.rs",
+        "crates/evo-engine/src/executor.rs"
+      ],
+      "scenarios": [
+        "V007",
+        "V008",
+        "V009",
+        "V038",
+        "V083",
+        "V085",
+        "V086",
+        "V087",
+        "V093",
+        "V094",
+        "V096"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E04.controller_acceptance",
+          "description": "persistent root budget and accounting subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "f02e535798423aaef930e915b2af081c110adf0e",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/33",
+          "merged_sha": "c1cf6a2e91253218033b5883a11baa02c85a5d43",
+          "test_entry": "crates/evo-storage/tests/budget.rs",
+          "command": "cargo test --locked --offline -p evo-storage --test budget",
+          "input_digest": "24d50350c1948b5d2e037443d0ec419c5a6cdf9ae11bb19f313cd2a72797660b",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e04-storage-final.log",
+          "actual_result": "12 budget tests passed",
+          "scope": "persistent root budget and accounting subset",
+          "risk": "paid provider reconciliation and production load/capacity remain unverified",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e04-final-input.json"
+        }
+      ],
+      "remaining": [
+        "engineering: no actual provider transport or qualified isolated runner is wired to the accepted budget/broker subset",
+        "external: paid provider reconciliation and production load/capacity evidence are unavailable"
+      ]
+    },
+    "E05": {
+      "title": "Independent Evaluator, Continuous Prefix, Early Stopping",
+      "status": "blocked",
+      "status_reason": "real provider samples, independent processes and complete optimization cost proof remain unavailable",
+      "implementation_files": [
+        "crates/evo-core/src/sequential.rs",
+        "crates/evo-engine/src/evaluator.rs",
+        "crates/evo-engine/src/streaming_evaluator.rs"
+      ],
+      "scenarios": [
+        "V010",
+        "V011",
+        "V012",
+        "V013",
+        "V028",
+        "V084",
+        "V085",
+        "V090",
+        "V091",
+        "V094",
+        "V097"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E05.controller_acceptance",
+          "description": "program-fixture streaming evaluation subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "86e53b9add040192c4db0334c04c15316cf32e66",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/34",
+          "merged_sha": "63824fff2e8d0cd0767d31140d064972542f6b53",
+          "test_entry": "crates/evo-engine/tests/streaming_evaluator.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test streaming_evaluator",
+          "input_digest": "7223e7dfd386a707f4037821db62225730a03b9b06b5fe23ca516d37fe523c3c",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e05-final-streaming.log",
+          "actual_result": "12 streaming evaluator tests passed",
+          "scope": "program-fixture streaming evaluation subset",
+          "risk": "real provider samples, independent processes and complete optimization cost proof remain unavailable",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "out/implementation-v4.1-20260919/controller-e05-acceptance.json",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e05-final-input.json"
+        }
+      ],
+      "remaining": [
+        "real provider samples, independent processes and complete optimization cost proof remain unavailable"
+      ]
+    },
+    "E06": {
+      "title": "Release Gate, CAS, Snapshot & Real-time Revocation",
+      "status": "blocked",
+      "status_reason": "production approval/canary/Active is blocked by non-production evaluation evidence",
+      "implementation_files": [
+        "crates/evo-engine/src/release_store.rs",
+        "crates/evo-engine/src/releases.rs"
+      ],
+      "scenarios": [
+        "V014",
+        "V015",
+        "V016",
+        "V017",
+        "V047",
+        "V049",
+        "V050",
+        "V059",
+        "V064",
+        "V070",
+        "V075",
+        "V077",
+        "V078",
+        "V081",
+        "V084",
+        "V085",
+        "V089",
+        "V091",
+        "V094",
+        "V095",
+        "V096"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E06.controller_acceptance",
+          "description": "guarded release and snapshot subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "071c54d53488f8d9a75cc7148d82ed5f9efb3253",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/35",
+          "merged_sha": "c017e6a32da3cdf692c3321dd29d6510edada0c4",
+          "test_entry": "crates/evo-engine/tests/release_store.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test release_store",
+          "input_digest": "0ec7af70de6ede4fa340ee8835bc38c283fe33a050e0bdf724d2ac78a5a9f684",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e06-final-tests.log",
+          "actual_result": "7 release integration tests passed",
+          "scope": "guarded release and snapshot subset",
+          "risk": "production approval/canary/Active is blocked by non-production evaluation evidence",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "out/implementation-v4.1-20260919/controller-e06-acceptance.json",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e06-final-input.json"
+        }
+      ],
+      "remaining": [
+        "production approval/canary/Active is blocked by non-production evaluation evidence"
+      ]
+    },
+    "E07": {
+      "title": "HostService, HTTP/MCP/CLI & Reference Host",
+      "status": "in_progress",
+      "status_reason": "engineering: exploration, curriculum and meta management adapters are not connected",
+      "implementation_files": [
+        "crates/evo-engine/src/service.rs",
+        "crates/evo-engine/src/closed_loop.rs",
+        "crates/evo-http/src/lib.rs",
+        "crates/evo-mcp/src/lib.rs",
+        "apps/rsia/src/main.rs"
+      ],
+      "scenarios": [
+        "V003",
+        "V010",
+        "V014",
+        "V015",
+        "V016",
+        "V042",
+        "V047",
+        "V059",
+        "V070",
+        "V077",
+        "V087",
+        "V088",
+        "V089",
+        "V091",
+        "V096",
+        "V097"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E07.controller_acceptance",
+          "description": "local protocol and disabled-model subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "0ed5ec915f438764217e9bd059bb99c401dce26e",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/36",
+          "merged_sha": "794cf0f517a57e48166ef2ad44cb5762f3a61d5e",
+          "test_entry": "crates/evo-http/tests/service.rs",
+          "command": "cargo test --locked --offline -p evo-http --test service",
+          "input_digest": "862ded25f4ec0ceec566a787f7f4a1346363e57c882beab3a407c6885298804f",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e07-service.log",
+          "actual_result": "9 HTTP service tests passed",
+          "scope": "local protocol and disabled-model subset",
+          "risk": "real provider, independent data/payment/grader and full G1 effect remain unavailable",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "out/implementation-v4.1-20260919/controller-e07-protocol-acceptance.json",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e07-protocol-input.json"
+        }
+      ],
+      "remaining": [
+        "engineering: exploration, curriculum and meta management adapters are not connected",
+        "external: real provider, independent data/payment/grader and full G1 effect evidence are unavailable"
+      ]
+    },
+    "E08": {
+      "title": "Persistent Revocation, Cleanup, Backup & Trusted Anchor Recovery",
+      "status": "in_progress",
+      "status_reason": "production disaster recovery, Linux deployment and future object scopes remain unverified",
+      "implementation_files": [
+        "crates/evo-storage/src/lifecycle.rs",
+        "crates/evo-engine/src/lifecycle.rs",
+        "scripts/restore_backup.py"
+      ],
+      "scenarios": [
+        "V017",
+        "V018",
+        "V038",
+        "V056",
+        "V069",
+        "V075",
+        "V081",
+        "V082",
+        "V083",
+        "V084",
+        "V085",
+        "V086",
+        "V090",
+        "V092",
+        "V094",
+        "V096"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E08.controller_acceptance",
+          "description": "offline revocation and backup/restore subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "644d95dd85490bc716f837d7148d7245bce0b2c3",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/37",
+          "merged_sha": "b0662ca1b7a2fe27d4a4622918679eed4934e214",
+          "test_entry": "crates/evo-storage/tests/lifecycle.rs",
+          "command": "cargo test --locked --offline -p evo-storage --test lifecycle",
+          "input_digest": "f80081e88aaae94cc1d179ec43fbc8ac926cf2544d56a97a0e4571d5f4db7fe8",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e08-storage-tests.log",
+          "actual_result": "13 storage lifecycle tests passed",
+          "scope": "offline revocation and backup/restore subset",
+          "risk": "production disaster recovery, Linux deployment and future object scopes remain unverified",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "out/implementation-v4.1-20260919/controller-e08-acceptance.json",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e08-final-input.json"
+        }
+      ],
+      "remaining": [
+        "production disaster recovery, Linux deployment and future object scopes remain unverified"
+      ]
+    },
+    "E09": {
+      "title": "Bounded Strategy, Persistent Exploration, E03 Consumers",
+      "status": "in_progress",
+      "status_reason": "engineering: repair-producing E03 chain, at-most-two skill groups, K=1/default and explicitly authorized K=3 consumers are incomplete",
+      "implementation_files": [
+        "crates/evo-core/src/strategy.rs",
+        "crates/evo-engine/src/exploration.rs"
+      ],
+      "scenarios": [
+        "V019",
+        "V020",
+        "V022",
+        "V024",
+        "V025",
+        "V081",
+        "V086",
+        "V088",
+        "V089",
+        "V090",
+        "V091",
+        "V093",
+        "V094",
+        "V095",
+        "V096"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E09.controller_acceptance",
+          "description": "deterministic program-fixture exploration subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "c71db74efd83a7dc2866b0f446049adcb4b8d3bd",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/38",
+          "merged_sha": "7a8a35908a2f7cc72ed601cbc902a2e4b49120bf",
+          "test_entry": "crates/evo-engine/tests/exploration_v41.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test exploration_v41",
+          "input_digest": "c0c3a6889c0ca761fb3d180476fb557103e3184b839f003b407b1e5118fa6b7c",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e09-engine.log",
+          "actual_result": "4 exploration integration tests passed",
+          "scope": "deterministic program-fixture exploration subset",
+          "risk": "real provider repair-producing path and real G2 run remain unverified",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "out/implementation-v4.1-20260919/controller-e09-acceptance.json",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e09-input.json"
+        }
+      ],
+      "remaining": [
+        "engineering: repair-producing E03 chain, at-most-two skill groups, K=1/default and explicitly authorized K=3 consumers are incomplete",
+        "external: real G2 provider/process execution and effect evidence are unavailable"
+      ]
+    },
+    "E10": {
+      "title": "Immutable Observation, World Pool, Replay & Reports",
+      "status": "in_progress",
+      "status_reason": "online target-environment effect and production release remain unverified",
+      "implementation_files": [
+        "crates/evo-core/src/replay.rs",
+        "crates/evo-storage/src/replay.rs",
+        "crates/evo-engine/src/replay.rs",
+        "crates/evo-engine/src/dispatch.rs"
+      ],
+      "scenarios": [
+        "V020",
+        "V021",
+        "V022",
+        "V023",
+        "V025",
+        "V026",
+        "V027",
+        "V081",
+        "V086",
+        "V094",
+        "V096"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E10.controller_acceptance",
+          "description": "immutable offline replay subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "77177cd5ffa87de5152a3295974ae41fc86498d4",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/39",
+          "merged_sha": "96e62412809610a72d2ab593aaca59a8bcebd6d2",
+          "test_entry": "crates/evo-engine/tests/replay_v41.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test replay_v41",
+          "input_digest": "26b42788f1b711b379950abebb298ceda646a79c3f7b7a4a092c804be8416f08",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e10-engine-integration.log",
+          "actual_result": "13 replay integration tests passed",
+          "scope": "immutable offline replay subset",
+          "risk": "online target-environment effect and production release remain unverified",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "out/implementation-v4.1-20260919/controller-e10-acceptance.json",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e10-final-input.json"
+        },
+        {
+          "id": "E10.replay_management_controller_acceptance",
+          "description": "replay.run management consumer only",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "0aef9345679e674988e67e4208c60aba63b5271b",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/43",
+          "merged_sha": "59afd1663a0d5f5212077dd92beaaf7920cde0ff",
+          "test_entry": "crates/evo-engine/tests/dispatch_management.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test dispatch_management",
+          "input_digest": "e8898207d56a4c952e1edefe11c5204728118d736638eefeb15bcb894ec94dad",
+          "exit_code": 0,
+          "log_path": "out/review-antigravity-20260919/ag001-engine.log",
+          "actual_result": "13 dispatch management tests passed; replay_v41 was separately regressed",
+          "scope": "replay.run management consumer only",
+          "risk": "exploration.start, curriculum.step and meta.start remain blocked; no production effect",
+          "rollback": "disable replay.run dispatch while retaining stored replay reports and revocation facts",
+          "record_source": "out/review-antigravity-20260919/ag001-acceptance.json",
+          "input_ref": "out/review-antigravity-20260919/ag001-input.json"
+        }
+      ],
+      "remaining": [
+        "online target-environment effect and production release remain unverified"
+      ]
+    },
+    "E11": {
+      "title": "Economic Experiment Contract, Full Cost, Blocking Report",
+      "status": "in_progress",
+      "status_reason": "engineering: the real paired online receipt consumer is not fully connected",
+      "implementation_files": [
+        "crates/evo-core/src/replay_economics.rs",
+        "crates/evo-engine/src/replay_experiment.rs"
+      ],
+      "scenarios": [
+        "V022",
+        "V026",
+        "V027",
+        "V028",
+        "V042",
+        "V081",
+        "V094",
+        "V096",
+        "V097"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E11.controller_acceptance",
+          "description": "static economics and blocked-path subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "289d9204c6d76018080a9221967eebe5848e2b8d",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/40",
+          "merged_sha": "09b3ebe8bad12d59bd3c2f926d3050802372e96f",
+          "test_entry": "crates/evo-core/tests/replay_economics.rs",
+          "command": "cargo test --locked --offline -p evo-core --test replay_economics",
+          "input_digest": "7d1f35d6a433730bbf99b6b580f8f2b8ee6f840e1788fa24288e13f539125cd9",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e11-core.log",
+          "actual_result": "4 replay economics contract tests passed",
+          "scope": "static economics and blocked-path subset",
+          "risk": "actual paired online receipt consumer and economic benefit experiment are not implemented",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "out/implementation-v4.1-20260919/controller-e11-acceptance.json",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e11-final-input.json"
+        }
+      ],
+      "remaining": [
+        "engineering: the real paired online receipt consumer is not fully connected",
+        "external: no paid paired economic experiment or benefit result has been run"
+      ]
+    },
+    "E12": {
+      "title": "Zero-budget Curriculum, Fixed Pure Functions, Rejection Gate",
+      "status": "blocked",
+      "status_reason": "engineering: the positive persistent-learning-to-next-topic chain is blocked by the missing E03 trusted execution/grader schema",
+      "implementation_files": [
+        "crates/evo-core/src/curriculum.rs",
+        "crates/evo-engine/src/curriculum.rs",
+        "crates/evo-engine/src/curriculum_profiles.rs",
+        "examples/reference-host/src/curriculum_target.rs"
+      ],
+      "scenarios": [
+        "V029",
+        "V030",
+        "V031",
+        "V034",
+        "V082",
+        "V083",
+        "V093",
+        "V094",
+        "V096"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E12.controller_acceptance",
+          "description": "offline zero-budget curriculum rejection subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "e612fcb9563c8e320e011e6d06f026b9730f561c",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/41",
+          "merged_sha": "b1127a228c4a40248631ed417aba0ad7ea1a0884",
+          "test_entry": "crates/evo-engine/tests/curriculum_v41.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test curriculum_v41",
+          "input_digest": "945313921ffc8446fb527c4d3e15fd3c15c9d417dc93da30484706eee7063d16",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e12-engine.log",
+          "actual_result": "3 curriculum integration tests passed",
+          "scope": "offline zero-budget curriculum rejection subset",
+          "risk": "trusted E03 execution/grader evidence, real sandbox and learning closure are blocked",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "out/implementation-v4.1-20260919/controller-e12-acceptance.json",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e12-final-input.json"
+        }
+      ],
+      "remaining": [
+        "engineering: the positive persistent-learning-to-next-topic chain is blocked by the missing E03 trusted execution/grader schema",
+        "external: real sandbox/provider learning effect evidence is unavailable"
+      ]
+    },
+    "E13": {
+      "title": "Persistent Monitoring, Consolidation Trigger, Root Budget & Recovery",
+      "status": "in_progress",
+      "status_reason": "real longitudinal provider execution and effect remain unverified",
+      "implementation_files": [
+        "crates/evo-engine/src/broker.rs",
+        "crates/evo-engine/src/monitoring.rs"
+      ],
+      "scenarios": [
+        "V016",
+        "V032",
+        "V037",
+        "V038",
+        "V082",
+        "V084",
+        "V087",
+        "V090",
+        "V091",
+        "V094",
+        "V096",
+        "V097"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E13.controller_acceptance",
+          "description": "persistent program-fixture monitoring subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "2c79608fb1d30f7592b742e972c209cb9208fabc",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/42",
+          "merged_sha": "2e209dcea36d63610c59d3797e039f35d063ec89",
+          "test_entry": "crates/evo-engine/tests/monitoring.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test monitoring",
+          "input_digest": "b896f96de03af66c4c3e96cc5049e6dbe1b65a7e405e9f8439bcf705c749a709",
+          "exit_code": 0,
+          "log_path": "out/implementation-v4.1-20260919/controller-e13-tests.log",
+          "actual_result": "10 monitoring tests passed",
+          "scope": "persistent program-fixture monitoring subset",
+          "risk": "real longitudinal provider execution and effect remain unverified",
+          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
+          "record_source": "out/implementation-v4.1-20260919/controller-e13-acceptance.json",
+          "input_ref": "out/implementation-v4.1-20260919/controller-e13-input.json"
+        }
+      ],
+      "remaining": [
+        "real longitudinal provider execution and effect remain unverified"
+      ]
+    },
+    "E14": {
+      "title": "Bounded Improver Inheritance Controller",
+      "status": "planned",
+      "status_reason": "bounded Improver inheritance and next-job mechanism use have not been implemented",
+      "implementation_files": [
+        "crates/evo-engine/src/meta.rs"
+      ],
+      "scenarios": [
+        "V015",
+        "V033",
+        "V034",
+        "V035",
+        "V036",
+        "V086",
+        "V090",
+        "V092",
+        "V094",
+        "V096",
+        "V097"
+      ],
+      "verified_subscopes": [],
+      "remaining": [
+        "bounded Improver inheritance and next-job mechanism use have not been implemented"
+      ]
+    },
+    "E15": {
+      "title": "Successor Quality & Cross-generation Benefit Experiment",
+      "status": "planned",
+      "status_reason": "cross-generation real experiment has not been run",
+      "implementation_files": [
+        "crates/evo-engine/src/meta_experiment.rs",
+        "reports/experiments/meta/README.md"
+      ],
+      "scenarios": [
+        "V026",
+        "V033",
+        "V035",
+        "V036",
+        "V042",
+        "V085",
+        "V092",
+        "V096",
+        "V097"
+      ],
+      "verified_subscopes": [],
+      "remaining": [
+        "cross-generation real experiment has not been run"
+      ]
+    },
+    "E16.1": {
+      "title": "Source Import & Versioned Readers",
+      "status": "implemented_not_verified",
+      "status_reason": "controller acceptance of repaired persistent import and end-to-end learned-use chain is pending",
+      "implementation_files": [
+        "crates/evo-engine/src/import.rs",
+        "crates/evo-core/src/evidence.rs"
+      ],
+      "scenarios": [
+        "V005",
+        "V006",
+        "V017",
+        "V051",
+        "V052",
+        "V053",
+        "V054",
+        "V055",
+        "V056",
+        "V076",
+        "V087",
+        "V090",
+        "V098"
+      ],
+      "verified_subscopes": [],
+      "remaining": [
+        "controller acceptance of repaired persistent import and end-to-end learned-use chain is pending"
+      ]
+    },
+    "E16.2": {
+      "title": "Asset Package Safety, Privacy Gates, Foreign Metadata Isolation",
+      "status": "implemented_not_verified",
+      "status_reason": "controller acceptance of repaired package/staging/export consumers is pending",
+      "implementation_files": [
+        "crates/evo-engine/src/packages.rs"
+      ],
+      "scenarios": [
+        "V017",
+        "V039",
+        "V066",
+        "V067",
+        "V068",
+        "V069",
+        "V070",
+        "V075",
+        "V091",
+        "V092",
+        "V098"
+      ],
+      "verified_subscopes": [],
+      "remaining": [
+        "controller acceptance of repaired package/staging/export consumers is pending"
+      ]
+    },
+    "E16.3": {
+      "title": "Built-in Seeds, B/L/U Reconciliation, Local Modification Protection",
+      "status": "implemented_not_verified",
+      "status_reason": "controller acceptance of repaired persistent seed/reset chain is pending",
+      "implementation_files": [
+        "crates/evo-engine/src/seeds.rs"
+      ],
+      "scenarios": [
+        "V014",
+        "V018",
+        "V038",
+        "V063",
+        "V064",
+        "V065",
+        "V078",
+        "V091",
+        "V092",
+        "V098"
+      ],
+      "verified_subscopes": [],
+      "remaining": [
+        "controller acceptance of repaired persistent seed/reset chain is pending"
+      ]
+    },
+    "E16.4": {
+      "title": "Extra Real Host MCP Tool-Only, Surface Drift & Attribution",
+      "status": "blocked",
+      "status_reason": "real Claude Code MCP Tool-only host is unavailable; local structure cannot satisfy the host claim",
+      "implementation_files": [
+        "crates/evo-engine/src/hosts.rs"
+      ],
+      "scenarios": [
+        "V002",
+        "V003",
+        "V009",
+        "V037",
+        "V039",
+        "V060",
+        "V061",
+        "V062",
+        "V077",
+        "V087",
+        "V091",
+        "V098"
+      ],
+      "verified_subscopes": [
+        {
+          "id": "E16.4.trusted_host_rejection_controller_acceptance",
+          "description": "trusted Store host receipt reload and fail-closed registration unit subset",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "9d04c679bd7f3cb6b3ab74fead60068adf29264d",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/47",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/src/hosts.rs",
+          "command": "cargo test --locked --offline -p evo-engine --lib hosts::tests",
+          "input_digest": "b0ce49bb802a5313a37f5df67eb73bbc77ed46118d7f888822cef7a416215738",
+          "exit_code": 0,
+          "log_path": "out/controller-final-e16-20260919/pr47-directed-1.log",
+          "actual_result": "2 hosts unit tests passed; the separate multi-target integration run is not encoded as a single-target record",
+          "scope": "trusted Store receipt reload and fail-closed registration structure only; no real Claude Code host",
+          "risk": "real Claude Code version, handshake, four-tool smoke, reconnect and cancellation remain unavailable",
+          "rollback": "revert PR47 changes through review while retaining reference-host evidence and immutable facts",
+          "record_source": "out/controller-final-e16-20260919/pr47-directed-results.json",
+          "input_ref": "out/controller-final-e16-20260919/pr47-source-input.json"
+        }
+      ],
+      "remaining": [
+        "real Claude Code MCP Tool-only host is unavailable; local structure cannot satisfy the host claim"
+      ]
+    },
+    "E16.5": {
+      "title": "Persistent Recovery Immutability, Capacity Limits & Deployment Security",
+      "status": "implemented_not_verified",
+      "status_reason": "controller acceptance of repaired capacity/recovery/deployment scope is pending",
+      "implementation_files": [
+        "crates/evo-engine/src/capacity.rs",
+        "crates/evo-storage/src/lifecycle.rs"
+      ],
+      "scenarios": [
+        "V007",
+        "V008",
+        "V017",
+        "V018",
+        "V037",
+        "V038",
+        "V039",
+        "V066",
+        "V069",
+        "V073",
+        "V075",
+        "V081",
+        "V082",
+        "V083",
+        "V084",
+        "V085",
+        "V086",
+        "V089",
+        "V090",
+        "V092",
+        "V094",
+        "V096",
+        "V098"
+      ],
+      "verified_subscopes": [],
+      "remaining": [
+        "controller acceptance of repaired capacity/recovery/deployment scope is pending"
+      ]
+    },
+    "E16.6": {
+      "title": "Release, Support Scope Manifest & Truth Ledger",
+      "status": "in_progress",
+      "status_reason": "this derived index repair requires independent controller verification; it does not close E16",
+      "implementation_files": [
+        "reports/support-scope.json",
+        "crates/evo-core/tests/support_scope.rs"
+      ],
+      "scenarios": [
+        "V001",
+        "V039",
+        "V042",
+        "V071",
+        "V072",
+        "V073",
+        "V074",
+        "V080",
+        "V098"
+      ],
+      "verified_subscopes": [],
+      "remaining": [
+        "this derived index repair requires independent controller verification; it does not close E16"
+      ]
+    },
+    "E16": {
+      "title": "Product Support Scope & Final Delivery Gate",
+      "status": "blocked",
+      "status_reason": "E14, E15, real extra host, deployment evidence and all six subpackage acceptances are incomplete",
+      "implementation_files": [
+        "reports/support-scope.json",
+        "reports/longitudinal/README.md"
+      ],
+      "scenarios": [
+        "V081",
+        "V082",
+        "V083",
+        "V084",
+        "V085",
+        "V086",
+        "V087",
+        "V088",
+        "V089",
+        "V090",
+        "V091",
+        "V092",
+        "V093",
+        "V094",
+        "V095",
+        "V096",
+        "V097",
+        "V098"
+      ],
+      "verified_subscopes": [],
+      "remaining": [
+        "E14, E15, real extra host, deployment evidence and all six subpackage acceptances are incomplete"
+      ]
+    },
+    "E17": {
+      "title": "Optional Development Scorer Evolution (Disabled)",
+      "status": "planned",
+      "status_reason": "optional scorer evolution is disabled by default and not implemented",
+      "implementation_files": [
+        "crates/evo-engine/src/evaluator.rs",
+        "crates/evo-engine/src/meta.rs"
+      ],
+      "scenarios": [
+        "V040"
+      ],
+      "verified_subscopes": [],
+      "remaining": [
+        "optional scorer evolution is disabled by default and not implemented"
+      ]
+    },
+    "E18": {
+      "title": "Optional Code Change Proposal Without Auto-deploy (Disabled)",
+      "status": "planned",
+      "status_reason": "optional isolated code-change proposal workflow is disabled by default and not implemented",
+      "implementation_files": [],
+      "scenarios": [
+        "V041"
+      ],
+      "verified_subscopes": [],
+      "remaining": [
+        "optional isolated code-change proposal workflow is disabled by default and not implemented"
+      ]
+    }
+  },
+  "traceability": {
+    "b_commitments": [
+      {
+        "id": "B01",
+        "specification_status": "included",
+        "sections": [
+          "§5.2"
+        ],
+        "sources": [
+          "RH01",
+          "RH02"
+        ],
+        "e_tasks": [
+          "E02",
+          "E06"
+        ],
+        "v_scenarios": [
+          "V044",
+          "V048",
+          "V079"
+        ],
+        "implementation_status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-core/src/contract.rs",
+          "crates/evo-core/src/skill_edit.rs",
+          "crates/evo-engine/src/release_store.rs"
+        ],
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E06.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "B02",
+        "specification_status": "included",
+        "sections": [
+          "§5.3"
+        ],
+        "sources": [
+          "RH03"
+        ],
+        "e_tasks": [
+          "E02"
+        ],
+        "v_scenarios": [
+          "V043",
+          "V045",
+          "V046",
+          "V078"
+        ],
+        "implementation_status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-core/src/skill_edit.rs"
+        ],
+        "related_evidence_refs": [
+          "E02.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "B03",
+        "specification_status": "included",
+        "sections": [
+          "§5.4",
+          "§6.5"
+        ],
+        "sources": [
+          "RH04"
+        ],
+        "e_tasks": [
+          "E02",
+          "E06",
+          "E07"
+        ],
+        "v_scenarios": [
+          "V047",
+          "V049",
+          "V050",
+          "V059",
+          "V077"
+        ],
+        "implementation_status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/compiler.rs",
+          "crates/evo-engine/src/release_store.rs",
+          "crates/evo-engine/src/service.rs"
+        ],
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E06.controller_acceptance",
+          "E07.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "B04",
+        "specification_status": "included",
+        "sections": [
+          "§5.5"
+        ],
+        "sources": [
+          "RH05"
+        ],
+        "e_tasks": [
+          "E02",
+          "E16.4"
+        ],
+        "v_scenarios": [
+          "V060",
+          "V061",
+          "V062"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-core/tests/host_surface.rs",
+          "crates/evo-engine/src/hosts.rs"
+        ],
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E16.4.trusted_host_rejection_controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "B05",
+        "specification_status": "included",
+        "sections": [
+          "§6.3"
+        ],
+        "sources": [
+          "RH06"
+        ],
+        "e_tasks": [
+          "E03"
+        ],
+        "v_scenarios": [
+          "V051",
+          "V052",
+          "V055",
+          "V056"
+        ],
+        "implementation_status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/evidence.rs",
+          "crates/evo-engine/src/optimization.rs"
+        ],
+        "related_evidence_refs": [
+          "E03.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "B06",
+        "specification_status": "included",
+        "sections": [
+          "§6.4"
+        ],
+        "sources": [
+          "RH07"
+        ],
+        "e_tasks": [
+          "E03",
+          "E14"
+        ],
+        "v_scenarios": [
+          "V054",
+          "V057",
+          "V058",
+          "V070"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/evidence.rs",
+          "crates/evo-engine/src/meta.rs"
+        ],
+        "related_evidence_refs": [
+          "E03.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "B07",
+        "specification_status": "included",
+        "sections": [
+          "§5.6",
+          "§6.3"
+        ],
+        "sources": [
+          "RH08"
+        ],
+        "e_tasks": [
+          "E03",
+          "E16.1"
+        ],
+        "v_scenarios": [
+          "V052",
+          "V053",
+          "V054",
+          "V056",
+          "V076"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/import.rs"
+        ],
+        "related_evidence_refs": [
+          "E03.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "B08",
+        "specification_status": "included",
+        "sections": [
+          "§11.1"
+        ],
+        "sources": [
+          "RH09"
+        ],
+        "e_tasks": [
+          "E06",
+          "E16.3"
+        ],
+        "v_scenarios": [
+          "V063",
+          "V064",
+          "V065",
+          "V078"
+        ],
+        "implementation_status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/release_store.rs",
+          "crates/evo-engine/src/seeds.rs"
+        ],
+        "related_evidence_refs": [
+          "E06.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "B09",
+        "specification_status": "included",
+        "sections": [
+          "§6.5",
+          "§9"
+        ],
+        "sources": [
+          "RH01",
+          "RH07"
+        ],
+        "e_tasks": [
+          "E06",
+          "E14",
+          "E15"
+        ],
+        "v_scenarios": [
+          "V015",
+          "V033",
+          "V036",
+          "V070"
+        ],
+        "implementation_status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/release_store.rs",
+          "crates/evo-engine/src/meta.rs",
+          "crates/evo-engine/src/meta_experiment.rs"
+        ],
+        "related_evidence_refs": [
+          "E06.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "B10",
+        "specification_status": "included",
+        "sections": [
+          "§11.2–§11.3"
+        ],
+        "sources": [
+          "RH01"
+        ],
+        "e_tasks": [
+          "E08",
+          "E16.2",
+          "E16.6"
+        ],
+        "v_scenarios": [
+          "V066",
+          "V067",
+          "V068",
+          "V069",
+          "V073",
+          "V075"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/packages.rs",
+          "crates/evo-storage/src/lifecycle.rs",
+          "reports/support-scope.json"
+        ],
+        "related_evidence_refs": [
+          "E08.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      }
+    ],
+    "u_commitments": [
+      {
+        "id": "U01",
+        "specification_status": "included",
+        "sections": [
+          "§7.1",
+          "§7.5"
+        ],
+        "sources": [],
+        "e_tasks": [
+          "E02",
+          "E09",
+          "E10",
+          "E11"
+        ],
+        "v_scenarios": [
+          "V025",
+          "V028",
+          "V081"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-core/src/strategy.rs",
+          "crates/evo-engine/src/replay.rs",
+          "crates/evo-engine/src/replay_experiment.rs"
+        ],
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E09.controller_acceptance",
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance",
+          "E11.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "U02",
+        "specification_status": "included",
+        "sections": [
+          "§7.5.1–§7.5.3"
+        ],
+        "sources": [],
+        "e_tasks": [
+          "E10",
+          "E11"
+        ],
+        "v_scenarios": [
+          "V021",
+          "V023",
+          "V027",
+          "V081"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-core/src/replay.rs",
+          "crates/evo-core/src/replay_economics.rs"
+        ],
+        "related_evidence_refs": [
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance",
+          "E11.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "U03",
+        "specification_status": "included",
+        "sections": [
+          "§8.1"
+        ],
+        "sources": [],
+        "e_tasks": [
+          "E12",
+          "E13"
+        ],
+        "v_scenarios": [
+          "V029",
+          "V034",
+          "V082"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/curriculum.rs",
+          "crates/evo-engine/src/monitoring.rs"
+        ],
+        "related_evidence_refs": [
+          "E12.controller_acceptance",
+          "E13.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "U04",
+        "specification_status": "included",
+        "sections": [
+          "§8.2–§8.4"
+        ],
+        "sources": [],
+        "e_tasks": [
+          "E04",
+          "E12"
+        ],
+        "v_scenarios": [
+          "V007",
+          "V030",
+          "V031",
+          "V083"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/curriculum_profiles.rs",
+          "crates/evo-storage/src/budget.rs"
+        ],
+        "related_evidence_refs": [
+          "E04.controller_acceptance",
+          "E12.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "U05",
+        "specification_status": "included",
+        "sections": [
+          "§3.2",
+          "§10"
+        ],
+        "sources": [],
+        "e_tasks": [
+          "E01",
+          "E05",
+          "E06"
+        ],
+        "v_scenarios": [
+          "V010",
+          "V011",
+          "V084"
+        ],
+        "implementation_status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-core/src/holdout.rs",
+          "crates/evo-engine/src/streaming_evaluator.rs",
+          "crates/evo-engine/src/release_store.rs"
+        ],
+        "related_evidence_refs": [
+          "E01.controller_acceptance",
+          "E05.controller_acceptance",
+          "E06.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "U06",
+        "specification_status": "included",
+        "sections": [
+          "§3.4.1",
+          "§6.6"
+        ],
+        "sources": [],
+        "e_tasks": [
+          "E01",
+          "E04",
+          "E05"
+        ],
+        "v_scenarios": [
+          "V012",
+          "V013",
+          "V085"
+        ],
+        "implementation_status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-core/src/sequential.rs",
+          "crates/evo-engine/src/streaming_evaluator.rs"
+        ],
+        "related_evidence_refs": [
+          "E01.controller_acceptance",
+          "E04.controller_acceptance",
+          "E05.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "U07",
+        "specification_status": "included",
+        "sections": [
+          "§7.1.1",
+          "§7.2.1"
+        ],
+        "sources": [],
+        "e_tasks": [
+          "E09"
+        ],
+        "v_scenarios": [
+          "V020",
+          "V024",
+          "V086"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-core/src/strategy.rs",
+          "crates/evo-engine/src/exploration.rs"
+        ],
+        "related_evidence_refs": [
+          "E09.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "U08",
+        "specification_status": "included",
+        "sections": [
+          "§1.4",
+          "§12",
+          "§14.2"
+        ],
+        "sources": [],
+        "e_tasks": [
+          "E00",
+          "E05",
+          "E09",
+          "E10",
+          "E12",
+          "E16.6"
+        ],
+        "v_scenarios": [
+          "V042",
+          "V062",
+          "V080",
+          "V081",
+          "V082",
+          "V083",
+          "V084",
+          "V085",
+          "V086"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/streaming_evaluator.rs",
+          "crates/evo-engine/src/exploration.rs",
+          "crates/evo-engine/src/replay.rs",
+          "crates/evo-engine/src/curriculum.rs",
+          "reports/support-scope.json"
+        ],
+        "related_evidence_refs": [
+          "E00.controller_acceptance",
+          "E05.controller_acceptance",
+          "E09.controller_acceptance",
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance",
+          "E12.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      }
+    ],
+    "k_commitments": [
+      {
+        "id": "K01",
+        "specification_status": "included",
+        "sections": [
+          "§6.4.1",
+          "§5.8"
+        ],
+        "sources": [
+          "SO06",
+          "SO01"
+        ],
+        "e_tasks": [
+          "E02",
+          "E03",
+          "E04",
+          "E07",
+          "E13"
+        ],
+        "v_scenarios": [
+          "V087"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/evidence.rs",
+          "crates/evo-engine/src/monitoring.rs"
+        ],
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E03.controller_acceptance",
+          "E04.controller_acceptance",
+          "E07.controller_acceptance",
+          "E13.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "K02",
+        "specification_status": "included",
+        "sections": [
+          "§6.7.1–§6.7.2"
+        ],
+        "sources": [
+          "SO02",
+          "SO03"
+        ],
+        "e_tasks": [
+          "E03",
+          "E09"
+        ],
+        "v_scenarios": [
+          "V088"
+        ],
+        "implementation_status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/optimization.rs",
+          "crates/evo-engine/src/exploration.rs"
+        ],
+        "related_evidence_refs": [
+          "E03.controller_acceptance",
+          "E09.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "K03",
+        "specification_status": "included",
+        "sections": [
+          "§5.3.1",
+          "§5.8"
+        ],
+        "sources": [
+          "SO04",
+          "SO05"
+        ],
+        "e_tasks": [
+          "E02",
+          "E03",
+          "E06",
+          "E09"
+        ],
+        "v_scenarios": [
+          "V089"
+        ],
+        "implementation_status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-core/src/skill_edit.rs",
+          "crates/evo-engine/src/optimization.rs"
+        ],
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E03.controller_acceptance",
+          "E06.controller_acceptance",
+          "E09.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "K04",
+        "specification_status": "included",
+        "sections": [
+          "§6.7.3",
+          "§5.8",
+          "§11.5"
+        ],
+        "sources": [
+          "SO01",
+          "SO02"
+        ],
+        "e_tasks": [
+          "E03",
+          "E05",
+          "E08",
+          "E09",
+          "E13"
+        ],
+        "v_scenarios": [
+          "V090",
+          "V094"
+        ],
+        "implementation_status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/optimization.rs",
+          "crates/evo-engine/src/exploration.rs",
+          "crates/evo-storage/src/lifecycle.rs"
+        ],
+        "related_evidence_refs": [
+          "E03.controller_acceptance",
+          "E05.controller_acceptance",
+          "E08.controller_acceptance",
+          "E09.controller_acceptance",
+          "E13.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "K05",
+        "specification_status": "included",
+        "sections": [
+          "§11.5",
+          "§10.2"
+        ],
+        "sources": [
+          "SO07",
+          "SO01",
+          "SO10"
+        ],
+        "e_tasks": [
+          "E05",
+          "E06",
+          "E09",
+          "E13"
+        ],
+        "v_scenarios": [
+          "V091"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/monitoring.rs",
+          "crates/evo-engine/src/release_store.rs"
+        ],
+        "related_evidence_refs": [
+          "E05.controller_acceptance",
+          "E06.controller_acceptance",
+          "E09.controller_acceptance",
+          "E13.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "K06",
+        "specification_status": "included",
+        "sections": [
+          "§9.1",
+          "§3.1.1"
+        ],
+        "sources": [
+          "SO08",
+          "SO01"
+        ],
+        "e_tasks": [
+          "E14",
+          "E15"
+        ],
+        "v_scenarios": [
+          "V092",
+          "V097"
+        ],
+        "implementation_status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/meta.rs",
+          "crates/evo-engine/src/meta_experiment.rs"
+        ],
+        "related_evidence_refs": [],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "K07",
+        "specification_status": "included",
+        "sections": [
+          "§8.5",
+          "§7.4.1"
+        ],
+        "sources": [
+          "SO12",
+          "SO13"
+        ],
+        "e_tasks": [
+          "E04",
+          "E09",
+          "E10",
+          "E12"
+        ],
+        "v_scenarios": [
+          "V093",
+          "V094"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/exploration.rs",
+          "crates/evo-engine/src/replay.rs",
+          "crates/evo-engine/src/curriculum.rs"
+        ],
+        "related_evidence_refs": [
+          "E04.controller_acceptance",
+          "E09.controller_acceptance",
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance",
+          "E12.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "K08",
+        "specification_status": "included",
+        "sections": [
+          "§7.7"
+        ],
+        "sources": [
+          "SO14",
+          "SO11"
+        ],
+        "e_tasks": [
+          "E06",
+          "E09"
+        ],
+        "v_scenarios": [
+          "V095"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/release_store.rs",
+          "crates/evo-engine/src/exploration.rs"
+        ],
+        "related_evidence_refs": [
+          "E06.controller_acceptance",
+          "E09.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "K09",
+        "specification_status": "included",
+        "sections": [
+          "§3.1.1",
+          "§3.6",
+          "§6.7.4"
+        ],
+        "sources": [
+          "SO15",
+          "SO13",
+          "SO16"
+        ],
+        "e_tasks": [
+          "E01",
+          "E04",
+          "E07",
+          "E11",
+          "E15"
+        ],
+        "v_scenarios": [
+          "V096",
+          "V097"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-storage/src/budget.rs",
+          "crates/evo-core/src/replay_economics.rs",
+          "crates/evo-engine/src/meta_experiment.rs"
+        ],
+        "related_evidence_refs": [
+          "E01.controller_acceptance",
+          "E04.controller_acceptance",
+          "E07.controller_acceptance",
+          "E11.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      },
+      {
+        "id": "K10",
+        "specification_status": "included",
+        "sections": [
+          "§2.7–§2.8",
+          "§16.5–§16.6",
+          "§18.7"
+        ],
+        "sources": [
+          "SO09",
+          "SO10",
+          "SO18"
+        ],
+        "e_tasks": [
+          "E00",
+          "E05",
+          "E06",
+          "E16"
+        ],
+        "v_scenarios": [
+          "V091",
+          "V098"
+        ],
+        "implementation_status": "in_progress",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "local_artifacts": [
+          "crates/evo-engine/src/streaming_evaluator.rs",
+          "crates/evo-engine/src/release_store.rs",
+          "reports/support-scope.json"
+        ],
+        "related_evidence_refs": [
+          "E00.controller_acceptance",
+          "E05.controller_acceptance",
+          "E06.controller_acceptance"
+        ],
+        "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
+      }
+    ],
+    "so_sources": [
+      {
+        "id": "SO01",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt/engine/trainer.py",
+        "blob_sha": "520a90eb8af422368c8e498b8487504bb8f6c279",
+        "read_range": "1–240、1270–2110",
+        "e_tasks": [
+          "E03",
+          "E05",
+          "E09",
+          "E13",
+          "E14"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-engine/src/optimization.rs",
+            "crates/evo-engine/src/exploration.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO02",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt/gradient/reflect.py",
+        "blob_sha": "df68c9b76de83b2465b267b04310399ec5f3cec8",
+        "read_range": "300–700",
+        "e_tasks": [
+          "E03",
+          "E09"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-engine/src/optimization.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO03",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt/gradient/aggregate.py",
+        "blob_sha": "14f0cd978f35afe579913c9b5677a803bbce9e70",
+        "read_range": "全文",
+        "e_tasks": [
+          "E03",
+          "E09"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-engine/src/optimization.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO04",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt/optimizer/clip.py",
+        "blob_sha": "a2ed965f7c81c18426e82e2fd49e589b0952a92f",
+        "read_range": "全文",
+        "e_tasks": [
+          "E02",
+          "E03",
+          "E09"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-core/src/skill_edit.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO05",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt/optimizer/skill.py",
+        "blob_sha": "65d574157f47e9b3f415d4db94b0e5a9c09e4826",
+        "read_range": "全文",
+        "e_tasks": [
+          "E02",
+          "E03",
+          "E06",
+          "E09"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-core/src/skill_edit.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO06",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt/optimizer/skill_aware.py",
+        "blob_sha": "de39427ed0cc85fa1e716363a22140c91090b2d6",
+        "read_range": "全文",
+        "e_tasks": [
+          "E03",
+          "E07",
+          "E13"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-engine/src/evidence.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO07",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt/optimizer/slow_update.py",
+        "blob_sha": "9f8dd52606c3ada4fea1e6c0f72ec38f8a5139e8",
+        "read_range": "1–260",
+        "e_tasks": [
+          "E09",
+          "E13"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-engine/src/monitoring.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO08",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt/optimizer/meta_skill.py",
+        "blob_sha": "6e34ff10d90655bb620d3e63b1d2041338616a5c",
+        "read_range": "全文",
+        "e_tasks": [
+          "E14",
+          "E15"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-engine/src/meta.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO09",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt/evaluation/gate.py",
+        "blob_sha": "10461a98756ebacbf7d5a8bbdc67657950e2c199",
+        "read_range": "全文",
+        "e_tasks": [
+          "E05",
+          "E06"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-engine/src/streaming_evaluator.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO10",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "configs/_base_/default.yaml",
+        "blob_sha": "4fe64088dc8011a2121335155d4a79ae7f90e9f5",
+        "read_range": "全文；本轮重读90–150",
+        "e_tasks": [
+          "E00",
+          "E03",
+          "E05",
+          "E13"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-core/src/strategy.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO11",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt_sleep/consolidate.py",
+        "blob_sha": "5b80b4a9825fb5b5a79b04fdad4c655d5f3228f6",
+        "read_range": "全文",
+        "e_tasks": [
+          "E05",
+          "E06",
+          "E09"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-engine/src/monitoring.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO12",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt_sleep/rollout.py",
+        "blob_sha": "f889333b3eecb83693a7005154dedadccbdc07f2",
+        "read_range": "全文",
+        "e_tasks": [
+          "E09",
+          "E12"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-engine/src/curriculum.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO13",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt_sleep/replay.py",
+        "blob_sha": "1502a71cf9069b8ea23293acbb080225cdc51de2",
+        "read_range": "全文",
+        "e_tasks": [
+          "E04",
+          "E09",
+          "E10",
+          "E12"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-engine/src/replay.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO14",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt_sleep/multi_skill.py",
+        "blob_sha": "32247639849e2c327ab7a1b7b3258dc7c35f53d4",
+        "read_range": "全文",
+        "e_tasks": [
+          "E06",
+          "E09"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-engine/src/release_store.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO15",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "skillopt_sleep/budget.py",
+        "blob_sha": "48875ca0f01cf099967ca2b5a45891e903645e36",
+        "read_range": "全文",
+        "e_tasks": [
+          "E01",
+          "E04",
+          "E11"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-storage/src/budget.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO16",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "docs/sleep/RESULTS.md",
+        "blob_sha": "441ffa28f8644631c275456c7ccf4e75fd1d8c99",
+        "read_range": "全文",
+        "e_tasks": [
+          "E01",
+          "E07",
+          "E15"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "reports/experiments/meta/README.md"
+          ]
+        }
+      },
+      {
+        "id": "SO17",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "docs/guide/training-loop.md",
+        "blob_sha": "30393dca9533de90e0cd0ff95f26eb327bfec0ff",
+        "read_range": "全文",
+        "e_tasks": [
+          "E03",
+          "E09"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-engine/src/optimization.rs"
+          ]
+        }
+      },
+      {
+        "id": "SO18",
+        "repository": "https://github.com/microsoft/SkillOpt.git",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "path": "LICENSE",
+        "blob_sha": "cf7bcb2ba475e33648180599c0f83c425f1705d9",
+        "read_range": "全文；本轮重读及固定字节校验",
+        "e_tasks": [
+          "E00",
+          "E16.2",
+          "E16.5"
+        ],
+        "license": "MIT",
+        "license_status": "reference_pin_from_spec_not_reverified_by_cp001",
+        "verification_status": "reference_pins_only",
+        "local_use": {
+          "mode": "reference_only_no_upstream_runtime_import",
+          "artifacts": [
+            "crates/evo-engine/src/packages.rs",
+            "crates/evo-engine/src/capacity.rs"
+          ]
+        }
+      }
+    ],
+    "v_scenarios": [
+      {
+        "id": "V001",
+        "specification_status": "included",
+        "e_tasks": [
+          "E00",
+          "E16.6"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E00.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V002",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E16.4"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E16.4.trusted_host_rejection_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V003",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E07",
+          "E16.4"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E07.controller_acceptance",
+          "E16.4.trusted_host_rejection_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V004",
+        "specification_status": "included",
+        "e_tasks": [
+          "E03"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E03.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V005",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E03",
+          "E16.1"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E03.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V006",
+        "specification_status": "included",
+        "e_tasks": [
+          "E03",
+          "E16.1"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E03.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V007",
+        "specification_status": "included",
+        "e_tasks": [
+          "E04",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E04.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V008",
+        "specification_status": "included",
+        "e_tasks": [
+          "E04",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E04.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V009",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E04",
+          "E16.4"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E04.controller_acceptance",
+          "E16.4.trusted_host_rejection_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V010",
+        "specification_status": "included",
+        "e_tasks": [
+          "E01",
+          "E05",
+          "E07"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E01.controller_acceptance",
+          "E05.controller_acceptance",
+          "E07.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V011",
+        "specification_status": "included",
+        "e_tasks": [
+          "E01",
+          "E05"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E01.controller_acceptance",
+          "E05.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V012",
+        "specification_status": "included",
+        "e_tasks": [
+          "E01",
+          "E05"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E01.controller_acceptance",
+          "E05.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V013",
+        "specification_status": "included",
+        "e_tasks": [
+          "E01",
+          "E05"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E01.controller_acceptance",
+          "E05.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V014",
+        "specification_status": "included",
+        "e_tasks": [
+          "E06",
+          "E07",
+          "E16.3"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E06.controller_acceptance",
+          "E07.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V015",
+        "specification_status": "included",
+        "e_tasks": [
+          "E06",
+          "E07",
+          "E14"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E06.controller_acceptance",
+          "E07.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V016",
+        "specification_status": "included",
+        "e_tasks": [
+          "E06",
+          "E07",
+          "E13"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E06.controller_acceptance",
+          "E07.controller_acceptance",
+          "E13.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V017",
+        "specification_status": "included",
+        "e_tasks": [
+          "E03",
+          "E06",
+          "E08",
+          "E16.1",
+          "E16.2",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E03.controller_acceptance",
+          "E06.controller_acceptance",
+          "E08.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V018",
+        "specification_status": "included",
+        "e_tasks": [
+          "E08",
+          "E16.3",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E08.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V019",
+        "specification_status": "included",
+        "e_tasks": [
+          "E09"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E09.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V020",
+        "specification_status": "included",
+        "e_tasks": [
+          "E09",
+          "E10"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E09.controller_acceptance",
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V021",
+        "specification_status": "included",
+        "e_tasks": [
+          "E10"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V022",
+        "specification_status": "included",
+        "e_tasks": [
+          "E09",
+          "E10",
+          "E11"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E09.controller_acceptance",
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance",
+          "E11.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V023",
+        "specification_status": "included",
+        "e_tasks": [
+          "E10"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V024",
+        "specification_status": "included",
+        "e_tasks": [
+          "E09"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E09.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V025",
+        "specification_status": "included",
+        "e_tasks": [
+          "E09",
+          "E10"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E09.controller_acceptance",
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V026",
+        "specification_status": "included",
+        "e_tasks": [
+          "E10",
+          "E11",
+          "E15"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance",
+          "E11.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V027",
+        "specification_status": "included",
+        "e_tasks": [
+          "E10",
+          "E11"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance",
+          "E11.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V028",
+        "specification_status": "included",
+        "e_tasks": [
+          "E05",
+          "E11"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E05.controller_acceptance",
+          "E11.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V029",
+        "specification_status": "included",
+        "e_tasks": [
+          "E12"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E12.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V030",
+        "specification_status": "included",
+        "e_tasks": [
+          "E12"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E12.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V031",
+        "specification_status": "included",
+        "e_tasks": [
+          "E12"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E12.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V032",
+        "specification_status": "included",
+        "e_tasks": [
+          "E13"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E13.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V033",
+        "specification_status": "included",
+        "e_tasks": [
+          "E14",
+          "E15"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V034",
+        "specification_status": "included",
+        "e_tasks": [
+          "E12",
+          "E14"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E12.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V035",
+        "specification_status": "included",
+        "e_tasks": [
+          "E14",
+          "E15"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V036",
+        "specification_status": "included",
+        "e_tasks": [
+          "E14",
+          "E15"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V037",
+        "specification_status": "included",
+        "e_tasks": [
+          "E13",
+          "E16.4",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E13.controller_acceptance",
+          "E16.4.trusted_host_rejection_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V038",
+        "specification_status": "included",
+        "e_tasks": [
+          "E04",
+          "E08",
+          "E13",
+          "E16.3",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E04.controller_acceptance",
+          "E08.controller_acceptance",
+          "E13.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V039",
+        "specification_status": "included",
+        "e_tasks": [
+          "E16.2",
+          "E16.4",
+          "E16.5",
+          "E16.6"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E16.4.trusted_host_rejection_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V040",
+        "specification_status": "included",
+        "e_tasks": [
+          "E17"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V041",
+        "specification_status": "included",
+        "e_tasks": [
+          "E18"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V042",
+        "specification_status": "included",
+        "e_tasks": [
+          "E07",
+          "E11",
+          "E15",
+          "E16.6"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E07.controller_acceptance",
+          "E11.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V043",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V044",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V045",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V046",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V047",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E06",
+          "E07"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E06.controller_acceptance",
+          "E07.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V048",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V049",
+        "specification_status": "included",
+        "e_tasks": [
+          "E06"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E06.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V050",
+        "specification_status": "included",
+        "e_tasks": [
+          "E06"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E06.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V051",
+        "specification_status": "included",
+        "e_tasks": [
+          "E03",
+          "E16.1"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E03.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V052",
+        "specification_status": "included",
+        "e_tasks": [
+          "E03",
+          "E16.1"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E03.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V053",
+        "specification_status": "included",
+        "e_tasks": [
+          "E16.1"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V054",
+        "specification_status": "included",
+        "e_tasks": [
+          "E03",
+          "E16.1"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E03.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V055",
+        "specification_status": "included",
+        "e_tasks": [
+          "E03",
+          "E16.1"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E03.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V056",
+        "specification_status": "included",
+        "e_tasks": [
+          "E03",
+          "E08",
+          "E16.1"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E03.controller_acceptance",
+          "E08.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V057",
+        "specification_status": "included",
+        "e_tasks": [
+          "E03"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E03.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V058",
+        "specification_status": "included",
+        "e_tasks": [
+          "E03"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E03.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V059",
+        "specification_status": "included",
+        "e_tasks": [
+          "E06",
+          "E07"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E06.controller_acceptance",
+          "E07.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V060",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E16.4"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E16.4.trusted_host_rejection_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V061",
+        "specification_status": "included",
+        "e_tasks": [
+          "E16.4"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E16.4.trusted_host_rejection_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V062",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E16.4"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E16.4.trusted_host_rejection_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V063",
+        "specification_status": "included",
+        "e_tasks": [
+          "E16.3"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V064",
+        "specification_status": "included",
+        "e_tasks": [
+          "E06",
+          "E16.3"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E06.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V065",
+        "specification_status": "included",
+        "e_tasks": [
+          "E16.3"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V066",
+        "specification_status": "included",
+        "e_tasks": [
+          "E16.2",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V067",
+        "specification_status": "included",
+        "e_tasks": [
+          "E16.2"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V068",
+        "specification_status": "included",
+        "e_tasks": [
+          "E16.2"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V069",
+        "specification_status": "included",
+        "e_tasks": [
+          "E08",
+          "E16.2",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E08.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V070",
+        "specification_status": "included",
+        "e_tasks": [
+          "E06",
+          "E07",
+          "E16.2"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E06.controller_acceptance",
+          "E07.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V071",
+        "specification_status": "included",
+        "e_tasks": [
+          "E00",
+          "E16.6"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E00.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V072",
+        "specification_status": "included",
+        "e_tasks": [
+          "E00",
+          "E16.6"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E00.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V073",
+        "specification_status": "included",
+        "e_tasks": [
+          "E00",
+          "E16.5",
+          "E16.6"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E00.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V074",
+        "specification_status": "included",
+        "e_tasks": [
+          "E16.6"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V075",
+        "specification_status": "included",
+        "e_tasks": [
+          "E06",
+          "E08",
+          "E16.2",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E06.controller_acceptance",
+          "E08.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V076",
+        "specification_status": "included",
+        "e_tasks": [
+          "E16.1"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V077",
+        "specification_status": "included",
+        "e_tasks": [
+          "E06",
+          "E07",
+          "E16.4"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E06.controller_acceptance",
+          "E07.controller_acceptance",
+          "E16.4.trusted_host_rejection_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V078",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E06",
+          "E16.3"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E06.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V079",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V080",
+        "specification_status": "included",
+        "e_tasks": [
+          "E00",
+          "E16.6"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E00.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V081",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E06",
+          "E08",
+          "E09",
+          "E10",
+          "E11",
+          "E16",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E06.controller_acceptance",
+          "E08.controller_acceptance",
+          "E09.controller_acceptance",
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance",
+          "E11.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V082",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E08",
+          "E12",
+          "E13",
+          "E16",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E08.controller_acceptance",
+          "E12.controller_acceptance",
+          "E13.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V083",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E04",
+          "E08",
+          "E12",
+          "E16",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E04.controller_acceptance",
+          "E08.controller_acceptance",
+          "E12.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V084",
+        "specification_status": "included",
+        "e_tasks": [
+          "E01",
+          "E02",
+          "E05",
+          "E06",
+          "E08",
+          "E13",
+          "E16",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E01.controller_acceptance",
+          "E02.controller_acceptance",
+          "E05.controller_acceptance",
+          "E06.controller_acceptance",
+          "E08.controller_acceptance",
+          "E13.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V085",
+        "specification_status": "included",
+        "e_tasks": [
+          "E01",
+          "E02",
+          "E04",
+          "E05",
+          "E06",
+          "E08",
+          "E15",
+          "E16",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E01.controller_acceptance",
+          "E02.controller_acceptance",
+          "E04.controller_acceptance",
+          "E05.controller_acceptance",
+          "E06.controller_acceptance",
+          "E08.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V086",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E04",
+          "E08",
+          "E09",
+          "E10",
+          "E14",
+          "E16",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E04.controller_acceptance",
+          "E08.controller_acceptance",
+          "E09.controller_acceptance",
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V087",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E03",
+          "E04",
+          "E07",
+          "E13",
+          "E16",
+          "E16.1",
+          "E16.4"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E03.controller_acceptance",
+          "E04.controller_acceptance",
+          "E07.controller_acceptance",
+          "E13.controller_acceptance",
+          "E16.4.trusted_host_rejection_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V088",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E03",
+          "E07",
+          "E09",
+          "E16"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E03.controller_acceptance",
+          "E07.controller_acceptance",
+          "E09.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V089",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E03",
+          "E06",
+          "E07",
+          "E09",
+          "E16",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E03.controller_acceptance",
+          "E06.controller_acceptance",
+          "E07.controller_acceptance",
+          "E09.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V090",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E03",
+          "E05",
+          "E08",
+          "E09",
+          "E13",
+          "E14",
+          "E16",
+          "E16.1",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E03.controller_acceptance",
+          "E05.controller_acceptance",
+          "E08.controller_acceptance",
+          "E09.controller_acceptance",
+          "E13.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V091",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E05",
+          "E06",
+          "E07",
+          "E09",
+          "E13",
+          "E16",
+          "E16.2",
+          "E16.3",
+          "E16.4"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E05.controller_acceptance",
+          "E06.controller_acceptance",
+          "E07.controller_acceptance",
+          "E09.controller_acceptance",
+          "E13.controller_acceptance",
+          "E16.4.trusted_host_rejection_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V092",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E08",
+          "E14",
+          "E15",
+          "E16",
+          "E16.2",
+          "E16.3",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E08.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V093",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E04",
+          "E09",
+          "E12",
+          "E16"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E04.controller_acceptance",
+          "E09.controller_acceptance",
+          "E12.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V094",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E03",
+          "E04",
+          "E05",
+          "E06",
+          "E08",
+          "E09",
+          "E10",
+          "E11",
+          "E12",
+          "E13",
+          "E14",
+          "E16",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E03.controller_acceptance",
+          "E04.controller_acceptance",
+          "E05.controller_acceptance",
+          "E06.controller_acceptance",
+          "E08.controller_acceptance",
+          "E09.controller_acceptance",
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance",
+          "E11.controller_acceptance",
+          "E12.controller_acceptance",
+          "E13.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V095",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E06",
+          "E09",
+          "E16"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E02.controller_acceptance",
+          "E06.controller_acceptance",
+          "E09.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V096",
+        "specification_status": "included",
+        "e_tasks": [
+          "E01",
+          "E02",
+          "E03",
+          "E04",
+          "E06",
+          "E07",
+          "E08",
+          "E09",
+          "E10",
+          "E11",
+          "E12",
+          "E13",
+          "E14",
+          "E15",
+          "E16",
+          "E16.5"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E01.controller_acceptance",
+          "E02.controller_acceptance",
+          "E03.controller_acceptance",
+          "E04.controller_acceptance",
+          "E06.controller_acceptance",
+          "E07.controller_acceptance",
+          "E08.controller_acceptance",
+          "E09.controller_acceptance",
+          "E10.controller_acceptance",
+          "E10.replay_management_controller_acceptance",
+          "E11.controller_acceptance",
+          "E12.controller_acceptance",
+          "E13.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V097",
+        "specification_status": "included",
+        "e_tasks": [
+          "E01",
+          "E05",
+          "E07",
+          "E11",
+          "E13",
+          "E14",
+          "E15",
+          "E16"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E01.controller_acceptance",
+          "E05.controller_acceptance",
+          "E07.controller_acceptance",
+          "E11.controller_acceptance",
+          "E13.controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V098",
+        "specification_status": "included",
+        "e_tasks": [
+          "E00",
+          "E16",
+          "E16.1",
+          "E16.2",
+          "E16.3",
+          "E16.4",
+          "E16.5",
+          "E16.6"
+        ],
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [
+          "E00.controller_acceptance",
+          "E16.4.trusted_host_rejection_controller_acceptance"
+        ],
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      }
+    ]
+  },
+  "trace_index_coverage": {
+    "E00": {
+      "purpose": "index_consistency_only_not_scenario_execution",
+      "ranges": [
+        "K01–K10",
+        "SO01–SO18",
+        "V087–V098"
+      ]
+    },
+    "E16.6": {
+      "purpose": "complete_derived_index_coverage_not_scenario_execution",
+      "ranges": [
+        "B01–B10",
+        "U01–U08",
+        "K01–K10",
+        "SO01–SO18",
+        "E00–E18",
+        "E16.1–E16.6",
+        "V001–V098"
+      ]
+    }
   }
 }
