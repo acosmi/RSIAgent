@@ -35,7 +35,9 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | 06 | E05 | 独立评测/留出、连续前缀与早停证书；依赖 E01/E03/E04 | sol/high；engine evaluator/streaming_evaluator及定向测试 | verified（持久评测程序子范围）/ blocked（真实评测） | [PR #34](https://github.com/acosmi/RSIAgent/pull/34) draft；源码 `86e53b9` 已推送；未合并 |
 | 07 | E06 | 组合发布门禁、CAS、实际应用快照与实时撤销；依赖 E02/E05 | sol/high实施；主控代码复读、修复回退与读取旁路后隔离复验 | verified（持久门禁/拒绝路径）/ blocked（真实发布） | [PR #35](https://github.com/acosmi/RSIAgent/pull/35) draft；源码 `071c54d` 已推送；未合并 |
 | 08 | E07 | HostService、HTTP/MCP/CLI与参考宿主；依赖E03–E06 | sol/high实施；主控独立代码与实际进程验收 | verified（本地协议子范围）/ in_progress（管理集成）/ blocked（真实G1） | [PR #36](https://github.com/acosmi/RSIAgent/pull/36) draft；源码 `b22eb5c` 已推送；未合并 |
-后续依真源依赖图按 E08、E09、E10、E11、E12、E13、E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
+| 09 | E08 | 持久撤销、内容清理、备份与可信锚恢复；依赖E06 | sol实施、Astra/low恢复修复；主控独立验收 | verified（当前对象/本机离线恢复） | [PR #37](https://github.com/acosmi/RSIAgent/pull/37) draft；源码 `644d95d` 已推送；未合并 |
+| 10 | E09 | 受限策略/持久探索/E03真实消费者；依赖E03/E04/E07 | sol/high实施，主控独立验收 | verified（程序协调子范围）/ blocked（真实G2及恢复场景） | [PR #38](https://github.com/acosmi/RSIAgent/pull/38) draft；源码 `c71db74` 已推送；未合并 |
+后续依真源依赖图按 E10、E11、E12、E13、E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
 
 ## 当前 v4.1 主任务状态
 
@@ -51,13 +53,13 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | E05 | 独立验收器与有边界的统计判定 | in_progress（持久控制/早停已verified） | 主控12流式+6旧评测+13core共31项及fmt/clippy通过；晚到回执、输出不可变、Exposure时间/终态/未知费用保留已修；真实提供商、进程隔离、完整成本及逐依赖撤销仍未验，fixture禁止晋级。 |
 | E06 | 组合发布、实际应用与最小撤销闭环 | in_progress（持久门禁已verified） | 主控7集成+4单元+12 E05回归及fmt/clippy通过；审批防回退、Host完整报告闭包、所有快照读入口已验；真实生产批准/组合应用/回滚受E05证据阻塞。 |
 | E07 | 第一个最小可验证真实闭环 | in_progress（协议子范围已verified）/ blocked（真实闭环） | 主控21项本地程序/真实HTTP/MCP测试、CLI smoke、参考宿主及fmt/clippy/build通过；管理job/dispatch增量在同PR继续。真实模型、独立数据与支付授权未取得。 |
-| E08 | 可恢复的撤销、保留和备份链 | implemented_not_verified | 持久撤销游标、来源闭包、账单保留脱敏、备份恢复实现待主控验收；不能用子代理结果标verified。 |
-| E09 | 生成/探索解耦与有状态在线探索 | implemented_not_verified | 纯决策与实际优化消费者协调器、恢复/历史/实践接口实现待主控验收；仅代码准备，不启用G2真实运行。 |
-| E10 | 不可变世界池与纯查表回放 | in_progress | 世界池冻结合同后实施中；policy无关转移、同前缀批屏障、v1/v2目标和持久世界封存待验。 |
-| E11 | 验证回放优化的真实经济收益 | planned | 真实配对经济实验未运行。 |
-| E12 | 学习者条件化的经验自主获取 | in_progress（合同准备） | 正在审查§8合同与现有消费者，先冻结独立oracle/隔离/持久学习接口；未启用G3运行。 |
-| E13 | 长期部署适应与能力保留监测 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
-| E14 | 受限改进器自身的继承控制器 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
+| E08 | 可恢复的撤销、保留和备份链 | in_progress（当前对象/本机恢复已verified） | 主控47项及clippy/fmt通过；当前可信SQLite锚由操作者指定，不声称辨别假冒旧库。Linux/生产演练及后续新增对象清理另验。 |
+| E09 | 生成/探索解耦与有状态在线探索 | in_progress（程序协调已verified） | 主控25项及clippy/fmt通过；完整输入幂等、两节点StoreJournal链、源水位、整批资源已验；实际产生可修复故障的E03链、真实G2及全多组/实践范围仍待完成。 |
+| E10 | 不可变世界池与纯查表回放 | in_progress | 主控退回OOS/uncertain/溢出计量及真实pool/report消费者缺口；修复和池合同实施中，未最终验收。 |
+| E11 | 验证回放优化的真实经济收益 | in_progress（合同/持久准备） | 真实配对经济实验未运行；正实现静态成本与持久拒绝门，E10验证读取接口正在补齐。 |
+| E12 | 学习者条件化的经验自主获取 | implemented_not_verified | 第一批零预算/disabled课程和纯函数oracle已交付，主控审查中；真实隔离/学习应用闭环未具备，不启用G3。 |
+| E13 | 长期部署适应与能力保留监测 | implemented_not_verified | 持久周期/巩固消费者已交付，主控尚未验收；真实长时证据未取得。 |
+| E14 | 受限改进器自身的继承控制器 | in_progress（合同审查） | 正冻结单机制候选与下一作业真实使用合同；未实施或启用G4。 |
 | E15 | 后继质量与跨代收益实验 | planned | 真实后继实验未运行。 |
 | E16 | 产品支持范围与最终交付门禁 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
 | E16.1 | 来源导入与版本化读取器 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
@@ -188,3 +190,17 @@ V010–13/V084/V085仅在冻结合同、程序fixture、持久票据/账本和�
 输入 `controller-e07-protocol-acceptance.json`。主控业务9、HTTP lib2/真实listener2、MCP lib1/stdio2、旧closed_loop fixture5共21项通过；`cargo test --locked --offline`、clippy -D warnings、fmt、build均exit0；`python3 scripts/smoke_cli.py target/debug/rsia`实际输出 `SMOKE_CLI_OK model_transport=disabled benefit_claimed=false`。HTTP监听初次因sandbox EPERM失败，取得本地回环执行权限后实际复跑通过，未调用付费模型。日志本地 `controller-e07-*.log`。
 
 主控另用rustc直接编译参考宿主并运行含tab/引号/换行/控制字符的真实路径，JSON解析和路径逐字一致；code模式sandbox_unavailable，见 `controller-e07-reference.json`。仅新增既有fs2所需锁定依赖，无原有registry版本漂移。管理操作仍待job/dispatch真实接线，真实G1/收益/独立进程/发布不在该通过声明内。回滚点为E06已验源码，不能撤回已有副作用或费用事实。
+
+### E08 作用域化独立验收与 PR
+
+[PR #37](https://github.com/acosmi/RSIAgent/pull/37)；原验收源码 `15e039ecee06de22eb6c3fc47ea67e094969aaf1`，已推送源码 `644d95dd85490bc716f837d7148d7245bce0b2c3`；源码逐文件一致（除台账），merged_sha=null。主控47项定向测试和clippy/fmt exit0。storage 9 unit + 15 budget + 13 lifecycle；engine 9 broker + 1 lifecycle。精确已知schema清理、嵌套秘密移除、不可逆费用/曝光保留、可信锚与原子no-replace均有真实数据库/目录回归。
+
+输入/结论：`controller-e08-acceptance.json`；实际命令均 `cargo ... --locked --offline`；日志 `controller-e08-*.log` 仅本地。回滚点为上一E任务已验源码，已消费query/alpha/派发/费用及撤销水位不回退；支持/未完成边界见状态表及PR正文。
+
+### E09 作用域化独立验收与 PR
+
+[PR #38](https://github.com/acosmi/RSIAgent/pull/38)；原验收源码 `2f540fecf7f88f2d701fb46f1aa7251a33f1ea57`，已推送源码 `c71db74efd83a7dc2866b0f446049adcb4b8d3bd`；源码逐文件一致（除台账），merged_sha=null。主控25项定向测试和clippy/fmt exit0。core探索11、engine探索4、E03回归7、旧探索3。主控核对E03完整请求JSON提取前后token一致；真实StoreJournal fixture形成两节点，完成重连不重复模型调用。
+
+输入/结论：`controller-e09-acceptance.json`；实际命令均 `cargo ... --locked --offline`；日志 `controller-e09-*.log` 仅本地。回滚点为上一E任务已验源码，已消费query/alpha/派发/费用及撤销水位不回退；支持/未完成边界见状态表及PR正文。
+
+环境事件：本轮独立副本生成缓存导致磁盘耗尽，已保留失败日志并仅清理10个已完成副本的target构建缓存，释放约22GiB；源码、原始QA日志和验收输入均保留。受影响E09编译已实际重跑通过，不把ENOSPC记作产品通过或永久阻塞。
