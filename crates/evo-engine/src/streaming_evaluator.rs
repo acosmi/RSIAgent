@@ -2156,6 +2156,23 @@ pub async fn verified_report_view_in_session(
     report_id: &str,
 ) -> Result<VerifiedFormalReportView> {
     ctx.require(&[Role::Evaluator, Role::Admin])?;
+    verified_report_view_core(ctx, session, report_id).await
+}
+
+pub(crate) async fn verified_report_view_for_host_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    report_id: &str,
+) -> Result<VerifiedFormalReportView> {
+    ctx.require(&[Role::Host])?;
+    verified_report_view_core(ctx, session, report_id).await
+}
+
+async fn verified_report_view_core(
+    ctx: &Context,
+    session: &mut Session,
+    report_id: &str,
+) -> Result<VerifiedFormalReportView> {
     identifier(report_id)?;
     let ticket: EvaluationTicketV2 = need_record(session, ctx, TICKET_KIND, report_id).await?;
     let formal: FormalEvaluationV2 = need_record(session, ctx, FORMAL_KIND, report_id).await?;
