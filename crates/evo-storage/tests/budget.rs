@@ -7,6 +7,8 @@ use evo_storage::budget::{
     UsageCharge,
 };
 
+use sqlx::{Connection, SqliteConnection};
+
 fn ctx(namespace: &str, actor: &str, role: Role) -> Context {
     Context::new(namespace, actor, role).unwrap()
 }
@@ -935,4 +937,87 @@ async fn every_frozen_stage_uses_the_same_root_reserve_dispatch_finalize_path() 
     let root = store.root_budget(&admin, "scope-1").await.unwrap().unwrap();
     assert_eq!(root.reserved_micros, 0);
     assert_eq!(root.spent_micros, 0);
+}
+
+#[tokio::test]
+async fn group_ledger_keyset_scan_returns_all_10001_calls_and_stop_fences_old_lease() {
+    let (dir, store) = store().await;
+    let admin = ctx("ns-a", "admin", Role::Admin);
+    let evaluator = ctx("ns-a", "evaluator", Role::Evaluator);
+    let worker = ctx("ns-a", "worker", Role::Worker);
+    store
+        .authorize_root_budget(&admin, &authorization("root-1", "scope-1"))
+        .await
+        .unwrap();
+    let path = dir.path().join("rsia.sqlite3");
+    let mut connection = SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .unwrap();
+    let mut transaction = connection.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO root_budget_dispatch_groups(
+           billing_scope,dispatch_group_id,owner_namespace,created_at
+         ) VALUES('scope-1','large-ticket','ns-a',1)",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    for index in 0..10_001 {
+        sqlx::query(
+            "INSERT INTO root_budget_calls(
+               billing_scope,call_id,dispatch_group_id,namespace,stage,actual_input_digest,
+               reserved_micros,state,lease_token,lease_epoch,lease_until,execution_closed,created_at
+             ) VALUES('scope-1',?,'large-ticket','ns-a','task_execution',?,1,'reserved',?,1,1000,1,1)",
+        )
+        .bind(format!("call-{index:05}"))
+        .bind(hash(format!("input-{index}").as_bytes()))
+        .bind(format!("lease-{index}"))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    }
+    sqlx::query("UPDATE root_budgets SET reserved_micros=10001 WHERE billing_scope='scope-1'")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    drop(connection);
+
+    let mut session = store.session().await.unwrap();
+    let calls = session
+        .budget_calls_for_group(&worker, "scope-1", "large-ticket")
+        .await
+        .unwrap();
+    assert_eq!(calls.len(), 10_001);
+    assert_eq!(calls.first().unwrap().call_id, "call-00000");
+    assert_eq!(calls.last().unwrap().call_id, "call-10000");
+    let attributed = calls
+        .iter()
+        .take(10_000)
+        .map(|call| call.call_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let unknown = calls
+        .iter()
+        .filter(|call| !attributed.contains(call.call_id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(unknown[0].call_id, "call-10000");
+    session
+        .stop_dispatch_group(&evaluator, "scope-1", "large-ticket", "early_stop", 2)
+        .await
+        .unwrap();
+    let first = calls.first().unwrap();
+    let old_fence = BudgetCallFence {
+        billing_scope: first.billing_scope.clone(),
+        call_id: first.call_id.clone(),
+        actual_input_digest: first.actual_input_digest.clone(),
+        lease_token: first.lease_token.clone(),
+        lease_epoch: first.lease_epoch,
+        now: 3,
+    };
+    assert!(matches!(
+        session.begin_budget_dispatch(&worker, &old_fence).await,
+        Err(Error::Cancelled)
+    ));
+    session.commit().await.unwrap();
 }

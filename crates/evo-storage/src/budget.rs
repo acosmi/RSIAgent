@@ -1242,25 +1242,37 @@ async fn budget_calls_for_group_in_tx(
     identifier(billing_scope)?;
     identifier(dispatch_group_id)?;
     require_namespace(tx, billing_scope, ctx.namespace()).await?;
-    let rows = sqlx::query(
-        "SELECT * FROM root_budget_calls
-         WHERE billing_scope=? AND dispatch_group_id=? ORDER BY call_id LIMIT 10001",
-    )
-    .bind(billing_scope)
-    .bind(dispatch_group_id)
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(internal)?;
-    if rows.len() > 10_000 {
-        return Err(Error::Conflict(
-            "dispatch group call scan exceeds supported bound".into(),
-        ));
-    }
-    let mut calls = Vec::with_capacity(rows.len());
-    for row in rows {
-        let call = call_from_row(&row)?;
-        require_call_access(tx, ctx, &call).await?;
-        calls.push(call);
+    const PAGE_SIZE: i64 = 1_000;
+    let mut calls = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let rows = sqlx::query(
+            "SELECT * FROM root_budget_calls
+             WHERE billing_scope=? AND dispatch_group_id=?
+               AND (? IS NULL OR call_id>?)
+             ORDER BY call_id LIMIT ?",
+        )
+        .bind(billing_scope)
+        .bind(dispatch_group_id)
+        .bind(&cursor)
+        .bind(&cursor)
+        .bind(PAGE_SIZE)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(internal)?;
+        if rows.is_empty() {
+            break;
+        }
+        let row_count = rows.len();
+        for row in rows {
+            let call = call_from_row(&row)?;
+            require_call_access(tx, ctx, &call).await?;
+            cursor = Some(call.call_id.clone());
+            calls.push(call);
+        }
+        if row_count < PAGE_SIZE as usize {
+            break;
+        }
     }
     Ok(calls)
 }
