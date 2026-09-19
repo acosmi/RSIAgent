@@ -13,6 +13,7 @@ pub mod executor;
 pub mod exploration;
 pub mod hosts;
 pub mod import;
+pub mod lifecycle;
 pub mod meta;
 pub mod meta_experiment;
 pub mod model;
