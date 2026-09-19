@@ -27,12 +27,12 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 
 | 顺序 | 任务 | 范围与依赖 | 负责人/修改白名单 | 状态 | PR / source_sha / merged_sha |
 |---|---|---|---|---|---|
-| 01 | E00 | 固定基线、真源切换、历史/当前证据范围；无依赖 | 子代理复验；主控已核对源码与原始日志并定向重测 | verified（基线子范围）/ implemented_not_verified（治理脚本改动） | 台账 PR 待创建；输入 `9d4ef19`；未合并 |
-| 02 | E01 | 统计与独立留出静态合同；依赖 E00 核心基线 | sol/high；core evaluation/holdout/sequential、定向测试及数值参考脚本 | in_progress | 本地实施；未推送/未合并 |
-| 03 | E02 | 有界原子 Skill 编辑纯编译作用域；依赖 E01 合同验收 | sol/high；core skill_edit、engine compiler、定向测试 | in_progress | 本地静态准备；未推送/未合并 |
+| 01 | E00 | 固定基线、真源切换、历史/当前证据范围；无依赖 | 子代理复验；主控已核对源码与原始日志并定向重测 | verified（固定基线与治理脚本局部） | [PR #29](https://github.com/acosmi/RSIAgent/pull/29) draft，仅台账；本地源码 `c71b9ca` 未推送；未合并 |
+| 02 | E01 | 统计与独立留出静态合同；依赖 E00 核心基线 | sol/high实施，主控独立验收 | verified（静态合同）/ blocked（真实小试） | 本地 `bfbed849e4b16d82e4bd088b4cc7cc01e3d3a64f`；PR待源码推送授权；未合并 |
+| 03 | E02 | 有界原子 Skill 编辑纯编译作用域；依赖 E01 合同验收 | sol/high实施，主控独立验收 | verified（编译子范围） | 本地 `b7b3f1f278612ebaebfbca15d743255b89ed746e`；PR待源码推送授权；未合并 |
 | 04 | E03 | 真实应用诊断、小批反思、建议来源与开发消费者；依赖 E02 | sol；core/engine optimization、model、evidence及定向测试 | in_progress | 本地实施；未推送/未合并 |
 | 05 | E04 | 持久根预算、broker、取消/对账；依赖 E02 | sol/high；storage budget、0005_root_budget、engine broker/executor及定向测试 | in_progress | 本地实施；未推送/未合并 |
-| 06 | E05 | 独立评测/留出、连续前缀与早停证书；依赖 E01/E03/E04 | 尚未派发 | planned | 无 |
+| 06 | E05 | 独立评测/留出、连续前缀与早停证书；依赖 E01/E03/E04 | sol/high；engine evaluator/streaming_evaluator及定向测试 | in_progress | 本地准备；E03/E04真实消费者待整合；未推送/未合并 |
 后续依真源依赖图按 E06、E07、E08、E09、E10、E11、E12、E13、E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
 
 ## 当前 v4.1 主任务状态
@@ -41,12 +41,12 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 
 | 编号 | 范围 | 状态 | 未完成项/边界 |
 |---|---|---|---|
-| E00 | 归并真实源码与可重建输入 | verified（核心固定基线）/ implemented_not_verified（治理脚本）/ blocked（历史归并） | 原始112测试与门禁均复验通过；脚本准确清点与保留迁移号待最终验收；历史缺包不隐藏。 |
-| E01 | 先冻结实验、任务分区和预算可行性 | in_progress | 修复并整合遗留 WIP；冻结统计/留出/固定算法对照，真实小试尚未授权。 |
+| E00 | 归并真实源码与可重建输入 | verified（固定基线/治理脚本）/ blocked（历史归并） | 原始112测试与门禁均复验通过；脚本已完成10项主控正负验证；源码或fixture变更后旧日志不能用于新输入；历史缺包不隐藏。 |
+| E01 | 先冻结实验、任务分区和预算可行性 | implemented_not_verified（静态合同已verified） | 本地bfbed84；显式n/统计前提、alpha/留出/比较/完整费用合同已验；开发小试/正式样本与付费授权仍缺。 |
 | E02 | 最小版本化契约与宿主能力边界 | in_progress | 纯编译作用域：有界原子编辑；运行/宿主/其他新增契约尚待后续消费者。 |
 | E03 | 把跨任务证据真正接入生成消费者 | in_progress | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
 | E04 | 可信执行、隔离与根资源预算 | in_progress | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
-| E05 | 独立验收器与有边界的统计判定 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
+| E05 | 独立验收器与有边界的统计判定 | in_progress | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
 | E06 | 组合发布、实际应用与最小撤销闭环 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
 | E07 | 第一个最小可验证真实闭环 | planned | 真实模型、独立数据与支付授权未取得；不能以结构演示代替。 |
 | E08 | 可恢复的撤销、保留和备份链 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
@@ -107,10 +107,10 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | 场景 | 状态 | 当前事实/后续条件 |
 |---|---|---|
 | V001/V072@E00 | verified（基线作用域） | 主控核对73个源blob、原始日志；112项测试全部通过；另行重跑缺行票据失败/不退额度测试通过；T历史等价仍unverified |
-| V071@E00 | verified（本机入口/归档） | v4归档前后摘要一致，根目录唯一v4.1，方案/归档/QA被gitignore排除；远程台账同步待PR |
+| V071@E00 | verified（本机入口/归档） | v4归档前后摘要一致，根目录唯一v4.1，方案/归档/QA被gitignore排除；远程台账已提交 PR #29 draft；方案未上传 |
 | V073@E00 | blocked | 历史原包/增量包未取得；不从方案重造；不阻塞独立当前实现 |
 | V080/V098@E00 | verified（来源/追踪索引局部） | 25个E节点、98个V场景族保留；SO/K/W41附件索引完整，3个vendor blob与8个RSIA blob吻合；未重新执行上游7项 |
-| V010–V013/V084/V085/V096/V097@E01 | in_progress | core静态合同/程序数值范围；持久broker、真实样本/费用/收益仍未验 |
+| V010–V013/V084/V085/V096/V097@E01/core | verified（静态/数值局部） | 主控75项core测试、fmt/clippy/80位Python参考均通过；完整端到端和真实数据/费用/收益仍未验 |
 | V089@E02/compiler | verified（a/b/c及d字节边界） | 主控隔离副本执行14项编辑测试与1项旧host_surface均通过；fmt/clippy修正后通过；Token/完整请求上下文部分仍未验 |
 | V091/V094@E02 | implemented_not_verified | 仅纯编译报告/作用域/来源绑定；运行上下文、缓存、后续消费者与全族断言未验 |
 
@@ -137,4 +137,14 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | E00主控定向 | 同固定基线 | `cargo test --locked --offline -p evo-engine evaluator::tests::incomplete_rows_fail_the_ticket_without_refund` exit0 | `controller-e00-directed-test.log` | 保留旧完整批次行为；不是流式早停已实现 |
 | E02编辑编译 | 固定基线+E02三个文件+单独module export；输入逐文件hash留本地 | `cargo test --offline --locked -p evo-core --test skill_edit --test host_surface` 15 passed；fmt exit0；clippy -D warnings最终exit0 | `controller-e02-input.json`、`controller-e02-tests.log`、`controller-e02-fmt-after.log`、`controller-e02-clippy-after.log` | 仅编译子范围；未接真实宿主/token硬限/正式评估；未合并 |
 
-审阅中已修复：E02必填锚点错误限制空技能插入、报告缺作用域、来源同ID异摘要、集合顺序、edition格式与Clippy。E01连续前缀逐项停止、alpha绑定、新wire数值与disabled留出等问题仍在修复，不提前标通过。所有工作均绑定页首v4.1摘要；方案正文未上传。
+审阅中已修复：E02必填锚点错误限制空技能插入、报告缺作用域、来源同ID异摘要、集合顺序、edition格式与Clippy。E01连续前缀逐项停止、alpha绑定、新wire数值、disabled留出与根费用合同均已修正并通过主控局部验收；相应持久消费者仍由E04/E05完成。所有工作均绑定页首v4.1摘要；方案正文未上传。
+
+### 2026-09-19 后续验收与本地提交
+
+| 任务 | 主控验收 | 本地源码提交 | 远程状态/仍未完成 |
+|---|---|---|---|
+| E00治理脚本 | 保留号/迁移checksum拒绝、未绑定/歧义台账拒绝、固定输入112日志观察、代码或fixture变化全部unverified；10项正负检查通过 | `c71b9ca05fd4652b7935a6c74997a4baabea2969` | 源码未推送；PR #29仅台账；历史归并仍blocked |
+| E01静态合同 | 隔离副本75项core测试（13项新增），fmt/clippy均0；独立80位参考k12/13/14和固定种子仿真通过；输入文件hash复核无变化 | `bfbed849e4b16d82e4bd088b4cc7cc01e3d3a64f` | 无真实小试/正式数据/付款授权，不声称E01全部完成 |
+| E02纯编译 | 14新测+1旧宿主契约；fmt/clippy最终0；所有修正由主控复读 | `b7b3f1f278612ebaebfbca15d743255b89ed746e` | 上下文Token计量、真实宿主、后续消费者另验 |
+
+E01原始日志：`controller-e01-tests.log`、`controller-e01-fmt.log`、`controller-e01-clippy.log`、`controller-e01-reference.log`、`controller-e01-input.json`，均位于本轮本地证据目录。数值外扩1e-12，当前参考扫描最大裸差约2.24e-16；此为程序参考检查，不是全平台数值证明或产品效果。E03/E04/E05进行中，不用当前局部测试计数标记全量后端完成。
