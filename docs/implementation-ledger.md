@@ -34,10 +34,11 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | 05 | E04 | 持久根预算、broker、取消/对账；依赖 E02 | sol/high；storage budget、0005_root_budget、engine broker/executor及定向测试 | verified（根预算/broker子范围） | [PR #33](https://github.com/acosmi/RSIAgent/pull/33) draft；源码 `f02e535` 已推送；未合并 |
 | 06 | E05 | 独立评测/留出、连续前缀与早停证书；依赖 E01/E03/E04 | sol/high；engine evaluator/streaming_evaluator及定向测试 | verified（持久评测程序子范围）/ blocked（真实评测） | [PR #34](https://github.com/acosmi/RSIAgent/pull/34) draft；源码 `86e53b9` 已推送；未合并 |
 | 07 | E06 | 组合发布门禁、CAS、实际应用快照与实时撤销；依赖 E02/E05 | sol/high实施；主控代码复读、修复回退与读取旁路后隔离复验 | verified（持久门禁/拒绝路径）/ blocked（真实发布） | [PR #35](https://github.com/acosmi/RSIAgent/pull/35) draft；源码 `071c54d` 已推送；未合并 |
-| 08 | E07 | HostService、HTTP/MCP/CLI与参考宿主；依赖E03–E06 | sol/high实施；主控独立代码与实际进程验收 | verified（本地协议子范围）/ in_progress（管理集成）/ blocked（真实G1） | [PR #36](https://github.com/acosmi/RSIAgent/pull/36) draft；源码 `b22eb5c` 已推送；未合并 |
+| 08 | E07 | HostService、HTTP/MCP/CLI与参考宿主；依赖E03–E06 | sol/high实施；主控独立代码与实际进程验收 | verified（本地协议/E05管理子范围）/ blocked（真实G1） | [PR #36](https://github.com/acosmi/RSIAgent/pull/36) draft；源码 `0ed5ec9` 已推送；未合并 |
 | 09 | E08 | 持久撤销、内容清理、备份与可信锚恢复；依赖E06 | sol实施、Astra/low恢复修复；主控独立验收 | verified（当前对象/本机离线恢复） | [PR #37](https://github.com/acosmi/RSIAgent/pull/37) draft；源码 `644d95d` 已推送；未合并 |
 | 10 | E09 | 受限策略/持久探索/E03真实消费者；依赖E03/E04/E07 | sol/high实施，主控独立验收 | verified（程序协调子范围）/ blocked（真实G2及恢复场景） | [PR #38](https://github.com/acosmi/RSIAgent/pull/38) draft；源码 `c71db74` 已推送；未合并 |
-后续依真源依赖图按 E10、E11、E12、E13、E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
+| 11 | E10 | 不可变观察/世界池/纯回放/持久报告；依赖E08/E09 | sol/high实施，主控独立验收 | verified（程序回放子范围） | [PR #39](https://github.com/acosmi/RSIAgent/pull/39) draft；源码 `77177cd` 已推送；未合并 |
+后续依真源依赖图按 E11、E12、E13、E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
 
 ## 当前 v4.1 主任务状态
 
@@ -52,10 +53,10 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | E04 | 可信执行、隔离与根资源预算 | in_progress（根预算/broker已verified） | 主控预算15（含10001调用）、broker9、executor6项及fmt/clippy通过；group完整分页停止修复已追加PR #33；真实提供商、进程隔离尚未验。 |
 | E05 | 独立验收器与有边界的统计判定 | in_progress（持久控制/早停已verified） | 主控12流式+6旧评测+13core共31项及fmt/clippy通过；晚到回执、输出不可变、Exposure时间/终态/未知费用保留已修；真实提供商、进程隔离、完整成本及逐依赖撤销仍未验，fixture禁止晋级。 |
 | E06 | 组合发布、实际应用与最小撤销闭环 | in_progress（持久门禁已verified） | 主控7集成+4单元+12 E05回归及fmt/clippy通过；审批防回退、Host完整报告闭包、所有快照读入口已验；真实生产批准/组合应用/回滚受E05证据阻塞。 |
-| E07 | 第一个最小可验证真实闭环 | in_progress（协议子范围已verified）/ blocked（真实闭环） | 主控21项本地程序/真实HTTP/MCP测试、CLI smoke、参考宿主及fmt/clippy/build通过；管理job/dispatch增量在同PR继续。真实模型、独立数据与支付授权未取得。 |
+| E07 | 第一个最小可验证真实闭环 | in_progress（协议子范围已verified）/ blocked（真实闭环） | 主控协议21项与管理增量27项、真实HTTP/MCP/CLI、参考宿主及fmt/clippy/build通过；E05注册/票据管理已接线。exploration/replay/curriculum/meta管理适配仍缺；真实模型、独立数据与支付授权未取得。 |
 | E08 | 可恢复的撤销、保留和备份链 | in_progress（当前对象/本机恢复已verified） | 主控47项及clippy/fmt通过；当前可信SQLite锚由操作者指定，不声称辨别假冒旧库。Linux/生产演练及后续新增对象清理另验。 |
 | E09 | 生成/探索解耦与有状态在线探索 | in_progress（程序协调已verified） | 主控25项及clippy/fmt通过；完整输入幂等、两节点StoreJournal链、源水位、整批资源已验；实际产生可修复故障的E03链、真实G2及全多组/实践范围仍待完成。 |
-| E10 | 不可变世界池与纯查表回放 | in_progress | 主控退回OOS/uncertain/溢出计量及真实pool/report消费者缺口；修复和池合同实施中，未最终验收。 |
+| E10 | 不可变世界池与纯查表回放 | in_progress（程序回放/池/报告已verified） | 主控57项、clippy/fmt通过；观察正文绑定实际共同输入和来源，q0/辅助来源篡改拒绝；世界/池/报告持久与实时撤销已验。真实观测与管理适配仍未完成，不声称经济收益。 |
 | E11 | 验证回放优化的真实经济收益 | in_progress（合同/持久准备） | 真实配对经济实验未运行；正实现静态成本与持久拒绝门，E10验证读取接口正在补齐。 |
 | E12 | 学习者条件化的经验自主获取 | implemented_not_verified | 第一批零预算/disabled课程和纯函数oracle已交付，主控审查中；真实隔离/学习应用闭环未具备，不启用G3。 |
 | E13 | 长期部署适应与能力保留监测 | implemented_not_verified | 持久周期/巩固消费者已交付，主控尚未验收；真实长时证据未取得。 |
@@ -204,3 +205,19 @@ V010–13/V084/V085仅在冻结合同、程序fixture、持久票据/账本和�
 输入/结论：`controller-e09-acceptance.json`；实际命令均 `cargo ... --locked --offline`；日志 `controller-e09-*.log` 仅本地。回滚点为上一E任务已验源码，已消费query/alpha/派发/费用及撤销水位不回退；支持/未完成边界见状态表及PR正文。
 
 环境事件：本轮独立副本生成缓存导致磁盘耗尽，已保留失败日志并仅清理10个已完成副本的target构建缓存，释放约22GiB；源码、原始QA日志和验收输入均保留。受影响E09编译已实际重跑通过，不把ENOSPC记作产品通过或永久阻塞。
+
+### E07 管理增量收口
+
+同一 [PR #36](https://github.com/acosmi/RSIAgent/pull/36) 追加源码 `0ed5ec915f438764217e9bd059bb99c401dce26e`（本地 `2e0b275064a6076413644779f1a02692f467c0cf`）。主控独立27项通过：管理集成8、单元3、E05/管理14、真实HTTP2；实际CLI smoke、build、clippy、fmt exit0。输入/结果为本地 `controller-e07-management-acceptance.json` 与 `controller-e07-management-*.log`。持久身份注册、私有输入恢复、generation/lease fence、取消与错误终态、E05注册/签发/状态消费者已验。exploration/replay/curriculum/meta仍返回blocked_feature，属于剩余工程适配；真实G1和完整逐依赖清理仍未验。E08/E09仅整合此已验前置，未合并任何GitHub PR。
+
+### E10 程序回放子范围独立验收与 PR
+
+[PR #39](https://github.com/acosmi/RSIAgent/pull/39)，base=`wrokbot/v4.1-pr-e09-persistent-exploration`；本地验收源码 `227a09e`，推送源码 `77177cd5ffa87de5152a3295974ae41fc86498d4`；除台账外逐文件一致，merged_sha=null。
+
+主控在固定独立副本执行 `cargo test --locked --offline`：core replay 7、storage unit/replay/lifecycle 33、engine legacy replay 4、engine replay integration 13，共57项；三crate的clippy all-targets -D warnings及fmt exit0。输入 `controller-e10-final-input.json`，结论 `controller-e10-acceptance.json`，日志 `controller-e10-*.log` 仅本地。
+
+完整观察输入/来源、真实存储篡改反例、W_sim=1/2/4屏障、OOS/uncertain成本、池分区、报告语义重算和撤销清理已验；原始观察为程序fixture，不冒充真实任务执行或收益。回滚点为E09加E07管理已验源码，已消费费用/来源撤销不得回退。
+
+### 实施分工切换决定
+
+用户确认先收口当前在途任务，再切换由 Antigravity 实施、Codex 主控裁决与独立验收。当前只收口 E07管理增量和 E10–E13，不启动E14及后续代码。E14仅保留本地合同建议；剩余工程与外部条件分别登记。每项任务保持独立PR，旧任务补齐继续追加对应PR；方案/合同/原始QA仍仅本地。
