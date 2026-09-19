@@ -542,6 +542,7 @@ fn new_schemas_reject_unknown_fields_and_certificates_never_promote() {
         "early_stop_plan_digest": d("early-plan"),
         "alpha_plan_digest": d("alpha-plan"),
         "manifest_digest": d("manifest"),
+        "slice_id": "slice-1",
         "candidate_digest": d("candidate"),
         "baseline_digest": d("baseline"),
         "grader_digest": d("grader"),
@@ -550,7 +551,10 @@ fn new_schemas_reject_unknown_fields_and_certificates_never_promote() {
         "lcb": "-1",
         "ucb": "-0.009",
         "completed_prefix_digest": d("prefix"),
+        "member_terminal_digest": d("terminal-members"),
         "stop_reason": "futility_quality_gain",
+        "stopped_at_unix_ms": 100,
+        "stop_sequence": 1,
         "usage_uncertain": true
     }))
     .unwrap();
@@ -564,6 +568,7 @@ fn new_schemas_reject_unknown_fields_and_certificates_never_promote() {
         "early_stop_plan_digest": d("early-plan"),
         "alpha_plan_digest": d("alpha-plan"),
         "manifest_digest": d("manifest"),
+        "slice_id": "slice-1",
         "candidate_digest": d("candidate"),
         "baseline_digest": d("baseline"),
         "grader_digest": d("grader"),
@@ -572,7 +577,10 @@ fn new_schemas_reject_unknown_fields_and_certificates_never_promote() {
         "lcb": null,
         "ucb": null,
         "completed_prefix_digest": d("empty-prefix"),
+        "member_terminal_digest": d("terminal-members"),
         "stop_reason": "critical_regression",
+        "stopped_at_unix_ms": 100,
+        "stop_sequence": 1,
         "usage_uncertain": false
     }))
     .unwrap();
