@@ -327,3 +327,37 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - Codex 及其他未列产品明确为 unsupported，不猜测其格式；
 - 真实外部模型调用预算仍为 0。
 
+### AG-003 / E16.2 资产导入/导出、隐私门禁与不可信元数据隔离实施与自测
+
+- 任务号：AG-003
+- E 归属：E16.2
+- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- base 分支：`wrokbot/ag-002-e16-1-source-import`
+- head 分支：`wrokbot/ag-003-e16-2-asset-package`
+- PR：[PR #45](https://github.com/acosmi/RSIAgent/pull/45)
+- merged_sha: null
+
+依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §11.1、§11.2、§11.3、§13.1 E16.2 及 V017, V039, V066, V067, V068, V069, V070, V075, V091, V092, V098 场景族。
+文件白名单修改：
+1. `crates/evo-engine/src/packages.rs`: 完整实现 §11.2 冻结的 `AssetPackageManifest` 规范；实现安全初值与越界前拒绝门禁（MAX_FILES=100, MAX_TOTAL=10MB, MAX_FILE=1MB, MAX_ZIP_RATIO=100，路径穿越/绝对路径/重复路径/可执行脚本/链接全面阻断）；全面增强隐私扫描器 `scan_privacy` 与 `privacy_block`（拦截私钥、API tokens、本地用户目录、内部网络IP/域名、隐藏评测答案、原始对话会话、敏感认证参数）；实现跨安装域不可信元数据隔离与 staging 工作流（`foreign_approval_is_not_local`、外部 FormalEvaluation/Approval 仅存历史声明、不赋予本地权限、不改写本地 Active、缺失依赖隔离为 quarantined）；实现三方差异与只读预览 `preview_package_diff`（改动强制新审批，绝不越权提升角色）；实现撤销感知的受控导出 `export_package`（导出途中源被撤销或水位前移立即终止失败，未完成包不成为可用包，交付审计记录保留事实但不虚构远程销毁）；实现共享依赖卸载保护 `DependencyTracker`（防止误删跨包共享依赖）。
+2. `fixtures/packages/golden_manifest.json`: 冻结并输出 v4.1 §11.2 规定的包清单 golden 规范样本。
+3. `crates/evo-engine/tests/packages_v41.rs`: 新增端到端集成测试套件，全面覆盖 V017, V039, V066, V067, V068, V069, V070, V075, V091, V092, V098 全部 14 项测试场景。
+
+自测证据（全部 exit 0）：
+- `cargo test --locked --offline -p evo-engine --test packages_v41`: 16 项全部通过（含主控对抗缺陷 F04 导出元数据/包清单隐私扫描门禁等 2 项回归测试）。
+- `cargo test --locked --offline -p evo-engine --lib packages::tests`: 4 项全部通过。
+- `cargo test --locked --offline -p evo-engine --test import_v41`: 13 项全部通过。
+- `cargo test --locked --offline -p evo-core -p evo-storage -p evo-engine`: 全量测试全部通过。
+- `cargo clippy --locked --offline -p evo-core -p evo-storage -p evo-engine --all-targets -- -D warnings`: 检查通过，无 warning。
+- `cargo fmt --all -- --check`: 格式化检查通过。
+
+主控审阅缺陷整改记录（PR #45）：
+- **F04（导出元数据与清单描述隐私扫描门禁）**：在 `export_package` 与 `validate_manifest` 中对 `description`、`name`、`publisher`、`license`、`version`、`asset_id`、依赖项属性以及跨安装域不可信元数据执行全量 `scan_privacy` 与 `privacy_block` 检查，彻底阻止敏感标记（如私钥标记 `BEGIN PRIVATE KEY`、Token等）借道元数据绕过隐私门禁。
+
+未完成项与边界：
+- E16.3–E16.6、E14、E15 仍为 planned；
+- 外部包无论携带何种外部评测与审批，导入后绝不自动生效（`is_active = false`, `is_approved = false`），必须经过本地编译、验收与正式审批；
+- 隐私扫描通过记录明确免责声明（`PRIVACY_DISCLAIMER`），不声称绝对无泄漏，禁止项不可通过“忽略告警”放行；
+- 撤销感知记录保留真实历史事实，不声称远程擦除第三方已下载副本。
+
+
