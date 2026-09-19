@@ -6,6 +6,54 @@ use evo_core::evidence::{
 use evo_core::{Error, Result, identifier};
 use std::collections::BTreeSet;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportedEvidenceSummaryView {
+    pub result_id: String,
+    pub evidence_set_id: String,
+    pub evidence_digest: String,
+    pub coverage: SourceCoverage,
+    pub total_sources: usize,
+    pub total_events: usize,
+    pub independent_clusters: usize,
+    pub task_origin: TaskOrigin,
+    pub execution_attestation: ExecutionAttestation,
+    pub generation_status: String,
+    pub formal_evaluation_eligible: bool,
+}
+
+/// Reads a persisted E16 import through its live source/tombstone/watermark
+/// gate. This is a summary consumer; it never upgrades imported history into
+/// the E03 TrustedHost run authority or exposes private source bytes.
+pub async fn read_persisted_imported_evidence(
+    context: &evo_core::Context,
+    store: &evo_storage::Store,
+    result_id: &str,
+) -> Result<ImportedEvidenceSummaryView> {
+    context.require(&[evo_core::Role::Admin, evo_core::Role::Evaluator])?;
+    let result = crate::import::PersistentImportService::new(store.clone())
+        .load_live_result(context, result_id)
+        .await?;
+    let evidence_set = result
+        .payload
+        .evidence_set
+        .as_ref()
+        .ok_or_else(|| Error::Invalid("import produced no usable evidence".into()))?;
+    Ok(ImportedEvidenceSummaryView {
+        result_id: result.id,
+        evidence_set_id: evidence_set.id.clone(),
+        evidence_digest: evidence_set.digest.clone(),
+        coverage: result.payload.aggregate_summary.coverage.clone(),
+        total_sources: result.payload.aggregate_summary.total_sources,
+        total_events: result.payload.aggregate_summary.total_events,
+        independent_clusters: result.payload.aggregate_summary.unique_clusters,
+        task_origin: TaskOrigin::ImportedHistory,
+        execution_attestation: ExecutionAttestation::UnverifiedImport,
+        generation_status: result.payload.generation_status,
+        formal_evaluation_eligible: false,
+    })
+}
+
 pub struct ForensicLimits {
     pub max_files: usize,
     pub max_header_bytes: usize,

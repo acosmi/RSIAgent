@@ -43,6 +43,9 @@ async fn put_source(store: &Store, id: &str, marker: &str) {
         .unwrap();
     session.commit().await.unwrap();
 }
+fn import_envelope(id: &str, payload: serde_json::Value) -> serde_json::Value {
+    json!({"schema_version":"rsia.e16.import_source.v1","id":id,"namespace":"n","owner_actor":"admin","request_key":format!("request-{id}"),"input_digest":hash(format!("input-{id}").as_bytes()),"created_at":1,"updated_at":1,"source_refs":[],"revoke_watermark":1,"payload":payload})
+}
 
 fn lifecycle_replay_world(id: &str, cluster: &str, partition: WorldPartition) -> ReplayWorldV2 {
     let transition = ReplayTransitionV2 {
@@ -907,6 +910,58 @@ fn restore(backup: &std::path::Path, dest: &std::path::Path, delta: &std::path::
         delta,
         Some(&backup.parent().unwrap().join("rsia.sqlite3")),
     )
+}
+
+#[tokio::test]
+async fn restore_replays_import_source_artifact_revocation() {
+    let (dir, store) = database().await;
+    let admin = ctx("admin", Role::Admin);
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, &hash(b"base"))
+        .await
+        .unwrap();
+    let source = import_envelope(
+        "import-source",
+        json!({"status":"missing","raw_blob_digest":hash(b"absent"),"blob_published":false}),
+    );
+    session
+        .put(&admin, "artifact", "import-source", "admin", &source)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let backup = dir.path().join("import-backup");
+    store.backup(&backup).await.unwrap();
+    let manifest_bytes = std::fs::read(backup.join("backup-manifest.json")).unwrap();
+    let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+    let base = manifest.watermarks.first().unwrap();
+    let revoked = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "artifact".into(),
+            id: "import-source".into(),
+        },
+        "post backup revoke",
+        9,
+    )
+    .await
+    .unwrap();
+    let mut session = store.session().await.unwrap();
+    let tombstone: evo_storage::lifecycle::RevokeTombstone = session
+        .need(&admin, "tombstone", "import-source")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let delta = dir.path().join("import-delta.json");
+    std::fs::write(&delta,serde_json::to_vec(&json!({"schema_version":"rsia.revoke_delta.v1","base_manifest_sha256":hash(&manifest_bytes),"namespaces":[{"namespace":base.namespace,"base_seq":base.seq,"base_digest":base.digest,"events":[{"seq":base.seq+1,"previous_digest":base.digest,"digest":revoked.watermark_digest,"source_kind":"artifact","source_id":"import-source","tombstone_digest":hash(&serde_json::to_vec(&tombstone).unwrap()),"reason":"post backup revoke","created_at":9}],"latest_seq":base.seq+1,"latest_digest":revoked.watermark_digest}]})).unwrap()).unwrap();
+    let restored = dir.path().join("import-restored");
+    assert_eq!(restore(&backup, &restored, &delta), 0);
+    let restored_store = Store::open(&restored.join("rsia.sqlite3")).await.unwrap();
+    let status = LifecycleStore::cleanup_status(&admin, &restored_store, &revoked.job_id)
+        .await
+        .unwrap();
+    assert_eq!(status.state, CleanupState::Pending);
 }
 
 #[tokio::test]

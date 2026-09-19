@@ -92,7 +92,7 @@ def verify_delta_event(event):
     exact_int(event["seq"],"delta event seq",1)
     exact_hex(event["previous_digest"],64,"delta previous digest")
     exact_hex(event["digest"],64,"delta digest")
-    if event["source_kind"]!="run": raise IsolationError("unsupported delta source kind")
+    if event["source_kind"] not in ("run","artifact"): raise IsolationError("unsupported delta source kind")
     exact_string(event["source_id"],"delta source id")
     exact_hex(event["tombstone_digest"],64,"tombstone digest")
     exact_string(event["reason"],"delta reason")
@@ -304,7 +304,7 @@ def verify_delta(path,manifest_raw,base,anchor,backup,database=None):
             for id,raw in trusted.execute("SELECT id,body FROM objects WHERE namespace=? AND kind='tombstone'",(ns,)):
                 t=read_json(raw)
                 required={"id","schema_version","source_kind","reason","watermark_seq","watermark_digest","created_at"}
-                if set(t)!=required or t["schema_version"]!="rsia.revoke_tombstone.v1" or t["id"]!=id or t["source_kind"]!="run":
+                if set(t)!=required or t["schema_version"]!="rsia.revoke_tombstone.v1" or t["id"]!=id or t["source_kind"] not in ("run","artifact"):
                     raise IsolationError("unknown trusted tombstone schema")
                 anchored_tombstones.append((ns,id,t))
                 if t["watermark_seq"]<=seq:
@@ -316,7 +316,7 @@ def verify_delta(path,manifest_raw,base,anchor,backup,database=None):
             authoritative.sort(key=lambda pair:pair[0]["watermark_seq"])
             expected=[];previous=digest
             for t,td in authoritative:
-                expected.append({"seq":t["watermark_seq"],"previous_digest":previous,"digest":t["watermark_digest"],"source_kind":"run","source_id":t["id"],"tombstone_digest":td,"reason":t["reason"],"created_at":t["created_at"]})
+                expected.append({"seq":t["watermark_seq"],"previous_digest":previous,"digest":t["watermark_digest"],"source_kind":t["source_kind"],"source_id":t["id"],"tombstone_digest":td,"reason":t["reason"],"created_at":t["created_at"]})
                 previous=t["watermark_digest"]
             if [e["seq"] for e in expected]!=list(range(seq+1,latest[0]+1)) or previous!=latest[1] or entry.get("events")!=expected:
                 raise IsolationError("delta is incomplete or differs from trusted revocation events")

@@ -7,6 +7,10 @@ use std::path::{Component, Path};
 pub const EVIDENCE_SCHEMA: &str = "rsia.evidence_set.v2";
 pub const MAX_DISCOVERED_FILES: usize = 200;
 pub const MAX_EXCERPTS: usize = 32;
+pub const MAX_HEADER_PROBE_BYTES: usize = 64 * 1024;
+pub const MAX_TOTAL_READ_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_EVENT_BYTES: usize = 256 * 1024;
+pub const MAX_TOTAL_EXCERPT_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,7 +109,7 @@ pub fn assert_authorized_path(path: &str, roots: &[String]) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceCoverage {
     pub discovery_exhausted: bool,
@@ -131,6 +135,7 @@ impl SourceCoverage {
             && self.permission_denied == 0
             && self.missing == 0
             && self.unsupported_format == 0
+            && self.zero_records == 0
             && self.event_truncated == 0
             && self.char_truncated == 0
             && self.excerpt_truncated == 0
@@ -205,6 +210,77 @@ impl EvidenceSet {
     pub fn contains_source(&self, source_id: &str) -> bool {
         self.members.iter().any(|m| m.source_id == source_id)
     }
+}
+
+/// Immutable locator binding source object digest, byte/event range, and excerpt digest (§5.6, §6.3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceLocator {
+    pub source_id: String,
+    pub source_digest: String,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub event_index: usize,
+    pub excerpt_digest: String,
+}
+
+impl EvidenceLocator {
+    pub fn build(
+        source_id: impl Into<String>,
+        source_digest: impl Into<String>,
+        byte_start: usize,
+        byte_end: usize,
+        event_index: usize,
+        excerpt_digest: impl Into<String>,
+    ) -> Result<Self> {
+        let source_id = source_id.into();
+        let source_digest = source_digest.into();
+        let excerpt_digest = excerpt_digest.into();
+        identifier(&source_id)?;
+        identifier(&source_digest)?;
+        identifier(&excerpt_digest)?;
+        if byte_start > byte_end {
+            return Err(Error::Invalid("invalid byte range".into()));
+        }
+        Ok(Self {
+            source_id,
+            source_digest,
+            byte_start,
+            byte_end,
+            event_index,
+            excerpt_digest,
+        })
+    }
+
+    /// Verifies source digest and extracts excerpt. Returns Error::Conflict("source_changed")
+    /// if the source file changed between probe and read (§6.3, V056).
+    pub fn verify_and_extract<'a>(&self, current_source_bytes: &'a [u8]) -> Result<&'a [u8]> {
+        let current_digest = crate::hash(current_source_bytes);
+        if current_digest != self.source_digest {
+            return Err(Error::Conflict("source_changed".into()));
+        }
+        let excerpt = current_source_bytes
+            .get(self.byte_start..self.byte_end)
+            .ok_or_else(|| Error::Invalid("offset out of bounds".into()))?;
+        let excerpt_digest = crate::hash(excerpt);
+        if excerpt_digest != self.excerpt_digest {
+            return Err(Error::Conflict("excerpt_digest_mismatch".into()));
+        }
+        Ok(excerpt)
+    }
+}
+
+/// Aggregate summary of forensic history across sources (§5.6, §6.3).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AggregateSummary {
+    pub total_sources: usize,
+    pub total_events: usize,
+    pub tool_calls_count: usize,
+    pub failure_count: usize,
+    pub unique_clusters: usize,
+    pub counter_examples: Vec<String>,
+    pub coverage: SourceCoverage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,7 +379,7 @@ pub struct ModelEvidenceRequest {
 
 impl ModelEvidenceRequest {
     pub fn from_set(set: &EvidenceSet, excerpts: Vec<String>) -> Result<Self> {
-        if set.members.len() < 2 {
+        if set.members.len() < 2 || set.independent_clusters.len() < 2 {
             return Err(Error::Invalid(
                 "generator request needs at least two authorized independent sources".into(),
             ));
@@ -388,6 +464,29 @@ mod tests {
     }
 
     #[test]
+    fn copied_sources_in_one_cluster_are_not_cross_task_evidence() {
+        let set = EvidenceSet::build(
+            "es1",
+            vec![
+                member(
+                    "copy1",
+                    TaskOrigin::ImportedHistory,
+                    ExecutionAttestation::UnverifiedImport,
+                ),
+                member(
+                    "copy2",
+                    TaskOrigin::ImportedHistory,
+                    ExecutionAttestation::UnverifiedImport,
+                ),
+            ],
+            SourceCoverage::default(),
+            ["content_same".into()].into(),
+        )
+        .unwrap();
+        assert!(ModelEvidenceRequest::from_set(&set, vec![]).is_err());
+    }
+
+    #[test]
     fn path_traversal_and_log_commands_rejected() {
         let roots = vec!["/authorized".into()];
         assert!(assert_authorized_path("../etc/passwd", &roots).is_err());
@@ -462,5 +561,44 @@ mod tests {
         .unwrap();
         let jobs = invalidate_jobs_if_source_revoked(&set, "run2", &["job-a".into()]).unwrap();
         assert_eq!(jobs, vec!["job-a"]);
+    }
+
+    #[test]
+    fn evidence_locator_binds_digest_and_detects_source_changed() {
+        let content = b"line1: safe code\nline2: failure observed\nline3: end";
+        let digest = crate::hash(content);
+        let excerpt = b"failure observed";
+        let excerpt_digest = crate::hash(excerpt);
+        let start = 24;
+        let locator = EvidenceLocator::build(
+            "src-1",
+            &digest,
+            start,
+            start + excerpt.len(),
+            1,
+            &excerpt_digest,
+        )
+        .unwrap();
+
+        let extracted = locator.verify_and_extract(content).unwrap();
+        assert_eq!(extracted, excerpt);
+
+        // If content changed (e.g. modified after probe), Conflict("source_changed") is returned.
+        let modified = b"line1: safe code\nline2: modified text\nline3: end";
+        let err = locator.verify_and_extract(modified).unwrap_err();
+        assert!(matches!(err, Error::Conflict(msg) if msg == "source_changed"));
+    }
+
+    #[test]
+    fn zero_record_sources_keep_coverage_partial() {
+        let mut coverage = SourceCoverage {
+            discovery_exhausted: true,
+            files_known: true,
+            ..SourceCoverage::default()
+        };
+        assert!(coverage.complete());
+        coverage.zero_records = 1;
+        assert!(!coverage.complete());
+        assert_eq!(coverage.as_label(), "partial");
     }
 }
