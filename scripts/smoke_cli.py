@@ -21,6 +21,7 @@ from typing import Any
 
 AGENT_TOKEN = "smoke-agent-token-0123456789"
 HOST_TOKEN = "smoke-host-token-01234567890"
+ADMIN_TOKEN = "smoke-admin-token-0123456789"
 
 
 def fail(message: str) -> None:
@@ -114,6 +115,8 @@ def smoke_http(binary: Path, root: Path) -> None:
             AGENT_TOKEN,
             "--host-token",
             HOST_TOKEN,
+            "--admin-token",
+            ADMIN_TOKEN,
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -147,6 +150,36 @@ def smoke_http(binary: Path, root: Path) -> None:
         )
         if second_mcp.returncode == 0 or "already locked" not in second_mcp.stderr:
             fail("MCP process acquired the HTTP process data directory")
+        request_file = root / "blocked-replay.json"
+        request_file.write_text(json.dumps({
+            "schema_version": "rsia.management.replay_run.v1",
+            "request_key": "cli-blocked-1",
+        }))
+        submitted = subprocess.run(
+            [str(binary), "manage", "replay.run", "--url", base,
+             "--auth-token", ADMIN_TOKEN, "--request-file", str(request_file)],
+            capture_output=True, text=True, timeout=5,
+        )
+        if submitted.returncode != 0:
+            fail(f"CLI management submit failed: {submitted.stderr}")
+        job = json.loads(submitted.stdout)
+        final = None
+        for _ in range(100):
+            status = subprocess.run(
+                [str(binary), "manage", "job.status", "--url", base,
+                 "--auth-token", ADMIN_TOKEN, "--job-id", job["id"]],
+                capture_output=True, text=True, timeout=5,
+            )
+            if status.returncode != 0:
+                fail(f"CLI management status failed: {status.stderr}")
+            final = json.loads(status.stdout)
+            if final.get("state") in {"blocked", "failed", "cancelled", "succeeded"}:
+                break
+            time.sleep(0.01)
+        if final is None or final.get("state") != "blocked":
+            fail(f"CLI management did not preserve blocked terminal: {final}")
+        if final.get("id") != job["id"]:
+            fail("CLI management status did not return the persisted job")
         prepare = {"request_key": "prepare-1", "goal": "locate config", "capabilities": []}
         if http_post(base, "/v1/tools/prepare", prepare, None)[0] != 401:
             fail("anonymous HTTP request was not rejected")
@@ -462,6 +495,7 @@ def main(argv: list[str]) -> int:
     secret = "must-not-appear-in-help-0123456789"
     help_environment = os.environ.copy()
     help_environment["RSIA_HTTP_TOKEN"] = secret
+    help_environment["RSIA_MANAGEMENT_TOKEN"] = secret
     serve_help = subprocess.run(
         [str(binary), "serve", "--help"],
         capture_output=True,
@@ -471,15 +505,11 @@ def main(argv: list[str]) -> int:
     if serve_help.returncode != 0 or secret in (serve_help.stdout + serve_help.stderr):
         print("CLI help exposed an environment token", file=sys.stderr)
         return 1
-    unsupported = subprocess.run(
-        [str(binary), "manage", "evaluation.start"], capture_output=True, text=True
-    )
-    if unsupported.returncode == 0 or "unsupported" not in unsupported.stderr:
-        print("pending management operation did not fail accurately", file=sys.stderr)
-        return 1
     unusual_operation = 'unknown"\noperation'
     unusual = subprocess.run(
-        [str(binary), "manage", unusual_operation], capture_output=True, text=True
+        [str(binary), "manage", unusual_operation, "--auth-token", ADMIN_TOKEN],
+        capture_output=True,
+        text=True,
     )
     try:
         unusual_json = json.loads(unusual.stderr.splitlines()[0])

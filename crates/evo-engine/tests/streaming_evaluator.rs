@@ -11,6 +11,11 @@ use evo_core::sequential::{
     AlphaAllocation, EarlyStopPlan, FormalClaimKind, ResearchFamilyAlphaPlan,
 };
 use evo_core::{Context, Error, Role, fingerprint, hash};
+use evo_engine::dispatch::{
+    EvaluationStartRequest, EvaluationStatusRequest, ExperimentRegisterRequest,
+    IssueTicketRequestWire, ManagementDispatcher, ManagementJob, ManagementJobState,
+    ManagementResult,
+};
 use evo_engine::streaming_evaluator::{
     EvaluationEvidenceScope, ExecutionReceiptRequest, ExecutionReceiptV2, ExecutionSide,
     FixedGraderMethod, FixedGraderSpec, FormalEvaluationV2, FrozenOracleEntry,
@@ -27,6 +32,27 @@ use std::path::PathBuf;
 
 fn d(label: &str) -> String {
     hash(label.as_bytes())
+}
+
+async fn wait_management(
+    dispatcher: &ManagementDispatcher,
+    context: &Context,
+    job_id: &str,
+) -> ManagementJob {
+    for _ in 0..100 {
+        let job = dispatcher.status(context, job_id).await.unwrap();
+        if matches!(
+            job.state,
+            ManagementJobState::Succeeded
+                | ManagementJobState::Failed
+                | ManagementJobState::Cancelled
+                | ManagementJobState::Blocked
+        ) {
+            return job;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("management job did not finish");
 }
 
 fn money(amount: &str) -> Money {
@@ -1351,4 +1377,196 @@ async fn dropped_start_transaction_rolls_back_dispatch_and_slot_side_effects() {
         status.ticket.targets[0].state,
         evo_engine::streaming_evaluator::TargetState::Planned
     ));
+}
+
+#[tokio::test]
+async fn registration_progress_is_digest_only_actor_scoped_and_preserves_partial_state() {
+    let fixture = fixture(5, false).await;
+    let progress = IndependentEvaluationControl::registration_progress(
+        &fixture.evaluator,
+        &fixture.store,
+        &fixture.control.id,
+        &fixture.holdout.id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        progress.control_digest,
+        Some(fixture.control.digest().unwrap())
+    );
+    assert_eq!(
+        progress.holdout_digest,
+        Some(fixture.holdout.digest(&fixture.control).unwrap())
+    );
+    assert!(
+        !serde_json::to_string(&progress)
+            .unwrap()
+            .contains("oracle_entries")
+    );
+    let other = Context::new("n", "other-evaluator", Role::Evaluator).unwrap();
+    assert!(
+        IndependentEvaluationControl::registration_progress(
+            &other,
+            &fixture.store,
+            &fixture.control.id,
+            &fixture.holdout.id
+        )
+        .await
+        .is_err()
+    );
+    let holdout_storage_id = format!(
+        "e05-{}",
+        fingerprint(&("protected_holdout_v41", fixture.holdout.id.as_str())).unwrap()
+    );
+    let mut session = fixture.store.session().await.unwrap();
+    session
+        .delete(&fixture.evaluator, "artifact", &holdout_storage_id)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let partial = IndependentEvaluationControl::registration_progress(
+        &fixture.evaluator,
+        &fixture.store,
+        &fixture.control.id,
+        &fixture.holdout.id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        partial.control_digest,
+        Some(fixture.control.digest().unwrap())
+    );
+    assert_eq!(partial.holdout_digest, None);
+}
+
+#[tokio::test]
+async fn management_dispatch_recovers_registered_inputs_and_existing_ticket_without_hidden_output()
+{
+    let fixture = fixture(5, false).await;
+    let dispatcher =
+        ManagementDispatcher::new(fixture.store.clone(), vec![fixture.evaluator.clone()]).unwrap();
+    let queued = dispatcher
+        .submit(
+            &fixture.evaluator,
+            "experiment.register",
+            serde_json::to_value(ExperimentRegisterRequest {
+                schema_version: "rsia.management.experiment_register.v1".into(),
+                request_key: "register-recover".into(),
+                control: fixture.control.clone(),
+                holdout: fixture.holdout.clone(),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let registered = wait_management(&dispatcher, &fixture.evaluator, &queued.id).await;
+    assert_eq!(registered.state, ManagementJobState::Succeeded);
+    assert!(
+        !serde_json::to_string(&registered)
+            .unwrap()
+            .contains("oracle_entries")
+    );
+    let control_storage_id = format!(
+        "e05-{}",
+        fingerprint(&(
+            "registered_evaluation_control_v41",
+            fixture.control.id.as_str()
+        ))
+        .unwrap()
+    );
+    let mut session = fixture.store.session().await.unwrap();
+    let dependents = session
+        .dependents(&fixture.evaluator, "artifact", &control_storage_id)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert!(dependents.contains(&("artifact".into(), registered.private_input_ref.clone())));
+    let holdout_storage_id = format!(
+        "e05-{}",
+        fingerprint(&("protected_holdout_v41", fixture.holdout.id.as_str())).unwrap()
+    );
+    let mut session = fixture.store.session().await.unwrap();
+    session
+        .delete(&fixture.evaluator, "artifact", &holdout_storage_id)
+        .await
+        .unwrap();
+    let mut interrupted = registered.clone();
+    interrupted.state = ManagementJobState::Queued;
+    interrupted.step = "control_registered".into();
+    interrupted.result = None;
+    interrupted.error_code = None;
+    interrupted.lease_token = None;
+    interrupted.lease_until = 0;
+    session
+        .put(
+            &fixture.evaluator,
+            "job",
+            &interrupted.id,
+            fixture.evaluator.actor(),
+            &interrupted,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    dispatcher.recover_pending().await.unwrap();
+    let recovered = wait_management(&dispatcher, &fixture.evaluator, &interrupted.id).await;
+    assert_eq!(recovered.state, ManagementJobState::Succeeded);
+    let progress = IndependentEvaluationControl::registration_progress(
+        &fixture.evaluator,
+        &fixture.store,
+        &fixture.control.id,
+        &fixture.holdout.id,
+    )
+    .await
+    .unwrap();
+    assert!(progress.control_digest.is_some());
+    assert!(progress.holdout_digest.is_some());
+
+    let queued = dispatcher
+        .submit(
+            &fixture.evaluator,
+            "evaluation.start",
+            serde_json::to_value(EvaluationStartRequest {
+                schema_version: "rsia.management.evaluation_start.v1".into(),
+                request_key: "start-recover".into(),
+                ticket: IssueTicketRequestWire {
+                    ticket_id: fixture.ticket_id.clone(),
+                    registration_id: fixture.control.id.clone(),
+                    holdout_id: fixture.holdout.id.clone(),
+                    issued_at_unix_seconds: 5,
+                },
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let started = wait_management(&dispatcher, &fixture.evaluator, &queued.id).await;
+    assert_eq!(started.state, ManagementJobState::Blocked);
+    assert_eq!(
+        started.error_code.as_deref(),
+        Some("execution_provider_unconfigured")
+    );
+
+    let queued = dispatcher
+        .submit(
+            &fixture.evaluator,
+            "evaluation.status",
+            serde_json::to_value(EvaluationStatusRequest {
+                schema_version: "rsia.management.evaluation_status.v1".into(),
+                request_key: "status-1".into(),
+                ticket_id: fixture.ticket_id.clone(),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = wait_management(&dispatcher, &fixture.evaluator, &queued.id).await;
+    assert_eq!(status.state, ManagementJobState::Succeeded);
+    assert!(matches!(
+        status.result,
+        Some(ManagementResult::EvaluationStatus { .. })
+    ));
+    let public = serde_json::to_string(&status).unwrap();
+    assert!(!public.contains("expected_answer_json"));
+    assert!(!public.contains("oracle_entries"));
 }
