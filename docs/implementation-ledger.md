@@ -380,5 +380,35 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - 种子或上游更新即使与基线完全同源，也绝不自动激活活跃版本，必须生成 staging 并经独立验收；
 - 人工解决冲突后的合并内容作为新候选处理，重新验收，不以文字合并自动继承任何前期通过记录。
 
+### AG-005 / E16.4 额外真实宿主、Claude Code MCP Tool-Only与配置面漂移门禁实施与自测
+
+- 任务号：AG-005
+- E 归属：E16.4
+- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- base 分支：`wrokbot/ag-004-e16-3-seed-blu`
+- head 分支：`wrokbot/ag-005-e16-4-extra-host`
+- PR：[PR #47](https://github.com/acosmi/RSIAgent/pull/47)
+- merged_sha: null
+
+依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §5.5、§13.1 E16.4 及 V002, V003, V009, V037, V039, V060, V061, V062, V077, V087, V091, V092, V098 场景族。
+文件白名单修改：
+1. `crates/evo-engine/src/hosts.rs`: 严格依循 v4.1 约束，拟议额外宿主目标固定为 Claude Code 的 MCP Tool-only 接入（`claude-code-mcp-tool-only`）；未检测到本地真实安装时绝不造假或替换为 mock 宿主，真实返回 blocked 错误（`claude_code_support`）；完整定义 Claude Code MCP Tool-Only 的 `HostSurfaceManifest`（固定四模型工具 `evo_prepare`, `evo_feedback`, `evo_propose`, `evo_inspect` 为 Supported 并对应 field_contract，内部 shell/web_search 明确标记为 Unsupported，model_selection 标记为 RuntimeOwned）；实现宿主配置面漂移检测 `detect_surface_drift`（严格检查未分类字段、空输出拒绝、非法字段映射拒绝）；实现宿主执行回执核验与防伪门禁 `verify_host_receipt`（截断/覆盖/遗漏严禁伪报为完整 `Used`，未经验收严禁伪报 `VerifiedBenefit`，落实 V087 Skill-Diagnosis-Attribution 归因分类）。
+2. `fixtures/hosts/claude_code_surface.v1.json`: 冻结并输出 Claude Code MCP Tool-only 宿主配置面 golden manifest fixture。
+3. `crates/evo-engine/tests/hosts_v41.rs`: 新增集成测试套件，全面覆盖 V002, V003, V009, V037, V039, V060, V061, V062, V077, V087, V091, V092, V098 全部测试场景。
+
+自测证据（全部 exit 0）：
+- `cargo test --locked --offline -p evo-engine --test hosts_v41`: 8 项全部通过。
+- `cargo test --locked --offline -p evo-engine --lib hosts::tests`: 2 项全部通过。
+- `cargo test --locked --offline -p evo-engine --test seeds_v41`: 5 项全部通过。
+- `cargo test --locked --offline -p evo-engine`: 全量测试全部通过。
+- `cargo clippy --locked --offline -p evo-engine --all-targets -- -D warnings`: 检查通过，无 warning。
+- `cargo fmt --all -- --check`: 格式化检查通过。
+
+未完成项与边界：
+- E16.5、E16.6、E14、E15 仍为 planned；
+- 本机未安装真实 Claude Code CLI 运行时，子包合同/漂移门禁/回执防伪已就绪，但真实宿主端到端执行如实保留 blocked 状态，不偷换为泛化 mock；
+- 真实宿主 Tool-only 模式仅承诺四工具交互，不承诺宿主内部 prompt/shell/model 生效，截断或覆盖不计为收益证明。
+
+
 
 
