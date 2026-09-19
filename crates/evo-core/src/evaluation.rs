@@ -823,6 +823,557 @@ pub fn estimate_n(
     })
 }
 
+pub const FORMAL_PLAN_V41_SCHEMA: &str = "rsia.formal_experiment_plan.v4_1";
+pub const COMPARISON_CONTRACT_SCHEMA: &str = "rsia.optimizer_comparison_contract.v1";
+pub const OPTIMIZATION_BUDGET_SCHEMA: &str = "rsia.optimization_budget_plan.v1";
+
+fn validate_sha256_digest(value: &str, name: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::Invalid(format!(
+            "{name} must be a lowercase sha256 digest"
+        )));
+    }
+    Ok(())
+}
+
+fn canonical_money_units(money: &Money, name: &str) -> Result<u128> {
+    money.validate()?;
+    let (negative, units) = parse_decimal(&money.amount)?;
+    if negative {
+        return Err(Error::Invalid(format!("{name} must not be negative")));
+    }
+    let whole = units / 100_000_000;
+    let fractional = units % 100_000_000;
+    let canonical = if fractional == 0 {
+        whole.to_string()
+    } else {
+        let fractional = format!("{fractional:08}").trim_end_matches('0').to_string();
+        format!("{whole}.{fractional}")
+    };
+    if money.amount != canonical {
+        return Err(Error::Invalid(format!(
+            "{name} must use a canonical decimal amount"
+        )));
+    }
+    Ok(units)
+}
+
+fn same_money_units(left: &Money, right: &Money) -> Result<bool> {
+    Ok(left.currency == right.currency
+        && left.pricing_version == right.pricing_version
+        && canonical_money_units(left, "left money")?
+            == canonical_money_units(right, "right money")?)
+}
+
+impl Money {
+    pub fn zero_unfunded(currency: impl Into<String>) -> Self {
+        Self {
+            currency: currency.into(),
+            pricing_version: "unset".into(),
+            amount: "0".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptimizationStage {
+    HistoryCollection,
+    Reflection,
+    Merge,
+    Ranking,
+    DevelopmentExecution,
+    DevelopmentScoring,
+    Practice,
+    Consolidation,
+    Guidance,
+    HumanReview,
+    StorageCpu,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageMoneyBudget {
+    pub stage: OptimizationStage,
+    pub per_call_limit: Money,
+    pub experiment_total: Money,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptimizationBudgetPlan {
+    pub schema_version: String,
+    pub root_budget_scope_id: String,
+    pub payer_id: String,
+    pub root_total: Money,
+    pub admin_authorization_receipt_digest: Option<String>,
+    pub stages: Vec<StageMoneyBudget>,
+}
+
+impl OptimizationBudgetPlan {
+    pub fn unfunded(
+        root_budget_scope_id: impl Into<String>,
+        payer_id: impl Into<String>,
+        currency: impl Into<String>,
+    ) -> Result<Self> {
+        let currency = currency.into();
+        let stages = [
+            OptimizationStage::HistoryCollection,
+            OptimizationStage::Reflection,
+            OptimizationStage::Merge,
+            OptimizationStage::Ranking,
+            OptimizationStage::DevelopmentExecution,
+            OptimizationStage::DevelopmentScoring,
+            OptimizationStage::Practice,
+            OptimizationStage::Consolidation,
+            OptimizationStage::Guidance,
+            OptimizationStage::HumanReview,
+            OptimizationStage::StorageCpu,
+        ]
+        .into_iter()
+        .map(|stage| StageMoneyBudget {
+            stage,
+            per_call_limit: Money::zero_unfunded(currency.clone()),
+            experiment_total: Money::zero_unfunded(currency.clone()),
+        })
+        .collect();
+        let plan = Self {
+            schema_version: OPTIMIZATION_BUDGET_SCHEMA.into(),
+            root_budget_scope_id: root_budget_scope_id.into(),
+            payer_id: payer_id.into(),
+            root_total: Money::zero_unfunded(currency),
+            admin_authorization_receipt_digest: None,
+            stages,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != OPTIMIZATION_BUDGET_SCHEMA {
+            return Err(Error::Invalid(
+                "unsupported optimization budget schema".into(),
+            ));
+        }
+        identifier(&self.root_budget_scope_id)?;
+        identifier(&self.payer_id)?;
+        let root_units = canonical_money_units(&self.root_total, "root_total")?;
+        if let Some(receipt) = &self.admin_authorization_receipt_digest {
+            validate_sha256_digest(receipt, "admin_authorization_receipt_digest")?;
+        }
+        let required: BTreeSet<_> = [
+            OptimizationStage::HistoryCollection,
+            OptimizationStage::Reflection,
+            OptimizationStage::Merge,
+            OptimizationStage::Ranking,
+            OptimizationStage::DevelopmentExecution,
+            OptimizationStage::DevelopmentScoring,
+            OptimizationStage::Practice,
+            OptimizationStage::Consolidation,
+            OptimizationStage::Guidance,
+            OptimizationStage::HumanReview,
+            OptimizationStage::StorageCpu,
+        ]
+        .into_iter()
+        .collect();
+        let mut actual = BTreeSet::new();
+        let mut stage_sum = 0u128;
+        for stage in &self.stages {
+            if !actual.insert(stage.stage) {
+                return Err(Error::Invalid("duplicate optimization budget stage".into()));
+            }
+            let per_call = canonical_money_units(&stage.per_call_limit, "per_call_limit")?;
+            let stage_total = canonical_money_units(&stage.experiment_total, "experiment_total")?;
+            if stage.per_call_limit.currency != self.root_total.currency
+                || stage.experiment_total.currency != self.root_total.currency
+                || stage.per_call_limit.pricing_version != self.root_total.pricing_version
+                || stage.experiment_total.pricing_version != self.root_total.pricing_version
+            {
+                return Err(Error::Invalid(
+                    "all stage budgets must use the root currency and pricing version".into(),
+                ));
+            }
+            if per_call > stage_total || stage_total > root_units {
+                return Err(Error::Invalid(
+                    "budget ordering must satisfy per_call <= stage_total <= root_total".into(),
+                ));
+            }
+            stage_sum = stage_sum
+                .checked_add(stage_total)
+                .ok_or_else(|| Error::Invalid("stage budget sum overflow".into()))?;
+        }
+        if actual != required {
+            return Err(Error::Invalid(
+                "optimization budget omits a charged stage".into(),
+            ));
+        }
+        if stage_sum > root_units {
+            return Err(Error::Invalid(
+                "sum of stage totals exceeds the root budget".into(),
+            ));
+        }
+        if root_units > 0 && self.admin_authorization_receipt_digest.is_none() {
+            return Err(Error::Budget);
+        }
+        if root_units > 0 && self.root_total.pricing_version == "unset" {
+            return Err(Error::Invalid(
+                "positive root budget requires an explicit pricing version".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String> {
+        self.validate()?;
+        fingerprint(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FixedOptimizerArm {
+    CSimple,
+    CSkillopt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixedOptimizerSpec {
+    pub arm: FixedOptimizerArm,
+    pub implementation_digest: String,
+    pub initial_s0_digest: String,
+    pub base_model_digest: String,
+    pub tools_digest: String,
+    pub authorized_materials_digest: String,
+    pub task_partition_digest: String,
+    pub context_limit_tokens: u64,
+    pub root_budget_scope_id: String,
+    pub budget_limit: Money,
+}
+
+impl FixedOptimizerSpec {
+    fn validate(&self) -> Result<()> {
+        for (value, name) in [
+            (&self.implementation_digest, "implementation_digest"),
+            (&self.initial_s0_digest, "initial_s0_digest"),
+            (&self.base_model_digest, "base_model_digest"),
+            (&self.tools_digest, "tools_digest"),
+            (
+                &self.authorized_materials_digest,
+                "authorized_materials_digest",
+            ),
+            (&self.task_partition_digest, "task_partition_digest"),
+        ] {
+            validate_sha256_digest(value, name)?;
+        }
+        identifier(&self.root_budget_scope_id)?;
+        canonical_money_units(&self.budget_limit, "optimizer budget_limit")?;
+        if self.context_limit_tokens == 0 {
+            return Err(Error::Invalid(
+                "optimizer context limit must be explicit".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptimizerComparisonContract {
+    pub schema_version: String,
+    pub c_simple: FixedOptimizerSpec,
+    pub c_skillopt: FixedOptimizerSpec,
+    pub d_starts_from: FixedOptimizerArm,
+}
+
+impl OptimizerComparisonContract {
+    pub fn new(
+        c_simple: FixedOptimizerSpec,
+        c_skillopt: FixedOptimizerSpec,
+        d_starts_from: FixedOptimizerArm,
+    ) -> Result<Self> {
+        let contract = Self {
+            schema_version: COMPARISON_CONTRACT_SCHEMA.into(),
+            c_simple,
+            c_skillopt,
+            d_starts_from,
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != COMPARISON_CONTRACT_SCHEMA {
+            return Err(Error::Invalid(
+                "unsupported optimizer comparison schema".into(),
+            ));
+        }
+        self.c_simple.validate()?;
+        self.c_skillopt.validate()?;
+        if self.c_simple.arm != FixedOptimizerArm::CSimple
+            || self.c_skillopt.arm != FixedOptimizerArm::CSkillopt
+        {
+            return Err(Error::Invalid("fixed optimizer arms are mislabeled".into()));
+        }
+        for (left, right, name) in [
+            (
+                &self.c_simple.initial_s0_digest,
+                &self.c_skillopt.initial_s0_digest,
+                "initial S0",
+            ),
+            (
+                &self.c_simple.base_model_digest,
+                &self.c_skillopt.base_model_digest,
+                "base model",
+            ),
+            (
+                &self.c_simple.tools_digest,
+                &self.c_skillopt.tools_digest,
+                "tools",
+            ),
+            (
+                &self.c_simple.authorized_materials_digest,
+                &self.c_skillopt.authorized_materials_digest,
+                "authorized materials",
+            ),
+            (
+                &self.c_simple.task_partition_digest,
+                &self.c_skillopt.task_partition_digest,
+                "task partition",
+            ),
+            (
+                &self.c_simple.root_budget_scope_id,
+                &self.c_skillopt.root_budget_scope_id,
+                "root budget scope",
+            ),
+        ] {
+            if left != right {
+                return Err(Error::Invalid(format!(
+                    "C_simple and C_skillopt must share {name}"
+                )));
+            }
+        }
+        if self.c_simple.context_limit_tokens != self.c_skillopt.context_limit_tokens {
+            return Err(Error::Invalid(
+                "C_simple and C_skillopt must share the context limit".into(),
+            ));
+        }
+        if !same_money_units(&self.c_simple.budget_limit, &self.c_skillopt.budget_limit)? {
+            return Err(Error::Invalid(
+                "C_simple and C_skillopt must have the same monetary budget limit".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn d_frozen_start_digest(&self) -> &str {
+        match self.d_starts_from {
+            FixedOptimizerArm::CSimple => &self.c_simple.implementation_digest,
+            FixedOptimizerArm::CSkillopt => &self.c_skillopt.implementation_digest,
+        }
+    }
+
+    pub fn digest(&self) -> Result<String> {
+        self.validate()?;
+        fingerprint(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormalStatisticalUnit {
+    IndependentTaskCluster,
+    IndependentCompleteStratifiedBlock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormalWeighting {
+    EqualUnits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixSelectionRule {
+    FrozenContinuousOrder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormalExecutionAuthority {
+    NotIssued,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormalExperimentPlanV41 {
+    pub schema_version: String,
+    pub v1_plan_snapshot_digest: String,
+    pub preregistration_receipt_digest: String,
+    pub research_family_id: String,
+    pub alpha_plan_digest: String,
+    pub optimizer_comparison_digest: String,
+    pub optimization_budget_digest: String,
+    pub anchor_coverage_digest: String,
+    pub source_sampling_digest: String,
+    pub statistical_assumptions_digest: String,
+    pub profile: ProfileKind,
+    pub statistical_unit: FormalStatisticalUnit,
+    pub weighting: FormalWeighting,
+    pub prefix_selection: PrefixSelectionRule,
+    pub execution_authority: FormalExecutionAuthority,
+    pub n_planned: u32,
+}
+
+impl FormalExperimentPlanV41 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        v1_plan_snapshot: &ExperimentPlan,
+        preregistration_receipt_digest: impl Into<String>,
+        alpha_plan: &crate::sequential::ResearchFamilyAlphaPlan,
+        comparison: &OptimizerComparisonContract,
+        budget: &OptimizationBudgetPlan,
+        anchor_coverage_digest: impl Into<String>,
+        source_sampling_digest: impl Into<String>,
+        statistical_assumptions_digest: impl Into<String>,
+        statistical_unit: FormalStatisticalUnit,
+        n_planned: u32,
+    ) -> Result<Self> {
+        let plan = Self {
+            schema_version: FORMAL_PLAN_V41_SCHEMA.into(),
+            v1_plan_snapshot_digest: v1_plan_snapshot.digest()?,
+            preregistration_receipt_digest: preregistration_receipt_digest.into(),
+            research_family_id: alpha_plan.research_family_id.clone(),
+            alpha_plan_digest: alpha_plan.digest()?,
+            optimizer_comparison_digest: comparison.digest()?,
+            optimization_budget_digest: budget.digest()?,
+            anchor_coverage_digest: anchor_coverage_digest.into(),
+            source_sampling_digest: source_sampling_digest.into(),
+            statistical_assumptions_digest: statistical_assumptions_digest.into(),
+            profile: v1_plan_snapshot.profile,
+            statistical_unit,
+            weighting: FormalWeighting::EqualUnits,
+            prefix_selection: PrefixSelectionRule::FrozenContinuousOrder,
+            execution_authority: FormalExecutionAuthority::NotIssued,
+            n_planned,
+        };
+        plan.validate_against(v1_plan_snapshot, alpha_plan, comparison, budget)?;
+        Ok(plan)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != FORMAL_PLAN_V41_SCHEMA {
+            return Err(Error::Invalid("unsupported v4.1 formal-plan schema".into()));
+        }
+        identifier(&self.research_family_id)?;
+        for (value, name) in [
+            (&self.v1_plan_snapshot_digest, "v1_plan_snapshot_digest"),
+            (
+                &self.preregistration_receipt_digest,
+                "preregistration_receipt_digest",
+            ),
+            (&self.alpha_plan_digest, "alpha_plan_digest"),
+            (
+                &self.optimizer_comparison_digest,
+                "optimizer_comparison_digest",
+            ),
+            (
+                &self.optimization_budget_digest,
+                "optimization_budget_digest",
+            ),
+            (&self.anchor_coverage_digest, "anchor_coverage_digest"),
+            (&self.source_sampling_digest, "source_sampling_digest"),
+            (
+                &self.statistical_assumptions_digest,
+                "statistical_assumptions_digest",
+            ),
+        ] {
+            validate_sha256_digest(value, name)?;
+        }
+        if self.n_planned < 2 {
+            return Err(Error::Invalid(
+                "formal n_planned must be supplied explicitly and be at least two".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(
+        &self,
+        v1_plan_snapshot: &ExperimentPlan,
+        alpha_plan: &crate::sequential::ResearchFamilyAlphaPlan,
+        comparison: &OptimizerComparisonContract,
+        budget: &OptimizationBudgetPlan,
+    ) -> Result<()> {
+        self.validate()?;
+        v1_plan_snapshot.validate()?;
+        alpha_plan.validate()?;
+        comparison.validate()?;
+        budget.validate()?;
+        if !v1_plan_snapshot.frozen
+            || v1_plan_snapshot.frozen_at.is_none()
+            || v1_plan_snapshot.candidate_digest.is_some()
+        {
+            return Err(Error::Invalid(
+                "v4.1 formal wrapper requires a frozen pre-candidate v1 plan snapshot".into(),
+            ));
+        }
+        if self.v1_plan_snapshot_digest != v1_plan_snapshot.digest()?
+            || self.alpha_plan_digest != alpha_plan.digest()?
+            || self.optimizer_comparison_digest != comparison.digest()?
+            || self.optimization_budget_digest != budget.digest()?
+            || self.research_family_id != alpha_plan.research_family_id
+        {
+            return Err(Error::Invalid(
+                "formal wrapper digest bindings do not match the supplied contracts".into(),
+            ));
+        }
+        let snapshot_n = u32::try_from(v1_plan_snapshot.n_planned)
+            .map_err(|_| Error::Invalid("v1 n_planned is outside the v4.1 domain".into()))?;
+        if self.n_planned != snapshot_n || self.profile != v1_plan_snapshot.profile {
+            return Err(Error::Invalid(
+                "formal n_planned/profile differ from the frozen v1 snapshot".into(),
+            ));
+        }
+        let (_, alpha_units) = parse_decimal(&alpha_plan.alpha_total)?;
+        let alpha_total = alpha_units as f64 / 100_000_000.0;
+        if (alpha_total - v1_plan_snapshot.alpha_total).abs() > 1e-15 {
+            return Err(Error::Invalid(
+                "research-family alpha total differs from the frozen v1 snapshot".into(),
+            ));
+        }
+        if !v1_plan_snapshot
+            .conditions
+            .contains(&ControlCondition::FixedImproverC)
+        {
+            return Err(Error::Invalid(
+                "optimizer comparison requires FixedImproverC in the v1 plan".into(),
+            ));
+        }
+        if comparison.c_simple.root_budget_scope_id != budget.root_budget_scope_id
+            || comparison.c_skillopt.root_budget_scope_id != budget.root_budget_scope_id
+            || !same_money_units(&comparison.c_simple.budget_limit, &budget.root_total)?
+            || !same_money_units(&comparison.c_skillopt.budget_limit, &budget.root_total)?
+            || !same_money_units(&v1_plan_snapshot.monetary_budget, &budget.root_total)?
+        {
+            return Err(Error::Invalid(
+                "formal comparison, v1 plan, and optimization budget must share one root budget"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String> {
+        self.validate()?;
+        fingerprint(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
