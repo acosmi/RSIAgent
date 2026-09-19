@@ -1,7 +1,7 @@
 //! Approve → canary → Active with CAS on the profile pointer.
 use evo_core::contract::{AppliedReceipt, CapabilityLevel, ResolvedBundle};
 use evo_core::evaluation::Verdict;
-use evo_core::{Context, Error, Result, Role, identifier};
+use evo_core::{Context, Error, Result, Role, fingerprint, identifier};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,9 +41,23 @@ impl ProfilePointer {
             return Err(Error::Conflict("cas_lost".into()));
         }
         self.active = Some(next_active);
-        self.epoch += 1;
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| Error::Conflict("pointer_epoch_overflow".into()))?;
         Ok(())
     }
+}
+
+pub fn validate_resolved_bundle_identity(bundle: &ResolvedBundle) -> Result<()> {
+    let mut preimage = bundle.clone();
+    preimage.digest.clear();
+    if fingerprint(&preimage)? != bundle.digest {
+        return Err(Error::Conflict(
+            "resolved bundle digest does not match its complete content".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn approve(
@@ -89,7 +103,10 @@ pub fn revoke(ctx: &Context, release: &mut Release, pointer: &mut ProfilePointer
     release.state = ReleaseState::Revoked;
     if pointer.active.as_deref() == Some(release.bundle_digest.as_str()) {
         pointer.active = None;
-        pointer.epoch += 1;
+        pointer.epoch = pointer
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| Error::Conflict("pointer_epoch_overflow".into()))?;
     }
     Ok(())
 }
@@ -108,7 +125,10 @@ pub fn rollback(
         ));
     }
     pointer.active = Some(previous_digest.into());
-    pointer.epoch += 1;
+    pointer.epoch = pointer
+        .epoch
+        .checked_add(1)
+        .ok_or_else(|| Error::Conflict("pointer_epoch_overflow".into()))?;
     current.state = ReleaseState::RolledBack;
     Ok(())
 }
