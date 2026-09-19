@@ -4,6 +4,8 @@ use crate::streaming_evaluator::{
     RegisteredEvaluationControl, StreamingEvaluationStatus,
 };
 use evo_core::contract::{MODEL_TOOLS, admin_ops, reject_admin_as_model_tool};
+use evo_core::replay::{ReplaySimulationProfile, WorldPartition};
+use evo_core::strategy::{ElasticPolicyV1, ExplorationCapsV1};
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, now};
 use evo_storage::Store;
 use serde::{Deserialize, Serialize};
@@ -88,6 +90,11 @@ pub enum ManagementResult {
         lifecycle: String,
         planned_targets: usize,
         has_formal_terminal: bool,
+    },
+    ReplayStored {
+        report_id: String,
+        pool_digest: String,
+        semantic_reports_digest: String,
     },
 }
 
@@ -180,6 +187,18 @@ pub struct EvaluationStatusRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ReplayRunRequest {
+    pub schema_version: String,
+    pub request_key: String,
+    pub pool_digest: String,
+    pub partition: WorldPartition,
+    pub policy: ElasticPolicyV1,
+    pub profile: ReplaySimulationProfile,
+    pub caps: ExplorationCapsV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockedManagementRequest {
     pub schema_version: String,
     pub request_key: String,
@@ -191,6 +210,7 @@ enum ParsedRequest {
     ExperimentRegister(Box<ExperimentRegisterRequest>),
     EvaluationStart(EvaluationStartRequest),
     EvaluationStatus(EvaluationStatusRequest),
+    ReplayRun(Box<ReplayRunRequest>),
     Blocked(BlockedManagementRequest),
 }
 
@@ -291,6 +311,27 @@ impl ManagementDispatcher {
                     IndependentEvaluationControl::status(ctx, &self.store, &request.ticket_id)
                         .await?;
                 job.result = Some(public_evaluation_status(&status));
+            }
+        }
+        if job.operation == "replay.run" && job.state == ManagementJobState::Succeeded {
+            if let Some(ManagementResult::ReplayStored {
+                report_id,
+                pool_digest,
+                semantic_reports_digest,
+            }) = &job.result
+            {
+                let view =
+                    crate::replay::verified_replay_report_view(ctx, &self.store, report_id).await?;
+                if &view.report_id != report_id
+                    || &view.pool_digest != pool_digest
+                    || &view.semantic_digest != semantic_reports_digest
+                {
+                    return Err(Error::Conflict("replay report view digest mismatch".into()));
+                }
+            } else {
+                return Err(Error::Conflict(
+                    "replay job succeeded without valid ReplayStored result".into(),
+                ));
             }
         }
         Ok(job)
@@ -443,6 +484,7 @@ impl ParsedRequest {
             Self::ExperimentRegister(request) => &request.request_key,
             Self::EvaluationStart(request) => &request.request_key,
             Self::EvaluationStatus(request) => &request.request_key,
+            Self::ReplayRun(request) => &request.request_key,
             Self::Blocked(request) => &request.request_key,
         }
     }
@@ -559,6 +601,7 @@ async fn execute_request(
         ParsedRequest::EvaluationStatus(request) => {
             run_evaluation_status(ctx, store, &mut job, request).await
         }
+        ParsedRequest::ReplayRun(request) => run_replay(ctx, store, &mut job, *request).await,
         ParsedRequest::Blocked(_) => {
             job.state = ManagementJobState::Blocked;
             job.step = "blocked_feature".into();
@@ -720,12 +763,46 @@ fn public_evaluation_status(status: &StreamingEvaluationStatus) -> ManagementRes
     }
 }
 
+async fn run_replay(
+    ctx: &Context,
+    store: &Store,
+    job: &mut ManagementJob,
+    request: ReplayRunRequest,
+) -> Result<()> {
+    checkpoint_claim(ctx, store, job, "before_replay_run").await?;
+    let stored = crate::replay::run_and_persist_pool_replay(
+        ctx,
+        store,
+        &request.pool_digest,
+        request.partition,
+        &request.policy,
+        &request.profile,
+        &request.caps,
+    )
+    .await?;
+    job.state = ManagementJobState::Succeeded;
+    job.step = "replay_stored".into();
+    job.result = Some(ManagementResult::ReplayStored {
+        report_id: stored.report_id,
+        pool_digest: stored.pool_digest,
+        semantic_reports_digest: stored.semantic_reports_digest,
+    });
+    Ok(())
+}
+
 fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<()> {
-    if let ParsedRequest::ExperimentRegister(request) = request
-        && (request.control.evaluator_actor != ctx.actor()
-            || request.holdout.registration_id != request.control.id)
-    {
-        return Err(Error::Forbidden);
+    match request {
+        ParsedRequest::ExperimentRegister(request) => {
+            if request.control.evaluator_actor != ctx.actor()
+                || request.holdout.registration_id != request.control.id
+            {
+                return Err(Error::Forbidden);
+            }
+        }
+        ParsedRequest::ReplayRun(_) => {
+            ctx.require(&[Role::Admin])?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -885,7 +962,10 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         "evaluation.status" => {
             ParsedRequest::EvaluationStatus(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
-        "exploration.start" | "replay.run" | "curriculum.step" | "meta.start" => {
+        "replay.run" => ParsedRequest::ReplayRun(Box::new(
+            serde_json::from_value(payload).map_err(|_| invalid())?,
+        )),
+        "exploration.start" | "curriculum.step" | "meta.start" => {
             ParsedRequest::Blocked(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
         _ => return Err(Error::Invalid("unknown management operation".into())),
@@ -895,6 +975,7 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::ExperimentRegister(request) => &request.schema_version,
         ParsedRequest::EvaluationStart(request) => &request.schema_version,
         ParsedRequest::EvaluationStatus(request) => &request.schema_version,
+        ParsedRequest::ReplayRun(request) => &request.schema_version,
         ParsedRequest::Blocked(request) => &request.schema_version,
     };
     if actual != &expected {
@@ -957,6 +1038,12 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
             "artifact".into(),
             e05_storage_id("evaluation_ticket_v2", &request.ticket_id)?,
         )),
+        ParsedRequest::ReplayRun(request) => {
+            dependencies.push((
+                "artifact".into(),
+                evo_storage::replay::replay_pool_storage_id(&request.pool_digest)?,
+            ));
+        }
         ParsedRequest::Blocked(_) => {}
     }
     dependencies.sort();

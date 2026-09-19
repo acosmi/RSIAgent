@@ -364,7 +364,7 @@ pub async fn load_live_replay_report(
     Ok(envelope.payload)
 }
 
-fn replay_pool_storage_id(pool_digest: &str) -> Result<String> {
+pub fn replay_pool_storage_id(pool_digest: &str) -> Result<String> {
     validate_digest(pool_digest)?;
     Ok(format!("replay-pool-{pool_digest}"))
 }

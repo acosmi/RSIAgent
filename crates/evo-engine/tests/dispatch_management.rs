@@ -1,6 +1,13 @@
+use evo_core::evidence::Purpose;
+use evo_core::hash;
+use evo_core::replay::*;
+use evo_core::strategy::{ActionKindV1, ElasticPolicyV1, ExplorationCapsV1, ObservedStatus};
 use evo_core::{Context, Error, Job, JobState, Role};
-use evo_engine::dispatch::{ManagementDispatcher, ManagementJob, ManagementJobState};
+use evo_engine::dispatch::{
+    ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
+};
 use evo_storage::Store;
+use evo_storage::replay::{register_replay_pool, replay_pool_storage_id, seal_replay_world};
 use serde_json::json;
 
 async fn store() -> (tempfile::TempDir, Store) {
@@ -120,12 +127,12 @@ async fn future_operations_persist_accurate_blocked_jobs_and_reconnect() {
     let (dir, store) = store().await;
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let request = json!({
-        "schema_version":"rsia.management.replay_run.v1",
+        "schema_version":"rsia.management.curriculum_step.v1",
         "request_key":"blocked-1"
     });
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
     let queued = dispatcher
-        .submit(&admin, "replay.run", request.clone())
+        .submit(&admin, "curriculum.step", request.clone())
         .await
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
@@ -155,10 +162,10 @@ async fn future_operations_persist_accurate_blocked_jobs_and_reconnect() {
     assert_eq!(first.state, ManagementJobState::Blocked);
     assert_eq!(
         first.error_code.as_deref(),
-        Some("replay.run_consumer_unavailable")
+        Some("curriculum.step_consumer_unavailable")
     );
     let reconnect = reopened_dispatcher
-        .submit(&admin, "replay.run", request)
+        .submit(&admin, "curriculum.step", request)
         .await
         .unwrap();
     assert_eq!(reconnect.id, first.id);
@@ -418,4 +425,605 @@ async fn evaluator_job_same_key_different_ticket_conflicts_after_restart_safe_fa
             .await,
         Err(Error::Conflict(_))
     ));
+}
+
+fn d(label: &str) -> String {
+    hash(label.as_bytes())
+}
+
+fn action(seq: u32, parent: &str, branch: u32, kind: ActionKindV1) -> ReplayActionSpecV1 {
+    ReplayActionSpecV1 {
+        record_seq: seq,
+        generation_signature: d("generation-v1"),
+        parent_context_signature: parent.into(),
+        branch_seq: branch,
+        target_depth: if matches!(kind, ActionKindV1::Widen { .. }) {
+            1
+        } else {
+            2
+        },
+        action_kind: kind,
+        estimated_cost_upper_micros: Some(10),
+        writes_shared_workspace: false,
+    }
+}
+
+fn transition(
+    seq: u32,
+    id: &str,
+    parent: &str,
+    next: &str,
+    kind: ActionKindV1,
+    outcome: ReplayTransitionOutcome,
+) -> ReplayTransitionV2 {
+    ReplayTransitionV2 {
+        record_id: id.into(),
+        record_seq: seq,
+        generation_signature: d("generation-v1"),
+        parent_context_signature: parent.into(),
+        action_kind: kind,
+        next_context_signature: next.into(),
+        outcome,
+        actual_usage: HistoricalUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cost_micros: Some(1),
+            latency_millis: Some(1),
+        },
+        source_ids: vec![format!("source-{seq}")],
+        observation_source_id: format!("source-{seq}"),
+    }
+}
+
+fn valid(q: u32) -> ReplayTransitionOutcome {
+    ReplayTransitionOutcome::Observed {
+        status: ObservedStatus::Valid { quality_micros: q },
+    }
+}
+
+fn refresh_evidence_digests(world: &mut ReplayWorldV2) {
+    let digest = replay_baseline_observation_digest(&world.manifest).unwrap();
+    let source_id = world.manifest.baseline_observation_source_id.clone();
+    world
+        .manifest
+        .source_closure
+        .iter_mut()
+        .find(|source| source.source_id == source_id)
+        .unwrap()
+        .content_digest = digest;
+    let observation_digests: Vec<_> = world
+        .transitions
+        .iter()
+        .map(|transition| {
+            (
+                transition.observation_source_id.clone(),
+                replay_observation_digest(&world.manifest, transition).unwrap(),
+            )
+        })
+        .collect();
+    for (source_id, digest) in observation_digests {
+        world
+            .manifest
+            .source_closure
+            .iter_mut()
+            .find(|source| source.source_id == source_id)
+            .unwrap()
+            .content_digest = digest;
+    }
+}
+
+fn sample_world() -> ReplayWorldV2 {
+    let actions = vec![
+        action(1, &d("baseline"), 1, ActionKindV1::Widen { root_slot: 1 }),
+        action(
+            2,
+            &d("ctx-1"),
+            1,
+            ActionKindV1::Deepen { parent_node_seq: 1 },
+        ),
+    ];
+    let transitions = vec![
+        transition(
+            1,
+            "opaque-root",
+            &d("baseline"),
+            &d("ctx-1"),
+            ActionKindV1::Widen { root_slot: 1 },
+            valid(400_000),
+        ),
+        transition(
+            2,
+            "opaque-child",
+            &d("ctx-1"),
+            &d("ctx-2"),
+            ActionKindV1::Deepen { parent_node_seq: 1 },
+            valid(800_000),
+        ),
+    ];
+    let mut world = ReplayWorldV2 {
+        schema_version: REPLAY_WORLD_SCHEMA.into(),
+        manifest: ReplayWorldManifestV2 {
+            schema_version: REPLAY_MANIFEST_SCHEMA.into(),
+            world_id: "world-1".into(),
+            cluster_id: "cluster-1".into(),
+            partition: WorldPartition::Select,
+            purpose: Purpose::Development,
+            generation_signature: d("generation-v1"),
+            world_context_signature: d("world-context"),
+            baseline_context_signature: d("baseline"),
+            approved_parent_digest: d("approved-parent"),
+            model_digest: d("model"),
+            tools_digest: d("tools"),
+            scorer_digest: d("scorer"),
+            guidance_digest: d("guidance"),
+            repair_template_digest: d("repair"),
+            input_order_digest: d("order"),
+            initial_baseline_quality_micros: 100_000,
+            baseline_observation_source_id: "baseline-source-1".into(),
+            source_closure: vec![
+                ReplaySourceRef {
+                    source_id: "source-1".into(),
+                    content_digest: String::new(),
+                },
+                ReplaySourceRef {
+                    source_id: "source-2".into(),
+                    content_digest: String::new(),
+                },
+                ReplaySourceRef {
+                    source_id: "baseline-source-1".into(),
+                    content_digest: d("pending-baseline"),
+                },
+            ],
+            revoke_watermark: 1,
+            prefix_coverage: vec![
+                PrefixCoverageV1 {
+                    context_signature: d("baseline"),
+                    exhausted: false,
+                },
+                PrefixCoverageV1 {
+                    context_signature: d("ctx-1"),
+                    exhausted: false,
+                },
+                PrefixCoverageV1 {
+                    context_signature: d("ctx-2"),
+                    exhausted: true,
+                },
+            ],
+            action_catalog: actions,
+        },
+        transitions,
+        sealed_digest: None,
+    };
+    refresh_evidence_digests(&mut world);
+    world.seal().unwrap();
+    world
+}
+
+fn sample_profile(pool_digest: String) -> ReplaySimulationProfile {
+    ReplaySimulationProfile {
+        simulation_version: SIMULATION_VERSION.into(),
+        objective: ReplayObjective::ParetoAttainmentV2,
+        w_sim: 1,
+        probe_budget: 2,
+        horizon: 2,
+        lambda_work_micros: DEFAULT_LAMBDA_MICROS,
+        lambda_round_micros: DEFAULT_LAMBDA_MICROS,
+        fixed_seed: 9,
+        global_recovery_dispatch_limit: 1,
+        pool_digest,
+        purpose: Purpose::Development,
+        target_runtime_profile: "simulation-only".into(),
+    }
+}
+
+async fn setup_sealed_pool(ctx: &Context, store: &Store) -> ReplayPoolManifestV1 {
+    let mut persisted = sample_world();
+    persisted.sealed_digest = None;
+    persisted.manifest.revoke_watermark = 1;
+    persisted.seal().unwrap();
+
+    let mut train = persisted.clone();
+    train.sealed_digest = None;
+    train.manifest.world_id = "world-train".into();
+    train.manifest.cluster_id = "cluster-train".into();
+    train.manifest.partition = WorldPartition::Train;
+    train.manifest.baseline_observation_source_id = "baseline-source-train".into();
+    train.manifest.source_closure[2].source_id = "baseline-source-train".into();
+    for (index, transition) in train.transitions.iter_mut().enumerate() {
+        let source_id = format!("train-source-{}", index + 1);
+        transition.source_ids = vec![source_id.clone()];
+        transition.observation_source_id = source_id.clone();
+        train.manifest.source_closure[index].source_id = source_id;
+    }
+    refresh_evidence_digests(&mut train);
+    train.seal().unwrap();
+
+    let mut session = store.session().await.unwrap();
+    for replay_world in [&persisted, &train] {
+        for source in &replay_world.manifest.source_closure {
+            let body = if source.source_id == replay_world.manifest.baseline_observation_source_id {
+                replay_baseline_observation_bytes(&replay_world.manifest).unwrap()
+            } else {
+                let transition = replay_world
+                    .transitions
+                    .iter()
+                    .find(|transition| transition.observation_source_id == source.source_id)
+                    .unwrap();
+                replay_observation_bytes(&replay_world.manifest, transition).unwrap()
+            };
+            let excerpt = String::from_utf8(body.clone()).unwrap();
+            session
+                .put(
+                    ctx,
+                    "run",
+                    &source.source_id,
+                    "host",
+                    &json!({
+                        "schema_version":"rsia.optimization.source.v1",
+                        "record":{"id":source.source_id,"body":body.clone(),"parent_family":format!("family-{}",source.source_id),"task_origin":"trusted_run","execution_attestation":"trusted_host","purpose":"development"},
+                        "trace":{"run_id":source.source_id,"parent_family":format!("family-{}",source.source_id),"source_digest":source.content_digest,"purpose":"development","outcome":"success","diagnosis":null,"excerpt":excerpt,"seed":1},
+                        "excerpt_start":0,"excerpt_end":body.len()
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    session.bump_watermark(ctx, &d("watermark")).await.unwrap();
+    session.commit().await.unwrap();
+
+    seal_replay_world(ctx, store, &persisted).await.unwrap();
+    seal_replay_world(ctx, store, &train).await.unwrap();
+    register_replay_pool(
+        ctx,
+        store,
+        &[
+            persisted.manifest.world_id.clone(),
+            train.manifest.world_id.clone(),
+        ],
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn replay_run_admin_e2e_and_idempotency() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let pool = setup_sealed_pool(&admin, &store).await;
+    let profile = sample_profile(pool.pool_digest.clone());
+    let policy = ElasticPolicyV1::default();
+    let caps = ExplorationCapsV1::online();
+
+    let request = json!({
+        "schema_version": "rsia.management.replay_run.v1",
+        "request_key": "replay-k1",
+        "pool_digest": pool.pool_digest,
+        "partition": "select",
+        "policy": policy,
+        "profile": profile,
+        "caps": caps,
+    });
+
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let queued = dispatcher
+        .submit(&admin, "replay.run", request.clone())
+        .await
+        .unwrap();
+    assert_eq!(queued.state, ManagementJobState::Queued);
+
+    let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded);
+    assert_eq!(done.step, "replay_stored");
+
+    let status = dispatcher.status(&admin, &done.id).await.unwrap();
+    assert_eq!(status.state, ManagementJobState::Succeeded);
+
+    let (report_id, pool_digest, semantic_reports_digest) = match status.result {
+        Some(ManagementResult::ReplayStored {
+            report_id,
+            pool_digest,
+            semantic_reports_digest,
+        }) => (report_id, pool_digest, semantic_reports_digest),
+        other => panic!("unexpected result: {:?}", other),
+    };
+    assert_eq!(pool_digest, pool.pool_digest);
+
+    // Verify report in store
+    let loaded = evo_storage::replay::load_live_replay_report(&admin, &store, &report_id)
+        .await
+        .unwrap();
+    assert_eq!(loaded.report_id, report_id);
+    assert_eq!(loaded.pool_digest, pool.pool_digest);
+    assert_eq!(loaded.semantic_reports_digest, semantic_reports_digest);
+
+    // Verify dependency edge: job -> private_input -> pool
+    let mut session = store.session().await.unwrap();
+    let pool_storage_id = replay_pool_storage_id(&pool.pool_digest).unwrap();
+    let deps = session
+        .dependents(&admin, "artifact", &pool_storage_id)
+        .await
+        .unwrap();
+    assert!(
+        deps.iter()
+            .any(|(kind, id)| kind == "artifact" && id == &done.private_input_ref)
+    );
+    session.commit().await.unwrap();
+
+    // Idempotency: same request returns same job
+    let same = dispatcher
+        .submit(&admin, "replay.run", request)
+        .await
+        .unwrap();
+    assert_eq!(same.id, queued.id);
+
+    // Conflict: same request_key with different partition
+    let different = json!({
+        "schema_version": "rsia.management.replay_run.v1",
+        "request_key": "replay-k1",
+        "pool_digest": pool.pool_digest,
+        "partition": "train",
+        "policy": policy,
+        "profile": sample_profile(pool.pool_digest.clone()),
+        "caps": caps,
+    });
+    assert!(matches!(
+        dispatcher.submit(&admin, "replay.run", different).await,
+        Err(Error::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn replay_run_role_unknown_fields_and_validation_rejections() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let agent = Context::new("n", "agent", Role::Agent).unwrap();
+    let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();
+    let pool = setup_sealed_pool(&admin, &store).await;
+    let profile = sample_profile(pool.pool_digest.clone());
+
+    let payload = json!({
+        "schema_version": "rsia.management.replay_run.v1",
+        "request_key": "replay-auth",
+        "pool_digest": pool.pool_digest,
+        "partition": "select",
+        "policy": ElasticPolicyV1::default(),
+        "profile": profile,
+        "caps": ExplorationCapsV1::online(),
+    });
+
+    let dispatcher =
+        ManagementDispatcher::new(store.clone(), vec![admin.clone(), evaluator.clone()]).unwrap();
+
+    // Agent forbidden
+    assert!(matches!(
+        dispatcher
+            .submit(&agent, "replay.run", payload.clone())
+            .await,
+        Err(Error::Forbidden)
+    ));
+
+    // Evaluator forbidden
+    assert!(matches!(
+        dispatcher
+            .submit(&evaluator, "replay.run", payload.clone())
+            .await,
+        Err(Error::Forbidden)
+    ));
+
+    // Unknown field rejected
+    let mut unknown = payload.clone();
+    unknown["extra_field"] = json!("unexpected");
+    assert!(matches!(
+        dispatcher.submit(&admin, "replay.run", unknown).await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Invalid schema version rejected
+    let mut bad_version = payload.clone();
+    bad_version["schema_version"] = json!("rsia.management.replay_run.v2");
+    assert!(matches!(
+        dispatcher.submit(&admin, "replay.run", bad_version).await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Missing field rejected
+    let incomplete = json!({
+        "schema_version": "rsia.management.replay_run.v1",
+        "request_key": "incomplete-key"
+    });
+    assert!(matches!(
+        dispatcher.submit(&admin, "replay.run", incomplete).await,
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[tokio::test]
+async fn replay_run_missing_pool_fails_cleanly() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let non_existent_pool = d("non-existent-pool");
+    let profile = sample_profile(non_existent_pool.clone());
+
+    let request = json!({
+        "schema_version": "rsia.management.replay_run.v1",
+        "request_key": "replay-missing-pool",
+        "pool_digest": non_existent_pool,
+        "partition": "select",
+        "policy": ElasticPolicyV1::default(),
+        "profile": profile,
+        "caps": ExplorationCapsV1::online(),
+    });
+
+    let queued = dispatcher
+        .submit(&admin, "replay.run", request)
+        .await
+        .unwrap();
+    assert_eq!(queued.state, ManagementJobState::Queued);
+
+    let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(terminal.state, ManagementJobState::Failed);
+    assert_eq!(terminal.step, "failed");
+    assert_eq!(terminal.error_code.as_deref(), Some("not_found"));
+}
+
+#[tokio::test]
+async fn replay_run_status_revocation_gate_and_terminal_preservation() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let pool = setup_sealed_pool(&admin, &store).await;
+    let profile = sample_profile(pool.pool_digest.clone());
+
+    let request = json!({
+        "schema_version": "rsia.management.replay_run.v1",
+        "request_key": "replay-revoke-test",
+        "pool_digest": pool.pool_digest,
+        "partition": "select",
+        "policy": ElasticPolicyV1::default(),
+        "profile": profile,
+        "caps": ExplorationCapsV1::online(),
+    });
+
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let queued = dispatcher
+        .submit(&admin, "replay.run", request)
+        .await
+        .unwrap();
+    let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded);
+
+    // Reading status succeeds initially
+    assert!(dispatcher.status(&admin, &done.id).await.is_ok());
+
+    // Also create a cancelled job
+    let request_cancel = json!({
+        "schema_version": "rsia.management.replay_run.v1",
+        "request_key": "replay-cancel-test",
+        "pool_digest": pool.pool_digest,
+        "partition": "select",
+        "policy": ElasticPolicyV1::default(),
+        "profile": sample_profile(pool.pool_digest.clone()),
+        "caps": ExplorationCapsV1::online(),
+    });
+    let queued_cancel = dispatcher
+        .submit(&admin, "replay.run", request_cancel)
+        .await
+        .unwrap();
+    let cancelled = dispatcher.cancel(&admin, &queued_cancel.id).await.unwrap();
+    assert!(matches!(
+        cancelled.state,
+        ManagementJobState::Cancelled | ManagementJobState::Succeeded
+    ));
+
+    // Now revoke a source member (source-2) by placing a tombstone
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "tombstone",
+            "source-2",
+            "admin",
+            &json!({"id": "source-2"}),
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+
+    // Now reading the Succeeded job MUST fail because live source verification fails
+    assert!(matches!(
+        dispatcher.status(&admin, &done.id).await,
+        Err(Error::Forbidden)
+    ));
+
+    // But if a job was cancelled before claim, reading its status does not revive or re-evaluate sources
+    let cancelled_direct = ManagementJob {
+        id: "management-job-cancelled-replay".into(),
+        schema_version: "rsia.management_job.v1".into(),
+        operation: "replay.run".into(),
+        request_key: "cancelled-replay-k".into(),
+        payload_digest: "c".repeat(64),
+        owner_actor: "admin".into(),
+        owner_role: Role::Admin,
+        state: ManagementJobState::Cancelled,
+        step: "cancelled_before_claim".into(),
+        private_input_ref: "missing-ref".into(),
+        result: None,
+        error_code: Some("cancelled".into()),
+        cancel_requested: true,
+        lease_token: None,
+        lease_until: 0,
+        generation: 0,
+        diagnostics: vec![],
+        created_at: 1,
+    };
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "job",
+            &cancelled_direct.id,
+            admin.actor(),
+            &cancelled_direct,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+
+    let observed_cancelled = dispatcher
+        .status(&admin, &cancelled_direct.id)
+        .await
+        .unwrap();
+    assert_eq!(observed_cancelled.state, ManagementJobState::Cancelled);
+    assert_eq!(observed_cancelled.step, "cancelled_before_claim");
+}
+
+#[tokio::test]
+async fn replay_run_crash_recovery_reuses_stored_report() {
+    let (dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let pool = setup_sealed_pool(&admin, &store).await;
+    let profile = sample_profile(pool.pool_digest.clone());
+
+    let request = json!({
+        "schema_version": "rsia.management.replay_run.v1",
+        "request_key": "replay-crash-1",
+        "pool_digest": pool.pool_digest,
+        "partition": "select",
+        "policy": ElasticPolicyV1::default(),
+        "profile": profile,
+        "caps": ExplorationCapsV1::online(),
+    });
+
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let queued = dispatcher
+        .submit(&admin, "replay.run", request.clone())
+        .await
+        .unwrap();
+    let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded);
+
+    // Simulate crash and restart
+    store.close().await;
+    let reopened = Store::open(&dir.path().join("management.sqlite3"))
+        .await
+        .unwrap();
+    let reopened_dispatcher =
+        ManagementDispatcher::new(reopened.clone(), vec![admin.clone()]).unwrap();
+    reopened_dispatcher.recover_pending().await.unwrap();
+
+    let recovered_status = reopened_dispatcher.status(&admin, &done.id).await.unwrap();
+    assert_eq!(recovered_status.id, done.id);
+    assert_eq!(recovered_status.state, ManagementJobState::Succeeded);
+    assert_eq!(
+        serde_json::to_value(&recovered_status.result).unwrap(),
+        serde_json::to_value(&done.result).unwrap()
+    );
+
+    // Submitting again connects to the same job
+    let resubmit = reopened_dispatcher
+        .submit(&admin, "replay.run", request)
+        .await
+        .unwrap();
+    assert_eq!(resubmit.id, done.id);
 }
