@@ -39,7 +39,8 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | 10 | E09 | 受限策略/持久探索/E03真实消费者；依赖E03/E04/E07 | sol/high实施，主控独立验收 | verified（程序协调子范围）/ blocked（真实G2及恢复场景） | [PR #38](https://github.com/acosmi/RSIAgent/pull/38) draft；源码 `c71db74` 已推送；未合并 |
 | 11 | E10 | 不可变观察/世界池/纯回放/持久报告；依赖E08/E09 | sol/high实施，主控独立验收 | verified（程序回放子范围） | [PR #39](https://github.com/acosmi/RSIAgent/pull/39) draft；源码 `77177cd` 已推送；未合并 |
 | 12 | E11 | 经济实验合同/全成本/持久阻塞报告；依赖E05/E07/E10 | sol/high实施，主控独立验收 | verified（静态与持久准备）/ blocked（真实经济实验） | [PR #40](https://github.com/acosmi/RSIAgent/pull/40) draft；源码 `289d920` 已推送；未合并 |
-后续依真源依赖图按 E12、E13、E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
+| 13 | E12 | 零预算课程/固定纯函数/可信事实拒绝门；依赖E04/E07/E08/E09 | sol/high实施，主控独立验收 | verified（离线子范围）/ blocked（真实学习闭环） | [PR #41](https://github.com/acosmi/RSIAgent/pull/41) draft；源码 `e612fcb` 已推送；未合并 |
+后续依真源依赖图按 E13、E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
 
 ## 当前 v4.1 主任务状态
 
@@ -59,7 +60,7 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | E09 | 生成/探索解耦与有状态在线探索 | in_progress（程序协调已verified） | 主控25项及clippy/fmt通过；完整输入幂等、两节点StoreJournal链、源水位、整批资源已验；实际产生可修复故障的E03链、真实G2及全多组/实践范围仍待完成。 |
 | E10 | 不可变世界池与纯查表回放 | in_progress（程序回放/池/报告已verified） | 主控57项、clippy/fmt通过；观察正文绑定实际共同输入和来源，q0/辅助来源篡改拒绝；世界/池/报告持久与实时撤销已验。真实观测与管理适配仍未完成，不声称经济收益。 |
 | E11 | 验证回放优化的真实经济收益 | in_progress（合同/持久准备已verified） | 主控10项及clippy/fmt通过；单票配对、九类成本、实际预算绑定/最终回执不可变、并发取消/晚到账/报告CAS已验。可信在线配对回执消费者尚未实现；真实经济实验未运行，不声称节省。 |
-| E12 | 学习者条件化的经验自主获取 | implemented_not_verified | 第一批零预算/disabled课程和纯函数oracle已交付，主控审查中；真实隔离/学习应用闭环未具备，不启用G3。 |
+| E12 | 学习者条件化的经验自主获取 | in_progress（离线子范围已verified） | 主控21项和参考宿主3个进程用例、clippy/fmt通过；控制注册、精确平台期、冷却/零预算终态、事实拒绝门已验。E03可信执行/评分回执schema仍缺，真实隔离、应用正例及持久学习改变下轮选题仍未验，不启用G3。 |
 | E13 | 长期部署适应与能力保留监测 | implemented_not_verified | 持久周期/巩固消费者已交付，主控尚未验收；真实长时证据未取得。 |
 | E14 | 受限改进器自身的继承控制器 | in_progress（合同审查） | 正冻结单机制候选与下一作业真实使用合同；未实施或启用G4。 |
 | E15 | 后继质量与跨代收益实验 | planned | 真实后继实验未运行。 |
@@ -228,3 +229,9 @@ V010–13/V084/V085仅在冻结合同、程序fixture、持久票据/账本和�
 [PR #40](https://github.com/acosmi/RSIAgent/pull/40)，base=`wrokbot/v4.1-pr-e10-immutable-replay`；本地 `d62bde65a42a46fa20ddcf06ad67418771bae099`，推送源码 `289d9204c6d76018080a9221967eebe5848e2b8d`；除台账外源码一致，merged_sha=null。主控 core 4、SQLite integration 3、legacy 3 共10项，clippy all-targets -D warnings、fmt exit0。输入 `controller-e11-final-input.json` / 结论 `controller-e11-acceptance.json`，日志 `controller-e11-*.log` 仅本地。
 
 实际根/namespace/group/stage/付款身份、所有者、不可变最终费用、并发成本合并/取消和最终报告CAS已验。当前引擎只能产出blocked_support/usage_uncertain，完整在线回执消费者属于未完成工程；实际配对实验及收益仍blocked。回滚点E10；实际费用/查询不退。
+
+### E12 离线子范围独立验收与 PR
+
+[PR #41](https://github.com/acosmi/RSIAgent/pull/41)，base=`wrokbot/v4.1-pr-e11-replay-economics`；本地 `6fd4f5eb644e59d944eab86a39f4b2d3b8ae25fc`，推送源码 `e612fcb9563c8e320e011e6d06f026b9730f561c`；除台账外源码一致，merged_sha=null。主控core 5、engine课程3、E09回归4、E03回归7、可信helper拒绝1、legacy 1，共21项；clippy all-targets -D warnings、fmt exit0。直接rustc编译参考宿主，clamp正例/非法域/code禁用3个实际进程用例通过。
+
+输入 `controller-e12-final-input.json`，结论 `controller-e12-acceptance.json`，日志 `controller-e12-*.log` 与 `controller-e12-reference.json` 仅本地。禁止用Fixture或Admin自报摘要形成完成周期；目前可信执行/评分回执schema仍未实现，实际学习改变下次选题的正链未验。来源撤销/预算事实不因回滚恢复；回滚点为前一已验源码。
