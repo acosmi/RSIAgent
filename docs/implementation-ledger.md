@@ -33,7 +33,8 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | 04 | E03 | 真实应用诊断、小批反思、建议来源与开发消费者；依赖 E02 | sol；core/engine optimization、model、evidence及定向测试 | verified（程序消费者/恢复子范围） | [PR #32](https://github.com/acosmi/RSIAgent/pull/32) draft；源码 `727e9cc` 已推送；未合并 |
 | 05 | E04 | 持久根预算、broker、取消/对账；依赖 E02 | sol/high；storage budget、0005_root_budget、engine broker/executor及定向测试 | verified（根预算/broker子范围） | [PR #33](https://github.com/acosmi/RSIAgent/pull/33) draft；源码 `f02e535` 已推送；未合并 |
 | 06 | E05 | 独立评测/留出、连续前缀与早停证书；依赖 E01/E03/E04 | sol/high；engine evaluator/streaming_evaluator及定向测试 | verified（持久评测程序子范围）/ blocked（真实评测） | [PR #34](https://github.com/acosmi/RSIAgent/pull/34) draft；源码 `86e53b9` 已推送；未合并 |
-后续依真源依赖图按 E06、E07、E08、E09、E10、E11、E12、E13、E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
+| 07 | E06 | 组合发布门禁、CAS、实际应用快照与实时撤销；依赖 E02/E05 | sol/high实施；主控代码复读、修复回退与读取旁路后隔离复验 | verified（持久门禁/拒绝路径）/ blocked（真实发布） | [PR #35](https://github.com/acosmi/RSIAgent/pull/35) draft；源码 `071c54d` 已推送；未合并 |
+后续依真源依赖图按 E07、E08、E09、E10、E11、E12、E13、E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
 
 ## 当前 v4.1 主任务状态
 
@@ -47,7 +48,7 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | E03 | 把跨任务证据真正接入生成消费者 | in_progress（消费者/恢复已verified） | 主控144项core/engine测试、fmt/clippy通过；实际ModelPort请求、同清单开发选择及持久恢复已验。真实提供商/样本/收益未验。 |
 | E04 | 可信执行、隔离与根资源预算 | in_progress（根预算/broker已verified） | 主控预算15（含10001调用）、broker9、executor6项及fmt/clippy通过；group完整分页停止修复已追加PR #33；真实提供商、进程隔离尚未验。 |
 | E05 | 独立验收器与有边界的统计判定 | in_progress（持久控制/早停已verified） | 主控12流式+6旧评测+13core共31项及fmt/clippy通过；晚到回执、输出不可变、Exposure时间/终态/未知费用保留已修；真实提供商、进程隔离、完整成本及逐依赖撤销仍未验，fixture禁止晋级。 |
-| E06 | 组合发布、实际应用与最小撤销闭环 | implemented_not_verified | 子代理已实现组合发布存储、独立批准/CAS、实际应用与实时撤销门；主控独立验收待完成，不采用子代理自报通过。 |
+| E06 | 组合发布、实际应用与最小撤销闭环 | in_progress（持久门禁已verified） | 主控7集成+4单元+12 E05回归及fmt/clippy通过；审批防回退、Host完整报告闭包、所有快照读入口已验；真实生产批准/组合应用/回滚受E05证据阻塞。 |
 | E07 | 第一个最小可验证真实闭环 | implemented_not_verified / blocked（真实闭环） | HTTP/MCP/CLI与参考宿主实现待主控验收；真实模型、独立数据与支付授权未取得；管理命令消费者接线尚未全部完成。 |
 | E08 | 可恢复的撤销、保留和备份链 | implemented_not_verified | 持久撤销游标、来源闭包、账单保留脱敏、备份恢复实现待主控验收；不能用子代理结果标verified。 |
 | E09 | 生成/探索解耦与有状态在线探索 | implemented_not_verified | 纯决策与实际优化消费者协调器、恢复/历史/实践接口实现待主控验收；仅代码准备，不启用G2真实运行。 |
@@ -170,3 +171,11 @@ E01原始日志：`controller-e01-tests.log`、`controller-e01-fmt.log`、`contr
 输入：`controller-e05-final-input.json` / `controller-e05-acceptance.json`；主控在隔离副本运行 `cargo test --locked --offline -p evo-engine --test streaming_evaluator` 12 passed、`cargo test --locked --offline -p evo-engine --lib evaluator::tests` 6 passed、`cargo test --locked --offline -p evo-core --test evaluation_v41` 13 passed；clippy all-targets -D warnings、fmt检查均exit0。日志为本地 `controller-e05-final-*.log`。修复后重新执行流式测试与clippy/fmt，最终输入摘要已冻结。
 
 V010–13/V084/V085仅在冻结合同、程序fixture、持久票据/账本和拒绝路径作用域验收；不标整个场景族通过。ProgramFixture报告不可批准生产，真实执行/数据、独立进程、完整费用和逐依赖来源闭包仍未完成。回滚点为E04已验源码；已消费的query/alpha/派发和未知账单不回退。
+
+### E06 持久发布门禁独立验收与 PR
+
+[PR #35](https://github.com/acosmi/RSIAgent/pull/35)，base=`wrokbot/v4.1-pr-e05-streaming-evaluation`；原验收提交 `92dafe82c2f7c1d90468fd8efa5efe3cfc38e311`，已推送源码 `071c54d53488f8d9a75cc7148d82ed5f9efb3253`；源码逐文件一致（除台账），merged_sha=null。
+
+输入 `controller-e06-final-input.json` / `controller-e06-acceptance.json`。主控在独立源码/target副本运行 `cargo test --locked --offline -p evo-engine --test release_store` 7 passed、`cargo test --locked --offline -p evo-engine --lib release_store::tests` 4 passed、E05流式回归12 passed，clippy all-targets -D warnings和fmt均exit0。日志本地 `controller-e06-final-*.log`、`controller-e06-e05-regression.log`。
+
+作用域限候选/组合摘要、独立审批拒绝、并发CAS、幂等防状态倒退、合法零技能快照与缺报告/撤销/删除拒绝；未产生真实Approved/Canary/Active正例。Host专用crate内部只读验证复用完整E05闭包，不角色提升、不跳过正式报告。回滚点为E05已验源码；真实发布/组合/回滚仍待外部证据，不能用fixture升级支持范围。
