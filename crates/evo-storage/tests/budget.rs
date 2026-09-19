@@ -6,7 +6,6 @@ use evo_storage::budget::{
     BudgetExecutionProvenance, BudgetStage, ModelCallSettlementEvidence, RootBudgetAuthorization,
     UsageCharge,
 };
-
 use sqlx::{Connection, SqliteConnection};
 
 fn ctx(namespace: &str, actor: &str, role: Role) -> Context {

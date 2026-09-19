@@ -5,7 +5,7 @@
 
 use super::{Session, Store, internal};
 use evo_core::evaluation::OptimizationStage;
-use evo_core::{Context, Error, Result, Role, hash, identifier, text};
+use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, text};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{Row, Sqlite, Transaction};
@@ -208,6 +208,17 @@ pub struct BudgetArtifact {
     pub schema_version: String,
     pub digest: String,
     pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetCallRef {
+    pub id: String,
+    pub schema_version: String,
+    pub namespace: String,
+    pub billing_scope: String,
+    pub call_id: String,
+    pub source_ids: Vec<String>,
 }
 
 impl BudgetArtifact {
@@ -458,12 +469,26 @@ impl Store {
         ctx: &Context,
         request: &BudgetCallReservation,
     ) -> Result<BudgetCallRecord> {
+        self.reserve_budget_call_with_sources(ctx, request, &[])
+            .await
+    }
+
+    pub async fn reserve_budget_call_with_sources(
+        &self,
+        ctx: &Context,
+        request: &BudgetCallReservation,
+        source_ids: &[String],
+    ) -> Result<BudgetCallRecord> {
         require_budget_caller(ctx)?;
         validate_reservation(request)?;
+        let source_ids = canonical_source_ids(source_ids)?;
         let mut tx = self.pool.begin().await.map_err(internal)?;
         if let Some(existing) = load_call(&mut tx, &request.billing_scope, &request.call_id).await?
         {
             ensure_same_reservation(ctx, &existing, request)?;
+            if !source_ids.is_empty() {
+                ensure_budget_call_ref(&mut tx, ctx, &existing, &source_ids).await?;
+            }
             tx.commit().await.map_err(internal)?;
             return Ok(existing);
         }
@@ -594,6 +619,9 @@ impl Store {
         let call = load_call(&mut tx, &request.billing_scope, &request.call_id)
             .await?
             .ok_or(Error::Internal)?;
+        if !source_ids.is_empty() {
+            ensure_budget_call_ref(&mut tx, ctx, &call, &source_ids).await?;
+        }
         tx.commit().await.map_err(internal)?;
         Ok(call)
     }
@@ -1159,6 +1187,16 @@ impl Store {
 }
 
 impl Session {
+    pub async fn redact_budget_call_content(
+        &mut self,
+        ctx: &Context,
+        billing_scope: &str,
+        call_id: &str,
+        reason: &str,
+    ) -> Result<BudgetCallRecord> {
+        redact_budget_call_content_in_tx(&mut self.tx, ctx, billing_scope, call_id, reason).await
+    }
+
     pub async fn budget_call(
         &mut self,
         ctx: &Context,
@@ -1214,6 +1252,76 @@ impl Session {
         )
         .await
     }
+}
+
+pub(crate) async fn index_budget_call_ref_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    billing_scope: &str,
+    call_id: &str,
+    source_ids: &[String],
+) -> Result<BudgetCallRef> {
+    let source_ids = canonical_source_ids(source_ids)?;
+    let call = load_call(tx, billing_scope, call_id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    require_call_access(tx, ctx, &call).await?;
+    ensure_budget_call_ref(tx, ctx, &call, &source_ids).await
+}
+
+pub(crate) async fn redact_budget_call_content_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    billing_scope: &str,
+    call_id: &str,
+    reason: &str,
+) -> Result<BudgetCallRecord> {
+    require_budget_caller(ctx)?;
+    identifier(billing_scope)?;
+    identifier(call_id)?;
+    text(reason, "budget redaction reason", 512)?;
+    let call = load_call(tx, billing_scope, call_id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    require_call_access(tx, ctx, &call).await?;
+    let request = redacted_artifact(call.request_artifact.as_ref(), reason)?;
+    let transport = redacted_artifact(call.transport_artifact.as_ref(), reason)?;
+    let response = redacted_artifact(call.response_artifact.as_ref(), reason)?;
+    sqlx::query(
+        "UPDATE root_budget_calls SET
+           request_artifact_schema=?,request_artifact_digest=?,request_artifact_body=?,
+           transport_artifact_schema=?,transport_artifact_digest=?,transport_artifact_body=?,
+           response_artifact_schema=?,response_artifact_digest=?,response_artifact_body=?,
+           response_usable=CASE WHEN response_artifact_body IS NULL THEN response_usable ELSE 0 END,
+           response_block_reason=CASE WHEN response_artifact_body IS NULL THEN response_block_reason ELSE 'source_revoked' END
+         WHERE billing_scope=? AND call_id=?",
+    )
+    .bind(request.as_ref().map(|value| value.schema_version.as_str()))
+    .bind(request.as_ref().map(|value| value.digest.as_str()))
+    .bind(request.as_ref().map(|value| value.body.as_str()))
+    .bind(transport.as_ref().map(|value| value.schema_version.as_str()))
+    .bind(transport.as_ref().map(|value| value.digest.as_str()))
+    .bind(transport.as_ref().map(|value| value.body.as_str()))
+    .bind(response.as_ref().map(|value| value.schema_version.as_str()))
+    .bind(response.as_ref().map(|value| value.digest.as_str()))
+    .bind(response.as_ref().map(|value| value.body.as_str()))
+    .bind(billing_scope)
+    .bind(call_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(internal)?;
+    insert_event(
+        tx,
+        billing_scope,
+        Some(call_id),
+        "content_redacted",
+        evo_core::now(),
+        json!({"reason":reason,"accounting_state_preserved":true}),
+    )
+    .await?;
+    load_call(tx, billing_scope, call_id)
+        .await?
+        .ok_or(Error::Internal)
 }
 
 async fn budget_call_in_tx(
@@ -1804,6 +1912,99 @@ fn validate_digest(value: &str, name: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn canonical_source_ids(values: &[String]) -> Result<Vec<String>> {
+    let mut output = values.to_vec();
+    for value in &output {
+        identifier(value)?;
+    }
+    output.sort();
+    if output.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(Error::Conflict("duplicate budget call source id".into()));
+    }
+    Ok(output)
+}
+
+async fn ensure_budget_call_ref(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    call: &BudgetCallRecord,
+    source_ids: &[String],
+) -> Result<BudgetCallRef> {
+    let source_ids = canonical_source_ids(source_ids)?;
+    let digest = fingerprint(&(
+        "rsia.budget_call_ref.v1",
+        ctx.namespace(),
+        &call.billing_scope,
+        &call.call_id,
+    ))?;
+    let reference = BudgetCallRef {
+        id: format!("budget-ref-{}", &digest[..32]),
+        schema_version: "rsia.budget_call_ref.v1".into(),
+        namespace: ctx.namespace().into(),
+        billing_scope: call.billing_scope.clone(),
+        call_id: call.call_id.clone(),
+        source_ids,
+    };
+    let old: Option<String> = sqlx::query_scalar(
+        "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+    )
+    .bind(ctx.namespace())
+    .bind(&reference.id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(internal)?;
+    if let Some(old) = old {
+        let old: BudgetCallRef = serde_json::from_str(&old).map_err(internal)?;
+        if old != reference {
+            return Err(Error::Conflict(
+                "budget call source closure changed for fixed call".into(),
+            ));
+        }
+        return Ok(old);
+    }
+    sqlx::query("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,'artifact',?,?,?)")
+        .bind(ctx.namespace())
+        .bind(&reference.id)
+        .bind(ctx.actor())
+        .bind(serde_json::to_string(&reference).map_err(internal)?)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+    for source_id in &reference.source_ids {
+        sqlx::query(
+            "INSERT OR IGNORE INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id)
+             VALUES(?,'artifact',?,'run',?)",
+        )
+        .bind(ctx.namespace())
+        .bind(&reference.id)
+        .bind(source_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+    }
+    Ok(reference)
+}
+
+fn redacted_artifact(
+    artifact: Option<&BudgetArtifact>,
+    reason: &str,
+) -> Result<Option<BudgetArtifact>> {
+    artifact
+        .map(|artifact| {
+            BudgetArtifact::from_serializable(
+                "rsia.redacted.v1",
+                &json!({
+                    "schema_version":"rsia.redacted.v1",
+                    "state":"source_revoked",
+                    "reason":reason,
+                    "original_schema":artifact.schema_version,
+                    "original_digest":artifact.digest,
+                }),
+            )
+        })
+        .transpose()
 }
 
 fn validate_reason(value: &str) -> Result<()> {

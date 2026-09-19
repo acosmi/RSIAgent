@@ -579,6 +579,7 @@ name = "evo-storage"
 version = "0.2.0"
 dependencies = [
  "evo-core",
+ "rustix",
  "serde",
  "serde_json",
  "sqlx",
