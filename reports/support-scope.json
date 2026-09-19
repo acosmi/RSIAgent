@@ -46,6 +46,280 @@
     "spec": "included",
     "verification": "pinned_git_blob_license_verified"
   },
+  "e_scopes": {
+    "E00": {
+      "title": "Fixed Baseline, Source Reconciliation, Scope Boundaries",
+      "status": "verified_baseline",
+      "impl_files": [
+        "crates/evo-core/src/evidence.rs"
+      ],
+      "test_files": [
+        "crates/evo-core/tests/evidence.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-core --test evidence",
+      "scenarios": ["V001", "V071", "V072"]
+    },
+    "E01": {
+      "title": "Statistical & Holdout Contract",
+      "status": "verified_static_contract",
+      "impl_files": [
+        "crates/evo-core/src/evaluation.rs",
+        "crates/evo-core/src/holdout.rs",
+        "crates/evo-core/src/sequential.rs"
+      ],
+      "test_files": [
+        "crates/evo-core/tests/evaluation_v41.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-core --test evaluation_v41",
+      "scenarios": ["V002", "V003", "V084", "V085"]
+    },
+    "E02": {
+      "title": "Bounded Atomic Skill Edit Pure Compiler Scope",
+      "status": "verified_compiler_subset",
+      "impl_files": [
+        "crates/evo-core/src/skill_edit.rs"
+      ],
+      "test_files": [
+        "crates/evo-core/tests/skill_edit.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-core --test skill_edit",
+      "scenarios": ["V089"]
+    },
+    "E03": {
+      "title": "Real Application Diagnosis, Small-batch Reflection, Model Consumers",
+      "status": "verified_consumer_subset",
+      "impl_files": [
+        "crates/evo-engine/src/optimization.rs",
+        "crates/evo-engine/src/model.rs",
+        "crates/evo-engine/src/evidence.rs"
+      ],
+      "test_files": [
+        "crates/evo-engine/tests/optimization_v41.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-engine --test optimization_v41",
+      "scenarios": ["V005", "V006", "V017"]
+    },
+    "E04": {
+      "title": "Persistent Root Budget, Broker, Cancellation & Reconciliation",
+      "status": "verified_budget_broker_subset",
+      "impl_files": [
+        "crates/evo-storage/src/budget.rs",
+        "crates/evo-engine/src/broker.rs",
+        "crates/evo-engine/src/executor.rs"
+      ],
+      "test_files": [
+        "crates/evo-storage/tests/budget.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-storage --test budget",
+      "scenarios": ["V007", "V008", "V096"]
+    },
+    "E05": {
+      "title": "Independent Evaluator, Continuous Prefix, Early Stopping",
+      "status": "verified_evaluator_subset",
+      "impl_files": [
+        "crates/evo-engine/src/evaluator.rs",
+        "crates/evo-engine/src/streaming_evaluator.rs"
+      ],
+      "test_files": [
+        "crates/evo-engine/tests/evaluator_v41.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-engine --test evaluator_v41",
+      "scenarios": ["V084", "V085"]
+    },
+    "E06": {
+      "title": "Release Gate, CAS, Snapshot & Real-time Revocation",
+      "status": "verified_release_gate_subset",
+      "impl_files": [
+        "crates/evo-engine/src/release.rs"
+      ],
+      "test_files": [
+        "crates/evo-engine/tests/release_v41.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-engine --test release_v41",
+      "scenarios": ["V017", "V075"]
+    },
+    "E07": {
+      "title": "HostService, HTTP/MCP/CLI & Reference Host",
+      "status": "verified_protocol_subset",
+      "impl_files": [
+        "crates/evo-http/src/lib.rs",
+        "crates/evo-engine/src/dispatch_management.rs"
+      ],
+      "test_files": [
+        "crates/evo-http/tests/service.rs",
+        "crates/evo-engine/tests/dispatch_management.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-http --test service",
+      "scenarios": ["V002", "V003"]
+    },
+    "E08": {
+      "title": "Persistent Revocation, Cleanup, Backup & Trusted Anchor Recovery",
+      "status": "verified_recovery_subset",
+      "impl_files": [
+        "crates/evo-storage/src/sqlite.rs"
+      ],
+      "test_files": [
+        "crates/evo-storage/tests/sqlite.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-storage --test sqlite",
+      "scenarios": ["V017", "V018"]
+    },
+    "E09": {
+      "title": "Bounded Strategy, Persistent Exploration, E03 Consumers",
+      "status": "verified_exploration_subset",
+      "impl_files": [
+        "crates/evo-engine/src/exploration.rs"
+      ],
+      "test_files": [
+        "crates/evo-engine/tests/exploration_v41.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-engine --test exploration_v41",
+      "scenarios": ["V086"]
+    },
+    "E10": {
+      "title": "Immutable Observation, World Pool, Replay & Reports",
+      "status": "verified_replay_subset",
+      "impl_files": [
+        "crates/evo-engine/src/replay.rs"
+      ],
+      "test_files": [
+        "crates/evo-engine/tests/replay_v41.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-engine --test replay_v41",
+      "scenarios": ["V081"]
+    },
+    "E11": {
+      "title": "Economic Experiment Contract, Full Cost, Blocking Report",
+      "status": "verified_economic_contract",
+      "impl_files": [
+        "crates/evo-core/src/economic.rs"
+      ],
+      "test_files": [
+        "crates/evo-core/tests/economic.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-core --test economic",
+      "scenarios": ["V096"]
+    },
+    "E12": {
+      "title": "Zero-budget Curriculum, Fixed Pure Functions, Rejection Gate",
+      "status": "verified_curriculum_subset",
+      "impl_files": [
+        "crates/evo-engine/src/curriculum.rs",
+        "crates/evo-engine/src/curriculum_profiles.rs"
+      ],
+      "test_files": [
+        "crates/evo-engine/tests/curriculum_v41.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-engine --test curriculum_v41",
+      "scenarios": ["V082", "V083"]
+    },
+    "E13": {
+      "title": "Persistent Monitoring, Consolidation Trigger, Root Budget & Recovery",
+      "status": "verified_monitoring_subset",
+      "impl_files": [
+        "crates/evo-engine/src/long_running.rs"
+      ],
+      "test_files": [
+        "crates/evo-engine/tests/long_running_v41.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-engine --test long_running_v41",
+      "scenarios": ["V018"]
+    },
+    "E14": {
+      "title": "Bounded Improver Inheritance Controller",
+      "status": "planned",
+      "impl_files": [
+        "crates/evo-engine/src/meta.rs"
+      ],
+      "test_files": [],
+      "test_command": "",
+      "scenarios": ["V092"]
+    },
+    "E15": {
+      "title": "Successor Quality & Cross-generation Benefit Experiment",
+      "status": "planned",
+      "impl_files": [
+        "crates/evo-engine/src/meta.rs"
+      ],
+      "test_files": [],
+      "test_command": "",
+      "scenarios": ["V092"]
+    },
+    "E16.1": {
+      "title": "Source Import & Versioned Readers",
+      "status": "implemented_not_verified",
+      "impl_files": [
+        "crates/evo-engine/src/import.rs",
+        "crates/evo-core/src/evidence.rs"
+      ],
+      "test_files": [
+        "crates/evo-engine/tests/import_v41.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-engine --test import_v41",
+      "scenarios": ["V005", "V006", "V017", "V051", "V052", "V053", "V054", "V055", "V056", "V076", "V087", "V090", "V098"]
+    },
+    "E16.2": {
+      "title": "Asset Package Safety, Privacy Gates, Foreign Metadata Isolation",
+      "status": "implemented_not_verified",
+      "impl_files": [
+        "crates/evo-engine/src/packages.rs"
+      ],
+      "test_files": [
+        "crates/evo-engine/tests/packages_v41.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-engine --test packages_v41",
+      "scenarios": ["V017", "V039", "V066", "V067", "V068", "V069", "V070", "V075", "V091", "V092", "V098"]
+    },
+    "E16.3": {
+      "title": "Built-in Seeds, B/L/U Reconciliation, Local Modification Protection",
+      "status": "implemented_not_verified",
+      "impl_files": [
+        "crates/evo-engine/src/seeds.rs"
+      ],
+      "test_files": [
+        "crates/evo-engine/tests/seeds_v41.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-engine --test seeds_v41",
+      "scenarios": ["V014", "V018", "V038", "V063", "V064", "V065", "V078", "V091", "V092", "V098"]
+    },
+    "E16.4": {
+      "title": "Extra Real Host MCP Tool-Only, Surface Drift & Attribution",
+      "status": "implemented_not_verified",
+      "impl_files": [
+        "crates/evo-engine/src/hosts.rs"
+      ],
+      "test_files": [
+        "crates/evo-engine/tests/hosts_v41.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-engine --test hosts_v41",
+      "scenarios": ["V002", "V003", "V009", "V037", "V039", "V060", "V061", "V062", "V077", "V087", "V091", "V092", "V098"]
+    },
+    "E16.5": {
+      "title": "Persistent Recovery Immutability, Capacity Limits & Deployment Security",
+      "status": "implemented_not_verified",
+      "impl_files": [
+        "crates/evo-engine/src/capacity.rs"
+      ],
+      "test_files": [
+        "crates/evo-engine/tests/capacity_v41.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-engine --test capacity_v41",
+      "scenarios": ["V007", "V008", "V017", "V018", "V037", "V038", "V039", "V066", "V069", "V073", "V075", "V081", "V082", "V083", "V084", "V085", "V086", "V096", "V098"]
+    },
+    "E16.6": {
+      "title": "Release, Support Scope Manifest & Truth Ledger",
+      "status": "implemented_not_verified",
+      "impl_files": [
+        "reports/support-scope.json",
+        "docs/implementation-ledger.md"
+      ],
+      "test_files": [
+        "crates/evo-core/tests/support_scope.rs"
+      ],
+      "test_command": "cargo test --locked --offline -p evo-core --test support_scope",
+      "scenarios": ["V001", "V039", "V042", "V071", "V072", "V073", "V074", "V080", "V098"]
+    }
+  },
   "traceability": {
     "b_commitments": [
       "B01",
@@ -82,24 +356,150 @@
       "K10"
     ],
     "so_sources": [
-      "SO01",
-      "SO02",
-      "SO03",
-      "SO04",
-      "SO05",
-      "SO06",
-      "SO07",
-      "SO08",
-      "SO09",
-      "SO10",
-      "SO11",
-      "SO12",
-      "SO13",
-      "SO14",
-      "SO15",
-      "SO16",
-      "SO17",
-      "SO18"
+      {
+        "id": "SO01",
+        "file": "skillopt/engine/trainer.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "520a90eb8af422368c8e498b8487504bb8f6c279",
+        "read_range": "1–240、1270–2110",
+        "e_tasks": ["E03", "E05", "E09", "E13", "E14"]
+      },
+      {
+        "id": "SO02",
+        "file": "skillopt/gradient/reflect.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "df68c9b76de83b2465b267b04310399ec5f3cec8",
+        "read_range": "300–700",
+        "e_tasks": ["E03", "E09"]
+      },
+      {
+        "id": "SO03",
+        "file": "skillopt/gradient/aggregate.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "14f0cd978f35afe579913c9b5677a803bbce9e70",
+        "read_range": "全文",
+        "e_tasks": ["E03", "E09"]
+      },
+      {
+        "id": "SO04",
+        "file": "skillopt/optimizer/clip.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "a2ed965f7c81c18426e82e2fd49e589b0952a92f",
+        "read_range": "全文",
+        "e_tasks": ["E02", "E03", "E09"]
+      },
+      {
+        "id": "SO05",
+        "file": "skillopt/optimizer/skill.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "65d574157f47e9b3f415d4db94b0e5a9c09e4826",
+        "read_range": "全文",
+        "e_tasks": ["E02", "E03", "E06", "E09"]
+      },
+      {
+        "id": "SO06",
+        "file": "skillopt/optimizer/skill_aware.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "de39427ed0cc85fa1e716363a22140c91090b2d6",
+        "read_range": "全文",
+        "e_tasks": ["E03", "E07", "E13"]
+      },
+      {
+        "id": "SO07",
+        "file": "skillopt/optimizer/slow_update.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "9f8dd52606c3ada4fea1e6c0f72ec38f8a5139e8",
+        "read_range": "1–260",
+        "e_tasks": ["E09", "E13"]
+      },
+      {
+        "id": "SO08",
+        "file": "skillopt/optimizer/meta_skill.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "6e34ff10d90655bb620d3e63b1d2041338616a5c",
+        "read_range": "全文",
+        "e_tasks": ["E14", "E15"]
+      },
+      {
+        "id": "SO09",
+        "file": "skillopt/evaluation/gate.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "10461a98756ebacbf7d5a8bbdc67657950e2c199",
+        "read_range": "全文",
+        "e_tasks": ["E05", "E06"]
+      },
+      {
+        "id": "SO10",
+        "file": "configs/_base_/default.yaml",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "4fe64088dc8011a2121335155d4a79ae7f90e9f5",
+        "read_range": "90–150",
+        "e_tasks": ["E00", "E03", "E05", "E13"]
+      },
+      {
+        "id": "SO11",
+        "file": "skillopt_sleep/consolidate.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "5b80b4a9825fb5b5a79b04fdad4c655d5f3228f6",
+        "read_range": "全文",
+        "e_tasks": ["E05", "E06", "E09"]
+      },
+      {
+        "id": "SO12",
+        "file": "skillopt_sleep/rollout.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "f889333b3eecb83693a7005154dedadccbdc07f2",
+        "read_range": "全文",
+        "e_tasks": ["E09", "E12"]
+      },
+      {
+        "id": "SO13",
+        "file": "skillopt_sleep/replay.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "1502a71cf9069b8ea23293acbb080225cdc51de2",
+        "read_range": "全文",
+        "e_tasks": ["E04", "E09", "E10", "E12"]
+      },
+      {
+        "id": "SO14",
+        "file": "skillopt_sleep/multi_skill.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "32247639849e2c327ab7a1b7b3258dc7c35f53d4",
+        "read_range": "全文",
+        "e_tasks": ["E06", "E09"]
+      },
+      {
+        "id": "SO15",
+        "file": "skillopt_sleep/budget.py",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "48875ca0f01cf099967ca2b5a45891e903645e36",
+        "read_range": "全文",
+        "e_tasks": ["E01", "E04", "E11"]
+      },
+      {
+        "id": "SO16",
+        "file": "docs/sleep/RESULTS.md",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "441ffa28f8644631c275456c7ccf4e75fd1d8c99",
+        "read_range": "全文",
+        "e_tasks": ["E01", "E07", "E15"]
+      },
+      {
+        "id": "SO17",
+        "file": "docs/guide/training-loop.md",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "30393dca9533de90e0cd0ff95f26eb327bfec0ff",
+        "read_range": "全文",
+        "e_tasks": ["E03", "E09"]
+      },
+      {
+        "id": "SO18",
+        "file": "LICENSE",
+        "commit": "79124b37e9a6371e13b753f8bcd7adb1e493ade1",
+        "blob_sha": "cf7bcb2ba475e33648180599c0f83c425f1705d9",
+        "read_range": "全文",
+        "e_tasks": ["E00", "E16.2", "E16.5"]
+      }
     ],
     "v_scenarios": [
       "V001",
