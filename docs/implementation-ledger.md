@@ -368,12 +368,15 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 2. `crates/evo-engine/tests/seeds_v41.rs`: 新增集成测试套件，全面覆盖 V014, V018, V038, V063, V064, V065, V078, V091, V092, V098 全部测试场景。
 
 自测证据（全部 exit 0）：
-- `cargo test --locked --offline -p evo-engine --test seeds_v41`: 5 项全部通过。
+- `cargo test --locked --offline -p evo-engine --test seeds_v41`: 6 项全部通过（含主控对抗缺陷 F05 种子重置单调水位门禁回归测试）。
 - `cargo test --locked --offline -p evo-engine --lib seeds::tests`: 1 项全部通过。
 - `cargo test --locked --offline -p evo-engine --test packages_v41`: 14 项全部通过。
 - `cargo test --locked --offline -p evo-engine`: 全量测试全部通过。
 - `cargo clippy --locked --offline -p evo-engine --all-targets -- -D warnings`: 检查通过，无 warning。
 - `cargo fmt --all -- --check`: 格式化检查通过。
+
+主控审阅缺陷整改记录（PR #46）：
+- **F05（种子重置单调水位一致性校验）**：在 `safe_reset_to_baseline` 中增加对 `current_watermark < record.revocation_watermark` 的严格拦截（返回 `Error::Conflict("stale_watermark: current watermark is older than installation")`），保证撤销水位的绝对单调性，拒绝以旧于安装时的过期水位请求基线重置。
 
 未完成项与边界：
 - E16.4–E16.6、E14、E15 仍为 planned；

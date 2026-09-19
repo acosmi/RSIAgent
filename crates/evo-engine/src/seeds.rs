@@ -258,6 +258,11 @@ pub fn safe_reset_to_baseline(
         )));
     }
 
+    if current_watermark < record.revocation_watermark {
+        return Err(Error::Conflict(
+            "stale_watermark: current watermark is older than installation".into(),
+        ));
+    }
     if current_watermark > record.revocation_watermark {
         return Err(Error::Conflict(
             "baseline_revoked: revocation watermark advanced since installation".into(),

@@ -360,3 +360,26 @@ fn test_v038_staging_session_commit_and_abort() {
     // Even when committed into staging, Active is NOT overwritten!
     assert!(!committed.active_overwritten);
 }
+
+// =========================================================================
+// F05 Adversarial Regression (from controller review)
+// =========================================================================
+#[test]
+fn test_f05_review_seed_reset_requires_consistent_current_watermark() {
+    let record = SeedInstallRecord {
+        publisher: "p".into(),
+        asset_id: "a".into(),
+        kind: "skill".into(),
+        baseline_digest: hash(b"baseline"),
+        local_digest: hash(b"local"),
+        upstream_digest: None,
+        installed_at: 1,
+        status: SeedStatus::Installed,
+        quarantine_reason: None,
+        revocation_watermark: 10,
+    };
+    assert!(
+        safe_reset_to_baseline(&record, Some("baseline"), |_| false, 1, |_| false).is_err(),
+        "seed reset accepted a current watermark older than installation"
+    );
+}
