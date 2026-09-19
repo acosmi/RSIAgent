@@ -246,12 +246,43 @@ fn test_deployment_safety_gates() {
     };
     assert!(validate_deployment_security(&missing_db_cfg).is_err());
 
-    // 3. Valid deployment config
+    // 3. Valid deployment config with verified anchor and disabled code execution
+    let temp_db = tempfile::NamedTempFile::new().unwrap();
+    let mut header = b"SQLite format 3\0".to_vec();
+    header.resize(100, 0);
+    std::fs::write(temp_db.path(), &header).unwrap();
+
     let valid_cfg = DeploymentSecurityConfig {
+        sandbox_enabled: false,
+        allow_code_execution: false,
+        allow_external_network: false,
+        trusted_revocations_db_path: Some(temp_db.path().to_str().unwrap().into()),
+    };
+    assert!(validate_deployment_security(&valid_cfg).is_ok());
+
+    // 4. Code execution with sandbox_enabled=true but unverified sandbox capability fails
+    let unverified_sandbox_cfg = DeploymentSecurityConfig {
         sandbox_enabled: true,
         allow_code_execution: true,
         allow_external_network: false,
-        trusted_revocations_db_path: Some("/var/lib/rsia/revocations.db".into()),
+        trusted_revocations_db_path: Some(temp_db.path().to_str().unwrap().into()),
     };
-    assert!(validate_deployment_security(&valid_cfg).is_ok());
+    assert!(validate_deployment_security(&unverified_sandbox_cfg).is_err());
+}
+
+// =========================================================================
+// F07 Adversarial Regression (from controller review)
+// =========================================================================
+#[test]
+fn test_f07_review_deployment_cannot_trust_nonexistent_anchor_and_sandbox_boolean() {
+    let cfg = DeploymentSecurityConfig {
+        sandbox_enabled: true,
+        allow_code_execution: true,
+        allow_external_network: true,
+        trusted_revocations_db_path: Some("/definitely-not-a-current-trusted-db".into()),
+    };
+    assert!(
+        validate_deployment_security(&cfg).is_err(),
+        "nonexistent trusted anchor + sandbox boolean accepted"
+    );
 }

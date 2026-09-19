@@ -425,17 +425,33 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 2. `crates/evo-engine/tests/capacity_v41.rs`: 新增集成测试套件，全面覆盖 V007, V008, V017, V018, V037, V038, V039, V066, V069, V073, V075, V081–V086, V096, V098 全部测试场景。
 
 自测证据（全部 exit 0）：
-- `cargo test --locked --offline -p evo-engine --test capacity_v41`: 6 项全部通过。
+- `cargo test --locked --offline -p evo-engine --test capacity_v41`: 7 项全部通过（含主控对抗缺陷 F07 可信 SQLite 撤销锚存在性/有效性与沙箱 capability 校验等回归测试）。
 - `cargo test --locked --offline -p evo-engine --lib capacity::tests`: 1 项全部通过。
-- `cargo test --locked --offline -p evo-engine --test hosts_v41`: 8 项全部通过。
+- `cargo test --locked --offline -p evo-engine --test hosts_v41`: 9 项全部通过。
 - `cargo test --locked --offline -p evo-engine`: 全量测试全部通过。
 - `cargo clippy --locked --offline -p evo-engine --all-targets -- -D warnings`: 检查通过，无 warning。
 - `cargo fmt --all -- --check`: 格式化检查通过。
 
+主控审阅缺陷整改与提案记录（PR #48）：
+- **F07（部署安全门禁撤销锚与沙箱真实有效性检验）**：在 `validate_deployment_security` 中严格核验 `trusted_revocations_db_path` 的真实存在性与 SQLite format 3 头部有效性，拒绝不存在或伪造的路径；实现 `probe_sandbox_capability`，在未检测到合格隔离沙箱运行时（或未明确提供已验证沙箱能力）时，绝对禁止以单纯的 `sandbox_enabled: true` 布尔值放行 `allow_code_execution`。
+- **F08（跨阶段持久化、staging、可信回执与 capacity 统一契约提案）**：依主控审查意见，不在未经冻结时自行发明公共契约，特此在台账与PR描述中向主控提出统一契约规范建议：
+  1. **持久 Staging 契约 (`StagedAssetRecord` / `StagingJournal`)**：
+     - 字段：`session_id: String`、`publisher: String`、`asset_id: String`、`kind: PackageKind`、`staged_digest: String`、`baseline_digest: Option<String>`、`referenced_source_ids: Vec<String>`、`allocated_budget_cents: u64`、`consumed_budget_cents: u64`、`staged_at: i64`、`expires_at: i64`、`status: StagingStatus` (`ActivePendingReview`, `ApprovedForRelease`, `AbortedRolledBack`, `QuarantinedRevocation`)、`revocation_watermark: u64`。
+     - 读写主体：由引擎 staging 工作流写入；由 `ReleaseStore` 在正式晋升 Active 时校验并消费（严禁直接修改 Active 指针）；评估器只读读取。
+     - 撤销/预算/恢复关系：中止或失败即回滚并释放预算；一旦关联源被撤销或当前水位前移，状态转为 `QuarantinedRevocation` 拒绝晋升。
+  2. **可信回执契约 (`TrustedHostReceiptJournal`)**：
+     - 字段：`receipt_id: String`、`host_id: String`、`run_id: String`、`stage: HostToolStage`、`attribution: SkillAttribution`、`invocation_digest: String`、`signed_attestation: Option<String>`、`claimed_used: bool`、`claimed_benefit: bool`、`verified_at: i64`。
+     - 读写主体：由宿主适配器内核/受信观察者写入；引擎诊断、评估器及计费对账器读取。
+     - 关系：严禁调用方自编或未经验收的 `Used`/`VerifiedBenefit` 回执；Truncated/Omitted/Offered 阶段不可伪报使用。
+  3. **容量与持久恢复锚点契约 (`SystemCapacityAndRecoveryAnchor`)**：
+     - 字段：`active_db_epoch: u64`、`current_revocation_watermark: u64`、`cumulative_queries_consumed: u64`、`cumulative_expenses_cents: u64`、`active_runs: u64`、`active_exploration_nodes: u64`、`active_replay_worlds: u64`、`active_leases: u64`、`staged_packages_count: u64`、`sandbox_runtime_capability: SandboxCapabilityState`。
+     - 读写主体：由 `evo-storage` SQLite 单事务管理；容量超限严格拒绝新派生（`Error::CapacityExceeded`）；恢复操作强制核验备份水位及已发生账单，保证单调递增。
+
 未完成项与边界：
 - E16.6、E14、E15 仍为 planned；
 - 本版仅承诺 MVP 明确受限规模（runs<=1000, events<=10000, nodes<=500, worlds<=100），不作无界横向扩展性能承诺；
-- 恢复演练确保历史事实、撤销水位及账单不可逆，不伪造远程擦除或自动恢复缺失的沙箱。
+- 恢复演练确保历史事实、撤销水位及账单不可逆，不伪造远程擦除或自动恢复缺失的沙箱；
+- F08 待主控定版后，按依赖顺序正式实施持久化存储。
 
 
 
