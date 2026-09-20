@@ -43,8 +43,26 @@ async fn put_source(store: &Store, id: &str, marker: &str) {
         .unwrap();
     session.commit().await.unwrap();
 }
-fn import_envelope(id: &str, payload: serde_json::Value) -> serde_json::Value {
-    json!({"schema_version":"rsia.e16.import_source.v1","id":id,"namespace":"n","owner_actor":"admin","request_key":format!("request-{id}"),"input_digest":hash(format!("input-{id}").as_bytes()),"created_at":1,"updated_at":1,"source_refs":[],"revoke_watermark":1,"payload":payload})
+
+fn e16_import_envelope(
+    schema: &str,
+    id: &str,
+    source_refs: serde_json::Value,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "schema_version":schema,
+        "id":id,
+        "namespace":"n",
+        "owner_actor":"admin",
+        "request_key":format!("request-{id}"),
+        "input_digest":hash(format!("input-{id}").as_bytes()),
+        "created_at":1,
+        "updated_at":1,
+        "source_refs":source_refs,
+        "revoke_watermark":0,
+        "payload":payload,
+    })
 }
 
 fn lifecycle_replay_world(id: &str, cluster: &str, partition: WorldPartition) -> ReplayWorldV2 {
@@ -913,51 +931,92 @@ fn restore(backup: &std::path::Path, dest: &std::path::Path, delta: &std::path::
 }
 
 #[tokio::test]
-async fn restore_replays_import_source_artifact_revocation() {
+async fn restore_replays_strict_e16_import_source_revocation_from_current_anchor() {
     let (dir, store) = database().await;
     let admin = ctx("admin", Role::Admin);
     let mut session = store.session().await.unwrap();
     session
-        .bump_watermark(&admin, &hash(b"base"))
+        .bump_watermark(&admin, &hash(b"e16-base-watermark"))
         .await
         .unwrap();
-    let source = import_envelope(
-        "import-source",
-        json!({"status":"missing","raw_blob_digest":hash(b"absent"),"blob_published":false}),
+    let source = e16_import_envelope(
+        "rsia.e16.import_source.v1",
+        "restore-import-source",
+        json!([]),
+        json!({"raw_blob_digest":null,"state":"missing"}),
     );
     session
-        .put(&admin, "artifact", "import-source", "admin", &source)
+        .put(
+            &admin,
+            "artifact",
+            "restore-import-source",
+            admin.actor(),
+            &source,
+        )
         .await
         .unwrap();
     session.commit().await.unwrap();
-    let backup = dir.path().join("import-backup");
+    let backup = dir.path().join("e16-backup");
     store.backup(&backup).await.unwrap();
     let manifest_bytes = std::fs::read(backup.join("backup-manifest.json")).unwrap();
     let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes).unwrap();
     let base = manifest.watermarks.first().unwrap();
+
     let revoked = LifecycleStore::begin_revoke(
         &admin,
         &store,
         TypedObjectRef {
             kind: "artifact".into(),
-            id: "import-source".into(),
+            id: "restore-import-source".into(),
         },
-        "post backup revoke",
+        "post backup import revoke",
         9,
     )
     .await
     .unwrap();
     let mut session = store.session().await.unwrap();
     let tombstone: evo_storage::lifecycle::RevokeTombstone = session
-        .need(&admin, "tombstone", "import-source")
+        .need(&admin, "tombstone", "restore-import-source")
         .await
         .unwrap();
     session.commit().await.unwrap();
-    let delta = dir.path().join("import-delta.json");
-    std::fs::write(&delta,serde_json::to_vec(&json!({"schema_version":"rsia.revoke_delta.v1","base_manifest_sha256":hash(&manifest_bytes),"namespaces":[{"namespace":base.namespace,"base_seq":base.seq,"base_digest":base.digest,"events":[{"seq":base.seq+1,"previous_digest":base.digest,"digest":revoked.watermark_digest,"source_kind":"artifact","source_id":"import-source","tombstone_digest":hash(&serde_json::to_vec(&tombstone).unwrap()),"reason":"post backup revoke","created_at":9}],"latest_seq":base.seq+1,"latest_digest":revoked.watermark_digest}]})).unwrap()).unwrap();
-    let restored = dir.path().join("import-restored");
+    let delta = dir.path().join("e16-delta.json");
+    std::fs::write(
+        &delta,
+        serde_json::to_vec(&json!({
+            "schema_version":"rsia.revoke_delta.v1",
+            "base_manifest_sha256":hash(&manifest_bytes),
+            "namespaces":[{
+                "namespace":base.namespace,
+                "base_seq":base.seq,
+                "base_digest":base.digest,
+                "events":[{
+                    "seq":base.seq + 1,
+                    "previous_digest":base.digest,
+                    "digest":revoked.watermark_digest,
+                    "source_kind":"artifact",
+                    "source_id":"restore-import-source",
+                    "tombstone_digest":hash(&serde_json::to_vec(&tombstone).unwrap()),
+                    "reason":"post backup import revoke",
+                    "created_at":9,
+                }],
+                "latest_seq":base.seq + 1,
+                "latest_digest":revoked.watermark_digest,
+            }],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let restored = dir.path().join("e16-restored");
     assert_eq!(restore(&backup, &restored, &delta), 0);
     let restored_store = Store::open(&restored.join("rsia.sqlite3")).await.unwrap();
+    let mut restored_session = restored_store.session().await.unwrap();
+    let restored_tombstone: evo_storage::lifecycle::RevokeTombstone = restored_session
+        .need(&admin, "tombstone", "restore-import-source")
+        .await
+        .unwrap();
+    assert_eq!(restored_tombstone.source_kind, "artifact");
+    restored_session.commit().await.unwrap();
     let status = LifecycleStore::cleanup_status(&admin, &restored_store, &revoked.job_id)
         .await
         .unwrap();
@@ -1511,6 +1570,370 @@ async fn cleanup_preserves_typed_spent_facts_redacts_world_and_blocks_unknown_ar
     assert_eq!(draft["schema_version"], "rsia.redacted.v1");
     assert!(!draft.to_string().contains("SECRET"));
     session.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn e16_import_source_revocation_cleans_full_result_closure_and_only_its_blob() {
+    let (_dir, store) = database().await;
+    let admin = ctx("admin", Role::Admin);
+    let first_blob = store.put_blob(&admin, b"SOURCE-ONE-SECRET").await.unwrap();
+    let second_blob = store.put_blob(&admin, b"SOURCE-TWO-SECRET").await.unwrap();
+    let source_one = e16_import_envelope(
+        "rsia.e16.import_source.v1",
+        "import-source-one",
+        json!([]),
+        json!({"raw_blob_digest":first_blob}),
+    );
+    let source_two = e16_import_envelope(
+        "rsia.e16.import_source.v1",
+        "import-source-two",
+        json!([]),
+        json!({"raw_blob_digest":second_blob}),
+    );
+    let result = e16_import_envelope(
+        "rsia.e16.import_result.v1",
+        "import-result",
+        json!([
+            {"kind":"artifact","id":"import-source-one","content_digest":hash(b"one")},
+            {"kind":"artifact","id":"import-source-two","content_digest":hash(b"two")}
+        ]),
+        json!({"aggregate_summary":{"total_events":2},"secret":"RESULT-SECRET"}),
+    );
+    let mut session = store.session().await.unwrap();
+    for (id, value) in [
+        ("import-source-one", source_one),
+        ("import-source-two", source_two),
+        ("import-result", result),
+    ] {
+        session
+            .put(&admin, "artifact", id, admin.actor(), &value)
+            .await
+            .unwrap();
+    }
+    session
+        .put_edge(&admin, "artifact", "import-source-one", "blob", &first_blob)
+        .await
+        .unwrap();
+    session
+        .put_edge(
+            &admin,
+            "artifact",
+            "import-source-two",
+            "blob",
+            &second_blob,
+        )
+        .await
+        .unwrap();
+    for source in ["import-source-one", "import-source-two"] {
+        session
+            .put_edge(&admin, "artifact", "import-result", "artifact", source)
+            .await
+            .unwrap();
+    }
+    session.commit().await.unwrap();
+
+    let mut status = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "artifact".into(),
+            id: "import-source-two".into(),
+        },
+        "source two revoked",
+        2,
+    )
+    .await
+    .unwrap();
+    for now in 3..30 {
+        status = LifecycleStore::cleanup_step(&admin, &store, &status.job_id, 16, now)
+            .await
+            .unwrap();
+        if status.pending_nodes == 0 {
+            break;
+        }
+    }
+    assert_eq!(status.state, CleanupState::Complete);
+    assert_eq!(
+        store.read_blob(&admin, &first_blob, 1024).await.unwrap(),
+        b"SOURCE-ONE-SECRET"
+    );
+    let second_read = store.read_blob(&admin, &second_blob, 1024).await;
+    assert!(
+        matches!(second_read, Err(evo_core::Error::NotFound)),
+        "unexpected revoked blob read: {second_read:?}"
+    );
+    let mut session = store.session().await.unwrap();
+    let first: serde_json::Value = session
+        .need(&admin, "artifact", "import-source-one")
+        .await
+        .unwrap();
+    assert_eq!(first["schema_version"], "rsia.e16.import_source.v1");
+    let second: serde_json::Value = session
+        .need(&admin, "artifact", "import-source-two")
+        .await
+        .unwrap();
+    let result: serde_json::Value = session
+        .need(&admin, "artifact", "import-result")
+        .await
+        .unwrap();
+    assert_eq!(second["schema_version"], "rsia.redacted.v1");
+    assert_eq!(result["schema_version"], "rsia.redacted.v1");
+    assert!(!result.to_string().contains("RESULT-SECRET"));
+    session.commit().await.unwrap();
+    let reconnected = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "artifact".into(),
+            id: "import-source-two".into(),
+        },
+        "source two revoked",
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reconnected.job_id, status.job_id);
+}
+
+#[tokio::test]
+async fn e16_shared_package_blob_is_deleted_only_after_every_source_closure_is_revoked() {
+    let (_dir, store) = database().await;
+    let admin = ctx("admin", Role::Admin);
+    put_source(&store, "source-a", "A").await;
+    put_source(&store, "source-b", "B").await;
+    let blob = store
+        .put_blob(&admin, b"SHARED-PACKAGE-SECRET")
+        .await
+        .unwrap();
+    let make_staged = |id: &str, source: &str| {
+        json!({
+            "schema_version":"rsia.e16.staged_asset.v1",
+            "id":id,
+            "namespace":"n",
+            "owner_actor":"admin",
+            "request_key":format!("request-{id}"),
+            "input_digest":hash(format!("input-{id}").as_bytes()),
+            "created_at":1,
+            "updated_at":1,
+            "source_refs":[{"kind":"run","id":source,"digest":hash(source.as_bytes())}],
+            "revoke_watermark":0,
+            "payload":{
+                "publisher":"publisher",
+                "asset_id":id,
+                "package_kind":"skill",
+                "manifest_digest":hash(b"manifest"),
+                "content_blob_digest":blob,
+                "content_bytes":21,
+                "baseline_digest":hash(b"baseline"),
+                "local_digest":hash(b"local"),
+                "environment_digest":hash(b"environment"),
+                "package_schema_version":"v1",
+                "compiler_version":"v1",
+                "state":"staged",
+                "secret":"PACKAGE-SECRET"
+            }
+        })
+    };
+    let mut session = store.session().await.unwrap();
+    for (id, source) in [("staged-a", "source-a"), ("staged-b", "source-b")] {
+        session
+            .put(
+                &admin,
+                "artifact",
+                id,
+                admin.actor(),
+                &make_staged(id, source),
+            )
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", id, "run", source)
+            .await
+            .unwrap();
+    }
+    session.commit().await.unwrap();
+
+    for (source, now, should_exist) in [("source-a", 2, true), ("source-b", 20, false)] {
+        let mut status = LifecycleStore::begin_revoke(
+            &admin,
+            &store,
+            TypedObjectRef {
+                kind: "run".into(),
+                id: source.into(),
+            },
+            "delete source",
+            now,
+        )
+        .await
+        .unwrap();
+        for step in now + 1..now + 15 {
+            status = LifecycleStore::cleanup_step(&admin, &store, &status.job_id, 16, step)
+                .await
+                .unwrap();
+            if status.pending_nodes == 0 {
+                break;
+            }
+        }
+        assert_eq!(status.state, CleanupState::Complete);
+        let read = store.read_blob(&admin, &blob, 1024).await;
+        assert_eq!(read.is_ok(), should_exist);
+    }
+}
+
+async fn prepared_staged_asset(
+    store: &Store,
+    admin: &Context,
+    source_id: &str,
+    artifact_id: &str,
+    bytes: &[u8],
+) -> String {
+    put_source(store, source_id, "authority").await;
+    let source = json!({
+        "id":source_id,
+        "schema_version":"rsia.optimization.source.v1",
+        "body":"authority"
+    });
+    let digest = hash(bytes);
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(admin, &hash(format!("watermark-{artifact_id}").as_bytes()))
+        .await
+        .unwrap();
+    let envelope = json!({
+        "schema_version":"rsia.e16.staged_asset.v1",
+        "id":artifact_id,
+        "namespace":"n",
+        "owner_actor":"admin",
+        "request_key":format!("request-{artifact_id}"),
+        "input_digest":hash(format!("input-{artifact_id}").as_bytes()),
+        "created_at":1,
+        "updated_at":1,
+        "source_refs":[{"kind":"run","id":source_id,"digest":fingerprint(&source).unwrap()}],
+        "revoke_watermark":1,
+        "payload":{
+            "publisher":"publisher",
+            "asset_id":artifact_id,
+            "package_kind":"skill",
+            "manifest_digest":hash(b"manifest"),
+            "content_blob_digest":digest,
+            "content_bytes":bytes.len(),
+            "baseline_digest":hash(b"baseline"),
+            "local_digest":hash(b"local"),
+            "environment_digest":hash(b"environment"),
+            "package_schema_version":"v1",
+            "compiler_version":"v1",
+            "state":"prepared"
+        }
+    });
+    session
+        .put(admin, "artifact", artifact_id, admin.actor(), &envelope)
+        .await
+        .unwrap();
+    session
+        .put_edge(admin, "artifact", artifact_id, "run", source_id)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    digest
+}
+
+#[tokio::test]
+async fn cleanup_before_registered_publish_rejects_late_blob_without_orphan() {
+    let (_dir, store) = database().await;
+    let admin = ctx("admin", Role::Admin);
+    let bytes = b"late package secret";
+    let digest =
+        prepared_staged_asset(&store, &admin, "late-source", "late-prepared-asset", bytes).await;
+    let mut status = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: "late-source".into(),
+        },
+        "revoke before publish",
+        2,
+    )
+    .await
+    .unwrap();
+    for now in 3..20 {
+        status = LifecycleStore::cleanup_step(&admin, &store, &status.job_id, 16, now)
+            .await
+            .unwrap();
+        if status.pending_nodes == 0 {
+            break;
+        }
+    }
+    assert_eq!(status.state, CleanupState::Complete);
+    assert!(
+        store
+            .publish_registered_blob(
+                &admin,
+                "late-prepared-asset",
+                "rsia.e16.staged_asset.v1",
+                "content_blob_digest",
+                bytes,
+                64 * 1024 * 1024,
+            )
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        store.read_blob(&admin, &digest, 1024).await,
+        Err(evo_core::Error::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn registered_publish_before_cleanup_leaves_prepared_reference_for_safe_deletion() {
+    let (_dir, store) = database().await;
+    let admin = ctx("admin", Role::Admin);
+    let bytes = b"published package secret";
+    let digest = prepared_staged_asset(
+        &store,
+        &admin,
+        "published-source",
+        "published-prepared-asset",
+        bytes,
+    )
+    .await;
+    store
+        .publish_registered_blob(
+            &admin,
+            "published-prepared-asset",
+            "rsia.e16.staged_asset.v1",
+            "content_blob_digest",
+            bytes,
+            64 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.read_blob(&admin, &digest, 1024).await.unwrap(), bytes);
+    let mut status = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: "published-source".into(),
+        },
+        "revoke after publish",
+        2,
+    )
+    .await
+    .unwrap();
+    for now in 3..20 {
+        status = LifecycleStore::cleanup_step(&admin, &store, &status.job_id, 16, now)
+            .await
+            .unwrap();
+        if status.pending_nodes == 0 {
+            break;
+        }
+    }
+    assert_eq!(status.state, CleanupState::Complete);
+    assert!(matches!(
+        store.read_blob(&admin, &digest, 1024).await,
+        Err(evo_core::Error::NotFound)
+    ));
 }
 
 fn spent_exposure_ledger() -> evo_core::holdout::ExposureLedger {

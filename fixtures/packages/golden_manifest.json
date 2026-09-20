@@ -1,0 +1,59 @@
+{
+  "schema_version": "rsia.package.v1",
+  "kind": "skill",
+  "publisher": "community.rsia",
+  "asset_id": "math_reasoning_v1",
+  "name": "Math Reasoning Skill",
+  "version": "1.0.0",
+  "description": "Standard mathematical reasoning skill package",
+  "license": "MIT",
+  "entries": [
+    {
+      "path": "skill.md",
+      "digest_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0,
+      "compressed_bytes": 0
+    },
+    {
+      "path": "prompt.json",
+      "digest_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "size_bytes": 2,
+      "compressed_bytes": 2
+    }
+  ],
+  "dependencies": [
+    {
+      "publisher": "core.rsia",
+      "asset_id": "base_evaluator",
+      "kind": "template",
+      "version_req": ">=1.0.0"
+    }
+  ],
+  "redaction_report": {
+    "scanned_at": 1726747200,
+    "findings_count": 0,
+    "status": "clean",
+    "disclaimer": "Privacy scan does not guarantee absolute absence of sensitive data; human audit is required.",
+    "findings": []
+  },
+  "foreign_metadata": {
+    "external_namespace": "remote.cluster.prod",
+    "external_parent_id": "math_v0",
+    "formal_evaluations": [
+      {
+        "evaluator_identity": "remote_evaluator_node_42",
+        "evaluated_at": 1726747000,
+        "score": "0.94",
+        "notes": "External evaluation on remote holdout dataset"
+      }
+    ],
+    "approvals": [
+      {
+        "approver_identity": "admin_remote_corp",
+        "approved_at": 1726747100,
+        "notes": "Approved for remote internal use"
+      }
+    ],
+    "disclaimer": "Foreign evaluations, approvals, and parent pointers are untrusted historical claims and do not grant local permissions or active status."
+  }
+}
