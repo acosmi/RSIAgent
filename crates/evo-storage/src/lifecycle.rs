@@ -184,9 +184,9 @@ impl LifecycleStore {
         }
         if source.kind == "artifact" {
             let value = existing_source.ok_or(Error::NotFound)?;
-            if value.get("schema_version").and_then(|v| v.as_str())
+            if value.get("schema_version").and_then(|item| item.as_str())
                 != Some("rsia.e16.import_source.v1")
-                || validate_import_envelope(ctx, &source, &value).is_err()
+                || validate_e16_envelope(ctx, &source, &value).is_err()
             {
                 return Err(Error::Invalid(
                     "only a strict E16 import_source artifact is a revocable source".into(),
@@ -1422,6 +1422,507 @@ async fn redact_replay_store_envelope(
     .await
 }
 
+fn e16_schema_kind(schema: &str) -> Option<&'static str> {
+    match schema {
+        "rsia.e16.source_selection.v1" => Some("source_selection"),
+        "rsia.e16.import_source.v1" => Some("import_source"),
+        "rsia.e16.import_result.v1" => Some("import_result"),
+        "rsia.e16.staged_asset.v1" => Some("staged_asset"),
+        "rsia.e16.seed_install.v1" => Some("seed_install"),
+        "rsia.e16.export_attempt.v1" => Some("export_attempt"),
+        "rsia.e16.delivery_audit.v1" => Some("delivery_audit"),
+        "rsia.e16.export_attempt.v2" => Some("export_attempt"),
+        "rsia.e16.delivery_audit.v2" => Some("delivery_audit"),
+        _ => None,
+    }
+}
+
+fn validate_e16_envelope(
+    ctx: &Context,
+    node: &TypedObjectRef,
+    value: &serde_json::Value,
+) -> Result<&'static str> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::Conflict("E16 envelope is not an object".into()))?;
+    const FIELDS: [&str; 11] = [
+        "schema_version",
+        "id",
+        "namespace",
+        "owner_actor",
+        "request_key",
+        "input_digest",
+        "created_at",
+        "updated_at",
+        "source_refs",
+        "revoke_watermark",
+        "payload",
+    ];
+    if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
+        return Err(Error::Conflict(
+            "unknown or missing E16 envelope field".into(),
+        ));
+    }
+    let schema = object["schema_version"]
+        .as_str()
+        .and_then(e16_schema_kind)
+        .ok_or_else(|| Error::Conflict("unknown E16 schema".into()))?;
+    if object["id"].as_str() != Some(node.id.as_str())
+        || object["namespace"].as_str() != Some(ctx.namespace())
+        || object["owner_actor"].as_str().is_none()
+        || object["request_key"].as_str().is_none()
+        || !is_lower_hex_digest(&object["input_digest"])
+        || object["created_at"].as_i64().is_none()
+        || object["updated_at"].as_i64().is_none()
+        || object["revoke_watermark"].as_u64().is_none()
+        || !object["payload"].is_object()
+    {
+        return Err(Error::Conflict(
+            "invalid E16 envelope authority fields".into(),
+        ));
+    }
+    let refs = object["source_refs"]
+        .as_array()
+        .ok_or_else(|| Error::Conflict("invalid E16 source_refs".into()))?;
+    let digest_field = if matches!(
+        schema,
+        "source_selection" | "import_source" | "import_result"
+    ) {
+        "content_digest"
+    } else {
+        "digest"
+    };
+    for source in refs {
+        let source = source
+            .as_object()
+            .ok_or_else(|| Error::Conflict("invalid E16 source_ref".into()))?;
+        if source.len() != 3
+            || !source.contains_key("kind")
+            || !source.contains_key("id")
+            || !source.contains_key(digest_field)
+            || source["kind"].as_str().is_none()
+            || source["id"].as_str().is_none()
+            || !is_lower_hex_digest(&source[digest_field])
+        {
+            return Err(Error::Conflict(
+                "unknown or invalid E16 source_ref field".into(),
+            ));
+        }
+    }
+    Ok(schema)
+}
+
+fn is_lower_hex_digest(value: &serde_json::Value) -> bool {
+    value.as_str().is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cleanup_e16_envelope(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    store: &Store,
+    ctx: &Context,
+    job_id: &str,
+    node: &TypedObjectRef,
+    body: &str,
+    value: &serde_json::Value,
+    now: i64,
+) -> Result<()> {
+    let kind = match validate_e16_envelope(ctx, node, value) {
+        Ok(kind) => kind,
+        Err(_) => {
+            return mark_unknown_scope(
+                tx,
+                ctx,
+                job_id,
+                node,
+                "blocked_unknown_scope:invalid_e16_envelope",
+                now,
+            )
+            .await;
+        }
+    };
+    if kind == "delivery_audit" {
+        let mut preserved = value.clone();
+        preserved["updated_at"] = json!(now);
+        preserved["payload"]["revoked"] = json!(true);
+        sqlx::query(
+            "UPDATE objects SET body=?,revision=revision+1 WHERE namespace=? AND kind='artifact' AND id=?",
+        )
+        .bind(preserved.to_string())
+        .bind(ctx.namespace())
+        .bind(&node.id)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+        insert_cleanup_event(
+            tx,
+            ctx.namespace(),
+            job_id,
+            Some(node),
+            "delivery_fact_preserved",
+            now,
+            json!({"remote_erasure_not_claimed":true,"revoked":true,"revocation_notice_sent":false}),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if kind == "export_attempt"
+        && value["schema_version"].as_str() == Some("rsia.e16.export_attempt.v2")
+    {
+        remove_controlled_local_export(store, ctx, node, job_id, tx, now).await?;
+    }
+
+    let mut blob_digests = Vec::new();
+    let payload = &value["payload"];
+    let fields: &[&str] = match kind {
+        "import_source" => &["raw_blob_digest"],
+        "staged_asset" => &["content_blob_digest"],
+        "seed_install" => &[
+            "baseline_blob_digest",
+            "local_blob_digest",
+            "upstream_blob_digest",
+        ],
+        "export_attempt" => {
+            if value["schema_version"].as_str() == Some("rsia.e16.export_attempt.v2") {
+                &["projection_blob_digest"]
+            } else {
+                &["output_blob_digest"]
+            }
+        }
+        _ => &[],
+    };
+    for field in fields {
+        if let Some(digest) = payload.get(*field).and_then(|value| value.as_str()) {
+            if !is_lower_hex_digest(&serde_json::Value::String(digest.into())) {
+                return mark_unknown_scope(
+                    tx,
+                    ctx,
+                    job_id,
+                    node,
+                    "blocked_unknown_scope:invalid_e16_blob_digest",
+                    now,
+                )
+                .await;
+            }
+            blob_digests.push(digest.to_string());
+        }
+    }
+
+    let mut retained_payload = serde_json::Map::new();
+    for field in [
+        "publisher",
+        "asset_id",
+        "package_kind",
+        "kind",
+        "manifest_digest",
+        "content_blob_digest",
+        "content_bytes",
+        "baseline_blob_digest",
+        "baseline_digest",
+        "local_blob_digest",
+        "local_digest",
+        "upstream_blob_digest",
+        "upstream_digest",
+        "environment_digest",
+        "package_schema_version",
+        "compiler_version",
+        "candidate_ref",
+        "final_projection_digest",
+        "output_blob_digest",
+        "output_bytes",
+        "projection_blob_digest",
+        "projection_blob_bytes",
+        "package_tree_digest",
+        "delivered_bytes",
+        "delivery_kind",
+        "local_export_ref",
+        "completion_receipt_digest",
+        "destination_scope",
+        "delivery_audit_id",
+        "budget_ref",
+        "root_budget_id",
+        "billing_scope",
+        "payment_subject",
+    ] {
+        if let Some(item) = payload.get(field) {
+            retained_payload.insert(field.into(), item.clone());
+        }
+    }
+    let redacted = json!({
+        "id": node.id,
+        "schema_version": "rsia.redacted.v1",
+        "state": if kind == "export_attempt" { "revoked" } else { "source_revoked" },
+        "original_kind": kind,
+        "original_schema": value["schema_version"],
+        "original_digest": evo_core::hash(body.as_bytes()),
+        "metadata": {
+            "namespace": value["namespace"],
+            "owner_actor": value["owner_actor"],
+            "request_key": value["request_key"],
+            "input_digest": value["input_digest"],
+            "created_at": value["created_at"],
+            "updated_at": value["updated_at"],
+            "source_refs": value["source_refs"],
+            "revoke_watermark": value["revoke_watermark"],
+            "payload": retained_payload,
+        },
+    });
+    sqlx::query(
+        "UPDATE objects SET body=?,revision=revision+1 WHERE namespace=? AND kind='artifact' AND id=?",
+    )
+    .bind(redacted.to_string())
+    .bind(ctx.namespace())
+    .bind(&node.id)
+    .execute(&mut **tx)
+    .await
+    .map_err(internal)?;
+    for digest in blob_digests {
+        remove_e16_blob_if_unreferenced(tx, store, ctx, job_id, &digest).await?;
+    }
+    insert_cleanup_event(
+        tx,
+        ctx.namespace(),
+        job_id,
+        Some(node),
+        "e16_content_redacted",
+        now,
+        json!({"record_kind":kind,"blob_candidates":fields.len()}),
+    )
+    .await
+}
+
+async fn remove_controlled_local_export(
+    store: &Store,
+    ctx: &Context,
+    node: &TypedObjectRef,
+    job_id: &str,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    now: i64,
+) -> Result<()> {
+    let export_root = store.root.join("exports");
+    let namespace_root = export_root.join(evo_core::hash(ctx.namespace().as_bytes()));
+    for ancestor in [&export_root, &namespace_root] {
+        match tokio::fs::symlink_metadata(ancestor).await {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return mark_unknown_scope(
+                    tx,
+                    ctx,
+                    job_id,
+                    node,
+                    "blocked_unknown_scope:linked_local_export_ancestor",
+                    now,
+                )
+                .await;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                insert_cleanup_event(
+                    tx,
+                    ctx.namespace(),
+                    job_id,
+                    Some(node),
+                    "local_export_directory_absent",
+                    now,
+                    json!({}),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => return Err(internal(error)),
+        }
+    }
+    let path = namespace_root.join(&node.id);
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return mark_unknown_scope(
+                    tx,
+                    ctx,
+                    job_id,
+                    node,
+                    "blocked_unknown_scope:invalid_local_export_directory",
+                    now,
+                )
+                .await;
+            }
+            tokio::fs::remove_dir_all(&path).await.map_err(internal)?;
+            if let Some(parent) = path.parent() {
+                sync_directory(parent.to_path_buf()).await?;
+            }
+            insert_cleanup_event(
+                tx,
+                ctx.namespace(),
+                job_id,
+                Some(node),
+                "local_export_directory_deleted",
+                now,
+                json!({"remote_erasure_not_claimed":true}),
+            )
+            .await?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            insert_cleanup_event(
+                tx,
+                ctx.namespace(),
+                job_id,
+                Some(node),
+                "local_export_directory_absent",
+                now,
+                json!({}),
+            )
+            .await?;
+        }
+        Err(error) => return Err(internal(error)),
+    }
+    Ok(())
+}
+
+async fn cleanup_e16_blob(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    store: &Store,
+    ctx: &Context,
+    job_id: &str,
+    node: &TypedObjectRef,
+    now: i64,
+) -> Result<()> {
+    if !is_lower_hex_digest(&serde_json::Value::String(node.id.clone())) {
+        return mark_unknown_scope(
+            tx,
+            ctx,
+            job_id,
+            node,
+            "blocked_unknown_scope:invalid_blob_digest",
+            now,
+        )
+        .await;
+    }
+    let removed = remove_e16_blob_if_unreferenced(tx, store, ctx, job_id, &node.id).await?;
+    insert_cleanup_event(
+        tx,
+        ctx.namespace(),
+        job_id,
+        Some(node),
+        if removed {
+            "blob_content_deleted"
+        } else {
+            "shared_blob_preserved"
+        },
+        now,
+        json!({}),
+    )
+    .await
+}
+
+async fn remove_e16_blob_if_unreferenced(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    store: &Store,
+    ctx: &Context,
+    job_id: &str,
+    digest: &str,
+) -> Result<bool> {
+    let live_edges: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM dependencies d
+         JOIN objects o ON o.namespace=d.namespace AND o.kind=d.src_kind AND o.id=d.src_id
+         WHERE d.namespace=? AND d.dst_kind='blob' AND d.dst_id=?
+         AND json_extract(o.body,'$.schema_version') IN (
+           'rsia.e16.import_source.v1','rsia.e16.staged_asset.v1',
+           'rsia.e16.seed_install.v1','rsia.e16.export_attempt.v1',
+           'rsia.e16.export_attempt.v2'
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM revoke_cleanup_frontier f
+           WHERE f.namespace=d.namespace AND f.job_id=?
+             AND f.node_kind=d.src_kind AND f.node_id=d.src_id
+         )",
+    )
+    .bind(ctx.namespace())
+    .bind(digest)
+    .bind(job_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(internal)?;
+    if live_edges != 0 || e16_payload_has_live_blob_reference(tx, ctx, job_id, digest).await? {
+        return Ok(false);
+    }
+    let path = store
+        .root
+        .join("blobs")
+        .join(evo_core::hash(ctx.namespace().as_bytes()))
+        .join(digest);
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(Error::Conflict("refusing to remove linked E16 blob".into()));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() != 1 {
+                    return Err(Error::Conflict(
+                        "refusing to remove hard-linked E16 blob".into(),
+                    ));
+                }
+            }
+            tokio::fs::remove_file(path).await.map_err(internal)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(internal(error)),
+    }
+}
+
+async fn e16_payload_has_live_blob_reference(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ctx: &Context,
+    job_id: &str,
+    digest: &str,
+) -> Result<bool> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT o.body FROM objects o
+         WHERE o.namespace=? AND o.kind='artifact'
+         AND json_extract(o.body,'$.schema_version') IN (
+           'rsia.e16.staged_asset.v1','rsia.e16.seed_install.v1','rsia.e16.export_attempt.v1',
+           'rsia.e16.export_attempt.v2'
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM revoke_cleanup_frontier f
+           WHERE f.namespace=o.namespace AND f.job_id=?
+             AND f.node_kind=o.kind AND f.node_id=o.id
+         )",
+    )
+    .bind(ctx.namespace())
+    .bind(job_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(internal)?;
+    for body in rows {
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(internal)?;
+        let node = TypedObjectRef {
+            kind: "artifact".into(),
+            id: value["id"].as_str().unwrap_or_default().into(),
+        };
+        validate_e16_envelope(ctx, &node, &value)?;
+        for field in [
+            "content_blob_digest",
+            "baseline_blob_digest",
+            "local_blob_digest",
+            "upstream_blob_digest",
+            "output_blob_digest",
+        ] {
+            if value["payload"].get(field).and_then(|item| item.as_str()) == Some(digest) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn replay_pool_from_cleanup_body(
     ctx: &Context,
     pool_id: &str,
@@ -1570,9 +2071,6 @@ async fn cleanup_node_content(
         .await?;
         return Ok(());
     }
-    if node.kind == "blob" {
-        return cleanup_import_blob(tx, store, ctx, job_id, node, now).await;
-    }
     if node.kind == "replay_world" {
         let body: Option<String> =
             sqlx::query_scalar("SELECT manifest FROM replay_worlds WHERE namespace=? AND id=?")
@@ -1650,6 +2148,9 @@ async fn cleanup_node_content(
         )
         .await;
     }
+    if node.kind == "blob" {
+        return cleanup_e16_blob(tx, store, ctx, job_id, node, now).await;
+    }
     let body: Option<String> =
         sqlx::query_scalar("SELECT body FROM objects WHERE namespace=? AND kind=? AND id=?")
             .bind(ctx.namespace())
@@ -1670,15 +2171,8 @@ async fn cleanup_node_content(
         .get("record_kind")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if node.kind == "artifact"
-        && matches!(
-            schema,
-            "rsia.e16.source_selection.v1"
-                | "rsia.e16.import_source.v1"
-                | "rsia.e16.import_result.v1"
-        )
-    {
-        return cleanup_import_envelope(tx, store, ctx, job_id, node, &body, &value, now).await;
+    if node.kind == "artifact" && e16_schema_kind(schema).is_some() {
+        return cleanup_e16_envelope(tx, store, ctx, job_id, node, &body, &value, now).await;
     }
     if node.kind == "artifact" && schema == crate::replay::REPLAY_STORE_ENVELOPE_SCHEMA {
         return redact_replay_store_envelope(tx, ctx, job_id, node, &body, &value, now).await;
@@ -1825,212 +2319,6 @@ async fn cleanup_node_content(
         "content_redacted",
         now,
         json!({"original_digest":evo_core::hash(body.as_bytes())}),
-    )
-    .await
-}
-
-fn lower_digest(value: &serde_json::Value) -> bool {
-    value.as_str().is_some_and(|d| {
-        d.len() == 64
-            && d.bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
-}
-fn validate_import_envelope(
-    ctx: &Context,
-    node: &TypedObjectRef,
-    value: &serde_json::Value,
-) -> Result<&'static str> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| Error::Conflict("E16 envelope is not an object".into()))?;
-    const FIELDS: [&str; 11] = [
-        "schema_version",
-        "id",
-        "namespace",
-        "owner_actor",
-        "request_key",
-        "input_digest",
-        "created_at",
-        "updated_at",
-        "source_refs",
-        "revoke_watermark",
-        "payload",
-    ];
-    if object.len() != FIELDS.len() || FIELDS.iter().any(|f| !object.contains_key(*f)) {
-        return Err(Error::Conflict(
-            "unknown or missing E16 envelope field".into(),
-        ));
-    }
-    let kind = match object["schema_version"].as_str() {
-        Some("rsia.e16.source_selection.v1") => "source_selection",
-        Some("rsia.e16.import_source.v1") => "import_source",
-        Some("rsia.e16.import_result.v1") => "import_result",
-        _ => return Err(Error::Conflict("unsupported import envelope schema".into())),
-    };
-    if object["id"].as_str() != Some(node.id.as_str())
-        || object["namespace"].as_str() != Some(ctx.namespace())
-        || object["owner_actor"].as_str().is_none()
-        || object["request_key"].as_str().is_none()
-        || !lower_digest(&object["input_digest"])
-        || object["created_at"].as_i64().is_none()
-        || object["updated_at"].as_i64().is_none()
-        || object["revoke_watermark"].as_u64().is_none()
-        || !object["payload"].is_object()
-    {
-        return Err(Error::Conflict(
-            "invalid import envelope authority fields".into(),
-        ));
-    }
-    let refs = object["source_refs"]
-        .as_array()
-        .ok_or_else(|| Error::Conflict("invalid import source_refs".into()))?;
-    for source in refs {
-        let source = source
-            .as_object()
-            .ok_or_else(|| Error::Conflict("invalid import source_ref".into()))?;
-        if source.len() != 3
-            || source["kind"].as_str().is_none()
-            || source["id"].as_str().is_none()
-            || !lower_digest(&source["content_digest"])
-        {
-            return Err(Error::Conflict(
-                "unknown or invalid import source_ref field".into(),
-            ));
-        }
-    }
-    Ok(kind)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn cleanup_import_envelope(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    store: &Store,
-    ctx: &Context,
-    job_id: &str,
-    node: &TypedObjectRef,
-    body: &str,
-    value: &serde_json::Value,
-    now: i64,
-) -> Result<()> {
-    let kind = match validate_import_envelope(ctx, node, value) {
-        Ok(kind) => kind,
-        Err(_) => {
-            return mark_unknown_scope(
-                tx,
-                ctx,
-                job_id,
-                node,
-                "blocked_unknown_scope:invalid_import_envelope",
-                now,
-            )
-            .await;
-        }
-    };
-    if kind == "import_source"
-        && let Some(digest) = value
-            .pointer("/payload/raw_blob_digest")
-            .and_then(|v| v.as_str())
-    {
-        if !lower_digest(&serde_json::Value::String(digest.into())) {
-            return mark_unknown_scope(
-                tx,
-                ctx,
-                job_id,
-                node,
-                "blocked_unknown_scope:invalid_import_blob_digest",
-                now,
-            )
-            .await;
-        }
-        remove_import_blob_if_unreferenced(tx, store, ctx, job_id, digest).await?;
-    }
-    let redacted = json!({"id":node.id,"schema_version":"rsia.redacted.v1","state":"source_revoked","original_kind":kind,"original_schema":value["schema_version"],"original_digest":evo_core::hash(body.as_bytes()),"metadata":{"namespace":value["namespace"],"owner_actor":value["owner_actor"],"request_key":value["request_key"],"input_digest":value["input_digest"],"created_at":value["created_at"],"updated_at":value["updated_at"],"source_refs":value["source_refs"],"revoke_watermark":value["revoke_watermark"]}});
-    sqlx::query("UPDATE objects SET body=?,revision=revision+1 WHERE namespace=? AND kind='artifact' AND id=?").bind(redacted.to_string()).bind(ctx.namespace()).bind(&node.id).execute(&mut **tx).await.map_err(internal)?;
-    insert_cleanup_event(
-        tx,
-        ctx.namespace(),
-        job_id,
-        Some(node),
-        "e16_import_content_redacted",
-        now,
-        json!({"record_kind":kind}),
-    )
-    .await
-}
-
-async fn remove_import_blob_if_unreferenced(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    store: &Store,
-    ctx: &Context,
-    job_id: &str,
-    digest: &str,
-) -> Result<bool> {
-    let live:i64=sqlx::query_scalar("SELECT COUNT(*) FROM dependencies d JOIN objects o ON o.namespace=d.namespace AND o.kind=d.src_kind AND o.id=d.src_id WHERE d.namespace=? AND d.dst_kind='blob' AND d.dst_id=? AND json_extract(o.body,'$.schema_version')='rsia.e16.import_source.v1' AND NOT EXISTS (SELECT 1 FROM revoke_cleanup_frontier f WHERE f.namespace=d.namespace AND f.job_id=? AND f.node_kind=d.src_kind AND f.node_id=d.src_id)").bind(ctx.namespace()).bind(digest).bind(job_id).fetch_one(&mut **tx).await.map_err(internal)?;
-    if live != 0 {
-        return Ok(false);
-    }
-    let path = store
-        .root
-        .join("blobs")
-        .join(evo_core::hash(ctx.namespace().as_bytes()))
-        .join(digest);
-    match tokio::fs::symlink_metadata(&path).await {
-        Ok(metadata) => {
-            if !metadata.file_type().is_file() {
-                return Err(Error::Conflict(
-                    "refusing to remove linked import blob".into(),
-                ));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.nlink() != 1 {
-                    return Err(Error::Conflict(
-                        "refusing to remove hard-linked import blob".into(),
-                    ));
-                }
-            }
-            tokio::fs::remove_file(path).await.map_err(internal)?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(internal(error)),
-    }
-}
-
-async fn cleanup_import_blob(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    store: &Store,
-    ctx: &Context,
-    job_id: &str,
-    node: &TypedObjectRef,
-    now: i64,
-) -> Result<()> {
-    if !lower_digest(&serde_json::Value::String(node.id.clone())) {
-        return mark_unknown_scope(
-            tx,
-            ctx,
-            job_id,
-            node,
-            "blocked_unknown_scope:invalid_import_blob_digest",
-            now,
-        )
-        .await;
-    }
-    let removed = remove_import_blob_if_unreferenced(tx, store, ctx, job_id, &node.id).await?;
-    insert_cleanup_event(
-        tx,
-        ctx.namespace(),
-        job_id,
-        Some(node),
-        if removed {
-            "blob_content_deleted"
-        } else {
-            "shared_blob_preserved"
-        },
-        now,
-        json!({}),
     )
     .await
 }
