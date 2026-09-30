@@ -1,6 +1,7 @@
 //! Persistent release control. Production transitions consume stored evidence by id.
 
 use crate::evidence::{load_stored_source, validate_stored_sources};
+use crate::hosts::CLAUDE_CODE_TARGET;
 use crate::releases::validate_resolved_bundle_identity;
 use crate::streaming_evaluator::{
     AnchorEvidenceStatus, CostEvidenceScope, DependencyEvidenceStatus, EvaluationEvidenceScope,
@@ -373,6 +374,19 @@ impl ReleaseStore {
     ) -> Result<HostSurfaceRecord> {
         ctx.require(&[Role::Admin])?;
         identifier(id)?;
+        // Controller F21: the guard is a family check, not an exact string match, so a
+        // relabelled version ("Unverified-...") or host id ("claude-code-mcp-tool-only:v1",
+        // "Claude-Code") cannot register an unverified Claude surface as supported.
+        let host = manifest.host.to_ascii_lowercase();
+        let host_version = manifest.host_version.to_ascii_lowercase();
+        if host_version.starts_with("unverified-")
+            || host == CLAUDE_CODE_TARGET
+            || host.contains("claude")
+        {
+            return Err(Error::Invalid(
+                "unverified host surface candidate cannot be registered as supported".into(),
+            ));
+        }
         manifest.validate_against_extraction(&extracted)?;
         let record = HostSurfaceRecord {
             id: id.into(),
