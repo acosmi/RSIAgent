@@ -250,7 +250,9 @@ def protected_facts(con,namespaces):
         schema=value.get("schema_version","")
         if kind in ("budget","reservation","evaluation","receipt") or schema in (
             "rsia.typed_artifact_envelope.v1","rsia.exploration_artifact_envelope.v1",
-            "rsia.optimization.stage_fact.v1","rsia.budget_call_ref.v1"):
+            "rsia.optimization.stage_fact.v1","rsia.budget_call_ref.v1",
+            "rsia.e16.export_attempt.v1","rsia.e16.delivery_audit.v1",
+            "rsia.e16.export_attempt.v2","rsia.e16.delivery_audit.v2"):
             facts.append((ns,kind,id,value))
     # Monetary state and irreversible dispatch counters must also agree.
     tables=[r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'root_budget%'")]
