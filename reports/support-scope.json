@@ -1126,7 +1126,7 @@
     "E16.6": {
       "title": "Release, Support Scope Manifest & Truth Ledger",
       "status": "in_progress",
-      "status_reason": "derived index and test are implemented; PR #49 (this index update to the 2026-09-30 controller merges) is implemented_not_verified until the controller accepts it; it does not close E16",
+      "status_reason": "derived index and test are implemented; #49 was replaced by PR #56 (merged 364a0722be7d5b05cbf01c453322ba35c2fdfa67) and the CP-002 checker by PR #57 (merged 7b425fcf4da08b8949aaa8f3426853f8938d3f3c); this index is now bound to plan v4.2 with lineage v4.1->v4.2 (AG-012) and is implemented_not_verified until the controller accepts that binding; it does not close E16",
       "implementation_files": [
         "reports/support-scope.json",
         "crates/evo-core/tests/support_scope.rs"
@@ -1144,13 +1144,13 @@
       ],
       "verified_subscopes": [],
       "remaining": [
-        "controller acceptance of PR #49 (support-scope index and support_scope test) is pending; the index does not close E16"
+        "controller acceptance of the v4.2 lineage binding (AG-012) is pending; the index does not close E16; full-route completion, real-host, sandbox and effect evidence remain unavailable"
       ]
     },
     "E16": {
       "title": "Product Support Scope & Final Delivery Gate",
       "status": "in_progress",
-      "status_reason": "E16.6 (PR #49 support-scope index) is the open sub-package; E16.4 stays blocked on real Claude Code evidence; E14/E15, production deployment and real-provider effect evidence remain unavailable",
+      "status_reason": "E16.6 index is rebound to plan v4.2 (AG-012, pending controller acceptance); E16.4 stays blocked on real Claude Code evidence; E16.5 capacity/recovery/deployment gates are not yet wired into runtime entry points; E14/E15, production deployment and real-provider effect evidence remain unavailable",
       "implementation_files": [
         "reports/support-scope.json",
         "reports/longitudinal/README.md"
@@ -1177,7 +1177,8 @@
       ],
       "verified_subscopes": [],
       "remaining": [
-        "E16.6 controller acceptance of the support-scope index (PR #49)",
+        "E16.6 controller acceptance of the v4.2 lineage binding (AG-012)",
+        "E16.5 capacity/recovery/deployment gates wired into real entry points",
         "real Claude Code extra-host evidence (E16.4 blocked)",
         "E14 and E15 research work, production deployment and effect evidence"
       ]
