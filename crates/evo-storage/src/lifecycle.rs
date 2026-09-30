@@ -2364,9 +2364,10 @@ async fn cleanup_node_content(
         | ("artifact", "rsia.host_execution_receipt.v1", _) => true,
         ("artifact", "rsia.resolved_bundle.v2", _) => true,
         // Monitoring content derived from source runs (environment and observation
-        // identities, per-task pairings, the claim and the consolidation proposal
-        // with its candidate bundle) is redacted; the preserved scope, run and
-        // drift facts above keep the ids and counts needed for reconciliation.
+        // identities, per-task pairings, the claim, the consolidation proposal with
+        // its candidate bundle and the binding that reserves its candidate id) is
+        // redacted; the preserved scope, run and drift facts above keep the ids
+        // and counts needed for reconciliation.
         (
             "artifact",
             "rsia.monitoring.environment.v1"
@@ -2375,7 +2376,8 @@ async fn cleanup_node_content(
             | "rsia.monitoring.development_cycle.v2"
             | "rsia.monitoring.development_report_binding.v1"
             | "rsia.monitoring.consolidation_claim.v1"
-            | "rsia.monitoring.consolidation_proposal.v1",
+            | "rsia.monitoring.consolidation_proposal.v1"
+            | "rsia.monitoring.consolidation_staging.v1",
             _,
         ) => true,
         // E03's persisted SourceSelection predates a schema field; exact fields define its shape.

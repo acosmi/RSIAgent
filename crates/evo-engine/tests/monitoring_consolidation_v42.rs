@@ -32,11 +32,12 @@ use evo_engine::model::{
     ModelExecutionProvenance, ModelExecutionReceipt, ModelPort, ModelResponse,
 };
 use evo_engine::monitoring::{
-    CONSOLIDATION_PROPOSAL_SCHEMA, ClaimOutcome, CompleteDevelopmentCycleRequest,
-    ConsolidationClaim, ConsolidationClaimState, ConsolidationDevRunner, ConsolidationModelPort,
-    ConsolidationProposal, ConsolidationRunOutcome, ConsolidationRunRecord,
-    DEVELOPMENT_CYCLE_SCHEMA, DevelopmentCycleRecord, ENVIRONMENT_DRIFT_SCHEMA,
-    EnvironmentEvidenceScope, MonitoringCoordinator, RecordEnvironmentRequest, RecordedEnvironment,
+    CONSOLIDATION_PROPOSAL_SCHEMA, CONSOLIDATION_STAGING_SCHEMA, ClaimOutcome,
+    CompleteDevelopmentCycleRequest, ConsolidationClaim, ConsolidationClaimState,
+    ConsolidationDevRunner, ConsolidationModelPort, ConsolidationProposal, ConsolidationRunOutcome,
+    ConsolidationRunRecord, ConsolidationStagingBinding, DEVELOPMENT_CYCLE_SCHEMA,
+    DevelopmentCycleRecord, ENVIRONMENT_DRIFT_SCHEMA, EnvironmentEvidenceScope,
+    MonitoringCoordinator, RecordEnvironmentRequest, RecordedEnvironment,
     StagedConsolidationCandidate,
 };
 use evo_engine::optimization::{
@@ -47,7 +48,8 @@ use evo_engine::optimization::{
     StoreOptimizationJournal,
 };
 use evo_engine::release_store::{
-    PrepareRunRequest, ReleaseCandidateRecord, ReleaseStore, TrustedHostExecutionEvidence,
+    PrepareRunRequest, ReleaseCandidateRecord, ReleaseStore, StageBundleRequest,
+    TrustedHostExecutionEvidence, TypedSourceRef,
 };
 use evo_storage::Store;
 use evo_storage::budget::{
@@ -180,6 +182,7 @@ fn no_contrast() -> Vec<ResultSpec> {
 
 struct Fixture {
     _dir: tempfile::TempDir,
+    database: std::path::PathBuf,
     store: Store,
     admin: Context,
     host: Context,
@@ -199,9 +202,8 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("consolidation.sqlite3"))
-            .await
-            .unwrap();
+        let database = dir.path().join("consolidation.sqlite3");
+        let store = Store::open(&database).await.unwrap();
         let admin = context("admin", Role::Admin);
         let host = context("host", Role::Host);
         let worker = context("worker", Role::Worker);
@@ -287,6 +289,7 @@ impl Fixture {
             .unwrap();
         Self {
             _dir: dir,
+            database,
             store,
             admin,
             host,
@@ -1036,6 +1039,78 @@ async fn objects_of_kind(store: &Store, ctx: &Context, kind: &str) -> usize {
     let all: Vec<Value> = session.list(ctx, kind).await.unwrap();
     session.commit().await.unwrap();
     all.len()
+}
+
+async fn exists(store: &Store, ctx: &Context, id: &str) -> bool {
+    let mut session = store.session().await.unwrap();
+    let found = session
+        .get::<Value>(ctx, "artifact", id)
+        .await
+        .unwrap()
+        .is_some();
+    session.commit().await.unwrap();
+    found
+}
+
+async fn put_artifact(store: &Store, ctx: &Context, id: &str, body: &Value) {
+    let mut session = store.session().await.unwrap();
+    session
+        .put(ctx, "artifact", id, "worker", body)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+}
+
+async fn release_candidates(store: &Store, ctx: &Context) -> usize {
+    artifacts_with_schema(store, ctx, "rsia.release_candidate.v1")
+        .await
+        .len()
+}
+
+fn staging_binding_id(proposal: &ConsolidationProposal) -> String {
+    format!("consolidation-staging-{}", proposal.id)
+}
+
+/// The reservation a crash between "reserve" and "stage" leaves behind.
+async fn reserve_directly(run: &Run, proposal: &ConsolidationProposal, candidate_id: &str) {
+    let binding = ConsolidationStagingBinding {
+        id: staging_binding_id(proposal),
+        schema_version: CONSOLIDATION_STAGING_SCHEMA.into(),
+        proposal_id: proposal.id.clone(),
+        candidate_id: candidate_id.into(),
+    };
+    put_artifact(
+        &run.fixture.store,
+        &run.fixture.worker,
+        &binding.id,
+        &serde_json::to_value(&binding).unwrap(),
+    )
+    .await;
+}
+
+/// Closes cycles 3 and 4, claims generation two and runs it with an edit that
+/// differs from generation one's, so its proposal holds another bundle.
+async fn second_generation(run: &Run) -> ConsolidationProposal {
+    for cycle in 3..=4 {
+        run.fixture
+            .close_cycle(cycle, &score_only_contrast())
+            .await
+            .unwrap();
+    }
+    let claim = run.fixture.claim_generation().await;
+    assert_eq!(claim.generation, 2);
+    let model = EditingModelPort::new("second");
+    let journal = run.fixture.journal();
+    let record = run
+        .run_with(&claim, &model, &journal, 2, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        record.outcome,
+        ConsolidationRunOutcome::Candidate,
+        "{record:?}"
+    );
+    run.proposal_of(&claim).await
 }
 
 /// Revokes `source` and drives the cleanup job until it stops moving.
@@ -2172,6 +2247,323 @@ async fn a_proposal_the_terminal_record_does_not_name_is_not_stageable() {
 }
 
 #[tokio::test]
+async fn a_proposal_is_staged_as_at_most_one_candidate() {
+    let run = Run::claimed(true).await;
+    let fixture = &run.fixture;
+    run.run(true).await.unwrap();
+    let proposal = run.proposal().await;
+
+    let first = run
+        .stage(&fixture.worker, &proposal, "candidate-1")
+        .await
+        .unwrap();
+    // Another id is refused and names the id taken, for the same caller and for
+    // another one; nothing is written for the refused ids.
+    for (ctx, id) in [
+        (&fixture.worker, "candidate-2"),
+        (&fixture.admin, "candidate-3"),
+    ] {
+        let refused = run.stage(ctx, &proposal, id).await;
+        assert!(
+            matches!(&refused, Err(Error::Conflict(message)) if message.contains("candidate-1")),
+            "{id}: {refused:?}"
+        );
+        assert!(!exists(&fixture.store, &fixture.worker, id).await, "{id}");
+    }
+    assert_eq!(release_candidates(&fixture.store, &fixture.worker).await, 1);
+    // The same id again is the same staging.
+    let again = run
+        .stage(&fixture.worker, &proposal, "candidate-1")
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&again.candidate).unwrap(),
+        serde_json::to_value(&first.candidate).unwrap()
+    );
+    assert_eq!(release_candidates(&fixture.store, &fixture.worker).await, 1);
+
+    // The reservation is a stored fact, not memory: the answers survive a restart.
+    fixture.store.close().await;
+    let reopened = Store::open(&fixture.database).await.unwrap();
+    let after_restart = MonitoringCoordinator::stage_consolidation_candidate(
+        &fixture.worker,
+        &reopened,
+        &proposal.id,
+        "candidate-2",
+    )
+    .await;
+    assert!(
+        matches!(&after_restart, Err(Error::Conflict(message)) if message.contains("candidate-1")),
+        "{after_restart:?}"
+    );
+    let repeated = MonitoringCoordinator::stage_consolidation_candidate(
+        &fixture.worker,
+        &reopened,
+        &proposal.id,
+        "candidate-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&repeated.candidate).unwrap(),
+        serde_json::to_value(&first.candidate).unwrap()
+    );
+    assert_eq!(release_candidates(&reopened, &fixture.worker).await, 1);
+    let binding = value(
+        &reopened,
+        &fixture.worker,
+        "artifact",
+        &staging_binding_id(&proposal),
+    )
+    .await;
+    assert_eq!(binding["candidate_id"], "candidate-1");
+    assert_eq!(binding["proposal_id"], json!(proposal.id));
+}
+
+#[tokio::test]
+async fn two_concurrent_stagings_of_one_proposal_leave_exactly_one_candidate() {
+    let run = Run::claimed(true).await;
+    let fixture = &run.fixture;
+    run.run(true).await.unwrap();
+    let proposal = run.proposal().await;
+
+    let (left, right) = tokio::join!(
+        MonitoringCoordinator::stage_consolidation_candidate(
+            &fixture.worker,
+            &fixture.store,
+            &proposal.id,
+            "candidate-left"
+        ),
+        MonitoringCoordinator::stage_consolidation_candidate(
+            &fixture.worker,
+            &fixture.store,
+            &proposal.id,
+            "candidate-right"
+        )
+    );
+    let (winner, refused) = match (left, right) {
+        (Ok(_), Err(error)) => ("candidate-left", error),
+        (Err(error), Ok(_)) => ("candidate-right", error),
+        other => panic!("exactly one concurrent staging may win: {other:?}"),
+    };
+    assert!(
+        matches!(&refused, Error::Conflict(message) if message.contains(winner)),
+        "{refused:?}"
+    );
+    assert_eq!(release_candidates(&fixture.store, &fixture.worker).await, 1);
+    assert!(exists(&fixture.store, &fixture.worker, winner).await);
+
+    // The same id from two callers at once is one staging, twice.
+    let (first, second) = tokio::join!(
+        MonitoringCoordinator::stage_consolidation_candidate(
+            &fixture.worker,
+            &fixture.store,
+            &proposal.id,
+            winner
+        ),
+        MonitoringCoordinator::stage_consolidation_candidate(
+            &fixture.worker,
+            &fixture.store,
+            &proposal.id,
+            winner
+        )
+    );
+    assert_eq!(
+        serde_json::to_value(&first.unwrap().candidate).unwrap(),
+        serde_json::to_value(&second.unwrap().candidate).unwrap()
+    );
+    assert_eq!(release_candidates(&fixture.store, &fixture.worker).await, 1);
+}
+
+#[tokio::test]
+async fn a_reserved_candidate_id_is_completed_by_a_retry_and_never_wedges_the_proposal() {
+    let run = Run::claimed(true).await;
+    let fixture = &run.fixture;
+    run.run(true).await.unwrap();
+    let first = run.proposal().await;
+    let second = second_generation(&run).await;
+
+    // A crash after the reservation and before the candidate left this behind.
+    reserve_directly(&run, &first, "candidate-reserved").await;
+    let other_id = run.stage(&fixture.worker, &first, "candidate-other").await;
+    assert!(
+        matches!(&other_id, Err(Error::Conflict(message)) if message.contains("candidate-reserved")),
+        "{other_id:?}"
+    );
+    assert_eq!(release_candidates(&fixture.store, &fixture.worker).await, 0);
+    // The reserved id finishes the job; afterwards the id is staged, not reserved.
+    let staged = run
+        .stage(&fixture.worker, &first, "candidate-reserved")
+        .await
+        .unwrap();
+    assert_eq!(staged.candidate.id, "candidate-reserved");
+    let refused = run.stage(&fixture.worker, &first, "candidate-other").await;
+    assert!(
+        matches!(&refused, Err(Error::Conflict(message)) if message.contains("already staged as candidate candidate-reserved")),
+        "{refused:?}"
+    );
+
+    // An id that holds other content is refused before anything is reserved.
+    let taken = run
+        .stage(&fixture.worker, &second, "candidate-reserved")
+        .await;
+    assert!(
+        matches!(&taken, Err(Error::Conflict(message)) if message.contains("other content")),
+        "{taken:?}"
+    );
+    assert!(
+        !exists(
+            &fixture.store,
+            &fixture.worker,
+            &staging_binding_id(&second)
+        )
+        .await
+    );
+
+    // A reservation whose candidate id was taken by other content can never be
+    // fulfilled: it is replaced instead of wedging the proposal. Here the second
+    // proposal was reserved for an id that the first proposal's candidate now holds.
+    reserve_directly(&run, &second, "candidate-reserved").await;
+    let replaced = run
+        .stage(&fixture.worker, &second, "candidate-free")
+        .await
+        .unwrap();
+    assert_eq!(replaced.candidate.id, "candidate-free");
+    let binding = value(
+        &fixture.store,
+        &fixture.worker,
+        "artifact",
+        &staging_binding_id(&second),
+    )
+    .await;
+    assert_eq!(binding["candidate_id"], "candidate-free");
+    assert_eq!(release_candidates(&fixture.store, &fixture.worker).await, 2);
+}
+
+#[tokio::test]
+async fn a_candidate_staged_outside_the_bridge_keeps_the_reservation_of_its_proposal() {
+    let run = Run::claimed(true).await;
+    let fixture = &run.fixture;
+    run.run(true).await.unwrap();
+    let proposal = run.proposal().await;
+
+    // The same bundle, environment and sources staged directly by another proposer.
+    ReleaseStore::stage_bundle(
+        &fixture.admin,
+        &fixture.store,
+        StageBundleRequest {
+            candidate_id: "candidate-direct".into(),
+            bundle: proposal.candidate_bundle.clone(),
+            environment_digest: proposal.environment_digest.clone(),
+            proposer_actor: "admin".into(),
+            sources: proposal
+                .sources
+                .iter()
+                .map(|source| TypedSourceRef {
+                    kind: "run".into(),
+                    id: source.id.clone(),
+                    content_digest: source.content_digest.clone(),
+                })
+                .collect(),
+            revoke_watermark: proposal.revoke_watermark,
+        },
+    )
+    .await
+    .unwrap();
+
+    // The worker's staging under that id conflicts on the proposer. The id already
+    // holds the proposal's bundle, so the reservation that call made stays: the
+    // proposal is staged as that id and no other id is open to it.
+    let worker = run
+        .stage(&fixture.worker, &proposal, "candidate-direct")
+        .await;
+    assert!(matches!(worker, Err(Error::Conflict(_))), "{worker:?}");
+    let other = run.stage(&fixture.worker, &proposal, "candidate-y").await;
+    assert!(
+        matches!(&other, Err(Error::Conflict(message)) if message.contains("candidate-direct")),
+        "{other:?}"
+    );
+    assert!(!exists(&fixture.store, &fixture.worker, "candidate-y").await);
+    // Its proposer can still complete it, idempotently.
+    let admin = run
+        .stage(&fixture.admin, &proposal, "candidate-direct")
+        .await
+        .unwrap();
+    assert_eq!(admin.candidate.id, "candidate-direct");
+    assert_eq!(release_candidates(&fixture.store, &fixture.worker).await, 1);
+}
+
+#[tokio::test]
+async fn a_stored_proposal_field_its_evidence_does_not_yield_is_refused_at_staging() {
+    let run = Run::claimed(true).await;
+    let fixture = &run.fixture;
+    run.run(true).await.unwrap();
+    let proposal = run.proposal().await;
+    let original = value(&fixture.store, &fixture.worker, "artifact", &proposal.id).await;
+    assert_eq!(original["provenance"], "program_fixture");
+
+    // The label staging reports, and the digests it carries into the candidate, are
+    // recomputed from the claim's stored environment and cycles. A stored value
+    // that the evidence does not yield is a conflict and produces no candidate.
+    for (field, forged, label) in [
+        ("provenance", json!("trusted_execution"), "provenance"),
+        (
+            "environment_digest",
+            json!(d("another environment")),
+            "environment digest",
+        ),
+        ("pairs_digest", json!(d("another pairing")), "pairs digest"),
+        (
+            "parent_skill_digest",
+            json!(d("another parent skill")),
+            "parent skill digest",
+        ),
+        (
+            "parent_bundle_digest",
+            json!(d("another parent bundle")),
+            "parent bundle digest",
+        ),
+    ] {
+        let mut altered = original.clone();
+        altered[field] = forged;
+        put_artifact(&fixture.store, &fixture.worker, &proposal.id, &altered).await;
+        let refused = run
+            .stage(&fixture.worker, &proposal, "forged-candidate")
+            .await;
+        assert!(
+            matches!(&refused, Err(Error::Conflict(message)) if message.contains(label)),
+            "{field}: {refused:?}"
+        );
+        assert_eq!(
+            release_candidates(&fixture.store, &fixture.worker).await,
+            0,
+            "{field}"
+        );
+        assert!(!exists(&fixture.store, &fixture.worker, "forged-candidate").await);
+        assert!(
+            !exists(
+                &fixture.store,
+                &fixture.worker,
+                &staging_binding_id(&proposal)
+            )
+            .await
+        );
+    }
+
+    // The genuine proposal stages, and reports the provenance its evidence yields.
+    put_artifact(&fixture.store, &fixture.worker, &proposal.id, &original).await;
+    let staged = run
+        .stage(&fixture.worker, &proposal, "genuine-candidate")
+        .await
+        .unwrap();
+    assert_eq!(staged.provenance, EnvironmentEvidenceScope::ProgramFixture);
+    assert_eq!(
+        staged.candidate.environment_digest,
+        fixture.environment.environment.environment_digest
+    );
+}
+
+#[tokio::test]
 async fn an_environment_drift_makes_the_proposal_unstageable() {
     let run = Run::claimed(true).await;
     let fixture = &run.fixture;
@@ -2342,6 +2734,15 @@ async fn revoking_a_source_cleans_the_monitoring_closure_to_complete() {
     )
     .await;
     assert_redacted(&candidate_body, "rsia.release_candidate.v1");
+    // The binding that reserved the candidate id is part of the closure too.
+    let binding_body = value(
+        &fixture.store,
+        &fixture.worker,
+        "artifact",
+        &staging_binding_id(&proposal),
+    )
+    .await;
+    assert_redacted(&binding_body, CONSOLIDATION_STAGING_SCHEMA);
     let terminal_body = value(
         &fixture.store,
         &fixture.worker,

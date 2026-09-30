@@ -6,10 +6,11 @@
 //! Revocation: every object written here is `kind = "artifact"` and is classified
 //! by schema in the cleanup matching of `evo-storage` (`lifecycle.rs`). Content
 //! derived from sources (environment and observation identities, cycles and their
-//! report bindings, claims, proposals) is redacted; the scope index, terminal run
-//! records (outcome and the budget calls they reconcile) and environment-drift
-//! facts are preserved. A new monitoring schema must be classified there too, or a
-//! revoked run that reaches it fails its cleanup job closed.
+//! report bindings, claims, proposals and the bindings that reserve their candidate
+//! ids) is redacted; the scope index, terminal run records (outcome and the budget
+//! calls they reconcile) and environment-drift facts are preserved. A new
+//! monitoring schema must be classified there too, or a revoked run that reaches
+//! it fails its cleanup job closed.
 
 use crate::broker::{BudgetPortBinding, ModelTransport, PersistentModelBroker};
 use crate::evidence::{load_stored_source, validate_stored_sources};
@@ -21,8 +22,8 @@ use crate::optimization::{
     StageFactKind, optimization_request_digest, run_optimization_step,
 };
 use crate::release_store::{
-    HostApplicationRecord, ReleaseCandidateRecord, ReleaseStore, RunApplicationSnapshot,
-    StageBundleRequest, TrustedHostExecutionReceipt, TypedSourceRef,
+    HostApplicationRecord, RELEASE_CANDIDATE_SCHEMA, ReleaseCandidateRecord, ReleaseStore,
+    RunApplicationSnapshot, StageBundleRequest, TrustedHostExecutionReceipt, TypedSourceRef,
 };
 use crate::releases::validate_resolved_bundle_identity;
 use async_trait::async_trait;
@@ -45,6 +46,7 @@ pub const DEVELOPMENT_REPORT_BINDING_SCHEMA: &str = "rsia.monitoring.development
 pub const CONSOLIDATION_SCOPE_SCHEMA: &str = "rsia.monitoring.consolidation_scope.v1";
 pub const CONSOLIDATION_CLAIM_SCHEMA: &str = "rsia.monitoring.consolidation_claim.v1";
 pub const CONSOLIDATION_PROPOSAL_SCHEMA: &str = "rsia.monitoring.consolidation_proposal.v1";
+pub const CONSOLIDATION_STAGING_SCHEMA: &str = "rsia.monitoring.consolidation_staging.v1";
 pub const CONSOLIDATION_RUN_SCHEMA: &str = "rsia.monitoring.consolidation_run.v1";
 pub const ENVIRONMENT_DRIFT_SCHEMA: &str = "rsia.monitoring.environment_drift.v1";
 
@@ -354,12 +356,28 @@ pub struct ConsolidationProposal {
 }
 
 /// Result of staging a proposal as a release candidate. No release, pointer or
-/// Active state exists after staging; `provenance` is the proposal's.
+/// Active state exists after staging. `provenance` is recomputed from the claim's
+/// frozen environment and cycles at staging time, never read back from the stored
+/// proposal.
 #[derive(Debug, Clone)]
 pub struct StagedConsolidationCandidate {
     pub candidate: ReleaseCandidateRecord,
     pub proposal_id: String,
     pub provenance: EnvironmentEvidenceScope,
+}
+
+/// The one candidate id a proposal may be staged as. It is written before the
+/// candidate, in the transaction that validates the proposal, so neither a crash
+/// between the two writes nor a concurrent second call can leave a proposal with
+/// two candidates: a call that names any other id is refused and told this one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsolidationStagingBinding {
+    /// `consolidation-staging-{proposal id}`: one binding per proposal.
+    pub id: String,
+    pub schema_version: String,
+    pub proposal_id: String,
+    pub candidate_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1198,9 +1216,16 @@ impl MonitoringCoordinator {
     /// Only a `ReleaseCandidateRecord` is written: no release, no pointer, and
     /// Active is untouched. The candidate still needs its own development
     /// selection, formal evaluation and a different approver (plan §11.5, E13).
-    /// A proposal whose sources were revoked, whose content was redacted, or
-    /// whose scope drifted is refused. Staging the same candidate id again with
-    /// the same content is idempotent; other content under that id is a conflict.
+    /// A proposal whose sources were revoked, whose content was redacted, whose
+    /// scope drifted, or whose stored fields no longer equal what its claim's
+    /// evidence yields is refused.
+    ///
+    /// A proposal has at most one candidate. The candidate id is reserved in a
+    /// [`ConsolidationStagingBinding`] in the transaction that validates the
+    /// proposal, before the candidate is written: staging the same id again with
+    /// the same content is idempotent, any other id is a conflict that names the
+    /// id already taken, and two concurrent calls cannot both pass. A failed
+    /// staging hands its reservation back, so a refusal never wedges a proposal.
     /// Fixture-backed proposals may be staged; their provenance is carried on the
     /// proposal and on the result, and formal approval refuses fixture evidence.
     pub async fn stage_consolidation_candidate(
@@ -1212,52 +1237,26 @@ impl MonitoringCoordinator {
         ctx.require(&[Role::Worker, Role::Admin])?;
         identifier(proposal_id)?;
         identifier(candidate_id)?;
-        let proposal = {
+        let (proposal, provenance, reserved) = {
             let mut session = store.session().await?;
-            let proposal = load_stageable_proposal(&mut session, ctx, proposal_id).await?;
+            let (proposal, provenance) =
+                load_stageable_proposal(&mut session, ctx, proposal_id).await?;
+            let reserved =
+                reserve_staging_binding(&mut session, ctx, &proposal, candidate_id).await?;
             session.commit().await?;
-            proposal
+            (proposal, provenance, reserved)
         };
         // `stage_bundle` re-checks the source closure in its own transaction, so a
         // revocation after the read above still cannot produce a candidate.
-        let candidate = ReleaseStore::stage_bundle(
-            ctx,
-            store,
-            StageBundleRequest {
-                candidate_id: candidate_id.into(),
-                bundle: proposal.candidate_bundle.clone(),
-                environment_digest: proposal.environment_digest.clone(),
-                proposer_actor: ctx.actor().into(),
-                sources: proposal
-                    .sources
-                    .iter()
-                    .map(|source| TypedSourceRef {
-                        kind: "run".into(),
-                        id: source.id.clone(),
-                        content_digest: source.content_digest.clone(),
-                    })
-                    .collect(),
-                revoke_watermark: proposal.revoke_watermark,
-            },
-        )
-        .await?;
-        // The candidate depends on the proposal it was staged from (plan §11.5
-        // closure: ConsolidationProposal -> Candidate), idempotently.
-        let mut session = store.session().await?;
-        session
-            .put_edge(
-                ctx,
-                ARTIFACT_KIND,
-                &candidate.id,
-                ARTIFACT_KIND,
-                &proposal.id,
-            )
+        let candidate =
+            stage_reserved_candidate(ctx, store, &proposal, candidate_id, reserved, |request| {
+                ReleaseStore::stage_bundle(ctx, store, request)
+            })
             .await?;
-        session.commit().await?;
         Ok(StagedConsolidationCandidate {
             candidate,
             proposal_id: proposal.id,
-            provenance: proposal.provenance,
+            provenance,
         })
     }
 
@@ -2128,6 +2127,61 @@ fn proposal_provenance(
     }
 }
 
+/// The frozen environment and the completed cycles behind a claim: what the
+/// derived fields of its proposal are recomputed from.
+struct ClaimEvidence {
+    environment: EnvironmentIdentityRecord,
+    cycles: Vec<DevelopmentCycleRecord>,
+}
+
+async fn load_claim_evidence(
+    session: &mut Session,
+    ctx: &Context,
+    claim: &ConsolidationClaim,
+    scope: &ConsolidationScope,
+) -> Result<ClaimEvidence> {
+    let environment: EnvironmentIdentityRecord = session
+        .need(ctx, ARTIFACT_KIND, &scope.environment_id)
+        .await?;
+    validate_environment_record(&environment)?;
+    let mut cycles = Vec::with_capacity(claim.cycle_ids.len());
+    for cycle_id in &claim.cycle_ids {
+        let cycle = load_cycle(session, ctx, cycle_id).await?;
+        if cycle.scope_id != claim.scope_id {
+            return Err(Error::Conflict("cycle escaped consolidation scope".into()));
+        }
+        cycles.push(cycle);
+    }
+    Ok(ClaimEvidence {
+        environment,
+        cycles,
+    })
+}
+
+/// The proposal fields that are a function of the claim's scope and evidence.
+/// They are computed here when the proposal is written and recomputed here when
+/// it is staged; a stored value is never trusted on its own.
+struct DerivedProposalFields {
+    pairs_digest: String,
+    parent_skill_digest: String,
+    parent_bundle_digest: String,
+    environment_digest: String,
+    provenance: EnvironmentEvidenceScope,
+}
+
+fn derive_proposal_fields(
+    scope: &ConsolidationScope,
+    evidence: &ClaimEvidence,
+) -> Result<DerivedProposalFields> {
+    Ok(DerivedProposalFields {
+        pairs_digest: pairs_digest(&evidence.cycles)?,
+        parent_skill_digest: scope.parent_skill_digest.clone(),
+        parent_bundle_digest: scope.parent_bundle_digest.clone(),
+        environment_digest: scope.environment_digest.clone(),
+        provenance: proposal_provenance(&evidence.environment, &evidence.cycles),
+    })
+}
+
 /// Persists the proposal of a `Candidate` outcome exactly once. The identity is
 /// derived from the claim; replaying the same content after a crash finds the
 /// stored proposal and writes nothing, different content under that identity is
@@ -2173,35 +2227,25 @@ async fn persist_consolidation_proposal(
             "development selection differs from the consolidation scope".into(),
         ));
     }
-    let environment: EnvironmentIdentityRecord = session
-        .need(ctx, ARTIFACT_KIND, &scope.environment_id)
-        .await?;
-    validate_environment_record(&environment)?;
-    let mut cycles = Vec::with_capacity(claim.cycle_ids.len());
-    for cycle_id in &claim.cycle_ids {
-        let cycle = load_cycle(&mut session, ctx, cycle_id).await?;
-        if cycle.scope_id != claim.scope_id {
-            return Err(Error::Conflict("cycle escaped consolidation scope".into()));
-        }
-        cycles.push(cycle);
-    }
+    let evidence = load_claim_evidence(&mut session, ctx, claim, scope).await?;
+    let derived = derive_proposal_fields(scope, &evidence)?;
     let proposal = ConsolidationProposal {
         id: consolidation_proposal_id(&claim.id),
         schema_version: CONSOLIDATION_PROPOSAL_SCHEMA.into(),
         claim_id: claim.id.clone(),
         scope_id: claim.scope_id.clone(),
         cycle_ids: claim.cycle_ids.clone(),
-        pairs_digest: pairs_digest(&cycles)?,
-        parent_skill_digest: scope.parent_skill_digest.clone(),
-        parent_bundle_digest: scope.parent_bundle_digest.clone(),
+        pairs_digest: derived.pairs_digest,
+        parent_skill_digest: derived.parent_skill_digest,
+        parent_bundle_digest: derived.parent_bundle_digest,
         candidate_skill_digest: skill_snapshot_digest(&material.bundle.skill)?,
         candidate_bundle: material.bundle.clone(),
         candidate_bundle_digest: material.bundle.digest.clone(),
         selection_digest: fingerprint(material.selection)?,
         terminal_fact_id: material.terminal_fact_id.into(),
         sources: claim.sources.clone(),
-        provenance: proposal_provenance(&environment, &cycles),
-        environment_digest: scope.environment_digest.clone(),
+        provenance: derived.provenance,
+        environment_digest: derived.environment_digest,
         revoke_watermark: claim.revoke_watermark,
     };
     validate_proposal(&proposal, claim)?;
@@ -2326,14 +2370,49 @@ async fn load_proposal(
 /// live claim: its sources unrevoked, its scope undrifted and its terminal run
 /// record naming it. A proposal written but not yet named (a crash between the
 /// two writes) is not stageable until the run completes.
+///
+/// Nothing stored on the proposal is trusted for what staging carries forward:
+/// every field that is a function of the claim's scope and evidence (pairing,
+/// parent and environment digests, provenance) is recomputed from the stored
+/// environment and cycles and must equal the stored value. The provenance that
+/// is returned is the recomputed one.
 async fn load_stageable_proposal(
     session: &mut Session,
     ctx: &Context,
     proposal_id: &str,
-) -> Result<ConsolidationProposal> {
+) -> Result<(ConsolidationProposal, EnvironmentEvidenceScope)> {
     let proposal = load_proposal(session, ctx, proposal_id).await?;
     let claim = load_live_claim(session, ctx, &proposal.claim_id).await?;
     validate_proposal(&proposal, &claim)?;
+    let index: ConsolidationScopeIndex = session.need(ctx, ARTIFACT_KIND, &claim.scope_id).await?;
+    validate_scope_index(&index)?;
+    let evidence = load_claim_evidence(session, ctx, &claim, &index.scope).await?;
+    let derived = derive_proposal_fields(&index.scope, &evidence)?;
+    for (name, agrees) in [
+        (
+            "pairs digest",
+            proposal.pairs_digest == derived.pairs_digest,
+        ),
+        (
+            "parent skill digest",
+            proposal.parent_skill_digest == derived.parent_skill_digest,
+        ),
+        (
+            "parent bundle digest",
+            proposal.parent_bundle_digest == derived.parent_bundle_digest,
+        ),
+        (
+            "environment digest",
+            proposal.environment_digest == derived.environment_digest,
+        ),
+        ("provenance", proposal.provenance == derived.provenance),
+    ] {
+        if !agrees {
+            return Err(Error::Conflict(format!(
+                "consolidation proposal {name} differs from its evidence"
+            )));
+        }
+    }
     let record = session
         .get::<ConsolidationRunRecord>(
             ctx,
@@ -2352,7 +2431,225 @@ async fn load_stageable_proposal(
             "proposal is not the recorded candidate outcome of its claim".into(),
         ));
     }
-    Ok(proposal)
+    Ok((proposal, derived.provenance))
+}
+
+/// Writes the candidate of a proposal whose candidate id is reserved, then links
+/// it to the proposal. `stage` is `ReleaseStore::stage_bundle`; it is a parameter
+/// so that the hand-back of a failed staging can be tested without a race.
+async fn stage_reserved_candidate<F, Fut>(
+    ctx: &Context,
+    store: &Store,
+    proposal: &ConsolidationProposal,
+    candidate_id: &str,
+    reserved: bool,
+    stage: F,
+) -> Result<ReleaseCandidateRecord>
+where
+    F: FnOnce(StageBundleRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<ReleaseCandidateRecord>>,
+{
+    let request = StageBundleRequest {
+        candidate_id: candidate_id.into(),
+        bundle: proposal.candidate_bundle.clone(),
+        environment_digest: proposal.environment_digest.clone(),
+        proposer_actor: ctx.actor().into(),
+        sources: proposal
+            .sources
+            .iter()
+            .map(|source| TypedSourceRef {
+                kind: "run".into(),
+                id: source.id.clone(),
+                content_digest: source.content_digest.clone(),
+            })
+            .collect(),
+        revoke_watermark: proposal.revoke_watermark,
+    };
+    let candidate = match stage(request).await {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            // A refusal writes nothing, so a reservation this call made is handed
+            // back. An I/O failure leaves it: its outcome is unknown and a retry
+            // with the same id finishes the job. If the hand-back itself fails the
+            // reservation stays and the same retry heals it.
+            if reserved && !matches!(error, Error::Internal) {
+                let _ = release_staging_binding(
+                    store,
+                    ctx,
+                    &proposal.id,
+                    &proposal.candidate_bundle_digest,
+                    candidate_id,
+                )
+                .await;
+            }
+            return Err(error);
+        }
+    };
+    // The candidate depends on the proposal it was staged from (plan §11.5
+    // closure: ConsolidationProposal -> Candidate), idempotently.
+    let mut session = store.session().await?;
+    session
+        .put_edge(
+            ctx,
+            ARTIFACT_KIND,
+            &candidate.id,
+            ARTIFACT_KIND,
+            &proposal.id,
+        )
+        .await?;
+    session.commit().await?;
+    Ok(candidate)
+}
+
+fn consolidation_staging_id(proposal_id: &str) -> String {
+    format!("consolidation-staging-{proposal_id}")
+}
+
+/// Whether the object stored under a candidate id is a release candidate that
+/// holds this bundle.
+fn holds_bundle(stored: &serde_json::Value, bundle_digest: &str) -> bool {
+    stored
+        .get("schema_version")
+        .and_then(|schema| schema.as_str())
+        == Some(RELEASE_CANDIDATE_SCHEMA)
+        && stored
+            .get("bundle_digest")
+            .and_then(|digest| digest.as_str())
+            == Some(bundle_digest)
+}
+
+fn parse_staging_binding(
+    value: serde_json::Value,
+    proposal_id: &str,
+) -> Result<ConsolidationStagingBinding> {
+    match value
+        .get("schema_version")
+        .and_then(|schema| schema.as_str())
+    {
+        Some(CONSOLIDATION_STAGING_SCHEMA) => {}
+        Some(REDACTED_SCHEMA) => {
+            return Err(Error::Conflict(
+                "consolidation staging binding was redacted after source revocation".into(),
+            ));
+        }
+        _ => {
+            return Err(Error::Invalid(
+                "unsupported consolidation staging binding schema".into(),
+            ));
+        }
+    }
+    let binding: ConsolidationStagingBinding =
+        serde_json::from_value(value).map_err(|_| Error::Internal)?;
+    if binding.id != consolidation_staging_id(proposal_id) || binding.proposal_id != proposal_id {
+        return Err(Error::Conflict(
+            "consolidation staging binding differs from its proposal".into(),
+        ));
+    }
+    identifier(&binding.candidate_id)?;
+    Ok(binding)
+}
+
+/// Reserves `candidate_id` as the one candidate of `proposal`, in the caller's
+/// transaction. Returns `true` when this call created the reservation and
+/// `false` when the proposal was already reserved for this very id. Any other
+/// id is a conflict that names the id taken, unless that reservation can never
+/// be fulfilled because other content holds its candidate id; then it is
+/// replaced rather than left to wedge the proposal.
+async fn reserve_staging_binding(
+    session: &mut Session,
+    ctx: &Context,
+    proposal: &ConsolidationProposal,
+    candidate_id: &str,
+) -> Result<bool> {
+    let binding_id = consolidation_staging_id(&proposal.id);
+    if let Some(stored) = session
+        .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &binding_id)
+        .await?
+    {
+        let bound = parse_staging_binding(stored, &proposal.id)?;
+        if bound.candidate_id == candidate_id {
+            return Ok(false);
+        }
+        match session
+            .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &bound.candidate_id)
+            .await?
+        {
+            Some(holder) if holds_bundle(&holder, &proposal.candidate_bundle_digest) => {
+                return Err(Error::Conflict(format!(
+                    "consolidation proposal {} is already staged as candidate {}",
+                    proposal.id, bound.candidate_id
+                )));
+            }
+            None => {
+                return Err(Error::Conflict(format!(
+                    "consolidation proposal {} is reserved for candidate {}; stage it under that id",
+                    proposal.id, bound.candidate_id
+                )));
+            }
+            Some(_) => {
+                session.delete(ctx, ARTIFACT_KIND, &binding_id).await?;
+                session
+                    .audit(ctx, "monitoring.consolidation.stage.release", &binding_id)
+                    .await?;
+            }
+        }
+    }
+    if let Some(existing) = session
+        .get::<serde_json::Value>(ctx, ARTIFACT_KIND, candidate_id)
+        .await?
+        && !holds_bundle(&existing, &proposal.candidate_bundle_digest)
+    {
+        return Err(Error::Conflict(format!(
+            "candidate id {candidate_id} already holds other content"
+        )));
+    }
+    let binding = ConsolidationStagingBinding {
+        id: binding_id,
+        schema_version: CONSOLIDATION_STAGING_SCHEMA.into(),
+        proposal_id: proposal.id.clone(),
+        candidate_id: candidate_id.into(),
+    };
+    session
+        .put(ctx, ARTIFACT_KIND, &binding.id, ctx.actor(), &binding)
+        .await?;
+    // Without an edge revocation cleanup could never reach the binding.
+    session
+        .put_edge(ctx, ARTIFACT_KIND, &binding.id, ARTIFACT_KIND, &proposal.id)
+        .await?;
+    session
+        .audit(ctx, "monitoring.consolidation.stage.reserve", &binding.id)
+        .await?;
+    Ok(true)
+}
+
+/// Hands back a reservation that a refused staging call made. The reservation is
+/// deleted only if it still names `candidate_id` and no candidate holding the
+/// proposal's bundle exists under that id; if one does, somebody completed the
+/// staging and the proposal is staged as that id.
+async fn release_staging_binding(
+    store: &Store,
+    ctx: &Context,
+    proposal_id: &str,
+    bundle_digest: &str,
+    candidate_id: &str,
+) -> Result<()> {
+    let binding_id = consolidation_staging_id(proposal_id);
+    let mut session = store.session().await?;
+    let reserved_here = session
+        .get::<ConsolidationStagingBinding>(ctx, ARTIFACT_KIND, &binding_id)
+        .await?
+        .is_some_and(|binding| binding.candidate_id == candidate_id);
+    let completed = session
+        .get::<serde_json::Value>(ctx, ARTIFACT_KIND, candidate_id)
+        .await?
+        .is_some_and(|holder| holds_bundle(&holder, bundle_digest));
+    if reserved_here && !completed {
+        session.delete(ctx, ARTIFACT_KIND, &binding_id).await?;
+        session
+            .audit(ctx, "monitoring.consolidation.stage.release", &binding_id)
+            .await?;
+    }
+    session.commit().await
 }
 
 async fn persist_terminal_run_with_state(
@@ -2681,5 +2978,266 @@ mod tests {
             validate_cycle_record(&empty),
             Err(Error::Invalid(_))
         ));
+    }
+
+    async fn unit_store() -> (tempfile::TempDir, Store, Context) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("unit.sqlite3")).await.unwrap();
+        let ctx = Context::new("tenant", "worker", Role::Worker).unwrap();
+        (dir, store, ctx)
+    }
+
+    async fn put_object(store: &Store, ctx: &Context, id: &str, body: &serde_json::Value) {
+        let mut session = store.session().await.unwrap();
+        session
+            .put(ctx, ARTIFACT_KIND, id, ctx.actor(), body)
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+    }
+
+    async fn reserve(store: &Store, ctx: &Context, proposal_id: &str, candidate_id: &str) {
+        let binding = ConsolidationStagingBinding {
+            id: consolidation_staging_id(proposal_id),
+            schema_version: CONSOLIDATION_STAGING_SCHEMA.into(),
+            proposal_id: proposal_id.into(),
+            candidate_id: candidate_id.into(),
+        };
+        put_object(
+            store,
+            ctx,
+            &binding.id,
+            &serde_json::to_value(&binding).unwrap(),
+        )
+        .await;
+    }
+
+    async fn is_stored(store: &Store, ctx: &Context, id: &str) -> bool {
+        let mut session = store.session().await.unwrap();
+        let found = session
+            .get::<serde_json::Value>(ctx, ARTIFACT_KIND, id)
+            .await
+            .unwrap()
+            .is_some();
+        session.commit().await.unwrap();
+        found
+    }
+
+    fn candidate_holding(id: &str, bundle_digest: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "schema_version": RELEASE_CANDIDATE_SCHEMA,
+            "bundle_digest": bundle_digest,
+        })
+    }
+
+    #[test]
+    fn a_candidate_holds_a_bundle_only_by_schema_and_digest() {
+        let bundle = "b".repeat(64);
+        assert!(holds_bundle(&candidate_holding("c", &bundle), &bundle));
+        assert!(!holds_bundle(
+            &candidate_holding("c", &"c".repeat(64)),
+            &bundle
+        ));
+        let other_schema = serde_json::json!({
+            "schema_version": "rsia.redacted.v1",
+            "bundle_digest": bundle,
+        });
+        assert!(!holds_bundle(&other_schema, &bundle));
+        assert!(!holds_bundle(&serde_json::json!({}), &bundle));
+    }
+
+    #[tokio::test]
+    async fn a_refused_staging_hands_its_reservation_back_unless_its_candidate_exists() {
+        let (_dir, store, ctx) = unit_store().await;
+        let bundle = "b".repeat(64);
+
+        // Reserved and never staged: the reservation goes back.
+        reserve(&store, &ctx, "proposal-a", "candidate-a").await;
+        release_staging_binding(&store, &ctx, "proposal-a", &bundle, "candidate-a")
+            .await
+            .unwrap();
+        assert!(!is_stored(&store, &ctx, &consolidation_staging_id("proposal-a")).await);
+
+        // A candidate holding the bundle exists under the id (another caller
+        // completed it): the proposal is staged as that id, so the reservation stays.
+        reserve(&store, &ctx, "proposal-b", "candidate-b").await;
+        put_object(
+            &store,
+            &ctx,
+            "candidate-b",
+            &candidate_holding("candidate-b", &bundle),
+        )
+        .await;
+        release_staging_binding(&store, &ctx, "proposal-b", &bundle, "candidate-b")
+            .await
+            .unwrap();
+        assert!(is_stored(&store, &ctx, &consolidation_staging_id("proposal-b")).await);
+
+        // The id holds other content: the reservation can never be fulfilled.
+        reserve(&store, &ctx, "proposal-c", "candidate-c").await;
+        put_object(
+            &store,
+            &ctx,
+            "candidate-c",
+            &candidate_holding("candidate-c", &"c".repeat(64)),
+        )
+        .await;
+        release_staging_binding(&store, &ctx, "proposal-c", &bundle, "candidate-c")
+            .await
+            .unwrap();
+        assert!(!is_stored(&store, &ctx, &consolidation_staging_id("proposal-c")).await);
+
+        // A reservation for another id is not this call's to hand back.
+        reserve(&store, &ctx, "proposal-d", "candidate-d").await;
+        release_staging_binding(&store, &ctx, "proposal-d", &bundle, "candidate-other")
+            .await
+            .unwrap();
+        assert!(is_stored(&store, &ctx, &consolidation_staging_id("proposal-d")).await);
+
+        // Nothing reserved: nothing to do, and no error.
+        release_staging_binding(&store, &ctx, "proposal-e", &bundle, "candidate-e")
+            .await
+            .unwrap();
+    }
+    fn bundle_fixture() -> ResolvedBundle {
+        let mut bundle = ResolvedBundle {
+            schema_version: "rsia.resolved_bundle.v2".into(),
+            profile_id: "profile".into(),
+            parent_digest: "1".repeat(64),
+            baseline_digest: "2".repeat(64),
+            skill: evo_core::contract::SkillSnapshot {
+                content: "rule".into(),
+                applicability: "development only".into(),
+                counterexample: "counterexample".into(),
+                required_capabilities: vec![],
+                dependencies: vec![],
+            },
+            improver: evo_core::Strategy::default(),
+            origins: vec![],
+            digest: String::new(),
+        };
+        bundle.digest = fingerprint(&bundle).unwrap();
+        bundle
+    }
+
+    fn proposal_fixture(proposal_id: &str) -> ConsolidationProposal {
+        let bundle = bundle_fixture();
+        ConsolidationProposal {
+            id: proposal_id.into(),
+            schema_version: CONSOLIDATION_PROPOSAL_SCHEMA.into(),
+            claim_id: "claim".into(),
+            scope_id: "scope".into(),
+            cycle_ids: vec![],
+            pairs_digest: "3".repeat(64),
+            parent_skill_digest: "4".repeat(64),
+            parent_bundle_digest: "5".repeat(64),
+            candidate_skill_digest: "6".repeat(64),
+            candidate_bundle_digest: bundle.digest.clone(),
+            candidate_bundle: bundle,
+            selection_digest: "7".repeat(64),
+            terminal_fact_id: "terminal".into(),
+            sources: vec![SourceDependency {
+                id: "source".into(),
+                content_digest: "8".repeat(64),
+            }],
+            provenance: EnvironmentEvidenceScope::ProgramFixture,
+            environment_digest: "9".repeat(64),
+            revoke_watermark: 1,
+        }
+    }
+
+    fn staged_as(request: StageBundleRequest) -> ReleaseCandidateRecord {
+        ReleaseCandidateRecord {
+            id: request.candidate_id,
+            schema_version: RELEASE_CANDIDATE_SCHEMA.into(),
+            bundle_digest: request.bundle.digest.clone(),
+            environment_digest: request.environment_digest,
+            profile_id: request.bundle.profile_id.clone(),
+            parent_digest: request.bundle.parent_digest.clone(),
+            proposer_actor: request.proposer_actor,
+            sources: request.sources,
+            revoke_watermark: request.revoke_watermark,
+            bundle: request.bundle,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_staging_keeps_or_hands_back_its_reservation_by_who_made_it() {
+        let (_dir, store, ctx) = unit_store().await;
+        let proposal = proposal_fixture("proposal-w");
+        let binding_id = consolidation_staging_id(&proposal.id);
+
+        // A reservation this call made and a refusal that wrote nothing: handed back.
+        reserve(&store, &ctx, &proposal.id, "candidate-w").await;
+        let refused =
+            stage_reserved_candidate(&ctx, &store, &proposal, "candidate-w", true, |_| {
+                std::future::ready(Err(Error::Conflict("refused".into())))
+            })
+            .await;
+        assert!(matches!(refused, Err(Error::Conflict(_))));
+        assert!(!is_stored(&store, &ctx, &binding_id).await);
+
+        // An I/O failure has an unknown outcome: the reservation stays for the retry.
+        reserve(&store, &ctx, &proposal.id, "candidate-w").await;
+        let unknown =
+            stage_reserved_candidate(&ctx, &store, &proposal, "candidate-w", true, |_| {
+                std::future::ready(Err(Error::Internal))
+            })
+            .await;
+        assert!(matches!(unknown, Err(Error::Internal)));
+        assert!(is_stored(&store, &ctx, &binding_id).await);
+
+        // A reservation made by an earlier call is not this call's to hand back.
+        let earlier =
+            stage_reserved_candidate(&ctx, &store, &proposal, "candidate-w", false, |_| {
+                std::future::ready(Err(Error::Conflict("refused".into())))
+            })
+            .await;
+        assert!(matches!(earlier, Err(Error::Conflict(_))));
+        assert!(is_stored(&store, &ctx, &binding_id).await);
+
+        // Refused, but a candidate holding the bundle now exists under the id: the
+        // proposal is staged as that id, the reservation stays.
+        put_object(
+            &store,
+            &ctx,
+            "candidate-w",
+            &candidate_holding("candidate-w", &proposal.candidate_bundle_digest),
+        )
+        .await;
+        let completed =
+            stage_reserved_candidate(&ctx, &store, &proposal, "candidate-w", true, |_| {
+                std::future::ready(Err(Error::Conflict("refused".into())))
+            })
+            .await;
+        assert!(matches!(completed, Err(Error::Conflict(_))));
+        assert!(is_stored(&store, &ctx, &binding_id).await);
+    }
+
+    #[tokio::test]
+    async fn a_staged_candidate_depends_on_its_proposal_and_carries_the_proposals_content() {
+        let (_dir, store, ctx) = unit_store().await;
+        let proposal = proposal_fixture("proposal-x");
+        let candidate =
+            stage_reserved_candidate(&ctx, &store, &proposal, "candidate-x", true, |request| {
+                std::future::ready(Ok(staged_as(request)))
+            })
+            .await
+            .unwrap();
+        assert_eq!(candidate.id, "candidate-x");
+        assert_eq!(candidate.bundle_digest, proposal.candidate_bundle_digest);
+        assert_eq!(candidate.environment_digest, proposal.environment_digest);
+        assert_eq!(candidate.proposer_actor, "worker");
+        assert_eq!(candidate.revoke_watermark, 1);
+        assert_eq!(candidate.sources.len(), 1);
+        assert_eq!(candidate.sources[0].kind, "run");
+        let mut session = store.session().await.unwrap();
+        let dependents = session
+            .dependents(&ctx, ARTIFACT_KIND, &proposal.id)
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        assert!(dependents.contains(&(ARTIFACT_KIND.to_string(), "candidate-x".to_string())));
     }
 }
