@@ -749,19 +749,7 @@ async fn exploration_start_result_carries_both_digests_and_status_rejects_tamper
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
     let world = world_for("world-start", policy_focus_one());
-    let queued = dispatcher
-        .submit(
-            &admin,
-            "exploration.start",
-            json!({
-                "schema_version": "rsia.management.exploration_start.v1",
-                "request_key": "meta-inheritance-start",
-                "world": serde_json::to_value(&world).unwrap(),
-            }),
-        )
-        .await
-        .unwrap();
-    let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    let done = start_job(&dispatcher, &admin, "meta-inheritance-start", &world).await;
     assert_eq!(done.state, ManagementJobState::Succeeded);
     let (policy_digest, caps_digest) = match &done.result {
         Some(ManagementResult::ExplorationStarted {
@@ -783,21 +771,11 @@ async fn exploration_start_result_carries_both_digests_and_status_rejects_tamper
 
     // Tampering with either digest in the stored result is a Conflict: the
     // status check compares the whole decision, not only the action.
-    let original: Value = {
-        let mut session = store.session().await.unwrap();
-        let value = session.need(&admin, "job", &done.id).await.unwrap();
-        session.commit().await.unwrap();
-        value
-    };
+    let original = raw_job(&store, &admin, &done.id).await;
     for field in ["policy_digest", "caps_digest"] {
         let mut tampered = original.clone();
         tampered["result"][field] = json!(hash(b"forged"));
-        let mut session = store.session().await.unwrap();
-        session
-            .put(&admin, "job", &done.id, admin.actor(), &tampered)
-            .await
-            .unwrap();
-        session.commit().await.unwrap();
+        put_raw_job(&store, &admin, &done.id, &tampered).await;
         assert!(
             matches!(
                 dispatcher.status(&admin, &done.id).await,
@@ -806,27 +784,143 @@ async fn exploration_start_result_carries_both_digests_and_status_rejects_tamper
             "tampered {field} must be a Conflict"
         );
     }
-    // A pre-E14 stored result (no digests at all) is not re-read as if it
-    // carried them: it no longer deserializes, so it fails closed instead of
-    // being verified against empty digests.
-    let mut legacy = original.clone();
-    let legacy_result = legacy["result"].as_object_mut().unwrap();
-    legacy_result.remove("policy_digest");
-    legacy_result.remove("caps_digest");
-    let mut session = store.session().await.unwrap();
-    session
-        .put(&admin, "job", &done.id, admin.actor(), &legacy)
-        .await
-        .unwrap();
-    session.commit().await.unwrap();
-    assert!(dispatcher.status(&admin, &done.id).await.is_err());
-    let mut session = store.session().await.unwrap();
-    session
-        .put(&admin, "job", &done.id, admin.actor(), &original)
-        .await
-        .unwrap();
-    session.commit().await.unwrap();
+    put_raw_job(&store, &admin, &done.id, &original).await;
     dispatcher.status(&admin, &done.id).await.unwrap();
+}
+
+/// A result stored before E14 has no digests. It must still load, because the
+/// dispatcher's startup recovery reads every stored job and must not fail on an
+/// old one; its digests read as empty strings; and `status` fails that job
+/// closed with a `Conflict` (the re-run decision never has an empty digest),
+/// not with an opaque internal error. New results keep both digests non-empty.
+#[tokio::test]
+async fn a_pre_e14_exploration_result_loads_fails_status_closed_and_never_blocks_recovery() {
+    let (_dir, store) = seeded_store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+
+    // A job written by the current code carries both digests, non-empty.
+    let legacy_world = world_for("world-legacy", policy_focus_one());
+    let legacy_job = start_job(&dispatcher, &admin, "legacy-start", &legacy_world).await;
+    assert_eq!(legacy_job.state, ManagementJobState::Succeeded);
+    assert_new_result_digests(&legacy_job, &legacy_world);
+
+    // Rewrite it into its pre-E14 stored shape: the real job JSON without the
+    // two digest keys.
+    let mut legacy_json = raw_job(&store, &admin, &legacy_job.id).await;
+    let result = legacy_json["result"].as_object_mut().unwrap();
+    assert!(result.remove("policy_digest").is_some());
+    assert!(result.remove("caps_digest").is_some());
+    put_raw_job(&store, &admin, &legacy_job.id, &legacy_json).await;
+
+    // The contrast: a second job that is not terminal, because the process
+    // died while it was running.
+    let pending_world = world_for("world-pending", ElasticPolicyV1::default());
+    let finished = start_job(&dispatcher, &admin, "pending-start", &pending_world).await;
+    let mut crashed = finished.clone();
+    crashed.state = ManagementJobState::Running;
+    crashed.step = "before_exploration_start".into();
+    crashed.result = None;
+    crashed.error_code = None;
+    crashed.lease_token = Some("dead-process-lease".into());
+    crashed.lease_until = 0;
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin, "job", &crashed.id, admin.actor(), &crashed)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+
+    // Startup recovery on a fresh dispatcher reads every stored job, the
+    // pre-E14 one included, does not fail, and picks up only the unfinished
+    // job (the terminal pre-E14 job is not counted).
+    let restarted = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    assert_eq!(restarted.recover_pending().await.unwrap(), 1);
+    let recovered = wait_terminal(&restarted, &admin, &crashed.id).await;
+    assert_eq!(recovered.state, ManagementJobState::Succeeded);
+    assert_eq!(recovered.step, "exploration_started");
+    assert_new_result_digests(&recovered, &pending_world);
+
+    // The pre-E14 job fails status closed with a Conflict, not an internal
+    // error, and the failed read does not rewrite the persisted terminal.
+    match restarted.status(&admin, &legacy_job.id).await {
+        Err(Error::Conflict(_)) => {}
+        other => panic!("a pre-E14 result must fail status with a Conflict, got {other:?}"),
+    }
+    assert_eq!(raw_job(&store, &admin, &legacy_job.id).await, legacy_json);
+    // It still deserializes, and the digests read as empty strings.
+    let typed: ManagementJob = serde_json::from_value(legacy_json.clone()).unwrap();
+    match &typed.result {
+        Some(ManagementResult::ExplorationStarted {
+            world_id,
+            policy_digest,
+            caps_digest,
+            ..
+        }) => {
+            assert_eq!(world_id, "world-legacy");
+            assert!(policy_digest.is_empty(), "{policy_digest:?}");
+            assert!(caps_digest.is_empty(), "{caps_digest:?}");
+        }
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+fn assert_new_result_digests(job: &ManagementJob, world: &ExplorationWorldV1) {
+    match &job.result {
+        Some(ManagementResult::ExplorationStarted {
+            policy_digest,
+            caps_digest,
+            ..
+        }) => {
+            assert_eq!(policy_digest.len(), 64);
+            assert_eq!(caps_digest.len(), 64);
+            assert_eq!(policy_digest, &world.policy.digest().unwrap());
+            assert_eq!(caps_digest, &world.caps.digest().unwrap());
+        }
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+fn exploration_start_payload(request_key: &str, world: &ExplorationWorldV1) -> Value {
+    json!({
+        "schema_version": "rsia.management.exploration_start.v1",
+        "request_key": request_key,
+        "world": serde_json::to_value(world).unwrap(),
+    })
+}
+
+/// Submits `exploration.start` for `world` and waits for the terminal job.
+async fn start_job(
+    dispatcher: &ManagementDispatcher,
+    admin: &Context,
+    request_key: &str,
+    world: &ExplorationWorldV1,
+) -> ManagementJob {
+    let queued = dispatcher
+        .submit(
+            admin,
+            "exploration.start",
+            exploration_start_payload(request_key, world),
+        )
+        .await
+        .unwrap();
+    wait_terminal(dispatcher, admin, &queued.id).await
+}
+
+async fn raw_job(store: &Store, admin: &Context, job_id: &str) -> Value {
+    let mut session = store.session().await.unwrap();
+    let value: Value = session.need(admin, "job", job_id).await.unwrap();
+    session.commit().await.unwrap();
+    value
+}
+
+async fn put_raw_job(store: &Store, admin: &Context, job_id: &str, value: &Value) {
+    let mut session = store.session().await.unwrap();
+    session
+        .put(admin, "job", job_id, admin.actor(), value)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
 }
 
 async fn wait_terminal(
@@ -834,7 +928,7 @@ async fn wait_terminal(
     context: &Context,
     job_id: &str,
 ) -> ManagementJob {
-    for _ in 0..200 {
+    for _ in 0..400 {
         let job = dispatcher.status(context, job_id).await.unwrap();
         if matches!(
             job.state,
@@ -845,7 +939,7 @@ async fn wait_terminal(
         ) {
             return job;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!("management job did not finish");
 }

@@ -108,9 +108,16 @@ pub enum ManagementResult {
         context_signature: String,
         prefix_digest: String,
         legal_actions_digest: String,
-        /// Digest of the policy the first decision was taken with (E14).
+        /// Digest of the policy the first decision was taken with (E14). A
+        /// result stored before E14 has none and reads as an empty string:
+        /// the job still loads (startup recovery must not depend on it), and
+        /// `status` then fails that job closed with a `Conflict`, because the
+        /// re-run decision never has an empty digest.
+        #[serde(default)]
         policy_digest: String,
-        /// Digest of the caps the first decision was taken with (E14).
+        /// Digest of the caps the first decision was taken with (E14); empty
+        /// for a pre-E14 result, like `policy_digest`.
+        #[serde(default)]
         caps_digest: String,
         action: BatchActionV1,
     },
