@@ -836,8 +836,8 @@
     },
     "E16.1": {
       "title": "Source Import & Versioned Readers",
-      "status": "implemented_not_verified",
-      "status_reason": "controller verified the durable source import sub-scope (PR #44, merged acda3189); the full real migration chain is not closed: imports yield no trusted run, AppliedReceipt, FormalEvaluation or Active",
+      "status": "in_progress",
+      "status_reason": "controller verified and merged the durable import sub-scope (PR #44, merged acda318); the full real migration chain (trusted run / AppliedReceipt / FormalEvaluation / Active from imports) remains open",
       "implementation_files": [
         "crates/evo-engine/src/import.rs",
         "crates/evo-core/src/evidence.rs"
@@ -886,8 +886,8 @@
     },
     "E16.2": {
       "title": "Asset Package Safety, Privacy Gates, Foreign Metadata Isolation",
-      "status": "implemented_not_verified",
-      "status_reason": "controller verified durable staging, registered blob publish, local_namespace export delivery and E16 cleanup with live-reference blob retention (PR #54, merged 16c2817b, supersedes #45); real third-party packages and real remote destruction remain unverified",
+      "status": "in_progress",
+      "status_reason": "controller verified and merged the durable staging and local_namespace export sub-scope (PR #54, merged 16c2817); real third-party packages and real remote destruction remain open; F08 compared to the proposal text only",
       "implementation_files": [
         "crates/evo-engine/src/packages.rs"
       ],
@@ -934,8 +934,8 @@
     },
     "E16.3": {
       "title": "Built-in Seeds, B/L/U Reconciliation, Local Modification Protection",
-      "status": "implemented_not_verified",
-      "status_reason": "controller verified seed B/L/U install and reset staging (PR #54, merged 16c2817b, supersedes #46); real user-directory seed drills remain unverified",
+      "status": "in_progress",
+      "status_reason": "controller verified and merged the seed install and reset-staging sub-scope (PR #54, merged 16c2817); real user-directory seed drills remain open",
       "implementation_files": [
         "crates/evo-engine/src/seeds.rs"
       ],
