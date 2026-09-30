@@ -5,7 +5,83 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 本台账是实施与证据索引，不另立规范；历史 PR、测试和旧台账不决定当前规则。
 用户于 2026-09-19 明确确认 v4.1 替代 v4，并授权将本台账上传远程；方案正文、内部合同、归档及 QA 原始材料只保留本地。用户最新授权 Antigravity 按第一真源持续实施，每个任务自测完成后提交、推送并提出独立PR，随即继续下一项，不自行合并；Codex负责最终独立验收，并在通过后按依赖顺序合并。Actions派发、付费运行和部署/发布未授权。
 
-## 2026-09-19 主控独立验收与合并结论（当前状态）
+## 2026-09-30 主控第二轮独立验收、返修与合并（真源文件缺席，依台账记录范围验证）
+
+前提：本轮在新机执行，`RSIAgent-v4.1定稿-工程实施方案-2026-09-19.md`（SHA-256 `45f3ba06…`）与 `out/copilot-handoff/`、F08 两份冻结合同均不在本机（旧机维修中）。用户明确决定继续。所有结论只对"台账记录的 v4.1 章节/E/V 映射、各 PR 分支主控记录、HANDOFF 复验证据、#48 台账 F08 提案文本"成立，**不构成第一真源核验**；真源恢复后须按正文复核。原始日志仅本地 `out/verify-20260930/qa/s2-*`。统一环境 `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`，Cargo 均 `--locked`；本机 crates.io 缓存缺 `crc`，以 rsproxy 镜像解析，Cargo.lock 未变。
+
+| 任务 / PR | 主控结论 | 依据/返修 | merged_sha |
+|---|---|---|---|
+| AG-002 / #44 E16.1 | verified（程序/持久导入子范围），已合并 | 记录测试复现通过；主控反例 8 项失败→返修 F13–F16（相对路径绕过授权、根可为 `/`/$HOME、聚簇膨胀、tool_result 角色判定与缺 content 记录） | `acda31895bb1cb42cf7985b907a4c600429573d0` |
+| AG-011 / #54 E16.2+E16.3 | verified（staging/种子/本地导出子范围，F08 按提案版对照），已合并 | 自测与 E16.1 回归复现通过；反例→返修 F17–F20（中止/失败记录保活共享 blob、纯函数重置不看状态、导出 id `.`/`..`、非规范成员路径）；F08 仅能对照提案版 | `16c2817bc192bf71535d2c99d867873e6e85bcf8` |
+| AG-005 / #47 E16.4 | verified（真实 Store 拒绝门与记录重载子范围），已合并 | 源提交 b9efc76/ff17969/9d04c67 重新堆叠到 main，逐文件与已验 head 一致，复测通过 | `1c824e6614667da4dc7ea74e96b46adfd1d2c089` |
+| AG-006 / #48 E16.5 | verified（容量/恢复/部署门纯函数子范围），已合并 | F07 返修不成立→主控返修 F10–F12（环境变量顶替布尔、整库读取只查头、曝光计数/撤销来源可回退）；重新堆叠到 main | `4980aa498baa80fd82e83441839e606859fa4065` |
+| AG-008 / #50 E17 | verified（关闭/拒绝子范围），已合并 | 关闭/拒绝子范围重新堆叠到 main 复测 | `e94042d3f2fd761455727a6c82ad13fd3d657d03` |
+| AG-009 / #51 E18 | verified（关闭/拒绝子范围），已合并 | 同上，堆叠于 #50 之上 | `bef7bd1763a01ccb677ada4acad71a063366539c` |
+| CP-002 / #53 | 返修已推送 `56f8644`，未合并 | HANDOFF 4.3 六个漏检：5 个结构性驳回，第 6 个（无冲突的伪造 merged_sha）无 git 不可驳回，显式列入 needs_verification；9/22 预审 2 个反例原件缺失 | null |
+| AG-007 / #49 E16.6 | 待 E16 链落定后更新索引 | 索引状态描述仍为旧链；引用文件在 main 均存在 | null |
+| AG-003 / #45、AG-004 / #46 | 被 #54 取代 | 关闭须经用户确认 | null |
+
+### AG-011 / E16.2+E16.3 持久 staging、内置种子与本地导出交付（实施方交付记录）
+
+- 任务号：AG-011；E 归属：E16.2 + E16.3；取代原 AG-003（#45）/ AG-004（#46）
+- base 分支：`wrokbot/ag-002-e16-1-source-import`；head 分支：`wrokbot/ag-011-e16-2-staging-export`；PR：[PR #54](https://github.com/acosmi/RSIAgent/pull/54)
+- 实施方声明依据：v4.1 §11.1–11.3、E16.2/E16.3，及 F08 合同 v1（`F08-CONTRACT-FROZEN.md`、`F08-LOCAL-EXPORT-FROZEN.md`）；原始交付提交 `02f40932dc7d3ed91d255240887a646c205b6e76`（基于已验 E16.1 head `7fae0fe`）。
+- 文件：`crates/evo-engine/src/packages.rs`（staged_asset 生命周期 Prepared/Staged/Quarantined/Aborted/Failed、注册 blob 发布、原子 NOREPLACE、export_attempt v2 与 local_namespace 交付、交付审计、重启对账、全投影隐私扫描、撤销感知中止）、`crates/evo-engine/src/seeds.rs`（持久 seed_install 绑定 B/L/U 摘要，重置只产生新 staging）、`crates/evo-storage/src/lib.rs`（有界/注册 blob 原语、本地导出树摘要与回执）、`crates/evo-storage/src/lifecycle.rs`（E16 schema 精确清理，`cleanup_import_*` 改为 `cleanup_e16_*`）、`scripts/restore_backup.py`、`fixtures/packages/golden_manifest.json` 及对应测试。
+- 实施方自测（PR 正文）：packages_v41 30、seeds_v41 9、local_export 8、lifecycle 19、import_integrity 4、import_v41 28、四 crate 406；PR 正文把 local_export/lifecycle 数量写反，以主控复跑为准。
+
+### CTRL-E16.1-R3 / PR #44：主控第二轮复核与返修
+
+- 真源文件缺席，依台账记录范围验证（见本节前提）。固定输入：原 head `c74369e553150521104369e71375ca9fa2b3f9f4`（= 已验 `7fae0fe` + 仅台账集成）。
+- 复现记录证据：import_v41+optimization 35、evo-storage 54、evo-core evidence 10、workspace 352；storage+engine 与 workspace 的 clippy `-D warnings`、fmt 均 exit 0。日志 `s2-pr44-[0-6].log`。
+- 主控反例 26 项（`s2-pr44-adversarial-e16_1.rs`）：18 通过、8 失败，归并为 4 项缺陷并由主控在原 PR 返修：
+  - F13 相对路径绕过根授权：`assert_authorized_path` 只校验绝对路径，持久注册可读取并落库授权根之外的文件。返修：路径与根必须为绝对且规范（无 `.`/`..`/空分量/NUL），组件级严格前缀授权，打开文件前再次断言。
+  - F14 根可为 `/`、`$HOME` 或其祖先：全 home 扫描门只查来源名不查根。返修：`assert_authorized_root`/`assert_not_whole_home_scan` 在 `SourceSelection::validate` 与持久注册统一生效。
+  - F15 聚簇膨胀：嵌套 `.try1:fork2` 只剥一层；内容去重把同一事故的重试拆成独立簇。返修：后缀剥至不动点；簇为"同事故 ∪ 同内容"关系的并查集闭包。
+  - F16 `tool_result_is_not_preference` 只认精确 `"user"`；`claude.fixture` 缺 `content` 的记录被当成空 user chat。返修：工具输出对任意角色拼写均非偏好；缺 `content` fail-closed。
+- 返修提交 `b6861a756bf1a2a5660cb9d6e0663b4385242104`（源码：evo-core evidence.rs、evo-engine evidence.rs/import.rs、import_v41.rs）。主控复跑：import_v41 34 + optimization 7、evidence 12、import 单元 4、evo-storage 54、三 crate clippy `-D warnings`/fmt exit 0（`s2-pr44fix-ctrl-[0-5].log`）；反例 25/26，余下 1 项 unwrap 了按要求 fail-closed 的解析。
+- 结论：verified（程序/持久导入子范围），已合并。通过范围同 CTRL-E16.1-R2；E16.1 完整真实迁移链仍未关闭。回滚点 `c74369e`。
+
+### CTRL-E16.2/3-R1 / PR #54：AG-011 主控独立验收与返修
+
+- 真源文件与 F08 冻结合同缺席；F08 只能对照 #48 台账提案文本：字段语义由 `E16Envelope`（id/request_key/source_refs/revoke_watermark）+ `StagedAssetPayload` 覆盖；偏差：无 `expires_at`；预算以 `E04BudgetRef` 引用而非记录内 allocated/consumed；状态名 Prepared/Staged/Quarantined/Aborted/Failed 且审批留在 ReleaseStore（无 ApprovedForRelease）；来源撤销后以拒绝+redaction 处理而非字面 Quarantined 迁移。冻结版是否采纳这些偏差无法判定，真源恢复后须复核。
+- 复现自测与 E16.1 回归（`02f4093`）：packages 30、seeds 9、local_export 8、lifecycle 19、import_integrity 4、import_v41+opt 35、storage 70、evidence 10；四 crate `--no-fail-fast` 406/0；workspace clippy/fmt 0。`dispatch_management::evaluator_job_same_key_different_ticket_conflicts_after_restart_safe_failure` 出现 1 次偶发失败（不在 PR 文件内），复跑 4 次通过，记为已知偶发。日志 `s2-pr54-*.log`。
+- 主控反例（engine 22、storage 15）：engine 19/3、storage 11/4，归并为 4 项缺陷并由主控在原 PR 返修：
+  - F17 `e16_payload_has_live_blob_reference` 不看记录状态：已中止/失败的 staged 记录使共享 blob 在最后活来源撤销后仍留在磁盘，违背 PR 自述"只计活引用"。返修：按 schema 状态集判活（staged_asset prepared/staged；export_attempt prepared/completed；seed_install prepared/installed；import_source prepared/ready），摘要字段单一定义并用于 SQL 预筛。
+  - F18 纯函数 `safe_reset_to_baseline` 不检查 `status`。返修：非 Installed 一律拒绝，与持久路径一致。
+  - F19 存储层导出 id 接受 `.`/`..`（`identifier` 允许点号），`local_export_directory("..")` 指向命名空间根之外。返修：`validate_export_id` 在全部导出入口与清理路径生效。
+  - F20 `validate_local_export_path` 依赖 `Path::components` 归一化，接受 `a/./b`、`a//b`、`a/`。返修：按原始字符串逐段校验。
+  - 接受为命名差异：来源撤销后 staged 记录不迁移到字面 Quarantined，而是全部消费入口拒绝并在清理作业中 redaction。
+- 返修提交 `cf0fd22b31b559b8c60587762cae51a4f6433bd4`。主控复跑：storage lifecycle+local_export+import_integrity 38、engine packages_v41+seeds_v41 42、import_v41+opt 35、workspace clippy/fmt 0（`s2-pr54fix-ctrl-[0-4].log`）；子代理四 crate 416/0；反例 engine 21/22（余 1 为上述命名差异）、storage 15/15。
+- 集成：`c57397f4ffbf9bff39c32a17e67e962bff3a8d45` = cf0fd22 + merge b6861a7（无冲突，cf0fd22 未改台账，台账 = b6861a7）；整树 workspace 428/0、四 crate 425/0、clippy/fmt 0（`s2-int54-*.log`）。
+- 结论：verified（staging/种子/本地导出子范围，F08 按提案版对照），已合并。通过范围：程序/持久 staging、seed、local_namespace 导出与 E16 清理子范围；不含真实第三方包、真实远端销毁、真实用户目录种子演练。#45/#46 由本 PR 取代，关闭须经用户确认。回滚点 `7fae0fe`。
+
+### CTRL-E16.4-R3 / PR #47：重新堆叠到 main 与复核
+
+- 源提交 `b9efc76`/`ff17969`/`9d04c67` 以 cherry-pick 重新堆叠到 main `4dea9ef`（跳过仅台账提交 `f6f7338`）= `ade7276`；hosts.rs、release_store.rs、hosts_v41.rs、claude_code_surface.v1.json 与已验 head `f6f7338` 逐字节一致。
+- 复跑：hosts_v41 6 + release_store 7、lib hosts 2、lib release_store 4、evo-engine 145；clippy/fmt 0（`s2-restack47-[0-5].log`）。
+- 反例 9 项：6 通过、3 项记录：(1) `verify_host_receipt` 在本仓库没有任何接受路径（ProgramFixture 证据不能激活发布），执行回执门 (b)(c)(d) 只能代码检视，属 fail-closed；(2)(3) 注册门做精确字符串比较，`Unverified-` 与 `claude-code-mcp-tool-only:v1` 可绕过。返修 F21：宿主 id 与版本小写后按家族判定，`11b42d2`，回归测试覆盖 4 种改写；复跑 hosts_v41 7 + release_store 7、lib 2，clippy/fmt 0（`s2-restack47-final-*.log`）。
+- 分支已强推为 `11b42d2`，base 改为 main。结论：verified（真实 Store 拒绝门与记录重载子范围），已合并；E16.4 整项仍 blocked（无真实 Claude Code 证据）。回滚点 `f6f7338`。
+
+### CTRL-E16.5-R2 / PR #48：F07 返修复审、主控返修与重新堆叠
+
+- 复审 `76f94e5` 的 F07 返修不成立：F10 `probe_sandbox_capability` 以环境变量 `RSIA_SANDBOX_CAPABILITY_VERIFIED` 放行，等同被退回的布尔开关；F11 锚校验整库读入内存只查 16 字节头，且跟随符号链接；F12 `verify_recovery_state` 允许 `total_exposure_count` 回退、允许备份丢失已撤销来源。
+- 主控返修 `ad8104a`：部署门改为依赖 E04 `IsolationPolicy` 事实（参考宿主永不放行代码执行）；锚必须为常规文件（拒绝符号链接/目录）且只读 16 字节头；曝光计数与已撤销来源集合不可回退。复跑 capacity_v41 21、lib 3，clippy/fmt 0（`s2-pr48-ctrl-*.log`）。
+- 重新堆叠到 main：`5eed6dc`/`7ce8387`/`5ed6088`（capacity 文件与 ad8104a 逐字节一致；capacity_v41 21、evo-engine 161、clippy/fmt 0，`s2-restack48-*.log`）。结论：verified（容量/恢复/部署门纯函数子范围），已合并；容量/恢复门仍未接入 dispatch/prepare 真实入口，E16.5 整项仍 blocked。回滚点 `76f94e5`。
+
+### CTRL-E17/E18-R2 / PR #50、#51：重新堆叠到 main 与拒绝门硬化
+
+- #50 源提交 `5d89154`、#51 源提交 `86064b5` 依次堆叠到 main（跳过仅台账提交）：`0b5b4e6`、`c1c0759`；features.rs 与各自测试与已验 head 逐字节一致。复跑 e17 4 + e18 12、lib features 3、evo-core 138；clippy/fmt 0（`s2-restack5051-*.log`）。
+- 反例 26 项：21 通过、5 项为默认关闭标志掩盖下的门内漏洞：E17 门做大小写敏感精确比较、自评只信自报布尔；E18 受保护路径漏 Dockerfile 变体/CI/cargo 配置/首尾空白，空审批 token 过门，空文件列表无门。主控硬化 F22/F23：#50 head `4e0cabe`（0b5b4e6 + F22）、#51 head `2d909c4`（+ 112a92b 重堆叠 86064b5 + F23）；e17 7 + e18 18、lib 3、evo-core 147、clippy/fmt 0、反例 26/26（`s2-e1718fix-*.log`）。
+- 结论：verified（关闭/拒绝子范围），已合并/verified（关闭/拒绝子范围），已合并；E17/E18 保持默认关闭，不代表真实扩展运行通过。
+
+### CTRL-CP002-R3 / PR #53：检查器漏检返修
+
+- HANDOFF 4.3 六个漏检在 `acfdc79` 全部复现放行（`s2-pr53-repro-before.txt`）。返修 `56f8644`：planned 不得携带 verified 证据；父范围不得强于最弱子包；optional_disabled 不得 verified；证据须以本任务命名空间登记、不得复用他任务 log/测试运行、目标须落在本任务 crate；各对象封闭键集；merged_sha 跨记录一致（一 PR 一合并、源/合并不互指、可选 `pr_state` 一致）。与清单内任何事实都不冲突的伪造 merged_sha 无 git 不可驳回，显式列入 needs_verification。
+- 主控复跑：40 单测、真实清单 structure_valid=true、6 反例 5 驳回（`s2-pr53-ctrl.log`）。9/22 预审的 2 个反例原件在旧机，未复核。结论：返修完成、未验收合并；base 仍为 #49 分支，等 E16 链落定。
+
+合并（用户在本机终端按主控固定的 head 执行，主控本机审查器拒绝合并动作）：#44 `acda318`（树 = b6861a7）、#54 `16c2817`（树 = c57397f）、#47 `1c824e6`、#48 `4980aa4`、#50 `e94042d`、#51 `bef7bd1`；主控逐一核对每个合并提交的非台账源码与已验 head 逐文件一致（`s2-controller-notes.md`）。合并后 main `bef7bd1763a01ccb677ada4acad71a063366539c` 收口：workspace 47 个测试二进制 486 通过 / 0 失败，clippy `-D warnings`、fmt、build 均 exit 0，定向 E16.x/E17/E18 套件 104 + 26 通过（`s2-main-*.log`）。发现 `scripts/smoke_cli.py` 在 main 上确定性失败（HTTP 400）：自 AG-001 `f9500d9`（#43，2026-09-19）起 `replay.run` 改为完整 `ReplayRunRequest`，E07 期的 smoke 载荷与"blocked"断言已过时；与本轮合并无关，本轮未修改，列为待办（更新 smoke 或裁定 E07 smoke 作废）。
+
+## 2026-09-19 主控独立验收与合并结论（历史，已被 2026-09-30 第二轮取代）
 
 本批未全量通过。Antigravity提交的原测试由主控在冻结副本重跑：380 passed，Clippy/fmt exit0；主控补充9个反例，9个均实际失败。完整源码输入为 `c78e05c2f9518aa73cee3d0b50671f3042e2b3fb`，日志和反例仅本地 `out/review-antigravity-20260919/`。自测数量不能代替实际消费者、安全边界和完整场景验收。
 
@@ -87,15 +163,15 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | E13 | 长期部署适应与能力保留监测 | in_progress（程序监测已verified） | 主控22项及clippy/fmt通过；两周期触发、单claim、真实根绑定前置校验、异常/撤销持久终态和漂移已验。仅程序fixture，真实提供商、连续轮次保留/长期效果仍未取得。 |
 | E14 | 受限改进器自身的继承控制器 | planned（本地合同建议已交接） | 未开始代码；单机制候选、真实下一作业及身份边界仍须主控定版；不启用G4。 |
 | E15 | 后继质量与跨代收益实验 | planned | 真实后继实验未运行。 |
-| E16 | 产品支持范围与最终交付门禁 | planned | 旧实现保留；尚未按 v4.1 全部合同独立验收。 |
-| E16.1 | 来源导入与版本化读取器 | implemented_not_verified（主控退回） | PR #44未合并；具体缺陷与返修条件见页首主控结论。已提交代码不代表完整E/V场景通过。 |
-| E16.2 | 资产导入／分享与隐私门禁 | implemented_not_verified（主控退回） | PR #45未合并；具体缺陷与返修条件见页首主控结论。已提交代码不代表完整E/V场景通过。 |
-| E16.3 | 内置种子与本地修改保护 | implemented_not_verified（主控退回） | PR #46未合并；具体缺陷与返修条件见页首主控结论。已提交代码不代表完整E/V场景通过。 |
-| E16.4 | 额外真实宿主与配置面漂移 | implemented_not_verified（主控退回） | PR #47未合并；具体缺陷与返修条件见页首主控结论。已提交代码不代表完整E/V场景通过。 |
-| E16.5 | 持久恢复、容量、依赖与部署安全 | implemented_not_verified（主控退回） | PR #48未合并；具体缺陷与返修条件见页首主控结论。已提交代码不代表完整E/V场景通过。 |
-| E16.6 | 发行、证据台账与唯一真源交接 | implemented_not_verified（主控退回） | PR #49未合并；具体缺陷与返修条件见页首主控结论。已提交代码不代表完整E/V场景通过。 |
-| E17 | 可选：开发代理评分器演化 | in_progress（关闭/拒绝子范围已复验） | PR #50因前置未通过暂不合并；默认关闭，不代表真实扩展运行通过。 |
-| E18 | 可选：自动提出代码修改，不自动部署 | in_progress（关闭/拒绝子范围已复验） | PR #51因前置未通过暂不合并；默认关闭，不代表真实扩展运行通过。 |
+| E16 | 产品支持范围与最终交付门禁 | in_progress（E16.1–E16.5 子范围已验并合并） | E16.6 索引待重新堆叠与更新；真实宿主/沙箱/第三方包证据未取得；真源文件缺席，本轮为依台账记录范围验证。 |
+| E16.1 | 来源导入与版本化读取器 | in_progress（程序/持久导入子范围已verified并合并） | PR #44 merged_sha `acda31895bb1cb42cf7985b907a4c600429573d0`（主控返修 F13–F16 后）；完整真实迁移链未关闭。 |
+| E16.2 | 资产导入／分享与隐私门禁 | in_progress（staging/本地导出子范围已verified并合并） | PR #54 取代 #45，merged_sha `16c2817bc192bf71535d2c99d867873e6e85bcf8`（主控返修 F17–F20 后）；F08 只对照提案版；真实第三方包/远端销毁未验。 |
+| E16.3 | 内置种子与本地修改保护 | in_progress（持久种子安装/重置 staging 子范围已verified并合并） | PR #54 取代 #46，merged_sha `16c2817bc192bf71535d2c99d867873e6e85bcf8`；真实用户目录演练未验。 |
+| E16.4 | 额外真实宿主与配置面漂移 | in_progress（拒绝门/记录重载子范围已verified并合并）/ blocked（真实宿主） | PR #47 重新堆叠后 merged_sha `1c824e6614667da4dc7ea74e96b46adfd1d2c089`（含主控 F21）；无真实 Claude Code 证据，`verify_host_receipt` 在本仓库无接受路径（fail-closed）。 |
+| E16.5 | 持久恢复、容量、依赖与部署安全 | in_progress（门函数子范围已verified并合并）/ blocked（未接运行入口） | PR #48 重新堆叠后 merged_sha `4980aa498baa80fd82e83441839e606859fa4065`（主控返修 F10–F12）；容量/恢复门未接入 dispatch/prepare，无真实沙箱。 |
+| E16.6 | 发行、证据台账与唯一真源交接 | implemented_not_verified | PR #49 待重新堆叠到 main 并按本轮合并事实更新索引（含 pr_state）；#53 检查器返修已推送，随 #49 重堆叠。 |
+| E17 | 可选：开发代理评分器演化 | in_progress（关闭/拒绝子范围已verified并合并） | PR #50 重新堆叠后 merged_sha `e94042d3f2fd761455727a6c82ad13fd3d657d03`（主控硬化 F22）；默认关闭，不代表真实扩展运行通过。 |
+| E18 | 可选：自动提出代码修改，不自动部署 | in_progress（关闭/拒绝子范围已verified并合并） | PR #51 重新堆叠后 merged_sha `bef7bd1763a01ccb677ada4acad71a063366539c`（主控硬化 F23）；默认关闭，不代表真实扩展运行通过。 |
 
 ## 追踪范围
 
@@ -317,11 +393,11 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 
 - 任务号：AG-002
 - E 归属：E16.1
-- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- 状态：`verified`（程序/持久导入子范围；主控 2026-09-30 R3 返修 F13–F16 后，依台账记录范围验证）
 - base 分支：`wrokbot/ag-001-e10-replay-management`
 - head 分支：`wrokbot/ag-002-e16-1-source-import`
 - PR：[PR #44](https://github.com/acosmi/RSIAgent/pull/44)
-- merged_sha: null
+- merged_sha: `acda31895bb1cb42cf7985b907a4c600429573d0`
 
 依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §6.3 授权历史取证、§5.6 内部记录、§13.1 E16.1 及 V005, V006, V017, V051, V052, V053, V054, V055, V056, V076, V087, V090, V098 场景族。
 文件白名单修改：
@@ -368,11 +444,11 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 
 - 任务号：AG-003
 - E 归属：E16.2
-- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- 状态：`superseded`（被 AG-011 / PR #54 取代；PR 关闭待用户确认）
 - base 分支：`wrokbot/ag-002-e16-1-source-import`
 - head 分支：`wrokbot/ag-003-e16-2-asset-package`
 - PR：[PR #45](https://github.com/acosmi/RSIAgent/pull/45)
-- merged_sha: null
+- merged_sha: null（未合并）
 
 依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §11.1、§11.2、§11.3、§13.1 E16.2 及 V017, V039, V066, V067, V068, V069, V070, V075, V091, V092, V098 场景族。
 文件白名单修改：
@@ -398,11 +474,11 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 
 - 任务号：AG-004
 - E 归属：E16.3
-- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- 状态：`superseded`（被 AG-011 / PR #54 取代；PR 关闭待用户确认）
 - base 分支：`wrokbot/ag-003-e16-2-asset-package`
 - head 分支：`wrokbot/ag-004-e16-3-seed-blu`
 - PR：[PR #46](https://github.com/acosmi/RSIAgent/pull/46)
-- merged_sha: null
+- merged_sha: null（未合并）
 
 依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §11.1、§13.1 E16.3 及 V014, V018, V038, V063, V064, V065, V078, V091, V092, V098 场景族。
 文件白名单修改：
@@ -426,11 +502,11 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 
 - 任务号：AG-005
 - E 归属：E16.4
-- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- 状态：`verified`（真实 Store 拒绝门与记录重载子范围；重新堆叠到 main，含主控 F21；E16.4 整项仍 blocked）
 - base 分支：`wrokbot/ag-004-e16-3-seed-blu`
 - head 分支：`wrokbot/ag-005-e16-4-extra-host`
 - PR：[PR #47](https://github.com/acosmi/RSIAgent/pull/47)
-- merged_sha: null
+- merged_sha: `1c824e6614667da4dc7ea74e96b46adfd1d2c089`
 
 依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §5.5、§13.1 E16.4 及 V002, V003, V009, V037, V039, V060, V061, V062, V077, V087, V091, V092, V098 场景族。
 文件白名单修改：
@@ -455,11 +531,11 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 
 - 任务号：AG-006
 - E 归属：E16.5
-- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- 状态：`verified`（容量/恢复/部署门纯函数子范围；主控返修 F10–F12 后重新堆叠；未接运行入口，E16.5 仍 blocked）
 - base 分支：`wrokbot/ag-005-e16-4-extra-host`
 - head 分支：`wrokbot/ag-006-e16-5-capacity-recovery`
 - PR：[PR #48](https://github.com/acosmi/RSIAgent/pull/48)
-- merged_sha: null
+- merged_sha: `4980aa498baa80fd82e83441839e606859fa4065`
 
 依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §11.3、§11.4、§13.1 E16.5 及 V007, V008, V017, V018, V037, V038, V039, V066, V069, V073, V075, V081–V086, V089, V096, V098 场景族。
 文件白名单修改：
@@ -509,11 +585,11 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 
 - 任务号：AG-008
 - E 归属：E17
-- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- 状态：`verified`（关闭/拒绝子范围；重新堆叠到 main，含主控 F22）
 - base 分支：`wrokbot/ag-007-e16-6-release-ledger`
 - head 分支：`wrokbot/ag-008-e17-scorer-rejection`
 - PR：[PR #50](https://github.com/acosmi/RSIAgent/pull/50)
-- merged_sha: null
+- merged_sha: `e94042d3f2fd761455727a6c82ad13fd3d657d03`
 
 依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §10、§13.2 E17 及 V040 场景族。
 文件白名单修改：
@@ -536,11 +612,11 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 
 - 任务号：AG-009
 - E 归属：E18
-- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- 状态：`verified`（关闭/拒绝子范围；重新堆叠到 main，含主控 F23）
 - base 分支：`wrokbot/ag-008-e17-scorer-rejection`
 - head 分支：`wrokbot/ag-009-e18-code-pr-rejection`
 - PR：[PR #51](https://github.com/acosmi/RSIAgent/pull/51)
-- merged_sha: null
+- merged_sha: `bef7bd1763a01ccb677ada4acad71a063366539c`
 
 依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §10、§12、§13.2 E18 及 V041 场景族。
 文件白名单修改：
