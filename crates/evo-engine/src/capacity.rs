@@ -1,7 +1,9 @@
 //! MVP capacity, persistent recovery verification, and deployment safety gates.
 //! Exceeding capacity limits refuses new derive; it never silent-truncates.
+use crate::executor::IsolationPolicy;
 use evo_core::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 
 pub const MAX_RUNS: u64 = 1_000;
 pub const MAX_EVENTS: u64 = 10_000;
@@ -14,6 +16,9 @@ pub const MAX_REPLAY_WORLDS: u64 = 100;
 pub const MAX_ACTIVE_LEASES: u64 = 10;
 pub const MAX_STAGED_PACKAGES: u64 = 20;
 pub const MAX_CONCURRENT_DISPATCH: u64 = 1;
+
+/// The 16-byte magic header every SQLite 3 database file starts with.
+const SQLITE_HEADER: [u8; 16] = *b"SQLite format 3\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
@@ -131,11 +136,19 @@ pub struct RecoveryAudit {
     pub notes: Vec<String>,
 }
 
+/// Verify that a backup manifest may be restored over the live system.
+///
+/// `previous_*` are the live system's already-consumed facts; the ledger rule is
+/// that consumed query, exposure, dispatch and expense facts never rewind.
+/// `previously_revoked_sources` are ids the live system has already revoked; a
+/// backup that forgets any of them would resurrect it, so it enters quarantine.
 pub fn verify_recovery_state(
     manifest: &RecoveryStateManifest,
     previous_watermark: u64,
     previous_consumed_queries: u64,
+    previous_exposure_count: u64,
     previous_spent: i64,
+    previously_revoked_sources: &[String],
 ) -> Result<RecoveryAudit> {
     // 1. Watermark check (V017, V018): Missing watermark enters quarantine
     let wm = manifest.trusted_revocation_watermark.ok_or_else(|| {
@@ -149,11 +162,26 @@ pub fn verify_recovery_state(
         )));
     }
 
-    // 2. Query consumption and financial accounting cannot be rewound
+    // 2. Content closure (V075): a backup can never drop an already revoked source
+    for id in previously_revoked_sources {
+        if !manifest.revoked_sources.contains(id) {
+            return Err(Error::Conflict(format!(
+                "recovery_quarantine: backup drops revoked source '{id}'"
+            )));
+        }
+    }
+
+    // 3. Query consumption, exposure and financial accounting cannot be rewound
     if manifest.consumed_queries < previous_consumed_queries {
         return Err(Error::Conflict(format!(
             "accounting_violation: recovery cannot rewind consumed queries from {} to {}",
             previous_consumed_queries, manifest.consumed_queries
+        )));
+    }
+    if manifest.total_exposure_count < previous_exposure_count {
+        return Err(Error::Conflict(format!(
+            "accounting_violation: recovery cannot rewind exposure count from {} to {}",
+            previous_exposure_count, manifest.total_exposure_count
         )));
     }
     if manifest.dispatched_expenses_incurred < previous_spent {
@@ -163,10 +191,10 @@ pub fn verify_recovery_state(
         )));
     }
 
-    // 3. Early stopping tickets remain unpromotable after recovery
+    // 4. Early stopping tickets remain unpromotable after recovery
     let can_promote_early_stopping = !manifest.has_early_stopping_ticket;
 
-    // 4. Uncertain calls stay uncertain and are not refunded
+    // 5. Uncertain calls stay uncertain and are not refunded
     let refunded_uncertain_costs = false;
 
     Ok(RecoveryAudit {
@@ -177,8 +205,15 @@ pub fn verify_recovery_state(
         notes: vec![
             format!("Restored trusted revocation watermark at {}", wm),
             format!(
-                "Maintained {} consumed queries and {} spent facts",
-                manifest.consumed_queries, manifest.dispatched_expenses_incurred
+                "Maintained {} consumed queries, {} exposures and {} spent facts",
+                manifest.consumed_queries,
+                manifest.total_exposure_count,
+                manifest.dispatched_expenses_incurred
+            ),
+            format!(
+                "Preserved all {} previously revoked sources ({} revoked in backup)",
+                previously_revoked_sources.len(),
+                manifest.revoked_sources.len()
             ),
         ],
     })
@@ -193,50 +228,77 @@ pub struct DeploymentSecurityConfig {
     pub trusted_revocations_db_path: Option<String>,
 }
 
-pub fn probe_sandbox_capability() -> bool {
-    // In this offline/MVP phase, no verified sandbox runtime daemon or container wrapper exists.
-    // Qualified sandbox requires an isolated runtime environment (e.g. bubblewrap, gVisor, or container daemon).
-    // An explicit environment override RSIA_SANDBOX_CAPABILITY_VERIFIED can signal capability for testing/staging.
-    if let Ok(val) = std::env::var("RSIA_SANDBOX_CAPABILITY_VERIFIED") {
-        return val == "1" || val.eq_ignore_ascii_case("true");
-    }
-    false
-}
-
-pub fn validate_deployment_security(cfg: &DeploymentSecurityConfig) -> Result<()> {
+/// Deployment safety gate.
+///
+/// Code execution is admitted only when the deployment config asks for a sandbox
+/// AND the E04 executor's isolation facts report a verified sandbox runtime with
+/// code execution enabled. No configuration boolean or environment variable can
+/// stand in for those facts; `IsolationPolicy::reference_host` (the production
+/// constructor) reports `sandbox_available = false` and code execution disabled,
+/// so code execution is never admitted on the reference host.
+///
+/// The trusted revocations anchor must be an existing regular file (never a
+/// symlink or directory) whose first 16 bytes are the SQLite format 3 header.
+pub fn validate_deployment_security(
+    cfg: &DeploymentSecurityConfig,
+    isolation: &IsolationPolicy,
+) -> Result<()> {
     if cfg.allow_code_execution {
         if !cfg.sandbox_enabled {
             return Err(Error::Forbidden);
         }
-        if !probe_sandbox_capability() {
+        if !isolation.sandbox_available || isolation.code_execution != "enabled" {
             return Err(Error::Invalid(
-                "deployment_rejected: sandbox capability not verified on this host; code execution must remain disabled".into(),
+                "deployment_rejected: code execution requires a verified sandbox runtime; E04 isolation reports sandbox_unavailable / code execution disabled".into(),
             ));
         }
     }
 
-    let db_path = cfg.trusted_revocations_db_path.as_deref().ok_or_else(|| {
+    verify_trusted_revocations_anchor(cfg.trusted_revocations_db_path.as_deref())
+}
+
+fn verify_trusted_revocations_anchor(db_path: Option<&str>) -> Result<()> {
+    let db_path = db_path.ok_or_else(|| {
         Error::Invalid("deployment_rejected: trusted revocations database is required".into())
     })?;
 
     if db_path.trim().is_empty() {
-        return Err(Error::Invalid("empty trusted revocations db path".into()));
+        return Err(Error::Invalid(
+            "deployment_rejected: trusted revocations db path is empty".into(),
+        ));
     }
 
     let p = std::path::Path::new(db_path);
-    if !p.exists() || !p.is_file() {
+    // symlink_metadata does not follow links, so a symlink is visible as such.
+    let meta = std::fs::symlink_metadata(p).map_err(|e| {
+        Error::Invalid(format!(
+            "deployment_rejected: trusted revocations db is not accessible: {db_path}: {e}"
+        ))
+    })?;
+    if meta.file_type().is_symlink() {
         return Err(Error::Invalid(format!(
-            "deployment_rejected: trusted revocations db does not exist or is not a file: {db_path}"
+            "deployment_rejected: trusted revocations db must not be a symlink: {db_path}"
+        )));
+    }
+    if !meta.is_file() {
+        return Err(Error::Invalid(format!(
+            "deployment_rejected: trusted revocations db is not a regular file: {db_path}"
         )));
     }
 
-    // Verify file header / readability
-    let header_bytes = std::fs::read(p).map_err(|e| {
+    // Read exactly the 16-byte header; never the whole file.
+    let mut file = std::fs::File::open(p).map_err(|e| {
         Error::Invalid(format!(
-            "deployment_rejected: cannot read revocations db: {e}"
+            "deployment_rejected: cannot open trusted revocations db: {db_path}: {e}"
         ))
     })?;
-    if header_bytes.len() < 16 || &header_bytes[..16] != b"SQLite format 3\0" {
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header).map_err(|e| {
+        Error::Invalid(format!(
+            "deployment_rejected: trusted revocations db is shorter than the 16-byte SQLite header: {e}"
+        ))
+    })?;
+    if header != SQLITE_HEADER {
         return Err(Error::Invalid(
             "deployment_rejected: trusted revocations db is not a valid SQLite format 3 file"
                 .into(),
@@ -270,5 +332,56 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn code_execution_is_never_admitted_on_reference_host() {
+        // sandbox_enabled is only a request; the E04 isolation facts decide.
+        let cfg = DeploymentSecurityConfig {
+            sandbox_enabled: true,
+            allow_code_execution: true,
+            allow_external_network: false,
+            trusted_revocations_db_path: Some("/nonexistent/revocations.db".into()),
+        };
+        let iso = IsolationPolicy::reference_host("/tmp/ws");
+        match validate_deployment_security(&cfg, &iso) {
+            Err(Error::Invalid(msg)) => assert!(
+                msg.starts_with(
+                    "deployment_rejected: code execution requires a verified sandbox runtime"
+                ),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected deployment_rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_never_rewinds_exposure_or_drops_revoked_sources() {
+        let manifest = RecoveryStateManifest {
+            backup_timestamp: 1,
+            trusted_revocation_watermark: Some(10),
+            consumed_queries: 100,
+            total_exposure_count: 40,
+            dispatched_expenses_incurred: 200,
+            uncertain_dispatches_count: 0,
+            has_early_stopping_ticket: false,
+            revoked_sources: vec!["a".into()],
+            installed_packages: vec![],
+        };
+        match verify_recovery_state(&manifest, 10, 100, 50, 200, &[]) {
+            Err(Error::Conflict(msg)) => assert_eq!(
+                msg,
+                "accounting_violation: recovery cannot rewind exposure count from 50 to 40"
+            ),
+            other => panic!("expected exposure rewind conflict, got {other:?}"),
+        }
+        let live_revoked = vec!["a".to_string(), "b".to_string()];
+        match verify_recovery_state(&manifest, 10, 100, 40, 200, &live_revoked) {
+            Err(Error::Conflict(msg)) => {
+                assert_eq!(msg, "recovery_quarantine: backup drops revoked source 'b'")
+            }
+            other => panic!("expected dropped-revocation quarantine, got {other:?}"),
+        }
+        assert!(verify_recovery_state(&manifest, 10, 100, 40, 200, &live_revoked[..1]).is_ok());
     }
 }
