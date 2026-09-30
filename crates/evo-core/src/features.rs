@@ -34,28 +34,82 @@ pub struct ScorerUpdateProposal {
     pub has_external_anchor: bool,
 }
 
+/// Grader / scorer names that no candidate may target. Compared against the
+/// normalised name (see [`normalize_scorer_name`]) with both equality and
+/// substring matching, so relabelled spellings such as `Final_Acceptance_Grader`,
+/// `final_acceptance_grader.rs`, `acceptance_policy.v2`, `independent_evaluator:main`
+/// or `src.final_acceptance_grader` are still caught by gate 1.
+const PROTECTED_GRADER_NAMES: &[&str] = &[
+    "final_acceptance_grader",
+    "acceptance_policy",
+    "independent_evaluator",
+];
+
+/// Normalise a scorer / grader / candidate name for gate comparisons:
+/// trim, ASCII-lowercase, drop a `:<suffix>` label, then repeatedly strip a
+/// trailing `.rs` extension or `.v<digits>` version suffix.
+fn normalize_scorer_name(name: &str) -> String {
+    let lowered = name.trim().to_ascii_lowercase();
+    let mut base = match lowered.find(':') {
+        Some(idx) => &lowered[..idx],
+        None => lowered.as_str(),
+    };
+    loop {
+        if let Some(stripped) = base.strip_suffix(".rs") {
+            base = stripped;
+            continue;
+        }
+        if let Some(idx) = base.rfind(".v") {
+            let digits = &base[idx + 2..];
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                base = &base[..idx];
+                continue;
+            }
+        }
+        break;
+    }
+    base.trim().to_string()
+}
+
+fn is_protected_grader_name(name: &str) -> bool {
+    let normalized = normalize_scorer_name(name);
+    PROTECTED_GRADER_NAMES
+        .iter()
+        .any(|protected| normalized == *protected || normalized.contains(protected))
+}
+
 /// V040: Evaluator evolution rejection gates.
 /// Rejects any attempt by a candidate to modify the final grader, score itself,
 /// or directly average scores across different epochs without external anchoring.
 pub fn validate_e17_scorer_gates(proposal: &ScorerUpdateProposal) -> Result<()> {
-    identifier(&proposal.candidate_id)?;
-    identifier(&proposal.proposed_scorer_id)?;
-    identifier(&proposal.target_grader_name)?;
-
-    // 1. Candidate attempting to modify final acceptance grader
-    if proposal.target_grader_name == "final_acceptance_grader"
-        || proposal.target_grader_name == "acceptance_policy"
-        || proposal.target_grader_name == "independent_evaluator"
-    {
+    // 1. Candidate attempting to modify final acceptance grader. Evaluated on the
+    //    normalised name and before identifier syntax validation, so a relabelled
+    //    or path-spelled grader name is rejected by this gate rather than merely as
+    //    a malformed identifier.
+    if is_protected_grader_name(&proposal.target_grader_name) {
         return Err(Error::Invalid(
             "V040 rejected: final acceptance grader is immutable and cannot be modified by candidates".into(),
         ));
     }
 
-    // 2. Self-scoring or self-approval is forbidden
+    identifier(&proposal.candidate_id)?;
+    identifier(&proposal.proposed_scorer_id)?;
+    identifier(&proposal.target_grader_name)?;
+
+    // 2. Self-scoring or self-approval is forbidden: declared, or structural
+    //    (candidate, proposed scorer and target grader must be pairwise distinct
+    //    after normalisation; the self-declared flag is not trusted on its own).
     if proposal.is_self_scoring {
         return Err(Error::Invalid(
             "V040 rejected: candidate cannot score itself or self-approve scorer updates".into(),
+        ));
+    }
+    let candidate = normalize_scorer_name(&proposal.candidate_id);
+    let scorer = normalize_scorer_name(&proposal.proposed_scorer_id);
+    let grader = normalize_scorer_name(&proposal.target_grader_name);
+    if candidate == scorer || candidate == grader || scorer == grader {
+        return Err(Error::Invalid(
+            "V040 rejected: candidate cannot score itself or self-approve scorer updates (candidate_id, proposed_scorer_id and target_grader_name must be distinct)".into(),
         ));
     }
 
