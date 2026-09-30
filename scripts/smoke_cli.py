@@ -989,6 +989,109 @@ def smoke_restore_admission(binary: Path, root: Path) -> None:
         fail("a quarantined restore gained an admission record or a lock file")
 
 
+def smoke_bare_data_path(binary: Path, root: Path) -> None:
+    """`--data rsia.sqlite3`, a bare file name, is the CLI default (AG-023).
+
+    The data directory of a bare file name is the current directory, for the
+    data-directory lock as for the startup gate. Every child below runs with
+    `cwd=` a scratch directory (this process never changes its own), so the
+    files it creates can only appear where it was started.
+    """
+    port = free_port() + 4
+    data_files = ("rsia.sqlite3", ".rsia.lock")
+
+    def serve_command(bind_port: int, *data: str) -> list[str]:
+        return [str(binary), "serve", "--bind", f"127.0.0.1:{bind_port}",
+                "--namespace", "smoke", "--actor", "agent-a",
+                "--auth-token", AGENT_TOKEN, *data]
+
+    def start_directory(name: str) -> Path:
+        directory = root / name
+        directory.mkdir()
+        return directory
+
+    def start_serve(directory: Path, bind_port: int, *data: str) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            serve_command(bind_port, *data), cwd=directory, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+    def wait_serving(process: subprocess.Popen[str], bind_port: int, label: str) -> None:
+        try:
+            wait_http(f"http://127.0.0.1:{bind_port}")
+        except RuntimeError:
+            if process.poll() is not None and process.stderr is not None:
+                fail(f"{label} exited {process.returncode} before listening: {process.stderr.read()!r}")
+            raise
+
+    def require_data_files(directory: Path, label: str) -> None:
+        for name in data_files:
+            if not (directory / name).is_file():
+                fail(f"{label}: {name} did not appear in its start directory: "
+                     f"{sorted(entry.name for entry in directory.iterdir())}")
+
+    # 1. `serve --data rsia.sqlite3` starts, reports its posture, and locks and
+    #    creates its files in the directory it was started in.
+    explicit = start_directory("bare-explicit")
+    first = start_serve(explicit, port, "--data", "rsia.sqlite3")
+    try:
+        wait_serving(first, port, "serve --data rsia.sqlite3")
+        require_data_files(explicit, "serve --data rsia.sqlite3")
+        # 2. A second instance for the same directory is refused by the lock,
+        #    whether it names the data file bare (same cwd) or by absolute path.
+        for label, command, directory in (
+            ("serve --data rsia.sqlite3", serve_command(port + 1, "--data", "rsia.sqlite3"), explicit),
+            ("mcp --data <absolute path>",
+             [str(binary), "mcp", "--data", str(explicit / "rsia.sqlite3"), "--namespace", "smoke"],
+             root),
+        ):
+            second = subprocess.run(
+                command, input="", capture_output=True, text=True, timeout=10, cwd=directory,
+            )
+            if second.returncode == 0 or "already locked" not in second.stderr:
+                fail(
+                    f"a second `{label}` for a bare-name data directory was not refused: "
+                    f"exit={second.returncode} stderr={second.stderr!r}"
+                )
+    finally:
+        first_stderr = stop(first)
+    if STARTUP_NORMAL not in first_stderr.splitlines():
+        fail(f"serve --data rsia.sqlite3 did not report its startup posture: {first_stderr!r}")
+
+    # 3. No --data at all: the default is the same bare file name.
+    default = start_directory("bare-default")
+    process = start_serve(default, port + 2)
+    try:
+        wait_serving(process, port + 2, "serve (default --data)")
+        require_data_files(default, "serve (default --data)")
+    finally:
+        default_stderr = stop(process)
+    if STARTUP_NORMAL not in default_stderr.splitlines():
+        fail(f"serve (default --data) did not report its startup posture: {default_stderr!r}")
+
+    # 4. `mcp` with a bare file name and with the default, each in a fresh
+    #    directory. An MCP server whose stdin ends before `initialize` exits
+    #    through the handshake error (exit 1, with an absolute --data as well);
+    #    anything else is a failed start. stdout is the JSON-RPC channel and
+    #    stays empty.
+    for label, data_args, name in (
+        ("mcp --data rsia.sqlite3", ("--data", "rsia.sqlite3"), "bare-mcp-explicit"),
+        ("mcp (default --data)", (), "bare-mcp-default"),
+    ):
+        directory = start_directory(name)
+        started = subprocess.run(
+            [str(binary), "mcp", "--namespace", "smoke", *data_args],
+            input="", capture_output=True, text=True, timeout=30, cwd=directory,
+        )
+        if started.returncode != 0 and "connection closed: initialize request" not in started.stderr:
+            fail(f"{label} did not start: exit={started.returncode} stderr={started.stderr!r}")
+        if started.stdout:
+            fail(f"{label} wrote to stdout before any request: {started.stdout!r}")
+        if STARTUP_NORMAL not in started.stderr.splitlines():
+            fail(f"{label} did not report its startup posture: {started.stderr!r}")
+        require_data_files(directory, label)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print("usage: smoke_cli.py <rsia-binary>", file=sys.stderr)
@@ -1034,6 +1137,7 @@ def main(argv: list[str]) -> int:
             smoke_http(binary, root)
             smoke_mcp(binary, root)
             smoke_mcp_duplicate(binary, root)
+            smoke_bare_data_path(binary, root)
             smoke_recovery_gate(binary, root)
             smoke_restore_admission(binary, root)
     except Exception as error:
