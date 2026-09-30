@@ -17,9 +17,9 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | AG-006 / #48 E16.5 | verified（容量/恢复/部署门纯函数子范围），已合并 | F07 返修不成立→主控返修 F10–F12（环境变量顶替布尔、整库读取只查头、曝光计数/撤销来源可回退）；重新堆叠到 main | `4980aa498baa80fd82e83441839e606859fa4065` |
 | AG-008 / #50 E17 | verified（关闭/拒绝子范围），已合并 | 关闭/拒绝子范围重新堆叠到 main 复测 | `e94042d3f2fd761455727a6c82ad13fd3d657d03` |
 | AG-009 / #51 E18 | verified（关闭/拒绝子范围），已合并 | 同上，堆叠于 #50 之上 | `bef7bd1763a01ccb677ada4acad71a063366539c` |
-| CP-002 / #53 | 返修已推送 `56f8644`，未合并 | HANDOFF 4.3 六个漏检：5 个结构性驳回，第 6 个（无冲突的伪造 merged_sha）无 git 不可驳回，显式列入 needs_verification；9/22 预审 2 个反例原件缺失 | null |
-| AG-007 / #49 E16.6 | 待 E16 链落定后更新索引 | 索引状态描述仍为旧链；引用文件在 main 均存在 | null |
-| AG-003 / #45、AG-004 / #46 | 被 #54 取代 | 关闭须经用户确认 | null |
+| CP-002 / #53 → #57 | verified（只读结构检查器子范围），已合并 | HANDOFF 4.3 六个漏检：5 个结构性驳回，第 6 个（无冲突的伪造 merged_sha）无 git 不可驳回，显式列入 needs_verification；9/22 预审 2 个反例原件缺失。#53 因 base 分支被 GitHub 自动删除而关闭，同一提交重叠到 main 后以 #57 合并 | `7b425fcf4da08b8949aaa8f3426853f8938d3f3c` |
+| AG-007 / #49 → #56 E16.6 | verified（派生索引结构与合并事实映射子范围），已合并 | #49 源提交重叠到 main，索引按本轮合并事实更新（7 条主控记录、pr_state、implementation_files、状态与台账对齐）；#49 因 base 分支被自动删除而关闭，以 #56 合并；support_scope 10 通过、CP-002 检查器 structure_valid | `364a0722be7d5b05cbf01c453322ba35c2fdfa67` |
+| AG-003 / #45、AG-004 / #46 | 被 #54 取代，已由用户关闭 | — | null |
 
 ### AG-011 / E16.2+E16.3 持久 staging、内置种子与本地导出交付（实施方交付记录）
 
@@ -80,6 +80,8 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 - 主控复跑：40 单测、真实清单 structure_valid=true、6 反例 5 驳回（`s2-pr53-ctrl.log`）。9/22 预审的 2 个反例原件在旧机，未复核。结论：返修完成、未验收合并；base 仍为 #49 分支，等 E16 链落定。
 
 合并（用户在本机终端按主控固定的 head 执行，主控本机审查器拒绝合并动作）：#44 `acda318`（树 = b6861a7）、#54 `16c2817`（树 = c57397f）、#47 `1c824e6`、#48 `4980aa4`、#50 `e94042d`、#51 `bef7bd1`；主控逐一核对每个合并提交的非台账源码与已验 head 逐文件一致（`s2-controller-notes.md`）。合并后 main `bef7bd1763a01ccb677ada4acad71a063366539c` 收口：workspace 47 个测试二进制 486 通过 / 0 失败，clippy `-D warnings`、fmt、build 均 exit 0，定向 E16.x/E17/E18 套件 104 + 26 通过（`s2-main-*.log`）。发现 `scripts/smoke_cli.py` 在 main 上确定性失败（HTTP 400）：自 AG-001 `f9500d9`（#43，2026-09-19）起 `replay.run` 改为完整 `ReplayRunRequest`，E07 期的 smoke 载荷与"blocked"断言已过时；与本轮合并无关，本轮未修改，列为待办（更新 smoke 或裁定 E07 smoke 作废）。
+
+收尾（2026-09-30 末）：台账 PR #55 merged_sha `243c6a5e44854c28c01b6911ea8ad5fe4585ae35`；#56（E16.6 索引，取代 #49）merged_sha `364a0722be7d5b05cbf01c453322ba35c2fdfa67`；#57（CP-002 检查器，取代 #53）merged_sha `7b425fcf4da08b8949aaa8f3426853f8938d3f3c`；main `7b425fcf4da08b8949aaa8f3426853f8938d3f3c` 上 support_scope 10 通过、检查器 structure_valid、40 单测通过。#49/#53 均因 GitHub 在合并后自动删除 base 分支而被关闭，替代 PR 使用同一提交内容（脚本/索引逐字节一致）。已合并与已关闭 PR 的远端/本地分支全部删除；本地只剩主工作树。
 
 ## 2026-09-19 主控独立验收与合并结论（历史，已被 2026-09-30 第二轮取代）
 
@@ -169,7 +171,7 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 | E16.3 | 内置种子与本地修改保护 | in_progress（持久种子安装/重置 staging 子范围已verified并合并） | PR #54 取代 #46，merged_sha `16c2817bc192bf71535d2c99d867873e6e85bcf8`；真实用户目录演练未验。 |
 | E16.4 | 额外真实宿主与配置面漂移 | in_progress（拒绝门/记录重载子范围已verified并合并）/ blocked（真实宿主） | PR #47 重新堆叠后 merged_sha `1c824e6614667da4dc7ea74e96b46adfd1d2c089`（含主控 F21）；无真实 Claude Code 证据，`verify_host_receipt` 在本仓库无接受路径（fail-closed）。 |
 | E16.5 | 持久恢复、容量、依赖与部署安全 | in_progress（门函数子范围已verified并合并）/ blocked（未接运行入口） | PR #48 重新堆叠后 merged_sha `4980aa498baa80fd82e83441839e606859fa4065`（主控返修 F10–F12）；容量/恢复门未接入 dispatch/prepare，无真实沙箱。 |
-| E16.6 | 发行、证据台账与唯一真源交接 | implemented_not_verified | PR #49 待重新堆叠到 main 并按本轮合并事实更新索引（含 pr_state）；#53 检查器返修已推送，随 #49 重堆叠。 |
+| E16.6 | 发行、证据台账与唯一真源交接 | in_progress（派生索引与检查器子范围已verified并合并） | #56 merged_sha `364a0722be7d5b05cbf01c453322ba35c2fdfa67`、#57 merged_sha `7b425fcf4da08b8949aaa8f3426853f8938d3f3c`；索引仍声明 subset_only，全路线未完成；真源缺席，依台账记录范围验证。 |
 | E17 | 可选：开发代理评分器演化 | in_progress（关闭/拒绝子范围已verified并合并） | PR #50 重新堆叠后 merged_sha `e94042d3f2fd761455727a6c82ad13fd3d657d03`（主控硬化 F22）；默认关闭，不代表真实扩展运行通过。 |
 | E18 | 可选：自动提出代码修改，不自动部署 | in_progress（关闭/拒绝子范围已verified并合并） | PR #51 重新堆叠后 merged_sha `bef7bd1763a01ccb677ada4acad71a063366539c`（主控硬化 F23）；默认关闭，不代表真实扩展运行通过。 |
 
@@ -559,11 +561,11 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 
 - 任务号：AG-007
 - E 归属：E16.6
-- 状态：`implemented_not_verified`（待主控独立验收；Antigravity 不得标记 verified 或填写 merged_sha）
+- 状态：`verified`（派生索引结构与合并事实映射子范围；2026-09-30 重叠到 main 并更新后以 PR #56 合并）
 - base 分支：`wrokbot/ag-006-e16-5-capacity-recovery`
 - head 分支：`wrokbot/ag-007-e16-6-release-ledger`
 - PR：[PR #49](https://github.com/acosmi/RSIAgent/pull/49)
-- merged_sha: null
+- merged_sha: `364a0722be7d5b05cbf01c453322ba35c2fdfa67`（PR #56，取代因 base 分支删除而关闭的 #49）
 
 依据与合同：严格依循 v4.1 第一真源 SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，落实 §1.4、§11.2、§13.1 E16.6 及 V071, V072, V073, V074, V080, V098 场景族。
 文件白名单修改：
