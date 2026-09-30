@@ -241,7 +241,7 @@ impl Fixture {
         anchor
     }
 
-    /// Evaluate, admit and return the admission record's path.
+    /// Evaluate against the live anchor and admit, as the service does.
     async fn admit(&self) {
         let decision = self.anchored().evaluate().await.unwrap();
         assert_eq!(decision.posture(), RecoveryPosture::RestoredVerified);
