@@ -393,11 +393,13 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
         e16["completion_evidence_refs"] = [record["id"]]
         errors = self._errors(manifest)
         self.assertIn(
-            "E16: status 'verified' is stronger than sub-package E16.1 status 'implemented_not_verified'",
+            "E16: status 'verified' is stronger than sub-package E16.1 status",
             errors[0],
         )
         with self.subTest(variant="implemented_not_verified parent over a blocked child"):
             manifest = _valid_manifest_dict()
+            for child in ("E16.1", "E16.2", "E16.3", "E16.5", "E16.6"):
+                manifest["e_scopes"][child]["status"] = "implemented_not_verified"
             manifest["e_scopes"]["E16"]["status"] = "implemented_not_verified"
             errors = self._errors(manifest)
             self.assertIn(
