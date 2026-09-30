@@ -1,0 +1,3 @@
+{"role":"user","kind":"chat","content":"implement feature x"}
+{"role":"assistant","kind":"thought","content":"analyzing codebase"}
+{"role":"user","kind":"tool_result","content":"test passed"}

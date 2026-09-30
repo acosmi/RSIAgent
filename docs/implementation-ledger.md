@@ -331,7 +331,7 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 4. `crates/evo-engine/tests/import_v41.rs`: 新增集成测试套件，全面覆盖 V005, V006, V017, V051, V052, V053, V054, V055, V056, V076, V087, V090, V098 全部 13 项场景族。
 
 自测证据（全部 exit 0）：
-- `cargo test --locked --offline -p evo-engine --test import_v41`: 13 项全部通过。
+- `cargo test --locked --offline -p evo-engine --test import_v41`: 18 项全部通过（含主控审阅缺陷 F01 未知版本拒绝/不根据用户文本瞎猜、F02 UTF-8 边界安全切片截断、F03 原始字节摘录与无损往返提取等 5 项对抗回归测试）。
 - `cargo test --locked --offline -p evo-engine --lib import::tests`: 3 项全部通过。
 - `cargo test --locked --offline -p evo-core --lib evidence::tests`: 8 项全部通过。
 - `cargo test --locked --offline -p evo-engine --test dispatch_management --test replay_v41`: 13 + 13 = 26 项回归通过。
@@ -339,11 +339,30 @@ AG-001归属E10，仅接通既有replay.run管理消费者；从最新交接基�
 - `cargo clippy --locked --offline -p evo-core -p evo-engine --all-targets -- -D warnings`: 检查通过，无 warning。
 - `cargo fmt --all -- --check`: 格式化检查通过。
 
+主控审阅缺陷整改记录（PR #44）：
+- **F01（未知版本/格式探测拒绝）**：重构 `detect_format_from_bytes`，采用结构化 JSON 探测检查 `schema_version`/`format`，未知版本（如 `rsia.trace.v999`、`unknown.v99`）一律报错拒绝，不再依据用户正文包含的 `"role":"user"` 臆断为 Claude；`parse_rsia_trace`/`parse_rsih_pi`/`parse_claude_fixture` 同步严格校验版本。
+- **F02（UTF-8 边界安全截断）**：`detect_format_from_bytes` 与 `ingest_imported_sources` 中的长度截断全部增加 `is_char_boundary` 安全校验，防止在多字节 UTF-8 字符（如中文 `'中'`）内部切片引发 panic。
+- **F03（原始字节定位器往返提取）**：在流式 JSON 解析时精准记录事件在 `raw_bytes` 中的原始字节跨度 `[byte_start..byte_end]`，`EvidenceLocator::build` 直接基于原始切片计算 `excerpt_digest`，确保 `locator.verify_and_extract(body)` 零差错准确提取原始切片。
+
 未完成项与边界：
 - E16.2–E16.6、E14、E15 仍为 planned；
 - 导入数据没有可信执行证明（`UnverifiedImport`），绝不伪造 `AppliedReceipt` 或晋升为 `TrustedHost`；
 - Codex 及其他未列产品明确为 unsupported，不猜测其格式；
 - 真实外部模型调用预算仍为 0。
+
+
+
+### CTRL-E16.1-R2 / 原PR #44：持久导入与必要存储的独立验收子范围
+
+- 归属原AG-002/E16.1，仍使用 [PR #44](https://github.com/acosmi/RSIAgent/pull/44)，保持草稿未合并；`merged_sha: null`。
+- 唯一真源：`plan_version: v4.1`；`plan_sha256: 45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`。固定基线 `0cd4d9e6a57e6b7a0b48386a59e54deef1fa4d77`；已测源码 `source_sha: af9888e091b8c707a2067cc0adbc864efd5187fe`；本地输入 `out/controller-final-e16-20260919/pr44-final-input.json`，SHA-256 `6340e771fb3ef7a0d375d6d1487ba5c00a8e8eeef74da72c2c0025192934421b`。提交前后全部9文件逐一重算一致。
+- 实现：严格结构化/版本化读取、UTF-8原始事件locator和累计摘录界限；真实Admin SourceSelection注册、Prepared→注册blob安全发布→持久结果/证据摘要，重启读取、同key幂等与异体拒绝；内容副本/已知共同谱系不增加独立簇，生成消费者要求两个独立簇。
+- 大于1MiB的合法历史源仍支持真源64MiB总读取预算；10,000事件按真实持久结果原子求和，缺失/NULL/错误类型不得当0。源2撤销阻断selection/result后继、清理实际raw blob；共享blob保留到最后活来源撤销。恢复沿原E08独立当前库锚重放artifact tombstone，不另建权威/费用账本。
+- 本PR仅带import所需存储/清理/恢复原语：registered blob静态门只接受import_source/raw_blob_digest；未混入资产/seed/export消费者或PR48的run/prepare/Skill业务容量门。未删除原基线断言；其他子包新增断言保留在各自交付队列。
+- 主控亲自运行99项：engine import28＋optimization7；storage全套56；core evidence8，全部exit 0；storage+engine all-target clippy `-D warnings`、workspace格式检查exit 0。统一环境 `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`，Cargo均 `--locked --offline`。
+- 原始QA仅本地：`out/controller-final-e16-20260919/pr44-final-[0-4].log`，命令/退出码 `pr44-final-results.json`。未上传方案或原始QA，未执行xtask ci、Actions、付费调用、发布或main合并。
+- 通过范围：上述三种固定reader的程序/持久证据消费与撤销恢复子范围。E16.1完整真实迁移链仍未关闭：ImportedHistory/UnverifiedImport不产生可信run、AppliedReceipt、FormalEvaluation或Active；实际候选生成/独立验收/新run使用仍依赖未齐的E03/E04/E05事实，管理wire扩展也未在本包冒称完成。
+- 风险/回滚：仅支持冻结格式与限额，不保证全部第三方版本；关闭新导入并经独立回退PR撤回该子范围，保留已发生费用、撤销和审计事实；回滚输入为上述原PR head。
 
 ### AG-003 / E16.2 资产导入/导出、隐私门禁与不可信元数据隔离实施与自测
 
