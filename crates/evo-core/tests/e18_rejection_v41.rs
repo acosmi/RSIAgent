@@ -1,3 +1,5 @@
+//! Integration test suite for E18: Automatic Code PR Rejection Paths (V041).
+use evo_core::Error;
 use evo_core::features::{
     CodePatchProposal, MAX_CODE_PATCH_DIFF_BYTES, enable_automatic_code_prs,
     is_protected_code_path, validate_e18_code_pr_gates,
@@ -269,4 +271,146 @@ fn test_e18_valid_proposal_still_rejected_by_default_disabled_extension() {
     // Passes all structural gates, but fails because E18 extension is strictly disabled
     let err = validate_e18_code_pr_gates(&proposal).unwrap_err();
     assert!(err.to_string().contains("E18 remains disabled"));
+}
+
+// ---------------------------------------------------------------------------
+// Controller F23 regressions. Protected path families, blank approval tokens
+// and empty file lists must be caught BY THE V041 GATE itself (defense in
+// depth), not merely by the always-on "E18 remains disabled" flag that runs last.
+// ---------------------------------------------------------------------------
+
+fn f23_base() -> CodePatchProposal {
+    CodePatchProposal {
+        candidate_id: "cand_f23".into(),
+        target_repo: "acosmi/RSIAgent".into(),
+        modified_files: vec!["crates/evo-engine/src/worker.rs".into()],
+        has_dependency_changes: false,
+        has_build_script_changes: false,
+        auto_merge: false,
+        auto_deploy: false,
+        isolated_sandbox: true,
+        human_approval_token: Some("human_token_f23".into()),
+        diff_bytes: 1024,
+    }
+}
+
+/// Container, CI, toolchain and build-configuration families; whitespace /
+/// control-character decorated names; trailing-slash and empty paths; renamed
+/// build scripts.
+const F23_PROTECTED_PATH_FAMILIES: &[&str] = &[
+    "Dockerfile.dev",
+    "Dockerfile.prod",
+    "dev.Dockerfile",
+    "docker-compose.yml",
+    "deploy/docker-compose.override.yaml",
+    ".cargo/config.toml",
+    "crates/x/.cargo/config",
+    "rust-toolchain.toml",
+    "rust-toolchain",
+    ".github/workflows/ci.yml",
+    ".github/CODEOWNERS",
+    "Makefile.in",
+    "makefile.am",
+    "Cargo.toml ",
+    " Cargo.toml",
+    "Cargo.toml\n",
+    "Cargo.toml\t",
+    "Cargo\0.toml",
+    "Cargo.toml/",
+    "crates/evo-core/",
+    "",
+    "build.rs.disabled",
+    "crates/x/build.rs.bak",
+];
+
+#[test]
+fn f23_protected_path_families_classified_as_protected() {
+    let accepted: Vec<&str> = F23_PROTECTED_PATH_FAMILIES
+        .iter()
+        .copied()
+        .filter(|p| !is_protected_code_path(p))
+        .collect();
+    assert!(
+        accepted.is_empty(),
+        "paths NOT classified as protected by is_protected_code_path: {:?}",
+        accepted
+    );
+}
+
+#[test]
+fn f23_ordinary_paths_not_protected() {
+    for path in [
+        "crates/evo-core/src/lib.rs",
+        "docs/guide.md",
+        "src/docker_client.rs",
+    ] {
+        assert!(
+            !is_protected_code_path(path),
+            "ordinary path wrongly classified as protected: {:?}",
+            path
+        );
+    }
+}
+
+#[test]
+fn f23_protected_path_families_rejected_by_protected_file_gate() {
+    let mut missed = Vec::new();
+    for path in F23_PROTECTED_PATH_FAMILIES {
+        let mut p = f23_base();
+        p.modified_files = vec!["crates/evo-engine/src/worker.rs".into(), (*path).into()];
+        let res = validate_e18_code_pr_gates(&p);
+        let by_gate =
+            matches!(&res, Err(Error::Invalid(m)) if m.contains("cannot modify protected"));
+        if !by_gate {
+            missed.push(format!("  path={:?} observed={:?}", path, res));
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "protected path families NOT caught by V041 gate 1:\n{}",
+        missed.join("\n")
+    );
+}
+
+#[test]
+fn f23_blank_approval_token_rejected_by_approval_gate() {
+    let mut missed = Vec::new();
+    for token in ["", " ", "   ", "\t\n ", "\u{a0}"] {
+        let mut p = f23_base();
+        p.human_approval_token = Some(token.into());
+        let res = validate_e18_code_pr_gates(&p);
+        let by_gate = matches!(&res, Err(Error::Invalid(m)) if m.contains("requires human review approval token"));
+        if !by_gate {
+            missed.push(format!("  token={:?} observed={:?}", token, res));
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "blank approval tokens NOT caught by V041 gate 7:\n{}",
+        missed.join("\n")
+    );
+}
+
+#[test]
+fn f23_empty_modified_files_rejected_by_file_list_gate() {
+    let mut p = f23_base();
+    p.modified_files = vec![];
+    let res = validate_e18_code_pr_gates(&p);
+    assert!(
+        matches!(&res, Err(Error::Invalid(m)) if m.contains("a code PR proposal must name at least one modified file")),
+        "observed={:?}",
+        res
+    );
+}
+
+#[test]
+fn f23_ordinary_proposal_passes_gates_but_e18_stays_disabled() {
+    // Positive control: the hardened gates must not over-reject an ordinary
+    // proposal, which must still end at the default-disabled flag.
+    let res = validate_e18_code_pr_gates(&f23_base());
+    assert!(
+        matches!(&res, Err(Error::Invalid(m)) if m.contains("E18 remains disabled")),
+        "observed={:?}",
+        res
+    );
 }

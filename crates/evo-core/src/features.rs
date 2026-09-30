@@ -144,6 +144,13 @@ pub struct CodePatchProposal {
 }
 
 pub fn is_protected_code_path(path: &str) -> bool {
+    // Malformed or decorated paths are never accepted: empty, containing control
+    // characters (newline, tab, NUL, ...) or carrying leading / trailing
+    // whitespace that would slip a protected name past an exact-name check.
+    if path.is_empty() || path.chars().any(char::is_control) || path != path.trim() {
+        return true;
+    }
+
     let lower = path.to_ascii_lowercase();
     let normalized = lower.replace('\\', "/");
 
@@ -157,14 +164,35 @@ pub fn is_protected_code_path(path: &str) -> bool {
         return true;
     }
 
-    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    // Cargo and GitHub configuration trees (`.cargo/config.toml`,
+    // `.github/workflows/ci.yml`, ...) at any depth
+    if normalized
+        .split('/')
+        .any(|component| component == ".cargo" || component == ".github")
+    {
+        return true;
+    }
 
-    // Build, lock & packaging files
+    // An empty file name (trailing slash) never names a modifiable file
+    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if file_name.is_empty() {
+        return true;
+    }
+
+    // Build, lock, packaging, container, CI and toolchain configuration files,
+    // including prefixed / suffixed variants (`Dockerfile.dev`, `dev.Dockerfile`,
+    // `docker-compose.yml`, `Makefile.in`, `rust-toolchain.toml`, `build.rs.disabled`)
     if file_name == "cargo.toml"
         || file_name == "cargo.lock"
         || file_name == "build.rs"
         || file_name == "makefile"
         || file_name == "dockerfile"
+        || file_name.starts_with("dockerfile")
+        || file_name.ends_with(".dockerfile")
+        || file_name.contains("docker-compose")
+        || file_name.starts_with("makefile")
+        || file_name.starts_with("rust-toolchain")
+        || file_name.starts_with("build.rs")
     {
         return true;
     }
@@ -214,7 +242,12 @@ pub fn validate_e18_code_pr_gates(proposal: &CodePatchProposal) -> Result<()> {
         return Err(Error::Invalid("target_repo cannot be empty".into()));
     }
 
-    // 1. Modifying protected files is forbidden
+    // 1. A proposal must name what it touches, and modifying protected files is forbidden
+    if proposal.modified_files.is_empty() {
+        return Err(Error::Invalid(
+            "V041 rejected: a code PR proposal must name at least one modified file".into(),
+        ));
+    }
     for file in &proposal.modified_files {
         if is_protected_code_path(file) {
             return Err(Error::Invalid(format!(
@@ -261,8 +294,13 @@ pub fn validate_e18_code_pr_gates(proposal: &CodePatchProposal) -> Result<()> {
         ));
     }
 
-    // 7. Human approval token is mandatory
-    if proposal.human_approval_token.is_none() {
+    // 7. Human approval token is mandatory and must carry content: `None`,
+    //    `Some("")` and whitespace-only tokens are all rejected.
+    let has_approval_token = proposal
+        .human_approval_token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty());
+    if !has_approval_token {
         return Err(Error::Invalid(
             "V041 rejected: code PR creation requires human review approval token".into(),
         ));
