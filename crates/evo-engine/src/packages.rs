@@ -1475,10 +1475,7 @@ impl PersistentPackageStore {
         } else {
             // E16.5: a new staged asset is a new derivation. Measure and refuse
             // inside this session so the count and the insert cannot race.
-            let usage: V41CapacityUsage = session
-                .capacity_usage_v41(ctx, unix_now_secs())
-                .await?
-                .into();
+            let usage: V41CapacityUsage = session.capacity_usage_v41(unix_now_secs()).await?.into();
             admit_field(
                 CapacityField::StagedPackages,
                 usage.staged_packages,

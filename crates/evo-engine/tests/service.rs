@@ -540,7 +540,7 @@ async fn prepare_refuses_the_run_past_mvp_capacity_and_writes_nothing() {
             .unwrap();
     }
     assert_eq!(
-        session.capacity_usage_v41(&agent, 0).await.unwrap().runs,
+        session.capacity_usage_v41(0).await.unwrap().runs,
         MAX_RUNS - 1
     );
     session.commit().await.unwrap();
@@ -555,10 +555,7 @@ async fn prepare_refuses_the_run_past_mvp_capacity_and_writes_nothing() {
         .await
         .unwrap();
     let mut session = service.store().session().await.unwrap();
-    assert_eq!(
-        session.capacity_usage_v41(&agent, 0).await.unwrap().runs,
-        MAX_RUNS
-    );
+    assert_eq!(session.capacity_usage_v41(0).await.unwrap().runs, MAX_RUNS);
     let artifacts_before = session
         .namespace_object_count(&agent, "artifact")
         .await
@@ -594,10 +591,7 @@ async fn prepare_refuses_the_run_past_mvp_capacity_and_writes_nothing() {
             .unwrap(),
         artifacts_before
     );
-    assert_eq!(
-        session.capacity_usage_v41(&agent, 0).await.unwrap().runs,
-        MAX_RUNS
-    );
+    assert_eq!(session.capacity_usage_v41(0).await.unwrap().runs, MAX_RUNS);
     session.commit().await.unwrap();
     assert_eq!(
         service.store().verify_audit(&admin).await.unwrap(),
@@ -615,6 +609,56 @@ async fn prepare_refuses_the_run_past_mvp_capacity_and_writes_nothing() {
         .await
         .unwrap();
     assert_eq!(replay.run.id, admitted.run.id);
+}
+
+/// F24: the run cap is per instance, not per namespace. Runs held by another
+/// tenant refuse a new prepare in this tenant, and nothing is written for it.
+#[tokio::test]
+async fn prepare_run_capacity_cannot_be_split_across_namespaces() {
+    let (_dir, service, _host, config) = setup().await;
+    let agent = context("agent-a", Role::Agent);
+    let other_tenant = Context::new("tenant-b", "agent-b", Role::Agent).unwrap();
+    let mut session = service.store().session().await.unwrap();
+    for index in 0..MAX_RUNS {
+        let id = format!("other-tenant-run-{index:04}");
+        let mut run = seed_run(&id);
+        run.owner = "agent-b".into();
+        session
+            .put(&other_tenant, "artifact", &id, "agent-b", &run)
+            .await
+            .unwrap();
+    }
+    assert_eq!(session.capacity_usage_v41(0).await.unwrap().runs, MAX_RUNS);
+    let artifacts_before = session
+        .namespace_object_count(&agent, "artifact")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    match service
+        .prepare(
+            &agent,
+            prepare_request("split-run", "run in another tenant"),
+            &config,
+        )
+        .await
+    {
+        Err(Error::Conflict(msg)) => assert_eq!(
+            msg,
+            format!("MVP capacity exceeded: runs {MAX_RUNS} >= limit {MAX_RUNS}")
+        ),
+        other => panic!("expected the MVP runs conflict, got {other:?}"),
+    }
+    let mut session = service.store().session().await.unwrap();
+    assert_eq!(
+        session
+            .namespace_object_count(&agent, "artifact")
+            .await
+            .unwrap(),
+        artifacts_before
+    );
+    assert_eq!(session.capacity_usage_v41(0).await.unwrap().runs, MAX_RUNS);
+    session.commit().await.unwrap();
+    assert_eq!(service.inflight_prepare(), 0);
 }
 
 #[tokio::test]

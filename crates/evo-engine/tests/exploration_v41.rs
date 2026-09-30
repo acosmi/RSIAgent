@@ -1140,7 +1140,7 @@ async fn run_next_refuses_a_new_node_at_capacity_before_any_model_call() {
     let mut session = store.session().await.unwrap();
     assert_eq!(
         session
-            .capacity_usage_v41(&worker, 0)
+            .capacity_usage_v41(0)
             .await
             .unwrap()
             .exploration_nodes,
@@ -1367,7 +1367,7 @@ async fn run_next_refuses_a_new_node_at_capacity_before_any_model_call() {
     let mut session = store.session().await.unwrap();
     assert_eq!(
         session
-            .capacity_usage_v41(&worker, 0)
+            .capacity_usage_v41(0)
             .await
             .unwrap()
             .exploration_nodes,

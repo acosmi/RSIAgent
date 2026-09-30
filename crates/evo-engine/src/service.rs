@@ -169,14 +169,13 @@ impl HostService {
 
     /// E16.5 / plan §3.3.1: a prepare derives a new run. Refuse it, inside the
     /// caller's session, once any MVP counter (runs, events, skills, other
-    /// in-flight prepares) is at its limit. Nothing is truncated; the caller
-    /// is told which counter to scale or clean up.
-    async fn admit_new_run(&self, session: &mut Session, caller: &Context) -> Result<()> {
+    /// in-flight prepares) is at its limit. Counters are instance-wide (F24):
+    /// a cap reached in any namespace refuses new runs in every namespace.
+    /// Nothing is truncated; the caller is told which counter to scale or
+    /// clean up.
+    async fn admit_new_run(&self, session: &mut Session) -> Result<()> {
         let others_in_flight = self.inflight_prepare().saturating_sub(1);
-        let usage: V41CapacityUsage = session
-            .capacity_usage_v41(caller, unix_now_secs())
-            .await?
-            .into();
+        let usage: V41CapacityUsage = session.capacity_usage_v41(unix_now_secs()).await?.into();
         let usage = usage.with_inflight_prepare(others_in_flight);
         let limits = CapacityLimits::default();
         for field in CapacityField::MVP_DERIVE {
@@ -251,7 +250,7 @@ impl HostService {
             // Idempotent replays above are not new derivations. A miss is:
             // refuse here, before the run snapshot is frozen, so a refused
             // prepare writes nothing at all.
-            self.admit_new_run(&mut session, caller).await?;
+            self.admit_new_run(&mut session).await?;
             session.commit().await?;
         }
 
@@ -344,7 +343,7 @@ impl HostService {
             // Service runs live in the artifact kind, so `Session::put`'s run
             // bound does not see them: re-admit in the session that inserts
             // the run, which is the authoritative count-then-insert.
-            self.admit_new_run(&mut session, caller).await?;
+            self.admit_new_run(&mut session).await?;
             session
                 .put(
                     caller,

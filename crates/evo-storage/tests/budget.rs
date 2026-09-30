@@ -1064,11 +1064,7 @@ async fn eleventh_live_lease_is_refused_and_released_or_expired_leases_do_not_co
     assert_eq!(root.unwrap().reserved_micros, 100);
     let mut session = store.session().await.unwrap();
     assert_eq!(
-        session
-            .capacity_usage_v41(&worker, 2)
-            .await
-            .unwrap()
-            .active_leases,
+        session.capacity_usage_v41(2).await.unwrap().active_leases,
         10
     );
     session.commit().await.unwrap();
@@ -1106,9 +1102,53 @@ async fn eleventh_live_lease_is_refused_and_released_or_expired_leases_do_not_co
         .unwrap();
     assert_eq!(after_expiry.state, BudgetCallState::Reserved);
     let mut session = store.session().await.unwrap();
-    let usage = session.capacity_usage_v41(&worker, 4).await.unwrap();
+    let usage = session.capacity_usage_v41(4).await.unwrap();
     assert_eq!(usage.active_leases, 11);
-    let usage = session.capacity_usage_v41(&worker, 500).await.unwrap();
+    let usage = session.capacity_usage_v41(500).await.unwrap();
     assert_eq!(usage.active_leases, 1);
+    session.commit().await.unwrap();
+}
+
+/// F24: the lease cap is per instance. Ten live leases taken from ns-a refuse
+/// the eleventh lease from ns-b on the same shared billing scope.
+#[tokio::test]
+async fn lease_capacity_cannot_be_split_across_namespaces() {
+    let (_dir, store) = store().await;
+    let admin = ctx("ns-a", "admin", Role::Admin);
+    let worker_a = ctx("ns-a", "worker-a", Role::Worker);
+    let worker_b = ctx("ns-b", "worker-b", Role::Worker);
+    store
+        .authorize_root_budget(&admin, &authorization("root-1", "scope-1"))
+        .await
+        .unwrap();
+    for index in 0..evo_storage::MVP_MAX_ACTIVE_LEASES {
+        store
+            .reserve_budget_call(&worker_a, &reservation(&format!("split-a-{index}"), 10, 1))
+            .await
+            .unwrap();
+    }
+    match store
+        .reserve_budget_call(&worker_b, &reservation("split-b", 10, 2))
+        .await
+    {
+        Err(Error::Conflict(msg)) => {
+            assert_eq!(msg, "MVP capacity exceeded: active leases 10 >= limit 10")
+        }
+        other => panic!("ns-b must not get an eleventh lease, got {other:?}"),
+    }
+    assert!(
+        store
+            .budget_call(&worker_b, "scope-1", "split-b")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let root = store.root_budget(&admin, "scope-1").await.unwrap().unwrap();
+    assert_eq!(root.reserved_micros, 100);
+    let mut session = store.session().await.unwrap();
+    assert_eq!(
+        session.capacity_usage_v41(2).await.unwrap().active_leases,
+        10
+    );
     session.commit().await.unwrap();
 }

@@ -1864,6 +1864,61 @@ async fn second_management_dispatch_waits_queued_until_the_live_lease_finishes()
     assert_eq!(untouched.state, ManagementJobState::Succeeded);
 }
 
+/// F24: the one concurrent management dispatch is per instance. A live lease
+/// held by a job in ns-a defers a claim in ns-b until that lease is released.
+#[tokio::test]
+async fn management_dispatch_capacity_cannot_be_split_across_namespaces() {
+    let (_dir, store) = store().await;
+    let admin_a = Context::new("ns-a", "admin", Role::Admin).unwrap();
+    let admin_b = Context::new("ns-b", "admin", Role::Admin).unwrap();
+    let holding = live_running_job();
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin_a, "job", &holding.id, admin_a.actor(), &holding)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin_b.clone()]).unwrap();
+    let queued = dispatcher
+        .submit(
+            &admin_b,
+            "meta.start",
+            json!({
+                "schema_version":"rsia.management.meta_start.v1",
+                "request_key":"waits-behind-another-namespace"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.state, ManagementJobState::Queued);
+    assert_waiting_for_capacity(&dispatcher, &admin_b, &queued.id).await;
+
+    let mut finished = holding.clone();
+    finished.state = ManagementJobState::Succeeded;
+    finished.step = "finished".into();
+    finished.lease_token = None;
+    finished.lease_until = 0;
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin_a, "job", &finished.id, admin_a.actor(), &finished)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let done = wait_terminal_slowly(&dispatcher, &admin_b, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Blocked);
+    assert_eq!(
+        done.error_code.as_deref(),
+        Some("meta.start_consumer_unavailable")
+    );
+    assert_eq!(done.generation, 1);
+    assert_eq!(done.diagnostics.len(), 1);
+    // ns-b never saw the ns-a job as content; only its lease counted.
+    assert!(matches!(
+        dispatcher.status(&admin_b, &holding.id).await,
+        Err(Error::NotFound)
+    ));
+}
+
 #[tokio::test]
 async fn capacity_deferred_job_can_still_be_cancelled_while_queued() {
     let (_dir, store) = store().await;

@@ -2192,12 +2192,12 @@ async fn f17_live_staged_asset_still_keeps_shared_projection_blob_beside_aborted
 // E16.5 AG-014: staged package capacity at the stage entry point
 // ---------------------------------------------------------------------------
 
-fn seeded_staged_asset(index: u64, state: &str) -> serde_json::Value {
+fn seeded_staged_asset(owner: &Context, index: u64, state: &str) -> serde_json::Value {
     serde_json::json!({
         "schema_version": E16_STAGED_ASSET_SCHEMA,
         "id": format!("seed-staged-asset-{index:03}"),
-        "namespace": "n",
-        "owner_actor": "admin",
+        "namespace": owner.namespace(),
+        "owner_actor": owner.actor(),
         "request_key": format!("seed-{index}"),
         "input_digest": hash(format!("seed-{index}").as_bytes()),
         "created_at": 1,
@@ -2210,7 +2210,7 @@ fn seeded_staged_asset(index: u64, state: &str) -> serde_json::Value {
 
 async fn put_seeded_staged_asset(store: &Store, admin: &Context, index: u64, state: &str) {
     let mut session = store.session().await.unwrap();
-    let body = seeded_staged_asset(index, state);
+    let body = seeded_staged_asset(admin, index, state);
     session
         .put(
             admin,
@@ -2226,17 +2226,44 @@ async fn put_seeded_staged_asset(store: &Store, admin: &Context, index: u64, sta
 
 async fn staged_package_usage(store: &Store, admin: &Context) -> (u64, u64) {
     let mut session = store.session().await.unwrap();
-    let staged = session
-        .capacity_usage_v41(admin, 0)
-        .await
-        .unwrap()
-        .staged_packages;
+    let staged = session.capacity_usage_v41(0).await.unwrap().staged_packages;
     let artifacts = session
         .namespace_object_count(admin, "artifact")
         .await
         .unwrap();
     session.commit().await.unwrap();
     (staged, artifacts)
+}
+
+/// F24: staged assets held by another namespace fill the same instance cap.
+#[tokio::test]
+async fn staged_package_capacity_cannot_be_split_across_namespaces() {
+    let (_directory, store, admin, sources) = persistent_store().await;
+    let other = Context::new("other", "admin", Role::Admin).unwrap();
+    for index in 0..MAX_STAGED_PACKAGES {
+        put_seeded_staged_asset(&store, &other, index, "staged").await;
+    }
+    let (staged, artifacts) = staged_package_usage(&store, &admin).await;
+    assert_eq!(staged, 20);
+    let files = valid_files();
+    match PersistentPackageStore::stage_package(
+        &admin,
+        &store,
+        persistent_stage_request(
+            "split-stage",
+            manifest_for_files("asset-split", &files),
+            files,
+            sources,
+        ),
+    )
+    .await
+    {
+        Err(Error::Conflict(msg)) => {
+            assert_eq!(msg, "MVP capacity exceeded: staged packages 20 >= limit 20")
+        }
+        other => panic!("expected the MVP staged package conflict, got {other:?}"),
+    }
+    assert_eq!(staged_package_usage(&store, &admin).await, (20, artifacts));
 }
 
 #[tokio::test]

@@ -450,7 +450,7 @@ impl ManagementDispatcher {
             // A refused job stays Queued (retriable): the wait is recorded
             // once on the job and the claim is retried after a short delay.
             let usage: crate::capacity::V41CapacityUsage = session
-                .capacity_usage_v41(trusted, crate::capacity::unix_now_secs())
+                .capacity_usage_v41(crate::capacity::unix_now_secs())
                 .await?
                 .into();
             let limits = crate::capacity::CapacityLimits::default();

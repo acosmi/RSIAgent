@@ -712,10 +712,8 @@ impl PersistentCoordinator {
                 // E16.5: this dispatch derives one new exploration node. Refuse
                 // inside the session, before the dispatch fact and before any
                 // model call, when the namespace already holds the MVP maximum.
-                let usage: V41CapacityUsage = session
-                    .capacity_usage_v41(&self.context, unix_now_secs())
-                    .await?
-                    .into();
+                let usage: V41CapacityUsage =
+                    session.capacity_usage_v41(unix_now_secs()).await?.into();
                 admit_field(
                     CapacityField::ExplorationNodes,
                     usage.exploration_nodes,
