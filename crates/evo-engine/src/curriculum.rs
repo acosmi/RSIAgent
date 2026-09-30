@@ -137,7 +137,54 @@ const ATTEMPT_KIND: &str = "curriculum_proposal_attempt_v1";
 const PROPOSAL_KIND: &str = "structured_test_proposal_v1";
 const VALIDITY_KIND: &str = "curriculum_validity_report_v1";
 const SELECTION_KIND: &str = "curriculum_selection_v1";
+const RECEIPT_KIND: &str = "probe_schedule_receipt_v1";
 const ENVELOPE_SCHEMA: &str = "rsia.curriculum_artifact_envelope.v1";
+
+/// Storage id of a registered curriculum control profile artifact.
+pub fn curriculum_profile_storage_id(profile_id: &str) -> Result<String> {
+    storage_id(PROFILE_KIND, profile_id)
+}
+
+/// Storage id of a persisted learner state artifact.
+pub fn curriculum_state_storage_id(state_id: &str) -> Result<String> {
+    storage_id(STATE_KIND, state_id)
+}
+
+/// Storage id of a persisted coverage probe job artifact.
+pub fn curriculum_probe_job_storage_id(probe_job_id: &str) -> Result<String> {
+    storage_id(JOB_KIND, probe_job_id)
+}
+
+/// Receipt id derived from a management idempotency key.
+pub fn probe_schedule_receipt_id(idempotency_key: &str) -> Result<String> {
+    identifier(idempotency_key)?;
+    Ok(format!(
+        "probe-schedule-{}",
+        &fingerprint(&(RECEIPT_KIND, idempotency_key))?[..24]
+    ))
+}
+
+/// Persisted stage fact binding one management idempotency key to the probe
+/// job it scheduled. A crash re-run reloads this instead of re-triggering the
+/// curriculum consumer, so the learner state is never mutated twice for one
+/// management request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeScheduleReceiptV1 {
+    pub schema_version: String,
+    pub id: String,
+    pub idempotency_key: String,
+    pub profile_id: String,
+    pub state_id: String,
+    pub root_budget_limit_micros: u64,
+    pub probe_job_id: String,
+    pub trigger_digest: String,
+    pub revoke_watermark: u64,
+}
+
+impl ProbeScheduleReceiptV1 {
+    pub const SCHEMA: &'static str = "rsia.probe_schedule_receipt.v1";
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -531,12 +578,131 @@ impl PersistentCurriculumCoordinator {
         root_budget_limit_micros: u64,
     ) -> Result<ProbeJobV1> {
         let mut session = self.store.session().await?;
+        let job = self
+            .schedule_probe_in_session(&mut session, profile_id, state_id, root_budget_limit_micros)
+            .await?;
+        session.commit().await?;
+        Ok(job)
+    }
+
+    /// Schedules at most one probe for `idempotency_key`. The first run
+    /// persists the probe job, the updated learner state, their edges and a
+    /// `ProbeScheduleReceiptV1` in one transaction; every later run with the
+    /// same key and inputs reloads the recorded probe job without touching the
+    /// learner state again (plan §6.7.4: recovery continues from persisted
+    /// stage facts, never from "a file exists").
+    pub async fn schedule_probe_idempotent(
+        &self,
+        idempotency_key: &str,
+        profile_id: &str,
+        state_id: &str,
+        root_budget_limit_micros: u64,
+    ) -> Result<ProbeJobV1> {
+        identifier(profile_id)?;
+        identifier(state_id)?;
+        let receipt_id = probe_schedule_receipt_id(idempotency_key)?;
+        let mut session = self.store.session().await?;
+        if let Some(receipt) = get_record::<ProbeScheduleReceiptV1>(
+            &mut session,
+            &self.context,
+            RECEIPT_KIND,
+            &receipt_id,
+        )
+        .await?
+        {
+            if receipt.schema_version != ProbeScheduleReceiptV1::SCHEMA
+                || receipt.id != receipt_id
+                || receipt.idempotency_key != idempotency_key
+                || receipt.profile_id != profile_id
+                || receipt.state_id != state_id
+                || receipt.root_budget_limit_micros != root_budget_limit_micros
+            {
+                return Err(Error::Conflict(
+                    "probe schedule receipt differs from the request".into(),
+                ));
+            }
+            let job: ProbeJobV1 =
+                get_record(&mut session, &self.context, JOB_KIND, &receipt.probe_job_id)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Conflict(
+                            "probe schedule receipt points at a missing probe job".into(),
+                        )
+                    })?;
+            if job.id != receipt.probe_job_id
+                || job.profile_id != receipt.profile_id
+                || job.state_id != receipt.state_id
+                || job.trigger_digest != receipt.trigger_digest
+                || job.root_budget_limit_micros != receipt.root_budget_limit_micros
+            {
+                return Err(Error::Conflict(
+                    "recorded probe job differs from its schedule receipt".into(),
+                ));
+            }
+            session.commit().await?;
+            return Ok(job);
+        }
+        let job = self
+            .schedule_probe_in_session(&mut session, profile_id, state_id, root_budget_limit_micros)
+            .await?;
+        let revoke_watermark = session
+            .watermark(&self.context)
+            .await?
+            .and_then(|value| u64::try_from(value.0).ok())
+            .ok_or_else(|| Error::Conflict("missing curriculum source watermark".into()))?;
+        let receipt = ProbeScheduleReceiptV1 {
+            schema_version: ProbeScheduleReceiptV1::SCHEMA.into(),
+            id: receipt_id.clone(),
+            idempotency_key: idempotency_key.into(),
+            profile_id: profile_id.into(),
+            state_id: state_id.into(),
+            root_budget_limit_micros,
+            probe_job_id: job.id.clone(),
+            trigger_digest: job.trigger_digest.clone(),
+            revoke_watermark,
+        };
+        put_record(
+            &mut session,
+            &self.context,
+            RECEIPT_KIND,
+            &receipt_id,
+            &self.owner,
+            &receipt,
+        )
+        .await?;
+        let receipt_storage_id = storage_id(RECEIPT_KIND, &receipt_id)?;
+        for dependency in [
+            storage_id(JOB_KIND, &job.id)?,
+            storage_id(STATE_KIND, state_id)?,
+            storage_id(PROFILE_KIND, profile_id)?,
+        ] {
+            session
+                .put_edge(
+                    &self.context,
+                    "artifact",
+                    &receipt_storage_id,
+                    "artifact",
+                    &dependency,
+                )
+                .await?;
+        }
+        session.commit().await?;
+        Ok(job)
+    }
+
+    async fn schedule_probe_in_session(
+        &self,
+        session: &mut Session,
+        profile_id: &str,
+        state_id: &str,
+        root_budget_limit_micros: u64,
+    ) -> Result<ProbeJobV1> {
         let profile: CurriculumControlProfileV1 =
-            need_record(&mut session, &self.context, PROFILE_KIND, profile_id).await?;
+            need_record(session, &self.context, PROFILE_KIND, profile_id).await?;
         let mut state: LearnerStateV2 =
-            need_record(&mut session, &self.context, STATE_KIND, state_id).await?;
-        verify_watermark(&mut session, &self.context, &state).await?;
-        verify_state_sources(&mut session, &self.context, &state).await?;
+            need_record(session, &self.context, STATE_KIND, state_id).await?;
+        verify_watermark(session, &self.context, &state).await?;
+        verify_state_sources(session, &self.context, &state).await?;
         let trigger = detect_plateau_signal(&profile, &state)?;
         let trigger_digest = fingerprint(&trigger)?;
         let job_id = format!(
@@ -544,14 +710,13 @@ impl PersistentCurriculumCoordinator {
             &fingerprint(&(profile_id, &trigger_digest))?[..24]
         );
         if let Some(existing) =
-            get_record::<ProbeJobV1>(&mut session, &self.context, JOB_KIND, &job_id).await?
+            get_record::<ProbeJobV1>(session, &self.context, JOB_KIND, &job_id).await?
         {
             if existing.root_budget_limit_micros != root_budget_limit_micros {
                 return Err(Error::Conflict(
                     "probe trigger cannot change its frozen root budget".into(),
                 ));
             }
-            session.commit().await?;
             return Ok(existing);
         }
         if let Some(active) = &state.active_probe_job_id {
@@ -595,17 +760,9 @@ impl PersistentCurriculumCoordinator {
             state.cooldown_remaining_cycles = profile.cooldown_completed_cycles;
         }
         state.last_trigger_window_digest = Some(trigger_digest);
+        put_record(session, &self.context, JOB_KIND, &job.id, &self.owner, &job).await?;
         put_record(
-            &mut session,
-            &self.context,
-            JOB_KIND,
-            &job.id,
-            &self.owner,
-            &job,
-        )
-        .await?;
-        put_record(
-            &mut session,
+            session,
             &self.context,
             STATE_KIND,
             &state.id,
@@ -635,7 +792,6 @@ impl PersistentCurriculumCoordinator {
                 )
                 .await?;
         }
-        session.commit().await?;
         Ok(job)
     }
 
@@ -1020,6 +1176,36 @@ impl PersistentCurriculumCoordinator {
     }
 }
 
+/// Read-side gate for a persisted probe job (plan §11.4). Reloads the probe
+/// job and its learner state, then re-verifies the live source closure: any
+/// watermark bump is `Conflict`, any tombstoned source is `Forbidden`, and a
+/// missing or malformed source fails closed. The stored job is never rewritten.
+pub async fn verified_probe_job_view(
+    ctx: &Context,
+    store: &Store,
+    probe_job_id: &str,
+) -> Result<ProbeJobV1> {
+    ctx.require(&[Role::Admin, Role::Evaluator])?;
+    identifier(probe_job_id)?;
+    let mut session = store.session().await?;
+    let job: ProbeJobV1 = need_record(&mut session, ctx, JOB_KIND, probe_job_id).await?;
+    if job.id != probe_job_id || job.schema_version != "rsia.coverage_probe_job.v1" {
+        return Err(Error::Conflict(
+            "stored probe job differs from its storage identity".into(),
+        ));
+    }
+    let state: LearnerStateV2 = need_record(&mut session, ctx, STATE_KIND, &job.state_id).await?;
+    if state.id != job.state_id || state.profile_id != job.profile_id {
+        return Err(Error::Conflict(
+            "probe job and learner state identities differ".into(),
+        ));
+    }
+    verify_watermark(&mut session, ctx, &state).await?;
+    verify_state_sources(&mut session, ctx, &state).await?;
+    session.commit().await?;
+    Ok(job)
+}
+
 async fn verify_watermark(
     session: &mut Session,
     context: &Context,
@@ -1043,6 +1229,15 @@ async fn need_typed_source(
     context: &Context,
     id: &str,
 ) -> Result<CurriculumSourceArtifactV1> {
+    // Same logical-revocation semantics as `evidence::validate_stored_sources`:
+    // a tombstoned source member fails the whole closure closed.
+    if session
+        .get::<serde_json::Value>(context, "tombstone", id)
+        .await?
+        .is_some()
+    {
+        return Err(Error::Forbidden);
+    }
     let source: CurriculumSourceArtifactV1 = session.need(context, "artifact", id).await?;
     source.validate()?;
     Ok(source)

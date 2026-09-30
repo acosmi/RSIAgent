@@ -4,6 +4,7 @@ use crate::streaming_evaluator::{
     RegisteredEvaluationControl, StreamingEvaluationStatus,
 };
 use evo_core::contract::{MODEL_TOOLS, admin_ops, reject_admin_as_model_tool};
+use evo_core::curriculum::ProbeTerminal;
 use evo_core::replay::{ReplaySimulationProfile, WorldPartition};
 use evo_core::strategy::{ElasticPolicyV1, ExplorationCapsV1};
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, now};
@@ -95,6 +96,11 @@ pub enum ManagementResult {
         report_id: String,
         pool_digest: String,
         semantic_reports_digest: String,
+    },
+    ProbeScheduled {
+        probe_job_id: String,
+        trigger_digest: String,
+        terminal: Option<ProbeTerminal>,
     },
 }
 
@@ -199,6 +205,16 @@ pub struct ReplayRunRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CurriculumStepRequest {
+    pub schema_version: String,
+    pub request_key: String,
+    pub profile_id: String,
+    pub state_id: String,
+    pub root_budget_limit_micros: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockedManagementRequest {
     pub schema_version: String,
     pub request_key: String,
@@ -211,6 +227,7 @@ enum ParsedRequest {
     EvaluationStart(EvaluationStartRequest),
     EvaluationStatus(EvaluationStatusRequest),
     ReplayRun(Box<ReplayRunRequest>),
+    CurriculumStep(CurriculumStepRequest),
     Blocked(BlockedManagementRequest),
 }
 
@@ -331,6 +348,30 @@ impl ManagementDispatcher {
             } else {
                 return Err(Error::Conflict(
                     "replay job succeeded without valid ReplayStored result".into(),
+                ));
+            }
+        }
+        if job.operation == "curriculum.step" && job.state == ManagementJobState::Succeeded {
+            if let Some(ManagementResult::ProbeScheduled {
+                probe_job_id,
+                trigger_digest,
+                terminal,
+            }) = &job.result
+            {
+                let view =
+                    crate::curriculum::verified_probe_job_view(ctx, &self.store, probe_job_id)
+                        .await?;
+                if &view.id != probe_job_id
+                    || &view.trigger_digest != trigger_digest
+                    || view.terminal != *terminal
+                {
+                    return Err(Error::Conflict(
+                        "probe job view differs from the stored result".into(),
+                    ));
+                }
+            } else {
+                return Err(Error::Conflict(
+                    "curriculum job succeeded without valid ProbeScheduled result".into(),
                 ));
             }
         }
@@ -485,6 +526,7 @@ impl ParsedRequest {
             Self::EvaluationStart(request) => &request.request_key,
             Self::EvaluationStatus(request) => &request.request_key,
             Self::ReplayRun(request) => &request.request_key,
+            Self::CurriculumStep(request) => &request.request_key,
             Self::Blocked(request) => &request.request_key,
         }
     }
@@ -602,6 +644,9 @@ async fn execute_request(
             run_evaluation_status(ctx, store, &mut job, request).await
         }
         ParsedRequest::ReplayRun(request) => run_replay(ctx, store, &mut job, *request).await,
+        ParsedRequest::CurriculumStep(request) => {
+            run_curriculum_step(ctx, store, &mut job, request).await
+        }
         ParsedRequest::Blocked(_) => {
             job.state = ManagementJobState::Blocked;
             job.step = "blocked_feature".into();
@@ -790,6 +835,38 @@ async fn run_replay(
     Ok(())
 }
 
+async fn run_curriculum_step(
+    ctx: &Context,
+    store: &Store,
+    job: &mut ManagementJob,
+    request: CurriculumStepRequest,
+) -> Result<()> {
+    checkpoint_claim(ctx, store, job, "before_curriculum_step").await?;
+    let coordinator = crate::curriculum::PersistentCurriculumCoordinator::new(
+        store.clone(),
+        ctx.clone(),
+        ctx.actor(),
+    )?;
+    // The management job id is the idempotency key: a crash re-run of the
+    // same job reloads the recorded probe job instead of re-triggering.
+    let probe = coordinator
+        .schedule_probe_idempotent(
+            &job.id,
+            &request.profile_id,
+            &request.state_id,
+            request.root_budget_limit_micros,
+        )
+        .await?;
+    job.state = ManagementJobState::Succeeded;
+    job.step = "probe_scheduled".into();
+    job.result = Some(ManagementResult::ProbeScheduled {
+        probe_job_id: probe.id,
+        trigger_digest: probe.trigger_digest,
+        terminal: probe.terminal,
+    });
+    Ok(())
+}
+
 fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<()> {
     match request {
         ParsedRequest::ExperimentRegister(request) => {
@@ -799,7 +876,7 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
                 return Err(Error::Forbidden);
             }
         }
-        ParsedRequest::ReplayRun(_) => {
+        ParsedRequest::ReplayRun(_) | ParsedRequest::CurriculumStep(_) => {
             ctx.require(&[Role::Admin])?;
         }
         _ => {}
@@ -965,7 +1042,10 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         "replay.run" => ParsedRequest::ReplayRun(Box::new(
             serde_json::from_value(payload).map_err(|_| invalid())?,
         )),
-        "exploration.start" | "curriculum.step" | "meta.start" => {
+        "curriculum.step" => {
+            ParsedRequest::CurriculumStep(serde_json::from_value(payload).map_err(|_| invalid())?)
+        }
+        "exploration.start" | "meta.start" => {
             ParsedRequest::Blocked(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
         _ => return Err(Error::Invalid("unknown management operation".into())),
@@ -976,6 +1056,7 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::EvaluationStart(request) => &request.schema_version,
         ParsedRequest::EvaluationStatus(request) => &request.schema_version,
         ParsedRequest::ReplayRun(request) => &request.schema_version,
+        ParsedRequest::CurriculumStep(request) => &request.schema_version,
         ParsedRequest::Blocked(request) => &request.schema_version,
     };
     if actual != &expected {
@@ -1042,6 +1123,16 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
             dependencies.push((
                 "artifact".into(),
                 evo_storage::replay::replay_pool_storage_id(&request.pool_digest)?,
+            ));
+        }
+        ParsedRequest::CurriculumStep(request) => {
+            dependencies.push((
+                "artifact".into(),
+                crate::curriculum::curriculum_profile_storage_id(&request.profile_id)?,
+            ));
+            dependencies.push((
+                "artifact".into(),
+                crate::curriculum::curriculum_state_storage_id(&request.state_id)?,
             ));
         }
         ParsedRequest::Blocked(_) => {}

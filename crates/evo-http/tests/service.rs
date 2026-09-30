@@ -394,9 +394,9 @@ async fn real_http_process_enforces_auth_identity_and_idempotency() {
     let blocked = post(
         &client,
         &base,
-        "/v1/manage/curriculum.step",
+        "/v1/manage/meta.start",
         Some(ADMIN_TOKEN),
-        json!({"schema_version":"rsia.management.curriculum_step.v1","request_key":"blocked-1"}),
+        json!({"schema_version":"rsia.management.meta_start.v1","request_key":"blocked-1"}),
     )
     .await;
     assert_eq!(blocked.status(), StatusCode::OK);
@@ -813,6 +813,319 @@ async fn authenticated_async_replay_flow_and_role_rejection() {
             .status(),
         StatusCode::NOT_FOUND
     );
+
+    task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// curriculum.step through the real listener (E07 management adapter).
+// Fixtures replicate crates/evo-engine/tests/curriculum_v41.rs inline.
+// ---------------------------------------------------------------------------
+
+const CURRICULUM_PROFILE_ID: &str = "pure_function_test_proposal.v1";
+const CURRICULUM_STATE_ID: &str = "learner-state";
+
+async fn setup_curriculum(admin: &Context, store: &Store) {
+    use evo_core::curriculum::{CurriculumControlProfileV1, LearnerStateV2};
+    use evo_core::evaluation::DataUse;
+    use evo_engine::curriculum::{
+        CurriculumSourceArtifactV1, CurriculumSourceKindV1, PersistentCurriculumCoordinator,
+    };
+    use evo_engine::curriculum_profiles::{
+        RegisteredPureFunctionProfileV1, registered_profile_source_bodies,
+    };
+    let source =
+        |id: &str, source_kind, subject_digest: String, body: Value| CurriculumSourceArtifactV1 {
+            schema_version: CurriculumSourceArtifactV1::SCHEMA.into(),
+            id: id.into(),
+            source_kind,
+            data_use: DataUse::Development,
+            subject_digest,
+            body_digest: evo_core::fingerprint(&body).unwrap(),
+            body,
+            dependency_ids: vec![],
+        };
+    let registered = RegisteredPureFunctionProfileV1::clamp_i64();
+    let profile = CurriculumControlProfileV1::offline_default(
+        CURRICULUM_PROFILE_ID,
+        d("task-space"),
+        registered.oracle_digest.clone(),
+        registered.runner_digest.clone(),
+    )
+    .unwrap();
+    let state = LearnerStateV2 {
+        schema_version: LearnerStateV2::SCHEMA.into(),
+        id: CURRICULUM_STATE_ID.into(),
+        profile_id: CURRICULUM_PROFILE_ID.into(),
+        skill_snapshot_digest: d("skill"),
+        improver_snapshot_digest: d("improver"),
+        environment_digest: d("environment"),
+        grader_digest: d("grader"),
+        model_tools_digest: d("model-tools"),
+        runner_digest: registered.runner_digest.clone(),
+        rules_digest: d("rules"),
+        source_watermark: 1,
+        source_artifact_ids: vec![
+            registered.oracle_source_id.clone(),
+            registered.runner_source_id.clone(),
+            registered.target_source_id.clone(),
+            "task-space-source".into(),
+        ],
+        development_fact_ids: vec![],
+        completed_cycles: vec![],
+        failure_clusters: vec![],
+        coverage_buckets: vec![],
+        applied_assets: vec![],
+        active_probe_job_id: None,
+        last_trigger_window_digest: None,
+        cooldown_remaining_cycles: 0,
+    };
+    let coordinator =
+        PersistentCurriculumCoordinator::new(store.clone(), admin.clone(), admin.actor()).unwrap();
+    coordinator
+        .register_source(source(
+            "task-space-source",
+            CurriculumSourceKindV1::TaskSpace,
+            d("task-space"),
+            json!({"buckets":["clamp-boundary"]}),
+        ))
+        .await
+        .unwrap();
+    for (id, body) in registered_profile_source_bodies() {
+        let kind = if id.contains("target") || id.contains("source") {
+            CurriculumSourceKindV1::TargetSpec
+        } else if id.contains("oracle") {
+            CurriculumSourceKindV1::OracleSpec
+        } else {
+            CurriculumSourceKindV1::RunnerSpec
+        };
+        coordinator
+            .register_source(source(
+                &id,
+                kind,
+                evo_core::fingerprint(&body).unwrap(),
+                body,
+            ))
+            .await
+            .unwrap();
+    }
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(admin, "curriculum-initial-watermark")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    coordinator
+        .register_profile_and_state(profile, state)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_async_curriculum_step_flow_and_role_rejection() {
+    let (_dir, state) = state(registry()).await;
+    let store = state.service.store().clone();
+    let admin = Context::new("tenant-a", "admin", Role::Admin).unwrap();
+    setup_curriculum(&admin, &store).await;
+    let (base, task) = spawn(state).await;
+    let client = reqwest::Client::new();
+
+    let payload = json!({
+        "schema_version": "rsia.management.curriculum_step.v1",
+        "request_key": "http-curriculum-k1",
+        "profile_id": CURRICULUM_PROFILE_ID,
+        "state_id": CURRICULUM_STATE_ID,
+        "root_budget_limit_micros": 1_000_000u64,
+    });
+
+    // 1. Unauthenticated -> 401 Unauthorized
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/curriculum.step",
+            None,
+            payload.clone()
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 2. Role rejection: Agent -> 403 Forbidden
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/curriculum.step",
+            Some(AGENT_A_TOKEN),
+            payload.clone()
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // 3. Role rejection: Evaluator -> 403 Forbidden
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/curriculum.step",
+            Some(EVALUATOR_TOKEN),
+            payload.clone()
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // 4. Identity injection in the body is refused by the HTTP layer (403);
+    // any other unknown field is refused by the typed request (400).
+    let mut injected = payload.clone();
+    injected["role"] = json!("admin");
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/curriculum.step",
+            Some(ADMIN_TOKEN),
+            injected
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let mut unknown = payload.clone();
+    unknown["extra_field"] = json!("unexpected");
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/curriculum.step",
+            Some(ADMIN_TOKEN),
+            unknown
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // 5. Authenticated Admin -> 200 OK, queued job with an immediate id
+    let response = post(
+        &client,
+        &base,
+        "/v1/manage/curriculum.step",
+        Some(ADMIN_TOKEN),
+        payload.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let queued: Value = response.json().await.unwrap();
+    assert_eq!(queued["state"], "queued");
+    let job_id = queued["id"].as_str().unwrap().to_string();
+
+    // 6. Wait for terminal state -> succeeded with ProbeScheduled
+    let terminal = wait_job(&client, &base, ADMIN_TOKEN, &job_id).await;
+    assert_eq!(terminal["state"], "succeeded");
+    assert_eq!(terminal["step"], "probe_scheduled");
+    assert_eq!(terminal["result"]["result"], "probe_scheduled");
+    assert_eq!(terminal["result"]["terminal"], "budget_exhausted");
+    let probe_job_id = terminal["result"]["probe_job_id"].as_str().unwrap();
+    assert!(probe_job_id.starts_with("probe-"));
+    assert_eq!(
+        terminal["result"]["trigger_digest"].as_str().unwrap().len(),
+        64
+    );
+
+    // 7. GET job status via HTTP returns the re-verified result
+    let status_res = client
+        .get(format!("{base}/v1/manage/jobs/{job_id}"))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_res.status(), StatusCode::OK);
+    let status: Value = status_res.json().await.unwrap();
+    assert_eq!(status["state"], "succeeded");
+    assert_eq!(status["result"], terminal["result"]);
+
+    // 8. Same request reconnects to the same job (reconnect never re-charges)
+    let same = post(
+        &client,
+        &base,
+        "/v1/manage/curriculum.step",
+        Some(ADMIN_TOKEN),
+        payload.clone(),
+    )
+    .await;
+    assert_eq!(same.status(), StatusCode::OK);
+    let same: Value = same.json().await.unwrap();
+    assert_eq!(same["id"], job_id);
+    assert_eq!(same["state"], "succeeded");
+
+    // 9. Same key, different payload -> 409 Conflict
+    let mut different = payload.clone();
+    different["root_budget_limit_micros"] = json!(2_000_000u64);
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/curriculum.step",
+            Some(ADMIN_TOKEN),
+            different
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+
+    // 10. Non-management role cannot read the job (403); a management role
+    // that does not own it gets 404.
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/manage/jobs/{job_id}"))
+            .bearer_auth(AGENT_A_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/manage/jobs/{job_id}"))
+            .bearer_auth(EVALUATOR_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // 11. Revocation gate (plan §11.4): bumping the source watermark makes the
+    // read side refuse with 409 while the persisted terminal stays succeeded.
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, "curriculum-source-revoked")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/manage/jobs/{job_id}"))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let mut session = store.session().await.unwrap();
+    let persisted: Value = session.need(&admin, "job", &job_id).await.unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(persisted["state"], "succeeded");
+    assert_eq!(persisted["result"], terminal["result"]);
 
     task.abort();
 }

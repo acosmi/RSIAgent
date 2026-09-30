@@ -238,13 +238,15 @@ def smoke_http(binary: Path, root: Path) -> None:
         )
         if second_mcp.returncode == 0 or "already locked" not in second_mcp.stderr:
             fail("MCP process acquired the HTTP process data directory")
-        # Blocked feature: curriculum.step has no consumer yet. The dispatcher
-        # must persist an accurate `blocked` terminal instead of failing or
-        # hanging (see future_operations_persist_accurate_blocked_jobs_and_reconnect).
+        # Blocked feature: meta.start has no consumer yet (curriculum.step is
+        # wired to the persistent curriculum consumer since AG-015). The
+        # dispatcher must persist an accurate `blocked` terminal instead of
+        # failing or hanging (see
+        # future_operations_persist_accurate_blocked_jobs_and_reconnect).
         submitted = cli_submit(
-            binary, base, root, "blocked-curriculum", "curriculum.step",
+            binary, base, root, "blocked-meta", "meta.start",
             {
-                "schema_version": "rsia.management.curriculum_step.v1",
+                "schema_version": "rsia.management.meta_start.v1",
                 "request_key": "cli-blocked-1",
             },
         )
@@ -254,7 +256,7 @@ def smoke_http(binary: Path, root: Path) -> None:
         blocked = cli_wait_terminal(binary, base, blocked_job["id"])
         if blocked.get("state") != "blocked" or blocked.get("step") != "blocked_feature":
             fail(f"CLI management did not preserve blocked terminal: {blocked}")
-        if blocked.get("error_code") != "curriculum.step_consumer_unavailable":
+        if blocked.get("error_code") != "meta.start_consumer_unavailable":
             fail(f"CLI blocked terminal carried the wrong error_code: {blocked}")
         if blocked.get("id") != blocked_job["id"]:
             fail("CLI management status did not return the persisted blocked job")

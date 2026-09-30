@@ -1,3 +1,4 @@
+use evo_core::curriculum::ProbeTerminal;
 use evo_core::evidence::Purpose;
 use evo_core::hash;
 use evo_core::replay::*;
@@ -127,12 +128,12 @@ async fn future_operations_persist_accurate_blocked_jobs_and_reconnect() {
     let (dir, store) = store().await;
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let request = json!({
-        "schema_version":"rsia.management.curriculum_step.v1",
+        "schema_version":"rsia.management.meta_start.v1",
         "request_key":"blocked-1"
     });
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
     let queued = dispatcher
-        .submit(&admin, "curriculum.step", request.clone())
+        .submit(&admin, "meta.start", request.clone())
         .await
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
@@ -162,10 +163,10 @@ async fn future_operations_persist_accurate_blocked_jobs_and_reconnect() {
     assert_eq!(first.state, ManagementJobState::Blocked);
     assert_eq!(
         first.error_code.as_deref(),
-        Some("curriculum.step_consumer_unavailable")
+        Some("meta.start_consumer_unavailable")
     );
     let reconnect = reopened_dispatcher
-        .submit(&admin, "curriculum.step", request)
+        .submit(&admin, "meta.start", request)
         .await
         .unwrap();
     assert_eq!(reconnect.id, first.id);
@@ -1026,4 +1027,699 @@ async fn replay_run_crash_recovery_reuses_stored_report() {
         .await
         .unwrap();
     assert_eq!(resubmit.id, done.id);
+}
+
+// ---------------------------------------------------------------------------
+// curriculum.step (E07 management adapter, program sub-scope)
+//
+// The fixtures below replicate `tests/curriculum_v41.rs` inline because test
+// crates cannot import each other. The registered pure-function profile is
+// offline and zero-budget, so every scheduled probe terminates immediately
+// with `BudgetExhausted` (first window) or `Cooldown` (later windows).
+// ---------------------------------------------------------------------------
+
+const CURRICULUM_PROFILE_ID: &str = "pure_function_test_proposal.v1";
+const CURRICULUM_STATE_ID: &str = "learner-state";
+const CURRICULUM_ENVELOPE_SCHEMA: &str = "rsia.curriculum_artifact_envelope.v1";
+const PROBE_JOB_KIND: &str = "coverage_probe_job_v1";
+const PROBE_RECEIPT_KIND: &str = "probe_schedule_receipt_v1";
+
+fn curriculum_profile() -> evo_core::curriculum::CurriculumControlProfileV1 {
+    let registered = evo_engine::curriculum_profiles::RegisteredPureFunctionProfileV1::clamp_i64();
+    registered.validate().unwrap();
+    evo_core::curriculum::CurriculumControlProfileV1::offline_default(
+        CURRICULUM_PROFILE_ID,
+        d("task-space"),
+        registered.oracle_digest,
+        registered.runner_digest,
+    )
+    .unwrap()
+}
+
+fn curriculum_source(
+    id: &str,
+    source_kind: evo_engine::curriculum::CurriculumSourceKindV1,
+    subject_digest: String,
+    body: serde_json::Value,
+) -> evo_engine::curriculum::CurriculumSourceArtifactV1 {
+    evo_engine::curriculum::CurriculumSourceArtifactV1 {
+        schema_version: evo_engine::curriculum::CurriculumSourceArtifactV1::SCHEMA.into(),
+        id: id.into(),
+        source_kind,
+        data_use: evo_core::evaluation::DataUse::Development,
+        subject_digest,
+        body_digest: evo_core::fingerprint(&body).unwrap(),
+        body,
+        dependency_ids: vec![],
+    }
+}
+
+fn learner_state() -> evo_core::curriculum::LearnerStateV2 {
+    let registered = evo_engine::curriculum_profiles::RegisteredPureFunctionProfileV1::clamp_i64();
+    evo_core::curriculum::LearnerStateV2 {
+        schema_version: evo_core::curriculum::LearnerStateV2::SCHEMA.into(),
+        id: CURRICULUM_STATE_ID.into(),
+        profile_id: CURRICULUM_PROFILE_ID.into(),
+        skill_snapshot_digest: d("skill"),
+        improver_snapshot_digest: d("improver"),
+        environment_digest: d("environment"),
+        grader_digest: d("grader"),
+        model_tools_digest: d("model-tools"),
+        runner_digest: registered.runner_digest,
+        rules_digest: d("rules"),
+        source_watermark: 1,
+        source_artifact_ids: vec![
+            registered.oracle_source_id,
+            registered.runner_source_id,
+            registered.target_source_id,
+            "task-space-source".into(),
+        ],
+        development_fact_ids: vec![],
+        completed_cycles: vec![],
+        failure_clusters: vec![],
+        coverage_buckets: vec![],
+        applied_assets: vec![],
+        active_probe_job_id: None,
+        last_trigger_window_digest: None,
+        cooldown_remaining_cycles: 0,
+    }
+}
+
+async fn setup_curriculum(admin: &Context, store: &Store) {
+    use evo_engine::curriculum::CurriculumSourceKindV1;
+    let coordinator = evo_engine::curriculum::PersistentCurriculumCoordinator::new(
+        store.clone(),
+        admin.clone(),
+        admin.actor(),
+    )
+    .unwrap();
+    coordinator
+        .register_source(curriculum_source(
+            "task-space-source",
+            CurriculumSourceKindV1::TaskSpace,
+            d("task-space"),
+            json!({"buckets":["clamp-boundary"]}),
+        ))
+        .await
+        .unwrap();
+    for (id, body) in evo_engine::curriculum_profiles::registered_profile_source_bodies() {
+        let kind = if id.contains("target") || id.contains("source") {
+            CurriculumSourceKindV1::TargetSpec
+        } else if id.contains("oracle") {
+            CurriculumSourceKindV1::OracleSpec
+        } else {
+            CurriculumSourceKindV1::RunnerSpec
+        };
+        coordinator
+            .register_source(curriculum_source(
+                &id,
+                kind,
+                evo_core::fingerprint(&body).unwrap(),
+                body,
+            ))
+            .await
+            .unwrap();
+    }
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(admin, "curriculum-initial-watermark")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    coordinator
+        .register_profile_and_state(curriculum_profile(), learner_state())
+        .await
+        .unwrap();
+}
+
+fn curriculum_step_request(request_key: &str) -> serde_json::Value {
+    json!({
+        "schema_version": "rsia.management.curriculum_step.v1",
+        "request_key": request_key,
+        "profile_id": CURRICULUM_PROFILE_ID,
+        "state_id": CURRICULUM_STATE_ID,
+        "root_budget_limit_micros": 1_000_000u64,
+    })
+}
+
+/// Typed curriculum records of one kind, read straight from the store so the
+/// assertions do not depend on the consumer's own read path.
+async fn curriculum_records(
+    admin: &Context,
+    store: &Store,
+    record_kind: &str,
+) -> Vec<serde_json::Value> {
+    let mut session = store.session().await.unwrap();
+    let values = session
+        .list::<serde_json::Value>(admin, "artifact")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    values
+        .into_iter()
+        .filter(|value| {
+            value["schema_version"] == CURRICULUM_ENVELOPE_SCHEMA
+                && value["record_kind"] == record_kind
+        })
+        .map(|value| value["payload"].clone())
+        .collect()
+}
+
+async fn raw_job(admin: &Context, store: &Store, job_id: &str) -> ManagementJob {
+    let mut session = store.session().await.unwrap();
+    let job: ManagementJob = session.need(admin, "job", job_id).await.unwrap();
+    session.commit().await.unwrap();
+    job
+}
+
+fn probe_scheduled(job: &ManagementJob) -> (String, String, Option<ProbeTerminal>) {
+    match &job.result {
+        Some(ManagementResult::ProbeScheduled {
+            probe_job_id,
+            trigger_digest,
+            terminal,
+        }) => (probe_job_id.clone(), trigger_digest.clone(), *terminal),
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn curriculum_step_admin_e2e_and_idempotency() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    setup_curriculum(&admin, &store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let request = curriculum_step_request("curriculum-k1");
+
+    // Immediate job_id (plan §6.1): the submit returns before the consumer runs.
+    let queued = dispatcher
+        .submit(&admin, "curriculum.step", request.clone())
+        .await
+        .unwrap();
+    assert_eq!(queued.state, ManagementJobState::Queued);
+    assert_eq!(queued.step, "accepted");
+
+    let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded);
+    assert_eq!(done.step, "probe_scheduled");
+    assert!(done.error_code.is_none());
+    let (probe_job_id, trigger_digest, terminal) = probe_scheduled(&done);
+    assert_eq!(terminal, Some(ProbeTerminal::BudgetExhausted));
+    assert!(probe_job_id.starts_with("probe-"));
+    assert_eq!(trigger_digest.len(), 64);
+
+    // The read side re-verifies against the live store and agrees.
+    let status = dispatcher.status(&admin, &done.id).await.unwrap();
+    assert_eq!(status.state, ManagementJobState::Succeeded);
+    assert_eq!(
+        probe_scheduled(&status),
+        (probe_job_id.clone(), trigger_digest.clone(), terminal)
+    );
+    let view = evo_engine::curriculum::verified_probe_job_view(&admin, &store, &probe_job_id)
+        .await
+        .unwrap();
+    assert_eq!(view.id, probe_job_id);
+    assert_eq!(view.trigger_digest, trigger_digest);
+    assert_eq!(view.terminal, Some(ProbeTerminal::BudgetExhausted));
+    assert_eq!(view.profile_id, CURRICULUM_PROFILE_ID);
+    assert_eq!(view.state_id, CURRICULUM_STATE_ID);
+    assert_eq!(view.root_budget_limit_micros, 1_000_000);
+    assert_eq!(view.curriculum_share_limit_micros, 200_000);
+    assert_eq!(view.effective_monetary_limit_micros, 0);
+    assert_eq!(view.provider_dispatch_count, 0);
+
+    // Dependency edges: job -> private_input -> {profile, state} artifacts.
+    let mut session = store.session().await.unwrap();
+    for storage_id in [
+        evo_engine::curriculum::curriculum_profile_storage_id(CURRICULUM_PROFILE_ID).unwrap(),
+        evo_engine::curriculum::curriculum_state_storage_id(CURRICULUM_STATE_ID).unwrap(),
+    ] {
+        let dependents = session
+            .dependents(&admin, "artifact", &storage_id)
+            .await
+            .unwrap();
+        assert!(
+            dependents
+                .iter()
+                .any(|(kind, id)| kind == "artifact" && id == &done.private_input_ref),
+            "missing private-input edge to {storage_id}"
+        );
+    }
+    session.commit().await.unwrap();
+
+    // Exactly one probe job and one schedule receipt bound to this job id.
+    let probes = curriculum_records(&admin, &store, PROBE_JOB_KIND).await;
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0]["id"], probe_job_id);
+    assert_eq!(probes[0]["terminal"], "budget_exhausted");
+    let receipts = curriculum_records(&admin, &store, PROBE_RECEIPT_KIND).await;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        receipts[0]["schema_version"],
+        "rsia.probe_schedule_receipt.v1"
+    );
+    assert_eq!(receipts[0]["idempotency_key"], done.id);
+    assert_eq!(receipts[0]["probe_job_id"], probe_job_id);
+    assert_eq!(receipts[0]["trigger_digest"], trigger_digest);
+    assert_eq!(receipts[0]["profile_id"], CURRICULUM_PROFILE_ID);
+    assert_eq!(receipts[0]["state_id"], CURRICULUM_STATE_ID);
+    assert_eq!(receipts[0]["root_budget_limit_micros"], 1_000_000u64);
+    assert_eq!(receipts[0]["revoke_watermark"], 1u64);
+
+    // Idempotency: the identical request reconnects and never re-charges the
+    // consumer (no second probe job, no Cooldown window opened).
+    let same = dispatcher
+        .submit(&admin, "curriculum.step", request)
+        .await
+        .unwrap();
+    assert_eq!(same.id, queued.id);
+    assert_eq!(same.state, ManagementJobState::Succeeded);
+    tokio::task::yield_now().await;
+    assert_eq!(
+        curriculum_records(&admin, &store, PROBE_JOB_KIND)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(
+        curriculum_records(&admin, &store, PROBE_RECEIPT_KIND)
+            .await
+            .len(),
+        1
+    );
+
+    // Same key with a different payload is a conflict, not a second probe.
+    let mut different = curriculum_step_request("curriculum-k1");
+    different["root_budget_limit_micros"] = json!(2_000_000u64);
+    assert!(matches!(
+        dispatcher
+            .submit(&admin, "curriculum.step", different)
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(
+        curriculum_records(&admin, &store, PROBE_JOB_KIND)
+            .await
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn curriculum_step_role_unknown_fields_and_validation_rejections() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let agent = Context::new("n", "agent", Role::Agent).unwrap();
+    let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();
+    setup_curriculum(&admin, &store).await;
+    let dispatcher =
+        ManagementDispatcher::new(store.clone(), vec![admin.clone(), evaluator.clone()]).unwrap();
+    let payload = curriculum_step_request("curriculum-auth");
+
+    assert!(matches!(
+        dispatcher
+            .submit(&agent, "curriculum.step", payload.clone())
+            .await,
+        Err(Error::Forbidden)
+    ));
+    assert!(matches!(
+        dispatcher
+            .submit(&evaluator, "curriculum.step", payload.clone())
+            .await,
+        Err(Error::Forbidden)
+    ));
+
+    let mut unknown = payload.clone();
+    unknown["extra_field"] = json!("unexpected");
+    assert!(matches!(
+        dispatcher.submit(&admin, "curriculum.step", unknown).await,
+        Err(Error::Invalid(_))
+    ));
+
+    // No top-level actor/role/namespace fields: identity comes from the caller.
+    for field in ["actor", "role", "namespace"] {
+        let mut injected = payload.clone();
+        injected[field] = json!("admin");
+        assert!(matches!(
+            dispatcher.submit(&admin, "curriculum.step", injected).await,
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    let mut bad_version = payload.clone();
+    bad_version["schema_version"] = json!("rsia.management.curriculum_step.v2");
+    assert!(matches!(
+        dispatcher
+            .submit(&admin, "curriculum.step", bad_version)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+
+    let incomplete = json!({
+        "schema_version": "rsia.management.curriculum_step.v1",
+        "request_key": "incomplete-key"
+    });
+    assert!(matches!(
+        dispatcher
+            .submit(&admin, "curriculum.step", incomplete)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+
+    let mut bad_identifier = payload.clone();
+    bad_identifier["state_id"] = json!("not a valid identifier");
+    assert!(matches!(
+        dispatcher
+            .submit(&admin, "curriculum.step", bad_identifier)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Nothing above reached the consumer.
+    assert!(
+        curriculum_records(&admin, &store, PROBE_JOB_KIND)
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn curriculum_step_missing_profile_or_state_fails_cleanly() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    setup_curriculum(&admin, &store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+
+    let mut missing_profile = curriculum_step_request("curriculum-missing-profile");
+    missing_profile["profile_id"] = json!("missing-profile");
+    let queued = dispatcher
+        .submit(&admin, "curriculum.step", missing_profile)
+        .await
+        .unwrap();
+    assert_eq!(queued.state, ManagementJobState::Queued);
+    let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(terminal.state, ManagementJobState::Failed);
+    assert_eq!(terminal.step, "failed");
+    assert_eq!(terminal.error_code.as_deref(), Some("not_found"));
+    assert!(terminal.result.is_none());
+
+    let mut missing_state = curriculum_step_request("curriculum-missing-state");
+    missing_state["state_id"] = json!("missing-state");
+    let queued = dispatcher
+        .submit(&admin, "curriculum.step", missing_state)
+        .await
+        .unwrap();
+    let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(terminal.state, ManagementJobState::Failed);
+    assert_eq!(terminal.step, "failed");
+    assert_eq!(terminal.error_code.as_deref(), Some("not_found"));
+
+    // Failed jobs are never re-verified and never mutated the learner state.
+    assert_eq!(
+        dispatcher.status(&admin, &queued.id).await.unwrap().state,
+        ManagementJobState::Failed
+    );
+    assert!(
+        curriculum_records(&admin, &store, PROBE_JOB_KIND)
+            .await
+            .is_empty()
+    );
+    assert!(
+        curriculum_records(&admin, &store, PROBE_RECEIPT_KIND)
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn curriculum_step_status_revocation_gate_and_terminal_preservation() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    setup_curriculum(&admin, &store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "curriculum.step",
+            curriculum_step_request("curriculum-revoke"),
+        )
+        .await
+        .unwrap();
+    let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded);
+    assert!(dispatcher.status(&admin, &done.id).await.is_ok());
+
+    // Tombstoning one member of the state's source closure (plan §11.4)
+    // fails the read side closed with Forbidden ...
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "tombstone",
+            "task-space-source",
+            "admin",
+            &json!({"id": "task-space-source"}),
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert!(matches!(
+        dispatcher.status(&admin, &done.id).await,
+        Err(Error::Forbidden)
+    ));
+    // ... and the persisted terminal is never rewritten.
+    let persisted = raw_job(&admin, &store, &done.id).await;
+    assert_eq!(persisted.state, ManagementJobState::Succeeded);
+    assert_eq!(persisted.step, "probe_scheduled");
+    assert_eq!(
+        serde_json::to_value(&persisted.result).unwrap(),
+        serde_json::to_value(&done.result).unwrap()
+    );
+
+    // A watermark bump (source closure changed) is a Conflict.
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, "curriculum-source-revoked")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert!(matches!(
+        dispatcher.status(&admin, &done.id).await,
+        Err(Error::Conflict(_))
+    ));
+    let persisted = raw_job(&admin, &store, &done.id).await;
+    assert_eq!(persisted.state, ManagementJobState::Succeeded);
+
+    // A new request after revocation fails inside the job, not at submit.
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "curriculum.step",
+            curriculum_step_request("curriculum-after-revoke"),
+        )
+        .await
+        .unwrap();
+    let failed = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(failed.state, ManagementJobState::Failed);
+    assert_eq!(failed.error_code.as_deref(), Some("conflict"));
+    assert_eq!(
+        dispatcher.status(&admin, &failed.id).await.unwrap().state,
+        ManagementJobState::Failed
+    );
+
+    // A job cancelled before claim is never re-verified against sources.
+    let cancelled_direct = ManagementJob {
+        id: "management-job-cancelled-curriculum".into(),
+        schema_version: "rsia.management_job.v1".into(),
+        operation: "curriculum.step".into(),
+        request_key: "cancelled-curriculum-k".into(),
+        payload_digest: "c".repeat(64),
+        owner_actor: "admin".into(),
+        owner_role: Role::Admin,
+        state: ManagementJobState::Cancelled,
+        step: "cancelled_before_claim".into(),
+        private_input_ref: "missing-ref".into(),
+        result: None,
+        error_code: Some("cancelled".into()),
+        cancel_requested: true,
+        lease_token: None,
+        lease_until: 0,
+        generation: 0,
+        diagnostics: vec![],
+        created_at: 1,
+    };
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "job",
+            &cancelled_direct.id,
+            admin.actor(),
+            &cancelled_direct,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let observed = dispatcher
+        .status(&admin, &cancelled_direct.id)
+        .await
+        .unwrap();
+    assert_eq!(observed.state, ManagementJobState::Cancelled);
+    assert_eq!(observed.step, "cancelled_before_claim");
+}
+
+#[tokio::test]
+async fn curriculum_step_crash_recovery_reuses_probe_schedule_receipt() {
+    let (dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    setup_curriculum(&admin, &store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let request = curriculum_step_request("curriculum-crash-1");
+    let queued = dispatcher
+        .submit(&admin, "curriculum.step", request.clone())
+        .await
+        .unwrap();
+    let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded);
+    let (probe_job_id, trigger_digest, terminal) = probe_scheduled(&done);
+    assert_eq!(terminal, Some(ProbeTerminal::BudgetExhausted));
+
+    // Simulate a crash after the consumer committed (probe job, state update
+    // and receipt are durable) but before `finish_claim` wrote the terminal.
+    let mut crashed = done.clone();
+    crashed.state = ManagementJobState::Running;
+    crashed.step = "before_curriculum_step".into();
+    crashed.result = None;
+    crashed.error_code = None;
+    crashed.lease_token = Some("dead-process-lease".into());
+    crashed.lease_until = 0;
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin, "job", &crashed.id, admin.actor(), &crashed)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    store.close().await;
+
+    let reopened = Store::open(&dir.path().join("management.sqlite3"))
+        .await
+        .unwrap();
+    let reopened_dispatcher =
+        ManagementDispatcher::new(reopened.clone(), vec![admin.clone()]).unwrap();
+    assert_eq!(reopened_dispatcher.recover_pending().await.unwrap(), 1);
+    let recovered = wait_terminal(&reopened_dispatcher, &admin, &done.id).await;
+    assert_eq!(recovered.id, done.id);
+    assert_eq!(recovered.state, ManagementJobState::Succeeded);
+    assert_eq!(recovered.step, "probe_scheduled");
+    assert_eq!(recovered.generation, done.generation + 1);
+    assert_eq!(
+        probe_scheduled(&recovered),
+        (probe_job_id.clone(), trigger_digest.clone(), terminal)
+    );
+    assert_eq!(
+        serde_json::to_value(&recovered.result).unwrap(),
+        serde_json::to_value(&done.result).unwrap()
+    );
+
+    // Recovery continued from the persisted receipt (plan §6.7.4): still
+    // exactly one probe job, and no Cooldown job was opened by the re-run.
+    let probes = curriculum_records(&admin, &reopened, PROBE_JOB_KIND).await;
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0]["id"], probe_job_id);
+    assert_eq!(probes[0]["terminal"], "budget_exhausted");
+    let receipts = curriculum_records(&admin, &reopened, PROBE_RECEIPT_KIND).await;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["idempotency_key"], done.id);
+    let view = evo_engine::curriculum::verified_probe_job_view(&admin, &reopened, &probe_job_id)
+        .await
+        .unwrap();
+    assert_eq!(view.terminal, Some(ProbeTerminal::BudgetExhausted));
+
+    // Reconnect after restart still resolves to the same job.
+    let resubmit = reopened_dispatcher
+        .submit(&admin, "curriculum.step", request)
+        .await
+        .unwrap();
+    assert_eq!(resubmit.id, done.id);
+
+    // A genuinely new request key on the same state opens the next window
+    // (Cooldown) — proving the re-run above did not consume that window.
+    let next = reopened_dispatcher
+        .submit(
+            &admin,
+            "curriculum.step",
+            curriculum_step_request("curriculum-crash-2"),
+        )
+        .await
+        .unwrap();
+    let next = wait_terminal(&reopened_dispatcher, &admin, &next.id).await;
+    assert_eq!(next.state, ManagementJobState::Succeeded);
+    let (next_probe_id, _, next_terminal) = probe_scheduled(&next);
+    assert_ne!(next_probe_id, probe_job_id);
+    assert_eq!(next_terminal, Some(ProbeTerminal::Cooldown));
+    assert_eq!(
+        curriculum_records(&admin, &reopened, PROBE_JOB_KIND)
+            .await
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn curriculum_step_cancel_before_claim_creates_no_probe_job() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    setup_curriculum(&admin, &store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+
+    // The store serializes sessions on one connection, so the cancel issued
+    // right after submit is applied before the background worker can claim.
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "curriculum.step",
+            curriculum_step_request("curriculum-cancel"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.state, ManagementJobState::Queued);
+    let cancelled = dispatcher.cancel(&admin, &queued.id).await.unwrap();
+    assert_eq!(cancelled.state, ManagementJobState::Cancelled);
+    assert_eq!(cancelled.step, "cancelled_before_claim");
+    assert_eq!(cancelled.error_code.as_deref(), Some("cancelled"));
+    assert!(cancelled.cancel_requested);
+
+    let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(terminal.state, ManagementJobState::Cancelled);
+    assert_eq!(terminal.step, "cancelled_before_claim");
+    assert!(terminal.result.is_none());
+    assert!(
+        curriculum_records(&admin, &store, PROBE_JOB_KIND)
+            .await
+            .is_empty()
+    );
+    assert!(
+        curriculum_records(&admin, &store, PROBE_RECEIPT_KIND)
+            .await
+            .is_empty()
+    );
+
+    // Cancellation is persisted (plan §6.6): reconnecting with the same key
+    // returns the cancelled job instead of scheduling.
+    let reconnect = dispatcher
+        .submit(
+            &admin,
+            "curriculum.step",
+            curriculum_step_request("curriculum-cancel"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reconnect.id, queued.id);
+    assert_eq!(reconnect.state, ManagementJobState::Cancelled);
+    tokio::task::yield_now().await;
+    assert!(
+        curriculum_records(&admin, &store, PROBE_JOB_KIND)
+            .await
+            .is_empty()
+    );
 }
