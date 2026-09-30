@@ -28,6 +28,7 @@ def _valid_manifest_dict() -> dict:
 def _fresh_record(base: dict, task: str, name: str, stem: str) -> dict:
     """Copy an existing record but give it its own id, PR, source, log, input and record_source."""
     record = copy.deepcopy(base)
+    record.pop("pr_state", None)  # a fresh unmerged record starts without a recorded PR state
     record.update(
         {
             "id": f"{task}.{name}",
@@ -152,6 +153,7 @@ class ValidManifestTests(unittest.TestCase):
                     "source_sha": "a" * 40,
                     "pr": "https://github.com/acosmi/RSIAgent/pull/999",
                     "merged_sha": None,
+                    "pr_state": "draft",
                     "input_ref": "out/future/input.json",
                     "input_digest": hashlib.sha256(input_bytes).hexdigest(),
                     "log_path": "out/future/test.log",
@@ -247,7 +249,8 @@ class RejectionTests(unittest.TestCase):
     def test_planned_status_tolerates_empty_test_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp))
-            self.assertEqual(repo.manifest["e_scopes"]["E18"]["status"], "planned")
+            self.assertEqual(repo.manifest["e_scopes"]["E14"]["status"], "planned")
+            self.assertEqual(repo.manifest["e_scopes"]["E14"]["verified_subscopes"], [])
             self.assertTrue(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
 
     def test_rejects_missing_e16_parent_e17_or_e18(self):
@@ -500,14 +503,17 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
             self.assertTrue(record["pr"].endswith("/47"))
             return record
 
-        self.assertIsNone(pr47(_valid_manifest_dict())["merged_sha"])
+        merged_pr47 = pr47(_valid_manifest_dict())
+        self.assertEqual(merged_pr47["pr_state"], "merged")
+        self.assertTrue(merged_pr47["merged_sha"])
+        pr47_id = merged_pr47["id"]
         with self.subTest(variant="merged_sha copied from another PR's merge commit"):
             manifest = _valid_manifest_dict()
             record = pr47(manifest)
             record["merged_sha"] = manifest["e_scopes"]["E13"]["verified_subscopes"][0]["merged_sha"]
             errors = self._errors(manifest)
             self.assertIn(
-                f"E16.4.trusted_host_rejection_controller_acceptance: merged_sha {record['merged_sha']} is already recorded as the merge commit of PR #42 (E13.controller_acceptance)",
+                f"{pr47_id}: merged_sha {record['merged_sha']} is already recorded as the merge commit of PR #42 (E13.controller_acceptance)",
                 errors[0],
             )
         with self.subTest(variant="merged_sha equal to another PR's source_sha"):
@@ -518,11 +524,11 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
         with self.subTest(variant="same PR merged in one record and unmerged in another"):
             manifest = _valid_manifest_dict()
             second = _fresh_record(pr47(manifest), "E16.4", "second_controller_acceptance", "pr47-second")
-            second.update({"pr": pr47(manifest)["pr"], "merged_sha": "b" * 40})
+            second.update({"pr": pr47(manifest)["pr"], "merged_sha": None})
             manifest["e_scopes"]["E16.4"]["verified_subscopes"].append(second)
             errors = self._errors(manifest)
             self.assertIn(
-                f"E16.4.second_controller_acceptance: PR #47 carries merged_sha {'b' * 40!r} here but None in E16.4.trusted_host_rejection_controller_acceptance",
+                f"E16.4.second_controller_acceptance: PR #47 carries merged_sha None here but {merged_pr47['merged_sha']!r} in {pr47_id}",
                 errors[0],
             )
         with self.subTest(variant="merged_sha on a record whose pr_state is draft"):
@@ -530,14 +536,14 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
             pr47(manifest).update({"pr_state": "draft", "merged_sha": "c" * 40})
             errors = self._errors(manifest)
             self.assertIn(
-                f"E16.4.trusted_host_rejection_controller_acceptance: merged_sha {'c' * 40} is set but the record's pr_state is 'draft', not 'merged'",
+                f"{pr47_id}: merged_sha {'c' * 40} is set but the record's pr_state is 'draft', not 'merged'",
                 errors[0],
             )
         with self.subTest(variant="pr_state merged without merged_sha"):
             manifest = _valid_manifest_dict()
-            pr47(manifest)["pr_state"] = "merged"
+            pr47(manifest).update({"pr_state": "merged", "merged_sha": None})
             errors = self._errors(manifest)
-            self.assertIn("E16.4.trusted_host_rejection_controller_acceptance: pr_state is 'merged' but merged_sha is null", errors[0])
+            self.assertIn(f"{pr47_id}: pr_state is 'merged' but merged_sha is null", errors[0])
         with self.subTest(variant="malformed merged_sha"):
             manifest = _valid_manifest_dict()
             pr47(manifest)["merged_sha"] = "2e209dc"
@@ -549,6 +555,7 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
         ancestry (no subprocess allowed); the checker must at least name the claim as unverified."""
         manifest = _valid_manifest_dict()
         record = manifest["e_scopes"]["E16.4"]["verified_subscopes"][0]
+        record.pop("pr_state")
         record["merged_sha"] = hashlib.sha1(b"fabricated merge of pr47").hexdigest()
         report = self._assert_valid(manifest)
         self.assertTrue(
@@ -607,7 +614,6 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
         merged_record = e10["verified_subscopes"][1]
         self.assertTrue(merged_record["pr"].endswith("/43") and merged_record["merged_sha"])
         merged_record["pr_state"] = "merged"
-        manifest["e_scopes"]["E16.4"]["verified_subscopes"][0]["pr_state"] = "draft"
         sibling = _fresh_record(merged_record, "E10", "replay_management_second_target", "e10-second")
         sibling.update(
             {
