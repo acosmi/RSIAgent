@@ -2227,6 +2227,8 @@ struct ExplorationStarted {
     context_signature: String,
     prefix_digest: String,
     legal_actions_digest: String,
+    policy_digest: String,
+    caps_digest: String,
     action: Value,
 }
 
@@ -2237,12 +2239,16 @@ fn exploration_started(job: &ManagementJob) -> ExplorationStarted {
             context_signature,
             prefix_digest,
             legal_actions_digest,
+            policy_digest,
+            caps_digest,
             action,
         }) => ExplorationStarted {
             world_id: world_id.clone(),
             context_signature: context_signature.clone(),
             prefix_digest: prefix_digest.clone(),
             legal_actions_digest: legal_actions_digest.clone(),
+            policy_digest: policy_digest.clone(),
+            caps_digest: caps_digest.clone(),
             action: serde_json::to_value(action).unwrap(),
         },
         other => panic!("unexpected result: {other:?}"),
@@ -2275,6 +2281,16 @@ async fn exploration_start_admin_e2e_and_idempotency() {
     assert_eq!(started.context_signature, world.context_signature);
     assert_eq!(started.prefix_digest.len(), 64);
     assert_eq!(started.legal_actions_digest.len(), 64);
+    // E14: the result carries the digests of the policy and caps the first
+    // decision was taken with (the built-in policy and the 12/4/1 caps here).
+    assert_eq!(
+        started.policy_digest,
+        ElasticPolicyV1::default().digest().unwrap()
+    );
+    assert_eq!(
+        started.caps_digest,
+        ExplorationCapsV1::online().digest().unwrap()
+    );
     // First pure decision over the empty prefix: dispatch the lowest root
     // opportunity (plan §7.1), exactly as `exploration_v41` observes it.
     assert_eq!(started.action["decision"], "dispatch");
@@ -2286,6 +2302,8 @@ async fn exploration_start_admin_e2e_and_idempotency() {
     assert_eq!(direct.world_id, "world-1");
     assert_eq!(direct.prefix_digest, started.prefix_digest);
     assert_eq!(direct.legal_actions_digest, started.legal_actions_digest);
+    assert_eq!(direct.policy_digest, started.policy_digest);
+    assert_eq!(direct.caps_digest, started.caps_digest);
     assert_eq!(
         serde_json::to_value(&direct.action).unwrap(),
         started.action
@@ -2879,6 +2897,8 @@ async fn exploration_start_crash_recovery_converges_on_registered_world() {
     assert_eq!(again.context_signature, started.context_signature);
     assert_eq!(again.prefix_digest, started.prefix_digest);
     assert_eq!(again.legal_actions_digest, started.legal_actions_digest);
+    assert_eq!(again.policy_digest, started.policy_digest);
+    assert_eq!(again.caps_digest, started.caps_digest);
     assert_eq!(again.action, started.action);
     assert_eq!(
         serde_json::to_value(&recovered.result).unwrap(),

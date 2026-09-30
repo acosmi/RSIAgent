@@ -1422,6 +1422,16 @@ async fn authenticated_async_exploration_start_flow_and_role_rejection() {
             .len(),
         64
     );
+    // E14: the wire result carries the digests of the policy and caps the
+    // first decision was taken with.
+    assert_eq!(
+        terminal["result"]["policy_digest"],
+        json!(ElasticPolicyV1::default().digest().unwrap())
+    );
+    assert_eq!(
+        terminal["result"]["caps_digest"],
+        json!(ExplorationCapsV1::online().digest().unwrap())
+    );
     assert_eq!(terminal["result"]["action"]["decision"], "dispatch");
     assert_eq!(terminal["result"]["action"]["action_seqs"], json!([1]));
 

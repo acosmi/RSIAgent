@@ -84,6 +84,35 @@ pub const FIELD_CONTRACTS: &[FieldContract] = &[
         owner: FieldOwner::ImproverCandidate,
         consumer: "worker",
     },
+    // E14 increment 1 (plan §5.2, §9.1): the only open mechanism class is the
+    // exploration policy; its five fields are read by `decide_elastic` and by
+    // nothing else. Caps, simulation and width are control plane and have no
+    // entry here, so they stay "no consumer" for a candidate.
+    FieldContract {
+        path: "improver.exploration_policy.significant_gain_micros",
+        owner: FieldOwner::ImproverCandidate,
+        consumer: "exploration.decide_elastic",
+    },
+    FieldContract {
+        path: "improver.exploration_policy.stagnation_abs_gain_micros",
+        owner: FieldOwner::ImproverCandidate,
+        consumer: "exploration.decide_elastic",
+    },
+    FieldContract {
+        path: "improver.exploration_policy.stagnation_window",
+        owner: FieldOwner::ImproverCandidate,
+        consumer: "exploration.decide_elastic",
+    },
+    FieldContract {
+        path: "improver.exploration_policy.max_focus_actions",
+        owner: FieldOwner::ImproverCandidate,
+        consumer: "exploration.decide_elastic",
+    },
+    FieldContract {
+        path: "improver.exploration_policy.fairness_wait_rounds",
+        owner: FieldOwner::ImproverCandidate,
+        consumer: "exploration.decide_elastic",
+    },
     FieldContract {
         path: "host.model",
         owner: FieldOwner::TrustedHost,
