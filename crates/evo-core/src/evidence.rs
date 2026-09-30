@@ -2,7 +2,7 @@
 use crate::{Error, Result, fingerprint, identifier, text};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::path::{Component, Path};
+use std::path::Path;
 
 pub const EVIDENCE_SCHEMA: &str = "rsia.evidence_set.v2";
 pub const MAX_DISCOVERED_FILES: usize = 200;
@@ -78,35 +78,107 @@ impl SourceSelection {
             identifier(id)?;
         }
         for root in &self.roots {
-            assert_authorized_path(root, &self.roots)?;
+            assert_authorized_root(root)?;
         }
         Ok(())
     }
 }
 
-pub fn assert_authorized_path(path: &str, roots: &[String]) -> Result<()> {
+/// Splits `path` into its normalised components. Only absolute paths made of plain
+/// components are accepted: relative paths, `.`/`..` components, empty components
+/// (`//x`) and NUL bytes are malformed (`Error::Invalid`). A single trailing `/` is
+/// tolerated only for roots. The filesystem root `/` yields an empty component list.
+fn normalized_components(path: &str, is_root: bool) -> Result<Vec<&str>> {
     if path.is_empty() || path.contains('\0') {
         return Err(Error::Invalid("invalid path".into()));
     }
-    let p = Path::new(path);
-    if p.is_absolute()
-        && !roots
-            .iter()
-            .any(|r| path == r || path.starts_with(&format!("{r}/")))
+    if !Path::new(path).is_absolute() || !path.starts_with('/') {
+        return Err(Error::Invalid("path must be absolute".into()));
+    }
+    let mut body = &path[1..];
+    if is_root && body.ends_with('/') {
+        body = &body[..body.len() - 1];
+    }
+    if is_root && body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let components: Vec<&str> = body.split('/').collect();
+    if components
+        .iter()
+        .any(|component| component.is_empty() || *component == "." || *component == "..")
     {
-        return Err(Error::Forbidden);
+        return Err(Error::Invalid("invalid path".into()));
     }
-    for c in p.components() {
-        if matches!(c, Component::ParentDir) {
-            return Err(Error::Forbidden);
-        }
-    }
+    Ok(components)
+}
+
+fn reject_log_command(path: &str) -> Result<()> {
     if path.contains('\n') || path.contains("sudo ") {
         return Err(Error::Invalid(
             "log command is data, not a new source".into(),
         ));
     }
     Ok(())
+}
+
+/// A per-user home directory shape (`/Users/<name>`, `/home/<name>`) or one of its
+/// ancestors. This floor applies regardless of `HOME`, so an unset or attacker-chosen
+/// `HOME` cannot re-open a whole-home scan.
+fn is_home_shape(components: &[&str]) -> bool {
+    matches!(
+        components,
+        ["Users"] | ["home"] | ["Users", _] | ["home", _]
+    )
+}
+
+/// Refuses the filesystem root, the current home directory (`HOME`, compared
+/// component-wise without resolving symlinks), any ancestor of it, and any
+/// `/Users/<name>` or `/home/<name>` shaped directory. `path` must already be a
+/// normalised absolute path; malformed input is `Error::Invalid`.
+pub fn assert_not_whole_home_scan(path: &str) -> Result<()> {
+    let components = normalized_components(path, true)?;
+    if components.is_empty() || is_home_shape(&components) {
+        return Err(Error::Forbidden);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if let Ok(home_components) = normalized_components(&home, true)
+            && !home_components.is_empty()
+            && components.len() <= home_components.len()
+            && home_components[..components.len()] == components[..]
+        {
+            return Err(Error::Forbidden);
+        }
+    }
+    Ok(())
+}
+
+/// A source root must be an absolute, normalised directory path (a single trailing
+/// `/` is tolerated) that is not the filesystem root, a home directory, or an
+/// ancestor of one.
+pub fn assert_authorized_root(root: &str) -> Result<()> {
+    normalized_components(root, true)?;
+    assert_not_whole_home_scan(root)?;
+    reject_log_command(root)
+}
+
+/// A source path must be an absolute, normalised path (no `.`/`..`/empty components,
+/// no trailing `/`) whose components extend some root's components by at least one
+/// component. Malformed paths are `Error::Invalid`; paths outside every root are
+/// `Error::Forbidden`. A malformed root never authorizes anything.
+pub fn assert_authorized_path(path: &str, roots: &[String]) -> Result<()> {
+    let components = normalized_components(path, false)?;
+    let authorized = roots.iter().any(|root| {
+        normalized_components(root, true).is_ok_and(|root_components| {
+            !root_components.is_empty()
+                && components.len() > root_components.len()
+                && components[..root_components.len()] == root_components[..]
+        })
+    });
+    if !authorized {
+        return Err(Error::Forbidden);
+    }
+    reject_log_command(path)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,6 +565,100 @@ mod tests {
         assert!(assert_authorized_path("/etc/passwd", &roots).is_err());
         assert!(assert_authorized_path("sudo rm -rf /\n/authorized", &roots).is_err());
         assert!(assert_authorized_path("/authorized/run.jsonl", &roots).is_ok());
+    }
+
+    #[test]
+    fn relative_and_malformed_paths_are_invalid_and_prefix_test_is_component_wise() {
+        let roots = vec!["/authorized/vault".into(), "/authorized/logs/".into()];
+        for malformed in [
+            "Cargo.toml",
+            "./Cargo.toml",
+            "",
+            "/",
+            "//authorized/vault/x.jsonl",
+            "/authorized/vault//x.jsonl",
+            "/authorized/vault/./x.jsonl",
+            "/authorized/vault/../vault/x.jsonl",
+            "/authorized/vault/x.jsonl/",
+            "/authorized/vault/x\u{0}.jsonl",
+        ] {
+            assert!(
+                matches!(
+                    assert_authorized_path(malformed, &roots),
+                    Err(Error::Invalid(_))
+                ),
+                "{malformed:?}"
+            );
+        }
+        for outside in [
+            "/authorized/vault2/x.jsonl",
+            "/authorized/vaul",
+            "/authorized/vault",
+            "/authorized",
+            "/etc/passwd",
+        ] {
+            assert!(
+                matches!(
+                    assert_authorized_path(outside, &roots),
+                    Err(Error::Forbidden)
+                ),
+                "{outside:?}"
+            );
+        }
+        assert!(assert_authorized_path("/authorized/vault/x.jsonl", &roots).is_ok());
+        assert!(assert_authorized_path("/authorized/logs/a/b.jsonl", &roots).is_ok());
+        assert!(assert_authorized_path("/authorized/vault/x.jsonl", &["/".to_string()]).is_err());
+        assert!(
+            assert_authorized_path("/authorized/vault/x.jsonl", &["relative".to_string()]).is_err()
+        );
+    }
+
+    #[test]
+    fn roots_must_be_absolute_and_never_the_filesystem_root_or_a_home() {
+        for root in [
+            "/",
+            "//",
+            "/Users",
+            "/home",
+            "/Users/someone",
+            "/home/someone/",
+        ] {
+            assert!(
+                matches!(assert_authorized_root(root), Err(Error::Forbidden)),
+                "{root:?}"
+            );
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = home.to_string_lossy().into_owned();
+            if home.starts_with('/') && home.len() > 1 {
+                assert!(matches!(
+                    assert_authorized_root(&home),
+                    Err(Error::Forbidden)
+                ));
+                assert!(matches!(
+                    assert_authorized_root(&format!("{home}/")),
+                    Err(Error::Forbidden)
+                ));
+                let parent = &home[..home.rfind('/').unwrap().max(1)];
+                assert!(assert_authorized_root(parent).is_err(), "{parent:?}");
+            }
+        }
+        for malformed in ["relative", "./x", "/a/../b", "/a//b", "/a/./b", ""] {
+            assert!(
+                matches!(assert_authorized_root(malformed), Err(Error::Invalid(_))),
+                "{malformed:?}"
+            );
+        }
+        assert!(assert_authorized_root("/authorized").is_ok());
+        assert!(assert_authorized_root("/authorized/").is_ok());
+        assert!(assert_authorized_root("/home/someone/project").is_ok());
+        let selection = SourceSelection {
+            roots: vec!["/".into()],
+            run_ids: vec![],
+            purpose: Purpose::Development,
+            allow_model_excerpts: false,
+        };
+        assert!(matches!(selection.validate(), Err(Error::Forbidden)));
     }
 
     #[test]

@@ -552,18 +552,119 @@ fn scan_value_end(bytes: &[u8], start: usize) -> Result<Option<usize>> {
     }
 }
 
-pub fn tool_result_is_not_preference(role: &str, kind: &str) -> bool {
-    !(role == "user" && (kind == "tool_result" || kind == "command_echo" || kind == "summary"))
+/// Role labels are compared trimmed and ASCII case-insensitively, so `"User"`
+/// or `" user"` are the user role.
+fn is_user_role(role: &str) -> bool {
+    role.trim().eq_ignore_ascii_case("user")
 }
 
+/// Tool output (`tool_result`, `command_echo`, `summary`) is never a human
+/// preference. The role label (normalised via `is_user_role`) no longer gates the
+/// rule: a spelling variant such as `"User"` or a non-user role such as
+/// `"assistant"` cannot re-open preference eligibility for tool output.
+pub fn tool_result_is_not_preference(role: &str, kind: &str) -> bool {
+    let _is_user = is_user_role(role);
+    !matches!(
+        kind.trim().to_ascii_lowercase().as_str(),
+        "tool_result" | "command_echo" | "summary"
+    )
+}
+
+/// Strips retry/fork suffixes (`:try1`, `.try2`, `.try1:fork2`, ...) to a fixed
+/// point, so nested separators still collapse to the incident id.
 pub fn extract_cluster_id(source_id: &str) -> String {
-    if let Some((prefix, _)) = source_id.split_once(':') {
-        prefix.to_string()
-    } else if let Some((prefix, _)) = source_id.split_once('.') {
-        prefix.to_string()
-    } else {
-        source_id.to_string()
+    let mut current = source_id;
+    loop {
+        let next = match current.split_once(':') {
+            Some((prefix, _)) => prefix,
+            None => match current.split_once('.') {
+                Some((prefix, _)) => prefix,
+                None => current,
+            },
+        };
+        if next == current {
+            return current.to_string();
+        }
+        current = next;
     }
+}
+
+/// Independent clusters are the transitive closure (union-find) of two relations
+/// over the ingested sources: same incident id (`extract_cluster_id` of the cluster
+/// hint) and identical content digest. A component that stays within one incident
+/// keeps that incident id as its label; a component that merged several incidents
+/// through identical bytes is labelled `content_<digest>` after the smallest shared
+/// digest, so byte copies under different family names are still one cluster.
+fn independent_clusters(cluster_inputs: &[(String, String)]) -> BTreeSet<String> {
+    fn find(parents: &mut [usize], index: usize) -> usize {
+        let mut root = index;
+        while parents[root] != root {
+            root = parents[root];
+        }
+        let mut current = index;
+        while parents[current] != root {
+            let next = parents[current];
+            parents[current] = root;
+            current = next;
+        }
+        root
+    }
+    fn union(parents: &mut [usize], a: usize, b: usize) {
+        let (a, b) = (find(parents, a), find(parents, b));
+        if a != b {
+            parents[a.max(b)] = a.min(b);
+        }
+    }
+
+    let incident_ids: Vec<String> = cluster_inputs
+        .iter()
+        .map(|(hint, _)| {
+            if hint.contains('.') || hint.contains(':') {
+                extract_cluster_id(hint)
+            } else {
+                "unverified_import_unknown".into()
+            }
+        })
+        .collect();
+    let mut parents: Vec<usize> = (0..cluster_inputs.len()).collect();
+    let mut by_incident: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut by_digest: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, (incident, (_, digest))) in incident_ids.iter().zip(cluster_inputs).enumerate() {
+        if let Some(first) = by_incident.insert(incident.as_str(), index) {
+            union(&mut parents, first, index);
+        }
+        if let Some(first) = by_digest.insert(digest.as_str(), index) {
+            union(&mut parents, first, index);
+        }
+    }
+
+    let mut components: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for index in 0..cluster_inputs.len() {
+        let root = find(&mut parents, index);
+        components.entry(root).or_default().push(index);
+    }
+    components
+        .values()
+        .map(|members| {
+            let incidents: BTreeSet<&str> =
+                members.iter().map(|&i| incident_ids[i].as_str()).collect();
+            if incidents.len() == 1 {
+                return incident_ids[members[0]].clone();
+            }
+            let mut digest_counts: BTreeMap<&str, usize> = BTreeMap::new();
+            for &member in members {
+                *digest_counts
+                    .entry(cluster_inputs[member].1.as_str())
+                    .or_default() += 1;
+            }
+            let shared = digest_counts
+                .iter()
+                .find(|(_, count)| **count > 1)
+                .map(|(digest, _)| *digest)
+                .unwrap_or(cluster_inputs[members[0]].1.as_str());
+            format!("content_{}", &shared[..16])
+        })
+        .collect()
 }
 
 pub fn parse_fixture(format: SourceFormat, body: &str) -> Result<Vec<ImportedEvent>> {
@@ -1068,7 +1169,7 @@ fn parse_claude_fixture(body: &str, _limits: &ImportForensicLimits) -> Result<Ve
             "tool_result".to_string()
         } else if typ == "command_echo" {
             "command_echo".to_string()
-        } else if role == "user"
+        } else if is_user_role(&role)
             && item
                 .get("content")
                 .and_then(|v| v.as_str())
@@ -1079,15 +1180,13 @@ fn parse_claude_fixture(body: &str, _limits: &ImportForensicLimits) -> Result<Ve
             "chat".to_string()
         };
 
-        let content_raw = if let Some(c) = item.get("content").and_then(|v| v.as_str()) {
-            c.to_string()
-        } else if let Some(c) = item.get("content") {
-            c.to_string()
-        } else {
-            String::new()
+        // A record without a top-level string `content` (for example the nested
+        // `message` shape of live Claude Code JSONL) is not a pinned claude.fixture
+        // record; it fails closed instead of becoming an empty user chat event.
+        let content = match item.get("content") {
+            Some(Value::String(c)) => c.clone(),
+            _ => return Err(Error::Invalid("content must be a string".into())),
         };
-
-        let content = content_raw;
 
         events.push(ImportedEvent {
             source_id: String::new(),
@@ -1189,14 +1288,14 @@ fn ingest_selected_sources(
         return Err(Error::Invalid("source selection is empty".into()));
     }
 
-    // Path authorization & rejection of home scan
+    // Path authorization. In-memory labels (valid identifiers, never opened on disk)
+    // are accepted as-is; anything else is a path and must be an absolute, normalised
+    // path strictly inside one of the validated roots (never "/" or a home directory,
+    // which `selection.validate()` already refused as roots).
     for source in sources {
-        if source.source_name == "/"
-            || source.source_name == std::env::var("HOME").unwrap_or_default()
-        {
-            return Err(Error::Forbidden);
+        if identifier(source.source_name).is_err() {
+            assert_authorized_path(source.source_name, &selection.roots)?;
         }
-        assert_authorized_path(source.source_name, &selection.roots)?;
     }
 
     let mut coverage = SourceCoverage {
@@ -1399,22 +1498,7 @@ fn ingest_selected_sources(
         });
     }
 
-    let mut digest_counts = BTreeMap::new();
-    for (_, digest) in &cluster_inputs {
-        *digest_counts.entry(digest.as_str()).or_insert(0usize) += 1;
-    }
-    let clusters: BTreeSet<_> = cluster_inputs
-        .iter()
-        .map(|(hint, digest)| {
-            if digest_counts.get(digest.as_str()).copied().unwrap_or(0) > 1 {
-                format!("content_{}", &digest[..16])
-            } else if hint.contains('.') || hint.contains(':') {
-                extract_cluster_id(hint)
-            } else {
-                "unverified_import_unknown".into()
-            }
-        })
-        .collect();
+    let clusters = independent_clusters(&cluster_inputs);
     let summary = AggregateSummary {
         total_sources: members.len(),
         total_events: all_events.len(),
@@ -1815,6 +1899,9 @@ impl PersistentImportService {
                 .find(|source| source.source_id == record.payload.logical_source_id)
                 .ok_or_else(|| Error::Conflict("prepared source is absent from request".into()))?;
             let remaining = MAX_TOTAL_READ_BYTES.saturating_sub(consumed);
+            // Re-check right before the filesystem is touched: only an absolute,
+            // normalised path strictly inside a validated root is ever opened.
+            assert_authorized_path(&spec.path, &request.roots)?;
             let metadata = match tokio::fs::symlink_metadata(&spec.path).await {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2746,6 +2833,17 @@ mod tests {
         assert!(tool_result_is_not_preference("user", "chat"));
         assert!(!tool_result_is_not_preference("user", "tool_result"));
         assert!(!tool_result_is_not_preference("user", "command_echo"));
+        for role in ["User", " user", "assistant", "tool", ""] {
+            assert!(
+                !tool_result_is_not_preference(role, "tool_result"),
+                "{role:?}"
+            );
+            assert!(!tool_result_is_not_preference(role, "summary"), "{role:?}");
+        }
+        assert!(matches!(
+            parse_fixture(SourceFormat::ClaudeFixture, r#"{"role":"user"}"#),
+            Err(Error::Invalid(message)) if message == "content must be a string"
+        ));
     }
 
     #[test]
@@ -2754,5 +2852,29 @@ mod tests {
         assert_eq!(extract_cluster_id("incident_a.try2"), "incident_a");
         assert_eq!(extract_cluster_id("task_1:fork_1"), "task_1");
         assert_eq!(extract_cluster_id("standalone_job"), "standalone_job");
+        assert_eq!(extract_cluster_id("incident_q.try1:fork2"), "incident_q");
+        assert_eq!(extract_cluster_id("incident_q:try1.retry2"), "incident_q");
+    }
+
+    #[test]
+    fn clusters_are_the_closure_of_incident_and_content_relations() {
+        let d = |s: &str| hash(s.as_bytes());
+        let inputs = vec![
+            ("incident_1.try1".to_string(), d("unique")),
+            ("incident_1.try2".to_string(), d("shared")),
+            ("other.run".to_string(), d("shared")),
+            ("third.run".to_string(), d("third")),
+        ];
+        let clusters = independent_clusters(&inputs);
+        assert_eq!(clusters.len(), 2, "{clusters:?}");
+        assert!(clusters.contains("third"));
+        assert!(clusters.contains(&format!("content_{}", &d("shared")[..16])));
+        let plain = independent_clusters(&[
+            ("a.try1".to_string(), d("x")),
+            ("a.try2".to_string(), d("y")),
+            ("b.run".to_string(), d("z")),
+        ]);
+        assert_eq!(plain, BTreeSet::from(["a".to_string(), "b".to_string()]));
+        assert!(independent_clusters(&[]).is_empty());
     }
 }

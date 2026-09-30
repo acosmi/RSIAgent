@@ -19,7 +19,7 @@ use evo_engine::evidence::read_persisted_imported_evidence;
 use evo_engine::import::{
     IMPORT_REGISTRATION_SCHEMA, ImportForensicLimits, ImportRegistrationRequest, ImportResultState,
     ImportRetentionScope, ImportSourceSpec, PersistentImportService, SourceFormat, detect_format,
-    detect_format_from_bytes, ingest_imported_sources, parse_fixture,
+    detect_format_from_bytes, extract_cluster_id, ingest_imported_sources, parse_fixture,
     tool_result_is_not_preference,
 };
 use evo_storage::Store;
@@ -1257,4 +1257,318 @@ async fn identical_persistent_copies_keep_one_cluster_across_restart_and_reselec
         first_set.independent_clusters
     );
     assert_eq!(second.payload.aggregate_summary.unique_clusters, 1);
+}
+
+// =========================================================================
+// Controller S2 regressions (F13-F16)
+// =========================================================================
+fn f_selection(roots: &[&str]) -> SourceSelection {
+    authorized_selection(roots.iter().map(|root| root.to_string()).collect(), vec![])
+}
+
+fn f_request(roots: Vec<String>, key: &str, path: &str, bytes: &[u8]) -> ImportRegistrationRequest {
+    ImportRegistrationRequest {
+        schema_version: IMPORT_REGISTRATION_SCHEMA.into(),
+        request_key: key.into(),
+        roots,
+        purpose: Purpose::Development,
+        allow_model_excerpts: false,
+        outbound_authorized: false,
+        retention_scope: ImportRetentionScope::LocalPrivate,
+        sources: vec![ImportSourceSpec {
+            source_id: "probe".into(),
+            path: path.into(),
+            reader: SourceFormat::ClaudeFixture,
+            expected_digest: hash(bytes),
+        }],
+    }
+}
+
+async fn f_service(directory: &tempfile::TempDir) -> (Store, Context, PersistentImportService) {
+    let store = Store::open(&directory.path().join("f.sqlite3"))
+        .await
+        .unwrap();
+    let admin = Context::new("tenant", "admin", Role::Admin).unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, &hash(b"f-watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    (store.clone(), admin, PersistentImportService::new(store))
+}
+
+fn f_trace(content: &str) -> String {
+    format!(
+        r#"{{"schema_version":"rsia.trace.v1","events":[{{"role":"user","content":"{content}"}}]}}"#
+    )
+}
+
+#[test]
+fn f13_paths_must_be_absolute_normalised_and_component_prefixed_by_a_root() {
+    let roots = vec!["/authorized/vault".to_string()];
+    for malformed in [
+        "Cargo.toml",
+        "./x.jsonl",
+        "",
+        "//authorized/vault/x.jsonl",
+        "/authorized/vault//x.jsonl",
+        "/authorized/vault/./x.jsonl",
+        "/authorized/vault/../vault/x.jsonl",
+        "/authorized/vault/x.jsonl/",
+    ] {
+        assert!(
+            matches!(
+                assert_authorized_path(malformed, &roots),
+                Err(Error::Invalid(_))
+            ),
+            "{malformed:?}"
+        );
+    }
+    for outside in [
+        "/authorized/vault2/x.jsonl",
+        "/authorized/vaul",
+        "/authorized/vault",
+    ] {
+        assert!(
+            matches!(
+                assert_authorized_path(outside, &roots),
+                Err(Error::Forbidden)
+            ),
+            "{outside:?}"
+        );
+    }
+    assert!(assert_authorized_path("/authorized/vault/x.jsonl", &roots).is_ok());
+    assert!(
+        assert_authorized_path("/authorized/vault/x.jsonl", &["/authorized/vault/".into()]).is_ok()
+    );
+    let sel = f_selection(&["/authorized/vault"]);
+    let body = f_trace("ok");
+    assert!(matches!(
+        ingest_imported_sources(
+            &sel,
+            &[("/authorized/vault2/x.jsonl", body.as_bytes())],
+            None
+        ),
+        Err(Error::Forbidden)
+    ));
+    assert!(matches!(
+        ingest_imported_sources(&sel, &[("relative/x.jsonl", body.as_bytes())], None),
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[tokio::test]
+async fn f13_persistent_registration_refuses_relative_path_before_opening_it() {
+    let bytes = std::fs::read("Cargo.toml").unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let (store, admin, service) = f_service(&directory).await;
+    let roots = vec![directory.path().to_string_lossy().into_owned()];
+    let outcome = service
+        .register(&admin, f_request(roots, "relative", "Cargo.toml", &bytes))
+        .await;
+    assert!(matches!(outcome, Err(Error::Invalid(_))), "{outcome:?}");
+    let mut session = store.session().await.unwrap();
+    let artifacts: Vec<serde_json::Value> = session.list(&admin, "artifact").await.unwrap();
+    session.commit().await.unwrap();
+    assert!(
+        artifacts.is_empty(),
+        "nothing may be pinned for a refused path"
+    );
+}
+
+#[test]
+fn f14_filesystem_root_home_and_home_ancestors_are_refused_as_roots() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    assert!(home.starts_with('/') && home.len() > 1, "HOME must be set");
+    let home_slash = format!("{home}/");
+    let parent = home[..home.rfind('/').unwrap().max(1)].to_string();
+    for root in [
+        "/",
+        "//",
+        "/Users",
+        "/home",
+        "/Users/x",
+        "/home/x/",
+        home.as_str(),
+        home_slash.as_str(),
+        parent.as_str(),
+    ] {
+        let sel = f_selection(&[root]);
+        assert!(
+            matches!(sel.validate(), Err(Error::Forbidden)),
+            "root {root:?}"
+        );
+        let probe = format!("{}/probe.jsonl", root.trim_end_matches('/'));
+        let body = f_trace("never read");
+        assert!(
+            matches!(
+                ingest_imported_sources(&sel, &[(probe.as_str(), body.as_bytes())], None),
+                Err(Error::Forbidden)
+            ),
+            "root {root:?}"
+        );
+    }
+    for root in ["relative", "/a/../b", "/a//b"] {
+        assert!(
+            matches!(f_selection(&[root]).validate(), Err(Error::Invalid(_))),
+            "{root:?}"
+        );
+    }
+    assert!(
+        f_selection(&["/home/x/project", "/authorized/"])
+            .validate()
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn f14_persistent_registration_refuses_home_and_filesystem_roots() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    assert!(home.starts_with('/') && home.len() > 1, "HOME must be set");
+    let directory = tempfile::tempdir().unwrap();
+    let (store, admin, service) = f_service(&directory).await;
+    for (key, root) in [("home", home.as_str()), ("root", "/")] {
+        let path = format!("{}/rsia-f14-probe.jsonl", root.trim_end_matches('/'));
+        let outcome = service
+            .register(
+                &admin,
+                f_request(vec![root.into()], key, &path, b"never read"),
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(Error::Forbidden)),
+            "{root:?}: {outcome:?}"
+        );
+    }
+    let mut session = store.session().await.unwrap();
+    let artifacts: Vec<serde_json::Value> = session.list(&admin, "artifact").await.unwrap();
+    session.commit().await.unwrap();
+    assert!(artifacts.is_empty());
+}
+
+#[test]
+fn f15_nested_suffixes_and_content_copies_collapse_to_one_cluster() {
+    assert_eq!(extract_cluster_id("incident_q.try1:fork2"), "incident_q");
+    assert_eq!(extract_cluster_id("incident_q:try1.retry2"), "incident_q");
+    let sel = f_selection(&["/authorized"]);
+    let unique = f_trace("incident one, first try");
+    let shared = f_trace("shared bytes");
+    let other = f_trace("different");
+
+    let joined = ingest_imported_sources(
+        &sel,
+        &[
+            ("incident_1.try1", unique.as_bytes()),
+            ("incident_1.try2", shared.as_bytes()),
+            ("other.run", shared.as_bytes()),
+        ],
+        None,
+    )
+    .unwrap();
+    assert_eq!(joined.evidence_set.members.len(), 3);
+    assert_eq!(
+        joined.evidence_set.independent_clusters.len(),
+        1,
+        "{:?}",
+        joined.evidence_set.independent_clusters
+    );
+    assert_eq!(joined.aggregate_summary.unique_clusters, 1);
+    assert!(ModelEvidenceRequest::from_set(&joined.evidence_set, vec![]).is_err());
+
+    let nested = ingest_imported_sources(
+        &sel,
+        &[
+            ("incident_y.try1", unique.as_bytes()),
+            ("incident_y:fork2", other.as_bytes()),
+        ],
+        None,
+    )
+    .unwrap();
+    assert_eq!(nested.aggregate_summary.unique_clusters, 1);
+
+    let copies = ingest_imported_sources(
+        &sel,
+        &[
+            ("inc_a.try1", shared.as_bytes()),
+            ("inc_b.try1", shared.as_bytes()),
+            ("inc_d.run", other.as_bytes()),
+        ],
+        None,
+    )
+    .unwrap();
+    assert_eq!(copies.aggregate_summary.unique_clusters, 2);
+    assert!(
+        copies
+            .evidence_set
+            .independent_clusters
+            .contains(&format!("content_{}", &hash(shared.as_bytes())[..16]))
+    );
+    assert!(copies.evidence_set.independent_clusters.contains("inc_d"));
+
+    let independent = ingest_imported_sources(
+        &sel,
+        &[
+            ("incident_x:try1", unique.as_bytes()),
+            ("incident_z.run", other.as_bytes()),
+        ],
+        None,
+    )
+    .unwrap();
+    assert_eq!(independent.aggregate_summary.unique_clusters, 2);
+    assert!(ModelEvidenceRequest::from_set(&independent.evidence_set, vec![]).is_ok());
+}
+
+#[test]
+fn f16_tool_output_is_never_preference_for_any_role_and_missing_content_fails_closed() {
+    for role in [
+        "user",
+        "User",
+        "USER",
+        " user",
+        "user ",
+        "assistant",
+        "tool",
+        "system",
+        "human",
+        "",
+    ] {
+        for kind in ["tool_result", "command_echo", "summary"] {
+            assert!(
+                !tool_result_is_not_preference(role, kind),
+                "role={role:?} kind={kind}"
+            );
+        }
+        assert!(tool_result_is_not_preference(role, "chat"), "role={role:?}");
+    }
+    let events = parse_fixture(
+        SourceFormat::ClaudeFixture,
+        r#"{"type":"tool_result","role":"User","content":"exit code 1"}"#,
+    )
+    .unwrap();
+    assert!(!tool_result_is_not_preference(
+        &events[0].role,
+        &events[0].kind
+    ));
+
+    for body in [
+        r#"{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"exit code 1"}]}}"#,
+        r#"{"role":"user"}"#,
+        r#"{"role":"user","content":["not a string"]}"#,
+    ] {
+        assert!(
+            matches!(
+                parse_fixture(SourceFormat::ClaudeFixture, body),
+                Err(Error::Invalid(message)) if message == "content must be a string"
+            ),
+            "{body}"
+        );
+    }
+    assert!(
+        parse_fixture(
+            SourceFormat::ClaudeFixture,
+            r#"{"role":"user","content":"hello"}"#
+        )
+        .is_ok()
+    );
 }
