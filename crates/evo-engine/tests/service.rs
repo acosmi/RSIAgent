@@ -7,8 +7,9 @@ use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
 use evo_core::{
     ArtifactKind, Context, EntityKind, Error, Feedback, Inspect, Outcome, Prepare, Proposal, Role,
-    hash,
+    Run, hash,
 };
+use evo_engine::capacity::{MAX_PREPARE, MAX_RUNS};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority};
 use evo_engine::release_store::{
     AppliedRequestMaterial, ReleaseStore, TrustedHostExecutionEvidence,
@@ -497,4 +498,187 @@ fn config_is_strict() {
         }))
         .is_err()
     );
+}
+
+// ---------------------------------------------------------------------------
+// E16.5 AG-014: MVP capacity gates at the prepare entry point
+// ---------------------------------------------------------------------------
+
+fn seed_run(id: &str) -> Run {
+    Run {
+        id: id.into(),
+        owner: "agent-a".into(),
+        goal: "seeded trusted host run".into(),
+        snapshot_id: "seed-snapshot".into(),
+        improver_version: "unavailable".into(),
+        capabilities: vec![],
+        status: "prepared".into(),
+        source: "trusted_host_snapshot".into(),
+        created_at: 1,
+    }
+}
+
+fn prepare_request(key: &str, goal: &str) -> Prepare {
+    Prepare {
+        request_key: key.into(),
+        goal: goal.into(),
+        capabilities: vec![],
+    }
+}
+
+#[tokio::test]
+async fn prepare_refuses_the_run_past_mvp_capacity_and_writes_nothing() {
+    let (_dir, service, _host, config) = setup().await;
+    let agent = context("agent-a", Role::Agent);
+    let admin = context("admin", Role::Admin);
+    let mut session = service.store().session().await.unwrap();
+    for index in 0..(MAX_RUNS - 1) {
+        let id = format!("seed-run-{index:04}");
+        session
+            .put(&agent, "artifact", &id, "agent-a", &seed_run(&id))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        session.capacity_usage_v41(&agent, 0).await.unwrap().runs,
+        MAX_RUNS - 1
+    );
+    session.commit().await.unwrap();
+
+    // 999 runs exist: the thousandth run is admitted.
+    let admitted = service
+        .prepare(
+            &agent,
+            prepare_request("run-1000", "last admitted run"),
+            &config,
+        )
+        .await
+        .unwrap();
+    let mut session = service.store().session().await.unwrap();
+    assert_eq!(
+        session.capacity_usage_v41(&agent, 0).await.unwrap().runs,
+        MAX_RUNS
+    );
+    let artifacts_before = session
+        .namespace_object_count(&agent, "artifact")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let audit_before = service.store().verify_audit(&admin).await.unwrap();
+
+    // At the limit a new derivation is refused with the typed conflict.
+    for _ in 0..2 {
+        match service
+            .prepare(
+                &agent,
+                prepare_request("run-1001", "one run too many"),
+                &config,
+            )
+            .await
+        {
+            Err(Error::Conflict(msg)) => assert_eq!(
+                msg,
+                format!("MVP capacity exceeded: runs {MAX_RUNS} >= limit {MAX_RUNS}")
+            ),
+            other => panic!("expected the MVP runs conflict, got {other:?}"),
+        }
+    }
+    // Nothing was written for the refused prepare: no run, no snapshot, no
+    // idempotency row (the repeat above was refused again instead of replayed)
+    // and no audit entry.
+    let mut session = service.store().session().await.unwrap();
+    assert_eq!(
+        session
+            .namespace_object_count(&agent, "artifact")
+            .await
+            .unwrap(),
+        artifacts_before
+    );
+    assert_eq!(
+        session.capacity_usage_v41(&agent, 0).await.unwrap().runs,
+        MAX_RUNS
+    );
+    session.commit().await.unwrap();
+    assert_eq!(
+        service.store().verify_audit(&admin).await.unwrap(),
+        audit_before
+    );
+    assert_eq!(service.inflight_prepare(), 0);
+
+    // The idempotent replay of an admitted run is not a new derivation.
+    let replay = service
+        .prepare(
+            &agent,
+            prepare_request("run-1000", "last admitted run"),
+            &config,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.run.id, admitted.run.id);
+}
+
+#[tokio::test]
+async fn inflight_prepare_slots_refuse_the_sixth_prepare_and_release_on_every_path() {
+    let (_dir, service, _host, config) = setup().await;
+    let agent = context("agent-a", Role::Agent);
+    let mut guards = Vec::new();
+    for _ in 0..MAX_PREPARE {
+        guards.push(service.begin_inflight_prepare().unwrap());
+    }
+    assert_eq!(service.inflight_prepare(), MAX_PREPARE);
+    match service.begin_inflight_prepare() {
+        Err(Error::Conflict(msg)) => assert_eq!(
+            msg,
+            format!(
+                "MVP capacity exceeded: in-flight prepare {MAX_PREPARE} >= limit {MAX_PREPARE}"
+            )
+        ),
+        other => panic!("expected the in-flight prepare conflict, got {other:?}"),
+    }
+    match service
+        .prepare(
+            &agent,
+            prepare_request("inflight-1", "sixth prepare"),
+            &config,
+        )
+        .await
+    {
+        Err(Error::Conflict(msg)) => assert_eq!(
+            msg,
+            format!(
+                "MVP capacity exceeded: in-flight prepare {MAX_PREPARE} >= limit {MAX_PREPARE}"
+            )
+        ),
+        other => panic!("expected the in-flight prepare conflict, got {other:?}"),
+    }
+    assert_eq!(service.inflight_prepare(), MAX_PREPARE);
+
+    // Releasing one slot admits again, and a completed prepare gives it back.
+    drop(guards.pop());
+    assert_eq!(service.inflight_prepare(), MAX_PREPARE - 1);
+    service
+        .prepare(
+            &agent,
+            prepare_request("inflight-1", "sixth prepare"),
+            &config,
+        )
+        .await
+        .unwrap();
+    assert_eq!(service.inflight_prepare(), MAX_PREPARE - 1);
+
+    // An error after the slot was taken (idempotency conflict inside the
+    // first session) releases it as well.
+    assert!(matches!(
+        service
+            .prepare(
+                &agent,
+                prepare_request("inflight-1", "different goal"),
+                &config
+            )
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(service.inflight_prepare(), MAX_PREPARE - 1);
+    drop(guards);
+    assert_eq!(service.inflight_prepare(), 0);
 }

@@ -1255,8 +1255,12 @@ async fn real_e03_no_change_and_zero_budget_paths_never_dispatch_or_write_active
                         request_artifact: None,
                         max_cost_micros,
                         lease_token: format!("budget-fill-lease-{index}"),
-                        lease_until: 100,
-                        now: 30,
+                        // Each fill lease has expired by the next reservation:
+                        // the calls keep their money reserved without holding
+                        // ten live leases (E16.5 caps live leases at 10 per
+                        // namespace, and `prior-dispatched-call` holds one).
+                        lease_until: 31 + index,
+                        now: 30 + index,
                     },
                 )
                 .await

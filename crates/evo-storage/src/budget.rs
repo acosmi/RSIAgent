@@ -3,7 +3,9 @@
 //! Monetary values are integer micros in the root's authorized currency/pricing
 //! version. No floating-point conversion occurs here.
 
-use super::{Session, Store, internal};
+use super::{
+    MVP_MAX_ACTIVE_LEASES, Session, Store, count_active_leases, internal, mvp_capacity_exceeded,
+};
 use evo_core::evaluation::OptimizationStage;
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, text};
 use serde::{Deserialize, Serialize};
@@ -567,6 +569,17 @@ impl Store {
                 )
             })
             .unwrap_or((None, None, None));
+        // E16.5: a reserved call holds a lease until `lease_until`. Refuse the
+        // new lease when the namespace already holds the MVP maximum; nothing
+        // below this point runs, so no reservation or event row is written.
+        let active_leases = count_active_leases(&mut tx, ctx.namespace(), request.now).await?;
+        if active_leases >= MVP_MAX_ACTIVE_LEASES {
+            return Err(mvp_capacity_exceeded(
+                "active leases",
+                active_leases,
+                MVP_MAX_ACTIVE_LEASES,
+            ));
+        }
         sqlx::query("UPDATE root_budgets SET reserved_micros=? WHERE billing_scope=?")
             .bind(
                 reserved

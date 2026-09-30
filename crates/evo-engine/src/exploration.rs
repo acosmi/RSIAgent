@@ -1,4 +1,7 @@
 //! generate → execute_dev → observe → decide. Intermediate nodes are not published.
+use crate::capacity::{
+    CapacityField, CapacityLimits, V41CapacityUsage, admit_field, unix_now_secs,
+};
 use crate::evidence::validate_stored_sources;
 use crate::model::ModelPort;
 use crate::optimization::{
@@ -113,10 +116,10 @@ impl Coordinator {
 }
 
 const WORLD_RECORD_KIND: &str = "exploration_world_v1";
-const NODE_RECORD_KIND: &str = "exploration_node_v1";
+pub(crate) const NODE_RECORD_KIND: &str = "exploration_node_v1";
 const DISPATCH_RECORD_KIND: &str = "exploration_dispatch_v1";
 const HISTORY_RECORD_KIND: &str = "optimization_history_v1";
-const ENVELOPE_SCHEMA: &str = "rsia.exploration_artifact_envelope.v1";
+pub(crate) const ENVELOPE_SCHEMA: &str = "rsia.exploration_artifact_envelope.v1";
 
 fn validate_digest(value: &str) -> Result<()> {
     if value.len() != 64
@@ -706,6 +709,18 @@ impl PersistentCoordinator {
                 if world.remaining_root_micros < cost {
                     return Err(Error::Budget);
                 }
+                // E16.5: this dispatch derives one new exploration node. Refuse
+                // inside the session, before the dispatch fact and before any
+                // model call, when the namespace already holds the MVP maximum.
+                let usage: V41CapacityUsage = session
+                    .capacity_usage_v41(&self.context, unix_now_secs())
+                    .await?
+                    .into();
+                admit_field(
+                    CapacityField::ExplorationNodes,
+                    usage.exploration_nodes,
+                    &CapacityLimits::default(),
+                )?;
                 let fact = ExplorationDispatchFact {
                     schema_version: "rsia.exploration_dispatch.v1".into(),
                     id: dispatch_id.clone(),

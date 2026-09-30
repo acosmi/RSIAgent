@@ -19,10 +19,11 @@
 
 use evo_core::Error;
 use evo_engine::capacity::{
-    DeploymentSecurityConfig, MAX_ACTIVE_LEASES, MAX_CONCURRENT_DISPATCH, MAX_EVENTS,
-    MAX_EXPLORATION_NODES, MAX_PREPARE, MAX_REPLAY_WORLDS, MAX_RUNS, MAX_SKILLS,
-    MAX_STAGED_PACKAGES, RecoveryStateManifest, Usage, V41CapacityUsage, admit, admit_v41,
-    validate_deployment_security, verify_recovery_state,
+    CapacityField, CapacityLimits, DeploymentSecurityConfig, MAX_ACTIVE_LEASES,
+    MAX_CONCURRENT_DISPATCH, MAX_EVENTS, MAX_EXPLORATION_NODES, MAX_PREPARE, MAX_REPLAY_WORLDS,
+    MAX_RUNS, MAX_SKILLS, MAX_STAGED_PACKAGES, RecoveryStateManifest, Usage, V41CapacityUsage,
+    admit, admit_field, admit_v41, admit_v41_with, validate_deployment_security,
+    verify_recovery_state,
 };
 use evo_engine::executor::IsolationPolicy;
 
@@ -785,4 +786,141 @@ fn test_f11_anchor_100_byte_valid_header_accepted_when_code_execution_disabled()
         &reference_isolation(),
     )
     .expect("sandbox_enabled without code execution must still be accepted");
+}
+
+// ---------------------------------------------------------------------------
+// E16.5 AG-014: CapacityLimits and per-field admission (the pure gate every
+// real entry point calls)
+// ---------------------------------------------------------------------------
+#[test]
+fn capacity_limits_default_pins_the_plan_constants() {
+    assert_eq!(
+        CapacityLimits::default(),
+        CapacityLimits {
+            runs: MAX_RUNS,
+            events: MAX_EVENTS,
+            skills: MAX_SKILLS,
+            inflight_prepare: MAX_PREPARE,
+            exploration_nodes: MAX_EXPLORATION_NODES,
+            replay_worlds: MAX_REPLAY_WORLDS,
+            active_leases: MAX_ACTIVE_LEASES,
+            staged_packages: MAX_STAGED_PACKAGES,
+            concurrent_dispatches: MAX_CONCURRENT_DISPATCH,
+        }
+    );
+    assert_eq!(
+        (
+            MAX_RUNS,
+            MAX_EVENTS,
+            MAX_SKILLS,
+            MAX_PREPARE,
+            MAX_EXPLORATION_NODES,
+            MAX_REPLAY_WORLDS,
+            MAX_ACTIVE_LEASES,
+            MAX_STAGED_PACKAGES,
+            MAX_CONCURRENT_DISPATCH
+        ),
+        (1_000, 10_000, 1_000, 5, 500, 100, 10, 20, 1)
+    );
+}
+
+#[test]
+fn every_capacity_field_admits_limit_minus_one_and_refuses_the_limit() {
+    let limits = CapacityLimits {
+        runs: 7,
+        events: 11,
+        skills: 5,
+        inflight_prepare: 3,
+        exploration_nodes: 9,
+        replay_worlds: 4,
+        active_leases: 6,
+        staged_packages: 8,
+        concurrent_dispatches: 1,
+    };
+    let empty = V41CapacityUsage {
+        runs: 0,
+        events: 0,
+        skills: 0,
+        inflight_prepare: 0,
+        exploration_nodes: 0,
+        replay_worlds: 0,
+        active_leases: 0,
+        staged_packages: 0,
+        concurrent_dispatches: 0,
+    };
+    assert!(admit_v41_with(&empty, &limits).is_ok());
+    fn set(usage: &mut V41CapacityUsage, field: CapacityField, value: u64) {
+        match field {
+            CapacityField::Runs => usage.runs = value,
+            CapacityField::Events => usage.events = value,
+            CapacityField::Skills => usage.skills = value,
+            CapacityField::InflightPrepare => usage.inflight_prepare = value,
+            CapacityField::ExplorationNodes => usage.exploration_nodes = value,
+            CapacityField::ReplayWorlds => usage.replay_worlds = value,
+            CapacityField::ActiveLeases => usage.active_leases = value,
+            CapacityField::StagedPackages => usage.staged_packages = value,
+            CapacityField::ConcurrentDispatches => usage.concurrent_dispatches = value,
+        }
+    }
+    for field in CapacityField::ALL {
+        let limit = field.limit(&limits);
+        let label = field.label();
+        if field == CapacityField::ConcurrentDispatches {
+            // The one bound where the limit itself is admitted (it counts the
+            // dispatch being admitted) and limit + 1 is refused.
+            assert!(admit_field(field, limit, &limits).is_ok());
+            match admit_field(field, limit + 1, &limits) {
+                Err(Error::Conflict(msg)) => assert_eq!(
+                    msg,
+                    format!(
+                        "MVP capacity exceeded: {label} {} > limit {limit}",
+                        limit + 1
+                    )
+                ),
+                other => panic!("{label} above limit must be refused, got {other:?}"),
+            }
+            let mut over = empty;
+            set(&mut over, field, limit + 1);
+            assert!(admit_v41_with(&over, &limits).is_err());
+            continue;
+        }
+        assert!(
+            admit_field(field, limit - 1, &limits).is_ok(),
+            "{label} at limit-1 must be admitted"
+        );
+        match admit_field(field, limit, &limits) {
+            Err(Error::Conflict(msg)) => assert_eq!(
+                msg,
+                format!("MVP capacity exceeded: {label} {limit} >= limit {limit}")
+            ),
+            other => panic!("{label} at limit must be refused, got {other:?}"),
+        }
+        let mut below = empty;
+        set(&mut below, field, limit - 1);
+        assert!(admit_v41_with(&below, &limits).is_ok());
+        let mut at_limit = empty;
+        set(&mut at_limit, field, limit);
+        assert_eq!(
+            admit_v41_with(&at_limit, &limits).unwrap_err().to_string(),
+            admit_field(field, limit, &limits).unwrap_err().to_string(),
+            "{label}: the vector gate and the field gate report the same refusal"
+        );
+        // A default-limit vector at the same usage: the field alone decides.
+        let mut default_case = empty;
+        set(
+            &mut default_case,
+            field,
+            field.limit(&CapacityLimits::default()),
+        );
+        assert_eq!(
+            admit_v41(&default_case).unwrap_err().to_string(),
+            admit_v41_with(&default_case, &CapacityLimits::default())
+                .unwrap_err()
+                .to_string()
+        );
+        assert_eq!(
+            field.usage(&default_case),
+            field.limit(&CapacityLimits::default())
+        );
+    }
 }

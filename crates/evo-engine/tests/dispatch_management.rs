@@ -3,13 +3,18 @@ use evo_core::evidence::Purpose;
 use evo_core::hash;
 use evo_core::replay::*;
 use evo_core::strategy::{ActionKindV1, ElasticPolicyV1, ExplorationCapsV1, ObservedStatus};
-use evo_core::{Context, Error, Job, JobState, Role};
+use evo_core::{Context, Error, Job, JobState, Role, now};
+use evo_engine::capacity::MAX_ACTIVE_LEASES;
 use evo_engine::dispatch::{
     ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
 };
 use evo_storage::Store;
+use evo_storage::budget::{
+    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization,
+};
 use evo_storage::replay::{register_replay_pool, replay_pool_storage_id, seal_replay_world};
 use serde_json::json;
+use std::time::Duration;
 
 async fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
@@ -403,13 +408,23 @@ async fn evaluator_job_same_key_different_ticket_conflicts_after_restart_safe_fa
         )
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let mut session = store.session().await.unwrap();
-    let first: ManagementJob = session
-        .need(&evaluator, "job", &first_queued.id)
-        .await
-        .unwrap();
-    session.commit().await.unwrap();
+    // The background consumer fails the job; poll the store (not `status`)
+    // until it is terminal instead of assuming a fixed delay.
+    let mut first: Option<ManagementJob> = None;
+    for _ in 0..400 {
+        let mut session = store.session().await.unwrap();
+        let job: ManagementJob = session
+            .need(&evaluator, "job", &first_queued.id)
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        if job.state != ManagementJobState::Queued && job.state != ManagementJobState::Running {
+            first = Some(job);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let first = first.expect("management job did not fail in the background");
     assert_eq!(first.state, ManagementJobState::Failed);
     assert_eq!(first.error_code.as_deref(), Some("not_found"));
     assert!(matches!(
@@ -1722,4 +1737,244 @@ async fn curriculum_step_cancel_before_claim_creates_no_probe_job() {
             .await
             .is_empty()
     );
+}
+
+// ---------------------------------------------------------------------------
+// E16.5 AG-014: MVP capacity gates at the management claim entry point
+// ---------------------------------------------------------------------------
+
+/// Like `wait_terminal`, but tolerant of the capacity retry delay.
+async fn wait_terminal_slowly(
+    dispatcher: &ManagementDispatcher,
+    context: &Context,
+    job_id: &str,
+) -> ManagementJob {
+    for _ in 0..200 {
+        let job = dispatcher.status(context, job_id).await.unwrap();
+        if matches!(
+            job.state,
+            ManagementJobState::Succeeded
+                | ManagementJobState::Failed
+                | ManagementJobState::Cancelled
+                | ManagementJobState::Blocked
+        ) {
+            return job;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("management job did not finish after the capacity wait");
+}
+
+fn live_running_job() -> ManagementJob {
+    ManagementJob {
+        id: "management-job-holding-the-dispatch".into(),
+        schema_version: "rsia.management_job.v1".into(),
+        operation: "meta.start".into(),
+        request_key: "holding".into(),
+        payload_digest: "a".repeat(64),
+        owner_actor: "admin".into(),
+        owner_role: Role::Admin,
+        state: ManagementJobState::Running,
+        step: "claimed".into(),
+        private_input_ref: "management-input-holding".into(),
+        result: None,
+        error_code: None,
+        cancel_requested: false,
+        lease_token: Some("live-lease".into()),
+        lease_until: now().saturating_add(60),
+        generation: 1,
+        diagnostics: vec![],
+        created_at: 1,
+    }
+}
+
+async fn assert_waiting_for_capacity(
+    dispatcher: &ManagementDispatcher,
+    admin: &Context,
+    job_id: &str,
+) -> ManagementJob {
+    // Let the spawned claim (and a few retries) run.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let waiting = dispatcher.status(admin, job_id).await.unwrap();
+    assert_eq!(waiting.state, ManagementJobState::Queued);
+    assert_eq!(waiting.step, ManagementDispatcher::CAPACITY_WAIT_STEP);
+    assert!(waiting.lease_token.is_none());
+    assert_eq!(waiting.lease_until, 0);
+    assert_eq!(waiting.generation, 0);
+    assert_eq!(waiting.diagnostics.len(), 1);
+    assert_eq!(waiting.diagnostics[0].code, "conflict");
+    // Retries keep the job Queued without piling up diagnostics.
+    tokio::time::sleep(ManagementDispatcher::CAPACITY_WAIT_RETRY * 2).await;
+    let still_waiting = dispatcher.status(admin, job_id).await.unwrap();
+    assert_eq!(still_waiting.state, ManagementJobState::Queued);
+    assert_eq!(still_waiting.diagnostics.len(), 1);
+    still_waiting
+}
+
+#[tokio::test]
+async fn second_management_dispatch_waits_queued_until_the_live_lease_finishes() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let holding = live_running_job();
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin, "job", &holding.id, admin.actor(), &holding)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "meta.start",
+            json!({
+                "schema_version":"rsia.management.meta_start.v1",
+                "request_key":"waits-for-dispatch-capacity"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.state, ManagementJobState::Queued);
+    assert_waiting_for_capacity(&dispatcher, &admin, &queued.id).await;
+
+    // The running job finishes and releases its lease: the deferred claim
+    // proceeds on its own and the job runs to its normal terminal state.
+    let mut finished = holding.clone();
+    finished.state = ManagementJobState::Succeeded;
+    finished.step = "finished".into();
+    finished.lease_token = None;
+    finished.lease_until = 0;
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin, "job", &finished.id, admin.actor(), &finished)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let done = wait_terminal_slowly(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Blocked);
+    assert_eq!(
+        done.error_code.as_deref(),
+        Some("meta.start_consumer_unavailable")
+    );
+    assert_eq!(done.generation, 1);
+    assert_eq!(done.diagnostics.len(), 1);
+    assert_eq!(done.diagnostics[0].code, "conflict");
+    // The job that held the dispatch was never touched.
+    let untouched = dispatcher.status(&admin, &holding.id).await.unwrap();
+    assert_eq!(untouched.state, ManagementJobState::Succeeded);
+}
+
+#[tokio::test]
+async fn capacity_deferred_job_can_still_be_cancelled_while_queued() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let holding = live_running_job();
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin, "job", &holding.id, admin.actor(), &holding)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "meta.start",
+            json!({"schema_version":"rsia.management.meta_start.v1","request_key":"cancel-while-waiting"}),
+        )
+        .await
+        .unwrap();
+    assert_waiting_for_capacity(&dispatcher, &admin, &queued.id).await;
+    let cancelled = dispatcher.cancel(&admin, &queued.id).await.unwrap();
+    assert_eq!(cancelled.state, ManagementJobState::Cancelled);
+    assert_eq!(cancelled.step, "cancelled_before_claim");
+    // The retry loop observes the terminal state and stops without a claim.
+    tokio::time::sleep(ManagementDispatcher::CAPACITY_WAIT_RETRY * 2).await;
+    let observed = dispatcher.status(&admin, &queued.id).await.unwrap();
+    assert_eq!(observed.state, ManagementJobState::Cancelled);
+    assert_eq!(observed.generation, 0);
+}
+
+#[tokio::test]
+async fn management_claim_waits_while_ten_budget_leases_are_live() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let worker = Context::new("n", "worker", Role::Worker).unwrap();
+    store
+        .authorize_root_budget(
+            &admin,
+            &RootBudgetAuthorization {
+                root_budget_id: "root-1".into(),
+                billing_scope: "scope-1".into(),
+                allowed_namespaces: vec!["n".into()],
+                currency: "USD".into(),
+                pricing_version: "price-v1".into(),
+                payment_subject: "payer-1".into(),
+                authorization_receipt_digest: hash(b"admin-authorization"),
+                per_call_cap_micros: 100,
+                total_limit_micros: 10_000,
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let clock = now();
+    let mut calls = Vec::new();
+    for index in 0..MAX_ACTIVE_LEASES {
+        let call_id = format!("lease-{index}");
+        calls.push(
+            store
+                .reserve_budget_call(
+                    &worker,
+                    &BudgetCallReservation {
+                        billing_scope: "scope-1".into(),
+                        call_id: call_id.clone(),
+                        dispatch_group_id: "group-1".into(),
+                        stage: BudgetStage::Reflection,
+                        actual_input_digest: hash(call_id.as_bytes()),
+                        request_artifact: None,
+                        max_cost_micros: 10,
+                        lease_token: format!("token-{index}"),
+                        lease_until: clock.saturating_add(600),
+                        now: clock,
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "meta.start",
+            json!({
+                "schema_version":"rsia.management.meta_start.v1",
+                "request_key":"waits-for-lease-capacity"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_waiting_for_capacity(&dispatcher, &admin, &queued.id).await;
+
+    // Releasing one lease is enough: the claim then holds the tenth lease.
+    let released = &calls[0];
+    store
+        .release_undispatched_budget_call(
+            &worker,
+            &BudgetCallFence {
+                billing_scope: released.billing_scope.clone(),
+                call_id: released.call_id.clone(),
+                actual_input_digest: released.actual_input_digest.clone(),
+                lease_token: released.lease_token.clone(),
+                lease_epoch: released.lease_epoch,
+                now: clock.saturating_add(1),
+            },
+            "capacity_test_release",
+        )
+        .await
+        .unwrap();
+    let done = wait_terminal_slowly(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Blocked);
+    assert_eq!(done.generation, 1);
 }

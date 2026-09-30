@@ -5,6 +5,9 @@
 //! host identity and one namespace at startup; request payloads cannot change
 //! either value.
 
+use crate::capacity::{
+    CapacityField, CapacityLimits, V41CapacityUsage, admit_field, unix_now_secs,
+};
 use crate::evidence::{StoredTraceAuthority, load_stored_source, store_trace_authority};
 use crate::release_store::{
     HostApplicationRecord, PersistentRelease, PrepareRunRequest, ReleaseCandidateRecord,
@@ -16,10 +19,11 @@ use evo_core::{
     Inspect, Job, Prepared, Proposal, Receipt, Release, Result, Role, Run, Skill, Validate,
     fingerprint, hash, identifier, now, text,
 };
-use evo_storage::Store;
+use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 // E03 owns Store kind=`run` for its trusted authority envelope. Service runs
@@ -100,6 +104,23 @@ pub struct HostService {
     store: Store,
     trusted_host: Context,
     application_lock: Arc<Mutex<()>>,
+    // In-flight prepare is never persisted: like `application_lock` it is a
+    // process-local fact shared by every clone of this service.
+    inflight_prepare: Arc<AtomicU64>,
+}
+
+/// One admitted in-flight prepare slot. Dropping it releases the slot on every
+/// exit path of `HostService::prepare`, including errors.
+#[derive(Debug)]
+#[must_use = "dropping the guard releases the in-flight prepare slot"]
+pub struct InflightPrepareGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl Drop for InflightPrepareGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl HostService {
@@ -109,11 +130,59 @@ impl HostService {
             store,
             trusted_host,
             application_lock: Arc::new(Mutex::new(())),
+            inflight_prepare: Arc::new(AtomicU64::new(0)),
         })
     }
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Prepares currently in flight in this process.
+    pub fn inflight_prepare(&self) -> u64 {
+        self.inflight_prepare.load(Ordering::Acquire)
+    }
+
+    /// Take one in-flight prepare slot, or refuse with the typed MVP capacity
+    /// conflict once `MAX_PREPARE` prepares are already in flight. Tests use
+    /// this to saturate the slots; `prepare` takes one for its whole duration.
+    pub fn begin_inflight_prepare(&self) -> Result<InflightPrepareGuard> {
+        let limits = CapacityLimits::default();
+        let mut current = self.inflight_prepare.load(Ordering::Acquire);
+        loop {
+            admit_field(CapacityField::InflightPrepare, current, &limits)?;
+            match self.inflight_prepare.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(InflightPrepareGuard {
+                        counter: Arc::clone(&self.inflight_prepare),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// E16.5 / plan §3.3.1: a prepare derives a new run. Refuse it, inside the
+    /// caller's session, once any MVP counter (runs, events, skills, other
+    /// in-flight prepares) is at its limit. Nothing is truncated; the caller
+    /// is told which counter to scale or clean up.
+    async fn admit_new_run(&self, session: &mut Session, caller: &Context) -> Result<()> {
+        let others_in_flight = self.inflight_prepare().saturating_sub(1);
+        let usage: V41CapacityUsage = session
+            .capacity_usage_v41(caller, unix_now_secs())
+            .await?
+            .into();
+        let usage = usage.with_inflight_prepare(others_in_flight);
+        let limits = CapacityLimits::default();
+        for field in CapacityField::MVP_DERIVE {
+            admit_field(field, field.usage(&usage), &limits)?;
+        }
+        Ok(())
     }
 
     pub fn trusted_namespace(&self) -> &str {
@@ -155,6 +224,8 @@ impl HostService {
             request: &request,
             config,
         };
+        // Held until this function returns on any path.
+        let _inflight = self.begin_inflight_prepare()?;
         {
             let mut session = self.store.session().await?;
             if let Some(existing) = session
@@ -177,6 +248,10 @@ impl HostService {
                 session.commit().await?;
                 return Ok(existing);
             }
+            // Idempotent replays above are not new derivations. A miss is:
+            // refuse here, before the run snapshot is frozen, so a refused
+            // prepare writes nothing at all.
+            self.admit_new_run(&mut session, caller).await?;
             session.commit().await?;
         }
 
@@ -266,6 +341,10 @@ impl HostService {
                 ));
             }
         } else {
+            // Service runs live in the artifact kind, so `Session::put`'s run
+            // bound does not see them: re-admit in the session that inserts
+            // the run, which is the authoritative count-then-insert.
+            self.admit_new_run(&mut session, caller).await?;
             session
                 .put(
                     caller,

@@ -417,6 +417,12 @@ impl ManagementDispatcher {
         finish_claim(&ctx, &self.store, &job, outcome).await
     }
 
+    /// Step recorded on a Queued job whose claim was deferred by an E16.5
+    /// capacity bound; the job stays retriable and is claimed later.
+    pub const CAPACITY_WAIT_STEP: &'static str = "capacity_wait";
+    /// Delay before a capacity-deferred claim is retried.
+    pub const CAPACITY_WAIT_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
+
     async fn claim(&self, job_id: &str) -> Result<(Context, Option<ManagementJob>)> {
         identifier(job_id)?;
         for trusted in self.trusted_contexts.iter() {
@@ -438,6 +444,51 @@ impl ManagementDispatcher {
                 session.commit().await?;
                 return Ok((trusted.clone(), None));
             }
+            // E16.5: claiming takes a lease and starts a dispatch. Measure in
+            // the claim session and refuse when this claim would exceed the
+            // one concurrent management dispatch or the live lease bound.
+            // A refused job stays Queued (retriable): the wait is recorded
+            // once on the job and the claim is retried after a short delay.
+            let usage: crate::capacity::V41CapacityUsage = session
+                .capacity_usage_v41(trusted, crate::capacity::unix_now_secs())
+                .await?
+                .into();
+            let limits = crate::capacity::CapacityLimits::default();
+            let admitted = crate::capacity::admit_field(
+                crate::capacity::CapacityField::ConcurrentDispatches,
+                usage.concurrent_dispatches.saturating_add(1),
+                &limits,
+            )
+            .and_then(|()| {
+                crate::capacity::admit_field(
+                    crate::capacity::CapacityField::ActiveLeases,
+                    usage.active_leases,
+                    &limits,
+                )
+            });
+            if let Err(refusal) = admitted {
+                if job.step != Self::CAPACITY_WAIT_STEP {
+                    if job.diagnostics.len() >= 32 {
+                        job.diagnostics.remove(0);
+                    }
+                    job.diagnostics.push(ManagementDiagnostic {
+                        code: error_code(&refusal).into(),
+                        observed_generation: job.generation,
+                        recorded_at: now(),
+                    });
+                    job.step = Self::CAPACITY_WAIT_STEP.into();
+                    session
+                        .put(trusted, "job", &job.id, trusted.actor(), &job)
+                        .await?;
+                    session
+                        .audit(trusted, "management.job.capacity_wait", &job.id)
+                        .await?;
+                }
+                session.commit().await?;
+                tracing::warn!(job_id = %job.id, error = %refusal, "management claim deferred by MVP capacity");
+                self.retry_claim_later(job.id);
+                return Ok((trusted.clone(), None));
+            }
             job.generation = job
                 .generation
                 .checked_add(1)
@@ -457,6 +508,17 @@ impl ManagementDispatcher {
             return Ok((trusted.clone(), Some(job)));
         }
         Err(Error::Forbidden)
+    }
+
+    /// Re-run a capacity-deferred claim after `CAPACITY_WAIT_RETRY`. The loop
+    /// ends when the job is claimed, cancelled, or otherwise terminal; a lost
+    /// process simply leaves the job Queued for `recover_pending`.
+    fn retry_claim_later(&self, job_id: String) {
+        let dispatcher = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Self::CAPACITY_WAIT_RETRY).await;
+            dispatcher.spawn_job(job_id);
+        });
     }
 
     async fn record_background_error(&self, job_id: &str, error: &Error) -> Result<()> {
