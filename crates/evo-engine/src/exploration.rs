@@ -115,6 +115,11 @@ impl Coordinator {
     }
 }
 
+// Revocation closure (plan §11.5, E08): a world depends on its source runs
+// (`persist_world_registration`), and every node, dispatch fact and history
+// entry depends on its world (`put_world_edge`). The cleanup walks the
+// dependents of a revoked run, so it reaches the world and, through it, each of
+// those records, which are all on its redact allow-list.
 const WORLD_RECORD_KIND: &str = "exploration_world_v1";
 pub(crate) const NODE_RECORD_KIND: &str = "exploration_node_v1";
 const DISPATCH_RECORD_KIND: &str = "exploration_dispatch_v1";
@@ -786,6 +791,16 @@ impl PersistentCoordinator {
             &entry,
         )
         .await?;
+        // The entry names no source run: it belongs to the world it is listed
+        // in (`history_ids`) and is only ever read through that world.
+        put_world_edge(
+            &mut session,
+            &self.context,
+            HISTORY_RECORD_KIND,
+            &entry.entry_id,
+            world_id,
+        )
+        .await?;
         put_record(
             &mut session,
             &self.context,
@@ -1023,6 +1038,14 @@ impl PersistentCoordinator {
                     &fact,
                 )
                 .await?;
+                put_world_edge(
+                    &mut session,
+                    &self.context,
+                    DISPATCH_RECORD_KIND,
+                    &dispatch_id,
+                    &world.id,
+                )
+                .await?;
                 put_record(
                     &mut session,
                     &self.context,
@@ -1238,6 +1261,14 @@ impl PersistentCoordinator {
             &node_id,
             &self.owner,
             &node,
+        )
+        .await?;
+        put_world_edge(
+            &mut session,
+            &self.context,
+            NODE_RECORD_KIND,
+            &node_id,
+            &world.id,
         )
         .await?;
         put_record(
@@ -1786,6 +1817,32 @@ async fn put_record<T: Serialize>(
                 record_kind: record_kind.into(),
                 payload,
             },
+        )
+        .await
+}
+
+/// Ties one exploration record to the world that owns it with the dependency
+/// edge `record -> world` (both are `artifact` objects, addressed by their
+/// storage ids). Revocation cleanup follows `dependents`, so this is the edge
+/// that carries a revoked run from the world to the record. `put_edge` is an
+/// `INSERT OR IGNORE`: repeating the call never adds a second edge.
+///
+/// Callers write it in the session that first writes the record. A record
+/// written before this edge existed has none, and nothing back-fills it.
+async fn put_world_edge(
+    session: &mut Session,
+    ctx: &Context,
+    record_kind: &str,
+    record_id: &str,
+    world_id: &str,
+) -> Result<()> {
+    session
+        .put_edge(
+            ctx,
+            "artifact",
+            &storage_id(record_kind, record_id)?,
+            "artifact",
+            &storage_id(WORLD_RECORD_KIND, world_id)?,
         )
         .await
 }
