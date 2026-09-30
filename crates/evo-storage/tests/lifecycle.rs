@@ -2028,3 +2028,155 @@ fn restore_rejects_symlink_above_the_package_root() {
             .success()
     );
 }
+
+// =========================================================================
+// F17 Adversarial Regression (from controller review): a staged asset whose
+// payload state is not live (aborted, failed, quarantined) must not keep a raw
+// import blob alive once the import source is revoked, while live states
+// (prepared, staged) still do.
+// =========================================================================
+
+/// Live import source `import_id` (edge -> blob) plus a staged asset
+/// `staged_id` in `state` whose `content_blob_digest` is the same raw blob and
+/// whose only source is run `source_id`.
+async fn f17_import_and_staged_asset_sharing_blob(
+    store: &Store,
+    admin: &Context,
+    import_id: &str,
+    staged_id: &str,
+    source_id: &str,
+    state: &str,
+) -> String {
+    let bytes = format!("SHARED-RAW-{import_id}");
+    let digest = store.put_blob(admin, bytes.as_bytes()).await.unwrap();
+    put_source(store, source_id, "authority").await;
+    let source = json!({
+        "id":source_id,
+        "schema_version":"rsia.optimization.source.v1",
+        "body":"authority"
+    });
+    let import = e16_import_envelope(
+        "rsia.e16.import_source.v1",
+        import_id,
+        json!([{"kind":"blob","id":digest,"content_digest":digest}]),
+        json!({"status":"ready","raw_blob_digest":digest,"blob_published":true}),
+    );
+    let staged = e16_import_envelope(
+        "rsia.e16.staged_asset.v1",
+        staged_id,
+        json!([{"kind":"run","id":source_id,"digest":fingerprint(&source).unwrap()}]),
+        json!({
+            "publisher":"publisher",
+            "asset_id":"asset",
+            "package_kind":"skill",
+            "manifest_digest":hash(b"manifest"),
+            "content_blob_digest":digest,
+            "content_bytes":bytes.len(),
+            "baseline_digest":hash(b"baseline"),
+            "local_digest":hash(b"local"),
+            "environment_digest":hash(b"environment"),
+            "package_schema_version":"v1",
+            "compiler_version":"v1",
+            "state":state
+        }),
+    );
+    let mut session = store.session().await.unwrap();
+    session
+        .put(admin, "artifact", import_id, admin.actor(), &import)
+        .await
+        .unwrap();
+    session
+        .put_edge(admin, "artifact", import_id, "blob", &digest)
+        .await
+        .unwrap();
+    session
+        .put(admin, "artifact", staged_id, admin.actor(), &staged)
+        .await
+        .unwrap();
+    session
+        .put_edge(admin, "artifact", staged_id, "run", source_id)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    digest
+}
+
+async fn f17_revoke_import_and_check_blob(state: &str, expect_blob_kept: bool) {
+    let (_dir, store) = database().await;
+    let admin = ctx("admin", Role::Admin);
+    let digest = f17_import_and_staged_asset_sharing_blob(
+        &store,
+        &admin,
+        "f17-import",
+        "f17-staged",
+        "f17-run",
+        state,
+    )
+    .await;
+    let mut status = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "artifact".into(),
+            id: "f17-import".into(),
+        },
+        "f17 import revoke",
+        2,
+    )
+    .await
+    .unwrap();
+    for now in 3..40 {
+        if matches!(status.state, CleanupState::Complete | CleanupState::Failed) {
+            break;
+        }
+        status = LifecycleStore::cleanup_step(&admin, &store, &status.job_id, 16, now)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        status.state,
+        CleanupState::Complete,
+        "{:?}",
+        status.last_error
+    );
+    let read = store.read_blob(&admin, &digest, 1024).await;
+    assert_eq!(
+        read.is_ok(),
+        expect_blob_kept,
+        "staged asset state {state:?}: blob read after import revoke = {read:?}"
+    );
+    let mut session = store.session().await.unwrap();
+    let import: serde_json::Value = session
+        .need(&admin, "artifact", "f17-import")
+        .await
+        .unwrap();
+    let staged: serde_json::Value = session
+        .need(&admin, "artifact", "f17-staged")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(import["schema_version"], "rsia.redacted.v1");
+    assert_eq!(staged["schema_version"], "rsia.e16.staged_asset.v1");
+    assert_eq!(staged["payload"]["state"], state);
+}
+
+#[tokio::test]
+async fn f17_aborted_staged_asset_does_not_keep_shared_import_blob_alive() {
+    f17_revoke_import_and_check_blob("aborted", false).await;
+}
+
+#[tokio::test]
+async fn f17_failed_staged_asset_does_not_keep_shared_import_blob_alive() {
+    f17_revoke_import_and_check_blob("failed", false).await;
+}
+
+#[tokio::test]
+async fn f17_quarantined_staged_asset_does_not_keep_shared_import_blob_alive() {
+    f17_revoke_import_and_check_blob("quarantined", false).await;
+}
+
+#[tokio::test]
+async fn f17_staged_and_prepared_staged_assets_keep_shared_import_blob_alive() {
+    f17_revoke_import_and_check_blob("staged", true).await;
+    f17_revoke_import_and_check_blob("prepared", true).await;
+}

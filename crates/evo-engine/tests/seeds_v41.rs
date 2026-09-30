@@ -603,3 +603,49 @@ async fn prepared_seed_install_resumes_after_restart_without_unregistered_blobs(
         installed.payload.upstream_digest
     );
 }
+
+// =========================================================================
+// F18 Adversarial Regression (from controller review): the pure reset gate
+// must mirror the persistent path's status check.
+// =========================================================================
+#[test]
+fn f18_pure_seed_reset_rejects_install_records_that_are_not_installed() {
+    let installed = SeedInstallRecord {
+        publisher: "org.rsia".into(),
+        asset_id: "reasoning_seed".into(),
+        kind: "skill".into(),
+        baseline_digest: hash(b"baseline seed"),
+        local_digest: hash(b"local seed edited"),
+        upstream_digest: None,
+        installed_at: 1000,
+        status: SeedStatus::Installed,
+        quarantine_reason: None,
+        revocation_watermark: 10,
+    };
+    let accepted =
+        safe_reset_to_baseline(&installed, Some("baseline seed"), |_| false, 10, |_| false)
+            .expect("an installed record at the current watermark resets");
+    assert!(!accepted.is_active);
+    assert!(accepted.requires_evaluation);
+    for status in [
+        SeedStatus::Prepared,
+        SeedStatus::Staged,
+        SeedStatus::Quarantined,
+        SeedStatus::Unknown,
+    ] {
+        let mut record = installed.clone();
+        record.status = status;
+        record.quarantine_reason =
+            (status == SeedStatus::Quarantined).then(|| "revoked_dependency".to_string());
+        let result =
+            safe_reset_to_baseline(&record, Some("baseline seed"), |_| false, 10, |_| false);
+        assert!(
+            matches!(
+                &result,
+                Err(Error::Conflict(message))
+                    if message == "reset_rejected: install record is not in the installed state"
+            ),
+            "safe_reset_to_baseline accepted a {status:?} install record: {result:?}"
+        );
+    }
+}

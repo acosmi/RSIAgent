@@ -1,4 +1,5 @@
-use evo_core::{Context, Role, fingerprint, hash};
+use evo_core::{Context, Error, Role, fingerprint, hash};
+use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
 use evo_storage::{LocalExportFile, Store, local_export_receipt, local_export_tree_digest};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -718,4 +719,248 @@ async fn concurrent_registered_producers_same_digest_conflict_then_reconnect_ide
         assert_eq!(staged["payload"]["state"], "prepared");
     }
     session.commit().await.unwrap();
+}
+
+// =========================================================================
+// F19 Adversarial Regression (from controller review): export ids that are
+// dot-only or carry a separator must be refused by every public entry point
+// and by cleanup, because `evo_core::identifier` admits dots.
+// =========================================================================
+
+fn f19_is_invalid_export_id<T>(result: &Result<T, Error>) -> bool {
+    matches!(result, Err(Error::Invalid(message)) if message == "invalid export id")
+}
+
+#[tokio::test]
+async fn f19_dot_and_separator_export_ids_are_rejected_at_every_entry_point() {
+    let (_directory, store, admin, export_id, files, completed, audit) = prepared_fixture().await;
+    let plan = store
+        .snapshot_local_export_dependencies(&admin, &export_id)
+        .await
+        .unwrap();
+    let dependencies = store
+        .prevalidate_local_export_dependency_blobs(&admin, plan)
+        .await
+        .unwrap();
+    let namespace_root = store
+        .local_export_directory(&admin, &export_id)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    for id in ["..", ".", "...", "a/b", "..\\x", "a\0b", ""] {
+        let directory = store.local_export_directory(&admin, id);
+        assert!(
+            f19_is_invalid_export_id(&directory),
+            "local_export_directory({id:?}) = {directory:?}"
+        );
+        let snapshot = store.snapshot_local_export_dependencies(&admin, id).await;
+        assert!(
+            f19_is_invalid_export_id(&snapshot),
+            "snapshot_local_export_dependencies({id:?}) accepted"
+        );
+        let verify = store
+            .verify_registered_local_export(&admin, id, &files)
+            .await;
+        assert!(
+            f19_is_invalid_export_id(&verify),
+            "verify_registered_local_export({id:?}) = {verify:?}"
+        );
+        let abort = store
+            .abort_registered_local_export(&admin, id, &json!({"id": id}))
+            .await;
+        assert!(
+            f19_is_invalid_export_id(&abort),
+            "abort_registered_local_export({id:?}) = {abort:?}"
+        );
+        let publish = store
+            .publish_registered_local_export(&admin, id, &files, &completed, &audit, &dependencies)
+            .await;
+        assert!(
+            f19_is_invalid_export_id(&publish),
+            "publish_registered_local_export({id:?}) = {publish:?}"
+        );
+    }
+    // Ordinary dotted identifiers remain valid and stay inside the namespace root.
+    for id in ["export.1", "a..b", ".hidden", "trailing."] {
+        let directory = store.local_export_directory(&admin, id).unwrap();
+        assert_eq!(directory.parent().unwrap(), namespace_root);
+        assert_eq!(directory.file_name().unwrap().to_str().unwrap(), id);
+    }
+}
+
+#[tokio::test]
+async fn f19_cleanup_refuses_export_attempt_whose_id_escapes_the_namespace_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("local-export.sqlite3"))
+        .await
+        .unwrap();
+    let admin = Context::new("tenant", "admin", Role::Admin).unwrap();
+    let host = Context::new("tenant", "host", Role::Host).unwrap();
+    let namespace_root = directory
+        .path()
+        .join("exports")
+        .join(hash(admin.namespace().as_bytes()));
+    let other_root = directory.path().join("exports").join(hash(b"other"));
+    let own_canary = namespace_root.join("legit-export").join("manifest.json");
+    let other_canary = other_root.join("other-export").join("manifest.json");
+    std::fs::create_dir_all(own_canary.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(other_canary.parent().unwrap()).unwrap();
+    std::fs::write(&own_canary, b"{}").unwrap();
+    std::fs::write(&other_canary, b"{}").unwrap();
+    let source = json!({"id":"f19-run","schema_version":"rsia.optimization.source.v1","body":"x"});
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&host, "run", "f19-run", host.actor(), &source)
+        .await
+        .unwrap();
+    let watermark = session
+        .bump_watermark(&admin, "f19-watermark")
+        .await
+        .unwrap() as u64;
+    let attempt = json!({
+        "schema_version":"rsia.e16.export_attempt.v2",
+        "id":"..",
+        "namespace":admin.namespace(),
+        "owner_actor":admin.actor(),
+        "request_key":"f19-key",
+        "input_digest":hash(b"f19-input"),
+        "created_at":1,
+        "updated_at":1,
+        "source_refs":[{"kind":"run","id":"f19-run","digest":fingerprint(&source).unwrap()}],
+        "revoke_watermark":watermark,
+        "payload":{"state":"prepared","projection_blob_digest":hash(b"projection")},
+    });
+    session
+        .put(&admin, "artifact", "..", admin.actor(), &attempt)
+        .await
+        .unwrap();
+    session
+        .put_edge(&admin, "artifact", "..", "run", "f19-run")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+
+    let mut status = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: "f19-run".into(),
+        },
+        "f19 revoke",
+        10,
+    )
+    .await
+    .unwrap();
+    for now in 11..60 {
+        if matches!(status.state, CleanupState::Complete | CleanupState::Failed) {
+            break;
+        }
+        status = LifecycleStore::cleanup_step(&admin, &store, &status.job_id, 16, now)
+            .await
+            .unwrap();
+    }
+    assert_eq!(status.state, CleanupState::Failed);
+    assert!(
+        status
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("blocked_unknown_scope:invalid_local_export_id")),
+        "{:?}",
+        status.last_error
+    );
+    assert!(
+        own_canary.exists(),
+        "cleanup of export id '..' deleted a sibling export"
+    );
+    assert!(
+        other_canary.exists(),
+        "cleanup of export id '..' deleted another namespace's export"
+    );
+    assert!(
+        directory.path().join("exports").exists(),
+        "cleanup of export id '..' deleted the exports root"
+    );
+}
+
+// =========================================================================
+// F20 Adversarial Regression (from controller review): member paths are
+// validated on the raw string, so non-canonical forms that
+// `Path::components()` would normalise away are refused.
+// =========================================================================
+#[test]
+fn f20_local_export_member_paths_are_validated_on_the_raw_string() {
+    let manifest = LocalExportFile {
+        path: "manifest.json".into(),
+        bytes: b"{}".to_vec(),
+    };
+    let tree = |path: &str| {
+        local_export_tree_digest(&[
+            manifest.clone(),
+            LocalExportFile {
+                path: path.into(),
+                bytes: b"x".to_vec(),
+            },
+        ])
+    };
+    for path in [
+        "a/./b.txt",
+        "./manifest.json",
+        "nested//x.txt",
+        "nested/",
+        "/nested/x.txt",
+        "nested/.",
+        "nested/..",
+        "nested/../x.txt",
+        "..",
+        ".",
+        "",
+        "nul\0.txt",
+        "a\\b",
+    ] {
+        let result = tree(path);
+        assert!(
+            matches!(result, Err(Error::Invalid(_))),
+            "unsafe local export path accepted: {path:?} -> {result:?}"
+        );
+    }
+    for path in [
+        "member.txt",
+        "nested/member.txt",
+        "a/b/c.txt",
+        "dotted.dir/file.v1.txt",
+        "x/..y",
+    ] {
+        assert!(
+            tree(path).is_ok(),
+            "valid local export path rejected: {path:?}"
+        );
+    }
+    // Parent/child conflicts and duplicates are still refused.
+    for pair in [["dir", "dir/file.txt"], ["dir/file.txt", "dir"]] {
+        assert!(
+            local_export_tree_digest(&[
+                manifest.clone(),
+                LocalExportFile {
+                    path: pair[0].into(),
+                    bytes: b"x".to_vec(),
+                },
+                LocalExportFile {
+                    path: pair[1].into(),
+                    bytes: b"y".to_vec(),
+                },
+            ])
+            .is_err(),
+            "parent/child conflict accepted: {pair:?}"
+        );
+    }
+    assert!(
+        local_export_tree_digest(&[LocalExportFile {
+            path: "only.txt".into(),
+            bytes: b"x".to_vec(),
+        }])
+        .is_err(),
+        "tree without manifest.json accepted"
+    );
 }

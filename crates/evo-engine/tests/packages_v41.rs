@@ -36,7 +36,7 @@ use evo_engine::packages::{
 };
 use evo_engine::release_store::{ReleaseStore, StageBundleRequest, TypedSourceRef};
 use evo_storage::Store;
-use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
+use evo_storage::lifecycle::{CleanupState, CleanupStatus, LifecycleStore, TypedObjectRef};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
@@ -1978,5 +1978,211 @@ async fn persistent_shared_dependency_edges_block_uninstall() {
         )
         .await
         .is_err()
+    );
+}
+
+// =========================================================================
+// F17 Adversarial Regression (from controller review): shared blob removal
+// counts only live E16 references, so an aborted staged asset must not keep a
+// shared projection blob alive once its last live referrer is revoked.
+// =========================================================================
+
+async fn f17_run_source(store: &Store, id: &str) -> E16SourceRef {
+    let host = Context::new("n", "host", Role::Host).unwrap();
+    let body = serde_json::json!({
+        "id": id,
+        "schema_version": "rsia.optimization.source.v1",
+        "body": format!("evidence-{id}"),
+    });
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&host, "run", id, host.actor(), &body)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    E16SourceRef {
+        kind: "run".into(),
+        id: id.into(),
+        digest: fingerprint(&body).unwrap(),
+    }
+}
+
+async fn f17_revoke_run_and_drain(
+    store: &Store,
+    admin: &Context,
+    id: &str,
+    now: i64,
+) -> CleanupStatus {
+    let mut status = LifecycleStore::begin_revoke(
+        admin,
+        store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: id.into(),
+        },
+        "f17 revoke",
+        now,
+    )
+    .await
+    .unwrap();
+    for step in now + 1..now + 80 {
+        if matches!(status.state, CleanupState::Complete | CleanupState::Failed) {
+            break;
+        }
+        status = LifecycleStore::cleanup_step(admin, store, &status.job_id, 32, step)
+            .await
+            .unwrap();
+    }
+    status
+}
+
+#[tokio::test]
+async fn f17_aborted_staged_asset_does_not_keep_shared_projection_blob_alive() {
+    let (directory, store, admin, _sources) = persistent_store().await;
+    let source_a = f17_run_source(&store, "f17-src-a").await;
+    let source_b = f17_run_source(&store, "f17-src-b").await;
+    let first = PersistentPackageStore::stage_package(
+        &admin,
+        &store,
+        persistent_stage_request(
+            "f17-key-a",
+            valid_base_manifest(),
+            valid_files(),
+            vec![source_a.clone()],
+        ),
+    )
+    .await
+    .unwrap();
+    let second = PersistentPackageStore::stage_package(
+        &admin,
+        &store,
+        persistent_stage_request(
+            "f17-key-b",
+            valid_base_manifest(),
+            valid_files(),
+            vec![source_b.clone()],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first.payload.content_blob_digest, second.payload.content_blob_digest,
+        "identical content must share one projection blob"
+    );
+    let digest = first.payload.content_blob_digest.clone();
+    let blob = directory
+        .path()
+        .join("blobs")
+        .join(hash(admin.namespace().as_bytes()))
+        .join(&digest);
+    assert!(blob.exists());
+    let aborted = PersistentPackageStore::abort_staged(&admin, &store, &second.id)
+        .await
+        .unwrap();
+    assert_eq!(aborted.payload.state, StagedAssetState::Aborted);
+
+    let status = f17_revoke_run_and_drain(&store, &admin, &source_a.id, 100).await;
+    assert_eq!(
+        status.state,
+        CleanupState::Complete,
+        "{:?}",
+        status.last_error
+    );
+    assert!(
+        !blob.exists(),
+        "an aborted staged asset kept the shared projection blob alive after the only live referrer was revoked"
+    );
+    assert!(matches!(
+        store.read_blob(&admin, &digest, 1 << 20).await,
+        Err(Error::NotFound)
+    ));
+    let mut session = store.session().await.unwrap();
+    let first_stored: serde_json::Value =
+        session.need(&admin, "artifact", &first.id).await.unwrap();
+    let second_stored: serde_json::Value =
+        session.need(&admin, "artifact", &second.id).await.unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(first_stored["schema_version"], "rsia.redacted.v1");
+    assert_eq!(second_stored["payload"]["state"], "aborted");
+}
+
+#[tokio::test]
+async fn f17_live_staged_asset_still_keeps_shared_projection_blob_beside_aborted_one() {
+    let (directory, store, admin, _sources) = persistent_store().await;
+    let source_a = f17_run_source(&store, "f17-live-src-a").await;
+    let source_b = f17_run_source(&store, "f17-live-src-b").await;
+    let source_c = f17_run_source(&store, "f17-live-src-c").await;
+    let mut staged = Vec::new();
+    for (key, source) in [
+        ("f17-live-key-a", &source_a),
+        ("f17-live-key-b", &source_b),
+        ("f17-live-key-c", &source_c),
+    ] {
+        staged.push(
+            PersistentPackageStore::stage_package(
+                &admin,
+                &store,
+                persistent_stage_request(
+                    key,
+                    valid_base_manifest(),
+                    valid_files(),
+                    vec![source.clone()],
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let digest = staged[0].payload.content_blob_digest.clone();
+    assert!(
+        staged
+            .iter()
+            .all(|asset| asset.payload.content_blob_digest == digest)
+    );
+    let blob = directory
+        .path()
+        .join("blobs")
+        .join(hash(admin.namespace().as_bytes()))
+        .join(&digest);
+    PersistentPackageStore::abort_staged(&admin, &store, &staged[1].id)
+        .await
+        .unwrap();
+
+    // The third package is still staged (live), so revoking the first source
+    // must preserve the shared blob even though the second referrer is aborted.
+    let status = f17_revoke_run_and_drain(&store, &admin, &source_a.id, 100).await;
+    assert_eq!(
+        status.state,
+        CleanupState::Complete,
+        "{:?}",
+        status.last_error
+    );
+    assert!(
+        blob.exists(),
+        "shared blob deleted while a live staged asset still references it"
+    );
+    // The revoke advanced the watermark, so the typed reader reports the
+    // surviving record as stale; its stored payload state is still live.
+    let mut session = store.session().await.unwrap();
+    let third_stored: serde_json::Value = session
+        .need(&admin, "artifact", &staged[2].id)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(third_stored["schema_version"], "rsia.e16.staged_asset.v1");
+    assert_eq!(third_stored["payload"]["state"], "staged");
+
+    // Once the last live referrer is revoked only the aborted record remains,
+    // and it must not keep the blob.
+    let status = f17_revoke_run_and_drain(&store, &admin, &source_c.id, 300).await;
+    assert_eq!(
+        status.state,
+        CleanupState::Complete,
+        "{:?}",
+        status.last_error
+    );
+    assert!(
+        !blob.exists(),
+        "an aborted staged asset kept the shared projection blob alive"
     );
 }

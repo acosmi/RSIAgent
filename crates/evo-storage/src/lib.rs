@@ -226,15 +226,36 @@ fn validate_local_export_path(path: &str) -> Result<()> {
     if path.is_empty() || path.contains('\0') || path.contains('\\') {
         return Err(Error::Invalid("invalid local export path".into()));
     }
-    let path = Path::new(path);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    // Validate the raw string rather than `Path::components()`: component
+    // iteration normalises away `.` segments and repeated or trailing
+    // separators, which would admit non-canonical member paths such as
+    // `a/./b`, `a//b` or `a/` that alias other members on disk. Every
+    // `/`-separated segment must be a plain, non-empty name; an empty first
+    // segment is an absolute path.
+    if path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
         return Err(Error::Invalid("unsafe local export path".into()));
     }
     Ok(())
+}
+
+/// Export ids name a directory directly under `<root>/exports/<namespace>/`.
+/// `evo_core::identifier` admits dots, so beyond being an identifier an export
+/// id must never be a dot-only name (`.` or `..` resolve to the namespace root
+/// or its parent) and must not carry a path separator or NUL. Every public
+/// local export entry point and the cleanup path validate ids with this.
+pub(crate) fn validate_export_id(export_id: &str) -> Result<()> {
+    if export_id.is_empty()
+        || export_id.bytes().all(|byte| byte == b'.')
+        || export_id
+            .chars()
+            .any(|character| matches!(character, '/' | '\\' | '\0'))
+    {
+        return Err(Error::Invalid("invalid export id".into()));
+    }
+    identifier(export_id)
 }
 
 fn local_export_ref(namespace: &str, export_id: &str) -> String {
@@ -1311,7 +1332,7 @@ impl Store {
 
     pub fn local_export_directory(&self, ctx: &Context, export_id: &str) -> Result<PathBuf> {
         ctx.require(&[evo_core::Role::Admin])?;
-        identifier(export_id)?;
+        validate_export_id(export_id)?;
         Ok(self
             .root
             .join("exports")
@@ -1325,6 +1346,7 @@ impl Store {
         export_id: &str,
     ) -> Result<LocalExportDependencyPlan> {
         ctx.require(&[evo_core::Role::Admin])?;
+        validate_export_id(export_id)?;
         self.snapshot_registered_dependencies(ctx, export_id).await
     }
 
@@ -1350,6 +1372,7 @@ impl Store {
         plan: LocalExportDependencyPlan,
     ) -> Result<LocalExportDependencySnapshot> {
         ctx.require(&[evo_core::Role::Admin])?;
+        validate_export_id(&plan.export_id)?;
         self.prevalidate_registered_dependency_blobs(ctx, plan, None)
             .await
     }
@@ -1412,7 +1435,7 @@ impl Store {
         dependencies: &LocalExportDependencySnapshot,
     ) -> Result<LocalExportReceipt> {
         ctx.require(&[evo_core::Role::Admin])?;
-        identifier(export_id)?;
+        validate_export_id(export_id)?;
         if dependencies.plan.namespace != ctx.namespace()
             || dependencies.plan.export_id != export_id
         {
@@ -1593,7 +1616,7 @@ impl Store {
         files: &[LocalExportFile],
     ) -> Result<LocalExportReceipt> {
         ctx.require(&[evo_core::Role::Admin])?;
-        identifier(export_id)?;
+        validate_export_id(export_id)?;
         let dependency_plan = self
             .snapshot_local_export_dependencies(ctx, export_id)
             .await?;
@@ -1668,7 +1691,7 @@ impl Store {
         aborted_attempt: &Value,
     ) -> Result<()> {
         ctx.require(&[evo_core::Role::Admin])?;
-        identifier(export_id)?;
+        validate_export_id(export_id)?;
         let _guard = self.blob_lock.write().await;
         let mut session = self.session().await?;
         let fenced = sqlx::query(

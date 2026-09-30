@@ -254,6 +254,14 @@ pub fn safe_reset_to_baseline(
 ) -> Result<StagedReset> {
     identifier(&record.publisher)?;
     identifier(&record.asset_id)?;
+    // Mirror the persistent path (`stage_reset_to_baseline`): only an
+    // installed record may be reset; prepared, staged, quarantined or unknown
+    // records are refused before any baseline or watermark check.
+    if record.status != SeedStatus::Installed {
+        return Err(Error::Conflict(
+            "reset_rejected: install record is not in the installed state".into(),
+        ));
+    }
 
     let content =
         baseline_content.ok_or_else(|| Error::Invalid("missing_baseline_content".into()))?;

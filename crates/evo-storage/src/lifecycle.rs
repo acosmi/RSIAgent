@@ -1580,23 +1580,7 @@ async fn cleanup_e16_envelope(
 
     let mut blob_digests = Vec::new();
     let payload = &value["payload"];
-    let fields: &[&str] = match kind {
-        "import_source" => &["raw_blob_digest"],
-        "staged_asset" => &["content_blob_digest"],
-        "seed_install" => &[
-            "baseline_blob_digest",
-            "local_blob_digest",
-            "upstream_blob_digest",
-        ],
-        "export_attempt" => {
-            if value["schema_version"].as_str() == Some("rsia.e16.export_attempt.v2") {
-                &["projection_blob_digest"]
-            } else {
-                &["output_blob_digest"]
-            }
-        }
-        _ => &[],
-    };
+    let fields = e16_blob_digest_fields(value["schema_version"].as_str().unwrap_or_default());
     for field in fields {
         if let Some(digest) = payload.get(*field).and_then(|value| value.as_str()) {
             if !is_lower_hex_digest(&serde_json::Value::String(digest.into())) {
@@ -1705,6 +1689,20 @@ async fn remove_controlled_local_export(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     now: i64,
 ) -> Result<()> {
+    // The export attempt id names the directory under the namespace export
+    // root; an id such as ".." would resolve outside it, so refuse to touch
+    // the filesystem for any id the export entry points would not accept.
+    if crate::validate_export_id(&node.id).is_err() {
+        return mark_unknown_scope(
+            tx,
+            ctx,
+            job_id,
+            node,
+            "blocked_unknown_scope:invalid_local_export_id",
+            now,
+        )
+        .await;
+    }
     let export_root = store.root.join("exports");
     let namespace_root = export_root.join(evo_core::hash(ctx.namespace().as_bytes()));
     for ancestor in [&export_root, &namespace_root] {
@@ -1877,6 +1875,63 @@ async fn remove_e16_blob_if_unreferenced(
     }
 }
 
+/// Every payload field of an E16 record schema that can carry a registered
+/// blob digest. This is the single source of truth for both content
+/// redaction (which blobs a revoked record may release) and shared-blob
+/// liveness (which blobs a surviving record may keep).
+fn e16_blob_digest_fields(schema: &str) -> &'static [&'static str] {
+    match schema {
+        "rsia.e16.import_source.v1" => &["raw_blob_digest"],
+        "rsia.e16.staged_asset.v1" => &["content_blob_digest"],
+        "rsia.e16.seed_install.v1" => &[
+            "baseline_blob_digest",
+            "local_blob_digest",
+            "upstream_blob_digest",
+        ],
+        "rsia.e16.export_attempt.v1" => &["output_blob_digest"],
+        "rsia.e16.export_attempt.v2" => &["projection_blob_digest"],
+        _ => &[],
+    }
+}
+
+/// Whether an E16 record is in a state that keeps the blobs it references
+/// alive. Shared blob removal counts only live references, so a record that
+/// has been aborted, failed, quarantined, or revoked (redacted records no
+/// longer carry an E16 schema and are never consulted) must not preserve a
+/// blob once its last live referrer is revoked.
+///
+/// The live sets are derived from each record kind's state enum:
+/// - import_source (`payload.status`, engine `ImportSourceReadStatus`):
+///   `prepared` (registration in flight) and `ready`; the read-failure
+///   statuses (`missing`, `permission_denied`, `source_changed`,
+///   `zero_records`, `invalid_file`, `too_large`) are not live.
+/// - staged_asset (`payload.state`, engine `StagedAssetState`): `prepared`
+///   (registration in flight) and `staged`; `quarantined`, `aborted` and
+///   `failed` are not live.
+/// - seed_install (`payload.status`, engine `SeedStatus`): `prepared`
+///   (registration in flight, same protocol as a prepared staged asset) and
+///   `installed`; `staged`, `quarantined` and `unknown` are not live.
+/// - export_attempt v1/v2 (`payload.state`, engine `ExportAttemptState`):
+///   `prepared` and `completed`; `aborted`, `revoked` and `failed` are not
+///   live.
+///
+/// A record with a missing or unrecognised state is never live.
+fn e16_record_keeps_blobs_alive(schema: &str, payload: &serde_json::Value) -> bool {
+    let (field, live): (&str, &[&str]) = match schema {
+        "rsia.e16.import_source.v1" => ("status", &["prepared", "ready"]),
+        "rsia.e16.staged_asset.v1" => ("state", &["prepared", "staged"]),
+        "rsia.e16.seed_install.v1" => ("status", &["prepared", "installed"]),
+        "rsia.e16.export_attempt.v1" | "rsia.e16.export_attempt.v2" => {
+            ("state", &["prepared", "completed"])
+        }
+        _ => return false,
+    };
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|state| live.contains(&state))
+}
+
 async fn e16_payload_has_live_blob_reference(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     ctx: &Context,
@@ -1887,8 +1942,18 @@ async fn e16_payload_has_live_blob_reference(
         "SELECT o.body FROM objects o
          WHERE o.namespace=? AND o.kind='artifact'
          AND json_extract(o.body,'$.schema_version') IN (
-           'rsia.e16.staged_asset.v1','rsia.e16.seed_install.v1','rsia.e16.export_attempt.v1',
+           'rsia.e16.import_source.v1','rsia.e16.staged_asset.v1',
+           'rsia.e16.seed_install.v1','rsia.e16.export_attempt.v1',
            'rsia.e16.export_attempt.v2'
+         )
+         AND (
+           json_extract(o.body,'$.payload.raw_blob_digest')=?
+           OR json_extract(o.body,'$.payload.content_blob_digest')=?
+           OR json_extract(o.body,'$.payload.baseline_blob_digest')=?
+           OR json_extract(o.body,'$.payload.local_blob_digest')=?
+           OR json_extract(o.body,'$.payload.upstream_blob_digest')=?
+           OR json_extract(o.body,'$.payload.output_blob_digest')=?
+           OR json_extract(o.body,'$.payload.projection_blob_digest')=?
          )
          AND NOT EXISTS (
            SELECT 1 FROM revoke_cleanup_frontier f
@@ -1897,6 +1962,13 @@ async fn e16_payload_has_live_blob_reference(
          )",
     )
     .bind(ctx.namespace())
+    .bind(digest)
+    .bind(digest)
+    .bind(digest)
+    .bind(digest)
+    .bind(digest)
+    .bind(digest)
+    .bind(digest)
     .bind(job_id)
     .fetch_all(&mut **tx)
     .await
@@ -1908,16 +1980,16 @@ async fn e16_payload_has_live_blob_reference(
             id: value["id"].as_str().unwrap_or_default().into(),
         };
         validate_e16_envelope(ctx, &node, &value)?;
-        for field in [
-            "content_blob_digest",
-            "baseline_blob_digest",
-            "local_blob_digest",
-            "upstream_blob_digest",
-            "output_blob_digest",
-        ] {
-            if value["payload"].get(field).and_then(|item| item.as_str()) == Some(digest) {
-                return Ok(true);
-            }
+        let schema = value["schema_version"].as_str().unwrap_or_default();
+        let payload = &value["payload"];
+        if !e16_record_keeps_blobs_alive(schema, payload) {
+            continue;
+        }
+        if e16_blob_digest_fields(schema)
+            .iter()
+            .any(|field| payload.get(*field).and_then(serde_json::Value::as_str) == Some(digest))
+        {
+            return Ok(true);
         }
     }
     Ok(false)
