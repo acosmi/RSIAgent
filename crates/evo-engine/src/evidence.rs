@@ -2,6 +2,7 @@
 use evo_core::evidence::{
     EvidenceMember, EvidenceSet, ExecutionAttestation, MAX_DISCOVERED_FILES, Purpose,
     SourceCoverage, SourceSelection, TaskOrigin, assert_authorized_path,
+    assert_not_whole_home_scan,
 };
 use evo_core::{Error, Result, identifier};
 use std::collections::BTreeSet;
@@ -211,10 +212,13 @@ fn require_all_selected_runs(selected: &BTreeSet<&str>, seen: &BTreeSet<&str>) -
     Ok(())
 }
 
+/// Refuses whole-filesystem and whole-home scans (including home ancestors and
+/// `/Users/<name>` / `/home/<name>` shapes), then requires `path` to sit strictly
+/// inside one of the selection's roots. The rule itself lives in
+/// `evo_core::evidence::assert_not_whole_home_scan` so `SourceSelection::validate`
+/// applies the same policy to roots.
 pub fn reject_home_scan(path: &str, selection: &SourceSelection) -> Result<()> {
-    if path == "/" || path == std::env::var("HOME").unwrap_or_default() {
-        return Err(Error::Forbidden);
-    }
+    assert_not_whole_home_scan(path)?;
     assert_authorized_path(path, &selection.roots)
 }
 
