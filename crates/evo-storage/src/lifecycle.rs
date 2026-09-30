@@ -2303,6 +2303,17 @@ async fn cleanup_node_content(
         ("release", "rsia.persistent_release.v1", _)
         | ("pointer", "rsia.profile_pointer.v1", _)
         | ("tombstone", "rsia.revoke_tombstone.v1", _) => true,
+        // Monitoring facts that are scope management, accounting or results: the
+        // consolidation scope index, the terminal run record (outcome and the
+        // budget call ids it reconciles) and an environment-drift invalidation
+        // survive a source revocation; revocation must not erase spend or history.
+        (
+            "artifact",
+            "rsia.monitoring.consolidation_scope.v1"
+            | "rsia.monitoring.consolidation_run.v1"
+            | "rsia.monitoring.environment_drift.v1",
+            _,
+        ) => true,
         ("evaluation", "", _) => value.as_object().is_some_and(|m| {
             m.len() == 3
                 && ["id", "score", "state"]
@@ -2352,6 +2363,21 @@ async fn cleanup_node_content(
         | ("receipt", "rsia.host_application.v1", _)
         | ("artifact", "rsia.host_execution_receipt.v1", _) => true,
         ("artifact", "rsia.resolved_bundle.v2", _) => true,
+        // Monitoring content derived from source runs (environment and observation
+        // identities, per-task pairings, the claim and the consolidation proposal
+        // with its candidate bundle) is redacted; the preserved scope, run and
+        // drift facts above keep the ids and counts needed for reconciliation.
+        (
+            "artifact",
+            "rsia.monitoring.environment.v1"
+            | "rsia.monitoring.observation.v1"
+            | "rsia.monitoring.development_cycle.v1"
+            | "rsia.monitoring.development_cycle.v2"
+            | "rsia.monitoring.development_report_binding.v1"
+            | "rsia.monitoring.consolidation_claim.v1"
+            | "rsia.monitoring.consolidation_proposal.v1",
+            _,
+        ) => true,
         // E03's persisted SourceSelection predates a schema field; exact fields define its shape.
         ("artifact", "", _) => value.as_object().is_some_and(|m| {
             m.len() == 4

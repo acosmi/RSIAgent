@@ -2,21 +2,35 @@
 //!
 //! Facts are derived from stored Host and E03 evidence. Monitoring never
 //! consumes hidden formal details, publishes a release, or mutates Active.
+//!
+//! Revocation: every object written here is `kind = "artifact"` and is classified
+//! by schema in the cleanup matching of `evo-storage` (`lifecycle.rs`). Content
+//! derived from sources (environment and observation identities, cycles and their
+//! report bindings, claims, proposals) is redacted; the scope index, terminal run
+//! records (outcome and the budget calls they reconcile) and environment-drift
+//! facts are preserved. A new monitoring schema must be classified there too, or a
+//! revoked run that reaches it fails its cleanup job closed.
 
 use crate::broker::{BudgetPortBinding, ModelTransport, PersistentModelBroker};
 use crate::evidence::{load_stored_source, validate_stored_sources};
 use crate::model::{ModelPort, ModelResponse, RejectedDispatch};
 use crate::optimization::{
-    DevRunner, DevelopmentExecutionProvenance, DevelopmentRunReport, OptimizationJournal,
+    DevRunner, DevelopmentExecutionProvenance, DevelopmentRunReport, DevelopmentSelection,
+    DevelopmentSelectionDecision, OPTIMIZATION_STAGE_FACT_SCHEMA, OptimizationJournal,
     OptimizationJournalStage, OptimizationStepOutcome, OptimizationStepRequest, StageFact,
     StageFactKind, optimization_request_digest, run_optimization_step,
 };
 use crate::release_store::{
-    HostApplicationRecord, ReleaseStore, RunApplicationSnapshot, TrustedHostExecutionReceipt,
+    HostApplicationRecord, ReleaseCandidateRecord, ReleaseStore, RunApplicationSnapshot,
+    StageBundleRequest, TrustedHostExecutionReceipt, TypedSourceRef,
 };
+use crate::releases::validate_resolved_bundle_identity;
 use async_trait::async_trait;
+use evo_core::contract::ResolvedBundle;
 use evo_core::evidence::Purpose;
-use evo_core::optimization::{ModelRequest, TraceOutcome};
+use evo_core::optimization::{ModelRequest, ModelRequestContext, TraceOutcome};
+use evo_core::skill_edit::skill_snapshot_digest;
+use evo_core::strategy::{ConsolidationClass, classify_consolidation_pair};
 use evo_core::{Context, Error, Result, Role, fingerprint, identifier};
 use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
@@ -24,12 +38,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const ENVIRONMENT_IDENTITY_SCHEMA: &str = "rsia.monitoring.environment.v1";
 pub const DEPLOYMENT_OBSERVATION_SCHEMA: &str = "rsia.monitoring.observation.v1";
-pub const DEVELOPMENT_CYCLE_SCHEMA: &str = "rsia.monitoring.development_cycle.v1";
+/// Current cycle schema. `v1` kept a score-biased `pair_classes` list without task
+/// ids; it is refused when read (there is no production writer to migrate).
+pub const DEVELOPMENT_CYCLE_SCHEMA: &str = "rsia.monitoring.development_cycle.v2";
+pub const DEVELOPMENT_REPORT_BINDING_SCHEMA: &str = "rsia.monitoring.development_report_binding.v1";
 pub const CONSOLIDATION_SCOPE_SCHEMA: &str = "rsia.monitoring.consolidation_scope.v1";
 pub const CONSOLIDATION_CLAIM_SCHEMA: &str = "rsia.monitoring.consolidation_claim.v1";
+pub const CONSOLIDATION_PROPOSAL_SCHEMA: &str = "rsia.monitoring.consolidation_proposal.v1";
 pub const CONSOLIDATION_RUN_SCHEMA: &str = "rsia.monitoring.consolidation_run.v1";
 pub const ENVIRONMENT_DRIFT_SCHEMA: &str = "rsia.monitoring.environment_drift.v1";
 
+const LEGACY_DEVELOPMENT_CYCLE_SCHEMA_V1: &str = "rsia.monitoring.development_cycle.v1";
+/// Body schema that source-revocation cleanup leaves behind for redacted content.
+const REDACTED_SCHEMA: &str = "rsia.redacted.v1";
 const ARTIFACT_KIND: &str = "artifact";
 const RECEIPT_KIND: &str = "receipt";
 
@@ -140,13 +161,20 @@ pub struct SourceDependency {
     pub content_digest: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PairClass {
-    Improved,
-    Regressed,
-    PersistentFail,
-    StableSuccess,
+/// One manifest task before and after the candidate within a completed cycle.
+///
+/// `class` is the pure pass/fail transition from `classify_consolidation_pair`
+/// (plan §11.5, V091.c). The scores are recorded evidence only: a rise in score
+/// never turns a failure into an improvement or a pass into a non-regression.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskPairV1 {
+    pub task_id: String,
+    pub parent_passed: bool,
+    pub candidate_passed: bool,
+    pub class: ConsolidationClass,
+    pub parent_score_micros: u32,
+    pub candidate_score_micros: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,7 +210,9 @@ pub struct DevelopmentCycleRecord {
     pub execution_receipt_id: String,
     pub usage_record_ids: Vec<String>,
     pub provenance: DevelopmentExecutionProvenance,
-    pub pair_classes: Vec<PairClass>,
+    /// One entry per reported task, in report order (`v1` kept a score-biased
+    /// `pair_classes` list without task ids instead).
+    pub pairs: Vec<TaskPairV1>,
     pub has_contrast: bool,
     pub sources: Vec<SourceDependency>,
 }
@@ -282,6 +312,54 @@ pub struct ConsolidationRunRecord {
     pub outcome: ConsolidationRunOutcome,
     pub reason: String,
     pub budget_call_ids: Vec<String>,
+    /// Set exactly when `outcome` is `Candidate`: the durable proposal that was
+    /// written before this terminal record. Records written before proposals
+    /// existed deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_id: Option<String>,
+}
+
+/// The durable form of a `Candidate` consolidation outcome (plan §11.5). It
+/// freezes the candidate bundle and the evidence it came from so a later
+/// release candidate is staged from stored facts, never from a caller's memory.
+/// A proposal is not an approval: the complete candidate chain (development
+/// selection, formal evaluation, human approval) still applies and Active is
+/// never rewritten here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsolidationProposal {
+    pub id: String,
+    pub schema_version: String,
+    pub claim_id: String,
+    pub scope_id: String,
+    pub cycle_ids: Vec<String>,
+    /// Fingerprint of the per-task pairings of the claim's two cycles.
+    pub pairs_digest: String,
+    pub parent_skill_digest: String,
+    pub parent_bundle_digest: String,
+    pub candidate_skill_digest: String,
+    pub candidate_bundle: ResolvedBundle,
+    pub candidate_bundle_digest: String,
+    pub selection_digest: String,
+    /// The optimization journal's terminal `StepCompleted` fact this candidate
+    /// was read from; it also holds the edit, patch and report.
+    pub terminal_fact_id: String,
+    pub sources: Vec<SourceDependency>,
+    /// `ProgramFixture` when the environment or any backing cycle is fixture
+    /// evidence. Fixture proposals may be staged; formal approval still refuses
+    /// fixture evidence (`ReleaseStore::approve_verified`).
+    pub provenance: EnvironmentEvidenceScope,
+    pub environment_digest: String,
+    pub revoke_watermark: u64,
+}
+
+/// Result of staging a proposal as a release candidate. No release, pointer or
+/// Active state exists after staging; `provenance` is the proposal's.
+#[derive(Debug, Clone)]
+pub struct StagedConsolidationCandidate {
+    pub candidate: ReleaseCandidateRecord,
+    pub proposal_id: String,
+    pub provenance: EnvironmentEvidenceScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,9 +649,7 @@ impl MonitoringCoordinator {
             .iter()
             .position(|id| id == &request.report_fact_id)
         {
-            let cycle: DevelopmentCycleRecord = session
-                .need(ctx, ARTIFACT_KIND, &index.cycle_ids[position])
-                .await?;
+            let cycle = load_cycle(&mut session, ctx, &index.cycle_ids[position]).await?;
             session.commit().await?;
             return Ok(cycle);
         }
@@ -585,7 +661,7 @@ impl MonitoringCoordinator {
             "development-cycle-{}",
             &fingerprint(&(&scope_id, &request.report_fact_id))?[..32]
         );
-        let (pair_classes, has_contrast) = classify_pairs(&report)?;
+        let (pairs, has_contrast) = pair_tasks(&report)?;
         let cycle = DevelopmentCycleRecord {
             id: cycle_id.clone(),
             schema_version: DEVELOPMENT_CYCLE_SCHEMA.into(),
@@ -598,12 +674,12 @@ impl MonitoringCoordinator {
             execution_receipt_id: report.execution_receipt_id,
             usage_record_ids: canonical_strings(report.usage_record_ids, "usage record")?,
             provenance: report.provenance,
-            pair_classes,
+            pairs,
             has_contrast,
             sources,
         };
         let binding = DevelopmentReportBinding {
-            schema_version: "rsia.monitoring.development_report_binding.v1".into(),
+            schema_version: DEVELOPMENT_REPORT_BINDING_SCHEMA.into(),
             id: format!(
                 "development-report-binding-{}",
                 &fingerprint(&cycle.report_fact_id)?[..32]
@@ -614,6 +690,11 @@ impl MonitoringCoordinator {
         };
         put_immutable(&mut session, ctx, &binding.id, &binding).await?;
         put_immutable(&mut session, ctx, &cycle.id, &cycle).await?;
+        // The binding names the report fact and cycle of a completed cycle; without
+        // an edge revocation cleanup could never reach it.
+        session
+            .put_edge(ctx, ARTIFACT_KIND, &binding.id, ARTIFACT_KIND, &cycle.id)
+            .await?;
         session
             .put_edge(ctx, ARTIFACT_KIND, &cycle.id, ARTIFACT_KIND, &scope_id)
             .await?;
@@ -685,7 +766,7 @@ impl MonitoringCoordinator {
         let mut sources = BTreeSet::new();
         let mut has_contrast = false;
         for cycle_id in &cycle_ids {
-            let cycle: DevelopmentCycleRecord = session.need(ctx, ARTIFACT_KIND, cycle_id).await?;
+            let cycle = load_cycle(&mut session, ctx, cycle_id).await?;
             if cycle.scope_id != scope_id {
                 return Err(Error::Conflict("cycle escaped consolidation scope".into()));
             }
@@ -774,6 +855,7 @@ impl MonitoringCoordinator {
             outcome: ConsolidationRunOutcome::NoChange,
             reason: "two completed development cycles contained no before/after contrast".into(),
             budget_call_ids: vec![],
+            proposal_id: None,
         };
         put_immutable(&mut session, ctx, &record.id, &record).await?;
         session
@@ -786,6 +868,13 @@ impl MonitoringCoordinator {
         Ok(record)
     }
 
+    /// Runs one claimed generation through the optimization step.
+    ///
+    /// A `Candidate` outcome first persists its [`ConsolidationProposal`] and only
+    /// then the terminal run record that names it, so a crash in between re-enters
+    /// with the journal replaying the same candidate and finds the same proposal.
+    /// No other outcome (no change, rejected, uncertain, revoked, blocked budget)
+    /// leaves a proposal, and none of them can touch Active.
     pub async fn run_consolidation(
         ctx: &Context,
         store: &Store,
@@ -934,6 +1023,9 @@ impl MonitoringCoordinator {
             context: ctx,
             billing_scope: &scope.billing_scope,
         };
+        // The step consumes its request; a Candidate's terminal journal fact is
+        // located from the identity of the request afterwards.
+        let step_context = request.model_context.clone();
         let outcome = run_optimization_step(
             Some(&root_bound_model),
             Some(&root_bound_runner),
@@ -1014,17 +1106,67 @@ impl MonitoringCoordinator {
             }
             session.commit().await?;
         }
+        let mut proposal_id = None;
         let (run_outcome, claim_state, reason) = match outcome {
             OptimizationStepOutcome::NoChange { reason } => (
                 ConsolidationRunOutcome::NoChange,
                 ConsolidationClaimState::CompletedNoChange,
                 reason,
             ),
-            OptimizationStepOutcome::Candidate { .. } => (
-                ConsolidationRunOutcome::Candidate,
-                ConsolidationClaimState::CompletedCandidate,
-                "development candidate produced; Active remains unchanged".into(),
-            ),
+            OptimizationStepOutcome::Candidate {
+                bundle, selection, ..
+            } => {
+                // The proposal is durable before the terminal record names it. A
+                // crash in between re-enters here, the journal replays the same
+                // Candidate and the same proposal is found instead of rewritten.
+                let terminal_fact_id = optimization_terminal_fact_id(&step_context, &input_digest)?;
+                let written = persist_consolidation_proposal(
+                    ctx,
+                    store,
+                    journal,
+                    &claim,
+                    CandidateMaterial {
+                        bundle: &bundle,
+                        selection: &selection,
+                        terminal_fact_id: &terminal_fact_id,
+                        input_digest: &input_digest,
+                    },
+                )
+                .await;
+                match written {
+                    Ok(proposal) => proposal_id = Some(proposal.id),
+                    Err(error) => {
+                        let revoked = {
+                            let mut session = store.session().await?;
+                            let revoked = validate_claim_sources(&mut session, ctx, &claim)
+                                .await
+                                .is_err();
+                            session.commit().await?;
+                            revoked
+                        };
+                        if !revoked {
+                            return Err(error);
+                        }
+                        let revoked_id = format!("consolidation-revoked-{}", claim.id);
+                        return persist_terminal_run_with_id(
+                            ctx,
+                            store,
+                            claim,
+                            revoked_id,
+                            Some(input_digest),
+                            ConsolidationRunOutcome::Revoked,
+                            ConsolidationClaimState::CompletedRevoked,
+                            "source_revoked_after_optimization",
+                        )
+                        .await;
+                    }
+                }
+                (
+                    ConsolidationRunOutcome::Candidate,
+                    ConsolidationClaimState::CompletedCandidate,
+                    "development candidate produced; Active remains unchanged".into(),
+                )
+            }
             OptimizationStepOutcome::Rejected { reason } => (
                 ConsolidationRunOutcome::Rejected,
                 ConsolidationClaimState::CompletedRejected,
@@ -1036,16 +1178,87 @@ impl MonitoringCoordinator {
                 reason,
             ),
         };
-        persist_terminal_run_with_state(
+        let run_id = format!("consolidation-run-{}", claim.id);
+        persist_terminal_run(
             ctx,
             store,
             claim,
+            run_id,
             Some(input_digest),
             run_outcome,
             claim_state,
             &reason,
+            proposal_id,
         )
         .await
+    }
+
+    /// Stages a stored consolidation proposal as a release candidate.
+    ///
+    /// Only a `ReleaseCandidateRecord` is written: no release, no pointer, and
+    /// Active is untouched. The candidate still needs its own development
+    /// selection, formal evaluation and a different approver (plan §11.5, E13).
+    /// A proposal whose sources were revoked, whose content was redacted, or
+    /// whose scope drifted is refused. Staging the same candidate id again with
+    /// the same content is idempotent; other content under that id is a conflict.
+    /// Fixture-backed proposals may be staged; their provenance is carried on the
+    /// proposal and on the result, and formal approval refuses fixture evidence.
+    pub async fn stage_consolidation_candidate(
+        ctx: &Context,
+        store: &Store,
+        proposal_id: &str,
+        candidate_id: &str,
+    ) -> Result<StagedConsolidationCandidate> {
+        ctx.require(&[Role::Worker, Role::Admin])?;
+        identifier(proposal_id)?;
+        identifier(candidate_id)?;
+        let proposal = {
+            let mut session = store.session().await?;
+            let proposal = load_stageable_proposal(&mut session, ctx, proposal_id).await?;
+            session.commit().await?;
+            proposal
+        };
+        // `stage_bundle` re-checks the source closure in its own transaction, so a
+        // revocation after the read above still cannot produce a candidate.
+        let candidate = ReleaseStore::stage_bundle(
+            ctx,
+            store,
+            StageBundleRequest {
+                candidate_id: candidate_id.into(),
+                bundle: proposal.candidate_bundle.clone(),
+                environment_digest: proposal.environment_digest.clone(),
+                proposer_actor: ctx.actor().into(),
+                sources: proposal
+                    .sources
+                    .iter()
+                    .map(|source| TypedSourceRef {
+                        kind: "run".into(),
+                        id: source.id.clone(),
+                        content_digest: source.content_digest.clone(),
+                    })
+                    .collect(),
+                revoke_watermark: proposal.revoke_watermark,
+            },
+        )
+        .await?;
+        // The candidate depends on the proposal it was staged from (plan §11.5
+        // closure: ConsolidationProposal -> Candidate), idempotently.
+        let mut session = store.session().await?;
+        session
+            .put_edge(
+                ctx,
+                ARTIFACT_KIND,
+                &candidate.id,
+                ARTIFACT_KIND,
+                &proposal.id,
+            )
+            .await?;
+        session.commit().await?;
+        Ok(StagedConsolidationCandidate {
+            candidate,
+            proposal_id: proposal.id,
+            provenance: proposal.provenance,
+        })
     }
 
     pub async fn record_environment_drift(
@@ -1472,11 +1685,30 @@ async fn validate_cycle_cost_evidence(
     Ok(())
 }
 
-fn classify_pairs(report: &DevelopmentRunReport) -> Result<(Vec<PairClass>, bool)> {
-    let mut classes = Vec::with_capacity(report.results.len());
+/// Pairs every reported task with its parent and candidate outcomes.
+///
+/// The class is the pure pass/fail transition; scores are kept as evidence and
+/// never decide it. `has_contrast` keeps its earlier meaning: any task whose
+/// score or pass state differs between parent and candidate. A report with no
+/// results or a repeated task id is not a pairing and is refused. Tasks that the
+/// frozen manifest lists but the report omits are not detectable here; that
+/// check belongs to the E03 pre-registered manifest gate.
+fn pair_tasks(report: &DevelopmentRunReport) -> Result<(Vec<TaskPairV1>, bool)> {
+    if report.results.is_empty() {
+        return Err(Error::Invalid(
+            "development report has no task results".into(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut pairs = Vec::with_capacity(report.results.len());
     let mut contrast = false;
     for result in &report.results {
         identifier(&result.task_id)?;
+        if !seen.insert(result.task_id.as_str()) {
+            return Err(Error::Invalid(
+                "development report repeats a task id".into(),
+            ));
+        }
         if result.parent_score_micros > 1_000_000 || result.candidate_score_micros > 1_000_000 {
             return Err(Error::Invalid(
                 "development score micros must be within 0..=1000000".into(),
@@ -1484,23 +1716,87 @@ fn classify_pairs(report: &DevelopmentRunReport) -> Result<(Vec<PairClass>, bool
         }
         contrast |= result.parent_score_micros != result.candidate_score_micros
             || result.parent_passed != result.candidate_passed;
-        classes.push(
-            if result.candidate_score_micros > result.parent_score_micros
-                || (result.candidate_passed && !result.parent_passed)
-            {
-                PairClass::Improved
-            } else if result.candidate_score_micros < result.parent_score_micros
-                || (!result.candidate_passed && result.parent_passed)
-            {
-                PairClass::Regressed
-            } else if result.parent_passed && result.candidate_passed {
-                PairClass::StableSuccess
-            } else {
-                PairClass::PersistentFail
-            },
-        );
+        pairs.push(TaskPairV1 {
+            task_id: result.task_id.clone(),
+            parent_passed: result.parent_passed,
+            candidate_passed: result.candidate_passed,
+            class: classify_consolidation_pair(result.parent_passed, result.candidate_passed),
+            parent_score_micros: result.parent_score_micros,
+            candidate_score_micros: result.candidate_score_micros,
+        });
     }
-    Ok((classes, contrast))
+    Ok((pairs, contrast))
+}
+
+/// Reads a development cycle. Pre-v2 records are refused explicitly, redacted
+/// content is reported as redacted, and a stored record must still be exactly
+/// what `pair_tasks` would have produced (no score-derived or altered class).
+async fn load_cycle(
+    session: &mut Session,
+    ctx: &Context,
+    cycle_id: &str,
+) -> Result<DevelopmentCycleRecord> {
+    identifier(cycle_id)?;
+    let value: serde_json::Value = session.need(ctx, ARTIFACT_KIND, cycle_id).await?;
+    match value
+        .get("schema_version")
+        .and_then(|schema| schema.as_str())
+    {
+        Some(DEVELOPMENT_CYCLE_SCHEMA) => {}
+        Some(LEGACY_DEVELOPMENT_CYCLE_SCHEMA_V1) => {
+            return Err(Error::Invalid(
+                "pre-v2 development cycle records are not supported".into(),
+            ));
+        }
+        Some(REDACTED_SCHEMA) => {
+            return Err(Error::Conflict(
+                "development cycle was redacted after source revocation".into(),
+            ));
+        }
+        _ => {
+            return Err(Error::Invalid(
+                "unsupported development cycle schema".into(),
+            ));
+        }
+    }
+    let cycle: DevelopmentCycleRecord =
+        serde_json::from_value(value).map_err(|_| Error::Internal)?;
+    validate_cycle_record(&cycle)?;
+    Ok(cycle)
+}
+
+fn validate_cycle_record(cycle: &DevelopmentCycleRecord) -> Result<()> {
+    identifier(&cycle.id)?;
+    identifier(&cycle.scope_id)?;
+    if cycle.pairs.is_empty() {
+        return Err(Error::Invalid("development cycle has no task pairs".into()));
+    }
+    let mut seen = BTreeSet::new();
+    let mut contrast = false;
+    for pair in &cycle.pairs {
+        identifier(&pair.task_id)?;
+        if !seen.insert(pair.task_id.as_str()) {
+            return Err(Error::Invalid("development cycle repeats a task id".into()));
+        }
+        if pair.parent_score_micros > 1_000_000 || pair.candidate_score_micros > 1_000_000 {
+            return Err(Error::Invalid(
+                "development score micros must be within 0..=1000000".into(),
+            ));
+        }
+        if pair.class != classify_consolidation_pair(pair.parent_passed, pair.candidate_passed) {
+            return Err(Error::Conflict(
+                "stored pair class differs from its pass/fail outcomes".into(),
+            ));
+        }
+        contrast |= pair.parent_score_micros != pair.candidate_score_micros
+            || pair.parent_passed != pair.candidate_passed;
+    }
+    if contrast != cycle.has_contrast {
+        return Err(Error::Conflict(
+            "stored cycle contrast differs from its pairs".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn scope_id(scope: &ConsolidationScope) -> Result<String> {
@@ -1536,7 +1832,17 @@ async fn load_claim_record(
     claim_id: &str,
 ) -> Result<ConsolidationClaim> {
     identifier(claim_id)?;
-    let claim: ConsolidationClaim = session.need(ctx, ARTIFACT_KIND, claim_id).await?;
+    let value: serde_json::Value = session.need(ctx, ARTIFACT_KIND, claim_id).await?;
+    if value
+        .get("schema_version")
+        .and_then(|schema| schema.as_str())
+        == Some(REDACTED_SCHEMA)
+    {
+        return Err(Error::Conflict(
+            "consolidation claim was redacted after source revocation".into(),
+        ));
+    }
+    let claim: ConsolidationClaim = serde_json::from_value(value).map_err(|_| Error::Internal)?;
     if claim.schema_version != CONSOLIDATION_CLAIM_SCHEMA {
         return Err(Error::Invalid("unsupported claim schema".into()));
     }
@@ -1721,6 +2027,334 @@ where
         .await
 }
 
+fn consolidation_proposal_id(claim_id: &str) -> String {
+    format!("consolidation-proposal-{claim_id}")
+}
+
+/// Id of the optimization journal's terminal `StepCompleted` fact for a step:
+/// the same canonical identity `run_optimization_step` seals for it.
+fn optimization_terminal_fact_id(
+    context: &ModelRequestContext,
+    input_digest: &str,
+) -> Result<String> {
+    Ok(StageFact {
+        schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+        artifact_id: String::new(),
+        namespace: context.namespace.clone(),
+        episode_id: context.episode_id.clone(),
+        step: context.step,
+        attempt: context.attempt,
+        stage: OptimizationJournalStage::Merge,
+        kind: StageFactKind::StepCompleted,
+        request_id: context.request_id.clone(),
+        input_digest: input_digest.into(),
+        output_digest: None,
+        dependencies: vec![],
+        payload: serde_json::json!({}),
+    }
+    .seal()?
+    .artifact_id)
+}
+
+struct CandidateMaterial<'a> {
+    bundle: &'a ResolvedBundle,
+    selection: &'a DevelopmentSelection,
+    terminal_fact_id: &'a str,
+    input_digest: &'a str,
+}
+
+/// The journal's terminal fact must be the very step this claim executed and
+/// must carry the same candidate bundle and selection the proposal will freeze.
+fn verify_terminal_candidate_fact(
+    fact: &StageFact,
+    claim: &ConsolidationClaim,
+    material: &CandidateMaterial<'_>,
+) -> Result<()> {
+    fact.validate()?;
+    if fact.artifact_id != material.terminal_fact_id
+        || fact.stage != OptimizationJournalStage::Merge
+        || fact.kind != StageFactKind::StepCompleted
+        || fact.episode_id != claim.id
+        || fact.input_digest != material.input_digest
+    {
+        return Err(Error::Conflict(
+            "optimization terminal fact differs from the consolidation step".into(),
+        ));
+    }
+    let payload_bundle_digest = fact
+        .payload
+        .get("bundle")
+        .and_then(|bundle| bundle.get("digest"))
+        .and_then(|digest| digest.as_str());
+    let selection = serde_json::to_value(material.selection).map_err(|_| Error::Internal)?;
+    if fact
+        .payload
+        .get("status")
+        .and_then(|status| status.as_str())
+        != Some("candidate")
+        || payload_bundle_digest != Some(material.bundle.digest.as_str())
+        || fact.payload.get("selection") != Some(&selection)
+    {
+        return Err(Error::Conflict(
+            "optimization terminal fact does not hold this candidate".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn pairs_digest(cycles: &[DevelopmentCycleRecord]) -> Result<String> {
+    fingerprint(
+        &cycles
+            .iter()
+            .map(|cycle| (&cycle.id, &cycle.pairs))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// A proposal is fixture-grade unless both the frozen environment and every
+/// backing cycle are free of fixture evidence.
+fn proposal_provenance(
+    environment: &EnvironmentIdentityRecord,
+    cycles: &[DevelopmentCycleRecord],
+) -> EnvironmentEvidenceScope {
+    if environment.evidence_scope == EnvironmentEvidenceScope::TrustedExecution
+        && cycles
+            .iter()
+            .all(|cycle| cycle.provenance != DevelopmentExecutionProvenance::Fixture)
+    {
+        EnvironmentEvidenceScope::TrustedExecution
+    } else {
+        EnvironmentEvidenceScope::ProgramFixture
+    }
+}
+
+/// Persists the proposal of a `Candidate` outcome exactly once. The identity is
+/// derived from the claim; replaying the same content after a crash finds the
+/// stored proposal and writes nothing, different content under that identity is
+/// a conflict. The source closure is re-checked in the writing transaction so a
+/// proposal can never appear after the logical revocation block.
+async fn persist_consolidation_proposal(
+    ctx: &Context,
+    store: &Store,
+    journal: &dyn OptimizationJournal,
+    claim: &ConsolidationClaim,
+    material: CandidateMaterial<'_>,
+) -> Result<ConsolidationProposal> {
+    if material.selection.decision != DevelopmentSelectionDecision::AcceptCandidate
+        || material.selection.candidate_bundle_digest != material.bundle.digest
+    {
+        return Err(Error::Conflict(
+            "development selection does not accept this candidate bundle".into(),
+        ));
+    }
+    validate_resolved_bundle_identity(material.bundle)?;
+    // The store has a single connection: journal reads open their own session, so
+    // they happen before this function's session does.
+    let terminal = journal
+        .lookup(material.terminal_fact_id)
+        .await?
+        .ok_or_else(|| Error::Conflict("optimization terminal fact is missing".into()))?;
+    verify_terminal_candidate_fact(&terminal, claim, &material)?;
+
+    let mut session = store.session().await?;
+    validate_claim_sources(&mut session, ctx, claim).await?;
+    let index: ConsolidationScopeIndex = session.need(ctx, ARTIFACT_KIND, &claim.scope_id).await?;
+    validate_scope_index(&index)?;
+    if index.claim_ids.get(&claim.generation) != Some(&claim.id)
+        || claim.revoke_watermark != index.scope.revoke_watermark
+    {
+        return Err(Error::Conflict("consolidation claim is stale".into()));
+    }
+    let scope = &index.scope;
+    if material.selection.manifest_digest != scope.development_manifest_digest
+        || material.selection.parent_bundle_digest != scope.parent_bundle_digest
+    {
+        return Err(Error::Conflict(
+            "development selection differs from the consolidation scope".into(),
+        ));
+    }
+    let environment: EnvironmentIdentityRecord = session
+        .need(ctx, ARTIFACT_KIND, &scope.environment_id)
+        .await?;
+    validate_environment_record(&environment)?;
+    let mut cycles = Vec::with_capacity(claim.cycle_ids.len());
+    for cycle_id in &claim.cycle_ids {
+        let cycle = load_cycle(&mut session, ctx, cycle_id).await?;
+        if cycle.scope_id != claim.scope_id {
+            return Err(Error::Conflict("cycle escaped consolidation scope".into()));
+        }
+        cycles.push(cycle);
+    }
+    let proposal = ConsolidationProposal {
+        id: consolidation_proposal_id(&claim.id),
+        schema_version: CONSOLIDATION_PROPOSAL_SCHEMA.into(),
+        claim_id: claim.id.clone(),
+        scope_id: claim.scope_id.clone(),
+        cycle_ids: claim.cycle_ids.clone(),
+        pairs_digest: pairs_digest(&cycles)?,
+        parent_skill_digest: scope.parent_skill_digest.clone(),
+        parent_bundle_digest: scope.parent_bundle_digest.clone(),
+        candidate_skill_digest: skill_snapshot_digest(&material.bundle.skill)?,
+        candidate_bundle: material.bundle.clone(),
+        candidate_bundle_digest: material.bundle.digest.clone(),
+        selection_digest: fingerprint(material.selection)?,
+        terminal_fact_id: material.terminal_fact_id.into(),
+        sources: claim.sources.clone(),
+        provenance: proposal_provenance(&environment, &cycles),
+        environment_digest: scope.environment_digest.clone(),
+        revoke_watermark: claim.revoke_watermark,
+    };
+    validate_proposal(&proposal, claim)?;
+    // Same content: nothing is written again. Other content under this identity is
+    // a conflict (`put_immutable`). A transaction either holds the proposal with
+    // all its edges or none of it, so an existing proposal already has its edges.
+    let already_written = session
+        .get::<ConsolidationProposal>(ctx, ARTIFACT_KIND, &proposal.id)
+        .await?
+        .is_some();
+    put_immutable(&mut session, ctx, &proposal.id, &proposal).await?;
+    if already_written {
+        session.commit().await?;
+        return Ok(proposal);
+    }
+    session
+        .put_edge(ctx, ARTIFACT_KIND, &proposal.id, ARTIFACT_KIND, &claim.id)
+        .await?;
+    session
+        .put_edge(
+            ctx,
+            ARTIFACT_KIND,
+            &proposal.id,
+            ARTIFACT_KIND,
+            &proposal.terminal_fact_id,
+        )
+        .await?;
+    for source in &proposal.sources {
+        session
+            .put_edge(ctx, ARTIFACT_KIND, &proposal.id, "run", &source.id)
+            .await?;
+    }
+    session
+        .audit(ctx, "monitoring.consolidation.proposal", &proposal.id)
+        .await?;
+    session.commit().await?;
+    Ok(proposal)
+}
+
+/// What a stored proposal must equal, field for field, given its claim.
+fn validate_proposal(proposal: &ConsolidationProposal, claim: &ConsolidationClaim) -> Result<()> {
+    if proposal.schema_version != CONSOLIDATION_PROPOSAL_SCHEMA {
+        return Err(Error::Invalid(
+            "unsupported consolidation proposal schema".into(),
+        ));
+    }
+    if proposal.id != consolidation_proposal_id(&claim.id)
+        || proposal.claim_id != claim.id
+        || proposal.scope_id != claim.scope_id
+        || proposal.cycle_ids != claim.cycle_ids
+        || proposal.sources != claim.sources
+        || proposal.revoke_watermark != claim.revoke_watermark
+    {
+        return Err(Error::Conflict(
+            "consolidation proposal differs from its claim".into(),
+        ));
+    }
+    for (value, name) in [
+        (&proposal.pairs_digest, "proposal pairs digest"),
+        (
+            &proposal.parent_skill_digest,
+            "proposal parent skill digest",
+        ),
+        (
+            &proposal.parent_bundle_digest,
+            "proposal parent bundle digest",
+        ),
+        (
+            &proposal.candidate_skill_digest,
+            "proposal candidate skill digest",
+        ),
+        (
+            &proposal.candidate_bundle_digest,
+            "proposal candidate bundle digest",
+        ),
+        (&proposal.selection_digest, "proposal selection digest"),
+        (&proposal.environment_digest, "proposal environment digest"),
+    ] {
+        validate_digest(value, name)?;
+    }
+    identifier(&proposal.terminal_fact_id)?;
+    validate_resolved_bundle_identity(&proposal.candidate_bundle)?;
+    if proposal.candidate_bundle.digest != proposal.candidate_bundle_digest
+        || proposal.candidate_skill_digest
+            != skill_snapshot_digest(&proposal.candidate_bundle.skill)?
+    {
+        return Err(Error::Conflict(
+            "consolidation proposal candidate digests differ from its bundle".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reads a proposal; content that cleanup redacted is reported as such.
+async fn load_proposal(
+    session: &mut Session,
+    ctx: &Context,
+    proposal_id: &str,
+) -> Result<ConsolidationProposal> {
+    identifier(proposal_id)?;
+    let value: serde_json::Value = session.need(ctx, ARTIFACT_KIND, proposal_id).await?;
+    match value
+        .get("schema_version")
+        .and_then(|schema| schema.as_str())
+    {
+        Some(CONSOLIDATION_PROPOSAL_SCHEMA) => {}
+        Some(REDACTED_SCHEMA) => {
+            return Err(Error::Conflict(
+                "consolidation proposal was redacted after source revocation".into(),
+            ));
+        }
+        _ => {
+            return Err(Error::Invalid(
+                "unsupported consolidation proposal schema".into(),
+            ));
+        }
+    }
+    serde_json::from_value(value).map_err(|_| Error::Internal)
+}
+
+/// A proposal can be staged only while it is the recorded candidate outcome of a
+/// live claim: its sources unrevoked, its scope undrifted and its terminal run
+/// record naming it. A proposal written but not yet named (a crash between the
+/// two writes) is not stageable until the run completes.
+async fn load_stageable_proposal(
+    session: &mut Session,
+    ctx: &Context,
+    proposal_id: &str,
+) -> Result<ConsolidationProposal> {
+    let proposal = load_proposal(session, ctx, proposal_id).await?;
+    let claim = load_live_claim(session, ctx, &proposal.claim_id).await?;
+    validate_proposal(&proposal, &claim)?;
+    let record = session
+        .get::<ConsolidationRunRecord>(
+            ctx,
+            ARTIFACT_KIND,
+            &format!("consolidation-run-{}", claim.id),
+        )
+        .await?
+        .ok_or_else(|| {
+            Error::Conflict("consolidation proposal has no terminal run record yet".into())
+        })?;
+    if claim.state != ConsolidationClaimState::CompletedCandidate
+        || record.outcome != ConsolidationRunOutcome::Candidate
+        || record.proposal_id.as_deref() != Some(proposal.id.as_str())
+    {
+        return Err(Error::Conflict(
+            "proposal is not the recorded candidate outcome of its claim".into(),
+        ));
+    }
+    Ok(proposal)
+}
+
 async fn persist_terminal_run_with_state(
     ctx: &Context,
     store: &Store,
@@ -1745,9 +2379,44 @@ async fn persist_terminal_run_with_id(
     state: ConsolidationClaimState,
     reason: &str,
 ) -> Result<ConsolidationRunRecord> {
+    persist_terminal_run(
+        ctx,
+        store,
+        claim,
+        id,
+        input_digest,
+        outcome,
+        state,
+        reason,
+        None,
+    )
+    .await
+}
+
+/// Writes the terminal run record and the claim's terminal state in one
+/// transaction. Only a `Candidate` outcome names a proposal, and it must: every
+/// other outcome (no change, rejected, uncertain, revoked, blocked budget)
+/// leaves no proposal behind.
+#[allow(clippy::too_many_arguments)]
+async fn persist_terminal_run(
+    ctx: &Context,
+    store: &Store,
+    claim: ConsolidationClaim,
+    id: String,
+    input_digest: Option<String>,
+    outcome: ConsolidationRunOutcome,
+    state: ConsolidationClaimState,
+    reason: &str,
+    proposal_id: Option<String>,
+) -> Result<ConsolidationRunRecord> {
     if reason.is_empty() || reason.len() > 128 {
         return Err(Error::Invalid(
             "consolidation terminal category must be 1..=128 bytes".into(),
+        ));
+    }
+    if (outcome == ConsolidationRunOutcome::Candidate) != proposal_id.is_some() {
+        return Err(Error::Invalid(
+            "only a candidate consolidation outcome names a proposal".into(),
         ));
     }
     let mut session = store.session().await?;
@@ -1759,6 +2428,11 @@ async fn persist_terminal_run_with_id(
         if existing.input_digest != input_digest {
             return Err(Error::Conflict(
                 "terminal consolidation input differs".into(),
+            ));
+        }
+        if existing.proposal_id != proposal_id {
+            return Err(Error::Conflict(
+                "terminal consolidation proposal differs".into(),
             ));
         }
         session.commit().await?;
@@ -1786,6 +2460,7 @@ async fn persist_terminal_run_with_id(
         outcome,
         reason: reason.into(),
         budget_call_ids,
+        proposal_id,
     };
     put_immutable(&mut session, ctx, &record.id, &record).await?;
     session
@@ -1796,4 +2471,215 @@ async fn persist_terminal_run_with_id(
         .await?;
     session.commit().await?;
     Ok(record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::optimization::PairedTaskResult;
+
+    fn result(
+        task_id: &str,
+        parent_score_micros: u32,
+        candidate_score_micros: u32,
+        parent_passed: bool,
+        candidate_passed: bool,
+    ) -> PairedTaskResult {
+        PairedTaskResult {
+            task_id: task_id.into(),
+            parent_score_micros,
+            candidate_score_micros,
+            parent_passed,
+            candidate_passed,
+            parent_execution_id: format!("parent-{task_id}"),
+            candidate_execution_id: format!("candidate-{task_id}"),
+            grader_receipt_digest: "0".repeat(64),
+        }
+    }
+
+    fn report(results: Vec<PairedTaskResult>) -> DevelopmentRunReport {
+        DevelopmentRunReport {
+            request_id: "request".into(),
+            manifest_digest: "0".repeat(64),
+            parent_bundle_digest: "0".repeat(64),
+            candidate_bundle_digest: "0".repeat(64),
+            environment_digest: "0".repeat(64),
+            grader_digest: "0".repeat(64),
+            results,
+            execution_receipt_id: "execution".into(),
+            usage_record_ids: vec![],
+            provenance: DevelopmentExecutionProvenance::Fixture,
+        }
+    }
+
+    #[test]
+    fn a_pair_class_is_the_pass_fail_transition_and_the_score_is_only_recorded() {
+        let (pairs, contrast) = pair_tasks(&report(vec![
+            result("fail-fail-up", 100, 900, false, false),
+            result("pass-fail-up", 500, 600, true, false),
+            result("fail-pass-down", 500, 100, false, true),
+            result("pass-pass-down", 900, 800, true, true),
+        ]))
+        .unwrap();
+        let classes: Vec<_> = pairs
+            .iter()
+            .map(|pair| (pair.task_id.as_str(), pair.class))
+            .collect();
+        assert_eq!(
+            classes,
+            vec![
+                ("fail-fail-up", ConsolidationClass::PersistentFail),
+                ("pass-fail-up", ConsolidationClass::Regressed),
+                ("fail-pass-down", ConsolidationClass::Improved),
+                ("pass-pass-down", ConsolidationClass::StableSuccess),
+            ]
+        );
+        assert!(contrast);
+        assert_eq!(pairs[0].parent_score_micros, 100);
+        assert_eq!(pairs[0].candidate_score_micros, 900);
+    }
+
+    #[test]
+    fn contrast_is_any_score_or_pass_difference_and_nothing_else() {
+        assert!(
+            !pair_tasks(&report(vec![result("same", 5, 5, true, true)]))
+                .unwrap()
+                .1
+        );
+        assert!(
+            pair_tasks(&report(vec![result("score-only", 5, 6, true, true)]))
+                .unwrap()
+                .1
+        );
+        assert!(
+            pair_tasks(&report(vec![result("pass-only", 5, 5, false, true)]))
+                .unwrap()
+                .1
+        );
+    }
+
+    #[test]
+    fn a_repeated_task_an_empty_report_or_an_out_of_range_score_is_not_a_pairing() {
+        assert!(matches!(
+            pair_tasks(&report(vec![])),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            pair_tasks(&report(vec![
+                result("task", 1, 2, true, true),
+                result("task", 3, 4, true, true),
+            ])),
+            Err(Error::Invalid(message)) if message.contains("repeats a task id")
+        ));
+        assert!(matches!(
+            pair_tasks(&report(vec![result("task", 1, 1_000_001, true, true)])),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    fn environment(scope: EnvironmentEvidenceScope) -> EnvironmentIdentityRecord {
+        EnvironmentIdentityRecord {
+            id: "environment".into(),
+            schema_version: ENVIRONMENT_IDENTITY_SCHEMA.into(),
+            identity_digest: "1".repeat(64),
+            namespace: "tenant".into(),
+            evidence_scope: scope,
+            profile_id: "profile".into(),
+            release_id: None,
+            bundle_digest: None,
+            environment_digest: "2".repeat(64),
+            model_identity: "model".into(),
+            ordered_tools: vec![],
+            host_id: "host".into(),
+            host_version: "1".into(),
+            host_surface_digest: "3".repeat(64),
+            host_capabilities_digest: "4".repeat(64),
+            mandatory_context_digest: "5".repeat(64),
+            development_manifest_digest: "6".repeat(64),
+            grader_digest: "7".repeat(64),
+            generation_strategy_digest: "8".repeat(64),
+            revoke_watermark: 1,
+        }
+    }
+
+    fn cycle(provenance: DevelopmentExecutionProvenance) -> DevelopmentCycleRecord {
+        DevelopmentCycleRecord {
+            id: "cycle".into(),
+            schema_version: DEVELOPMENT_CYCLE_SCHEMA.into(),
+            scope_id: "scope".into(),
+            ordinal: 1,
+            report_fact_id: "fact".into(),
+            report_digest: "9".repeat(64),
+            request_id: "request".into(),
+            candidate_bundle_digest: "a".repeat(64),
+            execution_receipt_id: "execution".into(),
+            usage_record_ids: vec![],
+            provenance,
+            pairs: vec![],
+            has_contrast: false,
+            sources: vec![],
+        }
+    }
+
+    #[test]
+    fn a_proposal_is_trusted_only_when_neither_the_environment_nor_any_cycle_is_fixture() {
+        use DevelopmentExecutionProvenance::{Fixture, IsolatedRunner, RegisteredPureFunction};
+        use EnvironmentEvidenceScope::{ProgramFixture, TrustedExecution};
+        let trusted = environment(TrustedExecution);
+        let fixture = environment(ProgramFixture);
+        assert_eq!(
+            proposal_provenance(
+                &trusted,
+                &[cycle(RegisteredPureFunction), cycle(IsolatedRunner)]
+            ),
+            TrustedExecution
+        );
+        // One fixture cycle taints the proposal; so does a fixture environment.
+        assert_eq!(
+            proposal_provenance(&trusted, &[cycle(RegisteredPureFunction), cycle(Fixture)]),
+            ProgramFixture
+        );
+        assert_eq!(
+            proposal_provenance(&fixture, &[cycle(RegisteredPureFunction)]),
+            ProgramFixture
+        );
+        assert_eq!(
+            proposal_provenance(&fixture, &[cycle(Fixture)]),
+            ProgramFixture
+        );
+    }
+
+    #[test]
+    fn a_stored_cycle_must_equal_what_pairing_would_have_written() {
+        let pair = |class| TaskPairV1 {
+            task_id: "task".into(),
+            parent_passed: true,
+            candidate_passed: true,
+            class,
+            parent_score_micros: 1,
+            candidate_score_micros: 2,
+        };
+        let mut valid = cycle(DevelopmentExecutionProvenance::Fixture);
+        valid.pairs = vec![pair(ConsolidationClass::StableSuccess)];
+        valid.has_contrast = true;
+        assert!(validate_cycle_record(&valid).is_ok());
+        let mut score_biased = valid.clone();
+        score_biased.pairs = vec![pair(ConsolidationClass::Improved)];
+        assert!(matches!(
+            validate_cycle_record(&score_biased),
+            Err(Error::Conflict(_))
+        ));
+        let mut wrong_contrast = valid.clone();
+        wrong_contrast.has_contrast = false;
+        assert!(matches!(
+            validate_cycle_record(&wrong_contrast),
+            Err(Error::Conflict(_))
+        ));
+        let mut empty = valid;
+        empty.pairs.clear();
+        assert!(matches!(
+            validate_cycle_record(&empty),
+            Err(Error::Invalid(_))
+        ));
+    }
 }
