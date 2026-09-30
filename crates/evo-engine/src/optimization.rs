@@ -562,6 +562,25 @@ fn canonical_stage_artifact_id(fact: &StageFact) -> Result<String> {
     ))
 }
 
+/// Canonical id of the `DevelopmentRequestPrepared` fact that pairs with a
+/// `DevelopmentObserved` fact. E03 stores the two as one Development stage, so
+/// namespace, episode, step, attempt and request id are shared and only the kind
+/// differs. A consumer handed just the observation (E13's cycle close) names the
+/// request half to the observation gate from this, never from the caller.
+pub(crate) fn development_request_fact_id(observed: &StageFact) -> Result<String> {
+    if observed.stage != OptimizationJournalStage::Development
+        || observed.kind != StageFactKind::DevelopmentObserved
+    {
+        return Err(Error::Invalid(
+            "a development request pairs with a DevelopmentObserved fact".into(),
+        ));
+    }
+    canonical_stage_artifact_id(&StageFact {
+        kind: StageFactKind::DevelopmentRequestPrepared,
+        ..observed.clone()
+    })
+}
+
 #[async_trait]
 pub trait OptimizationJournal: Send + Sync {
     /// Must commit one typed artifact and all dependency edges atomically.
