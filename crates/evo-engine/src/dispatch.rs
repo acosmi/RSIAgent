@@ -20,6 +20,12 @@ use std::sync::{
 
 const JOB_SCHEMA: &str = "rsia.management_job.v1";
 const INPUT_SCHEMA: &str = "rsia.management_private_input.v1";
+/// Schema of the tombstone the revocation cleanup leaves in place of a record
+/// whose source was revoked (plan §11.5, E08).
+const REDACTED_SCHEMA: &str = "rsia.redacted.v1";
+/// `ManagementJob::error_code` of a job that could not run because the cleanup
+/// redacted its private input after a source of the request was revoked.
+const SOURCE_REVOKED_CODE: &str = "source_revoked";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
@@ -352,8 +358,19 @@ impl ManagementDispatcher {
     pub async fn status(&self, ctx: &Context, job_id: &str) -> Result<ManagementJob> {
         self.require_trusted(ctx)?;
         let mut job = load_job(ctx, &self.store, job_id).await?;
+        if job.state == ManagementJobState::Succeeded {
+            // A Succeeded job serves a result computed from its private input. If
+            // the revocation cleanup redacted that input, a source of the request
+            // was revoked (plan §11.5): the result is not served as live, whatever
+            // the operation's own read-side check would make of the redacted
+            // records behind it. The job itself is preserved as the record of the
+            // action; only this read is refused.
+            ensure_private_input_not_redacted(ctx, &self.store, &job).await?;
+        }
         if job.operation == "evaluation.status" && job.state == ManagementJobState::Succeeded {
-            let request = load_private_request(ctx, &self.store, &job).await?;
+            let request = load_private_request(ctx, &self.store, &job)
+                .await
+                .map_err(InputFault::into_error)?;
             if let ParsedRequest::EvaluationStatus(request) = request {
                 let status =
                     IndependentEvaluationControl::status(ctx, &self.store, &request.ticket_id)
@@ -464,16 +481,22 @@ impl ManagementDispatcher {
         let Some(job) = claimed else { return Ok(()) };
         let request = match load_private_request(&ctx, &self.store, &job).await {
             Ok(request) => request,
-            Err(error) => {
+            Err(fault) => {
+                // A redacted input is a source revocation, not a damaged job: the
+                // job ends Failed (terminal, never retried) and says why.
+                let step = match fault {
+                    InputFault::Redacted { .. } => "private_input_redacted",
+                    InputFault::Other(_) => "private_input_invalid",
+                };
                 return finish_claim(
                     &ctx,
                     &self.store,
                     &job,
                     JobOutcome {
                         state: ManagementJobState::Failed,
-                        step: "private_input_invalid".into(),
+                        step: step.into(),
                         result: None,
-                        error_code: Some(error_code(&error).into()),
+                        error_code: Some(fault.error_code().into()),
                     },
                 )
                 .await;
@@ -1055,16 +1078,111 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
     Ok(())
 }
 
+/// Why a job's private input could not be turned into a request.
+#[derive(Debug)]
+enum InputFault {
+    /// The revocation cleanup replaced the input with an `rsia.redacted.v1`
+    /// tombstone: a source of the request was revoked (plan §11.5). Expected
+    /// after a revocation, not corruption.
+    Redacted { id: String },
+    /// Anything else: absent, damaged, differing from its job, not decodable.
+    Other(Error),
+}
+
+impl From<Error> for InputFault {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl InputFault {
+    /// The error a caller reports. A redacted input is a `Conflict` that names
+    /// the input and the revocation, never `Internal`.
+    fn into_error(self) -> Error {
+        match self {
+            Self::Redacted { id } => redacted_input_error(&id),
+            Self::Other(error) => error,
+        }
+    }
+
+    /// The `error_code` a job that hit this fault is recorded with.
+    fn error_code(&self) -> &'static str {
+        match self {
+            Self::Redacted { .. } => SOURCE_REVOKED_CODE,
+            Self::Other(error) => error_code(error),
+        }
+    }
+}
+
+fn redacted_input_error(id: &str) -> Error {
+    Error::Conflict(format!(
+        "management private input {id} was redacted because its source was revoked"
+    ))
+}
+
+/// The stored body of a job's private input, `None` when it is absent.
+///
+/// The body is read as plain JSON so that the two expected shapes (the input
+/// itself, or the cleanup's tombstone in its place) are told apart before any
+/// typed decoding; the tombstone is not an input, and decoding it as one would
+/// surface as `Internal` and raise the storage layer's "database operation
+/// failed" error log for an expected state.
+async fn private_input_body(
+    ctx: &Context,
+    store: &Store,
+    job: &ManagementJob,
+) -> Result<Option<Value>> {
+    let mut session = store.session().await?;
+    let body = session
+        .get::<Value>(ctx, "artifact", &job.private_input_ref)
+        .await?;
+    session.commit().await?;
+    Ok(body)
+}
+
+fn is_redacted(body: &Value) -> bool {
+    body.get("schema_version").and_then(Value::as_str) == Some(REDACTED_SCHEMA)
+}
+
+/// `Conflict` when the job's private input was redacted by the cleanup. An
+/// absent or ordinary input passes: this gate names one expected state and
+/// decides nothing else.
+async fn ensure_private_input_not_redacted(
+    ctx: &Context,
+    store: &Store,
+    job: &ManagementJob,
+) -> Result<()> {
+    match private_input_body(ctx, store, job).await? {
+        Some(body) if is_redacted(&body) => Err(redacted_input_error(&job.private_input_ref)),
+        _ => Ok(()),
+    }
+}
+
 async fn load_private_request(
     ctx: &Context,
     store: &Store,
     job: &ManagementJob,
-) -> Result<ParsedRequest> {
-    let mut session = store.session().await?;
-    let private: PrivateManagementInput = session
-        .need(ctx, "artifact", &job.private_input_ref)
-        .await?;
-    session.commit().await?;
+) -> std::result::Result<ParsedRequest, InputFault> {
+    let body = private_input_body(ctx, store, job)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if is_redacted(&body) {
+        return Err(InputFault::Redacted {
+            id: job.private_input_ref.clone(),
+        });
+    }
+    Ok(decode_private_request(body, job)?)
+}
+
+/// Decodes and cross-checks a stored (not redacted) private input against its job.
+fn decode_private_request(body: Value, job: &ManagementJob) -> Result<ParsedRequest> {
+    let private: PrivateManagementInput = match serde_json::from_value(body) {
+        Ok(private) => private,
+        Err(error) => {
+            tracing::error!(%error, id = %job.private_input_ref, "stored management private input does not decode");
+            return Err(Error::Internal);
+        }
+    };
     if private.id != job.private_input_ref
         || private.schema_version != INPUT_SCHEMA
         || private.operation != job.operation
