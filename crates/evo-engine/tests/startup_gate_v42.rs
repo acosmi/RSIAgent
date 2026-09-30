@@ -16,8 +16,8 @@ use evo_engine::startup_gate::{
 };
 use evo_storage::Store;
 use evo_storage::lifecycle::{
-    BackupManifest, LifecycleStore, PROTECTED_OBJECT_KINDS, PROTECTED_SCHEMA_VERSIONS,
-    ROOT_BUDGET_TABLE_QUERY, RevokeTombstone, TypedObjectRef,
+    BackupManifest, LifecycleStore, PROTECTED_ACTION_SCHEMA_VERSIONS, PROTECTED_OBJECT_KINDS,
+    PROTECTED_SCHEMA_VERSIONS, ROOT_BUDGET_TABLE_QUERY, RevokeTombstone, TypedObjectRef,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -1450,6 +1450,7 @@ fn protected_fact_selectors_match_restore_backup_py() {
         .collect();
     let mut rust_schemas: Vec<String> = PROTECTED_SCHEMA_VERSIONS
         .iter()
+        .chain(PROTECTED_ACTION_SCHEMA_VERSIONS.iter())
         .map(|s| (*s).to_owned())
         .collect();
     assert!(!kinds.is_empty() && !schemas.is_empty());
