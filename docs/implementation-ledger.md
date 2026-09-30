@@ -1,9 +1,100 @@
 # RSIAgent 实施台账
 
-唯一规范入口（方案正文仅本地）：`RSIAgent-v4.1定稿-工程实施方案-2026-09-19.md`。
-plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`。
+唯一规范入口（方案正文仅本地）：`RSIAgent-v4.2定稿-工程实施方案-2026-09-30.md`。
+plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455`。谱系：v4.1 `RSIAgent-v4.1定稿-工程实施方案-2026-09-19.md`（SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，2026-09-30 归档至本地 `archive/2026-09-30-pre-v4.2/`）→ v4.2。历史验证记录保留其验证时的 plan_sha256（真源 §18.8）。
 本台账是实施与证据索引，不另立规范；历史 PR、测试和旧台账不决定当前规则。
 用户于 2026-09-19 明确确认 v4.1 替代 v4，并授权将本台账上传远程；方案正文、内部合同、归档及 QA 原始材料只保留本地。用户最新授权 Antigravity 按第一真源持续实施，每个任务自测完成后提交、推送并提出独立PR，随即继续下一项，不自行合并；Codex负责最终独立验收，并在通过后按依赖顺序合并。Actions派发、付费运行和部署/发布未授权。
+
+## 2026-09-30 第一真源前置审计与 v4.1→v4.2 切换（主控）
+
+用户规则（2026-09-30）：除系统技能文件与本台账外，方案正文、归档、内部合同与原始 QA 一律不上传远程；台账必须完整记录。本机 `.gitignore` 已排除 `/RSIAgent-*.md`、`/archive/`、`/out/`，本轮 `git status` 干净。
+
+### 审计输入与方法
+- 输入：`RSIAgent-v4.1定稿-工程实施方案-2026-09-19.md`，322,750 字节，SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`（与本台账原绑定一致），全文 2,215 行逐节阅读；`out/handoff-20260930/HANDOFF.md`；本台账；main `0c43e0f`。
+- 机械核查（脚本与日志仅本地 `out/audit-20260930/`）：§3.4.1/V085 的 k=12/13/14 上界（0.0310417011 / −0.0092392266 / −0.0449493587）、§7.5.1 的 P=2/5、V081.a 的 0.4/0.4375/0.0375 与立即 Stop=0.5，按正文公式独立重算一致；80 处 § 引用全部指向存在标题；E 任务前置图无环；V001–V098 全部被 E 任务引用且在 §13 定义；K/SO/B/U/RH/R 编号无缺口；H00–H24↔E 映射双向一致；§12 各 E 任务 V 清单与 `scripts/check_support_scope.py` 的 EXPECTED_E_SCENARIOS 一致（E16/E16.5 的 V081–V086 为范围写法）。
+
+### 审计发现与裁决（详见真源 §19.4）
+| 编号 | 发现 | 裁决 |
+|---|---|---|
+| R-A 关联链条 | §13.3 场景族表"主要责任任务"列与 §12 各任务清单在 9/12 族不一致（如 E16.1 按 V087.b 验证导入方伪造 used 却未列入 V087 族；V097 族列 E09 而 E09 清单无 V097）；派生索引已按 §12 清单反推 V→E，若按族表生成会断链 | 族表改为 §12 清单并集并声明以 §12 为准；E09 补列 V097（§3.1.1 消融义务） |
+| R-B 内部一致性 | E14 模块写 `meta.rs（新增）`，与 §1.5/§16.5 W41-08"该文件已存在于固定源码"矛盾 | 改为按 E00 基线扩展、不重复建文件 |
+| R-C 合同完整性 | §3.3.1 MVP 容量合同未覆盖探索节点/回放世界/lease/staging 包/管理并发；E16.5 已按 500/100/10/20/1 实施而正文无依据 | 在 §3.3.1 登记为设计初值；修改须先修订正文并由 E16.5 重验 |
+| R-D 修订治理 | 正文无版本切换时历史验证记录、派生索引与检查器的绑定规则；单一常量摘要会使升级后所有历史记录失效或被静默改写 | 新增 §18.8 谱系、记录级绑定与 recheck_required 规则 |
+| R-E 过程合同 | 增量任务（AG-nnn）分 PR、主控验收、管理员合并的实际流程无正文合同；模块名与实际文件不一致易被误判未实现 | §12 增补增量交付合同与"模块列表为逻辑落点" |
+| R-F 证据可重现性 | 本地-only 冻结合同（F08）随旧机损坏丢失，导致 E16.2/E16.3 只能对照提案文本 | §18.5 要求机器可核部分随 PR 入库；合同不可得标 contract_unavailable |
+| R-G 真源身份 | 页首/§1.1/§16.1/§17/§18.1/§18.2/V071/V098.c 仍指 v4.1 | 更新为 v4.2 并保留谱系与历史记录 |
+
+不变项：E00–E18、E16 六子包、B01–B10、U01–U08、K01–K10、SO01–SO18、V001–V098 全部保留；无新增 E/V/数值门槛；默认关闭功能、支持范围、W_online=1、货币预算缺省 0 不变。审计确认无需修改：统计公式与判定顺序、W_sim、12/4/1、§6.3/§6.7/§8/§11.2 数值上限、E 前置与 G 门禁、K/SO 来源与许可边界。
+
+### v4.2 切换动作（真源 §18.8）
+- 生成 `RSIAgent-v4.2定稿-工程实施方案-2026-09-30.md`：332,938 字节，SHA-256 `70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455`；与 v4.1 的 diff 共 97 行，全部对应 §19.4 修订清单（脚本 `out/audit-20260930/make_v42.py` 逐锚点唯一替换）。
+- v4.1 原件移入本地 `archive/2026-09-30-pre-v4.2/`，移动前后 SHA-256 均 `45f3ba06…`；仓库根目录只剩 v4.2；方案与归档不上传。
+- 派生索引、检查器与索引测试的版本绑定与谱系：本节所在 PR（AG-012）。
+
+### 2026-09-30 第二轮结论按真源正文复核（原"真源缺席、依台账记录范围验证"）
+- #54（E16.2+E16.3）对 F08 提案的四处偏差逐条对照 §11.1–§11.3：无 `expires_at`（正文未要求）；预算以 `E04BudgetRef` 引用（符合 §3.5/§5.7 单一根账本与 §5.8 不另建可写事实库）；状态集 Prepared/Staged/Quarantined/Aborted/Failed、审批留在 ReleaseStore（符合 §11.1 staging≠Active、审批走 E06）；撤销后拒绝+redaction 而非字面 Quarantined 迁移（符合 §11.3 先提水位再分页清理）。四处均与正文一致；F08 冻结合同本身仍缺，按 §18.5 标 `contract_unavailable`。
+- #44 对 §6.3/§5.6/E16.1、#47 对 §5.5/E16.4、#48 对 §3.3.1/§11.3–11.4/E16.5、#50/#51 对 §10/E17/E18、#56 对 E16.6、#57 对 §18.5 逐条对照，未发现与正文冲突；各 PR 引用的 V 场景均在对应任务 §12 清单内。结论：由"依台账记录范围验证"升级为"已按真源正文复核"，作用域不变，仍不构成效果或发行声明。
+- 受 v4.2 修订章节影响需 recheck 的历史记录：E00 V071（入口/归档，已按 v4.2 复核：根目录唯一 v4.2、v4.1 已归档且摘要一致）；E16.5（§3.3.1 新登记上限与 `capacity.rs` 常量逐项相等）；E16.6（索引绑定，由 AG-012 更新）。其余记录 not_affected。
+
+### 审计发现的实现缺陷与任务队列（每任务一个 PR；主控验收后由管理员合并）
+| 任务 | E 归属 | 内容 | 状态 |
+|---|---|---|---|
+| AG-012 | E16.6/E00 | 派生索引、检查器、索引测试绑定 v4.2 与谱系；E09 加 V097；本节台账 | verified；PR #60 head `2e5c668`，ready，待管理员合并 |
+| AG-013 | E00/E07 | `scripts/smoke_cli.py` 自 AG-001 起过时（replay.run 需完整 ReplayRunRequest），CI 质量门在 main 失败；新增完整 replay.run 缺池→failed 与未知字段→400 路径；blocked 代表随 AG-015 改为 meta.start | verified；PR #59 head `9dec327`，ready |
+| AG-014 | E16.5 | MVP 容量门接入 prepare/管理 claim/探索节点/回放世界/staging 包/预算 lease 六个真实入口；主控返修 F24（计数须跨命名空间实例级）。启动恢复/部署门仍未接 | verified（容量门子范围）；PR #62 head `0d6ec3d`，ready |
+| AG-015 | E07 | curriculum.step 接入持久课程消费者（幂等回执、读侧重验） | verified；PR #61 head `3a0e26a`，ready |
+| AG-016 | E03 | 可信开发执行/评分回执 schema、已登记纯函数运行器、观察门禁重写 | verified；PR #63 head `b1d008f`，ready |
+| AG-017 | E07 | exploration.start 接入持久探索协调器（幂等注册、纯决策读侧重验）；meta.start 保持 blocked 直至 E14 | verified；PR #64 head `71c0fa8`，ready |
+| AG-020 | 台账 | 本轮主控验收记录、合并顺序与固定 head（本 PR #65） | 待管理员合并 |
+| 后续 | E16.5 启动门/E14/E09/E13/E15/E16.4 | 用户指示（2026-09-30）：在途任务完成后收尾，不再新派。AG-018（启动恢复/部署门）与 AG-019（E14 单机制继承合同）只完成本地任务卡草稿，未派发；E16.4 无真实 Claude Code 宿主仍 blocked | planned |
+
+### 合并顺序与固定 head（2026-09-30 末；全部 PR base=main，按序合并，每条用 --match-head-commit 固定）
+1. #60 AG-012 `2e5c668`（独立）；2. #59 AG-013 `9dec327`；3. #61 AG-015 `3a0e26a`（叠 #59）；4. #62 AG-014 `0d6ec3d`（叠 #61；= 主控重叠 `d8bfdd5` + F24）；5. #63 AG-016 `b1d008f`（叠 #62）；6. #64 AG-017 `71c0fa8`（叠 #63；主控解决了两处测试文件尾部并行追加冲突并重建导入块）；7. #65 台账（本记录，叠 #64）。
+- 栈顶 `71c0fa8` 主控复跑（`out/audit-20260930/qa/ctrl-stack-tip-71c0fa8.log`）：fmt 0、clippy 全工作区 -D warnings 0、全工作区 48 个测试二进制 536 通过 / 0 失败、`cargo build -p rsia` 0、`smoke_cli.py` SMOKE_CLI_OK、`smoke_workspace.py` OK、支持范围检查器 structure_valid（该栈不含 #60，故顶层仍 v4.1；#60 先合并）。main 基线 `0c43e0f`：47/495/0。
+- 合并命令：本地 `out/audit-20260930/user-commands.md`（A–G）。合并后需另开台账增量记录 merged_sha，并按 §18.5/§18.8 把各子范围登记进 `reports/support-scope.json`（记录级 v4.2 绑定与 plan_recheck）。
+- #59 合并前 main 上 CI 质量门仍失败（smoke_cli 过时）。
+
+### 主控验收记录（CTRL，2026-09-30）
+### CTRL-AG013-R1 / PR #59：E00/E07 CLI smoke 刷新（主控独立验收）
+
+- 真源：v4.2（SHA-256 `70ec06e4…`），E00"固定输入运行 fmt/check/test/clippy/build 与两组 smoke；检查真实退出码"、E07 本地协议子范围、§6.1 管理操作。固定 head `9dec3274716ac513d29f6f6f4d2e30793d4feeca`（base main `0c43e0f`），仅改 `scripts/smoke_cli.py`（+157/−29）。
+- 复现旧缺陷：main 版脚本对同一二进制 exit 1，`management request failed with HTTP 400`（replay.run 自 AG-001 起需完整 `ReplayRunRequest`）。日志 `out/audit-20260930/qa/ctrl-ag013-smoke-cli-original.log`。
+- 主控复跑：`cargom build --locked -p rsia` 0；`python3 scripts/smoke_cli.py` exit 0，末行 `SMOKE_CLI_OK model_transport=disabled benefit_claimed=false`；`python3 scripts/smoke_workspace.py` exit 0（`ctrl-ag013-smoke-*.log`）。
+- 反例：把 blocked 断言取反后 smoke 必须失败 → exit 1（`ctrl-ag013-mut.log`），断言真实生效。新增覆盖：curriculum.step blocked 终点（state/step/error_code/id）、完整 replay.run 缺池 → failed/not_found、幂等重提同 id、未知字段与不完整载荷 → HTTP 400 invalid_input（CLI 非零）。原有 401/403/重复键/零技能/MCP/锁断言全部保留。
+- 结论：verified（E00 两组 smoke 与 E07 管理接线 smoke 子范围）；不构成回放成功、模型或收益声明。PR 已转 ready，待管理员合并；merged_sha 待记。回滚点 `0c43e0f`。
+
+### CTRL-AG012-R1 / PR #60：派生索引、检查器、索引测试与台账绑定 v4.2（主控独立验收）
+
+- 真源：v4.2 §18.8（谱系与记录级绑定）、§19.4、E16.6/V071/V080/V098、E00。固定 head `2e5c6682c33b629fd9ce9cda30578f0d4eb99866`（= 实施提交 `4912136` + 主控修正 `2e5c668`：把索引中过期的"PR #49 pending"改为 #56/#57 已合并事实，台账 E16 行同步），base main `0c43e0f`。
+- 主控复跑：`check_support_scope.py --source-of-truth <v4.2>` structure_valid=true、plan_binding=true、errors=[]；`unittest` 48 通过；`cargom test -p evo-core --test support_scope` 14 通过；fmt/clippy 0（`out/audit-20260930/qa/ctrl-ag012-*.log`）。
+- 反例（`probe_ag012_inplace.py`，12 例）：顶层仍绑 v4.1、记录摘要谱系外、v4.2 版本配 v4.1 摘要、plan_recheck=required、非法 plan_recheck、缺 plan_lineage、谱系截断、谱系摘要篡改、E09 缺 V097、受影响任务记录未 recheck → 全部拒绝；原件与"记录绑定当前 v4.2 对"→ 接受。首轮探针误用绝对路径被检查器拒绝，属探针缺陷已修正。
+- 结论：verified（派生索引 v4.2 绑定与谱系子范围）。历史 22 条 verified 记录保留 v4.1 摘要，E00/E16.5 两条标 rechecked_v4.2。PR 已转 ready，待管理员合并；merged_sha 待记。回滚点 `0c43e0f`。
+
+### CTRL-AG015-R1 / PR #61：E07 curriculum.step 管理消费者（主控独立验收）
+
+- 真源：v4.2 §6.1/§6.2/§6.6/§6.7.4/§8.1/§11.4、E07 增量、V082.a/c/d、V034、V017/V056、V008。固定 head `3a0e26af88744f93bc0a1874aafc5ac6f67595e4`（叠在 #59 的 `9dec327` 之上，PR base=main）。文件：dispatch.rs、curriculum.rs、tests/dispatch_management.rs、evo-http tests/service.rs、scripts/smoke_cli.py（blocked 代表改为 meta.start）。
+- 实现要点：`CurriculumStepRequest`（deny_unknown_fields）→ Admin → `checkpoint_claim` → `schedule_probe_idempotent(job.id, …)`：以管理作业 id 为幂等键持久 `probe_schedule_receipt_v1`，探测作业/状态更新/依赖边/回执同一事务提交；崩溃重跑回读回执而非再次触发（§6.7.4）。`status` 对 Succeeded 作业以 `verified_probe_job_view` 重验（水位变更 Conflict、来源 tombstone Forbidden、结果不一致 Conflict），终态不改写。exploration.start/meta.start 仍 blocked。
+- 主控复跑（`ctrl-ag015-*.log`）：fmt 0、clippy（core/engine/http，-D warnings）0；干净 head 全工作区 47 个测试二进制 502 通过 / 0 失败（基线 495；+6 engine +1 http）。
+- 主控反例 3 项（临时追加、未提交）：篡改已存结果的 terminal → status Conflict；篡改 probe_job_id → fail-closed（Conflict/NotFound）；不同 request_key、相同输入 → 新探测作业（Cooldown），不复用他人回执，存储中恰好 2 个作业。全部通过。首轮工作区跑出的 1 失败系主控临时反例文件被并发编译所致，已在干净 head 复跑消除。
+- 结论：verified（E07 curriculum.step 管理接线程序子范围；离线 profile 只产生 BudgetExhausted/Cooldown 终点，不构成 G3/学习/模型声明）。PR 已转 ready，待管理员在 #59 之后合并；merged_sha 待记。回滚点 `9dec327`。
+
+### CTRL-AG016-R1 / PR #63：E03 可信开发执行/评分回执与已登记纯函数运行器（主控独立验收，内容提交 `f523fb4`，最终重叠 head `b1d008f`）
+
+- 真源：v4.2 §4/§4.1（执行器与独立 grader 分离，优化器不能签发使用证明/账单/评分）、§5.8、§6.7.3/§6.7.4（每阶段真实请求 ID/输入输出摘要/调用主体/来源闭包/费用；无执行证据不得 used_real_model）、§8.2–§8.3（已登记纯函数适配器、独立 oracle、不信布尔）、E03/E04/E05 增量、V083.a、V087.b、V090、V093、V096.a。
+- 实现：`DevelopmentControlV1`（Admin 登记；executor/grader/proposer 三方不同；冻结任务与 oracle 期望答案；evidence_scope ProgramFixture|RegisteredPureFunctionExecution）；`DevelopmentExecutionReceiptV1`（仅 control.executor_actor 以 Worker|Host 签发；预算行按 episode/stage DevelopmentExecution/输入摘要/已关闭/非 Fixture 复核；cost_state 由预算行推导）；`DevelopmentGraderReceiptV1`（仅 grader_actor 以 Evaluator 签发；服务端用冻结 ExactJsonAnswerV1 重算分数）；typed envelope `e03dev-…`；撤销闭包登记（lifecycle preserve/redact）；`verified_development_observation_in_session` 重写：依赖过滤 execution|grader（修复原"精确集合相等"使真实 journal 事实必被拒的潜在缺陷）、typed 加载、Fixture/ProgramFixture ⇒ Forbidden、预算行/摘要/分数比对、tombstone ⇒ Forbidden、水位漂移 ⇒ Conflict；`RegisteredDevelopmentRunner`（clamp_i64 进程内执行，零成本已知、幂等复用回执与预算行）；E12 `record_cycle` 正向用例通过。
+- 主控复跑（`ctrl-ag016-workspace.log`）：重叠到 d8bfdd5 后全工作区 48 个测试二进制 522 通过 / 0 失败；clippy 全工作区 -D warnings 0；fmt 0。
+- 主控反例 3 项（`ctrl-ag016-adversarial.log`，临时、未提交）：篡改已存执行输出工件、篡改执行回执 output_digest、篡改 grader 回执分数 → 门禁全部拒绝。
+- 已知边界（实施方如实披露）：无 BudgetExecutionProvenance 新变体（迁移编号由主控分配，改以 typed settlement 工件承载出处）；monitoring.rs 未收紧（其 fixture 路径不能消费真实运行器事实）；E12 课程 envelope 未入 lifecycle 列表（既有）；无隔离/沙箱运行器、无模型、无正式评估、无效果声明。
+- 结论：verified（E03 开发回执 schema、门禁与已登记纯函数运行器程序子范围）。最终 head `b1d008f`；重叠到 #62 之上后的全工作区复跑见下文“合并顺序”节。
+
+### CTRL-AG017-R1 / PR #64：E07 exploration.start 管理消费者（主控独立验收，内容提交 `96f0894`，最终重叠 head `71c0fa8`）
+
+- 真源：v4.2 §6.1/§6.2、§7.1/§7.1.1（decide 为只读前缀上的纯函数；协调器校验/预留/执行）、§7.3、§7.4.1（策略不属于世界兼容签名）、§6.7.4、E07/E09 程序范围、V019、V020、V086.c/d、V017/V056、V008。
+- 实现：`ExplorationStartRequest{world: ExplorationWorldV1}`（deny_unknown_fields；SimulationContext 补 deny_unknown_fields）→ Admin → `checkpoint_claim` → `register_world_idempotent`（注册指纹只含不可变登记字段：同 id 同指纹 ⇒ AlreadyRegistered 无写入；不同 ⇒ Conflict；来源 tombstone ⇒ Forbidden，水位漂移 ⇒ Conflict）→ `decide_next`；结果 `ExplorationStarted{world_id, context_signature, prefix_digest, legal_actions_digest, action}`；`status` 通过 `verified_world_decision_view` 重跑纯决策并逐项比对，不改写终态；依赖边 job→private_input→各来源 run 与世界 envelope。run_next/节点派发/封存/模型均未接（无生产 DevRunner/ModelPort）。
+- 实施方复跑：dispatch_management 27、exploration_v41 4、evo-http service 5、smoke OK、clippy/fmt 0、全工作区 47/511/0（其基线 3a0e26a）。主控在最终重叠 head `71c0fa8` 上复跑，见下文“合并顺序”节。
+- 主控反例 2 项（`ctrl-ag017-adversarial.log`，临时、未提交）：篡改已存结果 prefix_digest → status Conflict；在协调器之外把世界 remaining_root_micros 改为 0 → status 重决策不一致而失败，持久终态仍 Succeeded。全部通过。
+- 结论：verified（E07 exploration.start 管理接线程序子范围）。最终 head `71c0fa8`。
+
 
 ## 2026-09-30 主控第二轮独立验收、返修与合并（真源文件缺席，依台账记录范围验证）
 
@@ -143,35 +234,35 @@ plan_version：`v4.1`；plan_sha256：`45f3ba068b988cc502a96c15bd737e1688084dd21
 
 后续依真源依赖图按 E14、E15、E16.1–E16.6、E17、E18 分任务交付；E16 为六子包总门禁，不能用总勾选隐去未完成子包。
 
-## 当前 v4.1 主任务状态
+## 当前 v4.2 主任务状态
 
 状态：planned / in_progress / blocked / implemented_not_verified / verified / explicitly_out_of_scope。verified 只对明确作用域成立，不等于效果 improved 或可发行。
 
 | 编号 | 范围 | 状态 | 未完成项/边界 |
 |---|---|---|---|
-| E00 | 归并真实源码与可重建输入 | verified（固定基线/治理脚本）/ blocked（历史归并） | 原始112测试与门禁均复验通过；脚本已完成10项主控正负验证；源码或fixture变更后旧日志不能用于新输入；历史缺包不隐藏。 |
+| E00 | 归并真实源码与可重建输入 | verified（固定基线/治理脚本）/ blocked（历史归并） | 原始112测试与门禁均复验通过；脚本已完成10项主控正负验证；源码或fixture变更后旧日志不能用于新输入；历史缺包不隐藏。2026-09-30：`smoke_cli.py` 过时使 CI 门失败，AG-013 已修（#59 待合并）；派生索引/检查器绑定 v4.2（AG-012，#60 待合并）。 |
 | E01 | 先冻结实验、任务分区和预算可行性 | implemented_not_verified（静态合同已verified） | 本地bfbed84；显式n/统计前提、alpha/留出/比较/完整费用合同已验；开发小试/正式样本与付费授权仍缺。 |
 | E02 | 最小版本化契约与宿主能力边界 | in_progress | 纯编译作用域：有界原子编辑；运行/宿主/其他新增契约尚待后续消费者。 |
-| E03 | 把跨任务证据真正接入生成消费者 | in_progress（消费者/恢复已verified） | 主控144项core/engine测试、fmt/clippy通过；实际ModelPort请求、同清单开发选择及持久恢复已验。真实提供商/样本/收益未验。 |
+| E03 | 把跨任务证据真正接入生成消费者 | in_progress（消费者/恢复已verified；开发回执子范围已验待合并） | 主控144项core/engine测试、fmt/clippy通过；实际ModelPort请求、同清单开发选择及持久恢复已验。2026-09-30 AG-016（#63）：DevelopmentControl/执行回执/grader 回执 typed schema、已登记纯函数运行器与真实观察门禁。真实提供商/样本/收益、隔离运行器未验。 |
 | E04 | 可信执行、隔离与根资源预算 | in_progress（根预算/broker已verified） | 主控预算15（含10001调用）、broker9、executor6项及fmt/clippy通过；group完整分页停止修复已追加PR #33；真实提供商、进程隔离尚未验。 |
 | E05 | 独立验收器与有边界的统计判定 | in_progress（持久控制/早停已verified） | 主控12流式+6旧评测+13core共31项及fmt/clippy通过；晚到回执、输出不可变、Exposure时间/终态/未知费用保留已修；真实提供商、进程隔离、完整成本及逐依赖撤销仍未验，fixture禁止晋级。 |
 | E06 | 组合发布、实际应用与最小撤销闭环 | in_progress（持久门禁已verified） | 主控7集成+4单元+12 E05回归及fmt/clippy通过；审批防回退、Host完整报告闭包、所有快照读入口已验；真实生产批准/组合应用/回滚受E05证据阻塞。 |
-| E07 | 第一个最小可验证真实闭环 | in_progress（协议子范围已verified）/ blocked（真实闭环） | 主控协议21项与管理增量27项、真实HTTP/MCP/CLI、参考宿主及fmt/clippy/build通过；E05注册/票据管理已接线。exploration/curriculum/meta管理适配仍缺，replay.run已由AG-001接通并验收；真实模型、独立数据与支付授权未取得。 |
+| E07 | 第一个最小可验证真实闭环 | in_progress（协议子范围已verified）/ blocked（真实闭环） | 主控协议21项与管理增量27项、真实HTTP/MCP/CLI、参考宿主及fmt/clippy/build通过；E05注册/票据管理已接线。replay.run已由AG-001接通并验收；2026-09-30 AG-015/AG-017（#61/#64）接通 curriculum.step 与 exploration.start（幂等、读侧重验，待合并）；meta.start 保持 blocked 直至 E14；真实模型、独立数据与支付授权未取得。 |
 | E08 | 可恢复的撤销、保留和备份链 | in_progress（当前对象/本机恢复已verified） | 主控47项及clippy/fmt通过；当前可信SQLite锚由操作者指定，不声称辨别假冒旧库。Linux/生产演练及后续新增对象清理另验。 |
-| E09 | 生成/探索解耦与有状态在线探索 | in_progress（程序协调已verified） | 主控25项及clippy/fmt通过；完整输入幂等、两节点StoreJournal链、源水位、整批资源已验；实际产生可修复故障的E03链、真实G2及全多组/实践范围仍待完成。 |
+| E09 | 生成/探索解耦与有状态在线探索 | in_progress（程序协调已verified） | 主控25项及clippy/fmt通过；完整输入幂等、两节点StoreJournal链、源水位、整批资源已验；实际产生可修复故障的E03链、真实G2及全多组/实践范围仍待完成；V097（§3.1.1 消融）作用域未验。 |
 | E10 | 不可变世界池与纯查表回放 | in_progress（程序回放/池/报告已verified） | 主控57项、clippy/fmt通过；观察正文绑定实际共同输入和来源，q0/辅助来源篡改拒绝；世界/池/报告持久与实时撤销已验。replay.run管理适配经AG-001验收并合并；真实观测仍缺，不声称经济收益。 |
 | E11 | 验证回放优化的真实经济收益 | in_progress（合同/持久准备已verified） | 主控10项及clippy/fmt通过；单票配对、九类成本、实际预算绑定/最终回执不可变、并发取消/晚到账/报告CAS已验。可信在线配对回执消费者尚未实现；真实经济实验未运行，不声称节省。 |
 | E12 | 学习者条件化的经验自主获取 | in_progress（离线子范围已verified） | 主控21项和参考宿主3个进程用例、clippy/fmt通过；控制注册、精确平台期、冷却/零预算终态、事实拒绝门已验。E03可信执行/评分回执schema仍缺，真实隔离、应用正例及持久学习改变下轮选题仍未验，不启用G3。 |
 | E13 | 长期部署适应与能力保留监测 | in_progress（程序监测已verified） | 主控22项及clippy/fmt通过；两周期触发、单claim、真实根绑定前置校验、异常/撤销持久终态和漂移已验。仅程序fixture，真实提供商、连续轮次保留/长期效果仍未取得。 |
 | E14 | 受限改进器自身的继承控制器 | planned（本地合同建议已交接） | 未开始代码；单机制候选、真实下一作业及身份边界仍须主控定版；不启用G4。 |
 | E15 | 后继质量与跨代收益实验 | planned | 真实后继实验未运行。 |
-| E16 | 产品支持范围与最终交付门禁 | in_progress（E16.1–E16.5 子范围已验并合并） | E16.6 索引待重新堆叠与更新；真实宿主/沙箱/第三方包证据未取得；真源文件缺席，本轮为依台账记录范围验证。 |
+| E16 | 产品支持范围与最终交付门禁 | in_progress（E16.1–E16.5 子范围已验并合并） | E16.6 索引已按合并事实更新（#56）并由 AG-012 绑定 v4.2；真实宿主/沙箱/第三方包证据未取得；已按真源正文复核（2026-09-30，见顶部审计节）。 |
 | E16.1 | 来源导入与版本化读取器 | in_progress（程序/持久导入子范围已verified并合并） | PR #44 merged_sha `acda31895bb1cb42cf7985b907a4c600429573d0`（主控返修 F13–F16 后）；完整真实迁移链未关闭。 |
 | E16.2 | 资产导入／分享与隐私门禁 | in_progress（staging/本地导出子范围已verified并合并） | PR #54 取代 #45，merged_sha `16c2817bc192bf71535d2c99d867873e6e85bcf8`（主控返修 F17–F20 后）；F08 只对照提案版；真实第三方包/远端销毁未验。 |
 | E16.3 | 内置种子与本地修改保护 | in_progress（持久种子安装/重置 staging 子范围已verified并合并） | PR #54 取代 #46，merged_sha `16c2817bc192bf71535d2c99d867873e6e85bcf8`；真实用户目录演练未验。 |
 | E16.4 | 额外真实宿主与配置面漂移 | in_progress（拒绝门/记录重载子范围已verified并合并）/ blocked（真实宿主） | PR #47 重新堆叠后 merged_sha `1c824e6614667da4dc7ea74e96b46adfd1d2c089`（含主控 F21）；无真实 Claude Code 证据，`verify_host_receipt` 在本仓库无接受路径（fail-closed）。 |
-| E16.5 | 持久恢复、容量、依赖与部署安全 | in_progress（门函数子范围已verified并合并）/ blocked（未接运行入口） | PR #48 重新堆叠后 merged_sha `4980aa498baa80fd82e83441839e606859fa4065`（主控返修 F10–F12）；容量/恢复门未接入 dispatch/prepare，无真实沙箱。 |
-| E16.6 | 发行、证据台账与唯一真源交接 | in_progress（派生索引与检查器子范围已verified并合并） | #56 merged_sha `364a0722be7d5b05cbf01c453322ba35c2fdfa67`、#57 merged_sha `7b425fcf4da08b8949aaa8f3426853f8938d3f3c`；索引仍声明 subset_only，全路线未完成；真源缺席，依台账记录范围验证。 |
+| E16.5 | 持久恢复、容量、依赖与部署安全 | in_progress（门函数子范围已verified并合并）/ blocked（未接运行入口） | PR #48 merged_sha `4980aa498baa80fd82e83441839e606859fa4065`（F10–F12）；2026-09-30 AG-014（#62，待合并）：MVP 容量门接入六个真实入口并实例级跨命名空间计数（F24）；`verify_recovery_state`/`validate_deployment_security` 仍未接启动入口，无真实沙箱。 |
+| E16.6 | 发行、证据台账与唯一真源交接 | in_progress（派生索引与检查器子范围已verified并合并） | #56 merged_sha `364a0722be7d5b05cbf01c453322ba35c2fdfa67`、#57 merged_sha `7b425fcf4da08b8949aaa8f3426853f8938d3f3c`；索引仍声明 subset_only，全路线未完成；已按真源正文复核（2026-09-30，见顶部审计节）。 |
 | E17 | 可选：开发代理评分器演化 | in_progress（关闭/拒绝子范围已verified并合并） | PR #50 重新堆叠后 merged_sha `e94042d3f2fd761455727a6c82ad13fd3d657d03`（主控硬化 F22）；默认关闭，不代表真实扩展运行通过。 |
 | E18 | 可选：自动提出代码修改，不自动部署 | in_progress（关闭/拒绝子范围已verified并合并） | PR #51 重新堆叠后 merged_sha `bef7bd1763a01ccb677ada4acad71a063366539c`（主控硬化 F23）；默认关闭，不代表真实扩展运行通过。 |
 
