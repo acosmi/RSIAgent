@@ -2327,6 +2327,9 @@ async fn cleanup_node_content(
         // E09 practice: the Admin registration that authorizes a K=3 comparison
         // is a management fact, not source-derived content; it survives a revocation.
         ("artifact", "rsia.practice_registration.v1", _) => true,
+        // E09 practice: the unique registration-to-set binding records that a K=3
+        // registration was spent; a revocation never reopens that authorization.
+        ("artifact", "rsia.practice_registration_binding.v1", _) => true,
         ("evaluation", "", _) => value.as_object().is_some_and(|m| {
             m.len() == 3
                 && ["id", "score", "state"]

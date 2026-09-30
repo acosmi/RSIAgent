@@ -39,11 +39,12 @@ use evo_engine::optimization::{
     verify_development_observation,
 };
 use evo_engine::practice::{
-    PRACTICE_ATTEMPT_SET_SCHEMA, PRACTICE_REGISTRATION_SCHEMA, PracticeAttemptSetV1,
-    PracticeOutcomeV1, PracticeRegistrationV1, PracticeRunRequest, load_practice_attempt_set,
-    load_practice_registration, practice_attempt_request, practice_attempt_request_id,
-    practice_attempt_set_storage_id, practice_registration_storage_id, register_practice,
-    run_practice_set, select_contrast,
+    PRACTICE_ATTEMPT_SET_SCHEMA, PRACTICE_REGISTRATION_BINDING_SCHEMA,
+    PRACTICE_REGISTRATION_SCHEMA, PracticeAttemptSetV1, PracticeOutcomeV1, PracticeRegistrationV1,
+    PracticeRunRequest, load_practice_attempt_set, load_practice_registration,
+    load_practice_registration_binding, practice_attempt_request, practice_attempt_request_id,
+    practice_attempt_set_storage_id, practice_registration_binding_storage_id,
+    practice_registration_storage_id, register_practice, run_practice_set, select_contrast,
 };
 use evo_engine::streaming_evaluator::{FixedGraderMethod, FixedGraderSpec};
 use evo_storage::Store;
@@ -530,6 +531,44 @@ impl DevRunner for DisturbingRunner {
     }
 }
 
+/// Wraps the registered runner and, just before delegating attempt 2, overwrites
+/// the registration's binding so that it names another set: the registration is
+/// spent on an unrelated set while this one runs.
+struct RebindingRunner {
+    inner: RegisteredDevelopmentRunner,
+    store: Store,
+    admin: Context,
+    registration_id: String,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl DevRunner for RebindingRunner {
+    async fn run(&self, request: DevelopmentRunRequest) -> evo_core::Result<DevelopmentRunReport> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if request.attempt == 2 {
+            let storage = practice_registration_binding_storage_id(&self.registration_id)?;
+            let mut session = self.store.session().await?;
+            session
+                .put(
+                    &self.admin,
+                    "artifact",
+                    &storage,
+                    self.admin.actor(),
+                    &serde_json::json!({
+                        "schema_version": PRACTICE_REGISTRATION_BINDING_SCHEMA,
+                        "id": storage,
+                        "registration_id": self.registration_id,
+                        "set_id": "set-intruder",
+                    }),
+                )
+                .await?;
+            session.commit().await?;
+        }
+        self.inner.run(request).await
+    }
+}
+
 /// A runner whose candidate output depends on (attempt, task). It issues
 /// honest E03 evidence through the public issuing functions (budget row,
 /// settlement, receipts, run receipt) so that the practice layer verifies it
@@ -823,6 +862,14 @@ async fn register_k3(fixture: &Fixture, plan: &PracticePlan) -> PracticeRegistra
         .await
         .unwrap();
     registration
+}
+
+/// A K=3 plan over the fixture's two tasks, registered by the Admin. A
+/// registration authorizes one set only, so every K=3 set gets its own.
+async fn registered_plan(fixture: &Fixture, authorization: &str) -> PracticePlan {
+    let plan = plan_k3(authorization);
+    register_k3(fixture, &plan).await;
+    plan
 }
 
 fn known_zero() -> DevelopmentCostState {
@@ -1284,20 +1331,23 @@ async fn registered_k3_with_the_deterministic_runner_keeps_every_attempt_and_no_
 #[tokio::test]
 async fn a_worker_may_run_a_registered_set_and_a_new_set_never_reuses_an_old_attempt() {
     let fixture = Fixture::new().await;
-    let plan = plan_k3("authorization-two-sets");
+    let plan = plan_k3("authorization-two-sets-a");
+    let next_plan = plan_k3("authorization-two-sets-b");
     register_k3(&fixture, &plan).await;
+    register_k3(&fixture, &next_plan).await;
     let worker = Context::new(NAMESPACE, "practice-worker", Role::Worker).unwrap();
     let runner = fixture.counting();
     let first = run_practice_set(
         &worker,
         &fixture.store,
         &runner,
-        practice_request("set-one", plan.clone()),
+        practice_request("set-one", plan),
     )
     .await
     .unwrap();
-    // A deliberate new practice on the same tasks and bundle: a new set id.
-    let mut again = practice_request("set-two", plan);
+    // A deliberate new practice on the same tasks and bundle: a new set id under
+    // a new registration (one registration authorizes one set).
+    let mut again = practice_request("set-two", next_plan);
     again.episode_id = first.episode_id.clone();
     let second = run_practice_set(&worker, &fixture.store, &runner, again.clone())
         .await
@@ -1537,8 +1587,11 @@ async fn an_attempt_whose_receipts_already_exist_is_a_cache_hit_and_not_a_new_pr
     assert!(!set.counts_as_independent_samples);
     assert_eq!(set.outcome, PracticeOutcomeV1::NoContrast);
 
-    // A fully executed set re-requested under a new id is all new practice.
-    let mut fresh = practice_request("set-cache-fresh", set.plan.clone());
+    // A fully executed set re-requested under a new id and a new registration is
+    // all new practice.
+    let fresh_plan = plan_k3("authorization-cache-fresh");
+    register_k3(&fixture, &fresh_plan).await;
+    let mut fresh = practice_request("set-cache-fresh", fresh_plan);
     fresh.episode_id = request.episode_id.clone();
     let fresh_set = run_practice_set(&fixture.admin, &fixture.store, &runner, fresh)
         .await
@@ -1831,15 +1884,15 @@ async fn an_uncertain_second_attempt_stops_the_set_and_is_never_resent() {
 #[tokio::test]
 async fn an_exhausted_budget_or_an_error_stops_the_set_with_what_finished() {
     let fixture = Fixture::new().await;
-    let plan = plan_k3("authorization-stop");
-    register_k3(&fixture, &plan).await;
+    let budget_plan = registered_plan(&fixture, "authorization-stop-budget").await;
+    let error_plan = registered_plan(&fixture, "authorization-stop-error").await;
 
     let exhausted = fixture.counting().failing(2, || Error::Budget);
     let set = run_practice_set(
         &fixture.admin,
         &fixture.store,
         &exhausted,
-        practice_request("set-budget", plan.clone()),
+        practice_request("set-budget", budget_plan.clone()),
     )
     .await
     .unwrap();
@@ -1851,6 +1904,19 @@ async fn an_exhausted_budget_or_an_error_stops_the_set_with_what_finished() {
     );
     assert_eq!(set.attempts.len(), 1);
     assert_eq!(exhausted.calls(), 2);
+    // A stopped set has spent its registration: trying again under a new set id
+    // needs a new registration.
+    assert!(matches!(
+        run_practice_set(
+            &fixture.admin,
+            &fixture.store,
+            &exhausted,
+            practice_request("set-budget-retry", budget_plan.clone())
+        )
+        .await,
+        Err(Error::Conflict(message)) if message.contains("already authorized practice set set-budget")
+    ));
+    assert_eq!(exhausted.calls(), 2);
 
     // The very first attempt failing keeps nothing but still records the stop.
     let broken = fixture
@@ -1860,7 +1926,7 @@ async fn an_exhausted_budget_or_an_error_stops_the_set_with_what_finished() {
         &fixture.admin,
         &fixture.store,
         &broken,
-        practice_request("set-error", plan.clone()),
+        practice_request("set-error", error_plan.clone()),
     )
     .await
     .unwrap();
@@ -1877,7 +1943,7 @@ async fn an_exhausted_budget_or_an_error_stops_the_set_with_what_finished() {
         &fixture.admin,
         &fixture.store,
         &broken,
-        practice_request("set-error", plan),
+        practice_request("set-error", error_plan),
     )
     .await
     .unwrap();
@@ -1888,8 +1954,9 @@ async fn an_exhausted_budget_or_an_error_stops_the_set_with_what_finished() {
 #[tokio::test]
 async fn a_forged_report_is_never_recorded_as_an_attempt() {
     let fixture = Fixture::new().await;
-    let plan = plan_k3("authorization-forged");
-    register_k3(&fixture, &plan).await;
+    let score_plan = registered_plan(&fixture, "authorization-forged-score").await;
+    let fixture_plan = registered_plan(&fixture, "authorization-forged-fixture").await;
+    let run_plan = registered_plan(&fixture, "authorization-forged-run").await;
 
     // The report claims a worse score than the stored, server-graded receipts.
     let understated = ForgingRunner {
@@ -1904,7 +1971,7 @@ async fn a_forged_report_is_never_recorded_as_an_attempt() {
         &fixture.admin,
         &fixture.store,
         &understated,
-        practice_request("set-forged-score", plan.clone()),
+        practice_request("set-forged-score", score_plan),
     )
     .await
     .unwrap();
@@ -1927,7 +1994,7 @@ async fn a_forged_report_is_never_recorded_as_an_attempt() {
         &fixture.admin,
         &fixture.store,
         &fixture_claim,
-        practice_request("set-forged-fixture", plan.clone()),
+        practice_request("set-forged-fixture", fixture_plan),
     )
     .await
     .unwrap();
@@ -1951,7 +2018,7 @@ async fn a_forged_report_is_never_recorded_as_an_attempt() {
         &fixture.admin,
         &fixture.store,
         &wrong_run,
-        practice_request("set-forged-run", plan),
+        practice_request("set-forged-run", run_plan),
     )
     .await
     .unwrap();
@@ -1982,7 +2049,7 @@ async fn run_with_disturbance(revoke: bool) -> evo_core::Result<PracticeAttemptS
         &fixture.admin,
         &fixture.store,
         &runner,
-        practice_request("set-disturbed", plan),
+        practice_request("set-disturbed", plan.clone()),
     )
     .await;
     // Attempt 3 never ran, and no set was stored after the world had changed.
@@ -1991,6 +2058,28 @@ async fn run_with_disturbance(revoke: bool) -> evo_core::Result<PracticeAttemptS
         load_practice_attempt_set(&fixture.store, &fixture.admin, "set-disturbed").await,
         Err(Error::NotFound)
     ));
+    // The registration was claimed before the first runner call, so it stays
+    // spent on this set id although no set was stored: only that id can finish
+    // the practice, and any other set needs a new registration.
+    let registration = PracticeRegistrationV1::for_plan(&plan, "admin", 5).unwrap();
+    assert_eq!(
+        load_practice_registration_binding(&fixture.store, &fixture.admin, &registration.id)
+            .await
+            .unwrap()
+            .set_id,
+        "set-disturbed"
+    );
+    assert!(matches!(
+        run_practice_set(
+            &fixture.admin,
+            &fixture.store,
+            &runner,
+            practice_request("set-disturbed-other", plan)
+        )
+        .await,
+        Err(Error::Conflict(message)) if message.contains("already authorized practice set set-disturbed")
+    ));
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 2);
     outcome
 }
 
@@ -2066,6 +2155,8 @@ async fn revoking_a_source_redacts_the_set_and_keeps_the_registration() {
     let fixture = Fixture::new().await;
     let plan = plan_k3("authorization-revoke");
     let registration = register_k3(&fixture, &plan).await;
+    let empty_plan = plan_k3("authorization-revoke-empty");
+    let empty_registration = register_k3(&fixture, &empty_plan).await;
     let runner = fixture.counting();
     let request = practice_request("set-revoke", plan.clone());
     let set = run_practice_set(&fixture.admin, &fixture.store, &runner, request.clone())
@@ -2078,7 +2169,7 @@ async fn revoking_a_source_redacts_the_set_and_keeps_the_registration() {
         &fixture.admin,
         &fixture.store,
         &broken,
-        practice_request("set-revoke-empty", plan.clone()),
+        practice_request("set-revoke-empty", empty_plan),
     )
     .await
     .unwrap();
@@ -2093,6 +2184,30 @@ async fn revoking_a_source_redacts_the_set_and_keeps_the_registration() {
         fixture.raw_artifact(&set_storage).await["schema_version"],
         PRACTICE_ATTEMPT_SET_SCHEMA
     );
+    // Each registration is bound to the set it was spent on.
+    let binding_storages = [
+        practice_registration_binding_storage_id(&registration.id).unwrap(),
+        practice_registration_binding_storage_id(&empty_registration.id).unwrap(),
+    ];
+    let mut bindings_before = Vec::new();
+    for (storage, set_id) in binding_storages
+        .iter()
+        .zip(["set-revoke", "set-revoke-empty"])
+    {
+        let binding = fixture.raw_artifact(storage).await;
+        assert_eq!(
+            binding["schema_version"],
+            PRACTICE_REGISTRATION_BINDING_SCHEMA
+        );
+        assert_eq!(binding["set_id"], set_id);
+        bindings_before.push(binding);
+    }
+    let spent = |set_id: &str| {
+        format!(
+            "registration {} already authorized practice set {set_id}",
+            registration.id
+        )
+    };
 
     // Logical revocation alone already fails closed: nothing is returned or
     // started, but the stored bytes are not yet cleaned.
@@ -2109,15 +2224,29 @@ async fn revoking_a_source_redacts_the_set_and_keeps_the_registration() {
         run_practice_set(&fixture.admin, &fixture.store, &runner, request.clone()).await,
         Err(Error::Forbidden)
     ));
+    // A fresh registration does not help: the world is revoked.
+    let fresh_plan = registered_plan(&fixture, "authorization-revoke-fresh").await;
     assert!(matches!(
         run_practice_set(
             &fixture.admin,
             &fixture.store,
             &runner,
-            practice_request("set-after-revoke", plan.clone())
+            practice_request("set-after-revoke", fresh_plan)
         )
         .await,
         Err(Error::Forbidden)
+    ));
+    // The spent registration is refused on its persisted binding, whatever the
+    // world looks like now.
+    assert!(matches!(
+        run_practice_set(
+            &fixture.admin,
+            &fixture.store,
+            &runner,
+            practice_request("set-after-revoke-spent", plan.clone())
+        )
+        .await,
+        Err(Error::Conflict(message)) if message == spent("set-revoke")
     ));
     assert_eq!(runner.calls(), 3);
     assert_eq!(broken.calls(), 1);
@@ -2147,11 +2276,33 @@ async fn revoking_a_source_redacts_the_set_and_keeps_the_registration() {
         assert!(redacted.get("attempts").is_none());
         assert!(redacted.get("outcome").is_none());
     }
-    // The Admin registration survives; so do the E03 receipts.
+    // The Admin registration and its binding survive byte for byte (the binding
+    // was reached through its set and classified, not stalled on), so a
+    // revocation never reopens a spent registration; so do the E03 receipts.
     assert_eq!(
         fixture.raw_artifact(&registration_storage).await,
         registration_before
     );
+    for (storage, before) in binding_storages.iter().zip(&bindings_before) {
+        assert_eq!(&fixture.raw_artifact(storage).await, before);
+    }
+    assert_eq!(
+        load_practice_registration_binding(&fixture.store, &fixture.admin, &registration.id)
+            .await
+            .unwrap()
+            .set_id,
+        "set-revoke"
+    );
+    assert!(matches!(
+        run_practice_set(
+            &fixture.admin,
+            &fixture.store,
+            &runner,
+            practice_request("set-after-cleanup", plan.clone())
+        )
+        .await,
+        Err(Error::Conflict(message)) if message == spent("set-revoke")
+    ));
     assert_eq!(
         load_practice_registration(&fixture.store, &fixture.admin, &registration.id)
             .await
@@ -2206,6 +2357,341 @@ async fn a_revocation_that_reaches_the_registration_preserves_it() {
         CleanupState::Complete
     );
     assert_eq!(fixture.raw_artifact(&storage).await, before);
+}
+
+// ---------------------------------------------------------------------------
+// One registration authorizes one set
+// ---------------------------------------------------------------------------
+
+fn spent_message(registration_id: &str, set_id: &str) -> String {
+    format!("registration {registration_id} already authorized practice set {set_id}")
+}
+
+async fn binding_count(fixture: &Fixture) -> usize {
+    count_schema(
+        &fixture.artifacts().await,
+        PRACTICE_REGISTRATION_BINDING_SCHEMA,
+    )
+}
+
+#[tokio::test]
+async fn a_registration_authorizes_one_set_and_a_second_set_id_is_a_conflict() {
+    let fixture = Fixture::new().await;
+    let plan = plan_k3("authorization-one-set");
+    let registration = register_k3(&fixture, &plan).await;
+    let spent = spent_message(&registration.id, "set-first");
+    let runner = fixture.counting();
+    let first_request = practice_request("set-first", plan.clone());
+    let first = run_practice_set(
+        &fixture.admin,
+        &fixture.store,
+        &runner,
+        first_request.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(runner.calls(), 3);
+
+    // The registration is now bound to the set it was spent on.
+    let binding =
+        load_practice_registration_binding(&fixture.store, &fixture.admin, &registration.id)
+            .await
+            .unwrap();
+    assert_eq!(binding.registration_id, registration.id);
+    assert_eq!(binding.set_id, "set-first");
+    assert_eq!(
+        binding.id,
+        practice_registration_binding_storage_id(&registration.id).unwrap()
+    );
+
+    // A different set id under the same registration is a Conflict naming the
+    // set that spent it; nothing runs, nothing is stored, no budget row exists.
+    let second_request = practice_request("set-second", plan.clone());
+    let worker = Context::new(NAMESPACE, "practice-worker", Role::Worker).unwrap();
+    for ctx in [&fixture.admin, &worker] {
+        assert!(matches!(
+            run_practice_set(ctx, &fixture.store, &runner, second_request.clone()).await,
+            Err(Error::Conflict(message)) if message == spent
+        ));
+    }
+    let mut other_bundle = second_request.clone();
+    other_bundle.bundle_digest = d("another-bundle");
+    let mut other_episode = second_request.clone();
+    other_episode.episode_id = "another-episode".into();
+    for changed in [other_bundle, other_episode] {
+        assert!(matches!(
+            run_practice_set(&fixture.admin, &fixture.store, &runner, changed).await,
+            Err(Error::Conflict(message)) if message == spent
+        ));
+    }
+    assert_eq!(runner.calls(), 3);
+    assert!(matches!(
+        load_practice_attempt_set(&fixture.store, &fixture.admin, "set-second").await,
+        Err(Error::NotFound)
+    ));
+    assert!(
+        fixture
+            .group_calls(&second_request.episode_id)
+            .await
+            .is_empty()
+    );
+
+    // The same set id and request is idempotent: the stored set, no runner call.
+    let replay = run_practice_set(
+        &fixture.admin,
+        &fixture.store,
+        &runner,
+        first_request.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fingerprint(&replay).unwrap(), fingerprint(&first).unwrap());
+    assert_eq!(runner.calls(), 3);
+    assert_eq!(
+        load_practice_registration_binding(&fixture.store, &fixture.admin, &registration.id)
+            .await
+            .unwrap(),
+        binding
+    );
+
+    // K=1 needs no registration and has no quota: any number of sets.
+    for n in 0..3 {
+        let set = run_practice_set(
+            &fixture.admin,
+            &fixture.store,
+            &runner,
+            practice_request(&format!("set-k1-{n}"), plan_k1()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(set.registration_id, None);
+    }
+    assert_eq!(runner.calls(), 6);
+    assert_eq!(binding_count(&fixture).await, 1);
+
+    // A new registration (a different id) authorizes one more set, and the
+    // id that was refused earlier is free under it: nothing was stored for it.
+    let next_plan = plan_k3("authorization-one-set-next");
+    let next_registration = register_k3(&fixture, &next_plan).await;
+    assert_ne!(next_registration.id, registration.id);
+    let second = run_practice_set(
+        &fixture.admin,
+        &fixture.store,
+        &runner,
+        practice_request("set-second", next_plan.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.attempts.len(), 3);
+    assert_eq!(runner.calls(), 9);
+    assert_eq!(binding_count(&fixture).await, 2);
+    // Each registration stays spent on its own set.
+    assert!(matches!(
+        run_practice_set(
+            &fixture.admin,
+            &fixture.store,
+            &runner,
+            practice_request("set-third", next_plan)
+        )
+        .await,
+        Err(Error::Conflict(message)) if message == spent_message(&next_registration.id, "set-second")
+    ));
+    assert!(matches!(
+        run_practice_set(
+            &fixture.admin,
+            &fixture.store,
+            &runner,
+            practice_request("set-fourth", plan)
+        )
+        .await,
+        Err(Error::Conflict(message)) if message == spent
+    ));
+    assert_eq!(runner.calls(), 9);
+}
+
+#[tokio::test]
+async fn a_refused_request_does_not_spend_the_registration() {
+    let fixture = Fixture::new().await;
+    let plan = plan_k3("authorization-not-spent");
+    let registration = register_k3(&fixture, &plan).await;
+    let runner = fixture.counting();
+    // Everything that is refused before the first call leaves it unspent.
+    let mut bad_bundle = practice_request("set-bad-bundle", plan.clone());
+    bad_bundle.bundle_digest = "not-a-digest".into();
+    let mut drifted = practice_request("set-drifted", plan.clone());
+    drifted.revoke_watermark = 99;
+    let mut other_cluster = plan.clone();
+    other_cluster.parent_cluster_id = "cluster-2".into();
+    let mut unknown_control = practice_request("set-unknown-control", plan.clone());
+    unknown_control.control_id = "no-such-control".into();
+    for request in [
+        bad_bundle,
+        drifted,
+        practice_request("set-other-cluster", other_cluster),
+        unknown_control,
+    ] {
+        assert!(
+            run_practice_set(&fixture.admin, &fixture.store, &runner, request)
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(runner.calls(), 0);
+    assert!(matches!(
+        load_practice_registration_binding(&fixture.store, &fixture.admin, &registration.id).await,
+        Err(Error::NotFound)
+    ));
+    assert_eq!(binding_count(&fixture).await, 0);
+    // So the practice it authorizes can still run, once.
+    let set = run_practice_set(
+        &fixture.admin,
+        &fixture.store,
+        &runner,
+        practice_request("set-real", plan),
+    )
+    .await
+    .unwrap();
+    assert_eq!(set.attempts.len(), 3);
+    assert_eq!(runner.calls(), 3);
+    assert_eq!(binding_count(&fixture).await, 1);
+}
+
+#[tokio::test]
+async fn two_concurrent_sets_on_one_registration_let_exactly_one_run() {
+    let fixture = Fixture::new().await;
+    let plan = registered_plan(&fixture, "authorization-concurrent").await;
+    let registration = PracticeRegistrationV1::for_plan(&plan, "admin", 5).unwrap();
+    let runner = fixture.counting();
+    let (first, second) = tokio::join!(
+        run_practice_set(
+            &fixture.admin,
+            &fixture.store,
+            &runner,
+            practice_request("set-race-a", plan.clone())
+        ),
+        run_practice_set(
+            &fixture.admin,
+            &fixture.store,
+            &runner,
+            practice_request("set-race-b", plan.clone())
+        ),
+    );
+    let (winner, loser, error) = match (first, second) {
+        (Ok(_), Err(error)) => ("set-race-a", "set-race-b", error),
+        (Err(error), Ok(set)) => {
+            assert_eq!(set.set_id, "set-race-b");
+            ("set-race-b", "set-race-a", error)
+        }
+        (first, second) => panic!("expected exactly one success: {first:?} / {second:?}"),
+    };
+    assert!(matches!(
+        error,
+        Error::Conflict(message) if message == spent_message(&registration.id, winner)
+    ));
+    // The loser never ran: only the winner's three attempts were executed.
+    assert_eq!(runner.calls(), 3);
+    assert_eq!(
+        load_practice_attempt_set(&fixture.store, &fixture.admin, winner)
+            .await
+            .unwrap()
+            .attempts
+            .len(),
+        3
+    );
+    assert!(matches!(
+        load_practice_attempt_set(&fixture.store, &fixture.admin, loser).await,
+        Err(Error::NotFound)
+    ));
+    assert_eq!(binding_count(&fixture).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_parallel_set_ids_on_one_registration_let_exactly_one_succeed() {
+    let fixture = Arc::new(Fixture::new().await);
+    let plan = registered_plan(&fixture, "authorization-parallel").await;
+    let registration = PracticeRegistrationV1::for_plan(&plan, "admin", 5).unwrap();
+    let runner = Arc::new(fixture.counting());
+    let mut handles = Vec::new();
+    for n in 0..6 {
+        let (fixture, runner, plan) = (fixture.clone(), runner.clone(), plan.clone());
+        handles.push(tokio::spawn(async move {
+            let set_id = format!("set-parallel-{n}");
+            let outcome = run_practice_set(
+                &fixture.admin,
+                &fixture.store,
+                runner.as_ref(),
+                practice_request(&set_id, plan),
+            )
+            .await;
+            (set_id, outcome)
+        }));
+    }
+    let mut winners = Vec::new();
+    let mut losers = Vec::new();
+    for handle in handles {
+        let (set_id, outcome) = handle.await.unwrap();
+        match outcome {
+            Ok(set) => winners.push((set_id, set)),
+            Err(error) => losers.push((set_id, error)),
+        }
+    }
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one set may spend the registration"
+    );
+    let (winner, set) = &winners[0];
+    assert_eq!(set.attempts.len(), 3);
+    assert_eq!(losers.len(), 5);
+    for (loser, error) in &losers {
+        assert!(matches!(
+            error,
+            Error::Conflict(message) if *message == spent_message(&registration.id, winner)
+        ));
+        assert!(matches!(
+            load_practice_attempt_set(&fixture.store, &fixture.admin, loser).await,
+            Err(Error::NotFound)
+        ));
+    }
+    // Only the winner executed: three attempts, never eighteen.
+    assert_eq!(runner.calls(), 3);
+    assert_eq!(binding_count(&fixture).await, 1);
+}
+
+#[tokio::test]
+async fn a_set_is_never_stored_next_to_a_binding_of_another_set() {
+    let fixture = Fixture::new().await;
+    let plan = registered_plan(&fixture, "authorization-rebound").await;
+    let registration = PracticeRegistrationV1::for_plan(&plan, "admin", 5).unwrap();
+    let runner = RebindingRunner {
+        inner: fixture.runner(),
+        store: fixture.store.clone(),
+        admin: fixture.admin.clone(),
+        registration_id: registration.id.clone(),
+        calls: AtomicUsize::new(0),
+    };
+    // The persisting transaction re-asserts the binding with the set: another
+    // set's binding refuses it, and nothing is stored.
+    let outcome = run_practice_set(
+        &fixture.admin,
+        &fixture.store,
+        &runner,
+        practice_request("set-rebound", plan),
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        Err(Error::Conflict(message)) if message == spent_message(&registration.id, "set-intruder")
+    ));
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 3);
+    assert!(matches!(
+        load_practice_attempt_set(&fixture.store, &fixture.admin, "set-rebound").await,
+        Err(Error::NotFound)
+    ));
+    assert_eq!(
+        count_schema(&fixture.artifacts().await, PRACTICE_ATTEMPT_SET_SCHEMA),
+        0
+    );
 }
 
 // ---------------------------------------------------------------------------

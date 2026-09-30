@@ -11,6 +11,14 @@
 //!   must cite that persisted registration. A plan covers at most two tasks,
 //!   and they must be exactly the tasks of the control, so the set shares the
 //!   control's root budget and cannot spend on an unregistered task.
+//! * A registration authorizes exactly **one** set. A second K=3 set under it
+//!   would push the same tasks past K=3, a disguised re-sample (§8.5: K is never
+//!   raised to manufacture a difference), so a different set id is a `Conflict`
+//!   (`registration <id> already authorized practice set <set_id>`) while the
+//!   same set id and request stays idempotent. The decision rests on a persisted
+//!   [`PracticeRegistrationBindingV1`], claimed before the first runner call and
+//!   re-asserted, atomically with the set, in the transaction that stores it.
+//!   K=1 needs no registration and has no quota.
 //! * Attempt n uses a request id derived from the set id and n. A new set never
 //!   hits an old attempt (V094.b); re-running the same request returns the
 //!   stored set and sends nothing (an uncertain attempt is never resent).
@@ -43,6 +51,10 @@
 //!   no model sampling, hence no sampling configuration and no real cost.
 //! * A contrast does not feed the bounded edit chain (§6.7/§5.3.1), and there
 //!   is no management entry point.
+//! * A registration is spent when its set claims it, before the first runner
+//!   call. A run that dies, stops or is refused later keeps it spent: only that
+//!   set id can finish the practice (a rerun reuses the stored receipts), and
+//!   any other K=3 practice needs a new registration.
 //! * A registration authorizes a plan (cluster, tasks, K) and carries no
 //!   failure/instability/coverage basis. Only [`register_practice`] is gated to
 //!   Admin: like every engine artifact, a raw storage write that bypasses it
@@ -69,6 +81,7 @@ use std::collections::BTreeSet;
 
 pub const PRACTICE_REGISTRATION_SCHEMA: &str = "rsia.practice_registration.v1";
 pub const PRACTICE_ATTEMPT_SET_SCHEMA: &str = "rsia.practice_attempt_set.v1";
+pub const PRACTICE_REGISTRATION_BINDING_SCHEMA: &str = "rsia.practice_registration_binding.v1";
 /// The only expanded K. K=1 is the default and needs no registration.
 pub const REGISTERED_PRACTICE_ATTEMPTS: u8 = 3;
 
@@ -115,6 +128,13 @@ pub fn practice_attempt_set_storage_id(set_id: &str) -> Result<String> {
     ))
 }
 
+/// Storage id of the binding of a registration: one per registration, derived
+/// from the registration id, so a second binding of it is the same object.
+pub fn practice_registration_binding_storage_id(registration_id: &str) -> Result<String> {
+    digest(registration_id, "practice registration id")?;
+    Ok(format!("practice-binding-{registration_id}"))
+}
+
 /// Request id of attempt `attempt` (1-based) of a set. It is a pure function of
 /// the set id and the attempt number: a new set id yields new request ids, so a
 /// new deliberate practice can never hit an old attempt (V094.b), and the same
@@ -138,7 +158,8 @@ pub fn practice_attempt_request_id(set_id: &str, attempt: u32) -> Result<String>
 /// chosen by the Admin before the plan is built, so the plan can cite it, and
 /// an id is registered once: the same id with other content is a `Conflict`.
 /// The free digest inside a plan is therefore never trusted on its own; it only
-/// names a record that must exist and must bind exactly that plan.
+/// names a record that must exist and must bind exactly that plan. A
+/// registration authorizes one set only (see [`PracticeRegistrationBindingV1`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PracticeRegistrationV1 {
@@ -229,6 +250,51 @@ impl PracticeRegistrationV1 {
         {
             return Err(Error::Conflict(
                 "practice registration does not authorize this plan".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The persisted fact that a K=3 registration was spent on one set: `registration
+/// -> set id`. It is a typed management object, one per registration, written
+/// once and never changed, and a source revocation keeps it (the cleanup
+/// classifies it `preserve`), so revoking a source never reopens an authorization
+/// whose spend already happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PracticeRegistrationBindingV1 {
+    pub schema_version: String,
+    /// Storage id, `practice_registration_binding_storage_id(registration_id)`.
+    pub id: String,
+    pub registration_id: String,
+    pub set_id: String,
+}
+
+impl PracticeRegistrationBindingV1 {
+    pub const SCHEMA: &'static str = PRACTICE_REGISTRATION_BINDING_SCHEMA;
+
+    fn new(registration_id: &str, set_id: &str) -> Result<Self> {
+        let binding = Self {
+            schema_version: Self::SCHEMA.into(),
+            id: practice_registration_binding_storage_id(registration_id)?,
+            registration_id: registration_id.into(),
+            set_id: set_id.into(),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != Self::SCHEMA {
+            return Err(Error::Invalid(
+                "unsupported practice registration binding schema".into(),
+            ));
+        }
+        identifier(&self.set_id)?;
+        if self.id != practice_registration_binding_storage_id(&self.registration_id)? {
+            return Err(Error::Conflict(
+                "practice registration binding id is not derived from its registration".into(),
             ));
         }
         Ok(())
@@ -857,6 +923,150 @@ async fn load_existing_set(
     value.map(|value| parse_set(ctx, set_id, value)).transpose()
 }
 
+fn parse_binding(
+    registration_id: &str,
+    value: serde_json::Value,
+) -> Result<PracticeRegistrationBindingV1> {
+    match value
+        .get("schema_version")
+        .and_then(|schema| schema.as_str())
+    {
+        Some(PRACTICE_REGISTRATION_BINDING_SCHEMA) => {}
+        Some(REDACTED_SCHEMA) => {
+            return Err(Error::Conflict(
+                "practice registration binding was redacted".into(),
+            ));
+        }
+        _ => {
+            return Err(Error::Conflict(
+                "stored object is not a practice registration binding".into(),
+            ));
+        }
+    }
+    let binding: PracticeRegistrationBindingV1 = serde_json::from_value(value)
+        .map_err(|_| Error::Conflict("practice registration binding is not strict".into()))?;
+    binding.validate()?;
+    if binding.registration_id != registration_id {
+        return Err(Error::Conflict(
+            "practice registration binding identity mismatch".into(),
+        ));
+    }
+    Ok(binding)
+}
+
+async fn read_binding(
+    session: &mut Session,
+    ctx: &Context,
+    registration_id: &str,
+) -> Result<Option<PracticeRegistrationBindingV1>> {
+    let storage = practice_registration_binding_storage_id(registration_id)?;
+    session
+        .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &storage)
+        .await?
+        .map(|value| parse_binding(registration_id, value))
+        .transpose()
+}
+
+/// The set a registration was already spent on, in the words callers see.
+fn binding_conflict(registration_id: &str, spent_on: &str) -> Error {
+    Error::Conflict(format!(
+        "registration {registration_id} already authorized practice set {spent_on}"
+    ))
+}
+
+/// Reads the binding of a K=3 registration. `NotFound` while it is unspent.
+pub async fn load_practice_registration_binding(
+    store: &Store,
+    ctx: &Context,
+    registration_id: &str,
+) -> Result<PracticeRegistrationBindingV1> {
+    let mut session = store.session().await?;
+    let binding = read_binding(&mut session, ctx, registration_id).await?;
+    session.commit().await?;
+    binding.ok_or(Error::NotFound)
+}
+
+// One registration, one set: why it is a binding object, and why it is claimed
+// before the first call.
+//
+// "This registration is spent" must rest on a persisted fact that a concurrent
+// call cannot race past and that a revocation cannot erase.
+//
+// * The dependency edge set -> registration that `persist_set` also writes is
+//   no basis. A redacted set keeps its edge but loses its set id (redaction
+//   keeps only a fixed metadata allow-list), so the edge could neither name the
+//   set in the `Conflict` nor stay a typed fact once the set is redacted.
+// * A binding is one typed object per registration (its id is derived from the
+//   registration id), written once, naming the set in clear, and classified
+//   `preserve` by the cleanup: revoking a source never reopens an authorization
+//   whose spend already happened.
+// * The store serializes sessions on one connection, so check-and-insert inside
+//   one session is atomic: of two different set ids only one can bind.
+// * `persist_set` re-asserts the binding in the very transaction that stores the
+//   set. It is also claimed before the first runner call, because deciding only
+//   at persist time would let two concurrent sets, or a set that dies between its
+//   attempts followed by a retry under a new id, each execute K attempts of the
+//   same tasks: exactly the disguised re-sample the rule forbids. The price is
+//   that a run which dies before storing its set leaves the registration bound
+//   to that set id. Only that id can finish it (a rerun reuses the stored
+//   receipts); any other practice needs a new registration.
+
+/// Binds the registration to `set_id`, or confirms it is already bound to it.
+/// Another set id is a `Conflict`.
+async fn bind_registration(
+    session: &mut Session,
+    ctx: &Context,
+    registration_id: &str,
+    set_id: &str,
+) -> Result<()> {
+    match read_binding(session, ctx, registration_id).await? {
+        Some(binding) if binding.set_id == set_id => Ok(()),
+        Some(binding) => Err(binding_conflict(registration_id, &binding.set_id)),
+        None => {
+            let binding = PracticeRegistrationBindingV1::new(registration_id, set_id)?;
+            session
+                .put(ctx, ARTIFACT_KIND, &binding.id, ctx.actor(), &binding)
+                .await?;
+            session
+                .audit(ctx, "practice.registration.bind", registration_id)
+                .await
+        }
+    }
+}
+
+/// Read-only early refusal of a registration that is spent on another set, so
+/// the decision holds whatever the world looks like now and before anything else
+/// is checked or written. The claim below still decides races.
+async fn ensure_registration_available(
+    store: &Store,
+    ctx: &Context,
+    registration_id: &str,
+    set_id: &str,
+) -> Result<()> {
+    let mut session = store.session().await?;
+    let binding = read_binding(&mut session, ctx, registration_id).await?;
+    session.commit().await?;
+    match binding {
+        Some(binding) if binding.set_id != set_id => {
+            Err(binding_conflict(registration_id, &binding.set_id))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Claims the registration for `set_id` in its own transaction, before the first
+/// runner call. Of two concurrent different set ids exactly one claims it.
+async fn claim_registration(
+    ctx: &Context,
+    store: &Store,
+    registration_id: &str,
+    set_id: &str,
+) -> Result<()> {
+    let mut session = store.session().await?;
+    bind_registration(&mut session, ctx, registration_id, set_id).await?;
+    session.commit().await
+}
+
 /// A K=3 plan must cite a persisted registration that authorizes exactly it.
 /// A missing registration is a permission failure, never a silent K=1.
 async fn verify_registration(
@@ -1045,10 +1255,11 @@ async fn run_attempts(
 /// attempt, an exhausted budget or any runner error stops the set as
 /// `Incomplete` (finished attempts are kept, nothing is resent; trying again
 /// means a new set id, a new deliberate practice that never hits the stopped
-/// attempts). The set is written as an immutable artifact with dependency edges
-/// to the control's source runs, the control, every attempt's receipts and the
-/// registration, so a source revocation reaches it. No stage fact of any kind
-/// is written.
+/// attempts, and for K=3 also a new registration, because a registration
+/// authorizes one set only and a stopped set has spent it). The set is written
+/// as an immutable artifact with dependency edges to the control's source runs,
+/// the control, every attempt's receipts and the registration, so a source
+/// revocation reaches it. No stage fact of any kind is written.
 pub async fn run_practice_set(
     ctx: &Context,
     store: &Store,
@@ -1079,6 +1290,9 @@ pub async fn run_practice_set(
     } else {
         None
     };
+    if let Some(registration) = &registration_id {
+        ensure_registration_available(store, ctx, registration, &request.set_id).await?;
+    }
     {
         let mut session = store.session().await?;
         require_live_sources(
@@ -1089,6 +1303,9 @@ pub async fn run_practice_set(
         )
         .await?;
         session.commit().await?;
+    }
+    if let Some(registration) = &registration_id {
+        claim_registration(ctx, store, registration, &request.set_id).await?;
     }
 
     let k = u32::from(request.plan.attempts_per_task);
@@ -1132,6 +1349,8 @@ pub async fn run_practice_set(
 /// transaction, so a set is never stored after a revocation that could already
 /// have passed its cleanup. A concurrent writer of the same request wins: the
 /// stored set is returned; another request under the same id is a `Conflict`.
+/// A K=3 set re-asserts its registration's binding in this same transaction,
+/// atomically with the set, and never stores next to a binding of another set.
 async fn persist_set(
     ctx: &Context,
     store: &Store,
@@ -1153,6 +1372,9 @@ async fn persist_set(
         }
         session.commit().await?;
         return Ok(existing);
+    }
+    if let Some(registration) = &set.registration_id {
+        bind_registration(&mut session, ctx, registration, &set.set_id).await?;
     }
     session
         .put(ctx, ARTIFACT_KIND, &storage, ctx.actor(), &set)
@@ -1206,6 +1428,17 @@ async fn persist_set(
                 &storage,
                 ARTIFACT_KIND,
                 &practice_registration_storage_id(registration)?,
+            )
+            .await?;
+        // The binding depends on the set it was spent on, so a revocation that
+        // reaches the set also reaches (and classifies) the binding.
+        session
+            .put_edge(
+                ctx,
+                ARTIFACT_KIND,
+                &practice_registration_binding_storage_id(registration)?,
+                ARTIFACT_KIND,
+                &storage,
             )
             .await?;
     }
@@ -1498,6 +1731,72 @@ mod tests {
         )
         .validate()
         .unwrap();
+    }
+
+    #[test]
+    fn a_registration_binding_names_one_set_and_its_id_is_derived() {
+        let registration = d("registration");
+        let binding = PracticeRegistrationBindingV1::new(&registration, "set-one").unwrap();
+        assert_eq!(
+            binding.id,
+            practice_registration_binding_storage_id(&registration).unwrap()
+        );
+        assert_eq!(binding.registration_id, registration);
+        assert_eq!(binding.set_id, "set-one");
+        binding.validate().unwrap();
+        let mut other_id = binding.clone();
+        other_id.id = "practice-binding-elsewhere".into();
+        assert!(other_id.validate().is_err());
+        let mut other_schema = binding.clone();
+        other_schema.schema_version = "rsia.practice_registration_binding.v0".into();
+        assert!(other_schema.validate().is_err());
+        assert!(PracticeRegistrationBindingV1::new("not-a-digest", "set-one").is_err());
+        assert!(PracticeRegistrationBindingV1::new(&registration, "not a set id").is_err());
+        // Two registrations never share a binding object.
+        assert_ne!(
+            practice_registration_binding_storage_id(&d("another")).unwrap(),
+            binding.id
+        );
+    }
+
+    #[test]
+    fn a_spent_registration_is_reported_with_both_ids() {
+        assert!(matches!(
+            binding_conflict("reg", "set-a"),
+            Error::Conflict(message)
+                if message == "registration reg already authorized practice set set-a"
+        ));
+    }
+
+    #[test]
+    fn a_stored_binding_must_be_strict_unredacted_and_its_registrations_own() {
+        let registration = d("registration");
+        let binding = PracticeRegistrationBindingV1::new(&registration, "set-one").unwrap();
+        let value = serde_json::to_value(&binding).unwrap();
+        assert_eq!(
+            parse_binding(&registration, value.clone()).unwrap(),
+            binding
+        );
+        // Another registration's id, an unknown field, a redacted body and some
+        // other object are all refused, never read as a binding.
+        assert!(parse_binding(&d("other"), value.clone()).is_err());
+        let mut extra = value.clone();
+        extra["extra"] = serde_json::json!(1);
+        assert!(parse_binding(&registration, extra).is_err());
+        assert!(matches!(
+            parse_binding(
+                &registration,
+                serde_json::json!({"schema_version": REDACTED_SCHEMA, "id": binding.id})
+            ),
+            Err(Error::Conflict(message)) if message.contains("redacted")
+        ));
+        assert!(
+            parse_binding(
+                &registration,
+                serde_json::json!({"schema_version": PRACTICE_ATTEMPT_SET_SCHEMA})
+            )
+            .is_err()
+        );
     }
 
     #[test]
