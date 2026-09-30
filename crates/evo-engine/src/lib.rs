@@ -13,6 +13,7 @@ pub mod evaluator;
 pub mod evidence;
 pub mod executor;
 pub mod exploration;
+pub mod groups;
 pub mod hosts;
 pub mod import;
 pub mod lifecycle;
