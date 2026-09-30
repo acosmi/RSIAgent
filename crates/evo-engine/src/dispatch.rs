@@ -1,4 +1,5 @@
 //! Role-gated model and persistent management dispatch.
+use crate::exploration::ExplorationWorldV1;
 use crate::streaming_evaluator::{
     IndependentEvaluationControl, IssueTicketRequest, ProtectedHoldoutRecord,
     RegisteredEvaluationControl, StreamingEvaluationStatus,
@@ -6,7 +7,7 @@ use crate::streaming_evaluator::{
 use evo_core::contract::{MODEL_TOOLS, admin_ops, reject_admin_as_model_tool};
 use evo_core::curriculum::ProbeTerminal;
 use evo_core::replay::{ReplaySimulationProfile, WorldPartition};
-use evo_core::strategy::{ElasticPolicyV1, ExplorationCapsV1};
+use evo_core::strategy::{BatchActionV1, ElasticPolicyV1, ExplorationCapsV1};
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, now};
 use evo_storage::Store;
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,13 @@ pub enum ManagementResult {
         probe_job_id: String,
         trigger_digest: String,
         terminal: Option<ProbeTerminal>,
+    },
+    ExplorationStarted {
+        world_id: String,
+        context_signature: String,
+        prefix_digest: String,
+        legal_actions_digest: String,
+        action: BatchActionV1,
     },
 }
 
@@ -213,6 +221,17 @@ pub struct CurriculumStepRequest {
     pub root_budget_limit_micros: u64,
 }
 
+/// `exploration.start`: register an [`ExplorationWorldV1`] and take its
+/// first pure decision. Identity comes from the authenticated caller; the
+/// payload carries no actor, role or namespace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExplorationStartRequest {
+    pub schema_version: String,
+    pub request_key: String,
+    pub world: ExplorationWorldV1,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockedManagementRequest {
@@ -228,6 +247,7 @@ enum ParsedRequest {
     EvaluationStatus(EvaluationStatusRequest),
     ReplayRun(Box<ReplayRunRequest>),
     CurriculumStep(CurriculumStepRequest),
+    ExplorationStart(Box<ExplorationStartRequest>),
     Blocked(BlockedManagementRequest),
 }
 
@@ -372,6 +392,37 @@ impl ManagementDispatcher {
             } else {
                 return Err(Error::Conflict(
                     "curriculum job succeeded without valid ProbeScheduled result".into(),
+                ));
+            }
+        }
+        if job.operation == "exploration.start" && job.state == ManagementJobState::Succeeded {
+            if let Some(ManagementResult::ExplorationStarted {
+                world_id,
+                context_signature,
+                prefix_digest,
+                legal_actions_digest,
+                action,
+            }) = &job.result
+            {
+                // The decision is a pure function over the read-only prefix
+                // (plan §7.1); re-running it through the live source closure
+                // both re-checks revocation and proves the stored result.
+                let view =
+                    crate::exploration::verified_world_decision_view(ctx, &self.store, world_id)
+                        .await?;
+                if &view.decision.world_id != world_id
+                    || &view.context_signature != context_signature
+                    || &view.decision.prefix_digest != prefix_digest
+                    || &view.decision.legal_actions_digest != legal_actions_digest
+                    || fingerprint(&view.decision.action)? != fingerprint(action)?
+                {
+                    return Err(Error::Conflict(
+                        "exploration decision view differs from the stored result".into(),
+                    ));
+                }
+            } else {
+                return Err(Error::Conflict(
+                    "exploration job succeeded without valid ExplorationStarted result".into(),
                 ));
             }
         }
@@ -589,6 +640,7 @@ impl ParsedRequest {
             Self::EvaluationStatus(request) => &request.request_key,
             Self::ReplayRun(request) => &request.request_key,
             Self::CurriculumStep(request) => &request.request_key,
+            Self::ExplorationStart(request) => &request.request_key,
             Self::Blocked(request) => &request.request_key,
         }
     }
@@ -708,6 +760,9 @@ async fn execute_request(
         ParsedRequest::ReplayRun(request) => run_replay(ctx, store, &mut job, *request).await,
         ParsedRequest::CurriculumStep(request) => {
             run_curriculum_step(ctx, store, &mut job, request).await
+        }
+        ParsedRequest::ExplorationStart(request) => {
+            run_exploration_start(ctx, store, &mut job, *request).await
         }
         ParsedRequest::Blocked(_) => {
             job.state = ManagementJobState::Blocked;
@@ -929,6 +984,41 @@ async fn run_curriculum_step(
     Ok(())
 }
 
+async fn run_exploration_start(
+    ctx: &Context,
+    store: &Store,
+    job: &mut ManagementJob,
+    request: ExplorationStartRequest,
+) -> Result<()> {
+    checkpoint_claim(ctx, store, job, "before_exploration_start").await?;
+    let coordinator =
+        crate::exploration::PersistentCoordinator::new(store.clone(), ctx.clone(), ctx.actor())?;
+    let world_id = request.world.id.clone();
+    let context_signature = request.world.context_signature.clone();
+    // Registration is idempotent on the world's registration fingerprint: a
+    // crash re-run of this job converges on the world it already persisted
+    // (plan §6.7.4) instead of failing on its own earlier commit.
+    coordinator.register_world_idempotent(request.world).await?;
+    // The first decision is a pure function over the read-only prefix
+    // (plan §7.1); no node is dispatched by the management adapter.
+    let decision = coordinator.decide_next(&world_id).await?;
+    if decision.world_id != world_id {
+        return Err(Error::Conflict(
+            "exploration decision belongs to a different world".into(),
+        ));
+    }
+    job.state = ManagementJobState::Succeeded;
+    job.step = "exploration_started".into();
+    job.result = Some(ManagementResult::ExplorationStarted {
+        world_id,
+        context_signature,
+        prefix_digest: decision.prefix_digest,
+        legal_actions_digest: decision.legal_actions_digest,
+        action: decision.action,
+    });
+    Ok(())
+}
+
 fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<()> {
     match request {
         ParsedRequest::ExperimentRegister(request) => {
@@ -938,7 +1028,9 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
                 return Err(Error::Forbidden);
             }
         }
-        ParsedRequest::ReplayRun(_) | ParsedRequest::CurriculumStep(_) => {
+        ParsedRequest::ReplayRun(_)
+        | ParsedRequest::CurriculumStep(_)
+        | ParsedRequest::ExplorationStart(_) => {
             ctx.require(&[Role::Admin])?;
         }
         _ => {}
@@ -1107,7 +1199,10 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         "curriculum.step" => {
             ParsedRequest::CurriculumStep(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
-        "exploration.start" | "meta.start" => {
+        "exploration.start" => ParsedRequest::ExplorationStart(Box::new(
+            serde_json::from_value(payload).map_err(|_| invalid())?,
+        )),
+        "meta.start" => {
             ParsedRequest::Blocked(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
         _ => return Err(Error::Invalid("unknown management operation".into())),
@@ -1119,6 +1214,7 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::EvaluationStatus(request) => &request.schema_version,
         ParsedRequest::ReplayRun(request) => &request.schema_version,
         ParsedRequest::CurriculumStep(request) => &request.schema_version,
+        ParsedRequest::ExplorationStart(request) => &request.schema_version,
         ParsedRequest::Blocked(request) => &request.schema_version,
     };
     if actual != &expected {
@@ -1195,6 +1291,24 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
             dependencies.push((
                 "artifact".into(),
                 crate::curriculum::curriculum_state_storage_id(&request.state_id)?,
+            ));
+        }
+        ParsedRequest::ExplorationStart(request) => {
+            // The private input depends on every trusted run of the world's
+            // source closure and on the world envelope it will register, so a
+            // revoked run or a rewritten world is visible from the job.
+            for dependency in &request.world.dependencies {
+                if dependency.kind != "run" {
+                    return Err(Error::Invalid(
+                        "exploration source closure must reference trusted runs".into(),
+                    ));
+                }
+                identifier(&dependency.id)?;
+                dependencies.push(("run".into(), dependency.id.clone()));
+            }
+            dependencies.push((
+                "artifact".into(),
+                crate::exploration::exploration_world_storage_id(&request.world.id)?,
             ));
         }
         ParsedRequest::Blocked(_) => {}

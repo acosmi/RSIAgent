@@ -121,7 +121,7 @@ pub const ELASTIC_POLICY_V1: &str = "rsia.elastic_priority.v1";
 pub const EXPLORATION_CAPS_V1: &str = "rsia.exploration_caps.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SimulationContext {
     Online { fixed_seed: u64 },
     Offline { w_sim: u8, fixed_seed: u64 },

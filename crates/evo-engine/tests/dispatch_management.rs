@@ -1,19 +1,32 @@
 use evo_core::curriculum::ProbeTerminal;
-use evo_core::evidence::Purpose;
+use evo_core::evidence::{ExecutionAttestation, Purpose, SourceSelection, TaskOrigin};
 use evo_core::hash;
+use evo_core::optimization::{
+    OptimizationTrace, SkillFailureDiagnosis, SkillFailureKind, TraceOutcome,
+};
 use evo_core::replay::*;
-use evo_core::strategy::{ActionKindV1, ElasticPolicyV1, ExplorationCapsV1, ObservedStatus};
+use evo_core::skill_edit::EvidenceRef;
+use evo_core::strategy::{
+    ActionKindV1, ElasticPolicyV1, ExplorationCapsV1, ObservedStatus, SimulationContext,
+};
 use evo_core::{Context, Error, Job, JobState, Role, now};
 use evo_engine::capacity::MAX_ACTIVE_LEASES;
 use evo_engine::dispatch::{
     ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
+};
+use evo_engine::evidence::{
+    StoredRunRecord, StoredTraceAuthority, store_source_selection, store_trace_authority,
+};
+use evo_engine::exploration::{
+    ExplorationDependency, ExplorationWorldV1, PersistentCoordinator, RootOpportunity, WorldState,
+    exploration_world_storage_id,
 };
 use evo_storage::Store;
 use evo_storage::budget::{
     BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization,
 };
 use evo_storage::replay::{register_replay_pool, replay_pool_storage_id, seal_replay_world};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::time::Duration;
 
 async fn store() -> (tempfile::TempDir, Store) {
@@ -2032,4 +2045,902 @@ async fn management_claim_waits_while_ten_budget_leases_are_live() {
     let done = wait_terminal_slowly(&dispatcher, &admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Blocked);
     assert_eq!(done.generation, 1);
+}
+
+// ---------------------------------------------------------------------------
+// exploration.start (E07 management adapter over the E09 persistent
+// coordinator): register a world and take its first pure decision.
+// ---------------------------------------------------------------------------
+
+const EXPLORATION_ENVELOPE_SCHEMA: &str = "rsia.exploration_artifact_envelope.v1";
+const EXPLORATION_WORLD_KIND: &str = "exploration_world_v1";
+const EXPLORATION_RUNS: [&str; 2] = ["run-failure", "run-success"];
+
+/// Same world as `exploration_v41::world()`, parameterised by id and
+/// watermark so the context signature stays consistent with the store.
+fn exploration_world(id: &str, source_watermark: u64) -> ExplorationWorldV1 {
+    let parent_skill = hash(b"parent-skill");
+    let parent_bundle = hash(b"parent-bundle");
+    let environment = hash(b"environment");
+    let model = hash(b"model");
+    let tools = hash(b"tools");
+    let grader = hash(b"grader");
+    let rules = hash(b"rules");
+    let context_signature = evo_core::fingerprint(&(
+        &parent_skill,
+        &parent_bundle,
+        &environment,
+        &model,
+        &tools,
+        &grader,
+        &rules,
+        source_watermark,
+    ))
+    .unwrap();
+    ExplorationWorldV1 {
+        schema_version: ExplorationWorldV1::SCHEMA.into(),
+        id: id.into(),
+        approved_parent_digest: hash(b"approved-parent"),
+        context_signature,
+        parent_skill_digest: parent_skill,
+        parent_bundle_digest: parent_bundle,
+        environment_digest: environment,
+        model_digest: model,
+        tools_digest: tools,
+        grader_digest: grader,
+        rules_digest: rules,
+        source_watermark,
+        caps: ExplorationCapsV1::online(),
+        policy: ElasticPolicyV1::default(),
+        simulation: SimulationContext::Online { fixed_seed: 7 },
+        root_opportunities: vec![
+            RootOpportunity {
+                root_slot: 2,
+                branch_seq: 2,
+                action_seq: 2,
+                estimated_cost_upper_micros: 10,
+            },
+            RootOpportunity {
+                root_slot: 1,
+                branch_seq: 1,
+                action_seq: 1,
+                estimated_cost_upper_micros: 10,
+            },
+        ],
+        dependencies: EXPLORATION_RUNS
+            .iter()
+            .map(|run| ExplorationDependency {
+                kind: "run".into(),
+                id: (*run).into(),
+            })
+            .collect(),
+        successor_cost_upper_micros: 10,
+        initial_baseline_quality_micros: 500_000,
+        remaining_root_micros: 1_000,
+        remaining_recovery_dispatches: 2,
+        state: WorldState::Collecting,
+        node_ids: vec![],
+        dispatch_ids: vec![],
+        history_ids: vec![],
+        current_branch_seq: None,
+        current_branch_focus_actions: 0,
+        decision_round: 0,
+        waits: vec![],
+    }
+}
+
+fn exploration_trace(run: &str, family: &str, outcome: TraceOutcome) -> OptimizationTrace {
+    OptimizationTrace {
+        run_id: run.into(),
+        parent_family: family.into(),
+        source_digest: hash(run.as_bytes()),
+        purpose: Purpose::Development,
+        outcome,
+        diagnosis: (outcome == TraceOutcome::TaskFailure).then(|| SkillFailureDiagnosis {
+            kind: SkillFailureKind::SkillDefect,
+            skill_id: "skill".into(),
+            bundle_digest: hash(b"bundle"),
+            request_digest: hash(b"request"),
+            rule_id: Some("rule".into()),
+            support: vec![EvidenceRef {
+                id: run.into(),
+                digest: hash(run.as_bytes()),
+            }],
+            counterexamples: vec![],
+            reason: "fixture".into(),
+        }),
+        excerpt: run.into(),
+        seed: 1,
+    }
+}
+
+/// Seeds the trusted source closure exactly like `exploration_v41`: two
+/// Host-issued trace authorities, a source selection grant, and one watermark
+/// bump so `source_watermark == 1`.
+async fn setup_exploration(store: &Store) {
+    let host = Context::new("n", "host", Role::Host).unwrap();
+    for (id, family, outcome) in [
+        ("run-failure", "family-a", TraceOutcome::TaskFailure),
+        ("run-success", "family-b", TraceOutcome::Success),
+    ] {
+        let authority = StoredTraceAuthority {
+            schema_version: "rsia.optimization.source.v1".into(),
+            record: StoredRunRecord {
+                id: id.into(),
+                body: id.as_bytes().to_vec(),
+                parent_family: family.into(),
+                task_origin: TaskOrigin::TrustedRun,
+                execution_attestation: ExecutionAttestation::TrustedHost,
+                purpose: Purpose::Development,
+            },
+            trace: exploration_trace(id, family, outcome),
+            excerpt_start: 0,
+            excerpt_end: id.len(),
+        };
+        store_trace_authority(store, &host, &authority)
+            .await
+            .unwrap();
+    }
+    store_source_selection(
+        store,
+        &host,
+        &SourceSelection {
+            roots: vec![],
+            run_ids: EXPLORATION_RUNS.iter().map(|run| (*run).into()).collect(),
+            purpose: Purpose::Development,
+            allow_model_excerpts: true,
+        },
+    )
+    .await
+    .unwrap();
+    let mut session = store.session().await.unwrap();
+    session.bump_watermark(&host, "e09-initial").await.unwrap();
+    session.commit().await.unwrap();
+}
+
+fn exploration_start_request(request_key: &str, world: &ExplorationWorldV1) -> Value {
+    json!({
+        "schema_version": "rsia.management.exploration_start.v1",
+        "request_key": request_key,
+        "world": serde_json::to_value(world).unwrap(),
+    })
+}
+
+/// Persisted world envelopes, read straight from the store so the assertions
+/// do not depend on the consumer's own read path.
+async fn exploration_worlds(admin: &Context, store: &Store) -> Vec<Value> {
+    let mut session = store.session().await.unwrap();
+    let values = session.list::<Value>(admin, "artifact").await.unwrap();
+    session.commit().await.unwrap();
+    values
+        .into_iter()
+        .filter(|value| {
+            value["schema_version"] == EXPLORATION_ENVELOPE_SCHEMA
+                && value["record_kind"] == EXPLORATION_WORLD_KIND
+        })
+        .map(|value| value["payload"].clone())
+        .collect()
+}
+
+struct ExplorationStarted {
+    world_id: String,
+    context_signature: String,
+    prefix_digest: String,
+    legal_actions_digest: String,
+    action: Value,
+}
+
+fn exploration_started(job: &ManagementJob) -> ExplorationStarted {
+    match &job.result {
+        Some(ManagementResult::ExplorationStarted {
+            world_id,
+            context_signature,
+            prefix_digest,
+            legal_actions_digest,
+            action,
+        }) => ExplorationStarted {
+            world_id: world_id.clone(),
+            context_signature: context_signature.clone(),
+            prefix_digest: prefix_digest.clone(),
+            legal_actions_digest: legal_actions_digest.clone(),
+            action: serde_json::to_value(action).unwrap(),
+        },
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn exploration_start_admin_e2e_and_idempotency() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    setup_exploration(&store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let world = exploration_world("world-1", 1);
+    let request = exploration_start_request("exploration-k1", &world);
+
+    // Immediate job_id (plan §6.1): the submit returns before the consumer runs.
+    let queued = dispatcher
+        .submit(&admin, "exploration.start", request.clone())
+        .await
+        .unwrap();
+    assert_eq!(queued.state, ManagementJobState::Queued);
+    assert_eq!(queued.step, "accepted");
+
+    let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded);
+    assert_eq!(done.step, "exploration_started");
+    assert!(done.error_code.is_none());
+    let started = exploration_started(&done);
+    assert_eq!(started.world_id, "world-1");
+    assert_eq!(started.context_signature, world.context_signature);
+    assert_eq!(started.prefix_digest.len(), 64);
+    assert_eq!(started.legal_actions_digest.len(), 64);
+    // First pure decision over the empty prefix: dispatch the lowest root
+    // opportunity (plan §7.1), exactly as `exploration_v41` observes it.
+    assert_eq!(started.action["decision"], "dispatch");
+    assert_eq!(started.action["action_seqs"], json!([1]));
+
+    // The stored digests equal a direct pure decision on the same world.
+    let coordinator = PersistentCoordinator::new(store.clone(), admin.clone(), "admin").unwrap();
+    let direct = coordinator.decide_next("world-1").await.unwrap();
+    assert_eq!(direct.world_id, "world-1");
+    assert_eq!(direct.prefix_digest, started.prefix_digest);
+    assert_eq!(direct.legal_actions_digest, started.legal_actions_digest);
+    assert_eq!(
+        serde_json::to_value(&direct.action).unwrap(),
+        started.action
+    );
+
+    // The read side re-verifies against the live store and agrees.
+    let status = dispatcher.status(&admin, &done.id).await.unwrap();
+    assert_eq!(status.state, ManagementJobState::Succeeded);
+    assert_eq!(
+        serde_json::to_value(&status.result).unwrap(),
+        serde_json::to_value(&done.result).unwrap()
+    );
+
+    // Exactly one world envelope, still collecting and empty: the management
+    // adapter never dispatches a node.
+    let worlds = exploration_worlds(&admin, &store).await;
+    assert_eq!(worlds.len(), 1);
+    assert_eq!(worlds[0]["id"], "world-1");
+    assert_eq!(worlds[0]["state"], "collecting");
+    assert_eq!(worlds[0]["node_ids"], json!([]));
+    assert_eq!(worlds[0]["dispatch_ids"], json!([]));
+    assert_eq!(worlds[0]["decision_round"], 0);
+
+    // Dependency edges: job -> private_input -> {runs, world envelope} and
+    // world envelope -> runs.
+    let world_storage_id = exploration_world_storage_id("world-1").unwrap();
+    let mut session = store.session().await.unwrap();
+    for run in EXPLORATION_RUNS {
+        let dependents = session.dependents(&admin, "run", run).await.unwrap();
+        assert!(
+            dependents
+                .iter()
+                .any(|(kind, id)| kind == "artifact" && id == &done.private_input_ref),
+            "missing private-input edge to run {run}"
+        );
+        assert!(
+            dependents
+                .iter()
+                .any(|(kind, id)| kind == "artifact" && id == &world_storage_id),
+            "missing world edge to run {run}"
+        );
+    }
+    let dependents = session
+        .dependents(&admin, "artifact", &world_storage_id)
+        .await
+        .unwrap();
+    assert!(
+        dependents
+            .iter()
+            .any(|(kind, id)| kind == "artifact" && id == &done.private_input_ref),
+        "missing private-input edge to the world envelope"
+    );
+    let dependents = session
+        .dependents(&admin, "artifact", &done.private_input_ref)
+        .await
+        .unwrap();
+    assert!(
+        dependents
+            .iter()
+            .any(|(kind, id)| kind == "job" && id == &done.id)
+    );
+    session.commit().await.unwrap();
+
+    // Idempotency: the identical request reconnects and never re-charges the
+    // consumer (plan §6.1): still one world.
+    let same = dispatcher
+        .submit(&admin, "exploration.start", request)
+        .await
+        .unwrap();
+    assert_eq!(same.id, queued.id);
+    assert_eq!(same.state, ManagementJobState::Succeeded);
+    tokio::task::yield_now().await;
+    assert_eq!(exploration_worlds(&admin, &store).await.len(), 1);
+
+    // Same key with a different world is a conflict, not a second world.
+    let mut different = exploration_world("world-1", 1);
+    different.remaining_root_micros = 2_000;
+    assert!(matches!(
+        dispatcher
+            .submit(
+                &admin,
+                "exploration.start",
+                exploration_start_request("exploration-k1", &different)
+            )
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(exploration_worlds(&admin, &store).await.len(), 1);
+}
+
+#[tokio::test]
+async fn exploration_start_same_world_id_converges_or_conflicts() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    setup_exploration(&store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let world = exploration_world("world-1", 1);
+    let first = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_start_request("exploration-same-1", &world),
+        )
+        .await
+        .unwrap();
+    let first = wait_terminal(&dispatcher, &admin, &first.id).await;
+    assert_eq!(first.state, ManagementJobState::Succeeded);
+
+    // A new request key carrying the same registration converges on the
+    // persisted world (AlreadyRegistered) and reports the same pure decision.
+    let again = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_start_request("exploration-same-2", &world),
+        )
+        .await
+        .unwrap();
+    assert_ne!(again.id, first.id);
+    let again = wait_terminal(&dispatcher, &admin, &again.id).await;
+    assert_eq!(again.state, ManagementJobState::Succeeded);
+    assert_eq!(again.step, "exploration_started");
+    assert_eq!(
+        serde_json::to_value(&again.result).unwrap(),
+        serde_json::to_value(&first.result).unwrap()
+    );
+    assert_eq!(exploration_worlds(&admin, &store).await.len(), 1);
+
+    // The same world id with a different (but individually valid)
+    // registration fails inside the job with a typed conflict and leaves the
+    // persisted world untouched.
+    let mut other = exploration_world("world-1", 1);
+    other.approved_parent_digest = hash(b"other-approved-parent");
+    let conflicting = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_start_request("exploration-same-3", &other),
+        )
+        .await
+        .unwrap();
+    let conflicting = wait_terminal(&dispatcher, &admin, &conflicting.id).await;
+    assert_eq!(conflicting.state, ManagementJobState::Failed);
+    assert_eq!(conflicting.step, "failed");
+    assert_eq!(conflicting.error_code.as_deref(), Some("conflict"));
+    assert!(conflicting.result.is_none());
+    let worlds = exploration_worlds(&admin, &store).await;
+    assert_eq!(worlds.len(), 1);
+    assert_eq!(
+        worlds[0]["approved_parent_digest"],
+        json!(world.approved_parent_digest)
+    );
+}
+
+#[tokio::test]
+async fn exploration_start_role_unknown_fields_and_validation_rejections() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let agent = Context::new("n", "agent", Role::Agent).unwrap();
+    let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();
+    setup_exploration(&store).await;
+    let dispatcher =
+        ManagementDispatcher::new(store.clone(), vec![admin.clone(), evaluator.clone()]).unwrap();
+    let world = exploration_world("world-auth", 1);
+    let payload = exploration_start_request("exploration-auth", &world);
+
+    assert!(matches!(
+        dispatcher
+            .submit(&agent, "exploration.start", payload.clone())
+            .await,
+        Err(Error::Forbidden)
+    ));
+    assert!(matches!(
+        dispatcher
+            .submit(&evaluator, "exploration.start", payload.clone())
+            .await,
+        Err(Error::Forbidden)
+    ));
+
+    let mut unknown = payload.clone();
+    unknown["extra_field"] = json!("unexpected");
+    assert!(matches!(
+        dispatcher
+            .submit(&admin, "exploration.start", unknown)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Unknown fields are refused at every nesting level of the world.
+    let mut unknown_world = payload.clone();
+    unknown_world["world"]["extra_field"] = json!("unexpected");
+    assert!(matches!(
+        dispatcher
+            .submit(&admin, "exploration.start", unknown_world)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    let mut unknown_caps = payload.clone();
+    unknown_caps["world"]["caps"]["extra_field"] = json!(1);
+    assert!(matches!(
+        dispatcher
+            .submit(&admin, "exploration.start", unknown_caps)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    let mut unknown_simulation = payload.clone();
+    unknown_simulation["world"]["simulation"]["online"]["extra_field"] = json!(1);
+    assert!(matches!(
+        dispatcher
+            .submit(&admin, "exploration.start", unknown_simulation)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    let mut unknown_dependency = payload.clone();
+    unknown_dependency["world"]["dependencies"][0]["extra_field"] = json!(1);
+    assert!(matches!(
+        dispatcher
+            .submit(&admin, "exploration.start", unknown_dependency)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+
+    // No top-level actor/role/namespace fields: identity comes from the caller.
+    for field in ["actor", "role", "namespace"] {
+        let mut injected = payload.clone();
+        injected[field] = json!("admin");
+        assert!(matches!(
+            dispatcher
+                .submit(&admin, "exploration.start", injected)
+                .await,
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    let mut bad_version = payload.clone();
+    bad_version["schema_version"] = json!("rsia.management.exploration_start.v2");
+    assert!(matches!(
+        dispatcher
+            .submit(&admin, "exploration.start", bad_version)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+
+    let incomplete = json!({
+        "schema_version": "rsia.management.exploration_start.v1",
+        "request_key": "incomplete-key"
+    });
+    assert!(matches!(
+        dispatcher
+            .submit(&admin, "exploration.start", incomplete)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+
+    // The typed source closure must name trusted runs with valid identifiers.
+    let mut bad_kind = payload.clone();
+    bad_kind["world"]["dependencies"][0]["kind"] = json!("artifact");
+    assert!(matches!(
+        dispatcher
+            .submit(&admin, "exploration.start", bad_kind)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    let mut bad_identifier = payload.clone();
+    bad_identifier["world"]["id"] = json!("not a valid identifier");
+    assert!(matches!(
+        dispatcher
+            .submit(&admin, "exploration.start", bad_identifier)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+
+    // The blocked representative keeps its typed payload: a world is not
+    // accepted where meta.start expects the blocked request shape.
+    let mut meta = payload.clone();
+    meta["schema_version"] = json!("rsia.management.meta_start.v1");
+    assert!(matches!(
+        dispatcher.submit(&admin, "meta.start", meta).await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Nothing above reached the consumer.
+    assert!(exploration_worlds(&admin, &store).await.is_empty());
+}
+
+#[tokio::test]
+async fn exploration_start_invalid_world_fails_cleanly_without_persisting() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    setup_exploration(&store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+
+    // Empty source closure: rejected by the world's own validation.
+    let mut empty_closure = exploration_world("world-empty-closure", 1);
+    empty_closure.dependencies.clear();
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_start_request("exploration-empty-closure", &empty_closure),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.state, ManagementJobState::Queued);
+    let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(terminal.state, ManagementJobState::Failed);
+    assert_eq!(terminal.step, "failed");
+    assert_eq!(terminal.error_code.as_deref(), Some("invalid_input"));
+    assert!(terminal.result.is_none());
+
+    // A world signed for another watermark is not live in this store.
+    let stale = exploration_world("world-stale", 2);
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_start_request("exploration-stale", &stale),
+        )
+        .await
+        .unwrap();
+    let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(terminal.state, ManagementJobState::Failed);
+    assert_eq!(terminal.error_code.as_deref(), Some("conflict"));
+
+    // A context signature that does not match the S0 digests is a conflict.
+    let mut forged = exploration_world("world-forged", 1);
+    forged.context_signature = hash(b"forged");
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_start_request("exploration-forged", &forged),
+        )
+        .await
+        .unwrap();
+    let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(terminal.state, ManagementJobState::Failed);
+    assert_eq!(terminal.error_code.as_deref(), Some("conflict"));
+
+    // Pre-filled scheduling state is not a registration (plan §7.3: no
+    // fabricated branches).
+    let mut prefilled = exploration_world("world-prefilled", 1);
+    prefilled.node_ids.push("node-1".into());
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_start_request("exploration-prefilled", &prefilled),
+        )
+        .await
+        .unwrap();
+    let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(terminal.state, ManagementJobState::Failed);
+    assert_eq!(terminal.error_code.as_deref(), Some("invalid_input"));
+    let mut sealed = exploration_world("world-sealed", 1);
+    sealed.state = WorldState::Sealed;
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_start_request("exploration-sealed", &sealed),
+        )
+        .await
+        .unwrap();
+    let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(terminal.state, ManagementJobState::Failed);
+    assert_eq!(terminal.error_code.as_deref(), Some("invalid_input"));
+
+    // Failed jobs are never re-verified and never persisted a world.
+    assert_eq!(
+        dispatcher.status(&admin, &terminal.id).await.unwrap().state,
+        ManagementJobState::Failed
+    );
+    assert!(exploration_worlds(&admin, &store).await.is_empty());
+}
+
+#[tokio::test]
+async fn exploration_start_missing_dependency_run_fails_cleanly() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    setup_exploration(&store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let mut world = exploration_world("world-missing-run", 1);
+    world.dependencies.push(ExplorationDependency {
+        kind: "run".into(),
+        id: "run-missing".into(),
+    });
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_start_request("exploration-missing-run", &world),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.state, ManagementJobState::Queued);
+    let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(terminal.state, ManagementJobState::Failed);
+    assert_eq!(terminal.step, "failed");
+    // `check_world_live` fails closed on the missing trusted run.
+    assert_eq!(terminal.error_code.as_deref(), Some("not_found"));
+    assert!(terminal.result.is_none());
+    assert_eq!(
+        dispatcher.status(&admin, &terminal.id).await.unwrap().state,
+        ManagementJobState::Failed
+    );
+    assert!(exploration_worlds(&admin, &store).await.is_empty());
+}
+
+#[tokio::test]
+async fn exploration_start_status_revocation_gate_and_terminal_preservation() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    setup_exploration(&store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_start_request("exploration-revoke", &exploration_world("world-1", 1)),
+        )
+        .await
+        .unwrap();
+    let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded);
+    assert!(dispatcher.status(&admin, &done.id).await.is_ok());
+
+    // Tombstoning one trusted run of the world's source closure (V017/V056)
+    // fails the read side closed with Forbidden ...
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "tombstone",
+            "run-failure",
+            "admin",
+            &json!({"id": "run-failure"}),
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert!(matches!(
+        dispatcher.status(&admin, &done.id).await,
+        Err(Error::Forbidden)
+    ));
+    // ... and the persisted terminal is never rewritten.
+    let persisted = raw_job(&admin, &store, &done.id).await;
+    assert_eq!(persisted.state, ManagementJobState::Succeeded);
+    assert_eq!(persisted.step, "exploration_started");
+    assert_eq!(
+        serde_json::to_value(&persisted.result).unwrap(),
+        serde_json::to_value(&done.result).unwrap()
+    );
+
+    // A new world over the revoked closure fails inside the job, not at
+    // submit, and is never persisted.
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_start_request(
+                "exploration-after-tombstone",
+                &exploration_world("world-2", 1),
+            ),
+        )
+        .await
+        .unwrap();
+    let failed = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(failed.state, ManagementJobState::Failed);
+    assert_eq!(failed.error_code.as_deref(), Some("forbidden"));
+    assert_eq!(exploration_worlds(&admin, &store).await.len(), 1);
+
+    // A watermark bump (source closure changed) is a Conflict.
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, "e09-source-revoked")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert!(matches!(
+        dispatcher.status(&admin, &done.id).await,
+        Err(Error::Conflict(_))
+    ));
+    let persisted = raw_job(&admin, &store, &done.id).await;
+    assert_eq!(persisted.state, ManagementJobState::Succeeded);
+
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_start_request("exploration-after-bump", &exploration_world("world-3", 1)),
+        )
+        .await
+        .unwrap();
+    let failed = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(failed.state, ManagementJobState::Failed);
+    assert_eq!(failed.error_code.as_deref(), Some("conflict"));
+    assert_eq!(
+        dispatcher.status(&admin, &failed.id).await.unwrap().state,
+        ManagementJobState::Failed
+    );
+    assert_eq!(exploration_worlds(&admin, &store).await.len(), 1);
+
+    // A job cancelled before claim is never re-verified against sources.
+    let cancelled_direct = ManagementJob {
+        id: "management-job-cancelled-exploration".into(),
+        schema_version: "rsia.management_job.v1".into(),
+        operation: "exploration.start".into(),
+        request_key: "cancelled-exploration-k".into(),
+        payload_digest: "d".repeat(64),
+        owner_actor: "admin".into(),
+        owner_role: Role::Admin,
+        state: ManagementJobState::Cancelled,
+        step: "cancelled_before_claim".into(),
+        private_input_ref: "missing-ref".into(),
+        result: None,
+        error_code: Some("cancelled".into()),
+        cancel_requested: true,
+        lease_token: None,
+        lease_until: 0,
+        generation: 0,
+        diagnostics: vec![],
+        created_at: 1,
+    };
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "job",
+            &cancelled_direct.id,
+            admin.actor(),
+            &cancelled_direct,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let observed = dispatcher
+        .status(&admin, &cancelled_direct.id)
+        .await
+        .unwrap();
+    assert_eq!(observed.state, ManagementJobState::Cancelled);
+    assert_eq!(observed.step, "cancelled_before_claim");
+}
+
+#[tokio::test]
+async fn exploration_start_crash_recovery_converges_on_registered_world() {
+    let (dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    setup_exploration(&store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let request =
+        exploration_start_request("exploration-crash-1", &exploration_world("world-1", 1));
+    let queued = dispatcher
+        .submit(&admin, "exploration.start", request.clone())
+        .await
+        .unwrap();
+    let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded);
+    let started = exploration_started(&done);
+
+    // Simulate a crash after the world registration committed but before
+    // `finish_claim` wrote the terminal.
+    let mut crashed = done.clone();
+    crashed.state = ManagementJobState::Running;
+    crashed.step = "before_exploration_start".into();
+    crashed.result = None;
+    crashed.error_code = None;
+    crashed.lease_token = Some("dead-process-lease".into());
+    crashed.lease_until = 0;
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin, "job", &crashed.id, admin.actor(), &crashed)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    store.close().await;
+
+    let reopened = Store::open(&dir.path().join("management.sqlite3"))
+        .await
+        .unwrap();
+    let reopened_dispatcher =
+        ManagementDispatcher::new(reopened.clone(), vec![admin.clone()]).unwrap();
+    assert_eq!(reopened_dispatcher.recover_pending().await.unwrap(), 1);
+    let recovered = wait_terminal(&reopened_dispatcher, &admin, &done.id).await;
+    assert_eq!(recovered.id, done.id);
+    assert_eq!(recovered.state, ManagementJobState::Succeeded);
+    assert_eq!(recovered.step, "exploration_started");
+    assert_eq!(recovered.generation, done.generation + 1);
+    let again = exploration_started(&recovered);
+    assert_eq!(again.world_id, started.world_id);
+    assert_eq!(again.context_signature, started.context_signature);
+    assert_eq!(again.prefix_digest, started.prefix_digest);
+    assert_eq!(again.legal_actions_digest, started.legal_actions_digest);
+    assert_eq!(again.action, started.action);
+    assert_eq!(
+        serde_json::to_value(&recovered.result).unwrap(),
+        serde_json::to_value(&done.result).unwrap()
+    );
+
+    // Recovery converged on the persisted world (plan §6.7.4, compare on
+    // conflict): still exactly one world, still empty.
+    let worlds = exploration_worlds(&admin, &reopened).await;
+    assert_eq!(worlds.len(), 1);
+    assert_eq!(worlds[0]["id"], "world-1");
+    assert_eq!(worlds[0]["node_ids"], json!([]));
+    let view = evo_engine::exploration::verified_world_decision_view(&admin, &reopened, "world-1")
+        .await
+        .unwrap();
+    assert_eq!(view.decision.prefix_digest, started.prefix_digest);
+    assert_eq!(view.context_signature, started.context_signature);
+
+    // Reconnect after restart still resolves to the same job.
+    let resubmit = reopened_dispatcher
+        .submit(&admin, "exploration.start", request)
+        .await
+        .unwrap();
+    assert_eq!(resubmit.id, done.id);
+    assert_eq!(resubmit.state, ManagementJobState::Succeeded);
+}
+
+#[tokio::test]
+async fn exploration_start_cancel_before_claim_creates_no_world() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    setup_exploration(&store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let request = exploration_start_request("exploration-cancel", &exploration_world("world-1", 1));
+
+    // The store serializes sessions on one connection, so the cancel issued
+    // right after submit is applied before the background worker can claim.
+    let queued = dispatcher
+        .submit(&admin, "exploration.start", request.clone())
+        .await
+        .unwrap();
+    assert_eq!(queued.state, ManagementJobState::Queued);
+    let cancelled = dispatcher.cancel(&admin, &queued.id).await.unwrap();
+    assert_eq!(cancelled.state, ManagementJobState::Cancelled);
+    assert_eq!(cancelled.step, "cancelled_before_claim");
+    assert_eq!(cancelled.error_code.as_deref(), Some("cancelled"));
+    assert!(cancelled.cancel_requested);
+
+    let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(terminal.state, ManagementJobState::Cancelled);
+    assert_eq!(terminal.step, "cancelled_before_claim");
+    assert!(terminal.result.is_none());
+    assert!(exploration_worlds(&admin, &store).await.is_empty());
+
+    // Cancellation is persisted (plan §6.6, V008): reconnecting with the same
+    // key returns the cancelled job instead of registering.
+    let reconnect = dispatcher
+        .submit(&admin, "exploration.start", request)
+        .await
+        .unwrap();
+    assert_eq!(reconnect.id, queued.id);
+    assert_eq!(reconnect.state, ManagementJobState::Cancelled);
+    tokio::task::yield_now().await;
+    assert!(exploration_worlds(&admin, &store).await.is_empty());
 }

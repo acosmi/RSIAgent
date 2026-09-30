@@ -284,6 +284,43 @@ impl ExplorationWorldV1 {
         }
         Ok(())
     }
+
+    /// Digest of the immutable registration request: identity, S0 digests,
+    /// source closure, frozen caps/policy/simulation, root opportunities and
+    /// the initial budgets. Runtime-mutable scheduling state (world state,
+    /// node/dispatch/history ids, branch focus, decision round, waits) is
+    /// excluded on purpose so a crash re-run of the same registration
+    /// converges on the persisted world (plan §6.7.4) instead of conflicting
+    /// with its own earlier commit.
+    pub fn registration_fingerprint(&self) -> Result<String> {
+        fingerprint(&(
+            &self.schema_version,
+            &self.id,
+            &self.approved_parent_digest,
+            &self.context_signature,
+            (
+                &self.parent_skill_digest,
+                &self.parent_bundle_digest,
+                &self.environment_digest,
+                &self.model_digest,
+                &self.tools_digest,
+                &self.grader_digest,
+                &self.rules_digest,
+            ),
+            self.source_watermark,
+            &self.caps,
+            &self.policy,
+            self.simulation,
+            &self.root_opportunities,
+            &self.dependencies,
+            (
+                self.successor_cost_upper_micros,
+                self.initial_baseline_quality_micros,
+                self.remaining_root_micros,
+                self.remaining_recovery_dispatches,
+            ),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,6 +372,27 @@ pub struct CoordinatorDecision {
     pub action: BatchActionV1,
 }
 
+/// Outcome of an idempotent world registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegisterWorldOutcome {
+    /// The world was persisted by this call.
+    Registered,
+    /// A world with the same id and the same registration fingerprint was
+    /// already persisted; nothing was written.
+    AlreadyRegistered,
+}
+
+/// Read-only projection of a world's pure decision, used by the management
+/// `status` read side to re-verify a stored `exploration.start` result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorldDecisionView {
+    pub context_signature: String,
+    pub state: WorldState,
+    pub decision: CoordinatorDecision,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoordinatorStepResult {
@@ -375,16 +433,7 @@ impl PersistentCoordinator {
     }
 
     pub async fn register_world(&self, world: ExplorationWorldV1) -> Result<()> {
-        world.validate()?;
-        if world.state != WorldState::Collecting
-            || !world.node_ids.is_empty()
-            || !world.dispatch_ids.is_empty()
-            || !world.history_ids.is_empty()
-        {
-            return Err(Error::Invalid(
-                "new world must start empty and collecting".into(),
-            ));
-        }
+        ensure_new_world_shape(&world)?;
         let mut session = self.store.session().await?;
         check_world_live(&mut session, &self.context, &world).await?;
         if get_record::<ExplorationWorldV1>(
@@ -398,13 +447,62 @@ impl PersistentCoordinator {
         {
             return Err(Error::Conflict("exploration world already exists".into()));
         }
-        put_record(
+        self.persist_world_registration(&mut session, &world)
+            .await?;
+        session.commit().await
+    }
+
+    /// Registers `world` at most once. A world with the same id whose
+    /// registration fingerprint equals the request is reported as
+    /// `AlreadyRegistered` without writing anything, so a crash re-run of the
+    /// same management job converges (plan §6.7.4); a same-id world with a
+    /// different registration is a `Conflict`. Liveness of the source closure
+    /// is re-checked on every call: watermark drift is `Conflict`, a
+    /// tombstoned dependency is `Forbidden`.
+    pub async fn register_world_idempotent(
+        &self,
+        world: ExplorationWorldV1,
+    ) -> Result<RegisterWorldOutcome> {
+        ensure_new_world_shape(&world)?;
+        let mut session = self.store.session().await?;
+        check_world_live(&mut session, &self.context, &world).await?;
+        if let Some(existing) = get_record::<ExplorationWorldV1>(
             &mut session,
             &self.context,
             WORLD_RECORD_KIND,
             &world.id,
+        )
+        .await?
+        {
+            existing.validate()?;
+            if existing.id != world.id
+                || existing.registration_fingerprint()? != world.registration_fingerprint()?
+            {
+                return Err(Error::Conflict(
+                    "exploration world already exists with a different registration".into(),
+                ));
+            }
+            session.commit().await?;
+            return Ok(RegisterWorldOutcome::AlreadyRegistered);
+        }
+        self.persist_world_registration(&mut session, &world)
+            .await?;
+        session.commit().await?;
+        Ok(RegisterWorldOutcome::Registered)
+    }
+
+    async fn persist_world_registration(
+        &self,
+        session: &mut Session,
+        world: &ExplorationWorldV1,
+    ) -> Result<()> {
+        put_record(
+            session,
+            &self.context,
+            WORLD_RECORD_KIND,
+            &world.id,
             &self.owner,
-            &world,
+            world,
         )
         .await?;
         let world_storage_id = storage_id(WORLD_RECORD_KIND, &world.id)?;
@@ -419,41 +517,24 @@ impl PersistentCoordinator {
                 )
                 .await?;
         }
-        session.commit().await
+        Ok(())
     }
 
     pub async fn decide_next(&self, world_id: &str) -> Result<CoordinatorDecision> {
         let (world, nodes) = self.load_world_nodes(world_id).await?;
-        if world.state != WorldState::Collecting {
-            return Ok(CoordinatorDecision {
-                world_id: world.id,
-                prefix_digest: fingerprint(&nodes)?,
-                legal_actions_digest: fingerprint(&Vec::<String>::new())?,
-                action: BatchActionV1::Stop {
-                    reason: "world_not_collecting".into(),
-                },
-            });
-        }
-        let prefix = prefix_projection(&world, &nodes)?;
-        let legal = derive_legal_actions(&world, &nodes)?;
-        let budget = BudgetViewV1 {
-            remaining_nodes: world.caps.max_nodes.saturating_sub(nodes.len() as u8),
-            remaining_recovery_dispatches: world.remaining_recovery_dispatches,
-            remaining_root_micros: world.remaining_root_micros,
-        };
-        let action = decide_elastic(
-            &world.policy,
-            &prefix,
-            &legal,
-            &budget,
-            &world.caps,
-            world.simulation,
-        )?;
-        Ok(CoordinatorDecision {
-            world_id: world.id,
-            prefix_digest: fingerprint(&prefix)?,
-            legal_actions_digest: fingerprint(&legal)?,
-            action,
+        pure_decision(&world, &nodes)
+    }
+
+    /// Same pure decision as [`Self::decide_next`], returned together with the
+    /// world's context signature and state so a read side can compare it with
+    /// a previously stored result. Nothing is written.
+    pub async fn decision_view(&self, world_id: &str) -> Result<WorldDecisionView> {
+        let (world, nodes) = self.load_world_nodes(world_id).await?;
+        let decision = pure_decision(&world, &nodes)?;
+        Ok(WorldDecisionView {
+            context_signature: world.context_signature,
+            state: world.state,
+            decision,
         })
     }
 
@@ -1065,6 +1146,59 @@ fn reason_or_cancelled(reason: String) -> String {
     }
 }
 
+fn ensure_new_world_shape(world: &ExplorationWorldV1) -> Result<()> {
+    world.validate()?;
+    if world.state != WorldState::Collecting
+        || !world.node_ids.is_empty()
+        || !world.dispatch_ids.is_empty()
+        || !world.history_ids.is_empty()
+    {
+        return Err(Error::Invalid(
+            "new world must start empty and collecting".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Pure decision over a read-only prefix (plan §7.1): no store access, no
+/// clock, no randomness beyond the world's frozen simulation seed.
+fn pure_decision(
+    world: &ExplorationWorldV1,
+    nodes: &[PersistentSearchNode],
+) -> Result<CoordinatorDecision> {
+    if world.state != WorldState::Collecting {
+        return Ok(CoordinatorDecision {
+            world_id: world.id.clone(),
+            prefix_digest: fingerprint(&nodes)?,
+            legal_actions_digest: fingerprint(&Vec::<String>::new())?,
+            action: BatchActionV1::Stop {
+                reason: "world_not_collecting".into(),
+            },
+        });
+    }
+    let prefix = prefix_projection(world, nodes)?;
+    let legal = derive_legal_actions(world, nodes)?;
+    let budget = BudgetViewV1 {
+        remaining_nodes: world.caps.max_nodes.saturating_sub(nodes.len() as u8),
+        remaining_recovery_dispatches: world.remaining_recovery_dispatches,
+        remaining_root_micros: world.remaining_root_micros,
+    };
+    let action = decide_elastic(
+        &world.policy,
+        &prefix,
+        &legal,
+        &budget,
+        &world.caps,
+        world.simulation,
+    )?;
+    Ok(CoordinatorDecision {
+        world_id: world.id.clone(),
+        prefix_digest: fingerprint(&prefix)?,
+        legal_actions_digest: fingerprint(&legal)?,
+        action,
+    })
+}
+
 fn prefix_projection(
     world: &ExplorationWorldV1,
     nodes: &[PersistentSearchNode],
@@ -1309,6 +1443,32 @@ async fn check_world_live(
         .map(|dependency| dependency.id.clone())
         .collect::<Vec<_>>();
     validate_stored_sources(session, context, &source_ids, world.source_watermark).await
+}
+
+/// Read-side view for the management `status` of an `exploration.start` job:
+/// reloads the world through its live source closure (watermark drift is
+/// `Conflict`, a tombstoned dependency is `Forbidden`, a missing source fails
+/// closed) and re-runs the pure decision. The stored world is never rewritten.
+pub async fn verified_world_decision_view(
+    ctx: &Context,
+    store: &Store,
+    world_id: &str,
+) -> Result<WorldDecisionView> {
+    ctx.require(&[Role::Admin])?;
+    identifier(world_id)?;
+    let coordinator = PersistentCoordinator::new(store.clone(), ctx.clone(), ctx.actor())?;
+    let view = coordinator.decision_view(world_id).await?;
+    if view.decision.world_id != world_id {
+        return Err(Error::Conflict(
+            "stored exploration world differs from its storage identity".into(),
+        ));
+    }
+    Ok(view)
+}
+
+/// Storage id of a persisted exploration world envelope.
+pub fn exploration_world_storage_id(world_id: &str) -> Result<String> {
+    storage_id(WORLD_RECORD_KIND, world_id)
 }
 
 fn storage_id(record_kind: &str, id: &str) -> Result<String> {
