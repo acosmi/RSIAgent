@@ -374,7 +374,15 @@ impl ReleaseStore {
     ) -> Result<HostSurfaceRecord> {
         ctx.require(&[Role::Admin])?;
         identifier(id)?;
-        if manifest.host_version.starts_with("unverified-") || manifest.host == CLAUDE_CODE_TARGET {
+        // Controller F21: the guard is a family check, not an exact string match, so a
+        // relabelled version ("Unverified-...") or host id ("claude-code-mcp-tool-only:v1",
+        // "Claude-Code") cannot register an unverified Claude surface as supported.
+        let host = manifest.host.to_ascii_lowercase();
+        let host_version = manifest.host_version.to_ascii_lowercase();
+        if host_version.starts_with("unverified-")
+            || host == CLAUDE_CODE_TARGET
+            || host.contains("claude")
+        {
             return Err(Error::Invalid(
                 "unverified host surface candidate cannot be registered as supported".into(),
             ));

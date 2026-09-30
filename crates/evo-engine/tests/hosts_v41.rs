@@ -121,6 +121,56 @@ async fn unverified_claude_surface_cannot_enter_the_real_registration_store() {
     );
 }
 
+#[tokio::test]
+async fn f21_relabelled_unverified_surfaces_cannot_enter_the_registration_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("registration.sqlite3"))
+        .await
+        .unwrap();
+    let admin = context("admin", Role::Admin);
+    let relabels: [(&str, &str, &str); 4] = [
+        (
+            "reference-host",
+            "Unverified-no-fixed-version",
+            "capital-unverified",
+        ),
+        ("claude-code-mcp-tool-only:v1", "1.0.0", "host-suffix"),
+        ("Claude-Code", "1.0.0", "host-case"),
+        (
+            "vendor-claude-bridge",
+            "2.0.0-fixed-smoke-tested",
+            "host-family",
+        ),
+    ];
+    for (host, version, id) in relabels {
+        let mut manifest = unverified_claude_code_surface_candidate();
+        manifest.host = host.into();
+        manifest.host_version = version.into();
+        let extracted = manifest
+            .items
+            .iter()
+            .map(|item| item.name.clone())
+            .collect();
+        assert!(
+            matches!(
+                ReleaseStore::register_host_surface(&admin, &store, id, manifest, extracted).await,
+                Err(Error::Invalid(_))
+            ),
+            "relabel {host}/{version} must be refused"
+        );
+        let mut session = store.session().await.unwrap();
+        assert!(
+            session
+                .get::<serde_json::Value>(&admin, "artifact", id)
+                .await
+                .unwrap()
+                .is_none(),
+            "relabel {host}/{version} must not persist"
+        );
+        session.commit().await.unwrap();
+    }
+}
+
 async fn baseline_store() -> (tempfile::TempDir, Store, Context, String) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("host.sqlite3")).await.unwrap();
