@@ -922,36 +922,56 @@ async fn expand_budget_scan(
         if schema == "rsia.redacted.v1" {
             continue;
         }
-        if schema != "rsia.model_request.artifact.v1" {
-            mark_unknown_scope(
-                tx,
-                ctx,
-                job_id,
-                &TypedObjectRef {
-                    kind: "reservation".into(),
-                    id: call_id,
-                },
-                &format!("unknown_budget_request_schema:{schema}"),
-                now,
-            )
-            .await?;
-            continue;
-        }
         let body: String = row.try_get("request_artifact_body").map_err(internal)?;
-        let value: serde_json::Value = serde_json::from_str(&body).map_err(internal)?;
-        let source_ids = value
-            .get("source_closure")
-            .and_then(|value| value.as_array())
-            .ok_or_else(|| Error::Invalid("model request lacks source closure".into()))?
-            .iter()
-            .map(|value| {
+        let source_ids = match schema.as_str() {
+            "rsia.model_request.artifact.v1" => {
+                let value: serde_json::Value = serde_json::from_str(&body).map_err(internal)?;
                 value
-                    .get("id")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned)
-                    .ok_or_else(|| Error::Invalid("model request source id missing".into()))
-            })
-            .collect::<Result<Vec<_>>>()?;
+                    .get("source_closure")
+                    .and_then(|value| value.as_array())
+                    .ok_or_else(|| Error::Invalid("model request lacks source closure".into()))?
+                    .iter()
+                    .map(|value| {
+                        value
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned)
+                            .ok_or_else(|| Error::Invalid("model request source id missing".into()))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            crate::budget::REGISTERED_EXECUTION_REQUEST_SCHEMA => {
+                let value: serde_json::Value = serde_json::from_str(&body).map_err(internal)?;
+                value
+                    .get("source_ids")
+                    .and_then(|value| value.as_array())
+                    .ok_or_else(|| {
+                        Error::Invalid("registered execution request lacks source ids".into())
+                    })?
+                    .iter()
+                    .map(|value| {
+                        value.as_str().map(str::to_owned).ok_or_else(|| {
+                            Error::Invalid("registered execution source id missing".into())
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            _ => {
+                mark_unknown_scope(
+                    tx,
+                    ctx,
+                    job_id,
+                    &TypedObjectRef {
+                        kind: "reservation".into(),
+                        id: call_id,
+                    },
+                    &format!("unknown_budget_request_schema:{schema}"),
+                    now,
+                )
+                .await?;
+                continue;
+            }
+        };
         if source_ids.iter().any(|value| value == source_id) {
             let reference = crate::budget::index_budget_call_ref_in_tx(
                 tx,
@@ -2272,7 +2292,11 @@ async fn cleanup_node_content(
             | "evaluation_ticket_issue_receipt_v1"
             | "execution_receipt_v2"
             | "independent_grader_receipt_v2"
-            | "formal_evaluation_v2",
+            | "formal_evaluation_v2"
+            | "development_control_v1"
+            | "development_execution_receipt_v1"
+            | "development_grader_receipt_v1"
+            | "development_run_receipt_v1",
         ) => true,
         ("release", "rsia.persistent_release.v1", _)
         | ("pointer", "rsia.profile_pointer.v1", _)
@@ -2310,7 +2334,8 @@ async fn cleanup_node_content(
             "rsia.typed_artifact_envelope.v1",
             "registered_evaluation_control_v41"
             | "protected_holdout_v41"
-            | "evaluation_execution_output_v1",
+            | "evaluation_execution_output_v1"
+            | "development_execution_output_v1",
         ) => true,
         (
             "artifact",

@@ -2883,7 +2883,7 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
     }
 }
 
-fn grade_fixed_output(
+pub(crate) fn grade_fixed_output(
     grader: &FixedGraderSpec,
     output_utf8: &str,
     expected_answer_json: &str,
