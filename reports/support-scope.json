@@ -60,6 +60,7 @@
           "source_sha": "ef8244dae4b5dd173987e78915500cc997dcd9b0",
           "pr": "https://github.com/acosmi/RSIAgent/pull/29",
           "merged_sha": "28f892c3d68591d201a8029345257f051fb123ef",
+          "pr_state": "merged",
           "test_entry": "crates/evo-engine/src/evaluator.rs",
           "command": "cargo test --locked --offline -p evo-engine --lib evaluator::tests",
           "input_digest": "e4a0a35dd9ee7b9194892387fd61f1934ee653d127f4dae9f442b6f8a0a1def7",
@@ -105,6 +106,7 @@
           "source_sha": "c5ac47d506a98a9feb0b65fac6815e80087c8f49",
           "pr": "https://github.com/acosmi/RSIAgent/pull/30",
           "merged_sha": "faec991036f03f27cf6d2ad3db86f841815fc828",
+          "pr_state": "merged",
           "test_entry": "crates/evo-core/tests/evaluation_v41.rs",
           "command": "cargo test --locked --offline -p evo-core --test evaluation_v41",
           "input_digest": "e30d77b22db111ec01676b6bcc93df70eee042484316644bda85d0e2d00edc92",
@@ -171,6 +173,7 @@
           "source_sha": "79af6c515b3afdf36778ee57ba2f140a22a3c0e0",
           "pr": "https://github.com/acosmi/RSIAgent/pull/31",
           "merged_sha": "dfc861ce7572f8f9f49a8aaf9f0cc1687cba57f9",
+          "pr_state": "merged",
           "test_entry": "crates/evo-core/tests/skill_edit.rs",
           "command": "cargo test --locked --offline -p evo-core --test skill_edit",
           "input_digest": "0885dd7d111c1368fcdc3be7f7ab98bdea6c1b370ff230ae2b30564158c45dec",
@@ -226,6 +229,7 @@
           "source_sha": "727e9cca8d4118dd207b1ad5ab043c2b6229fef7",
           "pr": "https://github.com/acosmi/RSIAgent/pull/32",
           "merged_sha": "9b13237af884c525652813ea508eb8c5f100d6f8",
+          "pr_state": "merged",
           "test_entry": "crates/evo-engine/tests/optimization.rs",
           "command": "cargo test --locked --offline -p evo-engine --test optimization",
           "input_digest": "61f6e470ac3a2488ded8fde15786b1f6f327fe7fca3c2b93fbde62b2a939ebec",
@@ -275,6 +279,7 @@
           "source_sha": "f02e535798423aaef930e915b2af081c110adf0e",
           "pr": "https://github.com/acosmi/RSIAgent/pull/33",
           "merged_sha": "c1cf6a2e91253218033b5883a11baa02c85a5d43",
+          "pr_state": "merged",
           "test_entry": "crates/evo-storage/tests/budget.rs",
           "command": "cargo test --locked --offline -p evo-storage --test budget",
           "input_digest": "24d50350c1948b5d2e037443d0ec419c5a6cdf9ae11bb19f313cd2a72797660b",
@@ -324,6 +329,7 @@
           "source_sha": "86e53b9add040192c4db0334c04c15316cf32e66",
           "pr": "https://github.com/acosmi/RSIAgent/pull/34",
           "merged_sha": "63824fff2e8d0cd0767d31140d064972542f6b53",
+          "pr_state": "merged",
           "test_entry": "crates/evo-engine/tests/streaming_evaluator.rs",
           "command": "cargo test --locked --offline -p evo-engine --test streaming_evaluator",
           "input_digest": "7223e7dfd386a707f4037821db62225730a03b9b06b5fe23ca516d37fe523c3c",
@@ -381,6 +387,7 @@
           "source_sha": "071c54d53488f8d9a75cc7148d82ed5f9efb3253",
           "pr": "https://github.com/acosmi/RSIAgent/pull/35",
           "merged_sha": "c017e6a32da3cdf692c3321dd29d6510edada0c4",
+          "pr_state": "merged",
           "test_entry": "crates/evo-engine/tests/release_store.rs",
           "command": "cargo test --locked --offline -p evo-engine --test release_store",
           "input_digest": "0ec7af70de6ede4fa340ee8835bc38c283fe33a050e0bdf724d2ac78a5a9f684",
@@ -436,6 +443,7 @@
           "source_sha": "0ed5ec915f438764217e9bd059bb99c401dce26e",
           "pr": "https://github.com/acosmi/RSIAgent/pull/36",
           "merged_sha": "794cf0f517a57e48166ef2ad44cb5762f3a61d5e",
+          "pr_state": "merged",
           "test_entry": "crates/evo-http/tests/service.rs",
           "command": "cargo test --locked --offline -p evo-http --test service",
           "input_digest": "862ded25f4ec0ceec566a787f7f4a1346363e57c882beab3a407c6885298804f",
@@ -490,6 +498,7 @@
           "source_sha": "644d95dd85490bc716f837d7148d7245bce0b2c3",
           "pr": "https://github.com/acosmi/RSIAgent/pull/37",
           "merged_sha": "b0662ca1b7a2fe27d4a4622918679eed4934e214",
+          "pr_state": "merged",
           "test_entry": "crates/evo-storage/tests/lifecycle.rs",
           "command": "cargo test --locked --offline -p evo-storage --test lifecycle",
           "input_digest": "f80081e88aaae94cc1d179ec43fbc8ac926cf2544d56a97a0e4571d5f4db7fe8",
@@ -541,6 +550,7 @@
           "source_sha": "c71db74efd83a7dc2866b0f446049adcb4b8d3bd",
           "pr": "https://github.com/acosmi/RSIAgent/pull/38",
           "merged_sha": "7a8a35908a2f7cc72ed601cbc902a2e4b49120bf",
+          "pr_state": "merged",
           "test_entry": "crates/evo-engine/tests/exploration_v41.rs",
           "command": "cargo test --locked --offline -p evo-engine --test exploration_v41",
           "input_digest": "c0c3a6889c0ca761fb3d180476fb557103e3184b839f003b407b1e5118fa6b7c",
@@ -591,6 +601,7 @@
           "source_sha": "77177cd5ffa87de5152a3295974ae41fc86498d4",
           "pr": "https://github.com/acosmi/RSIAgent/pull/39",
           "merged_sha": "96e62412809610a72d2ab593aaca59a8bcebd6d2",
+          "pr_state": "merged",
           "test_entry": "crates/evo-engine/tests/replay_v41.rs",
           "command": "cargo test --locked --offline -p evo-engine --test replay_v41",
           "input_digest": "26b42788f1b711b379950abebb298ceda646a79c3f7b7a4a092c804be8416f08",
@@ -611,6 +622,7 @@
           "source_sha": "0aef9345679e674988e67e4208c60aba63b5271b",
           "pr": "https://github.com/acosmi/RSIAgent/pull/43",
           "merged_sha": "59afd1663a0d5f5212077dd92beaaf7920cde0ff",
+          "pr_state": "merged",
           "test_entry": "crates/evo-engine/tests/dispatch_management.rs",
           "command": "cargo test --locked --offline -p evo-engine --test dispatch_management",
           "input_digest": "e8898207d56a4c952e1edefe11c5204728118d736638eefeb15bcb894ec94dad",
@@ -656,6 +668,7 @@
           "source_sha": "289d9204c6d76018080a9221967eebe5848e2b8d",
           "pr": "https://github.com/acosmi/RSIAgent/pull/40",
           "merged_sha": "09b3ebe8bad12d59bd3c2f926d3050802372e96f",
+          "pr_state": "merged",
           "test_entry": "crates/evo-core/tests/replay_economics.rs",
           "command": "cargo test --locked --offline -p evo-core --test replay_economics",
           "input_digest": "7d1f35d6a433730bbf99b6b580f8f2b8ee6f840e1788fa24288e13f539125cd9",
@@ -704,6 +717,7 @@
           "source_sha": "e612fcb9563c8e320e011e6d06f026b9730f561c",
           "pr": "https://github.com/acosmi/RSIAgent/pull/41",
           "merged_sha": "b1127a228c4a40248631ed417aba0ad7ea1a0884",
+          "pr_state": "merged",
           "test_entry": "crates/evo-engine/tests/curriculum_v41.rs",
           "command": "cargo test --locked --offline -p evo-engine --test curriculum_v41",
           "input_digest": "945313921ffc8446fb527c4d3e15fd3c15c9d417dc93da30484706eee7063d16",
@@ -753,6 +767,7 @@
           "source_sha": "2c79608fb1d30f7592b742e972c209cb9208fabc",
           "pr": "https://github.com/acosmi/RSIAgent/pull/42",
           "merged_sha": "2e209dcea36d63610c59d3797e039f35d063ec89",
+          "pr_state": "merged",
           "test_entry": "crates/evo-engine/tests/monitoring.rs",
           "command": "cargo test --locked --offline -p evo-engine --test monitoring",
           "input_digest": "b896f96de03af66c4c3e96cc5049e6dbe1b65a7e405e9f8439bcf705c749a709",
@@ -822,7 +837,7 @@
     "E16.1": {
       "title": "Source Import & Versioned Readers",
       "status": "implemented_not_verified",
-      "status_reason": "controller acceptance of repaired persistent import and end-to-end learned-use chain is pending",
+      "status_reason": "controller verified the durable source import sub-scope (PR #44, merged acda3189); the full real migration chain is not closed: imports yield no trusted run, AppliedReceipt, FormalEvaluation or Active",
       "implementation_files": [
         "crates/evo-engine/src/import.rs",
         "crates/evo-core/src/evidence.rs"
@@ -842,15 +857,37 @@
         "V090",
         "V098"
       ],
-      "verified_subscopes": [],
+      "verified_subscopes": [
+        {
+          "id": "E16.1.durable_import_controller_acceptance",
+          "description": "durable source import: three pinned readers, persistent registration with authorization, cluster independence, revocation cleanup",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "b6861a756bf1a2a5660cb9d6e0663b4385242104",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/44",
+          "merged_sha": "acda31895bb1cb42cf7985b907a4c600429573d0",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/import_v41.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test import_v41",
+          "input_digest": "4f1153a9ae6f63b5c44698bbc09e439be4445c9be24af2cbd92fbe9332bd9820",
+          "exit_code": 0,
+          "log_path": "out/verify-20260930/qa/s2-pr44fix-ctrl-0.log",
+          "actual_result": "34 import_v41 tests passed (the log also carries a 7-test optimization run that is not part of this record)",
+          "scope": "durable source import: three pinned readers, persistent registration with authorization, cluster independence, revocation cleanup; no trusted run, AppliedReceipt, FormalEvaluation or Active from imports",
+          "risk": "full real migration chain remains unverified: ImportedHistory/UnverifiedImport does not yield a trusted run, AppliedReceipt, FormalEvaluation or Active",
+          "rollback": "disable new imports and withdraw the sub-scope through an independent revert PR while retaining incurred costs, revocation and audit facts",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/verify-20260930/qa/s2-input-E16.1.json"
+        }
+      ],
       "remaining": [
-        "controller acceptance of repaired persistent import and end-to-end learned-use chain is pending"
+        "full real migration chain: no trusted run, AppliedReceipt, FormalEvaluation or Active from imports"
       ]
     },
     "E16.2": {
       "title": "Asset Package Safety, Privacy Gates, Foreign Metadata Isolation",
       "status": "implemented_not_verified",
-      "status_reason": "controller acceptance of repaired package/staging/export consumers is pending",
+      "status_reason": "controller verified durable staging, registered blob publish, local_namespace export delivery and E16 cleanup with live-reference blob retention (PR #54, merged 16c2817b, supersedes #45); real third-party packages and real remote destruction remain unverified",
       "implementation_files": [
         "crates/evo-engine/src/packages.rs"
       ],
@@ -867,15 +904,38 @@
         "V092",
         "V098"
       ],
-      "verified_subscopes": [],
+      "verified_subscopes": [
+        {
+          "id": "E16.2.durable_staging_publish_controller_acceptance",
+          "description": "durable staging, registered blob publish, local_namespace export delivery, E16 cleanup with live-reference blob retention",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "c57397f4ffbf9bff39c32a17e67e962bff3a8d45",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/54",
+          "merged_sha": "16c2817bc192bf71535d2c99d867873e6e85bcf8",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/packages_v41.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test packages_v41",
+          "input_digest": "7a5e020573a5a9a33a94269c9d38a23c684c99689ec79b7ae8cbbaee48afa60c",
+          "exit_code": 0,
+          "log_path": "out/verify-20260930/qa/s2-pr54fix-ctrl-1.log",
+          "actual_result": "32 packages_v41 tests passed (the log also carries the 10-test seeds_v41 run recorded under E16.3)",
+          "scope": "PR #54 verified sub-scope (supersedes #45/#46; shared with E16.3): durable staging, registered blob publish, seed B/L/U install and reset staging, local_namespace export delivery, E16 cleanup with live-reference blob retention",
+          "risk": "real third-party packages and real remote destruction are unverified; F08 was compared against the proposal text only because the frozen contract is absent",
+          "rollback": "disable package staging and export and withdraw the sub-scope through an independent revert PR while retaining published-blob, revocation and audit facts",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/verify-20260930/qa/s2-input-E16.2.json"
+        }
+      ],
       "remaining": [
-        "controller acceptance of repaired package/staging/export consumers is pending"
+        "real third-party packages and real remote destruction are unverified",
+        "F08 compared against the proposal text only (frozen contract absent)"
       ]
     },
     "E16.3": {
       "title": "Built-in Seeds, B/L/U Reconciliation, Local Modification Protection",
       "status": "implemented_not_verified",
-      "status_reason": "controller acceptance of repaired persistent seed/reset chain is pending",
+      "status_reason": "controller verified seed B/L/U install and reset staging (PR #54, merged 16c2817b, supersedes #46); real user-directory seed drills remain unverified",
       "implementation_files": [
         "crates/evo-engine/src/seeds.rs"
       ],
@@ -891,17 +951,41 @@
         "V092",
         "V098"
       ],
-      "verified_subscopes": [],
+      "verified_subscopes": [
+        {
+          "id": "E16.3.seed_install_reset_controller_acceptance",
+          "description": "seed B/L/U install and reset staging",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "c57397f4ffbf9bff39c32a17e67e962bff3a8d45",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/54",
+          "merged_sha": "16c2817bc192bf71535d2c99d867873e6e85bcf8",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/seeds_v41.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test seeds_v41",
+          "input_digest": "53bca15263c124b715254880ede395a42b12fdf3b78b09256d9f528efe2905af",
+          "exit_code": 0,
+          "log_path": "out/verify-20260930/qa/s2-int54-ctrl-0.log",
+          "actual_result": "10 seeds_v41 tests passed (the integration log also carries import_v41, optimization and packages_v41 runs that are not part of this record)",
+          "scope": "PR #54 verified sub-scope (supersedes #45/#46; shared with E16.2): durable staging, registered blob publish, seed B/L/U install and reset staging, local_namespace export delivery, E16 cleanup with live-reference blob retention",
+          "risk": "real user-directory seed drills are unverified; F08 was compared against the proposal text only because the frozen contract is absent",
+          "rollback": "disable seed install and reset staging and withdraw the sub-scope through an independent revert PR while retaining install baselines, revocation and audit facts",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/verify-20260930/qa/s2-input-E16.3.json"
+        }
+      ],
       "remaining": [
-        "controller acceptance of repaired persistent seed/reset chain is pending"
+        "real user-directory seed drills are unverified",
+        "F08 compared against the proposal text only (frozen contract absent)"
       ]
     },
     "E16.4": {
       "title": "Extra Real Host MCP Tool-Only, Surface Drift & Attribution",
       "status": "blocked",
-      "status_reason": "real Claude Code MCP Tool-only host is unavailable; local structure cannot satisfy the host claim",
+      "status_reason": "real Claude Code MCP Tool-only host is unavailable; controller verified only real-store rejection of unverified Claude surfaces and trusted host record reload/structure checks (PR #47, merged 1c824e66); local structure cannot satisfy the host claim",
       "implementation_files": [
-        "crates/evo-engine/src/hosts.rs"
+        "crates/evo-engine/src/hosts.rs",
+        "crates/evo-engine/src/release_store.rs"
       ],
       "scenarios": [
         "V002",
@@ -919,34 +1003,35 @@
       ],
       "verified_subscopes": [
         {
-          "id": "E16.4.trusted_host_rejection_controller_acceptance",
-          "description": "trusted Store host receipt reload and fail-closed registration unit subset",
+          "id": "E16.4.real_store_rejection_controller_acceptance",
+          "description": "real-store rejection of unverified Claude surfaces, trusted host record reload and structure checks",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "source_sha": "9d04c679bd7f3cb6b3ab74fead60068adf29264d",
+          "source_sha": "11b42d277f861726b5e885c0ab08f305bc62169d",
           "pr": "https://github.com/acosmi/RSIAgent/pull/47",
-          "merged_sha": null,
-          "test_entry": "crates/evo-engine/src/hosts.rs",
-          "command": "cargo test --locked --offline -p evo-engine --lib hosts::tests",
-          "input_digest": "b0ce49bb802a5313a37f5df67eb73bbc77ed46118d7f888822cef7a416215738",
+          "merged_sha": "1c824e6614667da4dc7ea74e96b46adfd1d2c089",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/hosts_v41.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test hosts_v41",
+          "input_digest": "ade71c7f5c639bc57ff3ea0116e94bdc4567265c124529a130d376233a3a8df2",
           "exit_code": 0,
-          "log_path": "out/controller-final-e16-20260919/pr47-directed-1.log",
-          "actual_result": "2 hosts unit tests passed; the separate multi-target integration run is not encoded as a single-target record",
-          "scope": "trusted Store receipt reload and fail-closed registration structure only; no real Claude Code host",
-          "risk": "real Claude Code version, handshake, four-tool smoke, reconnect and cancellation remain unavailable",
-          "rollback": "revert PR47 changes through review while retaining reference-host evidence and immutable facts",
-          "record_source": "out/controller-final-e16-20260919/pr47-directed-results.json",
-          "input_ref": "out/controller-final-e16-20260919/pr47-source-input.json"
+          "log_path": "out/verify-20260930/qa/s2-restack47-final-3.log",
+          "actual_result": "7 hosts_v41 tests passed (the log also carries a 7-test release_store run that is not part of this record)",
+          "scope": "real-store rejection of unverified Claude surfaces, trusted host record reload and structure checks only; no real Claude Code host",
+          "risk": "real Claude Code version, handshake, four-tool smoke, reconnect and cancellation remain unavailable; E16.4 stays blocked without real Claude Code evidence",
+          "rollback": "revert PR #47 through an independent revert PR while retaining reference-host evidence and immutable facts",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/verify-20260930/qa/s2-input-E16.4.json"
         }
       ],
       "remaining": [
-        "real Claude Code MCP Tool-only host is unavailable; local structure cannot satisfy the host claim"
+        "real Claude Code MCP Tool-only host is unavailable; no real Claude Code evidence (version, handshake, four-tool smoke, reconnect, cancellation); local structure cannot satisfy the host claim"
       ]
     },
     "E16.5": {
       "title": "Persistent Recovery Immutability, Capacity Limits & Deployment Security",
-      "status": "implemented_not_verified",
-      "status_reason": "controller acceptance of repaired capacity/recovery/deployment scope is pending",
+      "status": "in_progress",
+      "status_reason": "controller verified the capacity, recovery-closure and deployment-safety gate functions (PR #48, merged 4980aa49); the gates are not wired into dispatch/prepare entry points and no real sandbox exists",
       "implementation_files": [
         "crates/evo-engine/src/capacity.rs",
         "crates/evo-storage/src/lifecycle.rs"
@@ -976,15 +1061,38 @@
         "V096",
         "V098"
       ],
-      "verified_subscopes": [],
+      "verified_subscopes": [
+        {
+          "id": "E16.5.gate_functions_controller_acceptance",
+          "description": "capacity, recovery-closure and deployment-safety gate functions",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "5ed6088deec727fb70cbb2186766d45c616e8047",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/48",
+          "merged_sha": "4980aa498baa80fd82e83441839e606859fa4065",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/capacity_v41.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test capacity_v41",
+          "input_digest": "c8b2b785008c3234e26afae6ca4512913d097ce796edc0893223c63f1230bfe4",
+          "exit_code": 0,
+          "log_path": "out/verify-20260930/qa/s2-restack48-ctrl-0.log",
+          "actual_result": "21 capacity_v41 tests passed",
+          "scope": "capacity, recovery-closure and deployment-safety gate functions as pure functions; not wired into dispatch/prepare entry points",
+          "risk": "gate functions are not wired into dispatch/prepare entry points and no real sandbox exists",
+          "rollback": "revert PR #48 through an independent revert PR; the gates are pure functions with no persisted state to unwind",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/verify-20260930/qa/s2-input-E16.5.json"
+        }
+      ],
       "remaining": [
-        "controller acceptance of repaired capacity/recovery/deployment scope is pending"
+        "gate functions are not wired into dispatch/prepare entry points",
+        "no real sandbox; deployment-safety evidence is local only"
       ]
     },
     "E16.6": {
       "title": "Release, Support Scope Manifest & Truth Ledger",
       "status": "in_progress",
-      "status_reason": "this derived index repair requires independent controller verification; it does not close E16",
+      "status_reason": "derived index and test are implemented; PR #49 (this index update to the 2026-09-30 controller merges) is implemented_not_verified until the controller accepts it; it does not close E16",
       "implementation_files": [
         "reports/support-scope.json",
         "crates/evo-core/tests/support_scope.rs"
@@ -1002,13 +1110,13 @@
       ],
       "verified_subscopes": [],
       "remaining": [
-        "this derived index repair requires independent controller verification; it does not close E16"
+        "controller acceptance of PR #49 (support-scope index and support_scope test) is pending; the index does not close E16"
       ]
     },
     "E16": {
       "title": "Product Support Scope & Final Delivery Gate",
-      "status": "blocked",
-      "status_reason": "E14, E15, real extra host, deployment evidence and all six subpackage acceptances are incomplete",
+      "status": "in_progress",
+      "status_reason": "E16.6 (PR #49 support-scope index) is the open sub-package; E16.4 stays blocked on real Claude Code evidence; E14/E15, production deployment and real-provider effect evidence remain unavailable",
       "implementation_files": [
         "reports/support-scope.json",
         "reports/longitudinal/README.md"
@@ -1035,36 +1143,83 @@
       ],
       "verified_subscopes": [],
       "remaining": [
-        "E14, E15, real extra host, deployment evidence and all six subpackage acceptances are incomplete"
+        "E16.6 controller acceptance of the support-scope index (PR #49)",
+        "real Claude Code extra-host evidence (E16.4 blocked)",
+        "E14 and E15 research work, production deployment and effect evidence"
       ]
     },
     "E17": {
       "title": "Optional Development Scorer Evolution (Disabled)",
-      "status": "planned",
-      "status_reason": "optional scorer evolution is disabled by default and not implemented",
+      "status": "in_progress",
+      "status_reason": "optional extension stays disabled; controller verified the default-disabled state and V040 rejection gates (PR #50, merged e94042d3); no real scorer evolution run",
       "implementation_files": [
-        "crates/evo-engine/src/evaluator.rs",
-        "crates/evo-engine/src/meta.rs"
+        "crates/evo-core/src/features.rs"
       ],
       "scenarios": [
         "V040"
       ],
-      "verified_subscopes": [],
+      "verified_subscopes": [
+        {
+          "id": "E17.disabled_rejection_controller_acceptance",
+          "description": "default-disabled state and V040 rejection gates",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "4e0cabe20668b62bd2efcaae8c2be6497a5de9d0",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/50",
+          "merged_sha": "e94042d3f2fd761455727a6c82ad13fd3d657d03",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-core/tests/e17_rejection_v41.rs",
+          "command": "cargo test --locked --offline -p evo-core --test e17_rejection_v41",
+          "input_digest": "285b6b2d60106b250e85b2cf0b1a684fc3aae42f02dfaa927ab09b269ed293ed",
+          "exit_code": 0,
+          "log_path": "out/verify-20260930/qa/s2-e1718fix-ctrl-0.log",
+          "actual_result": "7 e17_rejection_v41 tests passed (the log also carries the 18-test e18_rejection_v41 run that is not part of this record)",
+          "scope": "default-disabled state and V040 rejection gates only; the optional extension stays disabled",
+          "risk": "optional extension stays disabled; no real scorer evolution run; enabling the extension is rejected",
+          "rollback": "revert PR #50 through an independent revert PR; the extension is disabled by default so no runtime state changes",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/verify-20260930/qa/s2-input-E17.json"
+        }
+      ],
       "remaining": [
-        "optional scorer evolution is disabled by default and not implemented"
+        "optional extension stays disabled; no real scorer evolution run"
       ]
     },
     "E18": {
       "title": "Optional Code Change Proposal Without Auto-deploy (Disabled)",
-      "status": "planned",
-      "status_reason": "optional isolated code-change proposal workflow is disabled by default and not implemented",
-      "implementation_files": [],
+      "status": "in_progress",
+      "status_reason": "optional extension stays disabled; controller verified the default-disabled state and V041 rejection gates (PR #51, merged bef7bd17); no real code-change proposal run",
+      "implementation_files": [
+        "crates/evo-core/src/features.rs"
+      ],
       "scenarios": [
         "V041"
       ],
-      "verified_subscopes": [],
+      "verified_subscopes": [
+        {
+          "id": "E18.disabled_rejection_controller_acceptance",
+          "description": "default-disabled state and V041 rejection gates",
+          "plan_version": "v4.1",
+          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "source_sha": "2d909c4509d29445bbcbf701292fe351aabccfa4",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/51",
+          "merged_sha": "bef7bd1763a01ccb677ada4acad71a063366539c",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-core/tests/e18_rejection_v41.rs",
+          "command": "cargo test --locked --offline -p evo-core --test e18_rejection_v41",
+          "input_digest": "442ec3c3758632d0cc182c00e4ceeca8d312a39d6db066e363b0c2f4dbe04cc1",
+          "exit_code": 0,
+          "log_path": "out/verify-20260930/qa/s2-e1718fix-3.log",
+          "actual_result": "18 e18_rejection_v41 tests passed at head 2d909c45 (the log also carries the 7-test e17_rejection_v41 run that is not part of this record)",
+          "scope": "default-disabled state and V041 rejection gates only; the optional extension stays disabled",
+          "risk": "optional extension stays disabled; no real code-change proposal run; enabling the extension is rejected",
+          "rollback": "revert PR #51 through an independent revert PR; the extension is disabled by default so no runtime state changes",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/verify-20260930/qa/s2-input-E18.json"
+        }
+      ],
       "remaining": [
-        "optional isolated code-change proposal workflow is disabled by default and not implemented"
+        "optional extension stays disabled; no real code-change proposal run"
       ]
     }
   },
@@ -1196,7 +1351,7 @@
         ],
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E16.4.trusted_host_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -1289,7 +1444,8 @@
           "crates/evo-engine/src/import.rs"
         ],
         "related_evidence_refs": [
-          "E03.controller_acceptance"
+          "E03.controller_acceptance",
+          "E16.1.durable_import_controller_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -1320,7 +1476,8 @@
           "crates/evo-engine/src/seeds.rs"
         ],
         "related_evidence_refs": [
-          "E06.controller_acceptance"
+          "E06.controller_acceptance",
+          "E16.3.seed_install_reset_controller_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -1390,7 +1547,8 @@
           "reports/support-scope.json"
         ],
         "related_evidence_refs": [
-          "E08.controller_acceptance"
+          "E08.controller_acceptance",
+          "E16.2.durable_staging_publish_controller_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       }
@@ -2444,7 +2602,7 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E16.4.trusted_host_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -2462,7 +2620,7 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E07.controller_acceptance",
-          "E16.4.trusted_host_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -2493,7 +2651,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E03.controller_acceptance"
+          "E03.controller_acceptance",
+          "E16.1.durable_import_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -2508,7 +2667,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E03.controller_acceptance"
+          "E03.controller_acceptance",
+          "E16.1.durable_import_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -2523,7 +2683,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E04.controller_acceptance"
+          "E04.controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -2538,7 +2699,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E04.controller_acceptance"
+          "E04.controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -2556,7 +2718,7 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E04.controller_acceptance",
-          "E16.4.trusted_host_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -2639,7 +2801,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E06.controller_acceptance",
-          "E07.controller_acceptance"
+          "E07.controller_acceptance",
+          "E16.3.seed_install_reset_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -2695,7 +2858,10 @@
         "related_evidence_refs": [
           "E03.controller_acceptance",
           "E06.controller_acceptance",
-          "E08.controller_acceptance"
+          "E08.controller_acceptance",
+          "E16.1.durable_import_controller_acceptance",
+          "E16.2.durable_staging_publish_controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -2711,7 +2877,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E08.controller_acceptance"
+          "E08.controller_acceptance",
+          "E16.3.seed_install_reset_controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3000,7 +3168,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E13.controller_acceptance",
-          "E16.4.trusted_host_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3020,7 +3189,9 @@
         "related_evidence_refs": [
           "E04.controller_acceptance",
           "E08.controller_acceptance",
-          "E13.controller_acceptance"
+          "E13.controller_acceptance",
+          "E16.3.seed_install_reset_controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3037,7 +3208,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E16.4.trusted_host_rejection_controller_acceptance"
+          "E16.2.durable_staging_publish_controller_acceptance",
+          "E16.4.real_store_rejection_controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3047,10 +3220,12 @@
         "e_tasks": [
           "E17"
         ],
-        "status": "planned",
-        "verification_status": "planned",
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E17.disabled_rejection_controller_acceptance"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -3059,10 +3234,12 @@
         "e_tasks": [
           "E18"
         ],
-        "status": "planned",
-        "verification_status": "planned",
+        "status": "implemented_not_verified",
+        "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E18.disabled_rejection_controller_acceptance"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -3210,7 +3387,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E03.controller_acceptance"
+          "E03.controller_acceptance",
+          "E16.1.durable_import_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3225,7 +3403,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E03.controller_acceptance"
+          "E03.controller_acceptance",
+          "E16.1.durable_import_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3238,7 +3417,9 @@
         "status": "implemented_not_verified",
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E16.1.durable_import_controller_acceptance"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -3252,7 +3433,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E03.controller_acceptance"
+          "E03.controller_acceptance",
+          "E16.1.durable_import_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3267,7 +3449,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E03.controller_acceptance"
+          "E03.controller_acceptance",
+          "E16.1.durable_import_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3284,7 +3467,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E08.controller_acceptance"
+          "E08.controller_acceptance",
+          "E16.1.durable_import_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3344,7 +3528,7 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E16.4.trusted_host_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3358,7 +3542,7 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E16.4.trusted_host_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3374,7 +3558,7 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E16.4.trusted_host_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3387,7 +3571,9 @@
         "status": "implemented_not_verified",
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E16.3.seed_install_reset_controller_acceptance"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -3401,7 +3587,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E06.controller_acceptance"
+          "E06.controller_acceptance",
+          "E16.3.seed_install_reset_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3414,7 +3601,9 @@
         "status": "implemented_not_verified",
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E16.3.seed_install_reset_controller_acceptance"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -3427,7 +3616,10 @@
         "status": "implemented_not_verified",
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E16.2.durable_staging_publish_controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -3439,7 +3631,9 @@
         "status": "implemented_not_verified",
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E16.2.durable_staging_publish_controller_acceptance"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -3451,7 +3645,9 @@
         "status": "implemented_not_verified",
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E16.2.durable_staging_publish_controller_acceptance"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -3466,7 +3662,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E08.controller_acceptance"
+          "E08.controller_acceptance",
+          "E16.2.durable_staging_publish_controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3483,7 +3681,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E06.controller_acceptance",
-          "E07.controller_acceptance"
+          "E07.controller_acceptance",
+          "E16.2.durable_staging_publish_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3529,7 +3728,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E00.controller_acceptance"
+          "E00.controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3559,7 +3759,9 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E06.controller_acceptance",
-          "E08.controller_acceptance"
+          "E08.controller_acceptance",
+          "E16.2.durable_staging_publish_controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3572,7 +3774,9 @@
         "status": "implemented_not_verified",
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E16.1.durable_import_controller_acceptance"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -3589,7 +3793,7 @@
         "related_evidence_refs": [
           "E06.controller_acceptance",
           "E07.controller_acceptance",
-          "E16.4.trusted_host_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3606,7 +3810,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E06.controller_acceptance"
+          "E06.controller_acceptance",
+          "E16.3.seed_install_reset_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3662,7 +3867,8 @@
           "E09.controller_acceptance",
           "E10.controller_acceptance",
           "E10.replay_management_controller_acceptance",
-          "E11.controller_acceptance"
+          "E11.controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3684,7 +3890,8 @@
           "E02.controller_acceptance",
           "E08.controller_acceptance",
           "E12.controller_acceptance",
-          "E13.controller_acceptance"
+          "E13.controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3706,7 +3913,8 @@
           "E02.controller_acceptance",
           "E04.controller_acceptance",
           "E08.controller_acceptance",
-          "E12.controller_acceptance"
+          "E12.controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3732,7 +3940,8 @@
           "E05.controller_acceptance",
           "E06.controller_acceptance",
           "E08.controller_acceptance",
-          "E13.controller_acceptance"
+          "E13.controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3759,7 +3968,8 @@
           "E04.controller_acceptance",
           "E05.controller_acceptance",
           "E06.controller_acceptance",
-          "E08.controller_acceptance"
+          "E08.controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3785,7 +3995,8 @@
           "E08.controller_acceptance",
           "E09.controller_acceptance",
           "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance"
+          "E10.replay_management_controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3811,7 +4022,8 @@
           "E04.controller_acceptance",
           "E07.controller_acceptance",
           "E13.controller_acceptance",
-          "E16.4.trusted_host_rejection_controller_acceptance"
+          "E16.1.durable_import_controller_acceptance",
+          "E16.4.real_store_rejection_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3856,7 +4068,8 @@
           "E03.controller_acceptance",
           "E06.controller_acceptance",
           "E07.controller_acceptance",
-          "E09.controller_acceptance"
+          "E09.controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3884,7 +4097,9 @@
           "E05.controller_acceptance",
           "E08.controller_acceptance",
           "E09.controller_acceptance",
-          "E13.controller_acceptance"
+          "E13.controller_acceptance",
+          "E16.1.durable_import_controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3913,7 +4128,9 @@
           "E07.controller_acceptance",
           "E09.controller_acceptance",
           "E13.controller_acceptance",
-          "E16.4.trusted_host_rejection_controller_acceptance"
+          "E16.2.durable_staging_publish_controller_acceptance",
+          "E16.3.seed_install_reset_controller_acceptance",
+          "E16.4.real_store_rejection_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3935,7 +4152,10 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E08.controller_acceptance"
+          "E08.controller_acceptance",
+          "E16.2.durable_staging_publish_controller_acceptance",
+          "E16.3.seed_install_reset_controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3994,7 +4214,8 @@
           "E10.replay_management_controller_acceptance",
           "E11.controller_acceptance",
           "E12.controller_acceptance",
-          "E13.controller_acceptance"
+          "E13.controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4054,7 +4275,8 @@
           "E10.replay_management_controller_acceptance",
           "E11.controller_acceptance",
           "E12.controller_acceptance",
-          "E13.controller_acceptance"
+          "E13.controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4101,7 +4323,11 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E00.controller_acceptance",
-          "E16.4.trusted_host_rejection_controller_acceptance"
+          "E16.1.durable_import_controller_acceptance",
+          "E16.2.durable_staging_publish_controller_acceptance",
+          "E16.3.seed_install_reset_controller_acceptance",
+          "E16.4.real_store_rejection_controller_acceptance",
+          "E16.5.gate_functions_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       }

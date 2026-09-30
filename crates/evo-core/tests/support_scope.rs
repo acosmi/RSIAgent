@@ -249,7 +249,12 @@ fn expected_merge_for_pr(pr: u64) -> Result<Option<&'static str>, String> {
         41 => Some("b1127a228c4a40248631ed417aba0ad7ea1a0884"),
         42 => Some("2e209dcea36d63610c59d3797e039f35d063ec89"),
         43 => Some("59afd1663a0d5f5212077dd92beaaf7920cde0ff"),
-        47 => None,
+        44 => Some("acda31895bb1cb42cf7985b907a4c600429573d0"),
+        47 => Some("1c824e6614667da4dc7ea74e96b46adfd1d2c089"),
+        48 => Some("4980aa498baa80fd82e83441839e606859fa4065"),
+        50 => Some("e94042d3f2fd761455727a6c82ad13fd3d657d03"),
+        51 => Some("bef7bd1763a01ccb677ada4acad71a063366539c"),
+        54 => Some("16c2817bc192bf71535d2c99d867873e6e85bcf8"),
         _ => return Err(format!("no reviewed merge status for PR {pr}")),
     })
 }
@@ -998,8 +1003,14 @@ fn rejects_unknown_status_and_verified_without_execution_evidence() {
     assert!(validate_manifest(&unknown, &root).is_err());
 
     let mut unsupported_verified = load_manifest(&root);
-    unsupported_verified["e_scopes"]["E17"]["status"] = Value::String("verified".into());
-    unsupported_verified["e_scopes"]["E17"]["remaining"] = Value::Array(vec![]);
+    assert!(
+        unsupported_verified["e_scopes"]["E14"]["verified_subscopes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    unsupported_verified["e_scopes"]["E14"]["status"] = Value::String("verified".into());
+    unsupported_verified["e_scopes"]["E14"]["remaining"] = Value::Array(vec![]);
     assert!(validate_manifest(&unsupported_verified, &root).is_err());
 }
 
@@ -1116,19 +1127,22 @@ fn rejects_symlinked_evidence_file() {
 #[test]
 fn planned_scope_can_omit_files_only_with_explicit_remaining_reason() {
     let root = repo_root();
-    let value = load_manifest(&root);
-    assert_eq!(value["e_scopes"]["E18"]["status"], "planned");
+    let mut value = load_manifest(&root);
+    assert_eq!(value["e_scopes"]["E14"]["status"], "planned");
+    value["e_scopes"]["E14"]["implementation_files"] = Value::Array(vec![]);
     assert!(
-        value["e_scopes"]["E18"]["implementation_files"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        !value["e_scopes"]["E18"]["remaining"]
+        !value["e_scopes"]["E14"]["remaining"]
             .as_array()
             .unwrap()
             .is_empty()
     );
     validate_manifest(&value, &root).unwrap();
+
+    let mut started = load_manifest(&root);
+    assert_eq!(started["e_scopes"]["E18"]["status"], "in_progress");
+    started["e_scopes"]["E18"]["implementation_files"] = Value::Array(vec![]);
+    assert!(
+        validate_manifest(&started, &root).is_err(),
+        "a started scope without implementation files was accepted"
+    );
 }
