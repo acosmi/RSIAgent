@@ -2868,3 +2868,341 @@ async fn the_management_cleanup_is_paged_and_resumes_after_a_restart() {
     );
     assert_names_redaction(&message, &[&done.private_input_ref]);
 }
+
+// ---------------------------------------------------------------------------
+// 9. A new request over a revoked dependency is refused at submit (R1)
+// ---------------------------------------------------------------------------
+//
+// The cleanup runs once per revocation. A request submitted after it would write
+// its private input (for `exploration.start` the submitted world) with edges to a
+// revoked source, and nothing would ever clean it. `submit` therefore checks every
+// private dependency of a new request before it writes anything: a tombstoned
+// source (`begin_revoke` writes one under the source id; the cleanup then deletes
+// a run) or a dependency the cleanup already redacted refuses the whole
+// submission with a `Conflict` that names the dependency. A dependency that does
+// not exist is not refused (the job fails on it inside, as before), and a live
+// artifact whose upstream source was revoked but not cleaned yet cannot be judged
+// from the dependency alone (the session exposes dependency edges only from the
+// dependent side), so that request is accepted and its job fails closed.
+
+/// What a refused submission must leave untouched: the jobs and artifacts of the
+/// namespace, every edge into the request's dependencies, and the audit chain.
+async fn store_shape(
+    store: &Store,
+    ctx: &Context,
+    dependencies: &[(&str, String)],
+) -> (u64, u64, Vec<Vec<(String, String)>>, usize) {
+    let mut session = store.session().await.unwrap();
+    let jobs = session.namespace_object_count(ctx, "job").await.unwrap();
+    let artifacts = session
+        .namespace_object_count(ctx, "artifact")
+        .await
+        .unwrap();
+    let mut edges = Vec::new();
+    for (kind, id) in dependencies {
+        let mut dependents = session.dependents(ctx, kind, id).await.unwrap();
+        dependents.sort();
+        edges.push(dependents);
+    }
+    session.commit().await.unwrap();
+    let audits = store.verify_audit(ctx).await.unwrap();
+    (jobs, artifacts, edges, audits)
+}
+
+/// No idempotency row: a half-recorded submission would answer differently.
+async fn assert_no_idempotency_row(store: &Store, ctx: &Context, operation: &str, key: &str) {
+    let mut session = store.session().await.unwrap();
+    let row = session
+        .cached::<ManagementJob, _>(ctx, operation, key, &json!({}))
+        .await;
+    session.commit().await.unwrap();
+    assert!(matches!(row, Ok(None)), "{operation} {key}: {row:?}");
+}
+
+#[tokio::test]
+async fn a_new_exploration_request_over_a_cleaned_run_is_refused_at_submit() {
+    let (_dir, store, admin) = exploration_fx::open("refuse-exploration.sqlite3").await;
+    exploration_fx::setup(&store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let first = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_fx::start_request(
+                "exploration-before",
+                &exploration_fx::world("world-1", 1),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_job(&store, &admin, &first.id).await.state,
+        ManagementJobState::Succeeded
+    );
+    let cleanup = revoke_and_clean(&store, &admin, "run-failure").await;
+    assert_eq!(cleanup.state, CleanupState::Complete, "{cleanup:?}");
+
+    // The run is gone (deleted by the cleanup) and tombstoned. The store's
+    // watermark is 2 now, so a world for it is signed for 2.
+    let world = exploration_fx::world("world-2", 2);
+    let world_storage = evo_engine::exploration::exploration_world_storage_id("world-2").unwrap();
+    let dependencies = [
+        ("artifact", world_storage),
+        ("run", "run-failure".to_string()),
+        ("run", "run-success".to_string()),
+    ];
+    let before = store_shape(&store, &admin, &dependencies).await;
+    let message = expect_conflict(
+        dispatcher
+            .submit(
+                &admin,
+                "exploration.start",
+                exploration_fx::start_request("exploration-after-cleanup", &world),
+            )
+            .await,
+        "submit over a cleaned run",
+    );
+    assert!(message.contains("run run-failure"), "{message}");
+    assert!(message.contains("revoked"), "{message}");
+    assert_eq!(
+        store_shape(&store, &admin, &dependencies).await,
+        before,
+        "a refused submission writes no private input, job, edge or audit record"
+    );
+    assert_no_idempotency_row(
+        &store,
+        &admin,
+        "exploration.start",
+        "exploration-after-cleanup",
+    )
+    .await;
+
+    // A request whose dependencies are all live is accepted and runs as before.
+    let mut live = exploration_fx::world("world-3", 2);
+    live.dependencies
+        .retain(|dependency| dependency.id == "run-success");
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_fx::start_request("exploration-over-live-run", &live),
+        )
+        .await
+        .unwrap();
+    let done = wait_job(&store, &admin, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
+    // Its key is a recorded job: replays keep returning it without a new check.
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "tombstone",
+            "run-success",
+            "admin",
+            &json!({"id": "run-success"}),
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let replayed = dispatcher
+        .submit(
+            &admin,
+            "exploration.start",
+            exploration_fx::start_request("exploration-over-live-run", &live),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed.id, queued.id,
+        "a same-key replay returns the stored job"
+    );
+}
+
+#[tokio::test]
+async fn a_new_curriculum_request_over_a_redacted_learner_state_is_refused_at_submit() {
+    use curriculum_fx::*;
+    let chain = Chain::build().await;
+    let (store, admin) = (&chain.fixture.store, &chain.fixture.admin);
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let first = dispatcher
+        .submit(admin, "curriculum.step", step_request("curriculum-before"))
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_job(store, admin, &first.id).await.state,
+        ManagementJobState::Succeeded
+    );
+    let cleanup = revoke_and_clean(store, admin, "run-a").await;
+    assert_eq!(cleanup.state, CleanupState::Complete, "{cleanup:?}");
+
+    let state_storage = storage_id(STATE_KIND, STATE_ID);
+    let dependencies = [
+        ("artifact", storage_id(PROFILE_KIND, PROFILE_ID)),
+        ("artifact", state_storage.clone()),
+    ];
+    let before = store_shape(store, admin, &dependencies).await;
+    let message = expect_conflict(
+        dispatcher
+            .submit(
+                admin,
+                "curriculum.step",
+                step_request("curriculum-after-cleanup"),
+            )
+            .await,
+        "submit over a redacted learner state",
+    );
+    assert_names_redaction(&message, &["artifact", &state_storage]);
+    assert_eq!(
+        store_shape(store, admin, &dependencies).await,
+        before,
+        "a refused submission writes no private input, job, edge or audit record"
+    );
+    assert_no_idempotency_row(store, admin, "curriculum.step", "curriculum-after-cleanup").await;
+}
+
+#[tokio::test]
+async fn a_new_replay_request_over_a_redacted_pool_is_refused_at_submit() {
+    let (_dir, store, admin) = exploration_fx::open("refuse-replay.sqlite3").await;
+    let pool = replay_fx::setup_sealed_pool(&admin, &store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let first = dispatcher
+        .submit(
+            &admin,
+            "replay.run",
+            replay_fx::run_request("replay-before", &pool),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_job(&store, &admin, &first.id).await.state,
+        ManagementJobState::Succeeded
+    );
+    // A world of the pool lost its source: the cleanup redacts the world, the
+    // pool and the report.
+    let cleanup = revoke_and_clean(&store, &admin, "source-2").await;
+    assert_eq!(cleanup.state, CleanupState::Complete, "{cleanup:?}");
+
+    let pool_storage = evo_storage::replay::replay_pool_storage_id(&pool.pool_digest).unwrap();
+    let dependencies = [("artifact", pool_storage.clone())];
+    let before = store_shape(&store, &admin, &dependencies).await;
+    let message = expect_conflict(
+        dispatcher
+            .submit(
+                &admin,
+                "replay.run",
+                replay_fx::run_request("replay-after-cleanup", &pool),
+            )
+            .await,
+        "submit over a redacted pool",
+    );
+    assert_names_redaction(&message, &["artifact", &pool_storage]);
+    assert_eq!(
+        store_shape(&store, &admin, &dependencies).await,
+        before,
+        "a refused submission writes no private input, job, edge or audit record"
+    );
+    assert_no_idempotency_row(&store, &admin, "replay.run", "replay-after-cleanup").await;
+}
+
+#[tokio::test]
+async fn a_request_submitted_between_begin_revoke_and_the_cleanup_is_refused_when_the_source_is_a_dependency()
+ {
+    // Only `begin_revoke` ran: the tombstone exists and the watermark moved, the
+    // cleanup has not touched anything yet.
+    let (_dir, store, admin) = exploration_fx::open("refuse-begin-only.sqlite3").await;
+    exploration_fx::setup(&store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let cleanup = begin(&store, &admin, "run-failure").await;
+    assert_eq!(cleanup.state, CleanupState::Pending);
+    assert!(
+        try_raw(&store, &admin, "run", "run-failure")
+            .await
+            .is_some()
+    );
+
+    // exploration.start depends on the runs themselves: the tombstone decides.
+    let dependencies = [
+        ("run", "run-failure".to_string()),
+        ("run", "run-success".to_string()),
+    ];
+    let before = store_shape(&store, &admin, &dependencies).await;
+    let message = expect_conflict(
+        dispatcher
+            .submit(
+                &admin,
+                "exploration.start",
+                exploration_fx::start_request(
+                    "exploration-begin-only",
+                    &exploration_fx::world("world-2", 2),
+                ),
+            )
+            .await,
+        "submit over a tombstoned run",
+    );
+    assert!(message.contains("run run-failure"), "{message}");
+    assert_eq!(store_shape(&store, &admin, &dependencies).await, before);
+    assert_no_idempotency_row(
+        &store,
+        &admin,
+        "exploration.start",
+        "exploration-begin-only",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_artifact_dependency_whose_source_is_only_marked_revoked_cannot_be_judged_at_submit() {
+    // curriculum.step and replay.run depend on artifacts (learner state, pool),
+    // which are still live while only `begin_revoke` ran. Their upstream run is
+    // tombstoned, but the dependency edges are readable only from the dependent
+    // side, so the submit-time check cannot walk up to the run. Such a request is
+    // accepted and its job fails closed on the operation's own checks (the
+    // behaviour the existing revocation-gate tests pin); the cleanup then reaches
+    // its private input like any other.
+    use curriculum_fx::*;
+    let chain = Chain::build().await;
+    let (store, admin) = (&chain.fixture.store, &chain.fixture.admin);
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let cleanup = begin(store, admin, "run-a").await;
+    assert_eq!(cleanup.state, CleanupState::Pending);
+    let queued = dispatcher
+        .submit(
+            admin,
+            "curriculum.step",
+            step_request("curriculum-begin-only"),
+        )
+        .await
+        .unwrap();
+    let failed = wait_job(store, admin, &queued.id).await;
+    assert_eq!(failed.state, ManagementJobState::Failed, "{failed:?}");
+    assert_eq!(failed.error_code.as_deref(), Some("conflict"));
+    let cleanup = drive(store, admin, cleanup, 8).await;
+    assert_eq!(cleanup.state, CleanupState::Complete, "{cleanup:?}");
+    assert_redacted_input(
+        &raw(store, admin, "artifact", &failed.private_input_ref).await,
+        &failed.private_input_ref,
+    );
+
+    let (_dir, store, admin) = exploration_fx::open("replay-begin-only.sqlite3").await;
+    let pool = replay_fx::setup_sealed_pool(&admin, &store).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let cleanup = begin(&store, &admin, "source-2").await;
+    assert_eq!(cleanup.state, CleanupState::Pending);
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "replay.run",
+            replay_fx::run_request("replay-begin-only", &pool),
+        )
+        .await
+        .unwrap();
+    let failed = wait_job(&store, &admin, &queued.id).await;
+    assert_eq!(failed.state, ManagementJobState::Failed, "{failed:?}");
+    assert_eq!(failed.error_code.as_deref(), Some("conflict"));
+    let cleanup = drive(&store, &admin, cleanup, 8).await;
+    assert_eq!(cleanup.state, CleanupState::Complete, "{cleanup:?}");
+    assert_redacted_input(
+        &raw(&store, &admin, "artifact", &failed.private_input_ref).await,
+        &failed.private_input_ref,
+    );
+}

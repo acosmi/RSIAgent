@@ -9,7 +9,7 @@ use evo_core::curriculum::ProbeTerminal;
 use evo_core::replay::{ReplaySimulationProfile, WorldPartition};
 use evo_core::strategy::{BatchActionV1, ElasticPolicyV1, ExplorationCapsV1};
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, now};
-use evo_storage::Store;
+use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -707,6 +707,12 @@ async fn persist_management(
         session.commit().await?;
         return Ok(current);
     }
+    // A new request is not accepted over a dependency whose source was revoked
+    // (plan §11: a revocation refuses new access at once). The check runs in this
+    // session, before anything is written, so a refusal leaves no private input,
+    // job, edge, idempotency row or audit record behind.
+    let dependencies = private_dependencies(&request)?;
+    ensure_dependencies_live(ctx, &mut session, &dependencies).await?;
     let private = PrivateManagementInput {
         id: private_id.clone(),
         schema_version: INPUT_SCHEMA.into(),
@@ -737,9 +743,9 @@ async fn persist_management(
     session
         .put(ctx, "artifact", &private_id, ctx.actor(), &private)
         .await?;
-    for (kind, id) in private_dependencies(&request)? {
+    for (kind, id) in &dependencies {
         session
-            .put_edge(ctx, "artifact", &private_id, &kind, &id)
+            .put_edge(ctx, "artifact", &private_id, kind, id)
             .await?;
     }
     session.put(ctx, "job", &job_id, ctx.actor(), &job).await?;
@@ -759,6 +765,48 @@ async fn persist_management(
     session.audit(ctx, "management.accept", &job_id).await?;
     session.commit().await?;
     Ok(job)
+}
+
+/// `Conflict` naming the first dependency of a new request whose source was
+/// revoked: the dependency itself is a tombstoned source (`begin_revoke` writes a
+/// tombstone under the source id, and the cleanup then deletes a run), or the
+/// cleanup already replaced it with an `rsia.redacted.v1` tombstone.
+///
+/// A dependency that does not exist (and is not tombstoned) is not refused here:
+/// the operation itself fails on it inside the job (`not_found`), as before.
+/// Nor is a live artifact whose upstream source was revoked but not cleaned yet:
+/// the dependency edges are only readable from the dependent side through the
+/// session, so the upstream closure cannot be walked from here; such a request is
+/// accepted and its job fails closed on the operation's own watermark and source
+/// checks.
+async fn ensure_dependencies_live(
+    ctx: &Context,
+    session: &mut Session,
+    dependencies: &[(String, String)],
+) -> Result<()> {
+    for (kind, id) in dependencies {
+        if session.get::<Value>(ctx, "tombstone", id).await?.is_some() {
+            return Err(Error::Conflict(format!(
+                "management request depends on {kind} {id}, whose source was revoked"
+            )));
+        }
+        // The cleanup deletes a revoked run instead of redacting it, and a run body
+        // can be large: for a run only the tombstone matters.
+        if kind == "run" {
+            continue;
+        }
+        if session
+            .get::<Value>(ctx, kind, id)
+            .await?
+            .as_ref()
+            .is_some_and(is_redacted)
+        {
+            return Err(Error::Conflict(format!(
+                "management request depends on {kind} {id}, which was redacted because its source was revoked"
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn load_job(ctx: &Context, store: &Store, job_id: &str) -> Result<ManagementJob> {
