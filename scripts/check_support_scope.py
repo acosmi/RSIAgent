@@ -27,6 +27,37 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 PR_RE = re.compile(r"^https://github\.com/acosmi/RSIAgent/pull/(\d+)$")
 IDENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# Progress order used for the parent/child gate rule. blocked and in_progress are the same level
+# ("started, unfinished"); explicitly_out_of_scope has no rank and neither constrains nor is constrained.
+STATUS_RANK = {"planned": 0, "blocked": 1, "in_progress": 1, "implemented_not_verified": 2, "verified": 3}
+# Optional per-record PR state. When present it must agree with merged_sha (merged <=> merged_sha set).
+PR_STATES = {"draft", "open", "closed", "merged"}
+# Closed key sets per object type, derived from reports/support-scope.json (rsia.support_scope.v2).
+# Keys that the checker reads but the current manifest does not yet use (completion_evidence_refs,
+# verification_evidence_refs, pr_state) are listed so legitimate progress stays registrable.
+ROOT_KEYS = {
+    "schema_version", "plan_version", "plan_sha256", "derived_index_notice", "declaration", "not_full_route_complete",
+    "legacy_equivalence_unverified", "dimensions", "blocked", "explicitly_out_of_scope_until_revised", "optional_disabled",
+    "overall_remaining", "e_scopes", "traceability", "trace_index_coverage",
+}
+DIMENSION_KEYS = {"engineering", "host", "model", "effect", "deploy"}
+COVERAGE_KEYS = {"purpose", "ranges"}
+SCOPE_KEYS = {"title", "status", "status_reason", "implementation_files", "scenarios", "verified_subscopes", "remaining", "completion_evidence_refs"}
+EVIDENCE_KEYS = {
+    "id", "description", "plan_version", "plan_sha256", "source_sha", "pr", "merged_sha", "pr_state", "test_entry", "command",
+    "input_digest", "exit_code", "log_path", "actual_result", "scope", "risk", "rollback", "record_source", "input_ref",
+}
+TRACEABILITY_KEYS = {"b_commitments", "u_commitments", "k_commitments", "so_sources", "v_scenarios"}
+COMMITMENT_KEYS = {
+    "id", "specification_status", "sections", "sources", "e_tasks", "v_scenarios", "implementation_status", "verification_status",
+    "effect_status", "local_artifacts", "related_evidence_refs", "remaining", "completion_evidence_refs",
+}
+SO_SOURCE_KEYS = {
+    "id", "repository", "commit", "path", "blob_sha", "read_range", "e_tasks", "license", "license_status", "verification_status",
+    "local_use", "verification_evidence_refs", "completion_evidence_refs",
+}
+LOCAL_USE_KEYS = {"mode", "artifacts"}
+V_SCENARIO_KEYS = {"id", "specification_status", "e_tasks", "status", "verification_status", "effect_status", "related_evidence_refs", "remaining", "completion_evidence_refs"}
 
 EXPECTED_E_SCENARIOS = {
     "E00": "V001 V071 V072 V073 V080 V098",
@@ -160,6 +191,14 @@ def nonempty(value: Any, what: str) -> str:
         raise CheckerError(f"{what}: must be a non-empty string")
     return value
 
+def known_keys(value: Any, allowed: set[str], what: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CheckerError(f"{what}: must be an object")
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise CheckerError(f"{what}: unknown key(s) {unknown} are not part of the {SCHEMA_VERSION} schema and cannot carry claims")
+    return value
+
 def workspace_packages(repo_root: Path) -> dict[str, tuple[Path, dict[str, Any]]]:
     root_manifest = inspect_relative(repo_root, "Cargo.toml", "workspace Cargo.toml", True)
     try:
@@ -234,12 +273,16 @@ def expected_v_to_e() -> dict[str, set[str]]:
 def evidence_expected_refs(e_tasks: set[str], evidence_by_task: dict[str, set[str]]) -> set[str]:
     return {item for task in e_tasks for item in evidence_by_task[task]}
 
-def validate_evidence(record: Any, task: str, repo_root: Path, packages: dict[str, tuple[Path, dict[str, Any]]]) -> str:
+def validate_evidence(record: Any, task: str, repo_root: Path, packages: dict[str, tuple[Path, dict[str, Any]]], implementation_files: list[str]) -> str:
     if not isinstance(record, dict):
         raise CheckerError(f"{task}: evidence record is not an object")
     identifier = nonempty(record.get("id"), f"{task} evidence id")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", identifier):
         raise CheckerError(f"{task}: evidence id is invalid")
+    known_keys(record, EVIDENCE_KEYS, f"{task} evidence {identifier}")
+    owner = max((tid for tid in EXPECTED_E_IDS if identifier.startswith(tid + ".")), key=len, default=None)
+    if owner != task:
+        raise CheckerError(f"{task}: evidence id {identifier!r} is not namespaced under its own task; evidence must be registered as '{task}.<name>'")
     if record.get("plan_version") != PLAN_VERSION or record.get("plan_sha256") != PLAN_SHA256:
         raise CheckerError(f"{identifier}: plan binding differs")
     source_sha = record.get("source_sha")
@@ -251,6 +294,13 @@ def validate_evidence(record: Any, task: str, repo_root: Path, packages: dict[st
     merged = record.get("merged_sha")
     if merged is not None and (not isinstance(merged, str) or not HEX40.fullmatch(merged)):
         raise CheckerError(f"{identifier}: merged_sha must be null or lowercase 40-hex")
+    pr_state = record.get("pr_state")
+    if pr_state is not None and pr_state not in PR_STATES:
+        raise CheckerError(f"{identifier}: pr_state must be one of {sorted(PR_STATES)}")
+    if pr_state == "merged" and merged is None:
+        raise CheckerError(f"{identifier}: pr_state is 'merged' but merged_sha is null")
+    if pr_state not in (None, "merged") and merged is not None:
+        raise CheckerError(f"{identifier}: merged_sha {merged} is set but the record's pr_state is {pr_state!r}, not 'merged'")
     digest = record.get("input_digest")
     if not isinstance(digest, str) or not HEX64.fullmatch(digest):
         raise CheckerError(f"{identifier}: input_digest must be lowercase SHA-256")
@@ -261,6 +311,10 @@ def validate_evidence(record: Any, task: str, repo_root: Path, packages: dict[st
     command = nonempty(record.get("command"), f"{identifier} command")
     if resolve_cargo_target(repo_root, command, packages) != test_entry:
         raise CheckerError(f"{identifier}: command target differs from test_entry")
+    package = command.split()[5]
+    member = packages[package][0].as_posix()
+    if not any(file == test_entry or file.startswith(member + "/") for file in implementation_files):
+        raise CheckerError(f"{identifier}: test_entry {test_entry!r} (package {package}) is not among {task}'s declared implementation_files nor inside a crate they declare")
     exit_code = record.get("exit_code")
     if type(exit_code) is not int or exit_code != 0:
         raise CheckerError(f"{identifier}: verified execution must have integer exit_code 0")
@@ -285,10 +339,14 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
         raise CheckerError(f"unsupported schema_version: {manifest.get('schema_version')!r}")
     if manifest.get("plan_version") != PLAN_VERSION or manifest.get("plan_sha256") != PLAN_SHA256:
         raise CheckerError("manifest is not bound to the frozen v4.1 plan")
+    known_keys(manifest, ROOT_KEYS, "manifest root")
+    known_keys(manifest.get("dimensions"), DIMENSION_KEYS, "dimensions")
     if manifest.get("declaration") != "subset_only" or manifest.get("not_full_route_complete") is not True or manifest.get("legacy_equivalence_unverified") is not True or manifest.get("dimensions", {}).get("effect") != "not_claimed":
         raise CheckerError("manifest overstates completion/effect or drops legacy limitation")
-    if string_set(manifest.get("optional_disabled"), "optional_disabled") != {"E17", "E18"}:
+    optional_disabled = string_set(manifest.get("optional_disabled"), "optional_disabled")
+    if optional_disabled != {"E17", "E18"}:
         raise CheckerError("E17/E18 must remain disabled")
+    out_of_scope = string_set(manifest.get("explicitly_out_of_scope_until_revised"), "explicitly_out_of_scope_until_revised")
     trace_coverage = manifest.get("trace_index_coverage")
     expected_coverage = {
         "E00": {"purpose": "index_consistency_only_not_scenario_execution", "ranges": {"K01–K10", "SO01–SO18", "V087–V098"}},
@@ -297,6 +355,7 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
     if not isinstance(trace_coverage, dict) or set(trace_coverage) != set(expected_coverage):
         raise CheckerError("trace_index_coverage must separately contain E00 and E16.6")
     for task, expected in expected_coverage.items():
+        known_keys(trace_coverage[task], COVERAGE_KEYS, f"{task} trace_index_coverage")
         if trace_coverage[task].get("purpose") != expected["purpose"] or string_set(trace_coverage[task].get("ranges"), f"{task} trace ranges") != expected["ranges"]:
             raise CheckerError(f"{task} trace index responsibility differs")
 
@@ -304,11 +363,21 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
     scopes = manifest.get("e_scopes")
     if not isinstance(scopes, dict) or set(scopes) != EXPECTED_E_IDS:
         raise CheckerError(f"e_scopes must be the exact 25 task set; got {sorted(scopes) if isinstance(scopes, dict) else scopes!r}")
+    parents = {task: task.rsplit(".", 1)[0] for task in scopes if "." in task and task.rsplit(".", 1)[0] in scopes}
+    for child, parent in sorted(parents.items()):
+        parent_status = scopes[parent].get("status") if isinstance(scopes[parent], dict) else None
+        child_status = scopes[child].get("status") if isinstance(scopes[child], dict) else None
+        if parent_status in STATUS_RANK and child_status in STATUS_RANK and STATUS_RANK[parent_status] > STATUS_RANK[child_status]:
+            raise CheckerError(f"{parent}: status {parent_status!r} is stronger than sub-package {child} status {child_status!r}; a parent scope may not outrank its weakest child")
     evidence_records: list[dict[str, Any]] = []
     evidence_owner: dict[str, str] = {}
+    log_owner: dict[str, tuple[str, str]] = {}
+    run_owner: dict[tuple[str, str], tuple[str, str]] = {}
+    pr_merge: dict[int, tuple[str | None, str]] = {}
+    merged_owner: dict[str, tuple[int, str]] = {}
+    source_owner: dict[str, tuple[int, str]] = {}
     for task, entry in scopes.items():
-        if not isinstance(entry, dict):
-            raise CheckerError(f"{task}: entry must be an object")
+        known_keys(entry, SCOPE_KEYS, f"{task} scope entry")
         nonempty(entry.get("title"), f"{task} title")
         status = entry.get("status")
         if status not in STATUSES:
@@ -333,12 +402,41 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
             raise CheckerError(f"{task}: verified status requires evidence and no remaining work")
         if status != "verified" and not remaining:
             raise CheckerError(f"{task}: non-verified task must state remaining work")
+        if status == "planned" and records:
+            ids = [item.get("id") for item in records if isinstance(item, dict)]
+            raise CheckerError(f"{task}: status 'planned' is incompatible with verified evidence records {ids}; a planned scope has nothing verified")
+        if status != "verified" and entry.get("completion_evidence_refs") is not None:
+            raise CheckerError(f"{task}: completion_evidence_refs claims completion but status is {status!r}")
+        if status == "verified" and task in optional_disabled:
+            raise CheckerError(f"{task}: optional scope is listed in optional_disabled and no enablement is recorded; status 'verified' is not allowed")
+        if status == "explicitly_out_of_scope" and task not in out_of_scope:
+            raise CheckerError(f"{task}: status 'explicitly_out_of_scope' is not declared in explicitly_out_of_scope_until_revised")
         for record in records:
-            identifier = validate_evidence(record, task, repo_root, packages)
+            identifier = validate_evidence(record, task, repo_root, packages, files)
             if identifier in evidence_owner:
                 raise CheckerError(f"duplicate evidence id {identifier}")
             evidence_owner[identifier] = task
             evidence_records.append(record)
+            log_path, source_sha, test_entry = record["log_path"], record["source_sha"], record["test_entry"]
+            if log_path in log_owner:
+                raise CheckerError(f"{identifier}: log_path {log_path!r} duplicates evidence {log_owner[log_path][0]} of task {log_owner[log_path][1]}; one test run may support only one evidence record")
+            log_owner[log_path] = (identifier, task)
+            run = run_owner.setdefault((source_sha, test_entry), (identifier, task))
+            if run[1] != task:
+                raise CheckerError(f"{identifier}: the same test run ({test_entry} at source_sha {source_sha}) is already claimed by {run[0]} of task {run[1]}; evidence sets may not be duplicated across tasks")
+            number, merged = int(PR_RE.fullmatch(record["pr"]).group(1)), record["merged_sha"]
+            known = pr_merge.setdefault(number, (merged, identifier))
+            if known[0] != merged:
+                raise CheckerError(f"{identifier}: PR #{number} carries merged_sha {merged!r} here but {known[0]!r} in {known[1]}; one PR cannot be both merged and unmerged or merged twice")
+            if merged is not None:
+                claim = merged_owner.setdefault(merged, (number, identifier))
+                if claim[0] != number:
+                    raise CheckerError(f"{identifier}: merged_sha {merged} is already recorded as the merge commit of PR #{claim[0]} ({claim[1]}); one merge commit cannot also merge PR #{number}")
+                if merged in source_owner and source_owner[merged][0] != number:
+                    raise CheckerError(f"{identifier}: merged_sha {merged} is the source_sha of PR #{source_owner[merged][0]} ({source_owner[merged][1]}), not a merge of PR #{number}")
+            if source_sha in merged_owner and merged_owner[source_sha][0] != number:
+                raise CheckerError(f"{identifier}: source_sha {source_sha} is recorded as the merge commit of PR #{merged_owner[source_sha][0]} ({merged_owner[source_sha][1]})")
+            source_owner.setdefault(source_sha, (number, identifier))
         if status == "verified":
             completion = string_set(
                 entry.get("completion_evidence_refs"),
@@ -350,9 +448,7 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
                     f"{task}: verified status lacks explicit task completion evidence"
                 )
 
-    trace = manifest.get("traceability")
-    if not isinstance(trace, dict):
-        raise CheckerError("traceability must be an object")
+    trace = known_keys(manifest.get("traceability"), TRACEABILITY_KEYS, "traceability")
     so_entries = trace.get("so_sources")
     if not isinstance(so_entries, list):
         raise CheckerError("so_sources must be an array")
@@ -361,6 +457,7 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
         raise CheckerError("SO01-SO18 must be exact and duplicate-free")
     for sid, expected in EXPECTED_SO.items():
         entry = so_by_id[sid]
+        known_keys(entry, SO_SOURCE_KEYS, sid)
         path, blob, read_range, tasks_text = expected
         if entry.get("repository") != SKILLOPT_REPO or entry.get("commit") != SKILLOPT_COMMIT or entry.get("path") != path or entry.get("blob_sha") != blob or entry.get("read_range") != read_range or entry.get("license") != "MIT":
             raise CheckerError(f"{sid}: fixed source pin differs")
@@ -374,6 +471,7 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
         local = entry.get("local_use")
         if not isinstance(local, dict) or local.get("mode") not in {"reference_only_no_upstream_runtime_import", "adapted_with_license_notice"}:
             raise CheckerError(f"{sid}: local use mode is invalid")
+        known_keys(local, LOCAL_USE_KEYS, f"{sid} local_use")
         artifacts = local.get("artifacts")
         if not isinstance(artifacts, list) or not artifacts or len(artifacts) != len(set(artifacts)):
             raise CheckerError(f"{sid}: local landing is absent or duplicated")
@@ -398,6 +496,7 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
         raise CheckerError("V001-V098 must be exact and duplicate-free")
     for vid, tasks in expected_v.items():
         entry = v_by_id[vid]
+        known_keys(entry, V_SCENARIO_KEYS, vid)
         if entry.get("specification_status") != "included" or entry.get("effect_status") != "not_claimed":
             raise CheckerError(f"{vid}: specification/effect axes differ")
         status, verification = entry.get("status"), entry.get("verification_status")
@@ -437,6 +536,7 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
             raise CheckerError(f"{field} exact set differs")
         for cid in expected_ids:
             entry = by_id[cid]
+            known_keys(entry, COMMITMENT_KEYS, cid)
             sections, sources, tasks_text, scenarios = EXPECTED_COMMITMENTS[cid]
             tasks = set(tasks_text.split())
             if entry.get("specification_status") != "included" or entry.get("effect_status") != "not_claimed":
@@ -537,6 +637,10 @@ def run_check(repo_root: Path, manifest_rel: str, source_of_truth: Path | None) 
                 path = inspect_relative(repo_root, record[field], f"{identifier} {field}", False)
                 if path is None:
                     report.needs_verification.append(f"{identifier}: local {field} is unavailable")
+            if record["merged_sha"] is not None:
+                number = PR_RE.fullmatch(record["pr"]).group(1)
+                state = record.get("pr_state") or "unrecorded"
+                report.needs_verification.append(f"{identifier}: merged_sha {record['merged_sha']} for PR #{number} (pr_state {state}) is a manifest assertion; git ancestry (merge commit on main containing source_sha {record['source_sha']}) was not checked")
         report.input_binding_available = all_inputs
         report.needs_verification.extend([
             "manifest commands were parsed but never executed; exit codes and actual results require controller verification",
