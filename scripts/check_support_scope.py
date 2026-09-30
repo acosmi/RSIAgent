@@ -17,8 +17,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-PLAN_VERSION = "v4.1"
-PLAN_SHA256 = "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150"
+PLAN_VERSION = "v4.2"
+PLAN_SHA256 = "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455"
+# Registered plan lineage (plan §18.8), oldest first; the last entry is the current binding. The manifest
+# top level and the external plan file must be the current version. Historical evidence records keep the
+# plan_version/plan_sha256 they were verified against and are accepted only as a registered pair.
+PLAN_LINEAGE = {
+    "v4.1": {"file": "RSIAgent-v4.1定稿-工程实施方案-2026-09-19.md", "sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150"},
+    "v4.2": {"file": "RSIAgent-v4.2定稿-工程实施方案-2026-09-30.md", "sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455"},
+}
+# Optional per-record recheck marker (plan §18.8). Missing means not_affected. "required" is a pending
+# obligation and never passes; records of the tasks touched by the v4.2 revision (§19.4) that are still
+# bound to an older lineage digest must carry PLAN_RECHECKED.
+PLAN_RECHECKED = "rechecked_v4.2"
+PLAN_RECHECK_VALUES = {"not_affected", "required", PLAN_RECHECKED}
+PLAN_RECHECK_TASKS = {"E00", "E16.5", "E16.6"}
 SCHEMA_VERSION = "rsia.support_scope.v2"
 STATUSES = {"planned", "in_progress", "blocked", "implemented_not_verified", "verified", "explicitly_out_of_scope"}
 SKILLOPT_REPO = "https://github.com/microsoft/SkillOpt.git"
@@ -36,15 +49,16 @@ PR_STATES = {"draft", "open", "closed", "merged"}
 # Keys that the checker reads but the current manifest does not yet use (completion_evidence_refs,
 # verification_evidence_refs, pr_state) are listed so legitimate progress stays registrable.
 ROOT_KEYS = {
-    "schema_version", "plan_version", "plan_sha256", "derived_index_notice", "declaration", "not_full_route_complete",
+    "schema_version", "plan_version", "plan_sha256", "plan_lineage", "derived_index_notice", "declaration", "not_full_route_complete",
     "legacy_equivalence_unverified", "dimensions", "blocked", "explicitly_out_of_scope_until_revised", "optional_disabled",
     "overall_remaining", "e_scopes", "traceability", "trace_index_coverage",
 }
+LINEAGE_KEYS = {"version", "file", "sha256"}
 DIMENSION_KEYS = {"engineering", "host", "model", "effect", "deploy"}
 COVERAGE_KEYS = {"purpose", "ranges"}
 SCOPE_KEYS = {"title", "status", "status_reason", "implementation_files", "scenarios", "verified_subscopes", "remaining", "completion_evidence_refs"}
 EVIDENCE_KEYS = {
-    "id", "description", "plan_version", "plan_sha256", "source_sha", "pr", "merged_sha", "pr_state", "test_entry", "command",
+    "id", "description", "plan_version", "plan_sha256", "plan_recheck", "source_sha", "pr", "merged_sha", "pr_state", "test_entry", "command",
     "input_digest", "exit_code", "log_path", "actual_result", "scope", "risk", "rollback", "record_source", "input_ref",
 }
 TRACEABILITY_KEYS = {"b_commitments", "u_commitments", "k_commitments", "so_sources", "v_scenarios"}
@@ -69,7 +83,7 @@ EXPECTED_E_SCENARIOS = {
     "E06": "V014 V015 V016 V017 V047 V049 V050 V059 V064 V070 V075 V077 V078 V081 V084 V085 V089 V091 V094 V095 V096",
     "E07": "V003 V010 V014 V015 V016 V042 V047 V059 V070 V077 V087 V088 V089 V091 V096 V097",
     "E08": "V017 V018 V038 V056 V069 V075 V081 V082 V083 V084 V085 V086 V090 V092 V094 V096",
-    "E09": "V019 V020 V022 V024 V025 V081 V086 V088 V089 V090 V091 V093 V094 V095 V096",
+    "E09": "V019 V020 V022 V024 V025 V081 V086 V088 V089 V090 V091 V093 V094 V095 V096 V097",
     "E10": "V020 V021 V022 V023 V025 V026 V027 V081 V086 V094 V096",
     "E11": "V022 V026 V027 V028 V042 V081 V094 V096 V097",
     "E12": "V029 V030 V031 V034 V082 V083 V093 V094 V096",
@@ -283,8 +297,19 @@ def validate_evidence(record: Any, task: str, repo_root: Path, packages: dict[st
     owner = max((tid for tid in EXPECTED_E_IDS if identifier.startswith(tid + ".")), key=len, default=None)
     if owner != task:
         raise CheckerError(f"{task}: evidence id {identifier!r} is not namespaced under its own task; evidence must be registered as '{task}.<name>'")
-    if record.get("plan_version") != PLAN_VERSION or record.get("plan_sha256") != PLAN_SHA256:
-        raise CheckerError(f"{identifier}: plan binding differs")
+    version, digest = record.get("plan_version"), record.get("plan_sha256")
+    lineage = PLAN_LINEAGE.get(version) if isinstance(version, str) else None
+    if lineage is None:
+        raise CheckerError(f"{identifier}: plan_version {version!r} is outside the registered plan lineage {list(PLAN_LINEAGE)}")
+    if digest != lineage["sha256"]:
+        raise CheckerError(f"{identifier}: plan_sha256 {digest!r} is not the registered digest of plan {version}; digests outside the lineage or paired with the wrong version are rejected")
+    recheck = record["plan_recheck"] if "plan_recheck" in record else "not_affected"
+    if recheck not in PLAN_RECHECK_VALUES:
+        raise CheckerError(f"{identifier}: plan_recheck must be one of {sorted(PLAN_RECHECK_VALUES)}, got {recheck!r}")
+    if recheck == "required":
+        raise CheckerError(f"{identifier}: plan_recheck is 'required'; the record was verified against plan {version} in a scope revised by {PLAN_VERSION} and has not been rechecked, so the manifest cannot pass until it is rechecked or withdrawn")
+    if version != PLAN_VERSION and task in PLAN_RECHECK_TASKS and recheck != PLAN_RECHECKED:
+        raise CheckerError(f"{identifier}: task {task} is touched by the {PLAN_VERSION} revision; a record still bound to plan {version} must carry plan_recheck {PLAN_RECHECKED!r}, got {recheck!r}")
     source_sha = record.get("source_sha")
     if not isinstance(source_sha, str) or not HEX40.fullmatch(source_sha):
         raise CheckerError(f"{identifier}: source_sha must be lowercase 40-hex")
@@ -332,14 +357,33 @@ def validate_refs(refs: Any, what: str, evidence_owner: dict[str, str], relevant
         raise CheckerError(f"{what}: evidence refs are outside the mapped E scope: {sorted(irrelevant)}")
     return values
 
+def validate_plan_lineage(value: Any) -> None:
+    if not isinstance(value, list) or not value:
+        raise CheckerError("plan_lineage must be a non-empty array of {version, file, sha256} entries")
+    expected = [(version, entry["file"], entry["sha256"]) for version, entry in PLAN_LINEAGE.items()]
+    actual = []
+    for index, item in enumerate(value):
+        known_keys(item, LINEAGE_KEYS, f"plan_lineage[{index}]")
+        version = nonempty(item.get("version"), f"plan_lineage[{index}] version")
+        file = nonempty(item.get("file"), f"plan_lineage[{index}] file")
+        digest = item.get("sha256")
+        if not isinstance(digest, str) or not HEX64.fullmatch(digest):
+            raise CheckerError(f"plan_lineage[{index}] sha256 must be lowercase SHA-256")
+        actual.append((version, file, digest))
+    if actual != expected:
+        raise CheckerError(f"plan_lineage must list exactly the registered lineage {' -> '.join(PLAN_LINEAGE)} in order with the registered file names and SHA-256 digests")
+    if actual[-1][0] != PLAN_VERSION or actual[-1][2] != PLAN_SHA256:
+        raise CheckerError(f"plan_lineage must end with the current plan {PLAN_VERSION} ({PLAN_SHA256})")
+
 def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
     if not isinstance(manifest, dict):
         raise CheckerError("manifest root must be an object")
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise CheckerError(f"unsupported schema_version: {manifest.get('schema_version')!r}")
     if manifest.get("plan_version") != PLAN_VERSION or manifest.get("plan_sha256") != PLAN_SHA256:
-        raise CheckerError("manifest is not bound to the frozen v4.1 plan")
+        raise CheckerError(f"manifest top level is not bound to the current plan {PLAN_VERSION} ({PLAN_SHA256}); historical lineage digests are accepted only inside evidence records")
     known_keys(manifest, ROOT_KEYS, "manifest root")
+    validate_plan_lineage(manifest.get("plan_lineage"))
     known_keys(manifest.get("dimensions"), DIMENSION_KEYS, "dimensions")
     if manifest.get("declaration") != "subset_only" or manifest.get("not_full_route_complete") is not True or manifest.get("legacy_equivalence_unverified") is not True or manifest.get("dimensions", {}).get("effect") != "not_claimed":
         raise CheckerError("manifest overstates completion/effect or drops legacy limitation")
@@ -600,7 +644,7 @@ def validate_external_plan(path: Path) -> str:
         raise CheckerError(f"source-of-truth is linked or not a regular file: {path}")
     actual = sha256_of_file(path)
     if actual != PLAN_SHA256:
-        raise CheckerError(f"source-of-truth SHA-256 mismatch: computed={actual} expected={PLAN_SHA256}")
+        raise CheckerError(f"source-of-truth SHA-256 mismatch: computed={actual} expected={PLAN_SHA256} (plan {PLAN_VERSION})")
     return actual
 
 def run_check(repo_root: Path, manifest_rel: str, source_of_truth: Path | None) -> CheckReport:
