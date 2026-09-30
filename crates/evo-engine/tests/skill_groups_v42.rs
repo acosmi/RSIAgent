@@ -1452,6 +1452,19 @@ async fn an_invalid_job_is_refused_whole_before_any_model_or_runner_call() {
         conflict("trusted_input_digest_mismatch"),
     )
     .await;
+    let oversized = SkillSnapshot {
+        content: "x".repeat(16 * 1024 + 1),
+        ..a.parent.clone()
+    };
+    let mut request = job([a, b]);
+    request.groups[0].request.parent_skill = &oversized;
+    refused(
+        &world,
+        "parent is not a valid skill snapshot",
+        request,
+        invalid("content"),
+    )
+    .await;
     let scope_changes: [(&str, DevelopmentChange); 5] = [
         ("namespace", |request| request.namespace = "other".into()),
         ("episode", |request| request.episode_id = "episode-x".into()),

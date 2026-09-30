@@ -27,13 +27,12 @@
 //! `ResolvedBundle`, the development selection of the combination, formal
 //! acceptance, and any management entry point.
 
-use crate::compiler::compile_skill_edits;
 use crate::model::ModelPort;
 use crate::optimization::{
     DevRunner, OptimizationJournal, OptimizationStepOutcome, OptimizationStepRequest,
     run_optimization_step,
 };
-use evo_core::skill_edit::{EvidenceClosure, skill_snapshot_digest};
+use evo_core::skill_edit::{skill_snapshot_digest, validate_batch_scope};
 use evo_core::strategy::{
     CombinedSkillCandidate, SkillGroupCandidate, build_combined_skill_candidate,
 };
@@ -43,10 +42,6 @@ use serde::Serialize;
 /// The default bound of plan section 7.7, the same as
 /// `evo_core::strategy::validate_skill_groups` enforces on the marker.
 pub const MAX_SKILL_GROUPS_PER_JOB: usize = 2;
-
-/// The error `compile_skill_edit_batch` raises for a batch without evidence,
-/// after its scope check has passed. See `verify_trusted_edit_scope`.
-const EMPTY_EVIDENCE_CLOSURE: &str = "empty_evidence_closure";
 
 /// One group of a job: the group's name and its complete single-skill request.
 /// The request's `edit_context`, `edit_batch_template` and `parent_skill` are
@@ -253,33 +248,23 @@ fn group_scope(group: &SkillGroupSpec<'_>) -> Result<GroupScope> {
     })
 }
 
-/// `TrustedEditContext` deliberately has no accessors, and this increment does
-/// not widen `evo-core`. The group's edit scope can still be compared with its
-/// request, before any dispatch, by asking the context's own compiler to check
-/// the request's edit template stripped of evidence and edits.
-/// `compile_skill_edit_batch` checks, in this order: the parent skill and the
-/// context themselves, the batch's schema and compiler version, every scope
-/// field of the batch against the context (namespace, profile, skill id and
-/// version, input digest, approved parent digest, safe baseline digest), that
-/// the parent skill is the one the context was created for, and only then the
-/// evidence closure. A stripped batch therefore ends at
-/// `empty_evidence_closure` exactly when the scope agrees.
-/// On success the template's public scope fields are the trusted scope: the
-/// group's skill id, parent version and namespace. The tests pin this order;
-/// with accessors on the context this function reduces to reading them.
+/// A group may only edit the skill its `TrustedEditContext` was issued for.
+/// The context has no accessors, so the job cannot read its fields; it asks the
+/// core's own scope check instead. That is the check `compile_skill_edit_batch`
+/// applies to the real batch, only after the model calls: the template's schema
+/// and compiler version, every scope field of the template against the context
+/// (namespace, profile, skill id and version, input digest, approved parent
+/// digest, safe baseline digest), and that the parent skill is the one the
+/// context was issued for. Running it here refuses a doomed group before any
+/// dispatch. Once it passes, the template's public scope fields are the trusted
+/// scope, which is what the comparison across groups reads.
 fn verify_trusted_edit_scope(group_id: &str, request: &OptimizationStepRequest<'_>) -> Result<()> {
-    let mut probe = request.edit_batch_template.clone();
-    probe.evidence = EvidenceClosure {
-        support: Vec::new(),
-        counterexamples: Vec::new(),
-        dependencies: Vec::new(),
-    };
-    probe.edits = Vec::new();
-    match compile_skill_edits(request.parent_skill, request.edit_context, &probe, &[]) {
-        Ok(_) => Ok(()),
-        Err(Error::Invalid(message)) if message == EMPTY_EVIDENCE_CLOSURE => Ok(()),
-        Err(error) => Err(in_group(group_id, error)),
-    }
+    validate_batch_scope(
+        request.parent_skill,
+        request.edit_context,
+        &request.edit_batch_template,
+    )
+    .map_err(|error| in_group(group_id, error))
 }
 
 /// Checks across the (at most two) groups of one job.
