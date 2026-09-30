@@ -13,6 +13,8 @@ import hashlib
 import json
 import os
 import selectors
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -33,6 +35,18 @@ REPLAY_RUN_SCHEMA = "rsia.management.replay_run.v1"
 # `d("non-existent-pool")` (evo_core::hash is SHA-256 hex).
 MISSING_POOL_DIGEST = hashlib.sha256(b"non-existent-pool").hexdigest()
 TERMINAL_STATES = {"blocked", "failed", "cancelled", "succeeded"}
+# E16.5 startup posture (stderr only; stdout is the MCP JSON-RPC channel).
+STARTUP_NORMAL = (
+    "rsia startup: code_execution=disabled sandbox=unavailable recovery=normal"
+)
+# No CLI switch can enable code execution, a sandbox or external network.
+FORBIDDEN_SWITCHES = [
+    "--allow-code-execution",
+    "--sandbox",
+    "--code-execution",
+    "--enable-code-execution",
+    "--allow-external-network",
+]
 
 
 def fail(message: str) -> None:
@@ -210,6 +224,7 @@ def smoke_http(binary: Path, root: Path) -> None:
         stderr=subprocess.PIPE,
         text=True,
     )
+    serve_stderr = ""
     try:
         wait_http(base)
         second = subprocess.run(
@@ -391,6 +406,12 @@ def smoke_http(binary: Path, root: Path) -> None:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+        if process.stderr is not None:
+            serve_stderr = process.stderr.read()
+    # The startup gate reports the code-execution and sandbox posture before
+    # the service listens, for an ordinary (never restored) data directory.
+    if STARTUP_NORMAL not in serve_stderr.splitlines():
+        fail(f"serve did not report its startup posture on stderr: {serve_stderr!r}")
 
 
 class McpClient:
@@ -457,6 +478,7 @@ def smoke_mcp(binary: Path, root: Path) -> None:
         text=True,
         bufsize=1,
     )
+    mcp_stderr = ""
     try:
         client = McpClient(process)
         client.request(
@@ -528,6 +550,12 @@ def smoke_mcp(binary: Path, root: Path) -> None:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+        if process.stderr is not None:
+            mcp_stderr = process.stderr.read()
+    # stdout carried only JSON-RPC frames (McpClient parses every line); the
+    # posture line must have gone to stderr.
+    if STARTUP_NORMAL not in mcp_stderr.splitlines():
+        fail(f"mcp did not report its startup posture on stderr: {mcp_stderr!r}")
 
 
 def smoke_mcp_duplicate(binary: Path, root: Path) -> None:
@@ -610,6 +638,357 @@ def smoke_mcp_duplicate(binary: Path, root: Path) -> None:
             retry.wait(timeout=5)
 
 
+def tree_digest(directory: Path) -> dict[str, str]:
+    """Relative path -> sha256 of every file under `directory` (links recorded as such)."""
+    result: dict[str, str] = {}
+    for path in sorted(directory.rglob("*")):
+        relative = path.relative_to(directory).as_posix()
+        if path.is_symlink():
+            result[relative] = f"symlink:{os.readlink(path)}"
+        elif path.is_dir():
+            result[relative] = "dir"
+        else:
+            result[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return result
+
+
+def v2_restore_receipt() -> str:
+    """A receipt with the structure restore_backup.py writes (rsia.restore_receipt.v2)."""
+    return json.dumps(
+        {
+            "schema_version": "rsia.restore_receipt.v2",
+            "backup_manifest_sha256": "a" * 64,
+            "replayed_revoke_events": 0,
+            "isolated": False,
+            "trusted_anchor": {
+                "path_local_only": "/nonexistent/anchor.sqlite3",
+                "watermarks": {"smoke": {"seq": 1, "digest": "b" * 64}},
+                "control_plane_digest": "c" * 64,
+                "verified_at": "2026-09-30T00:00:00+00:00",
+                "scope": "smoke structure only",
+            },
+            "receipt_scope": "local_only_not_for_export",
+        }
+    ) + "\n"
+
+
+def smoke_recovery_gate(binary: Path, root: Path) -> None:
+    """Startup recovery gate and deployment gate through the real process (E16.5)."""
+    source = root / "http.sqlite3"
+    if not source.is_file():
+        fail("the HTTP smoke database is missing")
+    port = free_port() + 2
+
+    def serve(data: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(binary), "serve", "--bind", f"127.0.0.1:{port}",
+             "--data", str(data), "--namespace", "smoke", *extra],
+            capture_output=True, text=True, timeout=10,
+        )
+
+    def mcp(data: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(binary), "mcp", "--data", str(data), "--namespace", "smoke", *extra],
+            input="", capture_output=True, text=True, timeout=10,
+        )
+
+    # No switch can enable code execution, a sandbox or external network.
+    for command in ("serve", "mcp"):
+        for switch in FORBIDDEN_SWITCHES:
+            refused = subprocess.run(
+                [str(binary), command, switch],
+                input="", capture_output=True, text=True, timeout=10,
+            )
+            if refused.returncode != 2 or "unexpected argument" not in refused.stderr:
+                fail(
+                    f"{command} {switch} was not refused as an unknown argument: "
+                    f"exit={refused.returncode} stderr={refused.stderr!r}"
+                )
+
+    # A restored-looking directory (an existing database and a v2-structured
+    # restore.json) without an anchor is quarantined and left untouched.
+    restored = root / "restored-shape"
+    restored.mkdir()
+    shutil.copyfile(source, restored / "rsia.sqlite3")
+    (restored / "restore.json").write_text(v2_restore_receipt())
+    before = tree_digest(restored)
+    for label, run in (("serve", serve), ("mcp", mcp)):
+        quarantined = run(restored / "rsia.sqlite3")
+        if (
+            quarantined.returncode == 0
+            or "recovery_quarantine" not in quarantined.stderr
+            or "not mounting" not in quarantined.stderr
+        ):
+            fail(
+                f"{label}: a restored directory without an anchor was not quarantined: "
+                f"exit={quarantined.returncode} stderr={quarantined.stderr!r}"
+            )
+        if "code_execution=disabled" in quarantined.stderr:
+            fail(f"{label}: a quarantined start reported a posture line")
+        if tree_digest(restored) != before:
+            fail(f"{label}: a quarantined start wrote to the data directory")
+
+    # An anchor is only accepted for a restored directory that was not admitted.
+    plain = root / "never-restored"
+    plain.mkdir()
+    shutil.copyfile(source, plain / "rsia.sqlite3")
+    before = tree_digest(plain)
+    for label, run in (("serve", serve), ("mcp", mcp)):
+        rejected = run(plain / "rsia.sqlite3", "--trusted-revocations-db", str(source))
+        if rejected.returncode == 0 or "startup_rejected" not in rejected.stderr:
+            fail(
+                f"{label}: an anchor for an unrestored directory was not rejected: "
+                f"exit={rejected.returncode} stderr={rejected.stderr!r}"
+            )
+        if tree_digest(plain) != before:
+            fail(f"{label}: a rejected start wrote to the data directory")
+    # ... and not even a directory that does not exist yet is created.
+    absent = root / "never-created"
+    rejected = serve(absent / "rsia.sqlite3", "--trusted-revocations-db", str(source))
+    if rejected.returncode == 0 or "startup_rejected" not in rejected.stderr:
+        fail(f"an anchor for a missing directory was not rejected: {rejected.stderr!r}")
+    if absent.exists():
+        fail("a rejected start created the data directory")
+
+
+def restore_inputs(base: Path, source: Path) -> tuple[Path, Path, Path]:
+    """Build a live control plane, a complete backup of it and an empty revoke delta.
+
+    `source` is a database the real MCP process wrote. A restore needs a revoke
+    watermark for every namespace, which a service that never revoked anything
+    does not have yet, so one is recorded before the backup is taken.
+    """
+    live_dir = base / "live"
+    live_dir.mkdir()
+    live = live_dir / "rsia.sqlite3"
+    # Opening it recovers the WAL the terminated process left behind.
+    with sqlite3.connect(source) as connection:
+        namespaces = [
+            row[0]
+            for row in connection.execute(
+                "SELECT namespace FROM objects UNION SELECT namespace FROM audit "
+                "UNION SELECT namespace FROM root_budget_namespaces ORDER BY namespace"
+            )
+        ]
+        if not namespaces:
+            fail("the MCP smoke database has no namespace")
+        for namespace in namespaces:
+            digest = hashlib.sha256(f"smoke-initial-{namespace}".encode()).hexdigest()
+            connection.execute(
+                "INSERT OR IGNORE INTO revoke_watermark(namespace,seq,digest) VALUES(?,1,?)",
+                (namespace, digest),
+            )
+        connection.commit()
+        connection.execute("VACUUM INTO ?", (str(live),))
+    backup = base / "backup"
+    backup.mkdir()
+    shutil.copyfile(live, backup / "rsia.sqlite3")
+    database = (backup / "rsia.sqlite3").read_bytes()
+    with sqlite3.connect(live) as connection:
+        migrations = [
+            {"version": version, "description": description,
+             "checksum_hex": bytes(checksum).hex(), "success": bool(success)}
+            for version, description, checksum, success in connection.execute(
+                "SELECT version,description,checksum,success FROM _sqlx_migrations ORDER BY version"
+            )
+        ]
+        marks = [
+            {"namespace": namespace, "seq": seq, "digest": digest}
+            for namespace, seq, digest in connection.execute(
+                "SELECT namespace,seq,digest FROM revoke_watermark ORDER BY namespace"
+            )
+        ]
+    manifest = json.dumps(
+        {
+            "schema_version": "rsia.backup.v2",
+            "complete": True,
+            "database": {
+                "path": "rsia.sqlite3",
+                "sha256": hashlib.sha256(database).hexdigest(),
+                "bytes": len(database),
+            },
+            "blobs": [],
+            "migrations": migrations,
+            "watermarks": marks,
+            "created_at": int(time.time()),
+        },
+        indent=2,
+    ).encode()
+    (backup / "backup-manifest.json").write_bytes(manifest)
+    delta = base / "delta.json"
+    delta.write_text(
+        json.dumps(
+            {
+                "schema_version": "rsia.revoke_delta.v1",
+                "base_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+                "namespaces": [
+                    {
+                        "namespace": mark["namespace"],
+                        "base_seq": mark["seq"],
+                        "base_digest": mark["digest"],
+                        "events": [],
+                        "latest_seq": mark["seq"],
+                        "latest_digest": mark["digest"],
+                    }
+                    for mark in marks
+                ],
+            }
+        )
+    )
+    return live, backup, delta
+
+
+def restore_into(base: Path, name: str, live: Path, backup: Path, delta: Path) -> Path:
+    """Run the real restore script; returns the new data directory."""
+    destination = base / name
+    restored = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parent / "restore_backup.py"),
+            "--backup", str(backup),
+            "--dest", str(destination),
+            "--revoke-delta", str(delta),
+            "--trusted-revocations-db", str(live),
+        ],
+        capture_output=True, text=True, timeout=60,
+    )
+    if restored.returncode != 0 or "RESTORE_OK" not in restored.stdout:
+        fail(f"restore_backup.py failed: {restored.stdout!r} {restored.stderr!r}")
+    return destination
+
+
+def stop(process: subprocess.Popen[str]) -> str:
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+    return process.stderr.read() if process.stderr is not None else ""
+
+
+def smoke_restore_admission(binary: Path, root: Path) -> None:
+    """A real restore is verified against its anchor, admitted once, and re-started.
+
+    Everything goes through the real binary and the real restore script: the
+    restored directory is refused while the anchor has moved on, verified and
+    admitted on its first start (HTTP and MCP entry points alike), and afterwards
+    starts without any anchor.
+    """
+    source = root / "mcp.sqlite3"
+    if not source.is_file():
+        fail("the MCP smoke database is missing")
+    base = root / "restore-e2e"
+    base.mkdir()
+    base = base.resolve()  # restore_backup.py refuses symlinks in a supplied path
+    live, backup, delta = restore_inputs(base, source)
+    serve_dir = restore_into(base, "restored-serve", live, backup, delta)
+    mcp_dir = restore_into(base, "restored-mcp", live, backup, delta)
+    stale_dir = restore_into(base, "restored-stale", live, backup, delta)
+    port = free_port() + 3
+    url = f"http://127.0.0.1:{port}"
+
+    def start_serve(data: Path, *extra: str) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            [str(binary), "serve", "--bind", f"127.0.0.1:{port}", "--data", str(data),
+             "--namespace", "smoke", "--actor", "agent-a", "--auth-token", AGENT_TOKEN,
+             *extra],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+    def posture(label: str) -> str:
+        return f"rsia startup: code_execution=disabled sandbox=unavailable recovery={label}"
+
+    def check_admission(directory: Path, receipt: bytes) -> None:
+        if (directory / "restore.json").read_bytes() != receipt:
+            fail("admission rewrote restore.json")
+        admission_path = directory / "restore.admission.json"
+        if not admission_path.is_file():
+            fail(f"no admission record after a verified start: {sorted(p.name for p in directory.iterdir())}")
+        admission = json.loads(admission_path.read_text())
+        expected = {
+            "schema_version": "rsia.restore_admission.v1",
+            "receipt_sha256": hashlib.sha256(receipt).hexdigest(),
+            "anchor_path_local_only": str(live),
+            "namespaces": ["smoke"],
+            "scope": "local_only_not_for_export",
+        }
+        for key, value in expected.items():
+            if admission.get(key) != value:
+                fail(f"admission {key} is {admission.get(key)!r}, expected {value!r}")
+        if not isinstance(admission.get("admitted_at"), int) or len(admission.get("verified_facts_digest", "")) != 64:
+            fail(f"admission record is malformed: {admission}")
+        if sorted(p.name for p in directory.iterdir() if p.name.startswith(".restore.admission")):
+            fail("a temporary admission file was left behind")
+
+    # 1. HTTP entry point: verified against the anchor, then admitted before serving.
+    receipt = (serve_dir / "restore.json").read_bytes()
+    process = start_serve(serve_dir / "rsia.sqlite3", "--trusted-revocations-db", str(live))
+    try:
+        wait_http(url)
+    finally:
+        stderr = stop(process)
+    if posture("restored_verified") not in stderr.splitlines():
+        fail(f"serve did not report a verified restore: {stderr!r}")
+    check_admission(serve_dir, receipt)
+
+    # 2. The admitted directory starts without any anchor ...
+    process = start_serve(serve_dir / "rsia.sqlite3")
+    try:
+        wait_http(url)
+    finally:
+        stderr = stop(process)
+    if posture("admitted_previously") not in stderr.splitlines():
+        fail(f"serve did not report an admitted directory: {stderr!r}")
+    # ... and refuses one.
+    before = tree_digest(serve_dir)
+    refused = subprocess.run(
+        [str(binary), "serve", "--bind", f"127.0.0.1:{port}", "--data", str(serve_dir / "rsia.sqlite3"),
+         "--trusted-revocations-db", str(live)],
+        capture_output=True, text=True, timeout=10,
+    )
+    if refused.returncode == 0 or "startup_rejected" not in refused.stderr:
+        fail(f"an anchor for an admitted directory was not rejected: {refused.stderr!r}")
+    if tree_digest(serve_dir) != before:
+        fail("a rejected start wrote to an admitted data directory")
+
+    # 3. MCP entry point: the admission lands before stdin is even read.
+    receipt = (mcp_dir / "restore.json").read_bytes()
+    started = subprocess.run(
+        [str(binary), "mcp", "--data", str(mcp_dir / "rsia.sqlite3"), "--namespace", "smoke",
+         "--trusted-revocations-db", str(live)],
+        input="", capture_output=True, text=True, timeout=30,
+    )
+    if posture("restored_verified") not in started.stderr.splitlines():
+        fail(f"mcp did not report a verified restore: {started.stderr!r}")
+    if started.stdout.strip():
+        fail(f"mcp wrote to stdout before any request: {started.stdout!r}")
+    check_admission(mcp_dir, receipt)
+
+    # 4. An anchor that moved on after the restore quarantines the directory, untouched.
+    with sqlite3.connect(live) as connection:
+        connection.execute(
+            "UPDATE revoke_watermark SET seq=2,digest=?",
+            (hashlib.sha256(b"revoked-after-restore").hexdigest(),),
+        )
+    before = tree_digest(stale_dir)
+    stale = subprocess.run(
+        [str(binary), "serve", "--bind", f"127.0.0.1:{port}", "--data", str(stale_dir / "rsia.sqlite3"),
+         "--trusted-revocations-db", str(live)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if (
+        stale.returncode == 0
+        or "recovery_quarantine" not in stale.stderr
+        or "advanced since restore (namespace smoke: seq 1 → 2)" not in stale.stderr
+    ):
+        fail(f"a restore behind its anchor was not quarantined: exit={stale.returncode} {stale.stderr!r}")
+    if tree_digest(stale_dir) != before:
+        fail("a quarantined restore was written to")
+    if (stale_dir / "restore.admission.json").exists() or (stale_dir / ".rsia.lock").exists():
+        fail("a quarantined restore gained an admission record or a lock file")
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print("usage: smoke_cli.py <rsia-binary>", file=sys.stderr)
@@ -655,6 +1034,8 @@ def main(argv: list[str]) -> int:
             smoke_http(binary, root)
             smoke_mcp(binary, root)
             smoke_mcp_duplicate(binary, root)
+            smoke_recovery_gate(binary, root)
+            smoke_restore_admission(binary, root)
     except Exception as error:
         traceback.print_exc()
         print(f"SMOKE_CLI_FAILED: {error}", file=sys.stderr)
