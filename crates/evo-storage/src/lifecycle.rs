@@ -2314,6 +2314,16 @@ async fn cleanup_node_content(
             | "rsia.monitoring.environment_drift.v1",
             _,
         ) => true,
+        // E12 curriculum facts that are control registration, scheduling or quota:
+        // the administrator's profile, the coverage probe job (limits, attempt
+        // outcomes, terminal) and the idempotent schedule receipt survive a source
+        // revocation; revocation must not erase the control record or the
+        // scheduling history. They hold ids, digests and counters only.
+        (
+            "artifact",
+            "rsia.curriculum_artifact_envelope.v1",
+            "curriculum_profile_v1" | "coverage_probe_job_v1" | "probe_schedule_receipt_v1",
+        ) => true,
         ("evaluation", "", _) => value.as_object().is_some_and(|m| {
             m.len() == 3
                 && ["id", "score", "state"]
@@ -2379,6 +2389,21 @@ async fn cleanup_node_content(
             | "rsia.monitoring.consolidation_proposal.v1"
             | "rsia.monitoring.consolidation_staging.v1",
             _,
+        ) => true,
+        // E12 curriculum content derived from source runs (the learner state with
+        // its completed cycles and failure clusters, the cycle receipts, proposal
+        // attempts, structured test proposals, validity reports and task
+        // selections) is redacted; the preserved profile, probe job and schedule
+        // receipt above keep the control, limit and idempotency facts.
+        (
+            "artifact",
+            "rsia.curriculum_artifact_envelope.v1",
+            "learner_state_v2"
+            | "development_cycle_receipt_v1"
+            | "curriculum_proposal_attempt_v1"
+            | "structured_test_proposal_v1"
+            | "curriculum_validity_report_v1"
+            | "curriculum_selection_v1",
         ) => true,
         // E03's persisted SourceSelection predates a schema field; exact fields define its shape.
         ("artifact", "", _) => value.as_object().is_some_and(|m| {
