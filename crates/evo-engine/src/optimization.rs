@@ -469,6 +469,9 @@ pub enum OptimizationJournalStage {
     Rank,
     EditCompile,
     Development,
+    /// The model-call facts of a consolidation step (`ModelStage::Consolidate`).
+    /// The step's own `StepPrepared`/`StepCompleted` facts stay under `Merge`.
+    Consolidate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1230,10 +1233,13 @@ async fn run_optimization_step_inner(
     let per_batch_limit = MAX_SUGGESTIONS / reflection.batches.len();
     let mut suggestions = Vec::new();
     for (index, batch) in reflection.batches.iter().enumerate() {
-        let stage = match batch.kind {
-            ReflectionBatchKind::Failure => ModelStage::ReflectFailure,
-            ReflectionBatchKind::Success => ModelStage::ReflectSuccess,
-        };
+        let stage = call_stage(
+            request.model_context.stage,
+            match batch.kind {
+                ReflectionBatchKind::Failure => ModelStage::ReflectFailure,
+                ReflectionBatchKind::Success => ModelStage::ReflectSuccess,
+            },
+        );
         let context =
             model_context_for_batch(&request.model_context, batch, stage, index, per_batch_limit);
         let payload = serde_json::to_string(batch).map_err(|_| Error::Internal)?;
@@ -1765,7 +1771,7 @@ async fn rank_suggestions(
             request_id: format!("optrank-{}", fingerprint(&base.request_id)?),
             namespace: base.namespace.clone(),
             purpose: base.purpose,
-            stage: ModelStage::Rank,
+            stage: call_stage(base.stage, ModelStage::Rank),
             episode_id: base.episode_id.clone(),
             step: base.step,
             attempt: base.attempt,
@@ -1950,6 +1956,20 @@ fn journal_stage(stage: ModelStage) -> OptimizationJournalStage {
         ModelStage::ReflectSuccess => OptimizationJournalStage::ReflectSuccess,
         ModelStage::Merge => OptimizationJournalStage::Merge,
         ModelStage::Rank => OptimizationJournalStage::Rank,
+        ModelStage::Consolidate => OptimizationJournalStage::Consolidate,
+    }
+}
+
+/// The stage one model call of a step is made under. A consolidation step (base
+/// stage `Consolidate`) makes all of its calls under that one stage, so the
+/// ledger meters them as `Consolidation` (plan §3.6, §11.5) inside the claim's
+/// root budget. For every other step the base stage is ignored and `otherwise`
+/// (the batch kind, or `Rank`) decides, exactly as before.
+fn call_stage(base: ModelStage, otherwise: ModelStage) -> ModelStage {
+    if base == ModelStage::Consolidate {
+        ModelStage::Consolidate
+    } else {
+        otherwise
     }
 }
 
@@ -2312,7 +2332,39 @@ pub(crate) fn optimization_request_digest(request: &OptimizationStepRequest<'_>)
     fingerprint(&optimization_request_input(request))
 }
 
+/// Runs one ordinary optimization step. The `Consolidate` base stage belongs to
+/// the consolidation run alone (`MonitoringCoordinator::run_consolidation`): any
+/// other caller presenting it is refused before anything is journaled or
+/// dispatched.
 pub async fn run_optimization_step(
+    model: Option<&dyn ModelPort>,
+    runner: Option<&dyn DevRunner>,
+    journal: Option<&dyn OptimizationJournal>,
+    request: OptimizationStepRequest<'_>,
+) -> Result<OptimizationStepOutcome> {
+    if request.model_context.stage == ModelStage::Consolidate {
+        return Err(Error::Forbidden);
+    }
+    run_step(model, runner, journal, request).await
+}
+
+/// Entry of `MonitoringCoordinator::run_consolidation`. The step must carry the
+/// `Consolidate` base stage, which meters every model call of the step under the
+/// `Consolidation` budget stage; any other base stage is refused before anything
+/// is journaled or dispatched.
+pub(crate) async fn run_consolidation_step(
+    model: Option<&dyn ModelPort>,
+    runner: Option<&dyn DevRunner>,
+    journal: Option<&dyn OptimizationJournal>,
+    request: OptimizationStepRequest<'_>,
+) -> Result<OptimizationStepOutcome> {
+    if request.model_context.stage != ModelStage::Consolidate {
+        return Err(Error::Forbidden);
+    }
+    run_step(model, runner, journal, request).await
+}
+
+async fn run_step(
     model: Option<&dyn ModelPort>,
     runner: Option<&dyn DevRunner>,
     journal: Option<&dyn OptimizationJournal>,

@@ -508,6 +508,10 @@ pub fn validate_suggestion_pool(
     Ok(())
 }
 
+/// The optimizer stage a model request is made under. The serialized snake_case
+/// label is part of the request's `cache_key_digest`, so a variant's label is
+/// frozen once issued; a new variant only adds a label and never changes an
+/// existing request's digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelStage {
@@ -515,6 +519,10 @@ pub enum ModelStage {
     ReflectSuccess,
     Merge,
     Rank,
+    /// Every model call of a cross-cycle consolidation step (plan §11.5). It is
+    /// metered under its own `Consolidation` budget stage, still inside the
+    /// claim's root budget (plan §3.6). Serialized as `"consolidate"`.
+    Consolidate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

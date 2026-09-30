@@ -556,7 +556,22 @@ impl ModelPort for EditingModelPort {
                 .content,
         )
         .map_err(|_| Error::Invalid("fixture strategy input invalid".into()))?;
-        let (id, batch_id, field, start) = match request.stage {
+        // A consolidation step makes every model call under `Consolidate`, so the
+        // reflect stage is read from the batch the call carries: its evidence part
+        // is labelled with the batch id.
+        let stage = match request.stage {
+            ModelStage::Consolidate => request
+                .input
+                .iter()
+                .find_map(|part| match part.label.as_str() {
+                    "reflection-failure" => Some(ModelStage::ReflectFailure),
+                    "reflection-success" => Some(ModelStage::ReflectSuccess),
+                    _ => None,
+                })
+                .ok_or_else(|| Error::Invalid("unexpected fixture batch".into()))?,
+            other => other,
+        };
+        let (id, batch_id, field, start) = match stage {
             ModelStage::ReflectFailure => (
                 "fix-rule",
                 "reflection-failure",
@@ -576,7 +591,7 @@ impl ModelPort for EditingModelPort {
             hypothesis: "bounded fixture hypothesis".into(),
             batch_ids: vec![batch_id.into()],
             support: vec![source.clone()],
-            counterexamples: if request.stage == ModelStage::ReflectSuccess {
+            counterexamples: if stage == ModelStage::ReflectSuccess {
                 vec![source.clone()]
             } else {
                 vec![]
@@ -883,7 +898,7 @@ impl StepMaterial {
                 request_id: format!("consolidation-request-{sequence}"),
                 namespace: TENANT.into(),
                 purpose: Purpose::Development,
-                stage: ModelStage::Merge,
+                stage: ModelStage::Consolidate,
                 episode_id: claim_id.into(),
                 step: sequence,
                 attempt: 1,
