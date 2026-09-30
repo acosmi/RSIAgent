@@ -25,6 +25,23 @@ def _write(path: Path, content: str = "stub\n") -> None:
 def _valid_manifest_dict() -> dict:
     return copy.deepcopy(json.loads((REAL_ROOT / "reports/support-scope.json").read_text(encoding="utf-8")))
 
+def _fresh_record(base: dict, task: str, name: str, stem: str) -> dict:
+    """Copy an existing record but give it its own id, PR, source, log, input and record_source."""
+    record = copy.deepcopy(base)
+    record.update(
+        {
+            "id": f"{task}.{name}",
+            "source_sha": hashlib.sha1(f"{task}.{name}".encode()).hexdigest(),
+            "pr": "https://github.com/acosmi/RSIAgent/pull/999",
+            "merged_sha": None,
+            "log_path": f"out/fixture/{stem}.log",
+            "input_ref": f"out/fixture/{stem}-input.json",
+            "input_digest": hashlib.sha256(stem.encode()).hexdigest(),
+            "record_source": f"out/fixture/{stem}-acceptance.json",
+        }
+    )
+    return record
+
 class FixtureRepo:
     def __init__(self, root: Path, manifest: dict | None = None):
         self.root = root
@@ -329,6 +346,282 @@ class RejectionTests(unittest.TestCase):
             manifest["traceability"]["k_commitments"][4]["e_tasks"] = ["E18"]
             repo = FixtureRepo(Path(tmp), manifest)
             self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+
+class ControllerFalseAcceptanceTests(unittest.TestCase):
+    """One rejection per false acceptance reproduced by the controller (2026-09-30), plus legitimate counterparts."""
+
+    def _errors(self, manifest: dict) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            report = css.run_check(repo.root, "reports/support-scope.json", None)
+        self.assertFalse(report.structure_valid, "manipulated manifest must be rejected")
+        return report.errors
+
+    def _assert_valid(self, manifest: dict) -> css.CheckReport:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            report = css.run_check(repo.root, "reports/support-scope.json", None)
+        self.assertTrue(report.structure_valid, report.errors)
+        return report
+
+    def test_rejects_planned_scope_carrying_verified_evidence(self):
+        manifest = _valid_manifest_dict()
+        e14 = manifest["e_scopes"]["E14"]
+        self.assertEqual(e14["status"], "planned")
+        e14["verified_subscopes"].append(
+            _fresh_record(manifest["e_scopes"]["E13"]["verified_subscopes"][0], "E14", "controller_acceptance", "e14")
+        )
+        errors = self._errors(manifest)
+        self.assertIn(
+            "E14: status 'planned' is incompatible with verified evidence records ['E14.controller_acceptance']",
+            errors[0],
+        )
+
+    def test_rejects_parent_scope_stronger_than_weakest_child(self):
+        manifest = _valid_manifest_dict()
+        e16 = manifest["e_scopes"]["E16"]
+        e16["status"] = "verified"
+        e16["remaining"] = []
+        e16["implementation_files"].append("crates/evo-engine/src/hosts.rs")
+        record = _fresh_record(
+            manifest["e_scopes"]["E16.4"]["verified_subscopes"][0], "E16", "gate_controller_acceptance", "e16-gate"
+        )
+        e16["verified_subscopes"].append(record)
+        e16["completion_evidence_refs"] = [record["id"]]
+        errors = self._errors(manifest)
+        self.assertIn(
+            "E16: status 'verified' is stronger than sub-package E16.1 status 'implemented_not_verified'",
+            errors[0],
+        )
+        with self.subTest(variant="implemented_not_verified parent over a blocked child"):
+            manifest = _valid_manifest_dict()
+            manifest["e_scopes"]["E16"]["status"] = "implemented_not_verified"
+            errors = self._errors(manifest)
+            self.assertIn(
+                "E16: status 'implemented_not_verified' is stronger than sub-package E16.4 status 'blocked'",
+                errors[0],
+            )
+
+    def test_rejects_verified_status_for_optional_disabled_scope(self):
+        manifest = _valid_manifest_dict()
+        self.assertIn("E17", manifest["optional_disabled"])
+        e17 = manifest["e_scopes"]["E17"]
+        e17["status"] = "verified"
+        e17["remaining"] = []
+        record = _fresh_record(
+            manifest["e_scopes"]["E00"]["verified_subscopes"][0], "E17", "scorer_evolution_controller_acceptance", "e17"
+        )
+        e17["verified_subscopes"].append(record)
+        e17["completion_evidence_refs"] = [record["id"]]
+        errors = self._errors(manifest)
+        self.assertIn(
+            "E17: optional scope is listed in optional_disabled and no enablement is recorded; status 'verified' is not allowed",
+            errors[0],
+        )
+
+    def test_rejects_evidence_duplicated_or_borrowed_from_another_task(self):
+        manifest = _valid_manifest_dict()
+        e13, e14 = manifest["e_scopes"]["E13"], manifest["e_scopes"]["E14"]
+        e14["status"] = "in_progress"
+        e14["implementation_files"] = list(e13["implementation_files"])
+        borrowed = copy.deepcopy(e13["verified_subscopes"][0])
+        borrowed["id"] = "E14.controller_acceptance"
+        e14["verified_subscopes"].append(borrowed)
+        errors = self._errors(manifest)
+        self.assertIn(
+            f"E14.controller_acceptance: log_path {borrowed['log_path']!r} duplicates evidence E13.controller_acceptance of task E13",
+            errors[0],
+        )
+        with self.subTest(variant="same test run re-logged under another task"):
+            manifest = _valid_manifest_dict()
+            e13, e14 = manifest["e_scopes"]["E13"], manifest["e_scopes"]["E14"]
+            e14["status"] = "in_progress"
+            rerun = copy.deepcopy(e13["verified_subscopes"][0])
+            rerun.update({"id": "E14.controller_acceptance", "log_path": "out/fixture/e14-rerun.log"})
+            e14["verified_subscopes"].append(rerun)
+            errors = self._errors(manifest)
+            self.assertIn(
+                f"the same test run ({rerun['test_entry']} at source_sha {rerun['source_sha']}) is already claimed by E13.controller_acceptance of task E13",
+                errors[0],
+            )
+        with self.subTest(variant="evidence id namespaced under a foreign task"):
+            manifest = _valid_manifest_dict()
+            e14 = manifest["e_scopes"]["E14"]
+            e14["status"] = "in_progress"
+            e14["verified_subscopes"].append(
+                _fresh_record(manifest["e_scopes"]["E13"]["verified_subscopes"][0], "E13", "second_controller_acceptance", "e13-second")
+            )
+            errors = self._errors(manifest)
+            self.assertIn("E14: evidence id 'E13.second_controller_acceptance' is not namespaced under its own task", errors[0])
+        with self.subTest(variant="test target outside the task's declared crates"):
+            manifest = _valid_manifest_dict()
+            e14 = manifest["e_scopes"]["E14"]
+            e14["status"] = "in_progress"
+            e14["verified_subscopes"].append(
+                _fresh_record(manifest["e_scopes"]["E01"]["verified_subscopes"][0], "E14", "controller_acceptance", "e14-foreign")
+            )
+            errors = self._errors(manifest)
+            self.assertIn(
+                "E14.controller_acceptance: test_entry 'crates/evo-core/tests/evaluation_v41.rs' (package evo-core) is not among E14's declared implementation_files nor inside a crate they declare",
+                errors[0],
+            )
+
+    def test_rejects_unknown_keys_asserting_effect_or_verdict(self):
+        manifest = _valid_manifest_dict()
+        first_v = manifest["traceability"]["v_scenarios"][0]["id"]
+        first_b = manifest["traceability"]["b_commitments"][0]["id"]
+        first_so = manifest["traceability"]["so_sources"][0]["id"]
+        cases = [
+            ("scope entry", ("e_scopes", "E13"), "effect", "E13 scope entry: unknown key(s) ['effect']"),
+            ("evidence record", ("e_scopes", "E13", "verified_subscopes", 0), "verdict", "E13 evidence E13.controller_acceptance: unknown key(s) ['verdict']"),
+            ("v_scenario", ("traceability", "v_scenarios", 0), "benefit", f"{first_v}: unknown key(s) ['benefit']"),
+            ("commitment", ("traceability", "b_commitments", 0), "effect", f"{first_b}: unknown key(s) ['effect']"),
+            ("so_source", ("traceability", "so_sources", 0), "effect", f"{first_so}: unknown key(s) ['effect']"),
+            ("local_use", ("traceability", "so_sources", 0, "local_use"), "effect", f"{first_so} local_use: unknown key(s) ['effect']"),
+            ("traceability", ("traceability",), "effect", "traceability: unknown key(s) ['effect']"),
+            ("trace_index_coverage", ("trace_index_coverage", "E00"), "effect", "E00 trace_index_coverage: unknown key(s) ['effect']"),
+            ("dimensions", ("dimensions",), "benefit", "dimensions: unknown key(s) ['benefit']"),
+            ("root", (), "effect", "manifest root: unknown key(s) ['effect']"),
+        ]
+        for name, path, key, expected in cases:
+            with self.subTest(object=name):
+                manifest = _valid_manifest_dict()
+                target = manifest
+                for step in path:
+                    target = target[step]
+                target[key] = "improved"
+                errors = self._errors(manifest)
+                self.assertIn(expected, errors[0])
+                self.assertIn("not part of the rsia.support_scope.v2 schema", errors[0])
+
+    def test_rejects_merged_sha_inconsistent_with_manifest_merge_facts(self):
+        def pr47(manifest: dict) -> dict:
+            record = manifest["e_scopes"]["E16.4"]["verified_subscopes"][0]
+            self.assertTrue(record["pr"].endswith("/47"))
+            return record
+
+        self.assertIsNone(pr47(_valid_manifest_dict())["merged_sha"])
+        with self.subTest(variant="merged_sha copied from another PR's merge commit"):
+            manifest = _valid_manifest_dict()
+            record = pr47(manifest)
+            record["merged_sha"] = manifest["e_scopes"]["E13"]["verified_subscopes"][0]["merged_sha"]
+            errors = self._errors(manifest)
+            self.assertIn(
+                f"E16.4.trusted_host_rejection_controller_acceptance: merged_sha {record['merged_sha']} is already recorded as the merge commit of PR #42 (E13.controller_acceptance)",
+                errors[0],
+            )
+        with self.subTest(variant="merged_sha equal to another PR's source_sha"):
+            manifest = _valid_manifest_dict()
+            pr47(manifest)["merged_sha"] = manifest["e_scopes"]["E13"]["verified_subscopes"][0]["source_sha"]
+            errors = self._errors(manifest)
+            self.assertIn("is the source_sha of PR #42 (E13.controller_acceptance), not a merge of PR #47", errors[0])
+        with self.subTest(variant="same PR merged in one record and unmerged in another"):
+            manifest = _valid_manifest_dict()
+            second = _fresh_record(pr47(manifest), "E16.4", "second_controller_acceptance", "pr47-second")
+            second.update({"pr": pr47(manifest)["pr"], "merged_sha": "b" * 40})
+            manifest["e_scopes"]["E16.4"]["verified_subscopes"].append(second)
+            errors = self._errors(manifest)
+            self.assertIn(
+                f"E16.4.second_controller_acceptance: PR #47 carries merged_sha {'b' * 40!r} here but None in E16.4.trusted_host_rejection_controller_acceptance",
+                errors[0],
+            )
+        with self.subTest(variant="merged_sha on a record whose pr_state is draft"):
+            manifest = _valid_manifest_dict()
+            pr47(manifest).update({"pr_state": "draft", "merged_sha": "c" * 40})
+            errors = self._errors(manifest)
+            self.assertIn(
+                f"E16.4.trusted_host_rejection_controller_acceptance: merged_sha {'c' * 40} is set but the record's pr_state is 'draft', not 'merged'",
+                errors[0],
+            )
+        with self.subTest(variant="pr_state merged without merged_sha"):
+            manifest = _valid_manifest_dict()
+            pr47(manifest)["pr_state"] = "merged"
+            errors = self._errors(manifest)
+            self.assertIn("E16.4.trusted_host_rejection_controller_acceptance: pr_state is 'merged' but merged_sha is null", errors[0])
+        with self.subTest(variant="malformed merged_sha"):
+            manifest = _valid_manifest_dict()
+            pr47(manifest)["merged_sha"] = "2e209dc"
+            errors = self._errors(manifest)
+            self.assertIn("merged_sha must be null or lowercase 40-hex", errors[0])
+
+    def test_unverifiable_merged_sha_claim_is_named_in_needs_verification(self):
+        """A fabricated merged_sha that collides with nothing in the manifest cannot be refuted without git
+        ancestry (no subprocess allowed); the checker must at least name the claim as unverified."""
+        manifest = _valid_manifest_dict()
+        record = manifest["e_scopes"]["E16.4"]["verified_subscopes"][0]
+        record["merged_sha"] = hashlib.sha1(b"fabricated merge of pr47").hexdigest()
+        report = self._assert_valid(manifest)
+        self.assertTrue(
+            any(
+                f"{record['id']}: merged_sha {record['merged_sha']} for PR #47 (pr_state unrecorded) is a manifest assertion" in item
+                for item in report.needs_verification
+            ),
+            report.needs_verification,
+        )
+
+    def test_new_task_with_fresh_evidence_is_still_registrable(self):
+        manifest = _valid_manifest_dict()
+        e14 = manifest["e_scopes"]["E14"]
+        e14["status"] = "implemented_not_verified"
+        record = _fresh_record(
+            manifest["e_scopes"]["E13"]["verified_subscopes"][0], "E14", "inheritance_controller_acceptance", "e14-fresh"
+        )
+        record.update(
+            {
+                "test_entry": "crates/evo-engine/tests/meta.rs",
+                "command": "cargo test --locked --offline -p evo-engine --test meta",
+                "pr_state": "open",
+            }
+        )
+        e14["verified_subscopes"].append(record)
+        self._assert_valid(manifest)
+
+    def test_parent_verified_when_all_children_verified_is_allowed(self):
+        manifest = _valid_manifest_dict()
+        scopes = manifest["e_scopes"]
+        base = scopes["E13"]["verified_subscopes"][0]
+        plan = {
+            "E16.1": ("evo-engine", "import_gate"), "E16.2": ("evo-engine", "packages_gate"), "E16.3": ("evo-engine", "seeds_gate"),
+            "E16.4": ("evo-engine", "hosts_gate"), "E16.5": ("evo-engine", "capacity_gate"), "E16.6": ("evo-core", "support_scope"),
+            "E16": ("evo-engine", "delivery_gate"),
+        }
+        scopes["E16"]["implementation_files"].append("crates/evo-engine/src/delivery_gate.rs")
+        for task, (package, target) in plan.items():
+            record = _fresh_record(base, task, "gate_controller_acceptance", task.lower().replace(".", "-"))
+            record.update(
+                {
+                    "test_entry": f"crates/{package}/tests/{target}.rs",
+                    "command": f"cargo test --locked --offline -p {package} --test {target}",
+                }
+            )
+            entry = scopes[task]
+            entry["verified_subscopes"].append(record)
+            entry["status"] = "verified"
+            entry["remaining"] = []
+            entry["completion_evidence_refs"] = [record["id"]]
+        self._assert_valid(manifest)
+
+    def test_genuinely_merged_pr_with_consistent_state_is_allowed(self):
+        manifest = _valid_manifest_dict()
+        e10 = manifest["e_scopes"]["E10"]
+        merged_record = e10["verified_subscopes"][1]
+        self.assertTrue(merged_record["pr"].endswith("/43") and merged_record["merged_sha"])
+        merged_record["pr_state"] = "merged"
+        manifest["e_scopes"]["E16.4"]["verified_subscopes"][0]["pr_state"] = "draft"
+        sibling = _fresh_record(merged_record, "E10", "replay_management_second_target", "e10-second")
+        sibling.update(
+            {
+                "pr": merged_record["pr"],
+                "source_sha": merged_record["source_sha"],
+                "merged_sha": merged_record["merged_sha"],
+                "pr_state": "merged",
+                "test_entry": "crates/evo-engine/tests/replay_second.rs",
+                "command": "cargo test --locked --offline -p evo-engine --test replay_second",
+            }
+        )
+        e10["verified_subscopes"].append(sibling)
+        report = self._assert_valid(manifest)
+        self.assertTrue(any("for PR #43 (pr_state merged) is a manifest assertion" in item for item in report.needs_verification))
 
 class PathSafetyTests(unittest.TestCase):
     def test_rejects_dot_dot_path_escape(self):
