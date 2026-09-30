@@ -8,6 +8,10 @@
 //! its world (record -> world); the cleanup follows `dependents`, so it reaches
 //! them as run -> world -> record.
 //!
+//! After the cleanup a record is a redaction tombstone, an expected state: the
+//! coordinator's reads name it (`Conflict`, HTTP 409) and keep `Internal` for a
+//! body that is neither an envelope nor a tombstone (real corruption).
+//!
 //! Not covered (and not claimed): records written before the edges existed have
 //! none and nothing back-fills them (`a_record_without_the_edge_...` pins that
 //! boundary), and the cleanup's redaction rules themselves, which are unchanged.
@@ -27,7 +31,8 @@ use evo_core::skill_edit::{
     SkillTextEdit, SkillTextField, TextEditOperation, TrustedEditContext, skill_snapshot_digest,
 };
 use evo_core::strategy::{
-    ElasticPolicyV1, ExplorationCapsV1, HistoryOutcome, OptimizationHistoryEntry, SimulationContext,
+    ElasticPolicyV1, ExplorationCapsV1, HistoryOutcome, HistoryQuery, OptimizationHistoryEntry,
+    SimulationContext,
 };
 use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, hash};
 use evo_engine::evidence::{
@@ -48,7 +53,7 @@ use evo_engine::optimization::{
 };
 use evo_storage::Store;
 use evo_storage::lifecycle::{CleanupState, CleanupStatus};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -968,6 +973,26 @@ fn content_of_uncertain(envelope: &Value) -> Vec<String> {
     vec![digest]
 }
 
+/// The error is the coordinator naming a redacted record: a `Conflict` whose
+/// text says so and carries the record kind and id.
+fn assert_names_redaction(name: &str, error: &Error, record_kind: &str, id: &str) {
+    match error {
+        Error::Conflict(message) => {
+            assert!(message.contains("redacted"), "{name}: {message}");
+            assert!(message.contains(record_kind), "{name}: {message}");
+            assert!(message.contains(id), "{name}: {message}");
+        }
+        other => panic!("{name}: expected a Conflict naming the redaction, got {other:?}"),
+    }
+}
+
+fn names_redaction<T: std::fmt::Debug>(name: &str, result: Result<T>, record_kind: &str, id: &str) {
+    match result {
+        Err(error) => assert_names_redaction(name, &error, record_kind, id),
+        Ok(value) => panic!("{name} succeeded on a redacted {record_kind} {id}: {value:?}"),
+    }
+}
+
 /// What the coordinator's entry points say about `world_id` right now.
 struct Probe {
     results: Vec<(&'static str, Result<String>)>,
@@ -1216,18 +1241,186 @@ async fn a_redacted_world_stays_closed_after_the_cleanup() {
     .await;
     assert_eq!(cleaned.results.len(), 5);
     for (name, error) in cleaned.errors() {
-        // Known gap, unchanged here: a redacted envelope does not decode, so
-        // the coordinator's record reads report it as `Internal` rather than
-        // naming the revocation (E03's development artifacts say `Conflict`).
-        // Every entry point is closed either way, and none reached a model.
-        assert!(
-            matches!(
-                error,
-                Error::NotFound | Error::Forbidden | Error::Conflict(_) | Error::Internal
-            ),
-            "{name}: {error:?}"
-        );
+        // The world is a tombstone now, an expected state: every entry point
+        // names it (`Conflict`, HTTP 409). None reports a storage failure
+        // (`Internal`, HTTP 500), and none reached a model.
+        assert_names_redaction(name, error, WORLD, "world-chain");
     }
+}
+
+#[tokio::test]
+async fn a_redacted_record_is_named_by_its_kind_and_id_not_reported_as_internal() {
+    // Genuine tombstones: clean the same chain in a second store. The ids, and
+    // so the storage ids, are the same there. In the first store the world is
+    // still live, so each read below reaches the tombstone of one record.
+    let donor = env().await;
+    let donor_chain = chain(&donor, "world-chain").await;
+    revoke_and_clean(&donor.store, "run-failure", 4).await;
+
+    let env = env().await;
+    let chain = chain(&env, "world-chain").await;
+    assert_eq!(chain.nodes, donor_chain.nodes);
+    assert_eq!(chain.dispatches, donor_chain.dispatches);
+    assert_eq!(chain.history, donor_chain.history);
+    let parent = hash(b"approved-parent");
+    let environment = hash(b"env");
+    let query = HistoryQuery {
+        parent_digest: &parent,
+        environment_digest: &environment,
+        task_family: "family",
+        source_watermark: 1,
+    };
+
+    // A node, read by the decision and by the usage view.
+    let node = &chain.nodes[0];
+    let original = raw_record(&env.store, NODE, node).await;
+    let tombstone = raw_record(&donor.store, NODE, node).await;
+    assert_eq!(tombstone["schema_version"], "rsia.redacted.v1");
+    put_raw_record(&env.store, NODE, node, &tombstone).await;
+    names_redaction(
+        "decide_next",
+        env.coordinator.decide_next("world-chain").await,
+        NODE,
+        node,
+    );
+    names_redaction(
+        "verified_mechanism_usage",
+        env.coordinator
+            .verified_mechanism_usage("world-chain")
+            .await,
+        NODE,
+        node,
+    );
+    put_raw_record(&env.store, NODE, node, &original).await;
+
+    // A dispatch fact, read by the usage view and by a reconnecting `run_next`.
+    let dispatch = &chain.dispatches[0];
+    let original = raw_record(&env.store, DISPATCH, dispatch).await;
+    let tombstone = raw_record(&donor.store, DISPATCH, dispatch).await;
+    assert_eq!(tombstone["schema_version"], "rsia.redacted.v1");
+    put_raw_record(&env.store, DISPATCH, dispatch, &tombstone).await;
+    names_redaction(
+        "verified_mechanism_usage",
+        env.coordinator
+            .verified_mechanism_usage("world-chain")
+            .await,
+        DISPATCH,
+        dispatch,
+    );
+    names_redaction(
+        "run_next (reconnect)",
+        env.coordinator
+            .run_next(
+                None,
+                None,
+                None,
+                env.fixture.request("world-chain", 1, "world-chain-1"),
+            )
+            .await,
+        DISPATCH,
+        dispatch,
+    );
+    put_raw_record(&env.store, DISPATCH, dispatch, &original).await;
+
+    // A history entry, read by the history selection.
+    let entry = &chain.history[0];
+    let original = raw_record(&env.store, HISTORY, entry).await;
+    let tombstone = raw_record(&donor.store, HISTORY, entry).await;
+    assert_eq!(tombstone["schema_version"], "rsia.redacted.v1");
+    put_raw_record(&env.store, HISTORY, entry, &tombstone).await;
+    names_redaction(
+        "matching_history",
+        env.coordinator
+            .matching_history("world-chain", query.clone())
+            .await,
+        HISTORY,
+        entry,
+    );
+    put_raw_record(&env.store, HISTORY, entry, &original).await;
+
+    // Put back, the same calls work again: the world was live all along.
+    assert!(env.coordinator.decide_next("world-chain").await.is_ok());
+    assert_eq!(
+        env.coordinator
+            .verified_mechanism_usage("world-chain")
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        env.coordinator
+            .matching_history("world-chain", query)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_corrupt_record_stays_internal_and_is_not_taken_for_a_redaction() {
+    // Only the cleanup's tombstone is named. A body that is neither an envelope
+    // nor that tombstone is corruption, and it stays `Internal`.
+    let env = env().await;
+    let chain = chain(&env, "world-chain").await;
+    let corruptions = [
+        ("a string instead of an envelope", json!("not an envelope")),
+        (
+            "an envelope without its payload",
+            json!({"schema_version": ENVELOPE, "unexpected": true}),
+        ),
+        (
+            "a near miss of the tombstone schema",
+            json!({"schema_version": "rsia.redacted.v2", "state": "source_revoked"}),
+        ),
+    ];
+    for (what, body) in &corruptions {
+        // A node.
+        let node = &chain.nodes[0];
+        let original = raw_record(&env.store, NODE, node).await;
+        put_raw_record(&env.store, NODE, node, body).await;
+        let result = env.coordinator.decide_next("world-chain").await;
+        assert!(
+            matches!(result, Err(Error::Internal)),
+            "{what} as a node: {result:?}"
+        );
+        put_raw_record(&env.store, NODE, node, &original).await;
+
+        // A dispatch fact.
+        let dispatch = &chain.dispatches[0];
+        let original = raw_record(&env.store, DISPATCH, dispatch).await;
+        put_raw_record(&env.store, DISPATCH, dispatch, body).await;
+        let result = env
+            .coordinator
+            .verified_mechanism_usage("world-chain")
+            .await;
+        assert!(
+            matches!(result, Err(Error::Internal)),
+            "{what} as a dispatch fact: {result:?}"
+        );
+        put_raw_record(&env.store, DISPATCH, dispatch, &original).await;
+
+        // The world itself.
+        let original = raw_record(&env.store, WORLD, "world-chain").await;
+        put_raw_record(&env.store, WORLD, "world-chain", body).await;
+        let result = env.coordinator.decide_next("world-chain").await;
+        assert!(
+            matches!(result, Err(Error::Internal)),
+            "{what} as the world: {result:?}"
+        );
+        put_raw_record(&env.store, WORLD, "world-chain", &original).await;
+    }
+    // Put back, everything reads again.
+    assert!(env.coordinator.decide_next("world-chain").await.is_ok());
+    assert_eq!(
+        env.coordinator
+            .verified_mechanism_usage("world-chain")
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 // ---------------------------------------------------------------------------

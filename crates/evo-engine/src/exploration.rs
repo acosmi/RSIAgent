@@ -119,7 +119,8 @@ impl Coordinator {
 // (`persist_world_registration`), and every node, dispatch fact and history
 // entry depends on its world (`put_world_edge`). The cleanup walks the
 // dependents of a revoked run, so it reaches the world and, through it, each of
-// those records, which are all on its redact allow-list.
+// those records, which are all on its redact allow-list. A redacted record is
+// named by the reads (`read_envelope`), not reported as a storage failure.
 const WORLD_RECORD_KIND: &str = "exploration_world_v1";
 pub(crate) const NODE_RECORD_KIND: &str = "exploration_node_v1";
 const DISPATCH_RECORD_KIND: &str = "exploration_dispatch_v1";
@@ -129,6 +130,9 @@ const HISTORY_RECORD_KIND: &str = "optimization_history_v1";
 const DISPATCH_SCHEMA: &str = "rsia.exploration_dispatch.v2";
 const DISPATCH_SCHEMA_V1: &str = "rsia.exploration_dispatch.v1";
 pub(crate) const ENVELOPE_SCHEMA: &str = "rsia.exploration_artifact_envelope.v1";
+/// Schema of the tombstone the revocation cleanup leaves in place of a record
+/// whose source was revoked.
+const REDACTED_SCHEMA: &str = "rsia.redacted.v1";
 
 fn validate_digest(value: &str) -> Result<()> {
     if value.len() != 64
@@ -1702,6 +1706,48 @@ fn storage_id(record_kind: &str, id: &str) -> Result<String> {
     Ok(format!("e09-{}", fingerprint(&(record_kind, id))?))
 }
 
+/// Reads the stored body of one exploration record as an envelope.
+///
+/// After a source revocation the cleanup replaces the body with an
+/// `rsia.redacted.v1` tombstone, which is not an envelope. That is the expected
+/// state of a revoked world, not corruption, so the read names it: a `Conflict`
+/// carrying the record kind and id, the verdict E03's development artifacts give
+/// the same state (`development.rs`, `get_record`), instead of a decode failure
+/// that would surface as `Internal`. The body is inspected before it is decoded,
+/// so the expected state does not raise the storage layer's "database operation
+/// failed" error log either. Any other body that does not decode is corruption
+/// and stays `Internal`.
+async fn read_envelope<T: DeserializeOwned>(
+    session: &mut Session,
+    ctx: &Context,
+    record_kind: &str,
+    id: &str,
+    storage_id: &str,
+) -> Result<Option<ArtifactEnvelope<T>>> {
+    let Some(body) = session
+        .get::<serde_json::Value>(ctx, "artifact", storage_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if body
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        == Some(REDACTED_SCHEMA)
+    {
+        return Err(Error::Conflict(format!(
+            "exploration record {record_kind} {id} was redacted because its source was revoked"
+        )));
+    }
+    match serde_json::from_value(body) {
+        Ok(envelope) => Ok(Some(envelope)),
+        Err(error) => {
+            tracing::error!(%error, record_kind, id, "stored exploration record does not decode");
+            Err(Error::Internal)
+        }
+    }
+}
+
 async fn get_record<T: DeserializeOwned>(
     session: &mut Session,
     ctx: &Context,
@@ -1709,9 +1755,7 @@ async fn get_record<T: DeserializeOwned>(
     id: &str,
 ) -> Result<Option<T>> {
     let storage_id = storage_id(record_kind, id)?;
-    let envelope = session
-        .get::<ArtifactEnvelope<T>>(ctx, "artifact", &storage_id)
-        .await?;
+    let envelope = read_envelope::<T>(session, ctx, record_kind, id, &storage_id).await?;
     match envelope {
         Some(envelope)
             if envelope.schema_version == ENVELOPE_SCHEMA
@@ -1748,9 +1792,9 @@ async fn get_dispatch_fact(
     id: &str,
 ) -> Result<Option<ExplorationDispatchFact>> {
     let storage_id = storage_id(DISPATCH_RECORD_KIND, id)?;
-    let envelope = session
-        .get::<ArtifactEnvelope<serde_json::Value>>(ctx, "artifact", &storage_id)
-        .await?;
+    let envelope =
+        read_envelope::<serde_json::Value>(session, ctx, DISPATCH_RECORD_KIND, id, &storage_id)
+            .await?;
     match envelope {
         Some(envelope)
             if envelope.schema_version == ENVELOPE_SCHEMA
