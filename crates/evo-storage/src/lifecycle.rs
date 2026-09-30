@@ -2810,17 +2810,18 @@ pub const PROTECTED_SCHEMA_VERSIONS: [&str; 8] = [
 ];
 
 /// Body `schema_version` values of the durable facts of an action that already
-/// happened, an idempotency binding or a spend, introduced by the v4.2 monitoring,
-/// practice, curriculum and management work (E16.5, E08, plan §11.5). They are
-/// selected exactly like [`PROTECTED_SCHEMA_VERSIONS`] (any object kind, inside a
-/// watermarked namespace, compared for equality between the anchor and the
-/// restored database), so a backup that is older than the anchor on any of them
-/// is isolated and a restored directory the anchor has moved past on any of them
-/// is quarantined; nothing in the decision rule changes.
+/// happened, an idempotency binding, a spend or an invalidation, introduced by the
+/// v4.2 monitoring, practice, curriculum and management work (E16.5, E08, plan
+/// §11.5). They are selected exactly like [`PROTECTED_SCHEMA_VERSIONS`] (any
+/// object kind, inside a watermarked namespace, compared for equality between the
+/// anchor and the restored database), so a backup that is older than the anchor on
+/// any of them is isolated and a restored directory the anchor has moved past on
+/// any of them is quarantined; nothing in the decision rule changes.
 ///
 /// - monitoring: the consolidation claim (generation occupancy), the terminal run
-///   record (outcome and budget call ids), the proposal and the unique
-///   proposal-to-candidate staging binding;
+///   record (outcome and budget call ids), the proposal, the unique
+///   proposal-to-candidate staging binding and the environment drift record (the
+///   fact that an environment change invalidated a consolidation scope);
 /// - practice: the K=3 registration, the registration-to-set binding (what the
 ///   registration was spent on) and the attempt set;
 /// - curriculum: the artifact envelope, whose `coverage_probe_job_v1` and
@@ -2830,16 +2831,22 @@ pub const PROTECTED_SCHEMA_VERSIONS: [&str; 8] = [
 ///   holds the pre-management `evo_core::Job` records).
 ///
 /// `rsia.management_private_input.v1` is deliberately absent: it is the request
-/// payload, not an action or an account. A record that source revocation has
-/// redacted carries `rsia.redacted.v1` and no longer matches any of these.
+/// payload, not an action or an account. So is the mutable scope index
+/// `rsia.monitoring.consolidation_scope.v1`: each of its `claim_ids` is written in
+/// the transaction of its (protected) claim and its `invalidated_by` only in the
+/// transaction of the (protected) drift record, so what it decides is compared
+/// through those records; the rest of it is cycle bookkeeping. A record that
+/// source revocation has redacted carries `rsia.redacted.v1` and no longer matches
+/// any of these.
 ///
 /// Kept apart from [`PROTECTED_SCHEMA_VERSIONS`], the accounting set whose size
 /// `tests/control_plane_facts.rs` pins. The script lists both groups in one tuple.
-pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 9] = [
+pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 10] = [
     "rsia.monitoring.consolidation_claim.v1",
     "rsia.monitoring.consolidation_run.v1",
     "rsia.monitoring.consolidation_staging.v1",
     "rsia.monitoring.consolidation_proposal.v1",
+    "rsia.monitoring.environment_drift.v1",
     "rsia.practice_registration.v1",
     "rsia.practice_registration_binding.v1",
     "rsia.practice_attempt_set.v1",

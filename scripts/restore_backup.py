@@ -257,6 +257,7 @@ def protected_facts(con,namespaces):
             "rsia.e16.export_attempt.v2","rsia.e16.delivery_audit.v2",
             "rsia.monitoring.consolidation_claim.v1","rsia.monitoring.consolidation_run.v1",
             "rsia.monitoring.consolidation_staging.v1","rsia.monitoring.consolidation_proposal.v1",
+            "rsia.monitoring.environment_drift.v1",
             "rsia.practice_registration.v1","rsia.practice_registration_binding.v1",
             "rsia.practice_attempt_set.v1","rsia.curriculum_artifact_envelope.v1",
             "rsia.management_job.v1"):

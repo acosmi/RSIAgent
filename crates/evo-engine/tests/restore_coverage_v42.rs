@@ -1,19 +1,21 @@
-//! AG-029 (E16.5, E08; plan §11.5, §11.4): the durable facts of the actions and
-//! idempotency bindings the v4.2 monitoring, practice, curriculum and management
-//! work introduced are protected recovery facts.
+//! AG-029 (E16.5, E08; plan §11.5, §11.4): the durable facts of the actions,
+//! idempotency bindings and invalidations the v4.2 monitoring, practice,
+//! curriculum and management work introduced are protected recovery facts.
 //!
 //! Before this change a backup that was older than the trusted anchor on any of
 //! them was restored without complaint, and a restored directory the anchor had
 //! moved past was admitted, so a restore could redo a consolidation generation,
-//! reopen a spent K=3 registration, re-schedule a coverage probe or re-run a
-//! management job. The decision rule is unchanged ("the anchor and the backup
-//! agree on every protected fact"); only the set of facts grew.
+//! reopen a spent K=3 registration, re-schedule a coverage probe, re-run a
+//! management job, or forget that an environment change had invalidated a
+//! consolidation scope (the drift record). The decision rule is unchanged ("the
+//! anchor and the backup agree on every protected fact"); only the set of facts
+//! grew.
 //!
 //! Every case that involves a restore starts from a real `Store::backup` and a
 //! real run of `scripts/restore_backup.py`; the gate cases run the real
 //! `StartupGate` against the directory the script produced. Fixture bodies are
 //! built from the engine's own record types where they are public (claim, run,
-//! staging, registration, binding, attempt set, probe job, schedule receipt,
+//! staging, drift, registration, binding, attempt set, probe job, schedule receipt,
 //! management job), wrapped in the envelope `curriculum.rs` persists for the two
 //! curriculum records (that type is private), and shaped after the engine's record
 //! otherwise (the proposal, whose bundle is abbreviated, and the private input).
@@ -44,8 +46,11 @@ use evo_engine::curriculum::{
 use evo_engine::dispatch::{ManagementJob, ManagementJobState};
 use evo_engine::monitoring::{
     CONSOLIDATION_CLAIM_SCHEMA, CONSOLIDATION_PROPOSAL_SCHEMA, CONSOLIDATION_RUN_SCHEMA,
-    CONSOLIDATION_STAGING_SCHEMA, ConsolidationClaim, ConsolidationClaimState,
-    ConsolidationRunOutcome, ConsolidationRunRecord, ConsolidationStagingBinding, SourceDependency,
+    CONSOLIDATION_SCOPE_SCHEMA, CONSOLIDATION_STAGING_SCHEMA, ConsolidationClaim,
+    ConsolidationClaimState, ConsolidationRunOutcome, ConsolidationRunRecord, ConsolidationScope,
+    ConsolidationScopeIndex, ConsolidationStagingBinding, ENVIRONMENT_DRIFT_SCHEMA,
+    ENVIRONMENT_IDENTITY_SCHEMA, EnvironmentDriftRecord, EnvironmentEvidenceScope,
+    EnvironmentIdentityRecord, MonitoringCoordinator, SourceDependency,
 };
 use evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA;
 use evo_engine::practice::{
@@ -231,6 +236,33 @@ fn staging_fact() -> Fact {
             schema_version: CONSOLIDATION_STAGING_SCHEMA.into(),
             proposal_id: proposal_id(),
             candidate_id: "candidate-1".into(),
+        },
+    )
+}
+
+fn drift_id() -> String {
+    format!(
+        "environment-drift-{}",
+        &fingerprint(&("environment-1", "environment-2", SCOPE_ID)).unwrap()[..32]
+    )
+}
+
+/// The record `record_environment_drift` writes when an environment change
+/// invalidates a consolidation scope.
+fn drift_fact() -> Fact {
+    Fact::new(
+        "environment drift record",
+        "artifact",
+        drift_id(),
+        &EnvironmentDriftRecord {
+            id: drift_id(),
+            schema_version: ENVIRONMENT_DRIFT_SCHEMA.into(),
+            previous_environment_id: "environment-1".into(),
+            current_environment_id: "environment-2".into(),
+            previous_identity_digest: d("identity-previous"),
+            current_identity_digest: d("identity-current"),
+            invalidated_scope_id: SCOPE_ID.into(),
+            reason: "the model identity changed".into(),
         },
     )
 }
@@ -471,14 +503,16 @@ fn stage_fact() -> Fact {
     )
 }
 
-/// One fact of every class this change protects (the curriculum envelope twice:
-/// its two record kinds that carry scheduling idempotency and quota facts).
+/// One fact of every class this change protects (ten schemas, eleven facts: the
+/// curriculum envelope twice, for its two record kinds that carry scheduling
+/// idempotency and quota facts).
 fn every_class() -> Vec<Fact> {
     vec![
         claim_fact(ConsolidationClaimState::Claimed),
         run_fact(),
         staging_fact(),
         proposal_fact(),
+        drift_fact(),
         registration_fact(),
         binding_fact(),
         attempt_set_fact(),
@@ -500,6 +534,94 @@ fn advanced_pairs() -> Vec<(Fact, Fact)> {
             job_fact(ManagementJobState::Queued),
             job_fact(ManagementJobState::Failed),
         ),
+    ]
+}
+
+/// An environment identity as the monitoring coordinator stores it; `variant`
+/// makes two of them differ in identity and environment digest.
+fn environment_record(id: &str, variant: &str) -> EnvironmentIdentityRecord {
+    EnvironmentIdentityRecord {
+        id: id.into(),
+        schema_version: ENVIRONMENT_IDENTITY_SCHEMA.into(),
+        identity_digest: d(&format!("identity-{variant}")),
+        namespace: NS.into(),
+        evidence_scope: EnvironmentEvidenceScope::ProgramFixture,
+        profile_id: "profile-1".into(),
+        release_id: None,
+        bundle_digest: None,
+        environment_digest: d(&format!("environment-{variant}")),
+        model_identity: format!("model-{variant}"),
+        ordered_tools: vec!["tool-a".into()],
+        host_id: "host-1".into(),
+        host_version: "1".into(),
+        host_surface_digest: d("surface"),
+        host_capabilities_digest: d("capabilities"),
+        mandatory_context_digest: d("context"),
+        development_manifest_digest: d("manifest"),
+        grader_digest: d("grader"),
+        generation_strategy_digest: d("strategy"),
+        revoke_watermark: 1,
+    }
+}
+
+/// A live consolidation scope over `environment-1`, in the shape and under the id
+/// `close_development_cycle` gives it (the scope index is deliberately not a
+/// protected schema).
+fn scope_index_fact() -> Fact {
+    let previous = environment_record("environment-1", "previous");
+    let scope = ConsolidationScope {
+        namespace: NS.into(),
+        skill_id: "skill-1".into(),
+        profile_id: "profile-1".into(),
+        development_manifest_digest: d("manifest"),
+        environment_id: previous.id.clone(),
+        environment_identity_digest: previous.identity_digest.clone(),
+        environment_digest: previous.environment_digest.clone(),
+        grader_digest: d("grader"),
+        generation_strategy_digest: d("strategy"),
+        parent_skill_digest: d("parent-skill"),
+        parent_bundle_digest: d("parent-bundle"),
+        billing_scope: "scope-a".into(),
+        root_budget_id: "root-a".into(),
+        revoke_watermark: 1,
+    };
+    let id = format!(
+        "consolidation-scope-{}",
+        &fingerprint(&scope).unwrap()[..32]
+    );
+    Fact::new(
+        "consolidation scope index",
+        "artifact",
+        id.clone(),
+        &ConsolidationScopeIndex {
+            id,
+            schema_version: CONSOLIDATION_SCOPE_SCHEMA.into(),
+            scope,
+            cycle_ids: vec![],
+            report_fact_ids: vec![],
+            claim_ids: BTreeMap::new(),
+            invalidated_by: None,
+        },
+    )
+}
+
+/// What `record_environment_drift` reads: the two environment identities and the
+/// scope over the first one. None of them is a protected schema.
+fn drift_prerequisites() -> Vec<Fact> {
+    vec![
+        Fact::new(
+            "previous environment",
+            "artifact",
+            "environment-1".into(),
+            &environment_record("environment-1", "previous"),
+        ),
+        Fact::new(
+            "current environment",
+            "artifact",
+            "environment-2".into(),
+            &environment_record("environment-2", "current"),
+        ),
+        scope_index_fact(),
     ]
 }
 
@@ -883,6 +1005,7 @@ fn engine_action_schemas() -> BTreeSet<String> {
         CONSOLIDATION_RUN_SCHEMA,
         CONSOLIDATION_STAGING_SCHEMA,
         CONSOLIDATION_PROPOSAL_SCHEMA,
+        ENVIRONMENT_DRIFT_SCHEMA,
         PRACTICE_REGISTRATION_SCHEMA,
         PRACTICE_REGISTRATION_BINDING_SCHEMA,
         PRACTICE_ATTEMPT_SET_SCHEMA,
@@ -897,7 +1020,7 @@ fn engine_action_schemas() -> BTreeSet<String> {
 #[test]
 fn the_action_schemas_are_listed_once_in_rust_and_in_the_restore_script() {
     let expected = engine_action_schemas();
-    assert_eq!(expected.len(), 9, "nine distinct schemas");
+    assert_eq!(expected.len(), 10, "ten distinct schemas");
     let listed: BTreeSet<String> = PROTECTED_ACTION_SCHEMA_VERSIONS
         .iter()
         .map(|schema| (*schema).to_owned())
@@ -915,6 +1038,9 @@ fn the_action_schemas_are_listed_once_in_rust_and_in_the_restore_script() {
     }
     assert!(!listed.contains(PRIVATE_INPUT_SCHEMA));
     assert!(!PROTECTED_SCHEMA_VERSIONS.contains(&PRIVATE_INPUT_SCHEMA));
+    // the mutable scope index is compared through its claims and the drift record
+    assert!(!listed.contains(CONSOLIDATION_SCOPE_SCHEMA));
+    assert!(!PROTECTED_SCHEMA_VERSIONS.contains(&CONSOLIDATION_SCOPE_SCHEMA));
     // a redaction tombstone matches no protected schema (ruling 4)
     assert!(!listed.contains(REDACTED));
     assert!(!PROTECTED_SCHEMA_VERSIONS.contains(&REDACTED));
@@ -936,6 +1062,7 @@ fn the_action_schemas_are_listed_once_in_rust_and_in_the_restore_script() {
         );
     }
     assert!(!in_script.contains(PRIVATE_INPUT_SCHEMA));
+    assert!(!in_script.contains(CONSOLIDATION_SCOPE_SCHEMA));
     let mut both: BTreeSet<String> = listed.clone();
     both.extend(PROTECTED_SCHEMA_VERSIONS.iter().map(|s| (*s).to_owned()));
     assert_eq!(in_script, both, "the script and Rust lists drifted");
@@ -995,10 +1122,11 @@ async fn the_script_and_the_reader_select_the_same_objects_in_a_database_holding
     let mut facts = every_class();
     let protected_keys: BTreeSet<String> = facts.iter().map(Fact::key).collect();
     facts.extend([
-        // not protected: the request payload, a pre-management job (no schema), a
-        // job of a schema this code does not know, a redaction tombstone and an
-        // unrelated artifact
+        // not protected: the request payload, the mutable scope index, a
+        // pre-management job (no schema), a job of a schema this code does not
+        // know, a redaction tombstone and an unrelated artifact
         private_input_fact(),
+        scope_index_fact(),
         legacy_job_fact(),
         Fact {
             label: "job of an unknown schema",
@@ -1055,7 +1183,7 @@ async fn the_script_and_the_reader_select_the_same_objects_in_a_database_holding
     let from_script: BTreeSet<String> = script_selection(&scenario.live).into_iter().collect();
     assert_eq!(from_rust, all_keys, "the Rust reader's selection");
     assert_eq!(from_script, all_keys, "the script's selection");
-    // the ten fixtures are all in it, under both kinds
+    // the eleven fixtures are all in it, under both kinds
     assert!(protected_keys.iter().all(|key| from_rust.contains(key)));
     assert!(from_rust.iter().any(|key| key.starts_with("n/job/")));
     assert!(!from_rust.iter().any(|key| key.contains("legacy-job")));
@@ -1341,4 +1469,91 @@ async fn a_fact_created_and_redacted_after_the_backup_is_invisible_to_the_compar
     scenario
         .restore("restored", &delta)
         .assert_isolated("claim redacted, run record preserved");
+}
+
+// ---------------------------------------------------------------------------
+// 6. environment drift, recorded with the engine's own function
+// ---------------------------------------------------------------------------
+
+/// The anchor records an environment drift: one transaction invalidates the scope
+/// (`invalidated_by` on the scope index) and writes the drift record.
+async fn record_drift_on(database: &Path) -> EnvironmentDriftRecord {
+    let store = Store::open(database).await.unwrap();
+    let drift = MonitoringCoordinator::record_environment_drift(
+        &admin(),
+        &store,
+        "environment-1",
+        "environment-2",
+        &scope_index_fact().id,
+        "the model identity changed",
+    )
+    .await
+    .unwrap();
+    store.close().await;
+    drift
+}
+
+#[tokio::test]
+async fn an_environment_drift_recorded_after_the_backup_isolates_the_restore() {
+    // The backup holds a live scope. The anchor then learns that its environment
+    // drifted, which invalidates the scope. Restoring the old backup would forget
+    // that, and consolidation could go on in an environment known to have changed.
+    let scope = scope_index_fact();
+    let scenario = Scenario::with_backup(&drift_prerequisites()).await;
+    scenario
+        .restore_without_events("unchanged")
+        .assert_restored("before the drift", 0);
+
+    let drift = record_drift_on(&scenario.live).await;
+    assert_eq!(drift.schema_version, ENVIRONMENT_DRIFT_SCHEMA);
+    assert_eq!(drift.invalidated_scope_id, scope.id);
+    let stored = read_object(&scenario.live, "artifact", &drift.id)
+        .await
+        .unwrap();
+    assert_eq!(stored, serde_json::to_value(&drift).unwrap());
+    let index = read_object(&scenario.live, "artifact", &scope.id)
+        .await
+        .unwrap();
+    assert_eq!(index["invalidated_by"], json!(drift.id));
+
+    scenario
+        .restore_without_events("restored")
+        .assert_isolated("environment drift recorded after the backup");
+
+    // control: a backup taken after the drift holds it, and restores
+    let mut later = Scenario::begin(&drift_prerequisites()).await;
+    record_drift_on(&later.live).await;
+    later.take_backup().await;
+    later
+        .restore_without_events("restored")
+        .assert_restored("backup taken after the drift", 0);
+}
+
+#[tokio::test]
+async fn an_environment_drift_recorded_after_the_restore_quarantines_the_directory() {
+    let scenario = Scenario::with_backup(&drift_prerequisites()).await;
+    let restored = scenario.restore_without_events("restored");
+    restored.assert_restored("before the drift", 0);
+    let verified = StartupGate::new(&restored.data(), Some(&scenario.live))
+        .evaluate()
+        .await
+        .unwrap();
+    assert_eq!(verified.posture(), RecoveryPosture::RestoredVerified);
+
+    let drift = record_drift_on(&scenario.live).await;
+    let reason = quarantine_reason(&restored.data(), &scenario.live, &restored.dest).await;
+    assert!(
+        reason.contains("consumed accounting facts differ"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains(&format!(
+            "only in the trusted anchor: {NS}/artifact/{}",
+            drift.id
+        )),
+        "{reason}"
+    );
+    // The scope index changed on the anchor too, but it is not a compared fact:
+    // the drift record is the one that is named.
+    assert!(!reason.contains("consolidation-scope-"), "{reason}");
 }
