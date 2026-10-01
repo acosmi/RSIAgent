@@ -5,6 +5,224 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 本台账是实施与证据索引，不另立规范；历史 PR、测试和旧台账不决定当前规则。
 用户于 2026-09-19 明确确认 v4.1 替代 v4，并授权将本台账上传远程；方案正文、内部合同、归档及 QA 原始材料只保留本地。2026-10-01 第四轮由 Codex 主控持续推进；实施子代理统一使用 gpt-6.1-sol，逐卡记录思考档位。每个任务独立 PR；主控全量复跑及至少两个反例通过后，以固定 head 按依赖顺序合并并核对合并树。历史轮次的合并操作者按各节原始记录保留。Actions派发、付费运行和部署/发布未授权。
 
+## 2026-10-01 第四轮首批证据折入（AG-061）
+
+本节截至main `296b5a07a7bf911d02454b683d5732e9d38e3ae5`。逐事件原稿的“待合并/在途/随后执行”均为当时状态，当前状态以本节表和主任务状态表为准。原始QA、方案、卡、裁决与本地输入清单不上传。
+
+| PR | 任务 | 验收 head | merged_sha |
+|---|---|---|---|
+| [#98](https://github.com/acosmi/RSIAgent/pull/98) | AG-060台账 | `1112b7782a3b951f2bee24105b3a58b5b5855a3a` | `37fa6f08e9ef779b796b9713bc4664511321aa7e` |
+| [#99](https://github.com/acosmi/RSIAgent/pull/99) | AG-053 | `a2c62326c7ca87a724da16ee4cfd133462b49dbe` | `3aa3804db4ec39a72f38a8ec00cc7e6f9e92b360` |
+| [#100](https://github.com/acosmi/RSIAgent/pull/100) | AG-052 | `652d7cac0d6cf1fa086e96b6ac9554ed6326b1da` | `43f0022478d58dd8a8e6492cffb3aa24463b3fce` |
+| [#101](https://github.com/acosmi/RSIAgent/pull/101) | AG-059 | `8257e6a73304c250b545ead3c0bc9409cf2daa35` | `296b5a07a7bf911d02454b683d5732e9d38e3ae5` |
+
+四个合并树均等于各自验收head，全部采用固定head；仓库未要求审批保护，因此没有使用--admin。#99验收正文写入EOF后被错误地先合并再补写；#100合并前fetch TLS失败未终止后续调用。两次事后核对均无未验树，但属于已披露流程偏差；#101采用单一fail-fast脚本，将正文写入/读回、刷新main、head/base/clean全部作为硬前置并验证成功。
+
+新增范围索引三条分别引用原验收head、唯一日志和本地清单；旧记录的source/digest/log不改写，其历史risk可能已被后续卡关闭，当前边界看相应E项remaining和本节。命令字段的--offline仅为检查器文法；实际使用cargom --locked经镜像执行，从未offline。AG052新测试10项加私有2项；AG053 storage lib21项中新增6；AG059专项21项中新增8。最新独立全量1150/0，82个测试二进制和5个doc组，8项工具退出0、Python checker unittest48。该新树运行证据在ctrl-ag059-8257e6a.log*，三份ctrl-input分别完整绑定源码tree/test blob/日志SHA。
+
+当前在途：AG054类型化拒绝与开发1micro（max，含R1/R2）；AG055 v1 golden（high，本地完成，外发审批复核中）；AG056仅CI工作流（high）。AG057/058只读侦察已完成，SC062正核FieldContract/P-B绑定。AG052/053/059完成范围不再列待办；GA16的成本/分区/typed依赖/其他报告要求仍未完成。AG056的0005/0006校验将是额外CI门，不是改smoke_workspace脚本。原待用户/外部项保持；新发现import_source→optimization.source的unknown cleanup分类仅登记，不算本轮修复。
+
+
+### AG061索引入口裁决R1
+AG053原本地清单记作`--lib tests`，被有限文法拒绝（precommit检查退出1）。不伪造可执行命令、不扩检查器；改用同一已验head的storage `local_export` 11项作为主入口，完整工作区日志另包含新六项快照/VM单测，专门storage lib21/0日志及源码blob继续显式绑定在输入清单。旧输入保留为ctrl-input-ag-053-a2c6232-pre-ag061.json，原日志字节不变。cards/AG-061-R1.md SHA256d5b606eaf98671dc939cdceda8ae4a54c716730c8ba475374d8fe9f186dd96a7，复查checker通过；不改变产品验收或已验范围。
+
+### 第四轮事件逐项折入
+
+
+#### 2026-10-01T11:06:56.631971+00:00 启动闸门与一次性适配
+- 启动提示词 SHA-256 b0000207ee106fca9e2aa4773220e138b8f5d9e8b417374dbc6059117b028fc6，一致；完整读取。
+- 第一真源 SHA-256 70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455，一致；只读。
+- gh auth status 与 git fetch origin 首次受沙箱网络/.git 写限制影响；经 require_escalated 复核均退出 0，凭据有效（acosmi-fushihua）。自动审批未拒绝。
+- cargom: cargo 1.98.1；out/pybin/python3: 3.12.14；df: 21 GiB 可用。
+- 按顺序读取 controller-state、ledger-draft-r3、queue-r3、gap-A/B/C、_common、AG-046/048、AG-048-R1 与两组反例。r4 文件此前不存在。
+- main = origin/main = 804302602efe575d92973be20c532d264019f9aa，工作区干净，仅主 worktree。
+- _common.md Codex 适配：临时路径、模型、署名、PR 标记；明确 out 下仅任务工作区/target/scratch 可写；fmt 无 --locked 参数例外沿用命令语法。
+  - 改前 SHA-256 5b33c7145f3ee0e89c29fa89393f96fdc6284ba9fb27b7745ef585a75345e246
+  - 改后 SHA-256 cf21103badabebda012c1b92883d446e65a25a616bfbe376909d570726cc77b2
+- 用户授权向 chat 01a0f723-2cc0-7b10-943b-f03e5c6f95cc 派任务；已只读核对其 idle，标题“等待其他窗口派发任务”。
+- AG-060 由主控自做，折入第三轮；产品实施必须独立子代理，每 PR 主控全量复跑及至少 2 个反例。
+
+#### 2026-10-01T11:07:53.113563+00:00 派发 SC-AG052-r4（只读）
+- E05 / V010,V012,V084,V085；brief cards/SC-AG052-r4.md SHA-256 dd805a1893dfc29ac7ecabc3c640d87807946d5dc0bed3d1eab273ab913e6c36。
+- 基线 804302602efe575d92973be20c532d264019f9aa；只读主工作区，无实施 worktree/分支。
+- 用户授权 chat 01a0f723-2cc0-7b10-943b-f03e5c6f95cc；模型 gpt-6.1-sol，思考 high（M 侦察）。
+
+#### 2026-10-01T11:08:27.361716+00:00 派发 SC-AG053（只读）
+- 子代理 /root/scout_ag053；模型 gpt-6.1-sol，思考 high（存储闭包 M 侦察）。基线 804302602efe575d92973be20c532d264019f9aa。
+- E08/E16.5、§3.3.1 有界闭包事实；任务为核查 load_dependency_record_snapshots 的签名、调用、LIMIT/CROSS JOIN、确定性测试切口与真源依据，200 行以内，不写文件/不运行构建。
+- 依据 cards/gap-B-20261001.md D6 与 cards/queue-r3.md AG-053；尚未派实施，无 worktree/分支。
+
+#### 2026-10-01T11:10:00.343325+00:00 AG-060 主控自做启动
+- E00/E16.6，V001/V071/V072/V073/V074/V080/V098。卡 cards/AG-060.md SHA-256 ffd0a0f06b75e3325e68394bbbad3daa7eebe909fb4b39c95d6f196cc9a4fd6c。
+- 基线 804302602efe575d92973be20c532d264019f9aa；worktree out/work-20260930/ag-060；分支 wrokbot/ag-060-controller-ledger-r3。主控 Codex 自做；不冒称子代理型号。
+- 裁决：GA-1 总体状态与索引同口径、已验子范围分列；索引任务按启动提示词第5节用 Python 篡改反例，Rust append.rs 不适用。详见卡。
+
+#### 2026-10-01T11:13:25.912487+00:00 AG-060 基线证据与索引构建
+- registration.py 基线检查退出 1：缺 #94–97 四条记录，日志 qa/ctrl-ag060-registration-base-8043026.log。
+- GitHub API 初次 EOF、重试成功，#93–97 merged_sha/head/时间与第三轮草稿一致；开放 PR 0。
+- 四个历史 head 的全量日志退出码和计数逐一核对；验收 head 树等于各 merged_sha 树，且均为 main 祖先。生成四份本地 ctrl-input 清单，绑定源码树/测试 blob/原始日志 SHA。
+- SC-GA1 只读侦察派发 /root/scout_ga1，gpt-6.1-sol/high；基线 8043026，§1.4/1.5 当前消费者事实。
+
+#### 2026-10-01T11:19:18.227107+00:00 AG-060 交付与全量验收启动
+- Draft PR #98 https://github.com/acosmi/RSIAgent/pull/98；head 1112b7782a3b951f2bee24105b3a58b5b5855a3a，父为 main 804302602efe575d92973be20c532d264019f9aa，无叠放。3文件 +376/-26；仅白名单。
+- 第三轮草稿内容除标题层级外逐字折入校验通过。主控逐文件 diff 复核，修正 AG-048 rollback 为整个两提交 PR 的基线 229fea8；同步 E07/E13/E16.6 当前状态。
+- precommit checker structure_valid=true、errors=[]；input_binding_available=false 因旧历史记录的部分本地输入缺失，新四份均存在。
+- 独立新 target-ctrl-ag060 全量运行启动，日志 qa/ctrl-ag060-1112b77.log*。运行期间不向 ag-060 worktree 放任何文件。
+- 主控实际模型标识未由工具提供，提交署名 Codex，未伪造实际模型；子代理均使用明确可选 gpt-6.1-sol。
+
+#### 2026-10-01T11:21:10.255334+00:00 派发 AG-053
+- E08/E16.5；V017/V069/V075/V038 限卡中子范围。卡 cards/AG-053.md SHA-256 2057df98e3eb45dd074456ae0858e68cec8a22efab1e12eef63322f74ef6c59c。
+- 基线 804302602efe575d92973be20c532d264019f9aa；worktree out/work-20260930/ag-053；分支 wrokbot/ag-053-bounded-dependency-snapshots。
+- 实施 gpt-6.1-sol/high（M，存储查询、持久核验语义不变）；与 AG-060 白名单无重叠，实施并行数1、编译最多2。
+- 裁决依据真源 L319/L1081/L1295/L1299/L1451/L1453：保留既有上限与全部返回语义，提前终止递归；10000不是事件容量推导，不宣称总边扫描绝对有界。VM 指令比值门先复现后修。
+
+#### 2026-10-01T11:24:34.591394+00:00 CTRL-AG060-R1 / PR #98 独立验收通过
+- 固定 head 1112b7782a3b951f2bee24105b3a58b5b5855a3a；父=origin/main=804302602efe575d92973be20c532d264019f9aa。PR head/worktree HEAD一致、工作区干净。3白名单文件+376/-26；无叠放/冲突。
+- 全新 target-ctrl-ag060；qa/ctrl-ag060-1112b77.log*：fmt/clippy/test/build/2smoke/checker/unittest全部退出0。workspace 86结果行1124/0（main1124+0）；unittest48；另定向support_scope14/0（qa/ctrl-ag060-support-scope-1112b77.log）。
+- 主控探针 qa/probe-ag060/probe.py SHA256 7075219643b9ad755d6f1dddfb48ba9a49c96d05238d7ba85efe44e4711af588；head日志qa/ctrl-ag060-adversarial-head-1112b77.log 全过；独立父树base-8043026日志qa/ctrl-ag060-adversarial-base-8043026.log 因四条记录未登记退出1，复现登记缺口。
+- 四条新记录 git祖先/tree/test blob/输入与日志摘要均匹配。T1旧输入摘要篡改、T2跨scope复用日志、T3错误合并提交身份、T4新输入摘要篡改全拒；T1/T2基线也拒，明确边界核验。两树探针后均干净。
+- verified：E00/E16.6，L1181–1189/L1459–1463，V001/V071/V072/V073/V074/V080/V098限证据登记/当前基线与迁移/消费者复核子范围。不可声明整体E/V/产品新能力/真实效果/可发行/历史包等价。旧历史输入有缺失，新四条完整绑定。
+- 回滚点8043026；无返修，主控编辑阶段自行纠正AG-048两提交rollback与过期E状态；Python索引反例按第5节。下一步ready并固定head合并；当前保护状态CLEAN，无审批要求。
+
+#### 2026-10-01T11:26:23.313513+00:00 合并 AG-060 / #98
+- 主控固定验收head 1112b7782a3b951f2bee24105b3a58b5b5855a3a 合并；merged_sha 37fa6f08e9ef779b796b9713bc4664511321aa7e；mergedAt 2026-10-01T11:24:50Z。
+- merged tree = accepted tree = cafb1a34b9edb3b9f06fb64c9cd2f18892796ac8，一致。未使用 --admin（CLEAN且无审批保护要求，正常固定head合并成功）；无冲突、无返修。
+- 二次清单即时更新，清理随后执行；AG-053在途保持其原基线，交付后主控叠放到新main再全量验收。
+
+#### 2026-10-01T11:27:43.354699+00:00 AG-053-R1 裁决
+- 依据§11 L1081/E16.5 L1451，授权仅自身命令session中断长时间基线；基线与head长链夹具同样ANALYZE dependencies隔离外层LIMIT，固定2倍VM门不变。原JOIN基线4075/12804005已失败；取消不得记通过。
+- cards/AG-053-R1.md SHA256 2813cdaee00e8e4da7cb3e432d42f03de2bfe7b29fe861f3c31014b5b869c2ef；模型gpt-6.1-sol/high保持。
+
+- AG-060清理完成：本地main快进37fa6f0；ag-060/base-8043026工作树干净且head已合入后正常移除，branch -d，远端分支逐个删除；target-ctrl-ag060删除，原始qa日志/探针/输入保留。
+
+#### 2026-10-01T11:30:39.994680+00:00 AG-052 派发前R1裁决与新版卡
+- 主控复核SC-AG052两轮只读侦察，选择现有control.schema_version v1/v2绑定后处理，保留旧control完整序列化、管理恢复与冻结解释；finalize消费/提交前都核完整登记摘要。依据E05 L1253/L1257/L1259、§3.4 L337、§3.4.1 L372、§6.6 L709/L711。
+- 原卡备份cards/AG-052-pre-r4.md SHA256 f1bbe0abca06646e7816452b808f58f9b0bb0f046229015295cb96ca29cade98；新卡cards/AG-052.md SHA256 3ec6598f40da645833d3162e818f3f49af3b41a8a867f6478573c7317006de24；裁决cards/AG-052-R1.md SHA256 c02b2f32fe1661c350da08bb4193852d4939c076128f076182faab8a0edf6275。
+- E05/V010/V012/V084/V085；基线37fa6f08e9ef779b796b9713bc4664511321aa7e；worktree ag-052，分支wrokbot/ag-052-e05-complete-batch-verdicts；target-ag-052。
+- 实施使用用户授权chat 01a0f723-2cc0-7b10-943b-f03e5c6f95cc，gpt-6.1-sol/max（L：持久版本契约/恢复/摘要完整性）。与AG-053文件不重叠，实施并行数2；主控不写产品代码。
+- AG-053自身基线中断130已记录，R1允许夹具ANALYZE的原始日志保留，未称长链已通过。
+
+#### 2026-10-01T11:32:21.306529+00:00 下一批只读侦察派发
+- SC-AG054 /root/scout_ag054，gpt-6.1-sol/high（M/L），基线37fa6f0；E04/§7.2/§7.2.1，核dispatch前拒绝类型、真实释放原因及1micro路径，不写文件。
+- SC-AG059 /root/scout_ag059，gpt-6.1-sol/high（M），基线37fa6f0；E08/§11.3 L1110/§11.5 L1132，核stage manifest dependency_refs首写前闸门与残留，不写文件。
+- 两者禁止测试构建、修改或下级代理；尚未派实施。当前实施2（AG-052用户chat，AG-053子代理）。
+
+#### 2026-10-01T11:39:51.104509+00:00 压缩后启动闸门、侦察完成与派发 AG-059
+- 启动提示词 b0000207… 与真源70ec06e4…均匹配；gh auth/fetch、cargom1.98.1、Python3.12.14全通过；磁盘33GiB；main=origin/main=37fa6f08e9ef779b796b9713bc4664511321aa7e，干净。
+- SC-AG054/059只读侦察完成，主控已复读AG-059关键函数与既有known_boundary测试。AG-054需typed reserve/begin原因及不退款未知结果的独立裁决，尚未实施。
+- AG-059 E08/E16.2，V017/V075/V038子范围；卡cards/AG-059.md SHA256 42340897f0469180c54bd2c6819f285c795ab6ffbd4112aea2fc152837ceb9a8。§11.3 L1110、§11.5 L1132，裁决联合all_sources首写前同事务核验，保持原request与后续闸、unknown dependency quarantine及storage-kind既有边界。
+- 基线37fa6f08e9ef779b796b9713bc4664511321aa7e，worktree out/work-20260930/ag-059，分支wrokbot/ag-059-stage-manifest-prewrite-gate。实施 /root/impl_ag059，gpt-6.1-sol/max（M，安全拒绝缺陷）。与AG-052/053白名单不重叠；实施3个，其中AG-053已完成构建、仅待网络交付，主控验收+AG052+AG059编译最多3路。
+
+#### 2026-10-01T11:41:31.028046+00:00 AG-053 交付与叠放
+- #99 https://github.com/acosmi/RSIAgent/pull/99 draft；交付head f5214bcae56fd5e226308ad03f877dfb35195ec4，工作区干净；唯一lib.rs +280/-3，逐行diff已核，仅SQL与六个新增测试。实施原始材料归档qa/impl-ag053/，含被中断130、沙箱网络失败及提权成功日志，未删原文件。
+- rebase --onto 最新main37fa6f08e9ef779b796b9713bc4664511321aa7e 原基线804302602efe575d92973be20c532d264019f9aa，新head a2c62326c7ca87a724da16ee4cfd133462b49dbe；单提交patch前后cmp退出0，qa/ctrl-ag053-{before,after}-rebase.patch，无冲突。literal full ref/full oldhead force-with-lease推送。
+- 下一步全新target-ctrl-ag053独立全量，预期1124+6=1130；运行期间不写其工作区。主控两个公共consumer探针为语义保持边界，父树应同过；资源缺陷另据六项测试基线/头对照。
+
+#### 2026-10-01T11:42:09.015302+00:00 SC-AG055/056 只读派发
+- /root/scout_ag055_056，gpt-6.1-sol/high（M侦察）；基线37fa6f0，无分支/构建。E02 v1 golden与E00 CI缺口、最小白名单/真源V映射与可离线验证范围；尚未实施。
+
+#### 2026-10-01T11:44:12.096826+00:00 AG-054 派发前设计复核
+- 草案cards/AG-054-design-r4.md SHA256 fa74b578596c92650ec6ece3c0a0765681a4e455283af66f9dcc8a76745b2ac8。SC-AG054-R2交原侦察 /root/scout_ag054，gpt-6.1-sol/high；只读核reserve错误类别及Released重放、白名单与测试，不实施。最终裁决待正式卡。
+
+#### 2026-10-01T11:49:49.010424+00:00 CTRL-AG053-R1 / #99 独立验收通过
+- 固定head a2c62326c7ca87a724da16ee4cfd133462b49dbe，父37fa6f08e9ef779b796b9713bc4664511321aa7e。交付f5214bca…叠放补丁逐字节一致，唯一lib.rs +280/-3。远端head一致、两树探针后干净。
+- qa/ctrl-ag053-a2c6232.log*：全新target-ctrl-ag053，fmt/clippy/workspace/build/2smoke/checker/unittest全部退出0。workspace1130/0=main1124+新增6，81二进制+5doc组；unittest48。另定向storage lib21/0日志qa/ctrl-ag053-storage-lib-a2c6232.log。
+- 主控反例qa/probe-ag053/append.rs SHA256 ba5039042d17e5fb8fa252fc43d20194bd81f8c41c1a550616cac15ac009f6b2；固定源source-local_export-37fa6f0.rs SHA25662e8afcacdd8146e79f24f7eba3ea917d9c68ecb298f1a0a769483df6e464f7c。head日志qa/ctrl-ag053-adversarial-head-a2c6232.log、父日志qa/ctrl-ag053-adversarial-base-37fa6f0.log，各2/0、退出0，源码树/target各自独立。
+- P1同一多kind菱形/环边集的深层candidate正文变更，公开导出发布Conflict且无目录/audit/完成状态；P2同id跨namespace的正文/tombstone/edge不能重绑快照，错误namespace预检Forbidden，原scope成功且其他namespace仍撤销。两者基线同过，明确为公开消费侧语义保持边界，非性能缺陷复现。
+- 资源回归：实施方基线4/2失败，长链747060→2787061；无关边4075→12804005；头6/0及主控全量复跑全部通过。R1夹具ANALYZE仅长链、2倍门不变；原未ANALYZE基线中断130保留，不记通过。所有实施材料qa/impl-ag053/。
+- verified仅E08/E16.5，§3.3.1 L319/§11 L1081/E08 L1295,L1299/E16.5 L1451,L1453；V017/V069/V075导出依赖核验、V038受限规模拒绝子范围。不可声明总边扫描/队列绝对有界、N+1消除、完整闭包清理、生产容量/时延、Linux/真实效果/发行。返修0，测试机制裁决R1一次，无冲突；回滚37fa6f0。
+- 首次PR栈位更新EOF，重试成功。下一步固定head ready/merge；合并前再fetch复核父等于main。
+
+#### 2026-10-01T11:50:57.872402+00:00 AG-059-R1 白名单注释同步
+- cards/AG-059-R1.md SHA25623ddc7a475437ad2e36d5dfbfc63942bd22281d8170968738a8d0d528ec92c71，依据§11.3 L1110/§11.5 L1132，允许verify_sources文档调用计数随本次新增闸同步，先核真实调用点；代码与seeds不改。原实施max档不变。
+
+#### 2026-10-01T11:52:52.753187+00:00 合并 AG-053 / #99
+- fixed head a2c62326c7ca87a724da16ee4cfd133462b49dbe；merged_sha 3aa3804db4ec39a72f38a8ec00cc7e6f9e92b360；mergedAt 2026-10-01T11:51:03Z；accepted tree=merged tree=b5855ddf193f72b1b9dd43622e01d54b8c887c4d，一致。本地main已ff-only到origin/main。
+- --admin未使用（CLEAN且无审批保护要求，固定head普通merge成功）；实现返修0、测试裁决R1一次，无冲突。清理随后执行。
+- 过程偏离：Controller acceptance正文更新遇EOF，主控错误地继续ready/merge，随后立即重试补写并读取核对成功；实际独立全量/反例及本地CTRL记录都在merge前完成，验收head不变。此顺序偏离明确披露；后续把正文更新成功作为ready的显式前置条件。
+
+#### 2026-10-01T11:56:05.848971+00:00 AG-053清理与AG-054派发
+- #99工作树/父对照干净且均为main祖先，正常remove，本地branch -d，远端逐一删除；自身实施/验收/base targets删除，QA全保留。磁盘32GiB，main=origin/main=3aa3804db4ec39a72f38a8ec00cc7e6f9e92b360干净。
+- AG-054 E04/§7.2/§7.2.1、V008/V096/V086限卡中子范围。卡cards/AG-054.md SHA256d167cdaa3c34fc28ad07089d65f1764d3367f5e063c8708ce44b6eae4d99ad0e；正式裁决取代草案，版本化原因码防旧记录误解码，generic DB/未知/坏source不退款，旧storage API保持。
+- 基线3aa3804db4ec39a72f38a8ec00cc7e6f9e92b360；worktree out/work-20260930/ag-054；分支wrokbot/ag-054-typed-predispatch-refusals。实施 /root/impl_ag054，gpt-6.1-sol/max（L跨crate/计费/恢复安全缺陷）。与052/059文件不重叠；实施3，编译最多3。
+- SC-AG055/056完成，只读事实保存于会话；后续正式卡可纯golden测试/CI。AG056纯workflow只能加CI固定迁移摘要门，不能声称smoke脚本自身覆盖0005/6；此范围须正式裁决。尚未实施。
+
+#### 2026-10-01T11:58:35.612644+00:00 AG-052本地交付及主控接管发布请求
+- 用户辅助chat自动审批拒绝其git push，理由未识别该chat中的直接用户授权；主控未让其绕过，要求冻结并完整报告。root有直接用户授权：用户指定启动提示词SHA256并要求逐条执行，§3明文draft PR到acosmi/RSIAgent及固定head推送；再次核对hash/范围/远端。
+- 本地fc381036482727454f7b008a51fec99a8e2d581b，父37fa6f0；两文件+1432/-15（streaming_evaluator.rs +122/-15，新streaming_verdicts_v42.rs +1310），已全部读diff与测试。无out/方案/归档/秘密，root已用require_escalated显式说明原拒绝原因及可信授权，提交限定push请求。
+- 实施结果：基线3/7失败，新integration10/0+private2/0；workspace最终1136/0（旧main1124+12），沙箱HTTP5个失败已保留并提权全量复跑。主控叠放后应1130+12=1142；尚未主控验收，不合并。
+
+#### 2026-10-01T12:00:15.745134+00:00 AG-052 / #100 叠放与独立全量启动
+- 主控在直接用户授权下require_escalated发布已通过自动审批，push成功；draft PR #100 https://github.com/acosmi/RSIAgent/pull/100 已创建附到chat，辅助窗口阻断不再存在于主控请求。只提交两个审阅过的文件。
+- rebase从37fa6f08e9ef779b796b9713bc4664511321aa7e到3aa3804db4ec39a72f38a8ec00cc7e6f9e92b360，fc381036482727454f7b008a51fec99a8e2d581b→652d7cac0d6cf1fa086e96b6ac9554ed6326b1da。单提交patch cmp0（qa/ctrl-ag052-before-rebase.patch、after），无冲突；literal full refs/head force-with-lease推送。
+- 全新target-ctrl-ag052，qa/ctrl-ag052-652d7ca.log*正在独立全量，预期1142=1130+12；worktree复跑期间禁止添加文件。原实施日志复制qa/impl-ag052，最终report到达后补归档。
+- AG059最终tests-only基线17/4失败，日志baseline-final-tests，四失败为目标缺陷；初版fixture容量/namespace/shared未知cleanup错误已披露，仅修新夹具，不改产品边界。既有import→optimization.source清理unknown_scope不在本任务实施范围，后续归入typed边完整性/实际支持记录清单复核。
+
+#### 2026-10-01T12:04:56.807900+00:00 AG-052验收进展与SC-AG058派发
+- #100独立全量qa/ctrl-ag052-652d7ca.log*全部8项退出0；workspace1142/0（1130+12），82二进制+5doc组，unittest48。head两个主控探针2/0且clean，父树对照启动。
+- AG-052最终report已归档qa/impl-ag052/report.md，含辅助chat两次自动审批拒绝原文。root重新核对直接用户指令、payload和目标后自动审批允许，#100成功创建；不是借助辅助报告授予权限。child交付已结束，后续只读。
+- SC-AG058-r4卡SHA2563fba98dbd8b0e1a93dbf963f6be9141547b94665f44667dddef27feb9d41b3e4，派用户授权chat01a0f723-2cc0-7b10-943b-f03e5c6f95cc，gpt-6.1-sol/medium（S），基线3aa3804；AG058过期文字的真源/消费者事实，禁止任何写入/构建/发布。无实施分支。
+- AG059披露初读_common前AGENTS文件名搜索范围过宽（发现其他参考仓路径但未开内容/进入/修改），之后严格本WT；已记过程偏离，未授权扩展范围。
+
+#### 2026-10-01T12:05:36.364405+00:00 SC-AG057只读派发
+- /root/scout_ag057，gpt-6.1-sol/high（M API兼容），基线3aa3804；E01文档/显式样本量及旧冻结计划语义，核E/V与最小接口，不实施、不构建/写文件。
+
+#### 2026-10-01T12:06:46.429786+00:00 CTRL-AG052-R1 / #100 独立验收通过
+- 固定head652d7cac0d6cf1fa086e96b6ac9554ed6326b1da，父3aa3804db4ec39a72f38a8ec00cc7e6f9e92b360；交付fc381036…两文件+1432/-15逐行已读，单提交rebase patch逐字节相同，无冲突/产品返修。
+- 全新target-ctrl-ag052，qa/ctrl-ag052-652d7ca.log*，全部8检查退出0；workspace1142/0（main1130+10集成+2私有单测），82二进制+5doc组；unittest48。check结构/计划绑定成功。
+- 主控源probe-ag052/source-streaming-v1-37fa6f0.rs SHA25636d3bdb5b77946ab6715624eaefc6cf5b0f2a45ed67c65a6e9fafda9e32cc37b：固定原streaming_evaluator测试拷贝，只将控制schema常量改成v1字面量，确保两树相同且测旧control。append.rs SHA2560a370309dccf9c761791339262ef51e5fd541531dafcbb268ca007b9c2fe20cf。
+- head日志qa/ctrl-ag052-adversarial-head-652d7ca.log 2/0退出0；父树qa/ctrl-ag052-adversarial-base-3aa3804.log 0/2退出101，均正常编译且事后clean。P1合法v1控制只改approver_actor、schema/统计计划不改；P2只把ticket.registration_digest换为不同合法digest；旧版二者都Ok(CompleteBatch)，新head均Conflict、两次重复无artifact/audit写入。独立于实施方只改schema的篡改用例。
+- verified E05，E05L1253/L1257/L1259、§3.4L337、§3.4.1L372、§6.6L709/L711；V010/V012/V084/V085仅本地程序完整批次、冻结控制版本/摘要/恢复/晋级拒绝范围。v2保留Improved/Invalid/原Inconclusive，negative_lcb不称确认退化，成本节省无统计证明仍压Inconclusive；v1原字节/reasons保留。晋级门恒拒。
+- 不可声明新固定样本UCB算法、core decide已修、真实效果/生产验收权/可晋级/完整成本与尾延迟统计保证、所有新请求自动v2、全部E/V或Linux。提交事务二次读取控制检查代码已复核，无额外暂停hook模拟任意调度；不能夸称并发穷举。回滚需独立revert保留历史/费用，旧程序对v2失败关闭；父提交3aa3804仅源码回滚参考。
+- 辅助chat两次auto-review因无该chat可信用户授权拒绝push，报告原文在qa/impl-ag052/report.md；主控核本chat直接用户指令与实际payload/remote后正常通过审批并建PR。已披露交付适配，不隐藏拒绝。
+
+#### 2026-10-01T12:10:22.209696+00:00 合并 AG-052 / #100
+- fixed head 652d7cac0d6cf1fa086e96b6ac9554ed6326b1da，merged_sha43f0022478d58dd8a8e6492cffb3aa24463b3fce，mergedAt2026-10-01T12:08:10Z；双方tree=430461d69007524b1f531ed3ec457f722f86dcff。merge的第一父提交确为3aa3804db4ec39a72f38a8ec00cc7e6f9e92b360，第二父为验收head。主控树核对后ff-only更新main，未用--admin（CLEAN/无审批要求）。
+- 本次验收正文写入及逐字读回先成功，再ready/merge。另有过程偏离：合并前fetch遇TLS失败，functions.exec中后续工具调用未依退出码停止而继续merge；原origin/main值仍旧值。合并后fetch重试成功，确认实际父确为已验父、tree完全一致；没有合入未验树，但合并前刷新闸执行顺序不合要求。后续所有合并将采用单个set -euo pipefail脚本，fetch/正文读回/head/base/clean任一失败立即退出，不再跨多个工具调用假定成功。
+- 实施返修0，无叠放冲突；辅助chat发布阻断已由root基于直接用户授权合规接管并通过审批。二次清单已更新，清理随后执行。
+
+#### 2026-10-01T12:19:34.558209+00:00 压缩后启动闸门、AG-055派发与AG-059交付工具裁决
+- 提示词b0000207…、真源70ec06e4…一致，完整重读启动提示词与规定状态/队列/卡/探针/台账；gh auth/fetch、cargo1.98.1、Python3.12.14通过，磁盘33GiB。main=origin/main=43f0022478d58dd8a8e6492cffb3aa24463b3fce干净。
+- #100清理已完成：干净且已合入的AG052/父对照工作树正常移除，本地branch -d、远端逐个删除，实施/验收/base target移除；raw QA全部保留。
+- AG-055 E02/V002旧v1 wire/四工具/未知字段子范围；卡cards/AG-055.md SHA256853308a8c4f301df3cde2cc8e3a3c3382d9ba2ae6ac0901ef2dfe1f89dac7060；依据§5.1 L453/L455、§6.1 L605/L609、E02 L1213/L1215、V002 L1502、L2166。裁决仅新增golden测试，旧Evaluation/float/typed字节解释保持，不声称RFC8785或产品缺陷修复。
+- 基线43f0022478d58dd8a8e6492cffb3aa24463b3fce；worktree out/work-20260930/ag-055；branch wrokbot/ag-055-v1-contract-goldens；实施/root/impl_ag055，gpt-6.1-sol/high（M）。与054/059无重叠；实施3，059构建结束，root验收+054+055最多3路。
+- AG059交付工具裁决：gh GraphQL create两次EOF、REST查询确认无PR；允许等价REST POST创建同head/base/main/title/body且draft=true，任何未知结果先查询，禁止重复PR。依据启动§3.4同一draft交付要求，仅工具回退，不改变卡/文件/产品行为。
+
+#### 2026-10-01T12:23:07.675616+00:00 AG-059 / #101交付与叠放
+- draft PR https://github.com/acosmi/RSIAgent/pull/101，交付4c403ebc68c8c66bfd2c45f74778f4cef884f189；REST同等draft创建成功，GraphQL EOF原始日志保留。两文件+693/-58逐行已读，产品只有联合all_sources首写前verify_sources及R1调用数注释；测试8项新增且仅授权旧断言改变。
+- 原基线37fa6f08e9ef779b796b9713bc4664511321aa7e叠放到43f0022478d58dd8a8e6492cffb3aa24463b3fce，新head8257e6a73304c250b545ead3c0bc9409cf2daa35；单提交前后patch逐字节cmp0，无冲突。首次fetch TLS失败脚本立即退出未变更，重试成功再rebase，固定旧head lease推送成功（首推TLS后重试）。
+- 实施证据已归档qa/impl-ag059：baseline最终17/4失败；定向55/0；workspace首次沙箱5HTTP PermissionDenied，提权最终1132/0=旧main1124+8，其他全部0。主控全新target-ctrl-ag059运行中，日志qa/ctrl-ag059-8257e6a.log*，应1142+8=1150。未知cleanup范围和storage-kind边界继续保持。
+- 归档脚本首次调用提权环境默认python3遇编码错误、未归档，已改绝对out/pybin/python3重跑；验收脚本自身指定PATH不受影响。
+
+#### 2026-10-01T12:24:54.930302+00:00 SC-AG062派发与AG054-R1
+- SC-AG062卡SHA256d3d4f9206cb5d08e44928a2d2b95f3ccc92e30436386559f02980f87998c536f，用户授权辅助chat01a0f723-2cc0-7b10-943b-f03e5c6f95cc，gpt-6.1-sol/high，基线43f0022只读E02 FieldContract/P-B绑定，尚未实施。SC058报告已存cards/SC-AG058-r4-report.md。
+- AG054-R1 ae9c3c1a5d7eba66ec755ebfcd35f50cfd366cd24d2837947f2bf927cf80c320：依据§7.2 L819/§7.2.1 L831/E04 L1239,L1243，保留空sources恢复的原成功语义，两类API均不删除持久来源；source_closure_changed限原非空比较分支，不新增typed-only强制完整来源列表。须测空恢复后来源/金额不变、begin仍按持久源撤销拒绝。max档/白名单不变，卡已发实施。
+
+#### 2026-10-01T12:29:34.898268+00:00 CTRL-AG059-R1 / #101独立验收通过
+- 固定head8257e6a73304c250b545ead3c0bc9409cf2daa35，父43f0022478d58dd8a8e6492cffb3aa24463b3fce；原交付4c403eb…重放一提交patch逐字节cmp0。两文件+693/-58逐行复核，产品+4/-1只联合首写前核验及R1注释；测试新增8项。
+- qa/ctrl-ag059-8257e6a.log*全新target，8项退出0；1150/0=1142+8、82二进制+5doc组，unittest48。
+- 主控probe-ag059/source-write-side-3aa3804.rs SHA256e2f9b6ff8235ba5da2fe4edb643cd19f526a4d4501bb2336a08055dd5feced4d，append.rs SHA2561bf7fb8c4c441a7dde7046b1b383c7626c8f1d1145e9ebc4294645257b2683b8；head日志ctrl-ag059-adversarial-head-8257e6a.log 2/0 exit0，父ctrl-ag059-adversarial-base-43f0022.log 0/2 exit101。P1缺失+已解析脱敏依赖混合，两序/重复；P2同publisher/asset而kind不同的skill/improver，live skill正向与revoked improver混合，旧树均写Prepared/audit/边/blob后拒，新树无变更。两树clean。
+- verified E08/E16.2，§11.3L1110/§11.5L1132/E08L1295,L1299，V017/V075已解析manifest与请求联合首写前拒绝，V038现有联合10000界；missing保持quarantine。不可声明storage-kind/物理擦除/未知清理schema/真实宿主/吞吐时延/Linux/整体E-V/收益/发行。回滚参考父43f0022，不删除撤销/账单事实。
+- 接受实施夹具纠正（容量、namespace、unknown cleanup）且原失败日志保留；最终tests-only基线17/4失败。产品返修0，R1注释授权1，无冲突。GraphQL→REST交付回退与首次只读AGENTS文件名范围偏离均披露。验收正文已生成，必须写入读回成功再ready/固定head merge。
+
+#### 2026-10-01T12:32:11.224591+00:00 合并AG-059 / #101
+- fixed head 8257e6a73304c250b545ead3c0bc9409cf2daa35，merged_sha 296b5a07a7bf911d02454b683d5732e9d38e3ae5，mergedAt2026-10-01T12:31:01Z；两树均87dc2da1cb72494b7241792c96b4eb2341009a1f，merge父为43f0022478d58dd8a8e6492cffb3aa24463b3fce+验收head。main已ff-only。
+- 采用qa/merge-ag059-8257e6a.sh单一set -euo pipefail脚本，验收正文REST写入并逐字读回、remote head/base/draft/clean、fetch当前父、ready后再次head/CLEAN及fetch全部成功后才固定head合并。日志qa/ctrl-ag059-merge.log。admin=false，未有保护审批要求，无冲突，产品返修0、R1注释裁决1。
+- 原实施最终报告已归qa/impl-ag059/handoff.md；实施的最终head后置检查exit1是主控接管rebase导致，已核对非源码意外变化。二次清单即时更新；清理随后执行。AG060后已合并3产品任务，现触发AG061台账PR。
+
+#### 2026-10-01T12:33:29.256198+00:00 AG054-R2与AG055发布审批边界
+- AG054-R2 cards/AG-054-R2.md SHA25630db20fa59bf3217fb13245286df618550df58dc60145bf0412f225d58537e69：补授权engine budget_revoke_gate_v42两处既有断言，来源撤销broker Unauthorized固定码、dev Released且0预留；依据§7.2L819/§7.2.1L831/E04L1239,L1243，其余未知费用/无dispatch/receipt不变。
+- AG055自动审批拒绝其commit/push/create组合，认为未识别该payload到目标repo的直接用户授权；子代理未执行，正完成本地交付。root将独立审阅17新增测试/fixture及目标，引用本chat直接用户哈希指定提示词§3.4/§10授权，连同原拒绝提交审批；未获准不外发、不用子代理报告代替权限。
+
+#### 2026-10-01T12:35:11.534371+00:00 AG059清理及AG056派发
+- #101两工作树干净、heads均origin/main祖先后正常remove；本地branch -d、远端单分支删除；实施/验收/base target清理完，QA全保留，磁盘27GiB。
+- AG056 E00 V001/V071/V072/V073/V080/V098限定CI定义；卡cards/AG-056.md SHA256a996d6f23750c37f2d4af6b55a6fa0521c7f7467714ce11b878d144987ddb14d（草稿d92dc2ac…派发前更新基线/编译许可）。基线296b5a07a7bf911d02454b683d5732e9d38e3ae5；worktree out/work-20260930/ag-056；branch wrokbot/ag-056-ci-quality-gates；/root/impl_ag056 gpt-6.1-sol/high（S）。仅ci.yml，不派Actions；0005/6为独立CIchecksum门，非smoke脚本扩充。
+- AG054+055+056实施至多3；055已结束构建，root台账验收+054+056最多3编译。AG061由主控准备，3个产品合并触发，不等用户确认。
+
+#### 2026-10-01T12:35:40.251841+00:00 AG061主控台账任务启动
+- 卡cards/AG-061.md SHA256beb3c160ec5d99105aadec68bb4f567f8edfe3b2c32ae368975dea4d496eb9ab；E00/E16.6 V001/V071/V072/V073/V074/V080/V098限定证据登记；主控Codex自做，不虚构实际模型。
+- 基线296b5a07a7bf911d02454b683d5732e9d38e3ae5，worktree out/work-20260930/ag-061，branch wrokbot/ag-061-controller-ledger-r4a。折入r4至本事件，补#99–101三条子范围，刷新1150基线/队列；原始材料仅本地。
+
 ## 2026-10-01 第三轮证据折入（AG-060，第四轮主控整理）
 
 本节登记第三轮既有验收与合并事实；不是第四轮重新取得产品效果证据。原始卡、裁决、日志、反例和输入清单仅本地保留。AG-060 的新验收范围是登记一致性和当前整树回归，后续主控验收记录另行折入。
@@ -50,7 +268,7 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 | §1.4 L96 | `evo-core/src/curriculum.rs:8` 旧 LearnerState/next_task 仍保留；`:304 LearnerStateV2` 与 `:455 detect_plateau_signal` 有覆盖/环境/冷却/周期等，空失败可继续判断。离线默认零预算/Disabled，状态结构齐备不等于真实学习闭环；失败簇更新语义仍待 GC-6。 |
 | §1.4 L97 | `evo-core/src/curriculum.rs:73 proposal_from_text` 默认 oracle_ok=false（AG-050/#94）；`evo-engine/src/curriculum_profiles.rs:299 is_development_eligible` 恒 false，只有 Quarantined/SandboxUnavailable。文本形状不能取得 verified；真实 runner 与隔离仍缺。 |
 | §1.4 L98 | `evo-engine/src/curriculum.rs:23 step` 先 next_task? 后 reserve?，保留 typed 选题错误（AG-050/#94）。旧 RootBudget 接口仍为内存、无 dispatch/释放审计，完整预算生命周期不在本修复声明内。 |
-| §1.4 L99 | `evo-engine/src/evaluator.rs:80 grade` 保留旧整组 rows；streaming 的 record_grader_receipt/stop_ticket/invalidate/settle_after_stop 与 `evo-core/src/sequential.rs:469 record_complete_unit` 处理前缀、早停及对账。`streaming_evaluator.rs:1944` 完整批次仍被强制 Inconclusive（AG-052 待办）；仅 ProgramFixture/TicketExecutionOnly。 |
+| §1.4 L99 | `evo-engine/src/evaluator.rs:80 grade` 保留旧整组 rows；streaming 的 record_grader_receipt/stop_ticket/invalidate/settle_after_stop 与 `evo-core/src/sequential.rs:469 record_complete_unit` 处理前缀、早停及对账。该8043026基线的完整批次当时仍被强制 Inconclusive；第四轮AG-052/#100已补显式v2后处理，v1冻结行为保留，详见顶部新记录；仍仅 ProgramFixture/TicketExecutionOnly。 |
 | §1.5 L109 | `apps/rsia/src/main.rs:86 main` 已有 Serve/Mcp/Manage，`:139 axum::serve` 和 `:161 serve_stdio` 接入口，已非仅打印 bootstrap。bootstrap 仍是 disabled model/reference host；额外真实宿主与模型证据未取得。 |
 | §1.5 L110 | `evo-core/src/contract.rs:193 SkillSnapshot`、`:238 SkillPatch` 保留三态及叶字段；`skill_edit.rs:285 compile_skill_edit_batch` 校验绑定、保护区、编辑界限并生成既有 SkillPatch。文本编译不证明优化收益。 |
 | §1.5 L111 | `evo-engine/src/closed_loop.rs:53 run_structural_loop` 仍由传入 Verdict 构造观测；`:148` 忽略凭据 bool，used_real_model/auto_promote 固定 false，attached/used/benefit 为空。结构 fixture 无真实调用、审批或效果声明。 |
@@ -214,7 +432,7 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
   merge-all.sh 覆盖 A–AM，全部已合并。开放 PR 为 0。
 
 
-### 当前队列与待用户边界（第三轮结项后）
+### 第三轮结项时队列（历史快照；当前状态见第四轮折入节）
 
 #### 下一批（文件与在途不重叠，可随时派）
 - AG-052 [M] E05 完整批次保存统计判定本身（GA-16 方案 A）：卡 cards/AG-052.md 已写、未派。卡内基线 a4a60c8 已过期，派发前改为当时栈顶，并重核 streaming_evaluator.rs 行号。
@@ -1265,15 +1483,15 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 
 | 编号 | 范围 | 状态 | 未完成项/边界 |
 |---|---|---|---|
-| E00 | 归并真实源码与可重建输入 | implemented_not_verified（索引同口径；核心固定基线子范围 verified，历史归并 blocked） | 原始112测试与门禁均复验通过；脚本已完成10项主控正负验证；源码或fixture变更后旧日志不能用于新输入；历史缺包不隐藏。2026-09-30/10-01：`smoke_cli.py` 过时使 CI 门失败，AG-013 已修并合并（#59，merged_sha `69a3b3ed04377c30ee7193c0679a3747f1606a1e`）；派生索引/检查器绑定 v4.2（AG-012，#60，merged_sha `dc036d5f4dd5d870fb0ca98bdfe1ef6ec626140b`）；裸 `--data` 默认路径无法加锁启动已修（AG-023，#68，merged_sha `3ffe1e26a908d4c9240320d52fcba1e92dc383d4`）。历史包与 T001–T126 归并仍为外部阻塞。  当前基线为 8043026，第三轮完整工作区 1124 通过/0失败（86 个结果行，含 doc-test，不等同二进制数）；GA-1 测试与迁移清单见本轮节。|
+| E00 | 归并真实源码与可重建输入 | implemented_not_verified（索引同口径；核心固定基线子范围 verified，历史归并 blocked） | 原始112测试与门禁均复验通过；脚本已完成10项主控正负验证；源码或fixture变更后旧日志不能用于新输入；历史缺包不隐藏。2026-09-30/10-01：`smoke_cli.py` 过时使 CI 门失败，AG-013 已修并合并（#59，merged_sha `69a3b3ed04377c30ee7193c0679a3747f1606a1e`）；派生索引/检查器绑定 v4.2（AG-012，#60，merged_sha `dc036d5f4dd5d870fb0ca98bdfe1ef6ec626140b`）；裸 `--data` 默认路径无法加锁启动已修（AG-023，#68，merged_sha `3ffe1e26a908d4c9240320d52fcba1e92dc383d4`）。历史包与 T001–T126 归并仍为外部阻塞。  当前基线296b5a0，第四轮完整工作区1150通过/0失败（82测试二进制+5doc组）；历史1124基线与迁移清单保留，AG056 CI门仍在途。|
 | E01 | 先冻结实验、任务分区和预算可行性 | blocked（索引同口径；静态合同子范围已 verified） | 本地bfbed84；显式n/统计前提、alpha/留出/比较/完整费用合同已验；开发小试/正式样本与付费授权仍缺。 |
 | E02 | 最小版本化契约与宿主能力边界 | in_progress | 纯编译作用域：有界原子编辑；运行/宿主/其他新增契约尚待后续消费者。 |
 | E03 | 把跨任务证据真正接入生成消费者 | in_progress（消费者/恢复已verified；开发回执子范围已verified并合并） | 主控144项core/engine测试、fmt/clippy通过；实际ModelPort请求、同清单开发选择及持久恢复已验。2026-09-30 AG-016（#63，merged_sha `3e2fc067190077b8cf8401875d6c627b8d9e13fc`）：DevelopmentControl/执行回执/grader 回执 typed schema、已登记纯函数运行器与真实观察门禁。E03 门验证的是回执链自洽，不复算已登记纯函数的输出，也未把执行方身份绑定到登记的执行器（AG-033 验收观察）。真实提供商/样本/收益、隔离运行器未验。 |
 | E04 | 可信执行、隔离与根资源预算 | in_progress（根预算/broker已verified） | 主控预算15（含10001调用）、broker9、executor6项及fmt/clippy通过；group完整分页停止修复已追加PR #33；真实提供商、进程隔离尚未验。 |
-| E05 | 独立验收器与有边界的统计判定 | blocked（索引同口径；持久控制/早停子范围已 verified） | 主控12流式+6旧评测+13core共31项及fmt/clippy通过；晚到回执、输出不可变、Exposure时间/终态/未知费用保留已修；真实提供商、进程隔离、完整成本及逐依赖撤销仍未验，fixture禁止晋级。 |
+| E05 | 独立验收器与有边界的统计判定 | blocked（索引同口径；持久控制/早停子范围已 verified） | 主控12流式+6旧评测+13core共31项及fmt/clippy通过；晚到回执、输出不可变、Exposure时间/终态/未知费用保留已修；AG-052/#100已验显式v2完整批次结论与完整登记绑定，v1旧行为保留，非UCB确认/成本未证不扩声明；真实提供商、进程隔离、完整成本及逐依赖撤销仍未验，fixture禁止晋级。 |
 | E06 | 组合发布、实际应用与最小撤销闭环 | in_progress（持久门禁已verified） | 主控7集成+4单元+12 E05回归及fmt/clippy通过；审批防回退、Host完整报告闭包、所有快照读入口已验；真实生产批准/组合应用/回滚受E05证据阻塞。 |
-| E07 | 第一个最小可验证真实闭环 | in_progress（协议与管理消费者子范围已verified）/ blocked（真实闭环） | 主控协议21项与管理增量27项、真实HTTP/MCP/CLI、参考宿主及fmt/clippy/build通过；E05注册/票据管理已接线。replay.run已由AG-001接通并验收；AG-015/AG-017 接通 curriculum.step 与 exploration.start（幂等、读侧重验；#61 merged_sha `b220971c4e5ad44453c9d3e5787fbdfda6eb01ac`、#64 merged_sha `f8fa1a19d5e968f83a52385ecb43d07d56442610`）；第二轮 AG-027（#74，merged_sha `c72aae14c9f35c1bcc090b5a374d2696d57dacfc`）管理作业与私有输入清理闭包及提交时拒绝已撤销依赖、AG-044（#89，merged_sha `cc85b5c71cec06763909fb0efa33c4e296b6178d`）提交时上游闭包闸门。meta.start 保持 blocked 直至 E14.2c；grant/package/seed 的来源与上游闭包写入闸门已由 AG-046/#96 验收；manifest dependency_refs 的首写前闸门仍待 AG-059；真实模型、独立数据与支付授权未取得。 |
-| E08 | 可恢复的撤销、保留和备份链 | in_progress（当前对象/本机恢复与第二轮撤销闭包子范围已verified） | 主控47项及clippy/fmt通过；当前可信SQLite锚由操作者指定，不声称辨别假冒旧库。第二轮（均已合并）：清理只在闭包不动点完成（AG-035 #83）、同 id 第二撤销源点名拒绝（AG-036 #82）、已撤销来源不预留不派发（AG-038 #85）、经济回放记录保留（AG-037 #86）、撤销后到达的响应与 stage fact 不留明文（AG-043 #88、AG-045 #90），以及探索、课程、管理与回放对象接入清理闭包（AG-024/025/027/032）。第三轮 AG-051/#95 已补经济记录恢复保护；AG-046/#96 已补 grant/package/seed 来源与上游闭包首写前闸门及读侧闸。未完成：manifest dependency_refs 首写前检查（AG-059）、其他迟到写入与 stage_bundle；tombstone 键带 kind/发布期 kind 精确性与物理擦除无现行明确条款，待用户修订，不再误引 §11.1；Linux/生产演练另验。 |
+| E07 | 第一个最小可验证真实闭环 | in_progress（协议与管理消费者子范围已verified）/ blocked（真实闭环） | 主控协议21项与管理增量27项、真实HTTP/MCP/CLI、参考宿主及fmt/clippy/build通过；E05注册/票据管理已接线。replay.run已由AG-001接通并验收；AG-015/AG-017 接通 curriculum.step 与 exploration.start（幂等、读侧重验；#61 merged_sha `b220971c4e5ad44453c9d3e5787fbdfda6eb01ac`、#64 merged_sha `f8fa1a19d5e968f83a52385ecb43d07d56442610`）；第二轮 AG-027（#74，merged_sha `c72aae14c9f35c1bcc090b5a374d2696d57dacfc`）管理作业与私有输入清理闭包及提交时拒绝已撤销依赖、AG-044（#89，merged_sha `cc85b5c71cec06763909fb0efa33c4e296b6178d`）提交时上游闭包闸门。meta.start 保持 blocked 直至 E14.2c；grant/package/seed 的来源与上游闭包写入闸门已由 AG-046/#96 验收；AG-059/#101已补已解析manifest dependency_refs联合首写前闸门；真实模型、独立数据与支付授权未取得。 |
+| E08 | 可恢复的撤销、保留和备份链 | in_progress（当前对象/本机恢复与第二轮撤销闭包子范围已verified） | 主控47项及clippy/fmt通过；当前可信SQLite锚由操作者指定，不声称辨别假冒旧库。第二轮（均已合并）：清理只在闭包不动点完成（AG-035 #83）、同 id 第二撤销源点名拒绝（AG-036 #82）、已撤销来源不预留不派发（AG-038 #85）、经济回放记录保留（AG-037 #86）、撤销后到达的响应与 stage fact 不留明文（AG-043 #88、AG-045 #90），以及探索、课程、管理与回放对象接入清理闭包（AG-024/025/027/032）。第三轮 AG-051/#95 已补经济记录恢复保护；AG-046/#96 已补 grant/package/seed 来源与上游闭包首写前闸门及读侧闸。第四轮AG-053/#99保留依赖快照语义并前置递归限制；AG-059/#101补已解析manifest依赖首写前检查。未完成：typed边完整性、其他迟到写入与 stage_bundle；tombstone 键带 kind/发布期 kind 精确性与物理擦除无现行明确条款，待用户修订，不再误引 §11.1；Linux/生产演练另验。 |
 | E09 | 生成/探索解耦与有状态在线探索 | in_progress（程序协调与第二轮多项子范围已verified） | 主控25项及clippy/fmt通过；完整输入幂等、两节点StoreJournal链、源水位、整批资源已验。第二轮（均已合并）：技能组作业（AG-021 #69）、同题对比实践（AG-026 #73）、探索记录清理边（AG-024 #71）、run_next 可信观察门（AG-033 #80）、合法动作与前缀卫生（AG-039 #84）、登记指纹与计数器（AG-040 #87）、付费后收敛（AG-041 #91）、恢复计数派生（AG-042 #92）。第三轮 AG-048/#97 已验封闭终态类和白名单内固定码（模型回答日志与 broker 账本不在“不落原文”声明内）。未完成：可修复故障的类型化来源与 episode 绑定（AG-047）、优化历史进入请求与签名（PR-C）；真实 G2 未取得；V097（§3.1.1 消融）作用域未验。 |
 | E10 | 不可变世界池与纯查表回放 | in_progress（程序回放/池/报告已verified） | 主控57项、clippy/fmt通过；观察正文绑定实际共同输入和来源，q0/辅助来源篡改拒绝；世界/池/报告持久与实时撤销已验。replay.run管理适配经AG-001验收并合并；AG-032（#79，merged_sha `b262bbb2a0ea9ead68bc33fe1e58235e85bcffea`）：回放读路径在撤销清理的每个中间状态返回点名 Conflict。真实观测仍缺，不声称经济收益。 |
 | E11 | 验证回放优化的真实经济收益 | in_progress（合同/持久准备已verified） | 主控10项及clippy/fmt通过；单票配对、九类成本、实际预算绑定/最终回执不可变、并发取消/晚到账/报告CAS已验。可信在线配对回执消费者尚未实现；真实经济实验未运行，不声称节省。 |
@@ -1283,11 +1501,11 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 | E15 | 后继质量与跨代收益实验 | planned | 真实后继实验未运行。 |
 | E16 | 产品支持范围与最终交付门禁 | in_progress（E16.1–E16.5 子范围已验并合并） | E16.6 索引已按合并事实更新（#56）并由 AG-012 绑定 v4.2；真实宿主/沙箱/第三方包证据未取得；已按真源正文复核（2026-09-30，见顶部审计节）。2026-10-01：E16.5 容量门接线（AG-014 #62）、启动恢复/部署门（AG-018 #67）与恢复覆盖（AG-029 #76）已合并；索引登记第二轮 31 条验证记录（AG-049）。 |
 | E16.1 | 来源导入与版本化读取器 | in_progress（程序/持久导入子范围已verified并合并） | PR #44 merged_sha `acda31895bb1cb42cf7985b907a4c600429573d0`（主控返修 F13–F16 后）；完整真实迁移链未关闭。 |
-| E16.2 | 资产导入／分享与隐私门禁 | in_progress（staging/本地导出子范围已verified并合并） | PR #54 取代 #45，merged_sha `16c2817bc192bf71535d2c99d867873e6e85bcf8`（主控返修 F17–F20 后）；F08 只对照提案版；真实第三方包/远端销毁未验。 |
+| E16.2 | 资产导入／分享与隐私门禁 | in_progress（staging/本地导出子范围已verified并合并） | PR #54 取代 #45，merged_sha `16c2817bc192bf71535d2c99d867873e6e85bcf8`（主控返修 F17–F20 后）；F08 只对照提案版；AG-059/#101补manifest来源首写前闸（登记于E08），storage-kind晚拒边界保留；真实第三方包/远端销毁未验。 |
 | E16.3 | 内置种子与本地修改保护 | in_progress（持久种子安装/重置 staging 子范围已verified并合并） | PR #54 取代 #46，merged_sha `16c2817bc192bf71535d2c99d867873e6e85bcf8`；真实用户目录演练未验。 |
 | E16.4 | 额外真实宿主与配置面漂移 | in_progress（拒绝门/记录重载子范围已verified并合并）/ blocked（真实宿主） | PR #47 重新堆叠后 merged_sha `1c824e6614667da4dc7ea74e96b46adfd1d2c089`（含主控 F21）；无真实 Claude Code 证据，`verify_host_receipt` 在本仓库无接受路径（fail-closed）。 |
-| E16.5 | 持久恢复、容量、依赖与部署安全 | in_progress（门函数、容量门接线、启动恢复/部署门与恢复覆盖子范围已verified并合并）/ blocked（真实沙箱） | PR #48 merged_sha `4980aa498baa80fd82e83441839e606859fa4065`（F10–F12）；AG-014（#62，merged_sha `9c3ec979fd2ee3c53dfbf4ddf96967e94808b11e`）：容量门接入六个真实入口并实例级跨命名空间计数（F24）；AG-018（#67，merged_sha `5c4f81dca79373c6871449aed287f61fb1f3cbc2`）：启动恢复隔离门与部署门接入 rsia serve/mcp；AG-029（#76，merged_sha `7120842a1f586ae394b76e146c8298f11bec52bc`）：本轮新对象的恢复覆盖。AG-051/#95 以精确 schema 增补经济实验/作业/成本回执/报告恢复保护。未完成：真实沙箱（外部）、Linux 实测、启动时驱动未完成的撤销清理与残留 dispatched 调用、出站一致性；本轮新增内部对象的容量上限须先修订 §3.3.1。 |
-| E16.6 | 发行、证据台账与唯一真源交接 | in_progress（派生索引与检查器子范围已verified并合并） | #56 merged_sha `364a0722be7d5b05cbf01c453322ba35c2fdfa67`、#57 merged_sha `7b425fcf4da08b8949aaa8f3426853f8938d3f3c`；AG-012（#60，merged_sha `dc036d5f4dd5d870fb0ca98bdfe1ef6ec626140b`）绑定 v4.2 与谱系；2026-10-01 登记第二轮 31 条验证记录（AG-049），AG-060 补登记第三轮四条已验子范围；索引仍声明 subset_only，全路线未完成；已按真源正文复核（2026-09-30，见顶部审计节）。 |
+| E16.5 | 持久恢复、容量、依赖与部署安全 | in_progress（门函数、容量门接线、启动恢复/部署门与恢复覆盖子范围已verified并合并）/ blocked（真实沙箱） | PR #48 merged_sha `4980aa498baa80fd82e83441839e606859fa4065`（F10–F12）；AG-014（#62，merged_sha `9c3ec979fd2ee3c53dfbf4ddf96967e94808b11e`）：容量门接入六个真实入口并实例级跨命名空间计数（F24）；AG-018（#67，merged_sha `5c4f81dca79373c6871449aed287f61fb1f3cbc2`）：启动恢复隔离门与部署门接入 rsia serve/mcp；AG-029（#76，merged_sha `7120842a1f586ae394b76e146c8298f11bec52bc`）：本轮新对象的恢复覆盖。AG-051/#95 以精确 schema 增补经济实验/作业/成本回执/报告恢复保护。AG-053/#99已验有界依赖快照（登记于E08），不声称总边扫描绝对有界。未完成：真实沙箱（外部）、Linux 实测、启动时驱动未完成的撤销清理与残留 dispatched 调用、出站一致性；本轮新增内部对象的容量上限须先修订 §3.3.1。 |
+| E16.6 | 发行、证据台账与唯一真源交接 | in_progress（派生索引与检查器子范围已verified并合并） | #56 merged_sha `364a0722be7d5b05cbf01c453322ba35c2fdfa67`、#57 merged_sha `7b425fcf4da08b8949aaa8f3426853f8938d3f3c`；AG-012（#60，merged_sha `dc036d5f4dd5d870fb0ca98bdfe1ef6ec626140b`）绑定 v4.2 与谱系；2026-10-01 登记第二轮 31 条验证记录（AG-049），AG-060补登记第三轮四条、AG-061补登记第四轮首批三条已验子范围；索引仍声明 subset_only，全路线未完成；已按真源正文复核（2026-09-30，见顶部审计节）。 |
 | E17 | 可选：开发代理评分器演化 | in_progress（关闭/拒绝子范围已verified并合并） | PR #50 重新堆叠后 merged_sha `e94042d3f2fd761455727a6c82ad13fd3d657d03`（主控硬化 F22）；默认关闭，不代表真实扩展运行通过。 |
 | E18 | 可选：自动提出代码修改，不自动部署 | in_progress（关闭/拒绝子范围已verified并合并） | PR #51 重新堆叠后 merged_sha `bef7bd1763a01ccb677ada4acad71a063366539c`（主控硬化 F23）；默认关闭，不代表真实扩展运行通过。 |
 
