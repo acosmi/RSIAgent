@@ -8,7 +8,9 @@
 //! stream's stage facts, dispatch facts, nodes, history, model cache keys and
 //! budget dispatch group are disjoint from the other's; a request id reused
 //! across streams is refused by the budget layer; each stream's real spend is
-//! read back as it is and may differ; the fork replays to the same trial, also
+//! read back as it is under the trial's billing scope and may differ, and a
+//! stream billed under another scope makes the trial unverifiable (a
+//! `Conflict`, never a silent zero); the fork replays to the same trial, also
 //! after a crash in the middle of it and after a dispatch; a revoked source
 //! blocks the trial and its cleanup redacts the record; the fork enqueues no
 //! management job; and a trial without a verified usage record is only a
@@ -30,8 +32,8 @@ use evo_core::evidence::{
 };
 use evo_core::improver::{ImproverContentV2, ImproverMechanismV2};
 use evo_core::optimization::{
-    EditSuggestion, ModelRequest, ModelRequestContext, ModelStage, OptimizationTrace,
-    SkillFailureDiagnosis, SkillFailureKind, TraceOutcome, TrustedSourceBinding,
+    EditSuggestion, ModelInputPart, ModelInputRole, ModelRequest, ModelRequestContext, ModelStage,
+    OptimizationTrace, SkillFailureDiagnosis, SkillFailureKind, TraceOutcome, TrustedSourceBinding,
 };
 use evo_core::skill_edit::{
     EvidenceClosure, EvidenceRef, SKILL_EDIT_COMPILER_VERSION, SKILL_EDIT_SCHEMA, SkillEditBatch,
@@ -67,7 +69,7 @@ use evo_engine::optimization::{
 };
 use evo_storage::Store;
 use evo_storage::budget::{
-    BudgetCallRecord, BudgetCallReservation, BudgetCallState, RootBudgetAuthorization,
+    BudgetCallRecord, BudgetCallReservation, BudgetCallState, BudgetStage, RootBudgetAuthorization,
 };
 use evo_storage::lifecycle::{CleanupState, CleanupStatus};
 use serde_json::{Value, json};
@@ -681,19 +683,21 @@ async fn env() -> Env {
     env_with_root(10_000).await
 }
 
-async fn env_with_root(total_limit_micros: i64) -> Env {
-    let (dir, store) = seeded_store().await;
-    authorize_root(&store, total_limit_micros).await;
-    let executions = Arc::new(AtomicUsize::new(0));
-    let fail_old_stream = Arc::new(AtomicBool::new(false));
-    let broker = PersistentModelBroker::with_clock(
+/// A broker over the ledger of `store` whose calls are billed to `billing_scope`.
+fn broker_for_scope(
+    store: &Store,
+    executions: &Arc<AtomicUsize>,
+    fail_old_stream: &Arc<AtomicBool>,
+    billing_scope: &str,
+) -> PersistentModelBroker<StreamTransport> {
+    PersistentModelBroker::with_clock(
         store.clone(),
         StreamTransport {
             executions: executions.clone(),
             fail_old_stream: fail_old_stream.clone(),
         },
         BrokerConfig {
-            billing_scope: SCOPE.into(),
+            billing_scope: billing_scope.into(),
             actor: "trusted-broker".into(),
             currency: "USD".into(),
             pricing_version: "price-v1".into(),
@@ -702,7 +706,15 @@ async fn env_with_root(total_limit_micros: i64) -> Env {
         },
         Arc::new(|| 10),
     )
-    .unwrap();
+    .unwrap()
+}
+
+async fn env_with_root(total_limit_micros: i64) -> Env {
+    let (dir, store) = seeded_store().await;
+    authorize_root(&store, total_limit_micros).await;
+    let executions = Arc::new(AtomicUsize::new(0));
+    let fail_old_stream = Arc::new(AtomicBool::new(false));
+    let broker = broker_for_scope(&store, &executions, &fail_old_stream, SCOPE);
     let worker = worker();
     Env {
         coordinator: PersistentCoordinator::new(store.clone(), worker.clone(), "worker").unwrap(),
@@ -758,10 +770,53 @@ impl Env {
         step: u32,
         request_id: &str,
     ) -> Result<CoordinatorStepResult> {
+        self.try_step_via(&self.broker, trial_id, stream, step, request_id)
+            .await
+    }
+
+    /// A broker over the same ledger and the same transport behaviour that bills
+    /// the calls it makes to another root budget.
+    fn broker_for(&self, billing_scope: &str) -> PersistentModelBroker<StreamTransport> {
+        broker_for_scope(
+            &self.store,
+            &self.executions,
+            &self.fail_old_stream,
+            billing_scope,
+        )
+    }
+
+    /// One real step of `stream` through `port`, with the request id the trial
+    /// derives for it.
+    async fn step_via(
+        &self,
+        port: &dyn ModelPort,
+        trial_id: &str,
+        stream: MetaStream,
+        step: u32,
+    ) -> CoordinatorStepResult {
+        self.try_step_via(
+            port,
+            trial_id,
+            stream,
+            step,
+            &stream_request_id(trial_id, stream, step),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn try_step_via(
+        &self,
+        port: &dyn ModelPort,
+        trial_id: &str,
+        stream: MetaStream,
+        step: u32,
+        request_id: &str,
+    ) -> Result<CoordinatorStepResult> {
         let world_id = stream_world_id(trial_id, stream);
         self.coordinator
             .run_next(
-                Some(&self.broker),
+                Some(port),
                 Some(&ImprovingFixtureRunner),
                 Some(&self.journal),
                 self.fixture.request(&world_id, step, request_id),
@@ -770,9 +825,13 @@ impl Env {
     }
 
     async fn calls(&self, world_id: &str) -> Vec<BudgetCallRecord> {
+        self.calls_in(SCOPE, world_id).await
+    }
+
+    async fn calls_in(&self, billing_scope: &str, world_id: &str) -> Vec<BudgetCallRecord> {
         let mut session = self.store.session().await.unwrap();
         let calls = session
-            .budget_calls_for_group(&worker(), SCOPE, world_id)
+            .budget_calls_for_group(&worker(), billing_scope, world_id)
             .await
             .unwrap();
         session.commit().await.unwrap();
@@ -1965,6 +2024,389 @@ async fn the_longest_trial_id_still_yields_valid_world_node_and_request_ids() {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. The trial's billing scope binds the streams' spend (V033, V035)
+// ---------------------------------------------------------------------------
+
+/// The message a trial that is not verifiable on account of its billing scope
+/// returns: fixed, and naming only the stream.
+fn outside_scope_message(stream: &str) -> String {
+    format!(
+        "meta trial {stream} stream: its dispatch group was billed outside the trial's billing scope"
+    )
+}
+
+fn assert_outside_scope(result: Result<MetaTrialView>, stream: &str) {
+    match result {
+        Err(Error::Conflict(message)) => assert_eq!(message, outside_scope_message(stream)),
+        other => panic!(
+            "expected the Conflict that names the {stream} stream, got {:?}",
+            other.map(|view| view.status())
+        ),
+    }
+}
+
+/// A plain reflection request of `episode`, as the transport answers it.
+fn plain_request(request_id: &str, episode: &str) -> ModelRequest {
+    ModelRequest::build(
+        ModelRequestContext {
+            request_id: request_id.into(),
+            namespace: TENANT.into(),
+            purpose: Purpose::Development,
+            stage: ModelStage::ReflectFailure,
+            episode_id: episode.into(),
+            step: 1,
+            attempt: 1,
+            parent_skill_digest: hash(b"parent-v1"),
+            bundle_digest: hash(b"bundle-v1"),
+            source_closure: vec![EvidenceRef {
+                id: "run-failure".into(),
+                digest: hash(b"run-failure"),
+            }],
+            model_digest: hash(b"model"),
+            tools_digest: hash(b"tools"),
+            rules_digest: hash(b"rules"),
+            sampling_digest: hash(b"sampling"),
+            revoke_watermark: 1,
+            max_suggestions: 4,
+        },
+        vec![ModelInputPart {
+            role: ModelInputRole::User,
+            label: "parent-skill".into(),
+            content: serde_json::to_string(&parent_skill()).unwrap(),
+        }],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_stream_billed_outside_the_trials_billing_scope_makes_the_trial_unverifiable() {
+    // The trial declares one billing scope for both streams: they are compared
+    // on one ceiling, one root budget. A stream that spends from another root
+    // has no such ceiling, and a reader that totals its dispatch group under the
+    // declared scope would report that spend as zero. The trial is then not
+    // verifiable, and the view does not come out with a false account.
+    let env = env().await;
+    authorize_second_scope(&env.store, 10_000).await;
+    let elsewhere = env.broker_for("scope-2");
+
+    // The new stream's step is made by a broker bound to the other root; the old
+    // stream's by the declared one.
+    env.fork(TRIAL).await;
+    env.step(TRIAL, MetaStream::Old, 1).await;
+    env.step_via(&elsewhere, TRIAL, MetaStream::New, 1).await;
+    // The premise: the new stream really spent (two calls, 26 micros), under
+    // scope-2, and its dispatch is a real, verified one; the declared scope holds
+    // nothing for its group.
+    let spent = env.calls_in("scope-2", "trial-1-new").await;
+    assert_eq!(spent.len(), 2);
+    assert!(
+        spent
+            .iter()
+            .all(|call| call.state == BudgetCallState::Finalized)
+    );
+    assert_eq!(
+        spent
+            .iter()
+            .filter_map(|call| call.actual_cost_micros)
+            .sum::<i64>(),
+        2 * NEW_CALL_COST
+    );
+    assert!(env.calls("trial-1-new").await.is_empty());
+    assert_eq!(
+        env.coordinator
+            .verified_mechanism_usage("trial-1-new")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(env.calls("trial-1-old").await.len(), 2);
+    assert_outside_scope(env.view(TRIAL).await, "new");
+
+    // The refusal is the same whichever stream it is, and names that stream.
+    env.fork("trial-2").await;
+    env.step_via(&elsewhere, "trial-2", MetaStream::Old, 1)
+        .await;
+    env.step("trial-2", MetaStream::New, 1).await;
+    assert_outside_scope(env.view("trial-2").await, "old");
+
+    // A stream with calls under the declared scope as well as under another one
+    // is not verifiable either: any call outside the scope is enough.
+    env.fork("trial-3").await;
+    env.step("trial-3", MetaStream::New, 1).await;
+    env.step_via(&elsewhere, "trial-3", MetaStream::New, 2)
+        .await;
+    assert_eq!(env.calls("trial-3-new").await.len(), 2);
+    assert_eq!(env.calls_in("scope-2", "trial-3-new").await.len(), 2);
+    assert_outside_scope(env.view("trial-3").await, "new");
+
+    // With both streams outside, the old stream is the one named (it is read first).
+    env.fork("trial-4").await;
+    env.step_via(&elsewhere, "trial-4", MetaStream::Old, 1)
+        .await;
+    env.step_via(&elsewhere, "trial-4", MetaStream::New, 1)
+        .await;
+    assert_outside_scope(env.view("trial-4").await, "old");
+
+    // A trial whose streams both spent under the declared scope is read as
+    // usual, in the same store and next to the ones above.
+    env.fork("trial-5").await;
+    env.step("trial-5", MetaStream::Old, 1).await;
+    env.step("trial-5", MetaStream::New, 1).await;
+    let view = env.view("trial-5").await.unwrap();
+    assert_eq!(view.status(), MetaTrialStatus::UsageObserved);
+    assert_eq!(
+        view.old_stream().spend().actual_cost_micros,
+        2 * OLD_CALL_COST
+    );
+    assert_eq!(
+        view.new_stream().spend().actual_cost_micros,
+        2 * NEW_CALL_COST
+    );
+
+    // Reading changed nothing: the rows are as the steps left them.
+    assert_eq!(env.calls_in("scope-2", "trial-1-new").await, spent);
+}
+
+#[tokio::test]
+async fn calls_of_unrelated_dispatch_groups_under_another_scope_do_not_touch_the_trial() {
+    let env = env().await;
+    authorize_second_scope(&env.store, 10_000).await;
+    env.fork(TRIAL).await;
+    env.step(TRIAL, MetaStream::Old, 1).await;
+    env.step(TRIAL, MetaStream::New, 1).await;
+    let before = serde_json::to_value(env.view(TRIAL).await.unwrap()).unwrap();
+    assert_eq!(
+        before["new"]["spend"]["actual_cost_micros"],
+        2 * NEW_CALL_COST
+    );
+
+    // Calls of other dispatch groups under the other root: an unrelated episode
+    // and groups whose names only look like a stream's (a prefix, a suffix, the
+    // trial id itself). A group is matched by its exact name.
+    let elsewhere = env.broker_for("scope-2");
+    let groups = [
+        "unrelated-episode",
+        "trial-1-new-extra",
+        "trial-1-old-x",
+        "x-trial-1-new",
+        "trial-1",
+    ];
+    for (index, group) in groups.iter().enumerate() {
+        let request = plain_request(&format!("unrelated-call-{index}"), group);
+        assert!(matches!(
+            elsewhere.dispatch(request).await.unwrap(),
+            ModelResponse::Completed { .. }
+        ));
+    }
+    // An unrelated group under the declared scope itself is no different.
+    let declared = plain_request("unrelated-call-declared", "unrelated-episode-2");
+    assert!(matches!(
+        env.broker.dispatch(declared).await.unwrap(),
+        ModelResponse::Completed { .. }
+    ));
+    // They are real calls under scope-2, and of no stream's group.
+    for group in groups {
+        assert_eq!(env.calls_in("scope-2", group).await.len(), 1, "{group}");
+    }
+    for stream in MetaStream::BOTH {
+        let world = stream_world_id(TRIAL, stream);
+        assert!(env.calls_in("scope-2", &world).await.is_empty());
+    }
+
+    // The trial reads exactly as before.
+    let after = serde_json::to_value(env.view(TRIAL).await.unwrap()).unwrap();
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn before_any_call_the_billing_scope_is_only_the_trials_own_declaration() {
+    // A boundary, pinned. No world carries the billing scope, so until a stream
+    // has a call row there is nothing to compare the stored declaration with:
+    // changing it to another authorized scope goes unnoticed. The first call of a
+    // stream, which sits under the real scope, exposes it.
+    let env = env().await;
+    authorize_second_scope(&env.store, 10_000).await;
+    env.fork(TRIAL).await;
+    let original = raw_record(&env.store, TRIAL_KIND, TRIAL).await;
+    let mut moved = original.clone();
+    moved["payload"]["billing_scope"] = json!("scope-2");
+    put_raw_record(&env.store, TRIAL_KIND, TRIAL, &moved).await;
+    let view = env.view(TRIAL).await.unwrap();
+    assert_eq!(view.billing_scope(), "scope-2");
+    assert_eq!(view.old_stream().spend().calls, 0);
+    assert_eq!(view.new_stream().spend().calls, 0);
+
+    env.step(TRIAL, MetaStream::New, 1).await;
+    assert_outside_scope(env.view(TRIAL).await, "new");
+    put_raw_record(&env.store, TRIAL_KIND, TRIAL, &original).await;
+    assert_eq!(
+        env.view(TRIAL).await.unwrap().billing_scope(),
+        SCOPE,
+        "with the declaration restored the trial reads again"
+    );
+}
+
+/// A root budget `scope` that `authorizing` (a namespace's admin) opens to `namespaces`.
+async fn authorize_scope(store: &Store, authorizing: &Context, scope: &str, namespaces: &[&str]) {
+    store
+        .authorize_root_budget(
+            authorizing,
+            &RootBudgetAuthorization {
+                root_budget_id: format!("root-of-{scope}"),
+                billing_scope: scope.into(),
+                allowed_namespaces: namespaces.iter().map(|name| (*name).into()).collect(),
+                currency: "USD".into(),
+                pricing_version: "price-v1".into(),
+                payment_subject: "payer".into(),
+                authorization_receipt_digest: hash(scope.as_bytes()),
+                per_call_cap_micros: 20,
+                total_limit_micros: 1_000,
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+async fn reserve_call(store: &Store, ctx: &Context, scope: &str, call_id: &str, group: &str) {
+    store
+        .reserve_budget_call(
+            ctx,
+            &BudgetCallReservation {
+                billing_scope: scope.into(),
+                call_id: call_id.into(),
+                dispatch_group_id: group.into(),
+                stage: BudgetStage::Reflection,
+                actual_input_digest: hash(call_id.as_bytes()),
+                request_artifact: None,
+                max_cost_micros: 10,
+                lease_token: format!("lease-{call_id}"),
+                lease_until: 11,
+                now: 10,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+async fn scopes_of(store: &Store, ctx: &Context, group: &str) -> Result<Vec<String>> {
+    let mut session = store.session().await.unwrap();
+    let scopes = session.budget_call_scopes_for_group(ctx, group).await;
+    session.commit().await.unwrap();
+    scopes
+}
+
+#[tokio::test]
+async fn the_scopes_of_a_dispatch_group_are_distinct_sorted_and_stay_inside_the_namespace() {
+    // The ledger query the trial's scope check stands on, against a ledger that
+    // holds the same group name in several scopes and in two namespaces.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("scopes.sqlite3"))
+        .await
+        .unwrap();
+    let admin_n = admin();
+    let admin_m = Context::new("m", "admin", Role::Admin).unwrap();
+    let worker_n = worker();
+    let worker_m = Context::new("m", "worker", Role::Worker).unwrap();
+    authorize_scope(&store, &admin_n, "scope-b", &["n"]).await;
+    authorize_scope(&store, &admin_n, "scope-a", &["n"]).await;
+    authorize_scope(&store, &admin_n, "scope-x", &["n", "m"]).await;
+    authorize_scope(&store, &admin_m, "scope-m", &["m"]).await;
+
+    // Namespace n: group g under scope-b first (twice), then under scope-a; group
+    // h under the shared scope-x; and group g2, whose name starts with g.
+    reserve_call(&store, &worker_n, "scope-b", "b-1", "g").await;
+    reserve_call(&store, &worker_n, "scope-b", "b-2", "g").await;
+    reserve_call(&store, &worker_n, "scope-a", "a-1", "g").await;
+    reserve_call(&store, &worker_n, "scope-x", "x-n-1", "h").await;
+    reserve_call(&store, &worker_n, "scope-b", "b-3", "g2").await;
+    // Namespace m: the same group name g, under its own scope and under the
+    // shared one.
+    reserve_call(&store, &worker_m, "scope-m", "m-1", "g").await;
+    reserve_call(&store, &worker_m, "scope-x", "x-m-1", "g").await;
+    let rows_before = {
+        let mut session = store.session().await.unwrap();
+        let rows = session
+            .budget_calls_for_group(&worker_n, "scope-b", "g")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        rows
+    };
+    assert_eq!(rows_before.len(), 2);
+
+    // Distinct (scope-b holds two calls of g) and in byte order (scope-b was
+    // used first), and nothing of namespace m's g.
+    assert_eq!(
+        scopes_of(&store, &worker_n, "g").await.unwrap(),
+        ["scope-a", "scope-b"]
+    );
+    // A group is matched by its exact name, and only for the caller's namespace:
+    // h sits under the scope both namespaces share, g of namespace m does too.
+    assert_eq!(
+        scopes_of(&store, &worker_n, "h").await.unwrap(),
+        ["scope-x"]
+    );
+    assert_eq!(
+        scopes_of(&store, &worker_n, "g2").await.unwrap(),
+        ["scope-b"]
+    );
+    assert_eq!(
+        scopes_of(&store, &worker_m, "g").await.unwrap(),
+        ["scope-m", "scope-x"]
+    );
+    assert!(scopes_of(&store, &worker_m, "h").await.unwrap().is_empty());
+    assert!(scopes_of(&store, &worker_m, "g2").await.unwrap().is_empty());
+    // No call, no scope.
+    assert!(
+        scopes_of(&store, &worker_n, "no-such-group")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // A namespace without any call of its own sees nothing, whatever the others did.
+    let worker_other = Context::new("other", "worker", Role::Worker).unwrap();
+    assert!(
+        scopes_of(&store, &worker_other, "g")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Every reader role of the ledger may ask, the same answer; an agent may not.
+    for role in [Role::Admin, Role::Host, Role::Evaluator, Role::Worker] {
+        let ctx = Context::new("n", "reader", role).unwrap();
+        assert_eq!(
+            scopes_of(&store, &ctx, "g").await.unwrap(),
+            ["scope-a", "scope-b"],
+            "{role:?}"
+        );
+    }
+    let agent = Context::new("n", "agent", Role::Agent).unwrap();
+    assert!(matches!(
+        scopes_of(&store, &agent, "g").await,
+        Err(Error::Forbidden)
+    ));
+    assert!(matches!(
+        scopes_of(&store, &worker_n, "not an identifier").await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Reading is read-only: the rows are as they were.
+    let rows_after = {
+        let mut session = store.session().await.unwrap();
+        let rows = session
+            .budget_calls_for_group(&worker_n, "scope-b", "g")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        rows
+    };
+    assert_eq!(rows_after, rows_before);
+}
+
+// ---------------------------------------------------------------------------
 // 6. Idempotency (V033)
 // ---------------------------------------------------------------------------
 
@@ -2017,7 +2459,7 @@ async fn the_same_trial_id_with_different_content_is_a_conflict_and_changes_noth
     other_caps.s0_template.caps.max_nodes = 6;
     let mut other_scope = fork_request(TRIAL);
     other_scope.billing_scope = "scope-2".into();
-    authorize_second_scope(&env.store).await;
+    authorize_second_scope(&env.store, 100).await;
     for (label, request) in [
         ("another candidate", other_candidate),
         ("another declared quota", other_limits),
@@ -2035,7 +2477,8 @@ async fn the_same_trial_id_with_different_content_is_a_conflict_and_changes_noth
     env.view(TRIAL).await.unwrap();
 }
 
-async fn authorize_second_scope(store: &Store) {
+/// A second root budget, `scope-2`, authorized for the same namespace.
+async fn authorize_second_scope(store: &Store, total_limit_micros: i64) {
     store
         .authorize_root_budget(
             &admin(),
@@ -2048,7 +2491,7 @@ async fn authorize_second_scope(store: &Store) {
                 payment_subject: "payer-2".into(),
                 authorization_receipt_digest: hash(b"admin-authorization-2"),
                 per_call_cap_micros: 20,
-                total_limit_micros: 100,
+                total_limit_micros,
                 created_at: 1,
             },
         )
@@ -2535,6 +2978,7 @@ async fn assert_tamper_is_conflict(
 #[tokio::test]
 async fn tampering_with_the_trial_record_is_a_conflict() {
     let env = env().await;
+    authorize_second_scope(&env.store, 100).await;
     env.fork(TRIAL).await;
     // A trial that already ran, so that the records have something to agree on.
     env.step(TRIAL, MetaStream::Old, 1).await;
@@ -2638,6 +3082,12 @@ async fn tampering_with_the_trial_record_is_a_conflict() {
         (
             "revoke_watermark",
             Box::new(|r| r["payload"]["revoke_watermark"] = json!(2)),
+        ),
+        // The streams' calls sit under the real scope, so a record that names
+        // another one no longer matches the ledger (before any call it would).
+        (
+            "billing_scope moved to another authorized scope",
+            Box::new(|r| r["payload"]["billing_scope"] = json!("scope-2")),
         ),
         (
             "envelope record kind",

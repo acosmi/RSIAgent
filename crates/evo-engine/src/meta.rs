@@ -24,6 +24,11 @@
 //! development history, model cache keys, budget dispatch group) is disjoint
 //! between the streams. Nothing here enqueues a management job.
 //!
+//! Each stream's spend is read under the trial's billing scope. A stream whose
+//! dispatch group has calls under any other scope makes the trial unverifiable
+//! (`Conflict`): it spent from a root budget the trial never declared, and
+//! reading it under the declared scope would report that spend as zero.
+//!
 //! Not claimed: that a successor is better or that I1 beats I0 (there is no
 //! FormalEvaluation or statistic here); the same evidence step by step (the
 //! streams share a source closure and an evidence opportunity declaration, no
@@ -247,8 +252,10 @@ pub struct MetaTrialV1 {
     pub new_world_id: String,
     pub old_policy_digest: String,
     pub new_policy_digest: String,
-    /// The root budget both streams are billed against. It is the trial's own
-    /// declaration: no world carries it.
+    /// The root budget both streams are billed against. No world carries it: it
+    /// is the trial's own declaration, and what binds it afterwards is the
+    /// ledger. A stream whose dispatch group has calls under any other scope
+    /// makes the trial unverifiable (see [`verified_meta_trial`]).
     pub billing_scope: String,
     pub declared_stream_limits: StreamLimitsV1,
     /// The trusted runs of the S0 source closure, in the template's order.
@@ -678,7 +685,9 @@ impl MetaTrialCoordinator {
                 coordinator.register_world_idempotent(world.clone()).await?;
             }
         }
-        // What the fork returns is a trial that reads back as a verified fork.
+        // What the fork returns is a trial whose record and both worlds read back
+        // as the fork it made. The ledger is not read here: a stream billed
+        // outside the trial's billing scope is refused by `verified_meta_trial`.
         load_verified(ctx, store, &trial.trial_id).await?;
         Ok(trial)
     }
@@ -782,8 +791,9 @@ async fn load_verified(ctx: &Context, store: &Store, trial_id: &str) -> Result<M
 }
 
 /// What one stream has really spent, read from the budget ledger by dispatch
-/// group (the group of a stream is its world id). Nothing is estimated and the
-/// two streams are not compared or equalized.
+/// group (the group of a stream is its world id) under the trial's billing
+/// scope. Nothing is estimated and the two streams are not compared or
+/// equalized.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamSpendView {
     /// Every call row of the stream's dispatch group, whatever its state.
@@ -798,15 +808,33 @@ pub struct StreamSpendView {
     pub unsettled_reserved_micros: i64,
 }
 
+/// Reads the stream's calls under the trial's billing scope, in one ledger
+/// snapshot with a check that the stream has no call under any other scope.
+///
+/// Both streams are compared on the same declared ceiling, one root budget, and
+/// each stream's spend is read under that scope. A dispatch group is keyed by
+/// its scope, so a stream whose group also (or only) has calls under another
+/// root drew money from a budget the trial never declared: reading its group
+/// under the declared scope would report that spend as zero, a false account.
+/// Such a trial is not verifiable: `Conflict`, fail closed. The message is
+/// fixed and names only the stream.
 async fn stream_spend(
     ctx: &Context,
     store: &Store,
-    billing_scope: &str,
-    world_id: &str,
+    trial: &MetaTrialV1,
+    stream: MetaStream,
 ) -> Result<StreamSpendView> {
+    let world_id = trial.stream_world_id(stream);
     let mut session = store.session().await?;
+    let scopes = session.budget_call_scopes_for_group(ctx, world_id).await?;
+    if scopes.iter().any(|scope| *scope != trial.billing_scope) {
+        return Err(Error::Conflict(format!(
+            "meta trial {} stream: its dispatch group was billed outside the trial's billing scope",
+            stream.as_str()
+        )));
+    }
     let calls = session
-        .budget_calls_for_group(ctx, billing_scope, world_id)
+        .budget_calls_for_group(ctx, &trial.billing_scope, world_id)
         .await?;
     session.commit().await?;
     let overflow = || Error::Conflict("stream spend overflows the ledger's integer range".into());
@@ -977,8 +1005,12 @@ impl MetaTrialView {
 /// must carry the policy of its stream's improver; and the registration facts
 /// of both worlds, everything except the id, the policy and the scheduling
 /// state, must still equal the S0 the trial was forked from. Each stream's spend
-/// is read from the ledger by dispatch group and may differ from the other's.
-/// Nothing is written and no model is reached.
+/// is read from the ledger by dispatch group under the trial's billing scope and
+/// may differ from the other's. A stream whose dispatch group has a call under
+/// any other billing scope drew money from a root budget the trial never
+/// declared, so the trial is not verifiable: `Conflict`, with a fixed message
+/// that names the stream (old or new). Nothing is written and no model is
+/// reached.
 ///
 /// A stream's declared limits and its spend are reported side by side. They are
 /// not enforced per stream: both streams spend one shared root budget.
@@ -1028,7 +1060,7 @@ async fn stream_view(
             stream.as_str()
         )));
     }
-    let spend = stream_spend(ctx, store, &trial.billing_scope, world_id).await?;
+    let spend = stream_spend(ctx, store, trial, stream).await?;
     let dispatch_group_stopped = store
         .dispatch_group(ctx, &trial.billing_scope, world_id)
         .await?
