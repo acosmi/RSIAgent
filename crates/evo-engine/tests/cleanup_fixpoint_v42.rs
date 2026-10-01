@@ -458,46 +458,76 @@ async fn stored_chain(
 // Cases
 // ---------------------------------------------------------------------------
 
-/// `replay.run` is submitted before every one of the first twenty cleanup steps
-/// (one edge per step) of the revocation of `source-2`. The pool is not redacted
-/// yet, so each submission is accepted and its job fails closed (`conflict`: the
-/// source revoke watermark changed). At `Complete` no private input of an accepted
-/// submission may be left in plaintext; the jobs stay as the record of the action.
+/// The private input `persist_management` stores for an accepted `replay.run`
+/// under the request key `key`, written directly: under the id its request key
+/// hashes to, with an edge to the replay pool. Returns the id.
+async fn write_late_input(
+    store: &Store,
+    admin: &Context,
+    pool: &evo_core::replay::ReplayPoolManifestV1,
+    key: &str,
+) -> String {
+    let id = format!(
+        "management-input-{}",
+        &evo_core::hash(
+            format!(
+                "{}\0{}\0replay.run\0{key}",
+                admin.namespace(),
+                admin.actor()
+            )
+            .as_bytes()
+        )[..24]
+    );
+    let body = serde_json::json!({
+        "id": id,
+        "schema_version": "rsia.management_private_input.v1",
+        "operation": "replay.run",
+        "payload_digest": evo_core::hash(key.as_bytes()),
+        "payload": replay_fx::run_request(key, &pool.pool_digest),
+    });
+    let pool_storage = evo_storage::replay::replay_pool_storage_id(&pool.pool_digest).unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .put(admin, "artifact", &id, admin.actor(), &body)
+        .await
+        .unwrap();
+    session
+        .put_edge(admin, "artifact", &id, "artifact", &pool_storage)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    id
+}
+
+/// A private input of a `replay.run` is written before every one of the first
+/// twenty cleanup steps (one edge per step) of the revocation of `source-2`, after
+/// the cleanup has begun. The pool is not redacted yet, and until AG-044 `submit`
+/// accepted such a request; it now refuses it, because the closure of the pool
+/// holds the revoked run. A writer without that check still produces the same late
+/// dependent, so the inputs are written directly (`Session::put` and `put_edge`, as
+/// `persist_management` writes the input of an accepted request), and the cleanup
+/// must still visit every one of them before it reports `Complete`: at `Complete`
+/// no private input of the twenty may be left in plaintext.
 #[tokio::test]
-async fn management_inputs_accepted_during_the_cleanup_are_redacted_at_complete() {
+async fn late_management_inputs_written_during_the_cleanup_are_redacted_at_complete() {
     let (_dir, store, admin) = open("fixpoint-p3.sqlite3").await;
-    let (dispatcher, pool) = stored_chain(&store, &admin, "ctrl-p3-chain").await;
+    let (_dispatcher, pool) = stored_chain(&store, &admin, "ctrl-p3-chain").await;
 
     let mut status = begin(&store, &admin, "run", "source-2").await;
-    let mut accepted = Vec::new();
+    let mut late = Vec::new();
     for round in 0..20 {
         // The request keys are those of the controller's probe, so that the ids
         // (and with them the position of each input relative to the page cursor)
         // are the ones the 8 plaintext inputs were observed with.
         let key = format!("ctrl-p3-during-{round}");
-        let job = dispatcher
-            .submit(
-                &admin,
-                "replay.run",
-                replay_fx::run_request(&key, &pool.pool_digest),
-            )
-            .await
-            .unwrap_or_else(|error| panic!("round {round}: the submission was refused: {error:?}"));
-        let job = wait_job(&store, &admin, &job.id).await;
-        assert_eq!(
-            job.state,
-            ManagementJobState::Failed,
-            "round {round}: {job:?}"
-        );
-        assert_eq!(job.error_code.as_deref(), Some("conflict"), "round {round}");
-        accepted.push(job);
+        late.push(write_late_input(&store, &admin, &pool, &key).await);
         status = step(&store, &admin, &status, 1, round).await;
     }
     let (status, _) = drive(&store, &admin, status, 1, 20).await;
 
     let mut plaintext = Vec::new();
-    for (round, job) in accepted.iter().enumerate() {
-        let input = try_raw(&store, &admin, "artifact", &job.private_input_ref)
+    for (round, id) in late.iter().enumerate() {
+        let input = try_raw(&store, &admin, "artifact", id)
             .await
             .unwrap_or_else(|| panic!("round {round}: the private input is gone"));
         if input["schema_version"] != REDACTED {
@@ -508,22 +538,12 @@ async fn management_inputs_accepted_during_the_cleanup_are_redacted_at_complete(
         plaintext.is_empty(),
         "{} of {} private inputs are still plaintext at {:?}: {plaintext:?}",
         plaintext.len(),
-        accepted.len(),
+        late.len(),
         status.state
     );
     assert_eq!(status.state, CleanupState::Complete, "{status:?}");
     assert_eq!(status.pending_nodes, 0);
     assert_eq!(status.last_error, None);
-    // The jobs are preserved as the record of the action, still failed closed.
-    for (round, job) in accepted.iter().enumerate() {
-        let kept = wait_job(&store, &admin, &job.id).await;
-        assert_eq!(kept.state, ManagementJobState::Failed, "round {round}");
-        assert_eq!(
-            kept.error_code.as_deref(),
-            Some("conflict"),
-            "round {round}"
-        );
-    }
 }
 
 /// `(edge_page_limit, steps to Complete, processed_nodes)` of the cleanup of a

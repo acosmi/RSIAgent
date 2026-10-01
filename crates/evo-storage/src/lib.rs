@@ -109,6 +109,30 @@ pub struct Store {
 pub struct Session {
     tx: Transaction<'static, Sqlite>,
 }
+
+/// Schema of the tombstone the revocation cleanup leaves in place of an artifact
+/// whose source was revoked (plan §11.5, E08).
+const REDACTED_SCHEMA: &str = "rsia.redacted.v1";
+
+/// A `run` or `artifact` node of an upstream closure ([`Session::upstream_closure`])
+/// with what a revocation gate needs to judge it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpstreamNode {
+    /// `run` or `artifact`.
+    pub kind: String,
+    pub id: String,
+    /// The body stored under the `tombstone` kind and this id, as stored (the
+    /// caller decodes it), or `None` when the id has none. A tombstone is keyed by
+    /// the id of its source alone, so a run and an artifact of one id share it: it
+    /// was written for one of them, and the `source_kind` in its body says which.
+    pub tombstone: Option<Value>,
+    /// Whether the node is an artifact whose stored body carries the
+    /// `rsia.redacted.v1` schema, that is, one the revocation cleanup already
+    /// replaced. Always `false` for a run: the cleanup deletes a run instead of
+    /// redacting it, and a run body can be large, so it is never read here.
+    pub redacted: bool,
+}
+
 fn internal(e: impl std::fmt::Display) -> Error {
     tracing::error!(error=%e,"database operation failed");
     Error::Internal
@@ -2405,6 +2429,118 @@ impl Session {
             ));
         }
         Ok(out)
+    }
+
+    /// The `run` and `artifact` nodes of the upstream closure of `roots`: the
+    /// roots themselves and everything they depend on, directly or transitively.
+    /// The walk follows every dependency edge from its dependent to what it
+    /// depends on (the direction `dependents` reads backwards), inside this
+    /// session's namespace and transaction, so edges the session has written
+    /// are walked too. It is read-only.
+    ///
+    /// The walk passes through nodes of every kind (a release or a candidate can
+    /// sit between an artifact and a run), and the closure is counted over all of
+    /// them: `limit` bounds the closure, every root together, each node counted
+    /// once however many edges reach it (a cycle or a diamond adds nothing).
+    /// A closure of more than `limit` nodes is a `Conflict`, never a truncated
+    /// list: a caller that judged only the nodes it was handed could take a
+    /// revoked source it was never shown for a live one, which is the capacity
+    /// rule of E16.5 (a derivation beyond the scale is refused, not silently cut
+    /// short). The walk itself stops after `limit + 1` nodes.
+    ///
+    /// Each node comes with what a revocation gate judges it by, read in the same
+    /// statement: the tombstone stored under its id and, for an artifact, whether
+    /// its body is already redacted. A node nothing is stored for (a deleted run,
+    /// an id that was never written) is still a node of the closure; it is
+    /// listed, with no tombstone unless one exists. The result is ordered by
+    /// kind, then id; a node of another kind is walked through but not listed.
+    pub async fn upstream_closure<K: AsRef<str>, I: AsRef<str>>(
+        &mut self,
+        ctx: &Context,
+        roots: &[(K, I)],
+        limit: usize,
+    ) -> Result<Vec<UpstreamNode>> {
+        let mut seeds = Vec::with_capacity(roots.len());
+        for (kind, id) in roots {
+            identifier(id.as_ref())?;
+            seeds.push([kind.as_ref(), id.as_ref()]);
+        }
+        if seeds.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The roots travel as one JSON value: a root set can be larger than the
+        // number of variables one statement may bind.
+        let seeds = serde_json::to_string(&seeds).map_err(internal)?;
+        // One node more than `limit` is enough to know the closure is over it.
+        let fetch = i64::try_from(limit).unwrap_or(i64::MAX).saturating_add(1);
+        // Two things in this statement are load-bearing, and both were measured
+        // (the bundled SQLite 3.46; a chain of 200 000 edges, a walk cut at 11
+        // nodes, which takes 0.2 ms as written):
+        // - the `LIMIT` sits inside the recursive CTE, where SQLite stops the walk
+        //   after that many nodes. On the outer query, behind an `ORDER BY` like
+        //   `load_dependency_record_snapshots` has it, the whole closure is built
+        //   first: 500 ms.
+        // - `CROSS JOIN` fixes the join order. Left to itself the planner makes
+        //   the edge table the outer loop (it takes the walk's own queue for a
+        //   large table) and reads every edge of the namespace once per node it
+        //   walks: 190 ms for the 11 nodes (4 s for 300 nodes over 300 000 edges
+        //   in the sqlite3 shell), minutes for the 10 000 the bound allows. With
+        //   the queue as the outer loop each node is one lookup in the
+        //   `(namespace, src_kind, src_id)` prefix of the primary key.
+        // The `LEFT JOIN`s keep the walk the outer loop; each is one lookup in
+        // the primary key of `objects`, and only for the kinds that are judged.
+        let rows = sqlx::query(
+            "WITH RECURSIVE closure(kind, id) AS (
+               SELECT json_extract(r.value, '$[0]'), json_extract(r.value, '$[1]')
+                 FROM json_each(?1) AS r
+               UNION
+               SELECT d.dst_kind, d.dst_id
+                 FROM closure AS c
+                 CROSS JOIN dependencies AS d
+                   ON d.namespace = ?2 AND d.src_kind = c.kind AND d.src_id = c.id
+               LIMIT ?3
+             )
+             SELECT c.kind AS kind, c.id AS id, t.body AS tombstone,
+                    COALESCE(json_extract(o.body, '$.schema_version') = ?4, 0) AS redacted
+               FROM closure AS c
+               LEFT JOIN objects AS t
+                 ON c.kind IN ('run', 'artifact')
+                AND t.namespace = ?2 AND t.kind = 'tombstone' AND t.id = c.id
+               LEFT JOIN objects AS o
+                 ON c.kind = 'artifact'
+                AND o.namespace = ?2 AND o.kind = 'artifact' AND o.id = c.id",
+        )
+        .bind(seeds)
+        .bind(ctx.namespace())
+        .bind(fetch)
+        .bind(REDACTED_SCHEMA)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        if rows.len() > limit {
+            return Err(Error::Conflict(format!(
+                "upstream dependency closure exceeds {limit} nodes; it is refused, not truncated"
+            )));
+        }
+        let mut nodes = Vec::new();
+        for row in rows {
+            let kind: String = row.try_get("kind").map_err(internal)?;
+            if !matches!(kind.as_str(), "run" | "artifact") {
+                continue;
+            }
+            let tombstone: Option<String> = row.try_get("tombstone").map_err(internal)?;
+            let redacted: i64 = row.try_get("redacted").map_err(internal)?;
+            nodes.push(UpstreamNode {
+                kind,
+                id: row.try_get("id").map_err(internal)?,
+                tombstone: tombstone
+                    .map(|body| serde_json::from_str(&body).map_err(internal))
+                    .transpose()?,
+                redacted: redacted != 0,
+            });
+        }
+        nodes.sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+        Ok(nodes)
     }
 
     pub async fn bump_watermark(&mut self, ctx: &Context, digest: &str) -> Result<i64> {
