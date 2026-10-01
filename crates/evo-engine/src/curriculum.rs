@@ -14,14 +14,21 @@ use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Legacy v1 behavior is retained for compatibility and is not v2 evidence.
+///
+/// Selection is a pure computation and runs first. A selection that cannot be made
+/// returns its own typed error and reserves nothing, so a failed step leaves the
+/// budget as it was. Only a feasible selection reserves `cost`; if that reservation
+/// fails the budget's error is returned and the selected task is not handed out.
+/// Nothing can fail after the reservation, so there is no reservation to release.
 pub fn step(
     budget: &mut RootBudget,
     state: &LearnerState,
     pool: &[TaskProposal],
     cost: i64,
 ) -> Result<String> {
+    let task = next_task(state, pool)?;
     budget.reserve(cost)?;
-    next_task(state, pool).map_err(|_| Error::NotFound)
+    Ok(task)
 }
 
 #[allow(clippy::too_many_arguments)]

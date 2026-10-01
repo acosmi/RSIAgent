@@ -62,6 +62,14 @@ pub fn next_task(state: &LearnerState, pool: &[TaskProposal]) -> Result<String> 
         .ok_or(Error::NotFound)
 }
 
+/// Builds a development-only proposal from model text.
+///
+/// The text is checked for shape only (nonempty, bounded, no NUL). That check says
+/// nothing about whether the task has a sound oracle, so the proposal is born
+/// unverified (`oracle_ok: false`): `quarantine_reason()` reports `no_oracle` and
+/// `next_task` never selects it. Only an independent ValidityReport together with
+/// real check references can make a proposal verified; neither the model text nor
+/// this constructor may self-report it.
 pub fn proposal_from_text(id: &str, family: &str, body: &str) -> Result<TaskProposal> {
     text(body, "body", 4096)?;
     Ok(TaskProposal {
@@ -71,7 +79,7 @@ pub fn proposal_from_text(id: &str, family: &str, body: &str) -> Result<TaskProp
         difficulty: 0.5,
         learning_value: 0.5,
         correct: false,
-        oracle_ok: true,
+        oracle_ok: false,
     })
 }
 
