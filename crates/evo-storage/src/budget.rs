@@ -101,6 +101,94 @@ impl From<OptimizationStage> for BudgetStage {
     }
 }
 
+/// Determinate refusals made by the reservation/dispatch gates. These describe
+/// the attempted operation, never prove ownership of a call or authorize a refund.
+/// Storage failures and stale fences remain in the outer `Result`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetPreDispatchRefusal {
+    RootStopped,
+    GroupStopped,
+    LeaseExpired,
+    SourceRevoked,
+    RootConcurrencyLimit,
+    CallIdReused,
+    RootAuthorizationMissing,
+    PerCallCapExceeded,
+    RootBudgetExhausted,
+    BudgetArithmeticOverflow,
+    ActiveLeaseCapacity { used: u64, limit: u64 },
+    Unauthorized,
+    CallNamespaceMismatch,
+    GroupNamespaceMismatch,
+    InvalidRequest { message: String },
+    InvalidArtifactDigest,
+    DuplicateSource,
+    SourceClosureChanged,
+}
+
+/// `Ok(Err(..))` is a known refusal; `Err(..)` is not evidence of no dispatch.
+pub type BudgetPreDispatchResult<T> = Result<std::result::Result<T, BudgetPreDispatchRefusal>>;
+
+impl BudgetPreDispatchRefusal {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::RootStopped => "root_stopped",
+            Self::GroupStopped => "group_stopped",
+            Self::LeaseExpired => "lease_expired",
+            Self::SourceRevoked => "source_revoked",
+            Self::RootConcurrencyLimit => "root_concurrency_limit",
+            Self::CallIdReused => "call_id_reused",
+            Self::RootAuthorizationMissing => "root_authorization_missing",
+            Self::PerCallCapExceeded => "per_call_cap_exceeded",
+            Self::RootBudgetExhausted => "root_budget_exhausted",
+            Self::BudgetArithmeticOverflow => "budget_arithmetic_overflow",
+            Self::ActiveLeaseCapacity { .. } => "active_lease_capacity",
+            Self::Unauthorized | Self::CallNamespaceMismatch => "unauthorized",
+            Self::GroupNamespaceMismatch => "group_namespace_mismatch",
+            Self::InvalidRequest { .. } | Self::InvalidArtifactDigest => "invalid_request",
+            Self::DuplicateSource => "duplicate_source",
+            Self::SourceClosureChanged => "source_closure_changed",
+        }
+    }
+
+    /// Exact historical reservation error, including validation/capacity text.
+    pub fn into_reservation_error(self) -> Error {
+        match self {
+            Self::SourceRevoked => Error::Forbidden,
+            other => other.into_dispatch_error(),
+        }
+    }
+
+    /// Exact historical begin error. A revoked source was `Cancelled` here.
+    pub fn into_dispatch_error(self) -> Error {
+        match self {
+            Self::RootStopped | Self::GroupStopped | Self::LeaseExpired | Self::SourceRevoked => {
+                Error::Cancelled
+            }
+            Self::RootConcurrencyLimit => Error::Conflict("root_budget_concurrency_limit".into()),
+            Self::CallIdReused => Error::Conflict("call_id_reused_with_different_content".into()),
+            Self::RootAuthorizationMissing
+            | Self::PerCallCapExceeded
+            | Self::RootBudgetExhausted
+            | Self::BudgetArithmeticOverflow => Error::Budget,
+            Self::ActiveLeaseCapacity { used, limit } => {
+                mvp_capacity_exceeded("active leases", used, limit)
+            }
+            Self::Unauthorized => Error::Forbidden,
+            Self::CallNamespaceMismatch => Error::NotFound,
+            Self::GroupNamespaceMismatch => {
+                Error::Conflict("dispatch_group_owned_by_different_namespace".into())
+            }
+            Self::InvalidRequest { message } => Error::Invalid(message),
+            Self::InvalidArtifactDigest => Error::Conflict("artifact digest mismatch".into()),
+            Self::DuplicateSource => Error::Conflict("duplicate budget call source id".into()),
+            Self::SourceClosureChanged => {
+                Error::Conflict("budget call source closure changed for fixed call".into())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetCallState {
@@ -240,16 +328,26 @@ impl BudgetArtifact {
     }
 
     fn validate(&self) -> Result<()> {
-        identifier(&self.schema_version)?;
-        validate_digest(&self.digest, "artifact digest")?;
+        self.validate_typed()?
+            .map_err(BudgetPreDispatchRefusal::into_reservation_error)
+    }
+
+    fn validate_typed(&self) -> BudgetPreDispatchResult<()> {
+        if let Err(error) = identifier(&self.schema_version)
+            .and_then(|()| validate_digest(&self.digest, "artifact digest"))
+        {
+            return reservation_validation_refusal(error);
+        }
         if self.body.len() > 4 * 1024 * 1024 {
-            return Err(Error::Invalid("budget artifact exceeds 4 MiB".into()));
+            return Ok(Err(BudgetPreDispatchRefusal::InvalidRequest {
+                message: "budget artifact exceeds 4 MiB".into(),
+            }));
         }
         if hash(self.body.as_bytes()) != self.digest {
-            return Err(Error::Conflict("artifact digest mismatch".into()));
+            return Ok(Err(BudgetPreDispatchRefusal::InvalidArtifactDigest));
         }
         serde_json::from_str::<serde_json::Value>(&self.body).map_err(internal)?;
-        Ok(())
+        Ok(Ok(()))
     }
 }
 
@@ -577,60 +675,98 @@ impl Store {
         request: &BudgetCallReservation,
         source_ids: &[String],
     ) -> Result<BudgetCallRecord> {
-        require_budget_caller(ctx)?;
-        validate_reservation(request)?;
-        let source_ids = canonical_source_ids(source_ids)?;
+        self.reserve_budget_call_with_sources_typed(ctx, request, source_ids)
+            .await?
+            .map_err(BudgetPreDispatchRefusal::into_reservation_error)
+    }
+
+    pub async fn reserve_budget_call_typed(
+        &self,
+        ctx: &Context,
+        request: &BudgetCallReservation,
+    ) -> BudgetPreDispatchResult<BudgetCallRecord> {
+        self.reserve_budget_call_with_sources_typed(ctx, request, &[])
+            .await
+    }
+
+    /// Parallel typed gate. General database, commit, and unreadable source-ref
+    /// errors are deliberately left in the outer result.
+    pub async fn reserve_budget_call_with_sources_typed(
+        &self,
+        ctx: &Context,
+        request: &BudgetCallReservation,
+        source_ids: &[String],
+    ) -> BudgetPreDispatchResult<BudgetCallRecord> {
+        if require_budget_caller(ctx).is_err() {
+            return Ok(Err(BudgetPreDispatchRefusal::Unauthorized));
+        }
+        if let Err(refusal) = validate_reservation_typed(request)? {
+            return Ok(Err(refusal));
+        }
+        let source_ids = match canonical_source_ids_typed(source_ids)? {
+            Ok(ids) => ids,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
         let mut tx = self.pool.begin().await.map_err(internal)?;
         if let Some(existing) = load_call(&mut tx, &request.billing_scope, &request.call_id).await?
         {
-            ensure_same_reservation(ctx, &existing, request)?;
-            if !source_ids.is_empty() {
-                ensure_budget_call_ref(&mut tx, ctx, &existing, &source_ids).await?;
+            if !same_reservation(ctx, &existing, request) {
+                return Ok(Err(BudgetPreDispatchRefusal::CallIdReused));
+            }
+            if !source_ids.is_empty()
+                && let Err(refusal) =
+                    ensure_budget_call_ref_typed(&mut tx, ctx, &existing, &source_ids).await?
+            {
+                return Ok(Err(refusal));
             }
             tx.commit().await.map_err(internal)?;
-            return Ok(existing);
+            return Ok(Ok(existing));
         }
         // The revocation tombstone is committed before its cleanup runs, so it is
         // read here, in the transaction that would write the reservation and its
         // request body: nothing below has run when a source is refused.
         if any_run_source_revoked(&mut tx, ctx.namespace(), &source_ids).await? {
-            return Err(Error::Forbidden);
+            return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
         }
         let row = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
             .bind(&request.billing_scope)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(internal)?
-            .ok_or(Error::Budget)?;
-        require_namespace(&mut tx, &request.billing_scope, ctx.namespace()).await?;
+            .map_err(internal)?;
+        let Some(row) = row else {
+            return Ok(Err(BudgetPreDispatchRefusal::RootAuthorizationMissing));
+        };
+        if !namespace_allowed(&mut tx, &request.billing_scope, ctx.namespace()).await? {
+            return Ok(Err(BudgetPreDispatchRefusal::Unauthorized));
+        }
         if row.try_get::<i64, _>("stopped").map_err(internal)? != 0 {
-            return Err(Error::Cancelled);
+            return Ok(Err(BudgetPreDispatchRefusal::RootStopped));
         }
         let per_call_cap: i64 = row.try_get("per_call_cap_micros").map_err(internal)?;
         let total_limit: i64 = row.try_get("total_limit_micros").map_err(internal)?;
         let spent: i64 = row.try_get("spent_micros").map_err(internal)?;
         let reserved: i64 = row.try_get("reserved_micros").map_err(internal)?;
         if request.max_cost_micros > per_call_cap {
-            return Err(Error::Budget);
+            return Ok(Err(BudgetPreDispatchRefusal::PerCallCapExceeded));
         }
         let committed = spent
             .checked_add(reserved)
-            .and_then(|value| value.checked_add(request.max_cost_micros))
-            .ok_or(Error::Budget)?;
+            .and_then(|value| value.checked_add(request.max_cost_micros));
+        let Some(committed) = committed else {
+            return Ok(Err(BudgetPreDispatchRefusal::BudgetArithmeticOverflow));
+        };
         if committed > total_limit {
-            return Err(Error::Budget);
+            return Ok(Err(BudgetPreDispatchRefusal::RootBudgetExhausted));
         }
         match load_dispatch_group(&mut tx, &request.billing_scope, &request.dispatch_group_id)
             .await?
         {
             Some(group) => {
                 if group.owner_namespace != ctx.namespace() {
-                    return Err(Error::Conflict(
-                        "dispatch_group_owned_by_different_namespace".into(),
-                    ));
+                    return Ok(Err(BudgetPreDispatchRefusal::GroupNamespaceMismatch));
                 }
                 if group.stopped {
-                    return Err(Error::Cancelled);
+                    return Ok(Err(BudgetPreDispatchRefusal::GroupStopped));
                 }
             }
             None => {
@@ -677,18 +813,16 @@ impl Store {
         // reservation or event row is written.
         let active_leases = count_active_leases(&mut tx, request.now).await?;
         if active_leases >= MVP_MAX_ACTIVE_LEASES {
-            return Err(mvp_capacity_exceeded(
-                "active leases",
-                active_leases,
-                MVP_MAX_ACTIVE_LEASES,
-            ));
+            return Ok(Err(BudgetPreDispatchRefusal::ActiveLeaseCapacity {
+                used: active_leases,
+                limit: MVP_MAX_ACTIVE_LEASES,
+            }));
         }
+        let Some(next_reserved) = reserved.checked_add(request.max_cost_micros) else {
+            return Ok(Err(BudgetPreDispatchRefusal::BudgetArithmeticOverflow));
+        };
         sqlx::query("UPDATE root_budgets SET reserved_micros=? WHERE billing_scope=?")
-            .bind(
-                reserved
-                    .checked_add(request.max_cost_micros)
-                    .ok_or(Error::Budget)?,
-            )
+            .bind(next_reserved)
             .bind(&request.billing_scope)
             .execute(&mut *tx)
             .await
@@ -735,11 +869,14 @@ impl Store {
         let call = load_call(&mut tx, &request.billing_scope, &request.call_id)
             .await?
             .ok_or(Error::Internal)?;
-        if !source_ids.is_empty() {
-            ensure_budget_call_ref(&mut tx, ctx, &call, &source_ids).await?;
+        if !source_ids.is_empty()
+            && let Err(refusal) =
+                ensure_budget_call_ref_typed(&mut tx, ctx, &call, &source_ids).await?
+        {
+            return Ok(Err(refusal));
         }
         tx.commit().await.map_err(internal)?;
-        Ok(call)
+        Ok(Ok(call))
     }
 
     pub async fn refence_reserved_budget_call(
@@ -807,10 +944,40 @@ impl Store {
         ctx: &Context,
         fence: &BudgetCallFence,
     ) -> Result<BudgetDispatchDecision> {
+        self.begin_budget_dispatch_typed(ctx, fence)
+            .await?
+            .map_err(BudgetPreDispatchRefusal::into_dispatch_error)
+    }
+
+    pub async fn begin_budget_dispatch_typed(
+        &self,
+        ctx: &Context,
+        fence: &BudgetCallFence,
+    ) -> BudgetPreDispatchResult<BudgetDispatchDecision> {
         let mut tx = self.pool.begin().await.map_err(internal)?;
-        let decision = begin_budget_dispatch_in_tx(&mut tx, ctx, fence).await?;
+        let decision = begin_budget_dispatch_in_tx_typed(&mut tx, ctx, fence).await?;
+        if decision.is_err() {
+            return Ok(decision);
+        }
         tx.commit().await.map_err(internal)?;
         Ok(decision)
+    }
+
+    /// Read for the broker's idempotency gate with determinate access refusals.
+    /// The legacy lookup continues to return its original access errors.
+    pub async fn budget_call_typed(
+        &self,
+        ctx: &Context,
+        billing_scope: &str,
+        call_id: &str,
+    ) -> BudgetPreDispatchResult<Option<BudgetCallRecord>> {
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let result = budget_call_in_tx_typed(&mut tx, ctx, billing_scope, call_id).await?;
+        if result.is_err() {
+            return Ok(result);
+        }
+        tx.commit().await.map_err(internal)?;
+        Ok(result)
     }
 
     pub async fn finalize_budget_call(
@@ -1662,14 +1829,33 @@ async fn budget_call_in_tx(
     billing_scope: &str,
     call_id: &str,
 ) -> Result<Option<BudgetCallRecord>> {
-    require_budget_reader(ctx)?;
-    identifier(billing_scope)?;
-    identifier(call_id)?;
+    budget_call_in_tx_typed(tx, ctx, billing_scope, call_id)
+        .await?
+        .map_err(BudgetPreDispatchRefusal::into_dispatch_error)
+}
+
+async fn budget_call_in_tx_typed(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    billing_scope: &str,
+    call_id: &str,
+) -> BudgetPreDispatchResult<Option<BudgetCallRecord>> {
+    if require_budget_reader(ctx).is_err() {
+        return Ok(Err(BudgetPreDispatchRefusal::Unauthorized));
+    }
+    if let Err(error) = identifier(billing_scope).and_then(|()| identifier(call_id)) {
+        return reservation_validation_refusal(error);
+    }
     let call = load_call(tx, billing_scope, call_id).await?;
     if let Some(call) = &call {
-        require_call_access(tx, ctx, call).await?;
+        if !namespace_allowed(tx, billing_scope, ctx.namespace()).await? {
+            return Ok(Err(BudgetPreDispatchRefusal::Unauthorized));
+        }
+        if ctx.role() != Role::Admin && call.namespace != ctx.namespace() {
+            return Ok(Err(BudgetPreDispatchRefusal::CallNamespaceMismatch));
+        }
     }
-    Ok(call)
+    Ok(Ok(call))
 }
 
 async fn budget_calls_for_group_in_tx(
@@ -1741,21 +1927,42 @@ async fn begin_budget_dispatch_in_tx(
     ctx: &Context,
     fence: &BudgetCallFence,
 ) -> Result<BudgetDispatchDecision> {
-    require_budget_caller(ctx)?;
-    validate_fence(fence)?;
+    begin_budget_dispatch_in_tx_typed(tx, ctx, fence)
+        .await?
+        .map_err(BudgetPreDispatchRefusal::into_dispatch_error)
+}
+
+async fn begin_budget_dispatch_in_tx_typed(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    fence: &BudgetCallFence,
+) -> BudgetPreDispatchResult<BudgetDispatchDecision> {
+    if require_budget_caller(ctx).is_err() {
+        return Ok(Err(BudgetPreDispatchRefusal::Unauthorized));
+    }
+    if let Err(error) = validate_fence(fence) {
+        return reservation_validation_refusal(error);
+    }
     let call = load_call(tx, &fence.billing_scope, &fence.call_id)
         .await?
         .ok_or(Error::NotFound)?;
-    require_call_access(tx, ctx, &call).await?;
+    if !namespace_allowed(tx, &call.billing_scope, ctx.namespace()).await? {
+        return Ok(Err(BudgetPreDispatchRefusal::Unauthorized));
+    }
+    if ctx.role() != Role::Admin && call.namespace != ctx.namespace() {
+        return Ok(Err(BudgetPreDispatchRefusal::CallNamespaceMismatch));
+    }
+    // A mismatched epoch/token/digest is still an outer error. It is not the
+    // expiry of this lease and must never authorize releasing another lease.
     fence_call(&call, fence, false)?;
     if call.state != BudgetCallState::Reserved {
-        return Ok(BudgetDispatchDecision {
+        return Ok(Ok(BudgetDispatchDecision {
             call,
             new_dispatch: false,
-        });
+        }));
     }
     if fence.now > call.lease_until {
-        return Err(Error::Cancelled);
+        return Ok(Err(BudgetPreDispatchRefusal::LeaseExpired));
     }
     let stopped: i64 = sqlx::query_scalar("SELECT stopped FROM root_budgets WHERE billing_scope=?")
         .bind(&fence.billing_scope)
@@ -1763,7 +1970,7 @@ async fn begin_budget_dispatch_in_tx(
         .await
         .map_err(internal)?;
     if stopped != 0 {
-        return Err(Error::Cancelled);
+        return Ok(Err(BudgetPreDispatchRefusal::RootStopped));
     }
     let group_stopped: i64 = sqlx::query_scalar(
         "SELECT stopped FROM root_budget_dispatch_groups
@@ -1775,7 +1982,7 @@ async fn begin_budget_dispatch_in_tx(
     .await
     .map_err(internal)?;
     if group_stopped != 0 {
-        return Err(Error::Cancelled);
+        return Ok(Err(BudgetPreDispatchRefusal::GroupStopped));
     }
     // A source revoked after the reservation must not be sent out. The cleanup only
     // redacts the ledger copy of the request; the caller still holds the request
@@ -1784,7 +1991,7 @@ async fn begin_budget_dispatch_in_tx(
     // `Cancelled` is the decision a caller already releases the reservation on.
     let source_ids = registered_source_ids(tx, &call).await?;
     if any_run_source_revoked(tx, &call.namespace, &source_ids).await? {
-        return Err(Error::Cancelled);
+        return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
     }
     let active: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM root_budget_calls
@@ -1798,7 +2005,7 @@ async fn begin_budget_dispatch_in_tx(
     .await
     .map_err(internal)?;
     if active != 0 {
-        return Err(Error::Conflict("root_budget_concurrency_limit".into()));
+        return Ok(Err(BudgetPreDispatchRefusal::RootConcurrencyLimit));
     }
     let dispatch_id = uuid::Uuid::new_v4().to_string();
     sqlx::query(
@@ -1824,10 +2031,10 @@ async fn begin_budget_dispatch_in_tx(
     let call = load_call(tx, &fence.billing_scope, &fence.call_id)
         .await?
         .ok_or(Error::Internal)?;
-    Ok(BudgetDispatchDecision {
+    Ok(Ok(BudgetDispatchDecision {
         call,
         new_dispatch: true,
-    })
+    }))
 }
 
 async fn stop_dispatch_group_in_tx(
@@ -2191,23 +2398,36 @@ fn validate_authorization(ctx: &Context, value: &RootBudgetAuthorization) -> Res
     Ok(namespaces.into_iter().collect())
 }
 
-fn validate_reservation(value: &BudgetCallReservation) -> Result<()> {
-    identifier(&value.billing_scope)?;
-    identifier(&value.call_id)?;
-    identifier(&value.dispatch_group_id)?;
-    validate_digest(&value.actual_input_digest, "actual_input_digest")?;
-    identifier(&value.lease_token)?;
-    if let Some(artifact) = &value.request_artifact {
-        artifact.validate()?;
+fn validate_reservation_typed(value: &BudgetCallReservation) -> BudgetPreDispatchResult<()> {
+    let fields = (|| {
+        identifier(&value.billing_scope)?;
+        identifier(&value.call_id)?;
+        identifier(&value.dispatch_group_id)?;
+        validate_digest(&value.actual_input_digest, "actual_input_digest")?;
+        identifier(&value.lease_token)
+    })();
+    if let Err(error) = fields {
+        return reservation_validation_refusal(error);
     }
-    valid_time(value.now)?;
+    if let Some(artifact) = &value.request_artifact
+        && let Err(refusal) = artifact.validate_typed()?
+    {
+        return Ok(Err(refusal));
+    }
+    if let Err(error) = valid_time(value.now) {
+        return reservation_validation_refusal(error);
+    }
     if value.max_cost_micros <= 0 {
-        return Err(Error::Invalid("reservation must be positive".into()));
+        return Ok(Err(BudgetPreDispatchRefusal::InvalidRequest {
+            message: "reservation must be positive".into(),
+        }));
     }
     if value.lease_until <= value.now {
-        return Err(Error::Invalid("lease must expire after reservation".into()));
+        return Ok(Err(BudgetPreDispatchRefusal::InvalidRequest {
+            message: "lease must expire after reservation".into(),
+        }));
     }
-    Ok(())
+    Ok(Ok(()))
 }
 
 fn validate_fence(value: &BudgetCallFence) -> Result<()> {
@@ -2275,15 +2495,21 @@ fn validate_digest(value: &str, name: &str) -> Result<()> {
 }
 
 fn canonical_source_ids(values: &[String]) -> Result<Vec<String>> {
+    canonical_source_ids_typed(values)?.map_err(BudgetPreDispatchRefusal::into_reservation_error)
+}
+
+fn canonical_source_ids_typed(values: &[String]) -> BudgetPreDispatchResult<Vec<String>> {
     let mut output = values.to_vec();
     for value in &output {
-        identifier(value)?;
+        if let Err(error) = identifier(value) {
+            return reservation_validation_refusal(error);
+        }
     }
     output.sort();
     if output.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(Error::Conflict("duplicate budget call source id".into()));
+        return Ok(Err(BudgetPreDispatchRefusal::DuplicateSource));
     }
-    Ok(output)
+    Ok(Ok(output))
 }
 
 async fn ensure_budget_call_ref(
@@ -2292,7 +2518,21 @@ async fn ensure_budget_call_ref(
     call: &BudgetCallRecord,
     source_ids: &[String],
 ) -> Result<BudgetCallRef> {
-    let source_ids = canonical_source_ids(source_ids)?;
+    ensure_budget_call_ref_typed(tx, ctx, call, source_ids)
+        .await?
+        .map_err(BudgetPreDispatchRefusal::into_reservation_error)
+}
+
+async fn ensure_budget_call_ref_typed(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    call: &BudgetCallRecord,
+    source_ids: &[String],
+) -> BudgetPreDispatchResult<BudgetCallRef> {
+    let source_ids = match canonical_source_ids_typed(source_ids)? {
+        Ok(ids) => ids,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
     let digest = fingerprint(&(
         "rsia.budget_call_ref.v1",
         ctx.namespace(),
@@ -2318,11 +2558,9 @@ async fn ensure_budget_call_ref(
     if let Some(old) = old {
         let old: BudgetCallRef = serde_json::from_str(&old).map_err(internal)?;
         if old != reference {
-            return Err(Error::Conflict(
-                "budget call source closure changed for fixed call".into(),
-            ));
+            return Ok(Err(BudgetPreDispatchRefusal::SourceClosureChanged));
         }
-        return Ok(old);
+        return Ok(Ok(old));
     }
     sqlx::query("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,'artifact',?,?,?)")
         .bind(ctx.namespace())
@@ -2344,7 +2582,7 @@ async fn ensure_budget_call_ref(
         .await
         .map_err(internal)?;
     }
-    Ok(reference)
+    Ok(Ok(reference))
 }
 
 /// Whether any of `source_ids` was revoked, in `namespace`, as a `run`.
@@ -2497,23 +2735,17 @@ fn fence_call(call: &BudgetCallRecord, fence: &BudgetCallFence, check_expiry: bo
     Ok(())
 }
 
-fn ensure_same_reservation(
+fn same_reservation(
     ctx: &Context,
     call: &BudgetCallRecord,
     request: &BudgetCallReservation,
-) -> Result<()> {
-    if call.namespace != ctx.namespace()
-        || call.dispatch_group_id != request.dispatch_group_id
-        || call.stage != request.stage
-        || call.actual_input_digest != request.actual_input_digest
-        || call.request_artifact != request.request_artifact
-        || call.reserved_micros != request.max_cost_micros
-    {
-        return Err(Error::Conflict(
-            "call_id_reused_with_different_content".into(),
-        ));
-    }
-    Ok(())
+) -> bool {
+    call.namespace == ctx.namespace()
+        && call.dispatch_group_id == request.dispatch_group_id
+        && call.stage == request.stage
+        && call.actual_input_digest == request.actual_input_digest
+        && call.request_artifact == request.request_artifact
+        && call.reserved_micros == request.max_cost_micros
 }
 
 fn ensure_same_charge(call: &BudgetCallRecord, charge: &UsageCharge) -> Result<()> {
@@ -2579,6 +2811,17 @@ async fn require_namespace(
     billing_scope: &str,
     namespace: &str,
 ) -> Result<()> {
+    if !namespace_allowed(tx, billing_scope, namespace).await? {
+        return Err(Error::Forbidden);
+    }
+    Ok(())
+}
+
+async fn namespace_allowed(
+    tx: &mut Transaction<'_, Sqlite>,
+    billing_scope: &str,
+    namespace: &str,
+) -> Result<bool> {
     let allowed: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM root_budget_namespaces WHERE billing_scope=? AND namespace=?",
     )
@@ -2587,10 +2830,16 @@ async fn require_namespace(
     .fetch_optional(&mut **tx)
     .await
     .map_err(internal)?;
-    if allowed.is_none() {
-        return Err(Error::Forbidden);
+    Ok(allowed.is_some())
+}
+
+// Only called directly on pure request/source/fence validation. Do not reuse
+// this conversion on a database, refence, or general storage result.
+fn reservation_validation_refusal<T>(error: Error) -> BudgetPreDispatchResult<T> {
+    match error {
+        Error::Invalid(message) => Ok(Err(BudgetPreDispatchRefusal::InvalidRequest { message })),
+        error => Err(error),
     }
-    Ok(())
 }
 
 async fn load_namespaces(
