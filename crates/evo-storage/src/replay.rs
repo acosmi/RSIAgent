@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 pub const REPLAY_STORE_ENVELOPE_SCHEMA: &str = "rsia.replay.store_envelope.v1";
 pub const REPLAY_POOL_RECORD_KIND: &str = "replay_pool_manifest_v1";
 pub const REPLAY_REPORT_RECORD_KIND: &str = "stored_replay_report_v1";
+/// Record kind a replay world is named by. Worlds are not envelopes: the store
+/// keeps them in their own table, and `replay_world` is the node kind their
+/// dependency edges and cleanup events use.
+const REPLAY_WORLD_RECORD_KIND: &str = "replay_world";
+/// Body schema the revocation cleanup leaves in place of redacted content.
+const REDACTED_SCHEMA: &str = "rsia.redacted.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -148,6 +154,11 @@ async fn load_live_replay_world_in_session(
         .get_world(ctx, world_id)
         .await?
         .ok_or(Error::NotFound)?;
+    // Before the seal check and the decode: a redacted world is the expected
+    // state after a source revocation, whether or not it was ever sealed.
+    if is_redacted(&value) {
+        return Err(redacted_record(REPLAY_WORLD_RECORD_KIND, world_id));
+    }
     if !sealed {
         return Err(Error::Conflict("replay world is not sealed".into()));
     }
@@ -193,9 +204,9 @@ pub async fn register_replay_pool(
         record_kind: REPLAY_POOL_RECORD_KIND.into(),
         payload: manifest.clone(),
     };
-    if let Some(existing) = session
-        .get::<ReplayStoreEnvelope<ReplayPoolManifestV1>>(ctx, "artifact", &id)
-        .await?
+    if let Some(existing) =
+        read_envelope::<ReplayPoolManifestV1>(&mut session, ctx, REPLAY_POOL_RECORD_KIND, &id)
+            .await?
     {
         validate_envelope(
             ctx,
@@ -250,7 +261,9 @@ async fn load_live_replay_pool_in_session(
 ) -> Result<LoadedReplayPool> {
     let id = replay_pool_storage_id(pool_digest)?;
     let envelope: ReplayStoreEnvelope<ReplayPoolManifestV1> =
-        session.need(ctx, "artifact", &id).await?;
+        read_envelope(session, ctx, REPLAY_POOL_RECORD_KIND, &id)
+            .await?
+            .ok_or(Error::NotFound)?;
     validate_envelope(
         ctx,
         &id,
@@ -294,9 +307,13 @@ pub async fn put_replay_report(
         record_kind: REPLAY_REPORT_RECORD_KIND.into(),
         payload: report.clone(),
     };
-    if let Some(existing) = session
-        .get::<ReplayStoreEnvelope<StoredReplayReportV1>>(ctx, "artifact", &report.report_id)
-        .await?
+    if let Some(existing) = read_envelope::<StoredReplayReportV1>(
+        &mut session,
+        ctx,
+        REPLAY_REPORT_RECORD_KIND,
+        &report.report_id,
+    )
+    .await?
     {
         validate_envelope(
             ctx,
@@ -349,7 +366,9 @@ pub async fn load_live_replay_report(
     identifier(report_id)?;
     let mut session = store.session().await?;
     let envelope: ReplayStoreEnvelope<StoredReplayReportV1> =
-        session.need(ctx, "artifact", report_id).await?;
+        read_envelope(&mut session, ctx, REPLAY_REPORT_RECORD_KIND, report_id)
+            .await?
+            .ok_or(Error::NotFound)?;
     validate_envelope(
         ctx,
         report_id,
@@ -380,6 +399,55 @@ fn validate_digest(value: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn is_redacted(body: &serde_json::Value) -> bool {
+    body.get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        == Some(REDACTED_SCHEMA)
+}
+
+/// The `Conflict` a read of a redacted replay record reports.
+fn redacted_record(record_kind: &str, id: &str) -> Error {
+    Error::Conflict(format!(
+        "replay {record_kind} {id} was redacted because its source was revoked"
+    ))
+}
+
+/// Reads the stored body of one replay pool or report as its envelope.
+///
+/// After a source revocation the cleanup replaces the body with an
+/// `rsia.redacted.v1` tombstone, which is not an envelope. That is the expected
+/// state of a revoked replay record, not corruption, so the read names it: a
+/// `Conflict` carrying the record kind and id, the verdict the exploration and
+/// curriculum stores give the same state (`read_envelope` in `exploration.rs`,
+/// `get_record` in `curriculum.rs`), instead of a decode failure that would
+/// surface as `Internal`. The body is inspected before it is decoded, so the
+/// expected state does not raise the storage layer's "database operation failed"
+/// error log either. Any other body that does not decode is corruption and stays
+/// `Internal`.
+async fn read_envelope<T: DeserializeOwned>(
+    session: &mut Session,
+    ctx: &Context,
+    record_kind: &str,
+    id: &str,
+) -> Result<Option<ReplayStoreEnvelope<T>>> {
+    let Some(body) = session
+        .get::<serde_json::Value>(ctx, "artifact", id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if is_redacted(&body) {
+        return Err(redacted_record(record_kind, id));
+    }
+    match serde_json::from_value(body) {
+        Ok(envelope) => Ok(Some(envelope)),
+        Err(error) => {
+            tracing::error!(%error, record_kind, id, "stored replay record does not decode");
+            Err(Error::Internal)
+        }
+    }
 }
 
 fn validate_envelope<T: Serialize + DeserializeOwned>(
@@ -459,4 +527,90 @@ async fn validate_sources_live(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    async fn read(
+        store: &Store,
+        ctx: &Context,
+        id: &str,
+    ) -> Result<Option<ReplayStoreEnvelope<Value>>> {
+        let mut session = store.session().await.unwrap();
+        let envelope = read_envelope::<Value>(&mut session, ctx, REPLAY_POOL_RECORD_KIND, id).await;
+        session.commit().await.unwrap();
+        envelope
+    }
+
+    #[tokio::test]
+    async fn an_envelope_read_names_a_redacted_record_and_leaves_every_other_body_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("replay-envelope.sqlite3"))
+            .await
+            .unwrap();
+        let ctx = Context::new("n", "admin", Role::Admin).unwrap();
+        let put = |id: &'static str, body: Value| {
+            let (store, ctx) = (store.clone(), ctx.clone());
+            async move {
+                let mut session = store.session().await.unwrap();
+                session
+                    .put(&ctx, "artifact", id, "admin", &body)
+                    .await
+                    .unwrap();
+                session.commit().await.unwrap();
+            }
+        };
+        put(
+            "live",
+            json!({
+                "schema_version": REPLAY_STORE_ENVELOPE_SCHEMA,
+                "id": "live",
+                "namespace": "n",
+                "record_kind": REPLAY_POOL_RECORD_KIND,
+                "payload": {"member": 1},
+            }),
+        )
+        .await;
+        put(
+            "redacted",
+            json!({"id": "redacted", "schema_version": REDACTED_SCHEMA, "state": "source_revoked"}),
+        )
+        .await;
+        put(
+            "damaged",
+            json!({"schema_version": REPLAY_STORE_ENVELOPE_SCHEMA, "id": "damaged"}),
+        )
+        .await;
+        put(
+            "not-a-tombstone",
+            json!({"schema_version": "rsia.redacted.v2"}),
+        )
+        .await;
+        put("not-an-object", json!([REDACTED_SCHEMA])).await;
+
+        // Absent: no row, no error (the caller decides what absence means).
+        assert!(read(&store, &ctx, "absent").await.unwrap().is_none());
+        // A decodable envelope is returned as it is.
+        let envelope = read(&store, &ctx, "live").await.unwrap().unwrap();
+        assert_eq!(envelope.id, "live");
+        assert_eq!(envelope.payload, json!({"member": 1}));
+        // A tombstone is the expected state of a revoked record: a named Conflict.
+        match read(&store, &ctx, "redacted").await {
+            Err(Error::Conflict(message)) => assert_eq!(
+                message,
+                "replay replay_pool_manifest_v1 redacted was redacted because its source was revoked"
+            ),
+            other => panic!("a redacted row must be a named Conflict, got {other:?}"),
+        }
+        // Everything else that does not decode is corruption.
+        for id in ["damaged", "not-a-tombstone", "not-an-object"] {
+            assert!(
+                matches!(read(&store, &ctx, id).await, Err(Error::Internal)),
+                "{id} must stay Internal"
+            );
+        }
+    }
 }

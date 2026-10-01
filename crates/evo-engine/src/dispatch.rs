@@ -772,6 +772,16 @@ async fn persist_management(
 /// tombstone under the source id, and the cleanup then deletes a run), or the
 /// cleanup already replaced it with an `rsia.redacted.v1` tombstone.
 ///
+/// A tombstone is keyed by the id of its source alone, and a source is a run or
+/// an artifact, so a run and an artifact that share an id share one tombstone.
+/// The tombstone records which of the two it was written for (`source_kind`) and
+/// it decides a dependency only when that is the dependency's own kind: a revoked
+/// run does not refuse a live artifact that carries its id, nor the reverse. A
+/// tombstone that cannot be read as one `begin_revoke` writes (it does not decode,
+/// or its source kind is neither `run` nor `artifact`) cannot be matched to
+/// anything and fails closed: the dependency is refused. A dependency of any
+/// other kind is not judged by a tombstone, only by the redacted-body check.
+///
 /// A dependency that does not exist (and is not tombstoned) is not refused here:
 /// the operation itself fails on it inside the job (`not_found`), as before.
 /// Nor is a live artifact whose upstream source was revoked but not cleaned yet:
@@ -785,10 +795,29 @@ async fn ensure_dependencies_live(
     dependencies: &[(String, String)],
 ) -> Result<()> {
     for (kind, id) in dependencies {
-        if session.get::<Value>(ctx, "tombstone", id).await?.is_some() {
-            return Err(Error::Conflict(format!(
-                "management request depends on {kind} {id}, whose source was revoked"
-            )));
+        if matches!(kind.as_str(), "run" | "artifact")
+            && let Some(body) = session.get::<Value>(ctx, "tombstone", id).await?
+        {
+            let source_kind =
+                serde_json::from_value::<evo_storage::lifecycle::RevokeTombstone>(body)
+                    .ok()
+                    .map(|tombstone| tombstone.source_kind)
+                    .filter(|source_kind| matches!(source_kind.as_str(), "run" | "artifact"));
+            match source_kind {
+                Some(source_kind) if source_kind == *kind => {
+                    return Err(Error::Conflict(format!(
+                        "management request depends on {kind} {id}, whose source was revoked"
+                    )));
+                }
+                // The tombstone belongs to a source of the other kind that shares
+                // this id; this dependency is a different object.
+                Some(_) => {}
+                None => {
+                    return Err(Error::Conflict(format!(
+                        "management request depends on {kind} {id}, whose revocation tombstone cannot be read; the source is treated as revoked"
+                    )));
+                }
+            }
         }
         // The cleanup deletes a revoked run instead of redacting it, and a run body
         // can be large: for a run only the tombstone matters.
@@ -1604,5 +1633,158 @@ mod tests {
         assert_eq!(job.lease_token.as_deref(), Some("active-lease"));
         assert_eq!(job.diagnostics.len(), 1);
         assert_eq!(job.diagnostics[0].code, "conflict");
+    }
+
+    #[tokio::test]
+    async fn a_tombstone_judges_a_dependency_only_for_a_source_of_its_own_kind() {
+        use evo_storage::lifecycle::{REVOKE_TOMBSTONE_SCHEMA, RevokeTombstone};
+        use serde_json::json;
+
+        /// What sits under the dependency's id in the `tombstone` kind. A
+        /// tombstone is keyed by the source id alone, so a run and an artifact of
+        /// one id share it and `source_kind` says which of them it was written for.
+        #[derive(Clone, Copy)]
+        enum Under {
+            Nothing,
+            /// A tombstone as `begin_revoke` writes it, for a source of this kind.
+            Source(&'static str),
+            /// A body `begin_revoke` never writes.
+            Corrupt,
+        }
+        /// The stored body of the dependency itself.
+        #[derive(Clone, Copy)]
+        enum Stored {
+            Absent,
+            Live,
+            Redacted,
+        }
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Verdict {
+            Accepted,
+            Revoked,
+            Unreadable,
+            BodyRedacted,
+        }
+        use {Stored::*, Under::*, Verdict::*};
+
+        // Ids are unique across the rows: a tombstone is keyed by the id alone.
+        const RUN: &str = "run";
+        const ART: &str = "artifact";
+        const OTHER: &str = "release";
+        let cases = [
+            // A tombstone of the dependency's own kind refuses it.
+            (RUN, "run-revoked", Source(RUN), Absent, Revoked),
+            (ART, "art-revoked", Source(ART), Live, Revoked),
+            // A tombstone of the other kind belongs to a different object, ...
+            (ART, "shared-run", Source(RUN), Live, Accepted),
+            (RUN, "shared-art", Source(ART), Absent, Accepted),
+            // ... and the body check still applies to the artifact.
+            (ART, "shared-red", Source(RUN), Redacted, BodyRedacted),
+            // Without a tombstone: live, absent and redacted dependencies as before.
+            (RUN, "run-live", Nothing, Absent, Accepted),
+            (ART, "art-live", Nothing, Live, Accepted),
+            (ART, "art-none", Nothing, Absent, Accepted),
+            (ART, "art-red", Nothing, Redacted, BodyRedacted),
+            // A tombstone `begin_revoke` never writes fails closed, for a run and
+            // for an artifact alike (an unknown source kind is one of them).
+            (RUN, "run-bad", Corrupt, Absent, Unreadable),
+            (ART, "art-bad", Corrupt, Live, Unreadable),
+            (ART, "art-odd", Source(OTHER), Live, Unreadable),
+            // Another dependency kind is not judged by a tombstone, whatever it
+            // says or whether it can be read; only the redacted-body check applies.
+            (OTHER, "oth-run", Source(RUN), Live, Accepted),
+            (OTHER, "oth-art", Source(ART), Live, Accepted),
+            (OTHER, "oth-bad", Corrupt, Live, Accepted),
+            (OTHER, "oth-red", Source(RUN), Redacted, BodyRedacted),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("tombstone-kind.sqlite3"))
+            .await
+            .unwrap();
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        let mut session = store.session().await.unwrap();
+        for (kind, id, under, stored, _) in cases {
+            let tombstone = match under {
+                Nothing => None,
+                Source(source_kind) => Some(
+                    serde_json::to_value(RevokeTombstone {
+                        id: id.into(),
+                        schema_version: REVOKE_TOMBSTONE_SCHEMA.into(),
+                        source_kind: source_kind.into(),
+                        reason: "test".into(),
+                        watermark_seq: 1,
+                        watermark_digest: "a".repeat(64),
+                        created_at: 1,
+                    })
+                    .unwrap(),
+                ),
+                Corrupt => Some(json!({"id": id})),
+            };
+            if let Some(tombstone) = tombstone {
+                session
+                    .put(&admin, "tombstone", id, admin.actor(), &tombstone)
+                    .await
+                    .unwrap();
+            }
+            let body = match stored {
+                Absent => None,
+                Live => Some(json!({"id": id, "schema_version": "fixture.live.v1"})),
+                Redacted => Some(json!({"id": id, "schema_version": REDACTED_SCHEMA})),
+            };
+            if let Some(body) = body {
+                session
+                    .put(&admin, kind, id, admin.actor(), &body)
+                    .await
+                    .unwrap();
+            }
+        }
+        session.commit().await.unwrap();
+
+        for (kind, id, _, _, verdict) in cases {
+            let mut session = store.session().await.unwrap();
+            let outcome = ensure_dependencies_live(
+                &admin,
+                &mut session,
+                &[(kind.to_string(), id.to_string())],
+            )
+            .await;
+            session.commit().await.unwrap();
+            let prefix = format!("management request depends on {kind} {id}, ");
+            let expected = match verdict {
+                Accepted => None,
+                Revoked => Some("whose source was revoked"),
+                Unreadable => Some(
+                    "whose revocation tombstone cannot be read; the source is treated as revoked",
+                ),
+                BodyRedacted => Some("which was redacted because its source was revoked"),
+            };
+            match (expected, outcome) {
+                (None, Ok(())) => {}
+                (Some(tail), Err(Error::Conflict(message))) => {
+                    assert_eq!(message, format!("{prefix}{tail}"), "{kind} {id}");
+                }
+                (_, outcome) => panic!("{kind} {id}: expected {verdict:?}, got {outcome:?}"),
+            }
+        }
+
+        // The first dependency that fails decides, in the order they are given.
+        let mut session = store.session().await.unwrap();
+        let outcome = ensure_dependencies_live(
+            &admin,
+            &mut session,
+            &[
+                (ART.to_string(), "shared-run".to_string()),
+                (RUN.to_string(), "run-revoked".to_string()),
+                (ART.to_string(), "art-red".to_string()),
+            ],
+        )
+        .await;
+        match outcome {
+            Err(Error::Conflict(message)) => {
+                assert!(message.contains("run run-revoked"), "{message}")
+            }
+            other => panic!("expected the revoked run to refuse the set, got {other:?}"),
+        }
     }
 }
