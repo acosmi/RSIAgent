@@ -1,0 +1,1 @@
+{"request_key":"proposal-1","run_id":"run-1","kind":"skill","parent_snapshot":"snapshot-1","hypothesis":"先检查配置","applicability":"café 项目","counterexample":"无配置的任务","content":"第一行\r\n第二行\né","evidence_refs":[],"required_capabilities":[],"dependencies":[]}

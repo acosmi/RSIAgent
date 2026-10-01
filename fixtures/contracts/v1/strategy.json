@@ -1,0 +1,1 @@
+{"schema_version":"evo.strategy.v1","instruction":"保留 café\r\n下一行\né","max_candidates":4,"max_rounds":3,"require_counterexample":false}
