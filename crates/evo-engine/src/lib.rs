@@ -28,6 +28,7 @@ pub mod release_store;
 pub mod releases;
 pub mod replay;
 pub mod replay_experiment;
+mod revocation_gate;
 pub mod seeds;
 pub mod service;
 pub mod startup_gate;

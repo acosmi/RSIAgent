@@ -6,6 +6,7 @@ use crate::capacity::{
 use crate::evidence::{load_stored_source, validate_stored_sources};
 use crate::release_store::{RELEASE_CANDIDATE_SCHEMA, ReleaseCandidateRecord};
 use crate::releases::validate_resolved_bundle_identity;
+use crate::revocation_gate::{judge_dependency, judge_upstream};
 use evo_core::contract::SkillSnapshot;
 use evo_core::{
     Context, Error, Result, Role, Strategy, Validate, fingerprint, hash, identifier, now,
@@ -1341,14 +1342,37 @@ pub(crate) async fn current_watermark(session: &mut Session, ctx: &Context) -> R
         .ok_or_else(|| Error::Conflict("missing current revocation watermark".into()))
 }
 
+/// The gate every operation on an E16 package or seed install goes through, to
+/// create one or to read one that exists: stage, read, hand off and export a package;
+/// install, read and reset a seed. All 15 calls of it (8 here, 7 in `seeds`) are this
+/// one function. A source revoked anywhere above the references refuses the
+/// operation, before it writes anything (plan §11 and §11.5: a revocation blocks
+/// reads, derivation, export and publication first, and the cleanup follows).
+///
+/// Two stages, by the rule of the submit check of a management request
+/// (`revocation_gate`):
+///
+/// 1. Each reference, in the order given, judged by its own kind: a tombstone written
+///    for that kind of source (a tombstone of the other kind that shares the id is
+///    another object's), a tombstone that cannot be read (fail closed), a body the
+///    cleanup already redacted. Then the digest of the stored object must be the one
+///    the reference carries.
+/// 2. The upstream closure of all the references: every run and artifact they depend
+///    on, directly or transitively, judged node by node by the same rule. A closure of
+///    more than `MAX_UPSTREAM_CLOSURE_NODES` nodes is refused, not cut short.
+///
+/// The answers keep the convention of this function: `Forbidden` for a revoked source
+/// (found among the references or above them), `Conflict` for a source whose digest
+/// changed and, for a closure over the bound, the `Conflict` of
+/// `Session::upstream_closure`. (The submit check and the grant answer in their own
+/// words, a `Conflict` that names the node.)
 pub(crate) async fn verify_sources(
     session: &mut Session,
     ctx: &Context,
     sources: &[E16SourceRef],
 ) -> Result<()> {
     for source in sources {
-        if session
-            .get::<serde_json::Value>(ctx, "tombstone", &source.id)
+        if judge_dependency(ctx, session, &source.kind, &source.id)
             .await?
             .is_some()
         {
@@ -1361,6 +1385,13 @@ pub(crate) async fn verify_sources(
                 source.kind, source.id
             )));
         }
+    }
+    let roots: Vec<(String, String)> = sources
+        .iter()
+        .map(|source| (source.kind.clone(), source.id.clone()))
+        .collect();
+    if judge_upstream(ctx, session, &roots).await?.is_some() {
+        return Err(Error::Forbidden);
     }
     Ok(())
 }

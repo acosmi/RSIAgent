@@ -425,6 +425,24 @@ pub async fn store_trace_authority(
     session.commit().await
 }
 
+/// What the grant calls itself in the `Conflict` it refuses with.
+const GRANT_SUBJECT: &str = "source grant";
+
+/// Stores the grant of a source selection: the artifact `optgrant-<fingerprint>` and
+/// an edge to every run of it.
+///
+/// A grant is a new dependency over its runs, so it is refused, with nothing written,
+/// when one of them or anything above one of them was revoked (plan §11 and §11.3: a
+/// revocation refuses new generation, export and use at once; E08: a deleted
+/// non-primary source blocks every content-dependent successor). Each run is judged by
+/// its own kind (a tombstone written for a run; one that cannot be read fails closed),
+/// then the upstream closure of the runs, by the same rule as the submit check of a
+/// management request (`revocation_gate`), and the `Conflict` names the node. The check
+/// reads in the session that writes, before the first write, in whatever state the
+/// cleanup of the revoked source is.
+///
+/// Whether a run exists, and whether it is a trusted one, is not asked here: the
+/// consumer (`StoreOptimizationJournal::verify_sources`) decides that, as before.
 pub async fn store_source_selection(
     store: &evo_storage::Store,
     context: &evo_core::Context,
@@ -434,6 +452,13 @@ pub async fn store_source_selection(
     selection.validate()?;
     let id = format!("optgrant-{}", evo_core::fingerprint(selection)?);
     let mut session = store.session().await?;
+    let runs: Vec<(String, String)> = selection
+        .run_ids
+        .iter()
+        .map(|run| ("run".to_string(), run.clone()))
+        .collect();
+    crate::revocation_gate::ensure_dependencies_live(context, &mut session, &runs, GRANT_SUBJECT)
+        .await?;
     session
         .put(context, "artifact", &id, context.actor(), selection)
         .await?;
