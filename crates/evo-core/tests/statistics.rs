@@ -41,7 +41,7 @@ fn load(name: &str) -> Case {
 #[test]
 fn golden_zero_effect_is_not_improved() {
     let case = load("zero_effect.json");
-    let mut plan = ExperimentPlan::first_low_risk("g1").unwrap();
+    let mut plan = ExperimentPlan::first_low_risk("g1", 60).unwrap();
     plan.freeze(1).unwrap();
     plan.bind_candidate("cand").unwrap();
     let report = empirical_bernstein(&rows(case.n, case.d), case.alpha_i).unwrap();
@@ -89,7 +89,7 @@ fn boundary_scores_map_from_micros() {
 
 #[test]
 fn noninferior_profile_needs_savings() {
-    let mut plan = ExperimentPlan::first_low_risk("g2").unwrap();
+    let mut plan = ExperimentPlan::first_low_risk("g2", 60).unwrap();
     plan.profile = ProfileKind::NoninferiorSavings;
     plan.freeze(1).unwrap();
     plan.bind_candidate("cand").unwrap();

@@ -166,7 +166,10 @@ pub struct ExperimentPlan {
 }
 
 impl ExperimentPlan {
-    pub fn first_low_risk(id: impl Into<String>) -> Result<Self> {
+    /// Builds an unfunded low-risk starting plan with an explicit sample size.
+    /// E01 must establish the independent-unit design, power, and budget before
+    /// a formal experiment; a valid size alone does not authorize execution.
+    pub fn first_low_risk(id: impl Into<String>, n_planned: usize) -> Result<Self> {
         let plan = Self {
             schema_version: PLAN_SCHEMA.into(),
             id: id.into(),
@@ -185,7 +188,7 @@ impl ExperimentPlan {
             max_cost_ratio: 1.10,
             max_p95_latency_ratio: 1.20,
             alpha_total: 0.05,
-            n_planned: 60,
+            n_planned,
             query_limit: 3,
             monetary_budget: Money {
                 currency: "USD".into(),
@@ -1379,7 +1382,7 @@ mod tests {
     use super::*;
 
     fn frozen_plan() -> ExperimentPlan {
-        let mut p = ExperimentPlan::first_low_risk("exp1").unwrap();
+        let mut p = ExperimentPlan::first_low_risk("exp1", 60).unwrap();
         p.freeze(1).unwrap();
         p.bind_candidate("cand1").unwrap();
         p
@@ -1397,21 +1400,21 @@ mod tests {
 
     #[test]
     fn unknown_stats_version_rejected() {
-        let mut p = ExperimentPlan::first_low_risk("exp1").unwrap();
+        let mut p = ExperimentPlan::first_low_risk("exp1", 60).unwrap();
         p.stats_version = "sprt".into();
         assert!(p.validate().is_err());
     }
 
     #[test]
     fn first_round_rejects_d() {
-        let mut p = ExperimentPlan::first_low_risk("exp1").unwrap();
+        let mut p = ExperimentPlan::first_low_risk("exp1", 60).unwrap();
         p.conditions.push(ControlCondition::EvolvingImproverD);
         assert!(p.validate().is_err());
     }
 
     #[test]
     fn freeze_then_bind() {
-        let mut p = ExperimentPlan::first_low_risk("exp1").unwrap();
+        let mut p = ExperimentPlan::first_low_risk("exp1", 60).unwrap();
         assert!(p.bind_candidate("cand1").is_err());
         p.freeze(9).unwrap();
         p.bind_candidate("cand1").unwrap();
@@ -1421,7 +1424,7 @@ mod tests {
 
     #[test]
     fn nonzero_budget_needs_admin_authorization() {
-        let mut p = ExperimentPlan::first_low_risk("exp1").unwrap();
+        let mut p = ExperimentPlan::first_low_risk("exp1", 60).unwrap();
         p.monetary_budget.amount = "1.00".into();
         assert!(matches!(p.freeze(1), Err(Error::Budget)));
     }

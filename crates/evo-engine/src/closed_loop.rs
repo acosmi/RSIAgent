@@ -99,7 +99,7 @@ pub fn run_structural_loop(
         caps: &caps,
         revoked: &revoked,
     })?;
-    let mut plan = ExperimentPlan::first_low_risk("mvc")?;
+    let mut plan = ExperimentPlan::first_low_risk("mvc", 60)?;
     plan.freeze(1)?;
     plan.bind_candidate("cand1")?;
     let mut book = QueryBook::open(&plan)?;

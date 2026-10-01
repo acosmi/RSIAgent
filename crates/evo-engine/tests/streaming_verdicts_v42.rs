@@ -113,7 +113,7 @@ async fn unregistered_fixture(schema: &str, profile: ProfileKind, candidate_cost
         .await
         .unwrap();
 
-    let mut v1 = ExperimentPlan::first_low_risk("formal-e05").unwrap();
+    let mut v1 = ExperimentPlan::first_low_risk("formal-e05", 60).unwrap();
     v1.n_planned = n as usize;
     v1.profile = profile;
     v1.monetary_budget = money("0.001");

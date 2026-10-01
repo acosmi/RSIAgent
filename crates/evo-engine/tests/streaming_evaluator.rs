@@ -165,7 +165,7 @@ async fn fixture(n: u32, sequential: bool) -> Fixture {
         .await
         .unwrap();
 
-    let mut v1 = ExperimentPlan::first_low_risk("formal-e05").unwrap();
+    let mut v1 = ExperimentPlan::first_low_risk("formal-e05", 60).unwrap();
     v1.n_planned = n as usize;
     v1.monetary_budget = money("0.001");
     v1.frozen = true;
