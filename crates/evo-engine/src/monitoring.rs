@@ -21,7 +21,7 @@ use crate::optimization::{
     DevelopmentSelectionDecision, OPTIMIZATION_STAGE_FACT_SCHEMA, OptimizationJournal,
     OptimizationJournalStage, OptimizationStepOutcome, OptimizationStepRequest, StageFact,
     StageFactKind, VerifiedDevelopmentObservationView, development_request_fact_id,
-    optimization_request_digest, run_optimization_step,
+    optimization_request_digest, run_consolidation_step,
     verified_development_observation_in_session,
 };
 use crate::release_store::{
@@ -32,7 +32,7 @@ use crate::releases::validate_resolved_bundle_identity;
 use async_trait::async_trait;
 use evo_core::contract::ResolvedBundle;
 use evo_core::evidence::Purpose;
-use evo_core::optimization::{ModelRequest, ModelRequestContext, TraceOutcome};
+use evo_core::optimization::{ModelRequest, ModelRequestContext, ModelStage, TraceOutcome};
 use evo_core::skill_edit::skill_snapshot_digest;
 use evo_core::strategy::{ConsolidationClass, classify_consolidation_pair};
 use evo_core::{Context, Error, Result, Role, fingerprint, identifier};
@@ -995,6 +995,11 @@ impl MonitoringCoordinator {
     /// with the journal replaying the same candidate and finds the same proposal.
     /// No other outcome (no change, rejected, uncertain, revoked, blocked budget)
     /// leaves a proposal, and none of them can touch Active.
+    ///
+    /// The caller builds the request, and its base stage (`model_context.stage`)
+    /// must be [`ModelStage::Consolidate`]: that is what meters every model call
+    /// of the step under the `Consolidation` budget stage, inside the claim's root
+    /// budget. Any other base stage is `Forbidden` before the claim is taken.
     pub async fn run_consolidation(
         ctx: &Context,
         store: &Store,
@@ -1146,7 +1151,7 @@ impl MonitoringCoordinator {
         // The step consumes its request; a Candidate's terminal journal fact is
         // located from the identity of the request afterwards.
         let step_context = request.model_context.clone();
-        let outcome = run_optimization_step(
+        let outcome = run_consolidation_step(
             Some(&root_bound_model),
             Some(&root_bound_runner),
             Some(journal),
@@ -2191,6 +2196,16 @@ fn validate_execution_binding(
         && claim.state != ConsolidationClaimState::Running
     {
         return Err(Error::Conflict("claim is not dispatchable".into()));
+    }
+    // A consolidation step is the one step whose base stage is `Consolidate`: that
+    // stage is what meters every one of its model calls under the Consolidation
+    // budget stage (plan §3.6, §11.5), inside the claim's root budget. A request
+    // that labels its calls otherwise would be metered as ordinary reflection or
+    // ranking, so it is refused, and it never moves the claim to Running. The
+    // mirror rule, that no other step may use `Consolidate`, is enforced by
+    // `run_optimization_step`.
+    if request.model_context.stage != ModelStage::Consolidate {
+        return Err(Error::Forbidden);
     }
     let scope = &index.scope;
     let request_sources: BTreeSet<_> = request

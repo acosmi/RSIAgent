@@ -790,11 +790,16 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
     }
 }
 
+/// The ledger stage a model call is reserved under. Exhaustive on purpose: a new
+/// `ModelStage` must choose its budget stage here. A consolidation call is
+/// metered as `Consolidation`, apart from reflection and ranking, yet it is
+/// reserved against the same root budget like every other call.
 fn model_stage_budget(stage: ModelStage) -> BudgetStage {
     match stage {
         ModelStage::ReflectFailure | ModelStage::ReflectSuccess => BudgetStage::Reflection,
         ModelStage::Merge => BudgetStage::Merge,
         ModelStage::Rank => BudgetStage::Ranking,
+        ModelStage::Consolidate => BudgetStage::Consolidation,
     }
 }
 

@@ -1014,7 +1014,7 @@ async fn real_e03_no_change_and_zero_budget_paths_never_dispatch_or_write_active
             request_id: format!("consolidation-request-{sequence}"),
             namespace: "tenant".into(),
             purpose: Purpose::Development,
-            stage: ModelStage::Merge,
+            stage: ModelStage::Consolidate,
             episode_id: claim_id.into(),
             step: sequence,
             attempt: 1,
