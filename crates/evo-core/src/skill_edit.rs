@@ -375,7 +375,7 @@ fn clone_snapshot(input: &SkillSnapshot) -> SkillSnapshot {
     }
 }
 
-fn validate_batch_scope(
+pub fn validate_batch_scope(
     input: &SkillSnapshot,
     context: &TrustedEditContext,
     batch: &SkillEditBatch,
