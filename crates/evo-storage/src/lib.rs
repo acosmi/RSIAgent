@@ -744,14 +744,17 @@ async fn load_dependency_record_snapshots(
     ctx: &Context,
     artifact_id: &str,
 ) -> Result<Vec<DependencyRecordSnapshot>> {
+    // Bound recursive results before sorting; keep the closure as the outer
+    // loop so each node looks up its edges by (namespace, src_kind, src_id).
     let rows = sqlx::query(
         "WITH RECURSIVE closure(kind,id) AS (
            SELECT dst_kind,dst_id FROM dependencies
              WHERE namespace=? AND src_kind='artifact' AND src_id=?
            UNION
-           SELECT d.dst_kind,d.dst_id FROM dependencies d
-             JOIN closure c ON d.src_kind=c.kind AND d.src_id=c.id
-             WHERE d.namespace=?
+           SELECT d.dst_kind,d.dst_id FROM closure c
+             CROSS JOIN dependencies d
+               ON d.namespace=? AND d.src_kind=c.kind AND d.src_id=c.id
+           LIMIT 10001
          )
          SELECT kind,id FROM closure ORDER BY kind,id LIMIT 10001",
     )
@@ -2687,6 +2690,280 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let s = Store::open(&d.path().join("db.sqlite3")).await.unwrap();
         (d, s)
+    }
+
+    // Graph construction stays outside the progress handler's measured region.
+    async fn snapshot_blob_chain(session: &mut Session, ctx: &Context, root: &str, nodes: i64) {
+        sqlx::query(
+            "WITH RECURSIVE seq(i) AS (
+               SELECT 1 UNION ALL SELECT i+1 FROM seq WHERE i < ?1
+             )
+             INSERT INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id)
+             SELECT ?2, CASE WHEN i=1 THEN 'artifact' ELSE 'blob' END,
+                    CASE WHEN i=1 THEN ?3 ELSE ?3 || '-' || (i-1) END,
+                    'blob', ?3 || '-' || i FROM seq",
+        )
+        .bind(nodes)
+        .bind(ctx.namespace())
+        .bind(root)
+        .execute(&mut *session.tx)
+        .await
+        .unwrap();
+    }
+
+    async fn snapshot_vm_steps(
+        session: &mut Session,
+        ctx: &Context,
+        root: &str,
+    ) -> (Result<Vec<DependencyRecordSnapshot>>, u64) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let steps = std::sync::Arc::new(AtomicU64::new(0));
+        let counter = steps.clone();
+        session
+            .tx
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(1, move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                true
+            });
+        let result = load_dependency_record_snapshots(session, ctx, root).await;
+        session
+            .tx
+            .lock_handle()
+            .await
+            .unwrap()
+            .remove_progress_handler();
+        (result, steps.load(Ordering::Relaxed))
+    }
+
+    fn assert_snapshot_capacity_conflict(result: Result<Vec<DependencyRecordSnapshot>>) {
+        assert!(matches!(result, Err(Error::Conflict(message))
+            if message == "local export dependency closure exceeds bounded verification"));
+    }
+
+    #[tokio::test]
+    async fn dependency_snapshots_accept_exact_limit_and_refuse_one_more() {
+        let (_dir, store) = db().await;
+        let ctx = Context::new("n", "admin", Role::Admin).unwrap();
+        let mut session = store.session().await.unwrap();
+        snapshot_blob_chain(&mut session, &ctx, "root", 10_000).await;
+        // The root has no object: it must not be implicitly included.
+        let records = load_dependency_record_snapshots(&mut session, &ctx, "root")
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 10_000);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.kind == "blob" && record.fingerprint.is_none())
+        );
+        assert!(records.windows(2).all(|pair| pair[0].id < pair[1].id));
+        session
+            .put_edge(&ctx, "blob", "root-10000", "candidate", "overflow")
+            .await
+            .unwrap();
+        // Every kind counts, and capacity refusal precedes missing-object reads.
+        assert_snapshot_capacity_conflict(
+            load_dependency_record_snapshots(&mut session, &ctx, "root").await,
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_snapshots_preserve_typed_cycles_diamonds_sort_and_fingerprints() {
+        let (_dir, store) = db().await;
+        let ctx = Context::new("n", "admin", Role::Admin).unwrap();
+        let mut session = store.session().await.unwrap();
+        assert!(
+            load_dependency_record_snapshots(&mut session, &ctx, "root")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let objects = [
+            ("artifact", "root", json!({"root":true})),
+            ("candidate", "shared", json!({"candidate":1})),
+            ("release", "shared", json!({"release":2})),
+            ("run", "z", json!({"run":3})),
+        ];
+        for (kind, id, body) in &objects {
+            session
+                .put(&ctx, kind, id, ctx.actor(), body)
+                .await
+                .unwrap();
+        }
+        for (src_kind, src_id, dst_kind, dst_id) in [
+            ("artifact", "root", "run", "z"),
+            ("artifact", "root", "release", "shared"),
+            ("run", "z", "candidate", "shared"),
+            ("release", "shared", "candidate", "shared"),
+            ("candidate", "shared", "blob", "b"),
+            ("candidate", "shared", "candidate", "shared"),
+            ("blob", "b", "artifact", "root"),
+            ("artifact", "root", "artifact", "root"),
+        ] {
+            session
+                .put_edge(&ctx, src_kind, src_id, dst_kind, dst_id)
+                .await
+                .unwrap();
+        }
+        let mut expected: Vec<_> = objects
+            .iter()
+            .map(|(kind, id, body)| DependencyRecordSnapshot {
+                kind: (*kind).into(),
+                id: (*id).into(),
+                fingerprint: Some(fingerprint(body).unwrap()),
+            })
+            .collect();
+        expected.push(DependencyRecordSnapshot {
+            kind: "blob".into(),
+            id: "b".into(),
+            fingerprint: None,
+        });
+        expected.sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+        assert_eq!(
+            load_dependency_record_snapshots(&mut session, &ctx, "root")
+                .await
+                .unwrap(),
+            expected
+        );
+        let changed = json!({"candidate":4});
+        session
+            .put(&ctx, "candidate", "shared", ctx.actor(), &changed)
+            .await
+            .unwrap();
+        expected[2].fingerprint = Some(fingerprint(&changed).unwrap());
+        assert_eq!(
+            load_dependency_record_snapshots(&mut session, &ctx, "root")
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_snapshots_isolate_namespace_edges_objects_and_tombstones() {
+        let (_dir, store) = db().await;
+        let ctx = Context::new("n", "admin", Role::Admin).unwrap();
+        let other = Context::new("other", "admin", Role::Admin).unwrap();
+        let mut session = store.session().await.unwrap();
+        let body = json!({"namespace":"n"});
+        for scope in [&ctx, &other] {
+            session
+                .put_edge(scope, "artifact", "root", "run", "shared")
+                .await
+                .unwrap();
+            session
+                .put(
+                    scope,
+                    "run",
+                    "shared",
+                    scope.actor(),
+                    &json!({"namespace":scope.namespace()}),
+                )
+                .await
+                .unwrap();
+        }
+        session
+            .put_edge(&other, "run", "shared", "candidate", "missing")
+            .await
+            .unwrap();
+        session
+            .put(&other, "tombstone", "shared", other.actor(), &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            load_dependency_record_snapshots(&mut session, &ctx, "root")
+                .await
+                .unwrap(),
+            vec![DependencyRecordSnapshot {
+                kind: "run".into(),
+                id: "shared".into(),
+                fingerprint: Some(fingerprint(&body).unwrap()),
+            }]
+        );
+        assert!(matches!(
+            load_dependency_record_snapshots(&mut session, &other, "root").await,
+            Err(Error::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dependency_snapshots_refuse_missing_nonblob_and_tombstoned_ids() {
+        let (_dir, store) = db().await;
+        let ctx = Context::new("n", "admin", Role::Admin).unwrap();
+        let mut session = store.session().await.unwrap();
+        for kind in ["blob", "run", "artifact", "candidate", "release", "custom"] {
+            session
+                .put_edge(&ctx, "artifact", kind, kind, "missing")
+                .await
+                .unwrap();
+            let result = load_dependency_record_snapshots(&mut session, &ctx, kind).await;
+            if kind == "blob" {
+                assert_eq!(result.unwrap()[0].fingerprint, None);
+            } else {
+                assert!(matches!(result, Err(Error::NotFound)));
+            }
+            session
+                .put(&ctx, "tombstone", "missing", ctx.actor(), &json!({}))
+                .await
+                .unwrap();
+            assert!(matches!(
+                load_dependency_record_snapshots(&mut session, &ctx, kind).await,
+                Err(Error::Forbidden)
+            ));
+            session.delete(&ctx, "tombstone", "missing").await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dependency_snapshots_vm_rejection_stops_before_long_chain_tail() {
+        let (_dir, store) = db().await;
+        let short_ctx = Context::new("short", "admin", Role::Admin).unwrap();
+        let long_ctx = Context::new("long", "admin", Role::Admin).unwrap();
+        let mut session = store.session().await.unwrap();
+        snapshot_blob_chain(&mut session, &short_ctx, "root", 20_000).await;
+        snapshot_blob_chain(&mut session, &long_ctx, "root", 80_000).await;
+        // Isolate recursive result bounding from join-order cost. Both graph
+        // sizes use the same initialized statistics; the unrelated-edge test
+        // below separately checks lookup behavior without ANALYZE.
+        sqlx::query("ANALYZE dependencies")
+            .execute(&mut *session.tx)
+            .await
+            .unwrap();
+        let version: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(&mut *session.tx)
+            .await
+            .unwrap();
+        let (short_result, short_steps) = snapshot_vm_steps(&mut session, &short_ctx, "root").await;
+        let (long_result, long_steps) = snapshot_vm_steps(&mut session, &long_ctx, "root").await;
+        eprintln!("snapshot VM SQLite {version}: 20000={short_steps}, 80000={long_steps}");
+        assert_snapshot_capacity_conflict(short_result);
+        assert_snapshot_capacity_conflict(long_result);
+        assert!(short_steps > 0);
+        assert!(
+            long_steps <= short_steps * 2,
+            "long chain must take <= twice the VM steps"
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_snapshots_vm_lookup_ignores_unrelated_edges() {
+        let (_dir, store) = db().await;
+        let ctx = Context::new("n", "admin", Role::Admin).unwrap();
+        let mut session = store.session().await.unwrap();
+        snapshot_blob_chain(&mut session, &ctx, "root", 20).await;
+        let (before, before_steps) = snapshot_vm_steps(&mut session, &ctx, "root").await;
+        snapshot_blob_chain(&mut session, &ctx, "unrelated", 80_000).await;
+        let (after, after_steps) = snapshot_vm_steps(&mut session, &ctx, "root").await;
+        eprintln!("snapshot VM unrelated edges: 0={before_steps}, 80000={after_steps}");
+        assert_eq!(before.unwrap(), after.unwrap());
+        assert!(before_steps > 0);
+        assert!(
+            after_steps <= before_steps * 2,
+            "unrelated edges must take <= twice the VM steps"
+        );
     }
     #[tokio::test]
     async fn bounded_blob_read_is_role_namespace_digest_and_size_scoped() {
