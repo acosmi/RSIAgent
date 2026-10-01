@@ -35,7 +35,7 @@ use evo_core::evidence::Purpose;
 use evo_core::optimization::{ModelRequest, ModelRequestContext, ModelStage, TraceOutcome};
 use evo_core::skill_edit::skill_snapshot_digest;
 use evo_core::strategy::{ConsolidationClass, classify_consolidation_pair};
-use evo_core::{Context, Error, Result, Role, fingerprint, identifier};
+use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier};
 use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -346,6 +346,9 @@ pub struct ConsolidationRunRecord {
     pub claim_id: String,
     pub input_digest: Option<String>,
     pub outcome: ConsolidationRunOutcome,
+    /// The bounded terminal category of the outcome: [`terminal_category`] of its
+    /// reason. It is the reason itself when that fits 128 bytes; a longer reason is
+    /// cut and ends in a digest of the whole. The full text is not kept here.
     pub reason: String,
     pub budget_call_ids: Vec<String>,
     /// Set exactly when `outcome` is `Candidate`: the durable proposal that was
@@ -353,6 +356,53 @@ pub struct ConsolidationRunRecord {
     /// existed deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal_id: Option<String>,
+}
+
+/// The most bytes the terminal category of a run record holds.
+const TERMINAL_CATEGORY_MAX_BYTES: usize = 128;
+/// The category of an outcome that gave no reason.
+const TERMINAL_CATEGORY_UNSPECIFIED: &str = "unspecified";
+/// What ends a cut category, right before the digest: the ellipsis `U+2026`, `#`.
+const TERMINAL_CATEGORY_MARK: &str = "\u{2026}#";
+/// Hex digits of the sha256 of the whole reason that a cut category keeps.
+const TERMINAL_CATEGORY_DIGEST_HEX: usize = 16;
+
+/// Derives the terminal category a consolidation run record stores from the raw
+/// reason of its outcome (plan section 11.5: every outcome, a rejection included,
+/// ends in a durable terminal record).
+///
+/// It is a pure function of `reason`, so a re-entry that reaches the same outcome
+/// derives the same category and the idempotent comparisons of the terminal record
+/// keep holding:
+///
+/// * a reason of 1..=128 bytes is kept as it is;
+/// * an empty reason is `unspecified`;
+/// * a longer reason is cut on a UTF-8 character boundary and ends in the ellipsis
+///   `U+2026`, `#` and the first 16 hex digits of the sha256 of the whole reason,
+///   128 bytes at most in all.
+///
+/// The run record does not keep the full reason anywhere else: a terminal record
+/// survives a source revocation, and a long reason can carry model- or
+/// source-derived text. The cut prefix and the digest are what it keeps to tell
+/// one outcome from another; the whole text stays only in the optimization
+/// journal's own facts (its `StepCompleted` fact holds it), which a revocation
+/// redacts.
+pub fn terminal_category(reason: &str) -> String {
+    if reason.is_empty() {
+        return TERMINAL_CATEGORY_UNSPECIFIED.into();
+    }
+    if reason.len() <= TERMINAL_CATEGORY_MAX_BYTES {
+        return reason.into();
+    }
+    let suffix = format!(
+        "{TERMINAL_CATEGORY_MARK}{}",
+        &hash(reason.as_bytes())[..TERMINAL_CATEGORY_DIGEST_HEX]
+    );
+    let mut end = TERMINAL_CATEGORY_MAX_BYTES - suffix.len();
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &reason[..end])
 }
 
 /// The durable form of a `Candidate` consolidation outcome (plan §11.5). It
@@ -973,7 +1023,9 @@ impl MonitoringCoordinator {
             claim_id: claim.id.clone(),
             input_digest: None,
             outcome: ConsolidationRunOutcome::NoChange,
-            reason: "two completed development cycles contained no before/after contrast".into(),
+            reason: terminal_category(
+                "two completed development cycles contained no before/after contrast",
+            ),
             budget_call_ids: vec![],
             proposal_id: None,
         };
@@ -2980,6 +3032,11 @@ async fn persist_terminal_run_with_id(
 /// transaction. Only a `Candidate` outcome names a proposal, and it must: every
 /// other outcome (no change, rejected, uncertain, revoked, blocked budget)
 /// leaves no proposal behind.
+///
+/// `reason` is the raw reason of the outcome, of any length. Every terminal record
+/// is written here (a claim without contrast derives its category the same way),
+/// so the category it stores is always [`terminal_category`] of it: a long reason
+/// can no longer be refused and leave the claim in `Running`.
 #[allow(clippy::too_many_arguments)]
 async fn persist_terminal_run(
     ctx: &Context,
@@ -2992,11 +3049,7 @@ async fn persist_terminal_run(
     reason: &str,
     proposal_id: Option<String>,
 ) -> Result<ConsolidationRunRecord> {
-    if reason.is_empty() || reason.len() > 128 {
-        return Err(Error::Invalid(
-            "consolidation terminal category must be 1..=128 bytes".into(),
-        ));
-    }
+    let category = terminal_category(reason);
     if (outcome == ConsolidationRunOutcome::Candidate) != proposal_id.is_some() {
         return Err(Error::Invalid(
             "only a candidate consolidation outcome names a proposal".into(),
@@ -3041,7 +3094,7 @@ async fn persist_terminal_run(
         claim_id: current.id.clone(),
         input_digest,
         outcome,
-        reason: reason.into(),
+        reason: category,
         budget_call_ids,
         proposal_id,
     };
