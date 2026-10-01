@@ -368,6 +368,19 @@ impl OptimizationJournal for CrashAfterDispatchJournal {
     }
 }
 
+/// The payload of one stored exploration record, as the coordinator wrote it.
+async fn raw_payload(store: &Store, record_kind: &str, id: &str) -> serde_json::Value {
+    let worker = Context::new("n", "worker", Role::Worker).unwrap();
+    let storage_id = format!("e09-{}", fingerprint(&(record_kind, id)).unwrap());
+    let mut session = store.session().await.unwrap();
+    let envelope: serde_json::Value = session
+        .need(&worker, "artifact", &storage_id)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    envelope["payload"].clone()
+}
+
 fn trace(run: &str, family: &str, outcome: TraceOutcome) -> OptimizationTrace {
     OptimizationTrace {
         run_id: run.into(),
@@ -643,7 +656,25 @@ async fn coordinator_calls_the_existing_optimization_consumer_before_observing()
         )
         .await
         .unwrap();
-    assert_eq!(first.outcome, "candidate_observed");
+    // The fixture runner's report declares Fixture provenance, so the E03 gate is not
+    // asked and the node is a labelled terminal failure, not a valid candidate.
+    assert_eq!(first.outcome, "fixture_evidence_not_accepted");
+    let node = raw_payload(
+        &_store,
+        "exploration_node_v1",
+        first.node_id.as_deref().unwrap(),
+    )
+    .await;
+    assert_eq!(node["node"]["status"]["status"], "hard_failure");
+    assert_eq!(node["evidence"], "fixture_declared");
+    let fact = raw_payload(
+        &_store,
+        "exploration_dispatch_v1",
+        first.dispatch_id.as_deref().unwrap(),
+    )
+    .await;
+    assert_eq!(fact["state"], "observed");
+    assert_eq!(fact["evidence"], "fixture_declared");
     assert_eq!(candidate_model.0.load(Ordering::SeqCst), 2);
     let reconnected = coordinator
         .run_next(
@@ -683,25 +714,23 @@ async fn coordinator_calls_the_existing_optimization_consumer_before_observing()
             .await,
         Err(Error::Conflict(_))
     ));
-    let selected = coordinator
-        .final_candidate_request("world-1", first.node_id.as_deref().unwrap())
-        .await
-        .unwrap();
-    let second_parent_bundle = selected.selected_bundle_digest;
-    let mut evolved_parent = parent.clone();
-    evolved_parent.content.push_str(" [repair]");
-    evolved_parent.applicability.push_str(" [repair]");
-    let edit_context_2 = TrustedEditContext::new(
-        "n",
-        "profile",
-        "skill",
-        "v1",
-        hash(b"approved-parent"),
-        hash(b"baseline"),
-        &evolved_parent,
-        allowed.clone(),
-    )
-    .unwrap();
+    // A fixture-declared node is no final candidate and cannot be deepened: the only
+    // legal action left is the second root. The trusted chain (a valid node, its
+    // final candidate request and the deepening of it) is covered by
+    // `exploration_trust_v42`, with a runner whose receipts the gate verifies.
+    assert!(matches!(
+        coordinator
+            .final_candidate_request("world-1", first.node_id.as_deref().unwrap())
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    let next = coordinator.decide_next("world-1").await.unwrap();
+    assert!(matches!(
+        next.action,
+        BatchActionV1::Dispatch {
+            ref action_seqs, ..
+        } if action_seqs == &[2]
+    ));
     let second = coordinator
         .run_next(
             Some(&candidate_model),
@@ -713,21 +742,19 @@ async fn coordinator_calls_the_existing_optimization_consumer_before_observing()
                 "optimizer-request-2",
                 "dev-request-2",
                 "dev-idempotency-2",
-                evolved_parent,
-                edit_context_2,
-                second_parent_bundle
+                parent,
+                edit_context,
+                initial_parent_bundle
             ),
         )
         .await
         .unwrap();
-    assert_eq!(second.outcome, "candidate_observed");
+    assert_eq!(second.outcome, "fixture_evidence_not_accepted");
     assert_ne!(first.node_id, second.node_id);
-    let next = coordinator.decide_next("world-1").await.unwrap();
+    // Both roots are spent and neither node can be deepened: nothing is left.
     assert!(matches!(
-        next.action,
-        BatchActionV1::Dispatch {
-            ref action_seqs, ..
-        } if action_seqs == &[2]
+        coordinator.decide_next("world-1").await.unwrap().action,
+        BatchActionV1::Stop { .. }
     ));
     let mut other_world = world();
     other_world.id = "world-2".into();

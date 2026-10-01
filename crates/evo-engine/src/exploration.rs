@@ -1,12 +1,16 @@
 //! generate → execute_dev → observe → decide. Intermediate nodes are not published.
+//! A dispatched candidate is observed as a valid node only when E03's observation gate
+//! verified the development report behind it ([`ExplorationEvidenceV1`]).
 use crate::capacity::{
     CapacityField, CapacityLimits, V41CapacityUsage, admit_field, unix_now_secs,
 };
 use crate::evidence::validate_stored_sources;
 use crate::model::ModelPort;
 use crate::optimization::{
-    DevRunner, OptimizationJournal, OptimizationStepOutcome, OptimizationStepRequest,
-    optimization_request_digest, run_optimization_step,
+    DevRunner, DevelopmentExecutionProvenance, DevelopmentRunReport, OptimizationJournal,
+    OptimizationStepOutcome, OptimizationStepRequest, StageFact, StageFactKind,
+    development_stage_fact_ids, optimization_request_digest, run_optimization_step,
+    verified_development_observation_in_session,
 };
 use evo_core::evaluation::DataUse;
 use evo_core::skill_edit::skill_snapshot_digest;
@@ -336,6 +340,44 @@ impl ExplorationWorldV1 {
     }
 }
 
+/// What the E03 observation gate made of the development evidence behind a
+/// dispatched candidate (plan E09: successors are chosen only after a real
+/// per-node evaluation; E03: a self-reported provenance or score grants nothing).
+/// A node's `Valid` status is a claim of the optimizer's report until the gate has
+/// checked it, so the label travels with the node and its dispatch fact and every
+/// consumer that needs a trusted observation reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplorationEvidenceV1 {
+    /// The development report passed the observation gate: its receipts, budget
+    /// rows and scores were reloaded and the node's quality is the server-recomputed
+    /// one. The only label a `Valid` node written by `run_next` can carry.
+    Trusted,
+    /// The report declared Fixture provenance. That is honest, and it can never be
+    /// a trusted observation; the gate was not asked.
+    FixtureDeclared,
+    /// The report claimed an execution the gate refused: no receipts, scores that
+    /// differ from the recomputed ones, or any other mismatch.
+    EvidenceRejected,
+    /// No gate verdict exists: the outcome was no candidate, the gate could not be
+    /// reached, or the record was written before the gate existed (the default a
+    /// record without the field reads as).
+    #[default]
+    NotObserved,
+}
+
+impl ExplorationEvidenceV1 {
+    /// The label as it is stored, for messages that must not carry a raw error.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::FixtureDeclared => "fixture_declared",
+            Self::EvidenceRejected => "evidence_rejected",
+            Self::NotObserved => "not_observed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistentSearchNode {
@@ -346,6 +388,10 @@ pub struct PersistentSearchNode {
     pub candidate_skill_digest: Option<String>,
     pub development_selection_digest: Option<String>,
     pub intermediate_only: bool,
+    /// The gate's verdict on the evidence behind this node. A node stored without
+    /// the field is `NotObserved`.
+    #[serde(default)]
+    pub evidence: ExplorationEvidenceV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,6 +420,12 @@ pub struct ExplorationDispatchFact {
     pub state: ExplorationDispatchState,
     pub node_id: Option<String>,
     pub outcome_reason: Option<String>,
+    /// The gate's verdict on the evidence of the dispatched step, the same label
+    /// its node carries. `NotObserved` while the fact is claimed, for an outcome
+    /// that is no candidate, and for a fact written before the gate existed (the
+    /// schema is unchanged: a v2 fact without the field reads as `NotObserved`).
+    #[serde(default)]
+    pub evidence: ExplorationEvidenceV1,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,6 +491,7 @@ pub struct MechanismUsageRecordV1 {
     action_digest: String,
     dispatch_state: MechanismUsageState,
     node_id: Option<String>,
+    evidence: ExplorationEvidenceV1,
 }
 
 impl MechanismUsageRecordV1 {
@@ -485,6 +538,13 @@ impl MechanismUsageRecordV1 {
 
     pub fn node_id(&self) -> Option<&str> {
         self.node_id.as_deref()
+    }
+
+    /// The gate's verdict on the development evidence of the dispatched step, as
+    /// its dispatch fact stores it. A dispatch whose evidence is not `Trusted` still
+    /// happened and still cost something; it is not a trusted observation.
+    pub fn evidence(&self) -> ExplorationEvidenceV1 {
+        self.evidence
     }
 }
 
@@ -749,6 +809,7 @@ impl PersistentCoordinator {
                 action_digest: fingerprint(&fact.decision.action)?,
                 dispatch_state,
                 node_id: fact.node_id.clone(),
+                evidence: fact.evidence,
             });
         }
         session.commit().await?;
@@ -872,6 +933,11 @@ impl PersistentCoordinator {
     ) -> Result<CoordinatorStepResult> {
         let world_id = request.model_context.episode_id.clone();
         let request_digest = optimization_request_digest(&request)?;
+        // The two facts the observation gate reads once the step is done. A pure
+        // function of the request, derived before anything is claimed: nothing
+        // that can fail may run between the paid step and the node's write.
+        let (request_fact_id, observed_fact_id) =
+            development_stage_fact_ids(&request.model_context, &request.development_request)?;
         let prior = self
             .dispatch_for_request(&world_id, &request.model_context.request_id)
             .await?;
@@ -1031,6 +1097,7 @@ impl PersistentCoordinator {
                     state: ExplorationDispatchState::Claimed,
                     node_id: None,
                     outcome_reason: None,
+                    evidence: ExplorationEvidenceV1::NotObserved,
                 };
                 world.dispatch_ids.push(dispatch_id.clone());
                 put_record(
@@ -1089,57 +1156,88 @@ impl PersistentCoordinator {
         }
         let action = dispatch.selected_action.clone();
         let next_seq = world.node_ids.len() as u32 + 1;
-        let (status, skill_digest, bundle_digest, selection_digest, outcome_reason) = match outcome
-        {
-            Ok(OptimizationStepOutcome::Candidate {
-                edit,
-                bundle,
-                selection,
-            }) => {
-                let quality = if task_count == 0 {
-                    0
-                } else {
-                    u32::try_from(selection.candidate_total_micros / task_count as u64)
-                        .unwrap_or(1_000_000)
-                };
-                (
-                    ObservedStatus::Valid {
-                        quality_micros: quality.min(1_000_000),
-                    },
-                    Some(skill_snapshot_digest(&edit.output)?),
-                    Some(bundle.digest.clone()),
-                    Some(fingerprint(&selection)?),
-                    "candidate_observed".to_string(),
-                )
-            }
-            Ok(OptimizationStepOutcome::NoChange { reason }) => {
-                (ObservedStatus::HardFailure, None, None, None, reason)
-            }
-            Ok(OptimizationStepOutcome::Rejected { reason }) => {
-                (ObservedStatus::HardFailure, None, None, None, reason)
-            }
-            Ok(OptimizationStepOutcome::Uncertain { reason }) => (
-                ObservedStatus::UsageUncertain,
-                None,
-                None,
-                None,
-                reason_or_cancelled(reason),
-            ),
-            Err(Error::Cancelled) => (
-                ObservedStatus::UsageUncertain,
-                None,
-                None,
-                None,
-                "cancelled_or_uncertain".into(),
-            ),
-            Err(error) => (
-                ObservedStatus::UsageUncertain,
-                None,
-                None,
-                None,
-                format!("optimization dispatch outcome uncertain: {error}"),
-            ),
-        };
+        let (status, evidence, skill_digest, bundle_digest, selection_digest, outcome_reason) =
+            match outcome {
+                Ok(OptimizationStepOutcome::Candidate {
+                    edit,
+                    bundle,
+                    selection,
+                }) => {
+                    // The step's `Candidate` rests on the runner's own report: its
+                    // provenance and scores grant nothing (E03). The observation gate
+                    // runs in this session, so its verdict and the node it decides are
+                    // one commit. The step is paid for and its dispatch is claimed, so
+                    // the verdict is never an error: a refusal is a terminal node, and
+                    // a gate that could not answer is the uncertain path.
+                    let verdict = judge_candidate_evidence(
+                        &mut session,
+                        &self.context,
+                        &request_fact_id,
+                        &observed_fact_id,
+                        task_count,
+                    )
+                    .await;
+                    let (status, evidence, reason) = verdict.observed();
+                    let (skill_digest, bundle_digest, selection_digest) =
+                        if verdict.keeps_candidate() {
+                            (
+                                Some(skill_snapshot_digest(&edit.output)?),
+                                Some(bundle.digest.clone()),
+                                Some(fingerprint(&selection)?),
+                            )
+                        } else {
+                            (None, None, None)
+                        };
+                    (
+                        status,
+                        evidence,
+                        skill_digest,
+                        bundle_digest,
+                        selection_digest,
+                        reason.to_string(),
+                    )
+                }
+                Ok(OptimizationStepOutcome::NoChange { reason }) => (
+                    ObservedStatus::HardFailure,
+                    ExplorationEvidenceV1::NotObserved,
+                    None,
+                    None,
+                    None,
+                    reason,
+                ),
+                Ok(OptimizationStepOutcome::Rejected { reason }) => (
+                    ObservedStatus::HardFailure,
+                    ExplorationEvidenceV1::NotObserved,
+                    None,
+                    None,
+                    None,
+                    reason,
+                ),
+                Ok(OptimizationStepOutcome::Uncertain { reason }) => (
+                    ObservedStatus::UsageUncertain,
+                    ExplorationEvidenceV1::NotObserved,
+                    None,
+                    None,
+                    None,
+                    reason_or_cancelled(reason),
+                ),
+                Err(Error::Cancelled) => (
+                    ObservedStatus::UsageUncertain,
+                    ExplorationEvidenceV1::NotObserved,
+                    None,
+                    None,
+                    None,
+                    "cancelled_or_uncertain".into(),
+                ),
+                Err(error) => (
+                    ObservedStatus::UsageUncertain,
+                    ExplorationEvidenceV1::NotObserved,
+                    None,
+                    None,
+                    None,
+                    format!("optimization dispatch outcome uncertain: {error}"),
+                ),
+            };
         let (search_parent_seq, branch_seq, depth) = match &action.kind {
             ActionKindV1::Widen { root_slot: _ } => (None, action.branch_seq, 1),
             ActionKindV1::Deepen { parent_node_seq } => (
@@ -1239,6 +1337,7 @@ impl PersistentCoordinator {
             candidate_skill_digest: skill_digest,
             development_selection_digest: selection_digest,
             intermediate_only: true,
+            evidence,
         };
         world.remaining_root_micros = world.remaining_root_micros.saturating_sub(cost);
         world.node_ids.push(node_id.clone());
@@ -1258,6 +1357,7 @@ impl PersistentCoordinator {
         };
         dispatch.node_id = Some(node_id.clone());
         dispatch.outcome_reason = Some(outcome_reason.clone());
+        dispatch.evidence = evidence;
         put_record(
             &mut session,
             &self.context,
@@ -1322,6 +1422,22 @@ impl PersistentCoordinator {
                 "selected node does not belong to the requested world".into(),
             ));
         }
+        // A final candidate is proposed for re-resolution against the approved
+        // parent and independent formal evaluation, so it must rest on a development
+        // observation the E03 gate verified: a valid node whose evidence is trusted.
+        // A fixture, a refused report, an unobserved outcome and a record written
+        // before the gate existed are none of those.
+        if !matches!(node.node.status, ObservedStatus::Valid { .. }) {
+            return Err(Error::Conflict(
+                "selected node is not a valid observed candidate".into(),
+            ));
+        }
+        if node.evidence != ExplorationEvidenceV1::Trusted {
+            return Err(Error::Conflict(format!(
+                "selected node's development evidence is {}, not trusted",
+                node.evidence.as_str()
+            )));
+        }
         session.commit().await?;
         let bundle = node
             .candidate_bundle_digest
@@ -1368,6 +1484,164 @@ fn reason_or_cancelled(reason: String) -> String {
         "cancelled_or_uncertain".into()
     } else {
         reason
+    }
+}
+
+/// Outcome reasons of a dispatched candidate. Fixed literals: a refusal never
+/// stores the gate's own error text.
+const REASON_CANDIDATE_OBSERVED: &str = "candidate_observed";
+const REASON_FIXTURE_EVIDENCE: &str = "fixture_evidence_not_accepted";
+const REASON_EVIDENCE_REJECTED: &str = "development_evidence_rejected";
+const REASON_EVIDENCE_UNVERIFIED: &str = "development_evidence_unverified";
+
+/// The observation gate's verdict on the evidence behind a `Candidate` outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateVerdict {
+    /// The gate verified the report; the quality is the mean of the scores it
+    /// recomputed, not the runner's own.
+    Trusted { quality_micros: u32 },
+    /// The report declared Fixture provenance; the gate was not asked.
+    FixtureDeclared,
+    /// The gate refused the report.
+    Rejected,
+    /// The gate could not answer (a storage or infrastructure failure).
+    Unverified,
+}
+
+impl CandidateVerdict {
+    /// The node status, evidence label and outcome reason the verdict records. Only
+    /// a verified report is `Valid`; a fixture or refused one is a terminal
+    /// `HardFailure` (no new status: replay, strategy and the wire formats keep their
+    /// vocabulary) told apart by its label; an unanswered gate is the existing
+    /// uncertain path and the dispatch ends `Uncertain`.
+    fn observed(self) -> (ObservedStatus, ExplorationEvidenceV1, &'static str) {
+        match self {
+            Self::Trusted { quality_micros } => (
+                ObservedStatus::Valid { quality_micros },
+                ExplorationEvidenceV1::Trusted,
+                REASON_CANDIDATE_OBSERVED,
+            ),
+            Self::FixtureDeclared => (
+                ObservedStatus::HardFailure,
+                ExplorationEvidenceV1::FixtureDeclared,
+                REASON_FIXTURE_EVIDENCE,
+            ),
+            Self::Rejected => (
+                ObservedStatus::HardFailure,
+                ExplorationEvidenceV1::EvidenceRejected,
+                REASON_EVIDENCE_REJECTED,
+            ),
+            Self::Unverified => (
+                ObservedStatus::UsageUncertain,
+                ExplorationEvidenceV1::NotObserved,
+                REASON_EVIDENCE_UNVERIFIED,
+            ),
+        }
+    }
+
+    /// Whether the node still names the candidate it dispatched (bundle, skill and
+    /// selection digests). Every verdict that saw the candidate keeps them, for the
+    /// audit trail and the revocation cleanup; an uncertain node names none, like
+    /// every other uncertain node.
+    fn keeps_candidate(self) -> bool {
+        !matches!(self, Self::Unverified)
+    }
+}
+
+/// How the gate's error maps to a verdict. A refusal of the evidence itself (no
+/// report or receipt, a mismatch, a forbidden provenance, a malformed fact) rejects
+/// it. A storage or infrastructure failure says nothing about the evidence, so it
+/// leaves it unverified rather than rejected. Every variant is named: a new one has
+/// to be decided here.
+fn verdict_for_gate_error(error: &Error) -> CandidateVerdict {
+    match error {
+        Error::Forbidden | Error::Conflict(_) | Error::NotFound | Error::Invalid(_) => {
+            CandidateVerdict::Rejected
+        }
+        Error::Budget | Error::Cancelled | Error::Internal => CandidateVerdict::Unverified,
+    }
+}
+
+/// The mean of the per-task candidate scores over the manifest's tasks, the same
+/// rule the node's quality has always used, clamped to the score range.
+fn mean_quality_micros(total_micros: u64, task_count: usize) -> u32 {
+    if task_count == 0 {
+        return 0;
+    }
+    u32::try_from(total_micros / task_count as u64)
+        .unwrap_or(1_000_000)
+        .min(1_000_000)
+}
+
+/// The provenance the stored `DevelopmentObserved` report declared about itself.
+/// `None` when the fact is absent, redacted or no report; the gate then refuses it
+/// on its own terms.
+async fn declared_provenance(
+    session: &mut Session,
+    ctx: &Context,
+    observed_fact_id: &str,
+) -> Result<Option<DevelopmentExecutionProvenance>> {
+    let Some(value) = session
+        .get::<serde_json::Value>(ctx, "artifact", observed_fact_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Ok(fact) = serde_json::from_value::<StageFact>(value) else {
+        return Ok(None);
+    };
+    if fact.kind != StageFactKind::DevelopmentObserved {
+        return Ok(None);
+    }
+    Ok(serde_json::from_value::<DevelopmentRunReport>(fact.payload)
+        .ok()
+        .map(|report| report.provenance))
+}
+
+/// Puts the development evidence behind a `Candidate` outcome through E03's
+/// observation gate, inside the caller's session. A Fixture report is not sent to
+/// the gate: it can never be trusted, and the label says it was a fixture, not that
+/// it was forged. Any other declared provenance is a claim, checked by the gate
+/// against the persisted receipts, budget rows, recomputed scores and live sources.
+/// It never returns an error: the step has been paid for and its dispatch claimed,
+/// and an error here would leave that claim open for good (the dispatch id depends
+/// only on the world and the action, so a retry meets "dispatch idempotency
+/// conflict").
+///
+/// The facts are read from the store, so a journal that does not persist its facts
+/// there leaves nothing to verify: the evidence is refused, not trusted.
+async fn judge_candidate_evidence(
+    session: &mut Session,
+    ctx: &Context,
+    request_fact_id: &str,
+    observed_fact_id: &str,
+    task_count: usize,
+) -> CandidateVerdict {
+    match declared_provenance(session, ctx, observed_fact_id).await {
+        Ok(Some(DevelopmentExecutionProvenance::Fixture)) => {
+            return CandidateVerdict::FixtureDeclared;
+        }
+        Ok(_) => {}
+        Err(error) => return verdict_for_gate_error(&error),
+    }
+    match verified_development_observation_in_session(
+        ctx,
+        session,
+        request_fact_id,
+        observed_fact_id,
+    )
+    .await
+    {
+        Ok(view) => CandidateVerdict::Trusted {
+            quality_micros: mean_quality_micros(
+                view.outcomes
+                    .iter()
+                    .map(|outcome| u64::from(outcome.candidate_score_micros))
+                    .sum(),
+                task_count,
+            ),
+        },
+        Err(error) => verdict_for_gate_error(&error),
     }
 }
 
@@ -1933,5 +2207,304 @@ mod tests {
         };
         let mut c = Coordinator::new(ExplorationPolicy::default()).unwrap();
         assert!(c.generate("n1".into(), p).is_err());
+    }
+
+    // ----- AG-033: the observation gate and the evidence label -----
+
+    fn verdicts() -> [CandidateVerdict; 4] {
+        [
+            CandidateVerdict::Trusted {
+                quality_micros: 750_000,
+            },
+            CandidateVerdict::FixtureDeclared,
+            CandidateVerdict::Rejected,
+            CandidateVerdict::Unverified,
+        ]
+    }
+
+    #[test]
+    fn a_gate_error_rejects_the_evidence_or_leaves_it_unverified() {
+        // The evidence itself was refused: missing, mismatching, forbidden or
+        // malformed.
+        for error in [
+            Error::Forbidden,
+            Error::Conflict("receipt differs".into()),
+            Error::NotFound,
+            Error::Invalid("not a report".into()),
+        ] {
+            assert_eq!(
+                verdict_for_gate_error(&error),
+                CandidateVerdict::Rejected,
+                "{error:?}"
+            );
+        }
+        // The gate could not answer: that is no verdict on the evidence.
+        for error in [Error::Internal, Error::Budget, Error::Cancelled] {
+            assert_eq!(
+                verdict_for_gate_error(&error),
+                CandidateVerdict::Unverified,
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_verified_report_is_a_valid_node_and_every_refusal_is_terminal() {
+        let [trusted, fixture, rejected, unverified] = verdicts().map(CandidateVerdict::observed);
+        assert!(matches!(
+            trusted.0,
+            ObservedStatus::Valid {
+                quality_micros: 750_000
+            }
+        ));
+        assert_eq!(trusted.1, ExplorationEvidenceV1::Trusted);
+        assert_eq!(trusted.2, "candidate_observed");
+        // A fixture and a refused report share the status the strategy already knows
+        // and are told apart by the label and the fixed reason.
+        assert!(matches!(fixture.0, ObservedStatus::HardFailure));
+        assert_eq!(fixture.1, ExplorationEvidenceV1::FixtureDeclared);
+        assert_eq!(fixture.2, "fixture_evidence_not_accepted");
+        assert!(matches!(rejected.0, ObservedStatus::HardFailure));
+        assert_eq!(rejected.1, ExplorationEvidenceV1::EvidenceRejected);
+        assert_eq!(rejected.2, "development_evidence_rejected");
+        // An unanswered gate is the uncertain path: the dispatch ends uncertain, and
+        // nothing claims the evidence was seen.
+        assert!(matches!(unverified.0, ObservedStatus::UsageUncertain));
+        assert_eq!(unverified.1, ExplorationEvidenceV1::NotObserved);
+        assert_eq!(unverified.2, "development_evidence_unverified");
+        // Only the verdicts that saw the candidate keep naming it.
+        assert_eq!(
+            verdicts().map(CandidateVerdict::keeps_candidate),
+            [true, true, true, false]
+        );
+    }
+
+    #[test]
+    fn the_node_quality_is_the_mean_over_the_manifest_clamped_to_the_score_range() {
+        assert_eq!(mean_quality_micros(0, 0), 0);
+        assert_eq!(mean_quality_micros(900_000, 1), 900_000);
+        assert_eq!(mean_quality_micros(1_000_000, 2), 500_000);
+        assert_eq!(mean_quality_micros(1_000_001, 2), 500_000);
+        assert_eq!(mean_quality_micros(2_000_000, 2), 1_000_000);
+        assert_eq!(mean_quality_micros(5_000_000, 2), 1_000_000);
+        assert_eq!(mean_quality_micros(u64::MAX, 1), 1_000_000);
+    }
+
+    #[test]
+    fn evidence_labels_keep_their_wire_names_and_default_to_not_observed() {
+        assert_eq!(
+            ExplorationEvidenceV1::default(),
+            ExplorationEvidenceV1::NotObserved
+        );
+        for (label, name) in [
+            (ExplorationEvidenceV1::Trusted, "trusted"),
+            (ExplorationEvidenceV1::FixtureDeclared, "fixture_declared"),
+            (ExplorationEvidenceV1::EvidenceRejected, "evidence_rejected"),
+            (ExplorationEvidenceV1::NotObserved, "not_observed"),
+        ] {
+            assert_eq!(label.as_str(), name);
+            assert_eq!(serde_json::to_value(label).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<ExplorationEvidenceV1>(serde_json::json!(name)).unwrap(),
+                label
+            );
+        }
+        assert!(
+            serde_json::from_value::<ExplorationEvidenceV1>(serde_json::json!("verified")).is_err()
+        );
+    }
+
+    fn sample_node() -> PersistentSearchNode {
+        PersistentSearchNode {
+            schema_version: "rsia.exploration_node.v1".into(),
+            world_id: "world-1".into(),
+            node: PrefixNodeV2 {
+                node_seq: 1,
+                branch_seq: 1,
+                search_parent_seq: None,
+                approved_parent_digest: evo_core::hash(b"approved-parent"),
+                depth: 1,
+                status: ObservedStatus::HardFailure,
+                best_valid_ancestor_micros: Some(500_000),
+                recent_valid_gains_micros: vec![],
+                repair_failures_dispatched: 0,
+            },
+            candidate_bundle_digest: Some(evo_core::hash(b"bundle")),
+            candidate_skill_digest: Some(evo_core::hash(b"skill")),
+            development_selection_digest: Some(evo_core::hash(b"selection")),
+            intermediate_only: true,
+            evidence: ExplorationEvidenceV1::FixtureDeclared,
+        }
+    }
+
+    fn sample_dispatch_fact() -> ExplorationDispatchFact {
+        let action = LegalActionV1 {
+            action_id: "root-1".into(),
+            action_seq: 1,
+            branch_seq: 1,
+            target_depth: 1,
+            kind: ActionKindV1::Widen { root_slot: 1 },
+            estimated_cost_upper_micros: Some(10),
+        };
+        ExplorationDispatchFact {
+            schema_version: DISPATCH_SCHEMA.into(),
+            id: "dispatch-1".into(),
+            world_id: "world-1".into(),
+            action_id: "root-1".into(),
+            action_seq: 1,
+            request_digest: evo_core::hash(b"request"),
+            idempotency_key: "request-1".into(),
+            decision: CoordinatorDecision {
+                world_id: "world-1".into(),
+                prefix_digest: evo_core::hash(b"prefix"),
+                legal_actions_digest: evo_core::hash(b"legal"),
+                policy_digest: evo_core::hash(b"policy"),
+                caps_digest: evo_core::hash(b"caps"),
+                action: BatchActionV1::Dispatch {
+                    action_ids: vec!["root-1".into()],
+                    action_seqs: vec![1],
+                    reason: "first_preregistered_root".into(),
+                    estimated_cost_upper_micros: 10,
+                },
+            },
+            selected_action: action,
+            expected_parent_skill_digest: evo_core::hash(b"parent-skill"),
+            expected_parent_bundle_digest: evo_core::hash(b"parent-bundle"),
+            context_signature: evo_core::hash(b"context"),
+            state: ExplorationDispatchState::Observed,
+            node_id: Some("node-world-1-1".into()),
+            outcome_reason: Some("fixture_evidence_not_accepted".into()),
+            evidence: ExplorationEvidenceV1::FixtureDeclared,
+        }
+    }
+
+    #[test]
+    fn a_node_and_a_dispatch_fact_stored_before_the_label_read_as_not_observed() {
+        let mut node = serde_json::to_value(sample_node()).unwrap();
+        assert_eq!(node["evidence"], "fixture_declared");
+        node.as_object_mut().unwrap().remove("evidence");
+        let node: PersistentSearchNode = serde_json::from_value(node).unwrap();
+        assert_eq!(node.evidence, ExplorationEvidenceV1::NotObserved);
+
+        let mut fact = serde_json::to_value(sample_dispatch_fact()).unwrap();
+        assert_eq!(fact["evidence"], "fixture_declared");
+        fact.as_object_mut().unwrap().remove("evidence");
+        let fact = decode_dispatch_fact(fact).unwrap();
+        assert_eq!(fact.evidence, ExplorationEvidenceV1::NotObserved);
+        // The schema is the same v2: the label is an addition, not a new version.
+        assert_eq!(fact.schema_version, DISPATCH_SCHEMA);
+
+        // The shape stays strict: a label that is not one of the four, and a field
+        // that is not part of the record, are still refused.
+        let mut forged = serde_json::to_value(sample_node()).unwrap();
+        forged["evidence"] = serde_json::json!("verified");
+        assert!(serde_json::from_value::<PersistentSearchNode>(forged).is_err());
+        let mut unknown = serde_json::to_value(sample_node()).unwrap();
+        unknown["trusted"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<PersistentSearchNode>(unknown).is_err());
+    }
+
+    fn model_context() -> evo_core::optimization::ModelRequestContext {
+        evo_core::optimization::ModelRequestContext {
+            request_id: "optimizer-1".into(),
+            namespace: "n".into(),
+            purpose: evo_core::evidence::Purpose::Development,
+            stage: evo_core::optimization::ModelStage::ReflectFailure,
+            episode_id: "world-1".into(),
+            step: 1,
+            attempt: 1,
+            parent_skill_digest: evo_core::hash(b"parent-skill"),
+            bundle_digest: evo_core::hash(b"parent-bundle"),
+            source_closure: vec![],
+            model_digest: evo_core::hash(b"model"),
+            tools_digest: evo_core::hash(b"tools"),
+            rules_digest: evo_core::hash(b"rules"),
+            sampling_digest: evo_core::hash(b"sampling"),
+            revoke_watermark: 1,
+            max_suggestions: 4,
+        }
+    }
+
+    fn development_request() -> crate::optimization::DevelopmentRunRequest {
+        crate::optimization::DevelopmentRunRequest {
+            request_id: "dev-1".into(),
+            namespace: "n".into(),
+            purpose: evo_core::evidence::Purpose::Development,
+            episode_id: "world-1".into(),
+            step: 1,
+            attempt: 1,
+            manifest: crate::optimization::DevelopmentManifest::build(
+                "manifest",
+                vec![crate::optimization::DevelopmentTask {
+                    id: "task".into(),
+                    parent_family: "family".into(),
+                    input_digest: evo_core::hash(b"task"),
+                }],
+            )
+            .unwrap(),
+            parent_bundle_digest: evo_core::hash(b"parent-bundle"),
+            candidate_bundle_digest: evo_core::hash(b"candidate-bundle"),
+            environment_digest: evo_core::hash(b"environment"),
+            grader_digest: evo_core::hash(b"grader"),
+            rules_digest: evo_core::hash(b"rules"),
+            tools_digest: evo_core::hash(b"tools"),
+            revoke_watermark: 1,
+            idempotency_key: "dev-idempotency-1".into(),
+        }
+    }
+
+    #[test]
+    fn the_stage_fact_pair_follows_the_request_the_caller_built() {
+        let context = model_context();
+        let request = development_request();
+        let (request_fact, observed_fact) = development_stage_fact_ids(&context, &request).unwrap();
+        assert!(request_fact.starts_with("optstage-"));
+        assert!(observed_fact.starts_with("optstage-"));
+        assert_ne!(request_fact, observed_fact, "two facts, one stage");
+        assert_eq!(
+            development_stage_fact_ids(&context, &request).unwrap(),
+            (request_fact.clone(), observed_fact.clone()),
+            "a pure function of the request"
+        );
+
+        // What the step rewrites (the candidate bundle and the idempotency key) or
+        // validates elsewhere is not part of the pair's identity.
+        let mut rewritten = request.clone();
+        rewritten.candidate_bundle_digest = evo_core::hash(b"another-candidate");
+        rewritten.idempotency_key = "another-key".into();
+        assert_eq!(
+            development_stage_fact_ids(&context, &rewritten).unwrap(),
+            (request_fact.clone(), observed_fact.clone())
+        );
+
+        // Everything that names the stage does move it.
+        type Edit = fn(
+            &mut evo_core::optimization::ModelRequestContext,
+            &mut crate::optimization::DevelopmentRunRequest,
+        );
+        let edits: [Edit; 6] = [
+            |context, _| context.namespace = "m".into(),
+            |context, _| context.episode_id = "world-2".into(),
+            |context, _| context.step = 2,
+            |context, _| context.attempt = 2,
+            |context, _| context.request_id = "optimizer-2".into(),
+            |_, request| request.request_id = "dev-2".into(),
+        ];
+        let mut moved = Vec::new();
+        for edit in edits {
+            let mut context = model_context();
+            let mut request = development_request();
+            edit(&mut context, &mut request);
+            let ids = development_stage_fact_ids(&context, &request).unwrap();
+            assert_ne!(ids.0, request_fact);
+            assert_ne!(ids.1, observed_fact);
+            moved.push(ids);
+        }
+        let distinct: BTreeSet<_> = moved.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            moved.len(),
+            "each input moves it its own way"
+        );
     }
 }
