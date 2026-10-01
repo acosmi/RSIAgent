@@ -561,14 +561,15 @@ async fn a_budget_call_reserved_after_the_budget_scan_is_redacted_before_complet
     let status = step(&store, &status.job_id, 1, &mut clock).await;
     assert_eq!(status.processed_nodes, 1, "{status:?}");
 
-    // With a source list (the reservation indexes a budget-ref edge to the run),
-    // without one (no edge: only the scan could find it), a registered execution,
-    // and one that names another run.
+    // Without a source list (no budget-ref edge to the run: only the scan could
+    // find them): a model request whose closure is the revoked run alone, one that
+    // names it with another run, a registered execution, and one that names another
+    // run only. A late reservation with a source list is refused (AG-038), so that
+    // case can no longer be written here.
     store
-        .reserve_budget_call_with_sources(
+        .reserve_budget_call(
             &host(),
-            &reservation("call-ref", model_request("call-ref", &[SOURCE])),
-            &[SOURCE.to_string()],
+            &reservation("call-sole", model_request("call-sole", &[SOURCE])),
         )
         .await
         .unwrap();
@@ -602,7 +603,7 @@ async fn a_budget_call_reserved_after_the_budget_scan_is_redacted_before_complet
 
     let (status, _) = drive(&store, status, 1, &mut clock).await;
 
-    for call_id in ["call-ref", "call-bare", "call-registered"] {
+    for call_id in ["call-sole", "call-bare", "call-registered"] {
         let request = request_of(&store, call_id).await;
         assert_eq!(
             request.schema_version, REDACTED,

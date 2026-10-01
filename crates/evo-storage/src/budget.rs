@@ -3,6 +3,7 @@
 //! Monetary values are integer micros in the root's authorized currency/pricing
 //! version. No floating-point conversion occurs here.
 
+use super::lifecycle::RevokeTombstone;
 use super::{
     MVP_MAX_ACTIVE_LEASES, Session, Store, count_active_leases, internal, mvp_capacity_exceeded,
 };
@@ -548,6 +549,10 @@ impl Store {
         Ok(Some(root_from_row(&row, namespaces)?))
     }
 
+    /// Reserves a call with no registered source closure. Such a call has no source
+    /// for a revocation tombstone to refuse, at the reservation or at the dispatch;
+    /// the revocation cleanup rescans the request bodies of the calls that carry no
+    /// closure. A call derived from runs belongs on `reserve_budget_call_with_sources`.
     pub async fn reserve_budget_call(
         &self,
         ctx: &Context,
@@ -557,6 +562,15 @@ impl Store {
             .await
     }
 
+    /// Reserves a call and registers `source_ids`, the run ids its request is
+    /// derived from, as its source closure (a budget call reference with one typed
+    /// edge to each run).
+    ///
+    /// A source revoked as a `run` refuses a call that does not exist yet with
+    /// `Forbidden` and writes nothing (plan §11: the revocation is written first, so
+    /// new use is refused at once). A call that already exists is returned as
+    /// before, so recovery and reconciliation are not blocked. A call reserved
+    /// without `source_ids` has no closure to judge.
     pub async fn reserve_budget_call_with_sources(
         &self,
         ctx: &Context,
@@ -575,6 +589,12 @@ impl Store {
             }
             tx.commit().await.map_err(internal)?;
             return Ok(existing);
+        }
+        // The revocation tombstone is committed before its cleanup runs, so it is
+        // read here, in the transaction that would write the reservation and its
+        // request body: nothing below has run when a source is refused.
+        if any_run_source_revoked(&mut tx, ctx.namespace(), &source_ids).await? {
+            return Err(Error::Forbidden);
         }
         let row = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
             .bind(&request.billing_scope)
@@ -778,6 +798,10 @@ impl Store {
         Ok(updated)
     }
 
+    /// Moves a reserved call to dispatched. Besides the lease, the root and the
+    /// dispatch group, the registered source closure is read: a call over a source
+    /// revoked as a `run` is not dispatched and the decision is `Cancelled`, the
+    /// one a caller releases the undispatched reservation on.
     pub async fn begin_budget_dispatch(
         &self,
         ctx: &Context,
@@ -1473,6 +1497,8 @@ impl Session {
         budget_call_scopes_for_group_in_tx(&mut self.tx, ctx, dispatch_group_id).await
     }
 
+    /// `Store::begin_budget_dispatch` in the caller's transaction, with the same
+    /// refusals (`Cancelled` for a revoked source included).
     pub async fn begin_budget_dispatch(
         &mut self,
         ctx: &Context,
@@ -1701,6 +1727,15 @@ async fn begin_budget_dispatch_in_tx(
     .await
     .map_err(internal)?;
     if group_stopped != 0 {
+        return Err(Error::Cancelled);
+    }
+    // A source revoked after the reservation must not be sent out. The cleanup only
+    // redacts the ledger copy of the request; the caller still holds the request
+    // itself and would send it, so the revocation is read here, in the transaction
+    // that records the dispatch (plan §11: block outbound before the cleanup).
+    // `Cancelled` is the decision a caller already releases the reservation on.
+    let source_ids = registered_source_ids(tx, &call).await?;
+    if any_run_source_revoked(tx, &call.namespace, &source_ids).await? {
         return Err(Error::Cancelled);
     }
     let active: i64 = sqlx::query_scalar(
@@ -2262,6 +2297,81 @@ async fn ensure_budget_call_ref(
         .map_err(internal)?;
     }
     Ok(reference)
+}
+
+/// Whether any of `source_ids` was revoked, in `namespace`, as a `run`.
+///
+/// `begin_revoke` writes the tombstone and the watermark in one transaction
+/// before the cleanup starts, so a source is revoked from the moment it commits.
+/// A tombstone is keyed by the id of its source alone and records the kind it was
+/// written for (`source_kind`, `run` or `artifact`). The sources of a budget call
+/// are runs (`ensure_budget_call_ref` writes `run` edges), so a tombstone decides
+/// one only when it was written for a run: a revoked artifact that shares the id
+/// is another object and does not refuse it. A tombstone that cannot be read as
+/// one `begin_revoke` writes (it does not decode, or its source kind is neither
+/// `run` nor `artifact`) cannot be matched to anything and fails closed, the
+/// same rule the other tombstone gates follow (`ensure_dependencies_live`).
+async fn any_run_source_revoked(
+    tx: &mut Transaction<'_, Sqlite>,
+    namespace: &str,
+    source_ids: &[String],
+) -> Result<bool> {
+    for source_id in source_ids {
+        let body: Option<String> = sqlx::query_scalar(
+            "SELECT body FROM objects WHERE namespace=? AND kind='tombstone' AND id=?",
+        )
+        .bind(namespace)
+        .bind(source_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(internal)?;
+        let Some(body) = body else {
+            continue;
+        };
+        // `artifact`: the tombstone belongs to the other object that shares this id.
+        // `run`, a kind `begin_revoke` does not write, or a body that does not
+        // decode: revoked.
+        let source_kind = serde_json::from_str::<RevokeTombstone>(&body)
+            .ok()
+            .map(|tombstone| tombstone.source_kind);
+        if source_kind.as_deref() != Some("artifact") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The source closure registered for `call` when it was reserved: the
+/// `source_ids` of its budget call reference (the id is derived exactly as
+/// `ensure_budget_call_ref` derives it, from the call's own namespace, billing
+/// scope and call id). Empty for a call that was reserved without a closure, which
+/// has no reference. The cleanup preserves the reference as a historical
+/// accounting fact, so it is still readable after the cleanup completes. A
+/// reference that does not decode fails the dispatch with `Internal`, as it does
+/// in `ensure_budget_call_ref`: it is neither trusted nor guessed at.
+async fn registered_source_ids(
+    tx: &mut Transaction<'_, Sqlite>,
+    call: &BudgetCallRecord,
+) -> Result<Vec<String>> {
+    let digest = fingerprint(&(
+        "rsia.budget_call_ref.v1",
+        &call.namespace,
+        &call.billing_scope,
+        &call.call_id,
+    ))?;
+    let body: Option<String> = sqlx::query_scalar(
+        "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+    )
+    .bind(&call.namespace)
+    .bind(format!("budget-ref-{}", &digest[..32]))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(internal)?;
+    let Some(body) = body else {
+        return Ok(Vec::new());
+    };
+    let reference: BudgetCallRef = serde_json::from_str(&body).map_err(internal)?;
+    Ok(reference.source_ids)
 }
 
 fn redacted_artifact(
