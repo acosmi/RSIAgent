@@ -1738,14 +1738,14 @@ async fn a_request_id_reused_across_streams_is_refused_by_the_budget_layer() {
 
     // Through the coordinator the same mistake is not a silent shared call
     // either: the new stream's step under the old stream's request id ends as
-    // an uncertain dispatch that names the conflict, and bills nothing.
+    // an uncertain dispatch, and bills nothing. The broker's conflict is asserted
+    // directly above; a step run through the coordinator records only the fixed
+    // code of its outcome (AG-048), not the port's own error.
     let misused = env
         .step_with(TRIAL, MetaStream::New, 1, &old_request_id)
         .await;
-    assert!(
-        misused
-            .outcome
-            .contains("call_id reused with a different effective model request"),
+    assert_eq!(
+        misused.outcome, "model_transport_outcome_unknown",
         "{}",
         misused.outcome
     );
@@ -1819,10 +1819,13 @@ async fn each_stream_reads_back_what_it_really_spent_and_stopping_one_does_not_s
         .unwrap();
     assert!(stopped.stopped);
     // The stopped stream's next step is refused by the budget layer before any
-    // call row exists: no reservation and no model call.
+    // call row exists: no reservation and no model call. The broker files the refusal
+    // of a stopped group at the reservation as `Unauthorized` (a finer type for it is a
+    // follow-up of the broker, not of this check), so the step records the fixed code
+    // of a model rejected as unauthorized, and not the words of the refusal (AG-048).
     let refused = env.step(TRIAL, MetaStream::New, 2).await;
-    assert!(
-        refused.outcome.contains("cancelled"),
+    assert_eq!(
+        refused.outcome, "model_rejected_unauthorized",
         "the stopped stream's step ends on the stopped group: {}",
         refused.outcome
     );
@@ -1912,11 +1915,12 @@ async fn one_stream_can_exhaust_the_shared_root_and_starve_the_other() {
         .unwrap();
     assert_eq!(root.spent_micros, 4 * NEW_CALL_COST);
 
-    // The old stream's step finds no budget: its call is refused, nothing runs.
+    // The old stream's step finds no budget: its call is refused, nothing runs, and
+    // the step records the fixed code of a model rejected for want of budget (AG-048).
     let starved = env.step(TRIAL, MetaStream::Old, 1).await;
     assert_eq!(env.executions.load(Ordering::SeqCst), 4);
-    assert!(
-        starved.outcome.contains("budget"),
+    assert_eq!(
+        starved.outcome, "model_rejected_budget_unavailable",
         "the old stream's step ends on the exhausted root: {}",
         starved.outcome
     );
@@ -1952,16 +1956,15 @@ async fn an_uncertain_call_of_one_stream_holds_the_roots_concurrency_slot_agains
     env.fail_old_stream.store(true, Ordering::SeqCst);
     let failed = env.step(TRIAL, MetaStream::Old, 1).await;
     env.fail_old_stream.store(false, Ordering::SeqCst);
-    assert!(
-        failed.outcome.contains("usage remains unknown"),
-        "{}",
-        failed.outcome
-    );
+    assert_eq!(failed.outcome, "model_usage_unknown", "{}", failed.outcome);
     assert_eq!(env.executions.load(Ordering::SeqCst), 1);
 
+    // The ledger refuses the new stream's dispatch with a conflict that reaches the
+    // coordinator as an error of the model port, so the step records the fixed code of
+    // a transport outcome that is unknown, and not the ledger's own words (AG-048).
     let blocked = env.step(TRIAL, MetaStream::New, 1).await;
-    assert!(
-        blocked.outcome.contains("root_budget_concurrency_limit"),
+    assert_eq!(
+        blocked.outcome, "model_transport_outcome_unknown",
         "{}",
         blocked.outcome
     );
