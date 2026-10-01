@@ -174,6 +174,30 @@ impl LifecycleStore {
             return Err(Error::NotFound);
         }
         if let Some(tombstone) = existing_tombstone {
+            // A tombstone is keyed by the id of its source alone, so a run and an
+            // artifact that share an id share one tombstone, written for whichever
+            // was revoked first. A request for the other kind finds no job of its
+            // own under that tombstone: it is a name conflict, not corruption (this
+            // used to fall through to `Internal` below). Nothing is written for it:
+            // falling through to the writes further down would overwrite the first
+            // tombstone (`put` is an upsert) and the restore replay would lose its
+            // watermark sequence. Keying the tombstone by kind as well (§11.1) is a
+            // separate change.
+            if tombstone.source_kind != source.kind {
+                if existing_source.is_none() {
+                    return Err(Error::NotFound);
+                }
+                let revoked_as = match tombstone.source_kind.as_str() {
+                    kind @ ("run" | "artifact") => kind,
+                    // Not a kind `begin_revoke` writes; do not echo a stored string.
+                    _ => "an unrecognised source kind",
+                };
+                return Err(Error::Conflict(format!(
+                    "cannot revoke {} {}: the id is already revoked as {revoked_as} \
+                     (a revocation tombstone is keyed by id)",
+                    source.kind, source.id
+                )));
+            }
             let status = load_status_by_source(
                 &mut session.tx,
                 ctx.namespace(),
