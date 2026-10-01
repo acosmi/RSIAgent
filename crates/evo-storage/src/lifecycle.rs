@@ -645,6 +645,99 @@ async fn queue_late_dependents(
 /// the source, index its budget call reference and queue that reference; a
 /// request of a schema that cannot be read fails the job. Redacts at most
 /// `limit` calls; returns whether it redacted or failed any.
+/// New-mode history validation is shared by the initial scan and the late
+/// fixpoint. Its index repair precedes direct-source filtering so ref -> S -> R
+/// remains reachable when R is not a declared direct material.
+async fn scan_e16_budget_call(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ctx: &Context,
+    job_id: &str,
+    source: &TypedObjectRef,
+    row: &sqlx::sqlite::SqliteRow,
+    now: i64,
+) -> Result<Option<bool>> {
+    let scope: String = row.try_get("billing_scope").map_err(internal)?;
+    let call_id: String = row.try_get("call_id").map_err(internal)?;
+    let schema: String = row.try_get("request_artifact_schema").map_err(internal)?;
+    let body: String = row.try_get("request_artifact_body").map_err(internal)?;
+    if !crate::typed_budget::request_body_marks_e16(&schema, &body)
+        && !crate::typed_budget::new_ref_exists_in_tx(tx, ctx.namespace(), &scope, &call_id).await?
+    {
+        return Ok(None);
+    }
+    let call = crate::budget::load_call(tx, &scope, &call_id)
+        .await?
+        .ok_or(Error::Internal)?;
+    let history = crate::typed_budget::maintain_history_in_tx(tx, ctx, &call).await?;
+    let (reference, index_added) = match history {
+        crate::typed_budget::E16History::Bound {
+            reference,
+            index_added,
+        } => (reference, index_added),
+        crate::typed_budget::E16History::Legacy | crate::typed_budget::E16History::Unavailable => {
+            mark_unknown_scope(
+                tx,
+                ctx,
+                job_id,
+                &TypedObjectRef {
+                    kind: "reservation".into(),
+                    id: call_id,
+                },
+                "blocked_unknown_scope:e16_budget_binding",
+                now,
+            )
+            .await?;
+            return Ok(Some(true));
+        }
+    };
+    if index_added > 0 {
+        insert_cleanup_event(
+            tx,
+            ctx.namespace(),
+            job_id,
+            Some(&TypedObjectRef {
+                kind: "artifact".into(),
+                id: reference.id.clone(),
+            }),
+            "historical_budget_index_repaired",
+            now,
+            json!({"added_rows":index_added}),
+        )
+        .await?;
+    }
+    let direct = reference
+        .object_refs
+        .iter()
+        .any(|r| r.kind == source.kind && r.id == source.id);
+    let in_frontier: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM revoke_cleanup_frontier
+         WHERE namespace=? AND job_id=? AND node_kind='artifact' AND node_id=?)",
+    )
+    .bind(ctx.namespace())
+    .bind(job_id)
+    .bind(&reference.id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(internal)?;
+    let mut progress = index_added > 0;
+    if direct || in_frontier != 0 {
+        progress |=
+            crate::budget::redact_e16_budget_call_content_in_tx(tx, ctx, &scope, &call_id).await?;
+        let queued = sqlx::query(
+            "INSERT OR IGNORE INTO revoke_cleanup_frontier(namespace,job_id,node_kind,node_id)
+             VALUES(?,?,'artifact',?)",
+        )
+        .bind(ctx.namespace())
+        .bind(job_id)
+        .bind(&reference.id)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+        progress |= queued.rows_affected() > 0;
+    }
+    Ok(Some(progress))
+}
+
 async fn redact_late_budget_calls(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     ctx: &Context,
@@ -655,6 +748,7 @@ async fn redact_late_budget_calls(
 ) -> Result<bool> {
     const PAGE: i64 = 64;
     let mut redacted = 0usize;
+    let mut progress_calls = 0usize;
     let mut open = false;
     let mut cursor: Option<(String, String)> = None;
     loop {
@@ -666,7 +760,7 @@ async fn redact_late_budget_calls(
             "SELECT billing_scope,call_id,request_artifact_schema,request_artifact_body
              FROM root_budget_calls
              WHERE namespace=? AND request_artifact_body IS NOT NULL
-               AND request_artifact_schema<>'rsia.redacted.v1' AND
+               AND
                (? IS NULL OR billing_scope>? OR (billing_scope=? AND call_id>?))
              ORDER BY billing_scope,call_id LIMIT ?",
         )
@@ -685,6 +779,19 @@ async fn redact_late_budget_calls(
             let schema: String = row.try_get("request_artifact_schema").map_err(internal)?;
             let body: String = row.try_get("request_artifact_body").map_err(internal)?;
             cursor = Some((billing_scope.clone(), call_id.clone()));
+            if let Some(progress) = scan_e16_budget_call(tx, ctx, job_id, source, row, now).await? {
+                if progress {
+                    open = true;
+                    progress_calls += 1;
+                }
+                if progress_calls >= limit {
+                    break;
+                }
+                continue;
+            }
+            if schema == "rsia.redacted.v1" {
+                continue;
+            }
             let Some(source_ids) = budget_request_source_ids(&schema, &body)? else {
                 mark_unknown_scope(
                     tx,
@@ -732,12 +839,13 @@ async fn redact_late_budget_calls(
             .await
             .map_err(internal)?;
             redacted += 1;
+            progress_calls += 1;
             open = true;
-            if redacted >= limit {
+            if progress_calls >= limit {
                 break;
             }
         }
-        if redacted >= limit || rows.len() < PAGE as usize {
+        if progress_calls >= limit || rows.len() < PAGE as usize {
             break;
         }
     }
@@ -1109,7 +1217,7 @@ async fn expand_frontier(
             tx,
             ctx,
             job_id,
-            &node_id,
+            source,
             &BudgetScanCursor {
                 frontier_seq: seq,
                 scope: cursor_kind,
@@ -1295,7 +1403,7 @@ async fn expand_budget_scan(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     ctx: &Context,
     job_id: &str,
-    source_id: &str,
+    source: &TypedObjectRef,
     cursor: &BudgetScanCursor,
     limit: usize,
     now: i64,
@@ -1323,6 +1431,12 @@ async fn expand_budget_scan(
         let billing_scope: String = row.try_get("billing_scope").map_err(internal)?;
         let call_id: String = row.try_get("call_id").map_err(internal)?;
         let schema: String = row.try_get("request_artifact_schema").map_err(internal)?;
+        if scan_e16_budget_call(tx, ctx, job_id, source, row, now)
+            .await?
+            .is_some()
+        {
+            continue;
+        }
         if schema == "rsia.redacted.v1" {
             continue;
         }
@@ -1376,7 +1490,7 @@ async fn expand_budget_scan(
                 continue;
             }
         };
-        if source_ids.iter().any(|value| value == source_id) {
+        if source_ids.iter().any(|value| value == &source.id) {
             let reference = crate::budget::index_budget_call_ref_in_tx(
                 tx,
                 ctx,
@@ -2763,6 +2877,39 @@ async fn cleanup_node_content(
         return redact_evaluation_resource_evidence(tx, ctx, job_id, node, &body, &value, now)
             .await;
     }
+    if node.kind == "artifact" && schema == crate::typed_budget::E16_BUDGET_REF_SCHEMA {
+        let Some(call) =
+            crate::typed_budget::history_call_for_ref_in_tx(tx, ctx, node, &body).await?
+        else {
+            return mark_unknown_scope(
+                tx,
+                ctx,
+                job_id,
+                node,
+                "blocked_unknown_scope:e16_budget_ref_binding",
+                now,
+            )
+            .await;
+        };
+        crate::budget::redact_e16_budget_call_content_in_tx(
+            tx,
+            ctx,
+            &call.billing_scope,
+            &call.call_id,
+        )
+        .await?;
+        insert_cleanup_event(
+            tx,
+            ctx.namespace(),
+            job_id,
+            Some(node),
+            "historical_fact_preserved",
+            now,
+            json!({"kind":node.kind}),
+        )
+        .await?;
+        return Ok(());
+    }
     let preserve = match (node.kind.as_str(), schema, record_kind) {
         // These historical accounting facts retain their consumer's schema and spent counters.
         ("artifact", "rsia.budget_call_ref.v1", _) => true,
@@ -3339,11 +3486,12 @@ pub const PROTECTED_OBJECT_KINDS: [&str; 4] = ["budget", "reservation", "evaluat
 
 /// Body `schema_version` values `restore_backup.py::protected_facts` treats as
 /// consumed accounting regardless of the object kind.
-pub const PROTECTED_SCHEMA_VERSIONS: [&str; 8] = [
+pub const PROTECTED_SCHEMA_VERSIONS: [&str; 9] = [
     "rsia.typed_artifact_envelope.v1",
     "rsia.exploration_artifact_envelope.v1",
     "rsia.optimization.stage_fact.v1",
     "rsia.budget_call_ref.v1",
+    "rsia.budget_call_e16_ref.v1",
     "rsia.e16.export_attempt.v1",
     "rsia.e16.delivery_audit.v1",
     "rsia.e16.export_attempt.v2",

@@ -3,6 +3,7 @@
 pub mod budget;
 pub mod lifecycle;
 pub mod replay;
+pub mod typed_budget;
 
 use evo_core::{Context, Error, Result, fingerprint, hash, identifier, now, search_tokens};
 use serde::{Serialize, de::DeserializeOwned};
@@ -1183,6 +1184,84 @@ fn has_exact_fields(value: &Value, fields: &[&str]) -> bool {
     value.as_object().is_some_and(|object| {
         object.len() == fields.len() && fields.iter().all(|field| object.contains_key(*field))
     })
+}
+
+/// Private raw walk. `None` is a measured node-limit excess, never a SQL error.
+/// All node kinds count toward the bound; only run/artifact facts are returned.
+/// Run-body redaction is read only when the typed caller requests it.
+/// Session::upstream_closure keeps its historical decode, ordering and errors.
+pub(crate) struct RawUpstreamNode {
+    pub kind: String,
+    pub id: String,
+    pub tombstone: Option<String>,
+    pub redacted: bool,
+    pub exists: bool,
+}
+
+pub(crate) async fn upstream_rows_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    namespace: &str,
+    roots: &[(&str, &str)],
+    limit: usize,
+    inspect_run_redaction: bool,
+) -> Result<Option<Vec<RawUpstreamNode>>> {
+    if roots.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let seeds = serde_json::to_string(roots).map_err(internal)?;
+    let fetch = i64::try_from(limit).unwrap_or(i64::MAX).saturating_add(1);
+    // LIMIT inside the recursive CTE bounds the walk itself. CROSS JOIN keeps
+    // its queue outside the dependency lookup (the existing measured algorithm).
+    let rows = sqlx::query(
+        "WITH RECURSIVE closure(kind, id) AS (
+           SELECT json_extract(r.value, '$[0]'), json_extract(r.value, '$[1]')
+             FROM json_each(?1) AS r
+           UNION
+           SELECT d.dst_kind, d.dst_id
+             FROM closure AS c
+             CROSS JOIN dependencies AS d
+               ON d.namespace = ?2 AND d.src_kind = c.kind AND d.src_id = c.id
+           LIMIT ?3
+         )
+         SELECT c.kind AS kind, c.id AS id, t.body AS tombstone,
+                CASE WHEN c.kind = 'artifact' OR (?5 AND c.kind = 'run')
+                     THEN COALESCE(json_extract(o.body, '$.schema_version') = ?4, 0)
+                     ELSE 0 END AS redacted,
+                o.id IS NOT NULL AS present
+           FROM closure AS c
+           LEFT JOIN objects AS t
+             ON c.kind IN ('run', 'artifact')
+            AND t.namespace = ?2 AND t.kind = 'tombstone' AND t.id = c.id
+           LEFT JOIN objects AS o
+             ON c.kind IN ('run', 'artifact')
+            AND o.namespace = ?2 AND o.kind = c.kind AND o.id = c.id",
+    )
+    .bind(seeds)
+    .bind(namespace)
+    .bind(fetch)
+    .bind(REDACTED_SCHEMA)
+    .bind(inspect_run_redaction)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(internal)?;
+    if rows.len() > limit {
+        return Ok(None);
+    }
+    let mut nodes = Vec::new();
+    for row in rows {
+        let kind: String = row.try_get("kind").map_err(internal)?;
+        if !matches!(kind.as_str(), "run" | "artifact") {
+            continue;
+        }
+        nodes.push(RawUpstreamNode {
+            kind,
+            id: row.try_get("id").map_err(internal)?,
+            tombstone: row.try_get("tombstone").map_err(internal)?,
+            redacted: row.try_get::<i64, _>("redacted").map_err(internal)? != 0,
+            exists: row.try_get::<i64, _>("present").map_err(internal)? != 0,
+        });
+    }
+    Ok(Some(nodes))
 }
 
 impl Store {
@@ -2471,75 +2550,24 @@ impl Session {
         if seeds.is_empty() {
             return Ok(Vec::new());
         }
-        // The roots travel as one JSON value: a root set can be larger than the
-        // number of variables one statement may bind.
-        let seeds = serde_json::to_string(&seeds).map_err(internal)?;
-        // One node more than `limit` is enough to know the closure is over it.
-        let fetch = i64::try_from(limit).unwrap_or(i64::MAX).saturating_add(1);
-        // Two things in this statement are load-bearing, and both were measured
-        // (the bundled SQLite 3.46; a chain of 200 000 edges, a walk cut at 11
-        // nodes, which takes 0.2 ms as written):
-        // - the `LIMIT` sits inside the recursive CTE, where SQLite stops the walk
-        //   after that many nodes. On the outer query, behind an `ORDER BY` like
-        //   `load_dependency_record_snapshots` has it, the whole closure is built
-        //   first: 500 ms.
-        // - `CROSS JOIN` fixes the join order. Left to itself the planner makes
-        //   the edge table the outer loop (it takes the walk's own queue for a
-        //   large table) and reads every edge of the namespace once per node it
-        //   walks: 190 ms for the 11 nodes (4 s for 300 nodes over 300 000 edges
-        //   in the sqlite3 shell), minutes for the 10 000 the bound allows. With
-        //   the queue as the outer loop each node is one lookup in the
-        //   `(namespace, src_kind, src_id)` prefix of the primary key.
-        // The `LEFT JOIN`s keep the walk the outer loop; each is one lookup in
-        // the primary key of `objects`, and only for the kinds that are judged.
-        let rows = sqlx::query(
-            "WITH RECURSIVE closure(kind, id) AS (
-               SELECT json_extract(r.value, '$[0]'), json_extract(r.value, '$[1]')
-                 FROM json_each(?1) AS r
-               UNION
-               SELECT d.dst_kind, d.dst_id
-                 FROM closure AS c
-                 CROSS JOIN dependencies AS d
-                   ON d.namespace = ?2 AND d.src_kind = c.kind AND d.src_id = c.id
-               LIMIT ?3
-             )
-             SELECT c.kind AS kind, c.id AS id, t.body AS tombstone,
-                    COALESCE(json_extract(o.body, '$.schema_version') = ?4, 0) AS redacted
-               FROM closure AS c
-               LEFT JOIN objects AS t
-                 ON c.kind IN ('run', 'artifact')
-                AND t.namespace = ?2 AND t.kind = 'tombstone' AND t.id = c.id
-               LEFT JOIN objects AS o
-                 ON c.kind = 'artifact'
-                AND o.namespace = ?2 AND o.kind = 'artifact' AND o.id = c.id",
-        )
-        .bind(seeds)
-        .bind(ctx.namespace())
-        .bind(fetch)
-        .bind(REDACTED_SCHEMA)
-        .fetch_all(&mut *self.tx)
-        .await
-        .map_err(internal)?;
-        if rows.len() > limit {
-            return Err(Error::Conflict(format!(
+        let roots: Vec<(&str, &str)> = seeds.iter().map(|pair| (pair[0], pair[1])).collect();
+        let rows = upstream_rows_in_tx(&mut self.tx, ctx.namespace(), &roots, limit, false).await?
+            .ok_or_else(|| Error::Conflict(format!(
                 "upstream dependency closure exceeds {limit} nodes; it is refused, not truncated"
-            )));
-        }
+            )))?;
         let mut nodes = Vec::new();
         for row in rows {
-            let kind: String = row.try_get("kind").map_err(internal)?;
-            if !matches!(kind.as_str(), "run" | "artifact") {
-                continue;
-            }
-            let tombstone: Option<String> = row.try_get("tombstone").map_err(internal)?;
-            let redacted: i64 = row.try_get("redacted").map_err(internal)?;
+            // The public legacy API has always reported redaction only for
+            // artifacts; the private facts also cover runs for typed gates.
+            let redacted = row.kind == "artifact" && row.redacted;
             nodes.push(UpstreamNode {
-                kind,
-                id: row.try_get("id").map_err(internal)?,
-                tombstone: tombstone
+                kind: row.kind,
+                id: row.id,
+                tombstone: row
+                    .tombstone
                     .map(|body| serde_json::from_str(&body).map_err(internal))
                     .transpose()?,
-                redacted: redacted != 0,
+                redacted,
             });
         }
         nodes.sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
