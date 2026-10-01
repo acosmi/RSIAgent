@@ -998,6 +998,28 @@ impl Store {
 
     /// Atomically accounts a model charge and stores the exact request/transport/response facts.
     /// Stop and lease state are re-read in this transaction after the provider await.
+    ///
+    /// The source closure registered for the call (its budget call reference) is
+    /// read in this transaction too. A response can arrive after a source was revoked
+    /// as a `run`, and the cleanup never reads a call whose request it has already
+    /// redacted, so nothing else would stop its output from being stored as it came
+    /// (plan §11: a late output forms no usable candidate, its real cost is still
+    /// booked). When any source of the call is revoked:
+    ///
+    /// * the charge is booked exactly as without a revocation;
+    /// * the response is blocked, so the usable response, which carries the output,
+    ///   is never stored. The reason is `source_revoked`, which comes first among the
+    ///   reasons that held before the response arrived (an expired lease, a stopped
+    ///   root or dispatch group); a pricing mismatch, a reason the caller forces, an
+    ///   accounting overflow and a cost overrun still take precedence, as before;
+    /// * the transport body, which carries the output too, is stored as its
+    ///   `rsia.redacted.v1` redaction whichever reason is recorded.
+    ///
+    /// A call with no registered closure has no source to judge here; the cleanup
+    /// rescan, which finds a call by the closure its request names, is its backstop.
+    /// A closure that cannot be read fails the settlement with `Internal` and writes
+    /// nothing, like the dispatch: the call stays dispatched and its cost can still
+    /// be reconciled (`reconcile_budget_call_cost`).
     pub async fn settle_model_budget_call(
         &self,
         ctx: &Context,
@@ -1051,7 +1073,13 @@ impl Store {
         .fetch_one(&mut *tx)
         .await
         .map_err(internal)?;
-        let preexisting_block = if fence.now > call.lease_until {
+        // The tombstone is committed before the cleanup starts, so a source is revoked
+        // from the moment `begin_revoke` commits, whatever the cleanup has done since.
+        let source_ids = registered_source_ids(&mut tx, &call).await?;
+        let source_revoked = any_run_source_revoked(&mut tx, &call.namespace, &source_ids).await?;
+        let preexisting_block = if source_revoked {
+            Some(SOURCE_REVOKED)
+        } else if fence.now > call.lease_until {
             Some("lease_expired")
         } else if root_stopped != 0 {
             Some("root_stopped")
@@ -1085,6 +1113,18 @@ impl Store {
         } else {
             &evidence.blocked_response
         };
+        // The transport body carries the model output. Over a revoked source it is
+        // stored as its redaction, whichever reason won the chain above: the stored
+        // digest is that of the redaction (every read of the row rechecks it against
+        // the stored body) and the redaction names the digest of the body it replaces.
+        let redacted_transport = if source_revoked {
+            redacted_artifact(Some(&evidence.transport_artifact), SOURCE_REVOKED)?
+        } else {
+            None
+        };
+        let transport = redacted_transport
+            .as_ref()
+            .unwrap_or(&evidence.transport_artifact);
         sqlx::query(
             "UPDATE root_budget_calls SET
                execution_provenance=?,actual_model_digest=?,
@@ -1095,9 +1135,9 @@ impl Store {
         )
         .bind(evidence.provenance.as_str())
         .bind(&evidence.actual_model_digest)
-        .bind(&evidence.transport_artifact.schema_version)
-        .bind(&evidence.transport_artifact.digest)
-        .bind(&evidence.transport_artifact.body)
+        .bind(&transport.schema_version)
+        .bind(&transport.digest)
+        .bind(&transport.body)
         .bind(&response.schema_version)
         .bind(&response.digest)
         .bind(&response.body)
@@ -1108,21 +1148,29 @@ impl Store {
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
+        let mut details = json!({
+            "request_artifact_digest": call.request_artifact.as_ref().map(|value| &value.digest),
+            "transport_artifact_digest": transport.digest,
+            "response_artifact_digest": response.digest,
+            "response_usable": response_usable,
+            "response_block_reason": block_reason,
+            "execution_provenance": evidence.provenance,
+            "actual_model_digest": evidence.actual_model_digest,
+        });
+        if source_revoked {
+            // The reason on the row is whichever one came first in the chain above,
+            // so the revocation is recorded here whichever that was. The digest of
+            // the transport as the provider sent it is a digest, not content.
+            details["source_revoked"] = json!(true);
+            details["transport_original_digest"] = json!(evidence.transport_artifact.digest);
+        }
         insert_event(
             &mut tx,
             &call.billing_scope,
             Some(&call.call_id),
             "model_response_persisted",
             fence.now,
-            json!({
-                "request_artifact_digest": call.request_artifact.as_ref().map(|value| &value.digest),
-                "transport_artifact_digest": evidence.transport_artifact.digest,
-                "response_artifact_digest": response.digest,
-                "response_usable": response_usable,
-                "response_block_reason": block_reason,
-                "execution_provenance": evidence.provenance,
-                "actual_model_digest": evidence.actual_model_digest,
-            }),
+            details,
         )
         .await?;
         let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
@@ -2347,8 +2395,9 @@ async fn any_run_source_revoked(
 /// scope and call id). Empty for a call that was reserved without a closure, which
 /// has no reference. The cleanup preserves the reference as a historical
 /// accounting fact, so it is still readable after the cleanup completes. A
-/// reference that does not decode fails the dispatch with `Internal`, as it does
-/// in `ensure_budget_call_ref`: it is neither trusted nor guessed at.
+/// reference that does not decode fails the dispatch and the settlement with
+/// `Internal`, as it does in `ensure_budget_call_ref`: it is neither trusted nor
+/// guessed at.
 async fn registered_source_ids(
     tx: &mut Transaction<'_, Sqlite>,
     call: &BudgetCallRecord,
@@ -2374,12 +2423,23 @@ async fn registered_source_ids(
     Ok(reference.source_ids)
 }
 
+/// The reason a response is blocked with, and a redaction is made for, when a source
+/// of its call was revoked.
+const SOURCE_REVOKED: &str = "source_revoked";
+
+/// The `rsia.redacted.v1` form of `artifact`, naming the schema and the digest of
+/// the content it replaces. An artifact that is already a redaction is left as it
+/// is: redacting it again would keep only the digest of the first redaction and
+/// lose the digest of the content.
 fn redacted_artifact(
     artifact: Option<&BudgetArtifact>,
     reason: &str,
 ) -> Result<Option<BudgetArtifact>> {
     artifact
         .map(|artifact| {
+            if artifact.schema_version == "rsia.redacted.v1" {
+                return Ok(artifact.clone());
+            }
             BudgetArtifact::from_serializable(
                 "rsia.redacted.v1",
                 &json!({
@@ -2480,9 +2540,15 @@ fn ensure_same_model_settlement(
     } else {
         &evidence.blocked_response
     };
+    // Over a revoked source the transport body is stored as its redaction (by the
+    // settlement, and by the cleanup alike), which names the digest of the body it
+    // replaces: the same evidence is still the same evidence.
+    let same_transport = call.transport_artifact.as_ref() == Some(&evidence.transport_artifact)
+        || call.transport_artifact
+            == redacted_artifact(Some(&evidence.transport_artifact), SOURCE_REVOKED)?;
     if call.execution_provenance != Some(evidence.provenance)
         || call.actual_model_digest != evidence.actual_model_digest
-        || call.transport_artifact.as_ref() != Some(&evidence.transport_artifact)
+        || !same_transport
         || call.response_artifact.as_ref() != Some(expected_response)
     {
         return Err(Error::Conflict(
