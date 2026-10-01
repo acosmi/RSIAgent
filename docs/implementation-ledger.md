@@ -5,6 +5,776 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 本台账是实施与证据索引，不另立规范；历史 PR、测试和旧台账不决定当前规则。
 用户于 2026-09-19 明确确认 v4.1 替代 v4，并授权将本台账上传远程；方案正文、内部合同、归档及 QA 原始材料只保留本地。用户最新授权 Antigravity 按第一真源持续实施，每个任务自测完成后提交、推送并提出独立PR，随即继续下一项，不自行合并；Codex负责最终独立验收，并在通过后按依赖顺序合并。Actions派发、付费运行和部署/发布未授权。
 
+## 2026-09-30—10-01 v4.2 第二轮实施（PR #59–#92，runbook A–AH）：主控验收、合并与索引登记
+
+- 真源：`RSIAgent-v4.2定稿-工程实施方案-2026-09-30.md`，SHA-256 `70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455`（每次启动与压缩续跑均先核对）；谱系 v4.1 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`（本地 `archive/2026-09-30-pre-v4.2/`）。
+- 流程：每个增量一张本地任务卡（E 归属、所依据真源条款与行号、V 编号、主控裁决、文件白名单、必做测试、可声明与不可声明）；实施子代理在独立 worktree 实施并开 draft PR（base main，线性栈）；主控在全新 target 目录独立全量复跑（`out/audit-20260930/qa/ctrl_verify.sh`：fmt、clippy `-D warnings`、全工作区测试、build rsia、两组 smoke、support-scope 检查器及其 unittest），并至少做 2 个反例（尽量在基线上复现缺陷、在 head 上通过）；通过后转 ready，由用户在本机终端以 `--match-head-commit` 固定 head 合并。主控不合并。
+- 结果：34 个 PR 全部合并（用户运行 `merge-all.sh`，2026-10-01T02:02Z–07:59Z）。A–AG 合并后 main `ecdfe31` 的树等于主控验收栈顶 `e7c0d0f` 的树；AH 合并后 main = `696252faf8ef2b2391102f4e6b0e9c0ee20c53d5`，其树等于验收 head `3d68d30` 的树。开放 PR 为 0。
+- 声明边界：下列 verified 只对各自写明的子范围成立，不声称效果、收益或可发行；不让已验子范围掩盖各 E 的默认范围。E 任务整体状态见下文“当前 v4.2 主任务状态”。
+
+### 合并结果（runbook 顺序；merged_sha 为 GitHub 合并提交）
+
+| 序 | PR | 任务 | E 归属 | 子范围（摘要） | 主控验收 head | merged_sha | 索引登记 |
+|---|---|---|---|---|---|---|---|
+| A | [#60](https://github.com/acosmi/RSIAgent/pull/60) | AG-012 | E16.6/E00 | 派生索引、检查器、索引测试绑定 v4.2 与谱系；E09 补 V097 | `2e5c6682c33b629fd9ce9cda30578f0d4eb99866` | `dc036d5f4dd5d870fb0ca98bdfe1ef6ec626140b` | E16.6 记录 |
+| B | [#59](https://github.com/acosmi/RSIAgent/pull/59) | AG-013 | E00/E07 | smoke_cli 刷新（完整 replay.run 载荷；blocked 代表改为 meta.start） | `9dec3274716ac513d29f6f6f4d2e30793d4feeca` | `69a3b3ed04377c30ee7193c0679a3747f1606a1e` | 仅台账 |
+| C | [#61](https://github.com/acosmi/RSIAgent/pull/61) | AG-015 | E07 | curriculum.step 管理消费者（幂等回执、读侧重验） | `3a0e26af88744f93bc0a1874aafc5ac6f67595e4` | `b220971c4e5ad44453c9d3e5787fbdfda6eb01ac` | E07 记录 |
+| D | [#62](https://github.com/acosmi/RSIAgent/pull/62) | AG-014 | E16.5 | MVP 容量门接入六个真实入口，实例级跨命名空间计数（F24） | `0d6ec3dd94954be7c01a140463b12062be686e6c` | `9c3ec979fd2ee3c53dfbf4ddf96967e94808b11e` | E16.5 记录 |
+| E | [#63](https://github.com/acosmi/RSIAgent/pull/63) | AG-016 | E03 | 可信开发执行/评分回执、已登记纯函数运行器与观察门 | `b1d008f985b1568dcfce92237c8016866c4b0646` | `3e2fc067190077b8cf8401875d6c627b8d9e13fc` | E03 记录 |
+| F | [#64](https://github.com/acosmi/RSIAgent/pull/64) | AG-017 | E07 | exploration.start 管理消费者（幂等登记、读侧重决策） | `71c0fa8a79e34b1cfec1c2bb61728fbfc6703138` | `f8fa1a19d5e968f83a52385ecb43d07d56442610` | E07 记录 |
+| G | [#65](https://github.com/acosmi/RSIAgent/pull/65) | AG-020 | 台账 | 第一轮主控记录、合并顺序与固定 head | `eb64a4d74d82d521e41c095f6753f27d603bc35a` | `c763973ddf57c6b7babcd9bd6fa87025f367aef3` | 仅台账 |
+| H | [#67](https://github.com/acosmi/RSIAgent/pull/67) | AG-018 | E16.5 | 启动恢复隔离门与部署门接入 rsia serve/mcp | `3f96c53da1003b5358d68208dc3b963977f31f7f` | `5c4f81dca79373c6871449aed287f61fb1f3cbc2` | E16.5 记录 |
+| I | [#66](https://github.com/acosmi/RSIAgent/pull/66) | AG-019 | E14 | E14 增量 1：有界 ElasticPolicy、决策摘要、ImproverContentV2、MechanismUsageRecordV1 | `3dd88787cd1910ad3eafc1da50a6a883b1adba3a` | `5a0ef4419c51687534baa3296dbbf7e310a5d810` | E14 记录 |
+| J | [#68](https://github.com/acosmi/RSIAgent/pull/68) | AG-023 | E00/E07 | 裸 --data 文件名加锁启动修复 | `44b4c90d89447d94024f2f5d8802013cc7412fcf` | `3ffe1e26a908d4c9240320d52fcba1e92dc383d4` | 仅台账 |
+| K | [#69](https://github.com/acosmi/RSIAgent/pull/69) | AG-021 | E09 | §7.7 技能组作业编排（≤2 组、组间隔离、组合只作标记） | `c841d1a126dc51ffca424ff72e79105b4d8c5166` | `31566ce87203b44c44b72986233af1c02fbe5cda` | E09 记录 |
+| L | [#71](https://github.com/acosmi/RSIAgent/pull/71) | AG-024 | E09/E08 | 探索节点、派发事实与历史接入撤销清理闭包 | `605d92abf21eedf9ef48a3704a49de14c8c2513d` | `9519c26f049afff63154fb2337893217b18b7e3c` | E09 记录 |
+| M | [#70](https://github.com/acosmi/RSIAgent/pull/70) | AG-022 | E13 | 巩固：监测撤销闭包、纯 pass/fail 配对、提案持久化与单候选暂存 | `551aa33a8efdd0f92f5cfbf30820493443bbc020` | `c81b258b6f890ab78bc9c7111798f75560c2ea23` | E13 记录 |
+| N | [#72](https://github.com/acosmi/RSIAgent/pull/72) | AG-025 | E12/E08 | 课程信封 9 种记录的清理分类 | `2df06e77f6dd1442fe1f04f07a6a2e8d79f5a8ee` | `15b140ddef25c8e794d586fecae56f129226a5c6` | E12 记录 |
+| O | [#75](https://github.com/acosmi/RSIAgent/pull/75) | AG-028 | E13 | 巩固触发接入：E03 门控可信周期、自触发护栏、收口即触发 | `145f9cff261de6dbac9bbede1bf28080101bec3d` | `6a23cb3697f656e1f5132cbe62ae766b4c0383f0` | E13 记录 |
+| P | [#73](https://github.com/acosmi/RSIAgent/pull/73) | AG-026 | E09 | §8.5 同题对比实践 PracticeAttemptSetV1 | `6a906355fdfb33a9e663123092a3938340850cbd` | `7ad4994c7a9208f523612d305660dc8ca9529620` | E09 记录 |
+| Q | [#74](https://github.com/acosmi/RSIAgent/pull/74) | AG-027 | E07/E08/E12 | 管理作业与私有输入清理闭包；提交时拒绝已撤销依赖 | `d2929c7e16c0f535068922bd16945a8dbfdbcb3a` | `c72aae14c9f35c1bcc090b5a374d2696d57dacfc` | E07 记录 |
+| R | [#77](https://github.com/acosmi/RSIAgent/pull/77) | AG-030 | E13 | V096.a 巩固调用单独计量（Consolidation 预算阶段） | `400f707805084199a9046008a52a2afd6c038f96` | `887b1d714581ae8a71d45243d38be1759697600d` | E13 记录 |
+| S | [#76](https://github.com/acosmi/RSIAgent/pull/76) | AG-029 | E16.5/E08 | 本轮新增动作、幂等与失效事实的恢复覆盖 | `43984ab3ecc0833e435bb25ddc4b6b3f2adadbf5` | `7120842a1f586ae394b76e146c8298f11bec52bc` | E16.5 记录 |
+| T | [#78](https://github.com/acosmi/RSIAgent/pull/78) | AG-031 | E13 | 巩固终态类别有界 | `892ed1cebaf50ea3a7ae2a38ddd05d70313637b1` | `84d8a7054c2428db0f821fcd478c615b09ade76b` | E13 记录 |
+| U | [#79](https://github.com/acosmi/RSIAgent/pull/79) | AG-032 | E10/E07/E08 | 回放读路径点名脱敏；提交检查比对 tombstone 的 source_kind | `8954b6c86cbe1bc1a5c0b957828080b59f1d1704` | `b262bbb2a0ea9ead68bc33fe1e58235e85bcffea` | E10 记录 |
+| V | [#80](https://github.com/acosmi/RSIAgent/pull/80) | AG-033 | E09 | run_next 可信观察门与证据标签 | `04e63092f2995c3668e14640c985012fd6a6a2b2` | `9e3e350ed5fbef2975117f12a7f8d3ca3b9cdcbf` | E09 记录 |
+| W | [#81](https://github.com/acosmi/RSIAgent/pull/81) | AG-034 | E14 | E14.2a MetaTrial 分叉（程序范围） | `c5c04bad5c349f00c815bb02c9a3eccc439b0da7` | `d9b3f6f5234ad14da18956a78c804e4c6818fa10` | E14 记录 |
+| X | [#83](https://github.com/acosmi/RSIAgent/pull/83) | AG-035 | E08 | 撤销清理只在闭包不动点处完成 | `fee5897ff45070fc198c0f46daac9e364ce7e38d` | `51db9b6c9a251def4e6566c96641ed8b63d43a85` | E08 记录 |
+| Y | [#82](https://github.com/acosmi/RSIAgent/pull/82) | AG-036 | E08 | 同 id 第二撤销源点名拒绝；run 与 import_source 不再碰撞 | `f15a42fe94426a49e8967869f8087a99837fd4a5` | `8d959dee844fb16f0763b0684ba3adf48ad75f1f` | E08 记录 |
+| Z | [#85](https://github.com/acosmi/RSIAgent/pull/85) | AG-038 | E08/E04 | 已撤销来源的预算调用不预留、不派发，结算照常入账 | `e06bfdd513efbbf87952bd8c822e2de12e803df7` | `f4b1ef66340412f5c0edf69a48549cd1386324cf` | E08 记录 |
+| AA | [#84](https://github.com/acosmi/RSIAgent/pull/84) | AG-039 | E09 | 合法动作与前缀卫生（Deepen 要求 Trusted、X1、X2） | `d4837f5f53c4ecae67f8e528b3e4e9f06758ef0a` | `42f89bd602db0c2783de38d87d91e80cd65f220b` | E09 记录 |
+| AB | [#86](https://github.com/acosmi/RSIAgent/pull/86) | AG-037 | E08/E10 | 经济回放记录纳入清理分类；start 写作业前重验来源 | `0c1bacd1752e20a7f1de2ab6058fec6271781d8f` | `16bdb08e1ac118e3e732a912358add468c49173b` | E08 记录 |
+| AC | [#88](https://github.com/acosmi/RSIAgent/pull/88) | AG-043 | E08/E04 | 撤销后到达的模型响应照常计费、不可用、不留明文 | `b1c1bdefaf8e538f36287ca9b287c3aa2f41f18d` | `ca117c45d87986500b38bc5afee3d6e161fea4f5` | E08 记录 |
+| AD | [#87](https://github.com/acosmi/RSIAgent/pull/87) | AG-040 | E09/E07 | 登记指纹只含不可变字段；计数器按登记时值还原并绑定成本 | `c44aa8d7db9d79f0b62379239e06184e49b5f73b` | `32a2f5090fe5136b21c7d3454f53964b36990247` | E09 记录 |
+| AE | [#89](https://github.com/acosmi/RSIAgent/pull/89) | AG-044 | E07/E08 | 提交时上游闭包两阶段闸门 | `f7946f02407bb5694f08bd9f357425e2f1ad2262` | `cc85b5c71cec06763909fb0efa33c4e296b6178d` | E07 记录 |
+| AF | [#91](https://github.com/acosmi/RSIAgent/pull/91) | AG-041 | E09 | 付费后路径收敛为终态、确定性失败付费前拒绝、fact 与节点绑定 | `4254e6d9408dfe4bdba4526a19de4987e6244198` | `a38b1452ede8fc5755bcab65686edd2f2817b51a` | E09 记录 |
+| AG | [#90](https://github.com/acosmi/RSIAgent/pull/90) | AG-045 | E08 | 撤销后写入的 stage fact 以脱敏形态落盘 | `e7c0d0f94c2915cc95663f8673d6c62f87ada2e6` | `ecdfe31faabb21a368f08d341b2a6e15223b0849` | E08 记录 |
+| AH | [#92](https://github.com/acosmi/RSIAgent/pull/92) | AG-042 | E09 | 恢复计数改为派生视图、与回放同口径 | `3d68d30a43c3fc0582053d48cf14ac35c3d4e841` | `696252faf8ef2b2391102f4e6b0e9c0ee20c53d5` | E09 记录 |
+
+- #65 的验收 head 为 `f752e1d`；因 #60 先合并造成 criss-cross 合并基，用户在其上加了一个以 `f752e1d` 与当时 main `f8fa1a1` 为父、树保持 `f752e1d` 不变的提交 `eb64a4d`，再以它为固定 head 合并（主控只读核对树与父提交）。
+- 第一轮 #59–#65 的主控记录见下文“2026-09-30 第一真源前置审计”节；第二轮全部主控记录按时间顺序折入下文，每条结论后补记 merged_sha。
+
+### CTRL-AG014 补记 / PR #62：MVP 容量门接入六个真实入口（第一轮记录只有任务表一行，此处补全）
+
+- 真源：v4.2 E16.5、§3.3.1（MVP 容量初值）、§11.4。固定 head `0d6ec3dd94954be7c01a140463b12062be686e6c`（= 主控重叠 `d8bfdd5` + F24），叠在 #61 `3a0e26a` 之上。改动：capacity.rs、dispatch.rs、exploration.rs、packages.rs、service.rs、evo-storage budget.rs/lib.rs 及相应测试。
+- 主控返修 F24：容量计数必须是实例级、跨命名空间，不能按命名空间拆分。主控反例 `ctrl_ag014_lease_cap_cannot_be_split_across_namespaces` 通过（`qa/ctrl-ag014-adversarial.log`）；全工作区复跑见 `qa/ctrl-ag014-workspace.log`，栈顶 `71c0fa8` 复跑 48/536/0。
+- 2026-10-01 索引登记复跑：在 `0d6ec3d` 上 `cargom test --locked -p evo-engine --test capacity_v41` 23 passed / 0 failed（`qa/ctrl-reg-ag014-0d6ec3d.log`）。
+- 结论：verified（E16.5 容量门接入真实入口子范围）；启动恢复/部署门当时未接（由 AG-018 #67 完成）；无真实沙箱。已合并，merged_sha `9c3ec979fd2ee3c53dfbf4ddf96967e94808b11e`。
+
+### 第二轮主控记录（逐项折入，按时间顺序）
+
+#### 闸门与现状实查
+- 真源闸门：`RSIAgent-v4.2定稿-工程实施方案-2026-09-30.md` SHA-256 = `70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455`（一致）；谱系 v4.1 `archive/2026-09-30-pre-v4.2/…` = `45f3ba06…`（一致）。
+- 实查结果（gh pr list / git worktree list）：#60 `2e5c668`、#59 `9dec327`、#61 `3a0e26a`、#62 `0d6ec3d`、#63 `b1d008f`、#64 `71c0fa8`、#65 `099a99a` 均为 open、base=main、非 draft、MERGEABLE/CLEAN；main = origin/main = `0c43e0f`；均未合并。与交接一致。
+- 与交接的差异：
+  1. 模拟按序合并（`git merge-tree --write-tree` 链式模拟 #60→#59→#61→#62→#63→#64→#65）发现：#60 合并后 #65 在 `docs/implementation-ledger.md` 冲突（两处 hunk：顶部审计节任务表、E16.5 状态行），原 G 命令会失败。
+  2. `user-commands.md` 中 D（#62）与 F（#64）的 `--match-head-commit` 为 7 位短 SHA，已改为完整 SHA。
+
+#### CTRL-AG020-R2 / PR #65：台账 PR 重叠 #60
+- 处置：在 #65 分支合入 #60 head `2e5c6682c33b629fd9ce9cda30578f0d4eb99866`；两处冲突均取 #65 一侧（#65 为 #60 台账文本的超集），解决后台账与 `099a99a` 逐字节相同；树 = `099a99a` + #60 的索引/检查器/索引测试 4 个文件。新 head `f752e1db7df0e1d1231ec3e62bbc0c2acd72aca5`（快进推送；先转 draft、推送、再转 ready）。
+- 复跑（最终整树 = #60 + #59…#64 + 台账；`qa/ctrl-stack-final-f752e1d.log*`）：fmt 0；clippy 全工作区 -D warnings 0；全工作区 48 个测试二进制 540 通过 / 0 失败（71c0fa8 为 536，+4 为 #60 support_scope 新增）；`cargo build -p rsia` 0；`smoke_workspace.py` 0；`smoke_cli.py` SMOKE_CLI_OK；`check_support_scope.py --source-of-truth <v4.2>` structure_valid=true、plan_binding_available=true、plan_version v4.2、errors=[]；checker unittest 48 OK。
+- 结论：#65 可在 #60…#64 之后无冲突合并；固定 head `f752e1d`。（后因 criss-cross 合并基改以 `eb64a4d` 合并，merged_sha `c763973ddf57c6b7babcd9bd6fa87025f367aef3`，见本节合并结果表。）
+
+#### AG-018 派发（E16.5 启动恢复门/部署门接入 rsia serve/mcp）
+- 侦察完成：代码事实详见侦察报告要点（Store::open 必写库且无只读变体；restore.json 为 rsia.restore_receipt.v2 且位于被验目录；capacity.rs 恢复/部署门与 IsolationPolicy 在生产代码零调用；无 sandbox/code-execution CLI/env 入口；迁移 0001/0002/0004/0005/0006，0003 保留）。
+- 主控裁决（任务卡 cards/AG-018.md，SHA-256 见下）：启动门在 Store::open 前只读执行；锚只能由 CLI --trusted-revocations-db 给出（不信 restore.json 内 path_local_only）；首启与锚逐项等值（水位/墓碑/受保护账目/root_budget*/迁移集），通过后在 bootstrap 成功后写 restore.admission.json（绑定 restore.json 摘要，不覆盖、不删收据）；失败一律 recovery_quarantine 零写入；代码执行在 CLI 层无入口，部署门拆分后在两条路径都真实调用；不新增迁移。
+- 卡摘要：72f450f0efb96c8ffda088534d5db9059e0371af39b357d5553bdc5da061e828（_common.md 23f0e86f49427bef950834367bade4b3bb201875e5b477d50844cb8b7f831208）。
+
+#### AG-019 派发（E14 增量 1：单机制 ExplorationPolicy 受限内容、有界参数与真实决策使用证据）
+- 侦察要点：ElasticPolicyV1::validate 要求等于默认值（任何候选无法存在）；CoordinatorDecision 无 policy/caps 摘要；meta.rs 以 used_in_next_job 布尔为唯一门，且同时放行 generation 与 exploration 两类；ImproverContent*/MechanismUsageRecord 全仓库不存在；policy 不在世界 context_signature 中（符合 §7.4.1/V094.c）；meta.start 为 blocked 代表。
+- 主控裁决（cards/AG-019.md）：validate 改为有界区间（gain [1000,100000]；stagnation_abs [0,50000] 且 < gain；window [1,2]；focus [1,4]；fairness [1,11]），每个边界由代码事实推出（前缀只保留 2 条增益、零值退化、caps 可达范围），不增策略字段；决策携带 policy_digest/caps_digest（fingerprint 约定与 replay 同值），dispatch fact 升 v2，v1 显式拒绝；ImproverContentV2 只开放 exploration_policy 一类，其余类别分类报错（未开放 Invalid、acquisition 无消费者、受保护控制面 Forbidden），不进 bundle 与世界签名；FIELD_CONTRACTS 登记 5 个字段，consumer=exploration.decide_elastic；MechanismUsageRecordV1 为只可序列化的派生视图，只由 Observed（节点真实存在）或 Uncertain 的派发事实经校验生成，Claimed 与纯 decide 不计；删除 used_in_next_job，改由 verify_mechanism_inheritance 依据真实使用记录判定；meta.start 仍 blocked，不做 MetaTrial/批准登记。
+- 卡摘要：57f47ab6a7c54092a4efdfb89f5ced868571e1aec8129a7ded239f1f1671fd94。
+
+#### CTRL-AG018-R1 / PR #67：E16.5 启动恢复门与部署门接入 rsia serve/mcp（主控独立验收）
+- 真源：v4.2 E16.5、§11.3、§11.4、§11.5 末段、E08、E04；V018/V069/V075/V085/V086.d/V007（只覆盖程序子范围）。固定 head `3f96c53da1003b5358d68208dc3b963977f31f7f`（`51a2a55` 为实现，`3f96c53` 只改测试辅助函数的注释），叠在 #65 `f752e1d` 之上，PR base=main。改动 8 个文件 +4139/−9：apps/rsia/src/main.rs、evo-engine startup_gate.rs（新）/capacity.rs/lib.rs、evo-storage lifecycle.rs（只读读取器）、新测试 startup_gate_v42.rs 与 control_plane_facts.rs、smoke_cli.py。
+- 实现要点：门在加锁前评估一次（拒绝时零写入，连 .rsia.lock 都不创建），在锁内再评估一次（据此行动）；bootstrap 之后、recover_pending 与对外服务之前写 restore.admission.json（临时文件 → fsync → hard_link，不覆盖）。锚只能取自 CLI，须为绝对且 canonical 的路径、nlink==1、(dev,ino) 与 D 的库不同、不在 D 内、同目录无 backup-manifest.json、其 .rsia.lock 未被持有。两库都只读打开（query_only、integrity_check），迁移集复用备份侧同一比较。首启时水位、墓碑、受保护账目与 root_budget* 必须与锚逐项相等，D 的水位还须等于收据所记。部署配置的构造签名不接受任何代码执行、沙箱或网络输入，隔离事实取 reference_host，两条路径都真实调用部署门。
+- 主控复跑（`qa/ctrl-ag018-3f96c53.log*`）：fmt 0；clippy 全工作区 -D warnings 0；全工作区 50 个测试二进制 585 通过 / 0 失败；build 0；smoke_workspace 0；smoke_cli SMOKE_CLI_OK（含新增的恢复门与真实 admission 端到端）；检查器 structure_valid、plan v4.2、errors=[]；unittest 48 OK。
+- 主控反例（`qa/probe_ag018.py`，真实二进制 + 真实 restore_backup.py，`qa/ctrl-ag018-adversarial.log`）9/9：C1 锚路径经符号链接的祖先目录 → 隔离（not canonical）；C2 含 `..` 的锚路径 → 隔离；C3 restore.json 被换成目录 → 隔离（not a regular file）；C4 设置 RSIA_ALLOW_CODE_EXECUTION 等 4 个环境变量后，姿态行仍为 code_execution=disabled；C5 D 的库是指向锚的符号链接 → 隔离（same device and inode）；C6 伪造 admission 记录（摘要正确但带多余键）→ 隔离；C7b 只在 D 中修改墓碑 reason → 隔离（tombstones differ）；C7a 两侧插入相同墓碑 → 验证通过；C8 正对照 → restored_verified 并写入 admission。
+- 观察（非阻断）：compare_facts 用 "{ns}/{id}" 拼接字符串作比较键。标识符字符集 [A-Za-z0-9-_.:] 不含 "/"，而可信锚一侧满足标识符约束，所以这种拼接不会造成误放行。今后可改为按元组键比较、只在报错信息中拼接。
+- 实施方如实披露的边界：手工删除 restore.json 可绕过此门（属管理员行为）；未驱动 pending revoke_cleanup_jobs；启动时未把残留 dispatched 调用转为 uncertain；allow_external_network 未做一致性检查；只在 macOS 实测；无 WAL 旁文件的库在只读打开时使用 immutable。
+- 另发现的既有缺陷（不属本 PR）：`rsia serve --data rsia.sqlite3`（裸文件名默认值）在 DataDirectoryLock::acquire 对空父目录做 canonicalize 时失败——另立增量。
+- 结论：verified（E16.5 启动恢复隔离门与部署门接入子范围）；E16.5 整项仍 in_progress（真实沙箱、Linux 实测、清理驱动与出站一致性仍缺）。PR 已转 ready；须在 #65 之后合并。回滚点 `f752e1d`。（已合并，merged_sha `5c4f81dca79373c6871449aed287f61fb1f3cbc2`）
+
+#### CTRL-AG019-R1 / PR #66：E14 增量 1（主控独立验收，第一轮）
+- 固定输入 head `4ea62292c8646e37f0ae779e3dfd72328cb8d332`（基线 f752e1d，1 个提交，11 个文件 +3676/−60）。
+- 主控复跑（`qa/ctrl-ag019-4ea6229.log*`）：fmt 0；clippy 0；全工作区 50 个测试二进制 577 通过 / 0 失败；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例（`qa/ctrl-ag019-adversarial.log`，临时测试不入库）5/5 通过：P1 class 拼写变体（大小写、连字符、首尾空格、驼峰）全部拒绝；P2 在 policy 内或 mechanism 同级夹带控制面键（max_nodes、w_online、caps、recovery_penalty_micros）全部拒绝；P3 abs==significant 拒绝，abs=significant−1 接受；P4 顶层重复 mechanism 键被拒；P5 经 MetaCandidate 派生路径绕过 parse 时，越界 policy、tagged enum 内重复 class、v3 schema 仍被拒绝。编译期伪造检查：`serde_json::from_str::<MechanismUsageRecordV1>` 编译失败（E0277，未实现 Deserialize），无法从 JSON 伪造使用记录。
+- 退回返修 R1（实施方在设计偏差 1 中自报的升级风险，主控核实）：recover_pending 会反序列化全部管理作业（含终态作业）。已成功的旧形状 exploration.start 结果缺少两个新增必填摘要字段，导致 "damaged management job" Conflict，整个服务无法启动（数据库先在 #64 上运行、再升级到 #66 即可触发）。裁决：只给 `ManagementResult::ExplorationStarted` 的两个字段加 serde(default)，status 对旧结果返回作业级 Conflict；CoordinatorDecision 与 dispatch fact v2 保持严格。已发回原实施方在原 PR 追加提交。
+
+#### AG-021 / AG-022 派发（叠在 AG-018 #67 head 3f96c53 之上）
+- AG-021（E09 §7.7 技能组作业编排，≤2 组、组间隔离、只产生组合标记）：卡 cards/AG-021.md（SHA-256 6b3697b516a74479b600038224c84a2640f5d5fa7bf251ab247c481a75adef23）。
+- AG-022（E13：修复 monitoring 撤销清理闭包缺陷 D1、四类改为纯 pass/fail 并逐任务配对 D4、巩固提案与暂存桥 D2）：卡 cards/AG-022.md（SHA-256 59deae8722927e133043848e5134d699ae8e0b24ffe1b49c6df16c2ebc75053c）。清理分类：redact 为 environment/observation/development_cycle v1+v2/report_binding/claim/proposal；preserve 为 scope/run/drift。
+
+#### CTRL-AG019-R2 / PR #66：R1 返修验收与线性叠放
+- R1 返修提交 `558d9a5`（普通快进推送；dispatch.rs +9/−2：只给 ExplorationStarted 的 policy_digest/caps_digest 加 serde(default)；meta_inheritance_v42.rs +132/−38：新增测试，把旧形状的已成功作业与一个非终态作业放在一起 → recover_pending 返回 Ok(1)、只拾取非终态作业，旧作业 status 返回 Conflict 而非 Internal，终态不被改写，新结果仍带非空摘要）。实施方自测 578/0，并做了变异检查（去掉任一 serde(default)，新测试即失败）。CoordinatorDecision 与 dispatch fact v2 仍然严格，v1 仍显式拒绝。
+- 已知语义（已写入 PR）：旧作业用同一 request_key 重连时，返回存储中的原结果（两项摘要为空），这是所有终态作业重连的既有行为；HTTP GET 状态走 status，返回 409。
+- 线性叠放：两个提交从 f752e1d rebase 到 AG-018 head 3f96c53 之上，得到 `9884a98`/`3dd8878`。AG-019 补丁在叠放前后逐字节相同（git diff f752e1d 558d9a5 == git diff 3f96c53 3dd8878）。以 force-with-lease（锁定 558d9a5）推送到 draft 分支后，PR 转 ready。
+- 栈顶复跑（`qa/ctrl-stack-tip-3dd8878.log*`，整树 = #60 + #59…#65 + #67 + #66）：fmt 0；clippy 0；全工作区 52 个测试二进制 623 通过 / 0 失败（540 + AG-018 45 + AG-019 38）；build 0；smoke_workspace 0；smoke_cli SMOKE_CLI_OK（含 AG-018 真实恢复 admission 端到端）；检查器 structure_valid、plan v4.2；unittest 48 OK。
+- 结论：verified（E14 增量 1：有界 ElasticPolicy、决策携带 policy/caps 摘要、ImproverContentV2 单机制类别、MechanismUsageRecordV1 仅由真实派发派生、删除 used_in_next_job 布尔的结构/程序子范围）。不证明继承收益；meta.start 仍 blocked；E14 整项仍 planned→in_progress。固定 head `3dd88787cd1910ad3eafc1da50a6a883b1adba3a`（已合并，merged_sha `5a0ef4419c51687534baa3296dbbf7e310a5d810`）；须在 #67 之后合并。回滚点 `3f96c53`。
+
+#### AG-023 派发（E00/E07 缺陷修复：默认 --data 裸文件名无法加锁启动）
+- 缺陷由 AG-018 实施方实测发现，主控复核代码：`DataDirectoryLock::acquire` 对 parent 为空串的路径调用 canonicalize("") 失败。启动门中已有唯一正确的定义 `startup_gate::data_directory`，裁决加锁路径改用这一处定义。卡 cards/AG-023.md（SHA-256 59fb46b7b02c3131d5dd330ee31ae371c33d00a19dae7ae646ccf47d41a404a8），基线 3dd8878（栈顶）。
+
+#### CTRL-AG023-R1 / PR #68：裸 --data 文件名加锁启动修复（主控独立验收）
+- 固定 head `44b4c90d89447d94024f2f5d8802013cc7412fcf`（叠在 #66 `3dd8878` 之上，1 个提交；apps/rsia/src/main.rs +82/−9，scripts/smoke_cli.py +104）。DataDirectoryLock 改用 `startup_gate::data_directory`（唯一定义）；新增 4 个单元测试；smoke 新增 smoke_bare_data_path（子进程 cwd 为临时目录）。
+- 实施方如实披露：mcp 在 stdin 为空时以 "connection closed: initialize request" 非零退出，这是 evo-mcp 的既有行为，卡中"正常退出"的表述不准确；smoke 只接受退出码 0 或该握手错误。Store::open 自身仍独立计算父目录，但对裸文件名实测可用。
+- 主控复跑（`qa/ctrl-ag023-44b4c90.log*`）：fmt 0；clippy 0；全工作区 52 个测试二进制 627 通过 / 0 失败（623 + 4）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例（`qa/probe_ag023.py`，`qa/ctrl-ag023-adversarial.log`）6/6：CE1 用修复前二进制（3dd8878）复现 "failed to resolve data directory"，新二进制可启动并创建 rsia.sqlite3 与 .rsia.lock；CE2a 真实恢复目录中以 cwd=D、裸 --data 且不带锚 → 隔离，零写入（连 .rsia.lock 都没有）；CE2b 同目录带绝对路径锚 → restored_verified 并写入 admission；CE2c 再次启动 → admitted_previously；CE3 `--data ""` → clap 报错退出 2，无 panic、无文件；CE4 相对路径锚 → 隔离（must be absolute）。
+- 结论：verified（E00/E07 CLI 默认数据路径的加锁与启动子范围）。PR 已转 ready；须在 #66 之后合并。回滚点 `3dd8878`。（已合并，merged_sha `3ffe1e26a908d4c9240320d52fcba1e92dc383d4`）
+
+#### AG-024 派发（E09/E08 缺陷：探索节点/派发事实/优化历史不在撤销清理闭包内）
+- 来源：E09 侦察 §6，主控在栈顶 44b4c90 核实：exploration.rs 只有 persist_world_registration 写依赖边，节点、派发事实与历史记录都不写边，撤销时清理遍历只能到达世界本身，这三类记录尽管在 redact 白名单内也永远不会被脱敏（读侧靠水位严格相等 fail-closed）。裁决：首次写入时在同一事务内写入指向所属世界的依赖边；不改 lifecycle.rs 与任何 schema；不做回填（没有生产写入者）。卡 cards/AG-024.md（SHA-256 a03835fea111bada4fd67cbb9c9e51dc0a5c7168268ef51b7b6805d799f4fa1a），基线 44b4c90。
+
+#### CTRL-AG021-R1 / PR #69：E09 技能组作业编排（主控第一轮，返修中）
+- 交付 head `28ee9bbb90253bcd54fb1bd950ed836a2a5f2ebd`（基线 3f96c53；groups.rs 新增 335 行、lib.rs +1、skill_groups_v42.rs 新增 1979 行，10 个测试）。实施方自测 595/0，21 处变异全部被测试杀死。
+- 裁决：R1 返修——不采用"剥离模板预演 + 匹配 empty_evidence_closure 错误文本"（依赖检查顺序与错误文本，属脆弱耦合）。evo-core skill_edit.rs 已有私有的 `validate_batch_scope` 做同一件事，授权只改为 pub（函数体与行为不变），groups.rs 直接调用。R2 不返修——一个作业只接一个模型端口和一个运行器，预算绑定在端口上，两组结构上必然共享同一根预算，卡中"请求级 billing_scope/root_budget 校验"的前提有误，由主控承担，测试 6 用真实 broker 证明共享。
+- 环境事故（实施方如实披露）：父会话 scratchpad 根目录的 env.sh 被 AG-022 子代理覆盖。AG-021 在 13:23–13:25 期间 source 了被覆盖的版本，把 ag-021 源码的构建产物写进了 target-ag-022。实施方随后想删除相关 fingerprint，被权限分类器以 "Interfere With Workloads" 拒绝，主控不代为删除。处置：通知 AG-022 在其自身环境对 evo-core/evo-storage/evo-engine 执行 `cargom clean -p` 后重跑最终自测；主控对两者的验收都改用全新的 target 目录；今后子代理的临时文件一律放在 scratchpad/<任务>-impl/ 子目录中。
+
+#### CTRL-AG021-R2 / PR #69：返修验收与线性叠放
+- 返修 `702a343`：只把 skill_edit.rs 的 `validate_batch_scope` 改为 pub（+1/−1，函数体未改），groups.rs 直接调用它，删除剥离模板预演与错误文本匹配；零调用拒绝用例增至 31 项；evo-core 165/0 无行为变化。R2 的"预算结构性共享"已写入 PR。
+- 线性叠放：两个提交从 3f96c53 rebase 到 44b4c90（#68）之上，得到 `13c4dab`/`c841d1a`，补丁逐字节相同；以 force-with-lease（锁定 702a343）推送后转 ready。
+- 主控复跑（全新 target 目录 target-ctrl-ag021，`qa/ctrl-stack-ag021-c841d1a.log*`）：fmt 0；clippy 0；全工作区 53 个测试二进制 637 通过 / 0 失败（627 + 10）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例（`qa/ctrl-ag021-adversarial.log`，临时测试不入库）2/2：G6 第二个作业沿用 group-a 的 episode/request id 但来源内容不同 → group-a 记为 failed（"state conflict: same optimization key has different full input"），没有用旧 journal 冒充结果，也没有新的模型或运行器调用；group-b 与第一次结果一致。G18 全新库上不接端口运行 → 两组都记为 failed，combined 为空，作业本身不报错。
+- 结论：verified（E09 §7.7 技能组作业编排程序子范围：≤2 组、组间隔离、调用前全量校验、组合只作标记）。不含组合 Bundle 编译、完整组合开发选择或正式验收。固定 head `c841d1a126dc51ffca424ff72e79105b4d8c5166`（已合并，merged_sha `31566ce87203b44c44b72986233af1c02fbe5cda`）；须在 #68 之后合并。回滚点 `44b4c90`。
+
+#### CTRL-AG024-R1/R2 / PR #71：探索节点、派发事实与历史接入撤销清理闭包（主控独立验收）
+- 交付：`6288f63`（边 + 测试）、`dbef300`（测试拆分与晚到结果覆盖）、`f164778`（R1：脱敏记录返回点名的 Conflict，不再是 Internal）；基线 44b4c90。exploration.rs +107/−6（put_world_edge 在节点、派发事实、历史首次写入的同一事务写边；read_envelope 识别 rsia.redacted.v1 墓碑），新测试 exploration_cleanup_v42.rs（15 项）。历史条目的归属已确认属于世界。不回填（没有生产写入者）。
+- 第一轮裁决：清理完成后五个读入口返回 Internal，不符合错误契约 → R1 返修，按 development.rs/optimization.rs 的惯例返回 Conflict；真正的损坏仍为 Internal，并有区分测试。实施方改为先读原始正文、再判断墓碑，避免对预期状态记 error 日志，结果与裁决一致，主控接受。
+- 线性叠放：三个提交从 44b4c90 rebase 到 c841d1a（#69）之上，得到 `06e4e01`/`5a3152f`/`605d92a`，补丁逐字节相同；以 force-with-lease（锁定 f164778）推送后转 ready。
+- 主控复跑（全新 target 目录 target-ctrl-ag024，`qa/ctrl-stack-ag024-605d92a.log*`）：fmt 0；clippy 0；全工作区 54 个测试二进制 652 通过 / 0 失败（637 + 15）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例（`qa/ctrl-ag024-adversarial.log`）：E1 首版因测试世界的水位过时，被水位检查提前拦下，结论不成立，已记录；E1b 以当前水位重做：正对照中新 id 注册成功，而用已脱敏的 id 通过 register_world 与 register_world_idempotent 重新注册，都返回点名脱敏的 Conflict，墓碑保留，无法复活；E2 向已脱敏世界追加历史返回点名脱敏的 Conflict。
+- 结论：verified（E09/E08 探索记录撤销清理闭包与脱敏读取错误契约子范围）。已知边界：分页遍历期间新写入的边可能落在游标之前、修复前的记录不回填、只在首次写入时写边。固定 head `605d92abf21eedf9ef48a3704a49de14c8c2513d`（已合并，merged_sha `9519c26f049afff63154fb2337893217b18b7e3c`）；须在 #69 之后合并。回滚点 `c841d1a`。
+
+#### CTRL-AG022-R2 / PR #70：返修验收与线性叠放
+- 第一轮（bc033df，全新 target）：647/0 全绿。主控反例 4 项中 P2 与 P3 通过，P1 与 P4 暴露问题：P1 同一提案可用不同 candidate_id 重复暂存（出现 2 条候选，给"评测失败后换 id 重评"留出空间）；P4 暂存结果直接沿用存储中被篡改的 provenance。已退回返修。
+- 返修 `49cc157`：新增持久绑定 `rsia.monitoring.consolidation_staging.v1`（每个提案一条，在暂存前、与提案校验同一事务写入；同 id 幂等，换 id 为 Conflict；确定性拒绝时退回预留，I/O 未知时保留预留；绑定带指向提案的边，lifecycle 追加 redact 分支）。暂存时用 claim 的周期与环境记录重新推导 provenance，并同时推导 environment/pairs/parent 等摘要，不等即 Conflict。新增 5 个集成测试和 4 个单元测试，实施方自测 656/0，40 次重复运行零失败。
+- 实施方如实披露：一个提案一个候选的约束只由暂存桥执行，ReleaseStore::stage_bundle 本身未改，持有 bundle 的 Worker 或 Admin 仍可直接调用；暂存时不与 journal 终态事实做 bundle 交叉核对；此前已披露的边界不变。
+- 线性叠放：两个提交从 44b4c90 rebase 到 605d92a（#71）之上，得到 `4f9d2b7`/`551aa33`，补丁逐字节相同；以 force-with-lease（锁定 49cc157）推送后转 ready。
+- 主控复跑（主控专用 target 目录 target-ctrl-ag022，`qa/ctrl-stack-ag022-551aa33.log*`）：fmt 0；clippy 0；全工作区 55 个测试二进制 681 通过 / 0 失败（652 + 29）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例第二轮（`qa/ctrl-ag022-adversarial-r2.log`）4/4：P1 换 id 暂存返回 Conflict 并点名 candidate-1，同 id 保持幂等，存储中只有 1 条候选；P2 外命名空间与 Agent 角色被拒后，正当暂存方仍能暂存，没有残留的预留；P3 篡改 bundle 被 digest 校验拒绝；P4 篡改 provenance 返回 Conflict（"provenance differs from its evidence"），不产生候选。
+- 结论：verified（E13 巩固子范围：monitoring 撤销清理闭包、纯 pass/fail 逐任务配对 v2、巩固提案持久化、一个提案至多一个暂存候选、可信标签在暂存时重新推导）。巩固调用计费阶段、E03 可信周期收口、管理入口与任务族保留矩阵仍未做。固定 head `551aa33a8efdd0f92f5cfbf30820493443bbc020`（已合并，merged_sha `c81b258b6f890ab78bc9c7111798f75560c2ea23`）；须在 #71 之后合并。回滚点 `605d92a`。
+
+#### AG-025 / AG-026 派发与 E13 触发侦察
+- AG-025（E12/E08 缺陷：课程信封的 9 种 record_kind 不在清理白名单中，撤销后作业会 Failed；由 AG-022 实施方实证）：卡 cards/AG-025.md（SHA-256 883fd2e56bab79139a50c39785c9f30cb2b5bb86882817530d14a454fa986234），基线 bc033df。分类：来源派生的 6 种 redact，profile/job/receipt 3 种 preserve。
+- AG-026（E09 §8.5 同题对比实践 PracticeAttemptSetV1 程序子范围）：卡 cards/AG-026.md（SHA-256 e6cdc2cc9a0a97b13fb346b43739d1b6b7fb2140e1bda35eb9a76a85c4065276），基线 551aa33。裁决：attempt 不写成开发观察事实（防止 E12/E13 把它们计为独立周期）；K=3 须有 Admin 持久化的登记；独立簇数只按任务族计算，绝不含 K；缓存命中不计为新实践；沿用 DevelopmentExecution 记账并披露 Practice 阶段尚未使用。
+- E13 "巩固触发接入"：monitoring.rs 经 AG-022 大改，已在栈顶 551aa33 派出只读侦察（可信周期路径、自触发守卫、Consolidate 预算阶段、周期完成即触发的可行性，以及真源 §6.1 的管理操作清单是否包含巩固操作）。
+
+#### CTRL-AG025-R1 / PR #72：E12 课程信封接入撤销清理闭包（主控独立验收）
+- 交付 head `2df06e77f6dd1442fe1f04f07a6a2e8d79f5a8ee`：实施方发现 #70 已改栈，自行把单个提交 rebase 到 551aa33，无冲突，属合理处置。lifecycle.rs +25（preserve：profile/job/receipt；redact：state/cycle receipt/attempt/proposal/validity/selection），新测试 curriculum_cleanup_v42.rs（9 项）。9 种记录逐一核对了内容与依赖边：preserve 类不含原文、模型输出或答案（job/receipt 只含 state/trigger 的 SHA-256 摘要）；无需补边，curriculum.rs 未改。
+- 主控复跑（全新 target 目录 target-ctrl-ag025，`qa/ctrl-stack-ag025-2df06e7.log*`）：fmt 0；clippy 0；全工作区 56 个测试二进制 690 通过 / 0 失败（681 + 9）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控确认探针（`qa/ctrl-ag025-adversarial.log`）复现了实施方披露的两项缺陷，都在本卡白名单之外：(a) 经管理面提交 curriculum.step 后撤销 run-a，清理以 Failed 结束（blocked_unknown_scope:job:rsia.management_job.v1:，已处理 51 个节点），即 management_job/management_private_input 未分类，生产路径的撤销清理仍不完整；(b) begin_revoke 之后，用已记录的 key 重放 schedule_probe_idempotent 仍返回旧 job（fail-open）。另经代码核实：课程记录脱敏后的读取返回 Internal。
+- 结论：verified（E12 课程信封清理分类子范围）；上述缺陷另立 AG-027 修复，E12 生产路径的撤销闭包在 AG-027 前仍属 blocked。固定 head `2df06e7`（已合并，merged_sha `15b140ddef25c8e794d586fecae56f129226a5c6`）；须在 #70 之后合并。回滚点 `551aa33`。
+
+#### AG-027 派发（E07/E08/E12 缺陷：管理作业与私有输入未进清理闭包；课程重放 fail-open；课程脱敏读取返回 Internal）
+- 依据：AG-025 实施方披露，主控用探针复现（qa/ctrl-ag025-adversarial.log）。裁决：management_job 为 preserve（已发生动作的审计记录；ManagementResult 只含结构化字段，实施前须逐字段核对）；management_private_input 为 redact（完整请求载荷）；dispatch 读到脱敏私有输入时返回点名的 Conflict，执行中的作业以带 error_code 的 Failed 结束，recover_pending 不受影响；课程回执重放先重验水位与来源；课程脱敏读取返回点名的 Conflict。卡 cards/AG-027.md（SHA-256 f9a8cb78c6f93aec79dc9e44591b83218793d12bb4b8c649722af457ce0f5092），基线 2df06e7（#72）。
+
+#### AG-028 派发（E13 巩固触发接入，含可信周期护栏与真实运行器绑定）
+- 依据：E13 第二次侦察（栈顶 551aa33）。close_development_cycle 对真实 E03 事实会 NotFound，因为它对原始 id 执行 need，而真实回执存于 typed 存储 id 下，所以 E13 只接受手写 fixture 周期；provenance 取自自报值；巩固自身的开发运行可被当作新周期收口（自触发）；claim_consolidation 与 close 均无生产调用者；§6.1 管理操作清单中没有巩固操作。
+- 裁决：不新增管理操作（新增即扩公共接口，须先修订真源）；非 Fixture 的 report 在同一 session 内过 E03 门（verified_development_observation_in_session），逐项核对 view、report 与 scope，provenance 不再由自报决定；episode_id 命中巩固 claim 即拒绝；新增 close_development_cycle_and_trigger（先 close 后 claim，claim 失败返回 Unavailable 且周期保留）；RegisteredDevelopmentRunner 实现 ConsolidationDevRunner。ModelStage::Consolidate 与预算阶段拆分另立后续任务。卡 cards/AG-028.md（SHA-256 c88c2703ea430c5b7d5fc2f9e209dd8979ec0df3f8c4fec33f236718110e9c2a），基线 2df06e7。
+
+#### CTRL-AG026-R1 / PR #73：E09 同题对比实践（第一轮，返修中）
+- 交付 head `77156f7`（基线 551aa33；practice.rs 新增 1513 行、practice_v42.rs 新增 2317 行共 21 项、lifecycle.rs +5、lib.rs +1）。实施方自测 709/0。
+- 实施方的 8 项偏差全部接受：复用 E03 验证器所用的 StageFact 只作内存载体、从不落盘（有测试扫描存储作证）；集合有两个 id；请求摘要不含 created_at；不信任 runner 报告（回执、分数、control 不符都记为 incomplete）；停止原因；计划任务须等于 control 任务集；额外依赖边；对比规则按 (score, passed) 取较好与较差。
+- 裁决 R1（返修）：一个 K=3 登记只授权一个实践集合，同一登记下第二个 set_id 为 Conflict；依据 §8.5"不为制造差异无限增加 K"。K=1 不设配额。
+- 线性叠放：77156f7 rebase 到 #72 的 2df06e7 之上。lifecycle.rs 与 AG-025 的课程分支在两处相邻位置冲突，主控按两边都保留解决；engine 补丁逐字节不变，lifecycle 新增行不变，新 head `05801a5`，以 force-with-lease（锁定 77156f7）推送到 draft。R1 在其上追加。
+
+#### CTRL-AG027-R1 / PR #74：管理作业与私有输入接入清理闭包（第一轮，返修中）
+- 交付 head `bfe68af`（基线 2df06e7；lifecycle.rs +13，dispatch.rs +126/−8，curriculum.rs +58/−14，management_cleanup_v42.rs 新增 17 项）。实施方自测 707/0，稳定性多轮并发零失败，5 类变异全部被杀死；撤销 lifecycle 两个分支后，8 个新测试以原缺陷文本失败。
+- 字段核对：ManagementJob 的 18 个字段与 ManagementResult 的 6 个变体都不含来源派生的自由文本（BatchActionV1 的 reason 只有 5 个固定字面量），按裁决把 job 分为 preserve、私有输入分为 redact。可达性：curriculum.step、exploration.start、replay.run 可达；experiment.register 仅当 holdout 输入为 run 派生时可达；evaluation.* 与 meta.start 不可达（有测试佐证不变）。
+- 接受：status 闸门只对 Succeeded 作业生效且只认墓碑；新增 step/error_code 字面量 private_input_redacted、source_revoked；recover_pending 不读私有输入，因此不受影响。
+- 退回 R1：清理完成之后才提交的管理请求，其私有输入会带着指向已撤销来源的边以明文落库，清理不会再跑，违背"新访问即时拒绝"。裁决在提交与持久化路径中，写入之前、同一事务内，对全部私有依赖做存活检查；已撤销或已脱敏的依赖一律拒绝，返回 Conflict，不写任何记录。
+- 记为后续事项（不在本 PR 处理）：evo-storage replay.rs 的 replay 存储读路径对墓碑返回 Internal；重提交时 "subject was deleted" 文案不准确（仍 fail-closed）；E16 import_source 作为撤销源的端到端夹具。
+
+#### CTRL-AG028-R1 / PR #75：E13 巩固触发接入（主控独立验收）
+- 固定 head `145f9cff261de6dbac9bbede1bf28080101bec3d`（直接基于 #72 的 2df06e7，1 个提交；monitoring.rs +656/−24、optimization.rs 新增 1 个 pub(crate) 函数 +19、development.rs 新增 ConsolidationDevRunner 的 impl +38、新测试 monitoring_trusted_cycle_v42.rs 13 项，另有 5 个单元测试）。
+- 实现：非 Fixture 的 report 在同一 session 内经 E03 门（由 observed 事实推导 request 事实 id），逐项核对 view、report 与 scope；可信路径改用 typed 回执边；周期标签由门证明，固定为 RegisteredPureFunction。自触发护栏：episode 命中巩固 claim 或其脱敏墓碑即拒绝，对所有路径生效。新增 close_development_cycle_and_trigger（先 close 后 claim，claim 失败返回 Unavailable 且周期保留）。RegisteredDevelopmentRunner 实现了 ConsolidationDevRunner。实施方变异检查：在可信路径保留原始 id 的 need 时，13 项中 8 项失败，证实"E13 原先只接受 fixture 周期"的推断。
+- 实施方如实披露：真实撤销使 scope 水位变化，所以两次 close 之间的撤销会让第二次 close 直接报错，而不是返回 Unavailable；Unavailable 路径只能用手写墓碑模拟。测试环境为 ProgramFixture（TrustedExecution 环境需要走正式批准）。close 与 wrapper 仍没有生产调用者；巩固仍按 Reflection/Ranking 计费；真实链只能到 NoContrast 或 Rejected。
+- 主控复跑（全新 target 目录 target-ctrl-ag028，`qa/ctrl-stack-ag028-145f9cf.log*`）：fmt 0；clippy 0；全工作区 57 个测试二进制 708 通过 / 0 失败（690 + 18）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例（`qa/ctrl-ag028-adversarial.log`）2/2：Q1 经 wrapper 重复收口同一可信观察是幂等的（同一周期、NotEligible），第二周期为 Claimed{NoContrast}，再次收口返回 AlreadyClaimed（同一 claim id），索引中 2 个周期、1 个 claim，没有多出的 generation；Q4 把真实可信观察收口到 grader 或 manifest 不同的 scope → Conflict（"cycle differs from frozen environment"），环境 id 不同 → NotFound，之后仍能收口到它真实的 scope。
+- 结论：verified（E13 巩固触发接入子范围：E03 门控的可信周期、自触发护栏、周期收口即触发、真实运行器预算绑定）。ModelStage::Consolidate 的预算拆分、生产周期驱动与管理入口仍未做。须在 #72 之后合并。回滚点 `2df06e7`。（固定 head `145f9cf`，已合并，merged_sha `6a23cb3697f656e1f5132cbe62ae766b4c0383f0`）
+- AG-027 R1 阻塞裁决：提交时拒绝与两个既有测试冲突（curriculum_cleanup_v42.rs:1271–1281；dispatch_management.rs:2761–2777、2793–2808），它们编码的是"提交时接受、作业内失败"的旧契约。实施方按卡的约束停下请求授权，处置正确。主控依 §11"新访问即时拒绝"裁定：采纳选项 A，仅授权修改这三处，改为断言 Conflict 并点名依赖，保留全部不写入断言，不放宽其他断言；dispatch_management.rs:1541–1556（只标记撤销的 typed source）的既有契约不动；只 begin_revoke 时存活 artifact 依赖在提交时无法判定的边界，接受并记录。
+
+#### CTRL-AG026-R2 / PR #73：返修验收与线性叠放
+- R1 `b0cc0f5`：新增持久绑定 `rsia.practice_registration_binding.v1`（每个登记一条，preserve），先只读早拒绝，在首次调用运行器前认领登记，并在持久化事务中再确认；同一登记下第二个 set_id 为 Conflict，同一 set_id 重放幂等，K=1 无配额。实施方自测 726/0，并发 40 轮零失败，变异全部命中预期测试。
+- 偏离裁决的一步（主控接受）：在首次调用前认领，而非仅在持久化时写绑定。只在持久化时写，挡不住并发两个集合各跑 K 次，也挡不住中途失败后换 set_id 重跑，两者都是变相补采。代价是：认领后失败的集合也耗掉登记，续跑只能用同一 set_id，否则须重新登记。
+- 线性叠放：两个提交从 2df06e7 rebase 到 #75（145f9cf）之上，得到 `dbc7b36`/`6a90635`，补丁逐字节相同；以 force-with-lease（锁定 b0cc0f5）推送后转 ready。
+- 主控复跑（全新 target 目录 target-ctrl-ag026，`qa/ctrl-stack-ag026-6a90635.log*`）：fmt 0；clippy 0；全工作区 58 个测试二进制 744 通过 / 0 失败（708 + 36）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例（`qa/ctrl-ag026-adversarial.log`）2/2：S1 在第 2 次尝试 uncertain 而停止的集合（Incomplete）已耗掉登记，同一登记下另一个 set_id → Conflict 并点名 ctrl-set-a，健康运行器调用 0 次，原 set_id 重放返回已存集合且无新调用；S4 Agent 与 Evaluator 角色均为 Forbidden，运行器调用 0 次。
+- 结论：verified（E09 §8.5 同题对比实践程序子范围：K=1 默认、K=3 须 Admin 登记且一个登记只授权一个集合、attempt 不计为独立样本或周期、缓存命中不计为新实践、撤销闭包）。确定性运行器只能得到 no_contrast；Practice 预算阶段、课程额度、对比规则进入有界编辑链与管理入口仍未做。固定 head `6a906355fdfb33a9e663123092a3938340850cbd`（已合并，merged_sha `7ad4994c7a9208f523612d305660dc8ca9529620`）；须在 #75 之后合并。回滚点 `145f9cf`。
+
+#### CTRL-AG027-R2 / PR #74：返修验收与线性叠放
+- R1 `c8dc2a3`：dispatch.rs 的 persist_management 在同 key 重放分支之后、任何写入之前、同一会话内检查私有依赖；依赖有 tombstone 或正文为脱敏墓碑时，整个提交返回 Conflict，点名依赖的 kind 与 id，不写任何记录。经主控授权修改三处既有测试（curriculum_cleanup_v42.rs:1267–1290 一带；dispatch_management.rs 同一测试的 2761–2854 一带），改为断言点名依赖的 Conflict，不写入断言全部保留，并补充了"对象数不变、无幂等行"断言。另新增 5 个测试。实施方自测 712/0。
+- 线性叠放：从 2df06e7 rebase 到 #73（6a90635）之上，得到 `0eef4ef`/`d2929c7`；engine 补丁逐字节相同，lifecycle 新增行相同。首次强推失败：zsh 把 `$B:c8dc…` 当作变量修饰符（:c）处理，lease 被改写，git 以非快进为由拒绝；此前已误把 PR 转为 ready，随即转回 draft，改用 `${B}` 重推成功，再转 ready。事故与规避写入本地环境记忆。
+- 主控复跑（全新 target 目录 target-ctrl-ag027，`qa/ctrl-stack-ag027-d2929c7.log*`）：fmt 0；clippy 0；全工作区 59 个测试二进制 766 通过 / 0 失败（744 + 22）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控探针（`qa/ctrl-ag027-adversarial.log`）：M3 命名空间 n 撤销并清理后，命名空间 m 对同名 run 的提交被接受，无跨命名空间误拒；M5 清理后同 key 重提交返回 Conflict（"subject was deleted; request cannot be replayed"），我的预期（返回已存 job）有误，实际为实施方已披露的 fail-closed 行为，只是文案不准。代码审查的非阻断观察：提交检查按 id 查 tombstone，不比对 source_kind；在现行 id 方案（带前缀的哈希存储 id 与 run id）下碰撞不可达，留作后续精度改进。
+- 结论：verified（E07/E08/E12 管理作业与私有输入清理闭包、提交时拒绝已撤销依赖、课程重放与脱敏读取 fail-closed 子范围）。只 begin_revoke 时存活 artifact 依赖在提交时无法判定（作业内失败，清理后输入被脱敏），属已知边界。固定 head `d2929c7e16c0f535068922bd16945a8dbfdbcb3a`（已合并，merged_sha `c72aae14c9f35c1bcc090b5a374d2696d57dacfc`）；须在 #73 之后合并。回滚点 `6a90635`。
+
+#### AG-029 / AG-030 派发（基线 d2929c7 栈顶 #74）
+- AG-029（E16.5/E08 恢复覆盖）：本轮新增的动作、幂等与花费事实（巩固 claim/run/staging/proposal、实践登记/绑定/集合、课程信封、管理作业）不在 restore_backup.py 与启动门的受保护口径内，旧备份恢复后可能重做这些动作，违背 §11.5。裁决把这些 schema 同步加入受保护口径（Python 与 Rust 两处，靠漂移守卫保证一致），私有输入不纳入，判定规则仍是逐项相等。卡 cards/AG-029.md（SHA-256 e431e582e24c3f4fde931279ccba0138fd306dbd26ff6da079dacb2c43484b0d）。
+- AG-030（E13/V096.a）：巩固调用目前记在 Reflection/Ranking 名下。裁决新增 ModelStage::Consolidate → BudgetStage::Consolidation，并在 journal 阶段新增对应变体；只有巩固请求使用该阶段（双向校验）；补五类故障注入；不改 storage。卡 cards/AG-030.md（SHA-256 39b6ca49547c859906540050bbaf46b99c89eaaa724346c7f2d455a324cd7ff9）。
+- 真源层面的待决事项（须先修订真源才能实施）：§3.3.1 v4.2 补充要求"后续新增的内部对象在引入时同步登记上限"，而本轮新增的内部对象（巩固 claim/proposal、实践集合、技能组作业等）在真源中没有容量上限；按规定须先修订方案，再由 E16.5 实施与重验，不能由实现方单方设定。
+
+#### CTRL-AG030-R1 / PR #77：E13/V096.a 巩固调用单独计量（主控独立验收）
+- 固定 head `400f707805084199a9046008a52a2afd6c038f96`（直接基于 #74 的 d2929c7，1 个提交；8 个文件 +2077/−15，其中新测试 consolidation_budget_stage_v42.rs 12 项）。改动：ModelStage::Consolidate（serde "consolidate"）→ BudgetStage::Consolidation；journal 阶段新增 Consolidate；call_stage 只在 base stage 为 Consolidate 时切换；入口拆为公开的 run_optimization_step（拒绝 Consolidate）、crate 内的 run_consolidation_step（要求 Consolidate）与私有的 run_step（原函数体）；run_consolidation 在 claim 转 Running 之前校验阶段。五类 V096.a 注入（超时、取消、无效 JSON、费用缺失、晚到）都用真实 broker 与账本。金值测试钉住了旧阶段的标签与摘要，五个阶段的 cache key 互不相同。
+- 越出白名单一处（主控接受）：optimization.rs 入口拆分，是在不给请求加字段的前提下双向约束阶段的唯一做法。生产调用点已核对：exploration.rs:1070 与 groups.rs:148 走公开入口，monitoring.rs:1154 走巩固入口。
+- 实施方如实披露：step 级的 StepPrepared/StepCompleted 仍记在 Merge 下，只有模型调用级事实记为 consolidate；以 Merge 执行过的旧 claim 不能用 Consolidate 续跑（生产中无此数据）；开发运行器调用仍记为 development_execution。
+- 主控复跑（全新 target 目录 target-ctrl-ag030，`qa/ctrl-stack-ag030-400f707.log*`）：fmt 0；clippy 0；全工作区 60 个测试二进制 778 通过 / 0 失败；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例（`qa/ctrl-ag030-adversarial.log`，与 AG-021 技能组的交互）2/2：A2 某组请求带 Consolidate 阶段 → 只有该组失败（permission denied），另一组照常产出候选，组合标记只含该组；A3 两组都带 Consolidate → 模型与运行器调用 0 次。
+- 发现的既有缺陷（另立 AG-031）：monitoring.rs 的 persist_terminal_run 拒绝超过 128 字节的终态类别。合法 JSON 但含未知字段的巩固答案，其 serde 错误原因过长，导致 run_consolidation 返回 Invalid，claim 卡在 Running 且重试同样失败（资金侧安全，但缺少终态记录）。
+- 结论：verified（E13/V096.a 巩固调用单独计量与阶段越权拒绝子范围）。须在 #74 之后合并。回滚点 `d2929c7`。（固定 head `400f707`，已合并，merged_sha `887b1d714581ae8a71d45243d38be1759697600d`）
+- AG-029（#76）第一轮：主控复跑 777/0 全绿；反例 D2 通过（管理作业正文不同会隔离）。反例 D1 暴露卡中遗漏：锚在备份之后记录环境漂移（environment_drift.v1）时，恢复旧备份不隔离，旧备份会静默忘记 scope 已失效。已退回 R1，把 drift 加入受保护口径；consolidation_scope 索引不纳入，因为 drift 受保护后失效事实已可比较，索引中的 claim 也由受保护的 claim 覆盖。AG-029 返修后将叠到 #77 之上。
+
+#### AG-031 派发（E13 缺陷：终态类别超过 128 字节时 claim 卡在 Running）
+- 裁决：终态类别由确定性的有界函数推导（≤128 字节原样使用；超长时在 UTF-8 字符边界截断，并加上原因全文 sha256 前 16 位作后缀；空原因映射为固定字面量），所有终态写入路径统一经过它；不改 schema 与上限，不另存原因全文。交给 AG-030 实施方（有上下文）。卡 cards/AG-031.md（SHA-256 451847869aadb4a71d244efcd66309e681b9efc3a29e8f5e2172297b989ea3c6），基线 400f707（#77）。
+
+#### CTRL-AG029-R2 / PR #76：返修验收与线性叠放
+- R1 `35d0f81`：environment_drift.v1 加入受保护口径（Python 元组与 PROTECTED_ACTION_SCHEMA_VERSIONS 同步，后者由 9 项增至 10 项）；新增两个用真实 record_environment_drift 的测试（备份之后的漂移 → 恢复隔离；恢复之后的漂移 → 启动门隔离，且只点名 drift 记录）。consolidation_scope 索引仍不纳入，理由已按代码核实：claim_ids 与 invalidated_by 分别只与受保护的 claim、drift 在同一事务中写入。实施方的变异实验揭示了漂移守卫的局限：两侧同时缺同一类时守卫仍通过，所以必须有逐类覆盖测试，本 PR 已具备。
+- 线性叠放：从 d2929c7 rebase 到 #77（400f707）之上，得到 `9f740e4`/`43984ab`，补丁逐字节相同；以 force-with-lease（锁定 35d0f81，使用 ${B} 形式）推送后转 ready。
+- 主控复跑（主控专用 target 目录 target-ctrl-ag029，`qa/ctrl-stack-ag029-43984ab.log*`）：fmt 0；clippy 0；全工作区 61 个测试二进制 791 通过 / 0 失败（778 + 13）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例第二轮（`qa/ctrl-ag029-adversarial-r2.log`，真实 restore_backup.py）：D1 备份之后在锚上记录环境漂移 → 现在隔离（第一轮不隔离，R1 已修复）；D2 管理作业正文不同 → 隔离。
+- 已知边界（实施方披露，主控接受）：development_cycle.v2 与 report binding、scope 索引中的 cycle_ids 不受保护。周期数比锚少的备份仍可恢复，但关闭周期不花钱、按 report fact 幂等，且只要有 claim 就受保护，没有重做花费或动作的路径。备份之后产生、恢复前已被脱敏的派生内容无从比较，这是既有口径的性质。
+- 结论：verified（E16.5/E08 本轮新增动作、幂等与失效事实的恢复覆盖子范围）。固定 head `43984ab3ecc0833e435bb25ddc4b6b3f2adadbf5`（已合并，merged_sha `7120842a1f586ae394b76e146c8298f11bec52bc`）；须在 #77 之后合并。回滚点 `400f707`。
+
+#### AG-032 派发与下一批侦察（基线 43984ab 栈顶 #76）
+- AG-032（E10/E07 精度修复）：回放存储读路径遇脱敏墓碑时返回点名的 Conflict（沿用 AG-024 与 AG-027 的惯例）；提交检查比对 tombstone 的 source_kind 与依赖 kind。卡 cards/AG-032.md（SHA-256 fbcfcebb4215704416d1f2338eee5dd5ec3eb1fa0fb5cee7d850fe19407b72c4）。
+- 侦察：E09 run_next 的可信性缺口（Fixture 报告被记为 Valid、从不构造 RepairableFailure、优化历史不进入请求与签名）；E14 第二增量（MetaTrial 最小程序子范围、Improver 批准登记、下一项 Improver 作业使用 I1）的可行性。
+
+#### CTRL-AG031-R1 / PR #78：E13 终态类别有界（主控独立验收）
+- 交付 `1bc3961`（基线 400f707；monitoring.rs +61/−8，新增公开纯函数 `terminal_category`：1..=128 字节原样使用，空原因为 "unspecified"，超长时在 UTF-8 字符边界截断并加上 `…#<sha256 前 16 hex>` 后缀，总长不超过 128 字节；唯一出口 persist_terminal_run 与 complete_no_contrast 都经过它；删除原先的 Invalid 拒绝；原因全文不另存。新测试 consolidation_terminal_category_v42.rs 共 10 项）。实施方先复现了旧的 Invalid 失败，再修复；9 处变异全部被测试杀死。
+- 线性叠放：从 400f707 rebase 到 #76（43984ab）之上，得到 `892ed1c`，补丁逐字节相同；以 force-with-lease（锁定 1bc3961，使用 ${B} 形式）推送后转 ready。
+- 主控复跑（全新 target 目录 target-ctrl-ag031，`qa/ctrl-stack-ag031-892ed1c.log*`）：fmt 0；clippy 0；全工作区 62 个测试二进制 801 通过 / 0 失败（791 + 10）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例 2/2：(1) 随机性质检查（`qa/ctrl-ag031-adversarial.log`）：4000 个原因，其中 3253 个超长，混合 1–4 字节字符及标记字符 … 与 #，全部满足有界、确定、短原因原样、截断部分为原因前缀、摘要正确；(2) 撤销后检查（`qa/ctrl-ag031-adversarial-b.log`）：长原因 Rejected 终态之后撤销 source-1，清理到 Complete，任何存储对象都不再含原因全文，只有 consolidation_run 记录保留有界类别。实施方原先"读代码得出"的结论由此变为实测事实。
+- 设计观察（非阻断）：一个特意构造、恰好等于"某长原因截断加摘要"的短原因，会得到相同的类别。类别不参与身份或幂等比较，只影响显示，无安全影响。
+- 结论：verified（E13 巩固终态类别有界、claim 不再因长原因悬挂）。固定 head `892ed1cebaf50ea3a7ae2a38ddd05d70313637b1`（已合并，merged_sha `84d8a7054c2428db0f821fcd478c615b09ade76b`）；须在 #76 之后合并。回滚点 `43984ab`。
+
+#### AG-033 派发（E09 PR-A：run_next 的可信观察门与证据标签）
+- 依据 E09 第二次侦察：run_next 把 Fixture 报告记为 Valid，未调用 E03 门，分数为 runner 自报；可修复故障在生产代码中零写入；历史不进 decide、请求与签名；NoChange 与 KeepIncumbent 被混记为 HardFailure。拆分为 PR-A（可信门）、PR-B（可修复故障来源与 Recover 端到端）、PR-C（历史进入请求与签名），先做 PR-A。
+- 裁决：Candidate 且非 Fixture 时同 session 过 E03 门，质量取服务端重算分；Fixture 或门拒绝 → HardFailure 加证据标签（FixtureDeclared/EvidenceRejected），dispatch 仍为 Observed（付费后不能事后报错，否则会卡死）；不新增 ObservedStatus 变体、不升 DISPATCH_SCHEMA、不改 Outcome 形状；final_candidate_request 只接受 Trusted 且 Valid 的节点；授权最小修改两个既有测试（exploration_v41 的 chain、meta_inheritance_v42:1175–1217）。卡 cards/AG-033.md（SHA-256 d69d91241fc1212ca0fd72ca1323db2d09eaa953738bbdfb098194f09c4ec13f），基线 892ed1c。
+
+#### AG-034 派发（E14.2a MetaTrial 分叉，程序范围）与 E14 侦察要点
+- E14 第二次侦察要点：增量 1 的各部件在生产路径上互不相连（没有非测试调用者，world.policy 来自请求、未与获批内容绑定）；真批准在结构上不可达（streaming_evaluator 的 promotion_eligible 恒为 false，评估证据只有 ProgramFixture，release_store 的批准恒 Forbidden），因此 E14.2 只能做 ProgramFixture 范围的授权登记，不得称为生产批准或改进；meta.start 只能接成"登记与绑定"型消费者（受信的 OptimizationStepRequest 无法由 JSON 构造），且须排在 AG-032（dispatch.rs 相邻改动）之后。
+- 主控裁决 D1–D5：ProgramFixture 范围的登记（命名不用 release 或 approved improvement）；Improver 作业在本增量只作登记型标注，真正由 I1 提出或筛选 I2 另立 E14.3；存储用探索信封内的新 record_kind；meta.start 后置；每流额度 = 世界级声明上限 + 共享根额度，"一流可能饿死另一流"如实记录，不拆 billing scope（拆分与 E04 相悖）。
+- 既有缺陷（记为后续任务，不在 AG-034 中修）：registration_fingerprint 纳入了 run_next 会改写的 remaining_root_micros/remaining_recovery_dispatches（与代码注释不符），dispatch 之后重放 register_world_idempotent 得到 Conflict；exploration.start 的 status 重验的是"当前"纯决策，首次 dispatch 之后必为 Conflict。run_next 目前没有生产调用者，暂无生产影响。其他附带发现：evo-core lib.rs 中 MetaEvidence 的 "Equal total budgets" 注释与 §9/V035 相悖；contract.rs 中 v1 improver 字段的 consumer 为 "worker"，但没有对应模块（E02/V044）。
+- AG-034 卡 cards/AG-034.md（SHA-256 3b1cd8c125a63c8afb9924825933409fd6b216c105b27e16a00d9772f5de5253），基线 892ed1c；exploration.rs 只做纯增量，以免与 AG-033 冲突。
+
+#### CTRL-AG032-R1 / PR #79：E10/E07 回放读路径点名脱敏记录、提交检查比对 tombstone 的 source_kind（主控独立验收）
+- 交付 `5880ba6`（基线 43984ab；3 文件 +1924/−12，生产代码 +110/−12）：
+  - evo-storage replay.rs 新增私有 `read_envelope`：先读原始正文，若为 `rsia.redacted.v1` 则返回 `Conflict("replay <record kind> <id> was redacted because its source was revoked")`。覆盖世界、池、报告的读取，以及 register_replay_pool 与 put_replay_report 对既有记录的读取。其余解码失败保持原分类（池与报告为 Internal，世界为 Invalid）。
+  - dispatch.rs 的 `ensure_dependencies_live` 只在 tombstone 的 source_kind 等于依赖 kind 时才拒绝；tombstone 无法解析或 source_kind 不是 run/artifact 时 fail-closed；其他依赖 kind 只做脱敏正文检查（生产中的依赖 kind 只有 run 与 artifact，已核对 private_dependencies）。
+  - 新测试 replay_redacted_reads_v42.rs 共 8 项；dispatch 直接调用矩阵 16 例；storage 单测 1 项。
+- 线性叠放：从 43984ab rebase 到 #78（892ed1c）之上，得到 `8954b6c`，补丁逐字节相同；以 force-with-lease（锁定 5880ba6，使用 ${B} 形式）推送；PR 正文改为叠在 #78 之上，然后转 ready。
+- 主控复跑（全新 target 目录 target-ctrl-ag032，`qa/ctrl-stack-ag032-8954b6c.log*`）：fmt 0；clippy 0；全工作区 63 个测试二进制 811 通过 / 0 失败（801 + 10）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例（探针源 `qa/probe-ag032/append.rs`，SHA-256 310e3ddc…；head 日志 `qa/ctrl-ag032-adversarial.log`；基线 892ed1c 对照日志 `qa/ctrl-ag032-adversarial-base892ed1c.log`）：
+  - P1（通过）：撤销 source-2 后，真实清理每步只处理 1 个节点，共 12 个状态（Pending → Running ×10 → Complete）。每个状态下调用 12 个读入口：报告（admin/evaluator）、verified view（两种角色）、池、两个世界、register_replay_pool、put_replay_report、run_persisted_replay、run_and_persist_pool_replay、dispatcher status。没有任何一个返回 Ok 或 Internal：清理前为 watermark Conflict，之后依次点名世界、池、报告的脱敏。基线 892ed1c 同一探针在第 6 步返回 Invalid("sealed world is not ReplayWorldV2")，第 8 步返回 INTERNAL，即修复前失败、修复后通过，而且覆盖的是真实的中间状态，不是手写的部分脱敏。
+  - P2（同 id 碰撞，误放行方向）：artifact X（严格 import_source）先被撤销，再对同 id 的 run X 调 begin_revoke，返回 **INTERNAL**；水位不变，没有写入任何东西，run 行仍在。之后依赖 run X 的 exploration.start：head 在提交闸门放行（tombstone 的 source_kind 为 artifact），作业以 forbidden 失败（作业内按 id 判 tombstone 的检查兜住），没有使用该 run；基线在提交闸门拒绝。结论：AG-032 按裁决行事，端到端仍拒绝；暴露的是 lifecycle.rs 的既有缺陷，见下文 AG-036。
+  - P3（清理期间提交，超出本卡范围的信息性探针）：撤销 source-2 后，每个清理步提交一次 replay.run。在池被脱敏之前（第 0–19 步）的 20 次提交全部被接受，作业都以 conflict fail-closed，没有 Succeeded；从第 20 步起提交被拒。但清理 Complete 后，**20 个被接受作业中有 8 个的私有输入仍是明文 `rsia.management_private_input.v1`**（第 9、12、14–19 步提交的）。基线 892ed1c 结果相同（20/8），所以这是 AG-027（#74）管理清理闭包的既有缺口，不由 AG-032 引入。立为 AG-035。
+- 结论：verified（E10/E07 子范围：回放读路径在撤销后的每个真实中间状态都返回点名的 Conflict，不再返回 Internal 或 Invalid；提交检查按 source_kind 精确判定，无法解析时 fail-closed）。固定 head `8954b6c86cbe1bc1a5c0b957828080b59f1d1704`（已合并，merged_sha `b262bbb2a0ea9ead68bc33fe1e58235e85bcffea`）；须在 #78 之后合并。回滚点 `892ed1c`。
+- 实施方如实披露的边界（主控接受）：
+  - validate_sources_live、evidence.rs、development.rs、curriculum.rs、practice.rs、import.rs、packages.rs 仍按 id 判断 tombstone，所以"提交被接受"不等于作业一定通过（P2 实测就是作业以 forbidden 兜住）。
+  - seal_replay_world 与 put_replay_world_draft 对脱敏正文本来就返回 Conflict（消息较通用），未改。
+- 新发现的缺陷（均为既有缺陷，另立任务）：
+  - **AG-035（§11 清理闭包，高）**：begin_revoke 之后、直接依赖被脱敏之前接受的管理提交，其私有输入不一定能被清理到达；清理 Complete 之后仍有明文。漏掉的序号不单调，疑为清理枚举依赖的游标与并发插入发生竞争。待侦察后定卡。
+  - **AG-036（§11 撤销登记，中）**：tombstone 只以 id 为键。同 id 的 run 与 artifact 中，后撤销的一方 begin_revoke 返回 Internal（load_status_by_source 找不到该 kind 的状态），撤销无法登记，run 行与明文永不清理；外部只看到 Internal。待侦察后定卡。
+- 合并链模拟（17:55，origin/main 0c43e0f，git merge-tree 按 A–U 顺序逐个合并 21 个固定 head）：全部无冲突；最终树 `25e6f13b62d5…` 与 #79 head 的树逐字节相同，所以按顺序合并后 main 的内容就是主控已复跑（811/0）的那棵树。
+
+#### CTRL-AG033-R1 / PR #80：E09 run_next 的可信观察门与证据标签（主控独立验收）
+- 交付 `3d01a4f`（基线 892ed1c；5 文件 +3113/−82）。
+  - exploration.rs：
+    - Candidate 且非 Fixture 时，在付费步骤之后的同一写节点 session 内调用 E03 门（`judge_candidate_evidence`）。
+    - 质量取门重算分的均值。
+    - Fixture 短路为 FixtureDeclared；门的 Forbidden/Conflict/NotFound/Invalid 为 EvidenceRejected；Internal/Budget/Cancelled 走既有 Uncertain 路径（固定字面量 `development_evidence_unverified`）。
+    - 节点与 dispatch fact 各加 `#[serde(default)] evidence`，默认 NotObserved。
+    - 未新增 ObservedStatus 变体，DISPATCH_SCHEMA 仍为 v2。
+    - final_candidate_request 只接受 Valid 且 Trusted 的节点。
+    - MechanismUsageRecordV1 增加 `evidence()`。
+  - optimization.rs 只新增 `development_stage_fact_ids`（镜像 `optdev-` 改写，漂移时 fail-closed）。
+  - 新测试 exploration_trust_v42.rs 共 11 项，另有 6 个单测。
+  - 授权修改的两个既有测试：exploration_v41 的 chain 测试改为 FixtureDeclared + Widen root2 + 末尾 Stop；meta_inheritance_v42 通过 `promote_to_trusted_valid` 预置节点，所有原断言保留。
+  - 实施方做了 16 处变异，全部被测试杀死。
+- 偏差裁决（主控接受）：
+  - NotFound/Invalid 归入 EvidenceRejected：无回执的伪造声明在门内表现为 NotFound，畸形事实为 Invalid。
+  - provenance 从同 session 已存的 DevelopmentObserved 事实读取。
+  - 门无法回答时走既有 Uncertain 路径而非保持 Claimed：保持 Claimed 会重现卡死。
+- 线性叠放：从 892ed1c rebase 到 #79（8954b6c）之上，得到 `04e6309`，补丁逐字节相同；以 force-with-lease（锁定 3d01a4f，使用 ${B} 形式）推送；PR 正文改为叠在 #79 之上，然后转 ready。
+- 主控复跑（全新 target 目录 target-ctrl-ag033，`qa/ctrl-stack-ag033-04e6309.log*`）：fmt 0；clippy 0；全工作区 64 个测试二进制 828 通过 / 0 失败（811 + 17）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例 2/2（探针源 `qa/probe-ag033/append.rs`，SHA-256 cb1b77b8…；日志 `qa/ctrl-ag033-adversarial.log`，第一轮因探针辅助函数要求恰有 1 个 observed fact 而中断，日志留作 `.run1`）：
+  - C1（跨世界回执重放）：world-a 用诚实的 ContrastRunner 得到 Trusted。
+    - world-b 原样回放 world-a 的报告：步骤自身的绑定检查拒绝（development report binding mismatch），不写 DevelopmentObserved；节点为 HardFailure/NotObserved；dispatch 已消费；final_candidate_request 拒绝；重连得到同一终态。
+    - world-c 把报告身份改写为本请求、回执仍是 world-a 的：门拒绝（直接问门得到 Conflict "execution receipt does not bind the registered control and request"）；节点为 HardFailure/EvidenceRejected，原因为固定字面量；dispatch 已消费，不卡死；final_candidate_request 拒绝。
+  - C2（付费之后、门之前撤销来源）：runner 诚实执行后撤销 run-failure。run_next 走既有的"派发后来源闭包变化"路径：节点为 usage_uncertain/NotObserved，dispatch 为 uncertain 终态，没有 Trusted。重连、新一步、final_candidate_request 都以 watermark Conflict 拒绝；新一步的 runner 与模型调用数不变（零新增花费）。
+- 主控核实：回执签发函数（issue_execution_receipt、issue_grader_receipt、settle_registered_execution_call、reserve_budget_call_with_sources、begin_budget_dispatch）在 evo-http、evo-mcp、apps 中均无引用；生产中唯一调用方是 RegisteredDevelopmentRunner（development.rs:1959/1967/2103）。
+- 设计观察（非阻断，记入 E03 后续）：E03 门验证的是回执链（预算行、结算、执行与评分回执、重算分、来源存活），不重算已登记纯函数的输出。测试中的 ContrastRunner 以 Worker/Evaluator 身份经公开签发函数，为已登记纯函数不可能产生的输出（两侧不同）签发 RegisteredPureFunction 回执，门判为 Trusted。所以 Trusted 的含义是"进程内执行方按预算结算签发的回执链自洽"，不是"已登记函数可复算地产生了该输出"。接入真实执行器时，应把执行方身份绑定到登记的执行器；对 RegisteredPureFunction 来源，可在门内复算输出摘要。
+- 结论：verified（E09 子范围：run_next 只把经 E03 门验证的开发证据记为 Valid 节点；Fixture、伪造、重放或分数不符的证据被标记为 HardFailure 终态，不能驱动后继，也不能成为最终候选；付费后的拒绝不会卡死 dispatch）。固定 head `04e63092f2995c3668e14640c985012fd6a6a2b2`（已合并，merged_sha `9e3e350ed5fbef2975117f12a7f8d3ca3b9cdcbf`）；须在 #79 之后合并。回滚点 `8954b6c`。
+- 已知边界（如实披露，主控接受）：
+  - 可信 Valid 对生产 runner 仍端到端不可达（RegisteredDevelopmentRunner 两侧相同）。
+  - 旧 Valid 节点读作 NotObserved：仍可被 Deepen，但永远不能成为最终候选。目前没有生产调用者产生节点，所以没有存量；建议在 E09 PR-C 中让 Deepen 也要求 Trusted。
+  - 门返回 Internal/Budget/Cancelled 的路径只有单元测试。
+  - 线格式只前进不后退。
+  - run_next 付费之后既有的 Err 路径（prefix changed，以及 skill_snapshot_digest/fingerprint 上的 `?`）仍可能卡死 claim，记入 E09 PR-B。
+  - NoChange 与 KeepIncumbent 仍记为 HardFailure。
+
+#### CTRL-AG034-R0 / PR #81：E14.2a MetaTrial 分叉第一轮验收（退回 R1）
+- 交付 `530a03d`（基线 892ed1c；4 文件 +4573/−6）。
+  - meta.rs：
+    - MetaTrialV1 存在探索信封内，record_kind 为 meta_trial_v1；读后写，同 id 同内容幂等，异内容 Conflict。
+    - 可信 `MetaTrialCoordinator::fork`：请求只含 trial_id、S0 模板、new_content、billing_scope，带 deny_unknown_fields；模板策略必须是 I0；new_content 过 ImproverContentV2::parse 与 MetaCandidate::validate；两世界只差 id 与 policy。
+    - persist_trial 在同一 session 内先 validate_stored_sources（水位、tombstone、可信来源），再写记录和依赖边（试验 → 每个来源 run、试验 → 两个世界）。
+    - 读侧 `verified_meta_trial`：视图不可从 JSON 构造；派生状态为 candidate_only 或 usage_observed。
+    - `stream_request_id` 为纯函数。
+  - exploration.rs 只做纯增量：4 处 pub(crate) 加 registered_world。
+  - lifecycle.rs 追加一个 redact 分支。
+  - 新测试 meta_trial_v42.rs 共 25 项，另有 8 个单测；实施方做了 6 类变异，全部被杀死。
+- 偏差（主控接受）：
+  - fork 不在同一事务内：单连接存储无法嵌套 register_world_idempotent 的事务；以"重放收敛"保证，并有删除记录模拟中间状态的测试。
+  - 比卡片更严：billing_scope 必须是本 namespace 已授权的根预算；模板必须是全新世界；候选不能等于 I0；trial id 不超过 64 字节。
+- 线性叠放：从 892ed1c rebase 到 #80（04e6309）之上，得到 `df4a23d`。改动行逐行相同，只有 exploration.rs 的 hunk 偏移随 AG-033 的新增下移。以 force-with-lease（锁定 530a03d）推送，PR 正文改为叠在 #80 之上。叠放后先跑定向测试：meta_trial_v42 25、meta_inheritance_v42 15、exploration_trust_v42 11，全部通过，说明与 AG-033 的语义兼容。
+- 主控复跑（全新 target 目录 target-ctrl-ag034，`qa/ctrl-stack-ag034-df4a23d.log*`）：fmt 0；clippy 0；全工作区 65 个测试二进制 861 通过 / 0 失败（828 + 33）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控核读：
+  - fork 前置检查对不可信或缺失的来源闭包在写记录之前就拒绝（validate_stored_sources → load_stored_source 要求 `rsia.optimization.source.v1` 且 authority 校验通过），不会留下孤儿记录。
+  - 实施方的撤销测试已覆盖：撤销后 fork 新 trial 不留记录；清理后读为点名 Conflict；重新 fork 被拒。
+- 主控反例（探针源 `qa/probe-ag034/append.rs`，SHA-256 前缀见本节命令输出；日志 `qa/ctrl-ag034-adversarial.log`）：
+  - T2（通过，恢复覆盖）：fork 之后，read_control_plane_facts 的 protected_objects 从 0 增至 3，包含试验记录与两个流世界（探索信封 schema 已在 PROTECTED_SCHEMA_VERSIONS 与 restore_backup.py:254 中，按 schema 选取）。
+  - T1（**发现**，V035 实耗如实记录）：namespace 另授权 scope-2；old 流在 scope-1 下花 2 次 14 micros；new 流用 scope-2 的 broker 真实花 2 次 26 micros。verified_meta_trial 却报 new 流 calls=0、actual=0，status=UsageObserved：静默少报。
+- 裁决 R1（真源 §9 L1000–1023、V033/V035）：两流比较的前提是同一预算上限；任一流在声明 scope 以外有调用即破坏前提，必须失败闭合。
+  - evo-storage budget.rs 新增一个只读、按 namespace 隔离的查询（dispatch group 出现过的 billing scope 列表），不加迁移；
+  - verified_meta_trial 发现声明 scope 以外有调用时返回固定格式的 Conflict；
+  - 白名单只为该查询增加 budget.rs；
+  - PR 正文的实耗表述改准确。
+  - 已退回原实施方（保留上下文），在 df4a23d 之上追加提交。
+
+#### AG-035 / AG-036 派发（E08/§11 撤销闭包的两个既有缺陷；基线 04e6309 = #80）
+- 侦察（只读，树 8954b6c）结论：
+  - AG-035 根因在 E08 清理本身。闭包惰性展开，依赖按 (src_kind, src_id) 以严格 `>` 的前向键集游标翻页；节点末页之后置 expanded，永不复扫；pending==0 即置 Complete，没有完整性复核。用探针的 20 个私有输入 id 离线复算，与漏网集合 {9, 12, 14–19} 精确吻合。
+  - 侦察同时列出 begin_revoke 之后仍能挂新依赖者的写入点：管理提交、store_source_selection、DispatchObserved 迟到事实、Uncertain 探索节点、预算预留（budget-ref → run）。
+  - AG-036：tombstone 主键只含 id，begin_revoke 命中他 kind 的 tombstone 时 `ok_or(Internal)`（lifecycle.rs:185）；run（Host 自选 id）与 import_source（派生 id）在两条创建路径上都不互查。
+- AG-035 裁决：cleanup_step 在 pending==0 时于同一事务内做不动点复扫（依赖边；并核实或补上迟到预算调用的请求正文），复扫为空才置 Complete。
+  - 终止性由 frontier 单调、节点有限保证；迟到的未分类节点使作业 Failed（失败闭合）。
+  - 写入方闸门与 Complete 之后的迟到写入另立后续。
+  - 卡 cards/AG-035.md（SHA-256 567344f66f45b2bdd527326dfd30bb7e356b3b5567d7eb08171f10d0400856a3）。
+- AG-036 裁决：
+  - begin_revoke 遇他 kind 的 tombstone 时：对象不存在为 NotFound，存在为点名 Conflict，什么都不写（绝不落到 upsert 覆盖第一枚 tombstone）；
+  - store_trace_authority 与 import_source 创建互查同 id 的撤销源，冲突时 Conflict 且不写入；
+  - tombstone 键带 kind 的长期方案另立（信任锚格式变更）。
+  - 卡 cards/AG-036.md（SHA-256 a748fb5e84f68356401311ed99f61c85a84aecc33c8f662cdef55db05a88ed02）。
+- 两卡并行：AG-035 只改 cleanup_step 完成判定一带，AG-036 只改 begin_revoke，与 AG-034 的分类分支互不相邻；新测试各放新文件。
+- 后续候选（未派）：
+  - AG-035b 写入方闸门：提交时上游闭包检查（会翻转 dispatch_management.rs:1541–1556 与 management_cleanup_v42.rs:3153–3208 两处钉住"提交接受、作业失败"的测试）；预算预留的来源检查；store_source_selection 的闸门；replay_experiment start 的 TOCTOU 及其信封未分类；Complete 之后的迟到写入。
+  - E09 PR-B 与 PR-C；E14.2b 与 E14.2c；registration_fingerprint 既有缺陷。
+
+#### CTRL-AG034-R1 / PR #81：返修验收
+- R1 `c5c04ba`：在 df4a23d 之上快进追加，未 force。3 文件 +546/−28。
+  - budget.rs 新增只读的 `Session::budget_call_scopes_for_group`：按 namespace 隔离，DISTINCT 加 ORDER BY，无迁移。
+  - meta.rs 的 `stream_spend` 在同一账本快照内先查 scope 列表，有声明 scope 以外的就返回固定格式的 Conflict（只点名流）。
+  - 测试由 25 项增至 29 项。实施方的变异检查：关掉检查即回到假账；去掉 namespace 过滤或 DISTINCT 会被存储层测试抓到；去掉 ORDER BY 测试抓不到（SQLite 恰按索引序返回），已在 PR 中如实写明。
+- 主控复跑（target-ctrl-ag034，`qa/ctrl-stack-ag034-c5c04ba.log*`）：fmt 0；clippy 0；全工作区 65 个测试二进制 865 通过 / 0 失败（861 + 4）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例第二轮（`qa/ctrl-ag034-adversarial-r1.log`；探针 `qa/probe-ag034/append.rs` 只把 authorize_second_scope 调用补成 R1 的新签名，原版留作 append-r0.rs）：
+  - T1：修复前 new 流在 scope-2 真实花费 26 micros，视图却报 0 且为 UsageObserved；修复后视图返回 Conflict("meta trial new stream: its dispatch group was billed outside the trial's billing scope")。
+  - T2：恢复覆盖仍成立（protected_objects 0 → 3，含试验记录与两个流世界）。
+- 结论：verified（E14.2a 程序子范围）。
+  - 同一 S0 的两条探索流由可信 fork 构造，只差 id 与 policy；声明上限相同。
+  - 各流实耗按试验声明的 billing scope 如实读出；任一流在其他 scope 下有调用时试验不可验证。
+  - 撤销后封锁并被清理脱敏；试验记录受恢复保护。
+  - 固定 head `c5c04bad5c349f00c815bb02c9a3eccc439b0da7`（已合并，merged_sha `d9b3f6f5234ad14da18956a78c804e4c6818fa10`）；须在 #80 之后合并。回滚点 `04e6309`。
+- 不可声明：I1 更优或任何元收益；逐步同证据；按流的硬额度（共享根额度，一流可饿死另一流，已有测试钉住）。
+- 已知边界：
+  - 在没有任何调用之前，billing_scope 只是试验自己的声明；
+  - fork 重放不读账本；
+  - meta.start 接线（E14.2c）尚未做，流的 broker scope 目前由调用方保证。
+- 合并链模拟（18:55，origin/main 0c43e0f，A–W 共 23 个固定 head，git merge-tree 逐个合并）：全部无冲突；最终树 `fe7dfbbf8b65…` 与 #81 head 的树逐字节相同，主控已在该树上复跑（865/0）。合并脚本 `merge-all.sh` 由 user-commands.md 自动生成：23 条命令按 A–W 顺序排列，每条都钉住 head，遇第一处失败即停；生成时已与线上 23 个 PR 的 head 逐一核对，全部一致且都不是 draft。
+
+#### 合并进展（19:05，由用户在终端运行 merge-all.sh）
+- A #60 `dc036d5`、B #59 `69a3b3e`、C #61 `b220971`、D #62 `9c3ec97`、E #63 `3e2fc06`、F #64 `f8fa1a1` 已合并（main = f8fa1a1）。
+  - #60 由主控在用户加入 `Bash(gh pr merge:*)` 允许规则后执行；随后主控查询其状态被分类器以 Merge Without Review 拦截，主控停止，其余由用户运行脚本完成。
+- G #65 无法合并（GitHub：merge commit cannot be cleanly created），原因：
+  - #65 的 head f752e1d 是把 #60 合进来的合并提交，与新 main 有两个合并基（71c0fa8、2e5c668）。
+  - git ort（虚拟基）干净合并，结果树 `4908527b` 与 f752e1d 的树逐字节相同；只用单一合并基 71c0fa8 时，docs/implementation-ledger.md 冲突。GitHub 判为不可合并，与后者一致。
+- 修复方案：在 #65 分支上加一个合并提交，父为 f752e1d 与 main，树保持 f752e1d 不变。主控试图创建它，被分类器以 Auto-Mode Bypass 拦截。已把现成命令交给用户：命令只创建该提交、快进推送并钉住新 head 合并 #65，然后重跑脚本继续 H–W。
+- 推理：H–W 都线性叠在 f752e1d 之上，各自只有一个合并基，不会再遇到这一问题。最终模拟同样被拦，主控未实际跑。
+
+#### CTRL-AG035-R1 / PR #83：E08/§11 撤销清理只在闭包不动点处完成（主控独立验收）
+- 交付 `44fe003`（基线 04e6309；lifecycle.rs +287/−1，两个新测试文件共 11 项）。
+  - cleanup_step 在 pending==0 时，于同一事务内先调用 `closure_is_open` 再置 Complete：
+    - (a) `queue_late_dependents`：找 dst 为本作业已 expanded 节点、src 不在本作业 frontier 的依赖行，每步至多入队 edge_page_limit 个；
+    - (b) `redact_late_budget_calls`：用与 `__budget_scan` 相同的判据，复核尚未脱敏的预算请求正文。
+  - 实施方查明 (a) 不覆盖迟到的预算调用：budget-ref 属保留类，不带 source_ids 的调用没有边。已按同一原则补上 (b)。
+  - 迟到的未分类节点或未知请求 schema 会让作业 Failed（失败闭合）。
+  - 新增两种审计事件 late_dependents_queued 与 late_budget_calls_redacted。
+  - 无迁移，未改提交闸门与各写入方。
+- 修复前失败、修复后通过：
+  - 存储层 7 项、引擎 P3 1 项在基线失败；基线上漏网集合正是 {9, 12, 14–19}。
+  - 无迟到边的步数常量取自基线实测，修复后不变。
+  - 3 处变异被测试杀死。
+- 线性叠放：从 04e6309 rebase 到 #81（c5c04ba）之上，得到 `fee5897`。改动行逐行相同，只有偏移变化。以 force-with-lease（锁定 44fe003）推送；PR 正文改为叠在 #81 之上，然后转 ready。
+- 主控复跑（全新 target 目录 target-ctrl-ag035，`qa/ctrl-stack-ag035-fee5897.log*`）：fmt 0；clippy 0；全工作区 67 个测试二进制 876 通过 / 0 失败（865 + 11）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 恢复兼容核查：revoke_cleanup_events.event_kind 没有 CHECK 约束；restore_backup.py 只插入自己的 logical_block_restored 事件，不校验已有事件种类。新事件种类不影响恢复。
+- 主控反例 2/2（探针源 `qa/probe-ag035/append.rs`；日志 `qa/ctrl-ag035-adversarial.log`）：
+  - Q1（主控 P3 加断言）：清理期间每步提交一次 replay.run，共 20 次被接受；63 步后 Complete，明文私有输入 0 个（892ed1c 与 8954b6c 上为 8/20）。
+  - Q2（两个闭包重叠的清理作业）：先撤销 source-2；第 3 步再撤销 source-1（两者都是 world-1 的来源）。两作业交替单节点步进，每步之前都提交一次 replay.run，共 141 次被接受。724 步后两作业都是 Complete（无 last_error，未落入 unknown scope），明文 0 个。
+  - 观察：持续提交会推迟池的展开，从而推迟 Complete（只延迟、不漏删）。这再次说明提交侧闸门（AG-035b）有价值。
+- 结论：verified（E08/§11 子范围：Complete 时本作业依赖边闭包内没有未处理的依赖者，也没有符合判据却未脱敏的预算请求；P3 的明文残留已消除；崩溃重启后成立；两个重叠作业各自收敛）。固定 head `fee5897ff45070fc198c0f46daac9e364ce7e38d`（已合并，merged_sha `51db9b6c9a251def4e6566c96641ed8b63d43a85`）；须在 #81 之后合并。回滚点 `c5c04ba`。
+- 不可声明：撤销后在提交时即拒绝；Complete 之后的迟到写入；超出 MVP 规模的闭包；写入方以 upsert 覆盖已脱敏节点。
+
+#### CTRL-AG036-R1 / PR #82：E08/§11 同 id 的第二个撤销源点名拒绝、run 与 import_source 不再碰撞（主控独立验收）
+- 交付 `4b351da`（基线 04e6309；5 文件 +1191/−0）。
+  - lifecycle.rs 的 begin_revoke（:177–200）：遇他 kind 的 tombstone 时，对象不存在返回 NotFound，存在返回点名的 Conflict，什么都不写（绝不落到 upsert）。
+  - evidence.rs 的 store_trace_authority：在创建分支中，若同 id 有 import_source artifact，返回 Conflict。
+  - import.rs：在 register 写第一行之前，对每个 prepared source id 做 `ensure_import_source_id_is_free`（tombstone 为 Forbidden，同 id run 为 Conflict）。
+  - 新测试：存储 8 项、引擎 9 项。"什么都没写"由第二只读连接逐表比对。
+- 修复前失败、修复后通过：存储 4/8、引擎 5/9 在基线失败。3 处变异被杀死，其中包括"落到写入路径"这一陷阱。
+- 偏差（主控接受）：
+  - import 创建遇 tombstone 用 Forbidden，并先于 run 检查，与各读闸口径一致；
+  - 解码得出但 kind 未知的 tombstone 不回显存储串；
+  - store_trace_authority 只在创建分支检查，对已有同 id 对的同一 run 重存行为不变；
+  - 不可解码的 tombstone 仍为 Internal（Session::get 在比较 kind 之前就失败），有测试钉住。
+- 主控核读：prepared import source 在 register 时就以 `rsia.e16.import_source.v1` 写入（import.rs:1729、1790），所以 register 与 finalize 之间不存在 run 抢占同 id 的窗口。
+- 线性叠放：从 04e6309 rebase 到 #83（fee5897）之上，得到 `f15a42f`，改动行逐行相同。以 force-with-lease（锁定 4b351da）推送；PR 正文改为叠在 #83 之上，然后转 ready。
+- 主控复跑（全新 target 目录 target-ctrl-ag036，`qa/ctrl-stack-ag036-f15a42f.log*`）：fmt 0；clippy 0；全工作区 69 个测试二进制 893 通过 / 0 失败（876 + 17）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例（探针源 `qa/probe-ag036/append.rs`；head 日志 `qa/ctrl-ag036-adversarial.log`；基线 fee5897 对照日志 `qa/ctrl-ag036-adversarial-basefee5897.log`）：
+  - R1（P2 复验）：artifact X 先被撤销后，对同 id 的 run X 调 begin_revoke，返回 Conflict("cannot revoke run run-failure: the id is already revoked as artifact (a revocation tombstone is keyed by id)")。水位、第一枚 tombstone、run 行都不变；重复调用仍为同一 Conflict。基线 fee5897 上为 INTERNAL（修复前失败）。
+  - R2（与在途清理的交互）：被拒之后，第一次撤销（artifact）的清理照常到达 Complete，last_error 为空、pending 为 0。artifact 被脱敏，run 行原样保留；tombstone 的 source_kind 仍为 artifact。Complete 之后再次撤销 run，仍是同一点名 Conflict。
+- 结论：verified（E08/§11 子范围：同 id 的第二个撤销源得到点名的 Conflict 而不是 Internal，且不改动任何既有撤销记录；两条生产创建路径不再产生 run 与 import_source 的同 id 碰撞）。固定 head `f15a42fe94426a49e8967869f8087a99837fd4a5`（已合并，merged_sha `8d959dee844fb16f0763b0684ba3adf48ad75f1f`）；须在 #83 之后合并。回滚点 `fee5897`。
+- 不可声明：存量碰撞对象可以撤销（需要 tombstone 键带 kind 的后续方案，涉及信任锚格式变更与恢复双读）；经 raw put 的碰撞被阻止。
+- merge-all.sh 已重新生成并覆盖 A–Y（25 条）。生成时核对：A–F 已合并（不在 open 列表），G–Y 全部 open 且 head 与钉住值一致。#65 仍为 f752e1d，等待用户按方案 (a) 或 (b) 处理。
+
+#### 下一批侦察（19:30，只读，树 f15a42f）
+- E09 PR-B：run_next 付费后的 Err 路径会卡死 claim；RepairableFailure 与 Recover 端到端；NoChange 与 KeepIncumbent 的终态；registration_fingerprint 的可变字段缺陷；exploration.start status 在首次 dispatch 后必为 Conflict；Deepen 要求 Trusted。
+- AG-035b：写入方闸门，包括提交时上游闭包检查、预算预留的来源检查、store_source_selection、replay_experiment 的 TOCTOU 及其信封未分类、stage_package、Complete 之后的迟到写入。
+
+#### 侦察结论与派发（19:45–20:05，基线 f15a42f = 栈顶 #82）
+- AG-035b 侦察（写入方闸门）要点：
+  - 经济回放信封（rsia.replay_economic_artifact_envelope.v1）在清理器里未分类。撤销链 run → world → report → experiment → job 可达，清理会以 blocked_unknown_scope 失败，而不是 Complete。
+  - replay_experiment 的 start 存在 TOCTOU：会话 2 写 job 前不再重验来源。
+  - 预算预留无来源闸。begin_budget_dispatch 无闸：预留之后才撤销的调用仍会派发，属于出站泄露。
+  - 迟到响应在请求被脱敏之后仍以明文结算。
+  - 迟到的 DispatchObserved 在 Complete 之后留下明文。
+  - 提交时缺上游闭包检查（翻转测试已列出）；grant 与 stage_package 无闸（无生产调用方）。
+- E09 PR-B 侦察要点：
+  - 付费后有三类确定性 Err 会永久卡死 claim：前缀漂移、digest 的 `?`、world id 过长使节点 id 超过 128 字节；
+  - RepairableFailure 需要类型化来源；
+  - NoChange 与 KeepIncumbent 都记为 HardFailure；
+  - 两个新缺陷：X1，已有后继的父仍被重复 Deepen，命中同一 dispatch id，世界卡死；X2，子节点的最佳祖先口径与 PrefixViewV2::validate 不一致，父节点退步后世界变砖；
+  - registration_fingerprint 包含可变计数器；exploration.start 的 status 在首次 dispatch 之后必为 Conflict。
+- 磁盘：已合并的 AG-012 至 AG-017 各 worktree 均干净，其 head 都已在 origin/main 中；已移除这 6 个 worktree 与 target-ag-014 至 017，释放约 8 GB，可用空间 30 GB。
+- 派发（均基于 f15a42f，彼此不相邻，可以并行）：
+  - **AG-037**（卡 SHA-256 16e7e434…）：经济回放记录逐个精确列入 preserve 分类；start 在写 job 前重验来源。
+  - **AG-038**（卡 SHA-256 ec2d4b5e…）：预留闸与派发闸，按 kind 精确判定（run 类 tombstone 或不可解码时返回 Forbidden；派发被拒则释放预留、transport 调用 0 次）；结算类路径一律不拦；授权最小修改 AG-035 测试中的迟到预算调用构造。
+  - **AG-039**（卡 SHA-256 26e26d96…，B2）：Deepen 要求 Trusted；X1 已展开的父不再列为合法动作；X2 在 engine 侧按回放的 max 规则对齐校验口径（不改 evo-core 校验器）。每个缺陷先复现再修。
+  - **AG-040**（卡 SHA-256 9dac483b…，B3）：
+    - 指纹去掉两个可变计数器，计数器改为按登记时的值精确比对（由存储的当前值加已扣量还原，不足以还原则停下回报）；
+    - 新增 verified_world_registration_view；status 在世界已启动后改为比对首决策；run_exploration_start 重跑时取请求中的世界。
+- 排队中：
+  - AG-041（B1，付费后收敛，与 AG-039 在 run_next 中区域重叠，等 AG-039 完成后再派）；
+  - AG-042（B4，RepairableFailure 来源与 Recover 端到端，依赖 B2）；
+  - AG-043（迟到输出：结算时标为不可用并脱敏，以及 DispatchObserved 写入时脱敏）；
+  - AG-044（提交时上游闭包检查）；
+  - AG-045（grant 与 stage_package 闸门）；
+  - tombstone 键带 kind（信任锚格式变更）。
+
+#### CTRL-AG038-R1 / PR #85：E08/§11 来源已撤销的预算调用不预留、不派发，结算照常入账（主控独立验收）
+- 交付 `e06bfdd`（基线 f15a42f，即栈顶，无需叠放）：budget.rs +110；新增存储测试 13 项、引擎测试 7 项；按授权对 cleanup_fixpoint.rs 做了最小修改（+8/−7）。
+  - 预留闸（budget.rs:593–598）：在幂等提前返回之后、读根预算与首次写入之前，于同一事务内检查。来源以 run 撤销、tombstone 不可解码或 kind 未知时返回 Forbidden，什么都不写；同 id 的 artifact tombstone 不拒。
+  - 派发闸（budget.rs:1732–1740，同时覆盖 Store 与 Session 两条路径）：从调用的 budget-ref 读出已登记的闭包，命中已撤销来源时返回既有的 Cancelled。broker 随之走 release_undispatched，transport 调用 0 次，额度归还。
+  - 结算类路径一律不拦（finalize、settle、mark_uncertain、release、cancel、reconcile、close、refence），有测试钉住，"给 finalize 也加闸"的变异会被抓住。
+- 修复前失败、修复后通过：存储测试 6/13、引擎测试 5/7 在基线上失败；7 处变异全部被杀死。
+- 主控复跑（全新 target 目录 target-ctrl-ag038，`qa/ctrl-stack-ag038-e06bfdd.log*`）：fmt 0；clippy 0；全工作区 71 个测试二进制 913 通过 / 0 失败（893 + 20）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控核读：两个闸门的 tombstone 查询都按调用的 namespace 隔离（`WHERE namespace=? AND kind='tombstone' AND id=?`）。
+- 主控反例 2/2（探针源 `qa/probe-ag038/append.rs`；日志 `qa/ctrl-ag038-adversarial.log`）：
+  - G1（租户隔离）：m 撤销了自己的 run-r。n 有同 id 的存活 run，在 n 中对它预留得到 Reserved，派发得到 new_dispatch=true；m 中预留得到 Forbidden。
+  - G2（恢复路径不可绕过）：撤销之前预留，撤销之后首次派发得到 Cancelled，调用留在 Reserved，占用 20 micros。租约过期后 refence 成功（epoch 变为 2），用新租约派发仍得到 Cancelled；release 之后额度归零。
+- 结论：verified（E08/§11 子范围：来源撤销之后，对其不再产生新的预算预留，也不再向提供方派发预留在其上的调用，额度归还；已派发调用的真实费用照常对账）。固定 head `e06bfdd513efbbf87952bd8c822e2de12e803df7`（已合并，merged_sha `f4b1ef66340412f5c0edf69a48549cd1386324cf`）；须在 #82 之后合并。回滚点 `f15a42f`。
+- 已知边界（如实披露，主控接受）：
+  - 迟到响应在结算时不可用与脱敏的问题未做（AG-043）。
+  - 无 sources 的预留不拦，由 AG-035 的复扫兜底。
+  - 派发被拒时，broker 以通用理由 root_stopped_before_dispatch 释放，未写明真因。这是既有的笼统标记，记为后续：需要携带原因的决策。
+  - development runner 在派发被拒时不释放其 1 micro 的预留，与 root stop 和 group stop 时的既有做法一致；租约过期后可由 refence 加 release 收回（G2 已证）。
+  - tombstone 仍只以 id 为键。
+
+#### CTRL-AG039-R1 / PR #84：E09 合法动作与前缀卫生（主控独立验收）
+- 交付 `11b7019`（基线 f15a42f）。exploration.rs +52/−5；新测试 exploration_legal_actions_v42.rs 共 11 项（约 1000 行夹具复制自 exploration_trust_v42.rs，原文件未改）。
+  - Deepen 要求 evidence 为 Trusted（exploration.rs:1803），与 final_candidate_request 同口径。
+  - X1：节点已有子节点（search_parent_seq）后，不再提供它的 Deepen（:1780–1804）。
+  - X2：子节点的 best 取 max(父 quality, 父 best, 基线)，Valid 子节点再与自身 quality 取大，与回放（replay.rs:665–674）及 PrefixViewV2::validate 一致（:1293–1309）。gains 不变。
+  - 三个缺陷都先在 f15a42f 上复现：8/11 失败，其余 3 项钉住"不变"的行为。消融矩阵显示每处修复各自被对应测试抓住。
+- 偏差（主控接受）：X1 的判据用"已有子节点"，而不是卡中举例的"dispatch_ids 中已有该 action_seq"。claim 先于节点写入，后一判据会让 claim 中的 Deepen 从合法集消失，既不能 resume，付费后重核 legal 摘要也会失配。实施方实测该变体，7/11 失败。
+- 线性叠放：从 f15a42f rebase 到 #85（e06bfdd）之上，得到 `d4837f5`，补丁逐字节相同；以 force-with-lease（锁定 11b7019）推送；PR 正文改为叠在 #85 之上，然后转 ready。
+- 主控复跑（全新 target 目录 target-ctrl-ag039，`qa/ctrl-stack-ag039-d4837f5.log*`）：fmt 0；clippy 0；全工作区 72 个测试二进制 924 通过 / 0 失败（913 + 11）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例 2/2（探针源 `qa/probe-ag039/append.rs`；head 日志 `qa/ctrl-ag039-adversarial.log` 与 `-m.log`，第一轮因探针解析 seq 字段失误而中断，日志留作 `-m.run1.log`；基线对照日志 `qa/ctrl-ag039-adversarial-basee06bfdd.log`）：
+  - L（随机化混合结局）：5 种结局脚本（改进、持平、退步交替，含"先强后连续退步"）× 4 种世界形状与基线（1/2/3/5 个根，基线 0.1/0.3/0.5/0.9），证据全部经真实 E03 回执为 Trusted。20 个世界全部走到 Stop，没有任何动作被派发两次，结束后 decide_next、status 视图与 evo-core 前缀校验都通过。基线 e06bfdd 上第一个世界在第 4 轮即因 dispatch idempotency conflict 卡死（X1）。
+  - M（链中伪造标签）：两轮 Trusted 之后，把第 2 个节点的标签伪造为 fixture_declared（状态仍为 Valid）。deepen-2 立即离开合法集；此后 4 轮派发 [2, 1000006, 1000008, 1000010]，从未派发 1000004；世界走到 Stop，结束后各项读取正常。
+- 结论：verified（E09 子范围：后继选择只建立在可信观察之上；已展开的父不再重复 Deepen，世界能走到 Stop；父节点退步后前缀校验不会变砖）。固定 head `d4837f5f53c4ecae67f8e528b3e4e9f06758ef0a`（已合并，merged_sha `42f89bd602db0c2783de38d87d91e80cd65f220b`）；须在 #85 之后合并。回滚点 `e06bfdd`。
+- 已知边界（如实披露，主控接受）：
+  - 只向前修复：已按旧口径写入的节点不回填，已变砖的世界不会被修好。
+  - 旧构建开出的 claim 在本构建下 resume，可能在付费后重核时 Conflict，记入 AG-041。
+  - run_next 对 repair_failures_dispatched 的计数口径与回放不同，记入 AG-042。
+  - 付费后 Err 路径收敛、Recover 端到端、可信 Valid 对生产 runner 可达：均未声明。
+
+#### AG-040 第一轮（#87）与新一批派发（21:10）
+- AG-040 交付 `9094ba6`（基线 f15a42f）：exploration.rs +203/−13，dispatch.rs +58/−20，新测试 18 项。
+  - 指纹去掉两个可变计数器；
+  - registered_budget 由完成的 dispatch fact 精确还原登记时计数器，对不上时 Conflict；
+  - 新增 verified_world_registration_view；status 在世界已启动后比对首决策；run_exploration_start 重跑时取请求中的世界。
+  - 修复前失败、修复后通过：基线上 16/18 失败；7 处变异被测试抓住。
+- 主控裁决：
+  - 已启动世界的 status 不复核存储世界的不可变字段与登记时计数器，不接受为边界，退回 R1：复用登记处的两项检查。
+  - "预填调度状态"的缺口（ensure_new_world_shape 不要求 decision_round=0、无 current_branch、无 waits）并入 AG-041。
+  - meta.rs:649–653 的过期文字与台账第 93 行由主控在台账 PR 中处理。
+- 磁盘：仅剩 14 GB 时，删除已验收任务的构建缓存（target-ag-018 至 036、038、039，target-ctrl-ag021 至 036）。worktree 与全部验收日志保留，可用空间回到 91 GB。
+- AG-037（#86）已线性叠放到 #84（d4837f5）之上，得到 `0c1bacd`，补丁逐字节相同；已推送，PR 正文已改。主控复跑进行中。
+- 派发（均以 0c1bacd 为基线）：
+  - **AG-043**（卡 SHA-256 ae10a724…）：结算时检查来源闭包。命中撤销来源时，费用照常入账，block_reason 记为 source_revoked、response_usable=0，transport 正文脱敏。
+  - **AG-044**（卡 SHA-256 df941032…）：提交时做上游闭包两阶段判定。阶段 1 保持 AG-032 的直接判定；阶段 2 用新 Session::upstream_closure（递归 CTE，上限 10_000，超限返回 Conflict），按 kind 精确判定。授权最小修改三处钉住旧行为的测试。
+
+#### CTRL-AG037-R1 / PR #86：E08/E10 经济回放记录纳入撤销清理分类、start 写作业前重验来源（主控独立验收）
+- 交付 `2156225`（基线 f15a42f）：lifecycle.rs +25（一个 preserve 条目，精确列出 4 个 record_kind）；replay_experiment.rs +41/−1（抽出 `write_started_job`，会话 2 在写入前于同一会话内调用 verify_experiment_sources）；新测试 9 项。
+- 修复前失败、修复后通过：
+  - 基线上的整链撤销清理以 Failed 结束，原因为 blocked_unknown_scope:…:replay_economic_experiment_v1；
+  - 两个窗口测试在基线语义下写入了 job；
+  - 用临时 Notify 钩子做的确定性窗口：基线 start 返回 Ok 并留下 job 与边，本 PR 返回 Conflict；
+  - 7 处变异全部被抓住。
+- 偏差裁决（主控接受）：
+  - job.cancel_reason（Evaluator 输入）与 Admin receipt reason（Admin 输入）为操作员文本，各 ≤512 字节，不是来源派生，保留。这与 tombstone 的 reason 同理。
+  - `write_started_job` 为 `#[doc(hidden)] pub`，因为集成测试无法调用 pub(crate)；它在进程内使用，并复核角色、actor、实验与来源。后续可收窄为 cfg(test) 单测加 pub(crate)。
+  - 撤销之后对已启动 key 的重放改为 Conflict，与会话 1 的口径一致。
+- 线性叠放：从 f15a42f rebase 到 #84（d4837f5）之上，得到 `0c1bacd`，补丁逐字节相同。以 force-with-lease（锁定 2156225）推送，PR 正文改为叠在 #84 之上，随后转 ready。
+- 主控复跑（全新 target 目录 target-ctrl-ag037，`qa/ctrl-stack-ag037-0c1bacd.log*`）：fmt 0；clippy 0；全工作区 73 个测试二进制 933 通过 / 0 失败（924 + 9）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例 2/2（探针源 `qa/probe-ag037/append.rs`；日志 `qa/ctrl-ag037-adversarial.log`）：
+  - E1（另一条路径）：撤销 Train 世界的 run，经池与报告到达实验。limit 为 1 与 8 时都是 Complete，last_error 为空，processed 为 8；4 类经济记录逐字节不变；池、报告与 world-train 被脱敏，world-select 未动。
+  - E2（清理运行期间的经济写入）：以 limit 1 步进，在 11 个状态下各尝试一次新的 start 与重复 register。start 全部返回 Conflict("economic source watermark changed")。register 依清理进度依次返回：水位 Conflict 6 次，点名 world 脱敏 1 次，点名 pool 脱敏 1 次，点名 report 脱敏 3 次。没有任何一次返回 Ok 或 Internal。清理 Complete，经济记录没有任何新增或变化。
+- 结论：verified（E08/E10 子范围：撤销链经过经济实验时清理能完成，经济历史被保留；start 不再在来源撤销后写入作业）。固定 head `0c1bacd1752e20a7f1de2ab6058fec6271781d8f`（已合并，merged_sha `16bdb08e1ac118e3e732a912358add468c49173b`）；须在 #84 之后合并。回滚点 `d4837f5`。
+- 不可声明：经济记录受恢复保护（不在 PROTECTED_* 中，另立任务）；cancel、record_budget_cost 等账务路径重验来源（按裁决不重验）。
+
+#### CTRL-AG040-R1 / PR #87：第二轮验收（退回 R2）
+- R1 `9b523e3`：已启动世界的 status 也复核存储世界的 registration_fingerprint，以及 registered_budget 还原出的登记时计数器。
+  - 实现：共用私有函数 `ensure_registered_as`，status 的入口为 `ensure_world_registered_as`，世界与 fact 在同一快照内读取。
+  - 新增 3 个测试，覆盖 29 种篡改。修复前这 29 种篡改全部返回 Ok(Succeeded)。
+- 线性叠放：两个提交从 f15a42f rebase 到 #86（0c1bacd）之上，得到 `3d62150`，改动行逐行相同。以 force-with-lease 推送，并改写了 PR 正文。
+- 主控复跑（全新 target 目录 target-ctrl-ag040，`qa/ctrl-stack-ag040-3d62150.log*`）：fmt 0；clippy 0；全工作区 74 个测试二进制，954 通过 / 0 失败（933 + 21）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例（探针源 `qa/probe-ag040/append.rs`，日志 `qa/ctrl-ag040-adversarial.log`）：
+  - K2（通过）：claim 在途时，status Ok、重登记 AlreadyRegistered；用原请求 resume 后（结局 usage unknown，花费照扣，计数器 990/2），以及第二次 dispatch 后（965/2），status 与重登记都成立；换 key 的 start 首决策一致。
+  - K1（**发现**）：一致地篡改两条记录（第一个已完成 fact 的 decision 成本由 10 改为 5，世界剩余由 965 改为 970），status Ok(Succeeded)、重登记 AlreadyRegistered、换 key 的 start Succeeded。根额度被抬高 5 micros 而未被发现。原因是 registered_budget 把 fact 自报的花费当真，而该成本本由世界中受指纹保护的不可变事实决定：root opportunity 的成本，或 successor_cost_upper_micros。
+- 裁决 R2：registered_budget 对每个 fact 核对 selected_action 与 decision.action 的成本，必须等于世界不可变登记事实中该动作应有的成本（动作种类与 action_seq 的对应规则以 derive_legal_actions 为准）；不符时返回 Conflict。已退回原实施方，在 3d62150 之上追加提交。
+
+#### CTRL-AG043-R1 / PR #88：E08/§11 来源撤销之后到达的模型响应照常计费、不可用、不留明文（主控独立验收）
+- 交付 `b1c1bde`（基线 0c1bacd，即当时的栈顶，无需叠放）：budget.rs +82/−16；新增存储测试 11 项、引擎测试 4 项；broker.rs 未改。
+  - settle_model_budget_call 在同一事务内用 AG-038 的辅助函数读取该调用登记的闭包。任一来源以 run 被撤销时：
+    - 费用照常入账（apply_charge、金额、usage id 不变）；
+    - 响应被拦，原因固定为 source_revoked（排在既有原因之首）；
+    - transport 存为 redacted_artifact 形态；
+    - 事件中附带 source_revoked 与 transport_original_digest。
+  - 对 AG-038 辅助函数的调整：redacted_artifact 遇已脱敏的正文保持不变，保留原始摘要；结算重放可接受同一 transport 的脱敏形态。
+  - 闭包不可解码时，结算以 Internal 失败且不写入，调用仍为 Dispatched，可由 reconcile 记账。
+  - 修复前失败、修复后通过：存储测试 9/11、引擎测试 3/4 在基线上失败；7 处变异全部被抓住。
+- 摘要一致性：存储的 digest 是脱敏正文的 digest（artifact_from_row 每次读都会复核 hash(body)==digest）。原始 schema 与 digest 放在脱敏正文和事件中。
+- 主控复跑（全新 target 目录 target-ctrl-ag043，`qa/ctrl-stack-ag043-b1c1bde.log*`）：fmt 0；clippy 0；全工作区 75 个测试二进制 948 通过 / 0 失败（933 + 15）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例 2/2（探针源 `qa/probe-ag043/append.rs`；日志 `qa/ctrl-ag043-adversarial.log`）：
+  - S1（来源存活时结算、之后撤销）：结算时 usable=true，transport 与 response 含明文。撤销并清理到 Complete 后，request、transport、response 全部为 rsia.redacted.v1，usable=false，cost=10 照记，任何表行中都没有模型输出；只有 WAL 文件里还有物理残留（已披露的边界）。
+  - S2（撤销后重放存活期结算）：重放返回 Ok，账目不变，未写入新的明文。观察：重放返回的是原先可用的结算，清理到达之前仍为 usable=true、transport 为明文；能否被下游使用由消费者的存活检查决定，归 AG-045（迟到 DispatchObserved）。
+- 结论：verified（E08/§11 子范围：来源撤销之后才结算的模型响应照常计费、不可用，账本中不留明文；来源存活时结算的响应，在撤销清理之后不留在任何表行中）。固定 head `b1c1bdefaf8e538f36287ca9b287c3aa2f41f18d`（已合并，merged_sha `ca117c45d87986500b38bc5afee3d6e161fea4f5`）；须在 #86 之后合并。回滚点 `0c1bacd`。
+- 不可声明：
+  - 迟到的 DispatchObserved/ResponseObserved 事实不留明文（AG-045）；
+  - 无闭包的调用（只靠复扫兜底）；
+  - SQLite 空闲页与 WAL 中的物理残留（未启用 secure_delete，也未 VACUUM）；
+  - 其他拦截原因（租约过期、root/group 停止、超支、模型不符）下的 transport 仍按"留作审计"保留明文，与此前相同。
+
+#### CTRL-AG040-R2 / PR #87：返修验收（verified）
+- R2 `dc8b1c2`：新增 `registered_action_cost`。
+  - Widen 用 `derive_legal_actions(world, &[])` 做整体比对，成本取 root opportunity 的成本；Deepen 与 Recover 取 successor_cost_upper_micros，且不得带 root 的 action_seq。
+  - registered_budget 对每个 fact（含 Claimed）核对 decision 与 selected_action 的成本，加回时用世界的成本。selected_action 没有成本时拒绝。
+  - 新增 4 个测试；登记与 status 共用的用例表增加 8 例。修复前，这 22 种篡改在各检查面上全部被接受；6 处变异被抓住。
+- 线性叠放：3 个提交从 0c1bacd rebase 到 #88（b1c1bde）之上，得到 `c44aa8d`，补丁逐字节相同。以 force-with-lease（锁定 dc8b1c2）推送，PR 正文改为叠在 #88 之上，然后转 ready。
+- 主控复跑（target-ctrl-ag040，`qa/ctrl-stack-ag040-c44aa8d.log*`）：fmt 0；clippy 0；全工作区 76 个测试二进制，973 通过 / 0 失败（948 + 25）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例复验（`qa/ctrl-ag040-adversarial-r2.log`）：
+  - K1：修复前 status 为 Ok、重登记为 AlreadyRegistered；修复后 status 与重登记都是 Conflict("the dispatch facts of the exploration world do not account for its budget")，换 key 的 start 为 Failed/conflict。
+  - K2：仍然成立，计数器 990/2 → 965/2。
+- 结论：verified（E09/E07 子范围：探索世界的登记指纹只含不可变登记字段；计数器按登记时的值从 dispatch fact 精确还原，每笔成本绑定到世界不可变的成本；dispatch 之后的重登记幂等；exploration.start 的 status 与崩溃重跑在世界启动后成立，已启动世界的 status 复核指纹与登记时计数器）。固定 head `c44aa8d7db9d79f0b62379239e06184e49b5f73b`（已合并，merged_sha `32a2f5090fe5136b21c7d3454f53964b36990247`）；须在 #88 之后合并。回滚点 `b1c1bde`。
+- 已知边界（如实披露，主控接受）：
+  - fact 与节点尚未互相绑定。把 root dispatch 改写为 Deepen，并配套修改世界计数器，这种多记录篡改目前查不出来；已并入 AG-041。
+  - registered_action_cost 依赖派生规则"Deepen 与 Recover 的成本 = successor 成本"。
+  - 预填调度态的缺口已并入 AG-041。
+  - meta.rs:649–653 与台账第 93 行的过期文字，由主控在台账 PR 中处理。
+- 派发（21:45，基线 c44aa8d = 栈顶 AD）：
+  - **AG-041**（卡 SHA-256 eeefd30c…，E09 B1）：
+    - 付费之后的路径一律收敛为终态：前缀漂移、候选材料不可得、Recover 目标缺失、claim 输入变化，各用固定字面量记为 Uncertain；
+    - 节点 id 超长与新世界的预填调度态在付费之前拦截；
+    - registered_budget 把每个 fact 与其节点互相绑定。
+  - **AG-045**（卡 SHA-256 86262728…）：来源已撤销时，迟到写入的 DispatchObserved 与 ResponseObserved 事实以脱敏形态落盘，并同步脱敏其幂等缓存。
+  - AG-044（提交时上游闭包）仍在实施，基线为 0c1bacd，届时叠放到栈顶。
+
+#### AG-044 交付与叠放（21:55）
+- 交付 `170ce02`（基线 0c1bacd），一个提交。
+  - lib.rs 新增 `Session::upstream_closure`：递归 CTE；用 CROSS JOIN 固定连接顺序，LIMIT 写在 CTE 内部；根以一个 JSON 参数传入。
+  - dispatch.rs 采用两阶段判定，阶段 2 的上限为 10_000。
+  - 新测试：存储 14 项、引擎 8 项。按卡授权，对三处既有测试做了最小修改。
+- 实施方实测：
+  - CROSS JOIN 是必需的。若让规划器自选连接顺序，它把 dependencies 表放在外层循环；11 个节点时为 193 ms，而现写法为 0.175 ms。
+  - 恰好 10_000 个节点的闭包，经真实调用耗时 47 ms。
+  - 主控探针在 0c1bacd 上为：Q1 接受 20 次、63 步；Q2 接受 141 次、724 步。本 PR 上为：Q1 接受 0 次、11 步；Q2 接受 0 次、22 步。
+- 线性叠放：从 0c1bacd rebase 到 #87（c44aa8d）之上，得到 `f7946f0`，改动行逐行相同。以 force-with-lease（锁定 170ce02）推送，并改写 PR 正文。主控复跑与反例正在进行。
+- 设计注意（主控接受）：
+  - 本 PR 唯一依赖时间的测试是 timing 守卫，界限约为实测值的 100 倍。
+  - cleanup_fixpoint_v42.rs 文件头注释（6–16 行）仍描述"接受后失败"，已过时，留待后续顺手修正。
+- 顺带观察（另立任务）：lib.rs:718 的 load_dependency_record_snapshots（本地导出的闭包遍历）有同样两个问题：LIMIT 写在外层且带 ORDER BY，连接顺序由规划器自选。大 namespace 下可能要扫描数分钟。
+- 主控复跑（全新 target 目录 target-ctrl-ag044，`qa/ctrl-stack-ag044-f7946f0.log*`）：fmt 0；clippy 0；全工作区 78 个测试二进制 995 通过 / 0 失败（973 + 22）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例 2/2（探针源 `qa/probe-ag044/append.rs`；日志 `qa/ctrl-ag044-adversarial.log`）：
+  - U1：撤销 source-2 之后，从 Pending 到 Complete 的 12 个清理状态中，replay.run 在提交时全部被拒，且什么都没写（计数不变、没有幂等行）。拒绝理由分两类：8 次为阶段 2 "closure holds run source-2"，池被脱敏之后的 4 次为阶段 1 "redacted"。清理在 11 步内到达 Complete，与无迟到写入时的基线相同。
+  - U2（精确性）：撤销与池无关的 run 之后，replay.run 照常被提交闸门接受。作业因水位变化以 conflict 失败，这是既有的"任一撤销使已封存世界失效"语义，与本闸门无关。
+- 结论：verified（E07/E08/§11 子范围：撤销之后，从被撤销来源闭包派生的新管理请求在提交时即被拒，什么都不写；闭包超限时拒绝而不是截断；已接受的 request_key 重放仍先返回原作业）。固定 head `f7946f02407bb5694f08bd9f357425e2f1ad2262`（已合并，merged_sha `cc85b5c71cec06763909fb0efa33c4e296b6178d`）；须在 #87 之后合并。回滚点 `c44aa8d`。
+- 不可声明：非管理写入点的闸门（grant、stage_package 归 AG-046，迟到 DispatchObserved 归 AG-045）；Complete 之后的迟到写入；没有登记依赖边的来源。
+
+#### AG-045 第一轮（#90）与 R1（22:05）
+- 交付 `74504fa`（基线 c44aa8d）：
+  - optimization.rs +115：StoreOptimizationJournal::commit 在同一事务内判定 model stage 的 DispatchObserved/ResponseObserved 的 run 依赖是否被撤销。判定按 kind 精确匹配，不看水位。命中时：
+    - 以 rsia.redacted.v1 写入，不写 payload；
+    - 保留依赖边；
+    - 写入幂等行后立即 redact_cache；
+    - 审计记为 optimization.stage.commit_redacted。
+  - lifecycle.rs：把脱敏构造抽成 `pub fn redacted_object_body`，由清理调用，行为不变。
+  - 新测试 15 项：基线上 10/15 失败，8 处变异被杀死。
+- 线性叠放：从 c44aa8d rebase 到 #89（f7946f0）之上，得到 `6251250`，补丁逐字节相同；已推送。
+- 裁决 R1（已退回原实施方）：
+  1. 不可解码的 tombstone 改为 fail-closed，与 AG-032、AG-038、AG-043 同口径。授权最小修改 tests/optimization.rs 中 exploration_late_revocation 的断言（约 1278 行）：该断言把"畸形 tombstone 下保留明文"写成了预期，正是本卡要消除的旧行为。
+  2. StoreOptimizationJournal::lookup（以及 RecoveryJournal 的 lookup）读到 rsia.redacted.v1 时，返回点名的 Conflict，不再返回 Internal，与 AG-024、AG-027、AG-032 的读侧惯例一致。若有调用方依赖 Internal 做分支，停下回报。
+  3. lifecycle.rs 的重构，以及"对 fact 的全部 run 依赖生效"，主控接受。
+
+#### AG-041（#91）交付与主控裁决（22:20）
+- 交付 `0bf151a`（基线 c44aa8d）：exploration.rs +958/−195；新测试 exploration_postpaid_v42.rs 共 14 项集成测试，另有 8 个模块内单测。基线上 11/14 失败。
+  - 付费之后的路径统一收敛为终态：
+    - 尾部先重读 dispatch 状态，落后的 resumer 返回胜者的终态；
+    - 前缀漂移、claim 输入变化、Recover 目标缺失都写成固定字面量原因的 Uncertain；
+    - settle 在同一 session 内一次性写入 node、边、dispatch 与 world；若写入被存储拒绝，返回原 Err，claim 保持可续。
+  - 付费之前拦截：ensure_nodes_nameable 同时检查下一个节点与第 MAX_NODES 个节点，等价于登记时 120 字节的界限；ensure_new_world_shape 要求初始调度态。
+  - fact 与节点绑定：node_placement 与 node_follows_action。
+  - (d) 在端到端路径上无法复现（编辑编译器在 step 成为候选之前已校验并取摘要），由单测覆盖。
+- 待裁决项：把 Recover fact 绑定到节点，会使 AG-040 测试 `a_dispatch_that_spent_a_recovery_dispatch_is_added_back` 失败。该测试的夹具把真实 root dispatch 改写成"自己节点的 Recover"，正是绑定应当拒绝的不一致 fact。实施方把完整规则放在本地提交 74cf54b 上：解除豁免、新增 Recover 绑定测试，并修正 AG-040 的夹具（改写的 dispatch 改为第二个真实 dispatch，其节点改写为失败节点的子节点）。全工作区 996/0。
+- 主控裁决：采纳 74cf54b。Recover 绑定现在就完成卡中第 3 项，不留给 AG-042；授权修正 AG-040 的测试夹具，测试本意不变。
+  - 主控以快进方式把 74cf54b 并入 PR 分支，再连同两个提交从 c44aa8d rebase 到 #89（f7946f0）之上：fdf0cce、4254e6d。改动行与原提交逐行相同。
+  - 改写第二个提交的标题，去掉 "(needs a ruling)"，正文追加裁决说明与 Co-Authored-By。以 force-with-lease（锁定 0bf151a）推送。
+  - 主控复跑与反例正在进行：AG-039 的 L/M 与 AG-040 的 K1/K2 在新 run_next 上回归。
+- 实施方偏差（主控接受）：
+  - 终态写在检测到条件的同一 session 内，没有另开 session；
+  - ensure_nodes_nameable 检查到第 MAX_NODES 个节点；
+  - settle 不覆盖已存在的节点记录；
+  - waits 取自当前合法集；
+  - Recover 目标不是世界所列的第 n 个节点时，视为缺失。
+
+#### AG-045 R1（#90）
+- R1 `57c1814`（在 6251250 之上快进）：
+  - run_dependency_revoked 只有遇到可解码且 source_kind 为 "artifact" 的 tombstone 才放过，其余一律 fail-closed；
+  - 新增 read_stage_fact，lookup 读到 rsia.redacted.v1 时返回点名的 Conflict，其余解码失败仍为 Internal；
+  - 按授权修改了 tests/optimization.rs 中 exercise_late_revocation 的断言。
+- 新测试文件共 19 项。在 6251250 上修复前失败 6 项，tests/optimization.rs 在 1282 行失败；8 种变异全部被抓到。
+- 调用方核对：没有任何调用方依赖 Internal 分支。
+- 待叠放：AG-041 验收后，从 f7946f0 叠放到 AG-041 head 之上，再复跑并做反例。
+
+#### CTRL-AG041-R1 / PR #91：E09 付费后路径一律收敛为终态、确定性失败付费前拒绝、新世界初始调度态、dispatch fact 与节点互相绑定（主控独立验收，23:25）
+- 交付：fdf0cce、4254e6d（含主控裁决采纳的 74cf54b：Recover 绑定与 AG-040 夹具修正），叠在 #89（f7946f0）之上，改动行与原提交逐行相同。
+- 主控复跑（全新 target-ctrl-ag041，`qa/ctrl-stack-ag041-4254e6d.log*`）：fmt 0；clippy 0；全工作区 79 个测试二进制 1018 通过 / 0 失败（995 + 23）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 回归探针（`qa/ctrl-ag041-adversarial.log`）：AG-039 的 L（20 个随机世界走到 Stop 且可读）、M（伪造标签既不扩展也不卡住世界），AG-040 的 K1（两记录一致篡改被 status、重登记、换 key 的 start 拒绝）、K2（续跑的 claim 保持 status 与登记）全部通过。
+- 主控反例（探针源 `qa/probe-ag041/append.rs`；head 日志 `qa/ctrl-ag041-adversarial-n.log`，栈顶 e7c0d0f 日志 `-on-e7c0d0f.log`，基线 f7946f0 日志 `-base-f7946f0.log`；首轮两次因探针错误中断，日志留作 `*.run1.log`：一次请求的 step 未按世界 decision_round 绑定，一次把 Stop 当作拒绝）：
+  - N2：每一轮付费期间改写世界的 decision_round（另一世界只改第一轮），直到世界 Stop。每个已付费 dispatch 恰好一个终态节点（uncertain + exploration_prefix_changed_after_dispatch，或 observed），成本只扣一次；重连返回同一终态且不付费；每轮之后登记与 status 都成立；指向别的轮次的请求在付费前被拒、什么都不写；第 3 轮 Stop，计数器 (965, 2)。基线 f7946f0 上第 1 轮即 Conflict("exploration prefix changed while optimization was running")，claim 留在 Claimed。
+  - N3：第二步付费期间撤销世界的来源，清理在 0–119 步时返回（Pending → Running → Complete 共 120 个状态）。run_next 从不返回 Internal（世界可读时为终态 uncertain，世界被脱敏后为点名的脱敏 Conflict）；清理无错误完成后，世界的探索记录无一明文残留（含未结的 claim）；随后同一请求与新请求都不付费、不写入。基线上同样成立（无回归）。
+- 结论：verified（E09 子范围：付费之后不再有永久卡死的 claim，前缀漂移、claim 输入变化、Recover 目标缺失、候选材料不可得均收敛为恰好一个终态节点；节点 id 超长与新世界预填调度态在付费前拒绝；登记与 status 把每个已完成的 Widen/Deepen/Recover fact 与其节点对齐）。固定 head `4254e6d9408dfe4bdba4526a19de4987e6244198`（已合并，merged_sha `a38b1452ede8fc5755bcab65686edd2f2817b51a`）；须在 #89 之后合并。回滚点 `f7946f0`。
+- 不可声明：Recover 端到端（AG-042）；瞬时存储错误之后的自动续跑（Claimed 仍需原请求 resume）。
+- 主控观察（记入 AG-042 卡）：Recover 的 action_seq 若只由失败节点决定，同一节点的第二次 Recover 会撞上第一次的 dispatch id，需在 AG-042 中核对。
+
+#### CTRL-AG045-R1 / PR #90：E08/§11 来源撤销之后写入的 stage fact 以脱敏形态落盘、不留模型输出（主控独立验收，23:25）
+- 线性叠放：两个提交从 f7946f0 rebase 到 #91（4254e6d）之上，得到 `8ca50a1`、`e7c0d0f`，补丁逐字节相同；以 force-with-lease（锁定 57c1814）推送，PR 正文已改写，转 ready。
+- 主控复跑（全新 target-ctrl-ag045，`qa/ctrl-stack-ag045-e7c0d0f.log*`）：fmt 0；clippy 0；全工作区 80 个测试二进制 1037 通过 / 0 失败（1018 + 19）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例 2/2（探针源 `qa/probe-ag045/append.rs`；head 日志 `qa/ctrl-ag045-adversarial.log`，基线 4254e6d 日志 `qa/ctrl-ag045-adversarial-base4254e6d.log`）：
+  - W1（租户隔离）：n 撤销 run-failure（清理到 Complete），m 只在自己的 namespace 写 run-success 的 run tombstone。四种组合中，事实只在"本 namespace 的 tombstone 命中其 run"时被脱敏（对象与幂等行都脱敏，输出在库文件与 WAL 中都不存在）；run 只在另一 namespace 被撤销时，事实照原样存储（输出物理存在，作为对照）。基线上两种撤销组合都以明文落盘。
+  - W2（每个清理状态）：迟到观察在清理的 5 个状态（Pending、Running×3、Complete）分别落地，之后清理跑到 Complete。每个状态下提交都被接受，输出既不在库文件与 WAL 中，也读不到；事实即清理所做的脱敏（边保留、行脱敏）；清理无错误完成；只依赖存活 run 的对照事实保持原样、输出物理存在。基线上从第一个状态起输出就物理留在 WAL 中。
+- 结论：verified（E08/§11 子范围：来源以 run 撤销之后写入的、含模型输出的 stage fact 以 rsia.redacted.v1 落盘，不留模型输出明文，也不形成可用观察，幂等行同步脱敏，依赖边保留；判定按 namespace 与 kind 精确，不看水位；读取时为点名的 Conflict）。固定 head `e7c0d0f94c2915cc95663f8673d6c62f87ada2e6`（已合并，merged_sha `ecdfe31faabb21a368f08d341b2a6e15223b0849`）；须在 #91 之后合并。回滚点 `4254e6d`。
+- 不可声明：撤销之前已写入明文的 SQLite 物理残留（空闲页与 WAL）；无 run 依赖的事实；开发 runner 只含分数的事实（不含模型输出，不处理）。
+- runbook 增加 AF（#91）与 AG（#90）；merge-all.sh 覆盖 A–AG，共 33 项，与 runbook 逐项核对一致。全部 27 个开放 PR 对 main 显示 CONFLICTING，根因同 #65 的 criss-cross，待用户按方案 (a) 或 (b) 处理 #65 后按序合并。
+
+#### AG-042 侦察与派发（23:40）
+- 侦察（rsia-scout，树 4254e6d，只读）要点：生产代码仍零构造 RepairableFailure；settle 就地改写失败节点计数，且新节点 rfd 不继承，与回放（replay.rs 629-707）口径不同；推导出 S1（rfd 达 2 后 decide/status 全 Err，世界卡死）、S2/S3（engine 与回放的 rfd 不一致，可致决策分歧）、S4（存量非受支持类别使前缀校验失败）；改回存储计数即可重新打开已用的修复机会。NoChange 与 KeepIncumbent 都记为 HardFailure，Rejected/Uncertain 的原文 reason 直接入库。
+- 切分：AG-042 = B4a（计数派生、与回放同口径、Recover 提供条件与目标绑定，只改 exploration.rs）；AG-047 = B4b（类型化来源）；AG-048 = B4c（NoChange/KeepIncumbent 终态与固定字面量 reason）。
+- 派发 AG-042（卡 SHA-256 03703dba…），worktree ag-042，基线 e7c0d0f（栈顶）。
+
+#### #65 修复与 AG-042 裁决（2026-10-01 00:20）
+- 用户首次运行 G-fix 时 fetch 遇 SSL_ERROR_SYSCALL，什么都没做。第二次在 zsh 下 `"$X:refs/..."` 的 `:r` 被当作修饰符，推送引用变成 `…c35aefs/heads/…`，五次推送都失败，没有推送任何东西。
+  - 已生成的 X = eb64a4d 经主控只读核对：树 = f752e1d 的树，父为 f752e1d 与 f8fa1a1。
+  - 已给出字面 SHA 版命令（user-commands.md"G-fix 更正"）。
+  - merge-all.sh 加固：状态读取重试、关闭 gh 交互提示、#65 冲突时给出指引并停止。
+  - 此前一次运行中 EOF 让 gh 对已合并的 #61 弹出"删除分支"提示，无害。
+- AG-042 实施方回报：按卡严格读取 fact 会使 meta_inheritance_v42.rs:1054 失败（该测试把唯一的 fact 改为不可读后仍断言 decide_next 成功）。
+  - 主控裁决 B：仅当世界存在 RepairableFailure 节点时读取 fact，此时不可读返回点名 Conflict；无 RepairableFailure 节点时不读（自洽世界里此时派生视图恒为空，不自洽世界由 registered_budget 拒绝）；该测试不改。加两例钉住测试与两项变异。
+  - 按 episode 计数（§787）确认采纳；与回放按节点计数在同 episode 跨节点时的差异写入已知边界，回放对齐留给 AG-047，并加一例钉住。
+  - rfd 的保守判定（fact 选了 Recover，或父为 RepairableFailure）确认采纳。
+- 2026-10-01 00:25：用户运行字面 SHA 版 G-fix：快进推送 f752e1d..eb64a4d，并以 eb64a4d 钉住合并 #65，merged_sha `c763973`（main = c763973）。主控核对：main 的树等于 f752e1d 的树；H（#67）与 main 的合并基唯一为 f752e1d；GitHub 显示 #67 MERGEABLE。用户接着运行 merge-all.sh（H–AG）。
+
+#### 合并完成（2026-10-01 07:24Z，用户运行 merge-all.sh：ALL MERGED: A-AG）
+- main = `ecdfe31faabb21a368f08d341b2a6e15223b0849`；主控核对：main 的树等于主控验收的栈顶 e7c0d0f 的树（逐字节同一内容）。开放 PR 为 0。
+- 各 PR 的 merged_sha（PR、验收 head、merged_sha 全长、mergedAt；原始数据 `qa/merged-59-91.txt`）：
+  - #59 head 9dec327 → merged_sha `69a3b3ed04377c30ee7193c0679a3747f1606a1e`（2026-10-01T02:07:23Z）
+  - #60 head 2e5c668 → merged_sha `dc036d5f4dd5d870fb0ca98bdfe1ef6ec626140b`（2026-10-01T02:02:19Z）
+  - #61 head 3a0e26a → merged_sha `b220971c4e5ad44453c9d3e5787fbdfda6eb01ac`（2026-10-01T02:07:33Z）
+  - #62 head 0d6ec3d → merged_sha `9c3ec979fd2ee3c53dfbf4ddf96967e94808b11e`（2026-10-01T02:07:40Z）
+  - #63 head b1d008f → merged_sha `3e2fc067190077b8cf8401875d6c627b8d9e13fc`（2026-10-01T02:07:49Z）
+  - #64 head 71c0fa8 → merged_sha `f8fa1a19d5e968f83a52385ecb43d07d56442610`（2026-10-01T02:08:14Z）
+  - #65 head eb64a4d → merged_sha `c763973ddf57c6b7babcd9bd6fa87025f367aef3`（2026-10-01T07:15:14Z）
+  - #66 head 3dd8878 → merged_sha `5a0ef4419c51687534baa3296dbbf7e310a5d810`（2026-10-01T07:19:05Z）
+  - #67 head 3f96c53 → merged_sha `5c4f81dca79373c6871449aed287f61fb1f3cbc2`（2026-10-01T07:18:53Z）
+  - #68 head 44b4c90 → merged_sha `3ffe1e26a908d4c9240320d52fcba1e92dc383d4`（2026-10-01T07:19:15Z）
+  - #69 head c841d1a → merged_sha `31566ce87203b44c44b72986233af1c02fbe5cda`（2026-10-01T07:19:26Z）
+  - #70 head 551aa33 → merged_sha `c81b258b6f890ab78bc9c7111798f75560c2ea23`（2026-10-01T07:19:52Z）
+  - #71 head 605d92a → merged_sha `9519c26f049afff63154fb2337893217b18b7e3c`（2026-10-01T07:19:42Z）
+  - #72 head 2df06e7 → merged_sha `15b140ddef25c8e794d586fecae56f129226a5c6`（2026-10-01T07:20:04Z）
+  - #73 head 6a90635 → merged_sha `7ad4994c7a9208f523612d305660dc8ca9529620`（2026-10-01T07:20:36Z）
+  - #74 head d2929c7 → merged_sha `c72aae14c9f35c1bcc090b5a374d2696d57dacfc`（2026-10-01T07:20:50Z）
+  - #75 head 145f9cf → merged_sha `6a23cb3697f656e1f5132cbe62ae766b4c0383f0`（2026-10-01T07:20:27Z）
+  - #76 head 43984ab → merged_sha `7120842a1f586ae394b76e146c8298f11bec52bc`（2026-10-01T07:21:11Z）
+  - #77 head 400f707 → merged_sha `887b1d714581ae8a71d45243d38be1759697600d`（2026-10-01T07:21:00Z）
+  - #78 head 892ed1c → merged_sha `84d8a7054c2428db0f821fcd478c615b09ade76b`（2026-10-01T07:21:21Z）
+  - #79 head 8954b6c → merged_sha `b262bbb2a0ea9ead68bc33fe1e58235e85bcffea`（2026-10-01T07:21:37Z）
+  - #80 head 04e6309 → merged_sha `9e3e350ed5fbef2975117f12a7f8d3ca3b9cdcbf`（2026-10-01T07:21:49Z）
+  - #81 head c5c04ba → merged_sha `d9b3f6f5234ad14da18956a78c804e4c6818fa10`（2026-10-01T07:21:59Z）
+  - #82 head f15a42f → merged_sha `8d959dee844fb16f0763b0684ba3adf48ad75f1f`（2026-10-01T07:22:22Z）
+  - #83 head fee5897 → merged_sha `51db9b6c9a251def4e6566c96641ed8b63d43a85`（2026-10-01T07:22:11Z）
+  - #84 head d4837f5 → merged_sha `42f89bd602db0c2783de38d87d91e80cd65f220b`（2026-10-01T07:22:45Z）
+  - #85 head e06bfdd → merged_sha `f4b1ef66340412f5c0edf69a48549cd1386324cf`（2026-10-01T07:22:32Z）
+  - #86 head 0c1bacd → merged_sha `16bdb08e1ac118e3e732a912358add468c49173b`（2026-10-01T07:22:56Z）
+  - #87 head c44aa8d → merged_sha `32a2f5090fe5136b21c7d3454f53964b36990247`（2026-10-01T07:23:22Z）
+  - #88 head b1c1bde → merged_sha `ca117c45d87986500b38bc5afee3d6e161fea4f5`（2026-10-01T07:23:12Z）
+  - #89 head f7946f0 → merged_sha `cc85b5c71cec06763909fb0efa33c4e296b6178d`（2026-10-01T07:23:32Z）
+  - #90 head e7c0d0f → merged_sha `ecdfe31faabb21a368f08d341b2a6e15223b0849`（2026-10-01T07:24:20Z）
+  - #91 head 4254e6d → merged_sha `a38b1452ede8fc5755bcab65686edd2f2817b51a`（2026-10-01T07:24:08Z）
+- 下一步（新窗口执行，属合并后的收尾）：台账 PR（把本草稿逐项折入 docs/implementation-ledger.md，写明每个 merged_sha）；reports/support-scope.json 登记各子范围（plan_version/plan_sha256 用 v4.2 那一对，plan_recheck=not_affected）；运行检查器与 `cargom test --locked -p evo-core --test support_scope`；清理已合并的 worktree（ag-018…ag-045）、target 与本地分支；本地 main 快进到 origin/main。
+
+#### CTRL-AG042-R1 / PR #92：E09 恢复计数改为派生视图、与回放同口径；失败节点不再被改写；Recover 只对受支持类别且有余量的失败提供（主控独立验收，2026-10-01 01:00）
+- 交付 `3d68d30`（基线 e7c0d0f，已在 main 中；对 main 的差异只有这一个提交，无需叠放）：exploration.rs +1269/−93（生产代码 +384/−77，模块内单测 12 个）；新测试 exploration_recovery_counting_v42.rs 15 个；按卡授权改动 3 处夹具（legal_actions、postpaid、start_after_dispatch）。实施中途按主控裁决 B 处理了 meta_inheritance_v42 的冲突（仅当存在 RepairableFailure 节点时读取 dispatch fact）。
+- 实施方实测：基线上新测试 13/15 失败；18 处变异全部被杀。Cargo.lock 曾被裸 `cargo clean` 重排，提交前已还原，主控核对 diff 中没有 Cargo.lock。
+- 主控复跑（全新 target-ctrl-ag042，`qa/ctrl-stack-ag042-3d68d30.log*`）：fmt 0；clippy 0；全工作区 81 个结果行 1064 通过 / 0 失败（1037 + 27）；build 0；两组 smoke 通过；检查器 structure_valid；unittest 48 OK。
+- 主控反例 2/2（探针源 `qa/probe-ag042/append.rs`；head 日志 `qa/ctrl-ag042-adversarial.log`，基线 e7c0d0f 日志 `qa/ctrl-ag042-adversarial-base-e7c0d0f.log`）：
+  - P1（§7.2.1 不靠改 episode 名重置修复机会）：节点 1 的修复 dispatch 之后，把它存储的 episode id 改名，单独改名或连同计数器归零都试。均不再提供 Recover，run_next 报 Stop，世界可读，登记成立。基线上"改名+归零"重新提供 recover-1，run_next 撞上 "dispatch idempotency conflict"。
+  - P2（AG-041 × AG-042）：修复付费期间世界被改写，修复以 uncertain（exploration_prefix_changed_after_dispatch）终结。失败节点存储逐字节不变；恢复额度 2→1；子节点 rfd 为 0（回放口径）；不再提供该修复；重连返回同一终态且不付费；世界走到 Stop 并可读；登记成立。基线上失败节点被改写。
+- 回归探针（head 上）：AG-041 的 N2 与 N3（120 个清理状态，无明文残留、无付费与写入）、AG-039 的 L（20 个随机世界）与 M、AG-040 的 K1 与 K2，全部通过（`qa/ctrl-ag042-regress-{n,lm,k}.log`）。
+- 结论：verified（E09 子范围：恢复计数由 dispatch fact 与谱系派生，rfd 与 recovery_dispatches_used 与回放同口径；dispatched_repairs 按 episode 计数（§787，比回放的按节点计数更严，差异已钉住）；失败节点不再被改写；Recover 只对受支持类别、episode 有余量、rfd 低于上限的失败提供，前缀不会超过校验器上限；改存储计数或改名已修复节点的 episode 都不能重新打开已用的修复机会；Recover fact 与目标状态绑定）。固定 head `3d68d30a43c3fc0582053d48cf14ac35c3d4e841`（已合并，merged_sha `696252faf8ef2b2391102f4e6b0e9c0ee20c53d5`），PR 已转 ready，runbook AH。回滚点为合并前的 main（ecdfe31）。
+- 已知边界（P1 发现，接受为本步边界，并入 AG-047）：同一 episode 的两个根中，修复花在根 1 之后，把根 2 存储的 episode id 改名会重新提供 recover-2。节点所属 episode 读自其存储状态，需要在 AG-047 铸造 episode 时绑定到不可改写的事实。目前没有任何 step 产生可修复失败，存储世界里尚不能出现这种情形。
+- 也接受：既非信封也非墓碑的损坏 fact 正文仍为 Internal（沿用探索读取方的既有约定）；不支持的 schema、pre-E14、撤销墓碑、信封不匹配为点名 Conflict；缺失为 NotFound。
+- 不可声明：生产路径能产生可修复失败，或 Recover 端到端（AG-047）；NoChange/KeepIncumbent 终态（AG-048）。
+- 2026-10-01 07:59Z：用户合并 #92，merged_sha `696252faf8ef2b2391102f4e6b0e9c0ee20c53d5`；main = 696252f，其树等于验收 head 3d68d30 的树。本轮全部 34 个 PR（A–AH，#59–#92）均已合并，开放 PR 为 0。
+
+### 派生索引登记（本 PR：reports/support-scope.json、索引测试与检查器单测）
+
+- 按 §18.5/§18.8 与 `scripts/check_support_scope.py` 现行结构登记 31 条第二轮验证记录：E03 1、E07 4、E08 6、E09 8、E10 1、E12 1、E13 4、E14 2、E16.5 3、E16.6 1。每条 `plan_version` v4.2、`plan_sha256` `70ec06e4…`、`plan_recheck` not_affected；`source_sha` 为主控验收 head，`merged_sha` 与 `pr_state` merged 取自上表；`test_entry` 为该 PR 的主测试目标；`log_path` 各不相同（主控复跑的 `.test` 日志；#60–#64 第一轮的日志只有汇总行，于 2026-10-01 在各验收 head 上做单目标复跑，日志 `qa/ctrl-reg-*.log`，结果全部 exit 0）。
+- `input_ref` 指向本地输入清单 `out/audit-20260930/qa/inputs/ctrl-input-<任务>-<head>.json`（PR、head、树、回滚点、merged_sha、变更文件及其 blob、测试目标 blob、实际命令与环境、日志与任务卡的 SHA-256），`input_digest` 为该清单的 SHA-256。清单与日志只在本地，不上传。
+- `command` 字段：检查器的有限文法只接受 `cargo test --locked --offline -p <包> --test <目标>`。本机实际运行一律为 `cargom test --locked …`（rsproxy 镜像源替换、不带 `--offline`、Cargo.lock 不变），实际命令写在每条记录的 `actual_result` 与输入清单中。
+- 未登记（证据不在检查器单目标 cargo test 文法内，只在本台账记录）：#59 AG-013（`scripts/smoke_cli.py`）、#68 AG-023（apps/rsia 二进制 crate 单测与 smoke）、#65 台账。
+- 状态与范围：E14 由 planned 改为 in_progress（AG-019、AG-034 程序子范围已验）；其余 E 状态不变，status_reason 与 remaining 按本轮事实更新（含 E03/E07/E12/E16.6 原文中已过时的“回执 schema 缺失”“exploration/curriculum 管理适配未接”“AG-012 待验收”）。implementation_files：E03 加 development.rs，E09 加 groups.rs、practice.rs，E14 加 evo-core improver.rs，E16.5 加 startup_gate.rs。overall_remaining 增加 §3.3.1 修订事项。V 场景与 B/U/K 追踪条目未改。
+- 索引测试与检查器单测：`crates/evo-core/tests/support_scope.rs` 的已审合并表加入 #60–#64、#66、#67、#69–#92 的 merged_sha；其中两处“planned 示例”由 E14 改为仍为 planned 的 E15。`scripts/test_check_support_scope.py` 中以 E14 为 planned 夹具的用例同步改为 E15；“真源绑定”用例改为让绑定当前版本的记录随夹具摘要变化（历史 v4.1 记录保持不变），断言改为夹具至少含一条 v4.1 记录。检查器 `scripts/check_support_scope.py` 未改。
+- 主控复跑（AG-049 worktree，输入清单与日志复制到被忽略的 out/ 下）：检查器 `--source-of-truth <v4.2>` structure_valid=true、plan_binding_available=true、errors=[]，新登记的 31 条输入清单摘要全部核对一致（needs_verification 中 22 条“输入清单不可得”均为旧机丢失的历史记录）；`cargom test --locked -p evo-core --test support_scope` 14 passed；unittest 48 OK。全量复跑结果见本 PR 的主控验收说明。
+
+### 已知边界与后续队列（2026-10-01，按真源依赖顺序排队，详见各卡）
+
+- E09：AG-047（B4b：RepairableFailure 的类型化可信来源；episode 铸造并绑定不可改写事实——AG-042 反例 P1 发现改写兄弟根节点存储的 episode id 会重开已用的修复机会；回放 dispatched_repairs 按 episode 计数对齐）；AG-048（B4c：区分 NoChange 与 KeepIncumbent 终态，Rejected/Uncertain 的原文 reason 改为固定字面量）；E09 PR-C（优化历史进入请求与签名）。
+- E08/§11：AG-046（grant/store_source_selection、stage_package、seeds 的撤销闸门）；tombstone 键带 kind（§11.1，涉及信任锚格式变更与恢复双读）；经济回放记录纳入恢复保护集合（PROTECTED_*）；SQLite 物理残留（secure_delete 或 VACUUM）。
+- 性能与小项：lib.rs `load_dependency_record_snapshots`（LIMIT 在外层并带 ORDER BY、连接顺序由规划器决定）；收窄 AG-037 的 `write_started_job`；broker 派发被拒时写明真实释放原因；development runner 派发被拒时释放 1 micro。
+- 过期文字：meta.rs:649–653 注释（仍称登记指纹覆盖 run_next 会扣减的计数器，AG-040 后已不成立）；cleanup_fixpoint_v42.rs 文件头注释（仍描述“接受后失败”，AG-044 后提交时即拒绝）。代码注释另派任务修正。
+- 需先修订真源的事项（未派发，待用户决定）：§3.3.1 v4.2 补充要求新增内部对象引入时同步登记容量上限，而本轮新增的巩固 claim/proposal、实践集合、技能组作业、MetaTrial 等在真源中没有上限；§6.1 管理操作清单不含巩固操作（E13 管理入口）。
+- 外部阻塞（只登记，不推进）：真实模型凭据；付费实验（E01 小试与正式样本、E11、E15）；额外真实宿主 Claude Code（E16.4）；真实沙箱（E16.5）；历史包与 T001–T126 归并（E00）；E14 机制冻结合同。
+
 ## 2026-09-30 第一真源前置审计与 v4.1→v4.2 切换（主控）
 
 用户规则（2026-09-30）：除系统技能文件与本台账外，方案正文、归档、内部合同与原始 QA 一律不上传远程；台账必须完整记录。本机 `.gitignore` 已排除 `/RSIAgent-*.md`、`/archive/`、`/out/`，本轮 `git status` 干净。
@@ -39,20 +809,21 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 ### 审计发现的实现缺陷与任务队列（每任务一个 PR；主控验收后由管理员合并）
 | 任务 | E 归属 | 内容 | 状态 |
 |---|---|---|---|
-| AG-012 | E16.6/E00 | 派生索引、检查器、索引测试绑定 v4.2 与谱系；E09 加 V097；本节台账 | verified；PR #60 head `2e5c668`，ready，待管理员合并 |
-| AG-013 | E00/E07 | `scripts/smoke_cli.py` 自 AG-001 起过时（replay.run 需完整 ReplayRunRequest），CI 质量门在 main 失败；新增完整 replay.run 缺池→failed 与未知字段→400 路径；blocked 代表随 AG-015 改为 meta.start | verified；PR #59 head `9dec327`，ready |
-| AG-014 | E16.5 | MVP 容量门接入 prepare/管理 claim/探索节点/回放世界/staging 包/预算 lease 六个真实入口；主控返修 F24（计数须跨命名空间实例级）。启动恢复/部署门仍未接 | verified（容量门子范围）；PR #62 head `0d6ec3d`，ready |
-| AG-015 | E07 | curriculum.step 接入持久课程消费者（幂等回执、读侧重验） | verified；PR #61 head `3a0e26a`，ready |
-| AG-016 | E03 | 可信开发执行/评分回执 schema、已登记纯函数运行器、观察门禁重写 | verified；PR #63 head `b1d008f`，ready |
-| AG-017 | E07 | exploration.start 接入持久探索协调器（幂等注册、纯决策读侧重验）；meta.start 保持 blocked 直至 E14 | verified；PR #64 head `71c0fa8`，ready |
-| AG-020 | 台账 | 本轮主控验收记录、合并顺序与固定 head（本 PR #65） | 待管理员合并 |
-| 后续 | E16.5 启动门/E14/E09/E13/E15/E16.4 | 用户指示（2026-09-30）：在途任务完成后收尾，不再新派。AG-018（启动恢复/部署门）与 AG-019（E14 单机制继承合同）只完成本地任务卡草稿，未派发；E16.4 无真实 Claude Code 宿主仍 blocked | planned |
+| AG-012 | E16.6/E00 | 派生索引、检查器、索引测试绑定 v4.2 与谱系；E09 加 V097；本节台账 | verified；PR #60 head `2e5c668`，已合并，merged_sha `dc036d5f4dd5d870fb0ca98bdfe1ef6ec626140b` |
+| AG-013 | E00/E07 | `scripts/smoke_cli.py` 自 AG-001 起过时（replay.run 需完整 ReplayRunRequest），CI 质量门在 main 失败；新增完整 replay.run 缺池→failed 与未知字段→400 路径；blocked 代表随 AG-015 改为 meta.start | verified；PR #59 head `9dec327`，已合并，merged_sha `69a3b3ed04377c30ee7193c0679a3747f1606a1e` |
+| AG-014 | E16.5 | MVP 容量门接入 prepare/管理 claim/探索节点/回放世界/staging 包/预算 lease 六个真实入口；主控返修 F24（计数须跨命名空间实例级）。启动恢复/部署门仍未接 | verified（容量门子范围）；PR #62 head `0d6ec3d`，已合并，merged_sha `9c3ec979fd2ee3c53dfbf4ddf96967e94808b11e` |
+| AG-015 | E07 | curriculum.step 接入持久课程消费者（幂等回执、读侧重验） | verified；PR #61 head `3a0e26a`，已合并，merged_sha `b220971c4e5ad44453c9d3e5787fbdfda6eb01ac` |
+| AG-016 | E03 | 可信开发执行/评分回执 schema、已登记纯函数运行器、观察门禁重写 | verified；PR #63 head `b1d008f`，已合并，merged_sha `3e2fc067190077b8cf8401875d6c627b8d9e13fc` |
+| AG-017 | E07 | exploration.start 接入持久探索协调器（幂等注册、纯决策读侧重验）；meta.start 保持 blocked 直至 E14 | verified；PR #64 head `71c0fa8`，已合并，merged_sha `f8fa1a19d5e968f83a52385ecb43d07d56442610` |
+| AG-020 | 台账 | 本轮主控验收记录、合并顺序与固定 head（PR #65） | 已合并（以 `eb64a4d` 固定 head，树 = `f752e1d`），merged_sha `c763973ddf57c6b7babcd9bd6fa87025f367aef3` |
+| 后续 | E16.5 启动门/E14/E09/E13/E15/E16.4 | 用户指示（2026-09-30）：在途任务完成后收尾，不再新派。AG-018（启动恢复/部署门）与 AG-019（E14 单机制继承合同）只完成本地任务卡草稿，未派发；E16.4 无真实 Claude Code 宿主仍 blocked | 2026-10-01 更正：AG-018/AG-019 及后续 AG-021–AG-045、AG-042 已在第二轮派发、验收并合并，见页首第二轮节 |
 
 ### 合并顺序与固定 head（2026-09-30 末；全部 PR base=main，按序合并，每条用 --match-head-commit 固定）
 1. #60 AG-012 `2e5c668`（独立）；2. #59 AG-013 `9dec327`；3. #61 AG-015 `3a0e26a`（叠 #59）；4. #62 AG-014 `0d6ec3d`（叠 #61；= 主控重叠 `d8bfdd5` + F24）；5. #63 AG-016 `b1d008f`（叠 #62）；6. #64 AG-017 `71c0fa8`（叠 #63；主控解决了两处测试文件尾部并行追加冲突并重建导入块）；7. #65 台账（本记录，叠 #64）。
 - 栈顶 `71c0fa8` 主控复跑（`out/audit-20260930/qa/ctrl-stack-tip-71c0fa8.log`）：fmt 0、clippy 全工作区 -D warnings 0、全工作区 48 个测试二进制 536 通过 / 0 失败、`cargo build -p rsia` 0、`smoke_cli.py` SMOKE_CLI_OK、`smoke_workspace.py` OK、支持范围检查器 structure_valid（该栈不含 #60，故顶层仍 v4.1；#60 先合并）。main 基线 `0c43e0f`：47/495/0。
 - 合并命令：本地 `out/audit-20260930/user-commands.md`（A–G）。合并后需另开台账增量记录 merged_sha，并按 §18.5/§18.8 把各子范围登记进 `reports/support-scope.json`（记录级 v4.2 绑定与 plan_recheck）。
 - #59 合并前 main 上 CI 质量门仍失败（smoke_cli 过时）。
+- 2026-10-01 补记：A–F 由用户于 2026-10-01T02:02–02:08Z 按序合并；G #65 因 criss-cross 合并基改以 `eb64a4d` 固定 head，于 07:15Z 合并。各 merged_sha 见页首第二轮节合并结果表。
 
 ### 主控验收记录（CTRL，2026-09-30）
 ### CTRL-AG013-R1 / PR #59：E00/E07 CLI smoke 刷新（主控独立验收）
@@ -61,14 +832,14 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 - 复现旧缺陷：main 版脚本对同一二进制 exit 1，`management request failed with HTTP 400`（replay.run 自 AG-001 起需完整 `ReplayRunRequest`）。日志 `out/audit-20260930/qa/ctrl-ag013-smoke-cli-original.log`。
 - 主控复跑：`cargom build --locked -p rsia` 0；`python3 scripts/smoke_cli.py` exit 0，末行 `SMOKE_CLI_OK model_transport=disabled benefit_claimed=false`；`python3 scripts/smoke_workspace.py` exit 0（`ctrl-ag013-smoke-*.log`）。
 - 反例：把 blocked 断言取反后 smoke 必须失败 → exit 1（`ctrl-ag013-mut.log`），断言真实生效。新增覆盖：curriculum.step blocked 终点（state/step/error_code/id）、完整 replay.run 缺池 → failed/not_found、幂等重提同 id、未知字段与不完整载荷 → HTTP 400 invalid_input（CLI 非零）。原有 401/403/重复键/零技能/MCP/锁断言全部保留。
-- 结论：verified（E00 两组 smoke 与 E07 管理接线 smoke 子范围）；不构成回放成功、模型或收益声明。PR 已转 ready，待管理员合并；merged_sha 待记。回滚点 `0c43e0f`。
+- 结论：verified（E00 两组 smoke 与 E07 管理接线 smoke 子范围）；不构成回放成功、模型或收益声明。PR 已转 ready，待管理员合并；merged_sha 待记。回滚点 `0c43e0f`。（2026-10-01：已合并，merged_sha `69a3b3ed04377c30ee7193c0679a3747f1606a1e`）
 
 ### CTRL-AG012-R1 / PR #60：派生索引、检查器、索引测试与台账绑定 v4.2（主控独立验收）
 
 - 真源：v4.2 §18.8（谱系与记录级绑定）、§19.4、E16.6/V071/V080/V098、E00。固定 head `2e5c6682c33b629fd9ce9cda30578f0d4eb99866`（= 实施提交 `4912136` + 主控修正 `2e5c668`：把索引中过期的"PR #49 pending"改为 #56/#57 已合并事实，台账 E16 行同步），base main `0c43e0f`。
 - 主控复跑：`check_support_scope.py --source-of-truth <v4.2>` structure_valid=true、plan_binding=true、errors=[]；`unittest` 48 通过；`cargom test -p evo-core --test support_scope` 14 通过；fmt/clippy 0（`out/audit-20260930/qa/ctrl-ag012-*.log`）。
 - 反例（`probe_ag012_inplace.py`，12 例）：顶层仍绑 v4.1、记录摘要谱系外、v4.2 版本配 v4.1 摘要、plan_recheck=required、非法 plan_recheck、缺 plan_lineage、谱系截断、谱系摘要篡改、E09 缺 V097、受影响任务记录未 recheck → 全部拒绝；原件与"记录绑定当前 v4.2 对"→ 接受。首轮探针误用绝对路径被检查器拒绝，属探针缺陷已修正。
-- 结论：verified（派生索引 v4.2 绑定与谱系子范围）。历史 22 条 verified 记录保留 v4.1 摘要，E00/E16.5 两条标 rechecked_v4.2。PR 已转 ready，待管理员合并；merged_sha 待记。回滚点 `0c43e0f`。
+- 结论：verified（派生索引 v4.2 绑定与谱系子范围）。历史 22 条 verified 记录保留 v4.1 摘要，E00/E16.5 两条标 rechecked_v4.2。PR 已转 ready，待管理员合并；merged_sha 待记。回滚点 `0c43e0f`。（2026-10-01：已合并，merged_sha `dc036d5f4dd5d870fb0ca98bdfe1ef6ec626140b`）
 
 ### CTRL-AG015-R1 / PR #61：E07 curriculum.step 管理消费者（主控独立验收）
 
@@ -76,7 +847,7 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 - 实现要点：`CurriculumStepRequest`（deny_unknown_fields）→ Admin → `checkpoint_claim` → `schedule_probe_idempotent(job.id, …)`：以管理作业 id 为幂等键持久 `probe_schedule_receipt_v1`，探测作业/状态更新/依赖边/回执同一事务提交；崩溃重跑回读回执而非再次触发（§6.7.4）。`status` 对 Succeeded 作业以 `verified_probe_job_view` 重验（水位变更 Conflict、来源 tombstone Forbidden、结果不一致 Conflict），终态不改写。exploration.start/meta.start 仍 blocked。
 - 主控复跑（`ctrl-ag015-*.log`）：fmt 0、clippy（core/engine/http，-D warnings）0；干净 head 全工作区 47 个测试二进制 502 通过 / 0 失败（基线 495；+6 engine +1 http）。
 - 主控反例 3 项（临时追加、未提交）：篡改已存结果的 terminal → status Conflict；篡改 probe_job_id → fail-closed（Conflict/NotFound）；不同 request_key、相同输入 → 新探测作业（Cooldown），不复用他人回执，存储中恰好 2 个作业。全部通过。首轮工作区跑出的 1 失败系主控临时反例文件被并发编译所致，已在干净 head 复跑消除。
-- 结论：verified（E07 curriculum.step 管理接线程序子范围；离线 profile 只产生 BudgetExhausted/Cooldown 终点，不构成 G3/学习/模型声明）。PR 已转 ready，待管理员在 #59 之后合并；merged_sha 待记。回滚点 `9dec327`。
+- 结论：verified（E07 curriculum.step 管理接线程序子范围；离线 profile 只产生 BudgetExhausted/Cooldown 终点，不构成 G3/学习/模型声明）。PR 已转 ready，待管理员在 #59 之后合并；merged_sha 待记。回滚点 `9dec327`。（2026-10-01：已合并，merged_sha `b220971c4e5ad44453c9d3e5787fbdfda6eb01ac`）
 
 ### CTRL-AG016-R1 / PR #63：E03 可信开发执行/评分回执与已登记纯函数运行器（主控独立验收，内容提交 `f523fb4`，最终重叠 head `b1d008f`）
 
@@ -85,15 +856,15 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 - 主控复跑（`ctrl-ag016-workspace.log`）：重叠到 d8bfdd5 后全工作区 48 个测试二进制 522 通过 / 0 失败；clippy 全工作区 -D warnings 0；fmt 0。
 - 主控反例 3 项（`ctrl-ag016-adversarial.log`，临时、未提交）：篡改已存执行输出工件、篡改执行回执 output_digest、篡改 grader 回执分数 → 门禁全部拒绝。
 - 已知边界（实施方如实披露）：无 BudgetExecutionProvenance 新变体（迁移编号由主控分配，改以 typed settlement 工件承载出处）；monitoring.rs 未收紧（其 fixture 路径不能消费真实运行器事实）；E12 课程 envelope 未入 lifecycle 列表（既有）；无隔离/沙箱运行器、无模型、无正式评估、无效果声明。
-- 结论：verified（E03 开发回执 schema、门禁与已登记纯函数运行器程序子范围）。最终 head `b1d008f`；重叠到 #62 之上后的全工作区复跑见下文“合并顺序”节。
+- 结论：verified（E03 开发回执 schema、门禁与已登记纯函数运行器程序子范围）。最终 head `b1d008f`（2026-10-01：已合并，merged_sha `3e2fc067190077b8cf8401875d6c627b8d9e13fc`）；重叠到 #62 之上后的全工作区复跑见下文“合并顺序”节。
 
 ### CTRL-AG017-R1 / PR #64：E07 exploration.start 管理消费者（主控独立验收，内容提交 `96f0894`，最终重叠 head `71c0fa8`）
 
 - 真源：v4.2 §6.1/§6.2、§7.1/§7.1.1（decide 为只读前缀上的纯函数；协调器校验/预留/执行）、§7.3、§7.4.1（策略不属于世界兼容签名）、§6.7.4、E07/E09 程序范围、V019、V020、V086.c/d、V017/V056、V008。
-- 实现：`ExplorationStartRequest{world: ExplorationWorldV1}`（deny_unknown_fields；SimulationContext 补 deny_unknown_fields）→ Admin → `checkpoint_claim` → `register_world_idempotent`（注册指纹只含不可变登记字段：同 id 同指纹 ⇒ AlreadyRegistered 无写入；不同 ⇒ Conflict；来源 tombstone ⇒ Forbidden，水位漂移 ⇒ Conflict）→ `decide_next`；结果 `ExplorationStarted{world_id, context_signature, prefix_digest, legal_actions_digest, action}`；`status` 通过 `verified_world_decision_view` 重跑纯决策并逐项比对，不改写终态；依赖边 job→private_input→各来源 run 与世界 envelope。run_next/节点派发/封存/模型均未接（无生产 DevRunner/ModelPort）。
+- 实现：`ExplorationStartRequest{world: ExplorationWorldV1}`（deny_unknown_fields；SimulationContext 补 deny_unknown_fields）→ Admin → `checkpoint_claim` → `register_world_idempotent`（注册指纹只含不可变登记字段【2026-10-01 更正：此措辞在 #64 时不成立——指纹还包含 run_next 会改写的 remaining_root_micros 与 remaining_recovery_dispatches 两个计数器，派发后重放登记会 Conflict；由 AG-040（#87）去除并按登记时的值还原计数器，见第二轮节 CTRL-AG040】：同 id 同指纹 ⇒ AlreadyRegistered 无写入；不同 ⇒ Conflict；来源 tombstone ⇒ Forbidden，水位漂移 ⇒ Conflict）→ `decide_next`；结果 `ExplorationStarted{world_id, context_signature, prefix_digest, legal_actions_digest, action}`；`status` 通过 `verified_world_decision_view` 重跑纯决策并逐项比对，不改写终态；依赖边 job→private_input→各来源 run 与世界 envelope。run_next/节点派发/封存/模型均未接（无生产 DevRunner/ModelPort）。
 - 实施方复跑：dispatch_management 27、exploration_v41 4、evo-http service 5、smoke OK、clippy/fmt 0、全工作区 47/511/0（其基线 3a0e26a）。主控在最终重叠 head `71c0fa8` 上复跑，见下文“合并顺序”节。
 - 主控反例 2 项（`ctrl-ag017-adversarial.log`，临时、未提交）：篡改已存结果 prefix_digest → status Conflict；在协调器之外把世界 remaining_root_micros 改为 0 → status 重决策不一致而失败，持久终态仍 Succeeded。全部通过。
-- 结论：verified（E07 exploration.start 管理接线程序子范围）。最终 head `71c0fa8`。
+- 结论：verified（E07 exploration.start 管理接线程序子范围）。最终 head `71c0fa8`（2026-10-01：已合并，merged_sha `f8fa1a19d5e968f83a52385ecb43d07d56442610`）。
 
 
 ## 2026-09-30 主控第二轮独立验收、返修与合并（真源文件缺席，依台账记录范围验证）
@@ -240,29 +1011,29 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 
 | 编号 | 范围 | 状态 | 未完成项/边界 |
 |---|---|---|---|
-| E00 | 归并真实源码与可重建输入 | verified（固定基线/治理脚本）/ blocked（历史归并） | 原始112测试与门禁均复验通过；脚本已完成10项主控正负验证；源码或fixture变更后旧日志不能用于新输入；历史缺包不隐藏。2026-09-30：`smoke_cli.py` 过时使 CI 门失败，AG-013 已修（#59 待合并）；派生索引/检查器绑定 v4.2（AG-012，#60 待合并）。 |
+| E00 | 归并真实源码与可重建输入 | verified（固定基线/治理脚本）/ blocked（历史归并） | 原始112测试与门禁均复验通过；脚本已完成10项主控正负验证；源码或fixture变更后旧日志不能用于新输入；历史缺包不隐藏。2026-09-30/10-01：`smoke_cli.py` 过时使 CI 门失败，AG-013 已修并合并（#59，merged_sha `69a3b3ed04377c30ee7193c0679a3747f1606a1e`）；派生索引/检查器绑定 v4.2（AG-012，#60，merged_sha `dc036d5f4dd5d870fb0ca98bdfe1ef6ec626140b`）；裸 `--data` 默认路径无法加锁启动已修（AG-023，#68，merged_sha `3ffe1e26a908d4c9240320d52fcba1e92dc383d4`）。历史包与 T001–T126 归并仍为外部阻塞。 |
 | E01 | 先冻结实验、任务分区和预算可行性 | implemented_not_verified（静态合同已verified） | 本地bfbed84；显式n/统计前提、alpha/留出/比较/完整费用合同已验；开发小试/正式样本与付费授权仍缺。 |
 | E02 | 最小版本化契约与宿主能力边界 | in_progress | 纯编译作用域：有界原子编辑；运行/宿主/其他新增契约尚待后续消费者。 |
-| E03 | 把跨任务证据真正接入生成消费者 | in_progress（消费者/恢复已verified；开发回执子范围已验待合并） | 主控144项core/engine测试、fmt/clippy通过；实际ModelPort请求、同清单开发选择及持久恢复已验。2026-09-30 AG-016（#63）：DevelopmentControl/执行回执/grader 回执 typed schema、已登记纯函数运行器与真实观察门禁。真实提供商/样本/收益、隔离运行器未验。 |
+| E03 | 把跨任务证据真正接入生成消费者 | in_progress（消费者/恢复已verified；开发回执子范围已verified并合并） | 主控144项core/engine测试、fmt/clippy通过；实际ModelPort请求、同清单开发选择及持久恢复已验。2026-09-30 AG-016（#63，merged_sha `3e2fc067190077b8cf8401875d6c627b8d9e13fc`）：DevelopmentControl/执行回执/grader 回执 typed schema、已登记纯函数运行器与真实观察门禁。E03 门验证的是回执链自洽，不复算已登记纯函数的输出，也未把执行方身份绑定到登记的执行器（AG-033 验收观察）。真实提供商/样本/收益、隔离运行器未验。 |
 | E04 | 可信执行、隔离与根资源预算 | in_progress（根预算/broker已verified） | 主控预算15（含10001调用）、broker9、executor6项及fmt/clippy通过；group完整分页停止修复已追加PR #33；真实提供商、进程隔离尚未验。 |
 | E05 | 独立验收器与有边界的统计判定 | in_progress（持久控制/早停已verified） | 主控12流式+6旧评测+13core共31项及fmt/clippy通过；晚到回执、输出不可变、Exposure时间/终态/未知费用保留已修；真实提供商、进程隔离、完整成本及逐依赖撤销仍未验，fixture禁止晋级。 |
 | E06 | 组合发布、实际应用与最小撤销闭环 | in_progress（持久门禁已verified） | 主控7集成+4单元+12 E05回归及fmt/clippy通过；审批防回退、Host完整报告闭包、所有快照读入口已验；真实生产批准/组合应用/回滚受E05证据阻塞。 |
-| E07 | 第一个最小可验证真实闭环 | in_progress（协议子范围已verified）/ blocked（真实闭环） | 主控协议21项与管理增量27项、真实HTTP/MCP/CLI、参考宿主及fmt/clippy/build通过；E05注册/票据管理已接线。replay.run已由AG-001接通并验收；2026-09-30 AG-015/AG-017（#61/#64）接通 curriculum.step 与 exploration.start（幂等、读侧重验，待合并）；meta.start 保持 blocked 直至 E14；真实模型、独立数据与支付授权未取得。 |
-| E08 | 可恢复的撤销、保留和备份链 | in_progress（当前对象/本机恢复已verified） | 主控47项及clippy/fmt通过；当前可信SQLite锚由操作者指定，不声称辨别假冒旧库。Linux/生产演练及后续新增对象清理另验。 |
-| E09 | 生成/探索解耦与有状态在线探索 | in_progress（程序协调已verified） | 主控25项及clippy/fmt通过；完整输入幂等、两节点StoreJournal链、源水位、整批资源已验；实际产生可修复故障的E03链、真实G2及全多组/实践范围仍待完成；V097（§3.1.1 消融）作用域未验。 |
-| E10 | 不可变世界池与纯查表回放 | in_progress（程序回放/池/报告已verified） | 主控57项、clippy/fmt通过；观察正文绑定实际共同输入和来源，q0/辅助来源篡改拒绝；世界/池/报告持久与实时撤销已验。replay.run管理适配经AG-001验收并合并；真实观测仍缺，不声称经济收益。 |
+| E07 | 第一个最小可验证真实闭环 | in_progress（协议与管理消费者子范围已verified）/ blocked（真实闭环） | 主控协议21项与管理增量27项、真实HTTP/MCP/CLI、参考宿主及fmt/clippy/build通过；E05注册/票据管理已接线。replay.run已由AG-001接通并验收；AG-015/AG-017 接通 curriculum.step 与 exploration.start（幂等、读侧重验；#61 merged_sha `b220971c4e5ad44453c9d3e5787fbdfda6eb01ac`、#64 merged_sha `f8fa1a19d5e968f83a52385ecb43d07d56442610`）；第二轮 AG-027（#74，merged_sha `c72aae14c9f35c1bcc090b5a374d2696d57dacfc`）管理作业与私有输入清理闭包及提交时拒绝已撤销依赖、AG-044（#89，merged_sha `cc85b5c71cec06763909fb0efa33c4e296b6178d`）提交时上游闭包闸门。meta.start 保持 blocked 直至 E14.2c；grant/stage_package/seeds 写入点的撤销闸门（AG-046）未做；真实模型、独立数据与支付授权未取得。 |
+| E08 | 可恢复的撤销、保留和备份链 | in_progress（当前对象/本机恢复与第二轮撤销闭包子范围已verified） | 主控47项及clippy/fmt通过；当前可信SQLite锚由操作者指定，不声称辨别假冒旧库。第二轮（均已合并）：清理只在闭包不动点完成（AG-035 #83）、同 id 第二撤销源点名拒绝（AG-036 #82）、已撤销来源不预留不派发（AG-038 #85）、经济回放记录保留（AG-037 #86）、撤销后到达的响应与 stage fact 不留明文（AG-043 #88、AG-045 #90），以及探索、课程、管理与回放对象接入清理闭包（AG-024/025/027/032）。未完成：tombstone 键带 kind（§11.1）、SQLite 物理残留、经济记录的恢复保护、grant/stage_package/seeds 闸门；Linux/生产演练另验。 |
+| E09 | 生成/探索解耦与有状态在线探索 | in_progress（程序协调与第二轮多项子范围已verified） | 主控25项及clippy/fmt通过；完整输入幂等、两节点StoreJournal链、源水位、整批资源已验。第二轮（均已合并）：技能组作业（AG-021 #69）、同题对比实践（AG-026 #73）、探索记录清理边（AG-024 #71）、run_next 可信观察门（AG-033 #80）、合法动作与前缀卫生（AG-039 #84）、登记指纹与计数器（AG-040 #87）、付费后收敛（AG-041 #91）、恢复计数派生（AG-042 #92）。未完成：可修复故障的类型化来源与 episode 绑定（AG-047）、NoChange/KeepIncumbent 终态与固定字面量 reason（AG-048）、优化历史进入请求与签名（PR-C）；真实 G2 未取得；V097（§3.1.1 消融）作用域未验。 |
+| E10 | 不可变世界池与纯查表回放 | in_progress（程序回放/池/报告已verified） | 主控57项、clippy/fmt通过；观察正文绑定实际共同输入和来源，q0/辅助来源篡改拒绝；世界/池/报告持久与实时撤销已验。replay.run管理适配经AG-001验收并合并；AG-032（#79，merged_sha `b262bbb2a0ea9ead68bc33fe1e58235e85bcffea`）：回放读路径在撤销清理的每个中间状态返回点名 Conflict。真实观测仍缺，不声称经济收益。 |
 | E11 | 验证回放优化的真实经济收益 | in_progress（合同/持久准备已verified） | 主控10项及clippy/fmt通过；单票配对、九类成本、实际预算绑定/最终回执不可变、并发取消/晚到账/报告CAS已验。可信在线配对回执消费者尚未实现；真实经济实验未运行，不声称节省。 |
-| E12 | 学习者条件化的经验自主获取 | in_progress（离线子范围已verified） | 主控21项和参考宿主3个进程用例、clippy/fmt通过；控制注册、精确平台期、冷却/零预算终态、事实拒绝门已验。E03可信执行/评分回执schema仍缺，真实隔离、应用正例及持久学习改变下轮选题仍未验，不启用G3。 |
-| E13 | 长期部署适应与能力保留监测 | in_progress（程序监测已verified） | 主控22项及clippy/fmt通过；两周期触发、单claim、真实根绑定前置校验、异常/撤销持久终态和漂移已验。仅程序fixture，真实提供商、连续轮次保留/长期效果仍未取得。 |
-| E14 | 受限改进器自身的继承控制器 | planned（本地合同建议已交接） | 未开始代码；单机制候选、真实下一作业及身份边界仍须主控定版；不启用G4。 |
+| E12 | 学习者条件化的经验自主获取 | in_progress（离线子范围已verified） | 主控21项和参考宿主3个进程用例、clippy/fmt通过；控制注册、精确平台期、冷却/零预算终态、事实拒绝门已验。E03 回执 schema 已由 AG-016（#63）补齐；第二轮 AG-025（#72，merged_sha `15b140ddef25c8e794d586fecae56f129226a5c6`）课程信封清理分类、AG-027（#74）课程重放与脱敏读取 fail-closed。真实隔离（§12.0：E12 代码级范围依赖 E04 真实隔离验收）、应用正例及持久学习改变下轮选题仍未验，不启用G3。 |
+| E13 | 长期部署适应与能力保留监测 | in_progress（程序监测与第二轮巩固子范围已verified） | 主控22项及clippy/fmt通过；两周期触发、单claim、真实根绑定前置校验、异常/撤销持久终态和漂移已验。第二轮（均已合并）：巩固撤销闭包、纯 pass/fail 配对与单候选暂存（AG-022 #70）、E03 门控可信周期触发（AG-028 #75）、巩固单独计量（AG-030 #77，V096.a）、终态类别有界（AG-031 #78）。生产周期驱动与管理入口未做（§6.1 无巩固操作，须先修订真源）；真实提供商、连续轮次保留/长期效果仍未取得。 |
+| E14 | 受限改进器自身的继承控制器 | in_progress（增量 1 与 E14.2a 程序子范围已verified并合并） | AG-019（#66，merged_sha `5a0ef4419c51687534baa3296dbbf7e310a5d810`）：有界 ElasticPolicy、决策携带 policy/caps 摘要、ImproverContentV2 只开放 exploration_policy、MechanismUsageRecordV1 只由真实派发派生；AG-034（#81，merged_sha `d9b3f6f5234ad14da18956a78c804e4c6818fa10`）：MetaTrial 分叉（同一 S0 的两条流只差 id 与 policy，按 billing scope 如实读出实耗）。未完成：ProgramFixture 范围的改进器登记（E14.2b）、meta.start 登记与绑定型消费者（E14.2c）；真批准在结构上不可达；E14 机制冻结合同为外部阻塞；不声称继承或元收益，不启用G4。 |
 | E15 | 后继质量与跨代收益实验 | planned | 真实后继实验未运行。 |
-| E16 | 产品支持范围与最终交付门禁 | in_progress（E16.1–E16.5 子范围已验并合并） | E16.6 索引已按合并事实更新（#56）并由 AG-012 绑定 v4.2；真实宿主/沙箱/第三方包证据未取得；已按真源正文复核（2026-09-30，见顶部审计节）。 |
+| E16 | 产品支持范围与最终交付门禁 | in_progress（E16.1–E16.5 子范围已验并合并） | E16.6 索引已按合并事实更新（#56）并由 AG-012 绑定 v4.2；真实宿主/沙箱/第三方包证据未取得；已按真源正文复核（2026-09-30，见顶部审计节）。2026-10-01：E16.5 容量门接线（AG-014 #62）、启动恢复/部署门（AG-018 #67）与恢复覆盖（AG-029 #76）已合并；索引登记第二轮 31 条验证记录（AG-049）。 |
 | E16.1 | 来源导入与版本化读取器 | in_progress（程序/持久导入子范围已verified并合并） | PR #44 merged_sha `acda31895bb1cb42cf7985b907a4c600429573d0`（主控返修 F13–F16 后）；完整真实迁移链未关闭。 |
 | E16.2 | 资产导入／分享与隐私门禁 | in_progress（staging/本地导出子范围已verified并合并） | PR #54 取代 #45，merged_sha `16c2817bc192bf71535d2c99d867873e6e85bcf8`（主控返修 F17–F20 后）；F08 只对照提案版；真实第三方包/远端销毁未验。 |
 | E16.3 | 内置种子与本地修改保护 | in_progress（持久种子安装/重置 staging 子范围已verified并合并） | PR #54 取代 #46，merged_sha `16c2817bc192bf71535d2c99d867873e6e85bcf8`；真实用户目录演练未验。 |
 | E16.4 | 额外真实宿主与配置面漂移 | in_progress（拒绝门/记录重载子范围已verified并合并）/ blocked（真实宿主） | PR #47 重新堆叠后 merged_sha `1c824e6614667da4dc7ea74e96b46adfd1d2c089`（含主控 F21）；无真实 Claude Code 证据，`verify_host_receipt` 在本仓库无接受路径（fail-closed）。 |
-| E16.5 | 持久恢复、容量、依赖与部署安全 | in_progress（门函数子范围已verified并合并）/ blocked（未接运行入口） | PR #48 merged_sha `4980aa498baa80fd82e83441839e606859fa4065`（F10–F12）；2026-09-30 AG-014（#62，待合并）：MVP 容量门接入六个真实入口并实例级跨命名空间计数（F24）；`verify_recovery_state`/`validate_deployment_security` 仍未接启动入口，无真实沙箱。 |
-| E16.6 | 发行、证据台账与唯一真源交接 | in_progress（派生索引与检查器子范围已verified并合并） | #56 merged_sha `364a0722be7d5b05cbf01c453322ba35c2fdfa67`、#57 merged_sha `7b425fcf4da08b8949aaa8f3426853f8938d3f3c`；索引仍声明 subset_only，全路线未完成；已按真源正文复核（2026-09-30，见顶部审计节）。 |
+| E16.5 | 持久恢复、容量、依赖与部署安全 | in_progress（门函数、容量门接线、启动恢复/部署门与恢复覆盖子范围已verified并合并）/ blocked（真实沙箱） | PR #48 merged_sha `4980aa498baa80fd82e83441839e606859fa4065`（F10–F12）；AG-014（#62，merged_sha `9c3ec979fd2ee3c53dfbf4ddf96967e94808b11e`）：容量门接入六个真实入口并实例级跨命名空间计数（F24）；AG-018（#67，merged_sha `5c4f81dca79373c6871449aed287f61fb1f3cbc2`）：启动恢复隔离门与部署门接入 rsia serve/mcp；AG-029（#76，merged_sha `7120842a1f586ae394b76e146c8298f11bec52bc`）：本轮新对象的恢复覆盖。未完成：真实沙箱（外部）、Linux 实测、启动时驱动未完成的撤销清理与残留 dispatched 调用、出站一致性；本轮新增内部对象的容量上限须先修订 §3.3.1。 |
+| E16.6 | 发行、证据台账与唯一真源交接 | in_progress（派生索引与检查器子范围已verified并合并） | #56 merged_sha `364a0722be7d5b05cbf01c453322ba35c2fdfa67`、#57 merged_sha `7b425fcf4da08b8949aaa8f3426853f8938d3f3c`；AG-012（#60，merged_sha `dc036d5f4dd5d870fb0ca98bdfe1ef6ec626140b`）绑定 v4.2 与谱系；2026-10-01 登记第二轮 31 条验证记录（AG-049）；索引仍声明 subset_only，全路线未完成；已按真源正文复核（2026-09-30，见顶部审计节）。 |
 | E17 | 可选：开发代理评分器演化 | in_progress（关闭/拒绝子范围已verified并合并） | PR #50 重新堆叠后 merged_sha `e94042d3f2fd761455727a6c82ad13fd3d657d03`（主控硬化 F22）；默认关闭，不代表真实扩展运行通过。 |
 | E18 | 可选：自动提出代码修改，不自动部署 | in_progress（关闭/拒绝子范围已verified并合并） | PR #51 重新堆叠后 merged_sha `bef7bd1763a01ccb677ada4acad71a063366539c`（主控硬化 F23）；默认关闭，不代表真实扩展运行通过。 |
 
