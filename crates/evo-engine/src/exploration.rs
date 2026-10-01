@@ -7,16 +7,17 @@ use crate::capacity::{
 use crate::evidence::validate_stored_sources;
 use crate::model::ModelPort;
 use crate::optimization::{
-    DevRunner, DevelopmentExecutionProvenance, DevelopmentRunReport, OptimizationJournal,
-    OptimizationStepOutcome, OptimizationStepRequest, StageFact, StageFactKind,
-    development_stage_fact_ids, optimization_request_digest, run_optimization_step,
+    DevRunner, DevelopmentExecutionProvenance, DevelopmentRunReport, DevelopmentSelection,
+    OptimizationJournal, OptimizationStepOutcome, OptimizationStepRequest, StageFact,
+    StageFactKind, development_stage_fact_ids, optimization_request_digest, run_optimization_step,
     verified_development_observation_in_session,
 };
+use evo_core::contract::ResolvedBundle;
 use evo_core::evaluation::DataUse;
-use evo_core::skill_edit::skill_snapshot_digest;
+use evo_core::skill_edit::{CompiledSkillEdit, skill_snapshot_digest};
 use evo_core::strategy::{
     ActionKindV1, BatchActionV1, BudgetViewV1, ElasticPolicyV1, ExplorationCapsV1,
-    ExplorationPolicy, HistoryQuery, LegalActionV1, LegalActionsV1, ObservedStatus,
+    ExplorationPolicy, HistoryQuery, LegalActionV1, LegalActionsV1, MAX_NODES, ObservedStatus,
     OpportunityWait, OptimizationHistoryEntry, PrefixNodeV2, PrefixView, PrefixViewV2,
     RetryDecision, SimulationContext, decide_elastic, deterministic_retry_decision,
     select_optimization_history,
@@ -936,6 +937,17 @@ impl PersistentCoordinator {
         Ok(found)
     }
 
+    /// Runs the next dispatch of a world: decides it (or resumes the claim this
+    /// request already made), claims it, pays for the step and records its outcome.
+    ///
+    /// The claim is committed before the step is paid for, and from then on the call
+    /// ends in a terminal state of the dispatch: exactly one node, the cost of its
+    /// action spent, whatever the step produced and whatever became of the world
+    /// meanwhile (plan §7.2.1: a dispatch that was cancelled, crashed or ended in an
+    /// uncertain usage is a used opportunity, never repeated automatically). What
+    /// cannot succeed is refused before the claim is written. Only a failure of the
+    /// store returns an error once the claim is written; the claim then stays open,
+    /// and the same request resumes it.
     pub async fn run_next(
         &self,
         model: Option<&dyn ModelPort>,
@@ -960,15 +972,7 @@ impl PersistentCoordinator {
                 ));
             }
             if existing.state != ExplorationDispatchState::Claimed {
-                return Ok(CoordinatorStepResult {
-                    decision: existing.decision.clone(),
-                    dispatch_id: Some(existing.id.clone()),
-                    node_id: existing.node_id.clone(),
-                    outcome: existing
-                        .outcome_reason
-                        .clone()
-                        .unwrap_or_else(|| "terminal_dispatch".into()),
-                });
+                return Ok(terminal_result(existing.clone()));
             }
             existing.decision.clone()
         } else {
@@ -1010,7 +1014,7 @@ impl PersistentCoordinator {
             &fingerprint(&(world_id.as_str(), action_seq))?[..32]
         );
         let mut session = self.store.session().await?;
-        let mut world: ExplorationWorldV1 =
+        let world: ExplorationWorldV1 =
             need_record(&mut session, &self.context, WORLD_RECORD_KIND, &world_id).await?;
         world.validate()?;
         check_world_live(&mut session, &self.context, &world).await?;
@@ -1039,47 +1043,83 @@ impl PersistentCoordinator {
         }
         let nodes_before = self.load_nodes_in_session(&mut session, &world).await?;
         let legal_before = derive_legal_actions(&world, &nodes_before)?;
-        let selected_action = legal_before
-            .actions
-            .iter()
-            .find(|action| action.action_seq == action_seq && action.action_id == action_id)
-            .ok_or_else(|| Error::Conflict("selected action is no longer legal".into()))?
-            .clone();
-        let (expected_parent_skill_digest, expected_parent_bundle_digest) =
-            expected_parent_binding(&world, &nodes_before, &selected_action)?;
-        validate_optimization_request_binding(&world, &nodes_before, &selected_action, &request)?;
-        let available_action_seqs: Vec<u32> = legal_before
-            .actions
-            .iter()
-            .map(|action| action.action_seq)
-            .collect();
+        let state = LoadedWorld {
+            world,
+            nodes: nodes_before,
+            legal: legal_before,
+        };
         let stored_dispatch = get_dispatch_fact(&mut session, &self.context, &dispatch_id).await?;
+        // A request that finds its own claim open resumes it. That claim may already
+        // have been paid for (nobody knows how far the step got), so the inputs that
+        // no longer hold are not a reason to leave it open: it is a used opportunity
+        // (plan §7.2.1) and ends in a terminal state, never in an error that every
+        // later request would meet again.
+        let resumes_claim = prior
+            .as_ref()
+            .is_some_and(|fact| fact.state == ExplorationDispatchState::Claimed);
+        let guarded = guard_dispatch_inputs(
+            &state,
+            &decision,
+            &request,
+            &request_digest,
+            (&action_id, action_seq),
+            stored_dispatch.as_ref(),
+        );
+        let (selected_action, expected_parent_skill_digest, expected_parent_bundle_digest) =
+            match guarded {
+                Ok(inputs) => inputs,
+                Err(error) if resumes_claim => {
+                    let own_claim = stored_dispatch.filter(|fact| {
+                        fact.idempotency_key == request.model_context.request_id
+                            && fact.request_digest == request_digest
+                    });
+                    let Some(claim) = own_claim else {
+                        return Err(error);
+                    };
+                    if claim.state != ExplorationDispatchState::Claimed {
+                        // Another resumer of the same request completed it on its way
+                        // here: its terminal state is the answer.
+                        session.commit().await?;
+                        return Ok(terminal_result(claim));
+                    }
+                    let settled = self
+                        .settle(
+                            &mut session,
+                            state,
+                            &dispatch_id,
+                            claim,
+                            cost,
+                            Settlement::uncertain(REASON_CLAIM_INPUTS_CHANGED),
+                        )
+                        .await;
+                    // A settlement that cannot be written leaves the claim open and
+                    // resumable, with the error the guards gave.
+                    return match settled {
+                        Ok(result) => match session.commit().await {
+                            Ok(()) => Ok(result),
+                            Err(_) => Err(error),
+                        },
+                        Err(_) => Err(error),
+                    };
+                }
+                Err(error) => return Err(error),
+            };
+        let mut world = state.world;
         let mut dispatch = match stored_dispatch {
             Some(existing) => {
-                if existing.request_digest != request_digest
-                    || existing.action_seq != action_seq
-                    || fingerprint(&existing.decision)? != fingerprint(&decision)?
-                    || fingerprint(&existing.selected_action)? != fingerprint(&selected_action)?
-                    || existing.expected_parent_skill_digest != expected_parent_skill_digest
-                    || existing.expected_parent_bundle_digest != expected_parent_bundle_digest
-                    || existing.context_signature != world.context_signature
-                {
-                    return Err(Error::Conflict("dispatch idempotency conflict".into()));
-                }
                 if existing.state != ExplorationDispatchState::Claimed {
                     session.commit().await?;
-                    return Ok(CoordinatorStepResult {
-                        decision: existing.decision.clone(),
-                        dispatch_id: Some(existing.id),
-                        node_id: existing.node_id,
-                        outcome: existing
-                            .outcome_reason
-                            .unwrap_or_else(|| "terminal_dispatch".into()),
-                    });
+                    return Ok(terminal_result(existing));
                 }
                 existing
             }
             None => {
+                // What cannot succeed is refused before anything is written, so before
+                // anything is paid for: the node this dispatch derives is written after
+                // the step, and a node id that is no identifier cannot be written then
+                // (the claim would stay open for good). A world is refused whole when
+                // it cannot name the last node it may hold.
+                ensure_nodes_nameable(&world.id, world.node_ids.len() as u32 + 1)?;
                 if world.remaining_root_micros < cost {
                     return Err(Error::Budget);
                 }
@@ -1103,8 +1143,8 @@ impl PersistentCoordinator {
                     idempotency_key: request.model_context.request_id.clone(),
                     decision: decision.clone(),
                     selected_action: selected_action.clone(),
-                    expected_parent_skill_digest: expected_parent_skill_digest.into(),
-                    expected_parent_bundle_digest: expected_parent_bundle_digest.into(),
+                    expected_parent_skill_digest,
+                    expected_parent_bundle_digest,
                     context_signature: world.context_signature.clone(),
                     state: ExplorationDispatchState::Claimed,
                     node_id: None,
@@ -1147,127 +1187,134 @@ impl PersistentCoordinator {
         session.commit().await?;
         let task_count = request.development_request.manifest.tasks.len();
         let outcome = run_optimization_step(model, runner, journal, request).await;
+        // From here the step is paid for and its dispatch is claimed. The claim never
+        // stays open because of what this call finds: it ends in a terminal state of
+        // the dispatch (exactly one node, the cost of its action spent), whatever the
+        // step produced and whatever became of the world meanwhile. Only a failure of
+        // the store itself returns an error, and it leaves the claim as it was,
+        // resumable by the same request.
         let mut session = self.store.session().await?;
-        world = need_record(&mut session, &self.context, WORLD_RECORD_KIND, &world_id).await?;
-        let outcome = match check_world_live(&mut session, &self.context, &world).await {
-            Ok(()) => outcome,
-            Err(error) => Ok(OptimizationStepOutcome::Uncertain {
-                reason: format!("exploration source closure changed after dispatch: {error}"),
-            }),
+        let world: ExplorationWorldV1 =
+            need_record(&mut session, &self.context, WORLD_RECORD_KIND, &world_id).await?;
+        let (outcome, closure_changed) = match check_world_live(&mut session, &self.context, &world)
+            .await
+        {
+            Ok(()) => (outcome, false),
+            Err(error) => (
+                Ok(OptimizationStepOutcome::Uncertain {
+                    reason: format!("exploration source closure changed after dispatch: {error}"),
+                }),
+                true,
+            ),
         };
         dispatch = need_dispatch_fact(&mut session, &self.context, &dispatch_id).await?;
-        let mut existing_nodes = self.load_nodes_in_session(&mut session, &world).await?;
-        let current_prefix = prefix_projection(&world, &existing_nodes)?;
-        let current_legal = derive_legal_actions(&world, &existing_nodes)?;
-        if fingerprint(&current_prefix)? != decision.prefix_digest
-            || fingerprint(&current_legal)? != decision.legal_actions_digest
-        {
-            return Err(Error::Conflict(
-                "exploration prefix changed while optimization was running".into(),
-            ));
+        // The same request may have more than one resumer: the one that finishes
+        // first writes the node. A later one finds the dispatch already terminal and
+        // returns that terminal state, as a reconnect does.
+        if dispatch.state != ExplorationDispatchState::Claimed {
+            session.commit().await?;
+            return Ok(terminal_result(dispatch));
         }
+        let nodes = self.load_nodes_in_session(&mut session, &world).await?;
+        let legal = derive_legal_actions(&world, &nodes)?;
+        let prefix_moved = fingerprint(&prefix_projection(&world, &nodes)?)?
+            != decision.prefix_digest
+            || fingerprint(&legal)? != decision.legal_actions_digest;
+        // A step that was decided on another prefix cannot be recorded as observed on
+        // this one, but it was paid for: the dispatch is a used opportunity.
+        let settlement = if prefix_moved && !closure_changed {
+            Settlement::uncertain(REASON_PREFIX_CHANGED)
+        } else {
+            settlement_for(
+                &mut session,
+                &self.context,
+                outcome,
+                &request_fact_id,
+                &observed_fact_id,
+                task_count,
+            )
+            .await
+        };
+        // The error a moved prefix always gave stays the error of a settlement the
+        // store refuses to write: the claim is then still open, and still resumable.
+        let original_error = |error: Error| {
+            if prefix_moved {
+                Error::Conflict("exploration prefix changed while optimization was running".into())
+            } else {
+                error
+            }
+        };
+        let result = self
+            .settle(
+                &mut session,
+                LoadedWorld {
+                    world,
+                    nodes,
+                    legal,
+                },
+                &dispatch_id,
+                dispatch,
+                cost,
+                settlement,
+            )
+            .await
+            .map_err(original_error)?;
+        session.commit().await.map_err(original_error)?;
+        Ok(result)
+    }
+
+    /// Writes the terminal state of a dispatch whose step was paid for: exactly one
+    /// node (named after the world and its next sequence number, placed in the
+    /// prefix as the dispatched action derives it), the edge from that node to its
+    /// world, the dispatch fact (`Observed`, or `Uncertain` when the node is) and the
+    /// world, in the caller's session, which the caller commits. Nothing else spends
+    /// the dispatch: the cost of its action leaves `remaining_root_micros` here, and
+    /// a `Recover` also spends one recovery dispatch and counts on its failed node
+    /// (`registered_budget` rebuilds the registered budget from exactly this).
+    ///
+    /// A `Recover` whose failed node is not where the world lists it has nothing to
+    /// update, so its outcome is recorded as uncertain. A node id that is already
+    /// stored is never overwritten.
+    async fn settle(
+        &self,
+        session: &mut Session,
+        state: LoadedWorld,
+        dispatch_id: &str,
+        mut dispatch: ExplorationDispatchFact,
+        cost: u64,
+        mut settlement: Settlement,
+    ) -> Result<CoordinatorStepResult> {
+        let LoadedWorld {
+            mut world,
+            nodes: mut existing_nodes,
+            legal,
+        } = state;
         let action = dispatch.selected_action.clone();
         let next_seq = world.node_ids.len() as u32 + 1;
-        let (status, evidence, skill_digest, bundle_digest, selection_digest, outcome_reason) =
-            match outcome {
-                Ok(OptimizationStepOutcome::Candidate {
-                    edit,
-                    bundle,
-                    selection,
-                }) => {
-                    // The step's `Candidate` rests on the runner's own report: its
-                    // provenance and scores grant nothing (E03). The observation gate
-                    // runs in this session, so its verdict and the node it decides are
-                    // one commit. The step is paid for and its dispatch is claimed, so
-                    // the verdict is never an error: a refusal is a terminal node, and
-                    // a gate that could not answer is the uncertain path.
-                    let verdict = judge_candidate_evidence(
-                        &mut session,
-                        &self.context,
-                        &request_fact_id,
-                        &observed_fact_id,
-                        task_count,
-                    )
-                    .await;
-                    let (status, evidence, reason) = verdict.observed();
-                    let (skill_digest, bundle_digest, selection_digest) =
-                        if verdict.keeps_candidate() {
-                            (
-                                Some(skill_snapshot_digest(&edit.output)?),
-                                Some(bundle.digest.clone()),
-                                Some(fingerprint(&selection)?),
-                            )
-                        } else {
-                            (None, None, None)
-                        };
-                    (
-                        status,
-                        evidence,
-                        skill_digest,
-                        bundle_digest,
-                        selection_digest,
-                        reason.to_string(),
-                    )
-                }
-                Ok(OptimizationStepOutcome::NoChange { reason }) => (
-                    ObservedStatus::HardFailure,
-                    ExplorationEvidenceV1::NotObserved,
-                    None,
-                    None,
-                    None,
-                    reason,
-                ),
-                Ok(OptimizationStepOutcome::Rejected { reason }) => (
-                    ObservedStatus::HardFailure,
-                    ExplorationEvidenceV1::NotObserved,
-                    None,
-                    None,
-                    None,
-                    reason,
-                ),
-                Ok(OptimizationStepOutcome::Uncertain { reason }) => (
-                    ObservedStatus::UsageUncertain,
-                    ExplorationEvidenceV1::NotObserved,
-                    None,
-                    None,
-                    None,
-                    reason_or_cancelled(reason),
-                ),
-                Err(Error::Cancelled) => (
-                    ObservedStatus::UsageUncertain,
-                    ExplorationEvidenceV1::NotObserved,
-                    None,
-                    None,
-                    None,
-                    "cancelled_or_uncertain".into(),
-                ),
-                Err(error) => (
-                    ObservedStatus::UsageUncertain,
-                    ExplorationEvidenceV1::NotObserved,
-                    None,
-                    None,
-                    None,
-                    format!("optimization dispatch outcome uncertain: {error}"),
-                ),
-            };
-        let (search_parent_seq, branch_seq, depth) = match &action.kind {
-            ActionKindV1::Widen { root_slot: _ } => (None, action.branch_seq, 1),
-            ActionKindV1::Deepen { parent_node_seq } => (
-                Some(*parent_node_seq),
-                action.branch_seq,
-                action.target_depth,
-            ),
+        let node_id = node_id_for(&world.id, next_seq);
+        if get_record::<PersistentSearchNode>(session, &self.context, NODE_RECORD_KIND, &node_id)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Conflict(
+                "the exploration node of a dispatch already exists".into(),
+            ));
+        }
+        let (search_parent_seq, branch_seq, depth) = node_placement(&action);
+        let recover_target = match &action.kind {
             ActionKindV1::Recover {
                 failed_node_seq, ..
             } => {
                 world.remaining_recovery_dispatches =
                     world.remaining_recovery_dispatches.saturating_sub(1);
-                (
-                    Some(*failed_node_seq),
-                    action.branch_seq,
-                    action.target_depth,
-                )
+                let target = find_recover_target(&world, &existing_nodes, *failed_node_seq)
+                    .map(|(index, id)| (index, id.to_owned()));
+                if target.is_none() {
+                    settlement = Settlement::uncertain(REASON_RECOVER_TARGET_MISSING);
+                }
+                target
             }
+            ActionKindV1::Widen { .. } | ActionKindV1::Deepen { .. } => None,
         };
         let parent_node = search_parent_seq.and_then(|parent| {
             existing_nodes
@@ -1287,7 +1334,7 @@ impl PersistentCoordinator {
             .map(|parent| parent.node.recent_valid_gains_micros.clone())
             .unwrap_or_default();
         if let (ObservedStatus::Valid { quality_micros }, Some(parent)) =
-            (&status, previous_quality)
+            (&settlement.status, previous_quality)
         {
             gains.push(*quality_micros as i32 - parent as i32);
             if gains.len() > 2 {
@@ -1313,21 +1360,16 @@ impl PersistentCoordinator {
                 .chain(parent.node.best_valid_ancestor_micros)
                 .fold(baseline_micros, u32::max)
         });
-        let best_valid_ancestor_micros = Some(match &status {
+        let best_valid_ancestor_micros = Some(match &settlement.status {
             ObservedStatus::Valid { quality_micros } => {
                 (*quality_micros).max(inherited_best_micros)
             }
             _ => inherited_best_micros,
         });
         let repair_failed = matches!(action.kind, ActionKindV1::Recover { .. })
-            && !matches!(status, ObservedStatus::Valid { .. });
-        if let ActionKindV1::Recover {
-            failed_node_seq, ..
-        } = &action.kind
-            && let Some(failed) = existing_nodes
-                .iter_mut()
-                .find(|node| node.node.node_seq == *failed_node_seq)
-        {
+            && !matches!(settlement.status, ObservedStatus::Valid { .. });
+        if let Some((index, failed_id)) = &recover_target {
+            let failed = &mut existing_nodes[*index];
             if let ObservedStatus::RepairableFailure {
                 dispatched_repairs, ..
             } = &mut failed.node.status
@@ -1338,21 +1380,16 @@ impl PersistentCoordinator {
                 failed.node.repair_failures_dispatched =
                     failed.node.repair_failures_dispatched.saturating_add(1);
             }
-            let failed_id = world
-                .node_ids
-                .get((*failed_node_seq as usize).saturating_sub(1))
-                .ok_or(Error::NotFound)?;
             put_record(
-                &mut session,
+                session,
                 &self.context,
                 NODE_RECORD_KIND,
                 failed_id,
                 &self.owner,
-                failed,
+                &*failed,
             )
             .await?;
         }
-        let node_id = format!("node-{}-{next_seq}", world.id);
         let node = PersistentSearchNode {
             schema_version: "rsia.exploration_node.v1".into(),
             world_id: world.id.clone(),
@@ -1362,16 +1399,16 @@ impl PersistentCoordinator {
                 search_parent_seq,
                 approved_parent_digest: world.approved_parent_digest.clone(),
                 depth,
-                status,
+                status: settlement.status,
                 best_valid_ancestor_micros,
                 recent_valid_gains_micros: gains,
                 repair_failures_dispatched: u8::from(repair_failed),
             },
-            candidate_bundle_digest: bundle_digest,
-            candidate_skill_digest: skill_digest,
-            development_selection_digest: selection_digest,
+            candidate_bundle_digest: settlement.bundle_digest,
+            candidate_skill_digest: settlement.skill_digest,
+            development_selection_digest: settlement.selection_digest,
             intermediate_only: true,
-            evidence,
+            evidence: settlement.evidence,
         };
         world.remaining_root_micros = world.remaining_root_micros.saturating_sub(cost);
         world.node_ids.push(node_id.clone());
@@ -1383,17 +1420,22 @@ impl PersistentCoordinator {
             1
         };
         world.decision_round = world.decision_round.saturating_add(1);
-        update_waits(&mut world, action_seq, &available_action_seqs);
+        let available_action_seqs: Vec<u32> = legal
+            .actions
+            .iter()
+            .map(|action| action.action_seq)
+            .collect();
+        update_waits(&mut world, action.action_seq, &available_action_seqs);
         dispatch.state = if matches!(node.node.status, ObservedStatus::UsageUncertain) {
             ExplorationDispatchState::Uncertain
         } else {
             ExplorationDispatchState::Observed
         };
         dispatch.node_id = Some(node_id.clone());
-        dispatch.outcome_reason = Some(outcome_reason.clone());
-        dispatch.evidence = evidence;
+        dispatch.outcome_reason = Some(settlement.reason.clone());
+        dispatch.evidence = settlement.evidence;
         put_record(
-            &mut session,
+            session,
             &self.context,
             NODE_RECORD_KIND,
             &node_id,
@@ -1402,7 +1444,7 @@ impl PersistentCoordinator {
         )
         .await?;
         put_world_edge(
-            &mut session,
+            session,
             &self.context,
             NODE_RECORD_KIND,
             &node_id,
@@ -1410,16 +1452,16 @@ impl PersistentCoordinator {
         )
         .await?;
         put_record(
-            &mut session,
+            session,
             &self.context,
             DISPATCH_RECORD_KIND,
-            &dispatch_id,
+            dispatch_id,
             &self.owner,
             &dispatch,
         )
         .await?;
         put_record(
-            &mut session,
+            session,
             &self.context,
             WORLD_RECORD_KIND,
             &world.id,
@@ -1427,12 +1469,11 @@ impl PersistentCoordinator {
             &world,
         )
         .await?;
-        session.commit().await?;
         Ok(CoordinatorStepResult {
-            decision,
-            dispatch_id: Some(dispatch_id),
+            decision: dispatch.decision,
+            dispatch_id: Some(dispatch_id.to_owned()),
             node_id: Some(node_id),
-            outcome: outcome_reason,
+            outcome: settlement.reason,
         })
     }
 
@@ -1513,6 +1554,168 @@ impl PersistentCoordinator {
     }
 }
 
+/// A world as a dispatch finds it: the world, the nodes it lists (in order) and the
+/// actions it offers over them.
+struct LoadedWorld {
+    world: ExplorationWorldV1,
+    nodes: Vec<PersistentSearchNode>,
+    legal: LegalActionsV1,
+}
+
+/// What the node of a dispatch records about the outcome of its step: its status and
+/// the gate's label, the digests of the candidate it names (none unless a verdict saw
+/// a candidate) and the fixed reason the dispatch fact stores.
+struct Settlement {
+    status: ObservedStatus,
+    evidence: ExplorationEvidenceV1,
+    skill_digest: Option<String>,
+    bundle_digest: Option<String>,
+    selection_digest: Option<String>,
+    reason: String,
+}
+
+impl Settlement {
+    /// A step that ended without a candidate: a terminal failure, no gate verdict.
+    fn hard_failure(reason: String) -> Self {
+        Self {
+            status: ObservedStatus::HardFailure,
+            evidence: ExplorationEvidenceV1::NotObserved,
+            skill_digest: None,
+            bundle_digest: None,
+            selection_digest: None,
+            reason,
+        }
+    }
+
+    /// The terminal state of a dispatch that was paid for and whose outcome cannot
+    /// be recorded as observed. After a dispatch a cancel, a crash and an uncertain
+    /// usage all count as a used opportunity and are never repeated automatically
+    /// (plan §7.2.1), so the node is `UsageUncertain` (no gate verdict, no candidate)
+    /// and the dispatch ends `Uncertain`.
+    fn uncertain(reason: impl Into<String>) -> Self {
+        Self {
+            status: ObservedStatus::UsageUncertain,
+            evidence: ExplorationEvidenceV1::NotObserved,
+            skill_digest: None,
+            bundle_digest: None,
+            selection_digest: None,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// The step result of a dispatch that already has its terminal state: what a
+/// reconnect gets, and what the resumer that finished after another one gets.
+fn terminal_result(dispatch: ExplorationDispatchFact) -> CoordinatorStepResult {
+    CoordinatorStepResult {
+        decision: dispatch.decision,
+        dispatch_id: Some(dispatch.id),
+        node_id: dispatch.node_id,
+        outcome: dispatch
+            .outcome_reason
+            .unwrap_or_else(|| "terminal_dispatch".into()),
+    }
+}
+
+/// The guards a dispatch passes before it is claimed or resumed: the selected action
+/// is still one the world offers, the request binds its parent and context, and a
+/// fact already stored for this dispatch records exactly these inputs (a request that
+/// meets another request's claim is an idempotency conflict).
+fn guard_dispatch_inputs(
+    state: &LoadedWorld,
+    decision: &CoordinatorDecision,
+    request: &OptimizationStepRequest<'_>,
+    request_digest: &str,
+    (action_id, action_seq): (&str, u32),
+    stored: Option<&ExplorationDispatchFact>,
+) -> Result<(LegalActionV1, String, String)> {
+    let LoadedWorld {
+        world,
+        nodes,
+        legal,
+    } = state;
+    let selected_action = legal
+        .actions
+        .iter()
+        .find(|action| action.action_seq == action_seq && action.action_id == action_id)
+        .ok_or_else(|| Error::Conflict("selected action is no longer legal".into()))?
+        .clone();
+    let (expected_parent_skill_digest, expected_parent_bundle_digest) =
+        expected_parent_binding(world, nodes, &selected_action)?;
+    validate_optimization_request_binding(world, nodes, &selected_action, request)?;
+    if let Some(existing) = stored
+        && (existing.request_digest != request_digest
+            || existing.action_seq != action_seq
+            || fingerprint(&existing.decision)? != fingerprint(decision)?
+            || fingerprint(&existing.selected_action)? != fingerprint(&selected_action)?
+            || existing.expected_parent_skill_digest != expected_parent_skill_digest
+            || existing.expected_parent_bundle_digest != expected_parent_bundle_digest
+            || existing.context_signature != world.context_signature)
+    {
+        return Err(Error::Conflict("dispatch idempotency conflict".into()));
+    }
+    Ok((
+        selected_action,
+        expected_parent_skill_digest.into(),
+        expected_parent_bundle_digest.into(),
+    ))
+}
+
+/// Id of the node a world writes as its `node_seq`-th.
+fn node_id_for(world_id: &str, node_seq: u32) -> String {
+    format!("node-{world_id}-{node_seq}")
+}
+
+/// Refuses a world whose nodes cannot be named: a node is stored under
+/// `node-{world}-{seq}`, which has to be an identifier (128 bytes). It covers the
+/// node about to be written and the last node a world may hold (`MAX_NODES`), so a
+/// world is refused whole instead of at the node it first fails on: its id may not
+/// pass 120 bytes (`ensure_new_world_shape` refuses a longer one at registration).
+fn ensure_nodes_nameable(world_id: &str, next_node_seq: u32) -> Result<()> {
+    for node_seq in [next_node_seq, u32::from(MAX_NODES)] {
+        storage_id(NODE_RECORD_KIND, &node_id_for(world_id, node_seq)).map_err(|_| {
+            Error::Invalid("exploration world id is too long to name its nodes".into())
+        })?;
+    }
+    Ok(())
+}
+
+/// Where the node a dispatch derives sits in the prefix, as `derive_legal_actions`
+/// numbers the action it comes from: `(search_parent_seq, branch_seq, depth)`. A
+/// root has no parent and depth 1; a `Deepen` and a `Recover` are the child of the
+/// node they start from.
+fn node_placement(action: &LegalActionV1) -> (Option<u32>, u32, u8) {
+    match &action.kind {
+        ActionKindV1::Widen { .. } => (None, action.branch_seq, 1),
+        ActionKindV1::Deepen { parent_node_seq } => (
+            Some(*parent_node_seq),
+            action.branch_seq,
+            action.target_depth,
+        ),
+        ActionKindV1::Recover {
+            failed_node_seq, ..
+        } => (
+            Some(*failed_node_seq),
+            action.branch_seq,
+            action.target_depth,
+        ),
+    }
+}
+
+/// The node a `Recover` repairs and the id it is stored under, found where the
+/// dispatch looks for them: the node of sequence `failed_node_seq` is the
+/// `failed_node_seq`-th node the world lists (`settle` numbers nodes that way).
+/// `None` when the world does not list it there.
+fn find_recover_target<'a>(
+    world: &'a ExplorationWorldV1,
+    nodes: &[PersistentSearchNode],
+    failed_node_seq: u32,
+) -> Option<(usize, &'a str)> {
+    let index = usize::try_from(failed_node_seq).ok()?.checked_sub(1)?;
+    let id = world.node_ids.get(index)?;
+    (nodes.get(index)?.node.node_seq == failed_node_seq).then_some((index, id.as_str()))
+}
+
 fn reason_or_cancelled(reason: String) -> String {
     if reason.is_empty() {
         "cancelled_or_uncertain".into()
@@ -1527,6 +1730,18 @@ const REASON_CANDIDATE_OBSERVED: &str = "candidate_observed";
 const REASON_FIXTURE_EVIDENCE: &str = "fixture_evidence_not_accepted";
 const REASON_EVIDENCE_REJECTED: &str = "development_evidence_rejected";
 const REASON_EVIDENCE_UNVERIFIED: &str = "development_evidence_unverified";
+const REASON_CANDIDATE_MATERIAL_UNAVAILABLE: &str = "candidate_material_unavailable";
+
+/// Reasons of a dispatch that was paid for and ended `Uncertain` because its outcome
+/// could not be recorded as observed. Fixed literals, like the ones above.
+///
+/// The prefix the step was decided on is not the one the world holds when it ends.
+const REASON_PREFIX_CHANGED: &str = "exploration_prefix_changed_after_dispatch";
+/// A claim was resumed on a world that no longer carries the inputs it was claimed
+/// with (the action is not legal, the request no longer binds it, the fact differs).
+const REASON_CLAIM_INPUTS_CHANGED: &str = "claim_inputs_changed_after_dispatch";
+/// The node a `Recover` repairs is not where the world lists it.
+const REASON_RECOVER_TARGET_MISSING: &str = "recover_target_missing";
 
 /// The observation gate's verdict on the evidence behind a `Candidate` outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1540,6 +1755,10 @@ enum CandidateVerdict {
     Rejected,
     /// The gate could not answer (a storage or infrastructure failure).
     Unverified,
+    /// The verdict saw a candidate whose digests cannot be computed (`candidate_material`),
+    /// so its node would name nothing. It is the uncertain path, like an unanswered
+    /// gate: the step is paid for and its dispatch must still end in a node.
+    Unmaterialized,
 }
 
 impl CandidateVerdict {
@@ -1570,6 +1789,11 @@ impl CandidateVerdict {
                 ExplorationEvidenceV1::NotObserved,
                 REASON_EVIDENCE_UNVERIFIED,
             ),
+            Self::Unmaterialized => (
+                ObservedStatus::UsageUncertain,
+                ExplorationEvidenceV1::NotObserved,
+                REASON_CANDIDATE_MATERIAL_UNAVAILABLE,
+            ),
         }
     }
 
@@ -1578,7 +1802,7 @@ impl CandidateVerdict {
     /// audit trail and the revocation cleanup; an uncertain node names none, like
     /// every other uncertain node.
     fn keeps_candidate(self) -> bool {
-        !matches!(self, Self::Unverified)
+        !matches!(self, Self::Unverified | Self::Unmaterialized)
     }
 }
 
@@ -1679,6 +1903,108 @@ async fn judge_candidate_evidence(
     }
 }
 
+/// The digests a node names for the candidate it dispatched.
+struct CandidateMaterial {
+    skill_digest: String,
+    bundle_digest: String,
+    selection_digest: String,
+}
+
+/// The digests of a candidate, or `None` when one cannot be computed: the skill the
+/// edit produced is validated before it is digested, and the selection is
+/// serialized. A step that compiled and was selected is not expected to fail either,
+/// but by then the step is paid for, and a failure here must not leave its claim
+/// open.
+fn candidate_material(
+    edit: &CompiledSkillEdit,
+    bundle: &ResolvedBundle,
+    selection: &DevelopmentSelection,
+) -> Option<CandidateMaterial> {
+    Some(CandidateMaterial {
+        skill_digest: skill_snapshot_digest(&edit.output).ok()?,
+        bundle_digest: bundle.digest.clone(),
+        selection_digest: fingerprint(selection).ok()?,
+    })
+}
+
+/// The verdict a candidate ends up with once its material is known. A verdict that
+/// saw the candidate (every verdict but an unanswered gate) names it, so without its
+/// material it is `Unmaterialized`, the uncertain path; one that keeps nothing keeps
+/// its own verdict and names nothing.
+fn materialize<T>(verdict: CandidateVerdict, material: Option<T>) -> (CandidateVerdict, Option<T>) {
+    if !verdict.keeps_candidate() {
+        return (verdict, None);
+    }
+    match material {
+        Some(material) => (verdict, Some(material)),
+        None => (CandidateVerdict::Unmaterialized, None),
+    }
+}
+
+/// What the node of a dispatch records of the outcome its step ended with. Every
+/// outcome has one: the step is paid for and its dispatch is claimed, so nothing here
+/// is an error. A candidate rests on the runner's own report (its provenance and
+/// scores grant nothing, E03): the observation gate runs in the caller's session, so
+/// its verdict and the node it decides are one commit, and a refusal is a terminal
+/// node. A gate that could not answer, and a candidate without its digests, are the
+/// uncertain path.
+async fn settlement_for(
+    session: &mut Session,
+    ctx: &Context,
+    outcome: Result<OptimizationStepOutcome>,
+    request_fact_id: &str,
+    observed_fact_id: &str,
+    task_count: usize,
+) -> Settlement {
+    match outcome {
+        Ok(OptimizationStepOutcome::Candidate {
+            edit,
+            bundle,
+            selection,
+        }) => {
+            let verdict = judge_candidate_evidence(
+                session,
+                ctx,
+                request_fact_id,
+                observed_fact_id,
+                task_count,
+            )
+            .await;
+            let (verdict, material) =
+                materialize(verdict, candidate_material(&edit, &bundle, &selection));
+            let (status, evidence, reason) = verdict.observed();
+            let (skill_digest, bundle_digest, selection_digest) = match material {
+                Some(material) => (
+                    Some(material.skill_digest),
+                    Some(material.bundle_digest),
+                    Some(material.selection_digest),
+                ),
+                None => (None, None, None),
+            };
+            Settlement {
+                status,
+                evidence,
+                skill_digest,
+                bundle_digest,
+                selection_digest,
+                reason: reason.to_string(),
+            }
+        }
+        Ok(OptimizationStepOutcome::NoChange { reason }) => Settlement::hard_failure(reason),
+        Ok(OptimizationStepOutcome::Rejected { reason }) => Settlement::hard_failure(reason),
+        Ok(OptimizationStepOutcome::Uncertain { reason }) => {
+            Settlement::uncertain(reason_or_cancelled(reason))
+        }
+        Err(Error::Cancelled) => Settlement::uncertain("cancelled_or_uncertain"),
+        Err(error) => {
+            Settlement::uncertain(format!("optimization dispatch outcome uncertain: {error}"))
+        }
+    }
+}
+
+/// What a world has to be to be registered: valid and collecting, nothing listed (no
+/// node, dispatch or history), the scheduling state a dispatch moves still at its
+/// initial value, and an id that names every node it may hold.
 fn ensure_new_world_shape(world: &ExplorationWorldV1) -> Result<()> {
     world.validate()?;
     if world.state != WorldState::Collecting
@@ -1690,6 +2016,22 @@ fn ensure_new_world_shape(world: &ExplorationWorldV1) -> Result<()> {
             "new world must start empty and collecting".into(),
         ));
     }
+    // The scheduling state `run_next` moves starts as it is initially. It is no part
+    // of the registration fingerprint, so a request that carried another would
+    // converge on the registered world and report a first decision that is not the
+    // registered world's own (plan §7.3: no fabricated branches).
+    if world.decision_round != 0
+        || world.current_branch_seq.is_some()
+        || world.current_branch_focus_actions != 0
+        || !world.waits.is_empty()
+    {
+        return Err(Error::Invalid(
+            "new world must start at its initial scheduling state".into(),
+        ));
+    }
+    // A world that cannot name its nodes could not finish a dispatch (its node is
+    // written after the step is paid for).
+    ensure_nodes_nameable(&world.id, 1)?;
     Ok(())
 }
 
@@ -2164,6 +2506,37 @@ fn registered_action_cost(
     }
 }
 
+/// Whether `node` is the node the dispatch of `action` derives: it has the search
+/// parent, the depth and the branch `derive_legal_actions` gives that action
+/// (`node_placement`), and a node with a search parent has one that is a node of the
+/// world, older than it, on its branch and one level up. A root dispatch has no
+/// parent and depth 1 on the branch of its root; a `Deepen` is the child of the node
+/// it deepens.
+fn node_follows_action(
+    nodes: &[PersistentSearchNode],
+    node: &PersistentSearchNode,
+    action: &LegalActionV1,
+) -> bool {
+    let (search_parent_seq, branch_seq, depth) = node_placement(action);
+    if node.node.search_parent_seq != search_parent_seq
+        || node.node.branch_seq != branch_seq
+        || node.node.depth != depth
+    {
+        return false;
+    }
+    let Some(parent_seq) = search_parent_seq else {
+        return true;
+    };
+    nodes
+        .iter()
+        .find(|parent| parent.node.node_seq == parent_seq)
+        .is_some_and(|parent| {
+            parent.node.node_seq < node.node.node_seq
+                && parent.node.branch_seq == node.node.branch_seq
+                && parent.node.depth.checked_add(1) == Some(node.node.depth)
+        })
+}
+
 /// The budget a stored world was registered with, rebuilt from the facts
 /// `run_next` left behind: `(remaining_root_micros,
 /// remaining_recovery_dispatches)`.
@@ -2191,9 +2564,17 @@ fn registered_action_cost(
 /// ones the registration fingerprint covers; the caller has compared that
 /// fingerprint first (`ensure_registered_as`).
 ///
-/// This function states `run_next`'s spending rule from the reading side: a
-/// change to when or by how much `run_next` spends has to change it with it
-/// (`tests/exploration_start_after_dispatch_v42.rs` pins both).
+/// Nor is a completed fact taken on its word about the node it produced. The cost
+/// is bound to the action the fact records, so the action is bound to the node:
+/// the node sits where that action derives it (`node_follows_action`). A root
+/// dispatch rewritten into a `Deepen`, with the counters that would pay for it,
+/// would otherwise balance the books too. A `Recover` fact is the one kind not
+/// bound to its node yet (no step produces a repairable failure).
+///
+/// This function states the spending rule of `run_next` (`settle`) from the reading
+/// side: a change to when or by how much a dispatch spends, or to where its node is
+/// placed, has to change it with it (`tests/exploration_start_after_dispatch_v42.rs`
+/// and `tests/exploration_postpaid_v42.rs` pin both).
 async fn registered_budget(
     session: &mut Session,
     ctx: &Context,
@@ -2208,6 +2589,15 @@ async fn registered_budget(
     let mut recovery_dispatches = u32::from(world.remaining_recovery_dispatches);
     let mut listed = BTreeSet::new();
     let mut completed_nodes = BTreeSet::new();
+    // The nodes the world lists, in its order, to hold each completed fact to its node.
+    let mut nodes = Vec::with_capacity(world.node_ids.len());
+    for node_id in &world.node_ids {
+        nodes.push(
+            get_record::<PersistentSearchNode>(session, ctx, NODE_RECORD_KIND, node_id)
+                .await?
+                .ok_or_else(unaccounted)?,
+        );
+    }
     for dispatch_id in &world.dispatch_ids {
         if !listed.insert(dispatch_id.as_str()) {
             return Err(unaccounted());
@@ -2262,6 +2652,23 @@ async fn registered_budget(
                 };
                 if !world.node_ids.iter().any(|listed| listed == node_id)
                     || !completed_nodes.insert(node_id.to_owned())
+                {
+                    return Err(unaccounted());
+                }
+                let node = world
+                    .node_ids
+                    .iter()
+                    .position(|listed| listed == node_id)
+                    .and_then(|index| nodes.get(index));
+                // A `Recover` is the one kind not held to its node yet: no step produces a
+                // repairable failure (AG-042 derives the recovery end to end), so there is
+                // no real `Recover` fact to bind.
+                let held_to_node =
+                    !matches!(fact.selected_action.kind, ActionKindV1::Recover { .. });
+                if held_to_node
+                    && !node.is_some_and(|node| {
+                        node_follows_action(&nodes, node, &fact.selected_action)
+                    })
                 {
                     return Err(unaccounted());
                 }
@@ -2875,5 +3282,361 @@ mod tests {
             moved.len(),
             "each input moves it its own way"
         );
+    }
+
+    // ----- AG-041: what a paid dispatch settles as, and where its node is named -----
+
+    #[test]
+    fn a_candidate_without_its_material_is_the_uncertain_path_and_names_nothing() {
+        // Every verdict that saw the candidate names it, so without the material it is
+        // unmaterialized; an unanswered gate kept nothing and keeps its own verdict.
+        let seen = [
+            CandidateVerdict::Trusted {
+                quality_micros: 750_000,
+            },
+            CandidateVerdict::FixtureDeclared,
+            CandidateVerdict::Rejected,
+        ];
+        for verdict in seen {
+            assert_eq!(
+                materialize(verdict, Some("digests")),
+                (verdict, Some("digests"))
+            );
+            assert_eq!(
+                materialize(verdict, None::<&str>),
+                (CandidateVerdict::Unmaterialized, None)
+            );
+        }
+        for kept_nothing in [
+            CandidateVerdict::Unverified,
+            CandidateVerdict::Unmaterialized,
+        ] {
+            assert_eq!(
+                materialize(kept_nothing, Some("digests")),
+                (kept_nothing, None)
+            );
+            assert_eq!(
+                materialize(kept_nothing, None::<&str>),
+                (kept_nothing, None)
+            );
+        }
+
+        // Unmaterialized is the uncertain path of an unanswered gate, told apart by
+        // its fixed reason: the dispatch ends uncertain, nothing claims the evidence
+        // was seen and the node names no candidate.
+        let (status, evidence, reason) = CandidateVerdict::Unmaterialized.observed();
+        assert!(matches!(status, ObservedStatus::UsageUncertain));
+        assert_eq!(evidence, ExplorationEvidenceV1::NotObserved);
+        assert_eq!(reason, "candidate_material_unavailable");
+        assert!(!CandidateVerdict::Unmaterialized.keeps_candidate());
+        let (unverified_status, unverified_evidence, unverified_reason) =
+            CandidateVerdict::Unverified.observed();
+        assert!(matches!(unverified_status, ObservedStatus::UsageUncertain));
+        assert_eq!(unverified_evidence, evidence);
+        assert_ne!(unverified_reason, reason);
+    }
+
+    fn compiled_edit(output: evo_core::contract::SkillSnapshot) -> CompiledSkillEdit {
+        CompiledSkillEdit {
+            output,
+            patch: evo_core::contract::SkillPatch::default(),
+            report: evo_core::skill_edit::EditApplyReport {
+                schema_version: evo_core::skill_edit::SKILL_EDIT_SCHEMA.into(),
+                compiler_version: evo_core::skill_edit::SKILL_EDIT_COMPILER_VERSION.into(),
+                namespace: "n".into(),
+                profile_id: "profile".into(),
+                skill_id: "skill".into(),
+                skill_version: "v1".into(),
+                status: evo_core::skill_edit::EditApplyStatus::Applied,
+                input_digest: evo_core::hash(b"input"),
+                output_digest: evo_core::hash(b"output"),
+                approved_parent_digest: evo_core::hash(b"approved-parent"),
+                safe_baseline_digest: evo_core::hash(b"baseline"),
+                evidence: evo_core::skill_edit::EvidenceClosure {
+                    support: vec![],
+                    counterexamples: vec![],
+                    dependencies: vec![],
+                },
+                changed_bytes: 0,
+                edits: vec![],
+            },
+        }
+    }
+
+    fn skill(content: &str) -> evo_core::contract::SkillSnapshot {
+        evo_core::contract::SkillSnapshot {
+            content: content.into(),
+            applicability: "applies".into(),
+            counterexample: "counter".into(),
+            required_capabilities: vec![],
+            dependencies: vec![],
+        }
+    }
+
+    fn resolved_bundle() -> ResolvedBundle {
+        ResolvedBundle {
+            schema_version: "rsia.bundle.v1".into(),
+            profile_id: "profile".into(),
+            parent_digest: evo_core::hash(b"approved-parent"),
+            baseline_digest: evo_core::hash(b"baseline"),
+            skill: skill("new"),
+            improver: evo_core::Strategy::default(),
+            origins: vec![],
+            digest: evo_core::hash(b"candidate-bundle"),
+        }
+    }
+
+    fn development_selection() -> DevelopmentSelection {
+        DevelopmentSelection {
+            request_id: "dev-1".into(),
+            manifest_digest: evo_core::hash(b"manifest"),
+            parent_bundle_digest: evo_core::hash(b"parent-bundle"),
+            candidate_bundle_digest: evo_core::hash(b"candidate-bundle"),
+            decision: crate::optimization::DevelopmentSelectionDecision::AcceptCandidate,
+            parent_total_micros: 1,
+            candidate_total_micros: 2,
+            reason: "better".into(),
+        }
+    }
+
+    #[test]
+    fn the_material_of_a_candidate_is_its_digests_or_nothing() {
+        let selection = development_selection();
+        let bundle = resolved_bundle();
+        let output = skill("new");
+        let material = candidate_material(&compiled_edit(output.clone()), &bundle, &selection)
+            .expect("a candidate that compiled and was selected has its digests");
+        assert_eq!(
+            material.skill_digest,
+            skill_snapshot_digest(&output).unwrap()
+        );
+        assert_eq!(material.bundle_digest, bundle.digest);
+        assert_eq!(material.selection_digest, fingerprint(&selection).unwrap());
+
+        // A skill that is no valid snapshot has no digest: the material is missing and
+        // the step is paid for all the same, so the caller maps it, never an error.
+        let invalid = skill(&"x".repeat(16 * 1024 + 1));
+        assert!(skill_snapshot_digest(&invalid).is_err());
+        assert!(candidate_material(&compiled_edit(invalid), &bundle, &selection).is_none());
+    }
+
+    #[test]
+    fn a_settlement_that_is_uncertain_names_no_candidate_and_no_verdict() {
+        let uncertain = Settlement::uncertain(REASON_PREFIX_CHANGED);
+        assert!(matches!(uncertain.status, ObservedStatus::UsageUncertain));
+        assert_eq!(uncertain.evidence, ExplorationEvidenceV1::NotObserved);
+        assert!(
+            uncertain.skill_digest.is_none()
+                && uncertain.bundle_digest.is_none()
+                && uncertain.selection_digest.is_none()
+        );
+        assert_eq!(
+            uncertain.reason,
+            "exploration_prefix_changed_after_dispatch"
+        );
+        assert_eq!(
+            [
+                REASON_CLAIM_INPUTS_CHANGED,
+                REASON_RECOVER_TARGET_MISSING,
+                REASON_CANDIDATE_MATERIAL_UNAVAILABLE
+            ],
+            [
+                "claim_inputs_changed_after_dispatch",
+                "recover_target_missing",
+                "candidate_material_unavailable"
+            ]
+        );
+        // A step that ended without a candidate is a terminal failure, not uncertain.
+        let failure = Settlement::hard_failure("nothing to change".into());
+        assert!(matches!(failure.status, ObservedStatus::HardFailure));
+        assert_eq!(failure.evidence, ExplorationEvidenceV1::NotObserved);
+        assert_eq!(failure.reason, "nothing to change");
+    }
+
+    #[test]
+    fn a_terminal_dispatch_answers_with_its_own_node_and_reason() {
+        let mut fact = sample_dispatch_fact();
+        let answered = terminal_result(fact.clone());
+        assert_eq!(answered.dispatch_id.as_deref(), Some("dispatch-1"));
+        assert_eq!(answered.node_id.as_deref(), Some("node-world-1-1"));
+        assert_eq!(answered.outcome, "fixture_evidence_not_accepted");
+        assert_eq!(
+            fingerprint(&answered.decision).unwrap(),
+            fingerprint(&fact.decision).unwrap()
+        );
+        fact.outcome_reason = None;
+        assert_eq!(terminal_result(fact).outcome, "terminal_dispatch");
+    }
+
+    #[test]
+    fn a_world_id_is_refused_whole_when_it_cannot_name_every_node() {
+        let id = |len: usize| "w".repeat(len);
+        // `node-{id}-{seq}` is an identifier up to 128 bytes, and the last node a world
+        // may hold is numbered with two digits (`MAX_NODES` is 12): 120 bytes is the
+        // longest world id that names them all.
+        assert_eq!(MAX_NODES, 12, "the 120-byte bound follows the node cap");
+        assert_eq!(node_id_for(&id(120), 1).len(), 127);
+        assert_eq!(node_id_for(&id(120), u32::from(MAX_NODES)).len(), 128);
+        for node_seq in [1, 9, 12] {
+            ensure_nodes_nameable(&id(120), node_seq).unwrap();
+        }
+        // 121 bytes name the first nine nodes and not the tenth: the world is refused
+        // whole, at its first dispatch, not at the tenth after it was paid for.
+        assert!(storage_id(NODE_RECORD_KIND, &node_id_for(&id(121), 1)).is_ok());
+        assert!(storage_id(NODE_RECORD_KIND, &node_id_for(&id(121), 10)).is_err());
+        for len in [121, 122, 128] {
+            assert!(
+                matches!(ensure_nodes_nameable(&id(len), 1), Err(Error::Invalid(_))),
+                "{len} bytes"
+            );
+        }
+        // The node about to be written counts as well.
+        assert!(matches!(
+            ensure_nodes_nameable(&id(120), 100),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(node_id_for("world-1", 3), "node-world-1-3");
+    }
+
+    fn legal(kind: ActionKindV1, branch_seq: u32, target_depth: u8) -> LegalActionV1 {
+        LegalActionV1 {
+            action_id: "action".into(),
+            action_seq: 1_000_002,
+            branch_seq,
+            target_depth,
+            kind,
+            estimated_cost_upper_micros: Some(10),
+        }
+    }
+
+    /// A stored node of sequence `seq` on `branch_seq`, `depth` deep, under `parent`.
+    fn node_at(seq: u32, branch_seq: u32, parent: Option<u32>, depth: u8) -> PersistentSearchNode {
+        let mut node = sample_node();
+        node.node.node_seq = seq;
+        node.node.branch_seq = branch_seq;
+        node.node.search_parent_seq = parent;
+        node.node.depth = depth;
+        node
+    }
+
+    #[test]
+    fn a_node_is_placed_where_the_action_that_derived_it_puts_it() {
+        let widen = legal(ActionKindV1::Widen { root_slot: 1 }, 3, 1);
+        assert_eq!(node_placement(&widen), (None, 3, 1));
+        let deepen = legal(ActionKindV1::Deepen { parent_node_seq: 2 }, 3, 2);
+        assert_eq!(node_placement(&deepen), (Some(2), 3, 2));
+        let recover = legal(
+            ActionKindV1::Recover {
+                failed_node_seq: 2,
+                episode_id: "episode-1".into(),
+            },
+            3,
+            2,
+        );
+        assert_eq!(node_placement(&recover), (Some(2), 3, 2));
+    }
+
+    #[test]
+    fn a_node_follows_the_action_that_dispatched_it_or_it_is_refused() {
+        let nodes = [
+            node_at(1, 1, None, 1),
+            node_at(2, 2, None, 1),
+            node_at(3, 1, Some(1), 2),
+        ];
+        let widen_first = legal(ActionKindV1::Widen { root_slot: 1 }, 1, 1);
+        let widen_second = legal(ActionKindV1::Widen { root_slot: 2 }, 2, 1);
+        let deepen_first = legal(ActionKindV1::Deepen { parent_node_seq: 1 }, 1, 2);
+        // A root dispatch has no parent, depth 1 and the branch of its root.
+        assert!(node_follows_action(&nodes, &nodes[0], &widen_first));
+        assert!(node_follows_action(&nodes, &nodes[1], &widen_second));
+        assert!(!node_follows_action(&nodes, &nodes[1], &widen_first));
+        assert!(!node_follows_action(&nodes, &nodes[2], &widen_first));
+        // A Deepen is the child of its parent: on its branch, one level down.
+        assert!(node_follows_action(&nodes, &nodes[2], &deepen_first));
+        assert!(!node_follows_action(&nodes, &nodes[0], &deepen_first));
+        assert!(!node_follows_action(&nodes, &nodes[1], &deepen_first));
+        let wrong_depth = legal(ActionKindV1::Deepen { parent_node_seq: 1 }, 1, 3);
+        assert!(!node_follows_action(&nodes, &nodes[2], &wrong_depth));
+        let wrong_branch = legal(ActionKindV1::Deepen { parent_node_seq: 1 }, 2, 2);
+        assert!(!node_follows_action(&nodes, &nodes[2], &wrong_branch));
+        // The parent has to be a node of the world, older than the node, on its branch
+        // and one level up, whatever the fact says about itself.
+        let missing_parent = legal(ActionKindV1::Deepen { parent_node_seq: 9 }, 1, 2);
+        let mut orphan = node_at(4, 1, Some(9), 2);
+        assert!(!node_follows_action(&nodes, &orphan, &missing_parent));
+        orphan.node.search_parent_seq = Some(4);
+        let own_parent = legal(ActionKindV1::Deepen { parent_node_seq: 4 }, 1, 2);
+        assert!(!node_follows_action(&nodes, &orphan, &own_parent));
+        let shallow_parent = legal(ActionKindV1::Deepen { parent_node_seq: 3 }, 1, 2);
+        let child_of_a_child = node_at(4, 1, Some(3), 2);
+        assert!(!node_follows_action(
+            &[nodes[0].clone(), nodes[1].clone(), nodes[2].clone()],
+            &child_of_a_child,
+            &shallow_parent
+        ));
+        // A Recover is placed like a Deepen of its failed node.
+        let recover = legal(
+            ActionKindV1::Recover {
+                failed_node_seq: 1,
+                episode_id: "episode-1".into(),
+            },
+            1,
+            2,
+        );
+        assert!(node_follows_action(&nodes, &nodes[2], &recover));
+        assert!(!node_follows_action(&nodes, &nodes[0], &recover));
+    }
+
+    #[test]
+    fn a_recover_target_is_found_where_the_world_lists_it() {
+        let mut world = ExplorationWorldV1 {
+            schema_version: ExplorationWorldV1::SCHEMA.into(),
+            id: "world-1".into(),
+            approved_parent_digest: evo_core::hash(b"approved-parent"),
+            context_signature: evo_core::hash(b"context"),
+            parent_skill_digest: evo_core::hash(b"skill"),
+            parent_bundle_digest: evo_core::hash(b"bundle"),
+            environment_digest: evo_core::hash(b"environment"),
+            model_digest: evo_core::hash(b"model"),
+            tools_digest: evo_core::hash(b"tools"),
+            grader_digest: evo_core::hash(b"grader"),
+            rules_digest: evo_core::hash(b"rules"),
+            source_watermark: 1,
+            caps: ExplorationCapsV1::online(),
+            policy: ElasticPolicyV1::default(),
+            simulation: SimulationContext::Online { fixed_seed: 7 },
+            root_opportunities: vec![],
+            dependencies: vec![],
+            successor_cost_upper_micros: 10,
+            initial_baseline_quality_micros: 500_000,
+            remaining_root_micros: 1_000,
+            remaining_recovery_dispatches: 2,
+            state: WorldState::Collecting,
+            node_ids: vec!["node-world-1-1".into(), "node-world-1-2".into()],
+            dispatch_ids: vec![],
+            history_ids: vec![],
+            current_branch_seq: None,
+            current_branch_focus_actions: 0,
+            decision_round: 0,
+            waits: vec![],
+        };
+        let nodes = [node_at(1, 1, None, 1), node_at(2, 2, None, 1)];
+        assert_eq!(
+            find_recover_target(&world, &nodes, 2),
+            Some((1, "node-world-1-2"))
+        );
+        assert_eq!(
+            find_recover_target(&world, &nodes, 1),
+            Some((0, "node-world-1-1"))
+        );
+        // No such node, a sequence that is no position, and a node the world does not
+        // list at the position of its sequence: the target is gone.
+        assert_eq!(find_recover_target(&world, &nodes, 3), None);
+        assert_eq!(find_recover_target(&world, &nodes, 0), None);
+        let renumbered = [node_at(1, 1, None, 1), node_at(5, 2, None, 1)];
+        assert_eq!(find_recover_target(&world, &renumbered, 2), None);
+        assert_eq!(find_recover_target(&world, &renumbered, 5), None);
+        world.node_ids.pop();
+        assert_eq!(find_recover_target(&world, &nodes, 2), None);
     }
 }
