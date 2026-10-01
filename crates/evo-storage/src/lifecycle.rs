@@ -2801,21 +2801,7 @@ async fn cleanup_node_content(
         .await?;
         return Ok(());
     }
-    let mut metadata = minimal_metadata(&value);
-    if schema == "rsia.optimization.stage_fact.v1"
-        || schema == "rsia.exploration_artifact_envelope.v1"
-    {
-        metadata["historical_facts"] = historical_stage_facts(&value["payload"]);
-    }
-    let redacted = json!({
-        "id": node.id,
-        "schema_version": "rsia.redacted.v1",
-        "state": "source_revoked",
-        "original_kind": node.kind,
-        "original_schema": value.get("schema_version").and_then(|v| v.as_str()),
-        "original_digest": evo_core::hash(body.as_bytes()),
-        "metadata": metadata,
-    });
+    let redacted = redacted_object_body(&node.kind, &node.id, &value, &body);
     sqlx::query(
         "UPDATE objects SET body=?,revision=revision+1 WHERE namespace=? AND kind=? AND id=?",
     )
@@ -2867,6 +2853,46 @@ async fn mark_unknown_scope(
         json!({"error":error}),
     )
     .await
+}
+
+/// The `rsia.redacted.v1` object that replaces the object `kind`/`id`, whose stored
+/// body was `body` and whose parsed form is `value`, once a revoked source reaches
+/// it: its identity, the schema and the digest of the content it replaces, and the
+/// minimal metadata kept for reconciliation (`minimal_metadata`, and for a stage fact
+/// or an exploration envelope the history of its payload, `historical_stage_facts`).
+/// No other content survives.
+///
+/// This is the one construction of the redaction. The cleanup replaces what it
+/// finds with it, and a writer that is about to store content whose source is
+/// already revoked can store it directly, so the object it stores is exactly the
+/// one the cleanup would have made of it. `body` must be the text the object would
+/// have been stored as (the digest of that text is the digest of the replaced
+/// content).
+pub fn redacted_object_body(
+    kind: &str,
+    id: &str,
+    value: &serde_json::Value,
+    body: &str,
+) -> serde_json::Value {
+    let schema = value
+        .get("schema_version")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let mut metadata = minimal_metadata(value);
+    if schema == "rsia.optimization.stage_fact.v1"
+        || schema == "rsia.exploration_artifact_envelope.v1"
+    {
+        metadata["historical_facts"] = historical_stage_facts(&value["payload"]);
+    }
+    json!({
+        "id": id,
+        "schema_version": "rsia.redacted.v1",
+        "state": "source_revoked",
+        "original_kind": kind,
+        "original_schema": value.get("schema_version").and_then(|v| v.as_str()),
+        "original_digest": evo_core::hash(body.as_bytes()),
+        "metadata": metadata,
+    })
 }
 
 fn historical_stage_facts(value: &serde_json::Value) -> serde_json::Value {

@@ -15,6 +15,7 @@ use evo_core::skill_edit::{
     CompiledSkillEdit, ProtectedTextRange, SkillEditBatch, TrustedEditContext,
 };
 use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, identifier};
+use evo_storage::lifecycle::{RevokeTombstone, redacted_object_body};
 use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -801,6 +802,46 @@ async fn load_stage_fact(session: &mut Session, ctx: &Context, id: &str) -> Resu
         .map_err(|_| Error::Invalid("development stage fact is not a strict stage fact".into()))
 }
 
+/// The schema of the tombstone the revocation cleanup leaves in place of an object.
+const REDACTED_SCHEMA: &str = "rsia.redacted.v1";
+
+/// Reads the stored body of the stage fact `id`.
+///
+/// After a source revocation the cleanup replaces the body with an
+/// `rsia.redacted.v1` tombstone, which is not a stage fact, and a fact written
+/// after the revocation is stored as one (`StoreOptimizationJournal::commit_redacted`).
+/// That is the expected state of a revoked step, not corruption, so the read names
+/// it: a `Conflict` with a fixed message, the verdict the exploration, curriculum and
+/// replay stores give a redacted record of theirs (`read_envelope`, `get_record`),
+/// instead of a decode failure that would surface as `Internal`. The body is
+/// inspected before it is decoded, so the expected state does not raise the storage
+/// layer's "database operation failed" error log either. Any other body that does
+/// not decode is corruption and stays `Internal`.
+async fn read_stage_fact(
+    session: &mut Session,
+    context: &Context,
+    id: &str,
+) -> Result<Option<StageFact>> {
+    let Some(body) = session
+        .get::<serde_json::Value>(context, "artifact", id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if body.get("schema_version").and_then(|value| value.as_str()) == Some(REDACTED_SCHEMA) {
+        return Err(Error::Conflict(format!(
+            "optimization stage fact {id} was redacted because its source was revoked"
+        )));
+    }
+    match serde_json::from_value(body) {
+        Ok(fact) => Ok(Some(fact)),
+        Err(error) => {
+            tracing::error!(%error, id, "stored optimization stage fact does not decode");
+            Err(Error::Internal)
+        }
+    }
+}
+
 /// Public entry to the E03 observation gate for consumers that do not hold a
 /// session (E13 and operators). Same rules as the in-session gate.
 pub async fn verify_development_observation(
@@ -964,6 +1005,61 @@ impl StoreOptimizationJournal {
     pub async fn reload(&self, artifact_id: &str) -> Result<StageFact> {
         self.lookup(artifact_id).await?.ok_or(Error::NotFound)
     }
+
+    /// Stores `fact` as the `rsia.redacted.v1` object the revocation cleanup would
+    /// have made of it (`redacted_object_body`, the one construction), and nothing
+    /// of its payload. The dependency edges are kept, so the fact stays on the
+    /// closure of the runs it depends on. The idempotency row is written for the
+    /// same key and the same digest and is redacted at once: the same fact is
+    /// refused if it is committed again (`cached` refuses a redacted subject), and
+    /// no stored response holds its content. `session` is the transaction the
+    /// decision was taken in.
+    async fn commit_redacted(&self, mut session: Session, fact: &StageFact) -> Result<()> {
+        let value = serde_json::to_value(fact).map_err(|_| Error::Internal)?;
+        let body = serde_json::to_string(fact).map_err(|_| Error::Internal)?;
+        let redacted = redacted_object_body("artifact", &fact.artifact_id, &value, &body);
+        session
+            .put(
+                &self.context,
+                "artifact",
+                &fact.artifact_id,
+                &self.owner,
+                &redacted,
+            )
+            .await?;
+        for dependency in &fact.dependencies {
+            session
+                .put_edge(
+                    &self.context,
+                    "artifact",
+                    &fact.artifact_id,
+                    &dependency.kind,
+                    &dependency.id,
+                )
+                .await?;
+        }
+        session
+            .cache(
+                &self.context,
+                "optimization.stage",
+                &fact.artifact_id,
+                fact,
+                &fact.artifact_id,
+                &serde_json::Value::Null,
+            )
+            .await?;
+        session
+            .redact_cache(&self.context, &fact.artifact_id)
+            .await?;
+        session
+            .audit(
+                &self.context,
+                "optimization.stage.commit_redacted",
+                &fact.artifact_id,
+            )
+            .await?;
+        session.commit().await
+    }
 }
 
 #[async_trait]
@@ -1031,7 +1127,7 @@ impl OptimizationJournal for StoreOptimizationJournal {
     }
     async fn lookup(&self, artifact_id: &str) -> Result<Option<StageFact>> {
         let mut session = self.store.session().await?;
-        let fact: Option<StageFact> = session.get(&self.context, "artifact", artifact_id).await?;
+        let fact = read_stage_fact(&mut session, &self.context, artifact_id).await?;
         session.commit().await?;
         if let Some(fact) = &fact {
             fact.validate()?;
@@ -1157,6 +1253,18 @@ impl OptimizationJournal for StoreOptimizationJournal {
             }
             session.commit().await?;
             return Ok(());
+        }
+        // A fact that holds a model's answer and lands after a run it depends on was
+        // revoked is accepted, because the receipt it carries is accounting truth,
+        // but its content is not kept: the revocation cleanup only reaches what
+        // exists when it looks, so an answer stored in plaintext now could stay in
+        // the database for good. The decision is taken here, in the transaction that
+        // would write the fact, so that no revocation can fall between the check and
+        // the write.
+        if holds_model_output(&fact)
+            && run_dependency_revoked(&mut session, &self.context, &fact).await?
+        {
+            return self.commit_redacted(session, &fact).await;
         }
         session
             .put(
@@ -2546,6 +2654,8 @@ async fn validate_live_fact(
     fact: &StageFact,
 ) -> Result<()> {
     // Raw late receipts preserve billing/audit truth; every consumer still checks their watermark.
+    // What such a receipt holds of a revoked source's answer is not kept: `commit` stores
+    // it redacted (`run_dependency_revoked`).
     if fact.kind == StageFactKind::DispatchObserved {
         return Ok(());
     }
@@ -2564,4 +2674,53 @@ async fn validate_live_fact(
         crate::evidence::validate_stored_sources(session, context, &ids, expected).await?;
     }
     Ok(())
+}
+
+/// Whether `fact` holds the answer of a model: the observation of a model call (the
+/// whole `ModelResponse`, or the outcome built from it) of a model stage. The
+/// scores-only observation of the development runner holds none, and is not handled.
+fn holds_model_output(fact: &StageFact) -> bool {
+    matches!(
+        fact.kind,
+        StageFactKind::DispatchObserved | StageFactKind::ResponseObserved
+    ) && fact.stage != OptimizationJournalStage::Development
+}
+
+/// Whether a run `fact` depends on was revoked as a run, inside the caller's
+/// transaction. The tombstone of the run decides, and nothing else:
+///
+/// * not the watermark, which any revocation moves (another source's included): a
+///   fact over live runs must not be redacted because something unrelated was
+///   revoked, and the consumers of such a fact still check the watermark on read;
+/// * the kind is compared exactly: a tombstone is keyed by the id of its source
+///   alone and records the kind it was written for, so the tombstone of an artifact
+///   that shares the id of a run revokes the artifact, not the run, and spares the
+///   fact. Every other tombstone revokes: one written for a run, and one that cannot
+///   be read as a tombstone `begin_revoke` writes (a kind it does not write, or a
+///   body that does not decode) cannot be matched to anything and fails closed, the
+///   rule of the other tombstone gates (the management submit check, the budget
+///   reservation, dispatch and settlement gates). Production never writes such a
+///   tombstone; the rule only decides what a hand-written one means. (The readers of
+///   the fact go further: `validate_stored_sources` takes any tombstone for a
+///   revocation.)
+async fn run_dependency_revoked(
+    session: &mut Session,
+    context: &Context,
+    fact: &StageFact,
+) -> Result<bool> {
+    for dependency in fact.dependencies.iter().filter(|d| d.kind == "run") {
+        let Some(body) = session
+            .get::<serde_json::Value>(context, "tombstone", &dependency.id)
+            .await?
+        else {
+            continue;
+        };
+        let source_kind = serde_json::from_value::<RevokeTombstone>(body)
+            .ok()
+            .map(|tombstone| tombstone.source_kind);
+        if source_kind.as_deref() != Some("artifact") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
