@@ -111,10 +111,15 @@ class ValidManifestTests(unittest.TestCase):
             plan = Path(tmp) / "plan.md"
             plan.write_text("fixture plan bytes\n", encoding="utf-8")
             digest = css.sha256_of_file(plan)
-            # Only the top level and the current lineage entry follow the plan bytes; historical
-            # records keep the v4.1 pair they were verified against (plan §18.8).
+            # Only the top level, the current lineage entry and the records verified against the
+            # current version follow the plan bytes; historical records keep the v4.1 pair they were
+            # verified against (plan §18.8).
             repo.manifest["plan_sha256"] = digest
             repo.manifest["plan_lineage"][-1]["sha256"] = digest
+            for scope in repo.manifest["e_scopes"].values():
+                for record in scope["verified_subscopes"]:
+                    if record["plan_version"] == css.PLAN_VERSION:
+                        record["plan_sha256"] = digest
             repo.write_manifest(repo.manifest)
             lineage = copy.deepcopy(css.PLAN_LINEAGE)
             lineage[css.PLAN_VERSION]["sha256"] = digest
@@ -124,7 +129,7 @@ class ValidManifestTests(unittest.TestCase):
             self.assertTrue(report.plan_binding_available)
             self.assertFalse(report.input_binding_available)
             self.assertTrue(
-                all(record["plan_version"] == "v4.1" for scope in repo.manifest["e_scopes"].values() for record in scope["verified_subscopes"]),
+                any(record["plan_version"] == "v4.1" for scope in repo.manifest["e_scopes"].values() for record in scope["verified_subscopes"]),
                 "fixture must exercise historical records that stay bound to v4.1",
             )
 
@@ -258,8 +263,8 @@ class RejectionTests(unittest.TestCase):
     def test_planned_status_tolerates_empty_test_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp))
-            self.assertEqual(repo.manifest["e_scopes"]["E14"]["status"], "planned")
-            self.assertEqual(repo.manifest["e_scopes"]["E14"]["verified_subscopes"], [])
+            self.assertEqual(repo.manifest["e_scopes"]["E15"]["status"], "planned")
+            self.assertEqual(repo.manifest["e_scopes"]["E15"]["verified_subscopes"], [])
             self.assertTrue(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
 
     def test_rejects_missing_e16_parent_e17_or_e18(self):
@@ -378,14 +383,14 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
 
     def test_rejects_planned_scope_carrying_verified_evidence(self):
         manifest = _valid_manifest_dict()
-        e14 = manifest["e_scopes"]["E14"]
-        self.assertEqual(e14["status"], "planned")
-        e14["verified_subscopes"].append(
-            _fresh_record(manifest["e_scopes"]["E13"]["verified_subscopes"][0], "E14", "controller_acceptance", "e14")
+        e15 = manifest["e_scopes"]["E15"]
+        self.assertEqual(e15["status"], "planned")
+        e15["verified_subscopes"].append(
+            _fresh_record(manifest["e_scopes"]["E13"]["verified_subscopes"][0], "E15", "controller_acceptance", "e15")
         )
         errors = self._errors(manifest)
         self.assertIn(
-            "E14: status 'planned' is incompatible with verified evidence records ['E14.controller_acceptance']",
+            "E15: status 'planned' is incompatible with verified evidence records ['E15.controller_acceptance']",
             errors[0],
         )
 
@@ -435,24 +440,24 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
 
     def test_rejects_evidence_duplicated_or_borrowed_from_another_task(self):
         manifest = _valid_manifest_dict()
-        e13, e14 = manifest["e_scopes"]["E13"], manifest["e_scopes"]["E14"]
-        e14["status"] = "in_progress"
-        e14["implementation_files"] = list(e13["implementation_files"])
+        e13, e15 = manifest["e_scopes"]["E13"], manifest["e_scopes"]["E15"]
+        e15["status"] = "in_progress"
+        e15["implementation_files"] = list(e13["implementation_files"])
         borrowed = copy.deepcopy(e13["verified_subscopes"][0])
-        borrowed["id"] = "E14.controller_acceptance"
-        e14["verified_subscopes"].append(borrowed)
+        borrowed["id"] = "E15.controller_acceptance"
+        e15["verified_subscopes"].append(borrowed)
         errors = self._errors(manifest)
         self.assertIn(
-            f"E14.controller_acceptance: log_path {borrowed['log_path']!r} duplicates evidence E13.controller_acceptance of task E13",
+            f"E15.controller_acceptance: log_path {borrowed['log_path']!r} duplicates evidence E13.controller_acceptance of task E13",
             errors[0],
         )
         with self.subTest(variant="same test run re-logged under another task"):
             manifest = _valid_manifest_dict()
-            e13, e14 = manifest["e_scopes"]["E13"], manifest["e_scopes"]["E14"]
-            e14["status"] = "in_progress"
+            e13, e15 = manifest["e_scopes"]["E13"], manifest["e_scopes"]["E15"]
+            e15["status"] = "in_progress"
             rerun = copy.deepcopy(e13["verified_subscopes"][0])
-            rerun.update({"id": "E14.controller_acceptance", "log_path": "out/fixture/e14-rerun.log"})
-            e14["verified_subscopes"].append(rerun)
+            rerun.update({"id": "E15.controller_acceptance", "log_path": "out/fixture/e15-rerun.log"})
+            e15["verified_subscopes"].append(rerun)
             errors = self._errors(manifest)
             self.assertIn(
                 f"the same test run ({rerun['test_entry']} at source_sha {rerun['source_sha']}) is already claimed by E13.controller_acceptance of task E13",
@@ -460,23 +465,23 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
             )
         with self.subTest(variant="evidence id namespaced under a foreign task"):
             manifest = _valid_manifest_dict()
-            e14 = manifest["e_scopes"]["E14"]
-            e14["status"] = "in_progress"
-            e14["verified_subscopes"].append(
+            e15 = manifest["e_scopes"]["E15"]
+            e15["status"] = "in_progress"
+            e15["verified_subscopes"].append(
                 _fresh_record(manifest["e_scopes"]["E13"]["verified_subscopes"][0], "E13", "second_controller_acceptance", "e13-second")
             )
             errors = self._errors(manifest)
-            self.assertIn("E14: evidence id 'E13.second_controller_acceptance' is not namespaced under its own task", errors[0])
+            self.assertIn("E15: evidence id 'E13.second_controller_acceptance' is not namespaced under its own task", errors[0])
         with self.subTest(variant="test target outside the task's declared crates"):
             manifest = _valid_manifest_dict()
-            e14 = manifest["e_scopes"]["E14"]
-            e14["status"] = "in_progress"
-            e14["verified_subscopes"].append(
-                _fresh_record(manifest["e_scopes"]["E01"]["verified_subscopes"][0], "E14", "controller_acceptance", "e14-foreign")
+            e15 = manifest["e_scopes"]["E15"]
+            e15["status"] = "in_progress"
+            e15["verified_subscopes"].append(
+                _fresh_record(manifest["e_scopes"]["E01"]["verified_subscopes"][0], "E15", "controller_acceptance", "e15-foreign")
             )
             errors = self._errors(manifest)
             self.assertIn(
-                "E14.controller_acceptance: test_entry 'crates/evo-core/tests/evaluation_v41.rs' (package evo-core) is not among E14's declared implementation_files nor inside a crate they declare",
+                "E15.controller_acceptance: test_entry 'crates/evo-core/tests/evaluation_v41.rs' (package evo-core) is not among E15's declared implementation_files nor inside a crate they declare",
                 errors[0],
             )
 
@@ -579,10 +584,10 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
 
     def test_new_task_with_fresh_evidence_is_still_registrable(self):
         manifest = _valid_manifest_dict()
-        e14 = manifest["e_scopes"]["E14"]
-        e14["status"] = "implemented_not_verified"
+        e15 = manifest["e_scopes"]["E15"]
+        e15["status"] = "implemented_not_verified"
         record = _fresh_record(
-            manifest["e_scopes"]["E13"]["verified_subscopes"][0], "E14", "inheritance_controller_acceptance", "e14-fresh"
+            manifest["e_scopes"]["E13"]["verified_subscopes"][0], "E15", "inheritance_controller_acceptance", "e15-fresh"
         )
         record.update(
             {
@@ -591,7 +596,7 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
                 "pr_state": "open",
             }
         )
-        e14["verified_subscopes"].append(record)
+        e15["verified_subscopes"].append(record)
         self._assert_valid(manifest)
 
     def test_parent_verified_when_all_children_verified_is_allowed(self):

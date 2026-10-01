@@ -277,6 +277,37 @@ fn expected_merge_for_pr(pr: u64) -> Result<Option<&'static str>, String> {
         50 => Some("e94042d3f2fd761455727a6c82ad13fd3d657d03"),
         51 => Some("bef7bd1763a01ccb677ada4acad71a063366539c"),
         54 => Some("16c2817bc192bf71535d2c99d867873e6e85bcf8"),
+        60 => Some("dc036d5f4dd5d870fb0ca98bdfe1ef6ec626140b"),
+        61 => Some("b220971c4e5ad44453c9d3e5787fbdfda6eb01ac"),
+        62 => Some("9c3ec979fd2ee3c53dfbf4ddf96967e94808b11e"),
+        63 => Some("3e2fc067190077b8cf8401875d6c627b8d9e13fc"),
+        64 => Some("f8fa1a19d5e968f83a52385ecb43d07d56442610"),
+        66 => Some("5a0ef4419c51687534baa3296dbbf7e310a5d810"),
+        67 => Some("5c4f81dca79373c6871449aed287f61fb1f3cbc2"),
+        69 => Some("31566ce87203b44c44b72986233af1c02fbe5cda"),
+        70 => Some("c81b258b6f890ab78bc9c7111798f75560c2ea23"),
+        71 => Some("9519c26f049afff63154fb2337893217b18b7e3c"),
+        72 => Some("15b140ddef25c8e794d586fecae56f129226a5c6"),
+        73 => Some("7ad4994c7a9208f523612d305660dc8ca9529620"),
+        74 => Some("c72aae14c9f35c1bcc090b5a374d2696d57dacfc"),
+        75 => Some("6a23cb3697f656e1f5132cbe62ae766b4c0383f0"),
+        76 => Some("7120842a1f586ae394b76e146c8298f11bec52bc"),
+        77 => Some("887b1d714581ae8a71d45243d38be1759697600d"),
+        78 => Some("84d8a7054c2428db0f821fcd478c615b09ade76b"),
+        79 => Some("b262bbb2a0ea9ead68bc33fe1e58235e85bcffea"),
+        80 => Some("9e3e350ed5fbef2975117f12a7f8d3ca3b9cdcbf"),
+        81 => Some("d9b3f6f5234ad14da18956a78c804e4c6818fa10"),
+        82 => Some("8d959dee844fb16f0763b0684ba3adf48ad75f1f"),
+        83 => Some("51db9b6c9a251def4e6566c96641ed8b63d43a85"),
+        84 => Some("42f89bd602db0c2783de38d87d91e80cd65f220b"),
+        85 => Some("f4b1ef66340412f5c0edf69a48549cd1386324cf"),
+        86 => Some("16bdb08e1ac118e3e732a912358add468c49173b"),
+        87 => Some("32a2f5090fe5136b21c7d3454f53964b36990247"),
+        88 => Some("ca117c45d87986500b38bc5afee3d6e161fea4f5"),
+        89 => Some("cc85b5c71cec06763909fb0efa33c4e296b6178d"),
+        90 => Some("ecdfe31faabb21a368f08d341b2a6e15223b0849"),
+        91 => Some("a38b1452ede8fc5755bcab65686edd2f2817b51a"),
+        92 => Some("696252faf8ef2b2391102f4e6b0e9c0ee20c53d5"),
         _ => return Err(format!("no reviewed merge status for PR {pr}")),
     })
 }
@@ -1270,13 +1301,13 @@ fn rejects_unknown_status_and_verified_without_execution_evidence() {
 
     let mut unsupported_verified = load_manifest(&root);
     assert!(
-        unsupported_verified["e_scopes"]["E14"]["verified_subscopes"]
+        unsupported_verified["e_scopes"]["E15"]["verified_subscopes"]
             .as_array()
             .unwrap()
             .is_empty()
     );
-    unsupported_verified["e_scopes"]["E14"]["status"] = Value::String("verified".into());
-    unsupported_verified["e_scopes"]["E14"]["remaining"] = Value::Array(vec![]);
+    unsupported_verified["e_scopes"]["E15"]["status"] = Value::String("verified".into());
+    unsupported_verified["e_scopes"]["E15"]["remaining"] = Value::Array(vec![]);
     assert!(validate_manifest(&unsupported_verified, &root).is_err());
 }
 
@@ -1394,10 +1425,10 @@ fn rejects_symlinked_evidence_file() {
 fn planned_scope_can_omit_files_only_with_explicit_remaining_reason() {
     let root = repo_root();
     let mut value = load_manifest(&root);
-    assert_eq!(value["e_scopes"]["E14"]["status"], "planned");
-    value["e_scopes"]["E14"]["implementation_files"] = Value::Array(vec![]);
+    assert_eq!(value["e_scopes"]["E15"]["status"], "planned");
+    value["e_scopes"]["E15"]["implementation_files"] = Value::Array(vec![]);
     assert!(
-        !value["e_scopes"]["E14"]["remaining"]
+        !value["e_scopes"]["E15"]["remaining"]
             .as_array()
             .unwrap()
             .is_empty()
