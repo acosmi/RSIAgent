@@ -17,7 +17,8 @@ use evo_core::strategy::{
     BatchActionV1, ElasticPolicyV1, ExplorationCapsV1, HistoryOutcome, HistoryQuery,
     OptimizationHistoryEntry, SimulationContext,
 };
-use evo_core::{Context, Error, Result, Role, Strategy, hash};
+use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, hash};
+use evo_engine::capacity::MAX_EXPLORATION_NODES;
 use evo_engine::evidence::{
     StoredRunRecord, StoredTraceAuthority, store_source_selection, store_trace_authority,
 };
@@ -1095,4 +1096,291 @@ async fn intermediate_world_cannot_be_presented_as_final_candidate() {
             .await
             .is_err()
     );
+}
+
+// ---------------------------------------------------------------------------
+// E16.5 AG-014: exploration node capacity at the coordinator entry point
+// ---------------------------------------------------------------------------
+
+/// Seed `count` exploration node envelopes exactly as the coordinator stores
+/// them (`e09-<fingerprint(record_kind, id)>` artifacts in the envelope schema).
+async fn seed_exploration_nodes(store: &Store, count: u64) {
+    let worker = Context::new("n", "worker", Role::Worker).unwrap();
+    let mut session = store.session().await.unwrap();
+    for index in 0..count {
+        let node_id = format!("seed-node-{index:04}");
+        let storage_id = format!(
+            "e09-{}",
+            fingerprint(&("exploration_node_v1", node_id.as_str())).unwrap()
+        );
+        session
+            .put(
+                &worker,
+                "artifact",
+                &storage_id,
+                "worker",
+                &serde_json::json!({
+                    "schema_version": "rsia.exploration_artifact_envelope.v1",
+                    "id": storage_id,
+                    "record_kind": "exploration_node_v1",
+                    "payload": {"schema_version": "rsia.exploration_node.v1", "seed": index}
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    session.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn run_next_refuses_a_new_node_at_capacity_before_any_model_call() {
+    let (_dir, coordinator, store) = coordinator().await;
+    seed_exploration_nodes(&store, MAX_EXPLORATION_NODES).await;
+    let worker = Context::new("n", "worker", Role::Worker).unwrap();
+    let mut session = store.session().await.unwrap();
+    assert_eq!(
+        session
+            .capacity_usage_v41(0)
+            .await
+            .unwrap()
+            .exploration_nodes,
+        MAX_EXPLORATION_NODES
+    );
+    session.commit().await.unwrap();
+
+    let evidence = EvidenceSet::build(
+        "evidence",
+        vec![
+            EvidenceMember {
+                source_id: "run-failure".into(),
+                content_digest: hash(b"run-failure"),
+                task_origin: TaskOrigin::TrustedRun,
+                execution_attestation: ExecutionAttestation::TrustedHost,
+                purpose: Purpose::Development,
+            },
+            EvidenceMember {
+                source_id: "run-success".into(),
+                content_digest: hash(b"run-success"),
+                task_origin: TaskOrigin::TrustedRun,
+                execution_attestation: ExecutionAttestation::TrustedHost,
+                purpose: Purpose::Development,
+            },
+        ],
+        SourceCoverage {
+            discovery_exhausted: true,
+            files_known: true,
+            parsed_ok: 2,
+            bytes_read: 22,
+            ..SourceCoverage::default()
+        },
+        ["family-a".into(), "family-b".into()].into_iter().collect(),
+    )
+    .unwrap();
+    let parent = SkillSnapshot {
+        content: "old".into(),
+        applicability: "applies".into(),
+        counterexample: "counter".into(),
+        required_capabilities: vec![],
+        dependencies: vec![],
+    };
+    let mut registered_world = world();
+    registered_world.parent_skill_digest = skill_snapshot_digest(&parent).unwrap();
+    registered_world.context_signature = evo_core::fingerprint(&(
+        &registered_world.parent_skill_digest,
+        &registered_world.parent_bundle_digest,
+        &registered_world.environment_digest,
+        &registered_world.model_digest,
+        &registered_world.tools_digest,
+        &registered_world.grader_digest,
+        &registered_world.rules_digest,
+        registered_world.source_watermark,
+    ))
+    .unwrap();
+    coordinator.register_world(registered_world).await.unwrap();
+    let allowed = vec![
+        EvidenceRef {
+            id: "run-failure".into(),
+            digest: hash(b"run-failure"),
+        },
+        EvidenceRef {
+            id: "run-success".into(),
+            digest: hash(b"run-success"),
+        },
+    ];
+    let edit_context = TrustedEditContext::new(
+        "n",
+        "profile",
+        "skill",
+        "v1",
+        hash(b"approved-parent"),
+        hash(b"baseline"),
+        &parent,
+        allowed.clone(),
+    )
+    .unwrap();
+    let source_selection = SourceSelection {
+        roots: vec![],
+        run_ids: vec!["run-failure".into(), "run-success".into()],
+        purpose: Purpose::Development,
+        allow_model_excerpts: true,
+    };
+    let bindings = vec![
+        TrustedSourceBinding {
+            source_id: "run-failure".into(),
+            source_digest: hash(b"run-failure"),
+            parent_family: "family-a".into(),
+        },
+        TrustedSourceBinding {
+            source_id: "run-success".into(),
+            source_digest: hash(b"run-success"),
+            parent_family: "family-b".into(),
+        },
+    ];
+    let profile = Profile {
+        id: "profile".into(),
+        evolution_enabled: true,
+        parent_digest: hash(b"approved-parent"),
+        baseline_digest: hash(b"baseline"),
+    };
+    let baseline = parent.clone();
+    let parent_strategy = Strategy::default();
+    let baseline_strategy = Strategy::default();
+    let improver = ImproverPatch::default();
+    let caps = HostCapabilities {
+        available: BTreeSet::new(),
+        granted: BTreeSet::new(),
+    };
+    let revoked = BTreeSet::new();
+    let journal = StoreOptimizationJournal::new(store.clone(), worker.clone(), "worker").unwrap();
+    let parent_bundle = hash(b"parent-bundle");
+    macro_rules! request {
+        () => {
+            OptimizationStepRequest {
+                evidence: &evidence,
+                source_selection: &source_selection,
+                source_bindings: &bindings,
+                traces: vec![
+                    trace("run-failure", "family-a", TraceOutcome::TaskFailure),
+                    trace("run-success", "family-b", TraceOutcome::Success),
+                ],
+                model_context: ModelRequestContext {
+                    request_id: "capacity-request-1".into(),
+                    namespace: "n".into(),
+                    purpose: Purpose::Development,
+                    stage: ModelStage::ReflectFailure,
+                    episode_id: "world-1".into(),
+                    step: 1,
+                    attempt: 1,
+                    parent_skill_digest: skill_snapshot_digest(&parent).unwrap(),
+                    bundle_digest: parent_bundle.clone(),
+                    source_closure: allowed.clone(),
+                    model_digest: hash(b"model"),
+                    tools_digest: hash(b"tools"),
+                    rules_digest: hash(b"rules"),
+                    sampling_digest: hash(b"sampling"),
+                    revoke_watermark: 1,
+                    max_suggestions: 4,
+                },
+                parent_skill: &parent,
+                edit_context: &edit_context,
+                edit_batch_template: SkillEditBatch {
+                    schema_version: SKILL_EDIT_SCHEMA.into(),
+                    compiler_version: SKILL_EDIT_COMPILER_VERSION.into(),
+                    namespace: "n".into(),
+                    profile_id: "profile".into(),
+                    skill_id: "skill".into(),
+                    skill_version: "v1".into(),
+                    input_digest: skill_snapshot_digest(&parent).unwrap(),
+                    approved_parent_digest: hash(b"approved-parent"),
+                    safe_baseline_digest: hash(b"baseline"),
+                    evidence: EvidenceClosure {
+                        support: vec![],
+                        counterexamples: vec![],
+                        dependencies: vec![],
+                    },
+                    edits: vec![],
+                },
+                protected_ranges: &[],
+                bundle_context: BundleCompileContext {
+                    profile: &profile,
+                    baseline: &baseline,
+                    parent_strategy: &parent_strategy,
+                    baseline_strategy: &baseline_strategy,
+                    improver_patch: &improver,
+                    caps: &caps,
+                    revoked: &revoked,
+                },
+                development_request: DevelopmentRunRequest {
+                    request_id: "capacity-dev-request-1".into(),
+                    namespace: "n".into(),
+                    purpose: Purpose::Development,
+                    episode_id: "world-1".into(),
+                    step: 1,
+                    attempt: 1,
+                    manifest: DevelopmentManifest::build(
+                        "manifest-1".to_string(),
+                        vec![DevelopmentTask {
+                            id: "task".into(),
+                            parent_family: "family-a".into(),
+                            input_digest: hash(b"task"),
+                        }],
+                    )
+                    .unwrap(),
+                    parent_bundle_digest: parent_bundle.clone(),
+                    candidate_bundle_digest: hash(b"candidate-1"),
+                    environment_digest: hash(b"environment"),
+                    grader_digest: hash(b"grader"),
+                    rules_digest: hash(b"rules"),
+                    tools_digest: hash(b"tools"),
+                    revoke_watermark: 1,
+                    idempotency_key: "capacity-dev-idempotency-1".into(),
+                },
+                allow_rank_call: false,
+            }
+        };
+    }
+    // The model port counts every dispatch; the refusal must happen first.
+    let model = NotFoundAfterDispatchModel::default();
+    match coordinator
+        .run_next(
+            Some(&model),
+            Some(&ImprovingFixtureRunner),
+            Some(&journal),
+            request!(),
+        )
+        .await
+    {
+        Err(Error::Conflict(msg)) => assert_eq!(
+            msg,
+            format!(
+                "MVP capacity exceeded: exploration nodes {MAX_EXPLORATION_NODES} >= limit {MAX_EXPLORATION_NODES}"
+            )
+        ),
+        other => panic!("expected the MVP exploration node conflict, got {other:?}"),
+    }
+    assert_eq!(model.0.load(Ordering::SeqCst), 0);
+    // No dispatch fact was persisted: a reconnect finds nothing to resume.
+    assert!(matches!(
+        coordinator.run_next(None, None, None, request!()).await,
+        Err(Error::NotFound)
+    ));
+    let mut session = store.session().await.unwrap();
+    assert_eq!(
+        session
+            .capacity_usage_v41(0)
+            .await
+            .unwrap()
+            .exploration_nodes,
+        MAX_EXPLORATION_NODES
+    );
+    session.commit().await.unwrap();
+    // The pure decision is unchanged: the world still offers the same action.
+    let decision = coordinator.decide_next("world-1").await.unwrap();
+    assert!(matches!(
+        decision.action,
+        BatchActionV1::Dispatch {
+            ref action_seqs,
+            ..
+        } if action_seqs == &[1]
+    ));
 }

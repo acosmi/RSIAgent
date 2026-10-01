@@ -21,6 +21,18 @@ use std::{
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 
 pub const MVP_MAX_RUNS: u64 = 1_000;
+/// Storage-side mirrors of the E16.5 MVP capacity bounds enforced inside this
+/// crate (`Session::put_world`, `Store::reserve_budget_call_with_sources`).
+/// The engine's `capacity` module pins the same values and asserts equality.
+pub const MVP_MAX_REPLAY_WORLDS: u64 = 100;
+pub const MVP_MAX_ACTIVE_LEASES: u64 = 10;
+/// Schema identifiers the capacity measurement recognises. They mirror the
+/// engine's persisted schema versions; the engine asserts they stay equal.
+pub const CAPACITY_MANAGEMENT_JOB_SCHEMA: &str = "rsia.management_job.v1";
+pub const CAPACITY_IMPORT_RESULT_SCHEMA: &str = "rsia.e16.import_result.v1";
+pub const CAPACITY_EXPLORATION_ENVELOPE_SCHEMA: &str = "rsia.exploration_artifact_envelope.v1";
+pub const CAPACITY_EXPLORATION_NODE_RECORD_KIND: &str = "exploration_node_v1";
+pub const CAPACITY_STAGED_ASSET_SCHEMA: &str = "rsia.e16.staged_asset.v1";
 pub const MAX_LOCAL_EXPORT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_LOCAL_EXPORT_FILES: usize = 101;
 
@@ -100,6 +112,122 @@ pub struct Session {
 fn internal(e: impl std::fmt::Display) -> Error {
     tracing::error!(error=%e,"database operation failed");
     Error::Internal
+}
+
+/// Authority-side measurement of one namespace against the E16.5 MVP capacity
+/// bounds. Every field is counted inside the calling session, so a caller that
+/// measures and then inserts within the same session cannot race another
+/// writer across a limit (the Store serializes writers on one connection).
+///
+/// `inflight_prepare` is process-local and never persisted; the engine fills it
+/// in after conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CapacityUsageV41 {
+    /// `run` objects plus service runs (artifacts whose `$.source` is
+    /// `trusted_host_snapshot`), the same formula `Session::put` enforces.
+    pub runs: u64,
+    /// Sum of `$.payload.aggregate_summary.total_events` over live import
+    /// results plus any `event` objects.
+    pub events: u64,
+    /// Stored Skill candidates (`kind='candidate'`). This is the one Skill asset
+    /// table: release candidates are frozen artifacts derived from these rows
+    /// and the disposable `skill_fts` index is keyed by candidate id.
+    pub skills: u64,
+    /// Exploration node envelopes (`rsia.exploration_artifact_envelope.v1`
+    /// with `record_kind = exploration_node_v1`).
+    pub exploration_nodes: u64,
+    /// Rows in `replay_worlds` (drafts and sealed worlds alike).
+    pub replay_worlds: u64,
+    /// Live leases: root budget calls that are reserved, dispatched, uncertain
+    /// or finalized-but-not-closed with `lease_until > now`, plus running
+    /// management jobs whose lease is still live.
+    pub active_leases: u64,
+    /// Staged assets in `prepared`, `staged` or `quarantined` state.
+    pub staged_packages: u64,
+    /// Running management jobs whose `lease_until > now`.
+    pub concurrent_dispatches: u64,
+}
+
+/// Build the typed refusal every MVP capacity gate reports. The message names
+/// the exhausted counter and both numbers; it never truncates anything.
+pub fn mvp_capacity_exceeded(label: &str, used: u64, limit: u64) -> Error {
+    Error::Conflict(format!(
+        "MVP capacity exceeded: {label} {used} >= limit {limit}"
+    ))
+}
+
+fn count_to_u64(count: i64) -> Result<u64> {
+    u64::try_from(count).map_err(|_| Error::Internal)
+}
+
+/// Live leases across the whole instance at `now`: root budget calls holding a
+/// lease plus running management jobs holding a lease, in every namespace.
+/// Shared by the session measurement and the budget reservation gate so both
+/// count the same facts. Counting is instance-wide (F24): the MVP load
+/// contract is per deployment and a shared root cannot be split by claiming
+/// another namespace lane.
+pub(crate) async fn count_active_leases(
+    conn: &mut sqlx::SqliteConnection,
+    now: i64,
+) -> Result<u64> {
+    let budget: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM root_budget_calls
+         WHERE lease_until>? AND (
+           state IN ('reserved','dispatched','uncertain')
+           OR (state='finalized' AND execution_closed=0)
+         )",
+    )
+    .bind(now)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(internal)?;
+    let jobs = count_running_management_jobs(conn, now).await?;
+    count_to_u64(budget)?
+        .checked_add(jobs)
+        .ok_or(Error::Internal)
+}
+
+async fn count_running_management_jobs(conn: &mut sqlx::SqliteConnection, now: i64) -> Result<u64> {
+    let running: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objects
+         WHERE kind='job'
+           AND json_extract(body,'$.schema_version')=?
+           AND json_extract(body,'$.state')='running'
+           AND json_extract(body,'$.lease_until')>?",
+    )
+    .bind(CAPACITY_MANAGEMENT_JOB_SCHEMA)
+    .bind(now)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(internal)?;
+    count_to_u64(running)
+}
+
+/// Objects of `kind` across every namespace (a capacity count, never content).
+async fn count_objects_all_namespaces(
+    conn: &mut sqlx::SqliteConnection,
+    kind: &str,
+) -> Result<u64> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objects WHERE kind=?")
+        .bind(kind)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(internal)?;
+    count_to_u64(count)
+}
+
+/// Runs across every namespace: `run` objects plus service runs (artifacts
+/// whose `$.source` is `trusted_host_snapshot`).
+async fn count_runs_all_namespaces(conn: &mut sqlx::SqliteConnection) -> Result<u64> {
+    let runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objects WHERE
+           kind='run' OR
+           (kind='artifact' AND json_extract(body,'$.source')='trusted_host_snapshot')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(internal)?;
+    count_to_u64(runs)
 }
 
 struct PrivateStagedBlob {
@@ -1859,6 +1987,72 @@ impl Store {
     }
 }
 impl Session {
+    /// Measure the whole instance against the E16.5 MVP capacity bounds inside
+    /// this transaction. Every counter spans all namespaces (F24): the MVP load
+    /// contract is per deployment, so a cap cannot be split by deriving from
+    /// another namespace. Counts are not content; object reads stay
+    /// namespace-authorized. `now_secs` is the lease clock (unix seconds) used
+    /// for `active_leases` and `concurrent_dispatches`.
+    pub async fn capacity_usage_v41(&mut self, now_secs: u64) -> Result<CapacityUsageV41> {
+        let now = i64::try_from(now_secs)
+            .map_err(|_| Error::Invalid("capacity clock is out of range".into()))?;
+        let runs = count_runs_all_namespaces(&mut self.tx).await?;
+        let imported_events: i64 = sqlx::query_scalar(
+            "SELECT CAST(COALESCE(SUM(json_extract(body,'$.payload.aggregate_summary.total_events')),0) AS INTEGER)
+             FROM objects WHERE kind='artifact'
+               AND json_extract(body,'$.schema_version')=?",
+        )
+        .bind(CAPACITY_IMPORT_RESULT_SCHEMA)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        let event_objects = count_objects_all_namespaces(&mut self.tx, "event").await?;
+        let skills = count_objects_all_namespaces(&mut self.tx, "candidate").await?;
+        let exploration_nodes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objects WHERE kind='artifact'
+               AND json_extract(body,'$.schema_version')=?
+               AND json_extract(body,'$.record_kind')=?",
+        )
+        .bind(CAPACITY_EXPLORATION_ENVELOPE_SCHEMA)
+        .bind(CAPACITY_EXPLORATION_NODE_RECORD_KIND)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        let replay_worlds = self.replay_world_count().await?;
+        let active_leases = count_active_leases(&mut self.tx, now).await?;
+        let staged_packages: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objects WHERE kind='artifact'
+               AND json_extract(body,'$.schema_version')=?
+               AND json_extract(body,'$.payload.state') IN ('prepared','staged','quarantined')",
+        )
+        .bind(CAPACITY_STAGED_ASSET_SCHEMA)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        let concurrent_dispatches = count_running_management_jobs(&mut self.tx, now).await?;
+        Ok(CapacityUsageV41 {
+            runs,
+            events: count_to_u64(imported_events)?
+                .checked_add(event_objects)
+                .ok_or(Error::Internal)?,
+            skills,
+            exploration_nodes: count_to_u64(exploration_nodes)?,
+            replay_worlds,
+            active_leases,
+            staged_packages: count_to_u64(staged_packages)?,
+            concurrent_dispatches,
+        })
+    }
+
+    /// Count replay worlds (drafts and sealed) across every namespace.
+    pub async fn replay_world_count(&mut self) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM replay_worlds")
+            .fetch_one(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+        count_to_u64(count)
+    }
+
     /// Count persisted objects in the authenticated namespace inside this
     /// transaction. This is an authority-side measurement, never caller usage.
     pub async fn namespace_object_count(&mut self, ctx: &Context, kind: &str) -> Result<u64> {
@@ -2035,20 +2229,11 @@ impl Session {
             .await
             .map_err(internal)?;
             if exists == 0 {
-                let used: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM objects WHERE namespace=? AND (
-                       kind='run' OR
-                       (kind='artifact' AND json_extract(body,'$.source')='trusted_host_snapshot')
-                     )",
-                )
-                .bind(ctx.namespace())
-                .fetch_one(&mut *self.tx)
-                .await
-                .map_err(internal)?;
-                if u64::try_from(used).map_err(|_| Error::Internal)? >= MVP_MAX_RUNS {
-                    return Err(Error::Conflict(format!(
-                        "namespace run capacity exceeded: {used} >= {MVP_MAX_RUNS}"
-                    )));
+                // E16.5 / F24: the run bound is instance-wide, like every other
+                // MVP counter; a new run id anywhere counts against it.
+                let used = count_runs_all_namespaces(&mut self.tx).await?;
+                if used >= MVP_MAX_RUNS {
+                    return Err(mvp_capacity_exceeded("runs", used, MVP_MAX_RUNS));
                 }
             }
         }
@@ -2275,6 +2460,17 @@ impl Session {
             }
             if !sealed && existing_manifest == *manifest {
                 return Ok(());
+            }
+        } else {
+            // E16.5: a new world id is a new derivation. Sealing or updating an
+            // existing draft creates no world and is never refused here.
+            let worlds = self.replay_world_count().await?;
+            if worlds >= MVP_MAX_REPLAY_WORLDS {
+                return Err(mvp_capacity_exceeded(
+                    "replay worlds",
+                    worlds,
+                    MVP_MAX_REPLAY_WORLDS,
+                ));
             }
         }
         sqlx::query("INSERT INTO replay_worlds(namespace,id,sealed,manifest) VALUES(?,?,?,?) ON CONFLICT(namespace,id) DO UPDATE SET sealed=excluded.sealed,manifest=excluded.manifest")

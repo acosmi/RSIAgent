@@ -21,18 +21,19 @@ use evo_core::contract::{
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
 use evo_core::{Context, Error, Role, Strategy, fingerprint, hash};
+use evo_engine::capacity::MAX_STAGED_PACKAGES;
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::packages::{
     AssetPackageManifest, CandidateMaterialBinding, CandidateStrategyAuthority,
-    DeliveryAuditRecord, DependencyTracker, E16Envelope, E16SourceRef, ExportAttemptState,
-    ExportRequest, FindingSeverity, ForeignApprovalClaim, ForeignEvaluationClaim, ForeignMetadata,
-    MAX_FILE, MAX_FILES, MAX_TOTAL, MAX_ZIP_RATIO, PACKAGE_SCHEMA_V1, PRIVACY_DISCLAIMER,
-    PackageDependency, PackageEntry, PackageKind, PackageMember, PackageState,
-    PersistentPackageStore, RedactionReport, RedactionStatus, StagePackageRequest,
-    StagedAssetPayload, StagedAssetState, export_package, foreign_approval_is_not_local,
-    import_external_package, mark_delivered_package_revoked, package_dependency_ref_id,
-    preview_package_diff, privacy_block, reject_member, reject_package, scan_privacy,
-    validate_manifest,
+    DeliveryAuditRecord, DependencyTracker, E16_STAGED_ASSET_SCHEMA, E16Envelope, E16SourceRef,
+    ExportAttemptState, ExportRequest, FindingSeverity, ForeignApprovalClaim,
+    ForeignEvaluationClaim, ForeignMetadata, MAX_FILE, MAX_FILES, MAX_TOTAL, MAX_ZIP_RATIO,
+    PACKAGE_SCHEMA_V1, PRIVACY_DISCLAIMER, PackageDependency, PackageEntry, PackageKind,
+    PackageMember, PackageState, PersistentPackageStore, RedactionReport, RedactionStatus,
+    StagePackageRequest, StagedAssetPayload, StagedAssetState, export_package,
+    foreign_approval_is_not_local, import_external_package, mark_delivered_package_revoked,
+    package_dependency_ref_id, preview_package_diff, privacy_block, reject_member, reject_package,
+    scan_privacy, validate_manifest,
 };
 use evo_engine::release_store::{ReleaseStore, StageBundleRequest, TypedSourceRef};
 use evo_storage::Store;
@@ -2185,4 +2186,183 @@ async fn f17_live_staged_asset_still_keeps_shared_projection_blob_beside_aborted
         !blob.exists(),
         "an aborted staged asset kept the shared projection blob alive"
     );
+}
+
+// ---------------------------------------------------------------------------
+// E16.5 AG-014: staged package capacity at the stage entry point
+// ---------------------------------------------------------------------------
+
+fn seeded_staged_asset(owner: &Context, index: u64, state: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": E16_STAGED_ASSET_SCHEMA,
+        "id": format!("seed-staged-asset-{index:03}"),
+        "namespace": owner.namespace(),
+        "owner_actor": owner.actor(),
+        "request_key": format!("seed-{index}"),
+        "input_digest": hash(format!("seed-{index}").as_bytes()),
+        "created_at": 1,
+        "updated_at": 1,
+        "source_refs": [],
+        "revoke_watermark": 1,
+        "payload": {"state": state, "seed": index}
+    })
+}
+
+async fn put_seeded_staged_asset(store: &Store, admin: &Context, index: u64, state: &str) {
+    let mut session = store.session().await.unwrap();
+    let body = seeded_staged_asset(admin, index, state);
+    session
+        .put(
+            admin,
+            "artifact",
+            body["id"].as_str().unwrap(),
+            admin.actor(),
+            &body,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+}
+
+async fn staged_package_usage(store: &Store, admin: &Context) -> (u64, u64) {
+    let mut session = store.session().await.unwrap();
+    let staged = session.capacity_usage_v41(0).await.unwrap().staged_packages;
+    let artifacts = session
+        .namespace_object_count(admin, "artifact")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    (staged, artifacts)
+}
+
+/// F24: staged assets held by another namespace fill the same instance cap.
+#[tokio::test]
+async fn staged_package_capacity_cannot_be_split_across_namespaces() {
+    let (_directory, store, admin, sources) = persistent_store().await;
+    let other = Context::new("other", "admin", Role::Admin).unwrap();
+    for index in 0..MAX_STAGED_PACKAGES {
+        put_seeded_staged_asset(&store, &other, index, "staged").await;
+    }
+    let (staged, artifacts) = staged_package_usage(&store, &admin).await;
+    assert_eq!(staged, 20);
+    let files = valid_files();
+    match PersistentPackageStore::stage_package(
+        &admin,
+        &store,
+        persistent_stage_request(
+            "split-stage",
+            manifest_for_files("asset-split", &files),
+            files,
+            sources,
+        ),
+    )
+    .await
+    {
+        Err(Error::Conflict(msg)) => {
+            assert_eq!(msg, "MVP capacity exceeded: staged packages 20 >= limit 20")
+        }
+        other => panic!("expected the MVP staged package conflict, got {other:?}"),
+    }
+    assert_eq!(staged_package_usage(&store, &admin).await, (20, artifacts));
+}
+
+#[tokio::test]
+async fn twenty_first_staged_package_is_refused_and_aborted_or_failed_records_do_not_count() {
+    let (_directory, store, admin, sources) = persistent_store().await;
+    for index in 0..(MAX_STAGED_PACKAGES - 1) {
+        put_seeded_staged_asset(&store, &admin, index, "staged").await;
+    }
+    assert_eq!(staged_package_usage(&store, &admin).await.0, 19);
+    let files = valid_files();
+    // 19 staged assets exist: the twentieth is admitted through the real path.
+    let twentieth = PersistentPackageStore::stage_package(
+        &admin,
+        &store,
+        persistent_stage_request(
+            "stage-20",
+            manifest_for_files("asset-20", &files),
+            files.clone(),
+            sources.clone(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(twentieth.payload.state, StagedAssetState::Staged);
+    let (staged, artifacts) = staged_package_usage(&store, &admin).await;
+    assert_eq!(staged, 20);
+
+    // At the limit a new staged asset is refused inside the session and
+    // nothing is written (no envelope, no blob registration).
+    match PersistentPackageStore::stage_package(
+        &admin,
+        &store,
+        persistent_stage_request(
+            "stage-21",
+            manifest_for_files("asset-21", &files),
+            files.clone(),
+            sources.clone(),
+        ),
+    )
+    .await
+    {
+        Err(Error::Conflict(msg)) => {
+            assert_eq!(msg, "MVP capacity exceeded: staged packages 20 >= limit 20")
+        }
+        other => panic!("expected the MVP staged package conflict, got {other:?}"),
+    }
+    assert_eq!(staged_package_usage(&store, &admin).await, (20, artifacts));
+
+    // Re-staging an existing key is idempotent, not a new derivation.
+    assert_eq!(
+        PersistentPackageStore::stage_package(
+            &admin,
+            &store,
+            persistent_stage_request(
+                "stage-20",
+                manifest_for_files("asset-20", &files),
+                files.clone(),
+                sources.clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .id,
+        twentieth.id
+    );
+
+    // Aborted and failed records are not live staged packages.
+    put_seeded_staged_asset(&store, &admin, 0, "aborted").await;
+    put_seeded_staged_asset(&store, &admin, 1, "failed").await;
+    assert_eq!(staged_package_usage(&store, &admin).await.0, 18);
+    let admitted = PersistentPackageStore::stage_package(
+        &admin,
+        &store,
+        persistent_stage_request(
+            "stage-21",
+            manifest_for_files("asset-21", &files),
+            files.clone(),
+            sources.clone(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(admitted.payload.state, StagedAssetState::Staged);
+    assert_eq!(staged_package_usage(&store, &admin).await.0, 19);
+    // A quarantined asset (unresolved dependency) still occupies a slot.
+    let mut quarantined_manifest = manifest_for_files("asset-22", &files);
+    quarantined_manifest.dependencies = vec![PackageDependency {
+        publisher: "org.missing".into(),
+        asset_id: "missing-dependency".into(),
+        kind: "skill".into(),
+        version_req: "1.0.0".into(),
+    }];
+    let quarantined = PersistentPackageStore::stage_package(
+        &admin,
+        &store,
+        persistent_stage_request("stage-22", quarantined_manifest, files, sources),
+    )
+    .await
+    .unwrap();
+    assert_eq!(quarantined.payload.state, StagedAssetState::Quarantined);
+    assert_eq!(staged_package_usage(&store, &admin).await.0, 20);
 }

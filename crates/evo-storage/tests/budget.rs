@@ -1020,3 +1020,135 @@ async fn group_ledger_keyset_scan_returns_all_10001_calls_and_stop_fences_old_le
     ));
     session.commit().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// E16.5 AG-014: active lease capacity at the reservation entry point
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn eleventh_live_lease_is_refused_and_released_or_expired_leases_do_not_count() {
+    let (_dir, store) = store().await;
+    let admin = ctx("ns-a", "admin", Role::Admin);
+    let worker = ctx("ns-a", "worker-a", Role::Worker);
+    store
+        .authorize_root_budget(&admin, &authorization("root-1", "scope-1"))
+        .await
+        .unwrap();
+    let mut calls = Vec::new();
+    for index in 0..evo_storage::MVP_MAX_ACTIVE_LEASES {
+        calls.push(
+            store
+                .reserve_budget_call(&worker, &reservation(&format!("lease-{index}"), 10, 1))
+                .await
+                .unwrap(),
+        );
+    }
+    // Ten leases are live until 101: the eleventh reservation is refused
+    // with the typed conflict and writes nothing.
+    match store
+        .reserve_budget_call(&worker, &reservation("lease-10", 10, 2))
+        .await
+    {
+        Err(Error::Conflict(msg)) => {
+            assert_eq!(msg, "MVP capacity exceeded: active leases 10 >= limit 10")
+        }
+        other => panic!("expected the MVP active lease conflict, got {other:?}"),
+    }
+    assert!(
+        store
+            .budget_call(&worker, "scope-1", "lease-10")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let root = store.root_budget(&admin, "scope-1").await.unwrap();
+    assert_eq!(root.unwrap().reserved_micros, 100);
+    let mut session = store.session().await.unwrap();
+    assert_eq!(
+        session.capacity_usage_v41(2).await.unwrap().active_leases,
+        10
+    );
+    session.commit().await.unwrap();
+
+    // Re-reserving an existing call is idempotent, not a new lease.
+    let duplicate = store
+        .reserve_budget_call(&worker, &reservation("lease-0", 10, 1))
+        .await
+        .unwrap();
+    assert_eq!(duplicate, calls[0]);
+
+    // A released call holds no lease: the next reservation is admitted.
+    let released = store
+        .release_undispatched_budget_call(&worker, &fence(&calls[0], 3), "capacity_test")
+        .await
+        .unwrap();
+    assert_eq!(released.state, BudgetCallState::Released);
+    let admitted = store
+        .reserve_budget_call(&worker, &reservation("lease-10", 10, 3))
+        .await
+        .unwrap();
+    assert_eq!(admitted.state, BudgetCallState::Reserved);
+
+    // Ten live leases again: refused at a clock inside the leases, admitted
+    // once the request clock is past every lease_until.
+    assert!(matches!(
+        store
+            .reserve_budget_call(&worker, &reservation("lease-11", 10, 4))
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    let after_expiry = store
+        .reserve_budget_call(&worker, &reservation("lease-11", 10, 500))
+        .await
+        .unwrap();
+    assert_eq!(after_expiry.state, BudgetCallState::Reserved);
+    let mut session = store.session().await.unwrap();
+    let usage = session.capacity_usage_v41(4).await.unwrap();
+    assert_eq!(usage.active_leases, 11);
+    let usage = session.capacity_usage_v41(500).await.unwrap();
+    assert_eq!(usage.active_leases, 1);
+    session.commit().await.unwrap();
+}
+
+/// F24: the lease cap is per instance. Ten live leases taken from ns-a refuse
+/// the eleventh lease from ns-b on the same shared billing scope.
+#[tokio::test]
+async fn lease_capacity_cannot_be_split_across_namespaces() {
+    let (_dir, store) = store().await;
+    let admin = ctx("ns-a", "admin", Role::Admin);
+    let worker_a = ctx("ns-a", "worker-a", Role::Worker);
+    let worker_b = ctx("ns-b", "worker-b", Role::Worker);
+    store
+        .authorize_root_budget(&admin, &authorization("root-1", "scope-1"))
+        .await
+        .unwrap();
+    for index in 0..evo_storage::MVP_MAX_ACTIVE_LEASES {
+        store
+            .reserve_budget_call(&worker_a, &reservation(&format!("split-a-{index}"), 10, 1))
+            .await
+            .unwrap();
+    }
+    match store
+        .reserve_budget_call(&worker_b, &reservation("split-b", 10, 2))
+        .await
+    {
+        Err(Error::Conflict(msg)) => {
+            assert_eq!(msg, "MVP capacity exceeded: active leases 10 >= limit 10")
+        }
+        other => panic!("ns-b must not get an eleventh lease, got {other:?}"),
+    }
+    assert!(
+        store
+            .budget_call(&worker_b, "scope-1", "split-b")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let root = store.root_budget(&admin, "scope-1").await.unwrap().unwrap();
+    assert_eq!(root.reserved_micros, 100);
+    let mut session = store.session().await.unwrap();
+    assert_eq!(
+        session.capacity_usage_v41(2).await.unwrap().active_leases,
+        10
+    );
+    session.commit().await.unwrap();
+}

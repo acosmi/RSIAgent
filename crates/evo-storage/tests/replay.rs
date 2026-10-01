@@ -641,3 +641,103 @@ async fn replay_store_envelope_must_match_row_namespace_kind_and_id() {
             .is_err()
     );
 }
+
+// ---------------------------------------------------------------------------
+// E16.5 AG-014: replay world capacity at the storage entry point
+// ---------------------------------------------------------------------------
+
+/// F24: replay worlds stored by another namespace fill the same instance cap.
+#[tokio::test]
+async fn replay_world_capacity_cannot_be_split_across_namespaces() {
+    let (_dir, store, ctx) = setup().await;
+    let other = Context::new("other", "worker", Role::Worker).unwrap();
+    seed_replay_worlds(&store, &other, evo_storage::MVP_MAX_REPLAY_WORLDS).await;
+    match put_replay_world_draft(&ctx, &store, &world()).await {
+        Err(Error::Conflict(msg)) => {
+            assert_eq!(msg, "MVP capacity exceeded: replay worlds 100 >= limit 100")
+        }
+        other => panic!("expected the MVP replay world conflict, got {other:?}"),
+    }
+    let mut session = store.session().await.unwrap();
+    assert!(session.get_world(&ctx, "world-1").await.unwrap().is_none());
+    assert_eq!(session.replay_world_count().await.unwrap(), 100);
+    session.commit().await.unwrap();
+}
+
+async fn seed_replay_worlds(store: &Store, ctx: &Context, count: u64) {
+    let mut session = store.session().await.unwrap();
+    for index in 0..count {
+        session
+            .put_world(
+                ctx,
+                &format!("seed-world-{index:03}"),
+                false,
+                &json!({"seed": index}),
+            )
+            .await
+            .unwrap();
+    }
+    session.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn replay_world_capacity_refuses_a_new_draft_at_the_limit_and_writes_nothing() {
+    let (_dir, store, ctx) = setup().await;
+    seed_replay_worlds(&store, &ctx, evo_storage::MVP_MAX_REPLAY_WORLDS).await;
+    match put_replay_world_draft(&ctx, &store, &world()).await {
+        Err(Error::Conflict(msg)) => {
+            assert_eq!(msg, "MVP capacity exceeded: replay worlds 100 >= limit 100")
+        }
+        other => panic!("expected the MVP replay world conflict, got {other:?}"),
+    }
+    let mut session = store.session().await.unwrap();
+    assert_eq!(session.replay_world_count().await.unwrap(), 100);
+    assert!(session.get_world(&ctx, "world-1").await.unwrap().is_none());
+    assert_eq!(
+        session.capacity_usage_v41(0).await.unwrap().replay_worlds,
+        100
+    );
+    session.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn hundredth_replay_world_is_admitted_and_sealing_it_is_not_a_new_world() {
+    let (_dir, store, ctx) = setup().await;
+    seed_replay_worlds(&store, &ctx, evo_storage::MVP_MAX_REPLAY_WORLDS - 1).await;
+    // 99 worlds exist: the hundredth world is admitted.
+    let draft = world();
+    put_replay_world_draft(&ctx, &store, &draft).await.unwrap();
+    let mut session = store.session().await.unwrap();
+    assert_eq!(session.replay_world_count().await.unwrap(), 100);
+    // A hundred-and-first world id is refused inside the session; the draft
+    // of an existing id is untouched and nothing new is stored.
+    match session
+        .put_world(&ctx, "one-too-many", false, &json!({"seed": 100}))
+        .await
+    {
+        Err(Error::Conflict(msg)) => {
+            assert_eq!(msg, "MVP capacity exceeded: replay worlds 100 >= limit 100")
+        }
+        other => panic!("expected the MVP replay world conflict, got {other:?}"),
+    }
+    assert!(
+        session
+            .get_world(&ctx, "one-too-many")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(session.replay_world_count().await.unwrap(), 100);
+    session.commit().await.unwrap();
+    // Sealing the existing draft creates no world and still succeeds at the limit.
+    let mut sealed = draft.clone();
+    sealed.seal().unwrap();
+    seal_replay_world(&ctx, &store, &sealed).await.unwrap();
+    let loaded = load_live_replay_world(&ctx, &store, "world-1", Purpose::Development)
+        .await
+        .unwrap();
+    assert_eq!(loaded.sealed_digest, sealed.sealed_digest);
+    let mut session = store.session().await.unwrap();
+    assert_eq!(session.replay_world_count().await.unwrap(), 100);
+    session.commit().await.unwrap();
+}

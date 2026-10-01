@@ -1,5 +1,8 @@
 //! Asset package gates, staging, export, and privacy scanner.
 //! Foreign approval is not local permission.
+use crate::capacity::{
+    CapacityField, CapacityLimits, V41CapacityUsage, admit_field, unix_now_secs,
+};
 use crate::evidence::{load_stored_source, validate_stored_sources};
 use crate::release_store::{RELEASE_CANDIDATE_SCHEMA, ReleaseCandidateRecord};
 use crate::releases::validate_resolved_bundle_identity;
@@ -1470,6 +1473,14 @@ impl PersistentPackageStore {
                 return Self::read_staged(ctx, store, &existing.id).await;
             }
         } else {
+            // E16.5: a new staged asset is a new derivation. Measure and refuse
+            // inside this session so the count and the insert cannot race.
+            let usage: V41CapacityUsage = session.capacity_usage_v41(unix_now_secs()).await?.into();
+            admit_field(
+                CapacityField::StagedPackages,
+                usage.staged_packages,
+                &CapacityLimits::default(),
+            )?;
             let timestamp = now();
             let envelope = E16Envelope {
                 schema_version: E16_STAGED_ASSET_SCHEMA.into(),

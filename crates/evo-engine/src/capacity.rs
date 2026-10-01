@@ -54,62 +54,181 @@ pub struct V41CapacityUsage {
     pub concurrent_dispatches: u64,
 }
 
-pub fn admit_v41(u: &V41CapacityUsage) -> Result<()> {
-    if u.runs >= MAX_RUNS {
-        return Err(Error::Conflict(format!(
-            "MVP capacity exceeded: runs {} >= limit {}",
-            u.runs, MAX_RUNS
-        )));
+impl V41CapacityUsage {
+    /// Attach the process-local in-flight prepare count, which the Store never
+    /// measures.
+    pub fn with_inflight_prepare(mut self, inflight_prepare: u64) -> Self {
+        self.inflight_prepare = inflight_prepare;
+        self
     }
-    if u.events >= MAX_EVENTS {
-        return Err(Error::Conflict(format!(
-            "MVP capacity exceeded: events {} >= limit {}",
-            u.events, MAX_EVENTS
-        )));
+}
+
+impl From<evo_storage::CapacityUsageV41> for V41CapacityUsage {
+    fn from(usage: evo_storage::CapacityUsageV41) -> Self {
+        Self {
+            runs: usage.runs,
+            events: usage.events,
+            skills: usage.skills,
+            inflight_prepare: 0,
+            exploration_nodes: usage.exploration_nodes,
+            replay_worlds: usage.replay_worlds,
+            active_leases: usage.active_leases,
+            staged_packages: usage.staged_packages,
+            concurrent_dispatches: usage.concurrent_dispatches,
+        }
     }
-    if u.skills >= MAX_SKILLS {
-        return Err(Error::Conflict(format!(
-            "MVP capacity exceeded: skills {} >= limit {}",
-            u.skills, MAX_SKILLS
-        )));
+}
+
+/// The MVP capacity bounds. `Default` is the plan §3.3.1 constants above; a
+/// different set exists only so tests can exercise the pure gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityLimits {
+    pub runs: u64,
+    pub events: u64,
+    pub skills: u64,
+    pub inflight_prepare: u64,
+    pub exploration_nodes: u64,
+    pub replay_worlds: u64,
+    pub active_leases: u64,
+    pub staged_packages: u64,
+    pub concurrent_dispatches: u64,
+}
+
+impl Default for CapacityLimits {
+    fn default() -> Self {
+        Self {
+            runs: MAX_RUNS,
+            events: MAX_EVENTS,
+            skills: MAX_SKILLS,
+            inflight_prepare: MAX_PREPARE,
+            exploration_nodes: MAX_EXPLORATION_NODES,
+            replay_worlds: MAX_REPLAY_WORLDS,
+            active_leases: MAX_ACTIVE_LEASES,
+            staged_packages: MAX_STAGED_PACKAGES,
+            concurrent_dispatches: MAX_CONCURRENT_DISPATCH,
+        }
     }
-    if u.inflight_prepare >= MAX_PREPARE {
-        return Err(Error::Conflict(format!(
-            "MVP capacity exceeded: in-flight prepare {} >= limit {}",
-            u.inflight_prepare, MAX_PREPARE
-        )));
+}
+
+/// One bounded counter. Every real derivation entry point admits the counters
+/// it grows through [`admit_field`] before it writes anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityField {
+    Runs,
+    Events,
+    Skills,
+    InflightPrepare,
+    ExplorationNodes,
+    ReplayWorlds,
+    ActiveLeases,
+    StagedPackages,
+    ConcurrentDispatches,
+}
+
+impl CapacityField {
+    pub const ALL: [CapacityField; 9] = [
+        CapacityField::Runs,
+        CapacityField::Events,
+        CapacityField::Skills,
+        CapacityField::InflightPrepare,
+        CapacityField::ExplorationNodes,
+        CapacityField::ReplayWorlds,
+        CapacityField::ActiveLeases,
+        CapacityField::StagedPackages,
+        CapacityField::ConcurrentDispatches,
+    ];
+
+    /// The four MVP counters a new run derives against (plan §3.3.1).
+    pub const MVP_DERIVE: [CapacityField; 4] = [
+        CapacityField::Runs,
+        CapacityField::Events,
+        CapacityField::Skills,
+        CapacityField::InflightPrepare,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CapacityField::Runs => "runs",
+            CapacityField::Events => "events",
+            CapacityField::Skills => "skills",
+            CapacityField::InflightPrepare => "in-flight prepare",
+            CapacityField::ExplorationNodes => "exploration nodes",
+            CapacityField::ReplayWorlds => "replay worlds",
+            CapacityField::ActiveLeases => "active leases",
+            CapacityField::StagedPackages => "staged packages",
+            CapacityField::ConcurrentDispatches => "concurrent dispatches",
+        }
     }
-    if u.exploration_nodes >= MAX_EXPLORATION_NODES {
-        return Err(Error::Conflict(format!(
-            "MVP capacity exceeded: exploration nodes {} >= limit {}",
-            u.exploration_nodes, MAX_EXPLORATION_NODES
-        )));
+
+    pub fn limit(self, limits: &CapacityLimits) -> u64 {
+        match self {
+            CapacityField::Runs => limits.runs,
+            CapacityField::Events => limits.events,
+            CapacityField::Skills => limits.skills,
+            CapacityField::InflightPrepare => limits.inflight_prepare,
+            CapacityField::ExplorationNodes => limits.exploration_nodes,
+            CapacityField::ReplayWorlds => limits.replay_worlds,
+            CapacityField::ActiveLeases => limits.active_leases,
+            CapacityField::StagedPackages => limits.staged_packages,
+            CapacityField::ConcurrentDispatches => limits.concurrent_dispatches,
+        }
     }
-    if u.replay_worlds >= MAX_REPLAY_WORLDS {
-        return Err(Error::Conflict(format!(
-            "MVP capacity exceeded: replay worlds {} >= limit {}",
-            u.replay_worlds, MAX_REPLAY_WORLDS
-        )));
+
+    pub fn usage(self, usage: &V41CapacityUsage) -> u64 {
+        match self {
+            CapacityField::Runs => usage.runs,
+            CapacityField::Events => usage.events,
+            CapacityField::Skills => usage.skills,
+            CapacityField::InflightPrepare => usage.inflight_prepare,
+            CapacityField::ExplorationNodes => usage.exploration_nodes,
+            CapacityField::ReplayWorlds => usage.replay_worlds,
+            CapacityField::ActiveLeases => usage.active_leases,
+            CapacityField::StagedPackages => usage.staged_packages,
+            CapacityField::ConcurrentDispatches => usage.concurrent_dispatches,
+        }
     }
-    if u.active_leases >= MAX_ACTIVE_LEASES {
-        return Err(Error::Conflict(format!(
-            "MVP capacity exceeded: active leases {} >= limit {}",
-            u.active_leases, MAX_ACTIVE_LEASES
-        )));
+}
+
+/// Admit one counter. For every stored counter `used` is what already exists,
+/// so creating one more object is refused once `used >= limit`. Concurrent
+/// dispatch is the one bound where `used` is the number of dispatches that
+/// would be running (including the one being admitted): exactly the limit is
+/// admitted and `used > limit` is refused.
+///
+/// The refusal is `Error::Conflict` (HTTP 409 / MCP `conflict` / job error
+/// code `conflict`) and names the counter and both numbers.
+pub fn admit_field(field: CapacityField, used: u64, limits: &CapacityLimits) -> Result<()> {
+    let limit = field.limit(limits);
+    let label = field.label();
+    match field {
+        CapacityField::ConcurrentDispatches if used > limit => Err(Error::Conflict(format!(
+            "MVP capacity exceeded: {label} {used} > limit {limit}"
+        ))),
+        CapacityField::ConcurrentDispatches => Ok(()),
+        _ if used >= limit => Err(Error::Conflict(format!(
+            "MVP capacity exceeded: {label} {used} >= limit {limit}"
+        ))),
+        _ => Ok(()),
     }
-    if u.staged_packages >= MAX_STAGED_PACKAGES {
-        return Err(Error::Conflict(format!(
-            "MVP capacity exceeded: staged packages {} >= limit {}",
-            u.staged_packages, MAX_STAGED_PACKAGES
-        )));
-    }
-    if u.concurrent_dispatches > MAX_CONCURRENT_DISPATCH {
-        return Err(Error::Conflict(format!(
-            "MVP capacity exceeded: concurrent dispatches {} > limit {}",
-            u.concurrent_dispatches, MAX_CONCURRENT_DISPATCH
-        )));
+}
+
+/// Admit every counter of `usage` against `limits`.
+pub fn admit_v41_with(u: &V41CapacityUsage, limits: &CapacityLimits) -> Result<()> {
+    for field in CapacityField::ALL {
+        admit_field(field, field.usage(u), limits)?;
     }
     Ok(())
+}
+
+/// Admit every counter of `usage` against the plan §3.3.1 constants.
+pub fn admit_v41(u: &V41CapacityUsage) -> Result<()> {
+    admit_v41_with(u, &CapacityLimits::default())
+}
+
+/// Current unix time in seconds as the lease clock for capacity measurement.
+pub fn unix_now_secs() -> u64 {
+    u64::try_from(evo_core::now()).unwrap_or(0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,6 +430,70 @@ fn verify_trusted_revocations_anchor(db_path: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_mirrors_of_the_capacity_constants_cannot_drift() {
+        assert_eq!(evo_storage::MVP_MAX_RUNS, MAX_RUNS);
+        assert_eq!(evo_storage::MVP_MAX_REPLAY_WORLDS, MAX_REPLAY_WORLDS);
+        assert_eq!(evo_storage::MVP_MAX_ACTIVE_LEASES, MAX_ACTIVE_LEASES);
+        assert_eq!(
+            evo_storage::mvp_capacity_exceeded("replay worlds", 100, MAX_REPLAY_WORLDS).to_string(),
+            admit_field(CapacityField::ReplayWorlds, 100, &CapacityLimits::default())
+                .unwrap_err()
+                .to_string()
+        );
+        // dispatch.rs keeps its schema constant private; the persisted value is
+        // pinned by the management job contract tests.
+        assert_eq!(
+            evo_storage::CAPACITY_MANAGEMENT_JOB_SCHEMA,
+            "rsia.management_job.v1"
+        );
+        assert_eq!(
+            evo_storage::CAPACITY_IMPORT_RESULT_SCHEMA,
+            crate::import::IMPORT_RESULT_SCHEMA
+        );
+        assert_eq!(
+            evo_storage::CAPACITY_EXPLORATION_ENVELOPE_SCHEMA,
+            crate::exploration::ENVELOPE_SCHEMA
+        );
+        assert_eq!(
+            evo_storage::CAPACITY_EXPLORATION_NODE_RECORD_KIND,
+            crate::exploration::NODE_RECORD_KIND
+        );
+        assert_eq!(
+            evo_storage::CAPACITY_STAGED_ASSET_SCHEMA,
+            crate::packages::E16_STAGED_ASSET_SCHEMA
+        );
+    }
+
+    #[test]
+    fn storage_usage_converts_field_by_field() {
+        let usage = V41CapacityUsage::from(evo_storage::CapacityUsageV41 {
+            runs: 1,
+            events: 2,
+            skills: 3,
+            exploration_nodes: 4,
+            replay_worlds: 5,
+            active_leases: 6,
+            staged_packages: 7,
+            concurrent_dispatches: 8,
+        })
+        .with_inflight_prepare(9);
+        assert_eq!(
+            usage,
+            V41CapacityUsage {
+                runs: 1,
+                events: 2,
+                skills: 3,
+                inflight_prepare: 9,
+                exploration_nodes: 4,
+                replay_worlds: 5,
+                active_leases: 6,
+                staged_packages: 7,
+                concurrent_dispatches: 8,
+            }
+        );
+    }
 
     #[test]
     fn over_cap_stops_not_truncates() {
