@@ -69,7 +69,7 @@ use evo_engine::import::{
 use evo_engine::packages::{
     AssetPackageManifest, E16SourceRef, PACKAGE_SCHEMA_V1, PRIVACY_DISCLAIMER, PackageDependency,
     PackageEntry, PackageKind, PersistentPackageStore, RedactionReport, RedactionStatus,
-    StagePackageRequest, package_dependency_ref_id,
+    StagePackageRequest, StagedAssetState, package_dependency_ref_id,
 };
 use evo_engine::seeds::{InstallSeedRequest, PersistentSeedStore};
 use evo_storage::Store;
@@ -2038,12 +2038,8 @@ async fn the_submit_gate_answers_with_the_same_messages_as_before_it_was_shared(
 
 #[tokio::test]
 async fn the_repeated_request_of_a_package_is_judged_over_its_manifest_dependency() {
-    // `stage_package` verifies the sources of the request first, and, when the
-    // request was staged before, the sources of the stored envelope again: those are
-    // the sources of the request and the artifacts its manifest depends on. A static
-    // revoked state refuses at the first of the two unless only the dependency is
-    // revoked, which is the one way to reach the second call of `verify_sources`
-    // (`packages.rs`, the `existing` branch) on its own.
+    // Request sources keep their first check. The union with resolved manifest
+    // dependencies is also checked before either a new write or an existing lookup.
     let admin = admin();
     let dependency = PackageDependency {
         publisher: "org.rsia".into(),
@@ -2073,9 +2069,8 @@ async fn the_repeated_request_of_a_package_is_judged_over_its_manifest_dependenc
         .unwrap();
 
     // The run below the dependency is revoked without a watermark move. The sources
-    // of the request do not depend on it, so the first call of `verify_sources`
-    // passes; the stored envelope's sources include the dependency, and the second
-    // refuses.
+    // of the request do not depend on it, so their check passes; the union with the
+    // manifest dependency refuses before the existing envelope is considered.
     fx.put(&admin, "tombstone", "run-r", &tombstone("run-r", "run"))
         .await;
     let nodes = [("artifact", "src-art"), ("artifact", staged.id.as_str())];
@@ -2090,8 +2085,86 @@ async fn the_repeated_request_of_a_package_is_judged_over_its_manifest_dependenc
 }
 
 // ---------------------------------------------------------------------------
-// Known boundaries: where a new `stage_package` or `install` still fails late
+// Manifest dependencies are judged together with request sources before any write
 // ---------------------------------------------------------------------------
+
+fn manifest_dependency(asset: &str) -> PackageDependency {
+    PackageDependency {
+        publisher: "org.rsia".into(),
+        asset_id: asset.into(),
+        kind: "skill".into(),
+        version_req: "1".into(),
+    }
+}
+
+fn manifest_with(dependencies: Vec<PackageDependency>) -> AssetPackageManifest {
+    let mut package = manifest();
+    package.dependencies = dependencies;
+    package
+}
+
+/// The existing full store shape, plus blob/export content digests, so an unchanged
+/// path cannot conceal a rewrite of its bytes.
+async fn manifest_shape(
+    fx: &Fx,
+    ctx: &Context,
+    nodes: &[(&str, &str)],
+) -> (Shape, Vec<(String, String)>) {
+    let stored = shape(fx, ctx, nodes).await;
+    let contents = fx
+        .files()
+        .into_iter()
+        .map(|path| {
+            let digest = hash(&std::fs::read(fx.dir.path().join(&path)).unwrap());
+            (path, digest)
+        })
+        .collect();
+    (stored, contents)
+}
+
+enum ManifestRefusal {
+    Forbidden,
+    NotFound,
+    Conflict(&'static str),
+}
+
+async fn refused_manifest_stage(
+    fx: &Fx,
+    ctx: &Context,
+    request: StagePackageRequest,
+    nodes: &[(&str, &str)],
+    label: &str,
+    expected: ManifestRefusal,
+) -> Vec<String> {
+    let before = manifest_shape(fx, ctx, nodes).await;
+    let result = PersistentPackageStore::stage_package(ctx, &fx.store, request).await;
+    let mut problems = Vec::new();
+    match (&expected, &result) {
+        (ManifestRefusal::Forbidden, Err(Error::Forbidden))
+        | (ManifestRefusal::NotFound, Err(Error::NotFound)) => {}
+        (ManifestRefusal::Conflict(expected), Err(Error::Conflict(actual)))
+            if *expected == actual.as_str() => {}
+        _ => problems.push(format!("{label}: unexpected answer: {result:?}")),
+    }
+    let after = manifest_shape(fx, ctx, nodes).await;
+    let changes = before.0.changes(&after.0);
+    if !changes.is_empty() {
+        problems.push(format!("{label}: a refused stage wrote ({changes})"));
+    }
+    if before.1 != after.1 {
+        problems.push(format!("{label}: blob/export contents changed"));
+    }
+    problems
+}
+
+fn assert_manifest_problems(problems: Vec<String>) {
+    assert!(
+        problems.is_empty(),
+        "{} problems:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}
 
 /// The `Prepared` staged packages of the store.
 async fn prepared_staged(fx: &Fx) -> usize {
@@ -2103,77 +2176,636 @@ async fn prepared_staged(fx: &Fx) -> usize {
 }
 
 #[tokio::test]
-async fn known_boundary_a_manifest_dependency_is_judged_when_the_package_is_finalized() {
-    // `stage_package` verifies the sources of the request before its first write,
-    // and the artifacts its manifest depends on (`dependency_refs`) only after the
-    // `Prepared` envelope is committed, when it finalizes the package over all its
-    // sources. Closing that is a call of `verify_sources` over the dependency refs
-    // before the first write: an edit of `stage_package`, outside the files this
-    // change may touch. This test pins what is true today.
+async fn manifest_dependencies_are_judged_before_the_first_package_write() {
     let admin = admin();
-    let dependency = PackageDependency {
-        publisher: "org.rsia".into(),
-        asset_id: "dep-asset".into(),
-        kind: "skill".into(),
-        version_req: "1".into(),
-    };
+    let dependency = manifest_dependency("dep-asset");
     let dependency_id = package_dependency_ref_id(&dependency).unwrap();
-    let mut with_dependency = manifest();
-    with_dependency.dependencies.push(dependency);
+    let with_dependency = manifest_with(vec![dependency]);
+    let cases = [
+        "upstream-run-tombstone",
+        "dependency-redacted",
+        "dependency-artifact-tombstone",
+        "upstream-artifact-redacted",
+        "dependency-unreadable-tombstone",
+        "upstream-unreadable-tombstone",
+    ];
+    let mut problems = Vec::new();
+    for case in cases {
+        let fx = Fx::open("manifest-refusal.sqlite3").await;
+        fx.put(&admin, "artifact", "src-art", &live("src-art"))
+            .await;
+        fx.put(&admin, "artifact", &dependency_id, &live(&dependency_id))
+            .await;
+        match case {
+            "upstream-run-tombstone" => {
+                store_run(&fx, "run-r").await;
+                fx.edges(
+                    &admin,
+                    &[("artifact", dependency_id.as_str(), "run", "run-r")],
+                )
+                .await;
+                fx.put(&admin, "tombstone", "run-r", &tombstone("run-r", "run"))
+                    .await;
+            }
+            "dependency-redacted" => {
+                fx.put(
+                    &admin,
+                    "artifact",
+                    &dependency_id,
+                    &redacted(&dependency_id),
+                )
+                .await;
+            }
+            "dependency-artifact-tombstone" => {
+                fx.put(
+                    &admin,
+                    "tombstone",
+                    &dependency_id,
+                    &tombstone(&dependency_id, "artifact"),
+                )
+                .await;
+            }
+            "upstream-artifact-redacted" | "upstream-unreadable-tombstone" => {
+                let body = if case == "upstream-artifact-redacted" {
+                    redacted("upstream-art")
+                } else {
+                    live("upstream-art")
+                };
+                fx.put(&admin, "artifact", "upstream-art", &body).await;
+                fx.edges(
+                    &admin,
+                    &[(
+                        "artifact",
+                        dependency_id.as_str(),
+                        "artifact",
+                        "upstream-art",
+                    )],
+                )
+                .await;
+                if case == "upstream-unreadable-tombstone" {
+                    fx.put(
+                        &admin,
+                        "tombstone",
+                        "upstream-art",
+                        &corrupt("upstream-art"),
+                    )
+                    .await;
+                }
+            }
+            "dependency-unreadable-tombstone" => {
+                fx.put(
+                    &admin,
+                    "tombstone",
+                    &dependency_id,
+                    &corrupt(&dependency_id),
+                )
+                .await;
+            }
+            _ => unreachable!(),
+        }
+        let source = source_ref(&fx, &admin, "artifact", "src-art").await;
+        let nodes = [
+            ("artifact", "src-art"),
+            ("artifact", dependency_id.as_str()),
+            ("run", "run-r"),
+            ("artifact", "upstream-art"),
+        ];
+        problems.extend(
+            refused_manifest_stage(
+                &fx,
+                &admin,
+                stage_request_for("manifest-stage", with_dependency.clone(), vec![source]),
+                &nodes,
+                case,
+                ManifestRefusal::Forbidden,
+            )
+            .await,
+        );
+    }
+    assert_manifest_problems(problems);
+}
 
-    // A dependency whose closure holds a revoked run: the storage check at blob
-    // publication refuses it, as it did before, with the `Prepared` envelope left
-    // behind.
-    let fx = Fx::open("boundary-tombstone.sqlite3").await;
-    store_run(&fx, "run-r").await;
-    fx.put(&admin, "artifact", "src-art", &live("src-art"))
-        .await;
-    fx.put(&admin, "artifact", &dependency_id, &live(&dependency_id))
-        .await;
-    fx.edges(
-        &admin,
-        &[("artifact", dependency_id.as_str(), "run", "run-r")],
-    )
-    .await;
-    fx.put(&admin, "tombstone", "run-r", &tombstone("run-r", "run"))
-        .await;
-    let source = source_ref(&fx, &admin, "artifact", "src-art").await;
-    let result = PersistentPackageStore::stage_package(
+/// Give the manifest's storage ref a real staged-asset body and a real content
+/// blob, so the lifecycle cleanup can redact it rather than fail on a fixture schema.
+async fn store_staged_manifest_dependency(
+    fx: &Fx,
+    dependency: &PackageDependency,
+    source: E16SourceRef,
+) -> String {
+    let admin = admin();
+    let mut envelope = PersistentPackageStore::stage_package(
         &admin,
         &fx.store,
-        stage_request_for("boundary-stage", with_dependency.clone(), vec![source]),
+        stage_request("manifest-dependency-body", vec![source.clone()]),
     )
-    .await;
-    assert!(matches!(result, Err(Error::Forbidden)), "{result:?}");
-    assert_eq!(prepared_staged(&fx).await, 1);
-
-    // A dependency the cleanup already redacted, without a tombstone of its own: the
-    // storage check does not look at bodies, so before this change the package was
-    // finalized and staged over it. The gate refuses it when it finalizes (the
-    // `Prepared` envelope and its blob are left behind).
-    let fx = Fx::open("boundary-redacted.sqlite3").await;
-    fx.put(&admin, "artifact", "src-art", &live("src-art"))
-        .await;
+    .await
+    .unwrap();
+    let id = package_dependency_ref_id(dependency).unwrap();
+    envelope.id = id.clone();
     fx.put(
         &admin,
         "artifact",
-        &dependency_id,
-        &redacted(&dependency_id),
+        &id,
+        &serde_json::to_value(envelope).unwrap(),
     )
     .await;
-    let source = source_ref(&fx, &admin, "artifact", "src-art").await;
+    fx.edges(
+        &admin,
+        &[(
+            "artifact",
+            id.as_str(),
+            source.kind.as_str(),
+            source.id.as_str(),
+        )],
+    )
+    .await;
+    id
+}
+
+#[tokio::test]
+async fn manifest_dependencies_refuse_real_revocation_and_repeated_requests_without_revival() {
+    let admin = admin();
+    let mut problems = Vec::new();
+    for source_kind in ["run", "artifact"] {
+        for already_staged in [false, true] {
+            let fx = Fx::open("manifest-real-revoke.sqlite3").await;
+            let source_id = if source_kind == "run" {
+                store_run(&fx, "manifest-run").await;
+                "manifest-run".to_string()
+            } else {
+                tokio::fs::write(fx.dir.path().join("history.jsonl"), HISTORY)
+                    .await
+                    .unwrap();
+                let registered = PersistentImportService::new(fx.store.clone())
+                    .register(
+                        &admin,
+                        registration(fx.dir.path(), "manifest-import", &["source-one"]),
+                    )
+                    .await
+                    .unwrap();
+                registered.payload.import_source_ids[0].clone()
+            };
+            let dependency = manifest_dependency("real-dependency");
+            let source = source_ref(&fx, &admin, source_kind, &source_id).await;
+            let dependency_id = store_staged_manifest_dependency(&fx, &dependency, source).await;
+            fx.put(&admin, "artifact", "independent", &live("independent"))
+                .await;
+            let independent = source_ref(&fx, &admin, "artifact", "independent").await;
+            let request = stage_request_for(
+                "manifest-real-stage",
+                manifest_with(vec![dependency]),
+                vec![independent],
+            );
+            let existing = if already_staged {
+                let staged =
+                    PersistentPackageStore::stage_package(&admin, &fx.store, request.clone())
+                        .await
+                        .unwrap();
+                assert_eq!(staged.payload.state, StagedAssetState::Staged);
+                Some(staged.id)
+            } else {
+                None
+            };
+            let mut status = begin(&fx, &admin, source_kind, &source_id).await;
+            assert_eq!(status.state, CleanupState::Pending);
+            for phase in [CleanupState::Pending, CleanupState::Complete] {
+                if phase == CleanupState::Complete {
+                    for clock in 501..601 {
+                        if finished(&status) {
+                            break;
+                        }
+                        status = step(&fx, &admin, &status, 100, clock).await;
+                    }
+                    assert_eq!(status.state, CleanupState::Complete, "{status:?}");
+                    assert_eq!(
+                        fx.raw(&admin, "artifact", &dependency_id).await.unwrap()["schema_version"],
+                        REDACTED
+                    );
+                    if let Some(id) = &existing {
+                        assert_eq!(
+                            fx.raw(&admin, "artifact", id).await.unwrap()["schema_version"],
+                            REDACTED
+                        );
+                    }
+                }
+                let mut nodes = vec![
+                    (source_kind, source_id.as_str()),
+                    ("artifact", dependency_id.as_str()),
+                    ("artifact", "independent"),
+                ];
+                if let Some(id) = &existing {
+                    nodes.push(("artifact", id.as_str()));
+                }
+                for repeat in 1..=2 {
+                    let label = format!(
+                        "{source_kind}, staged={already_staged}, {phase:?}, repeat={repeat}"
+                    );
+                    problems.extend(
+                        refused_manifest_stage(
+                            &fx,
+                            &admin,
+                            request.clone(),
+                            &nodes,
+                            &label,
+                            ManifestRefusal::Forbidden,
+                        )
+                        .await,
+                    );
+                }
+            }
+        }
+    }
+    assert_manifest_problems(problems);
+}
+
+#[tokio::test]
+async fn manifest_dependencies_refuse_mixed_live_and_revoked_refs_in_either_order() {
+    let admin = admin();
+    let mut problems = Vec::new();
+    for reversed in [false, true] {
+        let fx = Fx::open("manifest-mixed.sqlite3").await;
+        let live_dependency = manifest_dependency("live-dependency");
+        let revoked_dependency = manifest_dependency("revoked-dependency");
+        let live_id = package_dependency_ref_id(&live_dependency).unwrap();
+        let revoked_id = package_dependency_ref_id(&revoked_dependency).unwrap();
+        for id in [
+            live_id.as_str(),
+            revoked_id.as_str(),
+            "request-a",
+            "request-b",
+        ] {
+            fx.put(&admin, "artifact", id, &live(id)).await;
+        }
+        store_run(&fx, "revoked-upstream").await;
+        fx.edges(
+            &admin,
+            &[("artifact", revoked_id.as_str(), "run", "revoked-upstream")],
+        )
+        .await;
+        fx.put(
+            &admin,
+            "tombstone",
+            "revoked-upstream",
+            &tombstone("revoked-upstream", "run"),
+        )
+        .await;
+        let mut dependencies = vec![live_dependency, revoked_dependency];
+        let mut sources = vec![
+            source_ref(&fx, &admin, "artifact", "request-a").await,
+            source_ref(&fx, &admin, "artifact", "request-b").await,
+        ];
+        if reversed {
+            dependencies.reverse();
+            sources.reverse();
+        }
+        let nodes = [
+            ("artifact", live_id.as_str()),
+            ("artifact", revoked_id.as_str()),
+            ("artifact", "request-a"),
+            ("artifact", "request-b"),
+            ("run", "revoked-upstream"),
+        ];
+        problems.extend(
+            refused_manifest_stage(
+                &fx,
+                &admin,
+                stage_request_for("manifest-mixed-stage", manifest_with(dependencies), sources),
+                &nodes,
+                &format!("mixed refs, reversed={reversed}"),
+                ManifestRefusal::Forbidden,
+            )
+            .await,
+        );
+    }
+    assert_manifest_problems(problems);
+}
+
+#[tokio::test]
+async fn manifest_dependencies_are_artifacts_in_the_request_namespace() {
+    let fx = Fx::open("manifest-namespace.sqlite3").await;
+    let admin = admin();
+    let other = Context::new("m", "admin", Role::Admin).unwrap();
+    fx.bump(&other, "manifest-other-watermark").await;
+    let dependency = manifest_dependency("namespace-dependency");
+    let id = package_dependency_ref_id(&dependency).unwrap();
+    fx.put(&admin, "artifact", &id, &live(&id)).await;
+    fx.put(&other, "artifact", &id, &redacted(&id)).await;
+    fx.put(&other, "tombstone", &id, &tombstone(&id, "artifact"))
+        .await;
+    let nodes = [("artifact", id.as_str())];
+    let before_other = manifest_shape(&fx, &other, &nodes).await;
+    let staged = PersistentPackageStore::stage_package(
+        &admin,
+        &fx.store,
+        stage_request_for(
+            "manifest-namespace-stage",
+            manifest_with(vec![dependency]),
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(staged.payload.state, StagedAssetState::Staged);
+    assert_eq!(
+        staged.source_refs,
+        vec![source_ref(&fx, &admin, "artifact", &id).await]
+    );
+    // The file snapshot spans namespaces: this successful n stage adds its n blob,
+    // while every m body, edge, audit row and watermark stays unchanged.
+    let after_other = manifest_shape(&fx, &other, &nodes).await;
+    assert_eq!(before_other.0.changes(&after_other.0), "files 0 -> 1");
+    assert!(before_other.1.is_empty());
+    assert_eq!(after_other.1.len(), 1);
+    assert!(
+        after_other.1[0]
+            .0
+            .starts_with(&format!("blobs/{}/", hash(b"n")))
+    );
+}
+
+#[tokio::test]
+async fn manifest_dependencies_keep_request_source_errors_before_the_union_gate() {
+    let admin = admin();
+    let mut problems = Vec::new();
+    for case in [
+        "wrong-digest",
+        "missing-request",
+        "duplicate-request",
+        "duplicate-manifest-ref",
+    ] {
+        let fx = Fx::open("manifest-request-errors.sqlite3").await;
+        let dependency = manifest_dependency("request-error-dependency");
+        let id = package_dependency_ref_id(&dependency).unwrap();
+        fx.put(&admin, "artifact", &id, &live(&id)).await;
+        fx.put(
+            &admin,
+            "artifact",
+            "request-source",
+            &live("request-source"),
+        )
+        .await;
+        let source = source_ref(&fx, &admin, "artifact", "request-source").await;
+        let (sources, expected) = match case {
+            "wrong-digest" => {
+                fx.put(&admin, "tombstone", &id, &tombstone(&id, "artifact"))
+                    .await;
+                let mut changed = source;
+                changed.digest = "a".repeat(64);
+                (
+                    vec![changed],
+                    ManifestRefusal::Conflict("source changed: artifact:request-source"),
+                )
+            }
+            "missing-request" => {
+                fx.put(&admin, "tombstone", &id, &tombstone(&id, "artifact"))
+                    .await;
+                (
+                    vec![E16SourceRef {
+                        kind: "artifact".into(),
+                        id: "missing-source".into(),
+                        digest: hash(b"missing"),
+                    }],
+                    ManifestRefusal::NotFound,
+                )
+            }
+            "duplicate-request" => (
+                vec![source.clone(), source],
+                ManifestRefusal::Conflict("duplicate E16 source ref"),
+            ),
+            "duplicate-manifest-ref" => (
+                vec![source_ref(&fx, &admin, "artifact", &id).await],
+                ManifestRefusal::Conflict("duplicate E16 source ref"),
+            ),
+            _ => unreachable!(),
+        };
+        let nodes = [
+            ("artifact", id.as_str()),
+            ("artifact", "request-source"),
+            ("artifact", "missing-source"),
+        ];
+        problems.extend(
+            refused_manifest_stage(
+                &fx,
+                &admin,
+                stage_request_for(
+                    "manifest-errors-stage",
+                    manifest_with(vec![dependency]),
+                    sources,
+                ),
+                &nodes,
+                case,
+                expected,
+            )
+            .await,
+        );
+    }
+    assert_manifest_problems(problems);
+}
+
+#[tokio::test]
+async fn missing_manifest_dependencies_still_quarantine_without_a_fabricated_source_ref() {
+    let admin = admin();
+    for with_resolved in [false, true] {
+        let fx = Fx::open("manifest-missing.sqlite3").await;
+        fx.put(
+            &admin,
+            "artifact",
+            "request-source",
+            &live("request-source"),
+        )
+        .await;
+        let source = source_ref(&fx, &admin, "artifact", "request-source").await;
+        let missing = manifest_dependency("missing-dependency");
+        let missing_id = package_dependency_ref_id(&missing).unwrap();
+        let mut dependencies = Vec::new();
+        let mut expected_sources = vec![source.clone()];
+        if with_resolved {
+            let resolved = manifest_dependency("resolved-dependency");
+            let resolved_id = package_dependency_ref_id(&resolved).unwrap();
+            fx.put(&admin, "artifact", &resolved_id, &live(&resolved_id))
+                .await;
+            expected_sources.push(source_ref(&fx, &admin, "artifact", &resolved_id).await);
+            dependencies.push(resolved);
+        }
+        dependencies.push(missing);
+        expected_sources.sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+        let request = stage_request_for(
+            "manifest-missing-stage",
+            manifest_with(dependencies),
+            vec![source],
+        );
+        let staged = PersistentPackageStore::stage_package(&admin, &fx.store, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(staged.payload.state, StagedAssetState::Quarantined);
+        assert_eq!(
+            staged.payload.quarantine_reason.as_deref(),
+            Some("unresolved_dependency:org.rsia:missing-dependency")
+        );
+        assert_eq!(staged.source_refs, expected_sources);
+        assert!(fx.raw(&admin, "artifact", &missing_id).await.is_none());
+        let nodes = [
+            ("artifact", "request-source"),
+            ("artifact", missing_id.as_str()),
+        ];
+        let before = manifest_shape(&fx, &admin, &nodes).await;
+        let repeated = PersistentPackageStore::stage_package(&admin, &fx.store, request)
+            .await
+            .unwrap();
+        assert_eq!(repeated.id, staged.id);
+        assert_eq!(repeated.payload.state, StagedAssetState::Quarantined);
+        assert_eq!(before, manifest_shape(&fx, &admin, &nodes).await);
+    }
+}
+
+/// Two disjoint, fully stored stars. Each root's closure fits the bound; the
+/// requested total includes both artifact roots and all their live candidate leaves.
+/// Non-source kinds count toward the closure too, without consuming the run cap.
+async fn store_manifest_joint_closure(
+    fx: &Fx,
+    dependency_id: &str,
+    total: usize,
+) -> Vec<(String, String)> {
+    let admin = admin();
+    let mut session = fx.store.session().await.unwrap();
+    let mut nodes = Vec::new();
+    let request_size = CLOSURE_BOUND / 2;
+    for (root, prefix, size) in [
+        ("joint-request", "request-leaf", request_size),
+        (dependency_id, "manifest-leaf", total - request_size),
+    ] {
+        session
+            .put(&admin, "artifact", root, admin.actor(), &live(root))
+            .await
+            .unwrap();
+        nodes.push(("artifact".into(), root.into()));
+        for index in 1..size {
+            let id = format!("{prefix}-{index}");
+            session
+                .put(&admin, "candidate", &id, admin.actor(), &live(&id))
+                .await
+                .unwrap();
+            session
+                .put_edge(&admin, "artifact", root, "candidate", &id)
+                .await
+                .unwrap();
+            nodes.push(("candidate".into(), id));
+        }
+        assert_eq!(
+            session
+                .upstream_closure(&admin, &[("artifact", root)], CLOSURE_BOUND)
+                .await
+                .unwrap()
+                .len(),
+            1 // Only source kinds are returned; all kinds are counted by the walk.
+        );
+        assert!(matches!(
+            session
+                .upstream_closure(&admin, &[("artifact", root)], size - 1)
+                .await,
+            Err(Error::Conflict(_))
+        ));
+    }
+    assert_eq!(nodes.len(), total);
+    session.commit().await.unwrap();
+    nodes
+}
+
+#[tokio::test]
+async fn manifest_and_request_closures_over_the_joint_bound_refuse_before_any_write() {
+    let fx = Fx::open("manifest-joint-over-bound.sqlite3").await;
+    let admin = admin();
+    let dependency = manifest_dependency("joint-dependency");
+    let id = package_dependency_ref_id(&dependency).unwrap();
+    let nodes = store_manifest_joint_closure(&fx, &id, CLOSURE_BOUND + 1).await;
+    let nodes = nodes
+        .iter()
+        .map(|(kind, id)| (kind.as_str(), id.as_str()))
+        .collect::<Vec<_>>();
+    let source = source_ref(&fx, &admin, "artifact", "joint-request").await;
+    let problems = refused_manifest_stage(
+        &fx,
+        &admin,
+        stage_request_for(
+            "manifest-joint-stage",
+            manifest_with(vec![dependency]),
+            vec![source],
+        ),
+        &nodes,
+        "5000 request nodes + 5001 manifest nodes",
+        ManifestRefusal::Conflict(
+            "upstream dependency closure exceeds 10000 nodes; it is refused, not truncated",
+        ),
+    )
+    .await;
+    assert_manifest_problems(problems);
+}
+
+#[tokio::test]
+async fn manifest_and_request_closures_at_the_joint_bound_can_stage() {
+    let fx = Fx::open("manifest-joint-at-bound.sqlite3").await;
+    let admin = admin();
+    let dependency = manifest_dependency("joint-dependency");
+    let id = package_dependency_ref_id(&dependency).unwrap();
+    store_manifest_joint_closure(&fx, &id, CLOSURE_BOUND).await;
+    let source = source_ref(&fx, &admin, "artifact", "joint-request").await;
+    let staged = PersistentPackageStore::stage_package(
+        &admin,
+        &fx.store,
+        stage_request_for(
+            "manifest-joint-stage",
+            manifest_with(vec![dependency]),
+            vec![source],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(staged.payload.state, StagedAssetState::Staged);
+    assert_eq!(staged.source_refs.len(), 2);
+}
+
+#[tokio::test]
+async fn known_boundary_a_manifest_dependency_with_another_kind_tombstone_still_fails_late() {
+    let fx = Fx::open("manifest-other-kind.sqlite3").await;
+    let admin = admin();
+    let dependency = manifest_dependency("other-kind-dependency");
+    let id = package_dependency_ref_id(&dependency).unwrap();
+    fx.put(&admin, "artifact", &id, &live(&id)).await;
+    fx.put(
+        &admin,
+        "artifact",
+        "request-source",
+        &live("request-source"),
+    )
+    .await;
+    fx.put(&admin, "tombstone", &id, &tombstone(&id, "run"))
+        .await;
+    let source = source_ref(&fx, &admin, "artifact", "request-source").await;
+    let nodes = [("artifact", id.as_str()), ("artifact", "request-source")];
+    let before = manifest_shape(&fx, &admin, &nodes).await;
     let result = PersistentPackageStore::stage_package(
         &admin,
         &fx.store,
-        stage_request_for("boundary-stage", with_dependency, vec![source]),
+        stage_request_for(
+            "manifest-other-kind-stage",
+            manifest_with(vec![dependency]),
+            vec![source],
+        ),
     )
     .await;
-    assert!(
-        matches!(result, Err(Error::Forbidden)),
-        "a package staged over a redacted dependency: {result:?}"
-    );
+    assert!(matches!(result, Err(Error::Forbidden)), "{result:?}");
+    let after = manifest_shape(&fx, &admin, &nodes).await;
     assert_eq!(prepared_staged(&fx).await, 1);
+    assert_eq!(
+        before.0.changes(&after.0),
+        "artifact objects 2 -> 3, edges into node 0 0 -> 1, edges into node 1 0 -> 1, audit rows 0 -> 1"
+    );
+    assert_eq!(before.1, after.1);
 }
+
+// ---------------------------------------------------------------------------
+// Known boundary: storage's id-only check can still refuse another kind late
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn known_boundary_a_tombstone_of_the_other_kind_still_stops_a_new_stage_or_install_late() {

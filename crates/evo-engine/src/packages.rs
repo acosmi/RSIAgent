@@ -1344,7 +1344,7 @@ pub(crate) async fn current_watermark(session: &mut Session, ctx: &Context) -> R
 
 /// The gate every operation on an E16 package or seed install goes through, to
 /// create one or to read one that exists: stage, read, hand off and export a package;
-/// install, read and reset a seed. All 15 calls of it (8 here, 7 in `seeds`) are this
+/// install, read and reset a seed. All 16 calls of it (9 here, 7 in `seeds`) are this
 /// one function. A source revoked anywhere above the references refuses the
 /// operation, before it writes anything (plan §11 and §11.5: a revocation blocks
 /// reads, derivation, export and publication first, and the cleanup follows).
@@ -1479,6 +1479,9 @@ impl PersistentPackageStore {
         let mut all_sources = sources;
         all_sources.extend(dependency_refs);
         let all_sources = canonical_sources(all_sources)?;
+        // Judge resolved manifest content and request sources together, including
+        // their joint closure bound, before either an existing lookup or any write.
+        verify_sources(&mut session, ctx, &all_sources).await?;
         if let Some(existing) = session
             .get::<E16Envelope<StagedAssetPayload>>(ctx, "artifact", &id)
             .await?
