@@ -2364,15 +2364,10 @@ async fn a_repair_that_ends_in_a_hard_failure_is_counted_as_the_replay_counts_it
 }
 
 #[tokio::test]
-async fn two_repairs_and_a_success_are_counted_as_the_replay_counts_them() {
-    // S3: a repairable failure, repaired into another repairable failure, repaired into
-    // a valid node. The replay's valid node inherits the repair failure of the node it
-    // repaired (1); the coordinator used to count none, which moved the value of the
-    // `Deepen` of that node by 50000 and could change the next action.
-    //
-    // The coordinator no longer offers the second repair (the repair of a repair is a
-    // failure of the same line), so this is the world a coordinator that did might have
-    // stored: three real dispatches, rewritten into that history.
+async fn historical_two_repairs_are_counted_but_replay_rejects_the_second() {
+    // Three real dispatch facts are rewritten into a historical two-repair line.
+    // The coordinator must still derive all paid history without changing it;
+    // a fresh replay must reject the second repair of that failed line.
     let env = Env::new().await;
     let id = "world-replay-two";
     let registered = world(id, &[1, 2, 3], HALF);
@@ -2400,7 +2395,7 @@ async fn two_repairs_and_a_success_are_counted_as_the_replay_counts_them() {
     history.world["payload"]["waits"] = json!([]);
     history.put(&env).await;
 
-    let replayed = replayed_prefix(
+    let report = replayed_report(
         &[
             Replayed::root(1, "ctx-1", replayed_repairable(EPISODE)),
             Replayed::recover(
@@ -2423,11 +2418,43 @@ async fn two_repairs_and_a_success_are_counted_as_the_replay_counts_them() {
         2,
     );
     assert_eq!(
-        counts(&replayed),
+        report
+            .batches
+            .iter()
+            .flat_map(|batch| batch.action_seqs.clone())
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "the second repair remains history, not a legal replay action"
+    );
+    assert_eq!(report.coverage.observed_actions, 2);
+    let replayed = report.revealed_prefix.unwrap();
+    assert_eq!(counts(&replayed), vec![(1, Some(1), 0), (2, Some(0), 1)]);
+    assert_eq!(replayed.recovery_dispatches_used, 1);
+
+    // Independent expected projection of the three stored facts, including the
+    // second recovery that happened in this deliberately rewritten history.
+    let mut expected = stored_prefix(&env, id).await;
+    for node in &mut expected.nodes[..2] {
+        match &mut node.status {
+            ObservedStatus::RepairableFailure {
+                dispatched_repairs, ..
+            } => *dispatched_repairs = 1,
+            other => panic!("historical failure: {other:?}"),
+        }
+    }
+    expected.nodes[1].repair_failures_dispatched = 1;
+    expected.nodes[2].repair_failures_dispatched = 1;
+    expected.recovery_dispatches_used = 2;
+    assert_eq!(
+        counts(&expected),
         vec![(1, Some(1), 0), (2, Some(1), 1), (3, None, 1)]
     );
-    assert_eq!(replayed.recovery_dispatches_used, 2);
-    assert_counted_as_replayed(&env, id, &replayed).await;
+    let decision = env.coordinator.decide_next(id).await.unwrap();
+    assert_eq!(decision.prefix_digest, fingerprint(&expected).unwrap());
+    assert!(
+        Stored::load(&env, id, &steps).await == history,
+        "the historical facts remain unchanged"
+    );
     assert_still_registered(&env, &registered, &job, id).await;
 }
 
@@ -3023,21 +3050,15 @@ async fn a_world_without_a_repairable_failure_does_not_depend_on_its_dispatch_fa
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn an_episode_that_spans_two_nodes_is_counted_per_episode_where_the_replay_counts_per_node() {
+async fn an_episode_that_spans_two_nodes_has_the_same_full_online_and_replay_prefix() {
     // The history `replay_v41` pins (`recovery_is_counted_only_when_dispatched_and_global_
     // limit_spans_episodes`): a repairable failure of episode-1 is repaired into another
     // repairable failure of episode-1, a second root fails episode-2, and the global limit
     // of one recovery keeps the second repair from being dispatched.
     //
-    // The replay counts the repairs dispatched on each node: the failure that was repaired
-    // has one, the repair that failed again in a repairable way has none. The coordinator
-    // counts the repairs of an episode (plan §7.1: at most one dispatched recovery per
-    // failed episode, the administrator's hard limit), wherever the failures of the
-    // episode sit, so both nodes of episode-1 have one: the repair is not repaired
-    // again. They differ on that one counter, and on no other: the repair failures and
-    // the recoveries used are the replay's. No production step produces a repairable
-    // failure yet, so a history that spans an episode over two nodes is written by hand;
-    // aligning the two is left to the step that mints the episode of a failure (B4b).
+    // Online and replay project the one observed recovery onto every failure
+    // of episode-1, including the failed repair child. No production step mints
+    // these repairable failures yet; the history remains an explicit fixture.
     let env = Env::new().await;
     let id = "world-episode-spans";
     let mut registered = world(id, &[1, 2], HALF);
@@ -3106,32 +3127,18 @@ async fn an_episode_that_spans_two_nodes_is_counted_per_episode_where_the_replay
     // dispatched, the repair has one repair failure, the ordinary failure has none.
     assert_eq!(
         counts(&replayed),
-        vec![(1, Some(1), 0), (2, Some(0), 1), (3, Some(0), 0)]
+        vec![(1, Some(1), 0), (2, Some(1), 1), (3, Some(0), 0)]
     );
     assert_eq!(replayed.recovery_dispatches_used, 1);
 
-    // The coordinator's prefix is the replay's but for the repairs dispatched on the repair
-    // (node 2): its episode has one, it is not a repair of its own.
-    let counted_by_node = prefix_counted_as(&env, id, &replayed).await;
-    let mut counted_by_episode = counted_by_node.clone();
-    match &mut counted_by_episode.nodes[1].status {
-        ObservedStatus::RepairableFailure {
-            dispatched_repairs, ..
-        } => *dispatched_repairs = 1,
-        other => panic!("the repair is a repairable failure: {other:?}"),
-    }
+    let expected = prefix_counted_as(&env, id, &replayed).await;
     let decision = env.coordinator.decide_next(id).await.unwrap();
     assert_eq!(
         decision.prefix_digest,
-        fingerprint(&counted_by_episode).unwrap(),
-        "the prefix of the decision is the replay's, with the repairs of the episode on node 2"
+        fingerprint(&expected).unwrap(),
+        "the complete online and replay prefixes agree without patching a counter"
     );
-    assert_ne!(
-        decision.prefix_digest,
-        fingerprint(&counted_by_node).unwrap(),
-        "the replay's count on node 2 (none) is not the coordinator's"
-    );
-    // What the difference is for: the repair of episode-1 is not offered a second repair,
+    // The shared count closes episode-1: the repair of episode-1 is not offered a second repair,
     // while episode-2 still has its own.
     assert_offered(&env, id, &[recover(3, 2, 1, "episode-2")]).await;
     assert_world_reads(&env, id, &job).await;

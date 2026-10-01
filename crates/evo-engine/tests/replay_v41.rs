@@ -663,6 +663,13 @@ fn recovery_is_counted_only_when_dispatched_and_global_limit_spans_episodes() {
     ));
     let failed_repair = prefix.nodes.iter().find(|node| node.node_seq == 2).unwrap();
     assert_eq!(failed_repair.repair_failures_dispatched, 1);
+    assert!(matches!(
+        failed_repair.status,
+        ObservedStatus::RepairableFailure {
+            dispatched_repairs: 1,
+            ..
+        }
+    ));
     let ordinary_failure = prefix.nodes.iter().find(|node| node.node_seq == 3).unwrap();
     assert_eq!(ordinary_failure.repair_failures_dispatched, 0);
 }

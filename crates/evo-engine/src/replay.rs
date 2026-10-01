@@ -29,6 +29,9 @@ pub struct LiveWorldAuthority {
 struct ReplayState {
     prefix: PrefixViewV2,
     selected: BTreeSet<u32>,
+    // Derived only from Observed Recover transitions revealed by this run.
+    // Historical status counters are not dispatch facts for the replay.
+    recoveries_by_episode: BTreeMap<String, u8>,
     context_by_node: BTreeMap<u32, String>,
     best_quality: u32,
     batches: Vec<ReplayBatchRecord>,
@@ -94,6 +97,7 @@ pub fn run_replay(
             recovery_dispatches_used: 0,
         },
         selected: BTreeSet::new(),
+        recoveries_by_episode: BTreeMap::new(),
         context_by_node: BTreeMap::new(),
         best_quality: world.manifest.initial_baseline_quality_micros,
         batches: Vec::new(),
@@ -607,6 +611,22 @@ fn reveal_batch(
         state.prefix.nodes.push(node);
     }
     state.prefix.nodes.sort_by_key(|node| node.node_seq);
+    // Project after the whole batch, including new failed children and roots
+    // revealed after an earlier recovery of their episode. Never rewrite the world.
+    for node in &mut state.prefix.nodes {
+        if let ObservedStatus::RepairableFailure {
+            episode_id,
+            dispatched_repairs,
+            ..
+        } = &mut node.status
+        {
+            *dispatched_repairs = state
+                .recoveries_by_episode
+                .get(episode_id)
+                .copied()
+                .unwrap_or(0);
+        }
+    }
     state.prefix.nodes_used = state.prefix.nodes.len() as u8;
     state.prefix.decisions_completed = round;
     update_focus(&mut state.prefix, chosen);
@@ -643,14 +663,15 @@ fn node_from_transition(
             let failed = state
                 .prefix
                 .nodes
-                .iter_mut()
+                .iter()
                 .find(|node| node.node_seq == *failed_node_seq)
                 .ok_or(Error::NotFound)?;
-            if let ObservedStatus::RepairableFailure {
-                dispatched_repairs, ..
-            } = &mut failed.status
-            {
-                *dispatched_repairs = dispatched_repairs.saturating_add(1);
+            if let ObservedStatus::RepairableFailure { episode_id, .. } = &failed.status {
+                let used = state
+                    .recoveries_by_episode
+                    .entry(episode_id.clone())
+                    .or_default();
+                *used = used.saturating_add(1);
             } else {
                 return Err(Error::Invalid(
                     "recover action does not target a repairable failure".into(),

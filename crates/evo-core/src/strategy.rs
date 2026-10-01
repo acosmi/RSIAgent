@@ -625,6 +625,10 @@ pub fn decide_elastic(
             let Some(node) = node_by_seq.get(failed_node_seq) else {
                 continue;
             };
+            // A failed repair closes its line even if its next failure was renamed.
+            if node.repair_failures_dispatched >= MAX_REPAIR {
+                continue;
+            }
             match &node.status {
                 ObservedStatus::RepairableFailure {
                     episode_id: observed_episode,
@@ -692,6 +696,12 @@ pub fn decide_elastic(
         .ok_or_else(|| Error::Invalid("selected action lacks cost bound".into()))?;
     let mut recovery_count =
         usize::from(matches!(selected.action.kind, ActionKindV1::Recover { .. }));
+    // Batch slots share one observed prefix. Reserve an episode in the selection
+    // ledger before revealing any outcome, including the fair first action.
+    let mut recovery_episodes = std::collections::BTreeSet::new();
+    if let ActionKindV1::Recover { episode_id, .. } = &selected.action.kind {
+        recovery_episodes.insert(episode_id.as_str());
+    }
     if width > 1 {
         for candidate in &ranked {
             if chosen.len() >= usize::from(width) {
@@ -702,6 +712,13 @@ pub fn decide_elastic(
                     .iter()
                     .any(|chosen| chosen.branch_seq == candidate.action.branch_seq)
             {
+                continue;
+            }
+            let candidate_episode = match &candidate.action.kind {
+                ActionKindV1::Recover { episode_id, .. } => Some(episode_id.as_str()),
+                _ => None,
+            };
+            if candidate_episode.is_some_and(|episode| recovery_episodes.contains(episode)) {
                 continue;
             }
             let candidate_cost = candidate
@@ -723,6 +740,9 @@ pub fn decide_elastic(
             chosen.push(candidate.action);
             total_cost += candidate_cost;
             recovery_count += candidate_recovery;
+            if let Some(episode) = candidate_episode {
+                recovery_episodes.insert(episode);
+            }
         }
     }
     Ok(BatchActionV1::Dispatch {
