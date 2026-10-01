@@ -1,5 +1,6 @@
 //! Role-gated model and persistent management dispatch.
 use crate::exploration::ExplorationWorldV1;
+use crate::revocation_gate;
 use crate::streaming_evaluator::{
     IndependentEvaluationControl, IssueTicketRequest, ProtectedHoldoutRecord,
     RegisteredEvaluationControl, StreamingEvaluationStatus,
@@ -816,138 +817,22 @@ async fn persist_management(
     Ok(job)
 }
 
-/// Nodes the upstream closure of a new request's dependencies may hold before the
-/// request is refused for its size (plan §11: a derivation beyond the scale is
-/// refused, never silently cut short; `capacity` has the same rule). The closure of
-/// a real request is a few dozen nodes.
-const MAX_UPSTREAM_CLOSURE_NODES: usize = 10_000;
+/// What the submit check of a new request calls the thing it refuses (the words of
+/// its `Conflict`).
+const SUBMIT_SUBJECT: &str = "management request";
 
 /// `Conflict` naming the first thing a new request depends on whose source was
-/// revoked, in two stages. Both read in the session that goes on to write, before
-/// anything is written, so a refusal leaves no private input, job, edge,
+/// revoked: the dependencies themselves, then everything above them. The judgement
+/// is shared with the other writers of a new dependency (`revocation_gate`); the
+/// request answers in its own words. It reads in the session that goes on to write,
+/// before anything is written, so a refusal leaves no private input, job, edge,
 /// idempotency row or audit record behind.
-///
-/// 1. The dependencies themselves, in the order given. A dependency is revoked when
-///    it is a tombstoned source (`begin_revoke` writes a tombstone under the source
-///    id, and the cleanup then deletes a run), or when the cleanup already replaced
-///    it with an `rsia.redacted.v1` tombstone.
-///
-///    A tombstone is keyed by the id of its source alone, and a source is a run or
-///    an artifact, so a run and an artifact that share an id share one tombstone.
-///    The tombstone records which of the two it was written for (`source_kind`) and
-///    it decides a dependency only when that is the dependency's own kind: a
-///    revoked run does not refuse a live artifact that carries its id, nor the
-///    reverse. A tombstone that cannot be read as one `begin_revoke` writes (it does
-///    not decode, or its source kind is neither `run` nor `artifact`) cannot be
-///    matched to anything and fails closed: the dependency is refused. A dependency
-///    of any other kind is not judged by a tombstone, only by the redacted-body
-///    check.
-///
-///    A dependency that does not exist (and is not tombstoned) is not refused here:
-///    the operation itself fails on it inside the job (`not_found`), as before.
-///
-/// 2. The upstream closure of the dependencies that passed the first stage: every
-///    node they depend on, directly or transitively. The cleanup reaches the nodes
-///    below a revoked source one page at a time, so for a while after
-///    `begin_revoke` the pool, learner state or input artifact a request depends on
-///    is still live, and only a node further up carries the tombstone. Each run or
-///    artifact of the closure is judged as a dependency is in the first stage, by
-///    the same rule, and the refusal names that node: a tombstone of its own kind, a
-///    tombstone that cannot be read, or (for an artifact) a body the cleanup already
-///    redacted. A closure of more than `MAX_UPSTREAM_CLOSURE_NODES` nodes is refused
-///    as well: judging part of it would take a revoked source nobody looked at for a
-///    live one.
 async fn ensure_dependencies_live(
     ctx: &Context,
     session: &mut Session,
     dependencies: &[(String, String)],
 ) -> Result<()> {
-    for (kind, id) in dependencies {
-        if matches!(kind.as_str(), "run" | "artifact")
-            && let Some(body) = session.get::<Value>(ctx, "tombstone", id).await?
-        {
-            let source_kind = tombstone_source_kind(body);
-            match source_kind {
-                Some(source_kind) if source_kind == *kind => {
-                    return Err(Error::Conflict(format!(
-                        "management request depends on {kind} {id}, whose source was revoked"
-                    )));
-                }
-                // The tombstone belongs to a source of the other kind that shares
-                // this id; this dependency is a different object.
-                Some(_) => {}
-                None => {
-                    return Err(Error::Conflict(format!(
-                        "management request depends on {kind} {id}, whose revocation tombstone cannot be read; the source is treated as revoked"
-                    )));
-                }
-            }
-        }
-        // The cleanup deletes a revoked run instead of redacting it, and a run body
-        // can be large: for a run only the tombstone matters.
-        if kind == "run" {
-            continue;
-        }
-        if session
-            .get::<Value>(ctx, kind, id)
-            .await?
-            .as_ref()
-            .is_some_and(is_redacted)
-        {
-            return Err(Error::Conflict(format!(
-                "management request depends on {kind} {id}, which was redacted because its source was revoked"
-            )));
-        }
-    }
-    ensure_upstream_closure_live(ctx, session, dependencies).await
-}
-
-/// The second stage of `ensure_dependencies_live`: the runs and artifacts above the
-/// dependencies, judged as the dependencies are.
-async fn ensure_upstream_closure_live(
-    ctx: &Context,
-    session: &mut Session,
-    dependencies: &[(String, String)],
-) -> Result<()> {
-    let closure = session
-        .upstream_closure(ctx, dependencies, MAX_UPSTREAM_CLOSURE_NODES)
-        .await?;
-    for node in closure {
-        let (kind, id) = (node.kind, node.id);
-        if let Some(body) = node.tombstone {
-            match tombstone_source_kind(body) {
-                Some(source_kind) if source_kind == kind => {
-                    return Err(Error::Conflict(format!(
-                        "management request's dependency closure holds {kind} {id}, whose source was revoked"
-                    )));
-                }
-                // The tombstone belongs to a source of the other kind that shares
-                // this id; this node is a different object.
-                Some(_) => {}
-                None => {
-                    return Err(Error::Conflict(format!(
-                        "management request's dependency closure holds {kind} {id}, whose revocation tombstone cannot be read; the source is treated as revoked"
-                    )));
-                }
-            }
-        }
-        if node.redacted {
-            return Err(Error::Conflict(format!(
-                "management request's dependency closure holds {kind} {id}, which was redacted because its source was revoked"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// The kind of source (`run` or `artifact`) a stored tombstone says it was written
-/// for; `None` for a body `begin_revoke` never writes (it does not decode, or its
-/// source kind is neither).
-fn tombstone_source_kind(body: Value) -> Option<String> {
-    serde_json::from_value::<evo_storage::lifecycle::RevokeTombstone>(body)
-        .ok()
-        .map(|tombstone| tombstone.source_kind)
-        .filter(|source_kind| matches!(source_kind.as_str(), "run" | "artifact"))
+    revocation_gate::ensure_dependencies_live(ctx, session, dependencies, SUBMIT_SUBJECT).await
 }
 
 async fn load_job(ctx: &Context, store: &Store, job_id: &str) -> Result<ManagementJob> {
