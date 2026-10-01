@@ -50,7 +50,7 @@
     "E00": {
       "title": "Fixed Baseline, Source Reconciliation, Scope Boundaries",
       "status": "implemented_not_verified",
-      "status_reason": "historical T001-T126 assertions were not supplied; legacy equivalence remains unverified",
+      "status_reason": "the fixed program baseline has verified sub-scopes, but historical package/T001-T126 reconciliation is unavailable and the full E00 input inventory is incomplete",
       "implementation_files": [
         "scripts/smoke_workspace.py",
         "scripts/inventory_baseline_tests.py",
@@ -89,7 +89,8 @@
         }
       ],
       "remaining": [
-        "historical T001-T126 assertions were not supplied; legacy equivalence remains unverified"
+        "historical packages and T001-T126 assertions are unavailable; legacy equivalence remains unverified",
+        "engineering: CI/inventory exit-code gate and complete input/source reconciliation remain (AG-056 and E00)"
       ]
     },
     "E01": {
@@ -136,7 +137,8 @@
         }
       ],
       "remaining": [
-        "real independent holdout execution and paid formal experiment remain unverified"
+        "real independent holdout execution and paid formal experiment remain unverified",
+        "engineering: profile documentation, explicit formal n and controlled-task definition remain (AG-057; controlled task requires plan clarification)"
       ]
     },
     "E02": {
@@ -386,7 +388,8 @@
         }
       ],
       "remaining": [
-        "real provider samples, independent processes and complete optimization cost proof remain unavailable"
+        "real provider samples, independent processes and complete optimization cost proof remain unavailable",
+        "engineering: complete-batch verdict preservation (AG-052), partition persistence, cost proof and typed report dependencies remain"
       ]
     },
     "E06": {
@@ -598,7 +601,7 @@
     "E08": {
       "title": "Persistent Revocation, Cleanup, Backup & Trusted Anchor Recovery",
       "status": "in_progress",
-      "status_reason": "revocation cleanup completes only at its closure fixpoint and covers this round's objects, budget reservation/dispatch, late responses and late stage facts (AG-035, AG-036, AG-037, AG-038, AG-043, AG-045); production disaster recovery and Linux deployment remain unverified",
+      "status_reason": "accepted program sub-scopes include revocation closure, late writes, economic restore protection (AG-051) and grant/package/seed source gates (AG-046); full production recovery and remaining write paths are unverified",
       "implementation_files": [
         "crates/evo-storage/src/lifecycle.rs",
         "crates/evo-engine/src/lifecycle.rs",
@@ -776,19 +779,41 @@
           "rollback": "revert PR #90 (merge ecdfe31) through an independent revert PR; accepted-stack rollback point 4254e6d; persisted revocation, budget, cost and audit facts are not rolled back",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-045-e7c0d0f.json"
+        },
+        {
+          "id": "E08.ag046_write_side_revocation",
+          "description": "Grants and package/seed sources use a shared write-side revocation gate",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "229fea802d8184eb03c7f53f979a78200284b47b",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/96",
+          "merged_sha": "49d5b85ec4fa757144213573c585087798324e91",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/write_side_revocation_gate_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test write_side_revocation_gate_v42",
+          "input_digest": "69e8f85e56d6264a9d840b428d6d0aacad092f1c86d8d12ae3bad45e491598fd",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag046-229fea8.log.test",
+          "actual_result": "controller full re-run at 229fea8 (ctrl_verify.sh: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy, not --offline, build, both smokes, support-scope checker and unittest): write_side_revocation_gate_v42 13 passed / 0 failed; workspace 85 result lines 1101 passed / 0 failed; test exit 0",
+          "scope": "E08; plan sections 11.3/11.5 lines 1110/1132; V017/V075: grants and new package/seed writes reject revoked source references or upstream closure before writing; existing package/seed reads, exports and handoff use the same namespace/kind-precise gate; malformed tombstones and closure overflow fail closed",
+          "risk": "Manifest dependency_refs are still checked after the first write; storage publication kind precision, kind-keyed tombstones, stage_bundle, other late writes, physical residue and production callers are not claimed; grant existence/trust stays a consumer responsibility",
+          "rollback": "revert PR #96 through an independent revert PR; accepted-head parent e2c9107142413c0ba304b5090692b56037958f40; preserve revocation, budget, cost and audit facts",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-046-229fea8.json"
         }
       ],
       "remaining": [
-        "engineering: tombstones are keyed by id only; pre-existing same-id run/artifact collisions cannot be revoked until a kind-keyed format with dual read (plan section 11.1)",
-        "engineering: SQLite free-page/WAL remnants of plaintext written before revocation (no secure_delete or VACUUM)",
-        "engineering: economic replay records are outside the restore-protected set; grant/stage_package/seed write points lack revocation gates",
+        "awaiting plan clarification: kind-keyed tombstones and storage publication kind precision/residue; no source clause currently authorizes a format change",
+        "awaiting plan clarification: physical SQLite free-page/WAL erasure is not a declared guarantee",
+        "engineering: stage_package manifest dependency_refs before first write (AG-059); other late writes and stage_bundle remain",
         "production disaster recovery, Linux deployment and future object scopes remain unverified"
       ]
     },
     "E09": {
       "title": "Bounded Strategy, Persistent Exploration, E03 Consumers",
       "status": "in_progress",
-      "status_reason": "skill groups, comparative practice, exploration cleanup edges, the trusted run_next gate, legal actions, registration, post-payment convergence and recovery counting are verified program sub-scopes (AG-021/024/026/033/039/040/041/042); the repair-producing chain, NoChange/KeepIncumbent terminals and history in requests remain",
+      "status_reason": "skill groups, comparative practice, exploration cleanup edges, the trusted run_next gate, legal actions, registration, post-payment convergence and recovery counting are verified program sub-scopes (AG-021/024/026/033/039/040/041/042); the repair-producing chain and history in requests remain; AG-048 now verifies explicit NoChange/KeepIncumbent classes and fixed codes within its accepted record whitelist",
       "implementation_files": [
         "crates/evo-core/src/strategy.rs",
         "crates/evo-engine/src/exploration.rs",
@@ -1011,14 +1036,36 @@
           "rollback": "revert PR #92 (merge 696252f) through an independent revert PR; accepted-stack rollback point e7c0d0f; persisted revocation, budget, cost and audit facts are not rolled back",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-042-3d68d30.json"
+        },
+        {
+          "id": "E09.ag048_terminal_classes",
+          "description": "Optimization step terminals use closed typed classes and fixed codes",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "f178dc239b619746b07b74241a756dce4897f059",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/97",
+          "merged_sha": "804302602efe575d92973be20c532d264019f9aa",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/step_terminal_classes_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test step_terminal_classes_v42",
+          "input_digest": "60f775e6d122e33f6ac53b1c31b2bf39795028c776efda57915f31610983c380",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag048-f178dc2.log.test",
+          "actual_result": "controller full re-run at f178dc2 (ctrl_verify.sh: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy, not --offline, build, both smokes, support-scope checker and unittest): step_terminal_classes_v42 14 passed / 0 failed; workspace 86 result lines 1124 passed / 0 failed; test exit 0; 9 additional module tests were included in the workspace total",
+          "scope": "E09/E03/E13; plan sections 5.3.1/6.7.3/7.2/11 lines 507/751–753/817/1077; V088/V089/V090: explicit no-change and kept-incumbent classes on nodes/dispatch facts, fixed codes in the accepted record whitelist, unchanged decision behavior and readable legacy records",
+          "risk": "DispatchObserved/ResponseObserved model answers and StepPrepared inputs remain in the revocable source closure; broker ledger text, typed repair sources/Recover, history/signature integration, deepen eligibility and quality benefits are not claimed; legacy intermediate states fail closed; class fields are not cross-validated",
+          "rollback": "revert PR #97 through an independent revert PR; accepted-stack rollback point 229fea802d8184eb03c7f53f979a78200284b47b; preserve revocation, budget, cost and audit facts",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-048-f178dc2.json"
         }
       ],
       "remaining": [
         "engineering: typed trusted source for RepairableFailure, episode minting bound to immutable facts and per-episode repair counting in replay (AG-047)",
-        "engineering: NoChange and KeepIncumbent terminal states and fixed-literal Rejected/Uncertain reasons (AG-048)",
         "engineering: optimization history in requests and cache signatures (E09 PR-C)",
         "external: real G2 provider/process execution and effect evidence are unavailable",
-        "V097 ablation scope not verified"
+        "V097 ablation scope not verified",
+        "engineering: broker pre-dispatch refusal classification (AG-054); kept-incumbent deepen eligibility awaits a decision"
       ]
     },
     "E10": {
@@ -1167,7 +1214,7 @@
     "E12": {
       "title": "Zero-budget Curriculum, Fixed Pure Functions, Rejection Gate",
       "status": "in_progress",
-      "status_reason": "curriculum envelope cleanup classification (AG-025) and curriculum replay/redacted-read fail-closed (AG-027) are verified and the E03 receipt schema it waited for exists (AG-016); the persistent-learning-to-next-topic positive chain is unverified and the code-level scope depends on the E04 real isolation acceptance (plan section 12.0)",
+      "status_reason": "curriculum envelope cleanup classification (AG-025) and curriculum replay/redacted-read fail-closed (AG-027) are verified and the E03 receipt schema it waited for exists (AG-016); the persistent-learning-to-next-topic positive chain is unverified and the code-level scope depends on the E04 real isolation acceptance (plan section 12.0); AG-050 verifies text-proposal unverified defaults and selection before legacy in-memory budget reservation",
       "implementation_files": [
         "crates/evo-core/src/curriculum.rs",
         "crates/evo-engine/src/curriculum.rs",
@@ -1229,6 +1276,28 @@
           "rollback": "revert PR #72 (merge 15b140d) through an independent revert PR; accepted-stack rollback point 551aa33; persisted revocation, budget, cost and audit facts are not rolled back",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-025-2df06e7.json"
+        },
+        {
+          "id": "E12.ag050_curriculum_priority",
+          "description": "Text proposals remain unverified and topic selection precedes budget reservation with typed errors",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "a4a60c8eb0f808cfb6492e867fe82e96d66af95d",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/94",
+          "merged_sha": "4a8487413cb8fe51ee16b91a538a71816997adfb",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/curriculum_priority_fixes_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test curriculum_priority_fixes_v42",
+          "input_digest": "3554b91066dc3cc41cd9a00d33ef4de122e791d9ffb67d08209c71a0ba09fbe9",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag050-a4a60c8.log.test",
+          "actual_result": "controller full re-run at a4a60c8 (ctrl_verify.sh: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy, not --offline, build, both smokes, support-scope checker and unittest): curriculum_priority_fixes_v42 10 passed / 0 failed; workspace 83 result lines 1079 passed / 0 failed; test exit 0; same workspace also ran the evo-core curriculum_priority_fixes_v42 target: 5 passed / 0 failed",
+          "scope": "E12/E04; plan section 1.4 lines 97–98; V030/V083 and V008/V034/V082: text proposals never self-certify oracle success; the legacy in-memory curriculum step selects before reserving and preserves typed errors",
+          "risk": "TaskProposal deserialization may still set oracle_ok=true; no persistent release audit in the legacy in-memory RootBudget path; real validity/isolation and learning gains are unverified",
+          "rollback": "revert PR #94 through an independent revert PR; accepted-head parent 81449ccd1a3a9f73b464438d8a6edd26a0ff9734; preserve revocation, budget, cost and audit facts",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-050-a4a60c8.json"
         }
       ],
       "remaining": [
@@ -1673,7 +1742,7 @@
     "E16.5": {
       "title": "Persistent Recovery Immutability, Capacity Limits & Deployment Security",
       "status": "in_progress",
-      "status_reason": "capacity gates are wired into six real entry points (AG-014), the startup recovery quarantine and deployment gates into rsia serve/mcp (AG-018), and restore protection covers this round's action and invalidation facts (AG-029); no real sandbox and Linux not exercised",
+      "status_reason": "capacity gates are wired into six real entry points (AG-014), the startup recovery quarantine and deployment gates into rsia serve/mcp (AG-018), and restore protection covers this round's action and invalidation facts (AG-029); no real sandbox and Linux not exercised; AG-051 adds exact-schema economic replay envelope restore protection",
       "implementation_files": [
         "crates/evo-engine/src/capacity.rs",
         "crates/evo-storage/src/lifecycle.rs",
@@ -1792,6 +1861,28 @@
           "rollback": "revert PR #76 (merge 7120842) through an independent revert PR; accepted-stack rollback point 400f707; persisted revocation, budget, cost and audit facts are not rolled back",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-029-43984ab.json"
+        },
+        {
+          "id": "E16.5.ag051_economic_restore",
+          "description": "Economic replay records included in restore protection by exact schema",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "4bdc8844738356ba70f9cbbfca1143d2bde94efe",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/95",
+          "merged_sha": "e2c9107142413c0ba304b5090692b56037958f40",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/restore_economic_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test restore_economic_v42",
+          "input_digest": "23e9613b0038125bdbfab9cff100b08219bb349eac5fc22dc84d59c7087adc73",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag051-4bdc884.log.test",
+          "actual_result": "controller full re-run at 4bdc884 (ctrl_verify.sh: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy, not --offline, build, both smokes, support-scope checker and unittest): restore_economic_v42 9 passed / 0 failed; workspace 84 result lines 1088 passed / 0 failed; test exit 0",
+          "scope": "E16.5/E08; plan E16.5 lines 1453–1455; V018/V038/V096: economic experiments, jobs, budget-call and Admin-measured cost receipts, and reports are protected by exact schema equality in restore and startup gates",
+          "risk": "Only macOS exercised; restore script quarantine text is generic while the startup gate names mismatches; future record kinds under the v1 envelope inherit protection",
+          "rollback": "revert PR #95 through an independent revert PR; accepted-head parent 4a8487413cb8fe51ee16b91a538a71816997adfb; preserve revocation, budget, cost and audit facts",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-051-4bdc884.json"
         }
       ],
       "remaining": [
