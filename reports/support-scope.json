@@ -90,7 +90,7 @@
       ],
       "remaining": [
         "historical packages and T001-T126 assertions are unavailable; legacy equivalence remains unverified",
-        "engineering: CI/inventory exit-code gate and complete input/source reconciliation remain (AG-056 and E00)"
+        "engineering: CI/inventory gate AG-056 is locally implemented but publication is blocked by missing OAuth workflow scope; full source/history reconciliation remains"
       ]
     },
     "E01": {
@@ -134,11 +134,33 @@
           "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/implementation-v4.1-20260919/controller-e01-input.json"
+        },
+        {
+          "id": "E01.ag057_explicit_sample_registration",
+          "description": "Explicit sample input and evaluation preregistration requirements",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "9150d8807d107f1ad24daa59b90f7de14f092477",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/106",
+          "merged_sha": "279ee7c5290fabbb20cbd16b7e53c5ac2b71c188",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-core/tests/evaluation_contract_v42.rs",
+          "command": "cargo test --locked --offline -p evo-core --test evaluation_contract_v42",
+          "input_digest": "ec5ad0a4d9bf2f53521fce35f9735b2ab22b62267861715e16b14e4199590507",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag057-9150d88.log.test",
+          "actual_result": "controller independent full re-run at 9150d88: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; evaluation_contract_v42 7 passed / 0 failed; workspace 90 result lines, 1202 passed / 0 failed; checker unittest 48 passed; two controller probes pass on head and actual parent; both probes are explicit compatibility/claim boundaries, not old runtime bug reproduction",
+          "scope": "E01; sections 3.1-3.6 L239-L401 and E01 L1197/L1201; V010/V011/V012/V013/V084/V085/V096/V097 limited to static registration obligations, explicit n input, legacy v1 bytes/digests and ticket-binding regression. first_low_risk(id,n) requires the supplied count and preserves the existing 2..100000 validation; fifteen old fixtures pass explicit 60",
+          "risk": "Intentional Rust source API break with migration guidance, unchanged wire/schema/statistics/budget policy. Legal n is not a power or independence proof; no real task/oracle/anchor registration, paid authority, nonzero-budget policy fix, full E01/V, benefit or release; QueryBook boundary is in-memory",
+          "rollback": "revert PR #106 through an independent revert PR; accepted-head parent 5337f4b17558b4c95176885d39f2518142d965b9; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-057-9150d88.json"
         }
       ],
       "remaining": [
         "real independent holdout execution and paid formal experiment remain unverified",
-        "engineering: profile documentation, explicit formal n and controlled-task definition remain (AG-057; controlled task requires plan clarification)"
+        "engineering: AG-057 documents registration and requires explicit formal n while retaining old wire; actual controlled-task/oracle/anchor definitions, nonzero budget authorization policy and real data registration remain"
       ]
     },
     "E02": {
@@ -203,10 +225,33 @@
           "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/implementation-v4.1-20260919/controller-e02-formatted-input.json"
+        },
+        {
+          "id": "E02.ag055_v1_wire_goldens",
+          "description": "v1 wire and tool descriptor regression goldens",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "c0ea35de8b028f849f89008f7edca2852e412812",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/103",
+          "merged_sha": "ba01a2e8489ceef6d1350f0babdac46d816071ec",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-core/tests/v1_golden.rs",
+          "command": "cargo test --locked --offline -p evo-core --test v1_golden",
+          "input_digest": "6d63c971e05bbe6eae18491af7d4e423a1dc8c048adc7762bebf5a98bf9656ce",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag055-c0ea35d.log.test",
+          "actual_result": "controller independent full re-run at c0ea35d: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; v1_golden 6 passed / 0 failed; workspace 89 result lines, 1158 passed / 0 failed; checker unittest 48 passed; two controller probes pass on head and actual parent; core golden 6 plus MCP golden 2 in the full suite; two extra real descriptor mutations fail and restored controls pass",
+          "scope": "E02; sections 5.1 L453/L455 and 6.1 L605/L609, E02 L1213/L1215, V002 L1502 and reproducible fixtures L2166: frozen typed bytes for five v1 requests, Strategy/legacy Evaluation and four real tool descriptors within 2000 bytes; independent descriptor perturbations detected",
+          "risk": "Tests and synthetic fixtures only; no RFC8785, new protocol, real host certification, full E02/V002, product effect or release claim",
+          "rollback": "revert PR #103 through an independent revert PR; accepted-head parent 35b4d4e08df121e68467b0783b29303e9fa31d94; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-055-c0ea35d.json"
         }
       ],
       "remaining": [
-        "full host application and multi-skill production behavior remain unverified"
+        "full host application and multi-skill production behavior remain unverified",
+        "engineering: AG-055 adds v1 goldens only; FieldContract metadata/real consumers, P/B content/revocation binding, negotiation and host drift detection remain; AG-062 missing-label gate is not accepted yet"
       ]
     },
     "E03": {
@@ -334,11 +379,34 @@
           "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/implementation-v4.1-20260919/controller-e04-final-input.json"
+        },
+        {
+          "id": "E04.ag054_typed_predispatch",
+          "description": "Typed pre-dispatch refusals and safe reserved-call cleanup",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "f6aa729a467f10f8b15b2d7b20e9a9d1c7d80351",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/104",
+          "merged_sha": "9b08c4b2fd882abab65f48ea0af8f23b13a3b50d",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/broker.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test broker",
+          "input_digest": "6341f8fad1ced29375cd8c3a6cb6db77c4ec4ed96be32165d73ccadbf884cd27",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag054-f6aa729.log.test",
+          "actual_result": "controller independent full re-run at f6aa729: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; broker 21 passed / 0 failed; workspace 89 result lines, 1195 passed / 0 failed; checker unittest 48 passed; two controller probes pass on head and both fail on actual parent; AG054 parent probes fail after successful compilation, exercising typed identity and cleanup-error behavior",
+          "scope": "E04; sections 7.2 L819 and 7.2.1 L827/L831, E04 L1239/L1243; V008/V086/V096 subset: known pre-dispatch causes, versioned durable refusal replay, legacy API mapping and full-fence cleanup limited to Reserved; unknown cost remains charged/reserved, empty-source legacy retry retains stored sources",
+          "risk": "No generic database/commit-failure classification, no unknown-cost refund; target execution error tested through private helper, not real process fault. No real provider bills, sandbox, complete recovery, exhaustive concurrency, full E/V, effect or release",
+          "rollback": "revert PR #104 through an independent revert PR; accepted-head parent ba01a2e8489ceef6d1350f0babdac46d816071ec; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-054-f6aa729.json"
         }
       ],
       "remaining": [
         "engineering: no actual provider transport or qualified isolated runner is wired to the accepted budget/broker subset",
-        "external: paid provider reconciliation and production load/capacity evidence are unavailable"
+        "external: paid provider reconciliation and production load/capacity evidence are unavailable",
+        "engineering: GA14 stage limits are only statically validated; root-plan version binding, stage mapping and payer correspondence need a defined contract before runtime enforcement"
       ]
     },
     "E05": {
@@ -1507,7 +1575,8 @@
       ],
       "remaining": [
         "engineering: no production caller drives close_development_cycle_and_trigger; the plan's section 6.1 operation list has no consolidation operation, so a management entry needs a plan revision first",
-        "real longitudinal provider execution and effect remain unverified"
+        "real longitudinal provider execution and effect remain unverified",
+        "engineering: QualityStatus remains Unknown, explicit Admin observation/drift paths are not automatic retention gates; AG-058 only corrects description"
       ]
     },
     "E14": {
@@ -1575,12 +1644,35 @@
           "rollback": "revert PR #81 (merge d9b3f6f) through an independent revert PR; accepted-stack rollback point 04e6309; persisted revocation, budget, cost and audit facts are not rolled back",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-034-c5c04ba.json"
+        },
+        {
+          "id": "E14.ag058_current_description_boundaries",
+          "description": "Current CLI, meta and cleanup description boundaries",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "4edb5b79220fe443d700808b99da9b9f6590a910",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/105",
+          "merged_sha": "5337f4b17558b4c95176885d39f2518142d965b9",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/meta_trial_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test meta_trial_v42",
+          "input_digest": "bc5e95958c32afc8a7dccf863ebd175c69efd1811e0f44804c57cf376dc20b3d",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag058-4edb5b7.log.test",
+          "actual_result": "controller independent full re-run at 4edb5b7: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; meta_trial_v42 29 passed / 0 failed; workspace 89 result lines, 1195 passed / 0 failed; checker unittest 48 passed; two controller probes pass on head and actual parent; both probes are explicit compatibility/claim boundaries, not old runtime bug reproduction",
+          "scope": "E00/E02/E08/E13/E14/E15 description-only correction; sections 6.1 L605-L609, 9 L1009/L1013, 11 L1077, E08 L1295/L1299 and E13 L1365/L1369; V001/V002/V017/V032/V033/V035/V037 subset. Text matches current consumers; three Rust files differ only in documentation comments. Counter depletion preserves meta registration fingerprint while immutable cost contract changes do not",
+          "risk": "No new runtime capability or complete E/V verification; old MetaEvidence is caller-reported, spends may differ, no independent attestation or per-stream hard cap. QualityStatus remains Unknown; drift/retention are not automatic; no general cleanup, effect or release claim",
+          "rollback": "revert PR #105 through an independent revert PR; accepted-head parent 9b08c4b2fd882abab65f48ea0af8f23b13a3b50d; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-058-4edb5b7.json"
         }
       ],
       "remaining": [
         "engineering: ProgramFixture-scoped improver registration (E14.2b) and the meta.start registration-and-binding consumer (E14.2c)",
         "external: the E14 frozen mechanism contract; real approval is structurally unreachable (promotion_eligible is false and evaluation evidence is ProgramFixture only)",
-        "no inheritance or meta benefit is claimed; G4 is not enabled"
+        "no inheritance or meta benefit is claimed; G4 is not enabled",
+        "AG-058 only aligns descriptions and compatibility boundaries; caller-reported MetaEvidence and unequal consumed amounts do not establish independent verification or stage/stream spending enforcement"
       ]
     },
     "E15": {
@@ -1960,7 +2052,7 @@
     "E16.6": {
       "title": "Release, Support Scope Manifest & Truth Ledger",
       "status": "in_progress",
-      "status_reason": "the index is bound to plan v4.2 with its lineage and carries round-2, round-3 and the first three round-4 product acceptance records; it does not close E16",
+      "status_reason": "the v4.2 derived index records round-2, round-3 and seven round-4 accepted product subsets, each with fixed source and merge identities; it does not close E16",
       "implementation_files": [
         "reports/support-scope.json",
         "crates/evo-core/tests/support_scope.rs"
