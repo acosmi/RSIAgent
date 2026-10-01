@@ -2116,6 +2116,54 @@ pub(crate) fn first_decision(world: &ExplorationWorldV1) -> Result<CoordinatorDe
     pure_decision(world, &[])
 }
 
+/// The cost the world's immutable registration facts give `action`, as
+/// `derive_legal_actions` derives it, or `None` when `action` is not one the world
+/// could have derived.
+///
+/// A root action (`Widen`) is the one the world derives from the root opportunity
+/// whose `action_seq` it carries, whole (id, branch, depth, kind and cost): its
+/// cost is that root opportunity's. A `Deepen` or a `Recover` costs the world's
+/// successor cost. The successors are numbered after the root opportunities, so a
+/// successor never carries a root opportunity's `action_seq`, and a root action
+/// always does: an action of one kind that is numbered like the other is none the
+/// world derived.
+///
+/// It reads only what the registration fingerprint covers (the root opportunities
+/// and the successor cost), so it is the registration's cost whenever the stored
+/// world has the registration's fingerprint.
+fn registered_action_cost(
+    world: &ExplorationWorldV1,
+    action: &LegalActionV1,
+) -> Result<Option<u64>> {
+    match &action.kind {
+        ActionKindV1::Widen { .. } => {
+            // With no node there is no branch yet: this derives the Widen of every root.
+            let roots = derive_legal_actions(world, &[])?;
+            let Some(root) = roots
+                .actions
+                .iter()
+                .find(|root| root.action_seq == action.action_seq)
+            else {
+                return Ok(None);
+            };
+            if fingerprint(root)? != fingerprint(action)? {
+                return Ok(None);
+            }
+            Ok(root.estimated_cost_upper_micros)
+        }
+        ActionKindV1::Deepen { .. } | ActionKindV1::Recover { .. } => {
+            if world
+                .root_opportunities
+                .iter()
+                .any(|root| root.action_seq == action.action_seq)
+            {
+                return Ok(None);
+            }
+            Ok(Some(world.successor_cost_upper_micros))
+        }
+    }
+}
+
 /// The budget a stored world was registered with, rebuilt from the facts
 /// `run_next` left behind: `(remaining_root_micros,
 /// remaining_recovery_dispatches)`.
@@ -2133,6 +2181,15 @@ pub(crate) fn first_decision(world: &ExplorationWorldV1) -> Result<CoordinatorDe
 /// completed one names a node the world lists, with as many completed facts as
 /// nodes. Anything else leaves no way to tell a spend from a counter someone
 /// lowered, so the registered budget is not rebuilt (`Conflict`), never guessed.
+///
+/// What a fact spent is not taken on its word. The cost of an action is fixed by
+/// the world's registration (`registered_action_cost`), so every fact, a claimed
+/// one included, has to record that cost, in its decision and in its selected
+/// action; and it is that cost which is added back. A fact whose cost was edited
+/// together with the counter that paid for it would otherwise balance the books
+/// and raise what the world may still spend. The world's immutable facts are the
+/// ones the registration fingerprint covers; the caller has compared that
+/// fingerprint first (`ensure_registered_as`).
 ///
 /// This function states `run_next`'s spending rule from the reading side: a
 /// change to when or by how much `run_next` spends has to change it with it
@@ -2180,6 +2237,16 @@ async fn registered_budget(
         {
             return Err(unaccounted());
         }
+        // The cost the fact records is the world's own cost of that action, in the
+        // decision and in the selected action alike.
+        let Some(cost) = registered_action_cost(world, &fact.selected_action)? else {
+            return Err(unaccounted());
+        };
+        if *estimated_cost_upper_micros != cost
+            || fact.selected_action.estimated_cost_upper_micros != Some(cost)
+        {
+            return Err(unaccounted());
+        }
         // Every state is named, so a state added later has to be decided here:
         // whether it spent the dispatch's budget is the whole question.
         match fact.state {
@@ -2198,9 +2265,7 @@ async fn registered_budget(
                 {
                     return Err(unaccounted());
                 }
-                root_micros = root_micros
-                    .checked_add(*estimated_cost_upper_micros)
-                    .ok_or_else(unaccounted)?;
+                root_micros = root_micros.checked_add(cost).ok_or_else(unaccounted)?;
                 if matches!(fact.selected_action.kind, ActionKindV1::Recover { .. }) {
                     recovery_dispatches += 1;
                 }

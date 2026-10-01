@@ -20,7 +20,14 @@
 //!   fingerprint of its immutable facts (a source closure replaced by other live
 //!   runs, a cost, a seed, a digest) and the budget it was registered with,
 //!   rebuilt from its dispatch facts, against the world in the job's private
-//!   input. A world that never started keeps comparing its own decision.
+//!   input. A world that never started keeps comparing its own decision;
+//! * (R2) the budget rebuilt from the dispatch facts takes what each fact spent from
+//!   the world's registration, not from the fact: the cost of an action is its root
+//!   opportunity's (a root action) or the successor cost (a Deepen or a Recover), and
+//!   every fact, a claimed one included, has to record that cost in its decision and
+//!   in its selected action. A cost edited together with the counter that paid for it
+//!   balances the books (the controller's probe K1) and is refused by registration,
+//!   by `status` and for a second job alike. A real `Deepen` is dispatched for that.
 //!
 //! Not covered (and not claimed): the paid `Err` paths of `run_next` (AG-041),
 //! that MetaTrial no longer needs its own guard against re-registering a stored
@@ -79,6 +86,10 @@ const REGISTERED_ROOT_MICROS: u64 = 1_000;
 const REGISTERED_RECOVERY_DISPATCHES: u8 = 2;
 const FIRST_ROOT_COST: u64 = 10;
 const SECOND_ROOT_COST: u64 = 25;
+/// The cost of a `Deepen` or a `Recover`. It differs from both root costs, so that a
+/// cost bound to the wrong kind of action shows.
+const SUCCESSOR_COST: u64 = 15;
+const NODE_KIND: &str = "exploration_node_v1";
 const WORLD_KIND: &str = "exploration_world_v1";
 const DISPATCH_KIND: &str = "exploration_dispatch_v1";
 const RUNS: [&str; 2] = ["run-failure", "run-success"];
@@ -413,9 +424,46 @@ impl Fixture {
         }
     }
 
+    /// The edit context of a skill other than the world's own parent: the parent
+    /// of a `Deepen` is the candidate of an earlier node.
+    fn edit_context_for(&self, skill: &SkillSnapshot) -> TrustedEditContext {
+        TrustedEditContext::new(
+            "n",
+            "profile",
+            "skill",
+            "v1",
+            hash(b"approved-parent"),
+            hash(b"baseline"),
+            skill,
+            self.allowed.clone(),
+        )
+        .unwrap()
+    }
+
     /// A request against the world's own parent skill/bundle, i.e. for a
     /// `Widen` action. `tag` keeps the request/idempotency ids distinct.
     fn request(&self, world_id: &str, step: u32, tag: &str) -> OptimizationStepRequest<'_> {
+        self.request_for(
+            &self.parent,
+            &self.edit_context,
+            &self.parent_bundle,
+            world_id,
+            step,
+            tag,
+        )
+    }
+
+    /// A request against `parent` (skill, its edit context and bundle): the world's
+    /// own for a `Widen`, the candidate of the parent node for a `Deepen`.
+    fn request_for<'a>(
+        &'a self,
+        parent: &'a SkillSnapshot,
+        edit_context: &'a TrustedEditContext,
+        bundle: &str,
+        world_id: &str,
+        step: u32,
+        tag: &str,
+    ) -> OptimizationStepRequest<'a> {
         OptimizationStepRequest {
             evidence: &self.evidence,
             source_selection: &self.source_selection,
@@ -432,8 +480,8 @@ impl Fixture {
                 episode_id: world_id.into(),
                 step,
                 attempt: 1,
-                parent_skill_digest: skill_snapshot_digest(&self.parent).unwrap(),
-                bundle_digest: self.parent_bundle.clone(),
+                parent_skill_digest: skill_snapshot_digest(parent).unwrap(),
+                bundle_digest: bundle.to_string(),
                 source_closure: self.allowed.clone(),
                 model_digest: hash(b"model"),
                 tools_digest: hash(b"tools"),
@@ -442,8 +490,8 @@ impl Fixture {
                 revoke_watermark: 1,
                 max_suggestions: 4,
             },
-            parent_skill: &self.parent,
-            edit_context: &self.edit_context,
+            parent_skill: parent,
+            edit_context,
             edit_batch_template: SkillEditBatch {
                 schema_version: SKILL_EDIT_SCHEMA.into(),
                 compiler_version: SKILL_EDIT_COMPILER_VERSION.into(),
@@ -451,7 +499,7 @@ impl Fixture {
                 profile_id: "profile".into(),
                 skill_id: "skill".into(),
                 skill_version: "v1".into(),
-                input_digest: skill_snapshot_digest(&self.parent).unwrap(),
+                input_digest: skill_snapshot_digest(parent).unwrap(),
                 approved_parent_digest: hash(b"approved-parent"),
                 safe_baseline_digest: hash(b"baseline"),
                 evidence: EvidenceClosure {
@@ -487,7 +535,7 @@ impl Fixture {
                     }],
                 )
                 .unwrap(),
-                parent_bundle_digest: self.parent_bundle.clone(),
+                parent_bundle_digest: bundle.to_string(),
                 candidate_bundle_digest: hash(format!("candidate-{tag}").as_bytes()),
                 environment_digest: hash(b"environment"),
                 grader_digest: hash(b"grader"),
@@ -566,7 +614,7 @@ fn world_for(id: &str) -> ExplorationWorldV1 {
                 id: (*run).into(),
             })
             .collect(),
-        successor_cost_upper_micros: 10,
+        successor_cost_upper_micros: SUCCESSOR_COST,
         initial_baseline_quality_micros: 500_000,
         remaining_root_micros: REGISTERED_ROOT_MICROS,
         remaining_recovery_dispatches: REGISTERED_RECOVERY_DISPATCHES,
@@ -670,6 +718,65 @@ impl Env {
         steps
     }
 
+    /// Rewrites a stored node as the observation of a trusted development report:
+    /// valid at `quality_micros`, with that gain over the baseline of the world. A
+    /// `Deepen` is only offered over such a node, and the fixture runner's report is
+    /// not one (it is a fixture); the node is the only thing rewritten.
+    async fn promote_to_trusted_valid(&self, node_id: &str, quality_micros: u32, gain_micros: i32) {
+        let mut node = raw_record(&self.store, NODE_KIND, node_id).await;
+        let payload = &mut node["payload"];
+        payload["evidence"] = json!("trusted");
+        payload["node"]["status"] = json!({"status": "valid", "quality_micros": quality_micros});
+        payload["node"]["best_valid_ancestor_micros"] = json!(quality_micros);
+        payload["node"]["recent_valid_gains_micros"] = json!([gain_micros]);
+        put_raw_record(&self.store, NODE_KIND, node_id, &node).await;
+    }
+
+    /// One real `Deepen` of the node `parent_node_id` through `run_next`. Its parent is
+    /// the candidate of that node: the world's skill with the fixture model's two
+    /// edits applied, and the bundle the node recorded.
+    async fn deepen(
+        &self,
+        world_id: &str,
+        parent_node_id: &str,
+        step: u32,
+        tag: &str,
+    ) -> CoordinatorStepResult {
+        let node = raw_record(&self.store, NODE_KIND, parent_node_id).await;
+        let bundle = node["payload"]["candidate_bundle_digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut skill = parent_skill();
+        skill.content.push_str(" [repair]");
+        skill.applicability.push_str(" [repair]");
+        let edit_context = self.fixture.edit_context_for(&skill);
+        self.coordinator
+            .run_next(
+                Some(&EditingFixtureModel),
+                Some(&ImprovingFixtureRunner),
+                Some(&self.journal),
+                self.fixture
+                    .request_for(&skill, &edit_context, &bundle, world_id, step, tag),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The two dispatches of a world that deepened: a `Widen` of the first root, whose
+    /// node is then taken for a trusted valid observation, and the `Deepen` of it.
+    async fn widen_then_deepen(&self, world_id: &str) -> Vec<CoordinatorStepResult> {
+        let widen = self.step(world_id, 1, &format!("{world_id}-1")).await;
+        let node_id = widen.node_id.clone().unwrap();
+        self.promote_to_trusted_valid(&node_id, 900_000, 400_000)
+            .await;
+        let deepen = self
+            .deepen(world_id, &node_id, 2, &format!("{world_id}-2"))
+            .await;
+        assert_eq!(dispatched_seq(&deepen.decision.action), 1_000_002);
+        vec![widen, deepen]
+    }
+
     async fn start_job(&self, request_key: &str, world: &ExplorationWorldV1) -> ManagementJob {
         start_job(&self.dispatcher, &admin(), request_key, world).await
     }
@@ -717,6 +824,22 @@ fn counters(world: &Value) -> (u64, u64) {
         world["remaining_root_micros"].as_u64().unwrap(),
         world["remaining_recovery_dispatches"].as_u64().unwrap(),
     )
+}
+
+/// Raises the remaining root budget a stored world record holds by `micros`.
+fn raise_remaining_root(world: &mut Value, micros: u64) {
+    let root = world["payload"]["remaining_root_micros"].as_u64().unwrap();
+    world["payload"]["remaining_root_micros"] = json!(root + micros);
+}
+
+/// The cost a stored dispatch fact records for the action its decision dispatched.
+fn set_decision_cost(fact: &mut Value, micros: u64) {
+    fact["payload"]["decision"]["action"]["estimated_cost_upper_micros"] = json!(micros);
+}
+
+/// The cost a stored dispatch fact records for the action it selected.
+fn set_selected_cost(fact: &mut Value, micros: u64) {
+    fact["payload"]["selected_action"]["estimated_cost_upper_micros"] = json!(micros);
 }
 
 /// The result a succeeded `exploration.start` job carries, as the wire shows it.
@@ -1864,6 +1987,63 @@ fn unaccounted_tampers(first_node: Value) -> Vec<(&'static str, FactTamper)> {
                 second["payload"]["node_id"] = first_node.clone();
             }),
         ),
+        // The cost a fact records is the world's own cost of that action: a root
+        // opportunity's for a root action, the successor cost for the others. A cost
+        // lowered together with the counter that paid for it balances the books and is
+        // refused all the same (AG-040 R2, the controller's probe K1).
+        (
+            "a recorded cost lowered and the counter raised to match (the decision's)",
+            Box::new(|world, first, _| {
+                set_decision_cost(first, FIRST_ROOT_COST - 5);
+                raise_remaining_root(world, 5);
+            }),
+        ),
+        (
+            "a recorded cost lowered and the counter raised to match (decision and selected action)",
+            Box::new(|world, first, _| {
+                set_decision_cost(first, FIRST_ROOT_COST - 5);
+                set_selected_cost(first, FIRST_ROOT_COST - 5);
+                raise_remaining_root(world, 5);
+            }),
+        ),
+        (
+            "the cost of a selected action alone",
+            Box::new(|_, first, _| set_selected_cost(first, FIRST_ROOT_COST - 5)),
+        ),
+        (
+            "the second fact's cost lowered and the counter raised to match",
+            Box::new(|world, _, second| {
+                set_decision_cost(second, SECOND_ROOT_COST - 5);
+                raise_remaining_root(world, 5);
+            }),
+        ),
+        (
+            "a selected action with no cost",
+            Box::new(|_, first, _| {
+                first["payload"]["selected_action"]["estimated_cost_upper_micros"] = Value::Null;
+            }),
+        ),
+        (
+            "a root action whose action_seq no root opportunity has",
+            Box::new(|_, _, second| {
+                second["payload"]["action_seq"] = json!(777);
+                second["payload"]["selected_action"]["action_seq"] = json!(777);
+                second["payload"]["decision"]["action"]["action_seqs"] = json!([777]);
+            }),
+        ),
+        (
+            "a root action of another root slot",
+            Box::new(|_, first, _| {
+                first["payload"]["selected_action"]["kind"]["root_slot"] = json!(2);
+            }),
+        ),
+        (
+            "a Deepen that carries the action_seq of a root",
+            Box::new(|_, first, _| {
+                first["payload"]["selected_action"]["kind"] =
+                    json!({"action": "deepen", "parent_node_seq": 1});
+            }),
+        ),
         (
             "nodes with no dispatch behind them, under the counters of an untouched world",
             Box::new(|world, _, _| {
@@ -1971,10 +2151,12 @@ async fn an_uncertain_dispatch_spent_its_cost_and_a_claimed_one_has_spent_nothin
 
 #[tokio::test]
 async fn a_dispatch_that_spent_a_recovery_dispatch_is_added_back() {
-    // `run_next` spends one recovery dispatch when the selected action is a
-    // `Recover`. A real recovery needs a repairable failure no step produces yet
-    // (E09 PR-B), so the fact of one real dispatch is rewritten as a recover
-    // dispatch and the world's counter as that dispatch would have left it.
+    // `run_next` spends one recovery dispatch, and the successor cost, when the
+    // selected action is a `Recover`. A real recovery needs a repairable failure no
+    // step produces yet (E09 PR-B), so the fact of one real dispatch is rewritten
+    // into the fact of the recover dispatch `derive_legal_actions` would have derived
+    // for the first node (id, numbering after the roots, successor cost) and the
+    // world's counters into what that dispatch would have left.
     let env = env().await;
     let world = world_for("world-1");
     env.register(&world).await.unwrap();
@@ -1985,31 +2167,48 @@ async fn a_dispatch_that_spent_a_recovery_dispatch_is_added_back() {
     expect_already_registered(env.register(&world).await, "the real dispatch");
 
     let mut recover_fact = fact.clone();
-    recover_fact["payload"]["selected_action"]["kind"] = json!({
-        "action": "recover",
-        "failed_node_seq": 1,
-        "episode_id": "episode-1",
+    let payload = &mut recover_fact["payload"];
+    payload["action_id"] = json!("recover-1");
+    payload["action_seq"] = json!(1_000_003);
+    payload["selected_action"] = json!({
+        "action_id": "recover-1",
+        "action_seq": 1_000_003,
+        "branch_seq": 1,
+        "target_depth": 2,
+        "kind": {"action": "recover", "failed_node_seq": 1, "episode_id": "episode-1"},
+        "estimated_cost_upper_micros": SUCCESSOR_COST,
     });
+    payload["decision"]["action"]["action_ids"] = json!(["recover-1"]);
+    payload["decision"]["action"]["action_seqs"] = json!([1_000_003]);
+    payload["decision"]["action"]["estimated_cost_upper_micros"] = json!(SUCCESSOR_COST);
+    // The world as that dispatch would have left it: it cost the successor cost and
+    // one recovery dispatch.
     let mut spent_world = world_record.clone();
     spent_world["payload"]["remaining_recovery_dispatches"] =
         json!(REGISTERED_RECOVERY_DISPATCHES - 1);
+    spent_world["payload"]["remaining_root_micros"] =
+        json!(REGISTERED_ROOT_MICROS - SUCCESSOR_COST);
+    // The real dispatch's world with one recovery dispatch spent.
+    let mut spent_recovery_only = world_record.clone();
+    spent_recovery_only["payload"]["remaining_recovery_dispatches"] =
+        json!(REGISTERED_RECOVERY_DISPATCHES - 1);
 
-    // A recover dispatch and a counter that spent one: registered.
+    // A recover dispatch and the counters that paid for it: registered.
     put_raw_fact(&env.store, &dispatch_id, &recover_fact).await;
     put_raw_record(&env.store, WORLD_KIND, "world-1", &spent_world).await;
     expect_already_registered(env.register(&world).await, "a spent recovery dispatch");
-    // A recover dispatch the counter never paid for, and a counter that spent
-    // one with no recover dispatch behind it: neither is the registered world.
+    // A recover dispatch the counters never paid for, and a recovery counter that
+    // spent one with no recover dispatch behind it: neither is the registered world.
     put_raw_record(&env.store, WORLD_KIND, "world-1", &world_record).await;
     expect_conflict(
         env.register(&world).await,
         "a recover dispatch that spent nothing",
     );
     put_raw_fact(&env.store, &dispatch_id, &fact).await;
-    put_raw_record(&env.store, WORLD_KIND, "world-1", &spent_world).await;
+    put_raw_record(&env.store, WORLD_KIND, "world-1", &spent_recovery_only).await;
     expect_conflict(
         env.register(&world).await,
-        "a spent counter without a recover dispatch",
+        "a spent recovery counter without a recover dispatch",
     );
     put_raw_record(&env.store, WORLD_KIND, "world-1", &world_record).await;
     expect_already_registered(env.register(&world).await, "restored");
@@ -2079,4 +2278,329 @@ async fn a_world_whose_facts_do_not_account_for_its_counters_is_not_the_register
     }
     put_raw_fact(&env.store, &second_id, &second_fact).await;
     expect_already_registered(env.register(&world).await, "restored again");
+}
+
+// ---------------------------------------------------------------------------
+// 6. AG-040 R2: every recorded cost is the world's immutable cost of its action
+//
+// The budget rebuilt from the dispatch facts takes what each completed fact
+// spent. A fact records that cost itself, so a fact edited together with the
+// counter that paid for it balanced the books (the controller's probe K1) and
+// raised what the world may still spend. The cost of an action is fixed by the
+// world's registration (the fingerprint covers it, and both registration and
+// `status` compare the fingerprint first): the cost of its root opportunity for
+// a root action, the successor cost for a Deepen or a Recover, as
+// `derive_legal_actions` derives them. Every fact, a claimed one included, has to
+// record that cost, in its decision and in its selected action.
+// ---------------------------------------------------------------------------
+
+/// Registration, `status` and a second job for the same world all refuse what
+/// `tamper` made of the records, and accept the untouched ones again.
+async fn expect_refused_everywhere(
+    env: &Env,
+    world: &ExplorationWorldV1,
+    done: &ManagementJob,
+    records: &DispatchedRecords,
+    key: &str,
+    label: &str,
+    tamper: &FactTamper,
+) {
+    records.put(env, &records.tampered(tamper)).await;
+    expect_conflict(env.register(world).await, label);
+    expect_status_conflict(&env.dispatcher, done, label).await;
+    // A job for the same world under another request key does not converge on it
+    // either: it fails on registering, it does not report a first decision.
+    let again = env.start_job(key, world).await;
+    assert_eq!(
+        again.state,
+        ManagementJobState::Failed,
+        "{label}: {again:?}"
+    );
+    assert_eq!(again.error_code.as_deref(), Some("conflict"), "{label}");
+    assert!(again.result.is_none(), "{label}");
+    records.restore(env).await;
+    expect_already_registered(env.register(world).await, &format!("restored: {label}"));
+    expect_status_ok(&env.dispatcher, done, &format!("restored: {label}")).await;
+}
+
+#[tokio::test]
+async fn a_recorded_cost_lowered_with_the_counter_raised_to_match_is_refused_everywhere() {
+    // K1: the cost the first completed fact records goes from 10 to 5 and the
+    // remaining root budget of the world from 965 to 970. Nothing else is touched.
+    let env = env().await;
+    let world = world_for("world-1");
+    let done = env.start_job("k1-start", &world).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
+    let steps = env.dispatches("world-1", 2).await;
+    let records = DispatchedRecords::load(&env, "world-1", &steps).await;
+    assert_eq!(
+        counters(&env.world("world-1").await).0,
+        REGISTERED_ROOT_MICROS - FIRST_ROOT_COST - SECOND_ROOT_COST
+    );
+    expect_already_registered(env.register(&world).await, "untouched");
+    expect_status_ok(&env.dispatcher, &done, "untouched").await;
+
+    let tampers: Vec<(&str, FactTamper)> = vec![
+        (
+            "K1: the first fact's decision cost 10 -> 5, the world's budget 965 -> 970",
+            Box::new(|world, first, _| {
+                set_decision_cost(first, 5);
+                world["payload"]["remaining_root_micros"] = json!(970);
+            }),
+        ),
+        (
+            "the same with the selected action's cost lowered too",
+            Box::new(|world, first, _| {
+                set_decision_cost(first, 5);
+                set_selected_cost(first, 5);
+                world["payload"]["remaining_root_micros"] = json!(970);
+            }),
+        ),
+        (
+            "the second fact lowered by 5 and the budget raised by 5",
+            Box::new(|world, _, second| {
+                set_decision_cost(second, SECOND_ROOT_COST - 5);
+                raise_remaining_root(world, 5);
+            }),
+        ),
+        (
+            "a selected action's cost alone, no counter touched",
+            Box::new(|_, first, _| set_selected_cost(first, 5)),
+        ),
+        (
+            "a cost raised and the budget lowered to match",
+            Box::new(|world, first, _| {
+                set_decision_cost(first, FIRST_ROOT_COST + 5);
+                let root = world["payload"]["remaining_root_micros"].as_u64().unwrap();
+                world["payload"]["remaining_root_micros"] = json!(root - 5);
+            }),
+        ),
+    ];
+    for (index, (label, tamper)) in tampers.iter().enumerate() {
+        expect_refused_everywhere(
+            &env,
+            &world,
+            &done,
+            &records,
+            &format!("k1-job-{index}"),
+            label,
+            tamper,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_deepen_fact_is_bound_to_the_successor_cost_of_the_world() {
+    let env = env().await;
+    let world = world_for("world-1");
+    let done = env.start_job("deepen-start", &world).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
+    let steps = env.widen_then_deepen("world-1").await;
+
+    // The real Deepen spent the successor cost, not a root's, and the facts account
+    // for it: the untouched world is accepted by registration and by `status`.
+    let stored = env.world("world-1").await;
+    assert_eq!(
+        counters(&stored),
+        (
+            REGISTERED_ROOT_MICROS - FIRST_ROOT_COST - SUCCESSOR_COST,
+            u64::from(REGISTERED_RECOVERY_DISPATCHES)
+        )
+    );
+    let records = DispatchedRecords::load(&env, "world-1", &steps).await;
+    assert_eq!(
+        records.second["payload"]["selected_action"]["kind"]["action"],
+        "deepen"
+    );
+    expect_already_registered(env.register(&world).await, "after a real Deepen");
+    expect_status_ok(&env.dispatcher, &done, "after a real Deepen").await;
+
+    let tampers: Vec<(&str, FactTamper)> = vec![
+        (
+            "the Deepen's decision cost lowered, the budget raised to match",
+            Box::new(|world, _, second| {
+                set_decision_cost(second, SUCCESSOR_COST - 5);
+                raise_remaining_root(world, 5);
+            }),
+        ),
+        (
+            "the Deepen's decision and selected cost lowered, the budget raised to match",
+            Box::new(|world, _, second| {
+                set_decision_cost(second, SUCCESSOR_COST - 5);
+                set_selected_cost(second, SUCCESSOR_COST - 5);
+                raise_remaining_root(world, 5);
+            }),
+        ),
+        (
+            "the Deepen recorded at the cost of a root, the budget lowered to match",
+            Box::new(|world, _, second| {
+                set_decision_cost(second, SECOND_ROOT_COST);
+                set_selected_cost(second, SECOND_ROOT_COST);
+                let root = world["payload"]["remaining_root_micros"].as_u64().unwrap();
+                world["payload"]["remaining_root_micros"] = json!(root - 10);
+            }),
+        ),
+        (
+            "the Deepen's selected cost alone",
+            Box::new(|_, _, second| set_selected_cost(second, SUCCESSOR_COST - 5)),
+        ),
+        (
+            "a Deepen relabelled as a root action (no root has its action_seq)",
+            Box::new(|_, _, second| {
+                second["payload"]["selected_action"]["kind"] =
+                    json!({"action": "widen", "root_slot": 2});
+            }),
+        ),
+        (
+            "a Deepen that carries the action_seq of a root",
+            Box::new(|_, _, second| {
+                second["payload"]["action_seq"] = json!(2);
+                second["payload"]["selected_action"]["action_seq"] = json!(2);
+                second["payload"]["decision"]["action"]["action_seqs"] = json!([2]);
+            }),
+        ),
+    ];
+    for (index, (label, tamper)) in tampers.iter().enumerate() {
+        expect_refused_everywhere(
+            &env,
+            &world,
+            &done,
+            &records,
+            &format!("deepen-job-{index}"),
+            label,
+            tamper,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_claimed_dispatch_fact_is_bound_to_the_worlds_cost_but_spends_nothing() {
+    // One observed dispatch and one that is claimed and never completed (the future
+    // is dropped once the model was entered): the claimed one has spent nothing, but
+    // the cost it records is held to the world's cost of its action all the same.
+    let env = env().await;
+    let world = world_for("world-1");
+    let done = env.start_job("claimed-cost-start", &world).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
+    env.step("world-1", 1, "claimed-cost-1").await;
+    let entered = Arc::new(Notify::new());
+    let hanging = HangingModel {
+        entered: entered.clone(),
+    };
+    tokio::select! {
+        biased;
+        result = env.coordinator.run_next(
+            Some(&hanging),
+            Some(&ImprovingFixtureRunner),
+            Some(&env.journal),
+            env.fixture.request("world-1", 2, "claimed-cost-2"),
+        ) => panic!("the hanging model must not answer: {result:?}"),
+        () = entered.notified() => {}
+    }
+    let stored = env.world("world-1").await;
+    let claimed_id = stored["dispatch_ids"][1].as_str().unwrap().to_string();
+    let claimed = raw_fact(&env.store, &claimed_id).await;
+    assert_eq!(claimed["payload"]["state"], "claimed");
+    assert_eq!(
+        counters(&stored).0,
+        REGISTERED_ROOT_MICROS - FIRST_ROOT_COST
+    );
+    expect_already_registered(env.register(&world).await, "untouched");
+    expect_status_ok(&env.dispatcher, &done, "untouched").await;
+
+    let tampers: Vec<(&str, ValueEdit)> = vec![
+        ("a claimed fact's decision cost", |fact| {
+            set_decision_cost(fact, SECOND_ROOT_COST - 5);
+        }),
+        ("a claimed fact's selected cost", |fact| {
+            set_selected_cost(fact, SECOND_ROOT_COST - 5);
+        }),
+        ("a claimed fact's cost raised", |fact| {
+            set_decision_cost(fact, SECOND_ROOT_COST + 5);
+        }),
+    ];
+    for (index, (label, tamper)) in tampers.into_iter().enumerate() {
+        let mut tampered = claimed.clone();
+        tamper(&mut tampered);
+        assert_ne!(tampered, claimed, "{label}: the tamper changed nothing");
+        put_raw_fact(&env.store, &claimed_id, &tampered).await;
+        expect_conflict(env.register(&world).await, label);
+        expect_status_conflict(&env.dispatcher, &done, label).await;
+        let again = env
+            .start_job(&format!("claimed-cost-job-{index}"), &world)
+            .await;
+        assert_eq!(
+            again.state,
+            ManagementJobState::Failed,
+            "{label}: {again:?}"
+        );
+        put_raw_fact(&env.store, &claimed_id, &claimed).await;
+        expect_already_registered(env.register(&world).await, &format!("restored: {label}"));
+        expect_status_ok(&env.dispatcher, &done, &format!("restored: {label}")).await;
+    }
+}
+
+#[tokio::test]
+async fn a_claimed_dispatch_resumed_to_completion_keeps_status_and_registration() {
+    // The cost a fact records has to stay the world's cost of its action while the
+    // fact goes from claimed to completed: a dispatch claimed and left in flight,
+    // resumed with the same request, then a second dispatch (the controller's probe
+    // K2). At every stage `status` holds, a re-registration is `AlreadyRegistered`,
+    // and another request key reports the first decision.
+    let env = env().await;
+    let world = world_for("world-1");
+    let done = env.start_job("resume-start", &world).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
+    let entered = Arc::new(Notify::new());
+    let hanging = HangingModel {
+        entered: entered.clone(),
+    };
+    tokio::select! {
+        biased;
+        result = env.coordinator.run_next(
+            Some(&hanging),
+            Some(&ImprovingFixtureRunner),
+            Some(&env.journal),
+            env.fixture.request("world-1", 1, "resume-1"),
+        ) => panic!("the hanging model must not answer: {result:?}"),
+        () = entered.notified() => {}
+    }
+    let claimed = env.world("world-1").await;
+    assert_eq!(claimed["node_ids"], json!([]));
+    assert_eq!(counters(&claimed).0, REGISTERED_ROOT_MICROS);
+    expect_status_ok(&env.dispatcher, &done, "claimed").await;
+    expect_already_registered(env.register(&world).await, "claimed");
+
+    // The same request, with a model that answers: the claimed dispatch completes.
+    env.coordinator
+        .run_next(
+            Some(&EditingFixtureModel),
+            Some(&ImprovingFixtureRunner),
+            Some(&env.journal),
+            env.fixture.request("world-1", 1, "resume-1"),
+        )
+        .await
+        .unwrap();
+    let completed = env.world("world-1").await;
+    assert_eq!(completed["node_ids"].as_array().unwrap().len(), 1);
+    assert_eq!(completed["dispatch_ids"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        counters(&completed).0,
+        REGISTERED_ROOT_MICROS - FIRST_ROOT_COST
+    );
+    expect_status_ok(&env.dispatcher, &done, "after the claim completed").await;
+    expect_already_registered(env.register(&world).await, "after the claim completed");
+
+    env.step("world-1", 2, "resume-2").await;
+    assert_eq!(
+        counters(&env.world("world-1").await).0,
+        REGISTERED_ROOT_MICROS - FIRST_ROOT_COST - SECOND_ROOT_COST
+    );
+    expect_status_ok(&env.dispatcher, &done, "after a second dispatch").await;
+    expect_already_registered(env.register(&world).await, "after a second dispatch");
+    let again = env.start_job("resume-other-key", &world).await;
+    assert_eq!(again.state, ManagementJobState::Succeeded, "{again:?}");
+    assert_eq!(started_result(&again), started_result(&done));
 }
