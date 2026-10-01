@@ -304,11 +304,18 @@ impl ExplorationWorldV1 {
 
     /// Digest of the immutable registration request: identity, S0 digests,
     /// source closure, frozen caps/policy/simulation, root opportunities and
-    /// the initial budgets. Runtime-mutable scheduling state (world state,
-    /// node/dispatch/history ids, branch focus, decision round, waits) is
-    /// excluded on purpose so a crash re-run of the same registration
-    /// converges on the persisted world (plan §6.7.4) instead of conflicting
-    /// with its own earlier commit.
+    /// the per-step cost and baseline (plan §7.1.1: the facts a world is
+    /// registered with never change, its state is derived). Everything
+    /// `run_next` and `record_history` move is excluded on purpose, so a crash
+    /// re-run of the same registration, or the same registration after the
+    /// world dispatched, converges on the persisted world (plan §6.7.4) instead
+    /// of conflicting with its own earlier commits: the world state, the
+    /// node/dispatch/history ids, branch focus, decision round, waits, and the
+    /// two budget counters (`remaining_root_micros`,
+    /// `remaining_recovery_dispatches`) that `run_next` spends. The counters are
+    /// the registration's initial budget, so
+    /// [`PersistentCoordinator::register_world_idempotent`] compares them apart,
+    /// against the value the world was registered with.
     pub fn registration_fingerprint(&self) -> Result<String> {
         fingerprint(&(
             &self.schema_version,
@@ -333,8 +340,6 @@ impl ExplorationWorldV1 {
             (
                 self.successor_cost_upper_micros,
                 self.initial_baseline_quality_micros,
-                self.remaining_root_micros,
-                self.remaining_recovery_dispatches,
             ),
         ))
     }
@@ -608,12 +613,23 @@ impl PersistentCoordinator {
     }
 
     /// Registers `world` at most once. A world with the same id whose
-    /// registration fingerprint equals the request is reported as
-    /// `AlreadyRegistered` without writing anything, so a crash re-run of the
-    /// same management job converges (plan §6.7.4); a same-id world with a
-    /// different registration is a `Conflict`. Liveness of the source closure
-    /// is re-checked on every call: watermark drift is `Conflict`, a
-    /// tombstoned dependency is `Forbidden`.
+    /// registration fingerprint and registered budget equal the request is
+    /// reported as `AlreadyRegistered` without writing anything, so a crash
+    /// re-run of the same management job, or the same registration after the
+    /// world dispatched, converges (plan §6.7.4); a same-id world with a
+    /// different registration is a `Conflict`.
+    ///
+    /// The fingerprint leaves out the two budget counters `run_next` spends, so
+    /// they are compared apart and exactly, against the value the world was
+    /// registered with: the stored value plus what the world's own dispatch
+    /// facts say was spent (`registered_budget`). Neither "not below the
+    /// current value" (it would take 2_000 for a world registered with 1_000)
+    /// nor the current value itself is a registration. Dispatch facts that do
+    /// not account for the world leave no way to tell a spend from a lowered
+    /// counter, and are a `Conflict` too.
+    ///
+    /// Liveness of the source closure is re-checked on every call: watermark
+    /// drift is `Conflict`, a tombstoned dependency is `Forbidden`.
     pub async fn register_world_idempotent(
         &self,
         world: ExplorationWorldV1,
@@ -635,6 +651,16 @@ impl PersistentCoordinator {
             {
                 return Err(Error::Conflict(
                     "exploration world already exists with a different registration".into(),
+                ));
+            }
+            if registered_budget(&mut session, &self.context, &existing).await?
+                != (
+                    world.remaining_root_micros,
+                    world.remaining_recovery_dispatches,
+                )
+            {
+                return Err(Error::Conflict(
+                    "exploration world already exists with a different registered budget".into(),
                 ));
             }
             session.commit().await?;
@@ -2014,6 +2040,170 @@ pub async fn verified_world_decision_view(
         ));
     }
     Ok(view)
+}
+
+/// What the management `status` of an `exploration.start` job reads of a stored
+/// world besides its decision: the world read through its live source closure,
+/// the digests its registration froze, and whether it moved past its
+/// registration. A derived, read-only view; nothing is written.
+#[derive(Debug, Clone)]
+pub struct WorldRegistrationView {
+    /// The stored world. It validated, it carries the id it is stored under and
+    /// its source closure is live.
+    pub registered_world: ExplorationWorldV1,
+    pub context_signature: String,
+    /// Digest of the world's frozen `ElasticPolicyV1`.
+    pub policy_digest: String,
+    /// Digest of the world's frozen `ExplorationCapsV1`.
+    pub caps_digest: String,
+    /// Whether a dispatch was claimed, a node written or a decision round taken:
+    /// the stored world has moved on and is no longer the registered one (its
+    /// budget, nodes, waits and the live decision are what `run_next` made of
+    /// them). A world that has not started is exactly what was registered.
+    pub started: bool,
+}
+
+/// Read-side view for the management `status` of an `exploration.start` job.
+/// Unlike [`verified_world_decision_view`] it does not re-run the decision on the
+/// stored prefix: it returns what a dispatch never changes (the world's id,
+/// context signature and the digests of its frozen policy and caps) and whether
+/// the world started, so the caller decides which first decision the stored
+/// result is compared with. The world is read through its live source closure
+/// (watermark drift is `Conflict`, a tombstoned dependency is `Forbidden`, a
+/// missing source fails closed) and the stored world is never rewritten.
+pub async fn verified_world_registration_view(
+    ctx: &Context,
+    store: &Store,
+    world_id: &str,
+) -> Result<WorldRegistrationView> {
+    ctx.require(&[Role::Admin])?;
+    identifier(world_id)?;
+    let coordinator = PersistentCoordinator::new(store.clone(), ctx.clone(), ctx.actor())?;
+    let registered_world = coordinator.registered_world(world_id).await?;
+    Ok(WorldRegistrationView {
+        context_signature: registered_world.context_signature.clone(),
+        policy_digest: registered_world.policy.digest()?,
+        caps_digest: registered_world.caps.digest()?,
+        started: world_started(&registered_world),
+        registered_world,
+    })
+}
+
+/// Whether a stored world moved past its registration: a dispatch is claimed or a
+/// node is written, or a decision round was taken. Until then the stored world is
+/// what was registered.
+fn world_started(world: &ExplorationWorldV1) -> bool {
+    !(world.node_ids.is_empty() && world.dispatch_ids.is_empty() && world.decision_round == 0)
+}
+
+/// The first pure decision of `world` as it was registered: the decision over an
+/// empty prefix (plan §7.1), a function of the world's registration alone. After a
+/// dispatch it is not the live decision (the prefix, the budget and the waits
+/// moved), so a consumer that has to report or re-verify the first decision takes
+/// it from the world as it was requested.
+pub(crate) fn first_decision(world: &ExplorationWorldV1) -> Result<CoordinatorDecision> {
+    world.validate()?;
+    pure_decision(world, &[])
+}
+
+/// The budget a stored world was registered with, rebuilt from the facts
+/// `run_next` left behind: `(remaining_root_micros,
+/// remaining_recovery_dispatches)`.
+///
+/// `run_next` spends the two counters in the one commit that completes a dispatch
+/// (its node is written and its fact leaves `Claimed`): the cost the dispatched
+/// decision announced, and one recovery dispatch when the selected action is a
+/// `Recover`. Nothing else moves them. The registered value is therefore the
+/// stored one plus exactly what the world's completed dispatch facts say was
+/// spent; a claimed dispatch has spent nothing yet, and for a world nothing was
+/// dispatched in it is the stored value itself.
+///
+/// The facts have to account for the world: each is listed once, belongs to this
+/// world, names the one action its decision dispatched and selected, and a
+/// completed one names a node the world lists, with as many completed facts as
+/// nodes. Anything else leaves no way to tell a spend from a counter someone
+/// lowered, so the registered budget is not rebuilt (`Conflict`), never guessed.
+///
+/// This function states `run_next`'s spending rule from the reading side: a
+/// change to when or by how much `run_next` spends has to change it with it
+/// (`tests/exploration_start_after_dispatch_v42.rs` pins both).
+async fn registered_budget(
+    session: &mut Session,
+    ctx: &Context,
+    world: &ExplorationWorldV1,
+) -> Result<(u64, u8)> {
+    let unaccounted = || {
+        Error::Conflict(
+            "the dispatch facts of the exploration world do not account for its budget".into(),
+        )
+    };
+    let mut root_micros = world.remaining_root_micros;
+    let mut recovery_dispatches = u32::from(world.remaining_recovery_dispatches);
+    let mut listed = BTreeSet::new();
+    let mut completed_nodes = BTreeSet::new();
+    for dispatch_id in &world.dispatch_ids {
+        if !listed.insert(dispatch_id.as_str()) {
+            return Err(unaccounted());
+        }
+        let fact = get_dispatch_fact(session, ctx, dispatch_id)
+            .await?
+            .ok_or_else(unaccounted)?;
+        let BatchActionV1::Dispatch {
+            action_ids,
+            action_seqs,
+            estimated_cost_upper_micros,
+            ..
+        } = &fact.decision.action
+        else {
+            return Err(unaccounted());
+        };
+        if fact.id != *dispatch_id
+            || fact.world_id != world.id
+            || fact.decision.world_id != world.id
+            || fact.context_signature != world.context_signature
+            || action_ids.len() != 1
+            || action_seqs.len() != 1
+            || action_ids[0] != fact.action_id
+            || action_seqs[0] != fact.action_seq
+            || fact.selected_action.action_id != fact.action_id
+            || fact.selected_action.action_seq != fact.action_seq
+        {
+            return Err(unaccounted());
+        }
+        // Every state is named, so a state added later has to be decided here:
+        // whether it spent the dispatch's budget is the whole question.
+        match fact.state {
+            // Claimed and not completed: its node is not written, nothing spent.
+            ExplorationDispatchState::Claimed => {
+                if fact.node_id.is_some() {
+                    return Err(unaccounted());
+                }
+            }
+            ExplorationDispatchState::Observed | ExplorationDispatchState::Uncertain => {
+                let Some(node_id) = fact.node_id.as_deref() else {
+                    return Err(unaccounted());
+                };
+                if !world.node_ids.iter().any(|listed| listed == node_id)
+                    || !completed_nodes.insert(node_id.to_owned())
+                {
+                    return Err(unaccounted());
+                }
+                root_micros = root_micros
+                    .checked_add(*estimated_cost_upper_micros)
+                    .ok_or_else(unaccounted)?;
+                if matches!(fact.selected_action.kind, ActionKindV1::Recover { .. }) {
+                    recovery_dispatches += 1;
+                }
+            }
+        }
+    }
+    if completed_nodes.len() != world.node_ids.len() {
+        return Err(unaccounted());
+    }
+    Ok((
+        root_micros,
+        u8::try_from(recovery_dispatches).map_err(|_| unaccounted())?,
+    ))
 }
 
 /// Storage id of a persisted exploration world envelope.

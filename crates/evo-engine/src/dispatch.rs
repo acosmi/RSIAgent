@@ -434,19 +434,51 @@ impl ManagementDispatcher {
                 action,
             }) = &job.result
             {
-                // The decision is a pure function over the read-only prefix
-                // (plan §7.1); re-running it through the live source closure
-                // both re-checks revocation and proves the stored result.
-                let view =
-                    crate::exploration::verified_world_decision_view(ctx, &self.store, world_id)
-                        .await?;
-                if &view.decision.world_id != world_id
-                    || &view.context_signature != context_signature
-                    || &view.decision.prefix_digest != prefix_digest
-                    || &view.decision.legal_actions_digest != legal_actions_digest
-                    || &view.decision.policy_digest != policy_digest
-                    || &view.decision.caps_digest != caps_digest
-                    || fingerprint(&view.decision.action)? != fingerprint(action)?
+                // What a dispatch never changes is always compared: the world's
+                // id, context and the digests of its frozen policy and caps,
+                // read through the live source closure (which also re-checks
+                // revocation).
+                let registration = crate::exploration::verified_world_registration_view(
+                    ctx,
+                    &self.store,
+                    world_id,
+                )
+                .await?;
+                // The result is the first decision, a pure function over the
+                // empty prefix of the world as registered (plan §7.1). While no
+                // dispatch has started that is the stored world's own. Once the
+                // stored world moved on (nodes, spent budget, waits), the live
+                // decision is another decision, so the first one is recomputed
+                // from the world this job requested, which its private input
+                // still holds.
+                let first = if registration.started {
+                    let request = load_private_request(ctx, &self.store, &job)
+                        .await
+                        .map_err(InputFault::into_error)?;
+                    let ParsedRequest::ExplorationStart(request) = request else {
+                        return Err(Error::Conflict(
+                            "exploration job input is not an exploration.start request".into(),
+                        ));
+                    };
+                    if &request.world.id != world_id {
+                        return Err(Error::Conflict(
+                            "exploration job input names a different world".into(),
+                        ));
+                    }
+                    crate::exploration::first_decision(&request.world)?
+                } else {
+                    crate::exploration::first_decision(&registration.registered_world)?
+                };
+                if &registration.registered_world.id != world_id
+                    || &registration.context_signature != context_signature
+                    || &registration.policy_digest != policy_digest
+                    || &registration.caps_digest != caps_digest
+                    || &first.world_id != world_id
+                    || &first.prefix_digest != prefix_digest
+                    || &first.legal_actions_digest != legal_actions_digest
+                    || &first.policy_digest != policy_digest
+                    || &first.caps_digest != caps_digest
+                    || fingerprint(&first.action)? != fingerprint(action)?
                 {
                     return Err(Error::Conflict(
                         "exploration decision view differs from the stored result".into(),
@@ -1110,13 +1142,19 @@ async fn run_exploration_start(
         crate::exploration::PersistentCoordinator::new(store.clone(), ctx.clone(), ctx.actor())?;
     let world_id = request.world.id.clone();
     let context_signature = request.world.context_signature.clone();
-    // Registration is idempotent on the world's registration fingerprint: a
-    // crash re-run of this job converges on the world it already persisted
-    // (plan §6.7.4) instead of failing on its own earlier commit.
-    coordinator.register_world_idempotent(request.world).await?;
-    // The first decision is a pure function over the read-only prefix
-    // (plan §7.1); no node is dispatched by the management adapter.
-    let decision = coordinator.decide_next(&world_id).await?;
+    // Registration is idempotent on the world's immutable registration facts and
+    // on the budget it was registered with: a crash re-run of this job, or the
+    // same world under another request key, converges on the world it already
+    // persisted (plan §6.7.4) instead of failing on its own earlier commit, also
+    // after the world dispatched.
+    coordinator
+        .register_world_idempotent(request.world.clone())
+        .await?;
+    // The first decision is a pure function over the empty prefix of the world as
+    // requested (plan §7.1), not the live decision: once a dispatch moved the
+    // stored world on, the live decision is another one. No node is dispatched
+    // by the management adapter.
+    let decision = crate::exploration::first_decision(&request.world)?;
     if decision.world_id != world_id {
         return Err(Error::Conflict(
             "exploration decision belongs to a different world".into(),
