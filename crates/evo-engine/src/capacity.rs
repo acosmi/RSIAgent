@@ -347,7 +347,7 @@ pub struct DeploymentSecurityConfig {
     pub trusted_revocations_db_path: Option<String>,
 }
 
-/// Deployment safety gate.
+/// Code-execution half of the deployment safety gate.
 ///
 /// Code execution is admitted only when the deployment config asks for a sandbox
 /// AND the E04 executor's isolation facts report a verified sandbox runtime with
@@ -356,9 +356,9 @@ pub struct DeploymentSecurityConfig {
 /// constructor) reports `sandbox_available = false` and code execution disabled,
 /// so code execution is never admitted on the reference host.
 ///
-/// The trusted revocations anchor must be an existing regular file (never a
-/// symlink or directory) whose first 16 bytes are the SQLite format 3 header.
-pub fn validate_deployment_security(
+/// This part needs no revocation anchor, so a startup that is not recovering a
+/// restored data directory calls only this.
+pub fn validate_code_execution_gate(
     cfg: &DeploymentSecurityConfig,
     isolation: &IsolationPolicy,
 ) -> Result<()> {
@@ -372,11 +372,24 @@ pub fn validate_deployment_security(
             ));
         }
     }
+    Ok(())
+}
 
+/// Full deployment safety gate: [`validate_code_execution_gate`] plus the
+/// trusted revocations anchor check ([`verify_trusted_revocations_anchor`]).
+pub fn validate_deployment_security(
+    cfg: &DeploymentSecurityConfig,
+    isolation: &IsolationPolicy,
+) -> Result<()> {
+    validate_code_execution_gate(cfg, isolation)?;
     verify_trusted_revocations_anchor(cfg.trusted_revocations_db_path.as_deref())
 }
 
-fn verify_trusted_revocations_anchor(db_path: Option<&str>) -> Result<()> {
+/// The trusted revocations anchor must be an existing regular file (never a
+/// symlink or directory) whose first 16 bytes are the SQLite format 3 header.
+/// The startup recovery gate adds the independence checks that need the data
+/// directory (`startup_gate`).
+pub fn verify_trusted_revocations_anchor(db_path: Option<&str>) -> Result<()> {
     let db_path = db_path.ok_or_else(|| {
         Error::Invalid("deployment_rejected: trusted revocations database is required".into())
     })?;
@@ -536,6 +549,46 @@ mod tests {
             ),
             other => panic!("expected deployment_rejected, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn code_execution_gate_is_the_anchor_free_half_of_the_deployment_gate() {
+        let iso = IsolationPolicy::reference_host("/tmp/ws");
+        let no_anchor = DeploymentSecurityConfig {
+            sandbox_enabled: false,
+            allow_code_execution: false,
+            allow_external_network: false,
+            trusted_revocations_db_path: None,
+        };
+        // Without code execution the gate needs no anchor; the full gate does.
+        assert!(validate_code_execution_gate(&no_anchor, &iso).is_ok());
+        assert!(validate_deployment_security(&no_anchor, &iso).is_err());
+        // Requested code execution is refused by the same half, on the same facts.
+        let asks = DeploymentSecurityConfig {
+            sandbox_enabled: true,
+            allow_code_execution: true,
+            ..no_anchor.clone()
+        };
+        assert!(matches!(
+            validate_code_execution_gate(&asks, &iso),
+            Err(Error::Invalid(message)) if message.starts_with(
+                "deployment_rejected: code execution requires a verified sandbox runtime"
+            )
+        ));
+        let no_sandbox = DeploymentSecurityConfig {
+            sandbox_enabled: false,
+            allow_code_execution: true,
+            ..no_anchor
+        };
+        assert!(matches!(
+            validate_code_execution_gate(&no_sandbox, &iso),
+            Err(Error::Forbidden)
+        ));
+        // The anchor half is public and keeps its messages.
+        assert!(matches!(
+            verify_trusted_revocations_anchor(None),
+            Err(Error::Invalid(message)) if message.contains("trusted revocations database is required")
+        ));
     }
 
     #[test]

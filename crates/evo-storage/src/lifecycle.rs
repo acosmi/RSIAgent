@@ -4,8 +4,10 @@ use super::{Store, internal};
 use evo_core::{Context, Error, Result, Role, fingerprint, identifier};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::Row;
+use sqlx::{ConnectOptions, Connection, Row, sqlite::SqliteConnectOptions};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const REVOKE_TOMBSTONE_SCHEMA: &str = "rsia.revoke_tombstone.v1";
 pub const MAX_CLEANUP_EDGE_PAGE: usize = 1_000;
@@ -2700,6 +2702,376 @@ fn valid_time(value: i64) -> Result<()> {
         return Err(Error::Invalid("time must be nonnegative".into()));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// E16.5 startup recovery gate: read-only control-plane facts.
+//
+// `Store::open` always writes (create_if_missing, migrations, staging cleanup),
+// so the recovery gate needs a reader that never goes through it. The facts read
+// here are exactly the ones `scripts/restore_backup.py` requires to be equal
+// between the trusted anchor and the restored database (`protected_facts`), plus
+// the revoke watermarks and tombstones it replays. The gate in
+// `evo-engine::startup_gate` only compares the returned structures.
+// ---------------------------------------------------------------------------
+
+/// `objects.kind` values `restore_backup.py::protected_facts` always treats as
+/// consumed accounting. `crates/evo-engine/tests/startup_gate_v42.rs` parses the
+/// script source and asserts this list and [`PROTECTED_SCHEMA_VERSIONS`] equal
+/// the script's, so the two implementations cannot drift apart silently.
+pub const PROTECTED_OBJECT_KINDS: [&str; 4] = ["budget", "reservation", "evaluation", "receipt"];
+
+/// Body `schema_version` values `restore_backup.py::protected_facts` treats as
+/// consumed accounting regardless of the object kind.
+pub const PROTECTED_SCHEMA_VERSIONS: [&str; 8] = [
+    "rsia.typed_artifact_envelope.v1",
+    "rsia.exploration_artifact_envelope.v1",
+    "rsia.optimization.stage_fact.v1",
+    "rsia.budget_call_ref.v1",
+    "rsia.e16.export_attempt.v1",
+    "rsia.e16.delivery_audit.v1",
+    "rsia.e16.export_attempt.v2",
+    "rsia.e16.delivery_audit.v2",
+];
+
+/// The exact table selector `restore_backup.py::protected_facts` uses. SQLite
+/// `LIKE` treats `_` as a single-character wildcard; the same quirk is kept so
+/// both implementations select the same tables.
+pub const ROOT_BUDGET_TABLE_QUERY: &str =
+    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'root_budget%'";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatermarkFact {
+    pub seq: i64,
+    pub digest: String,
+}
+
+/// One database's recovery-relevant facts, read through a read-only connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneFacts {
+    /// `revoke_watermark` rows by namespace.
+    pub watermarks: BTreeMap<String, WatermarkFact>,
+    /// `kind = 'tombstone'` objects by `(namespace, id)` with the parsed body.
+    /// Owner and revision are deliberately not part of the fact: a restore
+    /// replays tombstones under `owner = 'restore'`.
+    pub tombstones: BTreeMap<(String, String), serde_json::Value>,
+    /// Consumed-accounting objects by `(namespace, kind, id)` with the parsed
+    /// body, selected like `restore_backup.py::protected_facts`: only namespaces
+    /// that have a revoke watermark, and only [`PROTECTED_OBJECT_KINDS`] or a
+    /// body whose `schema_version` is in [`PROTECTED_SCHEMA_VERSIONS`].
+    pub protected_objects: BTreeMap<(String, String, String), serde_json::Value>,
+    /// Every `root_budget%` table: sorted canonical rows. Each row is the
+    /// comma-joined SQLite `quote()` of its columns, so value types are part of
+    /// the fact (integer 1 and text '1' differ).
+    pub root_budget_tables: BTreeMap<String, Vec<String>>,
+}
+
+/// Read the recovery facts of `path` without `Store::open`.
+///
+/// The database is opened `SQLITE_OPEN_READONLY` without `create_if_missing`,
+/// `PRAGMA query_only=ON` is set, and every read happens in one transaction.
+/// Before any fact is read the database must pass `PRAGMA integrity_check` and
+/// its `_sqlx_migrations` must equal the compiled-in migration set exactly
+/// (the same comparison a backup uses). Any failure is an error; nothing here
+/// repairs, migrates or creates anything.
+///
+/// One case would still leave files behind: a WAL-mode database that nobody has
+/// open has neither `-wal` nor `-shm`, and even a read-only connection creates
+/// both. That database cannot be mid-write (a live or crashed writer leaves the
+/// side files), so it is read as `immutable` and nothing is created. Every other
+/// database is read through a normal read-only connection so a WAL that a writer
+/// left behind is honoured.
+pub async fn read_control_plane_facts(path: &Path) -> Result<ControlPlaneFacts> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .immutable(is_unopened_wal_database(path))
+        .create_if_missing(false)
+        .busy_timeout(Duration::from_secs(5))
+        .disable_statement_logging();
+    let mut connection = options
+        .connect()
+        .await
+        .map_err(|error| Error::Invalid(format!("cannot open read-only: {error}")))?;
+    let facts = read_facts_from(&mut connection).await;
+    let _ = connection.close().await;
+    facts
+}
+
+/// A database file whose header says WAL mode (file format write/read version
+/// bytes 18 and 19 are both 2) while neither `<path>-wal` nor `<path>-shm` exists.
+fn is_unopened_wal_database(path: &Path) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 20];
+    let header_says_wal = std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok()
+        && header.starts_with(b"SQLite format 3\0")
+        && header[18] == 2
+        && header[19] == 2;
+    let absent = |suffix: &str| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        matches!(
+            std::fs::symlink_metadata(PathBuf::from(name)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    };
+    header_says_wal && absent("-wal") && absent("-shm")
+}
+
+async fn read_facts_from(connection: &mut sqlx::SqliteConnection) -> Result<ControlPlaneFacts> {
+    fn unreadable(context: &'static str) -> impl Fn(sqlx::Error) -> Error {
+        move |error| Error::Invalid(format!("{context}: {error}"))
+    }
+    sqlx::query("PRAGMA query_only = ON")
+        .execute(&mut *connection)
+        .await
+        .map_err(unreadable("cannot enforce query_only"))?;
+    let mut tx = connection
+        .begin()
+        .await
+        .map_err(unreadable("cannot begin read transaction"))?;
+
+    let integrity: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(unreadable("integrity check could not run"))?;
+    if integrity.len() != 1 || integrity[0] != "ok" {
+        let first = integrity.first().map(String::as_str).unwrap_or("no result");
+        return Err(Error::Conflict(format!(
+            "database integrity check failed: {}",
+            first.chars().take(200).collect::<String>()
+        )));
+    }
+    // One compiled-set comparison for backups and for the recovery gate.
+    if let Err(error) = load_backup_migrations(&mut tx).await {
+        return Err(Error::Conflict(format!(
+            "migration set is not the compiled-in set ({})",
+            match error {
+                Error::Conflict(message) | Error::Invalid(message) => message,
+                other => other.to_string(),
+            }
+        )));
+    }
+
+    let mut watermarks = BTreeMap::new();
+    let rows = sqlx::query("SELECT namespace,seq,digest FROM revoke_watermark ORDER BY namespace")
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(unreadable("revoke watermarks unreadable"))?;
+    for row in rows {
+        let namespace: String = row
+            .try_get("namespace")
+            .map_err(unreadable("revoke watermark namespace"))?;
+        watermarks.insert(
+            namespace,
+            WatermarkFact {
+                seq: row
+                    .try_get("seq")
+                    .map_err(unreadable("revoke watermark seq"))?,
+                digest: row
+                    .try_get("digest")
+                    .map_err(unreadable("revoke watermark digest"))?,
+            },
+        );
+    }
+
+    let mut tombstones = BTreeMap::new();
+    let mut protected_objects = BTreeMap::new();
+    let rows = sqlx::query("SELECT namespace,kind,id,body FROM objects ORDER BY namespace,kind,id")
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(unreadable("objects unreadable"))?;
+    for row in rows {
+        let namespace: String = row
+            .try_get("namespace")
+            .map_err(unreadable("object namespace"))?;
+        let kind: String = row.try_get("kind").map_err(unreadable("object kind"))?;
+        let id: String = row.try_get("id").map_err(unreadable("object id"))?;
+        let in_scope = watermarks.contains_key(&namespace);
+        if !in_scope && kind != "tombstone" {
+            continue;
+        }
+        let body: String = row.try_get("body").map_err(unreadable("object body"))?;
+        let value = parse_strict_json(&body).map_err(|error| {
+            Error::Invalid(format!(
+                "object {namespace}/{kind}/{id} has an unreadable body: {}",
+                match error {
+                    Error::Invalid(message) => message,
+                    other => other.to_string(),
+                }
+            ))
+        })?;
+        let schema = match &value {
+            serde_json::Value::Object(object) => object
+                .get("schema_version")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            _ => {
+                return Err(Error::Invalid(format!(
+                    "object {namespace}/{kind}/{id} body is not a JSON object"
+                )));
+            }
+        };
+        if kind == "tombstone" {
+            tombstones.insert((namespace.clone(), id.clone()), value.clone());
+        }
+        if in_scope
+            && (PROTECTED_OBJECT_KINDS.contains(&kind.as_str())
+                || schema
+                    .as_deref()
+                    .is_some_and(|schema| PROTECTED_SCHEMA_VERSIONS.contains(&schema)))
+        {
+            protected_objects.insert((namespace, kind, id), value);
+        }
+    }
+
+    let mut tables: Vec<String> = sqlx::query_scalar(ROOT_BUDGET_TABLE_QUERY)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(unreadable("root budget tables unreadable"))?;
+    tables.sort();
+    let mut root_budget_tables = BTreeMap::new();
+    for table in tables {
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+                .bind(&table)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(unreadable("root budget columns unreadable"))?;
+        if columns.is_empty() {
+            return Err(Error::Invalid(format!(
+                "root budget table {table} has no columns"
+            )));
+        }
+        let quoted = columns
+            .iter()
+            .map(|column| format!("quote({})", quote_identifier(column)))
+            .collect::<Vec<_>>()
+            .join("||','||");
+        let mut rows: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT {quoted} FROM {}",
+            quote_identifier(&table)
+        ))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(unreadable("root budget rows unreadable"))?;
+        rows.sort();
+        root_budget_tables.insert(table, rows);
+    }
+    tx.rollback()
+        .await
+        .map_err(unreadable("cannot end read transaction"))?;
+    Ok(ControlPlaneFacts {
+        watermarks,
+        tombstones,
+        protected_objects,
+        root_budget_tables,
+    })
+}
+
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Parse JSON that must not contain a duplicate object key at any depth
+/// (`restore_backup.py::read_json`). `serde_json::Value` alone silently keeps
+/// the last duplicate, which would let a receipt or fact hide a value.
+pub fn parse_strict_json(text: &str) -> Result<serde_json::Value> {
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let parsed = StrictJson::deserialize(&mut deserializer)
+        .map_err(|error| Error::Invalid(format!("invalid JSON: {error}")))?;
+    deserializer
+        .end()
+        .map_err(|error| Error::Invalid(format!("invalid JSON: {error}")))?;
+    Ok(parsed.0)
+}
+
+struct StrictJson(serde_json::Value);
+
+impl<'de> Deserialize<'de> for StrictJson {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictJsonVisitor)
+    }
+}
+
+struct StrictJsonVisitor;
+
+impl<'de> serde::de::Visitor<'de> for StrictJsonVisitor {
+    type Value = StrictJson;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJson(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJson(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJson(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(|number| StrictJson(serde_json::Value::Number(number)))
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJson(serde_json::Value::String(value.into())))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJson(serde_json::Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJson(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJson(serde_json::Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<StrictJson>()? {
+            values.push(value.0);
+        }
+        Ok(StrictJson(serde_json::Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate JSON key: {key}"
+                )));
+            }
+            let value = object.next_value::<StrictJson>()?;
+            values.insert(key, value.0);
+        }
+        Ok(StrictJson(serde_json::Value::Object(values)))
+    }
 }
 
 #[cfg(all(

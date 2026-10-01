@@ -7,6 +7,7 @@ use evo_core::contract::{
 use evo_core::{Context, Role, hash};
 use evo_engine::release_store::ReleaseStore;
 use evo_engine::service::{HostPrepareConfig, HostService};
+use evo_engine::startup_gate::{DATA_LOCK_FILE, GateDecision, StartupGate};
 use evo_http::{AuthIdentity, AuthRegistry, DEFAULT_BIND, HttpState};
 use evo_storage::Store;
 use fs2::FileExt;
@@ -49,6 +50,10 @@ enum Command {
         admin_token: Option<String>,
         #[arg(long, env = "RSIA_EVALUATOR_TOKEN", hide_env_values = true)]
         evaluator_token: Option<String>,
+        /// Current control-plane database that vouches for a restored data directory.
+        /// Accepted only for a restored directory that has not been admitted yet.
+        #[arg(long)]
+        trusted_revocations_db: Option<PathBuf>,
     },
     /// Run the four MCP tools over stdio with a startup-fixed Agent identity.
     Mcp {
@@ -58,6 +63,10 @@ enum Command {
         namespace: String,
         #[arg(long, default_value = "stdio-agent")]
         actor: String,
+        /// Current control-plane database that vouches for a restored data directory.
+        /// Accepted only for a restored directory that has not been admitted yet.
+        #[arg(long)]
+        trusted_revocations_db: Option<PathBuf>,
     },
     /// Submit or inspect authenticated management jobs through the HTTP service.
     Manage {
@@ -87,9 +96,11 @@ async fn main() -> Result<()> {
             host_token,
             admin_token,
             evaluator_token,
+            trusted_revocations_db,
         } => {
-            let _data_lock = DataDirectoryLock::acquire(&data)?;
+            let (_data_lock, gate) = mount_gate(&data, trusted_revocations_db.as_deref()).await?;
             let (service, prepare_config) = bootstrap(&data, &namespace).await?;
+            gate.admit()?;
             let mut entries = Vec::new();
             if let Some(token) = auth_token {
                 entries.push((token, AuthIdentity::new(&namespace, &actor, Role::Agent)?));
@@ -140,9 +151,11 @@ async fn main() -> Result<()> {
             data,
             namespace,
             actor,
+            trusted_revocations_db,
         } => {
-            let _data_lock = DataDirectoryLock::acquire(&data)?;
+            let (_data_lock, gate) = mount_gate(&data, trusted_revocations_db.as_deref()).await?;
             let (service, prepare_config) = bootstrap(&data, &namespace).await?;
+            gate.admit()?;
             let caller = Context::new(&namespace, &actor, Role::Agent)?;
             let server = evo_mcp::McpHost::new(service, caller, prepare_config)?;
             evo_mcp::serve_stdio(server)
@@ -210,6 +223,28 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// E16.5 startup recovery gate, then the data-directory lock.
+///
+/// The gate runs twice on purpose. The first evaluation happens before the lock
+/// exists so that a refusal writes nothing at all (taking the lock creates
+/// `.rsia.lock`); the second runs under the lock so the decision that is acted on
+/// cannot be raced by another RSIA process. Only a restored directory that is
+/// being verified for the first time pays for the second, database-reading pass.
+/// The caller admits a verified directory with `GateDecision::admit` after the
+/// store is bootstrapped and before anything recovers or serves.
+async fn mount_gate(
+    data: &Path,
+    trusted_revocations_db: Option<&Path>,
+) -> Result<(DataDirectoryLock, GateDecision)> {
+    let gate = StartupGate::new(data, trusted_revocations_db);
+    gate.evaluate().await?;
+    let lock = DataDirectoryLock::acquire(data)?;
+    let decision = gate.evaluate().await?;
+    // stderr only: stdout is the MCP JSON-RPC channel.
+    eprintln!("{}", decision.startup_line());
+    Ok((lock, decision))
+}
+
 struct DataDirectoryLock {
     _file: File,
 }
@@ -222,7 +257,7 @@ impl DataDirectoryLock {
         let parent = parent
             .canonicalize()
             .with_context(|| format!("failed to resolve data directory {}", parent.display()))?;
-        let lock_path = parent.join(".rsia.lock");
+        let lock_path = parent.join(DATA_LOCK_FILE);
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -290,4 +325,227 @@ async fn bootstrap(data: &Path, namespace: &str) -> Result<(HostService, HostPre
         capability_level: CapabilityLevel::ToolOnly,
     };
     Ok((HostService::new(store, host)?, prepare_config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+    use evo_engine::startup_gate::{
+        RESTORE_ADMISSION_FILE, RESTORE_RECEIPT_FILE, RecoveryPosture, StartupGateError,
+        deployment_config,
+    };
+
+    const FORBIDDEN_SWITCHES: [&str; 5] = [
+        "--allow-code-execution",
+        "--sandbox",
+        "--code-execution",
+        "--enable-code-execution",
+        "--allow-external-network",
+    ];
+
+    /// A unique scratch directory (this binary crate has no tempfile dev-dependency).
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "rsia-main-test-{label}-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path.canonicalize().unwrap())
+        }
+        fn listing(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&self.0)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn serve_and_mcp_accept_no_code_execution_sandbox_or_network_switch() {
+        for command in ["serve", "mcp"] {
+            assert!(Cli::try_parse_from(["rsia", command]).is_ok(), "{command}");
+            for switch in FORBIDDEN_SWITCHES {
+                assert!(
+                    Cli::try_parse_from(["rsia", command, switch]).is_err(),
+                    "{command} {switch}"
+                );
+                assert!(
+                    Cli::try_parse_from(["rsia", command, switch, "true"]).is_err(),
+                    "{command} {switch} true"
+                );
+                assert!(
+                    Cli::try_parse_from(["rsia", command, &format!("{switch}=true")]).is_err(),
+                    "{command} {switch}=true"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_serve_or_mcp_argument_or_environment_variable_can_name_code_execution() {
+        let command = Cli::command();
+        let mut inspected = 0;
+        for subcommand in command
+            .get_subcommands()
+            .filter(|subcommand| matches!(subcommand.get_name(), "serve" | "mcp"))
+        {
+            for argument in subcommand.get_arguments() {
+                inspected += 1;
+                let names = [
+                    argument.get_id().as_str().to_ascii_lowercase(),
+                    argument.get_long().unwrap_or_default().to_ascii_lowercase(),
+                    argument
+                        .get_env()
+                        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                        .unwrap_or_default(),
+                ];
+                for name in names {
+                    for word in ["code", "exec", "sandbox", "network"] {
+                        assert!(
+                            !name.contains(word),
+                            "{} exposes {name:?}",
+                            subcommand.get_name()
+                        );
+                    }
+                }
+            }
+        }
+        assert!(inspected > 8, "the serve and mcp arguments were inspected");
+    }
+
+    #[test]
+    fn trusted_revocations_db_is_a_serve_and_mcp_option_only() {
+        for command in ["serve", "mcp"] {
+            let parsed = Cli::try_parse_from([
+                "rsia",
+                command,
+                "--trusted-revocations-db",
+                "/anchor/rsia.sqlite3",
+            ])
+            .unwrap_or_else(|error| panic!("{command}: {error}"));
+            let anchor = match parsed.command {
+                Command::Serve {
+                    trusted_revocations_db,
+                    ..
+                }
+                | Command::Mcp {
+                    trusted_revocations_db,
+                    ..
+                } => trusted_revocations_db,
+                Command::Manage { .. } => panic!("unexpected subcommand"),
+            };
+            assert_eq!(anchor, Some(PathBuf::from("/anchor/rsia.sqlite3")));
+            // absent by default
+            match Cli::try_parse_from(["rsia", command]).unwrap().command {
+                Command::Serve {
+                    trusted_revocations_db,
+                    ..
+                }
+                | Command::Mcp {
+                    trusted_revocations_db,
+                    ..
+                } => assert_eq!(trusted_revocations_db, None),
+                Command::Manage { .. } => panic!("unexpected subcommand"),
+            }
+        }
+        let manage = ["rsia", "manage", "job.status", "--auth-token", "token"];
+        assert!(Cli::try_parse_from(manage).is_ok());
+        assert!(
+            Cli::try_parse_from(
+                manage
+                    .into_iter()
+                    .chain(["--trusted-revocations-db", "/anchor/rsia.sqlite3"])
+            )
+            .is_err(),
+            "manage is a pure HTTP client and takes no anchor"
+        );
+    }
+
+    #[test]
+    fn the_startup_deployment_config_never_allows_code_execution() {
+        for anchor in [None, Some(Path::new("/anchor/rsia.sqlite3"))] {
+            let config = deployment_config(anchor);
+            assert!(!config.allow_code_execution);
+            assert!(!config.sandbox_enabled);
+            assert!(!config.allow_external_network);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_directory_mounts_under_the_lock_and_reports_its_posture() {
+        let scratch = Scratch::new("normal");
+        let data = scratch.0.join("rsia.sqlite3");
+        let (lock, gate) = mount_gate(&data, None).await.unwrap();
+        assert_eq!(gate.posture(), RecoveryPosture::Normal);
+        assert_eq!(
+            gate.startup_line(),
+            "rsia startup: code_execution=disabled sandbox=unavailable recovery=normal"
+        );
+        gate.admit().unwrap();
+        assert_eq!(scratch.listing(), [DATA_LOCK_FILE]);
+        assert!(
+            DataDirectoryLock::acquire(&data).is_err(),
+            "the mounted directory stays locked"
+        );
+        drop(lock);
+        assert!(DataDirectoryLock::acquire(&data).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_refused_startup_writes_nothing_not_even_the_lock_file() {
+        // an anchor for a directory that was never restored (and does not exist)
+        let scratch = Scratch::new("refused");
+        let missing = scratch.0.join("never-created");
+        let error = mount_gate(
+            &missing.join("rsia.sqlite3"),
+            Some(Path::new("/anchor/rsia.sqlite3")),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            matches!(
+                error.downcast_ref::<StartupGateError>(),
+                Some(StartupGateError::Rejected(_))
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().starts_with("startup_rejected: "));
+        assert!(!missing.exists());
+
+        // a restored directory without an anchor is quarantined before any lock exists
+        let restored = scratch.0.join("restored");
+        std::fs::create_dir(&restored).unwrap();
+        std::fs::write(restored.join(RESTORE_RECEIPT_FILE), b"{}").unwrap();
+        std::fs::write(restored.join("rsia.sqlite3"), b"not opened").unwrap();
+        let before = std::fs::read_dir(&restored).unwrap().count();
+        let error = mount_gate(&restored.join("rsia.sqlite3"), None)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().starts_with("recovery_quarantine: ")
+                && error.to_string().ends_with("; not mounting"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(&restored).unwrap().count(), before);
+        assert!(!restored.join(DATA_LOCK_FILE).exists());
+        assert!(!restored.join(RESTORE_ADMISSION_FILE).exists());
+    }
 }
