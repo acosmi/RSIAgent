@@ -17,16 +17,16 @@ use evo_core::evaluation::DataUse;
 use evo_core::skill_edit::{CompiledSkillEdit, skill_snapshot_digest};
 use evo_core::strategy::{
     ActionKindV1, BatchActionV1, BudgetViewV1, ElasticPolicyV1, ExplorationCapsV1,
-    ExplorationPolicy, HistoryQuery, LegalActionV1, LegalActionsV1, MAX_NODES, ObservedStatus,
-    OpportunityWait, OptimizationHistoryEntry, PrefixNodeV2, PrefixView, PrefixViewV2,
-    RetryDecision, SimulationContext, decide_elastic, deterministic_retry_decision,
-    select_optimization_history,
+    ExplorationPolicy, FailureKind, HistoryQuery, LegalActionV1, LegalActionsV1, MAX_NODES,
+    MAX_REPAIR, ObservedStatus, OpportunityWait, OptimizationHistoryEntry, PrefixNodeV2,
+    PrefixView, PrefixViewV2, RetryDecision, SimulationContext, decide_elastic,
+    deterministic_retry_decision, select_optimization_history,
 };
 use evo_core::{Context, Error, Result, Role, Validate, fingerprint, identifier};
 use evo_storage::{Session, Store};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -689,16 +689,16 @@ impl PersistentCoordinator {
     }
 
     pub async fn decide_next(&self, world_id: &str) -> Result<CoordinatorDecision> {
-        let (world, nodes) = self.load_world_nodes(world_id).await?;
-        pure_decision(&world, &nodes)
+        let (world, nodes, facts) = self.load_world_nodes(world_id).await?;
+        pure_decision(&world, &nodes, &facts)
     }
 
     /// Same pure decision as [`Self::decide_next`], returned together with the
     /// world's context signature and state so a read side can compare it with
     /// a previously stored result. Nothing is written.
     pub async fn decision_view(&self, world_id: &str) -> Result<WorldDecisionView> {
-        let (world, nodes) = self.load_world_nodes(world_id).await?;
-        let decision = pure_decision(&world, &nodes)?;
+        let (world, nodes, facts) = self.load_world_nodes(world_id).await?;
+        let decision = pure_decision(&world, &nodes, &facts)?;
         Ok(WorldDecisionView {
             context_signature: world.context_signature,
             state: world.state,
@@ -1042,10 +1042,14 @@ impl PersistentCoordinator {
             });
         }
         let nodes_before = self.load_nodes_in_session(&mut session, &world).await?;
-        let legal_before = derive_legal_actions(&world, &nodes_before)?;
+        let facts_before = self
+            .load_facts_in_session(&mut session, &world, &nodes_before)
+            .await?;
+        let legal_before = derive_legal_actions(&world, &nodes_before, &facts_before)?;
         let state = LoadedWorld {
             world,
             nodes: nodes_before,
+            facts: facts_before,
             legal: legal_before,
         };
         let stored_dispatch = get_dispatch_fact(&mut session, &self.context, &dispatch_id).await?;
@@ -1216,8 +1220,11 @@ impl PersistentCoordinator {
             return Ok(terminal_result(dispatch));
         }
         let nodes = self.load_nodes_in_session(&mut session, &world).await?;
-        let legal = derive_legal_actions(&world, &nodes)?;
-        let prefix_moved = fingerprint(&prefix_projection(&world, &nodes)?)?
+        let facts = self
+            .load_facts_in_session(&mut session, &world, &nodes)
+            .await?;
+        let legal = derive_legal_actions(&world, &nodes, &facts)?;
+        let prefix_moved = fingerprint(&prefix_projection(&world, &nodes, &facts)?)?
             != decision.prefix_digest
             || fingerprint(&legal)? != decision.legal_actions_digest;
         // A step that was decided on another prefix cannot be recorded as observed on
@@ -1250,6 +1257,7 @@ impl PersistentCoordinator {
                 LoadedWorld {
                     world,
                     nodes,
+                    facts,
                     legal,
                 },
                 &dispatch_id,
@@ -1269,11 +1277,19 @@ impl PersistentCoordinator {
     /// world, the dispatch fact (`Observed`, or `Uncertain` when the node is) and the
     /// world, in the caller's session, which the caller commits. Nothing else spends
     /// the dispatch: the cost of its action leaves `remaining_root_micros` here, and
-    /// a `Recover` also spends one recovery dispatch and counts on its failed node
-    /// (`registered_budget` rebuilds the registered budget from exactly this).
+    /// a `Recover` also spends one recovery dispatch (`registered_budget` rebuilds the
+    /// registered budget from exactly this).
+    ///
+    /// A `Recover` writes nothing on the failed node it repairs: the repairs a failure
+    /// has used are derived from the completed dispatch facts (`derive_recovery`), of
+    /// which this one is the newest once it is written, never counted on a node that
+    /// could be rewritten to give them back (plan §7.2.1: a repair generates a new
+    /// successor and does not overwrite the failure it repairs). The node a dispatch
+    /// writes records the counts its world derives for it, which only makes it readable
+    /// (`recorded_with_derived_counts`).
     ///
     /// A `Recover` whose failed node is not where the world lists it has nothing to
-    /// update, so its outcome is recorded as uncertain. A node id that is already
+    /// repair, so its outcome is recorded as uncertain. A node id that is already
     /// stored is never overwritten.
     async fn settle(
         &self,
@@ -1286,7 +1302,8 @@ impl PersistentCoordinator {
     ) -> Result<CoordinatorStepResult> {
         let LoadedWorld {
             mut world,
-            nodes: mut existing_nodes,
+            nodes: existing_nodes,
+            facts,
             legal,
         } = state;
         let action = dispatch.selected_action.clone();
@@ -1301,21 +1318,18 @@ impl PersistentCoordinator {
             ));
         }
         let (search_parent_seq, branch_seq, depth) = node_placement(&action);
-        let recover_target = match &action.kind {
-            ActionKindV1::Recover {
-                failed_node_seq, ..
-            } => {
-                world.remaining_recovery_dispatches =
-                    world.remaining_recovery_dispatches.saturating_sub(1);
-                let target = find_recover_target(&world, &existing_nodes, *failed_node_seq)
-                    .map(|(index, id)| (index, id.to_owned()));
-                if target.is_none() {
-                    settlement = Settlement::uncertain(REASON_RECOVER_TARGET_MISSING);
-                }
-                target
+        // A Recover spends a recovery dispatch whatever it ends in, and it is spent even
+        // when there is nothing to repair: it was dispatched.
+        if let ActionKindV1::Recover {
+            failed_node_seq, ..
+        } = &action.kind
+        {
+            world.remaining_recovery_dispatches =
+                world.remaining_recovery_dispatches.saturating_sub(1);
+            if find_recover_target(&world, &existing_nodes, *failed_node_seq).is_none() {
+                settlement = Settlement::uncertain(REASON_RECOVER_TARGET_MISSING);
             }
-            ActionKindV1::Widen { .. } | ActionKindV1::Deepen { .. } => None,
-        };
+        }
         let parent_node = search_parent_seq.and_then(|parent| {
             existing_nodes
                 .iter()
@@ -1366,30 +1380,6 @@ impl PersistentCoordinator {
             }
             _ => inherited_best_micros,
         });
-        let repair_failed = matches!(action.kind, ActionKindV1::Recover { .. })
-            && !matches!(settlement.status, ObservedStatus::Valid { .. });
-        if let Some((index, failed_id)) = &recover_target {
-            let failed = &mut existing_nodes[*index];
-            if let ObservedStatus::RepairableFailure {
-                dispatched_repairs, ..
-            } = &mut failed.node.status
-            {
-                *dispatched_repairs = dispatched_repairs.saturating_add(1);
-            }
-            if repair_failed {
-                failed.node.repair_failures_dispatched =
-                    failed.node.repair_failures_dispatched.saturating_add(1);
-            }
-            put_record(
-                session,
-                &self.context,
-                NODE_RECORD_KIND,
-                failed_id,
-                &self.owner,
-                &*failed,
-            )
-            .await?;
-        }
         let node = PersistentSearchNode {
             schema_version: "rsia.exploration_node.v1".into(),
             world_id: world.id.clone(),
@@ -1402,7 +1392,9 @@ impl PersistentCoordinator {
                 status: settlement.status,
                 best_valid_ancestor_micros,
                 recent_valid_gains_micros: gains,
-                repair_failures_dispatched: u8::from(repair_failed),
+                // Replaced by the count its world derives for it, once the dispatch is
+                // completed (`recorded_with_derived_counts`).
+                repair_failures_dispatched: 0,
             },
             candidate_bundle_digest: settlement.bundle_digest,
             candidate_skill_digest: settlement.skill_digest,
@@ -1434,6 +1426,7 @@ impl PersistentCoordinator {
         dispatch.node_id = Some(node_id.clone());
         dispatch.outcome_reason = Some(settlement.reason.clone());
         dispatch.evidence = settlement.evidence;
+        let node = recorded_with_derived_counts(&world, &existing_nodes, &facts, &dispatch, node);
         put_record(
             session,
             &self.context,
@@ -1527,18 +1520,29 @@ impl PersistentCoordinator {
         })
     }
 
+    /// The world, the nodes it lists (in order) and the dispatch facts its recovery
+    /// state is derived from (`load_facts_in_session`): what a decision is a function
+    /// of (the recovery state is derived from the nodes and the facts together, never
+    /// read from a stored counter).
     async fn load_world_nodes(
         &self,
         world_id: &str,
-    ) -> Result<(ExplorationWorldV1, Vec<PersistentSearchNode>)> {
+    ) -> Result<(
+        ExplorationWorldV1,
+        Vec<PersistentSearchNode>,
+        Vec<ExplorationDispatchFact>,
+    )> {
         let mut session = self.store.session().await?;
         let world: ExplorationWorldV1 =
             need_record(&mut session, &self.context, WORLD_RECORD_KIND, world_id).await?;
         world.validate()?;
         check_world_live(&mut session, &self.context, &world).await?;
         let nodes = self.load_nodes_in_session(&mut session, &world).await?;
+        let facts = self
+            .load_facts_in_session(&mut session, &world, &nodes)
+            .await?;
         session.commit().await?;
-        Ok((world, nodes))
+        Ok((world, nodes, facts))
     }
 
     async fn load_nodes_in_session(
@@ -1552,13 +1556,47 @@ impl PersistentCoordinator {
         }
         Ok(nodes)
     }
+
+    /// The dispatch facts the recovery state of `world` is derived from
+    /// (`derive_recovery`): none when its nodes hold no repairable failure, otherwise
+    /// every fact the world lists, in its order.
+    ///
+    /// A world that holds no repairable failure has no recovery to derive: a completed
+    /// `Recover` repairs a repairable failure, which `settle` leaves as stored, so in a
+    /// consistent world it names a node that still is one; a world that is not
+    /// consistent is refused by `registered_budget`; and `run_next` reads every listed
+    /// fact anyway (`dispatch_for_request`). The decision of such a world therefore
+    /// does not depend on its facts being readable, which is what it always was.
+    ///
+    /// Once the world holds a repairable failure, whatever its kind, every listed fact
+    /// is read, and one that cannot be read is the reader's own error, never skipped
+    /// and never turned into an answer: a missing one is `NotFound`, a redacted one and
+    /// one of an unsupported schema are `Conflict`s that name it. The recovery state a
+    /// decision rests on is not guessed from part of the facts.
+    async fn load_facts_in_session(
+        &self,
+        session: &mut Session,
+        world: &ExplorationWorldV1,
+        nodes: &[PersistentSearchNode],
+    ) -> Result<Vec<ExplorationDispatchFact>> {
+        if !holds_repairable_failure(nodes) {
+            return Ok(Vec::new());
+        }
+        let mut facts = Vec::with_capacity(world.dispatch_ids.len());
+        for dispatch_id in &world.dispatch_ids {
+            facts.push(need_dispatch_fact(session, &self.context, dispatch_id).await?);
+        }
+        Ok(facts)
+    }
 }
 
-/// A world as a dispatch finds it: the world, the nodes it lists (in order) and the
-/// actions it offers over them.
+/// A world as a dispatch finds it: the world, the nodes it lists (in order), the
+/// dispatch facts its recovery state is derived from (`load_facts_in_session`) and
+/// the actions it offers over them.
 struct LoadedWorld {
     world: ExplorationWorldV1,
     nodes: Vec<PersistentSearchNode>,
+    facts: Vec<ExplorationDispatchFact>,
     legal: LegalActionsV1,
 }
 
@@ -1633,6 +1671,7 @@ fn guard_dispatch_inputs(
         world,
         nodes,
         legal,
+        ..
     } = state;
     let selected_action = legal
         .actions
@@ -2040,6 +2079,7 @@ fn ensure_new_world_shape(world: &ExplorationWorldV1) -> Result<()> {
 fn pure_decision(
     world: &ExplorationWorldV1,
     nodes: &[PersistentSearchNode],
+    facts: &[ExplorationDispatchFact],
 ) -> Result<CoordinatorDecision> {
     // The decision records the digests of the very policy and caps it passes
     // to `decide_elastic` (E14): a dispatched decision is then evidence of the
@@ -2060,8 +2100,8 @@ fn pure_decision(
             },
         });
     }
-    let prefix = prefix_projection(world, nodes)?;
-    let legal = derive_legal_actions(world, nodes)?;
+    let prefix = prefix_projection(world, nodes, facts)?;
+    let legal = derive_legal_actions(world, nodes, facts)?;
     let budget = BudgetViewV1 {
         remaining_nodes: world.caps.max_nodes.saturating_sub(nodes.len() as u8),
         remaining_recovery_dispatches: world.remaining_recovery_dispatches,
@@ -2078,20 +2118,24 @@ fn pure_decision(
     })
 }
 
+/// The projection of the stored nodes a decision is taken on: what evo-core's
+/// `PrefixViewV2` holds, with the recovery state of every node derived
+/// (`derive_recovery`), never read from the counters the nodes are stored with.
 fn prefix_projection(
     world: &ExplorationWorldV1,
     nodes: &[PersistentSearchNode],
+    facts: &[ExplorationDispatchFact],
 ) -> Result<PrefixViewV2> {
-    let projected: Vec<_> = nodes.iter().map(|node| node.node.clone()).collect();
-    let recovery_dispatches_used = projected
+    let recovery = derive_recovery(world, nodes, facts);
+    let projected: Vec<_> = nodes
         .iter()
-        .filter_map(|node| match node.status {
-            ObservedStatus::RepairableFailure {
-                dispatched_repairs, ..
-            } => Some(dispatched_repairs),
-            _ => None,
+        .zip(recovery.nodes)
+        .map(|(stored, derived)| PrefixNodeV2 {
+            status: derived.status,
+            repair_failures_dispatched: derived.repair_failures_dispatched,
+            ..stored.node.clone()
         })
-        .fold(0u8, u8::saturating_add);
+        .collect();
     Ok(PrefixViewV2 {
         schema_version: PrefixViewV2::SCHEMA.into(),
         context_signature: world.context_signature.clone(),
@@ -2103,8 +2147,232 @@ fn prefix_projection(
         current_branch_focus_actions: world.current_branch_focus_actions,
         decisions_completed: world.decision_round,
         waits: world.waits.clone(),
-        recovery_dispatches_used,
+        recovery_dispatches_used: recovery.dispatches_used,
     })
+}
+
+/// Whether a failure of this kind can be repaired: the kinds a repair addresses
+/// (plan §7.2.1: a locatable implementation, compile, type or output-shape problem),
+/// which are the ones `PrefixViewV2::validate` accepts for a repairable failure. An
+/// environment, resource, safety or unknown failure cannot be renamed into a
+/// repairable one, so it is no `Recover`'s target. Every kind is named: a new one has
+/// to be decided here.
+fn is_repairable_kind(kind: FailureKind) -> bool {
+    match kind {
+        FailureKind::Compile
+        | FailureKind::Implementation
+        | FailureKind::Type
+        | FailureKind::OutputShape => true,
+        FailureKind::Environment
+        | FailureKind::Resource
+        | FailureKind::Safety
+        | FailureKind::Unknown => false,
+    }
+}
+
+/// Whether the nodes hold a repairable failure, by their stored status and of any kind
+/// (one of a kind that cannot be repaired is recorded as the repairable failure it was
+/// stored as, and a world that holds one has a recovery state to derive): the rule that
+/// decides whether the dispatch facts are read at all (`load_facts_in_session`).
+fn holds_repairable_failure(nodes: &[PersistentSearchNode]) -> bool {
+    nodes
+        .iter()
+        .any(|node| matches!(node.node.status, ObservedStatus::RepairableFailure { .. }))
+}
+
+/// Whether `status` is a failure a `Recover` repairs: a repairable failure of a kind
+/// that can be repaired. The replay refuses a `Recover` of anything else.
+fn is_repairable_failure(status: &ObservedStatus) -> bool {
+    matches!(
+        status,
+        ObservedStatus::RepairableFailure { failure_kind, .. } if is_repairable_kind(*failure_kind)
+    )
+}
+
+/// What a node is for the decision, and what it counts: its status, as the decision
+/// takes it, and the repair failures on its line.
+struct RecoveryNode {
+    /// The stored status, except that a repairable failure of a kind that cannot be
+    /// repaired is a hard failure here (the stored record keeps its kind), and the
+    /// repairs a repairable failure has used are the derived ones.
+    status: ObservedStatus,
+    repair_failures_dispatched: u8,
+}
+
+/// The recovery state of a world, derived (plan §7.2.1: the recovery queue is a view of
+/// the observed failures and the dispatches that really happened, not a fact source
+/// that could be edited on its own; it is rebuilt from the persisted nodes and
+/// dispatch facts, and a repair that was spent is never given back).
+struct RecoveryView {
+    /// One entry per node, in the order of the nodes it was derived from.
+    nodes: Vec<RecoveryNode>,
+    /// The recoveries the world has used: every completed `Recover` (the replay adds
+    /// one for each).
+    dispatches_used: u8,
+}
+
+/// Derives the recovery state of `nodes` from the dispatch facts of the world, the way
+/// the replay counts the same history (`node_from_transition`):
+///
+/// * the repairs of an episode are the `Recover` dispatches that were completed
+///   (`Observed` or `Uncertain`: after a dispatch a cancel, a crash and an uncertain
+///   usage are all a used chance, plan §7.2.1) whose failed node is a repairable
+///   failure of that episode. A `Claimed` one is not counted: it has to stay legal
+///   so that it resumes, like a claimed `Deepen`. A repairable failure's own
+///   `dispatched_repairs` is the count of its episode, so one episode is repaired at
+///   most as often as the caps allow (plan §7.1) wherever its failures sit;
+/// * the recoveries a world has used are its completed `Recover` facts;
+/// * the repair failures of a node are its parent's, plus one when it is the repair
+///   (the node a `Recover` wrote) of a repairable failure and is a repairable failure
+///   itself, so a `Deepen` repeats its parent's count, a root has none and a failed
+///   node is not changed by the repair that was dispatched on it. A node is a repair
+///   when the fact that produced it selected a `Recover` or when its parent is a
+///   repairable failure (the only parent a `Recover` has): either alone is enough, so
+///   an edit of the one the other does not cover cannot take a repair failure back;
+/// * a repairable failure of a kind that cannot be repaired is a hard failure to the
+///   decision (`RecoveryNode::status`). The stored record is not touched: failures are
+///   recorded by kind, and a kind that is not repairable never becomes repairable
+///   (plan §7.2: a safety rejection cannot be reclassified), but it must not leave a
+///   prefix the check refuses for good either.
+///
+/// Nothing is read from the counters a node is stored with. A dispatch listed twice
+/// counts once, and a fact whose failed node is not where the world lists it counts
+/// as a recovery used and as no repair of any episode: `registered_budget` refuses
+/// such a world, this only derives.
+fn derive_recovery(
+    world: &ExplorationWorldV1,
+    nodes: &[PersistentSearchNode],
+    facts: &[ExplorationDispatchFact],
+) -> RecoveryView {
+    let mut repairs_by_episode: BTreeMap<&str, u32> = BTreeMap::new();
+    let mut repair_nodes: BTreeSet<&str> = BTreeSet::new();
+    let mut counted = BTreeSet::new();
+    let mut dispatches_used = 0u32;
+    for fact in facts {
+        // Every state is named, so a state added later has to be decided here: whether
+        // it used the chance of a recovery is the whole question.
+        let completed = match fact.state {
+            ExplorationDispatchState::Claimed => false,
+            ExplorationDispatchState::Observed | ExplorationDispatchState::Uncertain => true,
+        };
+        let ActionKindV1::Recover {
+            failed_node_seq, ..
+        } = &fact.selected_action.kind
+        else {
+            continue;
+        };
+        if !completed || !counted.insert(fact.id.as_str()) {
+            continue;
+        }
+        dispatches_used += 1;
+        if let Some(node_id) = fact.node_id.as_deref() {
+            repair_nodes.insert(node_id);
+        }
+        if let Some((index, _)) = find_recover_target(world, nodes, *failed_node_seq)
+            && let Some(target) = nodes.get(index)
+            && let ObservedStatus::RepairableFailure {
+                episode_id,
+                failure_kind,
+                ..
+            } = &target.node.status
+            && is_repairable_kind(*failure_kind)
+        {
+            *repairs_by_episode.entry(episode_id.as_str()).or_default() += 1;
+        }
+    }
+    // What a node hands its children, by sequence: whether it is a repairable failure
+    // and the repair failures on its line. A search parent is older than its children
+    // (the prefix check refuses a prefix where it is not), so it is derived first.
+    let mut lineage: BTreeMap<u32, (bool, u8)> = BTreeMap::new();
+    let mut derived = Vec::with_capacity(nodes.len());
+    for (index, stored) in nodes.iter().enumerate() {
+        let node = &stored.node;
+        let (status, repairable) = match &node.status {
+            ObservedStatus::RepairableFailure {
+                episode_id,
+                failure_kind,
+                repair_template_digest,
+                environment_reset,
+                ..
+            } if is_repairable_kind(*failure_kind) => (
+                ObservedStatus::RepairableFailure {
+                    episode_id: episode_id.clone(),
+                    failure_kind: *failure_kind,
+                    repair_template_digest: repair_template_digest.clone(),
+                    environment_reset: *environment_reset,
+                    dispatched_repairs: repairs_by_episode
+                        .get(episode_id.as_str())
+                        .map_or(0, |repairs| u8::try_from(*repairs).unwrap_or(u8::MAX)),
+                },
+                true,
+            ),
+            ObservedStatus::RepairableFailure { .. } => (ObservedStatus::HardFailure, false),
+            other => (other.clone(), false),
+        };
+        let parent = node
+            .search_parent_seq
+            .map(|seq| lineage.get(&seq).copied().unwrap_or((false, 0)));
+        let produced_by_recover = world
+            .node_ids
+            .get(index)
+            .is_some_and(|id| repair_nodes.contains(id.as_str()));
+        let is_repair =
+            parent.is_some_and(|(parent_repairable, _)| produced_by_recover || parent_repairable);
+        let repair_failures_dispatched = parent
+            .map_or(0, |(_, repair_failures)| repair_failures)
+            .saturating_add(u8::from(is_repair && repairable));
+        lineage.insert(node.node_seq, (repairable, repair_failures_dispatched));
+        derived.push(RecoveryNode {
+            status,
+            repair_failures_dispatched,
+        });
+    }
+    RecoveryView {
+        nodes: derived,
+        dispatches_used: u8::try_from(dispatches_used).unwrap_or(u8::MAX),
+    }
+}
+
+/// The node a dispatch writes, with the counts its world derives for it once that
+/// dispatch (`completed`, the fact as `settle` writes it) is completed. The counts only
+/// make the stored node readable: nothing reads them back, the decision derives them
+/// again from the facts and the lineage (`derive_recovery`), so they are what that
+/// derivation gives for this node by construction. `world` already lists the node and
+/// `nodes` are the nodes before it.
+fn recorded_with_derived_counts(
+    world: &ExplorationWorldV1,
+    nodes: &[PersistentSearchNode],
+    facts: &[ExplorationDispatchFact],
+    completed: &ExplorationDispatchFact,
+    mut node: PersistentSearchNode,
+) -> PersistentSearchNode {
+    let mut nodes_after = nodes.to_vec();
+    nodes_after.push(node.clone());
+    let facts_after: Vec<_> = facts
+        .iter()
+        .filter(|fact| fact.id != completed.id)
+        .cloned()
+        .chain(std::iter::once(completed.clone()))
+        .collect();
+    if let Some(derived) = derive_recovery(world, &nodes_after, &facts_after)
+        .nodes
+        .pop()
+    {
+        node.node.repair_failures_dispatched = derived.repair_failures_dispatched;
+        if let (
+            ObservedStatus::RepairableFailure {
+                dispatched_repairs, ..
+            },
+            ObservedStatus::RepairableFailure {
+                dispatched_repairs: derived_repairs,
+                ..
+            },
+        ) = (&mut node.node.status, &derived.status)
+        {
+            *dispatched_repairs = *derived_repairs;
+        }
+    }
+    node
 }
 
 /// The actions a world offers over its stored nodes: the roots whose branch has no
@@ -2124,9 +2392,29 @@ fn prefix_projection(
 /// the dispatch. It is not spent when the dispatch is merely claimed: a claimed
 /// Deepen has to stay legal so that it resumes (`run_next` looks the selected action
 /// up again, and checks the legal digest the claim recorded once the step is paid).
+///
+/// A Recover is the successor of a repairable failure (plan §7.2.1), offered only
+/// while all of these hold, over the recovery state derived from the facts
+/// (`derive_recovery`), never over the counters the node is stored with:
+///
+/// * the failure is of a kind that can be repaired (an environment, resource, safety
+///   or unknown failure is a hard failure to the decision and is offered none);
+/// * its environment was reset;
+/// * its episode has repairs left: the completed `Recover` dispatches on the failures
+///   of that episode are below the cap (plan §7.1, the administrator's hard limit);
+/// * its own repair failures are below `MAX_REPAIR`, so that a repair that fails
+///   again in a repairable way leaves a node the prefix check accepts (the failure of
+///   a repair that kept the name of its episode is closed by the episode's count, and
+///   one that renamed it, which would otherwise reset the chance, by this).
+///
+/// A Recover is also offered once: its `action_seq`, and so its dispatch id, is fixed
+/// by the world and the failed node, so a second selection would meet the spent
+/// dispatch id. It is spent when its dispatch is completed, not when it is merely
+/// claimed: a claimed Recover has to stay legal so that it resumes, like a Deepen.
 fn derive_legal_actions(
     world: &ExplorationWorldV1,
     nodes: &[PersistentSearchNode],
+    facts: &[ExplorationDispatchFact],
 ) -> Result<LegalActionsV1> {
     let existing_branches: BTreeSet<_> = nodes.iter().map(|node| node.node.branch_seq).collect();
     // A `Valid` node is only ever the search parent of its Deepen: a Recover starts
@@ -2135,6 +2423,7 @@ fn derive_legal_actions(
         .iter()
         .filter_map(|node| node.node.search_parent_seq)
         .collect();
+    let recovery = derive_recovery(world, nodes, facts);
     let mut actions = Vec::new();
     for root in &world.root_opportunities {
         if !existing_branches.contains(&root.branch_seq) {
@@ -2151,7 +2440,7 @@ fn derive_legal_actions(
         }
     }
     let next_seq_base = 1_000_000u32;
-    for node in nodes {
+    for (node, derived) in nodes.iter().zip(&recovery.nodes) {
         if node.node.depth < world.caps.max_depth
             && matches!(node.node.status, ObservedStatus::Valid { .. })
             && node.evidence == ExplorationEvidenceV1::Trusted
@@ -2173,8 +2462,9 @@ fn derive_legal_actions(
             environment_reset: true,
             dispatched_repairs,
             ..
-        } = &node.node.status
+        } = &derived.status
             && *dispatched_repairs < world.caps.max_repair_dispatches_per_episode
+            && derived.repair_failures_dispatched < MAX_REPAIR
         {
             actions.push(LegalActionV1 {
                 action_id: format!("recover-{}", node.node.node_seq),
@@ -2455,7 +2745,7 @@ fn world_started(world: &ExplorationWorldV1) -> bool {
 /// it from the world as it was requested.
 pub(crate) fn first_decision(world: &ExplorationWorldV1) -> Result<CoordinatorDecision> {
     world.validate()?;
-    pure_decision(world, &[])
+    pure_decision(world, &[], &[])
 }
 
 /// The cost the world's immutable registration facts give `action`, as
@@ -2480,7 +2770,7 @@ fn registered_action_cost(
     match &action.kind {
         ActionKindV1::Widen { .. } => {
             // With no node there is no branch yet: this derives the Widen of every root.
-            let roots = derive_legal_actions(world, &[])?;
+            let roots = derive_legal_actions(world, &[], &[])?;
             let Some(root) = roots
                 .actions
                 .iter()
@@ -2570,10 +2860,18 @@ fn node_follows_action(
 /// dispatch rewritten into a `Deepen`, with the counters that would pay for it,
 /// would otherwise balance the books too.
 ///
+/// Nor is a completed `Recover` taken on its word about its target: the node it
+/// repairs is a repairable failure of a kind that can be repaired, as the replay
+/// requires (it refuses a `Recover` of anything else). A root dispatch rewritten into
+/// the `Recover` of a hard failure, with the counters that would pay for it, balanced
+/// the books as well. The node is read where the world lists it (`find_recover_target`),
+/// so a `Recover` whose target is not there is refused too.
+///
 /// This function states the spending rule of `run_next` (`settle`) from the reading
 /// side: a change to when or by how much a dispatch spends, or to where its node is
-/// placed, has to change it with it (`tests/exploration_start_after_dispatch_v42.rs`
-/// and `tests/exploration_postpaid_v42.rs` pin both).
+/// placed, or to what a `Recover` may repair, has to change it with it
+/// (`tests/exploration_start_after_dispatch_v42.rs`, `tests/exploration_postpaid_v42.rs`
+/// and `tests/exploration_recovery_counting_v42.rs` pin these).
 async fn registered_budget(
     session: &mut Session,
     ctx: &Context,
@@ -2665,7 +2963,16 @@ async fn registered_budget(
                     return Err(unaccounted());
                 }
                 root_micros = root_micros.checked_add(cost).ok_or_else(unaccounted)?;
-                if matches!(fact.selected_action.kind, ActionKindV1::Recover { .. }) {
+                if let ActionKindV1::Recover {
+                    failed_node_seq, ..
+                } = &fact.selected_action.kind
+                {
+                    let repairs_a_failure = find_recover_target(world, &nodes, *failed_node_seq)
+                        .and_then(|(index, _)| nodes.get(index))
+                        .is_some_and(|target| is_repairable_failure(&target.node.status));
+                    if !repairs_a_failure {
+                        return Err(unaccounted());
+                    }
                     recovery_dispatches += 1;
                 }
             }
@@ -3581,7 +3888,33 @@ mod tests {
 
     #[test]
     fn a_recover_target_is_found_where_the_world_lists_it() {
-        let mut world = ExplorationWorldV1 {
+        let mut world = world_listing(2);
+        let nodes = [node_at(1, 1, None, 1), node_at(2, 2, None, 1)];
+        assert_eq!(
+            find_recover_target(&world, &nodes, 2),
+            Some((1, "node-world-1-2"))
+        );
+        assert_eq!(
+            find_recover_target(&world, &nodes, 1),
+            Some((0, "node-world-1-1"))
+        );
+        // No such node, a sequence that is no position, and a node the world does not
+        // list at the position of its sequence: the target is gone.
+        assert_eq!(find_recover_target(&world, &nodes, 3), None);
+        assert_eq!(find_recover_target(&world, &nodes, 0), None);
+        let renumbered = [node_at(1, 1, None, 1), node_at(5, 2, None, 1)];
+        assert_eq!(find_recover_target(&world, &renumbered, 2), None);
+        assert_eq!(find_recover_target(&world, &renumbered, 5), None);
+        world.node_ids.pop();
+        assert_eq!(find_recover_target(&world, &nodes, 2), None);
+    }
+
+    // ----- AG-042: the recovery state is derived, never read from a stored counter -----
+
+    /// A world that lists `count` nodes, named as `settle` names them, over the online
+    /// caps: the repair of a failure is what the derivation is asked about.
+    fn world_listing(count: u32) -> ExplorationWorldV1 {
+        ExplorationWorldV1 {
             schema_version: ExplorationWorldV1::SCHEMA.into(),
             id: "world-1".into(),
             approved_parent_digest: evo_core::hash(b"approved-parent"),
@@ -3604,31 +3937,874 @@ mod tests {
             remaining_root_micros: 1_000,
             remaining_recovery_dispatches: 2,
             state: WorldState::Collecting,
-            node_ids: vec!["node-world-1-1".into(), "node-world-1-2".into()],
+            node_ids: (1..=count)
+                .map(|node_seq| node_id_for("world-1", node_seq))
+                .collect(),
             dispatch_ids: vec![],
             history_ids: vec![],
             current_branch_seq: None,
             current_branch_focus_actions: 0,
             decision_round: 0,
             waits: vec![],
+        }
+    }
+
+    /// A repairable failure of `kind` whose environment was reset and that no repair was
+    /// dispatched on, as a step would write it.
+    fn repairable(episode: &str, kind: FailureKind) -> ObservedStatus {
+        ObservedStatus::RepairableFailure {
+            episode_id: episode.into(),
+            failure_kind: kind,
+            repair_template_digest: evo_core::hash(b"repair-template"),
+            environment_reset: true,
+            dispatched_repairs: 0,
+        }
+    }
+
+    /// A stored node of sequence `seq` on `branch_seq`, `depth` deep, under `parent`,
+    /// with `status`.
+    fn stored_node(
+        seq: u32,
+        branch_seq: u32,
+        parent: Option<u32>,
+        depth: u8,
+        status: ObservedStatus,
+    ) -> PersistentSearchNode {
+        let mut node = node_at(seq, branch_seq, parent, depth);
+        node.node.status = status;
+        node
+    }
+
+    /// The fact of the `Recover` of node `failed_seq` that wrote node `wrote_seq`, in
+    /// `state`.
+    fn recover_fact(
+        failed_seq: u32,
+        wrote_seq: u32,
+        state: ExplorationDispatchState,
+    ) -> ExplorationDispatchFact {
+        let mut fact = sample_dispatch_fact();
+        fact.id = format!("dispatch-recover-{failed_seq}-{wrote_seq}");
+        fact.state = state;
+        fact.node_id = Some(node_id_for("world-1", wrote_seq));
+        fact.selected_action.kind = ActionKindV1::Recover {
+            failed_node_seq: failed_seq,
+            episode_id: "episode-the-action-names".into(),
         };
-        let nodes = [node_at(1, 1, None, 1), node_at(2, 2, None, 1)];
+        fact
+    }
+
+    /// The fact of the `Deepen` of node `parent_seq` that wrote node `wrote_seq`.
+    fn deepen_fact(parent_seq: u32, wrote_seq: u32) -> ExplorationDispatchFact {
+        let mut fact = sample_dispatch_fact();
+        fact.id = format!("dispatch-deepen-{parent_seq}-{wrote_seq}");
+        fact.node_id = Some(node_id_for("world-1", wrote_seq));
+        fact.selected_action.kind = ActionKindV1::Deepen {
+            parent_node_seq: parent_seq,
+        };
+        fact
+    }
+
+    /// What the derivation gives for every node, in order (the repairs dispatched on it
+    /// when it is a repairable failure, its repair failures) and the recoveries used.
+    fn derived(
+        world: &ExplorationWorldV1,
+        nodes: &[PersistentSearchNode],
+        facts: &[ExplorationDispatchFact],
+    ) -> (Vec<(Option<u8>, u8)>, u8) {
+        let view = derive_recovery(world, nodes, facts);
+        (
+            view.nodes
+                .iter()
+                .map(|node| {
+                    let repairs = match &node.status {
+                        ObservedStatus::RepairableFailure {
+                            dispatched_repairs, ..
+                        } => Some(*dispatched_repairs),
+                        _ => None,
+                    };
+                    (repairs, node.repair_failures_dispatched)
+                })
+                .collect(),
+            view.dispatches_used,
+        )
+    }
+
+    use ExplorationDispatchState::{Claimed, Observed, Uncertain};
+
+    const ALL_KINDS: [FailureKind; 8] = [
+        FailureKind::Compile,
+        FailureKind::Implementation,
+        FailureKind::Type,
+        FailureKind::OutputShape,
+        FailureKind::Environment,
+        FailureKind::Resource,
+        FailureKind::Safety,
+        FailureKind::Unknown,
+    ];
+
+    #[test]
+    fn a_failure_kind_is_repairable_exactly_when_the_prefix_check_accepts_it() {
+        for kind in ALL_KINDS {
+            let prefix = PrefixViewV2 {
+                schema_version: PrefixViewV2::SCHEMA.into(),
+                context_signature: evo_core::hash(b"context"),
+                approved_parent_digest: evo_core::hash(b"approved-parent"),
+                initial_baseline_quality_micros: 500_000,
+                nodes_used: 1,
+                nodes: vec![stored_node(1, 1, None, 1, repairable("episode-1", kind)).node],
+                current_branch_seq: None,
+                current_branch_focus_actions: 0,
+                decisions_completed: 0,
+                waits: vec![],
+                recovery_dispatches_used: 0,
+            };
+            assert_eq!(
+                prefix.validate().is_ok(),
+                is_repairable_kind(kind),
+                "{kind:?}"
+            );
+            assert_eq!(
+                is_repairable_failure(&repairable("episode-1", kind)),
+                is_repairable_kind(kind),
+                "{kind:?}"
+            );
+        }
+        // Nothing but a repairable failure is repaired.
+        for status in [
+            ObservedStatus::Valid {
+                quality_micros: 600_000,
+            },
+            ObservedStatus::EnvironmentFailure,
+            ObservedStatus::HardFailure,
+            ObservedStatus::SafetyRejected,
+            ObservedStatus::Cancelled,
+            ObservedStatus::UsageUncertain,
+        ] {
+            assert!(!is_repairable_failure(&status), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn the_dispatch_facts_are_read_only_when_a_repairable_failure_is_stored() {
+        assert!(!holds_repairable_failure(&[]));
+        for status in [
+            ObservedStatus::Valid {
+                quality_micros: 600_000,
+            },
+            ObservedStatus::EnvironmentFailure,
+            ObservedStatus::HardFailure,
+            ObservedStatus::SafetyRejected,
+            ObservedStatus::Cancelled,
+            ObservedStatus::UsageUncertain,
+        ] {
+            let nodes = [stored_node(1, 1, None, 1, status.clone())];
+            assert!(!holds_repairable_failure(&nodes), "{status:?}");
+        }
+        // By stored status, of any kind: a failure that cannot be repaired is stored as the
+        // repairable failure it was, and a world that holds one has a recovery state.
+        for kind in ALL_KINDS {
+            let nodes = [
+                stored_node(1, 1, None, 1, ObservedStatus::HardFailure),
+                stored_node(2, 2, None, 1, repairable("episode-1", kind)),
+            ];
+            assert!(holds_repairable_failure(&nodes), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_repairs_of_an_episode_are_the_completed_recovers_on_the_failures_of_that_episode() {
+        // Two failures of episode-1 on two branches, one of episode-2.
+        let nodes = [
+            stored_node(1, 1, None, 1, repairable("episode-1", FailureKind::Compile)),
+            stored_node(2, 2, None, 1, repairable("episode-1", FailureKind::Type)),
+            stored_node(3, 3, None, 1, repairable("episode-2", FailureKind::Compile)),
+        ];
+        let world = world_listing(3);
+        let open = vec![(Some(0), 0), (Some(0), 0), (Some(0), 0)];
+        assert_eq!(derived(&world, &nodes, &[]), (open.clone(), 0));
+
+        // A repair of either failure of episode-1 is one repair of the episode: both
+        // failures of it have it, the failure of episode-2 does not. A `Recover` that ended
+        // uncertain is as spent as an observed one (plan §7.2.1).
+        for state in [Observed, Uncertain] {
+            for failed in [1, 2] {
+                assert_eq!(
+                    derived(&world, &nodes, &[recover_fact(failed, 4, state)]),
+                    (vec![(Some(1), 0), (Some(1), 0), (Some(0), 0)], 1),
+                    "failed node {failed}, {state:?}"
+                );
+            }
+        }
         assert_eq!(
-            find_recover_target(&world, &nodes, 2),
-            Some((1, "node-world-1-2"))
+            derived(&world, &nodes, &[recover_fact(3, 4, Observed)]),
+            (vec![(Some(0), 0), (Some(0), 0), (Some(1), 0)], 1)
         );
+        // Two repairs of one episode are two.
         assert_eq!(
-            find_recover_target(&world, &nodes, 1),
-            Some((0, "node-world-1-1"))
+            derived(
+                &world,
+                &nodes,
+                &[recover_fact(1, 4, Observed), recover_fact(2, 5, Observed)]
+            ),
+            (vec![(Some(2), 0), (Some(2), 0), (Some(0), 0)], 2)
         );
-        // No such node, a sequence that is no position, and a node the world does not
-        // list at the position of its sequence: the target is gone.
-        assert_eq!(find_recover_target(&world, &nodes, 3), None);
-        assert_eq!(find_recover_target(&world, &nodes, 0), None);
-        let renumbered = [node_at(1, 1, None, 1), node_at(5, 2, None, 1)];
-        assert_eq!(find_recover_target(&world, &renumbered, 2), None);
-        assert_eq!(find_recover_target(&world, &renumbered, 5), None);
-        world.node_ids.pop();
-        assert_eq!(find_recover_target(&world, &nodes, 2), None);
+    }
+
+    #[test]
+    fn a_dispatch_that_is_claimed_or_no_recover_or_listed_twice_does_not_count_wrongly() {
+        let nodes = [
+            stored_node(1, 1, None, 1, repairable("episode-1", FailureKind::Compile)),
+            stored_node(2, 2, None, 1, ObservedStatus::HardFailure),
+        ];
+        let world = world_listing(2);
+        let open = (vec![(Some(0), 0), (None, 0)], 0);
+        // A claimed `Recover` has spent nothing: it has to stay legal so that it resumes.
+        assert_eq!(
+            derived(&world, &nodes, &[recover_fact(1, 3, Claimed)]),
+            open
+        );
+        // Neither a root nor a `Deepen` is a recovery.
+        assert_eq!(
+            derived(&world, &nodes, &[sample_dispatch_fact(), deepen_fact(2, 3)]),
+            open
+        );
+        // A dispatch is one dispatch however often the world lists it.
+        let once = recover_fact(1, 3, Observed);
+        assert_eq!(
+            derived(&world, &nodes, &[once.clone(), once]),
+            (vec![(Some(1), 0), (None, 0)], 1)
+        );
+    }
+
+    #[test]
+    fn a_recover_that_repairs_nothing_is_a_recovery_used_and_no_repair_of_any_episode() {
+        // The failed node of the fact is a hard failure, a failure of a kind that cannot
+        // be repaired, or not where the world lists it: the dispatch was made (the replay
+        // adds one recovery for it), and no episode had a repair. `registered_budget`
+        // refuses such a world; the derivation only counts what happened.
+        let nodes = [
+            stored_node(1, 1, None, 1, repairable("episode-1", FailureKind::Compile)),
+            stored_node(2, 2, None, 1, ObservedStatus::HardFailure),
+            stored_node(3, 3, None, 1, repairable("episode-1", FailureKind::Safety)),
+        ];
+        let world = world_listing(3);
+        for failed in [2, 3, 9] {
+            let (counts, used) = derived(&world, &nodes, &[recover_fact(failed, 4, Observed)]);
+            assert_eq!(used, 1, "failed node {failed}");
+            assert_eq!(counts[0], (Some(0), 0), "failed node {failed}");
+        }
+    }
+
+    #[test]
+    fn the_counters_a_node_is_stored_with_are_not_read() {
+        let world = world_listing(2);
+        let mut nodes = [
+            stored_node(1, 1, None, 1, repairable("episode-1", FailureKind::Compile)),
+            stored_node(2, 2, None, 1, repairable("episode-2", FailureKind::Compile)),
+        ];
+        // Counters raised on failures that were never repaired give nothing.
+        for node in &mut nodes {
+            node.node.repair_failures_dispatched = 1;
+            if let ObservedStatus::RepairableFailure {
+                dispatched_repairs, ..
+            } = &mut node.node.status
+            {
+                *dispatched_repairs = 1;
+            }
+        }
+        assert_eq!(
+            derived(&world, &nodes, &[]),
+            (vec![(Some(0), 0), (Some(0), 0)], 0)
+        );
+        // Counters put back to 0 take nothing: the fact is what holds the repair.
+        for node in &mut nodes {
+            node.node.repair_failures_dispatched = 0;
+            if let ObservedStatus::RepairableFailure {
+                dispatched_repairs, ..
+            } = &mut node.node.status
+            {
+                *dispatched_repairs = 0;
+            }
+        }
+        assert_eq!(
+            derived(&world, &nodes, &[recover_fact(1, 3, Observed)]),
+            (vec![(Some(1), 0), (Some(0), 0)], 1)
+        );
+        // The projection hands the decision the derived counters, and the stored node
+        // is not touched by it.
+        let prefix = prefix_projection(&world, &nodes, &[recover_fact(1, 3, Observed)]).unwrap();
+        assert_eq!(prefix.recovery_dispatches_used, 1);
+        assert!(matches!(
+            prefix.nodes[0].status,
+            ObservedStatus::RepairableFailure {
+                dispatched_repairs: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            nodes[0].node.status,
+            ObservedStatus::RepairableFailure {
+                dispatched_repairs: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_failure_of_a_kind_that_cannot_be_repaired_is_a_hard_failure_to_the_decision_only() {
+        let world = world_listing(1);
+        for kind in ALL_KINDS {
+            let nodes = [stored_node(1, 1, None, 1, repairable("episode-1", kind))];
+            let prefix = prefix_projection(&world, &nodes, &[]).unwrap();
+            // What the decision is given: a repairable failure, or a hard failure.
+            match (&prefix.nodes[0].status, is_repairable_kind(kind)) {
+                (ObservedStatus::RepairableFailure { .. }, true)
+                | (ObservedStatus::HardFailure, false) => {}
+                (other, repairable) => panic!("{kind:?} (repairable: {repairable}): {other:?}"),
+            }
+            // The prefix check accepts what the decision is given, whatever the kind.
+            prefix
+                .validate()
+                .unwrap_or_else(|error| panic!("{kind:?}: {error:?}"));
+            // The stored record is as it was: its kind is not rewritten.
+            assert!(
+                matches!(&nodes[0].node.status, ObservedStatus::RepairableFailure { failure_kind, .. } if *failure_kind == kind),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_repair_failures_of_a_node_are_counted_as_the_replay_counts_them() {
+        let world = world_listing(5);
+        // S2: the repair of a repairable failure ends in a hard failure. The failed node
+        // and the repair count none (the coordinator used to count one on both).
+        let nodes = [
+            stored_node(1, 1, None, 1, repairable("episode-1", FailureKind::Compile)),
+            stored_node(2, 1, Some(1), 2, ObservedStatus::HardFailure),
+        ];
+        assert_eq!(
+            derived(&world, &nodes, &[recover_fact(1, 2, Observed)]),
+            (vec![(Some(1), 0), (None, 0)], 1)
+        );
+
+        // S3: a repairable failure repaired into a repairable failure of another episode,
+        // repaired into a valid node. The valid node repeats the repair failure of the
+        // node it repaired (the coordinator used to count none).
+        let valid = ObservedStatus::Valid {
+            quality_micros: 800_000,
+        };
+        let nodes = [
+            stored_node(1, 1, None, 1, repairable("episode-1", FailureKind::Compile)),
+            stored_node(
+                2,
+                1,
+                Some(1),
+                2,
+                repairable("episode-2", FailureKind::Compile),
+            ),
+            stored_node(3, 1, Some(2), 3, valid.clone()),
+        ];
+        let facts = [recover_fact(1, 2, Observed), recover_fact(2, 3, Observed)];
+        assert_eq!(
+            derived(&world, &nodes, &facts),
+            (vec![(Some(1), 0), (Some(1), 1), (None, 1)], 2)
+        );
+
+        // A `Deepen` repeats its parent's count, whatever it ends in: a valid node and a
+        // repairable failure alike. A root has none, even when a fact says it was a repair
+        // (a `Recover` has a parent).
+        let nodes = [
+            stored_node(1, 1, None, 1, repairable("episode-1", FailureKind::Compile)),
+            stored_node(
+                2,
+                1,
+                Some(1),
+                2,
+                repairable("episode-2", FailureKind::Compile),
+            ),
+            stored_node(3, 1, Some(2), 3, valid),
+            stored_node(
+                4,
+                1,
+                Some(3),
+                4,
+                repairable("episode-3", FailureKind::Compile),
+            ),
+            stored_node(5, 2, None, 1, repairable("episode-4", FailureKind::Compile)),
+        ];
+        let facts = [
+            recover_fact(1, 2, Observed),
+            recover_fact(2, 3, Observed),
+            deepen_fact(3, 4),
+            recover_fact(5, 5, Observed),
+        ];
+        assert_eq!(
+            derived(&world, &nodes, &facts),
+            (
+                vec![
+                    (Some(1), 0),
+                    (Some(1), 1),
+                    (None, 1),
+                    (Some(0), 1),
+                    (Some(1), 0)
+                ],
+                3
+            )
+        );
+    }
+
+    #[test]
+    fn a_node_is_a_repair_when_its_fact_says_so_or_its_parent_is_a_repairable_failure() {
+        let world = world_listing(2);
+        let child = |status| {
+            [
+                stored_node(1, 1, None, 1, repairable("episode-1", FailureKind::Compile)),
+                stored_node(2, 1, Some(1), 2, status),
+            ]
+        };
+        let child_failure = || repairable("episode-2", FailureKind::Compile);
+        let repair_failures = |nodes: &[PersistentSearchNode],
+                               facts: &[ExplorationDispatchFact]| {
+            derived(&world, nodes, facts).0[1].1
+        };
+
+        // Both say it: a repair that failed in a repairable way.
+        let both = child(child_failure());
+        assert_eq!(repair_failures(&both, &[recover_fact(1, 2, Observed)]), 1);
+        // The fact was edited to say `Deepen`, or is not there: the parent is still the
+        // repairable failure only a `Recover` has as its parent.
+        assert_eq!(repair_failures(&both, &[deepen_fact(1, 2)]), 1);
+        assert_eq!(repair_failures(&both, &[]), 1);
+        // The parent's status was edited (a hard failure now): the fact still says it was a
+        // repair. Neither edit alone takes a repair failure back.
+        let mut edited = child(child_failure());
+        edited[0].node.status = ObservedStatus::HardFailure;
+        assert_eq!(repair_failures(&edited, &[recover_fact(1, 2, Observed)]), 1);
+        // Neither says it: the child of a node that is no repairable failure, written by
+        // something that is no `Recover`, is no repair.
+        assert_eq!(repair_failures(&edited, &[deepen_fact(1, 2)]), 0);
+        assert_eq!(repair_failures(&edited, &[]), 0);
+        // A repair that is no repairable failure adds nothing, whoever says it is one.
+        for status in [
+            ObservedStatus::HardFailure,
+            ObservedStatus::UsageUncertain,
+            ObservedStatus::Valid {
+                quality_micros: 600_000,
+            },
+            repairable("episode-2", FailureKind::Safety),
+        ] {
+            let nodes = child(status.clone());
+            assert_eq!(
+                repair_failures(&nodes, &[recover_fact(1, 2, Observed)]),
+                0,
+                "{status:?}"
+            );
+        }
+        // A claimed fact does not make a node (none exists for it yet).
+        assert_eq!(repair_failures(&edited, &[recover_fact(1, 2, Claimed)]), 0);
+    }
+
+    /// The ids of the actions the world offers over `nodes` and `facts`.
+    fn offered_ids(
+        world: &ExplorationWorldV1,
+        nodes: &[PersistentSearchNode],
+        facts: &[ExplorationDispatchFact],
+    ) -> Vec<String> {
+        derive_legal_actions(world, nodes, facts)
+            .unwrap()
+            .actions
+            .into_iter()
+            .map(|action| action.action_id)
+            .collect()
+    }
+
+    #[test]
+    fn a_recover_is_offered_only_while_every_one_of_its_conditions_holds() {
+        let world = world_listing(2);
+        let failure = |episode, kind| stored_node(1, 1, None, 1, repairable(episode, kind));
+        let open = [failure("episode-1", FailureKind::Compile)];
+        assert_eq!(offered_ids(&world, &open, &[]), ["recover-1"]);
+
+        // The kind can be repaired: only the kinds the prefix check accepts are.
+        for kind in ALL_KINDS {
+            let nodes = [failure("episode-1", kind)];
+            let expected: &[&str] = if is_repairable_kind(kind) {
+                &["recover-1"]
+            } else {
+                &[]
+            };
+            assert_eq!(offered_ids(&world, &nodes, &[]), expected, "{kind:?}");
+        }
+
+        // The environment was reset.
+        let mut not_reset = open.clone();
+        if let ObservedStatus::RepairableFailure {
+            environment_reset, ..
+        } = &mut not_reset[0].node.status
+        {
+            *environment_reset = false;
+        }
+        assert!(offered_ids(&world, &not_reset, &[]).is_empty());
+
+        // The episode has repairs left: one that was dispatched, observed or uncertain,
+        // spends it; one that is only claimed does not.
+        let one_node_two = [
+            open[0].clone(),
+            stored_node(2, 2, None, 1, repairable("episode-1", FailureKind::Type)),
+        ];
+        for state in [Observed, Uncertain] {
+            let spent = [recover_fact(1, 3, state)];
+            assert!(offered_ids(&world, &open, &spent).is_empty(), "{state:?}");
+            // ... on any of the failures of the episode, not only the one that was repaired.
+            assert!(
+                offered_ids(&world, &one_node_two, &spent).is_empty(),
+                "{state:?}"
+            );
+        }
+        assert_eq!(
+            offered_ids(&world, &open, &[recover_fact(1, 3, Claimed)]),
+            ["recover-1"]
+        );
+        // Another episode has its own repair.
+        let apart = [
+            open[0].clone(),
+            stored_node(2, 2, None, 1, repairable("episode-2", FailureKind::Type)),
+        ];
+        assert_eq!(
+            offered_ids(&world, &apart, &[recover_fact(1, 3, Observed)]),
+            ["recover-2"]
+        );
+        // The caps decide how many: none when the administrator allows none.
+        let mut no_repairs = world.clone();
+        no_repairs.caps.max_repair_dispatches_per_episode = 0;
+        assert!(offered_ids(&no_repairs, &open, &[]).is_empty());
+
+        // Its own repair failures are below `MAX_REPAIR`: the repair of a failure that
+        // failed again in a repairable way, under another episode name (so that the
+        // episode's count does not close it), is offered no second repair. The one it was
+        // the repair of is spent.
+        let renamed = [
+            open[0].clone(),
+            stored_node(
+                2,
+                1,
+                Some(1),
+                2,
+                repairable("episode-2", FailureKind::Compile),
+            ),
+        ];
+        assert!(
+            offered_ids(&world, &renamed, &[recover_fact(1, 2, Observed)]).is_empty(),
+            "a second repair would give a node {} repair failures",
+            MAX_REPAIR + 1
+        );
+        // It is the repair failures on the line that close it, not the episode: without the
+        // fact that spent the first repair, the lineage still does.
+        assert_eq!(offered_ids(&world, &renamed, &[]), ["recover-1"]);
+
+        // The counters the node is stored with decide nothing, either way.
+        let mut raised = open.clone();
+        raised[0].node.repair_failures_dispatched = 1;
+        if let ObservedStatus::RepairableFailure {
+            dispatched_repairs, ..
+        } = &mut raised[0].node.status
+        {
+            *dispatched_repairs = 1;
+        }
+        assert_eq!(offered_ids(&world, &raised, &[]), ["recover-1"]);
+    }
+
+    #[test]
+    fn the_node_a_dispatch_writes_records_the_counts_its_world_derives_for_it() {
+        let world = world_listing(3);
+        // The failed node, and the dispatch that repairs it: the fact `settle` completes.
+        let failed = stored_node(1, 1, None, 1, repairable("episode-1", FailureKind::Compile));
+        let completing = recover_fact(1, 2, Observed);
+        let record = |status: ObservedStatus,
+                      nodes: &[PersistentSearchNode],
+                      facts: &[ExplorationDispatchFact],
+                      completing: &ExplorationDispatchFact| {
+            let mut written = stored_node(2, 1, Some(1), 2, status);
+            written.node.repair_failures_dispatched = 7;
+            recorded_with_derived_counts(&world, nodes, facts, completing, written)
+        };
+
+        // A repair that is a repairable failure of the same episode: one repair failure
+        // more than its parent, and the repair this dispatch just spent on the episode.
+        let written = record(
+            repairable("episode-1", FailureKind::Compile),
+            std::slice::from_ref(&failed),
+            &[],
+            &completing,
+        );
+        assert_eq!(written.node.repair_failures_dispatched, 1);
+        assert!(matches!(
+            written.node.status,
+            ObservedStatus::RepairableFailure {
+                dispatched_repairs: 1,
+                ..
+            }
+        ));
+        // ... of another episode: the same repair failure, and no repair on its episode.
+        let written = record(
+            repairable("episode-2", FailureKind::Compile),
+            std::slice::from_ref(&failed),
+            &[],
+            &completing,
+        );
+        assert_eq!(written.node.repair_failures_dispatched, 1);
+        assert!(matches!(
+            written.node.status,
+            ObservedStatus::RepairableFailure {
+                dispatched_repairs: 0,
+                ..
+            }
+        ));
+        // A repair that is no repairable failure repeats its parent's count and keeps its
+        // status as it is, a repairable failure of a kind that cannot be repaired included.
+        for status in [
+            ObservedStatus::HardFailure,
+            ObservedStatus::UsageUncertain,
+            ObservedStatus::Valid {
+                quality_micros: 600_000,
+            },
+            repairable("episode-1", FailureKind::Unknown),
+        ] {
+            let written = record(
+                status.clone(),
+                std::slice::from_ref(&failed),
+                &[],
+                &completing,
+            );
+            assert_eq!(written.node.repair_failures_dispatched, 0, "{status:?}");
+            assert_eq!(
+                serde_json::to_value(&written.node.status).unwrap(),
+                serde_json::to_value(&status).unwrap(),
+                "{status:?}"
+            );
+        }
+        // The claimed fact the world still lists is replaced by the completed one, not
+        // counted next to it.
+        let claimed = recover_fact(1, 2, Claimed);
+        let written = record(
+            repairable("episode-1", FailureKind::Compile),
+            std::slice::from_ref(&failed),
+            &[claimed],
+            &completing,
+        );
+        assert!(matches!(
+            written.node.status,
+            ObservedStatus::RepairableFailure {
+                dispatched_repairs: 1,
+                ..
+            }
+        ));
+
+        // A `Deepen` repeats the count of the node it deepens: a repair that succeeded
+        // after a repair failure carries it on.
+        let repaired = stored_node(
+            2,
+            1,
+            Some(1),
+            2,
+            repairable("episode-2", FailureKind::Compile),
+        );
+        let valid = stored_node(
+            3,
+            1,
+            Some(2),
+            3,
+            ObservedStatus::Valid {
+                quality_micros: 800_000,
+            },
+        );
+        let history = [failed.clone(), repaired, valid];
+        let facts = [recover_fact(1, 2, Observed), recover_fact(2, 3, Observed)];
+        let deepening = deepen_fact(3, 4);
+        let mut deepened = stored_node(
+            4,
+            1,
+            Some(3),
+            4,
+            ObservedStatus::Valid {
+                quality_micros: 900_000,
+            },
+        );
+        deepened.node.repair_failures_dispatched = 7;
+        let world = world_listing(4);
+        let written = recorded_with_derived_counts(&world, &history, &facts, &deepening, deepened);
+        assert_eq!(written.node.repair_failures_dispatched, 1);
+        // The nodes before it are not touched: only the node that is written carries the
+        // counts (the failed node a repair was dispatched on is stored as it was).
+        assert!(matches!(
+            history[0].node.status,
+            ObservedStatus::RepairableFailure {
+                dispatched_repairs: 0,
+                ..
+            }
+        ));
+        assert_eq!(history[0].node.repair_failures_dispatched, 0);
+    }
+
+    /// The claimed dispatch of the `Recover` of node 1, as `run_next` writes it, and the
+    /// node `settle` writes for it (`node-world-1-2`) once it ends in `status`.
+    async fn settle_a_recover_of_node_1(
+        status: ObservedStatus,
+    ) -> (
+        PersistentSearchNode,
+        PersistentSearchNode,
+        PersistentSearchNode,
+        ExplorationDispatchFact,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("settle.sqlite3"))
+            .await
+            .unwrap();
+        let ctx = Context::new("n", "worker", Role::Worker).unwrap();
+        let coordinator = PersistentCoordinator::new(store.clone(), ctx.clone(), "worker").unwrap();
+        let failed = stored_node(1, 1, None, 1, repairable("episode-1", FailureKind::Compile));
+        let mut world = world_listing(1);
+        world.dispatch_ids = vec!["dispatch-recover".into()];
+        let mut claimed = recover_fact(1, 2, Claimed);
+        claimed.id = "dispatch-recover".into();
+        claimed.node_id = None;
+        claimed.outcome_reason = None;
+        claimed.action_id = "recover-1".into();
+        claimed.action_seq = 1_000_003;
+        claimed.selected_action = LegalActionV1 {
+            action_id: "recover-1".into(),
+            action_seq: 1_000_003,
+            branch_seq: 1,
+            target_depth: 2,
+            kind: ActionKindV1::Recover {
+                failed_node_seq: 1,
+                episode_id: "episode-1".into(),
+            },
+            estimated_cost_upper_micros: Some(10),
+        };
+        let mut session = store.session().await.unwrap();
+        put_record(
+            &mut session,
+            &ctx,
+            NODE_RECORD_KIND,
+            &node_id_for("world-1", 1),
+            "worker",
+            &failed,
+        )
+        .await
+        .unwrap();
+        let reason = "outcome".to_string();
+        coordinator
+            .settle(
+                &mut session,
+                LoadedWorld {
+                    world,
+                    nodes: vec![failed.clone()],
+                    facts: vec![claimed.clone()],
+                    legal: LegalActionsV1 {
+                        schema_version: "rsia.legal_actions.v1".into(),
+                        actions: vec![],
+                    },
+                },
+                "dispatch-recover",
+                claimed,
+                10,
+                Settlement {
+                    status,
+                    evidence: ExplorationEvidenceV1::NotObserved,
+                    skill_digest: None,
+                    bundle_digest: None,
+                    selection_digest: None,
+                    reason,
+                },
+            )
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let mut session = store.session().await.unwrap();
+        let failed_after: PersistentSearchNode = need_record(
+            &mut session,
+            &ctx,
+            NODE_RECORD_KIND,
+            &node_id_for("world-1", 1),
+        )
+        .await
+        .unwrap();
+        let written: PersistentSearchNode = need_record(
+            &mut session,
+            &ctx,
+            NODE_RECORD_KIND,
+            &node_id_for("world-1", 2),
+        )
+        .await
+        .unwrap();
+        let fact = need_dispatch_fact(&mut session, &ctx, "dispatch-recover")
+            .await
+            .unwrap();
+        (failed, failed_after, written, fact)
+    }
+
+    #[tokio::test]
+    async fn settle_writes_the_derived_counts_on_its_node_and_nothing_on_the_failed_node() {
+        // A repair that is a repairable failure of the same episode: one repair failure
+        // more than the failed node, and the repair this dispatch just spent on the episode.
+        let (failed, failed_after, written, fact) =
+            settle_a_recover_of_node_1(repairable("episode-1", FailureKind::Compile)).await;
+        assert_eq!(
+            serde_json::to_value(&failed_after).unwrap(),
+            serde_json::to_value(&failed).unwrap(),
+            "the failed node was rewritten"
+        );
+        assert_eq!(written.node.search_parent_seq, Some(1));
+        assert_eq!(written.node.repair_failures_dispatched, 1);
+        assert!(matches!(
+            written.node.status,
+            ObservedStatus::RepairableFailure {
+                dispatched_repairs: 1,
+                ..
+            }
+        ));
+        assert_eq!(fact.state, Observed);
+        assert_eq!(fact.node_id.as_deref(), Some("node-world-1-2"));
+
+        // Of another episode: the same repair failure, and no repair on its episode.
+        let (_, _, written, _) =
+            settle_a_recover_of_node_1(repairable("episode-2", FailureKind::Compile)).await;
+        assert_eq!(written.node.repair_failures_dispatched, 1);
+        assert!(matches!(
+            written.node.status,
+            ObservedStatus::RepairableFailure {
+                dispatched_repairs: 0,
+                ..
+            }
+        ));
+
+        // A repair that ends in anything else repeats the failed node's count: none.
+        for status in [
+            ObservedStatus::HardFailure,
+            ObservedStatus::UsageUncertain,
+            ObservedStatus::Valid {
+                quality_micros: 600_000,
+            },
+        ] {
+            let (failed, failed_after, written, fact) =
+                settle_a_recover_of_node_1(status.clone()).await;
+            assert_eq!(
+                serde_json::to_value(&failed_after).unwrap(),
+                serde_json::to_value(&failed).unwrap(),
+                "{status:?}: the failed node was rewritten"
+            );
+            assert_eq!(written.node.repair_failures_dispatched, 0, "{status:?}");
+            assert_eq!(
+                fact.state,
+                if matches!(status, ObservedStatus::UsageUncertain) {
+                    Uncertain
+                } else {
+                    Observed
+                },
+                "{status:?}"
+            );
+        }
     }
 }
