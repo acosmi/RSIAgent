@@ -1538,22 +1538,53 @@ async fn curriculum_step_status_revocation_gate_and_terminal_preservation() {
     let persisted = raw_job(&admin, &store, &done.id).await;
     assert_eq!(persisted.state, ManagementJobState::Succeeded);
 
-    // A new request after revocation fails inside the job, not at submit.
-    let queued = dispatcher
+    // A new request after revocation is refused at submit (AG-044), not accepted
+    // and failed inside the job: the closure of its learner state holds the
+    // tombstoned source (the body written above does not decode, so the source is
+    // treated as revoked), and the refusal writes nothing.
+    let mut session = store.session().await.unwrap();
+    let jobs = session.namespace_object_count(&admin, "job").await.unwrap();
+    let artifacts = session
+        .namespace_object_count(&admin, "artifact")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let audits = store.verify_audit(&admin).await.unwrap();
+    let refused = dispatcher
         .submit(
             &admin,
             "curriculum.step",
             curriculum_step_request("curriculum-after-revoke"),
         )
-        .await
-        .unwrap();
-    let failed = wait_terminal(&dispatcher, &admin, &queued.id).await;
-    assert_eq!(failed.state, ManagementJobState::Failed);
-    assert_eq!(failed.error_code.as_deref(), Some("conflict"));
+        .await;
+    let Err(Error::Conflict(message)) = refused else {
+        panic!("a new request over a revoked source was not refused: {refused:?}");
+    };
+    assert!(message.contains("artifact task-space-source"), "{message}");
+    assert!(message.contains("revocation tombstone"), "{message}");
+    let mut session = store.session().await.unwrap();
     assert_eq!(
-        dispatcher.status(&admin, &failed.id).await.unwrap().state,
-        ManagementJobState::Failed
+        session.namespace_object_count(&admin, "job").await.unwrap(),
+        jobs
     );
+    assert_eq!(
+        session
+            .namespace_object_count(&admin, "artifact")
+            .await
+            .unwrap(),
+        artifacts
+    );
+    let recorded = session
+        .cached::<ManagementJob, _>(
+            &admin,
+            "curriculum.step",
+            "curriculum-after-revoke",
+            &json!({}),
+        )
+        .await;
+    session.commit().await.unwrap();
+    assert!(matches!(recorded, Ok(None)), "{recorded:?}");
+    assert_eq!(store.verify_audit(&admin).await.unwrap(), audits);
 
     // A job cancelled before claim is never re-verified against sources.
     let cancelled_direct = ManagementJob {

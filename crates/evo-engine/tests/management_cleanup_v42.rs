@@ -2879,11 +2879,12 @@ async fn the_management_cleanup_is_paged_and_resumes_after_a_restart() {
 // private dependency of a new request before it writes anything: a tombstoned
 // source (`begin_revoke` writes one under the source id; the cleanup then deletes
 // a run) or a dependency the cleanup already redacted refuses the whole
-// submission with a `Conflict` that names the dependency. A dependency that does
-// not exist is not refused (the job fails on it inside, as before), and a live
-// artifact whose upstream source was revoked but not cleaned yet cannot be judged
-// from the dependency alone (the session exposes dependency edges only from the
-// dependent side), so that request is accepted and its job fails closed.
+// submission with a `Conflict` that names the dependency. A live artifact whose
+// upstream source was revoked but not cleaned yet is judged too (AG-044): the check
+// then walks the upstream closure of the dependencies (`Session::upstream_closure`)
+// and refuses a request whose closure holds a revoked run or artifact, naming that
+// node. A dependency that does not exist is not refused (the job fails on it
+// inside, as before).
 
 /// What a refused submission must leave untouched: the jobs and artifacts of the
 /// namespace, every edge into the request's dependencies, and the audit chain.
@@ -3151,58 +3152,72 @@ async fn a_request_submitted_between_begin_revoke_and_the_cleanup_is_refused_whe
 }
 
 #[tokio::test]
-async fn an_artifact_dependency_whose_source_is_only_marked_revoked_cannot_be_judged_at_submit() {
+async fn an_artifact_dependency_whose_source_is_only_marked_revoked_is_refused_at_submit() {
     // curriculum.step and replay.run depend on artifacts (learner state, pool),
     // which are still live while only `begin_revoke` ran. Their upstream run is
-    // tombstoned, but the dependency edges are readable only from the dependent
-    // side, so the submit-time check cannot walk up to the run. Such a request is
-    // accepted and its job fails closed on the operation's own checks (the
-    // behaviour the existing revocation-gate tests pin); the cleanup then reaches
-    // its private input like any other.
+    // tombstoned: the submit-time check walks up to it (AG-044) and refuses the
+    // request with a `Conflict` that names the run, writing nothing. The cleanup
+    // then completes as before.
     use curriculum_fx::*;
     let chain = Chain::build().await;
     let (store, admin) = (&chain.fixture.store, &chain.fixture.admin);
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
     let cleanup = begin(store, admin, "run-a").await;
     assert_eq!(cleanup.state, CleanupState::Pending);
-    let queued = dispatcher
-        .submit(
-            admin,
-            "curriculum.step",
-            step_request("curriculum-begin-only"),
-        )
-        .await
-        .unwrap();
-    let failed = wait_job(store, admin, &queued.id).await;
-    assert_eq!(failed.state, ManagementJobState::Failed, "{failed:?}");
-    assert_eq!(failed.error_code.as_deref(), Some("conflict"));
+    let dependencies = [
+        ("artifact", storage_id(PROFILE_KIND, PROFILE_ID)),
+        ("artifact", storage_id(STATE_KIND, STATE_ID)),
+    ];
+    let before = store_shape(store, admin, &dependencies).await;
+    let message = expect_conflict(
+        dispatcher
+            .submit(
+                admin,
+                "curriculum.step",
+                step_request("curriculum-begin-only"),
+            )
+            .await,
+        "submit over a learner state of a tombstoned run",
+    );
+    assert!(message.contains("run run-a"), "{message}");
+    assert!(message.contains("revoked"), "{message}");
+    assert_eq!(
+        store_shape(store, admin, &dependencies).await,
+        before,
+        "a refused submission writes no private input, job, edge or audit record"
+    );
+    assert_no_idempotency_row(store, admin, "curriculum.step", "curriculum-begin-only").await;
     let cleanup = drive(store, admin, cleanup, 8).await;
     assert_eq!(cleanup.state, CleanupState::Complete, "{cleanup:?}");
-    assert_redacted_input(
-        &raw(store, admin, "artifact", &failed.private_input_ref).await,
-        &failed.private_input_ref,
-    );
 
     let (_dir, store, admin) = exploration_fx::open("replay-begin-only.sqlite3").await;
     let pool = replay_fx::setup_sealed_pool(&admin, &store).await;
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
     let cleanup = begin(&store, &admin, "source-2").await;
     assert_eq!(cleanup.state, CleanupState::Pending);
-    let queued = dispatcher
-        .submit(
-            &admin,
-            "replay.run",
-            replay_fx::run_request("replay-begin-only", &pool),
-        )
-        .await
-        .unwrap();
-    let failed = wait_job(&store, &admin, &queued.id).await;
-    assert_eq!(failed.state, ManagementJobState::Failed, "{failed:?}");
-    assert_eq!(failed.error_code.as_deref(), Some("conflict"));
+    let dependencies = [(
+        "artifact",
+        evo_storage::replay::replay_pool_storage_id(&pool.pool_digest).unwrap(),
+    )];
+    let before = store_shape(&store, &admin, &dependencies).await;
+    let message = expect_conflict(
+        dispatcher
+            .submit(
+                &admin,
+                "replay.run",
+                replay_fx::run_request("replay-begin-only", &pool),
+            )
+            .await,
+        "submit over a pool of a tombstoned run",
+    );
+    assert!(message.contains("run source-2"), "{message}");
+    assert!(message.contains("revoked"), "{message}");
+    assert_eq!(
+        store_shape(&store, &admin, &dependencies).await,
+        before,
+        "a refused submission writes no private input, job, edge or audit record"
+    );
+    assert_no_idempotency_row(&store, &admin, "replay.run", "replay-begin-only").await;
     let cleanup = drive(&store, &admin, cleanup, 8).await;
     assert_eq!(cleanup.state, CleanupState::Complete, "{cleanup:?}");
-    assert_redacted_input(
-        &raw(&store, &admin, "artifact", &failed.private_input_ref).await,
-        &failed.private_input_ref,
-    );
 }
