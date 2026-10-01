@@ -1974,7 +1974,32 @@ pub fn exploration_world_storage_id(world_id: &str) -> Result<String> {
     storage_id(WORLD_RECORD_KIND, world_id)
 }
 
-fn storage_id(record_kind: &str, id: &str) -> Result<String> {
+impl PersistentCoordinator {
+    /// Reads one registered world through its live source closure. The stored
+    /// world must validate and carry the id it is stored under, and its source
+    /// closure must still be live: watermark drift is `Conflict`, a tombstoned
+    /// source is `Forbidden`, a missing source fails closed, and a redacted
+    /// world is named by the read (`Conflict`). Read-only: nothing is written
+    /// and no model is reached. It is the read half the MetaTrial gate
+    /// (`meta.rs`) builds on.
+    pub(crate) async fn registered_world(&self, id: &str) -> Result<ExplorationWorldV1> {
+        identifier(id)?;
+        let mut session = self.store.session().await?;
+        let world: ExplorationWorldV1 =
+            need_record(&mut session, &self.context, WORLD_RECORD_KIND, id).await?;
+        world.validate()?;
+        if world.id != id {
+            return Err(Error::Conflict(
+                "stored exploration world differs from its storage identity".into(),
+            ));
+        }
+        check_world_live(&mut session, &self.context, &world).await?;
+        session.commit().await?;
+        Ok(world)
+    }
+}
+
+pub(crate) fn storage_id(record_kind: &str, id: &str) -> Result<String> {
     identifier(record_kind)?;
     identifier(id)?;
     Ok(format!("e09-{}", fingerprint(&(record_kind, id))?))
@@ -2022,7 +2047,7 @@ async fn read_envelope<T: DeserializeOwned>(
     }
 }
 
-async fn get_record<T: DeserializeOwned>(
+pub(crate) async fn get_record<T: DeserializeOwned>(
     session: &mut Session,
     ctx: &Context,
     record_kind: &str,
@@ -2045,7 +2070,7 @@ async fn get_record<T: DeserializeOwned>(
     }
 }
 
-async fn need_record<T: DeserializeOwned>(
+pub(crate) async fn need_record<T: DeserializeOwned>(
     session: &mut Session,
     ctx: &Context,
     record_kind: &str,
@@ -2114,7 +2139,7 @@ async fn need_dispatch_fact(
         .ok_or(Error::NotFound)
 }
 
-async fn put_record<T: Serialize>(
+pub(crate) async fn put_record<T: Serialize>(
     session: &mut Session,
     ctx: &Context,
     record_kind: &str,

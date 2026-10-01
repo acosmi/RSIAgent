@@ -2382,6 +2382,13 @@ async fn cleanup_node_content(
             | "exploration_dispatch_v1"
             | "optimization_history_v1",
         ) => true,
+        // E14.2a MetaTrial: the trial record carries the two improver contents,
+        // the S0 digests and the source closure it forks. That is derived from the
+        // trusted runs it names, so it is redacted like the two worlds it forks.
+        // Its dependency edges (trial -> source runs and trial -> both worlds,
+        // written in the transaction that writes the record) are what carry a
+        // revoked run to it.
+        ("artifact", "rsia.exploration_artifact_envelope.v1", "meta_trial_v1") => true,
         ("candidate" | "artifact", "rsia.release_candidate.v1", _) => true,
         ("artifact", "rsia.run_application.v1", _)
         | ("receipt", "rsia.host_application.v1", _)
