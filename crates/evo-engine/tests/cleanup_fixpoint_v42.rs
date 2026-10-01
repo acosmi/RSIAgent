@@ -1,20 +1,20 @@
-//! AG-035 (E08/E07/§11, V017): a revocation cleanup completes only at a closure
-//! fixpoint, so a management request accepted while the cleanup runs is cleaned
-//! before the job reports `Complete`. Real SQLite store, no model, no provider,
+//! AG-035 (E08/E07/§11, V017): the current regression injects late dependents
+//! directly through `Session::put` and `put_edge` while revocation cleanup runs.
+//! It asserts that all twenty private inputs are redacted before the job reports
+//! `Complete`, with zero pending nodes. Real SQLite store, no model, no provider,
 //! zero monetary cost.
 //!
-//! The submit check of a management request refuses a dependency that was
-//! already redacted, but until the cleanup reaches the replay pool a request over
-//! it is accepted: its private input (the whole request payload) is stored with an
-//! edge to the pool and its job then fails closed on the operation's own watermark
-//! check. That edge is written after `begin_revoke`. The cleanup pages the
-//! dependents of the pool through a forward key-set cursor and expands the pool
-//! once; an input whose id sorts before the cursor, or that arrives after the
-//! pool was expanded, was never visited, and the job still reported `Complete`.
-//! The id of a private input is a hash of its request key, so the position
-//! relative to the cursor is arbitrary, and with the request keys below eight of
-//! the twenty accepted inputs stayed in plaintext
-//! (`rsia.management_private_input.v1`) at `Complete`.
+//! Management submission now rejects dependencies with revoked upstream sources,
+//! even before the replay pool itself is redacted. The test therefore bypasses
+//! that submit gate to exercise cleanup of late edges written after `begin_revoke`.
+//! The injected records retain the current `rsia.management_private_input.v1`
+//! schema; this test does not cover every cleanup schema or concurrent schedule.
+//!
+//! Historically, before the closure-fixpoint repair, eight of these twenty inputs
+//! remained in plaintext at `Complete`: a forward key-set cursor could miss an
+//! input sorting before it or arriving after the pool was expanded. That 8/20
+//! observation describes the pre-fix reproduction, not the current assertion.
+//! A separate closed-graph regression preserves the prior step and node counts.
 //!
 //! The fixtures below are copied from `tests/replay_redacted_reads_v42.rs`
 //! (themselves copied from `tests/management_cleanup_v42.rs` and

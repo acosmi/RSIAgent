@@ -646,11 +646,11 @@ impl MetaTrialCoordinator {
     /// verified against the trial when it is present. A trial is never
     /// reported live without both worlds ([`verified_meta_trial`]).
     ///
-    /// A stored world is never re-registered. Its registration fingerprint
-    /// covers budget counters that `run_next` spends, so after a dispatch a
-    /// re-registration would conflict with the world's own earlier commit; the
-    /// trial verifies a stored world against the immutable facts it recorded
-    /// itself instead.
+    /// The registration fingerprint excludes the budget counters `run_next`
+    /// spends; idempotent registration checks the initial budget separately.
+    /// This fork verifies a stored world against the trial's immutable facts
+    /// and registers a world only when it is absent, rather than re-registering
+    /// a stored world.
     ///
     /// The fork reads the root budget (the billing scope must name one of this
     /// namespace) and reserves nothing. It makes no model call and enqueues no

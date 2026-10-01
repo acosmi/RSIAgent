@@ -104,7 +104,7 @@ git clone https://github.com/acosmi/RSIAgent.git && cd RSIAgent
 cat docs/implementation-ledger.md
 ```
 
-The CLI entry (`apps/rsia`) currently prints an in-progress bootstrap message and does **not** start a full service. Prefer the ledger over tutorials that assume `cargo run` already exposes MCP/HTTP.
+The CLI entry (`apps/rsia`) wires `serve` to the HTTP service, `mcp` to the four stdio MCP tools with a startup-fixed Agent identity, and `manage` to authenticated HTTP management jobs. The default bootstrap uses a disabled model transport and `ToolOnly` capabilities; without configured HTTP authentication, sensitive requests are refused with 503. These entry points do not establish production readiness; consult the ledger for the current support scope.
 
 ### Target host flow (designed)
 
@@ -144,7 +144,7 @@ Candidate states include: Proposed → Validated → AcceptancePassed → Approv
 ## Repository layout
 
 ```
-apps/rsia           CLI / process entry (bootstrap today)
+apps/rsia           CLI / process entry (serve / mcp / manage)
 crates/evo-core     Pure contracts & acceptance rules
 crates/evo-storage  Persistence
 crates/evo-engine   Controlled improvement & evaluation
