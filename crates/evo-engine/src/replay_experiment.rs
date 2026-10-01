@@ -268,9 +268,49 @@ impl PersistentReplayEconomicCoordinator {
             cancel_reason: None,
             created_seq,
         };
+        // The second session verifies the sources again, in the session that writes.
+        Self::write_started_job(ctx, store, &experiment, job).await
+    }
+
+    /// The second session of [`Self::start`]: the one that writes the job and its
+    /// edge to the experiment.
+    ///
+    /// The first session verified the experiment's sources, and then the live
+    /// selection and the paired E05 ticket were read without a session, so a
+    /// revocation can commit (it moves the revoke watermark) between the two. The
+    /// sources are therefore verified again here, in the session that writes: the
+    /// store has one connection, so nothing can commit between this check and the
+    /// writes below. A source that no longer matches is refused with the error
+    /// `verify_experiment_sources` reports (a `Conflict` for a moved watermark or
+    /// a changed digest, `NotFound` for a source that is gone), and nothing is
+    /// written: no job, no edge. The check comes first, like in the first session,
+    /// so a replay of a started key over changed sources is refused as well.
+    ///
+    /// Hidden from the documentation and not part of the API: it is public only
+    /// so that a test, which is a separate crate, can run this session after a
+    /// revocation. It checks its caller the way `start` does (an Evaluator that
+    /// owns the experiment) and that the job is of that experiment, but the job
+    /// itself is the caller's: nothing but `start` and such a test should call it.
+    #[doc(hidden)]
+    pub async fn write_started_job(
+        ctx: &Context,
+        store: &Store,
+        experiment: &ReplayEconomicExperimentV1,
+        job: ReplayEconomicJobV1,
+    ) -> Result<ReplayEconomicJobV1> {
+        ctx.require(&[Role::Evaluator])?;
+        if experiment.evaluator_actor != ctx.actor() {
+            return Err(Error::Forbidden);
+        }
+        if job.experiment_id != experiment.id {
+            return Err(Error::Invalid(
+                "job belongs to a different economic experiment".into(),
+            ));
+        }
         let mut session = store.session().await?;
+        verify_experiment_sources(&mut session, ctx, experiment).await?;
         if let Some(existing) =
-            get_record::<ReplayEconomicJobV1>(&mut session, ctx, JOB_KIND, &job_id).await?
+            get_record::<ReplayEconomicJobV1>(&mut session, ctx, JOB_KIND, &job.id).await?
         {
             if existing.request_digest != job.request_digest {
                 return Err(Error::Conflict("economic job concurrently changed".into()));
