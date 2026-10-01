@@ -3,8 +3,8 @@
 //! and replay/self-report artifacts cannot mint a formal evaluation.
 use evo_core::evaluation::{
     BernsteinReport, ClusterObservation, ExperimentPlan, FormalExperimentPlanV41,
-    OptimizationBudgetPlan, OptimizerComparisonContract, Verdict, decide, empirical_bernstein,
-    parse_decimal,
+    OptimizationBudgetPlan, OptimizerComparisonContract, ProfileKind, Verdict, decide,
+    empirical_bernstein, parse_decimal,
 };
 use evo_core::holdout::{
     AnchorCoverageMatrix, AnchorResult, ExposureLedger, ExposureState, FrozenCandidatePair,
@@ -109,10 +109,13 @@ pub enum CostEvidenceScope {
 }
 
 impl RegisteredEvaluationControl {
-    pub const SCHEMA: &'static str = "rsia.registered_evaluation_control.v1";
+    /// Frozen controls retain the original blanket-inconclusive postprocessing.
+    pub const SCHEMA_V1: &'static str = "rsia.registered_evaluation_control.v1";
+    /// Explicitly selects verdict preservation without changing the core algorithm.
+    pub const SCHEMA: &'static str = "rsia.registered_evaluation_control.v2";
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != Self::SCHEMA {
+        if self.schema_version != Self::SCHEMA_V1 && self.schema_version != Self::SCHEMA {
             return Err(Error::Invalid(
                 "unsupported registered-control schema".into(),
             ));
@@ -1838,6 +1841,12 @@ impl IndependentEvaluationControl {
                 "ticket is not ready for fixed-sample finalization".into(),
             ));
         }
+        let registration_digest = control.digest()?;
+        if registration_digest != ticket.registration_digest {
+            return Err(Error::Conflict(
+                "registered control digest differs from the frozen ticket".into(),
+            ));
+        }
         let mut calls = Vec::new();
         let mut candidate_cost = 0i128;
         let mut baseline_cost = 0i128;
@@ -1934,17 +1943,11 @@ impl IndependentEvaluationControl {
         if bound_v1_plan.digest()? != ticket.bound_v1_plan_digest {
             return Err(Error::Conflict("bound v1 plan digest mismatch".into()));
         }
-        let mut report = decide(&bound_v1_plan, raw, cost_ratio, p95_ratio, true)?;
-        if ticket.profile == evo_core::evaluation::ProfileKind::NoninferiorSavings {
-            report.verdict = Verdict::Inconclusive;
-            report
-                .reasons
-                .push("cost_savings_statistical_proof_unsupported".into());
-        }
-        report.verdict = Verdict::Inconclusive;
-        report
-            .reasons
-            .push("complete_optimization_cost_not_verified".into());
+        let report = postprocess_complete_report(
+            &control.schema_version,
+            ticket.profile,
+            decide(&bound_v1_plan, raw, cost_ratio, p95_ratio, true)?,
+        )?;
         let anchor_evidence_digest = anchor_evidence_digest(&ticket)?;
         let resource_evidence = ResourceEvidenceRecord {
             schema_version: "rsia.evaluation_resource_evidence.v1".into(),
@@ -1961,6 +1964,13 @@ impl IndependentEvaluationControl {
             || fingerprint(&latest)? != fingerprint(&ticket)?
         {
             return Err(Error::Conflict("ticket changed during finalization".into()));
+        }
+        let latest_control: RegisteredEvaluationControl =
+            need_record(&mut session, ctx, CONTROL_KIND, &latest.registration_id).await?;
+        if latest_control.digest()? != registration_digest {
+            return Err(Error::Conflict(
+                "registered control digest changed during finalization".into(),
+            ));
         }
         session
             .stop_dispatch_group(
@@ -3658,6 +3668,50 @@ fn stop_reason(decision: EarlyStopDecision) -> &'static str {
     }
 }
 
+fn postprocess_complete_report(
+    control_schema: &str,
+    profile: ProfileKind,
+    mut report: BernsteinReport,
+) -> Result<BernsteinReport> {
+    match control_schema {
+        RegisteredEvaluationControl::SCHEMA_V1 => {
+            // Preserve frozen v1 reports, including their original reason order.
+            if profile == ProfileKind::NoninferiorSavings {
+                report.verdict = Verdict::Inconclusive;
+                report
+                    .reasons
+                    .push("cost_savings_statistical_proof_unsupported".into());
+            }
+            report.verdict = Verdict::Inconclusive;
+            report
+                .reasons
+                .push("complete_optimization_cost_not_verified".into());
+        }
+        RegisteredEvaluationControl::SCHEMA => {
+            if profile == ProfileKind::NoninferiorSavings && report.verdict == Verdict::Noninferior
+            {
+                report.verdict = Verdict::Inconclusive;
+                report
+                    .reasons
+                    .push("cost_savings_statistical_proof_unsupported".into());
+            } else if report.verdict == Verdict::Regressed
+                && report.reasons.iter().any(|reason| reason == "negative_lcb")
+            {
+                report.verdict = Verdict::Inconclusive;
+                report
+                    .reasons
+                    .push("regression_not_confirmed_ucb_boundary_not_crossed".into());
+            }
+        }
+        _ => {
+            return Err(Error::Invalid(
+                "unsupported registered-control schema".into(),
+            ));
+        }
+    }
+    Ok(report)
+}
+
 fn p95(values: &mut [u64]) -> Result<u64> {
     if values.is_empty() {
         return Err(Error::Invalid("p95 requires observations".into()));
@@ -3668,4 +3722,57 @@ fn p95(values: &mut [u64]) -> Result<u64> {
         .ok_or_else(|| Error::Invalid("p95 rank overflow".into()))?
         .div_ceil(100);
     Ok(values[rank.saturating_sub(1)])
+}
+
+#[cfg(test)]
+mod complete_verdict_tests {
+    use super::*;
+
+    #[test]
+    fn v2_postprocessing_preserves_safety_regression_without_negative_lcb() {
+        // Complete-batch finalization always passes safety_ok=true; this checks
+        // only the private defensive rule, not a reachable batch safety path.
+        for profile in [ProfileKind::QualityGain, ProfileKind::NoninferiorSavings] {
+            let mut plan = ExperimentPlan::first_low_risk("safety-fixture").unwrap();
+            plan.profile = profile;
+            plan.freeze(1).unwrap();
+            plan.bind_candidate("candidate").unwrap();
+            let rows = vec![
+                ClusterObservation {
+                    cluster_id: "one".into(),
+                    d: 1.0,
+                    weight: 1.0,
+                },
+                ClusterObservation {
+                    cluster_id: "two".into(),
+                    d: 1.0,
+                    weight: 1.0,
+                },
+            ];
+            let report = decide(
+                &plan,
+                empirical_bernstein(&rows, 0.04).unwrap(),
+                1.0,
+                1.0,
+                false,
+            )
+            .unwrap();
+            assert_eq!(report.verdict, Verdict::Regressed);
+            assert_eq!(report.reasons, vec!["safety_failed"]);
+            let kept =
+                postprocess_complete_report(RegisteredEvaluationControl::SCHEMA, profile, report)
+                    .unwrap();
+            assert_eq!(kept.verdict, Verdict::Regressed);
+            assert_eq!(kept.reasons, vec!["safety_failed"]);
+        }
+    }
+
+    #[test]
+    fn private_postprocessing_rejects_an_unknown_control_version() {
+        let report = empirical_bernstein(&[], 0.04).unwrap();
+        assert!(matches!(
+            postprocess_complete_report("unknown", ProfileKind::QualityGain, report),
+            Err(Error::Invalid(_))
+        ));
+    }
 }
