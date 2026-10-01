@@ -15,6 +15,7 @@ use evo_core::skill_edit::{
     CompiledSkillEdit, ProtectedTextRange, SkillEditBatch, TrustedEditContext,
 };
 use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, identifier};
+use evo_storage::lifecycle::{RevokeTombstone, redacted_object_body};
 use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -964,6 +965,61 @@ impl StoreOptimizationJournal {
     pub async fn reload(&self, artifact_id: &str) -> Result<StageFact> {
         self.lookup(artifact_id).await?.ok_or(Error::NotFound)
     }
+
+    /// Stores `fact` as the `rsia.redacted.v1` object the revocation cleanup would
+    /// have made of it (`redacted_object_body`, the one construction), and nothing
+    /// of its payload. The dependency edges are kept, so the fact stays on the
+    /// closure of the runs it depends on. The idempotency row is written for the
+    /// same key and the same digest and is redacted at once: the same fact is
+    /// refused if it is committed again (`cached` refuses a redacted subject), and
+    /// no stored response holds its content. `session` is the transaction the
+    /// decision was taken in.
+    async fn commit_redacted(&self, mut session: Session, fact: &StageFact) -> Result<()> {
+        let value = serde_json::to_value(fact).map_err(|_| Error::Internal)?;
+        let body = serde_json::to_string(fact).map_err(|_| Error::Internal)?;
+        let redacted = redacted_object_body("artifact", &fact.artifact_id, &value, &body);
+        session
+            .put(
+                &self.context,
+                "artifact",
+                &fact.artifact_id,
+                &self.owner,
+                &redacted,
+            )
+            .await?;
+        for dependency in &fact.dependencies {
+            session
+                .put_edge(
+                    &self.context,
+                    "artifact",
+                    &fact.artifact_id,
+                    &dependency.kind,
+                    &dependency.id,
+                )
+                .await?;
+        }
+        session
+            .cache(
+                &self.context,
+                "optimization.stage",
+                &fact.artifact_id,
+                fact,
+                &fact.artifact_id,
+                &serde_json::Value::Null,
+            )
+            .await?;
+        session
+            .redact_cache(&self.context, &fact.artifact_id)
+            .await?;
+        session
+            .audit(
+                &self.context,
+                "optimization.stage.commit_redacted",
+                &fact.artifact_id,
+            )
+            .await?;
+        session.commit().await
+    }
 }
 
 #[async_trait]
@@ -1157,6 +1213,18 @@ impl OptimizationJournal for StoreOptimizationJournal {
             }
             session.commit().await?;
             return Ok(());
+        }
+        // A fact that holds a model's answer and lands after a run it depends on was
+        // revoked is accepted, because the receipt it carries is accounting truth,
+        // but its content is not kept: the revocation cleanup only reaches what
+        // exists when it looks, so an answer stored in plaintext now could stay in
+        // the database for good. The decision is taken here, in the transaction that
+        // would write the fact, so that no revocation can fall between the check and
+        // the write.
+        if holds_model_output(&fact)
+            && run_dependency_revoked(&mut session, &self.context, &fact).await?
+        {
+            return self.commit_redacted(session, &fact).await;
         }
         session
             .put(
@@ -2546,6 +2614,8 @@ async fn validate_live_fact(
     fact: &StageFact,
 ) -> Result<()> {
     // Raw late receipts preserve billing/audit truth; every consumer still checks their watermark.
+    // What such a receipt holds of a revoked source's answer is not kept: `commit` stores
+    // it redacted (`run_dependency_revoked`).
     if fact.kind == StageFactKind::DispatchObserved {
         return Ok(());
     }
@@ -2564,4 +2634,49 @@ async fn validate_live_fact(
         crate::evidence::validate_stored_sources(session, context, &ids, expected).await?;
     }
     Ok(())
+}
+
+/// Whether `fact` holds the answer of a model: the observation of a model call (the
+/// whole `ModelResponse`, or the outcome built from it) of a model stage. The
+/// scores-only observation of the development runner holds none, and is not handled.
+fn holds_model_output(fact: &StageFact) -> bool {
+    matches!(
+        fact.kind,
+        StageFactKind::DispatchObserved | StageFactKind::ResponseObserved
+    ) && fact.stage != OptimizationJournalStage::Development
+}
+
+/// Whether a run `fact` depends on was revoked as a run, inside the caller's
+/// transaction. The tombstone of the run decides, and nothing else:
+///
+/// * not the watermark, which any revocation moves (another source's included): a
+///   fact over live runs must not be redacted because something unrelated was
+///   revoked, and the consumers of such a fact still check the watermark on read;
+/// * the kind is compared exactly: a tombstone is keyed by the id of its source
+///   alone and records the kind it was written for, so the tombstone of an artifact
+///   that shares the id of a run revokes the artifact, not the run. A tombstone that
+///   is not one `begin_revoke` writes (it does not decode) is matched to no kind and
+///   redacts nothing here. Production never writes one, and a reader that checks the
+///   watermark of the fact (`lookup`, the recovery journal) still refuses it over such
+///   a tombstone, because `validate_stored_sources` takes any tombstone for a
+///   revocation.
+async fn run_dependency_revoked(
+    session: &mut Session,
+    context: &Context,
+    fact: &StageFact,
+) -> Result<bool> {
+    for dependency in fact.dependencies.iter().filter(|d| d.kind == "run") {
+        let Some(body) = session
+            .get::<serde_json::Value>(context, "tombstone", &dependency.id)
+            .await?
+        else {
+            continue;
+        };
+        if serde_json::from_value::<RevokeTombstone>(body)
+            .is_ok_and(|tombstone| tombstone.source_kind == "run")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
