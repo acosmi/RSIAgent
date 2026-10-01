@@ -802,6 +802,46 @@ async fn load_stage_fact(session: &mut Session, ctx: &Context, id: &str) -> Resu
         .map_err(|_| Error::Invalid("development stage fact is not a strict stage fact".into()))
 }
 
+/// The schema of the tombstone the revocation cleanup leaves in place of an object.
+const REDACTED_SCHEMA: &str = "rsia.redacted.v1";
+
+/// Reads the stored body of the stage fact `id`.
+///
+/// After a source revocation the cleanup replaces the body with an
+/// `rsia.redacted.v1` tombstone, which is not a stage fact, and a fact written
+/// after the revocation is stored as one (`StoreOptimizationJournal::commit_redacted`).
+/// That is the expected state of a revoked step, not corruption, so the read names
+/// it: a `Conflict` with a fixed message, the verdict the exploration, curriculum and
+/// replay stores give a redacted record of theirs (`read_envelope`, `get_record`),
+/// instead of a decode failure that would surface as `Internal`. The body is
+/// inspected before it is decoded, so the expected state does not raise the storage
+/// layer's "database operation failed" error log either. Any other body that does
+/// not decode is corruption and stays `Internal`.
+async fn read_stage_fact(
+    session: &mut Session,
+    context: &Context,
+    id: &str,
+) -> Result<Option<StageFact>> {
+    let Some(body) = session
+        .get::<serde_json::Value>(context, "artifact", id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if body.get("schema_version").and_then(|value| value.as_str()) == Some(REDACTED_SCHEMA) {
+        return Err(Error::Conflict(format!(
+            "optimization stage fact {id} was redacted because its source was revoked"
+        )));
+    }
+    match serde_json::from_value(body) {
+        Ok(fact) => Ok(Some(fact)),
+        Err(error) => {
+            tracing::error!(%error, id, "stored optimization stage fact does not decode");
+            Err(Error::Internal)
+        }
+    }
+}
+
 /// Public entry to the E03 observation gate for consumers that do not hold a
 /// session (E13 and operators). Same rules as the in-session gate.
 pub async fn verify_development_observation(
@@ -1087,7 +1127,7 @@ impl OptimizationJournal for StoreOptimizationJournal {
     }
     async fn lookup(&self, artifact_id: &str) -> Result<Option<StageFact>> {
         let mut session = self.store.session().await?;
-        let fact: Option<StageFact> = session.get(&self.context, "artifact", artifact_id).await?;
+        let fact = read_stage_fact(&mut session, &self.context, artifact_id).await?;
         session.commit().await?;
         if let Some(fact) = &fact {
             fact.validate()?;
@@ -2654,12 +2694,15 @@ fn holds_model_output(fact: &StageFact) -> bool {
 ///   revoked, and the consumers of such a fact still check the watermark on read;
 /// * the kind is compared exactly: a tombstone is keyed by the id of its source
 ///   alone and records the kind it was written for, so the tombstone of an artifact
-///   that shares the id of a run revokes the artifact, not the run. A tombstone that
-///   is not one `begin_revoke` writes (it does not decode) is matched to no kind and
-///   redacts nothing here. Production never writes one, and a reader that checks the
-///   watermark of the fact (`lookup`, the recovery journal) still refuses it over such
-///   a tombstone, because `validate_stored_sources` takes any tombstone for a
-///   revocation.
+///   that shares the id of a run revokes the artifact, not the run, and spares the
+///   fact. Every other tombstone revokes: one written for a run, and one that cannot
+///   be read as a tombstone `begin_revoke` writes (a kind it does not write, or a
+///   body that does not decode) cannot be matched to anything and fails closed, the
+///   rule of the other tombstone gates (the management submit check, the budget
+///   reservation, dispatch and settlement gates). Production never writes such a
+///   tombstone; the rule only decides what a hand-written one means. (The readers of
+///   the fact go further: `validate_stored_sources` takes any tombstone for a
+///   revocation.)
 async fn run_dependency_revoked(
     session: &mut Session,
     context: &Context,
@@ -2672,9 +2715,10 @@ async fn run_dependency_revoked(
         else {
             continue;
         };
-        if serde_json::from_value::<RevokeTombstone>(body)
-            .is_ok_and(|tombstone| tombstone.source_kind == "run")
-        {
+        let source_kind = serde_json::from_value::<RevokeTombstone>(body)
+            .ok()
+            .map(|tombstone| tombstone.source_kind);
+        if source_kind.as_deref() != Some("artifact") {
             return Ok(true);
         }
     }

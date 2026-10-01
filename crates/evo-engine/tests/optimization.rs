@@ -1275,7 +1275,18 @@ async fn exercise_late_revocation<'a>(make_request: impl Fn() -> OptimizationSte
     let mut session = store.session().await.unwrap();
     let facts: Vec<serde_json::Value> = session.list(&context, "artifact").await.unwrap();
     session.commit().await.unwrap();
-    assert!(facts.iter().any(|v| v["kind"] == "dispatch_observed"));
+    // The answer lands after the tombstone of `run-success`, which `begin_revoke` did
+    // not write (it does not decode): like every other tombstone gate, the journal
+    // takes it for a revocation. The receipt is kept as the redacted object the
+    // cleanup would make of the fact, and the model's answer is not stored.
+    assert!(!facts.iter().any(|v| v["kind"] == "dispatch_observed"));
+    assert!(
+        facts
+            .iter()
+            .any(|v| v["schema_version"] == "rsia.redacted.v1"
+                && v["state"] == "source_revoked"
+                && v["metadata"]["kind"] == "dispatch_observed")
+    );
     assert!(!facts.iter().any(|v| v["kind"] == "terminal_candidate"));
 }
 

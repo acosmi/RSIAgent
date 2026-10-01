@@ -20,14 +20,22 @@
 //! fact (a `DispatchObserved` or `ResponseObserved` fact of a model stage), whether a
 //! run it depends on is revoked, by the tombstone of that run and nothing else: not
 //! the watermark (another source's revocation moves it, and must not redact an
-//! unrelated fact), and by kind (a tombstone written for an artifact that shares the
-//! id of the run revokes the artifact, not the run). If one is, the fact is stored
-//! as the `rsia.redacted.v1` object the cleanup would have made of it, its
-//! dependency edges are kept, and its idempotency row is written redacted, so the
-//! same fact is refused if it is committed again. Nothing else changes: the write
-//! is accepted (the receipt is kept), the step's own liveness check after it still
-//! fails the step, the ledger is the ledger's, and a fact over live sources is
-//! stored exactly as committed.
+//! unrelated fact), and by kind. The only tombstone that spares the run is the one
+//! written for an artifact that shares its id (that revokes the artifact, not the
+//! run); every other tombstone redacts the fact: one written for a run, one of a
+//! kind `begin_revoke` does not write, and one that does not decode, which fails
+//! closed like the other tombstone gates (AG-032, AG-038, AG-043). If a run is
+//! revoked, the fact is stored as the `rsia.redacted.v1` object the cleanup would
+//! have made of it, its dependency edges are kept, and its idempotency row is
+//! written redacted, so the same fact is refused if it is committed again. Nothing
+//! else changes: the write is accepted (the receipt is kept), the step's own
+//! liveness check after it still fails the step, the ledger is the ledger's, and a
+//! fact over live sources is stored exactly as committed.
+//!
+//! Reading such a fact back is an expected state after a revocation, not a storage
+//! failure: `lookup` names it (a `Conflict` with a fixed message, as the exploration,
+//! curriculum and replay stores name a redacted record) instead of `Internal`, and a
+//! body that is neither a stage fact nor a tombstone stays `Internal`.
 //!
 //! "No plaintext" is read as physical absence where the marker is written by nothing
 //! but the stage fact: the raw bytes of the database file and its write-ahead log,
@@ -42,13 +50,14 @@
 //! the revocation (the free pages and the write-ahead log of an output the broker
 //! stored while the source was live), facts without a run dependency, the facts a
 //! revoked source's other writers leave (the liveness check refuses them, as
-//! before), a tombstone that `begin_revoke` did not write (it matches no kind, so a
-//! fact over it is stored as committed), and the scores-only facts of the
-//! development runner, which hold no model output and are left as they are.
+//! before), and the scores-only facts of the development runner, which hold no
+//! model output and are left as they are.
 //!
 //! Fixtures are copied from `tests/exploration_trust_v42.rs`,
 //! `tests/late_response_revoked_v42.rs` and `tests/optimization.rs`; the originals
-//! are untouched.
+//! are untouched, but for one assertion of `tests/optimization.rs`
+//! (`exercise_late_revocation`: its hand-written tombstone is the unreadable one
+//! above, so the late `DispatchObserved` it checks is now the redacted object).
 
 use async_trait::async_trait;
 use evo_core::contract::{HostCapabilities, ImproverPatch, Profile, SkillSnapshot};
@@ -607,6 +616,10 @@ enum InFlight {
     /// The tombstone of an artifact that shares the id of `RUNS[0]` is written, and
     /// the watermark moves as the revocation of an artifact moves it.
     RevokeArtifactWithTheSameId,
+    /// `RUNS[0]` is revoked by a tombstone `begin_revoke` did not write (the
+    /// hand-written `{"revoked":true}` of `tests/optimization.rs`), and the watermark
+    /// moves. No cleanup job exists for it.
+    RevokeWithAnUnreadableTombstone,
 }
 
 impl InFlight {
@@ -635,6 +648,22 @@ impl InFlight {
                     .await?;
                 session
                     .bump_watermark(&admin(), &d("artifact-revoked"))
+                    .await?;
+                session.commit().await?;
+            }
+            Self::RevokeWithAnUnreadableTombstone => {
+                let mut session = store.session().await?;
+                session
+                    .put(
+                        &admin(),
+                        "tombstone",
+                        RUNS[0],
+                        "admin",
+                        &json!({"revoked": true}),
+                    )
+                    .await?;
+                session
+                    .bump_watermark(&admin(), &d("unreadable-revoked"))
                     .await?;
                 session.commit().await?;
             }
@@ -903,6 +932,32 @@ async fn cache_row(store: &Store, fact: &StageFact) -> CacheRow {
             "the idempotency row of {} is unreadable: {other:?}",
             fact.artifact_id
         ),
+    }
+}
+
+/// Overwrites the stored body of the object `id` (an artifact), the way a store
+/// holding another record would.
+async fn put_raw(store: &Store, id: &str, body: &Value) {
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&worker(), "artifact", id, "worker", body)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+}
+
+/// What a read says of a stage fact that was redacted because its source was
+/// revoked, word for word.
+fn redacted_message(id: &str) -> String {
+    format!("optimization stage fact {id} was redacted because its source was revoked")
+}
+
+/// `result` must be the named `Conflict` of a redacted stage fact `id`: not
+/// `Internal`, not another `Conflict`, not a fact.
+fn assert_names_redaction<T: std::fmt::Debug>(result: Result<T>, id: &str, what: &str) {
+    match result {
+        Err(Error::Conflict(message)) => assert_eq!(message, redacted_message(id), "{what}"),
+        other => panic!("{what}: expected the named Conflict of {id}, got {other:?}"),
     }
 }
 
@@ -1235,9 +1290,10 @@ async fn a_late_observation_leaves_no_output(cleanup: Option<u32>) {
         matches!(&again, Err(Error::Conflict(message)) if message.contains("subject was deleted")),
         "{what}: {again:?}"
     );
-    assert!(
-        !matches!(journal.lookup(&late.artifact_id).await, Ok(Some(_))),
-        "{what}: the redacted observation is served as a usable fact"
+    assert_names_redaction(
+        journal.lookup(&late.artifact_id).await,
+        &late.artifact_id,
+        &format!("{what}: lookup"),
     );
     let defects = defects_of_late_storage(Some(&path), &store, &late, given).await;
     assert!(
@@ -1384,32 +1440,42 @@ async fn an_observation_over_live_sources_is_stored_as_committed() {
 }
 
 /// A tombstone is keyed by the id of its source alone and records the kind it was
-/// written for. Only the tombstone of a run redacts an observation that depends on
-/// the run; the tombstone of an artifact that shares the id does not (and the same
-/// construction written for a run does).
+/// written for. An observation that depends on a run is spared only by the tombstone
+/// of an artifact that shares the run's id (that is another object's revocation).
+/// Every other tombstone redacts it: one written for a run, one of a kind
+/// `begin_revoke` does not write, one that is not a tombstone `begin_revoke` writes
+/// at all (the hand-written `{"revoked":true}` of the older fixtures, and a body of
+/// no known shape). That is the fail-closed rule of the other tombstone gates.
 #[tokio::test]
-async fn only_the_tombstone_of_a_run_redacts_a_run_observation() {
+async fn only_the_tombstone_of_an_artifact_with_the_same_id_spares_a_run_observation() {
     let (_dir, path, store) = seeded_store(false).await;
     let journal = journal(&store);
-    for (source_kind, redacted) in [("artifact", false), ("run", true)] {
-        let id = format!("run-shared-{source_kind}");
+    let cases = [
+        ("artifact", false),
+        ("run", true),
+        ("blob", true),
+        ("legacy", true),
+        ("garbage", true),
+    ];
+    for (label, redacted) in cases {
+        let id = format!("run-shared-{label}");
+        let body = match label {
+            "artifact" | "run" | "blob" => serde_json::to_value(RevokeTombstone {
+                source_kind: label.into(),
+                ..artifact_tombstone(&id)
+            })
+            .unwrap(),
+            "legacy" => json!({"revoked": true}),
+            _ => json!({"id": id, "garbage": true}),
+        };
         let mut session = store.session().await.unwrap();
         session
-            .put(
-                &admin(),
-                "tombstone",
-                &id,
-                "admin",
-                &RevokeTombstone {
-                    source_kind: source_kind.into(),
-                    ..artifact_tombstone(&id)
-                },
-            )
+            .put(&admin(), "tombstone", &id, "admin", &body)
             .await
             .unwrap();
         session.commit().await.unwrap();
 
-        let fact = dispatch_observed(&format!("request-{source_kind}"), &[RUNS[1], &id]);
+        let fact = dispatch_observed(&format!("request-{label}"), &[RUNS[1], &id]);
         journal.commit(fact.clone()).await.unwrap();
         let defects = if redacted {
             defects_of_redaction(&store, &fact).await
@@ -1418,19 +1484,15 @@ async fn only_the_tombstone_of_a_run_redacts_a_run_observation() {
         };
         assert!(
             defects.is_empty(),
-            "a tombstone written for {source_kind}:\n{defects:#?}"
+            "a tombstone written as {label} ({body}):\n{defects:#?}"
+        );
+        let found = found_in(&path, &format!("{MARKER}-request-{label}")).await;
+        assert_eq!(
+            found.iter().any(|place| place.starts_with("file")),
+            !redacted,
+            "a tombstone written as {label}: {found:?}"
         );
     }
-    let found = found_in(&path, &format!("{MARKER}-request-artifact")).await;
-    assert!(
-        found.iter().any(|place| place.starts_with("file")),
-        "the observation over the artifact's id was redacted: {found:?}"
-    );
-    assert!(
-        found_in(&path, &format!("{MARKER}-request-run"))
-            .await
-            .is_empty()
-    );
 }
 
 /// The decision is the tombstone, not the watermark: the revocation of a run the
@@ -1670,6 +1732,34 @@ async fn a_response_that_lands_while_the_cleanup_runs_leaves_no_output() {
     );
 }
 
+/// The fixture of `tests/optimization.rs::exercise_late_revocation` at the level of
+/// this file: the revocation in flight is a tombstone `begin_revoke` did not write
+/// (it does not decode). Every other tombstone gate takes such a tombstone for a
+/// revocation, and so does the journal: the late answer is stored redacted and is
+/// nowhere in the database.
+#[tokio::test]
+async fn an_unreadable_tombstone_redacts_the_late_fact_of_a_step() {
+    let (late, requests) = run_step(InFlight::RevokeWithAnUnreadableTombstone, "episode-h").await;
+    assert_eq!(requests.len(), 1, "one model call");
+    assert!(
+        matches!(&late.result, Err(Error::Conflict(_))),
+        "{:?}",
+        late.result
+    );
+    let observation = late.the_observation();
+    assert!(observation.payload.to_string().contains(MARKER));
+    let defects = late.defects_of(&observation).await;
+    assert!(
+        defects.is_empty(),
+        "the late observation is not stored redacted and leaves the output:\n{defects:#?}"
+    );
+    let (replay, calls) = late.replay("episode-h").await;
+    assert!(replay.is_err(), "{replay:?}");
+    assert_eq!(calls, 0, "the replay dispatched again");
+    let defects = late.defects_of(&observation).await;
+    assert!(defects.is_empty(), "after the replay:\n{defects:#?}");
+}
+
 /// The controls of the step: a revocation that is not one of the step's sources
 /// (another run, or an artifact that only shares an id) fails the step on its own
 /// liveness check as before, and the observation is stored exactly as committed.
@@ -1734,7 +1824,148 @@ async fn a_step_over_live_sources_stores_every_fact_as_committed() {
 }
 
 // ===========================================================================
-// 3. The same, billed by the persistent broker: the cost stays on the books
+// 3. Reading a redacted stage fact back
+// ===========================================================================
+
+/// A stage fact that the cleanup redacted, or that the journal stored redacted
+/// because its source was already revoked, is an expected state after a revocation.
+/// A read names it: a `Conflict` with a fixed message, as the exploration,
+/// curriculum and replay stores name a redacted record, and not `Internal`.
+#[tokio::test]
+async fn a_redacted_stage_fact_is_named_on_lookup_not_reported_as_internal() {
+    // Redacted by the cleanup: committed while its sources were live, then revoked
+    // and cleaned.
+    let (_dir, _path, store) = seeded_store(false).await;
+    let by_the_cleanup = journal(&store);
+    let live = dispatch_observed("request-by-the-cleanup", &RUNS);
+    by_the_cleanup.commit(live.clone()).await.unwrap();
+    assert_eq!(
+        by_the_cleanup
+            .lookup(&live.artifact_id)
+            .await
+            .unwrap()
+            .map(|fact| fact.artifact_id),
+        Some(live.artifact_id.clone()),
+        "a live fact is served as it was"
+    );
+    let status = revoke(&store, RUNS[0], Some(1)).await.unwrap();
+    finish_cleanup(&store, status).await;
+    let body = raw(&store, "artifact", &live.artifact_id).await.unwrap();
+    assert_eq!(body["schema_version"], REDACTED);
+    assert_names_redaction(
+        by_the_cleanup.lookup(&live.artifact_id).await,
+        &live.artifact_id,
+        "redacted by the cleanup: lookup",
+    );
+    assert_names_redaction(
+        by_the_cleanup.reload(&live.artifact_id).await,
+        &live.artifact_id,
+        "redacted by the cleanup: reload",
+    );
+
+    // Redacted at write time: revoked and cleaned first, then committed.
+    let (_dir, _path, store) = seeded_store(false).await;
+    let at_write_time = journal(&store);
+    revoke(&store, RUNS[0], None).await.unwrap();
+    let late = dispatch_observed("request-at-write-time", &RUNS);
+    at_write_time.commit(late.clone()).await.unwrap();
+    assert_names_redaction(
+        at_write_time.lookup(&late.artifact_id).await,
+        &late.artifact_id,
+        "redacted at write time: lookup",
+    );
+    assert_names_redaction(
+        at_write_time.reload(&late.artifact_id).await,
+        &late.artifact_id,
+        "redacted at write time: reload",
+    );
+    // An id nothing was stored under is still absent, not named.
+    assert!(
+        at_write_time
+            .lookup("optstage-never-written")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Only the tombstone is named. A body that claims to be a stage fact and does not
+/// decode, a body of no known shape, and a body that only looks like a tombstone are
+/// corruption, and stay `Internal`.
+#[tokio::test]
+async fn a_stage_fact_body_that_is_neither_a_fact_nor_a_tombstone_stays_internal() {
+    let (_dir, _path, store) = seeded_store(false).await;
+    let journal = journal(&store);
+    for (id, body) in [
+        (
+            "optstage-corrupt-fact",
+            json!({"schema_version": OPTIMIZATION_STAGE_FACT_SCHEMA,
+                   "artifact_id": "optstage-corrupt-fact", "junk": true}),
+        ),
+        ("optstage-corrupt-shape", json!({"hello": "world"})),
+        (
+            "optstage-corrupt-lookalike",
+            json!({"schema_version": "rsia.redacted.v2", "id": "optstage-corrupt-lookalike"}),
+        ),
+    ] {
+        put_raw(&store, id, &body).await;
+        let result = journal.lookup(id).await;
+        assert!(
+            matches!(result, Err(Error::Internal)),
+            "{id}: expected Internal, got {result:?}"
+        );
+    }
+}
+
+/// The step reads its own stage facts back when it replays. When one of them is a
+/// tombstone (cleaned in a donor store, so a genuine one), the replay ends with the
+/// named `Conflict` through the journal of the step (`RecoveryJournal::lookup` hands
+/// the read on), and nothing is dispatched.
+#[tokio::test]
+async fn a_replay_that_reads_a_redacted_stage_fact_ends_with_the_named_conflict() {
+    // The donor ran the same step; its stage facts are cleaned.
+    let (donor, _) = run_step(InFlight::Nothing, "episode-r1").await;
+    let status = revoke(&donor.store, RUNS[0], None).await.unwrap();
+    assert_eq!(status.state, CleanupState::Complete, "{status:?}");
+
+    // The store under test holds the live step; a clean replay returns its candidate
+    // from the books, without a dispatch.
+    let (live, _) = run_step(InFlight::Nothing, "episode-r1").await;
+    assert!(
+        matches!(&live.result, Ok(OptimizationStepOutcome::Candidate { .. })),
+        "{:?}",
+        live.result
+    );
+    let (control, calls) = live.replay("episode-r1").await;
+    assert!(
+        matches!(&control, Ok(OptimizationStepOutcome::Candidate { .. })),
+        "{control:?}"
+    );
+    assert_eq!(calls, 0);
+
+    for kind in [StageFactKind::StepPrepared, StageFactKind::StepCompleted] {
+        let id = live
+            .journal
+            .given()
+            .into_iter()
+            .find(|fact| fact.kind == kind)
+            .unwrap_or_else(|| panic!("the step committed no {kind:?}"))
+            .artifact_id;
+        let original = raw(&live.store, "artifact", &id).await.unwrap();
+        let tombstone = raw(&donor.store, "artifact", &id).await.unwrap();
+        assert_eq!(tombstone["schema_version"], REDACTED, "{kind:?}");
+        put_raw(&live.store, &id, &tombstone).await;
+
+        let (replay, calls) = live.replay("episode-r1").await;
+        assert_names_redaction(replay, &id, &format!("{kind:?}"));
+        assert_eq!(calls, 0, "{kind:?}: the replay dispatched");
+
+        put_raw(&live.store, &id, &original).await;
+    }
+}
+
+// ===========================================================================
+// 4. The same, billed by the persistent broker: the cost stays on the books
 // ===========================================================================
 
 /// The broker settles the call while the source is live (the response is usable,
