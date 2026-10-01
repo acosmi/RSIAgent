@@ -3179,12 +3179,13 @@ pub const PROTECTED_SCHEMA_VERSIONS: [&str; 8] = [
 
 /// Body `schema_version` values of the durable facts of an action that already
 /// happened, an idempotency binding, a spend or an invalidation, introduced by the
-/// v4.2 monitoring, practice, curriculum and management work (E16.5, E08, plan
-/// §11.5). They are selected exactly like [`PROTECTED_SCHEMA_VERSIONS`] (any
-/// object kind, inside a watermarked namespace, compared for equality between the
-/// anchor and the restored database), so a backup that is older than the anchor on
-/// any of them is isolated and a restored directory the anchor has moved past on
-/// any of them is quarantined; nothing in the decision rule changes.
+/// v4.2 monitoring, practice, curriculum, management and replay-economic work
+/// (E16.5, E08, plan §11.3, §11.5). They are selected exactly like
+/// [`PROTECTED_SCHEMA_VERSIONS`] (any object kind, inside a watermarked namespace,
+/// compared for equality between the anchor and the restored database), so a backup
+/// that is older than the anchor on any of them is isolated and a restored
+/// directory the anchor has moved past on any of them is quarantined; nothing in
+/// the decision rule changes.
 ///
 /// - monitoring: the consolidation claim (generation occupancy), the terminal run
 ///   record (outcome and budget call ids), the proposal, the unique
@@ -3196,7 +3197,13 @@ pub const PROTECTED_SCHEMA_VERSIONS: [&str; 8] = [
 ///   `probe_schedule_receipt_v1` records are the scheduling idempotency and quota
 ///   facts;
 /// - management: the job (kind `job`; matched by schema because that kind also
-///   holds the pre-management `evo_core::Job` records).
+///   holds the pre-management `evo_core::Job` records);
+/// - replay economics: the artifact envelope of the preregistered experiment, the
+///   job started over it (its start key and state), the cost receipts (the amounts
+///   they book) and the blocked report. The schema covers all four record kinds,
+///   so each is compared whole. The revocation cleanup keeps them as they were (an
+///   amount or a history that happened is not reversed by a deletion), so a backup
+///   that predates one of them is behind the anchor.
 ///
 /// `rsia.management_private_input.v1` is deliberately absent: it is the request
 /// payload, not an action or an account. So is the mutable scope index
@@ -3209,7 +3216,7 @@ pub const PROTECTED_SCHEMA_VERSIONS: [&str; 8] = [
 ///
 /// Kept apart from [`PROTECTED_SCHEMA_VERSIONS`], the accounting set whose size
 /// `tests/control_plane_facts.rs` pins. The script lists both groups in one tuple.
-pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 10] = [
+pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 11] = [
     "rsia.monitoring.consolidation_claim.v1",
     "rsia.monitoring.consolidation_run.v1",
     "rsia.monitoring.consolidation_staging.v1",
@@ -3220,6 +3227,7 @@ pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 10] = [
     "rsia.practice_attempt_set.v1",
     "rsia.curriculum_artifact_envelope.v1",
     "rsia.management_job.v1",
+    "rsia.replay_economic_artifact_envelope.v1",
 ];
 
 fn is_protected_schema(schema: &str) -> bool {
