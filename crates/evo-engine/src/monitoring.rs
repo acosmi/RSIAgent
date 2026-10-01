@@ -13,13 +13,16 @@
 //! it fails its cleanup job closed.
 
 use crate::broker::{BudgetPortBinding, ModelTransport, PersistentModelBroker};
+use crate::development::{RUN_RECEIPT_KIND, storage_id};
 use crate::evidence::{load_stored_source, validate_stored_sources};
 use crate::model::{ModelPort, ModelResponse, RejectedDispatch};
 use crate::optimization::{
     DevRunner, DevelopmentExecutionProvenance, DevelopmentRunReport, DevelopmentSelection,
     DevelopmentSelectionDecision, OPTIMIZATION_STAGE_FACT_SCHEMA, OptimizationJournal,
     OptimizationJournalStage, OptimizationStepOutcome, OptimizationStepRequest, StageFact,
-    StageFactKind, optimization_request_digest, run_optimization_step,
+    StageFactKind, VerifiedDevelopmentObservationView, development_request_fact_id,
+    optimization_request_digest, run_optimization_step,
+    verified_development_observation_in_session,
 };
 use crate::release_store::{
     HostApplicationRecord, RELEASE_CANDIDATE_SCHEMA, ReleaseCandidateRecord, ReleaseStore,
@@ -55,6 +58,10 @@ const LEGACY_DEVELOPMENT_CYCLE_SCHEMA_V1: &str = "rsia.monitoring.development_cy
 const REDACTED_SCHEMA: &str = "rsia.redacted.v1";
 const ARTIFACT_KIND: &str = "artifact";
 const RECEIPT_KIND: &str = "receipt";
+/// Every consolidation claim id starts with this (`claim_consolidation` builds
+/// it). The self-trigger guard reads it off a redacted claim, whose body no longer
+/// says what it was.
+const CLAIM_ID_PREFIX: &str = "consolidation-claim-";
 
 fn validate_digest(value: &str, name: &str) -> Result<()> {
     if value.len() != 64
@@ -291,6 +298,33 @@ pub enum ClaimOutcome {
     NotEligible { completed_cycles: usize },
     Claimed(ConsolidationClaim),
     AlreadyClaimed(ConsolidationClaim),
+}
+
+/// What the consolidation trigger made of a closed cycle; see
+/// [`MonitoringCoordinator::close_development_cycle_and_trigger`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsolidationTrigger {
+    /// Fewer than two cycles are complete, so no generation exists to claim.
+    NotEligible,
+    /// This call claimed the generation. `state` is `NoContrast` when neither of
+    /// its two cycles held a before/after difference.
+    Claimed {
+        claim_id: String,
+        state: ConsolidationClaimState,
+    },
+    /// The newest complete generation was claimed by an earlier call.
+    AlreadyClaimed { claim_id: String },
+    /// The cycle is closed and kept, but the claim could not be made or read just
+    /// now (a source was revoked, the claim was redacted, the scope drifted, a
+    /// storage failure...). Nothing was rolled back; `reason` names the failure.
+    Unavailable { reason: String },
+}
+
+/// A closed development cycle together with its consolidation trigger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CycleTriggerOutcome {
+    pub cycle: DevelopmentCycleRecord,
+    pub trigger: ConsolidationTrigger,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -562,6 +596,28 @@ impl MonitoringCoordinator {
         })
     }
 
+    /// Closes one completed development cycle from its E03 `DevelopmentObserved`
+    /// fact, in one transaction.
+    ///
+    /// How the receipts behind the fact are checked follows what the report says
+    /// about itself, and only a fixture stays a fixture:
+    ///
+    /// - `provenance == Fixture`: the original path. The receipt ids are opaque
+    ///   objects that must exist under their own ids, and the cycle is labeled
+    ///   `Fixture` (fixture evidence; a proposal built on it stays
+    ///   `ProgramFixture`).
+    /// - any other declared provenance grants nothing by itself. The fact and its
+    ///   request half must pass the E03 observation gate
+    ///   (`verified_development_observation_in_session`) in this very transaction:
+    ///   typed execution, grader and run receipts, the Admin-registered control,
+    ///   persisted budget rows and server-recomputed scores. The verified view must
+    ///   then agree with the report and the cycle scope item by item. A fact that
+    ///   declares itself non-fixture but cannot pass is refused, and the cycle's
+    ///   label is what the verified receipts attest (`RegisteredPureFunction`), not
+    ///   what the report claims.
+    ///
+    /// The development run of a consolidation cannot be closed as a cycle (see
+    /// [`MonitoringCoordinator::run_consolidation`]); that is a `Conflict`.
     pub async fn close_development_cycle(
         ctx: &Context,
         store: &Store,
@@ -605,18 +661,26 @@ impl MonitoringCoordinator {
             .need(ctx, ARTIFACT_KIND, &request.report_fact_id)
             .await?;
         fact.validate()?;
+        reject_consolidation_own_episode(&mut session, ctx, &fact.episode_id).await?;
+        require_development_observed(ctx, &fact)?;
+        let report: DevelopmentRunReport = serde_json::from_value(fact.payload.clone())
+            .map_err(|_| Error::Invalid("development fact is not a strict report".into()))?;
+        let evidence = CycleEvidence::declared_by(&report);
         validate_development_fact(
             &mut session,
             ctx,
             &fact,
             &source_ids,
             request.revoke_watermark,
+            evidence,
         )
         .await?;
-        let report: DevelopmentRunReport = serde_json::from_value(fact.payload.clone())
-            .map_err(|_| Error::Invalid("development fact is not a strict report".into()))?;
         validate_report_scope(&report, &request, &environment)?;
-        validate_report_receipts(&mut session, ctx, &fact, &report).await?;
+        validate_report_receipts(&mut session, ctx, &fact, &report, evidence).await?;
+        if evidence == CycleEvidence::Verified {
+            verify_trusted_development(&mut session, ctx, &fact, &report, &request, &environment)
+                .await?;
+        }
         validate_cycle_cost_evidence(
             &mut session,
             ctx,
@@ -691,7 +755,7 @@ impl MonitoringCoordinator {
             candidate_bundle_digest: report.candidate_bundle_digest,
             execution_receipt_id: report.execution_receipt_id,
             usage_record_ids: canonical_strings(report.usage_record_ids, "usage record")?,
-            provenance: report.provenance,
+            provenance: evidence.label(report.provenance),
             pairs,
             has_contrast,
             sources,
@@ -725,14 +789,14 @@ impl MonitoringCoordinator {
                 &cycle.report_fact_id,
             )
             .await?;
+        // A verified cycle depends on the typed run receipt, which is what exists
+        // under `e03dev-…`; the report's own id for it is not a stored object.
+        let receipt_edge = match evidence {
+            CycleEvidence::Fixture => cycle.execution_receipt_id.clone(),
+            CycleEvidence::Verified => storage_id(RUN_RECEIPT_KIND, &cycle.execution_receipt_id)?,
+        };
         session
-            .put_edge(
-                ctx,
-                ARTIFACT_KIND,
-                &cycle.id,
-                ARTIFACT_KIND,
-                &cycle.execution_receipt_id,
-            )
+            .put_edge(ctx, ARTIFACT_KIND, &cycle.id, ARTIFACT_KIND, &receipt_edge)
             .await?;
         for source in &cycle.sources {
             session
@@ -749,6 +813,44 @@ impl MonitoringCoordinator {
             .await?;
         session.commit().await?;
         Ok(cycle)
+    }
+
+    /// Closes a development cycle and then triggers the consolidation claim for
+    /// the scope it belongs to (E13: at most one consolidation trigger per two
+    /// development cycles).
+    ///
+    /// The cycle is closed first, by [`Self::close_development_cycle`] with all of
+    /// its checks; that transaction is committed and its session released before
+    /// [`Self::claim_consolidation`] runs in its own. A cycle that cannot be closed
+    /// is an `Err` and nothing is claimed. A cycle that was closed stays closed
+    /// whatever the claim does: if the claim cannot be made or read (a source was
+    /// revoked in between, the claim was redacted, a storage failure) the result is
+    /// `Ok` with [`ConsolidationTrigger::Unavailable`], never a rollback.
+    ///
+    /// The trigger is `claim_consolidation`'s and inherits its semantics:
+    /// - a generation is two cycles (`completed cycles / 2`), so the first cycle is
+    ///   `NotEligible`, the second `Claimed`, the third `AlreadyClaimed` and the
+    ///   fourth claims generation two;
+    /// - only the newest complete generation is ever claimed. If four cycles are
+    ///   closed without a claim in between (through `close_development_cycle`
+    ///   alone, or while the trigger was `Unavailable`), generation one is skipped
+    ///   for good. Calling this for every cycle keeps each generation claimable;
+    /// - two concurrent calls for one generation produce exactly one `Claimed`.
+    ///
+    /// A trigger is not a run. `Claimed` only freezes the generation: the
+    /// consolidation itself (`run_consolidation`) still needs the caller's complete
+    /// optimization request and its model and development-runner ports, and a
+    /// `NoContrast` claim is finished with `complete_no_contrast`. Nothing here
+    /// dispatches a model or a runner, spends budget, or touches Active.
+    pub async fn close_development_cycle_and_trigger(
+        ctx: &Context,
+        store: &Store,
+        request: CompleteDevelopmentCycleRequest,
+    ) -> Result<CycleTriggerOutcome> {
+        let cycle = Self::close_development_cycle(ctx, store, request).await?;
+        let trigger =
+            trigger_from_claim(Self::claim_consolidation(ctx, store, &cycle.scope_id).await);
+        Ok(CycleTriggerOutcome { cycle, trigger })
     }
 
     pub async fn claim_consolidation(
@@ -800,7 +902,7 @@ impl MonitoringCoordinator {
         validate_stored_sources(&mut session, ctx, &source_ids, index.scope.revoke_watermark)
             .await?;
         let claim_id = format!(
-            "consolidation-claim-{}",
+            "{CLAIM_ID_PREFIX}{}",
             &fingerprint(&(scope_id, generation))?[..32]
         );
         let claim = ConsolidationClaim {
@@ -1513,13 +1615,7 @@ fn validate_cycle_request(request: &CompleteDevelopmentCycleRequest) -> Result<(
     Ok(())
 }
 
-async fn validate_development_fact(
-    session: &mut Session,
-    ctx: &Context,
-    fact: &StageFact,
-    expected_source_ids: &[String],
-    expected_watermark: u64,
-) -> Result<()> {
+fn require_development_observed(ctx: &Context, fact: &StageFact) -> Result<()> {
     if fact.stage != OptimizationJournalStage::Development
         || fact.kind != StageFactKind::DevelopmentObserved
         || fact.namespace != ctx.namespace()
@@ -1528,6 +1624,49 @@ async fn validate_development_fact(
             "cycle must consume an E03 DevelopmentObserved fact".into(),
         ));
     }
+    Ok(())
+}
+
+/// How the receipts behind a development fact are checked (see
+/// [`MonitoringCoordinator::close_development_cycle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CycleEvidence {
+    /// The report declares itself a fixture: its receipt ids are opaque stored
+    /// objects and the cycle stays fixture evidence.
+    Fixture,
+    /// The report declares any other provenance, which grants nothing by itself:
+    /// the receipts are the typed E03 receipts, verified by the observation gate.
+    Verified,
+}
+
+impl CycleEvidence {
+    fn declared_by(report: &DevelopmentRunReport) -> Self {
+        if report.provenance == DevelopmentExecutionProvenance::Fixture {
+            Self::Fixture
+        } else {
+            Self::Verified
+        }
+    }
+
+    /// The provenance a closed cycle carries. A fixture keeps its declaration; a
+    /// verified cycle carries what the typed receipts attest (the registered
+    /// pure-function runner is the only issuer), never the report's own word.
+    fn label(self, declared: DevelopmentExecutionProvenance) -> DevelopmentExecutionProvenance {
+        match self {
+            Self::Fixture => declared,
+            Self::Verified => DevelopmentExecutionProvenance::RegisteredPureFunction,
+        }
+    }
+}
+
+async fn validate_development_fact(
+    session: &mut Session,
+    ctx: &Context,
+    fact: &StageFact,
+    expected_source_ids: &[String],
+    expected_watermark: u64,
+    evidence: CycleEvidence,
+) -> Result<()> {
     let mut executions = 0usize;
     let mut graders = 0usize;
     let mut source_ids = Vec::new();
@@ -1558,6 +1697,14 @@ async fn validate_development_fact(
                     "development report has unsupported dependencies".into(),
                 ));
             }
+        }
+        // The execution and grader ids of a real E03 report are not stored under
+        // themselves (the typed receipts live under `e03dev-…` and the grader id is
+        // a digest); the observation gate loads and verifies those instead.
+        if evidence == CycleEvidence::Verified
+            && matches!(dependency.kind.as_str(), "execution" | "grader")
+        {
+            continue;
         }
         let actual_kind = if dependency.kind == "run" {
             "run"
@@ -1618,6 +1765,7 @@ async fn validate_report_receipts(
     ctx: &Context,
     fact: &StageFact,
     report: &DevelopmentRunReport,
+    evidence: CycleEvidence,
 ) -> Result<()> {
     let expected: BTreeSet<_> = report
         .results
@@ -1644,10 +1792,133 @@ async fn validate_report_receipts(
             "development report receipt closure differs from stage fact".into(),
         ));
     }
-    let _: serde_json::Value = session
-        .need(ctx, ARTIFACT_KIND, &report.execution_receipt_id)
-        .await?;
+    // A real run receipt is stored as a typed envelope under `e03dev-…`, not under
+    // the report's id; the observation gate loads it.
+    if evidence == CycleEvidence::Fixture {
+        let _: serde_json::Value = session
+            .need(ctx, ARTIFACT_KIND, &report.execution_receipt_id)
+            .await?;
+    }
     Ok(())
+}
+
+/// The E03 observation gate for a report that declares a provenance other than
+/// fixture, in the caller's transaction. The request half of the stage is named
+/// from the observation itself; the gate reloads both facts and verifies every
+/// typed receipt against the registered control, budget rows and sources. What it
+/// verified must then equal what the report and the cycle scope say.
+async fn verify_trusted_development(
+    session: &mut Session,
+    ctx: &Context,
+    fact: &StageFact,
+    report: &DevelopmentRunReport,
+    request: &CompleteDevelopmentCycleRequest,
+    environment: &EnvironmentIdentityRecord,
+) -> Result<()> {
+    let request_fact_id = development_request_fact_id(fact)?;
+    let view = verified_development_observation_in_session(
+        ctx,
+        session,
+        &request_fact_id,
+        &request.report_fact_id,
+    )
+    .await?;
+    require_view_matches(&view, fact, report, request, environment)
+}
+
+/// The verified observation against the report (task by task, in order) and the
+/// scope the cycle is closed into. The report's own scores and pass flags are
+/// never trusted: they must equal the server-recomputed ones.
+fn require_view_matches(
+    view: &VerifiedDevelopmentObservationView,
+    fact: &StageFact,
+    report: &DevelopmentRunReport,
+    request: &CompleteDevelopmentCycleRequest,
+    environment: &EnvironmentIdentityRecord,
+) -> Result<()> {
+    let same_tasks = view.outcomes.len() == report.results.len()
+        && view
+            .outcomes
+            .iter()
+            .zip(&report.results)
+            .all(|(outcome, result)| {
+                outcome.task_id == result.task_id
+                    && outcome.parent_score_micros == result.parent_score_micros
+                    && outcome.candidate_score_micros == result.candidate_score_micros
+                    && outcome.parent_passed == result.parent_passed
+                    && outcome.candidate_passed == result.candidate_passed
+                    && outcome.parent_execution_id == result.parent_execution_id
+                    && outcome.candidate_execution_id == result.candidate_execution_id
+                    && outcome.grader_receipt_digest == result.grader_receipt_digest
+            });
+    if !same_tasks
+        || view.episode_id != fact.episode_id
+        || view.step != fact.step
+        || view.attempt != fact.attempt
+        || view.request_id != report.request_id
+        || view.manifest_digest != report.manifest_digest
+        || view.manifest_digest != request.development_manifest_digest
+        || view.environment_digest != report.environment_digest
+        || view.environment_digest != environment.environment_digest
+        || view.grader_digest != report.grader_digest
+        || view.grader_digest != request.grader_digest
+    {
+        return Err(Error::Conflict(
+            "verified development observation differs from the cycle report and scope".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A consolidation step runs under its claim id as its episode (plan E13;
+/// `validate_execution_binding` pins `episode_id == claim.id`), and its own
+/// development observation agrees with the scope item by item. Closing it as a
+/// cycle would let a consolidation feed the next one: consolidate, cycle,
+/// consolidate. So a fact whose episode is a claim is refused, whether the claim is
+/// still readable or has been redacted: a redacted claim leaves a tombstone under
+/// its own id and no longer says what it was, only that it was a claim id.
+async fn reject_consolidation_own_episode(
+    session: &mut Session,
+    ctx: &Context,
+    episode_id: &str,
+) -> Result<()> {
+    let Some(stored) = session
+        .get::<serde_json::Value>(ctx, ARTIFACT_KIND, episode_id)
+        .await?
+    else {
+        return Ok(());
+    };
+    let schema = stored
+        .get("schema_version")
+        .and_then(|schema| schema.as_str());
+    let is_claim = schema == Some(CONSOLIDATION_CLAIM_SCHEMA);
+    let is_claim_tombstone =
+        schema == Some(REDACTED_SCHEMA) && episode_id.starts_with(CLAIM_ID_PREFIX);
+    if is_claim || is_claim_tombstone {
+        return Err(Error::Conflict(
+            "the development run of a consolidation cannot be closed as a new development cycle"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The consolidation trigger a claim attempt amounts to. A failed attempt is
+/// `Unavailable`: the cycle it follows is already committed.
+fn trigger_from_claim(claim: Result<ClaimOutcome>) -> ConsolidationTrigger {
+    match claim {
+        Ok(ClaimOutcome::NotEligible { .. }) => ConsolidationTrigger::NotEligible,
+        Ok(ClaimOutcome::Claimed(claim)) => ConsolidationTrigger::Claimed {
+            claim_id: claim.id,
+            state: claim.state,
+        },
+        Ok(ClaimOutcome::AlreadyClaimed(claim)) => {
+            ConsolidationTrigger::AlreadyClaimed { claim_id: claim.id }
+        }
+        Err(error) => ConsolidationTrigger::Unavailable {
+            reason: error.to_string(),
+        },
+    }
 }
 
 async fn validate_cycle_cost_evidence(
@@ -2773,7 +3044,7 @@ async fn persist_terminal_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimization::PairedTaskResult;
+    use crate::optimization::{PairedTaskResult, VerifiedDevelopmentTaskOutcome};
 
     fn result(
         task_id: &str,
@@ -3239,5 +3510,366 @@ mod tests {
             .unwrap();
         session.commit().await.unwrap();
         assert!(dependents.contains(&(ARTIFACT_KIND.to_string(), "candidate-x".to_string())));
+    }
+
+    // ---- E13 cycle trigger, E03-gated cycles and the self-trigger guard --------
+
+    fn claim_in_state(id: &str, state: ConsolidationClaimState) -> ConsolidationClaim {
+        ConsolidationClaim {
+            id: id.into(),
+            schema_version: CONSOLIDATION_CLAIM_SCHEMA.into(),
+            scope_id: "scope".into(),
+            generation: 1,
+            cycle_ids: vec![],
+            sources: vec![],
+            revoke_watermark: 1,
+            state,
+            execution_input_digest: None,
+        }
+    }
+
+    #[test]
+    fn a_claim_attempt_is_the_trigger_and_a_failed_one_is_unavailable_not_an_error() {
+        assert_eq!(
+            trigger_from_claim(Ok(ClaimOutcome::NotEligible {
+                completed_cycles: 1
+            })),
+            ConsolidationTrigger::NotEligible
+        );
+        assert_eq!(
+            trigger_from_claim(Ok(ClaimOutcome::Claimed(claim_in_state(
+                "claim",
+                ConsolidationClaimState::NoContrast
+            )))),
+            ConsolidationTrigger::Claimed {
+                claim_id: "claim".into(),
+                state: ConsolidationClaimState::NoContrast,
+            }
+        );
+        assert_eq!(
+            trigger_from_claim(Ok(ClaimOutcome::AlreadyClaimed(claim_in_state(
+                "claim",
+                ConsolidationClaimState::Running
+            )))),
+            ConsolidationTrigger::AlreadyClaimed {
+                claim_id: "claim".into()
+            }
+        );
+        for error in [
+            Error::Conflict("consolidation claim was redacted after source revocation".into()),
+            Error::Forbidden,
+            Error::NotFound,
+            Error::Budget,
+            Error::Internal,
+        ] {
+            let reason = error.to_string();
+            assert_eq!(
+                trigger_from_claim(Err(error)),
+                ConsolidationTrigger::Unavailable { reason }
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_declared_fixture_takes_the_fixture_path_and_a_verified_cycle_is_labeled_by_its_receipts()
+     {
+        use DevelopmentExecutionProvenance::{Fixture, IsolatedRunner, RegisteredPureFunction};
+        let mut declared = report(vec![]);
+        assert_eq!(declared.provenance, Fixture);
+        assert_eq!(
+            CycleEvidence::declared_by(&declared),
+            CycleEvidence::Fixture
+        );
+        for provenance in [IsolatedRunner, RegisteredPureFunction] {
+            declared.provenance = provenance;
+            assert_eq!(
+                CycleEvidence::declared_by(&declared),
+                CycleEvidence::Verified
+            );
+        }
+        assert_eq!(CycleEvidence::Fixture.label(Fixture), Fixture);
+        // What a verified report says about itself never reaches the cycle label.
+        assert_eq!(
+            CycleEvidence::Verified.label(IsolatedRunner),
+            RegisteredPureFunction
+        );
+        assert_eq!(
+            CycleEvidence::Verified.label(RegisteredPureFunction),
+            RegisteredPureFunction
+        );
+    }
+
+    fn development_fact(kind: StageFactKind) -> StageFact {
+        StageFact {
+            schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+            artifact_id: String::new(),
+            namespace: "tenant".into(),
+            episode_id: "episode".into(),
+            step: 3,
+            attempt: 2,
+            stage: OptimizationJournalStage::Development,
+            kind,
+            request_id: "request".into(),
+            input_digest: "0".repeat(64),
+            output_digest: None,
+            dependencies: vec![],
+            payload: serde_json::json!({"marker": format!("{kind:?}")}),
+        }
+        .seal()
+        .unwrap()
+    }
+
+    #[test]
+    fn the_request_half_of_a_development_stage_is_named_from_its_observation() {
+        let request = development_fact(StageFactKind::DevelopmentRequestPrepared);
+        let observed = development_fact(StageFactKind::DevelopmentObserved);
+        assert_ne!(request.artifact_id, observed.artifact_id);
+        assert_eq!(
+            development_request_fact_id(&observed).unwrap(),
+            request.artifact_id
+        );
+        // Only a development observation has a request half.
+        assert!(matches!(
+            development_request_fact_id(&request),
+            Err(Error::Invalid(_))
+        ));
+        let mut elsewhere = observed.clone();
+        elsewhere.stage = OptimizationJournalStage::Merge;
+        assert!(matches!(
+            development_request_fact_id(&elsewhere),
+            Err(Error::Invalid(_))
+        ));
+        // A different episode, step, attempt or request id is a different stage.
+        for change in [
+            |fact: &mut StageFact| fact.episode_id = "other-episode".into(),
+            |fact: &mut StageFact| fact.step += 1,
+            |fact: &mut StageFact| fact.attempt += 1,
+            |fact: &mut StageFact| fact.request_id = "other-request".into(),
+        ] {
+            let mut other = observed.clone();
+            change(&mut other);
+            assert_ne!(
+                development_request_fact_id(&other).unwrap(),
+                request.artifact_id
+            );
+        }
+    }
+
+    /// A verified observation, its report, stage fact, cycle request and frozen
+    /// environment that all agree with one another.
+    fn agreeing_observation() -> (
+        VerifiedDevelopmentObservationView,
+        StageFact,
+        DevelopmentRunReport,
+        CompleteDevelopmentCycleRequest,
+        EnvironmentIdentityRecord,
+    ) {
+        let environment = environment(EnvironmentEvidenceScope::ProgramFixture);
+        let mut report = report(vec![
+            result("task-a", 500_000, 600_000, true, true),
+            result("task-b", 0, 0, false, false),
+        ]);
+        report.environment_digest = environment.environment_digest.clone();
+        let mut fact = development_fact(StageFactKind::DevelopmentObserved);
+        fact.request_id = report.request_id.clone();
+        let request = CompleteDevelopmentCycleRequest {
+            skill_id: "skill".into(),
+            profile_id: "profile".into(),
+            environment_id: environment.id.clone(),
+            development_manifest_digest: report.manifest_digest.clone(),
+            grader_digest: report.grader_digest.clone(),
+            generation_strategy_digest: "8".repeat(64),
+            parent_skill_digest: "4".repeat(64),
+            parent_bundle_digest: report.parent_bundle_digest.clone(),
+            billing_scope: "billing".into(),
+            root_budget_id: "root".into(),
+            report_fact_id: fact.artifact_id.clone(),
+            source_ids: vec!["source".into()],
+            revoke_watermark: 1,
+        };
+        let view = VerifiedDevelopmentObservationView {
+            episode_id: fact.episode_id.clone(),
+            step: fact.step,
+            attempt: fact.attempt,
+            request_id: report.request_id.clone(),
+            manifest_digest: report.manifest_digest.clone(),
+            environment_digest: report.environment_digest.clone(),
+            grader_digest: report.grader_digest.clone(),
+            outcomes: report
+                .results
+                .iter()
+                .map(|result| VerifiedDevelopmentTaskOutcome {
+                    task_id: result.task_id.clone(),
+                    parent_family: format!("family-{}", result.task_id),
+                    parent_score_micros: result.parent_score_micros,
+                    candidate_score_micros: result.candidate_score_micros,
+                    parent_passed: result.parent_passed,
+                    candidate_passed: result.candidate_passed,
+                    parent_execution_id: result.parent_execution_id.clone(),
+                    candidate_execution_id: result.candidate_execution_id.clone(),
+                    grader_receipt_digest: result.grader_receipt_digest.clone(),
+                })
+                .collect(),
+        };
+        (view, fact, report, request, environment)
+    }
+
+    #[test]
+    fn a_verified_observation_must_agree_with_the_report_and_the_scope_item_by_item() {
+        let (view, fact, report, request, environment) = agreeing_observation();
+        require_view_matches(&view, &fact, &report, &request, &environment).unwrap();
+
+        // The server-recomputed outcome differs from what the report claims.
+        type Change = fn(&mut VerifiedDevelopmentObservationView);
+        let changes: [(&str, Change); 15] = [
+            ("parent score", |view| {
+                view.outcomes[0].parent_score_micros += 1
+            }),
+            ("candidate score", |view| {
+                view.outcomes[1].candidate_score_micros += 1
+            }),
+            ("parent pass flag", |view| {
+                view.outcomes[0].parent_passed = !view.outcomes[0].parent_passed
+            }),
+            ("candidate pass flag", |view| {
+                view.outcomes[1].candidate_passed = !view.outcomes[1].candidate_passed
+            }),
+            ("task id", |view| {
+                view.outcomes[0].task_id = "other-task".into()
+            }),
+            ("task order", |view| view.outcomes.swap(0, 1)),
+            ("missing task", |view| {
+                view.outcomes.pop();
+            }),
+            ("extra task", |view| {
+                let extra = view.outcomes[0].clone();
+                view.outcomes.push(extra);
+            }),
+            ("parent execution id", |view| {
+                view.outcomes[0].parent_execution_id = "other-execution".into()
+            }),
+            ("grader receipt digest", |view| {
+                view.outcomes[1].grader_receipt_digest = "f".repeat(64)
+            }),
+            ("episode", |view| view.episode_id = "other-episode".into()),
+            ("step", |view| view.step += 1),
+            ("attempt", |view| view.attempt += 1),
+            ("request id", |view| {
+                view.request_id = "other-request".into()
+            }),
+            ("manifest digest", |view| {
+                view.manifest_digest = "f".repeat(64)
+            }),
+        ];
+        for (name, change) in changes {
+            let mut changed = view.clone();
+            change(&mut changed);
+            assert!(
+                matches!(
+                    require_view_matches(&changed, &fact, &report, &request, &environment),
+                    Err(Error::Conflict(_))
+                ),
+                "{name}"
+            );
+        }
+        let mut environment_drift = view.clone();
+        environment_drift.environment_digest = "f".repeat(64);
+        let mut grader_drift = view.clone();
+        grader_drift.grader_digest = "f".repeat(64);
+        for (name, changed) in [
+            ("environment digest", environment_drift),
+            ("grader digest", grader_drift),
+        ] {
+            assert!(
+                matches!(
+                    require_view_matches(&changed, &fact, &report, &request, &environment),
+                    Err(Error::Conflict(_))
+                ),
+                "{name}"
+            );
+        }
+
+        // The scope is checked against the view too, not only through the report.
+        let mut other_manifest = request.clone();
+        other_manifest.development_manifest_digest = "f".repeat(64);
+        let mut other_grader = request.clone();
+        other_grader.grader_digest = "f".repeat(64);
+        for (name, scope) in [
+            ("scope manifest", other_manifest),
+            ("scope grader", other_grader),
+        ] {
+            assert!(
+                matches!(
+                    require_view_matches(&view, &fact, &report, &scope, &environment),
+                    Err(Error::Conflict(_))
+                ),
+                "{name}"
+            );
+        }
+        let mut other_environment = environment.clone();
+        other_environment.environment_digest = "f".repeat(64);
+        assert!(matches!(
+            require_view_matches(&view, &fact, &report, &request, &other_environment),
+            Err(Error::Conflict(_))
+        ));
+    }
+
+    async fn episode_refusal(store: &Store, ctx: &Context, episode_id: &str) -> Result<()> {
+        let mut session = store.session().await.unwrap();
+        let verdict = reject_consolidation_own_episode(&mut session, ctx, episode_id).await;
+        session.commit().await.unwrap();
+        verdict
+    }
+
+    fn claim_tombstone(id: &str) -> serde_json::Value {
+        // The shape the revocation cleanup leaves under a redacted object's own id.
+        serde_json::json!({
+            "id": id,
+            "schema_version": REDACTED_SCHEMA,
+            "state": "source_revoked",
+            "original_kind": ARTIFACT_KIND,
+            "original_schema": CONSOLIDATION_CLAIM_SCHEMA,
+            "original_digest": "0".repeat(64),
+            "metadata": {},
+        })
+    }
+
+    #[tokio::test]
+    async fn an_episode_that_is_a_claim_or_a_claim_tombstone_is_not_a_development_cycle() {
+        let (_dir, store, ctx) = unit_store().await;
+        let live = format!("{CLAIM_ID_PREFIX}live");
+        let redacted = format!("{CLAIM_ID_PREFIX}redacted");
+        let claim = claim_in_state(&live, ConsolidationClaimState::Claimed);
+        put_object(&store, &ctx, &live, &serde_json::to_value(&claim).unwrap()).await;
+        put_object(&store, &ctx, &redacted, &claim_tombstone(&redacted)).await;
+        // Redacted objects that were never claims, other monitoring objects and an
+        // absent id are ordinary episodes.
+        put_object(
+            &store,
+            &ctx,
+            "redacted-cycle",
+            &claim_tombstone("redacted-cycle"),
+        )
+        .await;
+        put_object(
+            &store,
+            &ctx,
+            "some-scope",
+            &serde_json::json!({"id":"some-scope","schema_version":CONSOLIDATION_SCOPE_SCHEMA}),
+        )
+        .await;
+
+        for episode in [live.as_str(), redacted.as_str()] {
+            assert!(
+                matches!(
+                    episode_refusal(&store, &ctx, episode).await,
+                    Err(Error::Conflict(message)) if message.contains("consolidation")
+                ),
+                "{episode}"
+            );
+        }
+        for episode in ["redacted-cycle", "some-scope", "development-episode-1"] {
+            episode_refusal(&store, &ctx, episode).await.unwrap();
+        }
     }
 }

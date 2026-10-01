@@ -2167,3 +2167,41 @@ impl DevRunner for RegisteredDevelopmentRunner {
         })
     }
 }
+
+/// A consolidation run spends under the billing root of the Admin-registered
+/// control this runner executes. The binding is that control's billing scope and
+/// root budget id, given only when the caller's namespace is the runner's own and
+/// the persisted root matches the control (the check `run` makes before it
+/// executes). It is accounting identity and nothing more: nothing is dispatched or
+/// reserved here, and `run_consolidation` compares the binding with the claim's
+/// scope before it dispatches anything.
+#[async_trait]
+impl crate::monitoring::ConsolidationDevRunner for RegisteredDevelopmentRunner {
+    async fn trusted_budget_binding(
+        &self,
+        namespace: &str,
+    ) -> Result<crate::broker::BudgetPortBinding> {
+        identifier(namespace)?;
+        if namespace != self.executor.namespace() {
+            return Err(Error::Conflict(
+                "development runner serves a different namespace".into(),
+            ));
+        }
+        let control =
+            load_development_control(&self.store, &self.executor, &self.control_id).await?;
+        let root = self
+            .store
+            .root_budget(&self.executor, &control.billing_scope)
+            .await?
+            .ok_or(Error::Budget)?;
+        if root.root_budget_id != control.root_budget_id {
+            return Err(Error::Conflict(
+                "control root budget differs from the persisted billing scope".into(),
+            ));
+        }
+        Ok(crate::broker::BudgetPortBinding {
+            billing_scope: control.billing_scope,
+            root_budget_id: control.root_budget_id,
+        })
+    }
+}
