@@ -3733,7 +3733,7 @@ mod complete_verdict_tests {
         // Complete-batch finalization always passes safety_ok=true; this checks
         // only the private defensive rule, not a reachable batch safety path.
         for profile in [ProfileKind::QualityGain, ProfileKind::NoninferiorSavings] {
-            let mut plan = ExperimentPlan::first_low_risk("safety-fixture").unwrap();
+            let mut plan = ExperimentPlan::first_low_risk("safety-fixture", 60).unwrap();
             plan.profile = profile;
             plan.freeze(1).unwrap();
             plan.bind_candidate("candidate").unwrap();

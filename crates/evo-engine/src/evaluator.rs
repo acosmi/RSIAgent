@@ -137,7 +137,7 @@ mod tests {
     use evo_core::evaluation::ExperimentPlan;
 
     fn frozen() -> (ExperimentPlan, QueryBook, QueryTicket) {
-        let mut plan = ExperimentPlan::first_low_risk("exp").unwrap();
+        let mut plan = ExperimentPlan::first_low_risk("exp", 60).unwrap();
         plan.freeze(1).unwrap();
         plan.bind_candidate("cand").unwrap();
         let book = QueryBook::open(&plan).unwrap();

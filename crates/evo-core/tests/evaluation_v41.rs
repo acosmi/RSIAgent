@@ -436,7 +436,7 @@ fn v096_v097_zero_budget_and_same_start_are_structural_contracts() {
         .is_err()
     );
 
-    let mut snapshot = ExperimentPlan::first_low_risk("formal-v41").unwrap();
+    let mut snapshot = ExperimentPlan::first_low_risk("formal-v41", 60).unwrap();
     snapshot.freeze(10).unwrap();
     let alpha = alpha_plan();
     assert!(
