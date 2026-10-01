@@ -584,6 +584,56 @@ pub(crate) fn development_request_fact_id(observed: &StageFact) -> Result<String
     })
 }
 
+/// Canonical ids `(request_fact_id, observed_fact_id)` of the
+/// `DevelopmentRequestPrepared` / `DevelopmentObserved` pair that
+/// `run_optimization_step` journals for the development stage of `context` and
+/// `development_request` (the request as the caller built it, before the step
+/// rewrites its identity). A consumer that holds only the step's request, such as
+/// the exploration coordinator, names the two facts to the E03 observation gate
+/// from this, never from the runner's report.
+///
+/// It mirrors, without sharing code with it, the request-id rewrite in
+/// `run_optimization_step_inner` (`optdev-` and a fingerprint of the scope, the
+/// step's request id and the caller's development request id) and the canonical id
+/// of `StageFact`. If the step ever derives either differently, the gate finds no
+/// fact and refuses the evidence: it fails closed, and the trusted-path tests of
+/// the coordinator fail with it.
+pub(crate) fn development_stage_fact_ids(
+    context: &ModelRequestContext,
+    development_request: &DevelopmentRunRequest,
+) -> Result<(String, String)> {
+    let request_id = format!(
+        "optdev-{}",
+        fingerprint(&(
+            &context.namespace,
+            &context.episode_id,
+            context.step,
+            context.attempt,
+            &context.request_id,
+            &development_request.request_id
+        ))?
+    );
+    let observed = StageFact {
+        schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+        artifact_id: String::new(),
+        namespace: context.namespace.clone(),
+        episode_id: context.episode_id.clone(),
+        step: context.step,
+        attempt: context.attempt,
+        stage: OptimizationJournalStage::Development,
+        kind: StageFactKind::DevelopmentObserved,
+        request_id,
+        input_digest: String::new(),
+        output_digest: None,
+        dependencies: vec![],
+        payload: serde_json::Value::Null,
+    };
+    Ok((
+        development_request_fact_id(&observed)?,
+        canonical_stage_artifact_id(&observed)?,
+    ))
+}
+
 #[async_trait]
 pub trait OptimizationJournal: Send + Sync {
     /// Must commit one typed artifact and all dependency edges atomically.

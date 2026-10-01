@@ -634,6 +634,23 @@ async fn put_raw_record(store: &Store, record_kind: &str, id: &str, value: &Valu
     session.commit().await.unwrap();
 }
 
+/// Rewrites a stored node as the observation of a trusted development report:
+/// valid at `quality_micros`, with that gain over the baseline of the world.
+async fn promote_to_trusted_valid(
+    store: &Store,
+    node_id: &str,
+    quality_micros: u32,
+    gain_micros: i32,
+) {
+    let mut node = raw_record(store, "exploration_node_v1", node_id).await;
+    let payload = &mut node["payload"];
+    payload["evidence"] = json!("trusted");
+    payload["node"]["status"] = json!({"status": "valid", "quality_micros": quality_micros});
+    payload["node"]["best_valid_ancestor_micros"] = json!(quality_micros);
+    payload["node"]["recent_valid_gains_micros"] = json!([gain_micros]);
+    put_raw_record(store, "exploration_node_v1", node_id, &node).await;
+}
+
 async fn raw_fact(store: &Store, dispatch_id: &str) -> Value {
     raw_record(store, "exploration_dispatch_v1", dispatch_id).await
 }
@@ -1185,6 +1202,20 @@ async fn the_policy_really_changes_the_dispatched_action() {
     let focus_first = env.dispatch("world-focus", 1, "focus-1").await;
     assert_eq!(dispatched_seq(&default_first.decision.action), 1);
     assert_eq!(dispatched_seq(&focus_first.decision.action), 1);
+    // The fixture runner's report is no longer a valid observation (AG-033: the E03
+    // gate is not asked for a Fixture report), so each first node is stored as a
+    // trusted observation would have been: valid, 900000 against the 500000
+    // baseline. The comparison below is about the policy, which needs a valid node
+    // to deepen.
+    for step in [&default_first, &focus_first] {
+        promote_to_trusted_valid(
+            &env.store,
+            step.node_id.as_deref().unwrap(),
+            900_000,
+            400_000,
+        )
+        .await;
+    }
     let default_next = env.coordinator.decide_next("world-default").await.unwrap();
     let focus_next = env.coordinator.decide_next("world-focus").await.unwrap();
     // Default: focus the branch that just gained (deepen node 1). Restricted to
