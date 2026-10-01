@@ -1264,20 +1264,69 @@ async fn a_revoked_curriculum_fails_closed_before_and_after_the_cleanup() {
         );
     }
 
-    // curriculum.step through the management dispatcher: the job ends Failed,
-    // never Succeeded, and schedules nothing.
+    // curriculum.step through the management dispatcher: a new request over the
+    // redacted learner state is refused at submit (plan §11: a revocation refuses
+    // new access at once) with a Conflict that names the redacted dependency,
+    // schedules nothing, and leaves no job, private input or idempotency row.
     let dispatcher = ManagementDispatcher::new(fixture.store.clone(), vec![ctx.clone()]).unwrap();
-    let queued = dispatcher
+    let (jobs_before, artifacts_before) = {
+        let mut session = fixture.store.session().await.unwrap();
+        let counts = (
+            session.namespace_object_count(ctx, "job").await.unwrap(),
+            session
+                .namespace_object_count(ctx, "artifact")
+                .await
+                .unwrap(),
+        );
+        session.commit().await.unwrap();
+        counts
+    };
+    let refused = dispatcher
         .submit(
             ctx,
             "curriculum.step",
             step_request("curriculum-after-revocation"),
         )
-        .await
-        .unwrap();
-    let finished = wait_terminal(&dispatcher, ctx, &queued.id).await;
-    assert_eq!(finished.state, ManagementJobState::Failed, "{finished:?}");
-    assert!(finished.error_code.is_some());
+        .await;
+    let message = match refused {
+        Err(Error::Conflict(message)) => message,
+        other => panic!("expected a Conflict at submit, got {other:?}"),
+    };
+    assert!(message.contains("redacted"), "{message}");
+    assert!(message.contains("artifact"), "{message}");
+    assert!(
+        message.contains(&curriculum_state_storage_id(STATE_ID).unwrap()),
+        "{message}"
+    );
+    {
+        let mut session = fixture.store.session().await.unwrap();
+        assert_eq!(
+            session.namespace_object_count(ctx, "job").await.unwrap(),
+            jobs_before,
+            "a refused submission writes no job"
+        );
+        assert_eq!(
+            session
+                .namespace_object_count(ctx, "artifact")
+                .await
+                .unwrap(),
+            artifacts_before,
+            "a refused submission writes no private input"
+        );
+        let row = session
+            .cached::<ManagementJob, _>(
+                ctx,
+                "curriculum.step",
+                "curriculum-after-revocation",
+                &json!({}),
+            )
+            .await;
+        assert!(
+            matches!(row, Ok(None)),
+            "a refused submission leaves no idempotency row: {row:?}"
+        );
+        session.commit().await.unwrap();
+    }
 
     // None of the refused calls wrote a curriculum record or rewrote the
     // redacted state.

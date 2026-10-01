@@ -2336,6 +2336,14 @@ async fn cleanup_node_content(
                     .iter()
                     .all(|key| m.contains_key(*key))
         }),
+        // E07 management jobs are the audit record of an action that already
+        // happened: who asked for which operation, how far it got and how it
+        // ended. `ManagementJob` and its `ManagementResult` hold ids, digests,
+        // enums, counters, booleans and fixed-vocabulary strings only (no
+        // source-derived text; the request payload lives in the private input,
+        // redacted below), so a job survives a source revocation. Revocation must
+        // not erase a performed action.
+        ("job", "rsia.management_job.v1", _) => true,
         _ => false,
     };
     let redact = match (node.kind.as_str(), schema, record_kind) {
@@ -2420,6 +2428,11 @@ async fn cleanup_node_content(
                     .iter()
                     .all(|key| m.contains_key(*key))
         }),
+        // E07 management private input: the complete request payload of a
+        // management job (for exploration.start the whole world and its run
+        // closure). It is content derived from sources and is redacted; the
+        // preserved job above keeps the id of the redacted input.
+        ("artifact", "rsia.management_private_input.v1", _) => true,
         _ => false,
     };
     if !redact && !preserve {

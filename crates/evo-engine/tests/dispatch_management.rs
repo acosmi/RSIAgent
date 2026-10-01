@@ -2758,9 +2758,23 @@ async fn exploration_start_status_revocation_gate_and_terminal_preservation() {
         serde_json::to_value(&done.result).unwrap()
     );
 
-    // A new world over the revoked closure fails inside the job, not at
-    // submit, and is never persisted.
-    let queued = dispatcher
+    // A new world over the revoked closure is refused at submit (plan §11: a
+    // revocation refuses new access at once) with a Conflict that names the
+    // revoked run, is never persisted, and leaves no job, private input or
+    // idempotency row.
+    let (jobs_before, artifacts_before) = {
+        let mut session = store.session().await.unwrap();
+        let counts = (
+            session.namespace_object_count(&admin, "job").await.unwrap(),
+            session
+                .namespace_object_count(&admin, "artifact")
+                .await
+                .unwrap(),
+        );
+        session.commit().await.unwrap();
+        counts
+    };
+    let refused = dispatcher
         .submit(
             &admin,
             "exploration.start",
@@ -2769,12 +2783,43 @@ async fn exploration_start_status_revocation_gate_and_terminal_preservation() {
                 &exploration_world("world-2", 1),
             ),
         )
-        .await
-        .unwrap();
-    let failed = wait_terminal(&dispatcher, &admin, &queued.id).await;
-    assert_eq!(failed.state, ManagementJobState::Failed);
-    assert_eq!(failed.error_code.as_deref(), Some("forbidden"));
+        .await;
+    let message = match refused {
+        Err(Error::Conflict(message)) => message,
+        other => panic!("expected a Conflict at submit, got {other:?}"),
+    };
+    assert!(message.contains("run run-failure"), "{message}");
+    assert!(message.contains("revoked"), "{message}");
     assert_eq!(exploration_worlds(&admin, &store).await.len(), 1);
+    {
+        let mut session = store.session().await.unwrap();
+        assert_eq!(
+            session.namespace_object_count(&admin, "job").await.unwrap(),
+            jobs_before,
+            "a refused submission writes no job"
+        );
+        assert_eq!(
+            session
+                .namespace_object_count(&admin, "artifact")
+                .await
+                .unwrap(),
+            artifacts_before,
+            "a refused submission writes no private input"
+        );
+        let row = session
+            .cached::<ManagementJob, _>(
+                &admin,
+                "exploration.start",
+                "exploration-after-tombstone",
+                &json!({}),
+            )
+            .await;
+        assert!(
+            matches!(row, Ok(None)),
+            "a refused submission leaves no idempotency row: {row:?}"
+        );
+        session.commit().await.unwrap();
+    }
 
     // A watermark bump (source closure changed) is a Conflict.
     let mut session = store.session().await.unwrap();
@@ -2790,22 +2835,51 @@ async fn exploration_start_status_revocation_gate_and_terminal_preservation() {
     let persisted = raw_job(&admin, &store, &done.id).await;
     assert_eq!(persisted.state, ManagementJobState::Succeeded);
 
-    let queued = dispatcher
+    // The run is still tombstoned after the watermark bump, so a new world is
+    // refused at submit as well, again with nothing left behind.
+    let refused = dispatcher
         .submit(
             &admin,
             "exploration.start",
             exploration_start_request("exploration-after-bump", &exploration_world("world-3", 1)),
         )
-        .await
-        .unwrap();
-    let failed = wait_terminal(&dispatcher, &admin, &queued.id).await;
-    assert_eq!(failed.state, ManagementJobState::Failed);
-    assert_eq!(failed.error_code.as_deref(), Some("conflict"));
-    assert_eq!(
-        dispatcher.status(&admin, &failed.id).await.unwrap().state,
-        ManagementJobState::Failed
-    );
+        .await;
+    let message = match refused {
+        Err(Error::Conflict(message)) => message,
+        other => panic!("expected a Conflict at submit, got {other:?}"),
+    };
+    assert!(message.contains("run run-failure"), "{message}");
+    assert!(message.contains("revoked"), "{message}");
     assert_eq!(exploration_worlds(&admin, &store).await.len(), 1);
+    {
+        let mut session = store.session().await.unwrap();
+        assert_eq!(
+            session.namespace_object_count(&admin, "job").await.unwrap(),
+            jobs_before,
+            "a refused submission writes no job"
+        );
+        assert_eq!(
+            session
+                .namespace_object_count(&admin, "artifact")
+                .await
+                .unwrap(),
+            artifacts_before,
+            "a refused submission writes no private input"
+        );
+        let row = session
+            .cached::<ManagementJob, _>(
+                &admin,
+                "exploration.start",
+                "exploration-after-bump",
+                &json!({}),
+            )
+            .await;
+        assert!(
+            matches!(row, Ok(None)),
+            "a refused submission leaves no idempotency row: {row:?}"
+        );
+        session.commit().await.unwrap();
+    }
 
     // A job cancelled before claim is never re-verified against sources.
     let cancelled_direct = ManagementJob {

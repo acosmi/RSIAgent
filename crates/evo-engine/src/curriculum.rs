@@ -139,6 +139,9 @@ const VALIDITY_KIND: &str = "curriculum_validity_report_v1";
 const SELECTION_KIND: &str = "curriculum_selection_v1";
 const RECEIPT_KIND: &str = "probe_schedule_receipt_v1";
 const ENVELOPE_SCHEMA: &str = "rsia.curriculum_artifact_envelope.v1";
+/// Schema of the tombstone the revocation cleanup leaves in place of a record
+/// whose source was revoked (plan §11.5, E08).
+const REDACTED_SCHEMA: &str = "rsia.redacted.v1";
 
 /// Storage id of a registered curriculum control profile artifact.
 pub fn curriculum_profile_storage_id(profile_id: &str) -> Result<String> {
@@ -588,9 +591,16 @@ impl PersistentCurriculumCoordinator {
     /// Schedules at most one probe for `idempotency_key`. The first run
     /// persists the probe job, the updated learner state, their edges and a
     /// `ProbeScheduleReceiptV1` in one transaction; every later run with the
-    /// same key and inputs reloads the recorded probe job without touching the
+    /// same key and inputs reloads the recorded probe job without mutating the
     /// learner state again (plan §6.7.4: recovery continues from persisted
     /// stage facts, never from "a file exists").
+    ///
+    /// The replay is not exempt from the revocation gate (plan §11.4): before it
+    /// hands the recorded job out it re-reads the learner state and re-verifies
+    /// its source watermark and source closure, the same rule a new execution
+    /// applies, so a revoked source is a `Conflict` (or `Forbidden`) for a
+    /// replayed key too, and a redacted learner state is a `Conflict` that names
+    /// the redaction.
     pub async fn schedule_probe_idempotent(
         &self,
         idempotency_key: &str,
@@ -639,6 +649,12 @@ impl PersistentCurriculumCoordinator {
                     "recorded probe job differs from its schedule receipt".into(),
                 ));
             }
+            // Fail closed like every other entry point: the recorded job is only
+            // returned while the learner state it was scheduled from is live.
+            let state: LearnerStateV2 =
+                need_record(&mut session, &self.context, STATE_KIND, state_id).await?;
+            verify_watermark(&mut session, &self.context, &state).await?;
+            verify_state_sources(&mut session, &self.context, &state).await?;
             session.commit().await?;
             return Ok(job);
         }
@@ -1325,6 +1341,18 @@ fn storage_id(record_kind: &str, id: &str) -> Result<String> {
     Ok(format!("e12-{}", fingerprint(&(record_kind, id))?))
 }
 
+/// Reads the stored body of one curriculum record as an envelope.
+///
+/// After a source revocation the cleanup replaces the body of a learner state,
+/// cycle receipt, proposal, validity report, attempt or selection with an
+/// `rsia.redacted.v1` tombstone, which is not an envelope. That is the expected
+/// state of a revoked curriculum, not corruption, so the read names it: a
+/// `Conflict` (HTTP 409) carrying the record kind and id, the same verdict
+/// `exploration.rs` (`read_envelope`) gives a redacted exploration record,
+/// instead of a decode failure that would surface as `Internal`. The body is
+/// inspected before it is decoded, so the expected state does not raise the
+/// storage layer's "database operation failed" error log either. Any other body
+/// that does not decode is corruption and stays `Internal`.
 async fn get_record<T: DeserializeOwned>(
     session: &mut Session,
     context: &Context,
@@ -1332,21 +1360,37 @@ async fn get_record<T: DeserializeOwned>(
     id: &str,
 ) -> Result<Option<T>> {
     let storage_id = storage_id(record_kind, id)?;
-    let envelope = session
-        .get::<ArtifactEnvelope<T>>(context, "artifact", &storage_id)
-        .await?;
-    match envelope {
-        Some(envelope)
-            if envelope.schema_version == ENVELOPE_SCHEMA
-                && envelope.id == storage_id
-                && envelope.record_kind == record_kind =>
-        {
-            Ok(Some(envelope.payload))
+    let Some(body) = session
+        .get::<serde_json::Value>(context, "artifact", &storage_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if body
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        == Some(REDACTED_SCHEMA)
+    {
+        return Err(Error::Conflict(format!(
+            "curriculum record {record_kind} {id} was redacted because its source was revoked"
+        )));
+    }
+    let envelope: ArtifactEnvelope<T> = match serde_json::from_value(body) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            tracing::error!(%error, record_kind, id, "stored curriculum record does not decode");
+            return Err(Error::Internal);
         }
-        Some(_) => Err(Error::Conflict(
+    };
+    if envelope.schema_version == ENVELOPE_SCHEMA
+        && envelope.id == storage_id
+        && envelope.record_kind == record_kind
+    {
+        Ok(Some(envelope.payload))
+    } else {
+        Err(Error::Conflict(
             "curriculum artifact envelope mismatch".into(),
-        )),
-        None => Ok(None),
+        ))
     }
 }
 
