@@ -576,7 +576,9 @@ pub struct EvaluationInput {
     #[serde(default)]
     pub meta: Option<MetaEvidence>,
 }
-/// Equal total budgets and descendant identities are attested by the independent evaluator.
+/// Reported descendant identities and actual spending totals; these fields alone
+/// do not establish independent verification. Comparisons use equal budget limits
+/// and record each stream's real spending separately, without equalizing totals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetaEvidence {
