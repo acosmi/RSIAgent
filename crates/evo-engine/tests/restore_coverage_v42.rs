@@ -89,6 +89,9 @@ const REDACTED: &str = "rsia.redacted.v1";
 /// `curriculum.rs` keeps this constant private; the literal is the persisted value.
 const CURRICULUM_ENVELOPE_SCHEMA: &str = "rsia.curriculum_artifact_envelope.v1";
 const PRIVATE_INPUT_SCHEMA: &str = "rsia.management_private_input.v1";
+/// AG-051 added the replay-economic envelope to the same list; its own cases are in
+/// `restore_economic_v42.rs`. The ten schemas this file covers are unchanged.
+const ECONOMIC_ENVELOPE_SCHEMA: &str = "rsia.replay_economic_artifact_envelope.v1";
 
 fn d(label: &str) -> String {
     hash(label.as_bytes())
@@ -1030,7 +1033,17 @@ fn the_action_schemas_are_listed_once_in_rust_and_in_the_restore_script() {
         listed.len(),
         "a schema is listed twice"
     );
-    assert_eq!(listed, expected, "the Rust list is the engine's schemas");
+    // the list is the ten schemas of this round plus the economic envelope (AG-051)
+    let without_economic: BTreeSet<String> = listed
+        .iter()
+        .filter(|schema| schema.as_str() != ECONOMIC_ENVELOPE_SCHEMA)
+        .cloned()
+        .collect();
+    assert_eq!(
+        without_economic, expected,
+        "the Rust list is the engine's schemas"
+    );
+    assert!(listed.contains(ECONOMIC_ENVELOPE_SCHEMA));
 
     // the two Rust groups do not overlap and the private input is in neither
     for schema in PROTECTED_SCHEMA_VERSIONS {
