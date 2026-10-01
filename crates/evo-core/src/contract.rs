@@ -406,6 +406,12 @@ pub fn compile_improver(
 ) -> Result<(Strategy, Vec<ValueOrigin>)> {
     parent.validate()?;
     baseline.validate()?;
+    // Require context labels even for all-Set patches; this does not bind input content.
+    if profile.parent_digest.is_empty() || profile.baseline_digest.is_empty() {
+        return Err(Error::Invalid(
+            "parent and baseline digests are required".into(),
+        ));
+    }
     let mut origins = Vec::new();
     let instruction = apply_leaf(
         "improver.instruction",
