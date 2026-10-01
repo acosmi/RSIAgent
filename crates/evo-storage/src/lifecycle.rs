@@ -151,6 +151,51 @@ struct ReplayCleanupEnvelope<T> {
     payload: T,
 }
 
+// Read-only Host authority shape; storage cannot depend on engine's writer type.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeTraceAuthorityWire {
+    schema_version: String,
+    record: NativeRunRecordWire,
+    trace: evo_core::optimization::OptimizationTrace,
+    excerpt_start: usize,
+    excerpt_end: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeRunRecordWire {
+    id: String,
+    body: Vec<u8>,
+    parent_family: String,
+    task_origin: evo_core::evidence::TaskOrigin,
+    execution_attestation: evo_core::evidence::ExecutionAttestation,
+    purpose: evo_core::evidence::Purpose,
+}
+
+fn valid_native_trace_authority(node: &TypedObjectRef, value: &serde_json::Value) -> bool {
+    let Ok(authority) = serde_json::from_value::<NativeTraceAuthorityWire>(value.clone()) else {
+        return false;
+    };
+    let record = &authority.record;
+    let trace = &authority.trace;
+    authority.schema_version == "rsia.optimization.source.v1"
+        && record.id == node.id
+        && record.task_origin == evo_core::evidence::TaskOrigin::TrustedRun
+        && record.execution_attestation == evo_core::evidence::ExecutionAttestation::TrustedHost
+        && record.purpose == evo_core::evidence::Purpose::Development
+        && trace.purpose == record.purpose
+        && trace.run_id == record.id
+        && trace.parent_family == record.parent_family
+        && trace.source_digest == evo_core::hash(&record.body)
+        && record
+            .body
+            .get(authority.excerpt_start..authority.excerpt_end)
+            == Some(trace.excerpt.as_bytes())
+        && identifier(&record.id).is_ok()
+        && identifier(&record.parent_family).is_ok()
+}
+
 impl LifecycleStore {
     pub async fn begin_revoke(
         ctx: &Context,
@@ -2683,6 +2728,8 @@ async fn cleanup_node_content(
     };
     let redact = match (node.kind.as_str(), schema, record_kind) {
         (_, "rsia.redacted.v1", _) => return Ok(()),
+        // Only complete native Host authorities qualify, bound to this closure node.
+        ("run", "rsia.optimization.source.v1", _) => valid_native_trace_authority(node, &value),
         ("artifact", "rsia.optimization.stage_fact.v1", _) => matches!(
             value["kind"].as_str(),
             Some(
