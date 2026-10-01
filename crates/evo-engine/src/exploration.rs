@@ -2568,8 +2568,7 @@ fn node_follows_action(
 /// is bound to the action the fact records, so the action is bound to the node:
 /// the node sits where that action derives it (`node_follows_action`). A root
 /// dispatch rewritten into a `Deepen`, with the counters that would pay for it,
-/// would otherwise balance the books too. A `Recover` fact is the one kind not
-/// bound to its node yet (no step produces a repairable failure).
+/// would otherwise balance the books too.
 ///
 /// This function states the spending rule of `run_next` (`settle`) from the reading
 /// side: a change to when or by how much a dispatch spends, or to where its node is
@@ -2660,15 +2659,8 @@ async fn registered_budget(
                     .iter()
                     .position(|listed| listed == node_id)
                     .and_then(|index| nodes.get(index));
-                // A `Recover` is the one kind not held to its node yet: no step produces a
-                // repairable failure (AG-042 derives the recovery end to end), so there is
-                // no real `Recover` fact to bind.
-                let held_to_node =
-                    !matches!(fact.selected_action.kind, ActionKindV1::Recover { .. });
-                if held_to_node
-                    && !node.is_some_and(|node| {
-                        node_follows_action(&nodes, node, &fact.selected_action)
-                    })
+                if !node
+                    .is_some_and(|node| node_follows_action(&nodes, node, &fact.selected_action))
                 {
                     return Err(unaccounted());
                 }

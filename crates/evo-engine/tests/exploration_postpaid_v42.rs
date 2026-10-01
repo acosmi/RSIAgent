@@ -21,9 +21,9 @@
 //! * a new world starts at the initial scheduling state: registration refuses a
 //!   pre-filled decision round, current branch, branch focus and waits, which no
 //!   registration fingerprint covers and which change the first decision it reports;
-//! * the registration and `status` of a started world hold each completed `Widen` or
-//!   `Deepen` fact to its node: the search parent, the depth and the branch are the
-//!   ones the fact's action derives. A root dispatch rewritten into a `Deepen`
+//! * the registration and `status` of a started world hold each completed dispatch
+//!   fact to its node: the search parent, the depth and the branch are the ones the
+//!   fact's action derives. A root dispatch rewritten into a `Deepen` or a `Recover`
 //!   together with the counters that would pay for it is refused (it balanced the
 //!   books before);
 //! * none of the new terminal states leaves a world `register_world_idempotent` or
@@ -31,11 +31,11 @@
 //!   target test excepted: its world was tampered with to make the target vanish).
 //!
 //! Not covered (and not claimed): the recovery of a repairable failure end to end
-//! (AG-042: no step produces a repairable failure yet, so a `Recover` fact is not yet
-//! held to its node, and the Recover here is made by rewriting a stored node), and a
-//! transient storage error after the step was paid for, which still leaves the
-//! dispatch claimed until the original request resumes it. Real SQLite store, fixture
-//! model and runner, no provider, zero monetary cost.
+//! (AG-042: no step produces a repairable failure yet, so the Recover facts here are
+//! made by rewriting stored records), and a transient storage error after the step
+//! was paid for, which still leaves the dispatch claimed until the original request
+//! resumes it. Real SQLite store, fixture model and runner, no provider, zero
+//! monetary cost.
 //!
 //! Fixtures are copied from `exploration_start_after_dispatch_v42.rs` and
 //! `exploration_trust_v42.rs`; those files are unchanged.
@@ -2220,6 +2220,102 @@ async fn a_deepen_fact_is_held_to_the_node_it_produced() {
             &done,
             &original,
             &format!("deepen-bind-job-{index}"),
+            label,
+            tamper,
+        )
+        .await;
+    }
+}
+
+/// The stored fact of a root dispatch rewritten into the fact of the `Recover` of node
+/// `failed_seq`, on `branch_seq` and `target_depth`, at the successor cost: what
+/// `derive_legal_actions` would have derived for a repairable failure.
+fn rewrite_as_recover(fact: &mut Value, failed_seq: u32, branch_seq: u32, target_depth: u32) {
+    let action_id = format!("recover-{failed_seq}");
+    let action_seq = 1_000_000 + 2 * failed_seq + 1;
+    let payload = &mut fact["payload"];
+    payload["action_id"] = json!(action_id);
+    payload["action_seq"] = json!(action_seq);
+    payload["selected_action"] = json!({
+        "action_id": action_id,
+        "action_seq": action_seq,
+        "branch_seq": branch_seq,
+        "target_depth": target_depth,
+        "kind": {"action": "recover", "failed_node_seq": failed_seq, "episode_id": "episode-1"},
+        "estimated_cost_upper_micros": SUCCESSOR_COST,
+    });
+    payload["decision"]["action"]["action_ids"] = json!([action_id]);
+    payload["decision"]["action"]["action_seqs"] = json!([action_seq]);
+    payload["decision"]["action"]["estimated_cost_upper_micros"] = json!(SUCCESSOR_COST);
+}
+
+#[tokio::test]
+async fn a_recover_fact_is_held_to_its_node_like_a_deepen() {
+    // No step produces a repairable failure yet (AG-042), so the second of two real
+    // dispatches is rewritten into the Recover of the first node: its fact, the
+    // counters that pay for it (the successor cost and one recovery dispatch) and its
+    // node, which a Recover derives as the child of the failed node, one level down,
+    // on its branch.
+    let env = env().await;
+    let world = world_for("world-1");
+    let done = env.start_job("recover-bind-start", &world).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
+    let steps = env.dispatches("world-1", 2).await;
+    let original = Stored::load(&env, "world-1", &steps).await;
+    let spend_a_recover = |stored: &mut Stored| {
+        rewrite_as_recover(&mut stored.facts[1], 1, 1, 2);
+        set_remaining_root(
+            &mut stored.world,
+            REGISTERED_ROOT_MICROS - FIRST_ROOT_COST - SUCCESSOR_COST,
+        );
+        stored.world["payload"]["remaining_recovery_dispatches"] =
+            json!(REGISTERED_RECOVERY_DISPATCHES - 1);
+    };
+    let placed_as_a_recover_child = |stored: &mut Stored| {
+        stored.nodes[1]["payload"]["node"]["search_parent_seq"] = json!(1);
+        stored.nodes[1]["payload"]["node"]["branch_seq"] = json!(1);
+        stored.nodes[1]["payload"]["node"]["depth"] = json!(2);
+    };
+
+    // The Recover, its counters and its node: registered.
+    let mut consistent = original.clone();
+    spend_a_recover(&mut consistent);
+    placed_as_a_recover_child(&mut consistent);
+    consistent.put(&env).await;
+    assert_still_registered(&env, &world, &done, "a spent Recover and its node").await;
+    original.put(&env).await;
+
+    // The fact and the counters alone are not: the node of a root dispatch is no
+    // child of a failed node.
+    let tampers: Vec<(&str, StoredTamper)> = vec![
+        (
+            "a Recover and its counters over the node of a root dispatch",
+            Box::new(spend_a_recover),
+        ),
+        (
+            "a Recover whose node sits under another parent",
+            Box::new(move |stored| {
+                spend_a_recover(stored);
+                placed_as_a_recover_child(stored);
+                stored.nodes[1]["payload"]["node"]["search_parent_seq"] = json!(2);
+            }),
+        ),
+        (
+            "a Recover whose node is not one level down",
+            Box::new(move |stored| {
+                spend_a_recover(stored);
+                placed_as_a_recover_child(stored);
+                stored.nodes[1]["payload"]["node"]["depth"] = json!(3);
+            }),
+        ),
+    ];
+    for (index, (label, tamper)) in tampers.iter().enumerate() {
+        expect_refused_everywhere(
+            &env,
+            &world,
+            &done,
+            &original,
+            &format!("recover-bind-job-{index}"),
             label,
             tamper,
         )

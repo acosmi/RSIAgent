@@ -2153,18 +2153,21 @@ async fn an_uncertain_dispatch_spent_its_cost_and_a_claimed_one_has_spent_nothin
 async fn a_dispatch_that_spent_a_recovery_dispatch_is_added_back() {
     // `run_next` spends one recovery dispatch, and the successor cost, when the
     // selected action is a `Recover`. A real recovery needs a repairable failure no
-    // step produces yet (E09 PR-B), so the fact of one real dispatch is rewritten
-    // into the fact of the recover dispatch `derive_legal_actions` would have derived
-    // for the first node (id, numbering after the roots, successor cost) and the
-    // world's counters into what that dispatch would have left.
+    // step produces yet (E09 PR-B), so the second of two real dispatches is rewritten
+    // into the Recover that `derive_legal_actions` would have derived for the first
+    // node: its fact (id, numbering after the roots, successor cost), its node (the
+    // child of the failed node, one level down, on its branch) and the world's
+    // counters into what that dispatch would have left.
     let env = env().await;
     let world = world_for("world-1");
     env.register(&world).await.unwrap();
-    let step = env.step("world-1", 1, "recover-1").await;
-    let dispatch_id = step.dispatch_id.clone().unwrap();
+    let steps = env.dispatches("world-1", 2).await;
+    let dispatch_id = steps[1].dispatch_id.clone().unwrap();
+    let node_id = steps[1].node_id.clone().unwrap();
     let fact = raw_fact(&env.store, &dispatch_id).await;
+    let node = raw_record(&env.store, NODE_KIND, &node_id).await;
     let world_record = raw_record(&env.store, WORLD_KIND, "world-1").await;
-    expect_already_registered(env.register(&world).await, "the real dispatch");
+    expect_already_registered(env.register(&world).await, "the real dispatches");
 
     let mut recover_fact = fact.clone();
     let payload = &mut recover_fact["payload"];
@@ -2181,20 +2184,26 @@ async fn a_dispatch_that_spent_a_recovery_dispatch_is_added_back() {
     payload["decision"]["action"]["action_ids"] = json!(["recover-1"]);
     payload["decision"]["action"]["action_seqs"] = json!([1_000_003]);
     payload["decision"]["action"]["estimated_cost_upper_micros"] = json!(SUCCESSOR_COST);
+    // The node that dispatch would have written: the child of the failed node.
+    let mut recover_node = node.clone();
+    recover_node["payload"]["node"]["search_parent_seq"] = json!(1);
+    recover_node["payload"]["node"]["branch_seq"] = json!(1);
+    recover_node["payload"]["node"]["depth"] = json!(2);
     // The world as that dispatch would have left it: it cost the successor cost and
     // one recovery dispatch.
     let mut spent_world = world_record.clone();
     spent_world["payload"]["remaining_recovery_dispatches"] =
         json!(REGISTERED_RECOVERY_DISPATCHES - 1);
     spent_world["payload"]["remaining_root_micros"] =
-        json!(REGISTERED_ROOT_MICROS - SUCCESSOR_COST);
-    // The real dispatch's world with one recovery dispatch spent.
+        json!(REGISTERED_ROOT_MICROS - FIRST_ROOT_COST - SUCCESSOR_COST);
+    // The real dispatches' world with one recovery dispatch spent.
     let mut spent_recovery_only = world_record.clone();
     spent_recovery_only["payload"]["remaining_recovery_dispatches"] =
         json!(REGISTERED_RECOVERY_DISPATCHES - 1);
 
     // A recover dispatch and the counters that paid for it: registered.
     put_raw_fact(&env.store, &dispatch_id, &recover_fact).await;
+    put_raw_record(&env.store, NODE_KIND, &node_id, &recover_node).await;
     put_raw_record(&env.store, WORLD_KIND, "world-1", &spent_world).await;
     expect_already_registered(env.register(&world).await, "a spent recovery dispatch");
     // A recover dispatch the counters never paid for, and a recovery counter that
@@ -2205,6 +2214,7 @@ async fn a_dispatch_that_spent_a_recovery_dispatch_is_added_back() {
         "a recover dispatch that spent nothing",
     );
     put_raw_fact(&env.store, &dispatch_id, &fact).await;
+    put_raw_record(&env.store, NODE_KIND, &node_id, &node).await;
     put_raw_record(&env.store, WORLD_KIND, "world-1", &spent_recovery_only).await;
     expect_conflict(
         env.register(&world).await,
