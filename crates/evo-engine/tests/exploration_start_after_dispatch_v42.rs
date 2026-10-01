@@ -2078,7 +2078,13 @@ async fn an_uncertain_dispatch_spent_its_cost_and_a_claimed_one_has_spent_nothin
         )
         .await
         .unwrap();
-    assert!(step.outcome.contains("not found"), "{}", step.outcome);
+    // The model port failed after the dispatch was claimed: the dispatch keeps the fixed
+    // code of that outcome, not the port's own error (AG-048).
+    assert_eq!(
+        step.outcome, "model_transport_outcome_unknown",
+        "{}",
+        step.outcome
+    );
     let stored = env.world("world-uncertain").await;
     assert_eq!(
         counters(&stored).0,

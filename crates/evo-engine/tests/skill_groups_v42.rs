@@ -37,8 +37,8 @@ use evo_engine::model::{
 use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentTask, OPTIMIZATION_STAGE_FACT_SCHEMA,
-    OptimizationStepOutcome, OptimizationStepRequest, PairedTaskResult, StoreOptimizationJournal,
-    run_optimization_step,
+    OptimizationStepOutcome, OptimizationStepRequest, PairedTaskResult, StepTerminalClass,
+    StoreOptimizationJournal, run_optimization_step,
 };
 use evo_storage::Store;
 use evo_storage::budget::RootBudgetAuthorization;
@@ -866,7 +866,7 @@ async fn two_groups_each_produce_a_candidate_with_disjoint_facts_and_an_order_in
         assert_eq!(got.skill_id, skill);
         assert_eq!(got.episode_id, fixture.episode_id);
         assert_eq!(got.kind, GroupOutcomeKind::Candidate);
-        assert_eq!(got.reason, None);
+        assert_eq!(got.terminal, None);
         assert_eq!(
             got.candidate_skill_digest.as_deref(),
             Some(expected_candidate_digest(fixture).as_str())
@@ -1003,7 +1003,8 @@ struct Isolation {
     /// Applied to the failing group's fixture after the store was seeded.
     mutate: Option<fn(&mut GroupFixture)>,
     kind: GroupOutcomeKind,
-    reason: &'static str,
+    /// The fixed code of the terminal class the group's outcome carries (AG-048).
+    class_code: &'static str,
     /// Calls the failing group is expected to make: (model, development runner).
     calls: (usize, usize),
     /// Durable fact kinds the failing group must have left behind; empty means none at all.
@@ -1023,7 +1024,7 @@ async fn a_group_that_fails_keeps_its_own_record_and_never_erases_the_other_grou
             runner: None,
             mutate: None,
             kind: GroupOutcomeKind::Rejected,
-            reason: "fixture provider refused the request",
+            class_code: "model_rejected_provider_rejected",
             calls: (1, 0),
             facts: &["response_observed", "terminal_rejected", "step_completed"],
             status: Some("rejected"),
@@ -1035,7 +1036,7 @@ async fn a_group_that_fails_keeps_its_own_record_and_never_erases_the_other_grou
             runner: None,
             mutate: None,
             kind: GroupOutcomeKind::Uncertain,
-            reason: "model usage remains unknown",
+            class_code: "model_usage_unknown",
             calls: (1, 0),
             facts: &["dispatch_observed", "terminal_uncertain", "step_completed"],
             status: Some("uncertain"),
@@ -1047,7 +1048,7 @@ async fn a_group_that_fails_keeps_its_own_record_and_never_erases_the_other_grou
             runner: None,
             mutate: None,
             kind: GroupOutcomeKind::Uncertain,
-            reason: "model transport outcome unknown",
+            class_code: "model_transport_outcome_unknown",
             calls: (1, 0),
             facts: &["dispatch_prepared", "step_completed"],
             status: Some("uncertain"),
@@ -1059,7 +1060,7 @@ async fn a_group_that_fails_keeps_its_own_record_and_never_erases_the_other_grou
             runner: Some(RunnerScript::TransportError),
             mutate: None,
             kind: GroupOutcomeKind::Uncertain,
-            reason: "development execution outcome unknown",
+            class_code: "development_execution_outcome_unknown",
             calls: (2, 1),
             facts: &[
                 "edit_compiled",
@@ -1076,7 +1077,7 @@ async fn a_group_that_fails_keeps_its_own_record_and_never_erases_the_other_grou
             runner: Some(RunnerScript::Regress),
             mutate: None,
             kind: GroupOutcomeKind::Rejected,
-            reason: "candidate did not strictly improve",
+            class_code: "keep_incumbent_not_improved",
             calls: (2, 1),
             facts: &["edit_compiled", "development_observed", "terminal_rejected"],
             status: Some("rejected"),
@@ -1088,7 +1089,7 @@ async fn a_group_that_fails_keeps_its_own_record_and_never_erases_the_other_grou
             runner: None,
             mutate: None,
             kind: GroupOutcomeKind::NoChange,
-            reason: "model returned no edit suggestions",
+            class_code: "no_edit_suggestions",
             calls: (2, 0),
             facts: &["response_observed", "terminal_no_change", "step_completed"],
             status: Some("no_change"),
@@ -1100,7 +1101,7 @@ async fn a_group_that_fails_keeps_its_own_record_and_never_erases_the_other_grou
             runner: None,
             mutate: Some(|group| group.selection.allow_model_excerpts = false),
             kind: GroupOutcomeKind::Rejected,
-            reason: "model excerpt grant is absent or incompatible",
+            class_code: "grant_unavailable",
             calls: (0, 0),
             facts: &["terminal_rejected", "step_completed"],
             status: Some("rejected"),
@@ -1112,7 +1113,7 @@ async fn a_group_that_fails_keeps_its_own_record_and_never_erases_the_other_grou
             runner: None,
             mutate: Some(|group| group.traces[0].excerpt = "unbacked bytes".into()),
             kind: GroupOutcomeKind::Failed,
-            reason: "permission denied",
+            class_code: "step_error_forbidden",
             calls: (0, 0),
             facts: &[],
             status: None,
@@ -1124,7 +1125,7 @@ async fn a_group_that_fails_keeps_its_own_record_and_never_erases_the_other_grou
             runner: Some(RunnerScript::TransportError),
             mutate: None,
             kind: GroupOutcomeKind::Uncertain,
-            reason: "development execution outcome unknown",
+            class_code: "development_execution_outcome_unknown",
             calls: (2, 1),
             facts: &["edit_compiled", "dispatch_prepared", "step_completed"],
             status: Some("uncertain"),
@@ -1154,10 +1155,11 @@ async fn a_group_that_fails_keeps_its_own_record_and_never_erases_the_other_grou
 
         let failed = group(&outcome, bad);
         assert_eq!(failed.kind, case.kind, "{name}");
-        assert!(
-            failed.reason.as_deref().unwrap().contains(case.reason),
+        assert_eq!(
+            failed.terminal.map(|class| class.code()),
+            Some(case.class_code),
             "{name}: {:?}",
-            failed.reason
+            failed.terminal
         );
         assert_eq!(
             (
@@ -1818,14 +1820,13 @@ async fn an_exhausted_root_budget_ends_the_affected_groups_in_a_terminal_state_a
             "limit {limit}"
         );
         for stopped in outcome.groups.iter().filter(|group| group.kind == Rejected) {
-            assert!(
-                stopped
-                    .reason
-                    .as_deref()
-                    .unwrap()
-                    .contains("budget exhausted"),
+            // The group carries the closed class of its step: a model rejected for want
+            // of budget, as a typed kind and not as the words of the refusal (AG-048).
+            assert_eq!(
+                stopped.terminal.map(|class| class.code()),
+                Some("model_rejected_budget_unavailable"),
                 "limit {limit}: {:?}",
-                stopped.reason
+                stopped.terminal
             );
         }
         // The marker lists exactly the groups that finished.
@@ -1982,9 +1983,13 @@ async fn groups_that_share_a_request_id_would_reuse_the_brokers_call_id() {
     )
     .await
     .unwrap();
+    // The broker refuses the reused call id with a conflict that reaches the step as an
+    // error of the model port: the second group ends uncertain, and its outcome carries
+    // the fixed class of a transport outcome that is unknown, not the port's own words
+    // (AG-048).
     match second {
-        OptimizationStepOutcome::Uncertain { reason } => {
-            assert!(reason.contains("call_id reused"), "{reason}")
+        OptimizationStepOutcome::Uncertain { class } => {
+            assert_eq!(class, StepTerminalClass::ModelTransportOutcomeUnknown)
         }
         other => panic!("the second group must not proceed: {other:?}"),
     }

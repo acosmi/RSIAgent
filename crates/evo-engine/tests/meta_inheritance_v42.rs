@@ -1264,8 +1264,10 @@ async fn uncertain_dispatches_count_and_claimed_ones_do_not() {
         )
         .await
         .unwrap();
-    assert!(
-        uncertain.outcome.contains("not found"),
+    // The model port failed after the dispatch was claimed: the fixed code of that
+    // outcome, not the port's own error.
+    assert_eq!(
+        uncertain.outcome, "model_transport_outcome_unknown",
         "{}",
         uncertain.outcome
     );

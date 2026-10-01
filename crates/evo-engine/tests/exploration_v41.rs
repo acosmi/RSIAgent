@@ -887,7 +887,9 @@ async fn coordinator_calls_the_existing_optimization_consumer_before_observing()
         )
         .await
         .unwrap();
-    assert!(uncertain.outcome.contains("outcome uncertain"));
+    // The step ended in an error the coordinator cannot classify: the dispatch is a used
+    // opportunity and says so with its fixed code, never with the error's own text.
+    assert_eq!(uncertain.outcome, "optimization_dispatch_outcome_uncertain");
     assert!(uncertain.node_id.is_some());
     assert_eq!(crash_model.0.load(Ordering::SeqCst), 2);
     assert!(matches!(
@@ -951,7 +953,9 @@ async fn coordinator_calls_the_existing_optimization_consumer_before_observing()
         )
         .await
         .unwrap();
-    assert!(not_found.outcome.contains("not found"));
+    // The model port failed after the dispatch was claimed: a fixed code, not the
+    // port's own error.
+    assert_eq!(not_found.outcome, "model_transport_outcome_unknown");
     assert!(not_found.node_id.is_some());
     assert_eq!(not_found_model.0.load(Ordering::SeqCst), 1);
     let not_found_reconnect = resumed

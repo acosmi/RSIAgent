@@ -347,8 +347,11 @@ pub struct ConsolidationRunRecord {
     pub input_digest: Option<String>,
     pub outcome: ConsolidationRunOutcome,
     /// The bounded terminal category of the outcome: [`terminal_category`] of its
-    /// reason. It is the reason itself when that fits 128 bytes; a longer reason is
-    /// cut and ends in a digest of the whole. The full text is not kept here.
+    /// reason. Since the classes of the optimization step (`StepTerminalClass`) the
+    /// reason of a step outcome is always a fixed code, so the category is that code:
+    /// no text of an error, a model or a source is kept here. A record written before
+    /// the classes holds the bounded prefix of the free text its step reported, and is
+    /// read as it is.
     pub reason: String,
     pub budget_call_ids: Vec<String>,
     /// Set exactly when `outcome` is `Candidate`: the durable proposal that was
@@ -360,7 +363,8 @@ pub struct ConsolidationRunRecord {
 
 /// The most bytes the terminal category of a run record holds.
 const TERMINAL_CATEGORY_MAX_BYTES: usize = 128;
-/// The category of an outcome that gave no reason.
+/// The category of an outcome that gave no reason (the fixed codes of the step's
+/// classes are never empty, so only a caller outside the step can give none).
 const TERMINAL_CATEGORY_UNSPECIFIED: &str = "unspecified";
 /// What ends a cut category, right before the digest: the ellipsis `U+2026`, `#`.
 const TERMINAL_CATEGORY_MARK: &str = "\u{2026}#";
@@ -384,9 +388,10 @@ const TERMINAL_CATEGORY_DIGEST_HEX: usize = 16;
 /// The run record does not keep the full reason anywhere else: a terminal record
 /// survives a source revocation, and a long reason can carry model- or
 /// source-derived text. The cut prefix and the digest are what it keeps to tell
-/// one outcome from another; the whole text stays only in the optimization
-/// journal's own facts (its `StepCompleted` fact holds it), which a revocation
-/// redacts.
+/// one outcome from another. The reason a consolidation run passes is the fixed code of
+/// the step's terminal class (`StepTerminalClass::code`), which is short and carries no
+/// such text, so in practice the category is the code itself; the bound stays for the
+/// callers that give a longer reason, and for records written before the classes.
 pub fn terminal_category(reason: &str) -> String {
     if reason.is_empty() {
         return TERMINAL_CATEGORY_UNSPECIFIED.into();
@@ -1285,10 +1290,10 @@ impl MonitoringCoordinator {
         }
         let mut proposal_id = None;
         let (run_outcome, claim_state, reason) = match outcome {
-            OptimizationStepOutcome::NoChange { reason } => (
+            OptimizationStepOutcome::NoChange { class } => (
                 ConsolidationRunOutcome::NoChange,
                 ConsolidationClaimState::CompletedNoChange,
-                reason,
+                class.code().to_owned(),
             ),
             OptimizationStepOutcome::Candidate {
                 bundle, selection, ..
@@ -1341,18 +1346,18 @@ impl MonitoringCoordinator {
                 (
                     ConsolidationRunOutcome::Candidate,
                     ConsolidationClaimState::CompletedCandidate,
-                    "development candidate produced; Active remains unchanged".into(),
+                    "development candidate produced; Active remains unchanged".to_owned(),
                 )
             }
-            OptimizationStepOutcome::Rejected { reason } => (
+            OptimizationStepOutcome::Rejected { class } => (
                 ConsolidationRunOutcome::Rejected,
                 ConsolidationClaimState::CompletedRejected,
-                reason,
+                class.code().to_owned(),
             ),
-            OptimizationStepOutcome::Uncertain { reason } => (
+            OptimizationStepOutcome::Uncertain { class } => (
                 ConsolidationRunOutcome::Uncertain,
                 ConsolidationClaimState::CompletedUncertain,
-                reason,
+                class.code().to_owned(),
             ),
         };
         let run_id = format!("consolidation-run-{}", claim.id);
@@ -3033,10 +3038,11 @@ async fn persist_terminal_run_with_id(
 /// other outcome (no change, rejected, uncertain, revoked, blocked budget)
 /// leaves no proposal behind.
 ///
-/// `reason` is the raw reason of the outcome, of any length. Every terminal record
-/// is written here (a claim without contrast derives its category the same way),
-/// so the category it stores is always [`terminal_category`] of it: a long reason
-/// can no longer be refused and leave the claim in `Running`.
+/// `reason` is the reason of the outcome, of any length: the fixed code of the step's
+/// class, or a fixed sentence of the run's own. Every terminal record is written here
+/// (a claim without contrast derives its category the same way), so the category it
+/// stores is always [`terminal_category`] of it: a long reason can no longer be
+/// refused and leave the claim in `Running`.
 #[allow(clippy::too_many_arguments)]
 async fn persist_terminal_run(
     ctx: &Context,

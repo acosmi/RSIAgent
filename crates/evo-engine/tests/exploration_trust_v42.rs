@@ -103,8 +103,9 @@ const WRONG_ANSWER: &str = "{\"answer\":{\"clamped\":12345}}";
 const FIXTURE_REASON: &str = "fixture_evidence_not_accepted";
 const REJECTED_REASON: &str = "development_evidence_rejected";
 const OBSERVED_REASON: &str = "candidate_observed";
-const KEEP_INCUMBENT_REASON: &str =
-    "candidate did not strictly improve while preserving all incumbent passes";
+/// The fixed code a kept incumbent is recorded under (AG-048): the class says the
+/// selection did not improve the incumbent while every incumbent pass was kept.
+const KEEP_INCUMBENT_REASON: &str = "keep_incumbent_not_improved";
 
 fn d(label: &str) -> String {
     hash(label.as_bytes())
@@ -1594,8 +1595,8 @@ async fn the_registered_runner_executes_both_sides_alike_so_it_never_yields_a_ca
         .unwrap();
 
     // The node is the plain failure of a step without a candidate. The gate was not
-    // misused on it: the label is not a verdict, and the reason is the selection's,
-    // not the refusal literal.
+    // misused on it: the label is not a verdict, and the reason is the fixed code of
+    // the selection's verdict (a kept incumbent), not the refusal literal.
     let step_seen = seen(&env, &step).await;
     assert_eq!(step_seen.outcome, KEEP_INCUMBENT_REASON);
     assert_eq!(step_seen.status, json!({"status": "hard_failure"}));
@@ -2198,7 +2199,7 @@ async fn an_outcome_without_a_candidate_carries_no_verdict() {
         )
         .await
         .unwrap();
-    assert_eq!(nochange.outcome, "model returned no edit suggestions");
+    assert_eq!(nochange.outcome, "no_edit_suggestions");
     let node = payload(&env.store, NODE, nochange.node_id.as_deref().unwrap()).await;
     assert_eq!(node["node"]["status"], json!({"status": "hard_failure"}));
     assert_eq!(node["evidence"], "not_observed");

@@ -30,7 +30,7 @@
 use crate::model::ModelPort;
 use crate::optimization::{
     DevRunner, OptimizationJournal, OptimizationStepOutcome, OptimizationStepRequest,
-    run_optimization_step,
+    StepErrorKind, StepTerminalClass, run_optimization_step,
 };
 use evo_core::skill_edit::{skill_snapshot_digest, validate_batch_scope};
 use evo_core::strategy::{
@@ -81,7 +81,12 @@ pub struct GroupOutcome {
     pub kind: GroupOutcomeKind,
     pub candidate_skill_digest: Option<String>,
     pub candidate_bundle_digest: Option<String>,
-    pub reason: Option<String>,
+    /// How the group's step ended, as the closed class of the optimization step: a
+    /// no change, an incumbent kept, a rejection or an uncertain dispatch, and, for a
+    /// group that has no durable outcome of its own (`Failed`), the kind of the error
+    /// that ended it. `None` for a candidate. In memory only: the job persists nothing,
+    /// and no text of an error, a model or a source is part of it.
+    pub terminal: Option<StepTerminalClass>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,14 +178,22 @@ pub async fn run_skill_group_job(
 }
 
 fn group_outcome(scope: GroupScope, result: Result<OptimizationStepOutcome>) -> GroupOutcome {
-    let outcome = |kind, reason: Option<String>| GroupOutcome {
+    let outcome = |kind, terminal: Option<StepTerminalClass>| GroupOutcome {
         group_id: scope.group_id.clone(),
         skill_id: scope.skill_id.clone(),
         episode_id: scope.episode_id.clone(),
         kind,
         candidate_skill_digest: None,
         candidate_bundle_digest: None,
-        reason,
+        terminal,
+    };
+    let failed = |error: &Error| {
+        outcome(
+            GroupOutcomeKind::Failed,
+            Some(StepTerminalClass::StepError {
+                error: StepErrorKind::from(error),
+            }),
+        )
     };
     match result {
         Ok(OptimizationStepOutcome::Candidate { edit, bundle, .. }) => {
@@ -190,19 +203,19 @@ fn group_outcome(scope: GroupScope, result: Result<OptimizationStepOutcome>) -> 
                     candidate_bundle_digest: Some(bundle.digest),
                     ..outcome(GroupOutcomeKind::Candidate, None)
                 },
-                Err(error) => outcome(GroupOutcomeKind::Failed, Some(error.to_string())),
+                Err(error) => failed(&error),
             }
         }
-        Ok(OptimizationStepOutcome::NoChange { reason }) => {
-            outcome(GroupOutcomeKind::NoChange, Some(reason))
+        Ok(OptimizationStepOutcome::NoChange { class }) => {
+            outcome(GroupOutcomeKind::NoChange, Some(class))
         }
-        Ok(OptimizationStepOutcome::Rejected { reason }) => {
-            outcome(GroupOutcomeKind::Rejected, Some(reason))
+        Ok(OptimizationStepOutcome::Rejected { class }) => {
+            outcome(GroupOutcomeKind::Rejected, Some(class))
         }
-        Ok(OptimizationStepOutcome::Uncertain { reason }) => {
-            outcome(GroupOutcomeKind::Uncertain, Some(reason))
+        Ok(OptimizationStepOutcome::Uncertain { class }) => {
+            outcome(GroupOutcomeKind::Uncertain, Some(class))
         }
-        Err(error) => outcome(GroupOutcomeKind::Failed, Some(error.to_string())),
+        Err(error) => failed(&error),
     }
 }
 
