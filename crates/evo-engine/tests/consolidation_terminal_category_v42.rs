@@ -1169,16 +1169,15 @@ async fn a_long_rejection_reason_ends_the_claim_with_a_bounded_category() {
         "{record:?}"
     );
 
-    // The reason really was longer than the old rule allowed, and it names the field.
+    // The reason of the step is the fixed code of its class (AG-048): the serde error
+    // that named the field, about 150 bytes and more than a category held, is no longer
+    // part of the outcome, so the reason is bounded by construction and the record's
+    // category is that code.
     let full = world.step_reason(&claim).await;
-    assert!(full.len() > LIMIT, "{} bytes: {full}", full.len());
-    assert!(full.contains("unknown field `bogus`"), "{full}");
-    // The record holds its bounded category: a cut prefix of the reason, then the
-    // digest of the whole of it.
+    assert_eq!(full, "suggestion_shape_invalid");
+    assert!(full.len() <= LIMIT, "{} bytes: {full}", full.len());
     assert_eq!(record.reason, terminal_category(&full));
-    assert_eq!(record.reason.len(), LIMIT);
-    cut_prefix(&full, &record.reason);
-    assert!(record.reason.contains("unknown field"), "{}", record.reason);
+    assert_eq!(record.reason, full);
     // The claim is terminal, not stranded.
     assert_eq!(
         world.stored_claim(&claim).await.state,
@@ -1205,12 +1204,27 @@ async fn a_long_rejection_reason_ends_the_claim_with_a_bounded_category() {
     assert_eq!(world.runner_calls(), 0);
     assert_eq!(world.ledger(&claim).await, ledger);
     assert_eq!(world.root().await, root);
-    // The bounded category is not a second copy of the reason: of everything stored,
-    // only the optimization journal's stage facts hold the whole text, and the run
-    // record holds the category alone.
+    // What is stored of the reason is the code, in the step's terminal fact and in the
+    // run record, and what is stored of the parser's error is nothing: no artifact holds
+    // the text that named the field.
     assert_eq!(
         world.artifact_schemas_holding(&full).await,
-        BTreeSet::from([OPTIMIZATION_STAGE_FACT_SCHEMA.to_string()])
+        BTreeSet::from([
+            OPTIMIZATION_STAGE_FACT_SCHEMA.to_string(),
+            "rsia.monitoring.consolidation_run.v1".to_string()
+        ])
+    );
+    assert!(
+        world
+            .artifact_schemas_holding("invalid optimizer suggestions")
+            .await
+            .is_empty()
+    );
+    assert!(
+        world
+            .artifact_schemas_holding("unknown field `bogus`")
+            .await
+            .is_empty()
     );
     assert_eq!(world.step_reason(&claim).await, full);
 }
@@ -1260,15 +1274,17 @@ async fn a_long_uncertain_reason_is_bounded_too() {
         "{record:?}"
     );
 
+    // The runner's 300-byte message is not part of the outcome (AG-048): the reason is
+    // the fixed code of the class, so it is bounded by construction.
     let full = world.step_reason(&claim).await;
-    assert!(
-        full.starts_with("development execution outcome unknown"),
-        "{full}"
-    );
-    assert!(full.len() > LIMIT, "{} bytes", full.len());
+    assert_eq!(full, "development_execution_outcome_unknown");
+    assert!(full.len() <= LIMIT, "{} bytes", full.len());
     assert_eq!(record.reason, terminal_category(&full));
-    assert_eq!(record.reason.len(), LIMIT);
-    cut_prefix(&full, &record.reason);
+    assert_eq!(record.reason, full);
+    assert!(
+        world.artifact_schemas_holding(&message).await.is_empty(),
+        "the runner's message is stored nowhere"
+    );
     assert_eq!(
         world.stored_claim(&claim).await.state,
         ConsolidationClaimState::CompletedUncertain

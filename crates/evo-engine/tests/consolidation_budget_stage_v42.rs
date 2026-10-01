@@ -1831,7 +1831,7 @@ async fn a_consolidation_timeout_is_uncertain_and_keeps_its_reservation() {
     assert!(run.call.dispatch_id.is_some());
     assert_eq!(run.root.reserved_micros, RESERVED_MICROS);
     assert_eq!(run.root.spent_micros, 0);
-    assert_eq!(run.record.reason, "model usage remains unknown");
+    assert_eq!(run.record.reason, "model_usage_unknown");
     assert!(matches!(
         run.assert_never_redispatched().await,
         ModelResponse::Uncertain { .. }
@@ -1881,8 +1881,10 @@ async fn a_consolidation_answer_that_is_not_json_is_billed_and_rejected() {
     assert_eq!(run.call.response_usable, Some(true));
     assert_eq!(run.root.spent_micros, COST_MICROS);
     assert_eq!(run.root.reserved_micros, 0);
-    assert!(
-        run.record.reason.contains("invalid optimizer suggestions"),
+    // The step's reason is the fixed code of its class: the parser's own error, which
+    // echoes the answer, is not kept.
+    assert_eq!(
+        run.record.reason, "suggestion_shape_invalid",
         "{}",
         run.record.reason
     );
@@ -1912,10 +1914,8 @@ async fn a_consolidation_answer_without_a_usage_record_is_uncertain_and_keeps_it
     assert!(run.call.response_artifact.is_none());
     assert_eq!(run.root.reserved_micros, RESERVED_MICROS);
     assert_eq!(run.root.spent_micros, 0);
-    assert!(
-        run.record
-            .reason
-            .starts_with("model transport outcome unknown"),
+    assert_eq!(
+        run.record.reason, "model_transport_outcome_unknown",
         "{}",
         run.record.reason
     );

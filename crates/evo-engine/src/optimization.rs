@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::compiler::compile_skill_edits;
-use crate::model::{ModelExecutionReceipt, ModelPort, ModelResponse};
+use crate::model::{ModelExecutionReceipt, ModelPort, ModelRejectionKind, ModelResponse};
 
 fn validate_digest(value: &str, name: &str) -> Result<()> {
     if value.len() != 64
@@ -164,6 +164,16 @@ pub fn select_development(
     request: &DevelopmentRunRequest,
     report: &DevelopmentRunReport,
 ) -> Result<DevelopmentSelection> {
+    select_development_detailed(request, report).map(|(selection, _)| selection)
+}
+
+/// [`select_development`], and whether the candidate kept every task the incumbent
+/// passed. The step needs the second to tell the two ways a selection keeps the
+/// incumbent apart without reading the sentence of the selection.
+fn select_development_detailed(
+    request: &DevelopmentRunRequest,
+    report: &DevelopmentRunReport,
+) -> Result<(DevelopmentSelection, bool)> {
     validate_development_binding(request, report)?;
     let result_by_id: BTreeMap<&str, &PairedTaskResult> = report
         .results
@@ -199,24 +209,27 @@ pub fn select_development(
         preserves_passes &= !result.parent_passed || result.candidate_passed;
     }
     let improved = candidate_total_micros > parent_total_micros && preserves_passes;
-    Ok(DevelopmentSelection {
-        request_id: request.request_id.clone(),
-        manifest_digest: request.manifest.digest.clone(),
-        parent_bundle_digest: request.parent_bundle_digest.clone(),
-        candidate_bundle_digest: request.candidate_bundle_digest.clone(),
-        decision: if improved {
-            DevelopmentSelectionDecision::AcceptCandidate
-        } else {
-            DevelopmentSelectionDecision::KeepIncumbent
+    Ok((
+        DevelopmentSelection {
+            request_id: request.request_id.clone(),
+            manifest_digest: request.manifest.digest.clone(),
+            parent_bundle_digest: request.parent_bundle_digest.clone(),
+            candidate_bundle_digest: request.candidate_bundle_digest.clone(),
+            decision: if improved {
+                DevelopmentSelectionDecision::AcceptCandidate
+            } else {
+                DevelopmentSelectionDecision::KeepIncumbent
+            },
+            parent_total_micros,
+            candidate_total_micros,
+            reason: if improved {
+                "strictly improved the same full development manifest and preserved passes".into()
+            } else {
+                "candidate did not strictly improve while preserving all incumbent passes".into()
+            },
         },
-        parent_total_micros,
-        candidate_total_micros,
-        reason: if improved {
-            "strictly improved the same full development manifest and preserved passes".into()
-        } else {
-            "candidate did not strictly improve while preserving all incumbent passes".into()
-        },
-    })
+        preserves_passes,
+    ))
 }
 
 fn validate_development_binding(
@@ -325,12 +338,13 @@ pub enum SuggestionOutcome {
         output_digest: String,
         receipt: ModelExecutionReceipt,
     },
+    /// The provider rejected the request. Only the typed kind of the rejection is kept:
+    /// the words that came with it are the provider's, not the engine's.
     Rejected {
-        reason: String,
+        kind: ModelRejectionKind,
         dependency_ids: Vec<String>,
     },
     Uncertain {
-        reason: String,
         dependency_ids: Vec<String>,
     },
 }
@@ -340,6 +354,23 @@ pub async fn request_suggestions(
     request: ModelRequest,
     batches: &[ReflectionBatch],
 ) -> Result<SuggestionOutcome> {
+    suggestion_outcome(port, request, batches)
+        .await?
+        // The text of the parser's error is not kept: it echoes the answer.
+        .ok_or_else(|| {
+            Error::Invalid("optimizer suggestions are not a valid suggestion list".into())
+        })
+}
+
+/// [`request_suggestions`], with the one verdict that is no outcome and no error: `None`
+/// when the answer is complete and is not a suggestion list (it does not parse as one,
+/// or it holds more suggestions than the request allowed). The step records that exit
+/// as a class of its own, and writes no fact for it, as it never did.
+async fn suggestion_outcome(
+    port: Option<&dyn ModelPort>,
+    request: ModelRequest,
+    batches: &[ReflectionBatch],
+) -> Result<Option<SuggestionOutcome>> {
     request.validate()?;
     validate_model_source_scope(&request, batches)?;
     let port = port.ok_or(Error::NotFound)?;
@@ -353,9 +384,7 @@ pub async fn request_suggestions(
             execution_receipt,
             ..
         } => (response_id, output, output_digest, execution_receipt),
-        ModelResponse::Rejected {
-            reason, dispatch, ..
-        } => {
+        ModelResponse::Rejected { kind, dispatch, .. } => {
             let dependency_ids = match dispatch {
                 crate::model::RejectedDispatch::NotDispatched => vec![],
                 crate::model::RejectedDispatch::Dispatched { receipt } => vec![
@@ -366,10 +395,10 @@ pub async fn request_suggestions(
                     receipt.usage_record_id,
                 ],
             };
-            return Ok(SuggestionOutcome::Rejected {
-                reason,
+            return Ok(Some(SuggestionOutcome::Rejected {
+                kind,
                 dependency_ids,
-            });
+            }));
         }
         ModelResponse::Uncertain {
             dispatch_id,
@@ -381,35 +410,31 @@ pub async fn request_suggestions(
             let mut dependency_ids = vec![dispatch_id, root_budget_id];
             dependency_ids.extend(provider_request_id);
             dependency_ids.extend(usage_record_id);
-            return Ok(SuggestionOutcome::Uncertain {
-                reason: "model dispatch or usage remains uncertain".into(),
-                dependency_ids,
-            });
+            return Ok(Some(SuggestionOutcome::Uncertain { dependency_ids }));
         }
     };
-    let suggestions: Vec<EditSuggestion> = serde_json::from_str(&output)
-        .map_err(|error| Error::Invalid(format!("invalid optimizer suggestions: {error}")))?;
+    let Ok(suggestions) = serde_json::from_str::<Vec<EditSuggestion>>(&output) else {
+        return Ok(None);
+    };
     if suggestions.is_empty() {
-        return Ok(SuggestionOutcome::NoChange {
+        return Ok(Some(SuggestionOutcome::NoChange {
             response_id,
             output,
             output_digest,
             receipt: execution_receipt,
-        });
+        }));
     }
     if suggestions.len() > request.max_suggestions || suggestions.len() > MAX_SUGGESTIONS {
-        return Err(Error::Invalid(
-            "optimizer suggestion pool must contain one to the requested maximum".into(),
-        ));
+        return Ok(None);
     }
     validate_suggestion_pool(batches, &suggestions)?;
-    Ok(SuggestionOutcome::Suggestions {
+    Ok(Some(SuggestionOutcome::Suggestions {
         items: suggestions,
         response_id,
         output,
         output_digest,
         receipt: execution_receipt,
-    })
+    }))
 }
 
 fn validate_model_source_scope(request: &ModelRequest, batches: &[ReflectionBatch]) -> Result<()> {
@@ -1332,16 +1357,256 @@ pub struct OptimizationStepRequest<'a> {
     pub allow_rank_call: bool,
 }
 
+/// The kind of the error that ended a step for a reason no named [`StepTerminalClass`]
+/// describes. The error itself is dropped: its message can echo a source, a model
+/// answer or what a store said, and what a record keeps of it is this closed kind and
+/// nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepErrorKind {
+    Invalid,
+    Forbidden,
+    NotFound,
+    Budget,
+    Conflict,
+    Cancelled,
+    Internal,
+}
+
+impl StepErrorKind {
+    /// The fixed code of the kind, the suffix of the code of a [`StepTerminalClass::StepError`].
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::Forbidden => "forbidden",
+            Self::NotFound => "not_found",
+            Self::Budget => "budget",
+            Self::Conflict => "conflict",
+            Self::Cancelled => "cancelled",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+impl From<&Error> for StepErrorKind {
+    /// Every error is named, so an error added to `evo_core` has to be decided here.
+    fn from(error: &Error) -> Self {
+        match error {
+            Error::Invalid(_) => Self::Invalid,
+            Error::Forbidden => Self::Forbidden,
+            Error::NotFound => Self::NotFound,
+            Error::Budget => Self::Budget,
+            Error::Conflict(_) => Self::Conflict,
+            Error::Cancelled => Self::Cancelled,
+            Error::Internal => Self::Internal,
+        }
+    }
+}
+
+/// The closed set of ways an optimization step, or the dispatch that paid for one,
+/// ends without a candidate (plan §5.3.1: no change is an explicit end point; §5.8 and
+/// §6.7.3: the accepted, the rejected and the unchanged end points, the unmatched edits
+/// and the failure modes are recorded; §7.2: a legal direction that failed, a compile,
+/// shape or implementation error, an external failure, a lack of resources and a safety
+/// rejection are recorded apart, and an unknown one as unknown).
+///
+/// Every exit is one variant. A variant serializes as a fixed snake_case `class` tag
+/// plus the typed fields it carries (a number, a model's rejection kind, an error
+/// kind), and has one fixed [`code`](Self::code), the only text any record keeps of the
+/// outcome: the stage facts and the `StepCompleted` payload of the journal, the
+/// reason of an exploration dispatch fact and the category of a consolidation run. The
+/// text of an error, of a model's rejection or of a source never becomes part of a
+/// class, so nothing derived from them reaches a record that outlives the source.
+///
+/// The variants are grouped by the outcome that carries them
+/// ([`OptimizationStepOutcome::NoChange`], `Rejected`, `Uncertain`); the last group is
+/// what the exploration coordinator settles a dispatch as when the step is not the one
+/// that ended it, and what it records of a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "class", rename_all = "snake_case")]
+pub enum StepTerminalClass {
+    // ----- no change: the step ended on purpose, with nothing to propose (V088.b, V089.c)
+    /// No reflection batch could be built from the traces of the step.
+    NoEligibleReflectionBatch,
+    /// Every reflection call answered with no suggestion.
+    NoEditSuggestions,
+    /// The atomic edit compiled and changed nothing.
+    EditProducedNoChange,
+
+    // ----- the incumbent is kept: the candidate was run and not accepted (V090.a)
+    /// The development selection kept the incumbent: the candidate did not strictly
+    /// improve the total of the same full manifest, and no incumbent pass was lost.
+    KeepIncumbentNotImproved {
+        parent_total_micros: u64,
+        candidate_total_micros: u64,
+    },
+    /// The development selection kept the incumbent because the candidate lost a task
+    /// the incumbent passed, whatever its total (a higher total included).
+    KeepIncumbentRetentionBroken {
+        parent_total_micros: u64,
+        candidate_total_micros: u64,
+    },
+
+    // ----- rejected: the step ended on a refusal
+    /// The source grant does not allow a model excerpt, or is not the one of the step.
+    GrantUnavailable,
+    /// The model's provider rejected a request. The kind is the typed answer; the
+    /// words that came with it are never kept.
+    ModelRejected { kind: ModelRejectionKind },
+    /// The model's answer is not a suggestion list: it does not parse as one, or it is
+    /// longer than the request allowed.
+    SuggestionShapeInvalid,
+    /// The pool holds more suggestions than the final edit limit and no ranking call
+    /// was preregistered.
+    SuggestionPoolUnranked,
+    /// The atomic skill edit did not compile.
+    EditCompileFailed,
+    /// The complete bundle did not compile.
+    BundleCompileFailed,
+    /// The development selection refused the report of the development runner.
+    DevelopmentReportRejected,
+    /// Any other refusal of the step, by the kind of the error that ended it.
+    StepError { error: StepErrorKind },
+
+    // ----- uncertain: the dispatch was paid for and its outcome cannot be recorded
+    /// The usage of a model call is unknown.
+    ModelUsageUnknown,
+    /// A model dispatch was prepared and has no durable response: its usage is unknown.
+    ModelDispatchUnrecorded,
+    /// Another worker holds the model dispatch.
+    ModelDispatchConcurrent,
+    /// The model transport failed after the dispatch.
+    ModelTransportOutcomeUnknown,
+    /// A development execution was prepared and has no durable result.
+    DevelopmentExecutionUnrecorded,
+    /// Another worker holds the development execution.
+    DevelopmentExecutionConcurrent,
+    /// The development runner failed after the dispatch.
+    DevelopmentExecutionOutcomeUnknown,
+    /// The dispatch was cancelled, or its outcome cannot be told.
+    CancelledOrUncertain,
+    /// The optimization step ended in an error the coordinator cannot classify.
+    OptimizationDispatchOutcomeUncertain,
+    /// The source closure of the world changed while the step ran.
+    ExplorationSourceClosureChangedAfterDispatch,
+    /// The prefix the step was decided on is not the one the world holds when it ends.
+    ExplorationPrefixChangedAfterDispatch,
+    /// A claim was resumed on a world that no longer carries the inputs it was claimed with.
+    ClaimInputsChangedAfterDispatch,
+    /// The node a `Recover` repairs is not where the world lists it.
+    RecoverTargetMissing,
+    /// The observation gate could not answer for the evidence of a candidate.
+    DevelopmentEvidenceUnverified,
+    /// The digests of a candidate that compiled and was selected cannot be computed.
+    CandidateMaterialUnavailable,
+
+    // ----- a candidate, as the exploration coordinator records the verdict on it
+    /// The observation gate verified the candidate's evidence.
+    CandidateObserved,
+    /// The report declared Fixture provenance, which can never be trusted evidence.
+    FixtureEvidenceNotAccepted,
+    /// The observation gate refused the report.
+    DevelopmentEvidenceRejected,
+
+    // ----- a record written before the classes existed
+    /// The terminal of a step journaled as free text. The text is not carried forward.
+    LegacyUnclassified,
+}
+
+impl StepTerminalClass {
+    /// The fixed code of the class: lowercase ASCII and underscores, the same for the
+    /// same class on every record. A class that carries a typed field adds the field's
+    /// own code where the field decides the outcome (the kind of a model's rejection,
+    /// the kind of an error); a number is never part of a code.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoEligibleReflectionBatch => "no_eligible_reflection_batch",
+            Self::NoEditSuggestions => "no_edit_suggestions",
+            Self::EditProducedNoChange => "edit_produced_no_change",
+            Self::KeepIncumbentNotImproved { .. } => "keep_incumbent_not_improved",
+            Self::KeepIncumbentRetentionBroken { .. } => "keep_incumbent_retention_broken",
+            Self::GrantUnavailable => "grant_unavailable",
+            Self::ModelRejected { kind } => match kind {
+                ModelRejectionKind::Unauthorized => "model_rejected_unauthorized",
+                ModelRejectionKind::BudgetUnavailable => "model_rejected_budget_unavailable",
+                ModelRejectionKind::InvalidRequest => "model_rejected_invalid_request",
+                ModelRejectionKind::ProviderRejected => "model_rejected_provider_rejected",
+                ModelRejectionKind::CancelledBeforeDispatch => {
+                    "model_rejected_cancelled_before_dispatch"
+                }
+                ModelRejectionKind::CancelledAfterDispatch => {
+                    "model_rejected_cancelled_after_dispatch"
+                }
+            },
+            Self::SuggestionShapeInvalid => "suggestion_shape_invalid",
+            Self::SuggestionPoolUnranked => "suggestion_pool_unranked",
+            Self::EditCompileFailed => "edit_compile_failed",
+            Self::BundleCompileFailed => "bundle_compile_failed",
+            Self::DevelopmentReportRejected => "development_report_rejected",
+            Self::StepError { error } => match error {
+                StepErrorKind::Invalid => "step_error_invalid",
+                StepErrorKind::Forbidden => "step_error_forbidden",
+                StepErrorKind::NotFound => "step_error_not_found",
+                StepErrorKind::Budget => "step_error_budget",
+                StepErrorKind::Conflict => "step_error_conflict",
+                StepErrorKind::Cancelled => "step_error_cancelled",
+                StepErrorKind::Internal => "step_error_internal",
+            },
+            Self::ModelUsageUnknown => "model_usage_unknown",
+            Self::ModelDispatchUnrecorded => "model_dispatch_unrecorded",
+            Self::ModelDispatchConcurrent => "model_dispatch_concurrent",
+            Self::ModelTransportOutcomeUnknown => "model_transport_outcome_unknown",
+            Self::DevelopmentExecutionUnrecorded => "development_execution_unrecorded",
+            Self::DevelopmentExecutionConcurrent => "development_execution_concurrent",
+            Self::DevelopmentExecutionOutcomeUnknown => "development_execution_outcome_unknown",
+            Self::CancelledOrUncertain => "cancelled_or_uncertain",
+            Self::OptimizationDispatchOutcomeUncertain => "optimization_dispatch_outcome_uncertain",
+            Self::ExplorationSourceClosureChangedAfterDispatch => {
+                "exploration_source_closure_changed_after_dispatch"
+            }
+            Self::ExplorationPrefixChangedAfterDispatch => {
+                "exploration_prefix_changed_after_dispatch"
+            }
+            Self::ClaimInputsChangedAfterDispatch => "claim_inputs_changed_after_dispatch",
+            Self::RecoverTargetMissing => "recover_target_missing",
+            Self::DevelopmentEvidenceUnverified => "development_evidence_unverified",
+            Self::CandidateMaterialUnavailable => "candidate_material_unavailable",
+            Self::CandidateObserved => "candidate_observed",
+            Self::FixtureEvidenceNotAccepted => "fixture_evidence_not_accepted",
+            Self::DevelopmentEvidenceRejected => "development_evidence_rejected",
+            Self::LegacyUnclassified => "legacy_unclassified",
+        }
+    }
+}
+
+/// The code of a rejection kind: what a journaled rejection keeps where the provider's
+/// own words were (`journaled_response`).
+fn rejection_kind_code(kind: ModelRejectionKind) -> &'static str {
+    match kind {
+        ModelRejectionKind::Unauthorized => "unauthorized",
+        ModelRejectionKind::BudgetUnavailable => "budget_unavailable",
+        ModelRejectionKind::InvalidRequest => "invalid_request",
+        ModelRejectionKind::ProviderRejected => "provider_rejected",
+        ModelRejectionKind::CancelledBeforeDispatch => "cancelled_before_dispatch",
+        ModelRejectionKind::CancelledAfterDispatch => "cancelled_after_dispatch",
+    }
+}
+
+/// How a step ended. An outcome that is no candidate carries the closed class of its
+/// exit, never the text of an error, of a model or of a source.
 #[derive(Debug)]
 pub enum OptimizationStepOutcome {
     NoChange {
-        reason: String,
+        class: StepTerminalClass,
     },
+    /// The candidate, the model or the step was refused: a rejection proper, or the
+    /// incumbent kept (`KeepIncumbent*`, which is what a development selection that
+    /// does not accept the candidate ends in).
     Rejected {
-        reason: String,
+        class: StepTerminalClass,
     },
     Uncertain {
-        reason: String,
+        class: StepTerminalClass,
     },
     Candidate {
         edit: Box<CompiledSkillEdit>,
@@ -1359,33 +1624,31 @@ async fn run_optimization_step_inner(
     let model = model.ok_or(Error::NotFound)?;
     let runner = runner.ok_or(Error::NotFound)?;
     let journal = journal.ok_or(Error::NotFound)?;
-    if let Err(error) = validate_outbound_grant(request.source_selection) {
+    if validate_outbound_grant(request.source_selection).is_err() {
+        let class = StepTerminalClass::GrantUnavailable;
         commit_terminal(
             journal,
             &request.model_context,
             StageFactKind::TerminalRejected,
-            "model excerpt grant is absent or incompatible",
+            &class,
             vec![],
         )
         .await?;
-        return Ok(OptimizationStepOutcome::Rejected {
-            reason: error.to_string(),
-        });
+        return Ok(OptimizationStepOutcome::Rejected { class });
     }
     let reflection =
         build_reflection_batches(request.evidence, request.source_bindings, request.traces)?;
     if reflection.batches.is_empty() {
+        let class = StepTerminalClass::NoEligibleReflectionBatch;
         commit_terminal(
             journal,
             &request.model_context,
             StageFactKind::TerminalNoChange,
-            "no eligible development reflection batch",
+            &class,
             vec![],
         )
         .await?;
-        return Ok(OptimizationStepOutcome::NoChange {
-            reason: "no eligible development reflection batch".into(),
-        });
+        return Ok(OptimizationStepOutcome::NoChange { class });
     }
 
     let per_batch_limit = MAX_SUGGESTIONS / reflection.batches.len();
@@ -1440,14 +1703,21 @@ async fn run_optimization_step_inner(
             serde_json::to_value(&model_request).map_err(|_| Error::Internal)?,
         )
         .await?;
-        let outcome = match request_suggestions(
+        let outcome = match suggestion_outcome(
             Some(model),
             model_request.clone(),
             std::slice::from_ref(batch),
         )
         .await
         {
-            Ok(outcome) => outcome,
+            Ok(Some(outcome)) => outcome,
+            // The exit that ends the step without a fact of its own, as it always did:
+            // only the terminal fact of the step (`StepCompleted`) records it.
+            Ok(None) => {
+                return Ok(OptimizationStepOutcome::Rejected {
+                    class: StepTerminalClass::SuggestionShapeInvalid,
+                });
+            }
             Err(error) => return Err(error),
         };
         let outcome_payload = serde_json::to_value(&outcome).map_err(|_| Error::Internal)?;
@@ -1466,9 +1736,10 @@ async fn run_optimization_step_inner(
                 receipt,
             } => (items, response_id, output_digest, receipt),
             SuggestionOutcome::Rejected {
-                reason,
+                kind,
                 dependency_ids,
             } => {
+                let class = StepTerminalClass::ModelRejected { kind };
                 commit_model_fact(
                     journal,
                     &model_request,
@@ -1482,16 +1753,14 @@ async fn run_optimization_step_inner(
                     journal,
                     &request.model_context,
                     StageFactKind::TerminalRejected,
-                    &reason,
+                    &class,
                     dependency_ids,
                 )
                 .await?;
-                return Ok(OptimizationStepOutcome::Rejected { reason });
+                return Ok(OptimizationStepOutcome::Rejected { class });
             }
-            SuggestionOutcome::Uncertain {
-                reason,
-                dependency_ids,
-            } => {
+            SuggestionOutcome::Uncertain { dependency_ids } => {
+                let class = StepTerminalClass::ModelUsageUnknown;
                 commit_model_fact(
                     journal,
                     &model_request,
@@ -1505,11 +1774,11 @@ async fn run_optimization_step_inner(
                     journal,
                     &request.model_context,
                     StageFactKind::TerminalUncertain,
-                    &reason,
+                    &class,
                     dependency_ids,
                 )
                 .await?;
-                return Ok(OptimizationStepOutcome::Uncertain { reason });
+                return Ok(OptimizationStepOutcome::Uncertain { class });
             }
         };
         commit_model_fact(
@@ -1531,30 +1800,28 @@ async fn run_optimization_step_inner(
         suggestions.append(&mut items);
     }
     if suggestions.is_empty() {
+        let class = StepTerminalClass::NoEditSuggestions;
         commit_terminal(
             journal,
             &request.model_context,
             StageFactKind::TerminalNoChange,
-            "model returned no edit suggestions",
+            &class,
             vec![],
         )
         .await?;
-        return Ok(OptimizationStepOutcome::NoChange {
-            reason: "model returned no edit suggestions".into(),
-        });
+        return Ok(OptimizationStepOutcome::NoChange { class });
     }
     if suggestions.len() > MAX_FINAL_EDITS && !request.allow_rank_call {
+        let class = StepTerminalClass::SuggestionPoolUnranked;
         commit_terminal(
             journal,
             &request.model_context,
             StageFactKind::TerminalRejected,
-            "suggestion pool exceeds four and ranking was not preregistered",
+            &class,
             vec![],
         )
         .await?;
-        return Ok(OptimizationStepOutcome::Rejected {
-            reason: "suggestion pool exceeds four and ranking was not preregistered".into(),
-        });
+        return Ok(OptimizationStepOutcome::Rejected { class });
     }
     let selected_ids: Vec<String> = if suggestions.len() > MAX_FINAL_EDITS {
         match rank_suggestions(
@@ -1610,33 +1877,31 @@ async fn run_optimization_step_inner(
             request.protected_ranges,
         ) {
             Ok(compiled) => compiled,
-            Err(error) => {
+            Err(_) => {
+                let class = StepTerminalClass::EditCompileFailed;
                 commit_terminal(
                     journal,
                     &request.model_context,
                     StageFactKind::TerminalRejected,
-                    &format!("atomic skill edit rejected: {error}"),
+                    &class,
                     vec![],
                 )
                 .await?;
-                return Ok(OptimizationStepOutcome::Rejected {
-                    reason: error.to_string(),
-                });
+                return Ok(OptimizationStepOutcome::Rejected { class });
             }
         }
     };
     if compiled.report.status == evo_core::skill_edit::EditApplyStatus::NoChange {
+        let class = StepTerminalClass::EditProducedNoChange;
         commit_terminal(
             journal,
             &request.model_context,
             StageFactKind::TerminalNoChange,
-            "atomic skill edit produced no change",
+            &class,
             vec![],
         )
         .await?;
-        return Ok(OptimizationStepOutcome::NoChange {
-            reason: "atomic skill edit produced no change".into(),
-        });
+        return Ok(OptimizationStepOutcome::NoChange { class });
     }
     let bundle = if let Some(saved) = &saved_compile {
         serde_json::from_value(saved.payload["bundle"].clone()).map_err(|_| Error::Internal)?
@@ -1653,18 +1918,17 @@ async fn run_optimization_step_inner(
             revoked: request.bundle_context.revoked,
         }) {
             Ok(bundle) => bundle,
-            Err(error) => {
+            Err(_) => {
+                let class = StepTerminalClass::BundleCompileFailed;
                 commit_terminal(
                     journal,
                     &request.model_context,
                     StageFactKind::TerminalRejected,
-                    &format!("complete bundle compilation failed: {error}"),
+                    &class,
                     vec![],
                 )
                 .await?;
-                return Ok(OptimizationStepOutcome::Rejected {
-                    reason: error.to_string(),
-                });
+                return Ok(OptimizationStepOutcome::Rejected { class });
             }
         }
     };
@@ -1754,22 +2018,22 @@ async fn run_optimization_step_inner(
         Ok(report) => report,
         Err(error) => return Err(error),
     };
-    let selection = match select_development(&development_request, &report) {
-        Ok(selection) => selection,
-        Err(error) => {
-            commit_terminal(
-                journal,
-                &request.model_context,
-                StageFactKind::TerminalRejected,
-                &format!("development report rejected: {error}"),
-                vec![bundle.digest.clone()],
-            )
-            .await?;
-            return Ok(OptimizationStepOutcome::Rejected {
-                reason: error.to_string(),
-            });
-        }
-    };
+    let (selection, preserves_passes) =
+        match select_development_detailed(&development_request, &report) {
+            Ok(selected) => selected,
+            Err(_) => {
+                let class = StepTerminalClass::DevelopmentReportRejected;
+                commit_terminal(
+                    journal,
+                    &request.model_context,
+                    StageFactKind::TerminalRejected,
+                    &class,
+                    vec![bundle.digest.clone()],
+                )
+                .await?;
+                return Ok(OptimizationStepOutcome::Rejected { class });
+            }
+        };
     commit_stage(
         journal,
         StageFact {
@@ -1842,17 +2106,43 @@ async fn run_optimization_step_inner(
         commit_stage(journal, fact).await?;
         Ok(outcome)
     } else {
+        let class = keep_incumbent_class(&selection, preserves_passes);
         commit_terminal(
             journal,
             &request.model_context,
             StageFactKind::TerminalRejected,
-            &selection.reason,
+            &class,
             vec![bundle.digest],
         )
         .await?;
-        Ok(OptimizationStepOutcome::Rejected {
-            reason: selection.reason,
-        })
+        Ok(OptimizationStepOutcome::Rejected { class })
+    }
+}
+
+/// The class of a development selection that kept the incumbent. Which way it was kept
+/// is read from the pass-retention verdict of the selection, never from its sentence:
+/// a candidate that lost a task the incumbent passed is `retention_broken` whatever its
+/// total was (a higher one included), and every other candidate the selection did not
+/// accept is `not_improved`. The totals are the selection's, and the only numbers the
+/// class carries.
+fn keep_incumbent_class(
+    selection: &DevelopmentSelection,
+    preserves_passes: bool,
+) -> StepTerminalClass {
+    let (parent_total_micros, candidate_total_micros) = (
+        selection.parent_total_micros,
+        selection.candidate_total_micros,
+    );
+    if preserves_passes {
+        StepTerminalClass::KeepIncumbentNotImproved {
+            parent_total_micros,
+            candidate_total_micros,
+        }
+    } else {
+        StepTerminalClass::KeepIncumbentRetentionBroken {
+            parent_total_micros,
+            candidate_total_micros,
+        }
     }
 }
 
@@ -2072,14 +2362,17 @@ async fn commit_stage(journal: &dyn OptimizationJournal, fact: StageFact) -> Res
     journal.commit(fact.seal()?).await
 }
 
+/// Commits the terminal stage fact of a step that ended without a candidate. Its payload
+/// is the fixed code of the class and the class itself (typed fields included): the
+/// fact never holds the text of an error, of a model or of a source.
 async fn commit_terminal(
     journal: &dyn OptimizationJournal,
     context: &ModelRequestContext,
     kind: StageFactKind,
-    reason: &str,
+    class: &StepTerminalClass,
     dependencies: Vec<String>,
 ) -> Result<()> {
-    let payload = serde_json::json!({"reason": reason});
+    let payload = serde_json::json!({"reason": class.code(), "class": class});
     commit_stage(
         journal,
         StageFact {
@@ -2243,7 +2536,30 @@ struct RecoveryModel<'a> {
     port: &'a dyn ModelPort,
     journal: &'a RecoveryJournal<'a>,
     context: &'a ModelRequestContext,
-    uncertain: &'a std::sync::Mutex<Option<String>>,
+    uncertain: &'a std::sync::Mutex<Option<StepTerminalClass>>,
+}
+
+/// What the journal keeps of a model's answer: all of it, except the words a rejection
+/// came with. They are the provider's, they do not decide anything (the typed kind
+/// does), and a rejected call has nothing else to recover from them, so the journal
+/// keeps the code of the kind where they were. The answer a completed call returned is
+/// the model's work product and is kept whole, as the recovery of the step needs it.
+fn journaled_response(response: &ModelResponse) -> Result<serde_json::Value> {
+    let kept = match response {
+        ModelResponse::Rejected {
+            request_id,
+            kind,
+            dispatch,
+            ..
+        } => ModelResponse::Rejected {
+            request_id: request_id.clone(),
+            kind: *kind,
+            reason: rejection_kind_code(*kind).into(),
+            dispatch: dispatch.clone(),
+        },
+        other => other.clone(),
+    };
+    serde_json::to_value(&kept).map_err(|_| Error::Internal)
 }
 #[async_trait]
 impl ModelPort for RecoveryModel<'_> {
@@ -2273,7 +2589,7 @@ impl ModelPort for RecoveryModel<'_> {
             response.validate_against(&request)?;
             if matches!(response, ModelResponse::Uncertain { .. }) {
                 *self.uncertain.lock().map_err(|_| Error::Internal)? =
-                    Some("model usage remains unknown".into());
+                    Some(StepTerminalClass::ModelUsageUnknown);
             }
             return Ok(response);
         }
@@ -2282,26 +2598,27 @@ impl ModelPort for RecoveryModel<'_> {
                 return Err(Error::Conflict("model recovery input differs".into()));
             }
             *self.uncertain.lock().map_err(|_| Error::Internal)? =
-                Some("prepared model dispatch has no durable response; usage unknown".into());
+                Some(StepTerminalClass::ModelDispatchUnrecorded);
             return Err(Error::Conflict(
                 "model dispatch uncertain; automatic retry forbidden".into(),
             ));
         }
         if !self.journal.claim(prepared.clone()).await? {
             *self.uncertain.lock().map_err(|_| Error::Internal)? =
-                Some("concurrent model dispatch remains uncertain".into());
+                Some(StepTerminalClass::ModelDispatchConcurrent);
             return Err(Error::Conflict("model dispatch already claimed".into()));
         }
         let response = match self.port.dispatch(request.clone()).await {
             Ok(r) => r,
             Err(e) => {
+                // The error is the port's own and is not kept: the outcome is unknown.
                 *self.uncertain.lock().map_err(|_| Error::Internal)? =
-                    Some(format!("model transport outcome unknown: {e}"));
+                    Some(StepTerminalClass::ModelTransportOutcomeUnknown);
                 return Err(e);
             }
         };
         prepared.kind = StageFactKind::DispatchObserved;
-        prepared.payload = serde_json::to_value(&response).map_err(|_| Error::Internal)?;
+        prepared.payload = journaled_response(&response)?;
         // Preserve the receipt even if revocation raced with dispatch. It cannot be reused.
         prepared.dependencies.extend(
             self.journal
@@ -2328,7 +2645,7 @@ impl ModelPort for RecoveryModel<'_> {
             .await?;
         if matches!(response, ModelResponse::Uncertain { .. }) {
             *self.uncertain.lock().map_err(|_| Error::Internal)? =
-                Some("model usage remains unknown".into());
+                Some(StepTerminalClass::ModelUsageUnknown);
         }
         response.validate_against(&request)?;
         Ok(response)
@@ -2339,7 +2656,7 @@ struct RecoveryRunner<'a> {
     runner: &'a dyn DevRunner,
     journal: &'a RecoveryJournal<'a>,
     context: &'a ModelRequestContext,
-    uncertain: &'a std::sync::Mutex<Option<String>>,
+    uncertain: &'a std::sync::Mutex<Option<StepTerminalClass>>,
 }
 #[async_trait]
 impl DevRunner for RecoveryRunner<'_> {
@@ -2372,17 +2689,15 @@ impl DevRunner for RecoveryRunner<'_> {
             if old.input_digest != prepared.input_digest {
                 return Err(Error::Conflict("development recovery input differs".into()));
             }
-            *self.uncertain.lock().map_err(|_| Error::Internal)? = Some(
-                "prepared development execution has no durable result; execution and usage unknown"
-                    .into(),
-            );
+            *self.uncertain.lock().map_err(|_| Error::Internal)? =
+                Some(StepTerminalClass::DevelopmentExecutionUnrecorded);
             return Err(Error::Conflict(
                 "development execution uncertain; automatic retry forbidden".into(),
             ));
         }
         if !self.journal.claim(prepared).await? {
             *self.uncertain.lock().map_err(|_| Error::Internal)? =
-                Some("concurrent development execution remains uncertain".into());
+                Some(StepTerminalClass::DevelopmentExecutionConcurrent);
             return Err(Error::Conflict(
                 "development execution already claimed".into(),
             ));
@@ -2390,8 +2705,9 @@ impl DevRunner for RecoveryRunner<'_> {
         let report = match self.runner.run(request.clone()).await {
             Ok(r) => r,
             Err(e) => {
+                // The error is the runner's own and is not kept: the outcome is unknown.
                 *self.uncertain.lock().map_err(|_| Error::Internal)? =
-                    Some(format!("development execution outcome unknown: {e}"));
+                    Some(StepTerminalClass::DevelopmentExecutionOutcomeUnknown);
                 return Err(e);
             }
         };
@@ -2433,16 +2749,26 @@ fn encode_outcome(outcome: &OptimizationStepOutcome) -> Result<serde_json::Value
         } => {
             serde_json::json!({"status":"candidate", "output": edit.output, "patch":edit.patch, "report":edit.report, "bundle":bundle, "selection":selection})
         }
-        OptimizationStepOutcome::Rejected { reason } => {
-            serde_json::json!({"status":"rejected", "reason":reason})
-        }
-        OptimizationStepOutcome::NoChange { reason } => {
-            serde_json::json!({"status":"no_change", "reason":reason})
-        }
-        OptimizationStepOutcome::Uncertain { reason } => {
-            serde_json::json!({"status":"uncertain", "reason":reason})
-        }
+        OptimizationStepOutcome::Rejected { class } => terminal_payload("rejected", class),
+        OptimizationStepOutcome::NoChange { class } => terminal_payload("no_change", class),
+        OptimizationStepOutcome::Uncertain { class } => terminal_payload("uncertain", class),
     })
+}
+
+/// The `StepCompleted` payload of an outcome that is no candidate: its status, the
+/// fixed code of its class and the class. No text of an error, a model or a source.
+fn terminal_payload(status: &str, class: &StepTerminalClass) -> serde_json::Value {
+    serde_json::json!({"status": status, "reason": class.code(), "class": class})
+}
+
+/// The class a stored terminal names. A terminal journaled before the classes existed
+/// carries free text only, which is never carried forward: it reads as
+/// [`StepTerminalClass::LegacyUnclassified`].
+fn stored_class(value: &serde_json::Value) -> Result<StepTerminalClass> {
+    match value.get("class") {
+        Some(class) => serde_json::from_value(class.clone()).map_err(|_| Error::Internal),
+        None => Ok(StepTerminalClass::LegacyUnclassified),
+    }
 }
 fn decode_outcome(value: serde_json::Value) -> Result<OptimizationStepOutcome> {
     fn field<T: serde::de::DeserializeOwned>(v: &serde_json::Value, name: &str) -> Result<T> {
@@ -2460,13 +2786,13 @@ fn decode_outcome(value: serde_json::Value) -> Result<OptimizationStepOutcome> {
             selection: field(&value, "selection")?,
         }),
         Some("rejected") => Ok(OptimizationStepOutcome::Rejected {
-            reason: field(&value, "reason")?,
+            class: stored_class(&value)?,
         }),
         Some("no_change") => Ok(OptimizationStepOutcome::NoChange {
-            reason: field(&value, "reason")?,
+            class: stored_class(&value)?,
         }),
         Some("uncertain") => Ok(OptimizationStepOutcome::Uncertain {
-            reason: field(&value, "reason")?,
+            class: stored_class(&value)?,
         }),
         _ => Err(Error::Invalid(
             "invalid durable optimization outcome".into(),
@@ -2555,21 +2881,18 @@ async fn run_step(
             }
             return decode_outcome(old.payload);
         }
+        let class = StepTerminalClass::GrantUnavailable;
         commit_terminal(
             journal,
             &request.model_context,
             StageFactKind::TerminalRejected,
-            "model excerpt grant is absent or incompatible",
+            &class,
             vec![],
         )
         .await?;
-        terminal.payload = encode_outcome(&OptimizationStepOutcome::Rejected {
-            reason: "model excerpt grant is absent or incompatible".into(),
-        })?;
+        terminal.payload = encode_outcome(&OptimizationStepOutcome::Rejected { class })?;
         journal.commit(terminal.seal()?).await?;
-        return Ok(OptimizationStepOutcome::Rejected {
-            reason: "model excerpt grant is absent or incompatible".into(),
-        });
+        return Ok(OptimizationStepOutcome::Rejected { class });
     }
     journal
         .verify_sources(
@@ -2625,13 +2948,17 @@ async fn run_step(
     };
     let result =
         run_optimization_step_inner(Some(&model), Some(&runner), Some(&recovery), request).await;
-    let outcome = if let Some(reason) = uncertain.into_inner().map_err(|_| Error::Internal)? {
-        OptimizationStepOutcome::Uncertain { reason }
+    let outcome = if let Some(class) = uncertain.into_inner().map_err(|_| Error::Internal)? {
+        OptimizationStepOutcome::Uncertain { class }
     } else {
         match result {
             Ok(v) => v,
+            // Any other refusal is recorded by the kind of the error, never by its
+            // message: it can echo a source, a model answer or a store.
             Err(e) => OptimizationStepOutcome::Rejected {
-                reason: e.to_string(),
+                class: StepTerminalClass::StepError {
+                    error: StepErrorKind::from(&e),
+                },
             },
         }
     };
@@ -2723,4 +3050,509 @@ async fn run_dependency_revoked(
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod step_terminal_class_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    /// One value of every variant (and of every typed field that decides a code). A
+    /// variant added to the enum has to be named here: [`ordinal`] matches without a
+    /// wildcard, so it does not compile until it is.
+    fn every_class() -> Vec<StepTerminalClass> {
+        use StepTerminalClass as C;
+        let mut classes = vec![
+            C::NoEligibleReflectionBatch,
+            C::NoEditSuggestions,
+            C::EditProducedNoChange,
+            C::KeepIncumbentNotImproved {
+                parent_total_micros: 500_000,
+                candidate_total_micros: 400_000,
+            },
+            C::KeepIncumbentRetentionBroken {
+                parent_total_micros: 500_000,
+                candidate_total_micros: 900_000,
+            },
+            C::GrantUnavailable,
+            C::SuggestionShapeInvalid,
+            C::SuggestionPoolUnranked,
+            C::EditCompileFailed,
+            C::BundleCompileFailed,
+            C::DevelopmentReportRejected,
+            C::ModelUsageUnknown,
+            C::ModelDispatchUnrecorded,
+            C::ModelDispatchConcurrent,
+            C::ModelTransportOutcomeUnknown,
+            C::DevelopmentExecutionUnrecorded,
+            C::DevelopmentExecutionConcurrent,
+            C::DevelopmentExecutionOutcomeUnknown,
+            C::CancelledOrUncertain,
+            C::OptimizationDispatchOutcomeUncertain,
+            C::ExplorationSourceClosureChangedAfterDispatch,
+            C::ExplorationPrefixChangedAfterDispatch,
+            C::ClaimInputsChangedAfterDispatch,
+            C::RecoverTargetMissing,
+            C::DevelopmentEvidenceUnverified,
+            C::CandidateMaterialUnavailable,
+            C::CandidateObserved,
+            C::FixtureEvidenceNotAccepted,
+            C::DevelopmentEvidenceRejected,
+            C::LegacyUnclassified,
+        ];
+        classes.extend(
+            [
+                ModelRejectionKind::Unauthorized,
+                ModelRejectionKind::BudgetUnavailable,
+                ModelRejectionKind::InvalidRequest,
+                ModelRejectionKind::ProviderRejected,
+                ModelRejectionKind::CancelledBeforeDispatch,
+                ModelRejectionKind::CancelledAfterDispatch,
+            ]
+            .map(|kind| C::ModelRejected { kind }),
+        );
+        classes.extend(
+            [
+                StepErrorKind::Invalid,
+                StepErrorKind::Forbidden,
+                StepErrorKind::NotFound,
+                StepErrorKind::Budget,
+                StepErrorKind::Conflict,
+                StepErrorKind::Cancelled,
+                StepErrorKind::Internal,
+            ]
+            .map(|error| C::StepError { error }),
+        );
+        classes
+    }
+
+    /// The position of a variant in the declaration, with no wildcard: it exists to
+    /// stop compiling when a variant is added without being listed above.
+    fn ordinal(class: &StepTerminalClass) -> usize {
+        use StepTerminalClass as C;
+        match class {
+            C::NoEligibleReflectionBatch => 0,
+            C::NoEditSuggestions => 1,
+            C::EditProducedNoChange => 2,
+            C::KeepIncumbentNotImproved { .. } => 3,
+            C::KeepIncumbentRetentionBroken { .. } => 4,
+            C::GrantUnavailable => 5,
+            C::ModelRejected { .. } => 6,
+            C::SuggestionShapeInvalid => 7,
+            C::SuggestionPoolUnranked => 8,
+            C::EditCompileFailed => 9,
+            C::BundleCompileFailed => 10,
+            C::DevelopmentReportRejected => 11,
+            C::StepError { .. } => 12,
+            C::ModelUsageUnknown => 13,
+            C::ModelDispatchUnrecorded => 14,
+            C::ModelDispatchConcurrent => 15,
+            C::ModelTransportOutcomeUnknown => 16,
+            C::DevelopmentExecutionUnrecorded => 17,
+            C::DevelopmentExecutionConcurrent => 18,
+            C::DevelopmentExecutionOutcomeUnknown => 19,
+            C::CancelledOrUncertain => 20,
+            C::OptimizationDispatchOutcomeUncertain => 21,
+            C::ExplorationSourceClosureChangedAfterDispatch => 22,
+            C::ExplorationPrefixChangedAfterDispatch => 23,
+            C::ClaimInputsChangedAfterDispatch => 24,
+            C::RecoverTargetMissing => 25,
+            C::DevelopmentEvidenceUnverified => 26,
+            C::CandidateMaterialUnavailable => 27,
+            C::CandidateObserved => 28,
+            C::FixtureEvidenceNotAccepted => 29,
+            C::DevelopmentEvidenceRejected => 30,
+            C::LegacyUnclassified => 31,
+        }
+    }
+
+    #[test]
+    fn every_variant_is_listed_and_has_its_own_fixed_snake_case_code() {
+        let classes = every_class();
+        let variants: BTreeSet<usize> = classes.iter().map(ordinal).collect();
+        assert_eq!(variants, (0..=31).collect::<BTreeSet<_>>());
+        let codes: BTreeSet<&str> = classes.iter().map(StepTerminalClass::code).collect();
+        assert_eq!(codes.len(), classes.len(), "two classes share a code");
+        for code in &codes {
+            assert!(
+                !code.is_empty()
+                    && code.len() <= 64
+                    && code
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_serialized_tag_of_a_class_is_its_code_unless_a_typed_field_decides_the_code() {
+        for class in every_class() {
+            let value = serde_json::to_value(class).unwrap();
+            let tag = value["class"].as_str().unwrap();
+            match class {
+                StepTerminalClass::ModelRejected { kind } => {
+                    assert_eq!(tag, "model_rejected");
+                    assert_eq!(
+                        class.code(),
+                        format!("model_rejected_{}", rejection_kind_code(kind))
+                    );
+                    assert_eq!(value["kind"], json!(rejection_kind_code(kind)));
+                }
+                StepTerminalClass::StepError { error } => {
+                    assert_eq!(tag, "step_error");
+                    assert_eq!(class.code(), format!("step_error_{}", error.code()));
+                    assert_eq!(value["error"], json!(error.code()));
+                }
+                _ => assert_eq!(tag, class.code(), "{class:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_class_round_trips_through_json_and_is_read_strictly() {
+        for class in every_class() {
+            let value = serde_json::to_value(class).unwrap();
+            assert_eq!(
+                serde_json::from_value::<StepTerminalClass>(value).unwrap(),
+                class
+            );
+        }
+        // The totals of a kept incumbent are numbers and nothing else.
+        let kept = StepTerminalClass::KeepIncumbentNotImproved {
+            parent_total_micros: 7,
+            candidate_total_micros: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(kept).unwrap(),
+            json!({
+                "class": "keep_incumbent_not_improved",
+                "parent_total_micros": 7,
+                "candidate_total_micros": 3,
+            })
+        );
+        // A class that is not one of the closed set, a typed field outside its set or of
+        // the wrong type, a typed field that is missing and a value that is no object
+        // are refused. (A field the class does not have is not read, so no text under
+        // another name is carried by it.)
+        for forged in [
+            json!({"class": "something_else"}),
+            json!({"class": "model_rejected", "kind": "politely_declined"}),
+            json!({"class": "model_rejected"}),
+            json!({"class": "step_error", "error": "boom"}),
+            json!({"class": "keep_incumbent_not_improved", "parent_total_micros": "7"}),
+            json!({"class": "keep_incumbent_retention_broken", "parent_total_micros": 7}),
+            json!("no_edit_suggestions"),
+            json!(null),
+        ] {
+            assert!(
+                serde_json::from_value::<StepTerminalClass>(forged.clone()).is_err(),
+                "{forged}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_error_is_kept_as_its_kind_alone() {
+        for (error, kind, code) in [
+            (
+                Error::Invalid("echoes a source".into()),
+                StepErrorKind::Invalid,
+                "invalid",
+            ),
+            (Error::Forbidden, StepErrorKind::Forbidden, "forbidden"),
+            (Error::NotFound, StepErrorKind::NotFound, "not_found"),
+            (Error::Budget, StepErrorKind::Budget, "budget"),
+            (
+                Error::Conflict("echoes a store".into()),
+                StepErrorKind::Conflict,
+                "conflict",
+            ),
+            (Error::Cancelled, StepErrorKind::Cancelled, "cancelled"),
+            (Error::Internal, StepErrorKind::Internal, "internal"),
+        ] {
+            assert_eq!(StepErrorKind::from(&error), kind);
+            assert_eq!(kind.code(), code);
+        }
+    }
+
+    #[test]
+    fn a_terminal_payload_is_the_status_the_code_and_the_class_and_reads_back() {
+        for class in every_class() {
+            for (status, outcome) in [
+                ("no_change", OptimizationStepOutcome::NoChange { class }),
+                ("rejected", OptimizationStepOutcome::Rejected { class }),
+                ("uncertain", OptimizationStepOutcome::Uncertain { class }),
+            ] {
+                let payload = encode_outcome(&outcome).unwrap();
+                assert_eq!(payload["status"], status);
+                assert_eq!(payload["reason"], class.code());
+                assert_eq!(payload["class"], serde_json::to_value(class).unwrap());
+                let read = match (status, decode_outcome(payload).unwrap()) {
+                    ("no_change", OptimizationStepOutcome::NoChange { class }) => class,
+                    ("rejected", OptimizationStepOutcome::Rejected { class }) => class,
+                    ("uncertain", OptimizationStepOutcome::Uncertain { class }) => class,
+                    (status, other) => panic!("{status} read back as {other:?}"),
+                };
+                assert_eq!(read, class);
+            }
+        }
+    }
+
+    #[test]
+    fn a_terminal_journaled_as_free_text_reads_as_unclassified_and_carries_no_text() {
+        for (status, free_text) in [
+            ("no_change", "model returned no edit suggestions"),
+            (
+                "rejected",
+                "invalid input: invalid optimizer suggestions: unknown field `x`",
+            ),
+            (
+                "uncertain",
+                "model transport outcome unknown: state conflict: words",
+            ),
+        ] {
+            let read = decode_outcome(json!({"status": status, "reason": free_text})).unwrap();
+            let class = match read {
+                OptimizationStepOutcome::NoChange { class }
+                | OptimizationStepOutcome::Rejected { class }
+                | OptimizationStepOutcome::Uncertain { class } => class,
+                OptimizationStepOutcome::Candidate { .. } => panic!("{status}"),
+            };
+            assert_eq!(class, StepTerminalClass::LegacyUnclassified);
+            assert_eq!(class.code(), "legacy_unclassified");
+        }
+        // A class that is not one of the closed set is a corrupt terminal, not a text.
+        assert!(matches!(
+            decode_outcome(json!({"status": "rejected", "reason": "x", "class": {"class": "x"}})),
+            Err(Error::Internal)
+        ));
+        // And an unknown status is refused as it always was.
+        assert!(decode_outcome(json!({"status": "approved", "reason": "x"})).is_err());
+    }
+
+    /// A development request and its report over `results.len()` tasks:
+    /// `(parent score, candidate score, parent passed, candidate passed)` per task.
+    fn development_pair(
+        results: &[(u32, u32, bool, bool)],
+    ) -> (DevelopmentRunRequest, DevelopmentRunReport) {
+        let tasks: Vec<DevelopmentTask> = (0..results.len())
+            .map(|index| DevelopmentTask {
+                id: format!("task-{index}"),
+                parent_family: "family".into(),
+                input_digest: evo_core::hash(format!("task-{index}").as_bytes()),
+            })
+            .collect();
+        let manifest = DevelopmentManifest::build("manifest", tasks).unwrap();
+        let request = DevelopmentRunRequest {
+            request_id: "development-request".into(),
+            namespace: "n".into(),
+            purpose: Purpose::Development,
+            episode_id: "episode".into(),
+            step: 1,
+            attempt: 1,
+            manifest: manifest.clone(),
+            parent_bundle_digest: evo_core::hash(b"parent"),
+            candidate_bundle_digest: evo_core::hash(b"candidate"),
+            environment_digest: evo_core::hash(b"environment"),
+            grader_digest: evo_core::hash(b"grader"),
+            rules_digest: evo_core::hash(b"rules"),
+            tools_digest: evo_core::hash(b"tools"),
+            revoke_watermark: 1,
+            idempotency_key: "idempotency".into(),
+        };
+        let report = DevelopmentRunReport {
+            request_id: request.request_id.clone(),
+            manifest_digest: manifest.digest,
+            parent_bundle_digest: request.parent_bundle_digest.clone(),
+            candidate_bundle_digest: request.candidate_bundle_digest.clone(),
+            environment_digest: request.environment_digest.clone(),
+            grader_digest: request.grader_digest.clone(),
+            results: results
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, (parent, candidate, parent_passed, candidate_passed))| {
+                        PairedTaskResult {
+                            task_id: format!("task-{index}"),
+                            parent_score_micros: *parent,
+                            candidate_score_micros: *candidate,
+                            parent_passed: *parent_passed,
+                            candidate_passed: *candidate_passed,
+                            parent_execution_id: format!("parent-{index}"),
+                            candidate_execution_id: format!("candidate-{index}"),
+                            grader_receipt_digest: evo_core::hash(
+                                format!("grade-{index}").as_bytes(),
+                            ),
+                        }
+                    },
+                )
+                .collect(),
+            execution_receipt_id: "execution".into(),
+            usage_record_ids: vec![],
+            provenance: DevelopmentExecutionProvenance::Fixture,
+        };
+        (request, report)
+    }
+
+    #[test]
+    fn a_kept_incumbent_is_told_apart_by_the_retention_of_passes_and_carries_only_the_totals() {
+        use DevelopmentSelectionDecision::{AcceptCandidate, KeepIncumbent};
+        // `(results, decision, preserves passes, class)`.
+        type Case = (
+            Vec<(u32, u32, bool, bool)>,
+            DevelopmentSelectionDecision,
+            bool,
+            Option<StepTerminalClass>,
+        );
+        let cases: Vec<Case> = vec![
+            // Strictly better with every pass kept: the candidate is accepted.
+            (
+                vec![(500_000, 900_000, true, true)],
+                AcceptCandidate,
+                true,
+                None,
+            ),
+            // Equal totals, every pass kept: not improved.
+            (
+                vec![(500_000, 500_000, true, true)],
+                KeepIncumbent,
+                true,
+                Some(StepTerminalClass::KeepIncumbentNotImproved {
+                    parent_total_micros: 500_000,
+                    candidate_total_micros: 500_000,
+                }),
+            ),
+            // A lower total, every pass kept: not improved.
+            (
+                vec![(500_000, 100_000, false, false)],
+                KeepIncumbent,
+                true,
+                Some(StepTerminalClass::KeepIncumbentNotImproved {
+                    parent_total_micros: 500_000,
+                    candidate_total_micros: 100_000,
+                }),
+            ),
+            // A higher total that loses a task the incumbent passed: retention broken.
+            (
+                vec![(400_000, 900_000, true, false)],
+                KeepIncumbent,
+                false,
+                Some(StepTerminalClass::KeepIncumbentRetentionBroken {
+                    parent_total_micros: 400_000,
+                    candidate_total_micros: 900_000,
+                }),
+            ),
+            // The same over two tasks, one lost and one gained.
+            (
+                vec![
+                    (400_000, 100_000, true, false),
+                    (100_000, 900_000, false, true),
+                ],
+                KeepIncumbent,
+                false,
+                Some(StepTerminalClass::KeepIncumbentRetentionBroken {
+                    parent_total_micros: 500_000,
+                    candidate_total_micros: 1_000_000,
+                }),
+            ),
+            // A lower total that also loses a pass: retention is what broke.
+            (
+                vec![(500_000, 100_000, true, false)],
+                KeepIncumbent,
+                false,
+                Some(StepTerminalClass::KeepIncumbentRetentionBroken {
+                    parent_total_micros: 500_000,
+                    candidate_total_micros: 100_000,
+                }),
+            ),
+        ];
+        for (results, decision, preserves, class) in cases {
+            let (request, report) = development_pair(&results);
+            let (selection, preserved) = select_development_detailed(&request, &report).unwrap();
+            assert_eq!(selection.decision, decision, "{results:?}");
+            assert_eq!(preserved, preserves, "{results:?}");
+            // The public selection is the same one.
+            let public = select_development(&request, &report).unwrap();
+            assert_eq!(
+                serde_json::to_value(&public).unwrap(),
+                serde_json::to_value(&selection).unwrap(),
+                "{results:?}"
+            );
+            if decision == KeepIncumbent {
+                assert_eq!(
+                    Some(keep_incumbent_class(&selection, preserved)),
+                    class,
+                    "{results:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_journaled_rejection_keeps_its_kind_and_receipt_and_never_the_providers_words() {
+        let receipt = ModelExecutionReceipt {
+            call_id: "call".into(),
+            dispatch_id: "dispatch".into(),
+            root_budget_id: "root".into(),
+            provider_request_id: "provider".into(),
+            usage_record_id: "usage".into(),
+            provenance: crate::model::ModelExecutionProvenance::Fixture,
+        };
+        for kind in [
+            ModelRejectionKind::Unauthorized,
+            ModelRejectionKind::BudgetUnavailable,
+            ModelRejectionKind::InvalidRequest,
+            ModelRejectionKind::ProviderRejected,
+            ModelRejectionKind::CancelledBeforeDispatch,
+            ModelRejectionKind::CancelledAfterDispatch,
+        ] {
+            let dispatch = match kind {
+                ModelRejectionKind::ProviderRejected
+                | ModelRejectionKind::CancelledAfterDispatch => {
+                    crate::model::RejectedDispatch::Dispatched {
+                        receipt: receipt.clone(),
+                    }
+                }
+                _ => crate::model::RejectedDispatch::NotDispatched,
+            };
+            let rejected = ModelResponse::Rejected {
+                request_id: "request".into(),
+                kind,
+                reason: "the provider's own words".into(),
+                dispatch: dispatch.clone(),
+            };
+            let kept = journaled_response(&rejected).unwrap();
+            assert!(!kept.to_string().contains("own words"), "{kept}");
+            // It is still a rejection that reads back, with the same kind and dispatch,
+            // and its reason is a non-empty text (the model response contract).
+            let read: ModelResponse = serde_json::from_value(kept).unwrap();
+            let ModelResponse::Rejected {
+                kind: read_kind,
+                reason,
+                dispatch: read_dispatch,
+                ..
+            } = read
+            else {
+                panic!("a rejection reads back as something else");
+            };
+            assert_eq!((read_kind, read_dispatch), (kind, dispatch));
+            assert_eq!(reason, rejection_kind_code(kind));
+        }
+        // An answer that completed is the model's work product and is kept whole.
+        let completed = ModelResponse::Completed {
+            request_id: "request".into(),
+            response_id: "response".into(),
+            actual_model_digest: evo_core::hash(b"model"),
+            input_digest: evo_core::hash(b"input"),
+            output: "[]".into(),
+            output_digest: evo_core::hash(b"[]"),
+            execution_receipt: receipt,
+        };
+        assert_eq!(
+            journaled_response(&completed).unwrap(),
+            serde_json::to_value(&completed).unwrap()
+        );
+    }
 }
