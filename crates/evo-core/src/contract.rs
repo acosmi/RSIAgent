@@ -684,6 +684,16 @@ impl HostSurfaceManifest {
                 }
             }
         }
+        // Check old names only after the existing schema, coverage, and item guards.
+        let extracted_names: BTreeSet<&str> = extracted.iter().map(String::as_str).collect();
+        for item in &self.items {
+            if !extracted_names.contains(item.name.as_str()) {
+                return Err(Error::Invalid(format!(
+                    "host surface field {} is missing from extraction",
+                    item.name
+                )));
+            }
+        }
         Ok(())
     }
 }
