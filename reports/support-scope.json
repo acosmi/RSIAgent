@@ -735,7 +735,7 @@
     "E08": {
       "title": "Persistent Revocation, Cleanup, Backup & Trusted Anchor Recovery",
       "status": "in_progress",
-      "status_reason": "accepted program sub-scopes include revocation closure, late writes, economic restore protection (AG-051) and grant/package/seed source gates (AG-046); full production recovery and remaining write paths are unverified; AG-053 bounds dependency snapshot recursion and AG-059 checks resolved manifest sources before first package write",
+      "status_reason": "accepted program sub-scopes include revocation closure, late writes, economic restore protection (AG-051) and grant/package/seed source gates (AG-046); full production recovery and remaining write paths are unverified; AG-053 bounds dependency snapshot recursion and AG-059 checks resolved manifest sources before first package write; AG068/#113 also cleans registered valid native-authority successors in new Pending/Running jobs",
       "implementation_files": [
         "crates/evo-storage/src/lifecycle.rs",
         "crates/evo-engine/src/lifecycle.rs",
@@ -979,13 +979,36 @@
           "rollback": "revert PR #101 through an independent revert PR; accepted-head parent 43f0022478d58dd8a8e6492cffb3aa24463b3fce; preserve immutable evidence, revocation, budget, cost and audit facts",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-059-8257e6a.json"
+        },
+        {
+          "id": "E08.ag068_native_authority_cleanup",
+          "description": "Registered native authority successors are cleaned in new revocation jobs",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "75754911a01aab756d5f17b9d6fef8bb3959de33",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/113",
+          "merged_sha": "212c78488b403397eaebaa65a6d280b9c6be3899",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/import_source_successor_cleanup_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test import_source_successor_cleanup_v42",
+          "input_digest": "d2a606dbae7cf15e2b3e7432215ac599af4fd98ca0d08d670421d944baade678",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag068-7575491.log.test",
+          "actual_result": "controller independent full re-run at 7575491: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; checker unittest 48 passed; import_source_successor_cleanup_v42 10 passed / 0 failed; workspace 96 result lines, 1273 passed / 0 failed; two root probes pass on head and both fail after successful compilation on the actual parent; actual old-program Failed database boundary 1 passed / 0 failed",
+          "scope": "E08/E16.1; section 11 L1077, section 11.3 L1110-L1112, section 11.5 L1132-L1134 and E08 L1295/L1299; V017/V018/V075 limited logical cleanup of valid native authorities in a registered typed closure, including non-primary sources",
+          "risk": "Only new Pending/Running jobs. Real import and Host writers are exercised with explicitly manual dependency edges; this does not implement the full production import-learning/new-use chain or all V076. The actual old-program Failed database still remains Failed at this accepted head; AG069 local recovery is separate and unmerged. No physical erasure, arbitrary late writes, production or effect claim",
+          "rollback": "revert PR #113 through an independent revert PR; accepted-head parent 200c43bc19368ff52b064e67eb1b14e35f096d39; retain evidence, costs, dispatch history and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-068-7575491.json"
         }
       ],
       "remaining": [
         "awaiting plan clarification: kind-keyed tombstones and storage publication kind precision/residue; no source clause currently authorizes a format change",
         "awaiting plan clarification: physical SQLite free-page/WAL erasure is not a declared guarantee",
         "engineering: other late writes, stage_bundle and typed dependency-edge completeness remain; AG-059 closes resolved manifest prewrite checking only",
-        "production disaster recovery, Linux deployment and future object scopes remain unverified"
+        "production disaster recovery, Linux deployment and future object scopes remain unverified",
+        "local only, not merged: AG069 old Failed-job recovery, AG073 cached-response freshness and AG075 bounded E16 typed-edge diagnostics passed controller acceptance; their accepted heads are not current main. AG077 typed budget binding/cleanup/restore remains in progress"
       ]
     },
     "E09": {
@@ -1770,7 +1793,7 @@
     "E16.1": {
       "title": "Source Import & Versioned Readers",
       "status": "in_progress",
-      "status_reason": "controller verified and merged the durable import sub-scope (PR #44, merged acda318); the full real migration chain (trusted run / AppliedReceipt / FormalEvaluation / Active from imports) remains open",
+      "status_reason": "durable import readers are verified and merged; AG068 adds a registered native-authority cleanup subset. The complete import-to-development-candidate-to-new-use-to-revocation chain remains required and incomplete; unverified import history is permitted as development material and is not trusted application evidence",
       "implementation_files": [
         "crates/evo-engine/src/import.rs",
         "crates/evo-core/src/evidence.rs"
@@ -1815,7 +1838,8 @@
         }
       ],
       "remaining": [
-        "full real migration chain: no trusted run, AppliedReceipt, FormalEvaluation or Active from imports"
+        "engineering: complete three-reader import learning, persistent provenance/candidate, development selection, real subsequent content use and revocation chain remain incomplete; local accepted AG070 material reading and AG076 executable ProgramFixture core are unmerged, and AG077 typed budget plumbing is in progress",
+        "evidence boundary: imported history does not create trusted run/AppliedReceipt/FormalEvaluation/Active authority; ProgramFixture cannot substitute for real approval or benefit evidence"
       ]
     },
     "E16.2": {
@@ -1918,10 +1942,12 @@
     "E16.4": {
       "title": "Extra Real Host MCP Tool-Only, Surface Drift & Attribution",
       "status": "blocked",
-      "status_reason": "real Claude Code MCP Tool-only host is unavailable; controller verified only real-store rejection of unverified Claude surfaces and trusted host record reload/structure checks (PR #47, merged 1c824e66); local structure cannot satisfy the host claim",
+      "status_reason": "real Claude Code MCP Tool-only host is unavailable; controller verified only real-store rejection of unverified Claude surfaces and trusted host record reload/structure checks (PR #47, merged 1c824e66); local structure cannot satisfy the host claim; AG066/#111 adds the local real-process stdio harness, with its 47-case Python evidence separately bound",
       "implementation_files": [
         "crates/evo-engine/src/hosts.rs",
-        "crates/evo-engine/src/release_store.rs"
+        "crates/evo-engine/src/release_store.rs",
+        "crates/evo-mcp/tests/service.rs",
+        "scripts/test_mcp_stdio.py"
       ],
       "scenarios": [
         "V002",
@@ -1959,11 +1985,33 @@
           "rollback": "revert PR #47 through an independent revert PR while retaining reference-host evidence and immutable facts",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/verify-20260930/qa/s2-input-E16.4.json"
+        },
+        {
+          "id": "E16.4.ag066_local_stdio_harness",
+          "description": "Local MCP stdio process harness with frozen v1 protocol",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "1d0d93d1dc42deae83056bfc8602fd3bf2760f3d",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/111",
+          "merged_sha": "200c43bc19368ff52b064e67eb1b14e35f096d39",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-mcp/tests/service.rs",
+          "command": "cargo test --locked --offline -p evo-mcp --test service",
+          "input_digest": "9f982bc0afa115e267537cb1779beef852d788b7301cd263da811509e2385ff8",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag066-1d0d93d.log.test",
+          "actual_result": "controller independent full re-run at 1d0d93d: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; checker unittest 48 passed; service 2 passed / 0 failed; workspace 95 result lines, 1263 passed / 0 failed; separate real-process Python harness 47 passed / 0 failed in each normal, optimized reverse and restored run; both semantic response mutations detected; two root probes pass on both head and parent and are boundary checks, not red-to-green defects",
+          "scope": "E02/E16.4; section 6.1 L605-L609 and E16.4 L1443-L1445; V002 local v1 interface and V039 platform/host claim boundaries: fixed SDK handshake, four schemas, persistence/reconnect and protocol rejection paths in local subprocesses",
+          "risk": "The primary cargo entry is the existing MCP service 2-case regression, not the HTTP service or the additional 47-case Python harness. The bound additional Python script and normal/optimized-reverse/restored logs contain the substantive new coverage. No real Claude, in-flight cancellation propagation, business v2 negotiation, production effect or release",
+          "rollback": "revert PR #111 through an independent revert PR; accepted-head parent e7ec4904b42e8c6f0d20e425b3bdc77c3109c180; retain evidence, costs, dispatch history and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-066-1d0d93d.json"
         }
       ],
       "remaining": [
         "real Claude Code MCP Tool-only host is unavailable; no real Claude Code evidence (version, handshake, four-tool smoke, reconnect, cancellation); local structure cannot satisfy the host claim",
-        "AG-065 verifies names only; types/defaults and actual consumers remain unverified. AG-066 local stdio harness is in progress and is not yet controller accepted; it cannot establish real host or in-flight cancellation support"
+        "AG065 verifies names only; types/defaults and actual consumers remain unverified. AG066/#111 verifies a local 47-case real-process stdio harness, not real Claude or in-flight cancellation propagation"
       ]
     },
     "E16.5": {
@@ -2115,13 +2163,14 @@
       "remaining": [
         "no real sandbox; deployment-safety evidence is local only; Linux not exercised",
         "pending revoke cleanup jobs are not driven at startup; residual dispatched calls are not turned uncertain at startup; outbound-network consistency is unchecked",
-        "capacity limits for internal objects added in round 2 (consolidation claims/proposals, practice sets, skill-group jobs, meta trials) are not registered in plan section 3.3.1; a plan revision must come first"
+        "capacity limits for internal objects added in round 2 (consolidation claims/proposals, practice sets, skill-group jobs, meta trials) are not registered in plan section 3.3.1; a plan revision must come first",
+        "AG077 typed budget source/restore binding and AG078 read-only unresolved-bill report are local work in progress, not merged support claims"
       ]
     },
     "E16.6": {
       "title": "Release, Support Scope Manifest & Truth Ledger",
       "status": "in_progress",
-      "status_reason": "the v4.2 derived index records round-2, round-3 and seven round-4 accepted product subsets, each with fixed source and merge identities; it does not close E16",
+      "status_reason": "the v4.2 derived index preserves historical records and binds round-2, round-3 and twelve round-4 accepted product subsets to fixed source and merge identities; local-only accepted heads are not registered as merged; it does not close E16",
       "implementation_files": [
         "reports/support-scope.json",
         "crates/evo-core/tests/support_scope.rs"
