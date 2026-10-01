@@ -297,7 +297,7 @@ async fn a_model_call_over_a_revoked_source_is_rejected_and_never_reaches_the_tr
 }
 
 /// Reserved over a live run, revoked before the dispatch: the broker finds its
-/// reservation, the dispatch is refused, the reservation is released (the quota
+/// reservation, the dispatch is refused as Unauthorized/source_revoked, the reservation is released (the quota
 /// comes back), and the provider is never called, now or on a retry.
 #[tokio::test]
 async fn a_revoke_between_the_reservation_and_the_dispatch_releases_the_quota_and_sends_nothing() {
@@ -335,11 +335,13 @@ async fn a_revoke_between_the_reservation_and_the_dispatch_releases_the_quota_an
     let broker = broker_over(&store, transport);
     for attempt in ["first", "retry"] {
         let response = broker.dispatch(request.clone()).await.unwrap();
-        assert_rejected_before_dispatch(
-            &response,
-            ModelRejectionKind::CancelledBeforeDispatch,
-            attempt,
-        );
+        assert_rejected_before_dispatch(&response, ModelRejectionKind::Unauthorized, attempt);
+        match &response {
+            ModelResponse::Rejected { reason, .. } => {
+                assert_eq!(reason, "broker_pre_dispatch_v1.source_revoked");
+            }
+            other => panic!("{attempt}: expected source refusal, got {other:?}"),
+        }
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -761,9 +763,9 @@ async fn a_revoke_after_the_start_check_is_refused_at_the_reservation() {
 }
 
 /// The revocation lands after the reservation and before the dispatch. The
-/// dispatch is refused (`Cancelled`): the call stays an undispatched reservation,
-/// nothing is executed or settled, and no receipt is issued. (Before this change
-/// it was dispatched and settled, and only the receipt check failed it.)
+/// dispatch is refused (`Cancelled`), its undispatched 1 micro is released with
+/// the source-revoked reason, and no receipt is issued. The in-process target may
+/// already have executed before begin; no budget dispatch or settlement occurs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoke_after_the_reservation_is_refused_at_the_dispatch() {
     let fixture = Fixture::new().await;
@@ -785,7 +787,12 @@ async fn a_revoke_after_the_reservation_is_refused_at_the_dispatch() {
     let expected =
         execution_budget_call_id(&request.request_id, "task-a", DevelopmentSide::Parent).unwrap();
     assert_eq!(calls[0].call_id, expected);
-    assert_eq!(calls[0].state, BudgetCallState::Reserved);
+    assert_eq!(calls[0].state, BudgetCallState::Released);
+    assert_eq!(
+        calls[0].terminal_reason.as_deref(),
+        Some("development_pre_dispatch_v1.source_revoked")
+    );
+    assert_eq!(micros(&fixture.store, SCOPE, &fixture.admin).await, (0, 0));
     assert_eq!(calls[0].dispatch_id, None, "the call was dispatched");
     assert_eq!(calls[0].actual_cost_micros, None);
     fixture.assert_no_execution_receipt(&request).await;

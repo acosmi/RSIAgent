@@ -1983,13 +1983,15 @@ async fn groups_that_share_a_request_id_would_reuse_the_brokers_call_id() {
     )
     .await
     .unwrap();
-    // The broker refuses the reused call id with a conflict that reaches the step as an
-    // error of the model port: the second group ends uncertain, and its outcome carries
-    // the fixed class of a transport outcome that is unknown, not the port's own words
-    // (AG-048).
+    // A reused call id is a determinate invalid request before dispatch.
     match second {
-        OptimizationStepOutcome::Uncertain { class } => {
-            assert_eq!(class, StepTerminalClass::ModelTransportOutcomeUnknown)
+        OptimizationStepOutcome::Rejected { class } => {
+            assert_eq!(
+                class,
+                StepTerminalClass::ModelRejected {
+                    kind: ModelRejectionKind::InvalidRequest
+                }
+            )
         }
         other => panic!("the second group must not proceed: {other:?}"),
     }

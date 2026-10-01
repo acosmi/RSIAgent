@@ -1152,3 +1152,872 @@ async fn lease_capacity_cannot_be_split_across_namespaces() {
     );
     session.commit().await.unwrap();
 }
+
+// AG-054: added comparisons leave every historical assertion above intact.
+fn assert_exact_error(actual: Error, expected: &Error) {
+    assert_eq!(
+        std::mem::discriminant(&actual),
+        std::mem::discriminant(expected)
+    );
+    assert_eq!(actual.to_string(), expected.to_string());
+}
+
+async fn compare_reserve_refusal(
+    store: &Store,
+    caller: &Context,
+    request: &BudgetCallReservation,
+    sources: &[String],
+    code: &str,
+    legacy: Error,
+) {
+    let refusal = store
+        .reserve_budget_call_with_sources_typed(caller, request, sources)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(refusal.code(), code);
+    assert_exact_error(refusal.into_reservation_error(), &legacy);
+    assert_exact_error(
+        store
+            .reserve_budget_call_with_sources(caller, request, sources)
+            .await
+            .unwrap_err(),
+        &legacy,
+    );
+}
+
+async fn authorized_store() -> (tempfile::TempDir, Store, Context, Context) {
+    let (dir, store) = store().await;
+    let admin = ctx("ns-a", "admin", Role::Admin);
+    let worker = ctx("ns-a", "worker", Role::Worker);
+    store
+        .authorize_root_budget(&admin, &authorization("root-1", "scope-1"))
+        .await
+        .unwrap();
+    (dir, store, admin, worker)
+}
+
+async fn put_budget_gate_object(
+    store: &Store,
+    admin: &Context,
+    kind: &str,
+    id: &str,
+    body: serde_json::Value,
+) {
+    let mut session = store.session().await.unwrap();
+    session
+        .put(admin, kind, id, admin.actor(), &body)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+}
+
+fn budget_ref_id(call: &evo_storage::budget::BudgetCallRecord) -> String {
+    let digest = evo_core::fingerprint(&(
+        "rsia.budget_call_ref.v1",
+        &call.namespace,
+        &call.billing_scope,
+        &call.call_id,
+    ))
+    .unwrap();
+    format!("budget-ref-{}", &digest[..32])
+}
+
+#[tokio::test]
+async fn ag054_reserve_typed_validation_authority_and_money_keep_legacy_errors() {
+    let (_dir, missing) = store().await;
+    let worker = ctx("ns-a", "worker", Role::Worker);
+    compare_reserve_refusal(
+        &missing,
+        &worker,
+        &reservation("missing", 10, 1),
+        &[],
+        "root_authorization_missing",
+        Error::Budget,
+    )
+    .await;
+    let (dir, store, admin, worker) = authorized_store().await;
+    let request = reservation("new", 10, 2);
+    compare_reserve_refusal(
+        &store,
+        &ctx("ns-a", "agent", Role::Agent),
+        &request,
+        &[],
+        "unauthorized",
+        Error::Forbidden,
+    )
+    .await;
+    compare_reserve_refusal(
+        &store,
+        &ctx("ns-c", "worker", Role::Worker),
+        &request,
+        &[],
+        "unauthorized",
+        Error::Forbidden,
+    )
+    .await;
+    let mut invalid = request.clone();
+    invalid.max_cost_micros = 0;
+    compare_reserve_refusal(
+        &store,
+        &worker,
+        &invalid,
+        &[],
+        "invalid_request",
+        Error::Invalid("reservation must be positive".into()),
+    )
+    .await;
+    compare_reserve_refusal(
+        &store,
+        &worker,
+        &request,
+        &["bad source".into()],
+        "invalid_request",
+        evo_core::identifier("bad source").unwrap_err(),
+    )
+    .await;
+    compare_reserve_refusal(
+        &store,
+        &worker,
+        &request,
+        &["source".into(), "source".into()],
+        "duplicate_source",
+        Error::Conflict("duplicate budget call source id".into()),
+    )
+    .await;
+    let mut cap = request.clone();
+    cap.max_cost_micros = 101;
+    compare_reserve_refusal(
+        &store,
+        &worker,
+        &cap,
+        &[],
+        "per_call_cap_exceeded",
+        Error::Budget,
+    )
+    .await;
+    let path = dir.path().join("rsia.sqlite3");
+    let mut connection = SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE root_budgets SET spent_micros=999")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    compare_reserve_refusal(
+        &store,
+        &worker,
+        &request,
+        &[],
+        "root_budget_exhausted",
+        Error::Budget,
+    )
+    .await;
+    sqlx::query("UPDATE root_budgets SET spent_micros=?")
+        .bind(i64::MAX)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    compare_reserve_refusal(
+        &store,
+        &worker,
+        &request,
+        &[],
+        "budget_arithmetic_overflow",
+        Error::Budget,
+    )
+    .await;
+    assert!(
+        store
+            .budget_call(&worker, "scope-1", "new")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .root_budget(&admin, "scope-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .reserved_micros,
+        0
+    );
+}
+
+#[tokio::test]
+async fn ag054_reserve_root_group_namespace_revocation_and_capacity_keep_legacy_errors() {
+    for mode in [
+        "root_stopped",
+        "group_stopped",
+        "group_namespace_mismatch",
+        "source_revoked",
+        "active_lease_capacity",
+    ] {
+        let (_dir, store, admin, worker) = authorized_store().await;
+        let request = reservation("refused", 10, 2);
+        let mut sources = Vec::new();
+        match mode {
+            "root_stopped" => {
+                store
+                    .stop_root_budget(&admin, "scope-1", "operator", 2)
+                    .await
+                    .unwrap();
+            }
+            "group_stopped" => {
+                store
+                    .stop_dispatch_group(
+                        &admin,
+                        "scope-1",
+                        &request.dispatch_group_id,
+                        "operator",
+                        2,
+                    )
+                    .await
+                    .unwrap();
+            }
+            "group_namespace_mismatch" => {
+                let mut other = reservation("other", 10, 2);
+                other.dispatch_group_id = request.dispatch_group_id.clone();
+                store
+                    .reserve_budget_call(&ctx("ns-b", "worker-b", Role::Worker), &other)
+                    .await
+                    .unwrap();
+            }
+            "source_revoked" => {
+                sources.push("source".into());
+                // Malformed tombstone is a determinate fail-closed refusal.
+                put_budget_gate_object(
+                    &store,
+                    &admin,
+                    "tombstone",
+                    "source",
+                    serde_json::json!({}),
+                )
+                .await;
+            }
+            "active_lease_capacity" => {
+                for index in 0..10 {
+                    store
+                        .reserve_budget_call(&worker, &reservation(&format!("held-{index}"), 10, 2))
+                        .await
+                        .unwrap();
+                }
+                let refusal = store
+                    .reserve_budget_call_typed(&worker, &request)
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+                assert!(matches!(
+                    refusal,
+                    evo_storage::budget::BudgetPreDispatchRefusal::ActiveLeaseCapacity {
+                        used: 10,
+                        limit: 10
+                    }
+                ));
+            }
+            _ => unreachable!(),
+        }
+        let expected = match mode {
+            "root_stopped" | "group_stopped" => Error::Cancelled,
+            "group_namespace_mismatch" => {
+                Error::Conflict("dispatch_group_owned_by_different_namespace".into())
+            }
+            "source_revoked" => Error::Forbidden,
+            "active_lease_capacity" => {
+                Error::Conflict("MVP capacity exceeded: active leases 10 >= limit 10".into())
+            }
+            _ => unreachable!(),
+        };
+        compare_reserve_refusal(&store, &worker, &request, &sources, mode, expected).await;
+        assert!(
+            store
+                .budget_call(&worker, "scope-1", "refused")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn ag054_call_reuse_preserves_reserved_finalized_and_uncertain_facts() {
+    for state in [
+        BudgetCallState::Reserved,
+        BudgetCallState::Finalized,
+        BudgetCallState::Uncertain,
+    ] {
+        let (_dir, store, _admin, worker) = authorized_store().await;
+        let request = reservation("same", 10, 2);
+        let call = store.reserve_budget_call(&worker, &request).await.unwrap();
+        if state != BudgetCallState::Reserved {
+            store
+                .begin_budget_dispatch(&worker, &fence(&call, 3))
+                .await
+                .unwrap();
+            if state == BudgetCallState::Finalized {
+                store
+                    .finalize_budget_call(&worker, &fence(&call, 4), &charge(7, "same"))
+                    .await
+                    .unwrap();
+            } else {
+                store
+                    .mark_budget_call_uncertain(&worker, &fence(&call, 4), "unknown usage")
+                    .await
+                    .unwrap();
+            }
+        }
+        let before = store
+            .budget_call(&worker, "scope-1", "same")
+            .await
+            .unwrap()
+            .unwrap();
+        let root_before = store
+            .root_budget(&worker, "scope-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut changed = request.clone();
+        changed.actual_input_digest = hash(b"changed");
+        compare_reserve_refusal(
+            &store,
+            &worker,
+            &changed,
+            &[],
+            "call_id_reused",
+            Error::Conflict("call_id_reused_with_different_content".into()),
+        )
+        .await;
+        assert_eq!(
+            store
+                .budget_call(&worker, "scope-1", "same")
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            store
+                .root_budget(&worker, "scope-1")
+                .await
+                .unwrap()
+                .unwrap(),
+            root_before
+        );
+    }
+}
+
+#[tokio::test]
+async fn ag054_source_closure_changed_is_typed_but_unreadable_ref_stays_internal() {
+    let (_dir, store, admin, worker) = authorized_store().await;
+    let request = reservation("closure", 10, 2);
+    let call = store
+        .reserve_budget_call_with_sources(&worker, &request, &["source".into()])
+        .await
+        .unwrap();
+    let reference_id = budget_ref_id(&call);
+    let mut session = store.session().await.unwrap();
+    let before = session
+        .raw_object(&admin, "artifact", &reference_id)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    compare_reserve_refusal(
+        &store,
+        &worker,
+        &request,
+        &["other".into()],
+        "source_closure_changed",
+        Error::Conflict("budget call source closure changed for fixed call".into()),
+    )
+    .await;
+    let mut session = store.session().await.unwrap();
+    assert_eq!(
+        session
+            .raw_object(&admin, "artifact", &reference_id)
+            .await
+            .unwrap(),
+        before
+    );
+    session.commit().await.unwrap();
+    // Reachable corrupt persisted reference, not a simulated DB/commit failure.
+    put_budget_gate_object(
+        &store,
+        &admin,
+        "artifact",
+        &reference_id,
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(matches!(
+        store
+            .reserve_budget_call_with_sources_typed(&worker, &request, &["source".into()])
+            .await,
+        Err(Error::Internal)
+    ));
+    assert!(matches!(
+        store
+            .reserve_budget_call_with_sources(&worker, &request, &["source".into()])
+            .await,
+        Err(Error::Internal)
+    ));
+    assert!(matches!(
+        store
+            .begin_budget_dispatch_typed(&worker, &fence(&call, 3))
+            .await,
+        Err(Error::Internal)
+    ));
+    assert_eq!(
+        store
+            .budget_call(&worker, "scope-1", "closure")
+            .await
+            .unwrap()
+            .unwrap(),
+        call
+    );
+    assert_eq!(
+        store
+            .root_budget(&worker, "scope-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .reserved_micros,
+        10
+    );
+}
+
+#[tokio::test]
+async fn ag054_begin_causes_are_distinct_and_store_session_legacy_errors_are_exact() {
+    for mode in [
+        "root_stopped",
+        "group_stopped",
+        "lease_expired",
+        "source_revoked",
+        "root_concurrency_limit",
+    ] {
+        let (_dir, store, admin, worker) = authorized_store().await;
+        let request = reservation("pending", 13, 2);
+        let call = store
+            .reserve_budget_call_with_sources(&worker, &request, &["source".into()])
+            .await
+            .unwrap();
+        let mut pending_fence = fence(&call, 3);
+        match mode {
+            "root_stopped" => {
+                store
+                    .stop_root_budget(&admin, "scope-1", "operator", 3)
+                    .await
+                    .unwrap();
+            }
+            "group_stopped" => {
+                store
+                    .stop_dispatch_group(&admin, "scope-1", &call.dispatch_group_id, "operator", 3)
+                    .await
+                    .unwrap();
+            }
+            "lease_expired" => pending_fence.now = call.lease_until + 1,
+            "source_revoked" => {
+                put_budget_gate_object(
+                    &store,
+                    &admin,
+                    "tombstone",
+                    "source",
+                    serde_json::json!({}),
+                )
+                .await;
+            }
+            "root_concurrency_limit" => {
+                let active = store
+                    .reserve_budget_call(&worker, &reservation("active", 7, 2))
+                    .await
+                    .unwrap();
+                store
+                    .begin_budget_dispatch(&worker, &fence(&active, 3))
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let refusal = store
+            .begin_budget_dispatch_typed(&worker, &pending_fence)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refusal.code(), mode);
+        let expected = if mode == "root_concurrency_limit" {
+            Error::Conflict("root_budget_concurrency_limit".into())
+        } else {
+            Error::Cancelled
+        };
+        assert_exact_error(refusal.into_dispatch_error(), &expected);
+        assert_exact_error(
+            store
+                .begin_budget_dispatch(&worker, &pending_fence)
+                .await
+                .unwrap_err(),
+            &expected,
+        );
+        let mut session = store.session().await.unwrap();
+        assert_exact_error(
+            session
+                .begin_budget_dispatch(&worker, &pending_fence)
+                .await
+                .unwrap_err(),
+            &expected,
+        );
+        session.commit().await.unwrap();
+        assert_eq!(
+            store
+                .budget_call(&worker, "scope-1", "pending")
+                .await
+                .unwrap()
+                .unwrap(),
+            call
+        );
+    }
+}
+
+#[tokio::test]
+async fn ag054_old_fence_remains_outer_error_and_cannot_release_new_lease() {
+    let (_dir, store, _admin, worker) = authorized_store().await;
+    let call = store
+        .reserve_budget_call(&worker, &reservation("refenced", 13, 2))
+        .await
+        .unwrap();
+    let old_fence = fence(&call, 103);
+    let new_call = store
+        .refence_reserved_budget_call(
+            &worker,
+            &BudgetCallRefence {
+                billing_scope: call.billing_scope.clone(),
+                call_id: call.call_id.clone(),
+                expected_epoch: call.lease_epoch,
+                new_lease_token: "new-token".into(),
+                new_lease_until: 300,
+                now: 103,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.begin_budget_dispatch_typed(&worker, &old_fence).await,
+        Err(Error::Cancelled)
+    ));
+    assert!(matches!(
+        store
+            .release_undispatched_budget_call(&worker, &old_fence, "must not refund")
+            .await,
+        Err(Error::Cancelled)
+    ));
+    assert!(matches!(
+        store
+            .refence_reserved_budget_call(
+                &worker,
+                &BudgetCallRefence {
+                    billing_scope: call.billing_scope.clone(),
+                    call_id: call.call_id.clone(),
+                    expected_epoch: call.lease_epoch,
+                    new_lease_token: "stale-token".into(),
+                    new_lease_until: 400,
+                    now: 301,
+                }
+            )
+            .await,
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(
+        store
+            .budget_call(&worker, "scope-1", "refenced")
+            .await
+            .unwrap()
+            .unwrap(),
+        new_call
+    );
+    assert_eq!(
+        store
+            .root_budget(&worker, "scope-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .reserved_micros,
+        13
+    );
+}
+
+#[tokio::test]
+async fn ag054_typed_access_refusals_preserve_legacy_scope_errors_without_mutation() {
+    let (_dir, store, _admin, worker) = authorized_store().await;
+    let call = store
+        .reserve_budget_call(&worker, &reservation("private", 13, 2))
+        .await
+        .unwrap();
+    for (caller, expected) in [
+        (ctx("ns-c", "outsider", Role::Worker), Error::Forbidden),
+        (ctx("ns-b", "worker-b", Role::Worker), Error::NotFound),
+        (ctx("ns-a", "agent", Role::Agent), Error::Forbidden),
+    ] {
+        let refusal = store
+            .begin_budget_dispatch_typed(&caller, &fence(&call, 3))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refusal.code(), "unauthorized");
+        assert_exact_error(refusal.into_dispatch_error(), &expected);
+        assert_exact_error(
+            store
+                .begin_budget_dispatch(&caller, &fence(&call, 3))
+                .await
+                .unwrap_err(),
+            &expected,
+        );
+        let refusal = store
+            .budget_call_typed(&caller, "scope-1", "private")
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refusal.code(), "unauthorized");
+        assert_exact_error(refusal.into_dispatch_error(), &expected);
+        assert_exact_error(
+            store
+                .budget_call(&caller, "scope-1", "private")
+                .await
+                .unwrap_err(),
+            &expected,
+        );
+    }
+    assert_eq!(
+        store
+            .budget_call(&worker, "scope-1", "private")
+            .await
+            .unwrap()
+            .unwrap(),
+        call
+    );
+}
+
+#[tokio::test]
+async fn ag054_r1_empty_source_recovery_preserves_money_refs_edges_and_revocation_gate() {
+    let (dir, store, admin, worker) = authorized_store().await;
+    put_budget_gate_object(&store, &admin, "run", "source",
+        serde_json::json!({"id":"source","schema_version":"rsia.optimization.source.v1","body":"trusted source"})).await;
+    let request = reservation("recovery", 13, 2);
+    let call = store
+        .reserve_budget_call_with_sources(&worker, &request, &["source".into()])
+        .await
+        .unwrap();
+    let root = store
+        .root_budget(&worker, "scope-1")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut connection = SqliteConnection::connect(&format!(
+        "sqlite://{}",
+        dir.path().join("rsia.sqlite3").display()
+    ))
+    .await
+    .unwrap();
+    let reference: String = sqlx::query_scalar(
+        "SELECT body FROM objects WHERE namespace='ns-a' AND kind='artifact' AND id=?",
+    )
+    .bind(budget_ref_id(&call))
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    let edges: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT src_kind,src_id,dst_kind,dst_id FROM dependencies WHERE namespace='ns-a' ORDER BY src_kind,src_id,dst_kind,dst_id"
+    ).fetch_all(&mut connection).await.unwrap();
+    assert!(!edges.is_empty());
+    assert_eq!(
+        store
+            .reserve_budget_call_with_sources_typed(&worker, &request, &[])
+            .await
+            .unwrap()
+            .unwrap(),
+        call
+    );
+    assert_eq!(
+        store
+            .reserve_budget_call_with_sources(&worker, &request, &[])
+            .await
+            .unwrap(),
+        call
+    );
+    assert_eq!(
+        store
+            .reserve_budget_call_typed(&worker, &request)
+            .await
+            .unwrap()
+            .unwrap(),
+        call
+    );
+    assert_eq!(
+        store.reserve_budget_call(&worker, &request).await.unwrap(),
+        call
+    );
+    assert_eq!(
+        store
+            .root_budget(&worker, "scope-1")
+            .await
+            .unwrap()
+            .unwrap(),
+        root
+    );
+    let after_ref: String = sqlx::query_scalar(
+        "SELECT body FROM objects WHERE namespace='ns-a' AND kind='artifact' AND id=?",
+    )
+    .bind(budget_ref_id(&call))
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    let after_edges: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT src_kind,src_id,dst_kind,dst_id FROM dependencies WHERE namespace='ns-a' ORDER BY src_kind,src_id,dst_kind,dst_id"
+    ).fetch_all(&mut connection).await.unwrap();
+    assert_eq!(after_ref, reference);
+    assert_eq!(after_edges, edges);
+    evo_storage::lifecycle::LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        evo_storage::lifecycle::TypedObjectRef {
+            kind: "run".into(),
+            id: "source".into(),
+        },
+        "revoked after recovery",
+        3,
+    )
+    .await
+    .unwrap();
+    let refused = store
+        .begin_budget_dispatch_typed(&worker, &fence(&call, 4))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked
+    );
+    assert!(matches!(
+        store.begin_budget_dispatch(&worker, &fence(&call, 4)).await,
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(
+        store
+            .budget_call(&worker, "scope-1", &call.call_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        call
+    );
+    assert_eq!(
+        store
+            .root_budget(&worker, "scope-1")
+            .await
+            .unwrap()
+            .unwrap(),
+        root
+    );
+}
+
+#[tokio::test]
+async fn ag054_reservation_validation_branches_keep_exact_legacy_error_text() {
+    let (_dir, store, _admin, worker) = authorized_store().await;
+    for mode in [
+        "scope",
+        "call",
+        "group",
+        "input_digest",
+        "token",
+        "time",
+        "lease",
+        "artifact_schema",
+        "artifact_digest",
+        "artifact_mismatch",
+        "artifact_size",
+    ] {
+        let mut request = reservation("invalid", 10, 2);
+        let expected = match mode {
+            "scope" => {
+                request.billing_scope = "bad id".into();
+                evo_core::identifier("bad id").unwrap_err()
+            }
+            "call" => {
+                request.call_id = "bad id".into();
+                evo_core::identifier("bad id").unwrap_err()
+            }
+            "group" => {
+                request.dispatch_group_id = "bad id".into();
+                evo_core::identifier("bad id").unwrap_err()
+            }
+            "input_digest" => {
+                request.actual_input_digest = "bad".into();
+                Error::Invalid("actual_input_digest: expected lowercase sha256 digest".into())
+            }
+            "token" => {
+                request.lease_token = "bad id".into();
+                evo_core::identifier("bad id").unwrap_err()
+            }
+            "time" => {
+                request.now = -1;
+                Error::Invalid("time must be nonnegative".into())
+            }
+            "lease" => {
+                request.lease_until = request.now;
+                Error::Invalid("lease must expire after reservation".into())
+            }
+            "artifact_schema" => {
+                request.request_artifact = Some(BudgetArtifact {
+                    schema_version: "bad id".into(),
+                    digest: hash(b"{}"),
+                    body: "{}".into(),
+                });
+                evo_core::identifier("bad id").unwrap_err()
+            }
+            "artifact_digest" => {
+                request.request_artifact = Some(BudgetArtifact {
+                    schema_version: "test.v1".into(),
+                    digest: "bad".into(),
+                    body: "{}".into(),
+                });
+                Error::Invalid("artifact digest: expected lowercase sha256 digest".into())
+            }
+            "artifact_mismatch" => {
+                request.request_artifact = Some(BudgetArtifact {
+                    schema_version: "test.v1".into(),
+                    digest: hash(b"wrong"),
+                    body: "{}".into(),
+                });
+                Error::Conflict("artifact digest mismatch".into())
+            }
+            "artifact_size" => {
+                request.request_artifact = Some(BudgetArtifact {
+                    schema_version: "test.v1".into(),
+                    digest: hash(b"{}"),
+                    body: " ".repeat(4 * 1024 * 1024 + 1),
+                });
+                Error::Invalid("budget artifact exceeds 4 MiB".into())
+            }
+            _ => unreachable!(),
+        };
+        compare_reserve_refusal(&store, &worker, &request, &[], "invalid_request", expected).await;
+    }
+    let mut request = reservation("invalid-json", 10, 2);
+    request.request_artifact = Some(BudgetArtifact {
+        schema_version: "test.v1".into(),
+        digest: hash(b"not json"),
+        body: "not json".into(),
+    });
+    assert!(matches!(
+        store.reserve_budget_call_typed(&worker, &request).await,
+        Err(Error::Internal)
+    ));
+    assert!(matches!(
+        store.reserve_budget_call(&worker, &request).await,
+        Err(Error::Internal)
+    ));
+    assert!(
+        store
+            .budget_call(&worker, "scope-1", "invalid-json")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

@@ -18,10 +18,10 @@ use evo_engine::development::{
     DevelopmentControlV1, DevelopmentCostState, DevelopmentEvidenceScope, DevelopmentSide,
     DevelopmentTaskSpecV1, EXECUTION_OUTPUT_KIND, EXECUTION_RECEIPT_KIND,
     ExecutionReceiptIssueRequest, GraderReceiptIssueRequest, RegisteredDevelopmentRunner,
-    RegisteredTargetInputV1, execution_budget_call_id, execution_receipt_id, grader_receipt_id,
-    issue_execution_receipt, issue_grader_receipt, load_execution_output, load_execution_receipt,
-    load_grader_receipt, register_development_control, registered_runner_digest, storage_id,
-    typed_receipt_closure,
+    RegisteredExecutionRequestV1, RegisteredTargetInputV1, execution_budget_call_id,
+    execution_receipt_id, execution_request_digest, grader_receipt_id, issue_execution_receipt,
+    issue_grader_receipt, load_execution_output, load_execution_receipt, load_grader_receipt,
+    register_development_control, registered_runner_digest, storage_id, typed_receipt_closure,
 };
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::lifecycle::LifecycleCoordinator;
@@ -33,12 +33,14 @@ use evo_engine::optimization::{
 use evo_engine::streaming_evaluator::{FixedGraderMethod, FixedGraderSpec};
 use evo_storage::Store;
 use evo_storage::budget::{
-    BudgetCallFence, BudgetCallReservation, BudgetCallState, BudgetStage,
-    REGISTERED_EXECUTION_SETTLEMENT_SCHEMA, RegisteredExecutionProvenance,
-    RegisteredExecutionSettlement, RootBudgetAuthorization, UsageCharge,
+    BudgetArtifact, BudgetCallFence, BudgetCallReservation, BudgetCallState, BudgetStage,
+    REGISTERED_EXECUTION_REQUEST_SCHEMA, REGISTERED_EXECUTION_SETTLEMENT_SCHEMA,
+    RegisteredExecutionProvenance, RegisteredExecutionSettlement, RootBudgetAuthorization,
+    UsageCharge,
 };
 use evo_storage::lifecycle::CleanupState;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn d(value: &str) -> String {
     hash(value.as_bytes())
@@ -822,6 +824,142 @@ async fn reserve_dispatched(
     (fence, dispatched.call.dispatch_id.unwrap())
 }
 
+async fn assert_development_reservation_released(fixture: &Fixture, reason: &str, held: i64) {
+    let request = fixture.request();
+    let task = &fixture.control.tasks[0];
+    let call_id =
+        execution_budget_call_id(&request.request_id, &task.task_id, DevelopmentSide::Parent)
+            .unwrap();
+    let call = fixture
+        .store
+        .budget_call(&fixture.executor, SCOPE, &call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.state, BudgetCallState::Released);
+    assert_eq!(call.terminal_reason.as_deref(), Some(reason));
+    assert_eq!(
+        fixture
+            .store
+            .root_budget(&fixture.executor, SCOPE)
+            .await
+            .unwrap()
+            .unwrap()
+            .reserved_micros,
+        held
+    );
+    let receipt_id =
+        execution_receipt_id(&request.request_id, &task.task_id, DevelopmentSide::Parent).unwrap();
+    assert!(matches!(
+        load_execution_receipt(&fixture.store, &fixture.executor, &receipt_id).await,
+        Err(Error::NotFound)
+    ));
+    // A valid clock on retry does not turn the Released row into a free rerun.
+    assert!(matches!(
+        fixture.runner().run(request).await,
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(
+        fixture
+            .store
+            .budget_call(&fixture.executor, SCOPE, &call_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        call
+    );
+    assert!(matches!(
+        load_execution_receipt(&fixture.store, &fixture.executor, &receipt_id).await,
+        Err(Error::NotFound)
+    ));
+}
+
+// Stage A: public runner + public clocks; no injected target error or new storage API.
+#[tokio::test]
+async fn ag054_public_development_concurrency_refusal_releases_one_micro() {
+    let fixture = Fixture::new().await;
+    reserve_dispatched(
+        &fixture,
+        "held",
+        "held-group",
+        BudgetStage::Reflection,
+        &d("held"),
+    )
+    .await;
+    assert!(matches!(
+        fixture.runner().run(fixture.request()).await,
+        Err(Error::Conflict(_))
+    ));
+    assert_development_reservation_released(
+        &fixture,
+        "development_pre_dispatch_v1.root_concurrency_limit",
+        1,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ag054_public_development_lease_refusal_releases_one_micro() {
+    let fixture = Fixture::new().await;
+    let reads = Arc::new(AtomicUsize::new(0));
+    let runner = RegisteredDevelopmentRunner::with_clock(
+        fixture.store.clone(),
+        fixture.executor.clone(),
+        fixture.grader.clone(),
+        CONTROL_ID,
+        600,
+        Arc::new(move || {
+            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                100
+            } else {
+                800
+            }
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        runner.run(fixture.request()).await,
+        Err(Error::Cancelled)
+    ));
+    assert_development_reservation_released(
+        &fixture,
+        "development_pre_dispatch_v1.lease_expired",
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ag054_public_development_second_clock_failure_releases_one_micro() {
+    let fixture = Fixture::new().await;
+    let reads = Arc::new(AtomicUsize::new(0));
+    let runner = RegisteredDevelopmentRunner::with_clock(
+        fixture.store.clone(),
+        fixture.executor.clone(),
+        fixture.grader.clone(),
+        CONTROL_ID,
+        600,
+        Arc::new(move || {
+            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                100
+            } else {
+                -1
+            }
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        runner.run(fixture.request()).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_development_reservation_released(
+        &fixture,
+        "development_pre_dispatch_v1.clock_failed",
+        0,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn budget_rows_must_be_closed_development_rows_with_a_registered_settlement() {
     let fixture = Fixture::new().await;
@@ -1255,4 +1393,236 @@ async fn revocation_cleanup_traverses_receipts_and_redacts_outputs() {
         Err(Error::Conflict(_))
     ));
     assert!(fixture.runner().run(request).await.is_err());
+}
+
+async fn reserve_development_parent(fixture: &Fixture) -> evo_storage::budget::BudgetCallRecord {
+    let request = fixture.request();
+    let task = &fixture.control.tasks[0];
+    let side = DevelopmentSide::Parent;
+    let request_digest = execution_request_digest(&fixture.control, &request, task, side).unwrap();
+    let stored_request = RegisteredExecutionRequestV1 {
+        schema_version: REGISTERED_EXECUTION_REQUEST_SCHEMA.into(),
+        control_id: fixture.control.id.clone(),
+        request_id: request.request_id.clone(),
+        episode_id: request.episode_id.clone(),
+        task_id: task.task_id.clone(),
+        side,
+        input: task.input,
+        input_digest: task.input_digest.clone(),
+        bundle_digest: request.parent_bundle_digest.clone(),
+        environment_digest: request.environment_digest.clone(),
+        request_digest: request_digest.clone(),
+        target_id: task.target_id.clone(),
+        target_digest: fixture.control.target_digest.clone(),
+        runner_digest: fixture.control.runner_digest.clone(),
+        source_ids: fixture.control.source_ids.clone(),
+    };
+    fixture
+        .store
+        .reserve_budget_call_with_sources(
+            &fixture.executor,
+            &BudgetCallReservation {
+                billing_scope: SCOPE.into(),
+                call_id: execution_budget_call_id(&request.request_id, &task.task_id, side)
+                    .unwrap(),
+                dispatch_group_id: request.episode_id.clone(),
+                stage: BudgetStage::DevelopmentExecution,
+                actual_input_digest: request_digest,
+                request_artifact: Some(
+                    BudgetArtifact::from_serializable(
+                        REGISTERED_EXECUTION_REQUEST_SCHEMA,
+                        &stored_request,
+                    )
+                    .unwrap(),
+                ),
+                max_cost_micros: 1,
+                lease_token: "preexisting".into(),
+                lease_until: 1000,
+                now: 100,
+            },
+            &fixture.control.source_ids,
+        )
+        .await
+        .unwrap()
+}
+
+fn development_fence(call: &evo_storage::budget::BudgetCallRecord) -> BudgetCallFence {
+    BudgetCallFence {
+        billing_scope: call.billing_scope.clone(),
+        call_id: call.call_id.clone(),
+        actual_input_digest: call.actual_input_digest.clone(),
+        lease_token: call.lease_token.clone(),
+        lease_epoch: call.lease_epoch,
+        now: 100,
+    }
+}
+
+#[tokio::test]
+async fn ag054_public_dispatched_and_unknown_development_calls_are_never_refunded() {
+    for uncertain in [false, true] {
+        let fixture = Fixture::new().await;
+        let call = reserve_development_parent(&fixture).await;
+        let fence = development_fence(&call);
+        fixture
+            .store
+            .begin_budget_dispatch(&fixture.executor, &fence)
+            .await
+            .unwrap();
+        if uncertain {
+            fixture
+                .store
+                .mark_budget_call_uncertain(&fixture.executor, &fence, "unknown execution")
+                .await
+                .unwrap();
+        }
+        let before = fixture
+            .store
+            .budget_call(&fixture.executor, SCOPE, &call.call_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let runner = RegisteredDevelopmentRunner::with_clock(
+            fixture.store.clone(),
+            fixture.executor.clone(),
+            fixture.grader.clone(),
+            CONTROL_ID,
+            600,
+            Arc::new(move || {
+                if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    100
+                } else {
+                    -1
+                }
+            }),
+        )
+        .unwrap();
+        assert!(runner.run(fixture.request()).await.is_err());
+        assert_eq!(
+            fixture
+                .store
+                .budget_call(&fixture.executor, SCOPE, &call.call_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            fixture
+                .store
+                .root_budget(&fixture.executor, SCOPE)
+                .await
+                .unwrap()
+                .unwrap()
+                .reserved_micros,
+            1
+        );
+        let receipt = execution_receipt_id(
+            &fixture.request().request_id,
+            &fixture.control.tasks[0].task_id,
+            DevelopmentSide::Parent,
+        )
+        .unwrap();
+        assert!(matches!(
+            load_execution_receipt(&fixture.store, &fixture.executor, &receipt).await,
+            Err(Error::NotFound)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn ag054_public_cancelled_development_call_retries_keep_terminal_facts() {
+    let fixture = Fixture::new().await;
+    let call = reserve_development_parent(&fixture).await;
+    let terminal = fixture
+        .store
+        .cancel_budget_call(
+            &fixture.executor,
+            &development_fence(&call),
+            "development_pre_dispatch_v1.source_revoked",
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            fixture.runner().run(fixture.request()).await,
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .budget_call(&fixture.executor, SCOPE, &call.call_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            terminal
+        );
+        assert_eq!(
+            fixture
+                .store
+                .root_budget(&fixture.executor, SCOPE)
+                .await
+                .unwrap()
+                .unwrap()
+                .reserved_micros,
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn ag054_public_receipt_clock_failure_after_begin_keeps_finalized_zero_cost_facts() {
+    let fixture = Fixture::new().await;
+    let reads = Arc::new(AtomicUsize::new(0));
+    let runner = RegisteredDevelopmentRunner::with_clock(
+        fixture.store.clone(),
+        fixture.executor.clone(),
+        fixture.grader.clone(),
+        CONTROL_ID,
+        600,
+        Arc::new(move || {
+            if reads.fetch_add(1, Ordering::SeqCst) < 2 {
+                100
+            } else {
+                -1
+            }
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        runner.run(fixture.request()).await,
+        Err(Error::Invalid(_))
+    ));
+    let call_id = execution_budget_call_id(
+        &fixture.request().request_id,
+        &fixture.control.tasks[0].task_id,
+        DevelopmentSide::Parent,
+    )
+    .unwrap();
+    let call = fixture
+        .store
+        .budget_call(&fixture.executor, SCOPE, &call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.state, BudgetCallState::Finalized);
+    assert!(call.dispatch_id.is_some());
+    assert_eq!(call.actual_cost_micros, Some(0));
+    assert!(call.response_artifact.is_some());
+    assert_eq!(
+        fixture
+            .store
+            .root_budget(&fixture.executor, SCOPE)
+            .await
+            .unwrap()
+            .unwrap()
+            .reserved_micros,
+        0
+    );
+    assert!(
+        !call
+            .terminal_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("development_pre_dispatch_v1."))
+    );
 }

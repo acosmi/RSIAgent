@@ -25,8 +25,9 @@ use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier};
 pub use evo_storage::budget::REGISTERED_EXECUTION_REQUEST_SCHEMA;
 use evo_storage::budget::{
     BudgetArtifact, BudgetCallFence, BudgetCallRecord, BudgetCallReservation, BudgetCallState,
-    BudgetExecutionProvenance, BudgetStage, REGISTERED_EXECUTION_SETTLEMENT_SCHEMA,
-    RegisteredExecutionProvenance, RegisteredExecutionSettlement, RootBudgetRecord, UsageCharge,
+    BudgetDispatchDecision, BudgetExecutionProvenance, BudgetStage,
+    REGISTERED_EXECUTION_SETTLEMENT_SCHEMA, RegisteredExecutionProvenance,
+    RegisteredExecutionSettlement, RootBudgetRecord, UsageCharge,
 };
 use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1913,24 +1914,49 @@ impl RegisteredDevelopmentRunner {
         };
         let call = self
             .store
-            .reserve_budget_call_with_sources(&self.executor, &reservation, &control.source_ids)
+            .reserve_budget_call_with_sources_typed(
+                &self.executor,
+                &reservation,
+                &control.source_ids,
+            )
+            .await?
+            .map_err(evo_storage::budget::BudgetPreDispatchRefusal::into_reservation_error)?;
+        if matches!(
+            call.state,
+            BudgetCallState::Released | BudgetCallState::Cancelled
+        ) {
+            return Err(Error::Cancelled);
+        }
+        // This clock was validated before reserve. On a later clock failure it
+        // still supplies a nonnegative release time; ownership is rechecked by
+        // storage using all of the original digest/token/epoch fence.
+        let reserve_fence = BudgetCallFence {
+            billing_scope: call.billing_scope.clone(),
+            call_id: call.call_id.clone(),
+            actual_input_digest: call.actual_input_digest.clone(),
+            lease_token: call.lease_token.clone(),
+            lease_epoch: call.lease_epoch,
+            now,
+        };
+        let output_utf8 = self
+            .resolve_pre_dispatch_result(
+                &call,
+                &reserve_fence,
+                task.input.execute_target(),
+                "target_execution_failed",
+            )
             .await?;
-        let output_utf8 = task.input.execute_target()?;
         let output_digest = hash(output_utf8.as_bytes());
         let call = match call.state {
             BudgetCallState::Reserved | BudgetCallState::Dispatched => {
-                let fence = BudgetCallFence {
-                    billing_scope: control.billing_scope.clone(),
-                    call_id: call_id.clone(),
-                    actual_input_digest: request_digest.clone(),
-                    lease_token: call.lease_token.clone(),
-                    lease_epoch: call.lease_epoch,
-                    now: self.now()?,
-                };
-                let decision = self
-                    .store
-                    .begin_budget_dispatch(&self.executor, &fence)
+                let dispatch_now = self
+                    .resolve_pre_dispatch_result(&call, &reserve_fence, self.now(), "clock_failed")
                     .await?;
+                let fence = BudgetCallFence {
+                    now: dispatch_now,
+                    ..reserve_fence
+                };
+                let decision = self.begin_execution(&call, &fence).await?;
                 let dispatch_id = decision.call.dispatch_id.clone().ok_or(Error::Internal)?;
                 let settlement = RegisteredExecutionSettlement {
                     schema_version: REGISTERED_EXECUTION_SETTLEMENT_SCHEMA.into(),
@@ -1978,6 +2004,59 @@ impl RegisteredDevelopmentRunner {
             },
         )
         .await
+    }
+
+    /// Private result boundary for failures before this invocation's begin
+    /// succeeds. Tests inject target/clock errors here; ClampI64's normal JSON
+    /// error answer is a successful execution, not an `execute_target` error.
+    async fn resolve_pre_dispatch_result<T>(
+        &self,
+        original_call: &BudgetCallRecord,
+        fence: &BudgetCallFence,
+        result: Result<T>,
+        code: &str,
+    ) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if original_call.state == BudgetCallState::Reserved {
+                    self.store
+                        .release_undispatched_budget_call(
+                            &self.executor,
+                            fence,
+                            &format!("development_pre_dispatch_v1.{code}"),
+                        )
+                        .await?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn begin_execution(
+        &self,
+        original_call: &BudgetCallRecord,
+        fence: &BudgetCallFence,
+    ) -> Result<BudgetDispatchDecision> {
+        // Outer errors, including an unreadable source ref or a stale fence,
+        // cannot prove no dispatch and do not enter the cleanup boundary.
+        match self
+            .store
+            .begin_budget_dispatch_typed(&self.executor, fence)
+            .await?
+        {
+            Ok(decision) => Ok(decision),
+            Err(refusal) => {
+                let code = refusal.code();
+                self.resolve_pre_dispatch_result(
+                    original_call,
+                    fence,
+                    Err(refusal.into_dispatch_error()),
+                    code,
+                )
+                .await
+            }
+        }
     }
 
     async fn issue_run_receipt(
@@ -2203,5 +2282,332 @@ impl crate::monitoring::ConsolidationDevRunner for RegisteredDevelopmentRunner {
             billing_scope: control.billing_scope,
             root_budget_id: control.root_budget_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod pre_dispatch_tests {
+    use super::*;
+    use evo_storage::budget::{BudgetCallRefence, RootBudgetAuthorization};
+
+    struct CleanupFixture {
+        _dir: tempfile::TempDir,
+        runner: RegisteredDevelopmentRunner,
+        call: BudgetCallRecord,
+        fence: BudgetCallFence,
+    }
+
+    impl CleanupFixture {
+        async fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("development.sqlite3"))
+                .await
+                .unwrap();
+            let admin = Context::new("n", "admin", Role::Admin).unwrap();
+            let executor = Context::new("n", "executor", Role::Worker).unwrap();
+            let grader = Context::new("n", "grader", Role::Evaluator).unwrap();
+            store
+                .authorize_root_budget(
+                    &admin,
+                    &RootBudgetAuthorization {
+                        root_budget_id: "root".into(),
+                        billing_scope: "scope".into(),
+                        allowed_namespaces: vec!["n".into()],
+                        currency: "USD".into(),
+                        pricing_version: "price".into(),
+                        payment_subject: "fixture".into(),
+                        authorization_receipt_digest: hash(b"auth"),
+                        per_call_cap_micros: 10,
+                        total_limit_micros: 100,
+                        created_at: 1,
+                    },
+                )
+                .await
+                .unwrap();
+            let call = store
+                .reserve_budget_call_with_sources(
+                    &executor,
+                    &BudgetCallReservation {
+                        billing_scope: "scope".into(),
+                        call_id: "execution".into(),
+                        dispatch_group_id: "group".into(),
+                        stage: BudgetStage::DevelopmentExecution,
+                        actual_input_digest: hash(b"input"),
+                        request_artifact: None,
+                        max_cost_micros: 1,
+                        lease_token: "lease".into(),
+                        lease_until: 70,
+                        now: 10,
+                    },
+                    &["source".into()],
+                )
+                .await
+                .unwrap();
+            let fence = BudgetCallFence {
+                billing_scope: call.billing_scope.clone(),
+                call_id: call.call_id.clone(),
+                actual_input_digest: call.actual_input_digest.clone(),
+                lease_token: call.lease_token.clone(),
+                lease_epoch: call.lease_epoch,
+                now: 10,
+            };
+            let runner = RegisteredDevelopmentRunner::with_clock(
+                store,
+                executor,
+                grader,
+                "control",
+                60,
+                Arc::new(|| 10),
+            )
+            .unwrap();
+            Self {
+                _dir: dir,
+                runner,
+                call,
+                fence,
+            }
+        }
+
+        async fn persisted(&self) -> BudgetCallRecord {
+            self.runner
+                .store
+                .budget_call(&self.runner.executor, "scope", "execution")
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn reserved(&self) -> i64 {
+            self.runner
+                .store
+                .root_budget(&self.runner.executor, "scope")
+                .await
+                .unwrap()
+                .unwrap()
+                .reserved_micros
+        }
+    }
+
+    /// Private helper fault injection: the real ClampI64 public target normally
+    /// cannot produce an execute_target Err; its JSON error output is Ok.
+    #[tokio::test]
+    async fn injected_target_execution_error_releases_owned_micro_and_returns_original_error() {
+        let fixture = CleanupFixture::new().await;
+        let result = fixture
+            .runner
+            .resolve_pre_dispatch_result::<String>(
+                &fixture.call,
+                &fixture.fence,
+                Err(Error::Internal),
+                "target_execution_failed",
+            )
+            .await;
+        assert!(matches!(result, Err(Error::Internal)));
+        let call = fixture.persisted().await;
+        assert_eq!(call.state, BudgetCallState::Released);
+        assert_eq!(
+            call.terminal_reason.as_deref(),
+            Some("development_pre_dispatch_v1.target_execution_failed")
+        );
+        assert_eq!(call.dispatch_id, None);
+        assert_eq!(call.response_artifact, None);
+        assert_eq!(fixture.reserved().await, 0);
+    }
+
+    #[tokio::test]
+    async fn injected_clock_failure_uses_validated_reserve_time_and_returns_original_error() {
+        let fixture = CleanupFixture::new().await;
+        let result = fixture
+            .runner
+            .resolve_pre_dispatch_result::<i64>(
+                &fixture.call,
+                &fixture.fence,
+                Err(Error::Invalid("clock went negative".into())),
+                "clock_failed",
+            )
+            .await;
+        assert!(matches!(result, Err(Error::Invalid(message)) if message == "clock went negative"));
+        assert_eq!(
+            fixture.persisted().await.terminal_reason.as_deref(),
+            Some("development_pre_dispatch_v1.clock_failed")
+        );
+        assert_eq!(fixture.reserved().await, 0);
+    }
+
+    #[tokio::test]
+    async fn injected_failure_in_dispatched_unknown_or_finalized_call_never_refunds() {
+        for state in [
+            BudgetCallState::Dispatched,
+            BudgetCallState::Uncertain,
+            BudgetCallState::Finalized,
+        ] {
+            let fixture = CleanupFixture::new().await;
+            fixture
+                .runner
+                .store
+                .begin_budget_dispatch(&fixture.runner.executor, &fixture.fence)
+                .await
+                .unwrap();
+            match state {
+                BudgetCallState::Uncertain => {
+                    fixture
+                        .runner
+                        .store
+                        .mark_budget_call_uncertain(
+                            &fixture.runner.executor,
+                            &fixture.fence,
+                            "unknown usage",
+                        )
+                        .await
+                        .unwrap();
+                }
+                BudgetCallState::Finalized => {
+                    fixture
+                        .runner
+                        .store
+                        .finalize_budget_call(
+                            &fixture.runner.executor,
+                            &fixture.fence,
+                            &UsageCharge {
+                                amount_micros: 0,
+                                currency: "USD".into(),
+                                pricing_version: "price".into(),
+                                provider_request_id: "registered".into(),
+                                usage_record_id: "usage".into(),
+                                output_digest: hash(b"output"),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let original = fixture.persisted().await;
+            let held = fixture.reserved().await;
+            for code in ["clock_failed", "target_execution_failed"] {
+                assert!(matches!(
+                    fixture
+                        .runner
+                        .resolve_pre_dispatch_result::<String>(
+                            &original,
+                            &fixture.fence,
+                            Err(Error::Internal),
+                            code,
+                        )
+                        .await,
+                    Err(Error::Internal)
+                ));
+                assert_eq!(fixture.persisted().await, original);
+                assert_eq!(fixture.reserved().await, held);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_cleanup_failure_propagates_old_fence_and_preserves_new_lease() {
+        let fixture = CleanupFixture::new().await;
+        let newer = fixture
+            .runner
+            .store
+            .refence_reserved_budget_call(
+                &fixture.runner.executor,
+                &BudgetCallRefence {
+                    billing_scope: "scope".into(),
+                    call_id: "execution".into(),
+                    expected_epoch: 1,
+                    new_lease_token: "new-lease".into(),
+                    new_lease_until: 200,
+                    now: 71,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .runner
+                .resolve_pre_dispatch_result::<String>(
+                    &fixture.call,
+                    &fixture.fence,
+                    Err(Error::Internal),
+                    "target_execution_failed",
+                )
+                .await,
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(fixture.persisted().await, newer);
+        assert_eq!(fixture.reserved().await, 1);
+    }
+
+    #[tokio::test]
+    async fn injected_cleanup_race_propagates_dispatch_conflict_and_preserves_winning_reason() {
+        let fixture = CleanupFixture::new().await;
+        fixture
+            .runner
+            .store
+            .begin_budget_dispatch(&fixture.runner.executor, &fixture.fence)
+            .await
+            .unwrap();
+        let dispatched = fixture.persisted().await;
+        assert!(
+            matches!(fixture.runner.resolve_pre_dispatch_result::<String>(
+            &fixture.call, &fixture.fence, Err(Error::Internal), "target_execution_failed",
+        ).await, Err(Error::Conflict(message)) if message == "only_undispatched_reservation_can_be_released")
+        );
+        assert_eq!(fixture.persisted().await, dispatched);
+        assert_eq!(fixture.reserved().await, 1);
+
+        let fixture = CleanupFixture::new().await;
+        let winner = fixture
+            .runner
+            .store
+            .release_undispatched_budget_call(
+                &fixture.runner.executor,
+                &fixture.fence,
+                "development_pre_dispatch_v1.group_stopped",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .runner
+                .resolve_pre_dispatch_result::<String>(
+                    &fixture.call,
+                    &fixture.fence,
+                    Err(Error::Internal),
+                    "target_execution_failed",
+                )
+                .await,
+            Err(Error::Internal)
+        ));
+        assert_eq!(fixture.persisted().await, winner);
+        assert_eq!(fixture.reserved().await, 0);
+    }
+
+    #[tokio::test]
+    async fn generic_begin_error_keeps_reserved_micro() {
+        let fixture = CleanupFixture::new().await;
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        let digest = fingerprint(&("rsia.budget_call_ref.v1", "n", "scope", "execution")).unwrap();
+        let mut session = fixture.runner.store.session().await.unwrap();
+        session
+            .put(
+                &admin,
+                "artifact",
+                &format!("budget-ref-{}", &digest[..32]),
+                admin.actor(),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        assert!(matches!(
+            fixture
+                .runner
+                .begin_execution(&fixture.call, &fixture.fence)
+                .await,
+            Err(Error::Internal)
+        ));
+        assert_eq!(fixture.persisted().await, fixture.call);
+        assert_eq!(fixture.reserved().await, 1);
     }
 }

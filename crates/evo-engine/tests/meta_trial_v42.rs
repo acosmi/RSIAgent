@@ -61,7 +61,9 @@ use evo_engine::meta::{
     MetaTrialStatus, MetaTrialV1, MetaTrialView, stream_request_id, stream_world_id,
     verified_meta_trial,
 };
-use evo_engine::model::{ModelExecutionProvenance, ModelPort, ModelResponse};
+use evo_engine::model::{
+    ModelExecutionProvenance, ModelPort, ModelRejectionKind, ModelResponse, RejectedDispatch,
+};
 use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentTask, OptimizationStepRequest,
@@ -1646,8 +1648,8 @@ async fn a_request_id_reused_across_streams_is_refused_by_the_budget_layer() {
     let spent_before = env.executions.load(Ordering::SeqCst);
     assert_eq!(spent_before, 2);
 
-    // The budget layer keys a call by its id and refuses (Conflict, fail
-    // closed) the same id for another effective request: here the same call id
+    // The broker refuses a call id reused for another effective request:
+    // here the same call id
     // but the episode of the new stream. Built from the very request the old
     // stream's call stored, with only the stream's world changed.
     let stored: ModelRequest =
@@ -1676,14 +1678,18 @@ async fn a_request_id_reused_across_streams_is_refused_by_the_budget_layer() {
     )
     .unwrap();
     assert_ne!(reused.cache_key_digest, stored.cache_key_digest);
-    match env.broker.dispatch(reused).await {
-        Err(Error::Conflict(message)) => {
-            assert_eq!(
-                message,
-                "call_id reused with a different effective model request"
-            );
+    match env.broker.dispatch(reused).await.unwrap() {
+        ModelResponse::Rejected {
+            kind,
+            reason,
+            dispatch,
+            ..
+        } => {
+            assert_eq!(kind, ModelRejectionKind::InvalidRequest);
+            assert_eq!(reason, "broker_pre_dispatch_v1.call_id_reused");
+            assert_eq!(dispatch, RejectedDispatch::NotDispatched);
         }
-        other => panic!("expected the budget layer's Conflict, got {other:?}"),
+        other => panic!("expected a typed call-id refusal, got {other:?}"),
     }
     // The same at the reservation itself, which is where the ledger keys a call
     // by its id: the old stream's call id asked for in the new stream's
@@ -1736,16 +1742,13 @@ async fn a_request_id_reused_across_streams_is_refused_by_the_budget_layer() {
     assert!(env.calls(new_id).await.is_empty());
     assert_eq!(env.calls(old_id).await, old_calls);
 
-    // Through the coordinator the same mistake is not a silent shared call
-    // either: the new stream's step under the old stream's request id ends as
-    // an uncertain dispatch, and bills nothing. The broker's conflict is asserted
-    // directly above; a step run through the coordinator records only the fixed
-    // code of its outcome (AG-048), not the port's own error.
+    // The coordinator records the determinate refusal as observed usage of the
+    // mechanism, with no dispatch or bill to the new stream.
     let misused = env
         .step_with(TRIAL, MetaStream::New, 1, &old_request_id)
         .await;
     assert_eq!(
-        misused.outcome, "model_transport_outcome_unknown",
+        misused.outcome, "model_rejected_invalid_request",
         "{}",
         misused.outcome
     );
@@ -1755,7 +1758,7 @@ async fn a_request_id_reused_across_streams_is_refused_by_the_budget_layer() {
         .await
         .unwrap();
     assert_eq!(usage.len(), 1);
-    assert_eq!(usage[0].dispatch_state(), MechanismUsageState::Uncertain);
+    assert_eq!(usage[0].dispatch_state(), MechanismUsageState::Observed);
     assert_eq!(env.executions.load(Ordering::SeqCst), spent_before);
     assert!(env.calls(new_id).await.is_empty());
     assert_eq!(
@@ -1819,13 +1822,11 @@ async fn each_stream_reads_back_what_it_really_spent_and_stopping_one_does_not_s
         .unwrap();
     assert!(stopped.stopped);
     // The stopped stream's next step is refused by the budget layer before any
-    // call row exists: no reservation and no model call. The broker files the refusal
-    // of a stopped group at the reservation as `Unauthorized` (a finer type for it is a
-    // follow-up of the broker, not of this check), so the step records the fixed code
-    // of a model rejected as unauthorized, and not the words of the refusal (AG-048).
+    // call row exists: no reservation and no model call. The broker classifies
+    // the group stop as a determinate cancellation before dispatch.
     let refused = env.step(TRIAL, MetaStream::New, 2).await;
     assert_eq!(
-        refused.outcome, "model_rejected_unauthorized",
+        refused.outcome, "model_rejected_cancelled_before_dispatch",
         "the stopped stream's step ends on the stopped group: {}",
         refused.outcome
     );
@@ -1959,12 +1960,11 @@ async fn an_uncertain_call_of_one_stream_holds_the_roots_concurrency_slot_agains
     assert_eq!(failed.outcome, "model_usage_unknown", "{}", failed.outcome);
     assert_eq!(env.executions.load(Ordering::SeqCst), 1);
 
-    // The ledger refuses the new stream's dispatch with a conflict that reaches the
-    // coordinator as an error of the model port, so the step records the fixed code of
-    // a transport outcome that is unknown, and not the ledger's own words (AG-048).
+    // The ledger refuses the new stream before dispatch. Its own reservation
+    // is released while the old stream's unknown bill remains held.
     let blocked = env.step(TRIAL, MetaStream::New, 1).await;
     assert_eq!(
-        blocked.outcome, "model_transport_outcome_unknown",
+        blocked.outcome, "model_rejected_budget_unavailable",
         "{}",
         blocked.outcome
     );
@@ -1976,7 +1976,7 @@ async fn an_uncertain_call_of_one_stream_holds_the_roots_concurrency_slot_agains
 
     // The view reports both streams as they are: the old stream's call is
     // uncertain (its cost unknown, its reservation held), the new stream's
-    // call was reserved and never dispatched, and nothing was settled at all.
+    // call was reserved, refused, and released; nothing was settled.
     let view = env.view(TRIAL).await.unwrap();
     let (old, new) = (view.old_stream().spend(), view.new_stream().spend());
     assert_eq!(
@@ -1997,16 +1997,16 @@ async fn an_uncertain_call_of_one_stream_holds_the_roots_concurrency_slot_agains
             new.actual_cost_micros,
             new.unsettled_reserved_micros
         ),
-        (1, 0, 0, 0, 20)
+        (1, 0, 0, 0, 0)
     );
-    // Both dispatches are real dispatches that happened under their own
-    // policies, uncertain ones included (they were already paid for).
+    // Both mechanisms were used under their policies: the old call dispatched
+    // with unknown usage, while the new step observed a determinate refusal.
     assert_eq!(view.old_stream().verified_usage(), 1);
     assert_eq!(view.new_stream().verified_usage(), 1);
     assert_eq!(view.status(), MetaTrialStatus::UsageObserved);
     let wire = serde_json::to_value(&view).unwrap();
     assert_eq!(wire["old"]["spend"]["uncertain_calls"], 1);
-    assert_eq!(wire["new"]["spend"]["unsettled_reserved_micros"], 20);
+    assert_eq!(wire["new"]["spend"]["unsettled_reserved_micros"], 0);
 }
 
 #[tokio::test]
