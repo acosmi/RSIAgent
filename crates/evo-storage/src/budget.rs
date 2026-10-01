@@ -276,6 +276,88 @@ impl BudgetExecutionProvenance {
     }
 }
 
+/// Request artifact schema of a registered in-process execution row. Its body
+/// carries a `source_ids` closure so source revocation can find the row.
+pub const REGISTERED_EXECUTION_REQUEST_SCHEMA: &str = "rsia.registered_execution_request.v1";
+pub const REGISTERED_EXECUTION_SETTLEMENT_SCHEMA: &str = "rsia.registered_execution_settlement.v1";
+
+/// Provenance of an in-process registered execution. It is recorded in the
+/// row's typed settlement artifact because `execution_provenance` is pinned
+/// by the 0005 schema to model provenances; it is never a fixture and never a
+/// sandbox claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegisteredExecutionProvenance {
+    RegisteredPureFunction,
+}
+
+/// Typed settlement of one registered execution, persisted as the budget
+/// row's response artifact by `settle_registered_execution_call`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisteredExecutionSettlement {
+    pub schema_version: String,
+    pub provenance: RegisteredExecutionProvenance,
+    pub call_id: String,
+    pub dispatch_id: String,
+    pub request_digest: String,
+    pub output_digest: String,
+    pub target_id: String,
+    pub target_digest: String,
+    pub runner_digest: String,
+}
+
+impl RegisteredExecutionSettlement {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != REGISTERED_EXECUTION_SETTLEMENT_SCHEMA {
+            return Err(Error::Invalid(
+                "unsupported registered execution settlement schema".into(),
+            ));
+        }
+        identifier(&self.call_id)?;
+        identifier(&self.dispatch_id)?;
+        identifier(&self.target_id)?;
+        validate_digest(&self.request_digest, "settlement request_digest")?;
+        validate_digest(&self.output_digest, "settlement output_digest")?;
+        validate_digest(&self.target_digest, "settlement target_digest")?;
+        validate_digest(&self.runner_digest, "settlement runner_digest")?;
+        Ok(())
+    }
+
+    pub fn artifact(&self) -> Result<BudgetArtifact> {
+        self.validate()?;
+        BudgetArtifact::from_serializable(REGISTERED_EXECUTION_SETTLEMENT_SCHEMA, self)
+    }
+
+    /// Reloads the settlement from a persisted row and rechecks that the row's
+    /// own columns agree with it. A row without this artifact is not a
+    /// registered execution.
+    pub fn from_call(call: &BudgetCallRecord) -> Result<Self> {
+        let artifact = call.response_artifact.as_ref().ok_or_else(|| {
+            Error::Conflict("budget call carries no registered execution settlement".into())
+        })?;
+        if artifact.schema_version != REGISTERED_EXECUTION_SETTLEMENT_SCHEMA {
+            return Err(Error::Conflict(
+                "budget call response artifact is not a registered execution settlement".into(),
+            ));
+        }
+        let settlement: Self = serde_json::from_str(&artifact.body)
+            .map_err(|_| Error::Conflict("registered execution settlement is invalid".into()))?;
+        settlement.validate()?;
+        if settlement.call_id != call.call_id
+            || call.dispatch_id.as_deref() != Some(settlement.dispatch_id.as_str())
+            || call.actual_input_digest != settlement.request_digest
+            || call.output_digest.as_deref() != Some(settlement.output_digest.as_str())
+            || call.execution_provenance == Some(BudgetExecutionProvenance::Fixture)
+        {
+            return Err(Error::Conflict(
+                "registered execution settlement differs from its budget row".into(),
+            ));
+        }
+        Ok(settlement)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelCallSettlementEvidence {
     pub provenance: BudgetExecutionProvenance,
@@ -735,6 +817,151 @@ impl Store {
         }
         let accounting_overflow =
             apply_charge(&mut tx, &call, charge, fence.now, "finalized").await?;
+        let updated = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
+            .await?
+            .ok_or(Error::Internal)?;
+        tx.commit().await.map_err(internal)?;
+        if accounting_overflow {
+            return Err(Error::Conflict("cost_accounting_overflow".into()));
+        }
+        Ok(updated)
+    }
+
+    /// Atomically finalizes a registered in-process execution: a zero known
+    /// charge in the root's pricing identity, the typed settlement as the row's
+    /// response artifact, and execution closed. Only the executing Worker or
+    /// Host may settle; Admin cannot mint registered execution evidence.
+    pub async fn settle_registered_execution_call(
+        &self,
+        ctx: &Context,
+        fence: &BudgetCallFence,
+        charge: &UsageCharge,
+        settlement: &RegisteredExecutionSettlement,
+    ) -> Result<BudgetCallRecord> {
+        ctx.require(&[Role::Worker, Role::Host])?;
+        validate_fence(fence)?;
+        validate_charge(charge)?;
+        let artifact = settlement.artifact()?;
+        if charge.amount_micros != 0 {
+            return Err(Error::Invalid(
+                "registered pure-function execution has no monetary cost".into(),
+            ));
+        }
+        if settlement.call_id != fence.call_id
+            || settlement.request_digest != fence.actual_input_digest
+            || settlement.output_digest != charge.output_digest
+        {
+            return Err(Error::Conflict(
+                "registered settlement differs from its fence and charge".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        require_call_access(&mut tx, ctx, &call).await?;
+        if call.namespace != ctx.namespace() {
+            return Err(Error::NotFound);
+        }
+        fence_call(&call, fence, false)?;
+        if !matches!(
+            call.stage,
+            BudgetStage::DevelopmentExecution | BudgetStage::DevelopmentScoring
+        ) {
+            return Err(Error::Conflict(
+                "registered settlement requires a development stage".into(),
+            ));
+        }
+        if call.dispatch_id.as_deref() != Some(settlement.dispatch_id.as_str()) {
+            return Err(Error::Conflict(
+                "registered settlement dispatch differs from the row".into(),
+            ));
+        }
+        if let Some(existing) = &call.response_artifact {
+            if *existing != artifact || !call.execution_closed {
+                return Err(Error::Conflict(
+                    "registered settlement reused with different content".into(),
+                ));
+            }
+            ensure_same_charge(&call, charge)?;
+            tx.commit().await.map_err(internal)?;
+            return Ok(call);
+        }
+        if call.state != BudgetCallState::Dispatched {
+            return Err(Error::Conflict(
+                "registered settlement requires dispatched call".into(),
+            ));
+        }
+        if fence.now > call.lease_until {
+            return Err(Error::Cancelled);
+        }
+        let root_stopped: i64 =
+            sqlx::query_scalar("SELECT stopped FROM root_budgets WHERE billing_scope=?")
+                .bind(&fence.billing_scope)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal)?;
+        let group_stopped: i64 = sqlx::query_scalar(
+            "SELECT stopped FROM root_budget_dispatch_groups
+             WHERE billing_scope=? AND dispatch_group_id=?",
+        )
+        .bind(&fence.billing_scope)
+        .bind(&call.dispatch_group_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal)?;
+        let block_reason = if root_stopped != 0 {
+            Some("root_stopped")
+        } else if group_stopped != 0 {
+            Some("dispatch_group_stopped")
+        } else {
+            None
+        };
+        let accounting_overflow = apply_charge(
+            &mut tx,
+            &call,
+            charge,
+            fence.now,
+            "registered_execution_settled",
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE root_budget_calls SET
+               response_artifact_schema=?,response_artifact_digest=?,response_artifact_body=?,
+               response_usable=?,response_block_reason=?,
+               execution_closed=1,execution_closed_at=?,execution_close_reason=?
+             WHERE billing_scope=? AND call_id=?",
+        )
+        .bind(&artifact.schema_version)
+        .bind(&artifact.digest)
+        .bind(&artifact.body)
+        .bind(block_reason.is_none())
+        .bind(block_reason)
+        .bind(fence.now)
+        .bind("registered_execution_settled")
+        .bind(&call.billing_scope)
+        .bind(&call.call_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+        insert_event(
+            &mut tx,
+            &call.billing_scope,
+            Some(&call.call_id),
+            "registered_execution_settled",
+            fence.now,
+            json!({
+                "dispatch_id": settlement.dispatch_id,
+                "request_digest": settlement.request_digest,
+                "output_digest": settlement.output_digest,
+                "provenance": settlement.provenance,
+                "target_id": settlement.target_id,
+                "runner_digest": settlement.runner_digest,
+                "response_usable": block_reason.is_none(),
+                "response_block_reason": block_reason,
+            }),
+        )
+        .await?;
         let updated = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::Internal)?;

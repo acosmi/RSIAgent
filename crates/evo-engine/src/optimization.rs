@@ -37,7 +37,11 @@ fn validate_digest(value: &str, name: &str) -> Result<()> {
 #[serde(rename_all = "snake_case")]
 pub enum DevelopmentExecutionProvenance {
     Fixture,
+    /// Reserved for a future sandboxed runner; nothing issues it today.
     IsolatedRunner,
+    /// Registered pure-function adapters executed in-process by the fixed
+    /// trusted runner (`crate::development`). Not isolated, not a sandbox.
+    RegisteredPureFunction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,7 +278,7 @@ fn validate_development_binding(
     Ok(())
 }
 
-fn validate_development_request(request: &DevelopmentRunRequest) -> Result<()> {
+pub(crate) fn validate_development_request(request: &DevelopmentRunRequest) -> Result<()> {
     if request.purpose != Purpose::Development {
         return Err(Error::Forbidden);
     }
@@ -583,23 +587,12 @@ pub struct StoreOptimizationJournal {
     owner: String,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct VerifiedDevelopmentTaskOutcome {
-    pub task_id: String,
-    pub parent_family: String,
-    pub parent_score_micros: u32,
-    pub candidate_score_micros: u32,
-    pub parent_passed: bool,
-    pub candidate_passed: bool,
-    pub parent_execution_id: String,
-    pub candidate_execution_id: String,
-    pub grader_receipt_digest: String,
-}
+pub use crate::development::VerifiedDevelopmentTaskOutcome;
 
+/// A DevelopmentObserved report whose receipts, budget rows, scores, and
+/// source closure were reloaded and verified. Never built from caller JSON.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct VerifiedDevelopmentObservationView {
+pub struct VerifiedDevelopmentObservationView {
     pub episode_id: String,
     pub step: u32,
     pub attempt: u32,
@@ -610,6 +603,17 @@ pub(crate) struct VerifiedDevelopmentObservationView {
     pub outcomes: Vec<VerifiedDevelopmentTaskOutcome>,
 }
 
+/// E03 observation gate shared by E12 (`record_cycle`) and other consumers.
+///
+/// The two stage facts must form one Development stage; the report must pass
+/// `select_development`; the fact's `execution`/`grader` dependencies must
+/// equal the report's receipt ids (other dependency kinds such as `run`,
+/// `revoke_watermark`, and `artifact` are added by the recovery journal and
+/// are checked separately, not counted here); then every receipt is reloaded
+/// as a typed envelope and verified against the Admin-registered control, its
+/// persisted budget rows, server-recomputed scores, and the live source
+/// closure. `report.provenance` is non-authoritative: Fixture is rejected
+/// outright, and any other value grants nothing by itself.
 pub(crate) async fn verified_development_observation_in_session(
     ctx: &Context,
     session: &mut Session,
@@ -620,8 +624,8 @@ pub(crate) async fn verified_development_observation_in_session(
     for id in [request_fact_id, observed_fact_id] {
         identifier(id)?;
     }
-    let request_fact: StageFact = session.need(ctx, "artifact", request_fact_id).await?;
-    let observed_fact: StageFact = session.need(ctx, "artifact", observed_fact_id).await?;
+    let request_fact = load_stage_fact(session, ctx, request_fact_id).await?;
+    let observed_fact = load_stage_fact(session, ctx, observed_fact_id).await?;
     request_fact.validate()?;
     observed_fact.validate()?;
     if request_fact.stage != OptimizationJournalStage::Development
@@ -666,6 +670,7 @@ pub(crate) async fn verified_development_observation_in_session(
     let actual_dependencies = observed_fact
         .dependencies
         .iter()
+        .filter(|dependency| matches!(dependency.kind.as_str(), "execution" | "grader"))
         .map(|dependency| (dependency.kind.as_str(), dependency.id.as_str()))
         .collect::<std::collections::BTreeSet<_>>();
     if actual_dependencies != expected_dependencies {
@@ -673,14 +678,75 @@ pub(crate) async fn verified_development_observation_in_session(
             "development observation dependency closure differs from report".into(),
         ));
     }
-    if report.provenance != DevelopmentExecutionProvenance::IsolatedRunner {
+    if observed_fact.dependencies.iter().any(|dependency| {
+        matches!(
+            dependency.kind.as_str(),
+            "formal" | "holdout" | "oracle" | "anchor" | "evaluation"
+        )
+    }) {
         return Err(Error::Forbidden);
     }
-    // E03 currently stores opaque execution/grader IDs but defines no trusted
-    // typed receipt schema for them. Do not upgrade those IDs into evidence.
-    Err(Error::Invalid(
-        "trusted development execution/grader receipt schema is unavailable".into(),
-    ))
+    // A self-declared fixture is honest and can never become cycle evidence.
+    // Any other declared provenance is checked, not trusted: the receipts,
+    // budget rows, scores, and sources are reloaded below.
+    if report.provenance == DevelopmentExecutionProvenance::Fixture {
+        return Err(Error::Forbidden);
+    }
+    let outcomes = crate::development::verify_observed_report_in_session(
+        ctx,
+        session,
+        &observed_fact,
+        &request,
+        &report,
+    )
+    .await?;
+    if outcomes.len() != report.results.len() {
+        return Err(Error::Internal);
+    }
+    Ok(VerifiedDevelopmentObservationView {
+        episode_id: observed_fact.episode_id,
+        step: observed_fact.step,
+        attempt: observed_fact.attempt,
+        request_id: request.request_id,
+        manifest_digest: request.manifest.digest,
+        environment_digest: request.environment_digest,
+        grader_digest: request.grader_digest,
+        outcomes,
+    })
+}
+
+/// A redacted or untyped artifact is a clean verdict, not a storage failure.
+async fn load_stage_fact(session: &mut Session, ctx: &Context, id: &str) -> Result<StageFact> {
+    let value: serde_json::Value = session.need(ctx, "artifact", id).await?;
+    if value.get("schema_version").and_then(|value| value.as_str())
+        != Some(OPTIMIZATION_STAGE_FACT_SCHEMA)
+    {
+        return Err(Error::Conflict(
+            "development stage fact is redacted or untyped".into(),
+        ));
+    }
+    serde_json::from_value(value)
+        .map_err(|_| Error::Invalid("development stage fact is not a strict stage fact".into()))
+}
+
+/// Public entry to the E03 observation gate for consumers that do not hold a
+/// session (E13 and operators). Same rules as the in-session gate.
+pub async fn verify_development_observation(
+    store: &Store,
+    ctx: &Context,
+    request_fact_id: &str,
+    observed_fact_id: &str,
+) -> Result<VerifiedDevelopmentObservationView> {
+    let mut session = store.session().await?;
+    let view = verified_development_observation_in_session(
+        ctx,
+        &mut session,
+        request_fact_id,
+        observed_fact_id,
+    )
+    .await?;
+    session.commit().await?;
+    Ok(view)
 }
 
 #[cfg(test)]
@@ -1540,17 +1606,26 @@ async fn run_optimization_step_inner(
             request_id: development_request.request_id.clone(),
             input_digest: development_request.manifest.digest,
             output_digest: Some(fingerprint(&selection)?),
-            dependencies: report
-                .results
-                .iter()
-                .flat_map(|result| {
-                    [
-                        dependency("execution", result.parent_execution_id.clone()),
-                        dependency("execution", result.candidate_execution_id.clone()),
-                        dependency("grader", result.grader_receipt_digest.clone()),
-                    ]
-                })
-                .collect(),
+            dependencies: {
+                let mut dependencies: Vec<StageDependency> = report
+                    .results
+                    .iter()
+                    .flat_map(|result| {
+                        [
+                            dependency("execution", result.parent_execution_id.clone()),
+                            dependency("execution", result.candidate_execution_id.clone()),
+                            dependency("grader", result.grader_receipt_digest.clone()),
+                        ]
+                    })
+                    .collect();
+                // A non-fixture report names typed receipts; declare them so
+                // revocation traverses fact -> receipts and the gate can
+                // require the closure. Fixture ids are opaque and untyped.
+                if report.provenance != DevelopmentExecutionProvenance::Fixture {
+                    dependencies.extend(crate::development::typed_receipt_closure(&report)?);
+                }
+                dependencies
+            },
             payload: serde_json::to_value(&report).map_err(|_| Error::Internal)?,
         },
     )
