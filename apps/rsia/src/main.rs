@@ -7,7 +7,7 @@ use evo_core::contract::{
 use evo_core::{Context, Role, hash};
 use evo_engine::release_store::ReleaseStore;
 use evo_engine::service::{HostPrepareConfig, HostService};
-use evo_engine::startup_gate::{DATA_LOCK_FILE, GateDecision, StartupGate};
+use evo_engine::startup_gate::{DATA_LOCK_FILE, GateDecision, StartupGate, data_directory};
 use evo_http::{AuthIdentity, AuthRegistry, DEFAULT_BIND, HttpState};
 use evo_storage::Store;
 use fs2::FileExt;
@@ -245,19 +245,28 @@ async fn mount_gate(
     Ok((lock, decision))
 }
 
+/// The directory the data-directory lock is taken in, before it is created and
+/// canonicalized. It is the startup gate's own definition of the data directory,
+/// not a second computation of it: a bare file name (the `--data` default) is the
+/// current directory, where the gate also looks for the restore receipt. An empty
+/// parent must never reach `canonicalize`, which rejects it.
+fn lock_directory(data: &Path) -> PathBuf {
+    data_directory(data)
+}
+
 struct DataDirectoryLock {
     _file: File,
 }
 
 impl DataDirectoryLock {
     fn acquire(data: &Path) -> Result<Self> {
-        let parent = data.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create data directory {}", parent.display()))?;
-        let parent = parent
+        let directory = lock_directory(data);
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("failed to create data directory {}", directory.display()))?;
+        let directory = directory
             .canonicalize()
-            .with_context(|| format!("failed to resolve data directory {}", parent.display()))?;
-        let lock_path = parent.join(DATA_LOCK_FILE);
+            .with_context(|| format!("failed to resolve data directory {}", directory.display()))?;
+        let lock_path = directory.join(DATA_LOCK_FILE);
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -269,11 +278,11 @@ impl DataDirectoryLock {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 bail!(
                     "data directory is already locked by another RSIA process: {}",
-                    parent.display()
+                    directory.display()
                 );
             }
             return Err(error)
-                .with_context(|| format!("failed to lock data directory {}", parent.display()));
+                .with_context(|| format!("failed to lock data directory {}", directory.display()));
         }
         Ok(Self { _file: file })
     }
@@ -485,6 +494,70 @@ mod tests {
             assert!(!config.sandbox_enabled);
             assert!(!config.allow_external_network);
         }
+    }
+
+    #[test]
+    fn the_lock_directory_is_the_startup_gate_data_directory() {
+        // (`--data` path, its data directory): a bare file name is the current directory
+        for (data, directory) in [
+            ("rsia.sqlite3", "."),
+            ("./rsia.sqlite3", "."),
+            ("dir/x.sqlite3", "dir"),
+            ("a/b/x.sqlite3", "a/b"),
+            ("/var/lib/rsia/rsia.sqlite3", "/var/lib/rsia"),
+            ("/rsia.sqlite3", "/"),
+        ] {
+            let data = Path::new(data);
+            assert_eq!(lock_directory(data), Path::new(directory), "{data:?}");
+            // one definition: the lock cannot drift from what the startup gate reads
+            assert_eq!(lock_directory(data), data_directory(data), "{data:?}");
+        }
+    }
+
+    #[test]
+    fn a_bare_file_name_locks_the_current_directory() {
+        // `Path::parent` of a bare file name is empty and `canonicalize` rejects an
+        // empty path, so the lock directory must be the resolvable current directory.
+        let directory = lock_directory(Path::new("rsia.sqlite3"));
+        assert_eq!(
+            directory.canonicalize().unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn the_default_data_path_of_serve_and_mcp_locks_the_current_directory() {
+        for command in ["serve", "mcp"] {
+            let data = match Cli::try_parse_from(["rsia", command]).unwrap().command {
+                Command::Serve { data, .. } | Command::Mcp { data, .. } => data,
+                Command::Manage { .. } => panic!("unexpected subcommand"),
+            };
+            assert_eq!(data, Path::new("rsia.sqlite3"), "{command}");
+            assert_eq!(lock_directory(&data), Path::new("."), "{command}");
+        }
+    }
+
+    #[test]
+    fn the_lock_is_taken_in_the_directory_the_startup_gate_reads() {
+        let scratch = Scratch::new("lock-directory");
+        // the data directory does not exist yet
+        let data = scratch.0.join("nested").join("x.sqlite3");
+        let lock = DataDirectoryLock::acquire(&data).unwrap();
+        let directory = data_directory(&data);
+        assert_eq!(directory, scratch.0.join("nested"));
+        assert!(directory.join(DATA_LOCK_FILE).is_file());
+
+        // the lock guards the directory, not one database name or one spelling of its path
+        let other = directory.join(".").join("y.sqlite3");
+        let error = DataDirectoryLock::acquire(&other).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .starts_with("data directory is already locked by another RSIA process: "),
+            "{error}"
+        );
+        drop(lock);
+        assert!(DataDirectoryLock::acquire(&other).is_ok());
     }
 
     #[tokio::test]
