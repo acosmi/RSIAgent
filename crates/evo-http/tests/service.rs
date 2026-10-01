@@ -1129,3 +1129,390 @@ async fn authenticated_async_curriculum_step_flow_and_role_rejection() {
 
     task.abort();
 }
+
+const EXPLORATION_WORLD_ID: &str = "world-http-1";
+
+/// Same world as `exploration_v41::world()`, signed for `source_watermark == 1`.
+fn exploration_world() -> evo_engine::exploration::ExplorationWorldV1 {
+    use evo_core::strategy::SimulationContext;
+    use evo_engine::exploration::{
+        ExplorationDependency, ExplorationWorldV1, RootOpportunity, WorldState,
+    };
+    let parent_skill = d("parent-skill");
+    let parent_bundle = d("parent-bundle");
+    let environment = d("environment");
+    let model = d("model");
+    let tools = d("tools");
+    let grader = d("grader");
+    let rules = d("rules");
+    let context_signature = evo_core::fingerprint(&(
+        &parent_skill,
+        &parent_bundle,
+        &environment,
+        &model,
+        &tools,
+        &grader,
+        &rules,
+        1u64,
+    ))
+    .unwrap();
+    ExplorationWorldV1 {
+        schema_version: ExplorationWorldV1::SCHEMA.into(),
+        id: EXPLORATION_WORLD_ID.into(),
+        approved_parent_digest: d("approved-parent"),
+        context_signature,
+        parent_skill_digest: parent_skill,
+        parent_bundle_digest: parent_bundle,
+        environment_digest: environment,
+        model_digest: model,
+        tools_digest: tools,
+        grader_digest: grader,
+        rules_digest: rules,
+        source_watermark: 1,
+        caps: ExplorationCapsV1::online(),
+        policy: ElasticPolicyV1::default(),
+        simulation: SimulationContext::Online { fixed_seed: 7 },
+        root_opportunities: vec![
+            RootOpportunity {
+                root_slot: 2,
+                branch_seq: 2,
+                action_seq: 2,
+                estimated_cost_upper_micros: 10,
+            },
+            RootOpportunity {
+                root_slot: 1,
+                branch_seq: 1,
+                action_seq: 1,
+                estimated_cost_upper_micros: 10,
+            },
+        ],
+        dependencies: vec![
+            ExplorationDependency {
+                kind: "run".into(),
+                id: "run-failure".into(),
+            },
+            ExplorationDependency {
+                kind: "run".into(),
+                id: "run-success".into(),
+            },
+        ],
+        successor_cost_upper_micros: 10,
+        initial_baseline_quality_micros: 500_000,
+        remaining_root_micros: 1_000,
+        remaining_recovery_dispatches: 2,
+        state: WorldState::Collecting,
+        node_ids: vec![],
+        dispatch_ids: vec![],
+        history_ids: vec![],
+        current_branch_seq: None,
+        current_branch_focus_actions: 0,
+        decision_round: 0,
+        waits: vec![],
+    }
+}
+
+/// Seeds the trusted source closure like `exploration_v41`: two Host-issued
+/// trace authorities, a source selection grant and one watermark bump.
+async fn setup_exploration(host: &Context, store: &Store) {
+    use evo_core::evidence::{ExecutionAttestation, SourceSelection, TaskOrigin};
+    use evo_core::optimization::{
+        OptimizationTrace, SkillFailureDiagnosis, SkillFailureKind, TraceOutcome,
+    };
+    use evo_core::skill_edit::EvidenceRef;
+    use evo_engine::evidence::{
+        StoredRunRecord, StoredTraceAuthority, store_source_selection, store_trace_authority,
+    };
+    for (id, family, outcome) in [
+        ("run-failure", "family-a", TraceOutcome::TaskFailure),
+        ("run-success", "family-b", TraceOutcome::Success),
+    ] {
+        let trace = OptimizationTrace {
+            run_id: id.into(),
+            parent_family: family.into(),
+            source_digest: d(id),
+            purpose: Purpose::Development,
+            outcome,
+            diagnosis: (outcome == TraceOutcome::TaskFailure).then(|| SkillFailureDiagnosis {
+                kind: SkillFailureKind::SkillDefect,
+                skill_id: "skill".into(),
+                bundle_digest: d("bundle"),
+                request_digest: d("request"),
+                rule_id: Some("rule".into()),
+                support: vec![EvidenceRef {
+                    id: id.into(),
+                    digest: d(id),
+                }],
+                counterexamples: vec![],
+                reason: "fixture".into(),
+            }),
+            excerpt: id.into(),
+            seed: 1,
+        };
+        let authority = StoredTraceAuthority {
+            schema_version: "rsia.optimization.source.v1".into(),
+            record: StoredRunRecord {
+                id: id.into(),
+                body: id.as_bytes().to_vec(),
+                parent_family: family.into(),
+                task_origin: TaskOrigin::TrustedRun,
+                execution_attestation: ExecutionAttestation::TrustedHost,
+                purpose: Purpose::Development,
+            },
+            trace,
+            excerpt_start: 0,
+            excerpt_end: id.len(),
+        };
+        store_trace_authority(store, host, &authority)
+            .await
+            .unwrap();
+    }
+    store_source_selection(
+        store,
+        host,
+        &SourceSelection {
+            roots: vec![],
+            run_ids: vec!["run-failure".into(), "run-success".into()],
+            purpose: Purpose::Development,
+            allow_model_excerpts: true,
+        },
+    )
+    .await
+    .unwrap();
+    let mut session = store.session().await.unwrap();
+    session.bump_watermark(host, "e09-initial").await.unwrap();
+    session.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_async_exploration_start_flow_and_role_rejection() {
+    let (_dir, state) = state(registry()).await;
+    let store = state.service.store().clone();
+    let host = Context::new("tenant-a", "gateway-host", Role::Host).unwrap();
+    let admin = Context::new("tenant-a", "admin", Role::Admin).unwrap();
+    setup_exploration(&host, &store).await;
+    let (base, task) = spawn(state).await;
+    let client = reqwest::Client::new();
+
+    let payload = json!({
+        "schema_version": "rsia.management.exploration_start.v1",
+        "request_key": "http-exploration-k1",
+        "world": serde_json::to_value(exploration_world()).unwrap(),
+    });
+
+    // 1. Unauthenticated -> 401 Unauthorized
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/exploration.start",
+            None,
+            payload.clone()
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 2. Role rejection: Agent -> 403 Forbidden
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/exploration.start",
+            Some(AGENT_A_TOKEN),
+            payload.clone()
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // 3. Role rejection: Evaluator -> 403 Forbidden
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/exploration.start",
+            Some(EVALUATOR_TOKEN),
+            payload.clone()
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // 4. Identity injection in the body is refused by the HTTP layer (403);
+    // any other unknown field, at any nesting level, is refused by the typed
+    // request (400).
+    let mut injected = payload.clone();
+    injected["role"] = json!("admin");
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/exploration.start",
+            Some(ADMIN_TOKEN),
+            injected
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let mut unknown = payload.clone();
+    unknown["extra_field"] = json!("unexpected");
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/exploration.start",
+            Some(ADMIN_TOKEN),
+            unknown
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let mut unknown_world = payload.clone();
+    unknown_world["world"]["extra_field"] = json!("unexpected");
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/exploration.start",
+            Some(ADMIN_TOKEN),
+            unknown_world
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // 5. Authenticated Admin -> 200 OK, queued job with an immediate id
+    let response = post(
+        &client,
+        &base,
+        "/v1/manage/exploration.start",
+        Some(ADMIN_TOKEN),
+        payload.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let queued: Value = response.json().await.unwrap();
+    assert_eq!(queued["state"], "queued");
+    let job_id = queued["id"].as_str().unwrap().to_string();
+
+    // 6. Wait for terminal state -> succeeded with ExplorationStarted
+    let terminal = wait_job(&client, &base, ADMIN_TOKEN, &job_id).await;
+    assert_eq!(terminal["state"], "succeeded");
+    assert_eq!(terminal["step"], "exploration_started");
+    assert_eq!(terminal["result"]["result"], "exploration_started");
+    assert_eq!(terminal["result"]["world_id"], EXPLORATION_WORLD_ID);
+    assert_eq!(
+        terminal["result"]["context_signature"],
+        exploration_world().context_signature
+    );
+    assert_eq!(
+        terminal["result"]["prefix_digest"].as_str().unwrap().len(),
+        64
+    );
+    assert_eq!(
+        terminal["result"]["legal_actions_digest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(terminal["result"]["action"]["decision"], "dispatch");
+    assert_eq!(terminal["result"]["action"]["action_seqs"], json!([1]));
+
+    // 7. GET job status via HTTP returns the re-verified result
+    let status_res = client
+        .get(format!("{base}/v1/manage/jobs/{job_id}"))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_res.status(), StatusCode::OK);
+    let status: Value = status_res.json().await.unwrap();
+    assert_eq!(status["state"], "succeeded");
+    assert_eq!(status["result"], terminal["result"]);
+
+    // 8. Same request reconnects to the same job (reconnect never re-charges)
+    let same = post(
+        &client,
+        &base,
+        "/v1/manage/exploration.start",
+        Some(ADMIN_TOKEN),
+        payload.clone(),
+    )
+    .await;
+    assert_eq!(same.status(), StatusCode::OK);
+    let same: Value = same.json().await.unwrap();
+    assert_eq!(same["id"], job_id);
+    assert_eq!(same["state"], "succeeded");
+
+    // 9. Same key, different world -> 409 Conflict
+    let mut different = payload.clone();
+    different["world"]["remaining_root_micros"] = json!(2_000u64);
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/exploration.start",
+            Some(ADMIN_TOKEN),
+            different
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+
+    // 10. Non-management role cannot read the job (403); a management role
+    // that does not own it gets 404.
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/manage/jobs/{job_id}"))
+            .bearer_auth(AGENT_A_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/manage/jobs/{job_id}"))
+            .bearer_auth(EVALUATOR_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // 11. Revocation gate (V017/V056): bumping the source watermark makes the
+    // read side refuse with 409 while the persisted terminal stays succeeded.
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, "e09-source-revoked")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/manage/jobs/{job_id}"))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let mut session = store.session().await.unwrap();
+    let persisted: Value = session.need(&admin, "job", &job_id).await.unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(persisted["state"], "succeeded");
+    assert_eq!(persisted["result"], terminal["result"]);
+
+    task.abort();
+}
