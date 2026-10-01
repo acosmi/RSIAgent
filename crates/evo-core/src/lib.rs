@@ -11,6 +11,7 @@ pub mod evaluation;
 pub mod evidence;
 pub mod features;
 pub mod holdout;
+pub mod improver;
 pub mod optimization;
 pub mod replay;
 pub mod replay_economics;

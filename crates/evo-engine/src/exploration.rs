@@ -119,6 +119,10 @@ const WORLD_RECORD_KIND: &str = "exploration_world_v1";
 pub(crate) const NODE_RECORD_KIND: &str = "exploration_node_v1";
 const DISPATCH_RECORD_KIND: &str = "exploration_dispatch_v1";
 const HISTORY_RECORD_KIND: &str = "optimization_history_v1";
+/// Dispatch facts carry the decision's policy/caps digests (E14). The v1 shape
+/// has none and is refused on read instead of being reinterpreted.
+const DISPATCH_SCHEMA: &str = "rsia.exploration_dispatch.v2";
+const DISPATCH_SCHEMA_V1: &str = "rsia.exploration_dispatch.v1";
 pub(crate) const ENVELOPE_SCHEMA: &str = "rsia.exploration_artifact_envelope.v1";
 
 fn validate_digest(value: &str) -> Result<()> {
@@ -369,6 +373,10 @@ pub struct CoordinatorDecision {
     pub world_id: String,
     pub prefix_digest: String,
     pub legal_actions_digest: String,
+    /// Digest of the `ElasticPolicyV1` actually passed to `decide_elastic`.
+    pub policy_digest: String,
+    /// Digest of the `ExplorationCapsV1` actually passed to `decide_elastic`.
+    pub caps_digest: String,
     pub action: BatchActionV1,
 }
 
@@ -391,6 +399,84 @@ pub struct WorldDecisionView {
     pub context_signature: String,
     pub state: WorldState,
     pub decision: CoordinatorDecision,
+}
+
+/// Whether the real dispatch behind a usage record ended observed or
+/// uncertain (an uncertain dispatch already cost something, so it counts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MechanismUsageState {
+    Observed,
+    Uncertain,
+}
+
+/// Derived, read-only evidence that an already dispatched real decision was
+/// taken with a world's frozen policy and caps (plan §9.1, V036). It is a
+/// view, not a fact source: it cannot be deserialized, its fields are private,
+/// and [`PersistentCoordinator::verified_mechanism_usage`] is the only place
+/// that builds one, after re-reading and cross-checking the stored facts. It
+/// proves that the policy appeared in a dispatched decision, not that the
+/// policy is better.
+#[derive(Debug, Clone, Serialize)]
+pub struct MechanismUsageRecordV1 {
+    world_id: String,
+    dispatch_id: String,
+    context_signature: String,
+    approved_parent_digest: String,
+    policy_digest: String,
+    caps_digest: String,
+    prefix_digest: String,
+    legal_actions_digest: String,
+    action_digest: String,
+    dispatch_state: MechanismUsageState,
+    node_id: Option<String>,
+}
+
+impl MechanismUsageRecordV1 {
+    pub fn world_id(&self) -> &str {
+        &self.world_id
+    }
+
+    pub fn dispatch_id(&self) -> &str {
+        &self.dispatch_id
+    }
+
+    pub fn context_signature(&self) -> &str {
+        &self.context_signature
+    }
+
+    pub fn approved_parent_digest(&self) -> &str {
+        &self.approved_parent_digest
+    }
+
+    pub fn policy_digest(&self) -> &str {
+        &self.policy_digest
+    }
+
+    pub fn caps_digest(&self) -> &str {
+        &self.caps_digest
+    }
+
+    pub fn prefix_digest(&self) -> &str {
+        &self.prefix_digest
+    }
+
+    pub fn legal_actions_digest(&self) -> &str {
+        &self.legal_actions_digest
+    }
+
+    /// `fingerprint` of the decision's actual `BatchActionV1`.
+    pub fn action_digest(&self) -> &str {
+        &self.action_digest
+    }
+
+    pub fn dispatch_state(&self) -> MechanismUsageState {
+        self.dispatch_state
+    }
+
+    pub fn node_id(&self) -> Option<&str> {
+        self.node_id.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -538,6 +624,128 @@ impl PersistentCoordinator {
         })
     }
 
+    /// Mechanism usage derived from the world's persisted dispatch facts, in
+    /// dispatch order (plan §9.1, V036/V086.d). A record exists only for a
+    /// dispatch that really happened: `Observed`, or `Uncertain` (already paid
+    /// for). A `Claimed` fact (not yet proven dispatched) yields none, and the
+    /// first decision of `decide_next`/`decision_view`/`exploration.start`
+    /// yields none either: no dispatch, no use.
+    ///
+    /// Every fact is cross-checked against the live world: the world must
+    /// validate and its source closure must still be live (watermark drift is
+    /// `Conflict`, a tombstoned source is `Forbidden`); a fact must belong to
+    /// this world and context signature and to a dispatch listed exactly once;
+    /// its decision must carry the digests of the world's frozen policy and
+    /// caps and a single dispatch action equal to the fact's action; an
+    /// observed fact must name a node persisted for this world. Any failure
+    /// fails the whole call; nothing partial is returned.
+    pub async fn verified_mechanism_usage(
+        &self,
+        world_id: &str,
+    ) -> Result<Vec<MechanismUsageRecordV1>> {
+        identifier(world_id)?;
+        let mut session = self.store.session().await?;
+        let world: ExplorationWorldV1 =
+            need_record(&mut session, &self.context, WORLD_RECORD_KIND, world_id).await?;
+        world.validate()?;
+        if world.id != world_id {
+            return Err(Error::Conflict(
+                "stored exploration world differs from its storage identity".into(),
+            ));
+        }
+        check_world_live(&mut session, &self.context, &world).await?;
+        let policy_digest = world.policy.digest()?;
+        let caps_digest = world.caps.digest()?;
+        let mut listed = BTreeSet::new();
+        let mut records = Vec::new();
+        for dispatch_id in &world.dispatch_ids {
+            if !listed.insert(dispatch_id.as_str()) {
+                return Err(Error::Conflict(
+                    "exploration world lists a dispatch more than once".into(),
+                ));
+            }
+            let fact = need_dispatch_fact(&mut session, &self.context, dispatch_id).await?;
+            if fact.id != *dispatch_id
+                || fact.world_id != world.id
+                || fact.context_signature != world.context_signature
+                || fact.decision.world_id != world.id
+            {
+                return Err(Error::Conflict(
+                    "dispatch fact does not belong to this exploration world".into(),
+                ));
+            }
+            if fact.decision.policy_digest != policy_digest
+                || fact.decision.caps_digest != caps_digest
+            {
+                return Err(Error::Conflict(
+                    "dispatch decision was not taken with the world's frozen policy and caps"
+                        .into(),
+                ));
+            }
+            let dispatch_state = match fact.state {
+                ExplorationDispatchState::Claimed => continue,
+                ExplorationDispatchState::Observed => MechanismUsageState::Observed,
+                ExplorationDispatchState::Uncertain => MechanismUsageState::Uncertain,
+            };
+            validate_digest(&fact.decision.prefix_digest)?;
+            validate_digest(&fact.decision.legal_actions_digest)?;
+            match &fact.decision.action {
+                BatchActionV1::Dispatch {
+                    action_ids,
+                    action_seqs,
+                    ..
+                } if action_ids.len() == 1
+                    && action_seqs.len() == 1
+                    && action_ids[0] == fact.action_id
+                    && action_seqs[0] == fact.action_seq
+                    && fact.selected_action.action_id == fact.action_id
+                    && fact.selected_action.action_seq == fact.action_seq => {}
+                _ => {
+                    return Err(Error::Conflict(
+                        "dispatch fact does not match its decision action".into(),
+                    ));
+                }
+            }
+            match (&fact.node_id, dispatch_state) {
+                (None, MechanismUsageState::Observed) => {
+                    return Err(Error::Conflict(
+                        "observed dispatch names no exploration node".into(),
+                    ));
+                }
+                (Some(node_id), _) => {
+                    if !world.node_ids.iter().any(|known| known == node_id) {
+                        return Err(Error::Conflict(
+                            "dispatch node is not listed by the exploration world".into(),
+                        ));
+                    }
+                    let node: PersistentSearchNode =
+                        need_record(&mut session, &self.context, NODE_RECORD_KIND, node_id).await?;
+                    if node.world_id != world.id {
+                        return Err(Error::Conflict(
+                            "dispatch node belongs to a different exploration world".into(),
+                        ));
+                    }
+                }
+                (None, MechanismUsageState::Uncertain) => {}
+            }
+            records.push(MechanismUsageRecordV1 {
+                world_id: world.id.clone(),
+                dispatch_id: fact.id.clone(),
+                context_signature: world.context_signature.clone(),
+                approved_parent_digest: world.approved_parent_digest.clone(),
+                policy_digest: fact.decision.policy_digest.clone(),
+                caps_digest: fact.decision.caps_digest.clone(),
+                prefix_digest: fact.decision.prefix_digest.clone(),
+                legal_actions_digest: fact.decision.legal_actions_digest.clone(),
+                action_digest: fingerprint(&fact.decision.action)?,
+                dispatch_state,
+                node_id: fact.node_id.clone(),
+            });
+        }
+        session.commit().await?;
+        Ok(records)
+    }
+
     pub async fn record_history(
         &self,
         world_id: &str,
@@ -622,13 +830,7 @@ impl PersistentCoordinator {
         check_world_live(&mut session, &self.context, &world).await?;
         let mut found = None;
         for dispatch_id in &world.dispatch_ids {
-            let dispatch: ExplorationDispatchFact = need_record(
-                &mut session,
-                &self.context,
-                DISPATCH_RECORD_KIND,
-                dispatch_id,
-            )
-            .await?;
+            let dispatch = need_dispatch_fact(&mut session, &self.context, dispatch_id).await?;
             if dispatch.idempotency_key == request_id {
                 if found.is_some() {
                     return Err(Error::Conflict(
@@ -754,14 +956,8 @@ impl PersistentCoordinator {
             .iter()
             .map(|action| action.action_seq)
             .collect();
-        let mut dispatch = match get_record::<ExplorationDispatchFact>(
-            &mut session,
-            &self.context,
-            DISPATCH_RECORD_KIND,
-            &dispatch_id,
-        )
-        .await?
-        {
+        let stored_dispatch = get_dispatch_fact(&mut session, &self.context, &dispatch_id).await?;
+        let mut dispatch = match stored_dispatch {
             Some(existing) => {
                 if existing.request_digest != request_digest
                     || existing.action_seq != action_seq
@@ -801,7 +997,7 @@ impl PersistentCoordinator {
                     &CapacityLimits::default(),
                 )?;
                 let fact = ExplorationDispatchFact {
-                    schema_version: "rsia.exploration_dispatch.v1".into(),
+                    schema_version: DISPATCH_SCHEMA.into(),
                     id: dispatch_id.clone(),
                     world_id: world_id.clone(),
                     action_id: action_id.clone(),
@@ -853,13 +1049,7 @@ impl PersistentCoordinator {
                 reason: format!("exploration source closure changed after dispatch: {error}"),
             }),
         };
-        dispatch = need_record(
-            &mut session,
-            &self.context,
-            DISPATCH_RECORD_KIND,
-            &dispatch_id,
-        )
-        .await?;
+        dispatch = need_dispatch_fact(&mut session, &self.context, &dispatch_id).await?;
         let mut existing_nodes = self.load_nodes_in_session(&mut session, &world).await?;
         let current_prefix = prefix_projection(&world, &existing_nodes)?;
         let current_legal = derive_legal_actions(&world, &existing_nodes)?;
@@ -1166,11 +1356,20 @@ fn pure_decision(
     world: &ExplorationWorldV1,
     nodes: &[PersistentSearchNode],
 ) -> Result<CoordinatorDecision> {
+    // The decision records the digests of the very policy and caps it passes
+    // to `decide_elastic` (E14): a dispatched decision is then evidence of the
+    // mechanism that produced it, not of whichever policy is stored later.
+    let policy = &world.policy;
+    let caps = &world.caps;
+    let policy_digest = policy.digest()?;
+    let caps_digest = caps.digest()?;
     if world.state != WorldState::Collecting {
         return Ok(CoordinatorDecision {
             world_id: world.id.clone(),
             prefix_digest: fingerprint(&nodes)?,
             legal_actions_digest: fingerprint(&Vec::<String>::new())?,
+            policy_digest,
+            caps_digest,
             action: BatchActionV1::Stop {
                 reason: "world_not_collecting".into(),
             },
@@ -1183,18 +1382,13 @@ fn pure_decision(
         remaining_recovery_dispatches: world.remaining_recovery_dispatches,
         remaining_root_micros: world.remaining_root_micros,
     };
-    let action = decide_elastic(
-        &world.policy,
-        &prefix,
-        &legal,
-        &budget,
-        &world.caps,
-        world.simulation,
-    )?;
+    let action = decide_elastic(policy, &prefix, &legal, &budget, caps, world.simulation)?;
     Ok(CoordinatorDecision {
         world_id: world.id.clone(),
         prefix_digest: fingerprint(&prefix)?,
         legal_actions_digest: fingerprint(&legal)?,
+        policy_digest,
+        caps_digest,
         action,
     })
 }
@@ -1509,6 +1703,64 @@ async fn need_record<T: DeserializeOwned>(
     id: &str,
 ) -> Result<T> {
     get_record(session, ctx, record_kind, id)
+        .await?
+        .ok_or(Error::NotFound)
+}
+
+/// Reads a dispatch fact. The envelope is checked like every other record, but
+/// the payload is inspected as JSON first so a pre-E14 (v1) fact is refused by
+/// name instead of failing as an opaque shape error: v1 carries no policy or
+/// caps digest and is never reinterpreted as v2.
+async fn get_dispatch_fact(
+    session: &mut Session,
+    ctx: &Context,
+    id: &str,
+) -> Result<Option<ExplorationDispatchFact>> {
+    let storage_id = storage_id(DISPATCH_RECORD_KIND, id)?;
+    let envelope = session
+        .get::<ArtifactEnvelope<serde_json::Value>>(ctx, "artifact", &storage_id)
+        .await?;
+    match envelope {
+        Some(envelope)
+            if envelope.schema_version == ENVELOPE_SCHEMA
+                && envelope.id == storage_id
+                && envelope.record_kind == DISPATCH_RECORD_KIND =>
+        {
+            decode_dispatch_fact(envelope.payload).map(Some)
+        }
+        Some(_) => Err(Error::Conflict(
+            "exploration artifact envelope mismatch".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
+fn decode_dispatch_fact(payload: serde_json::Value) -> Result<ExplorationDispatchFact> {
+    match payload
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(DISPATCH_SCHEMA_V1) => {
+            return Err(Error::Conflict(
+                "pre-E14 dispatch fact without policy digest".into(),
+            ));
+        }
+        Some(DISPATCH_SCHEMA) => {}
+        _ => {
+            return Err(Error::Conflict(
+                "unsupported exploration dispatch fact schema".into(),
+            ));
+        }
+    }
+    serde_json::from_value(payload).map_err(|_| Error::Internal)
+}
+
+async fn need_dispatch_fact(
+    session: &mut Session,
+    ctx: &Context,
+    id: &str,
+) -> Result<ExplorationDispatchFact> {
+    get_dispatch_fact(session, ctx, id)
         .await?
         .ok_or(Error::NotFound)
 }

@@ -1,12 +1,33 @@
 //! Generation vs exploration. Not a third publishable asset.
 use crate::evaluation::DataUse;
-use crate::{Error, Result, Validate, identifier, text};
+use crate::{Error, Result, Validate, fingerprint, identifier, text};
 use serde::{Deserialize, Serialize};
 
 pub const W_DEFAULT: u8 = 1;
 pub const MAX_NODES: u8 = 12;
 pub const MAX_DEPTH: u8 = 4;
 pub const MAX_REPAIR: u8 = 1;
+
+/// Most recent valid gains a revealed node carries. `PrefixViewV2::validate`
+/// rejects more than this, and the coordinator and the replay driver each keep
+/// exactly this many (they truncate at two), so a stagnation window above it
+/// could never be satisfied.
+pub const PREFIX_RECENT_GAINS_MAX: u8 = 2;
+
+/// Bounds of the restricted `ElasticPolicyV1` (plan §5.2, §7.1.1). Each bound
+/// excludes a value that no consumer can use or that degenerates the rule, and
+/// stays inside the administrator caps (12/4/1). They are field-value
+/// constraints, not a performance claim.
+pub const ELASTIC_SIGNIFICANT_GAIN_MIN_MICROS: i32 = 1_000;
+pub const ELASTIC_SIGNIFICANT_GAIN_MAX_MICROS: i32 = 100_000;
+pub const ELASTIC_STAGNATION_ABS_GAIN_MIN_MICROS: i32 = 0;
+pub const ELASTIC_STAGNATION_ABS_GAIN_MAX_MICROS: i32 = 50_000;
+pub const ELASTIC_STAGNATION_WINDOW_MIN: u8 = 1;
+pub const ELASTIC_STAGNATION_WINDOW_MAX: u8 = PREFIX_RECENT_GAINS_MAX;
+pub const ELASTIC_MAX_FOCUS_ACTIONS_MIN: u8 = 1;
+pub const ELASTIC_MAX_FOCUS_ACTIONS_MAX: u8 = MAX_DEPTH;
+pub const ELASTIC_FAIRNESS_WAIT_ROUNDS_MIN: u8 = 1;
+pub const ELASTIC_FAIRNESS_WAIT_ROUNDS_MAX: u8 = MAX_NODES - 1;
 
 fn validate_digest(value: &str, name: &str) -> Result<()> {
     if value.len() != 64
@@ -171,6 +192,12 @@ impl ExplorationCapsV1 {
         }
         Ok(())
     }
+
+    /// Digest of the whole caps value: the same `fingerprint` convention the
+    /// replay report's `caps_digest` uses.
+    pub fn digest(&self) -> Result<String> {
+        fingerprint(self)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,20 +224,71 @@ impl Default for ElasticPolicyV1 {
     }
 }
 
+fn within<T>(field: &str, value: T, min: T, max: T) -> Result<()>
+where
+    T: PartialOrd + std::fmt::Display,
+{
+    if value < min || value > max {
+        return Err(Error::Invalid(format!(
+            "elastic policy {field} {value} is outside [{min}, {max}]"
+        )));
+    }
+    Ok(())
+}
+
 impl ElasticPolicyV1 {
+    /// Interval validation (plan §5.2): every field must lie inside its bound
+    /// above, and the stagnation threshold must stay below the significant-gain
+    /// threshold. The administrator caps (12/4/1, `W_online = 1`) are not part
+    /// of this value and cannot be reached through it.
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != ELASTIC_POLICY_V1
-            || self.significant_gain_micros != 20_000
-            || self.stagnation_abs_gain_micros != 5_000
-            || self.stagnation_window != 2
-            || self.max_focus_actions != 2
-            || self.fairness_wait_rounds != 4
-        {
+        if self.schema_version != ELASTIC_POLICY_V1 {
             return Err(Error::Invalid(
                 "unsupported elastic-priority policy version".into(),
             ));
         }
-        Ok(())
+        within(
+            "significant_gain_micros",
+            self.significant_gain_micros,
+            ELASTIC_SIGNIFICANT_GAIN_MIN_MICROS,
+            ELASTIC_SIGNIFICANT_GAIN_MAX_MICROS,
+        )?;
+        within(
+            "stagnation_abs_gain_micros",
+            self.stagnation_abs_gain_micros,
+            ELASTIC_STAGNATION_ABS_GAIN_MIN_MICROS,
+            ELASTIC_STAGNATION_ABS_GAIN_MAX_MICROS,
+        )?;
+        if self.stagnation_abs_gain_micros >= self.significant_gain_micros {
+            return Err(Error::Invalid(format!(
+                "elastic policy stagnation_abs_gain_micros {} must be below significant_gain_micros {}",
+                self.stagnation_abs_gain_micros, self.significant_gain_micros
+            )));
+        }
+        within(
+            "stagnation_window",
+            self.stagnation_window,
+            ELASTIC_STAGNATION_WINDOW_MIN,
+            ELASTIC_STAGNATION_WINDOW_MAX,
+        )?;
+        within(
+            "max_focus_actions",
+            self.max_focus_actions,
+            ELASTIC_MAX_FOCUS_ACTIONS_MIN,
+            ELASTIC_MAX_FOCUS_ACTIONS_MAX,
+        )?;
+        within(
+            "fairness_wait_rounds",
+            self.fairness_wait_rounds,
+            ELASTIC_FAIRNESS_WAIT_ROUNDS_MIN,
+            ELASTIC_FAIRNESS_WAIT_ROUNDS_MAX,
+        )
+    }
+
+    /// Digest of the whole policy: the same `fingerprint` convention the replay
+    /// report's `policy_digest` uses.
+    pub fn digest(&self) -> Result<String> {
+        fingerprint(self)
     }
 }
 
@@ -310,7 +388,7 @@ impl PrefixViewV2 {
                 || node.depth > MAX_DEPTH
                 || !node_seqs.insert(node.node_seq)
                 || node.node_seq <= previous_seq
-                || node.recent_valid_gains_micros.len() > 2
+                || node.recent_valid_gains_micros.len() > usize::from(PREFIX_RECENT_GAINS_MAX)
                 || node
                     .recent_valid_gains_micros
                     .iter()

@@ -108,6 +108,17 @@ pub enum ManagementResult {
         context_signature: String,
         prefix_digest: String,
         legal_actions_digest: String,
+        /// Digest of the policy the first decision was taken with (E14). A
+        /// result stored before E14 has none and reads as an empty string:
+        /// the job still loads (startup recovery must not depend on it), and
+        /// `status` then fails that job closed with a `Conflict`, because the
+        /// re-run decision never has an empty digest.
+        #[serde(default)]
+        policy_digest: String,
+        /// Digest of the caps the first decision was taken with (E14); empty
+        /// for a pre-E14 result, like `policy_digest`.
+        #[serde(default)]
+        caps_digest: String,
         action: BatchActionV1,
     },
 }
@@ -401,6 +412,8 @@ impl ManagementDispatcher {
                 context_signature,
                 prefix_digest,
                 legal_actions_digest,
+                policy_digest,
+                caps_digest,
                 action,
             }) = &job.result
             {
@@ -414,6 +427,8 @@ impl ManagementDispatcher {
                     || &view.context_signature != context_signature
                     || &view.decision.prefix_digest != prefix_digest
                     || &view.decision.legal_actions_digest != legal_actions_digest
+                    || &view.decision.policy_digest != policy_digest
+                    || &view.decision.caps_digest != caps_digest
                     || fingerprint(&view.decision.action)? != fingerprint(action)?
                 {
                     return Err(Error::Conflict(
@@ -1014,6 +1029,8 @@ async fn run_exploration_start(
         context_signature,
         prefix_digest: decision.prefix_digest,
         legal_actions_digest: decision.legal_actions_digest,
+        policy_digest: decision.policy_digest,
+        caps_digest: decision.caps_digest,
         action: decision.action,
     });
     Ok(())
