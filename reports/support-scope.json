@@ -247,11 +247,55 @@
           "rollback": "revert PR #103 through an independent revert PR; accepted-head parent 35b4d4e08df121e68467b0783b29303e9fa31d94; retain immutable evidence, frozen plans, costs and revocation state",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-055-c0ea35d.json"
+        },
+        {
+          "id": "E02.ag062_required_improver_baselines",
+          "description": "Required baseline labels at independent Improver compilation",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "e6e7eec47a3494425a1842604c154d8695089222",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/108",
+          "merged_sha": "6f0e5fa35b582f0f4cde4207ddf59d65a51b180a",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-core/tests/improver_required_baselines_v42.rs",
+          "command": "cargo test --locked --offline -p evo-core --test improver_required_baselines_v42",
+          "input_digest": "ad35eaa9900b9a03fd40ab70d40e0d46e59c85d34b6dec62f73f8667b5b7b854",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag062-e6e7eec.log.test",
+          "actual_result": "controller independent full re-run at e6e7eec: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; improver_required_baselines_v42 13 passed / 0 failed; workspace 91 result lines, 1215 passed / 0 failed; checker unittest 48 passed; two root probes pass on head and both fail after successful compilation on the actual parent; 13 new core tests",
+          "scope": "E02; sections 5.3 L473/L487-L491 and 5.1 L453/L455, E02 L1211/L1215; V046 missing P/B labels and V043 legal three-state compatibility: both nonempty labels are required after the original parent/baseline checks, even for all-Set patches",
+          "risk": "Does not authenticate P/B contents, digests, approval, existence, revocation or profile binding; no full FieldContract or consumer coverage, real host, effect or release",
+          "rollback": "revert PR #108 through an independent revert PR; accepted-head parent 3f9ed595bdcd8bf241bc73fb83640d277947810a; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-062-e6e7eec.json"
+        },
+        {
+          "id": "E02.ag065_host_surface_name_coverage",
+          "description": "Host surface reverse name coverage",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "2787e0c19f4b73298e73c0ddead0f959ceb6bfef",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/110",
+          "merged_sha": "eb275812f09dd8850ad4edac08a2282cb5e82112",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-core/tests/host_surface_name_coverage_v42.rs",
+          "command": "cargo test --locked --offline -p evo-core --test host_surface_name_coverage_v42",
+          "input_digest": "45ffd891ec47b3a3a5cdbdd3f85fffae9e49dd0e7542bbb2b9aaa9a6ec9d244e",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag065-2787e0c.log.test",
+          "actual_result": "controller independent full re-run at 2787e0c: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; host_surface_name_coverage_v42 16 passed / 0 failed; workspace 93 result lines, 1249 passed / 0 failed; checker unittest 48 passed; two root probes pass on head and both fail after successful compilation on the actual parent; 16 new core and 18 new engine tests, same target basename but separately bound source blobs",
+          "scope": "E02/E16.4; sections 5.5 L523-L529 and 5.6 L541, E02 L1215; V060 deleted/renamed-away names and V061 nonempty extraction truncation: each manifest name must occur in extracted names, across all three classifications, before registration or a new run",
+          "risk": "Names only; no type/enum/default drift, real extraction/consumer authentication, Tool-only mapping or Claude evidence. Existing frozen run snapshot reuse is outside the new guard; no full E/V, effect or release",
+          "rollback": "revert PR #110 through an independent revert PR; accepted-head parent 6f0e5fa35b582f0f4cde4207ddf59d65a51b180a; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-065-2787e0c.json"
         }
       ],
       "remaining": [
         "full host application and multi-skill production behavior remain unverified",
-        "engineering: AG-055 adds v1 goldens only; FieldContract metadata/real consumers, P/B content/revocation binding, negotiation and host drift detection remain; AG-062 missing-label gate is not accepted yet"
+        "engineering: AG-055 v1 goldens, AG-062 missing-label rejection and AG-065 reverse name coverage are verified subsets; FieldContract metadata/real consumers, P/B content/revocation binding, business v2 negotiation, type/default drift and real host evidence remain"
       ]
     },
     "E03": {
@@ -947,7 +991,7 @@
     "E09": {
       "title": "Bounded Strategy, Persistent Exploration, E03 Consumers",
       "status": "in_progress",
-      "status_reason": "skill groups, comparative practice, exploration cleanup edges, the trusted run_next gate, legal actions, registration, post-payment convergence and recovery counting are verified program sub-scopes (AG-021/024/026/033/039/040/041/042); the repair-producing chain and history in requests remain; AG-048 now verifies explicit NoChange/KeepIncumbent classes and fixed codes within its accepted record whitelist",
+      "status_reason": "skill groups, comparative practice, exploration cleanup edges, the trusted run_next gate, legal actions, registration, post-payment convergence and recovery counting are verified program sub-scopes (AG-021/024/026/033/039/040/041/042); the repair-producing chain and history in requests remain; AG-048 now verifies explicit NoChange/KeepIncumbent classes and fixed codes within its accepted record whitelist; AG-064 adds shared failed-lineage and batch-episode guards and observed-fact replay counters, without a production repair generator",
       "implementation_files": [
         "crates/evo-core/src/strategy.rs",
         "crates/evo-engine/src/exploration.rs",
@@ -1195,17 +1239,17 @@
         }
       ],
       "remaining": [
-        "engineering: typed trusted source for RepairableFailure, episode minting bound to immutable facts and per-episode repair counting in replay (AG-047)",
+        "engineering: typed trusted source for RepairableFailure, episode minting bound to immutable facts, repair templates/reset and production recovery (AG-047); AG-064 verifies only existing observed-fact replay counting and shared eligibility",
         "engineering: optimization history in requests and cache signatures (E09 PR-C)",
         "external: real G2 provider/process execution and effect evidence are unavailable",
         "V097 ablation scope not verified",
-        "engineering: broker pre-dispatch refusal classification (AG-054); kept-incumbent deepen eligibility awaits a decision"
+        "engineering: kept-incumbent deepen eligibility awaits a decision; AG-054 pre-dispatch refusal subset is verified, while real provider and generic database failures remain outside that claim"
       ]
     },
     "E10": {
       "title": "Immutable Observation, World Pool, Replay & Reports",
       "status": "in_progress",
-      "status_reason": "replay read paths name redacted records at every cleanup state (AG-032); online target-environment effect and production release remain unverified",
+      "status_reason": "replay read paths name redacted records at every cleanup state (AG-032); online target-environment effect and production release remain unverified; AG-064 verifies replay episode projection, shared failed-lineage eligibility and one recovery per episode per batch",
       "implementation_files": [
         "crates/evo-core/src/replay.rs",
         "crates/evo-storage/src/replay.rs",
@@ -1291,10 +1335,34 @@
           "rollback": "revert PR #79 (merge b262bbb) through an independent revert PR; accepted-stack rollback point 892ed1c; persisted revocation, budget, cost and audit facts are not rolled back",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-032-8954b6c.json"
+        },
+        {
+          "id": "E10.ag064_replay_episode_recovery",
+          "description": "Replay recovery facts, lineage eligibility and batch episode bound",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "437af3fc7e414a3509bbb3f9d2cc8a614f231616",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/109",
+          "merged_sha": "c6e13e906ea888916294e6deac77c37f4391225f",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/replay_recovery_contract_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test replay_recovery_contract_v42",
+          "input_digest": "875f78f9d6b8d4b97c772edda20d59d8ad7265c486eb306eb3f1397b6a1099b1",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag064-437af3f.log.test",
+          "actual_result": "controller independent full re-run at 437af3f: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; replay_recovery_contract_v42 10 passed / 0 failed; workspace 95 result lines, 1263 passed / 0 failed; checker unittest 48 passed; two root probes pass on head and both fail after successful compilation on the actual parent; 4 new core and 10 new engine tests; three actual old-program report fixtures and unchanged stored-history assertions",
+          "scope": "E09/E10; sections 7.1 L785/L787, 7.1.1 L791-L809, 7.2.1 L825-L831, E10 L1323-L1329, 5.1 L453 and 7.4.1 L853-L855; V024/V081/V086.b/d subset: derive per-episode counters from observed Recover targets, project after the whole batch, reject exhausted failure lineages and duplicate episodes in a batch",
+          "risk": "No production repair templates/reset/leases/billing, arbitrary-prefix authentication, full legal-action filtering, normal Deepen expanded-parent rule or PolicyStop classification. Old affected reports remain statically readable but semantic verification and same-ID reruns reject; no migration, overwrite, full E/V, effect or release",
+          "rollback": "revert PR #109 through an independent revert PR; accepted-head parent eb275812f09dd8850ad4edac08a2282cb5e82112; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-064-437af3f.json"
         }
       ],
       "remaining": [
-        "online target-environment effect and production release remain unverified"
+        "online target-environment effect and production release remain unverified",
+        "engineering: production world sealing/ReplayWorldV2 construction, general available-actions/normal Deepen expanded-parent rules and PolicyStop/WorldExhausted support classification remain",
+        "compatibility: affected legacy reports fail semantic recomputation and same-ID reruns; no migration or overwrite protocol is defined"
       ]
     },
     "E11": {
@@ -1894,7 +1962,8 @@
         }
       ],
       "remaining": [
-        "real Claude Code MCP Tool-only host is unavailable; no real Claude Code evidence (version, handshake, four-tool smoke, reconnect, cancellation); local structure cannot satisfy the host claim"
+        "real Claude Code MCP Tool-only host is unavailable; no real Claude Code evidence (version, handshake, four-tool smoke, reconnect, cancellation); local structure cannot satisfy the host claim",
+        "AG-065 verifies names only; types/defaults and actual consumers remain unverified. AG-066 local stdio harness is in progress and is not yet controller accepted; it cannot establish real host or in-flight cancellation support"
       ]
     },
     "E16.5": {
