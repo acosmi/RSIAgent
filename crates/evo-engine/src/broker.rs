@@ -323,6 +323,34 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         Ok(now)
     }
 
+    /// Judge the validated request's full source closure in one read-only
+    /// snapshot, before recovery can close an execution. Missing budget refs do
+    /// not shrink that closure; billing and dispatched receipts remain facts.
+    async fn ensure_cached_response_sources_live(&self, request: &ModelRequest) -> Result<()> {
+        let ctx = self.broker_context(&request.namespace)?;
+        let dependencies = request
+            .source_closure
+            .iter()
+            .map(|source| ("run".to_string(), source.id.clone()))
+            .collect::<Vec<_>>();
+        let mut session = self.store.session().await?;
+        for (kind, id) in &dependencies {
+            if crate::revocation_gate::judge_dependency(&ctx, &mut session, kind, id)
+                .await?
+                .is_some()
+            {
+                return Err(Error::Conflict("model_response_source_unavailable".into()));
+            }
+        }
+        if crate::revocation_gate::judge_upstream(&ctx, &mut session, &dependencies)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Conflict("model_response_source_unavailable".into()));
+        }
+        session.commit().await
+    }
+
     async fn existing_response(
         &self,
         request: &ModelRequest,
@@ -366,6 +394,12 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                     usage_record_id: call.usage_record_id,
                 });
             }
+            let response: ModelResponse =
+                serde_json::from_str(&artifact.body).map_err(|_| Error::Internal)?;
+            response.validate_against(request)?;
+            if matches!(response, ModelResponse::Completed { .. }) {
+                self.ensure_cached_response_sources_live(request).await?;
+            }
             if !call.execution_closed {
                 let dispatch_id = call.dispatch_id.as_deref().ok_or(Error::Internal)?;
                 self.store
@@ -379,9 +413,6 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                     )
                     .await?;
             }
-            let response: ModelResponse =
-                serde_json::from_str(&artifact.body).map_err(|_| Error::Internal)?;
-            response.validate_against(request)?;
             self.verify_persisted_response(request, &response).await?;
             return Ok(response);
         }
