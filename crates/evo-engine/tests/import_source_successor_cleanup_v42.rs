@@ -718,7 +718,7 @@ async fn malformed_authorities_remain_blocked_without_touching_unrelated_objects
 }
 
 #[tokio::test]
-async fn failed_job_stays_failed_after_legal_body_is_restored_without_frontier_reset() {
+async fn failed_job_requires_admin_retry_and_legal_body_before_full_frontier_cleanup() {
     let mut fixture = fixture(TraceOutcome::Success, false).await;
     replace_object(
         &fixture,
@@ -737,25 +737,58 @@ async fn failed_job_stays_failed_after_legal_body_is_restored_without_frontier_r
             .iter()
             .any(|node| node["node_id"] == RUN && node["expanded"] == 1)
     );
+    // Worker does not initiate a retry, and an explicit Admin retry still fails
+    // when the authority is malformed. Neither call grants the old shape trust.
+    let worker = LifecycleStore::cleanup_step(
+        &context(NS, Role::Worker),
+        &fixture.store,
+        &failed.job_id,
+        1,
+        200,
+    )
+    .await
+    .unwrap();
+    assert_eq!(worker.state, CleanupState::Failed);
+    let started = LifecycleStore::cleanup_step(
+        &context(NS, Role::Admin),
+        &fixture.store,
+        &failed.job_id,
+        1,
+        201,
+    )
+    .await
+    .unwrap();
+    let malformed = resume_one_node_pages(&mut fixture, started).await;
+    assert_eq!(malformed.state, CleanupState::Failed);
     // Model an old Failed job whose content shape is now recognized. Repair only
-    // the test object; never rewrite job state or reset the persisted frontier.
+    // the test object; recovery uses the public Admin API, with no fixture writes
+    // to job state or the persisted frontier.
     let legal = serde_json::to_value(&fixture.authority).unwrap();
     replace_object(&fixture, "run", &legal).await;
-    for now in 200..203 {
-        reopen(&mut fixture).await;
-        let status = LifecycleStore::cleanup_step(
-            &context(NS, Role::Admin),
-            &fixture.store,
-            &failed.job_id,
-            1,
-            now,
-        )
-        .await
-        .unwrap();
-        assert_eq!(status.state, CleanupState::Failed);
-        assert_eq!(status.last_error, failed.last_error);
-        assert_eq!(run_value(&fixture.store, NS, RUN).await.unwrap(), legal);
-    }
+    reopen(&mut fixture).await;
+    let worker = LifecycleStore::cleanup_step(
+        &context(NS, Role::Worker),
+        &fixture.store,
+        &failed.job_id,
+        1,
+        300,
+    )
+    .await
+    .unwrap();
+    assert_eq!(worker.state, CleanupState::Failed);
+    assert_eq!(run_value(&fixture.store, NS, RUN).await.unwrap(), legal);
+    let started = LifecycleStore::cleanup_step(
+        &context(NS, Role::Admin),
+        &fixture.store,
+        &failed.job_id,
+        1,
+        301,
+    )
+    .await
+    .unwrap();
+    let complete = resume_one_node_pages(&mut fixture, started).await;
+    assert_redacted(&fixture, &complete, &legal.to_string()).await;
+    assert!(complete.last_error.is_none());
     assert_eq!(begin_secondary(&fixture).await.job_id, failed.job_id);
 }
 

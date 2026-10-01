@@ -376,6 +376,9 @@ impl LifecycleStore {
             return Ok(status);
         }
         ensure_logical_block(&mut tx, ctx, &status).await?;
+        if status.state == CleanupState::Failed && ctx.role() == Role::Admin {
+            prepare_failed_cleanup_retry(&mut tx, ctx, &status, now).await?;
+        }
         sqlx::query(
             "UPDATE revoke_cleanup_jobs SET state='running',updated_at=?
              WHERE namespace=? AND job_id=? AND state IN ('pending','running')",
@@ -443,7 +446,7 @@ impl LifecycleStore {
             && !closure_is_open(&mut tx, ctx, job_id, &status.source, edge_page_limit, now).await?
         {
             let completed = sqlx::query(
-                "UPDATE revoke_cleanup_jobs SET state='complete',updated_at=?
+                "UPDATE revoke_cleanup_jobs SET state='complete',last_error=NULL,updated_at=?
                  WHERE namespace=? AND job_id=? AND state='running'",
             )
             .bind(now)
@@ -486,6 +489,50 @@ impl LifecycleStore {
         tx.commit().await.map_err(internal)?;
         Ok(status)
     }
+}
+
+/// An explicit Admin retry is a new verification round over the same frontier.
+/// Keep old diagnostics until completion, with the old progress in the audit.
+/// Both scan cursors are reset: historical failures do not identify every world
+/// or a budget call's billing scope. No execution/accounting facts are changed.
+async fn prepare_failed_cleanup_retry(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ctx: &Context,
+    status: &CleanupStatus,
+    now: i64,
+) -> Result<()> {
+    insert_cleanup_event(
+        tx,
+        ctx.namespace(),
+        &status.job_id,
+        Some(&status.source),
+        "cleanup_retry_started",
+        now,
+        json!({"previous_processed_nodes":status.processed_nodes,
+            "previous_pending_nodes":status.pending_nodes,"previous_last_error":status.last_error}),
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE revoke_cleanup_frontier
+         SET expanded=0,cursor_src_kind=NULL,cursor_src_id=NULL
+         WHERE namespace=? AND job_id=?",
+    )
+    .bind(ctx.namespace())
+    .bind(&status.job_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(internal)?;
+    sqlx::query(
+        "UPDATE revoke_cleanup_jobs SET state='running',processed_nodes=0,updated_at=?
+         WHERE namespace=? AND job_id=? AND state='failed'",
+    )
+    .bind(now)
+    .bind(ctx.namespace())
+    .bind(&status.job_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(internal)?;
+    Ok(())
 }
 
 /// Whether the closure of a job whose queue is empty is still open: a dependent
@@ -1907,6 +1954,7 @@ async fn cleanup_e16_envelope(
     node: &TypedObjectRef,
     body: &str,
     value: &serde_json::Value,
+    export_directory_rechecked: bool,
     now: i64,
 ) -> Result<()> {
     let kind = match validate_e16_envelope(ctx, node, value) {
@@ -1951,6 +1999,7 @@ async fn cleanup_e16_envelope(
 
     if kind == "export_attempt"
         && value["schema_version"].as_str() == Some("rsia.e16.export_attempt.v2")
+        && !export_directory_rechecked
     {
         remove_controlled_local_export(store, ctx, node, job_id, tx, now).await?;
     }
@@ -2056,6 +2105,36 @@ async fn cleanup_e16_envelope(
         json!({"record_kind":kind,"blob_candidates":fields.len()}),
     )
     .await
+}
+
+/// The caller's typed node is a member of this job's persisted frontier. A
+/// directory failure from another job in the same namespace still belongs to
+/// that node. EXISTS avoids loading the history; its scan cost is not constant.
+async fn has_failed_local_export(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ctx: &Context,
+    node: &TypedObjectRef,
+) -> Result<bool> {
+    if node.kind != "artifact" {
+        return Ok(false);
+    }
+    let failed: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+           SELECT 1 FROM revoke_cleanup_events
+           WHERE namespace=? AND node_kind=? AND node_id=?
+             AND event_kind='blocked_unknown_scope'
+             AND json_extract(details,'$.error') IN (
+               'blocked_unknown_scope:invalid_local_export_id',
+               'blocked_unknown_scope:linked_local_export_ancestor',
+               'blocked_unknown_scope:invalid_local_export_directory'))",
+    )
+    .bind(ctx.namespace())
+    .bind(&node.kind)
+    .bind(&node.id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(internal)?;
+    Ok(failed == 1)
 }
 
 async fn remove_controlled_local_export(
@@ -2608,10 +2687,46 @@ async fn cleanup_node_content(
             .fetch_optional(&mut **tx)
             .await
             .map_err(internal)?;
-    let Some(body) = body else {
+    let value = body
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .map_err(internal)?;
+    let redacted_export = node.kind == "artifact"
+        && value.as_ref().is_some_and(|value| {
+            value["schema_version"] == "rsia.redacted.v1"
+                && value["original_schema"] == "rsia.e16.export_attempt.v2"
+        });
+    let export_directory_rechecked =
+        has_failed_local_export(tx, ctx, node).await? || redacted_export;
+    if export_directory_rechecked {
+        if let Some(value) = &value {
+            // Bind an extant export record to this namespace and typed identity
+            // before touching its controlled directory. Absent historical nodes
+            // still require the path check; no user-supplied path is consulted.
+            if (value["schema_version"] == "rsia.e16.export_attempt.v2"
+                && validate_e16_envelope(ctx, node, value).is_err())
+                || (redacted_export
+                    && (value["id"].as_str() != Some(node.id.as_str())
+                        || value["original_kind"] != "export_attempt"
+                        || value["metadata"]["namespace"].as_str() != Some(ctx.namespace())))
+            {
+                return mark_unknown_scope(
+                    tx,
+                    ctx,
+                    job_id,
+                    node,
+                    "blocked_unknown_scope:invalid_e16_envelope",
+                    now,
+                )
+                .await;
+            }
+        }
+        remove_controlled_local_export(store, ctx, node, job_id, tx, now).await?;
+    }
+    let (Some(body), Some(value)) = (body, value) else {
         return Ok(());
     };
-    let value: serde_json::Value = serde_json::from_str(&body).map_err(internal)?;
     let schema = value
         .get("schema_version")
         .and_then(|v| v.as_str())
@@ -2621,7 +2736,18 @@ async fn cleanup_node_content(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if node.kind == "artifact" && e16_schema_kind(schema).is_some() {
-        return cleanup_e16_envelope(tx, store, ctx, job_id, node, &body, &value, now).await;
+        return cleanup_e16_envelope(
+            tx,
+            store,
+            ctx,
+            job_id,
+            node,
+            &body,
+            &value,
+            export_directory_rechecked,
+            now,
+        )
+        .await;
     }
     if node.kind == "artifact" && schema == crate::replay::REPLAY_STORE_ENVELOPE_SCHEMA {
         return redact_replay_store_envelope(tx, ctx, job_id, node, &body, &value, now).await;

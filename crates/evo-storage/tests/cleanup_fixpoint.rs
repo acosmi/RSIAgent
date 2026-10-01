@@ -369,9 +369,42 @@ async fn an_unclassified_late_dependent_fails_the_job_instead_of_completing_it()
         error.contains("blocked_unknown_scope:artifact:rsia.unknown.v9"),
         "{status:?}"
     );
-    // A failed job stays failed under further steps.
-    let again = step(&store, &status.job_id, 1, &mut clock).await;
+    // Worker keeps Failed. An explicit Admin retry must revisit the complete
+    // frontier before it can conclude; the unknown node still fails that round.
+    let unknown_before = body(&store, "artifact", "late-unknown").await;
+    clock += 1;
+    let worker_status = LifecycleStore::cleanup_step(&worker(), &store, &status.job_id, 1, clock)
+        .await
+        .unwrap();
+    assert_eq!(
+        worker_status.state,
+        CleanupState::Failed,
+        "{worker_status:?}"
+    );
+    assert_eq!(worker_status.last_error, status.last_error);
+    let started = step(&store, &status.job_id, 1, &mut clock).await;
+    assert_eq!(started.state, CleanupState::Running, "{started:?}");
+    assert_eq!(started.last_error, status.last_error);
+    let (again, retry_trajectory) = drive(&store, started, 1, &mut clock).await;
+    assert!(
+        retry_trajectory
+            .iter()
+            .all(|(state, _, _)| *state != CleanupState::Complete),
+        "retry reported Complete with an unclassified dependent: {retry_trajectory:?}"
+    );
     assert_eq!(again.state, CleanupState::Failed, "{again:?}");
+    assert_eq!(
+        again.last_error.as_deref(),
+        Some("blocked_unknown_scope:artifact:rsia.unknown.v9:")
+    );
+    assert_eq!(again.job_id, status.job_id);
+    assert_eq!(again.source, status.source);
+    assert_eq!(again.watermark_seq, status.watermark_seq);
+    assert_eq!(again.watermark_digest, status.watermark_digest);
+    assert_eq!(
+        body(&store, "artifact", "late-unknown").await,
+        unknown_before
+    );
 }
 
 /// The recheck reads only the tables, so a restart changes nothing: a dependent
