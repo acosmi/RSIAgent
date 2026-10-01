@@ -1,11 +1,33 @@
 //! Strict derived support-scope verification for E16.6 (V071/V072/V074/V080/V098).
-//! The v4.1 plan remains normative; this test rejects incomplete or inflated indexes.
+//! The current plan (lineage v4.1→v4.2, plan §18.8) remains normative; this test rejects
+//! incomplete or inflated indexes. Historical evidence records keep the lineage digest they
+//! were verified against; only the top level must bind the current plan.
 
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-const PLAN_SHA: &str = "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150";
+const PLAN_VERSION: &str = "v4.2";
+const PLAN_SHA: &str = "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455";
+/// Registered plan lineage (plan §18.8) as (version, file, sha256), oldest first; the last
+/// entry is the current binding.
+const PLAN_LINEAGE: &[(&str, &str, &str)] = &[
+    (
+        "v4.1",
+        "RSIAgent-v4.1定稿-工程实施方案-2026-09-19.md",
+        "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+    ),
+    (
+        "v4.2",
+        "RSIAgent-v4.2定稿-工程实施方案-2026-09-30.md",
+        "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+    ),
+];
+/// Optional per-record recheck marker; a missing key means not_affected and "required" never passes.
+const PLAN_RECHECKED: &str = "rechecked_v4.2";
+const PLAN_RECHECK_VALUES: &[&str] = &["not_affected", "required", PLAN_RECHECKED];
+/// Tasks whose historical records are touched by the v4.2 revision (plan §19.4).
+const PLAN_RECHECK_TASKS: &[&str] = &["E00", "E16.5", "E16.6"];
 const SKILLOPT_REPO: &str = "https://github.com/microsoft/SkillOpt.git";
 const SKILLOPT_COMMIT: &str = "79124b37e9a6371e13b753f8bcd7adb1e493ade1";
 const ALLOWED_STATUSES: &[&str] = &[
@@ -40,7 +62,7 @@ fn expected_e_scenarios() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ("E06", "V014 V015 V016 V017 V047 V049 V050 V059 V064 V070 V075 V077 V078 V081 V084 V085 V089 V091 V094 V095 V096"),
         ("E07", "V003 V010 V014 V015 V016 V042 V047 V059 V070 V077 V087 V088 V089 V091 V096 V097"),
         ("E08", "V017 V018 V038 V056 V069 V075 V081 V082 V083 V084 V085 V086 V090 V092 V094 V096"),
-        ("E09", "V019 V020 V022 V024 V025 V081 V086 V088 V089 V090 V091 V093 V094 V095 V096"),
+        ("E09", "V019 V020 V022 V024 V025 V081 V086 V088 V089 V090 V091 V093 V094 V095 V096 V097"),
         ("E10", "V020 V021 V022 V023 V025 V026 V027 V081 V086 V094 V096"),
         ("E11", "V022 V026 V027 V028 V042 V081 V094 V096 V097"),
         ("E12", "V029 V030 V031 V034 V082 V083 V093 V094 V096"),
@@ -262,8 +284,37 @@ fn expected_merge_for_pr(pr: u64) -> Result<Option<&'static str>, String> {
 fn validate_evidence_record(record: &Value, task: &str, root: &Path) -> Result<String, String> {
     let id = nonempty_string(&record["id"], &format!("{task} evidence id"))?;
     nonempty_string(&record["description"], &format!("{id} description"))?;
-    if record["plan_version"] != "v4.1" || record["plan_sha256"] != PLAN_SHA {
-        return Err(format!("{id} does not bind the v4.1 plan"));
+    let version = nonempty_string(&record["plan_version"], &format!("{id} plan_version"))?;
+    let digest = nonempty_string(&record["plan_sha256"], &format!("{id} plan_sha256"))?;
+    let Some((_, _, registered)) = PLAN_LINEAGE.iter().find(|(known, _, _)| *known == version)
+    else {
+        return Err(format!(
+            "{id} plan_version {version} is outside the registered plan lineage"
+        ));
+    };
+    if digest != *registered {
+        return Err(format!(
+            "{id} plan_sha256 is not the registered digest of plan {version}"
+        ));
+    }
+    let recheck = match record.get("plan_recheck") {
+        None => "not_affected",
+        Some(value) => nonempty_string(value, &format!("{id} plan_recheck"))?,
+    };
+    if !PLAN_RECHECK_VALUES.contains(&recheck) {
+        return Err(format!(
+            "{id} plan_recheck {recheck} is not a registered marker"
+        ));
+    }
+    if recheck == "required" {
+        return Err(format!(
+            "{id} still requires a recheck against plan {PLAN_VERSION}"
+        ));
+    }
+    if version != PLAN_VERSION && PLAN_RECHECK_TASKS.contains(&task) && recheck != PLAN_RECHECKED {
+        return Err(format!(
+            "{id} belongs to {task}, which the {PLAN_VERSION} revision touches, but was not rechecked"
+        ));
     }
     lower_hex(&record["source_sha"], 40, &format!("{id} source_sha"))?;
     let pr = nonempty_string(&record["pr"], &format!("{id} pr"))?;
@@ -353,7 +404,9 @@ fn validate_e_scopes(value: &Value, root: &Path) -> Result<BTreeSet<String>, Str
             .map(|value| value.to_string())
             .collect();
         if actual_scenarios != expected_for_task {
-            return Err(format!("{task} scenario responsibility differs from v4.1"));
+            return Err(format!(
+                "{task} scenario responsibility differs from plan {PLAN_VERSION}"
+            ));
         }
         let remaining = entry["remaining"]
             .as_array()
@@ -581,7 +634,10 @@ fn validate_commitments(
             || tasks != split_set(expected.e_tasks)
             || scenarios != split_set(expected.scenarios)
         {
-            return Err(format!("{} trace chain differs from v4.1", expected.id));
+            return Err(format!(
+                "{} trace chain differs from plan {PLAN_VERSION}",
+                expected.id
+            ));
         }
         if !tasks.is_subset(e_ids) || !scenarios.is_subset(v_ids) {
             return Err(format!("{} points to an unknown E or V id", expected.id));
@@ -799,11 +855,17 @@ fn validate_so_sources(
             || entry["license_status"] != "reference_pin_from_spec_not_reverified_by_cp001"
             || entry["verification_status"] != "reference_pins_only"
         {
-            return Err(format!("{} pin/provenance differs from v4.1", expected.id));
+            return Err(format!(
+                "{} pin/provenance differs from plan {PLAN_VERSION}",
+                expected.id
+            ));
         }
         let tasks = string_set(&entry["e_tasks"], &format!("{} e_tasks", expected.id))?;
         if tasks != split_set(expected.tasks) || !tasks.is_subset(e_ids) {
-            return Err(format!("{} task mapping differs from v4.1", expected.id));
+            return Err(format!(
+                "{} task mapping differs from plan {PLAN_VERSION}",
+                expected.id
+            ));
         }
         if entry["local_use"]["mode"] != "reference_only_no_upstream_runtime_import" {
             return Err(format!(
@@ -874,7 +936,9 @@ fn validate_v_scenarios(
         }
         let tasks = string_set(&entry["e_tasks"], &format!("{id} e_tasks"))?;
         if &tasks != expected_tasks {
-            return Err(format!("{id} E responsibility mapping differs from v4.1"));
+            return Err(format!(
+                "{id} E responsibility mapping differs from plan {PLAN_VERSION}"
+            ));
         }
         let refs = string_set(
             &entry["related_evidence_refs"],
@@ -903,24 +967,64 @@ fn validate_trace_index_coverage(value: &Value) -> Result<(), String> {
         || string_set(&object["E00"]["ranges"], "E00 trace ranges")?
             != split_set("K01–K10 SO01–SO18 V087–V098")
     {
-        return Err("E00 trace-only responsibility differs from v4.1".into());
+        return Err(format!(
+            "E00 trace-only responsibility differs from plan {PLAN_VERSION}"
+        ));
     }
     if object["E16.6"]["purpose"] != "complete_derived_index_coverage_not_scenario_execution"
         || string_set(&object["E16.6"]["ranges"], "E16.6 trace ranges")?
             != split_set("B01–B10 U01–U08 K01–K10 SO01–SO18 E00–E18 E16.1–E16.6 V001–V098")
     {
-        return Err("E16.6 complete index responsibility differs from v4.1".into());
+        return Err(format!(
+            "E16.6 complete index responsibility differs from plan {PLAN_VERSION}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plan_lineage(value: &Value) -> Result<(), String> {
+    let array = value.as_array().ok_or("plan_lineage must be an array")?;
+    if array.len() != PLAN_LINEAGE.len() {
+        return Err(format!(
+            "plan_lineage must list exactly the {} registered plan versions",
+            PLAN_LINEAGE.len()
+        ));
+    }
+    let allowed: BTreeSet<&str> = ["version", "file", "sha256"].into_iter().collect();
+    for (entry, (version, file, sha256)) in array.iter().zip(PLAN_LINEAGE) {
+        let object = entry
+            .as_object()
+            .ok_or("plan_lineage entries must be objects")?;
+        if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != allowed {
+            return Err(format!(
+                "plan_lineage entry for {version} carries unknown or missing keys"
+            ));
+        }
+        if entry["version"] != *version || entry["file"] != *file || entry["sha256"] != *sha256 {
+            return Err(format!(
+                "plan_lineage entry for {version} differs from the registered lineage"
+            ));
+        }
+    }
+    let last = array.last().ok_or("plan_lineage must not be empty")?;
+    if last["version"] != PLAN_VERSION || last["sha256"] != PLAN_SHA {
+        return Err(format!(
+            "plan_lineage must end with the current plan {PLAN_VERSION}"
+        ));
     }
     Ok(())
 }
 
 fn validate_manifest(value: &Value, root: &Path) -> Result<(), String> {
     if value["schema_version"] != "rsia.support_scope.v2"
-        || value["plan_version"] != "v4.1"
+        || value["plan_version"] != PLAN_VERSION
         || value["plan_sha256"] != PLAN_SHA
     {
-        return Err("support index is not bound to the v4.1 plan".into());
+        return Err(format!(
+            "support index top level is not bound to the current plan {PLAN_VERSION}"
+        ));
     }
+    validate_plan_lineage(&value["plan_lineage"])?;
     if value["declaration"] != "subset_only"
         || value["not_full_route_complete"] != true
         || value["legacy_equivalence_unverified"] != true
@@ -968,7 +1072,7 @@ fn validate_manifest(value: &Value, root: &Path) -> Result<(), String> {
 }
 
 #[test]
-fn support_scope_is_a_complete_but_non_normative_v41_derivative() {
+fn support_scope_is_a_complete_but_non_normative_plan_derivative() {
     let root = repo_root();
     let value = load_manifest(&root);
     validate_manifest(&value, &root).unwrap_or_else(|error| panic!("{error}"));
@@ -980,6 +1084,168 @@ fn support_scope_is_a_complete_but_non_normative_v41_derivative() {
             .values()
             .all(|entry| entry["status"] != "verified")
     );
+}
+
+#[test]
+fn historical_records_keep_lineage_digests_but_top_level_must_be_current() {
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let record = &baseline["e_scopes"]["E01"]["verified_subscopes"][0];
+    assert_eq!(record["plan_version"], "v4.1");
+    assert_eq!(record["plan_sha256"], PLAN_LINEAGE[0].2);
+    validate_manifest(&baseline, &root).unwrap();
+
+    let mut current = load_manifest(&root);
+    current["e_scopes"]["E01"]["verified_subscopes"][0]["plan_version"] =
+        Value::String(PLAN_VERSION.into());
+    current["e_scopes"]["E01"]["verified_subscopes"][0]["plan_sha256"] =
+        Value::String(PLAN_SHA.into());
+    validate_manifest(&current, &root).unwrap();
+
+    let mut mismatched = load_manifest(&root);
+    mismatched["e_scopes"]["E01"]["verified_subscopes"][0]["plan_version"] =
+        Value::String(PLAN_VERSION.into());
+    let error = validate_manifest(&mismatched, &root)
+        .expect_err("a v4.2 version paired with the v4.1 digest was accepted");
+    assert!(
+        error.contains("not the registered digest of plan v4.2"),
+        "{error}"
+    );
+
+    let mut outside = load_manifest(&root);
+    outside["e_scopes"]["E01"]["verified_subscopes"][0]["plan_sha256"] =
+        Value::String("a".repeat(64));
+    assert!(
+        validate_manifest(&outside, &root).is_err(),
+        "a digest outside the lineage was accepted"
+    );
+
+    let mut unknown_version = load_manifest(&root);
+    unknown_version["e_scopes"]["E01"]["verified_subscopes"][0]["plan_version"] =
+        Value::String("v4.0".into());
+    let error = validate_manifest(&unknown_version, &root)
+        .expect_err("an unregistered plan version was accepted");
+    assert!(
+        error.contains("outside the registered plan lineage"),
+        "{error}"
+    );
+
+    let mut stale_top = load_manifest(&root);
+    stale_top["plan_version"] = Value::String("v4.1".into());
+    stale_top["plan_sha256"] = Value::String(PLAN_LINEAGE[0].2.into());
+    let error = validate_manifest(&stale_top, &root)
+        .expect_err("a top level still bound to v4.1 was accepted");
+    assert!(
+        error.contains("not bound to the current plan v4.2"),
+        "{error}"
+    );
+}
+
+#[test]
+fn rejects_pending_or_unknown_plan_recheck_markers() {
+    let root = repo_root();
+    let mut required = load_manifest(&root);
+    required["e_scopes"]["E01"]["verified_subscopes"][0]["plan_recheck"] =
+        Value::String("required".into());
+    let error = validate_manifest(&required, &root)
+        .expect_err("a record still requiring a recheck was accepted");
+    assert!(
+        error.contains("E01.controller_acceptance still requires a recheck"),
+        "{error}"
+    );
+
+    let mut unknown = load_manifest(&root);
+    unknown["e_scopes"]["E01"]["verified_subscopes"][0]["plan_recheck"] =
+        Value::String("improved".into());
+    assert!(validate_manifest(&unknown, &root).is_err());
+
+    let mut untouched_without_marker = load_manifest(&root);
+    untouched_without_marker["e_scopes"]["E01"]["verified_subscopes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("plan_recheck");
+    validate_manifest(&untouched_without_marker, &root).unwrap();
+
+    for task in ["E00", "E16.5"] {
+        let mut downgraded = load_manifest(&root);
+        let record = &mut downgraded["e_scopes"][task]["verified_subscopes"][0];
+        assert_eq!(record["plan_recheck"], PLAN_RECHECKED);
+        record["plan_recheck"] = Value::String("not_affected".into());
+        assert!(
+            validate_manifest(&downgraded, &root).is_err(),
+            "{task}: a v4.1 record of a touched task without a recheck was accepted"
+        );
+        let mut missing = load_manifest(&root);
+        missing["e_scopes"][task]["verified_subscopes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("plan_recheck");
+        assert!(
+            validate_manifest(&missing, &root).is_err(),
+            "{task}: a v4.1 record of a touched task with no marker was accepted"
+        );
+    }
+}
+
+#[test]
+fn rejects_missing_or_unregistered_plan_lineage() {
+    let root = repo_root();
+    let mut missing = load_manifest(&root);
+    missing.as_object_mut().unwrap().remove("plan_lineage");
+    assert!(validate_manifest(&missing, &root).is_err());
+
+    let mut reversed = load_manifest(&root);
+    reversed["plan_lineage"].as_array_mut().unwrap().reverse();
+    assert!(validate_manifest(&reversed, &root).is_err());
+
+    let mut truncated = load_manifest(&root);
+    truncated["plan_lineage"].as_array_mut().unwrap().remove(0);
+    assert!(validate_manifest(&truncated, &root).is_err());
+
+    let mut wrong_digest = load_manifest(&root);
+    wrong_digest["plan_lineage"][1]["sha256"] = Value::String(PLAN_LINEAGE[0].2.into());
+    assert!(validate_manifest(&wrong_digest, &root).is_err());
+
+    let mut extra_key = load_manifest(&root);
+    extra_key["plan_lineage"][1]["effect"] = Value::String("improved".into());
+    assert!(validate_manifest(&extra_key, &root).is_err());
+
+    let mut extended = load_manifest(&root);
+    extended["plan_lineage"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "version": "v4.3",
+            "file": "future.md",
+            "sha256": "b".repeat(64),
+        }));
+    assert!(validate_manifest(&extended, &root).is_err());
+}
+
+#[test]
+fn e09_scenarios_include_the_v097_ablation_obligation() {
+    assert!(expected_e_scenarios()["E09"].contains("V097"));
+    assert!(expected_v_to_e()["V097"].contains("E09"));
+    let root = repo_root();
+    let mut without_scenario = load_manifest(&root);
+    without_scenario["e_scopes"]["E09"]["scenarios"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|item| item.as_str() != Some("V097"));
+    assert!(validate_manifest(&without_scenario, &root).is_err());
+
+    let mut without_task = load_manifest(&root);
+    let v097 = without_task["traceability"]["v_scenarios"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["id"] == "V097")
+        .unwrap();
+    v097["e_tasks"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|item| item.as_str() != Some("E09"));
+    assert!(validate_manifest(&without_task, &root).is_err());
 }
 
 #[test]

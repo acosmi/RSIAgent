@@ -1,8 +1,20 @@
 {
   "schema_version": "rsia.support_scope.v2",
-  "plan_version": "v4.1",
-  "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-  "derived_index_notice": "This file is a checked derivative; the pinned v4.1 plan remains the sole normative source.",
+  "plan_version": "v4.2",
+  "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+  "plan_lineage": [
+    {
+      "version": "v4.1",
+      "file": "RSIAgent-v4.1定稿-工程实施方案-2026-09-19.md",
+      "sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150"
+    },
+    {
+      "version": "v4.2",
+      "file": "RSIAgent-v4.2定稿-工程实施方案-2026-09-30.md",
+      "sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455"
+    }
+  ],
+  "derived_index_notice": "This file is a checked derivative; the pinned v4.2 plan (lineage v4.1→v4.2) remains the sole normative source.",
   "declaration": "subset_only",
   "not_full_route_complete": true,
   "legacy_equivalence_unverified": true,
@@ -57,6 +69,7 @@
           "description": "fixed baseline directed regression only",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "rechecked_v4.2",
           "source_sha": "ef8244dae4b5dd173987e78915500cc997dcd9b0",
           "pr": "https://github.com/acosmi/RSIAgent/pull/29",
           "merged_sha": "28f892c3d68591d201a8029345257f051fb123ef",
@@ -103,6 +116,7 @@
           "description": "statistical and holdout contract subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "c5ac47d506a98a9feb0b65fac6815e80087c8f49",
           "pr": "https://github.com/acosmi/RSIAgent/pull/30",
           "merged_sha": "faec991036f03f27cf6d2ad3db86f841815fc828",
@@ -170,6 +184,7 @@
           "description": "bounded atomic edit/compiler subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "79af6c515b3afdf36778ee57ba2f140a22a3c0e0",
           "pr": "https://github.com/acosmi/RSIAgent/pull/31",
           "merged_sha": "dfc861ce7572f8f9f49a8aaf9f0cc1687cba57f9",
@@ -226,6 +241,7 @@
           "description": "program-fixture optimization consumer subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "727e9cca8d4118dd207b1ad5ab043c2b6229fef7",
           "pr": "https://github.com/acosmi/RSIAgent/pull/32",
           "merged_sha": "9b13237af884c525652813ea508eb8c5f100d6f8",
@@ -276,6 +292,7 @@
           "description": "persistent root budget and accounting subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "f02e535798423aaef930e915b2af081c110adf0e",
           "pr": "https://github.com/acosmi/RSIAgent/pull/33",
           "merged_sha": "c1cf6a2e91253218033b5883a11baa02c85a5d43",
@@ -326,6 +343,7 @@
           "description": "program-fixture streaming evaluation subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "86e53b9add040192c4db0334c04c15316cf32e66",
           "pr": "https://github.com/acosmi/RSIAgent/pull/34",
           "merged_sha": "63824fff2e8d0cd0767d31140d064972542f6b53",
@@ -384,6 +402,7 @@
           "description": "guarded release and snapshot subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "071c54d53488f8d9a75cc7148d82ed5f9efb3253",
           "pr": "https://github.com/acosmi/RSIAgent/pull/35",
           "merged_sha": "c017e6a32da3cdf692c3321dd29d6510edada0c4",
@@ -440,6 +459,7 @@
           "description": "local protocol and disabled-model subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "0ed5ec915f438764217e9bd059bb99c401dce26e",
           "pr": "https://github.com/acosmi/RSIAgent/pull/36",
           "merged_sha": "794cf0f517a57e48166ef2ad44cb5762f3a61d5e",
@@ -495,6 +515,7 @@
           "description": "offline revocation and backup/restore subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "644d95dd85490bc716f837d7148d7245bce0b2c3",
           "pr": "https://github.com/acosmi/RSIAgent/pull/37",
           "merged_sha": "b0662ca1b7a2fe27d4a4622918679eed4934e214",
@@ -539,7 +560,8 @@
         "V093",
         "V094",
         "V095",
-        "V096"
+        "V096",
+        "V097"
       ],
       "verified_subscopes": [
         {
@@ -547,6 +569,7 @@
           "description": "deterministic program-fixture exploration subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "c71db74efd83a7dc2866b0f446049adcb4b8d3bd",
           "pr": "https://github.com/acosmi/RSIAgent/pull/38",
           "merged_sha": "7a8a35908a2f7cc72ed601cbc902a2e4b49120bf",
@@ -566,7 +589,8 @@
       ],
       "remaining": [
         "engineering: repair-producing E03 chain, at-most-two skill groups, K=1/default and explicitly authorized K=3 consumers are incomplete",
-        "external: real G2 provider/process execution and effect evidence are unavailable"
+        "external: real G2 provider/process execution and effect evidence are unavailable",
+        "V097 ablation scope not verified"
       ]
     },
     "E10": {
@@ -598,6 +622,7 @@
           "description": "immutable offline replay subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "77177cd5ffa87de5152a3295974ae41fc86498d4",
           "pr": "https://github.com/acosmi/RSIAgent/pull/39",
           "merged_sha": "96e62412809610a72d2ab593aaca59a8bcebd6d2",
@@ -619,6 +644,7 @@
           "description": "replay.run management consumer only",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "0aef9345679e674988e67e4208c60aba63b5271b",
           "pr": "https://github.com/acosmi/RSIAgent/pull/43",
           "merged_sha": "59afd1663a0d5f5212077dd92beaaf7920cde0ff",
@@ -665,6 +691,7 @@
           "description": "static economics and blocked-path subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "289d9204c6d76018080a9221967eebe5848e2b8d",
           "pr": "https://github.com/acosmi/RSIAgent/pull/40",
           "merged_sha": "09b3ebe8bad12d59bd3c2f926d3050802372e96f",
@@ -714,6 +741,7 @@
           "description": "offline zero-budget curriculum rejection subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "e612fcb9563c8e320e011e6d06f026b9730f561c",
           "pr": "https://github.com/acosmi/RSIAgent/pull/41",
           "merged_sha": "b1127a228c4a40248631ed417aba0ad7ea1a0884",
@@ -764,6 +792,7 @@
           "description": "persistent program-fixture monitoring subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "2c79608fb1d30f7592b742e972c209cb9208fabc",
           "pr": "https://github.com/acosmi/RSIAgent/pull/42",
           "merged_sha": "2e209dcea36d63610c59d3797e039f35d063ec89",
@@ -863,6 +892,7 @@
           "description": "durable source import: three pinned readers, persistent registration with authorization, cluster independence, revocation cleanup",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "b6861a756bf1a2a5660cb9d6e0663b4385242104",
           "pr": "https://github.com/acosmi/RSIAgent/pull/44",
           "merged_sha": "acda31895bb1cb42cf7985b907a4c600429573d0",
@@ -910,6 +940,7 @@
           "description": "durable staging, registered blob publish, local_namespace export delivery, E16 cleanup with live-reference blob retention",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "c57397f4ffbf9bff39c32a17e67e962bff3a8d45",
           "pr": "https://github.com/acosmi/RSIAgent/pull/54",
           "merged_sha": "16c2817bc192bf71535d2c99d867873e6e85bcf8",
@@ -957,6 +988,7 @@
           "description": "seed B/L/U install and reset staging",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "c57397f4ffbf9bff39c32a17e67e962bff3a8d45",
           "pr": "https://github.com/acosmi/RSIAgent/pull/54",
           "merged_sha": "16c2817bc192bf71535d2c99d867873e6e85bcf8",
@@ -1007,6 +1039,7 @@
           "description": "real-store rejection of unverified Claude surfaces, trusted host record reload and structure checks",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "11b42d277f861726b5e885c0ab08f305bc62169d",
           "pr": "https://github.com/acosmi/RSIAgent/pull/47",
           "merged_sha": "1c824e6614667da4dc7ea74e96b46adfd1d2c089",
@@ -1067,6 +1100,7 @@
           "description": "capacity, recovery-closure and deployment-safety gate functions",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "rechecked_v4.2",
           "source_sha": "5ed6088deec727fb70cbb2186766d45c616e8047",
           "pr": "https://github.com/acosmi/RSIAgent/pull/48",
           "merged_sha": "4980aa498baa80fd82e83441839e606859fa4065",
@@ -1092,7 +1126,7 @@
     "E16.6": {
       "title": "Release, Support Scope Manifest & Truth Ledger",
       "status": "in_progress",
-      "status_reason": "derived index and test are implemented; PR #49 (this index update to the 2026-09-30 controller merges) is implemented_not_verified until the controller accepts it; it does not close E16",
+      "status_reason": "derived index and test are implemented; #49 was replaced by PR #56 (merged 364a0722be7d5b05cbf01c453322ba35c2fdfa67) and the CP-002 checker by PR #57 (merged 7b425fcf4da08b8949aaa8f3426853f8938d3f3c); this index is now bound to plan v4.2 with lineage v4.1->v4.2 (AG-012) and is implemented_not_verified until the controller accepts that binding; it does not close E16",
       "implementation_files": [
         "reports/support-scope.json",
         "crates/evo-core/tests/support_scope.rs"
@@ -1110,13 +1144,13 @@
       ],
       "verified_subscopes": [],
       "remaining": [
-        "controller acceptance of PR #49 (support-scope index and support_scope test) is pending; the index does not close E16"
+        "controller acceptance of the v4.2 lineage binding (AG-012) is pending; the index does not close E16; full-route completion, real-host, sandbox and effect evidence remain unavailable"
       ]
     },
     "E16": {
       "title": "Product Support Scope & Final Delivery Gate",
       "status": "in_progress",
-      "status_reason": "E16.6 (PR #49 support-scope index) is the open sub-package; E16.4 stays blocked on real Claude Code evidence; E14/E15, production deployment and real-provider effect evidence remain unavailable",
+      "status_reason": "E16.6 index is rebound to plan v4.2 (AG-012, pending controller acceptance); E16.4 stays blocked on real Claude Code evidence; E16.5 capacity/recovery/deployment gates are not yet wired into runtime entry points; E14/E15, production deployment and real-provider effect evidence remain unavailable",
       "implementation_files": [
         "reports/support-scope.json",
         "reports/longitudinal/README.md"
@@ -1143,7 +1177,8 @@
       ],
       "verified_subscopes": [],
       "remaining": [
-        "E16.6 controller acceptance of the support-scope index (PR #49)",
+        "E16.6 controller acceptance of the v4.2 lineage binding (AG-012)",
+        "E16.5 capacity/recovery/deployment gates wired into real entry points",
         "real Claude Code extra-host evidence (E16.4 blocked)",
         "E14 and E15 research work, production deployment and effect evidence"
       ]
@@ -1164,6 +1199,7 @@
           "description": "default-disabled state and V040 rejection gates",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "4e0cabe20668b62bd2efcaae8c2be6497a5de9d0",
           "pr": "https://github.com/acosmi/RSIAgent/pull/50",
           "merged_sha": "e94042d3f2fd761455727a6c82ad13fd3d657d03",
@@ -1201,6 +1237,7 @@
           "description": "default-disabled state and V041 rejection gates",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
+          "plan_recheck": "not_affected",
           "source_sha": "2d909c4509d29445bbcbf701292fe351aabccfa4",
           "pr": "https://github.com/acosmi/RSIAgent/pull/51",
           "merged_sha": "bef7bd1763a01ccb677ada4acad71a063366539c",
@@ -4287,6 +4324,7 @@
           "E01",
           "E05",
           "E07",
+          "E09",
           "E11",
           "E13",
           "E14",
