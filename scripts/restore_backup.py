@@ -242,6 +242,8 @@ def verify_manifest(backup):
 
 def protected_facts(con,namespaces):
     # Conservative restore: later consumption requires a new backup; never reset a ledger.
+    # The schema list below is mirrored by evo-storage lifecycle.rs (PROTECTED_SCHEMA_VERSIONS
+    # plus PROTECTED_ACTION_SCHEMA_VERSIONS); the tests assert that the two stay equal.
     facts=[]
     for ns,kind,id,body in con.execute("SELECT namespace,kind,id,body FROM objects ORDER BY namespace,kind,id"):
         if ns not in namespaces:
@@ -252,7 +254,13 @@ def protected_facts(con,namespaces):
             "rsia.typed_artifact_envelope.v1","rsia.exploration_artifact_envelope.v1",
             "rsia.optimization.stage_fact.v1","rsia.budget_call_ref.v1",
             "rsia.e16.export_attempt.v1","rsia.e16.delivery_audit.v1",
-            "rsia.e16.export_attempt.v2","rsia.e16.delivery_audit.v2"):
+            "rsia.e16.export_attempt.v2","rsia.e16.delivery_audit.v2",
+            "rsia.monitoring.consolidation_claim.v1","rsia.monitoring.consolidation_run.v1",
+            "rsia.monitoring.consolidation_staging.v1","rsia.monitoring.consolidation_proposal.v1",
+            "rsia.monitoring.environment_drift.v1",
+            "rsia.practice_registration.v1","rsia.practice_registration_binding.v1",
+            "rsia.practice_attempt_set.v1","rsia.curriculum_artifact_envelope.v1",
+            "rsia.management_job.v1"):
             facts.append((ns,kind,id,value))
     # Monetary state and irreversible dispatch counters must also agree.
     tables=[r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'root_budget%'")]
