@@ -363,6 +363,27 @@ pub async fn store_trace_authority(
             return Err(Error::Conflict("immutable source authority differs".into()));
         }
     } else {
+        // A run and an E16 import_source artifact are the two revocation sources, and
+        // a revocation tombstone is keyed by the id of its source alone: a run that
+        // shares its id with an import source would share its tombstone, and
+        // whichever was revoked first would make the other unrevocable. The id of an
+        // import source is derived from its selection, the id of a run is chosen by
+        // the caller, so refuse here, before anything is written. An object of any
+        // other kind with this id is a different object and does not matter.
+        if session
+            .get::<serde_json::Value>(context, "artifact", &authority.record.id)
+            .await?
+            .is_some_and(|body| {
+                body.get("schema_version").and_then(|value| value.as_str())
+                    == Some(crate::import::IMPORT_SOURCE_SCHEMA)
+            })
+        {
+            return Err(Error::Conflict(format!(
+                "run {} cannot be stored: an E16 import_source artifact already has this id \
+                 (a revocation tombstone is keyed by id)",
+                authority.record.id
+            )));
+        }
         // Cache tombstones prevent a deleted source from being silently reintroduced.
         if session
             .cached::<StoredTraceAuthority, _>(

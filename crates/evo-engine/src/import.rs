@@ -1782,6 +1782,11 @@ impl PersistentImportService {
                         .collect(),
                 },
             };
+            // Every id is checked before the first row is written, so a refusal
+            // leaves nothing behind (not even a half-prepared selection).
+            for record in &prepared_sources {
+                ensure_import_source_id_is_free(&mut session, ctx, &record.id).await?;
+            }
             for record in &prepared_sources {
                 put_new_artifact(&mut session, ctx, record).await?;
                 session
@@ -2614,6 +2619,33 @@ async fn current_watermark(session: &mut evo_storage::Session, ctx: &Context) ->
         .await?
         .and_then(|(sequence, _)| u64::try_from(sequence).ok())
         .ok_or_else(|| Error::Conflict("missing source revoke watermark".into()))
+}
+
+/// An import source and a run are the two revocation sources, and a revocation
+/// tombstone is keyed by the id of its source alone: a run and an import source
+/// that share an id would share one tombstone, and whichever was revoked first would
+/// make the other unrevocable. The id of an import source is derived from its
+/// selection, so a caller that knows the request can predict it, and the id of a run
+/// is chosen by the Host. An id that already has a tombstone is refused with
+/// `Forbidden`, as every tombstone gate answers (the creation used to fail with that
+/// later, while finalizing, after the prepared rows were committed); an id that
+/// already names a run with `Conflict`. Nothing is written. An object of any other
+/// kind with this id is a different object and does not matter.
+async fn ensure_import_source_id_is_free(
+    session: &mut evo_storage::Session,
+    ctx: &Context,
+    id: &str,
+) -> Result<()> {
+    if session.get::<Value>(ctx, "tombstone", id).await?.is_some() {
+        return Err(Error::Forbidden);
+    }
+    if session.get::<Value>(ctx, "run", id).await?.is_some() {
+        return Err(Error::Conflict(format!(
+            "import source {id} cannot be created: a run already has this id \
+             (a revocation tombstone is keyed by id)"
+        )));
+    }
+    Ok(())
 }
 
 async fn put_new_artifact<T: Serialize>(
