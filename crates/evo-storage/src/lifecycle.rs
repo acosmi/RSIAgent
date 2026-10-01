@@ -350,7 +350,29 @@ impl LifecycleStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(internal)?;
-        if pending == 0 {
+        // An empty queue is not yet a closed closure. A node's dependents are read
+        // through a forward key-set cursor and the node is expanded once, so an
+        // edge written after `begin_revoke` can be missed: its key sorts before
+        // the cursor of a node that is still being paged, or the node was already
+        // expanded. `closure_is_open` rereads, in this transaction, what the queue
+        // is derived from (the dependency table, and the budget calls that
+        // `__budget_scan` reads once), queues or redacts what the queue does not
+        // hold, and the job completes only when it finds nothing.
+        //
+        // Termination: the frontier only grows, and every positive answer either
+        // adds a node to it or redacts a budget call that no later recheck selects
+        // again; the nodes and the calls are finite. A writer that never stops
+        // postpones `Complete` but cannot slip a dependent past it, and once the
+        // writer stops the job finishes. A late node of a schema the cleanup does
+        // not classify is expanded like any other and fails the job
+        // (`blocked_unknown_scope`) instead of completing it.
+        //
+        // The store has one connection, so this recheck and the state change below
+        // are atomic with respect to every writer. Only the tables are read, so the
+        // argument holds after a restart.
+        if pending == 0
+            && !closure_is_open(&mut tx, ctx, job_id, &status.source, edge_page_limit, now).await?
+        {
             let completed = sqlx::query(
                 "UPDATE revoke_cleanup_jobs SET state='complete',updated_at=?
                  WHERE namespace=? AND job_id=? AND state='running'",
@@ -395,6 +417,270 @@ impl LifecycleStore {
         tx.commit().await.map_err(internal)?;
         Ok(status)
     }
+}
+
+/// Whether the closure of a job whose queue is empty is still open: a dependent
+/// or a budget call written after the queue passed it was found (and, for a
+/// dependent, queued; for a call, redacted), so the job must stay `Running` and
+/// be stepped again. `false` is the fixpoint: the dependency table holds no
+/// dependent of an expanded node that the frontier lacks, and no budget call that
+/// names the source keeps its request. A job that is not running (a node of
+/// unknown scope failed it) cannot complete whatever the closure holds, so there
+/// is nothing to recheck.
+///
+/// At most `limit` nodes are queued, or calls redacted, per call, like the edge
+/// pages of the expansion; the dependency recheck goes first and a positive
+/// answer skips the budget recheck, which reads every unredacted request of the
+/// namespace.
+async fn closure_is_open(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ctx: &Context,
+    job_id: &str,
+    source: &TypedObjectRef,
+    limit: usize,
+    now: i64,
+) -> Result<bool> {
+    let running: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM revoke_cleanup_jobs WHERE namespace=? AND job_id=? AND state='running'",
+    )
+    .bind(ctx.namespace())
+    .bind(job_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(internal)?;
+    if running.is_none() {
+        return Ok(false);
+    }
+    if queue_late_dependents(tx, ctx, job_id, limit, now).await? > 0 {
+        return Ok(true);
+    }
+    redact_late_budget_calls(tx, ctx, job_id, source, limit, now).await
+}
+
+/// Queues up to `limit` dependents of an expanded node of this job that the
+/// job's frontier does not hold, as unexpanded nodes (the ordinary expansion then
+/// reads their own dependents and cleans their content). Returns how many.
+/// A frontier is the closure of one job, so membership is per `job_id`.
+async fn queue_late_dependents(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ctx: &Context,
+    job_id: &str,
+    limit: usize,
+    now: i64,
+) -> Result<usize> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT d.src_kind,d.src_id
+         FROM revoke_cleanup_frontier f
+         JOIN dependencies d
+           ON d.namespace=f.namespace AND d.dst_kind=f.node_kind AND d.dst_id=f.node_id
+         WHERE f.namespace=? AND f.job_id=? AND f.expanded=1
+           AND NOT EXISTS (
+             SELECT 1 FROM revoke_cleanup_frontier g
+             WHERE g.namespace=f.namespace AND g.job_id=f.job_id
+               AND g.node_kind=d.src_kind AND g.node_id=d.src_id)
+         ORDER BY d.src_kind,d.src_id LIMIT ?",
+    )
+    .bind(ctx.namespace())
+    .bind(job_id)
+    .bind(i64::try_from(limit).map_err(|_| Error::Internal)?)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(internal)?;
+    for row in &rows {
+        let kind: String = row.try_get("src_kind").map_err(internal)?;
+        let id: String = row.try_get("src_id").map_err(internal)?;
+        let queued = sqlx::query(
+            "INSERT OR IGNORE INTO revoke_cleanup_frontier(
+               namespace,job_id,node_kind,node_id
+             ) VALUES(?,?,?,?)",
+        )
+        .bind(ctx.namespace())
+        .bind(job_id)
+        .bind(kind)
+        .bind(id)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+        // The query excluded every node the frontier holds, under the key the
+        // insert is unique on; an ignored insert would report progress forever.
+        if queued.rows_affected() != 1 {
+            return Err(Error::Internal);
+        }
+    }
+    if !rows.is_empty() {
+        insert_cleanup_event(
+            tx,
+            ctx.namespace(),
+            job_id,
+            None,
+            "late_dependents_queued",
+            now,
+            json!({"count":rows.len()}),
+        )
+        .await?;
+    }
+    Ok(rows.len())
+}
+
+/// The `__budget_scan` of a job reads `root_budget_calls` once; a call reserved
+/// after it passed holds its request body (and the model input in it) although it
+/// names the revoked source. Same criterion as `expand_budget_scan`: redact the
+/// request of every unredacted call of the namespace whose source closure holds
+/// the source, index its budget call reference and queue that reference; a
+/// request of a schema that cannot be read fails the job. Redacts at most
+/// `limit` calls; returns whether it redacted or failed any.
+async fn redact_late_budget_calls(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ctx: &Context,
+    job_id: &str,
+    source: &TypedObjectRef,
+    limit: usize,
+    now: i64,
+) -> Result<bool> {
+    const PAGE: i64 = 64;
+    let mut redacted = 0usize;
+    let mut open = false;
+    let mut cursor: Option<(String, String)> = None;
+    loop {
+        let (after_scope, after_call) = match &cursor {
+            Some((scope, call)) => (Some(scope.as_str()), Some(call.as_str())),
+            None => (None, None),
+        };
+        let rows = sqlx::query(
+            "SELECT billing_scope,call_id,request_artifact_schema,request_artifact_body
+             FROM root_budget_calls
+             WHERE namespace=? AND request_artifact_body IS NOT NULL
+               AND request_artifact_schema<>'rsia.redacted.v1' AND
+               (? IS NULL OR billing_scope>? OR (billing_scope=? AND call_id>?))
+             ORDER BY billing_scope,call_id LIMIT ?",
+        )
+        .bind(ctx.namespace())
+        .bind(after_scope)
+        .bind(after_scope)
+        .bind(after_scope)
+        .bind(after_call)
+        .bind(PAGE)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(internal)?;
+        for row in &rows {
+            let billing_scope: String = row.try_get("billing_scope").map_err(internal)?;
+            let call_id: String = row.try_get("call_id").map_err(internal)?;
+            let schema: String = row.try_get("request_artifact_schema").map_err(internal)?;
+            let body: String = row.try_get("request_artifact_body").map_err(internal)?;
+            cursor = Some((billing_scope.clone(), call_id.clone()));
+            let Some(source_ids) = budget_request_source_ids(&schema, &body)? else {
+                mark_unknown_scope(
+                    tx,
+                    ctx,
+                    job_id,
+                    &TypedObjectRef {
+                        kind: "reservation".into(),
+                        id: call_id,
+                    },
+                    &format!("unknown_budget_request_schema:{schema}"),
+                    now,
+                )
+                .await?;
+                open = true;
+                continue;
+            };
+            if !source_ids.contains(&source.id) {
+                continue;
+            }
+            let reference = crate::budget::index_budget_call_ref_in_tx(
+                tx,
+                ctx,
+                &billing_scope,
+                &call_id,
+                &source_ids,
+            )
+            .await?;
+            crate::budget::redact_budget_call_content_in_tx(
+                tx,
+                ctx,
+                &billing_scope,
+                &call_id,
+                "source_revoked",
+            )
+            .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO revoke_cleanup_frontier(
+                   namespace,job_id,node_kind,node_id
+                 ) VALUES(?,?,'artifact',?)",
+            )
+            .bind(ctx.namespace())
+            .bind(job_id)
+            .bind(reference.id)
+            .execute(&mut **tx)
+            .await
+            .map_err(internal)?;
+            redacted += 1;
+            open = true;
+            if redacted >= limit {
+                break;
+            }
+        }
+        if redacted >= limit || rows.len() < PAGE as usize {
+            break;
+        }
+    }
+    if redacted > 0 {
+        insert_cleanup_event(
+            tx,
+            ctx.namespace(),
+            job_id,
+            None,
+            "late_budget_calls_redacted",
+            now,
+            json!({"count":redacted}),
+        )
+        .await?;
+    }
+    Ok(open)
+}
+
+/// The source ids a budget call's request names; `None` for a request schema the
+/// cleanup cannot read. The twin of the parsing in `expand_budget_scan`: the two
+/// must accept the same schemas and read the same fields, or the recheck would
+/// not be a recheck of that scan.
+fn budget_request_source_ids(schema: &str, body: &str) -> Result<Option<Vec<String>>> {
+    let ids = match schema {
+        "rsia.model_request.artifact.v1" => {
+            let value: serde_json::Value = serde_json::from_str(body).map_err(internal)?;
+            value
+                .get("source_closure")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| Error::Invalid("model request lacks source closure".into()))?
+                .iter()
+                .map(|value| {
+                    value
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                        .ok_or_else(|| Error::Invalid("model request source id missing".into()))
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+        crate::budget::REGISTERED_EXECUTION_REQUEST_SCHEMA => {
+            let value: serde_json::Value = serde_json::from_str(body).map_err(internal)?;
+            value
+                .get("source_ids")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| {
+                    Error::Invalid("registered execution request lacks source ids".into())
+                })?
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        Error::Invalid("registered execution source id missing".into())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(ids))
 }
 
 pub(crate) async fn backup_consistent(store: &Store, destination: &Path) -> Result<()> {
