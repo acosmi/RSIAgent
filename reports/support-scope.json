@@ -385,11 +385,33 @@
           "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
           "record_source": "out/implementation-v4.1-20260919/controller-e05-acceptance.json",
           "input_ref": "out/implementation-v4.1-20260919/controller-e05-final-input.json"
+        },
+        {
+          "id": "E05.ag052_versioned_batch_verdicts",
+          "description": "Versioned complete-batch verdict preservation",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "652d7cac0d6cf1fa086e96b6ac9554ed6326b1da",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/100",
+          "merged_sha": "43f0022478d58dd8a8e6492cffb3aa24463b3fce",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/streaming_verdicts_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test streaming_verdicts_v42",
+          "input_digest": "553355fd10dd745a44e29bb94af5f19f096fc79a102d655ad7fe607bfbd9da44",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag052-652d7ca.log.test",
+          "actual_result": "controller independent full re-run at 652d7ca: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; streaming_verdicts_v42 10 passed / 0 failed; workspace 87 result lines, 1142 passed / 0 failed; checker unittest 48 passed; test exit 0",
+          "scope": "E05 L1253/L1257/L1259, sections 3.4 L337, 3.4.1 L372 and 6.6 L709/L711; V010/V012/V084/V085 program scope: explicitly selected control v2 preserves eligible statistical verdicts with conservative negative-LCB/cost-saving postprocessing; v1 frozen bytes, digest and reasons remain; full registration binding is checked before calculation and final persistence; promotion gates remain closed",
+          "risk": "No new UCB algorithm, full cost proof, real-provider samples, promotion authority, universal v2 upgrade, Linux or effect claim; complete-batch ProgramFixture evidence stays non-promotable",
+          "rollback": "revert PR #100 through an independent revert PR; accepted-head parent 3aa3804db4ec39a72f38a8ec00cc7e6f9e92b360; preserve immutable evidence, revocation, budget, cost and audit facts",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-052-652d7ca.json"
         }
       ],
       "remaining": [
         "real provider samples, independent processes and complete optimization cost proof remain unavailable",
-        "engineering: complete-batch verdict preservation (AG-052), partition persistence, cost proof and typed report dependencies remain"
+        "engineering: partition persistence, full cost proof and typed report dependencies remain; AG-052 verifies explicit v2 complete-batch postprocessing while v1 frozen behavior remains"
       ]
     },
     "E06": {
@@ -601,7 +623,7 @@
     "E08": {
       "title": "Persistent Revocation, Cleanup, Backup & Trusted Anchor Recovery",
       "status": "in_progress",
-      "status_reason": "accepted program sub-scopes include revocation closure, late writes, economic restore protection (AG-051) and grant/package/seed source gates (AG-046); full production recovery and remaining write paths are unverified",
+      "status_reason": "accepted program sub-scopes include revocation closure, late writes, economic restore protection (AG-051) and grant/package/seed source gates (AG-046); full production recovery and remaining write paths are unverified; AG-053 bounds dependency snapshot recursion and AG-059 checks resolved manifest sources before first package write",
       "implementation_files": [
         "crates/evo-storage/src/lifecycle.rs",
         "crates/evo-engine/src/lifecycle.rs",
@@ -801,12 +823,56 @@
           "rollback": "revert PR #96 through an independent revert PR; accepted-head parent e2c9107142413c0ba304b5090692b56037958f40; preserve revocation, budget, cost and audit facts",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-046-229fea8.json"
+        },
+        {
+          "id": "E08.ag053_bounded_dependency_snapshots",
+          "description": "Bounded dependency snapshot recursion",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "a2c62326c7ca87a724da16ee4cfd133462b49dbe",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/99",
+          "merged_sha": "3aa3804db4ec39a72f38a8ec00cc7e6f9e92b360",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-storage/tests/local_export.rs",
+          "command": "cargo test --locked --offline -p evo-storage --test local_export",
+          "input_digest": "2ece3ccd3dcedafc1d5d53301ef73e27db6888ea35fa547260be9e47f1839c00",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag053-a2c6232.log.test",
+          "actual_result": "controller independent full re-run at a2c6232: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; local_export 11 passed / 0 failed; separate evo-storage lib 21 passed / 0 failed including 6 new dependency snapshot/VM tests (qa/ctrl-ag053-storage-lib-a2c6232.log); workspace 86 result lines, 1130 passed / 0 failed; checker unittest 48 passed; AG-061-R1 uses consumer entry because root lib tests are outside the index grammar; original storage command and test blob retained in input manifest",
+          "scope": "E08/E16.5; sections 3.3.1 L319, 11 L1081, E08 L1295/L1299, E16.5 L1451/L1453; V017/V069/V075 export dependency snapshots and V038 bounded refusal: preserve the 10000-node bound, root/all-kind snapshot semantics, namespace, order, errors and fingerprints while limiting recursion and using keyed closure joins",
+          "risk": "No absolute bound on total edge scanning or queue memory, no N+1 removal, complete cleanup, production performance, Linux, benefit or release claim",
+          "rollback": "revert PR #99 through an independent revert PR; accepted-head parent 37fa6f08e9ef779b796b9713bc4664511321aa7e; preserve immutable evidence, revocation, budget, cost and audit facts",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-053-a2c6232.json"
+        },
+        {
+          "id": "E08.ag059_manifest_prewrite_gate",
+          "description": "Manifest dependencies checked before package writes",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "8257e6a73304c250b545ead3c0bc9409cf2daa35",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/101",
+          "merged_sha": "296b5a07a7bf911d02454b683d5732e9d38e3ae5",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/write_side_revocation_gate_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test write_side_revocation_gate_v42",
+          "input_digest": "abf5d40aba4546aff5490af3098279bb0f37688ba55719e2125d207a4fe3608d",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag059-8257e6a.log.test",
+          "actual_result": "controller independent full re-run at 8257e6a: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; write_side_revocation_gate_v42 21 passed / 0 failed; workspace 87 result lines, 1150 passed / 0 failed; checker unittest 48 passed; test exit 0",
+          "scope": "E08/E16.2; sections 11.3 L1110 and 11.5 L1132, E08 L1295/L1299; V017/V075: resolved manifest and request source refs are checked jointly before first package write; revoked inputs leave no Prepared envelope, audit, edge or blob; V038 existing joint closure bound; missing manifest refs retain quarantine semantics",
+          "risk": "Storage publication still has the documented id-only other-kind tombstone late-refusal residue; no physical erasure, unknown-schema cleanup, real host support, production performance, Linux, effect or full E/V claim",
+          "rollback": "revert PR #101 through an independent revert PR; accepted-head parent 43f0022478d58dd8a8e6492cffb3aa24463b3fce; preserve immutable evidence, revocation, budget, cost and audit facts",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-059-8257e6a.json"
         }
       ],
       "remaining": [
         "awaiting plan clarification: kind-keyed tombstones and storage publication kind precision/residue; no source clause currently authorizes a format change",
         "awaiting plan clarification: physical SQLite free-page/WAL erasure is not a declared guarantee",
-        "engineering: stage_package manifest dependency_refs before first write (AG-059); other late writes and stage_bundle remain",
+        "engineering: other late writes, stage_bundle and typed dependency-edge completeness remain; AG-059 closes resolved manifest prewrite checking only",
         "production disaster recovery, Linux deployment and future object scopes remain unverified"
       ]
     },
@@ -1742,7 +1808,7 @@
     "E16.5": {
       "title": "Persistent Recovery Immutability, Capacity Limits & Deployment Security",
       "status": "in_progress",
-      "status_reason": "capacity gates are wired into six real entry points (AG-014), the startup recovery quarantine and deployment gates into rsia serve/mcp (AG-018), and restore protection covers this round's action and invalidation facts (AG-029); no real sandbox and Linux not exercised; AG-051 adds exact-schema economic replay envelope restore protection",
+      "status_reason": "capacity gates are wired into six real entry points (AG-014), the startup recovery quarantine and deployment gates into rsia serve/mcp (AG-018), and restore protection covers this round's action and invalidation facts (AG-029); no real sandbox and Linux not exercised; AG-051 adds exact-schema economic replay envelope restore protection; AG-053 preserves snapshot semantics with bounded recursive collection (registered under E08)",
       "implementation_files": [
         "crates/evo-engine/src/capacity.rs",
         "crates/evo-storage/src/lifecycle.rs",
@@ -1894,7 +1960,7 @@
     "E16.6": {
       "title": "Release, Support Scope Manifest & Truth Ledger",
       "status": "in_progress",
-      "status_reason": "the index is bound to plan v4.2 with the v4.1->v4.2 lineage (AG-012, PR #60 merged dc036d5) and carries the round-2 controller records; it does not close E16",
+      "status_reason": "the index is bound to plan v4.2 with its lineage and carries round-2, round-3 and the first three round-4 product acceptance records; it does not close E16",
       "implementation_files": [
         "reports/support-scope.json",
         "crates/evo-core/tests/support_scope.rs"
