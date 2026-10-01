@@ -246,6 +246,15 @@ pub fn reject_package(members: &[PackageMember]) -> Result<()> {
     Ok(())
 }
 
+// Callers use an ASCII marker's find offset, so start is a character boundary.
+fn privacy_snippet(text: &str, start: usize, max_bytes: usize) -> &str {
+    let mut end = start.saturating_add(max_bytes).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[start..end]
+}
+
 pub fn scan_privacy(text: &str) -> RedactionReport {
     let mut findings = Vec::new();
 
@@ -273,12 +282,11 @@ pub fn scan_privacy(text: &str) -> RedactionReport {
     let token_prefixes = ["sk-", "ghp_", "gho_", "ghs_", "xoxb-", "xoxp-", "AIza"];
     for prefix in token_prefixes {
         if let Some(idx) = text.find(prefix) {
-            let snippet_end = (idx + 12).min(text.len());
             findings.push(PrivacyFinding {
                 rule: "secret_token".into(),
                 severity: FindingSeverity::Block,
                 detail: format!("contains secret token prefix '{prefix}'"),
-                snippet: text[idx..snippet_end].into(),
+                snippet: privacy_snippet(text, idx, 12).into(),
             });
         }
     }
@@ -287,12 +295,11 @@ pub fn scan_privacy(text: &str) -> RedactionReport {
     let path_markers = ["/Users/", "/home/", "C:\\Users\\", "C:/Users/"];
     for marker in path_markers {
         if let Some(idx) = text.find(marker) {
-            let snippet_end = (idx + 24).min(text.len());
             findings.push(PrivacyFinding {
                 rule: "local_user_path".into(),
                 severity: FindingSeverity::Block,
                 detail: format!("contains local user path '{marker}'"),
-                snippet: text[idx..snippet_end].into(),
+                snippet: privacy_snippet(text, idx, 24).into(),
             });
         }
     }
@@ -328,12 +335,11 @@ pub fn scan_privacy(text: &str) -> RedactionReport {
     ];
     for marker in internal_network_markers {
         if let Some(idx) = text.find(marker) {
-            let snippet_end = (idx + 16).min(text.len());
             findings.push(PrivacyFinding {
                 rule: "internal_network".into(),
                 severity: FindingSeverity::Block,
                 detail: format!("contains internal network address/domain '{marker}'"),
-                snippet: text[idx..snippet_end].into(),
+                snippet: privacy_snippet(text, idx, 16).into(),
             });
         }
     }
