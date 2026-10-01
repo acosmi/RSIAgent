@@ -1456,6 +1456,23 @@ impl Session {
         budget_calls_for_group_in_tx(&mut self.tx, ctx, billing_scope, dispatch_group_id).await
     }
 
+    /// The billing scopes under which `dispatch_group_id` has call rows in the
+    /// caller's namespace, without repeats and in byte order. Read-only; a group
+    /// with no calls yields an empty list. Rows of other namespaces are never
+    /// returned, even for a group of the same name.
+    ///
+    /// A dispatch group is keyed by its billing scope, so one group name can hold
+    /// calls under several roots. A reader that totals a group under one scope
+    /// (`budget_calls_for_group`) uses this to see whether any call of the group
+    /// sits under another one.
+    pub async fn budget_call_scopes_for_group(
+        &mut self,
+        ctx: &Context,
+        dispatch_group_id: &str,
+    ) -> Result<Vec<String>> {
+        budget_call_scopes_for_group_in_tx(&mut self.tx, ctx, dispatch_group_id).await
+    }
+
     pub async fn begin_budget_dispatch(
         &mut self,
         ctx: &Context,
@@ -1624,6 +1641,25 @@ async fn budget_calls_for_group_in_tx(
         }
     }
     Ok(calls)
+}
+
+async fn budget_call_scopes_for_group_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    dispatch_group_id: &str,
+) -> Result<Vec<String>> {
+    require_budget_reader(ctx)?;
+    identifier(dispatch_group_id)?;
+    sqlx::query_scalar(
+        "SELECT DISTINCT billing_scope FROM root_budget_calls
+         WHERE namespace=? AND dispatch_group_id=?
+         ORDER BY billing_scope",
+    )
+    .bind(ctx.namespace())
+    .bind(dispatch_group_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(internal)
 }
 
 async fn begin_budget_dispatch_in_tx(
