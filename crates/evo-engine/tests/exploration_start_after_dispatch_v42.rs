@@ -2162,6 +2162,22 @@ async fn a_dispatch_that_spent_a_recovery_dispatch_is_added_back() {
     let world = world_for("world-1");
     env.register(&world).await.unwrap();
     let steps = env.dispatches("world-1", 2).await;
+    // The first node is the one the second dispatch is rewritten into the Recover of, so
+    // it is written as what a Recover repairs: a repairable failure of a kind a repair
+    // addresses. A completed Recover fact is held to its target (AG-042), and a hard
+    // failure, which the fixture runner's node is, is not one. No Recover is dispatched
+    // yet, so the real dispatches are the registered world all the same.
+    let failed_id = steps[0].node_id.clone().unwrap();
+    let mut failed = raw_record(&env.store, NODE_KIND, &failed_id).await;
+    failed["payload"]["node"]["status"] = json!({
+        "status": "repairable_failure",
+        "episode_id": "episode-1",
+        "failure_kind": "compile",
+        "repair_template_digest": hash(b"repair-template"),
+        "environment_reset": true,
+        "dispatched_repairs": 0,
+    });
+    put_raw_record(&env.store, NODE_KIND, &failed_id, &failed).await;
     let dispatch_id = steps[1].dispatch_id.clone().unwrap();
     let node_id = steps[1].node_id.clone().unwrap();
     let fact = raw_fact(&env.store, &dispatch_id).await;

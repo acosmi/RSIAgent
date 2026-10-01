@@ -2261,6 +2261,22 @@ async fn a_recover_fact_is_held_to_its_node_like_a_deepen() {
     let done = env.start_job("recover-bind-start", &world).await;
     assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
     let steps = env.dispatches("world-1", 2).await;
+    // The first node is the one the second dispatch is rewritten into the Recover of, so
+    // it is written as what a Recover repairs: a repairable failure of a kind a repair
+    // addresses. A completed Recover fact is held to its target (AG-042), and a hard
+    // failure, which the fixture runner's node is, is not one. Nothing else changes: the
+    // placement of the Recover's node is what the tampers below vary.
+    let failed_id = steps[0].node_id.clone().unwrap();
+    let mut failed = raw_record(&env.store, NODE_KIND, &failed_id).await;
+    failed["payload"]["node"]["status"] = json!({
+        "status": "repairable_failure",
+        "episode_id": "episode-1",
+        "failure_kind": "compile",
+        "repair_template_digest": hash(b"repair-template"),
+        "environment_reset": true,
+        "dispatched_repairs": 0,
+    });
+    put_raw_record(&env.store, NODE_KIND, &failed_id, &failed).await;
     let original = Stored::load(&env, "world-1", &steps).await;
     let spend_a_recover = |stored: &mut Stored| {
         rewrite_as_recover(&mut stored.facts[1], 1, 1, 2);

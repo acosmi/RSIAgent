@@ -1887,13 +1887,16 @@ async fn the_legal_actions_of_a_world_without_old_nodes_are_what_they_were() {
 async fn the_legal_action_conditions_of_recover_are_unchanged() {
     let env = Env::new().await;
     // A failed root rewritten into a repairable failure: Recover is offered while the
-    // environment was reset and the episode has repairs left, and only then.
+    // environment was reset and the episode has repairs left, and only then. The repairs
+    // an episode has used are the Recover dispatches that were completed (AG-042: the
+    // counter stored on the node is no longer what holds them), so a spent one is
+    // dispatched for real.
     let cases = [
-        ("open", true, 0, true),
-        ("not-reset", false, 0, false),
-        ("spent", true, 1, false),
+        ("open", true, false, true),
+        ("not-reset", false, false, false),
+        ("spent", true, true, false),
     ];
-    for (case, environment_reset, dispatched_repairs, offered) in cases {
+    for (case, environment_reset, spent, offered) in cases {
         let id = format!("world-recover-{case}");
         env.register(world(&id, &[1], HALF)).await;
         let first = env
@@ -1907,10 +1910,24 @@ async fn the_legal_action_conditions_of_recover_are_unchanged() {
                 "failure_kind": "compile",
                 "repair_template_digest": d("repair-template"),
                 "environment_reset": environment_reset,
-                "dispatched_repairs": dispatched_repairs,
+                "dispatched_repairs": 0,
             });
         })
         .await;
+        if spent {
+            // The failed root has no candidate, so the repair is requested against the
+            // world's own skill; it ends in a failure that has no successor.
+            let parent = env.fixture.root_parent();
+            env.coordinator
+                .run_next(
+                    Some(Child::HardFailure.model()),
+                    Some(&env.runner(answers_all)),
+                    Some(&env.journal),
+                    env.fixture.request(&parent, &id, 2, &format!("{id}-2")),
+                )
+                .await
+                .unwrap();
+        }
         let expected = if offered {
             vec![recover(1, 1, 1, "episode-1")]
         } else {
