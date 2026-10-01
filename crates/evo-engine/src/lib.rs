@@ -23,6 +23,7 @@ pub mod model;
 pub mod monitoring;
 pub mod optimization;
 pub mod packages;
+pub mod practice;
 pub mod release_store;
 pub mod releases;
 pub mod replay;

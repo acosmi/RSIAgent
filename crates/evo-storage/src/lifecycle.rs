@@ -2324,6 +2324,12 @@ async fn cleanup_node_content(
             "rsia.curriculum_artifact_envelope.v1",
             "curriculum_profile_v1" | "coverage_probe_job_v1" | "probe_schedule_receipt_v1",
         ) => true,
+        // E09 practice: the Admin registration that authorizes a K=3 comparison
+        // is a management fact, not source-derived content; it survives a revocation.
+        ("artifact", "rsia.practice_registration.v1", _) => true,
+        // E09 practice: the unique registration-to-set binding records that a K=3
+        // registration was spent; a revocation never reopens that authorization.
+        ("artifact", "rsia.practice_registration_binding.v1", _) => true,
         ("evaluation", "", _) => value.as_object().is_some_and(|m| {
             m.len() == 3
                 && ["id", "score", "state"]
@@ -2405,6 +2411,8 @@ async fn cleanup_node_content(
             | "curriculum_validity_report_v1"
             | "curriculum_selection_v1",
         ) => true,
+        // E09 practice attempt sets carry source-derived scores and output digests.
+        ("artifact", "rsia.practice_attempt_set.v1", _) => true,
         // E03's persisted SourceSelection predates a schema field; exact fields define its shape.
         ("artifact", "", _) => value.as_object().is_some_and(|m| {
             m.len() == 4
