@@ -451,7 +451,7 @@ impl ManagementDispatcher {
                 // decision is another decision, so the first one is recomputed
                 // from the world this job requested, which its private input
                 // still holds.
-                let first = if registration.started {
+                let requested = if registration.started {
                     let request = load_private_request(ctx, &self.store, &job)
                         .await
                         .map_err(InputFault::into_error)?;
@@ -465,9 +465,13 @@ impl ManagementDispatcher {
                             "exploration job input names a different world".into(),
                         ));
                     }
-                    crate::exploration::first_decision(&request.world)?
+                    Some(request)
                 } else {
-                    crate::exploration::first_decision(&registration.registered_world)?
+                    None
+                };
+                let first = match &requested {
+                    Some(request) => crate::exploration::first_decision(&request.world)?,
+                    None => crate::exploration::first_decision(&registration.registered_world)?,
                 };
                 if &registration.registered_world.id != world_id
                     || &registration.context_signature != context_signature
@@ -483,6 +487,19 @@ impl ManagementDispatcher {
                     return Err(Error::Conflict(
                         "exploration decision view differs from the stored result".into(),
                     ));
+                }
+                // A started world's counters, nodes and waits have moved, but
+                // what it was registered as cannot have: re-check it against the
+                // requested world the way registration compares it (the
+                // fingerprint of its immutable facts, and the budget it was
+                // registered with, rebuilt from its dispatch facts).
+                if let Some(request) = &requested {
+                    crate::exploration::ensure_world_registered_as(
+                        ctx,
+                        &self.store,
+                        &request.world,
+                    )
+                    .await?;
                 }
             } else {
                 return Err(Error::Conflict(

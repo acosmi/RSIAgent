@@ -626,7 +626,9 @@ impl PersistentCoordinator {
     /// current value" (it would take 2_000 for a world registered with 1_000)
     /// nor the current value itself is a registration. Dispatch facts that do
     /// not account for the world leave no way to tell a spend from a lowered
-    /// counter, and are a `Conflict` too.
+    /// counter, and are a `Conflict` too. The comparison is
+    /// `ensure_registered_as`, the one the management `status` of a started
+    /// world makes as well.
     ///
     /// Liveness of the source closure is re-checked on every call: watermark
     /// drift is `Conflict`, a tombstoned dependency is `Forbidden`.
@@ -646,23 +648,7 @@ impl PersistentCoordinator {
         .await?
         {
             existing.validate()?;
-            if existing.id != world.id
-                || existing.registration_fingerprint()? != world.registration_fingerprint()?
-            {
-                return Err(Error::Conflict(
-                    "exploration world already exists with a different registration".into(),
-                ));
-            }
-            if registered_budget(&mut session, &self.context, &existing).await?
-                != (
-                    world.remaining_root_micros,
-                    world.remaining_recovery_dispatches,
-                )
-            {
-                return Err(Error::Conflict(
-                    "exploration world already exists with a different registered budget".into(),
-                ));
-            }
+            ensure_registered_as(&mut session, &self.context, &existing, &world).await?;
             session.commit().await?;
             return Ok(RegisterWorldOutcome::AlreadyRegistered);
         }
@@ -2089,6 +2075,30 @@ pub async fn verified_world_registration_view(
     })
 }
 
+/// Read-side check for the management `status` of an `exploration.start` job
+/// whose world started: the world stored under the id of `requested` (the world
+/// in the job's private input), read through its live source closure, is still
+/// the registration `requested` describes. It is the comparison registration
+/// makes (`ensure_registered_as`): the fingerprint of the immutable registration
+/// facts and the budget the world was registered with, exactly. A started world
+/// has moved on, so its decision cannot be compared, but these two cannot move.
+/// A mismatch, and dispatch facts that do not account for the world, are a
+/// `Conflict`; nothing is written.
+pub(crate) async fn ensure_world_registered_as(
+    ctx: &Context,
+    store: &Store,
+    requested: &ExplorationWorldV1,
+) -> Result<()> {
+    ctx.require(&[Role::Admin])?;
+    let mut session = store.session().await?;
+    let stored: ExplorationWorldV1 =
+        need_record(&mut session, ctx, WORLD_RECORD_KIND, &requested.id).await?;
+    stored.validate()?;
+    check_world_live(&mut session, ctx, &stored).await?;
+    ensure_registered_as(&mut session, ctx, &stored, requested).await?;
+    session.commit().await
+}
+
 /// Whether a stored world moved past its registration: a dispatch is claimed or a
 /// node is written, or a decision round was taken. Until then the stored world is
 /// what was registered.
@@ -2204,6 +2214,38 @@ async fn registered_budget(
         root_micros,
         u8::try_from(recovery_dispatches).map_err(|_| unaccounted())?,
     ))
+}
+
+/// The comparison registration and the management `status` of a started world
+/// share, read-only: `stored` is still the registration `requested` describes.
+/// It has the same id and the same registration fingerprint, and the budget it
+/// was registered with, rebuilt from its dispatch facts (`registered_budget`),
+/// is the one `requested` declares. Anything else is a `Conflict` with a fixed
+/// message, and so are facts that do not account for the world.
+async fn ensure_registered_as(
+    session: &mut Session,
+    ctx: &Context,
+    stored: &ExplorationWorldV1,
+    requested: &ExplorationWorldV1,
+) -> Result<()> {
+    if stored.id != requested.id
+        || stored.registration_fingerprint()? != requested.registration_fingerprint()?
+    {
+        return Err(Error::Conflict(
+            "exploration world already exists with a different registration".into(),
+        ));
+    }
+    if registered_budget(session, ctx, stored).await?
+        != (
+            requested.remaining_root_micros,
+            requested.remaining_recovery_dispatches,
+        )
+    {
+        return Err(Error::Conflict(
+            "exploration world already exists with a different registered budget".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Storage id of a persisted exploration world envelope.

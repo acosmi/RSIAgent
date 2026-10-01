@@ -14,7 +14,13 @@
 //!   another request key for the same world) reports the first decision of the
 //!   world as it was requested, not the live one, and `status` of a started
 //!   world compares the stored result with that first decision and always with
-//!   the world's id, context, policy and caps.
+//!   the world's id, context, policy and caps;
+//! * (R1) `status` of a started world also re-checks that the stored world is
+//!   still the registration the job made, the way registration compares it: the
+//!   fingerprint of its immutable facts (a source closure replaced by other live
+//!   runs, a cost, a seed, a digest) and the budget it was registered with,
+//!   rebuilt from its dispatch facts, against the world in the job's private
+//!   input. A world that never started keeps comparing its own decision.
 //!
 //! Not covered (and not claimed): the paid `Err` paths of `run_next` (AG-041),
 //! that MetaTrial no longer needs its own guard against re-registering a stored
@@ -116,6 +122,29 @@ fn parent_skill() -> SkillSnapshot {
     }
 }
 
+/// One Host-issued trusted run. A run stored after the watermark was bumped is
+/// live under it too: the world's source closure is checked by id.
+async fn store_trusted_run(store: &Store, id: &str, family: &str, outcome: TraceOutcome) {
+    let host = Context::new("n", "host", Role::Host).unwrap();
+    let authority = StoredTraceAuthority {
+        schema_version: "rsia.optimization.source.v1".into(),
+        record: StoredRunRecord {
+            id: id.into(),
+            body: id.as_bytes().to_vec(),
+            parent_family: family.into(),
+            task_origin: TaskOrigin::TrustedRun,
+            execution_attestation: ExecutionAttestation::TrustedHost,
+            purpose: Purpose::Development,
+        },
+        trace: trace(id, family, outcome),
+        excerpt_start: 0,
+        excerpt_end: id.len(),
+    };
+    store_trace_authority(store, &host, &authority)
+        .await
+        .unwrap();
+}
+
 async fn seeded_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("exploration-start-after-dispatch.sqlite3"))
@@ -126,23 +155,7 @@ async fn seeded_store() -> (tempfile::TempDir, Store) {
         ("run-failure", "family-a", TraceOutcome::TaskFailure),
         ("run-success", "family-b", TraceOutcome::Success),
     ] {
-        let authority = StoredTraceAuthority {
-            schema_version: "rsia.optimization.source.v1".into(),
-            record: StoredRunRecord {
-                id: id.into(),
-                body: id.as_bytes().to_vec(),
-                parent_family: family.into(),
-                task_origin: TaskOrigin::TrustedRun,
-                execution_attestation: ExecutionAttestation::TrustedHost,
-                purpose: Purpose::Development,
-            },
-            trace: trace(id, family, outcome),
-            excerpt_start: 0,
-            excerpt_end: id.len(),
-        };
-        store_trace_authority(&store, &host, &authority)
-            .await
-            .unwrap();
+        store_trusted_run(&store, id, family, outcome).await;
     }
     store_source_selection(
         &store,
@@ -1420,6 +1433,160 @@ async fn status_of_a_started_world_refuses_a_stored_world_that_changed_its_polic
     }
 }
 
+// ---------------------------------------------------------------------------
+// 4b. AG-040 R1: status of a started world re-checks the registration
+//
+// The stored world of a started job has moved on, so its decision cannot be
+// compared; what can be is the registration it must still be: the fingerprint of
+// its immutable facts and the budget it was registered with (rebuilt from its
+// dispatch facts), both against the world in the job's private input, exactly as
+// the registration compares them. Each tamper below leaves the world valid and
+// live and leaves its context, policy and caps alone, so nothing else sees it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn status_of_a_started_world_refuses_a_stored_world_whose_source_closure_was_replaced() {
+    let env = env().await;
+    // Another trusted run that is alive under the same watermark.
+    store_trusted_run(&env.store, "run-other", "family-c", TraceOutcome::Success).await;
+    let done = env.start_job("closure-r1", &world_for("world-1")).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
+    env.dispatches("world-1", 2).await;
+    expect_status_ok(&env.dispatcher, &done, "before tampering").await;
+
+    let original = raw_record(&env.store, WORLD_KIND, "world-1").await;
+    let tampers: Vec<(&str, ValueEdit)> = vec![
+        ("one run replaced by another live run", |world| {
+            world["payload"]["dependencies"][1]["id"] = json!("run-other");
+        }),
+        ("a live run added", |world| {
+            let closure = world["payload"]["dependencies"].as_array_mut().unwrap();
+            closure.push(json!({"kind": "run", "id": "run-other"}));
+        }),
+        ("a run dropped", |world| {
+            world["payload"]["dependencies"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+        }),
+    ];
+    for (label, tamper) in tampers {
+        let mut tampered = original.clone();
+        tamper(&mut tampered);
+        assert_ne!(tampered, original, "{label}: the tamper changed nothing");
+        put_raw_record(&env.store, WORLD_KIND, "world-1", &tampered).await;
+        expect_status_conflict(
+            &env.dispatcher,
+            &done,
+            &format!("a stored world with {label}"),
+        )
+        .await;
+        put_raw_record(&env.store, WORLD_KIND, "world-1", &original).await;
+        expect_status_ok(&env.dispatcher, &done, &format!("after restoring: {label}")).await;
+    }
+}
+
+#[tokio::test]
+async fn status_of_a_started_world_refuses_rewritten_counters_and_registration_facts() {
+    let env = env().await;
+    let done = env.start_job("facts-r1", &world_for("world-1")).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
+    env.dispatches("world-1", 2).await;
+    expect_status_ok(&env.dispatcher, &done, "before tampering").await;
+
+    let original = raw_record(&env.store, WORLD_KIND, "world-1").await;
+    let tampers: Vec<(&str, ValueEdit)> = vec![
+        ("the root budget raised by one micro", |world| {
+            let root = world["payload"]["remaining_root_micros"].as_u64().unwrap();
+            world["payload"]["remaining_root_micros"] = json!(root + 1);
+        }),
+        ("the root budget lowered by one micro", |world| {
+            let root = world["payload"]["remaining_root_micros"].as_u64().unwrap();
+            world["payload"]["remaining_root_micros"] = json!(root - 1);
+        }),
+        ("the root budget zeroed", |world| {
+            world["payload"]["remaining_root_micros"] = json!(0);
+        }),
+        ("the recovery budget raised", |world| {
+            world["payload"]["remaining_recovery_dispatches"] = json!(3);
+        }),
+        ("the recovery budget lowered", |world| {
+            world["payload"]["remaining_recovery_dispatches"] = json!(1);
+        }),
+        ("the cost of a root opportunity", |world| {
+            let root = &mut world["payload"]["root_opportunities"][0];
+            let cost = root["estimated_cost_upper_micros"].as_u64().unwrap();
+            root["estimated_cost_upper_micros"] = json!(cost + 1);
+        }),
+        ("the successor cost", |world| {
+            world["payload"]["successor_cost_upper_micros"] = json!(11);
+        }),
+        ("the baseline quality", |world| {
+            world["payload"]["initial_baseline_quality_micros"] = json!(400_000);
+        }),
+        ("the simulation seed", |world| {
+            world["payload"]["simulation"]["online"]["fixed_seed"] = json!(8);
+        }),
+        ("the approved parent digest", |world| {
+            world["payload"]["approved_parent_digest"] = json!(hash(b"forged"));
+        }),
+    ];
+    for (label, tamper) in tampers {
+        let mut tampered = original.clone();
+        tamper(&mut tampered);
+        assert_ne!(tampered, original, "{label}: the tamper changed nothing");
+        put_raw_record(&env.store, WORLD_KIND, "world-1", &tampered).await;
+        expect_status_conflict(
+            &env.dispatcher,
+            &done,
+            &format!("a stored world with {label} rewritten"),
+        )
+        .await;
+        put_raw_record(&env.store, WORLD_KIND, "world-1", &original).await;
+        expect_status_ok(&env.dispatcher, &done, &format!("after restoring: {label}")).await;
+    }
+}
+
+#[tokio::test]
+async fn status_of_a_started_world_refuses_facts_that_do_not_account_for_its_counters() {
+    let env = env().await;
+    let done = env.start_job("accounts-r1", &world_for("world-1")).await;
+    assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
+    let steps = env.dispatches("world-1", 2).await;
+    let records = DispatchedRecords::load(&env, "world-1", &steps).await;
+    expect_status_ok(&env.dispatcher, &done, "before tampering").await;
+
+    // The same tampers the registration refuses.
+    for (label, tamper) in unaccounted_tampers(records.first["payload"]["node_id"].clone()) {
+        records.put(&env, &records.tampered(&tamper)).await;
+        expect_status_conflict(&env.dispatcher, &done, label).await;
+        records.restore(&env).await;
+        expect_status_ok(&env.dispatcher, &done, &format!("after restoring: {label}")).await;
+    }
+
+    // A dispatch fact that is gone, and one the revocation cleanup redacted.
+    let mut session = env.store.session().await.unwrap();
+    session
+        .delete(
+            &worker(),
+            "artifact",
+            &storage_id(DISPATCH_KIND, &records.second_id),
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    expect_status_conflict(&env.dispatcher, &done, "a missing dispatch fact").await;
+    put_raw_fact(
+        &env.store,
+        &records.second_id,
+        &json!({"schema_version": "rsia.redacted.v1"}),
+    )
+    .await;
+    expect_status_conflict(&env.dispatcher, &done, "a redacted dispatch fact").await;
+    records.restore(&env).await;
+    expect_status_ok(&env.dispatcher, &done, "after restoring the facts").await;
+}
+
 #[tokio::test]
 async fn status_of_a_world_that_never_started_still_compares_the_stored_worlds_decision() {
     // No dispatch yet: the stored world's own first decision is compared, so a
@@ -1549,6 +1716,164 @@ async fn status_of_a_started_world_still_fails_closed_on_a_revoked_source() {
         .unwrap();
     session.commit().await.unwrap();
     expect_status_conflict(&env.dispatcher, &done, "a watermark bump").await;
+}
+
+/// The raw stored records `unaccounted_tampers` edit, for a world that
+/// dispatched twice, to put edited and to put back.
+struct DispatchedRecords {
+    world_id: String,
+    first_id: String,
+    second_id: String,
+    world: Value,
+    first: Value,
+    second: Value,
+}
+
+impl DispatchedRecords {
+    async fn load(env: &Env, world_id: &str, steps: &[CoordinatorStepResult]) -> Self {
+        let first_id = steps[0].dispatch_id.clone().unwrap();
+        let second_id = steps[1].dispatch_id.clone().unwrap();
+        Self {
+            world_id: world_id.into(),
+            world: raw_record(&env.store, WORLD_KIND, world_id).await,
+            first: raw_fact(&env.store, &first_id).await,
+            second: raw_fact(&env.store, &second_id).await,
+            first_id,
+            second_id,
+        }
+    }
+
+    /// The three records with one edit applied.
+    fn tampered(&self, tamper: &FactTamper) -> (Value, Value, Value) {
+        let mut records = (self.world.clone(), self.first.clone(), self.second.clone());
+        tamper(&mut records.0, &mut records.1, &mut records.2);
+        records
+    }
+
+    async fn put(&self, env: &Env, records: &(Value, Value, Value)) {
+        put_raw_record(&env.store, WORLD_KIND, &self.world_id, &records.0).await;
+        put_raw_fact(&env.store, &self.first_id, &records.1).await;
+        put_raw_fact(&env.store, &self.second_id, &records.2).await;
+    }
+
+    async fn restore(&self, env: &Env) {
+        self.put(
+            env,
+            &(self.world.clone(), self.first.clone(), self.second.clone()),
+        )
+        .await;
+    }
+}
+
+/// One edit of the three stored records of a world that dispatched twice: the
+/// world, its first dispatch fact and its second one, as raw JSON.
+type FactTamper = Box<dyn Fn(&mut Value, &mut Value, &mut Value)>;
+
+/// The ways a world and its dispatch facts can stop accounting for the budget the
+/// world was registered with. Each is an edit of the stored records; both the
+/// registration and `status` have to refuse the world it makes (fail closed).
+fn unaccounted_tampers(first_node: Value) -> Vec<(&'static str, FactTamper)> {
+    vec![
+        (
+            "a counter lowered by one micro",
+            Box::new(|world, _, _| {
+                let root = world["payload"]["remaining_root_micros"].as_u64().unwrap();
+                world["payload"]["remaining_root_micros"] = json!(root - 1);
+            }),
+        ),
+        (
+            "a counter raised by one micro",
+            Box::new(|world, _, _| {
+                let root = world["payload"]["remaining_root_micros"].as_u64().unwrap();
+                world["payload"]["remaining_root_micros"] = json!(root + 1);
+            }),
+        ),
+        (
+            "a recovery counter lowered",
+            Box::new(|world, _, _| {
+                world["payload"]["remaining_recovery_dispatches"] = json!(1);
+            }),
+        ),
+        (
+            "a dispatch fact that names another cost",
+            Box::new(|_, first, _| {
+                first["payload"]["decision"]["action"]["estimated_cost_upper_micros"] =
+                    json!(FIRST_ROOT_COST + 1);
+            }),
+        ),
+        (
+            "a dispatch fact of another world",
+            Box::new(|_, _, second| {
+                second["payload"]["world_id"] = json!("another-world");
+            }),
+        ),
+        (
+            "a dispatch fact whose decision is a stop",
+            Box::new(|_, _, second| {
+                second["payload"]["decision"]["action"] =
+                    json!({"decision": "stop", "reason": "forged"});
+            }),
+        ),
+        (
+            "a dispatch that is no longer listed (its node is not accounted for)",
+            Box::new(|world, _, _| {
+                let listed = world["payload"]["dispatch_ids"].as_array_mut().unwrap();
+                listed.pop();
+            }),
+        ),
+        (
+            "a dispatch listed twice",
+            Box::new(|world, _, _| {
+                let listed = world["payload"]["dispatch_ids"].as_array_mut().unwrap();
+                let first = listed[0].clone();
+                listed[1] = first;
+            }),
+        ),
+        (
+            "a completed dispatch whose node the world does not list",
+            Box::new(|world, _, _| {
+                let nodes = world["payload"]["node_ids"].as_array_mut().unwrap();
+                nodes.pop();
+            }),
+        ),
+        (
+            "a completed dispatch that names no node",
+            Box::new(|_, _, second| {
+                second["payload"]["node_id"] = Value::Null;
+            }),
+        ),
+        (
+            "a dispatch listed twice, under counters that paid for it twice",
+            Box::new(|world, _, _| {
+                let listed = world["payload"]["dispatch_ids"].as_array_mut().unwrap();
+                let first = listed[0].clone();
+                listed.push(first);
+                let root = world["payload"]["remaining_root_micros"].as_u64().unwrap();
+                world["payload"]["remaining_root_micros"] = json!(root - FIRST_ROOT_COST);
+            }),
+        ),
+        (
+            "a claimed dispatch that names a node",
+            Box::new(|_, _, second| {
+                second["payload"]["state"] = json!("claimed");
+            }),
+        ),
+        (
+            "two completed dispatches that name the same node",
+            Box::new(move |_, _, second| {
+                second["payload"]["node_id"] = first_node.clone();
+            }),
+        ),
+        (
+            "nodes with no dispatch behind them, under the counters of an untouched world",
+            Box::new(|world, _, _| {
+                world["payload"]["dispatch_ids"] = json!([]);
+                world["payload"]["remaining_root_micros"] = json!(REGISTERED_ROOT_MICROS);
+                world["payload"]["remaining_recovery_dispatches"] =
+                    json!(REGISTERED_RECOVERY_DISPATCHES);
+            }),
+        ),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1707,122 +2032,18 @@ async fn a_world_whose_facts_do_not_account_for_its_counters_is_not_the_register
 
     // Each case edits one stored record; the registration must be refused
     // (fail closed) and the untouched records must be accepted again.
-    type Tamper = Box<dyn Fn(&mut Value, &mut Value, &mut Value)>;
-    let cases: Vec<(&str, Tamper)> = vec![
-        (
-            "a counter lowered by one micro",
-            Box::new(|world, _, _| {
-                let root = world["payload"]["remaining_root_micros"].as_u64().unwrap();
-                world["payload"]["remaining_root_micros"] = json!(root - 1);
-            }),
-        ),
-        (
-            "a counter raised by one micro",
-            Box::new(|world, _, _| {
-                let root = world["payload"]["remaining_root_micros"].as_u64().unwrap();
-                world["payload"]["remaining_root_micros"] = json!(root + 1);
-            }),
-        ),
-        (
-            "a recovery counter lowered",
-            Box::new(|world, _, _| {
-                world["payload"]["remaining_recovery_dispatches"] = json!(1);
-            }),
-        ),
-        (
-            "a dispatch fact that names another cost",
-            Box::new(|_, first, _| {
-                first["payload"]["decision"]["action"]["estimated_cost_upper_micros"] =
-                    json!(FIRST_ROOT_COST + 1);
-            }),
-        ),
-        (
-            "a dispatch fact of another world",
-            Box::new(|_, _, second| {
-                second["payload"]["world_id"] = json!("another-world");
-            }),
-        ),
-        (
-            "a dispatch fact whose decision is a stop",
-            Box::new(|_, _, second| {
-                second["payload"]["decision"]["action"] =
-                    json!({"decision": "stop", "reason": "forged"});
-            }),
-        ),
-        (
-            "a dispatch that is no longer listed (its node is not accounted for)",
-            Box::new(|world, _, _| {
-                let listed = world["payload"]["dispatch_ids"].as_array_mut().unwrap();
-                listed.pop();
-            }),
-        ),
-        (
-            "a dispatch listed twice",
-            Box::new(|world, _, _| {
-                let listed = world["payload"]["dispatch_ids"].as_array_mut().unwrap();
-                let first = listed[0].clone();
-                listed[1] = first;
-            }),
-        ),
-        (
-            "a completed dispatch whose node the world does not list",
-            Box::new(|world, _, _| {
-                let nodes = world["payload"]["node_ids"].as_array_mut().unwrap();
-                nodes.pop();
-            }),
-        ),
-        (
-            "a completed dispatch that names no node",
-            Box::new(|_, _, second| {
-                second["payload"]["node_id"] = Value::Null;
-            }),
-        ),
-        (
-            "a dispatch listed twice, under counters that paid for it twice",
-            Box::new(|world, _, _| {
-                let listed = world["payload"]["dispatch_ids"].as_array_mut().unwrap();
-                let first = listed[0].clone();
-                listed.push(first);
-                let root = world["payload"]["remaining_root_micros"].as_u64().unwrap();
-                world["payload"]["remaining_root_micros"] = json!(root - FIRST_ROOT_COST);
-            }),
-        ),
-        (
-            "a claimed dispatch that names a node",
-            Box::new(|_, _, second| {
-                second["payload"]["state"] = json!("claimed");
-            }),
-        ),
-        (
-            "two completed dispatches that name the same node",
-            Box::new(move |_, _, second| {
-                second["payload"]["node_id"] = first_node.clone();
-            }),
-        ),
-        (
-            "nodes with no dispatch behind them, under the counters of an untouched world",
-            Box::new(|world, _, _| {
-                world["payload"]["dispatch_ids"] = json!([]);
-                world["payload"]["remaining_root_micros"] = json!(REGISTERED_ROOT_MICROS);
-                world["payload"]["remaining_recovery_dispatches"] =
-                    json!(REGISTERED_RECOVERY_DISPATCHES);
-            }),
-        ),
-    ];
-    for (label, tamper) in cases {
-        let (mut world_edit, mut first_edit, mut second_edit) = (
-            world_record.clone(),
-            first_fact.clone(),
-            second_fact.clone(),
-        );
-        tamper(&mut world_edit, &mut first_edit, &mut second_edit);
-        put_raw_record(&env.store, WORLD_KIND, "world-1", &world_edit).await;
-        put_raw_fact(&env.store, &first_id, &first_edit).await;
-        put_raw_fact(&env.store, &second_id, &second_edit).await;
+    let records = DispatchedRecords {
+        world_id: "world-1".into(),
+        first_id: first_id.clone(),
+        second_id: second_id.clone(),
+        world: world_record.clone(),
+        first: first_fact.clone(),
+        second: second_fact.clone(),
+    };
+    for (label, tamper) in unaccounted_tampers(first_node) {
+        records.put(&env, &records.tampered(&tamper)).await;
         expect_conflict(env.register(&world).await, label);
-        put_raw_record(&env.store, WORLD_KIND, "world-1", &world_record).await;
-        put_raw_fact(&env.store, &first_id, &first_fact).await;
-        put_raw_fact(&env.store, &second_id, &second_fact).await;
+        records.restore(&env).await;
         expect_already_registered(
             env.register(&world).await,
             &format!("after restoring: {label}"),
