@@ -1262,6 +1262,9 @@ impl PersistentCoordinator {
                 .iter()
                 .find(|node| node.node.node_seq == parent)
         });
+        // What a valid node's gain is measured against: the parent's own quality (its
+        // best valid ancestor when the parent is not valid, the baseline for a root).
+        // The replay computes the gain the same way (`node_from_transition`).
         let previous_quality = parent_node
             .and_then(|parent| match parent.node.status {
                 ObservedStatus::Valid { quality_micros } => Some(quality_micros),
@@ -1279,12 +1282,31 @@ impl PersistentCoordinator {
                 gains.remove(0);
             }
         }
-        let best_valid_ancestor_micros = match (&status, previous_quality) {
-            (ObservedStatus::Valid { quality_micros }, Some(parent)) => {
-                Some((*quality_micros).max(parent))
+        // The best valid ancestor is not the gain's reference. `PrefixViewV2::validate`
+        // requires a node's best to be its parent's best (the baseline for a root),
+        // raised to the node's own quality when it is valid. The replay takes the
+        // largest of the parent's quality, the parent's best and the baseline, which
+        // is the same value on any prefix that check accepts. Taking the parent's
+        // *quality* instead leaves a node the check refuses whenever that quality is
+        // below the parent's best (a trusted root under the baseline, or a parent
+        // that regressed), and `decide_next` and `status` then fail for good.
+        let baseline_micros = world.initial_baseline_quality_micros;
+        let inherited_best_micros = parent_node.map_or(baseline_micros, |parent| {
+            let parent_quality = match parent.node.status {
+                ObservedStatus::Valid { quality_micros } => Some(quality_micros),
+                _ => None,
+            };
+            parent_quality
+                .into_iter()
+                .chain(parent.node.best_valid_ancestor_micros)
+                .fold(baseline_micros, u32::max)
+        });
+        let best_valid_ancestor_micros = Some(match &status {
+            ObservedStatus::Valid { quality_micros } => {
+                (*quality_micros).max(inherited_best_micros)
             }
-            (_, parent) => parent,
-        };
+            _ => inherited_best_micros,
+        });
         let repair_failed = matches!(action.kind, ActionKindV1::Recover { .. })
             && !matches!(status, ObservedStatus::Valid { .. });
         if let ActionKindV1::Recover {
@@ -1731,11 +1753,34 @@ fn prefix_projection(
     })
 }
 
+/// The actions a world offers over its stored nodes: the roots whose branch has no
+/// node yet, and the successors of the nodes that can have one.
+///
+/// A Deepen is the successor of a trusted observation (E09: a successor is chosen
+/// only after a real per-node evaluation): its parent is `Valid` and the E03 gate
+/// verified the evidence behind it. A record written before the gate existed, a
+/// fixture and a refused report are none of those, exactly as they are no final
+/// candidate (`final_candidate_request`).
+///
+/// A Deepen is also offered once. Its `action_seq`, and so its dispatch id, is fixed
+/// by the world and the parent, so a second selection would meet the spent dispatch
+/// id and conflict before anything is paid, and the decision being deterministic the
+/// world could neither advance nor stop (§7.1.1). It is spent when a node names its
+/// parent as the search parent, which `run_next` writes in the commit that consumes
+/// the dispatch. It is not spent when the dispatch is merely claimed: a claimed
+/// Deepen has to stay legal so that it resumes (`run_next` looks the selected action
+/// up again, and checks the legal digest the claim recorded once the step is paid).
 fn derive_legal_actions(
     world: &ExplorationWorldV1,
     nodes: &[PersistentSearchNode],
 ) -> Result<LegalActionsV1> {
     let existing_branches: BTreeSet<_> = nodes.iter().map(|node| node.node.branch_seq).collect();
+    // A `Valid` node is only ever the search parent of its Deepen: a Recover starts
+    // from a repairable failure.
+    let expanded_parents: BTreeSet<_> = nodes
+        .iter()
+        .filter_map(|node| node.node.search_parent_seq)
+        .collect();
     let mut actions = Vec::new();
     for root in &world.root_opportunities {
         if !existing_branches.contains(&root.branch_seq) {
@@ -1755,6 +1800,8 @@ fn derive_legal_actions(
     for node in nodes {
         if node.node.depth < world.caps.max_depth
             && matches!(node.node.status, ObservedStatus::Valid { .. })
+            && node.evidence == ExplorationEvidenceV1::Trusted
+            && !expanded_parents.contains(&node.node.node_seq)
         {
             actions.push(LegalActionV1 {
                 action_id: format!("deepen-{}", node.node.node_seq),
