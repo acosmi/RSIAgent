@@ -681,6 +681,7 @@ struct TicketRecord {
 pub struct QueryBook {
     plan_digest: String,
     candidate_digest: String,
+    dataset_epoch: String,
     limit: u32,
     used: u32,
     tickets: BTreeMap<String, TicketRecord>,
@@ -695,13 +696,35 @@ impl QueryBook {
             .candidate_digest
             .clone()
             .ok_or_else(|| Error::Invalid("query book requires a bound candidate".into()))?;
+        plan.validate()?;
         Ok(Self {
             plan_digest: plan.digest()?,
             candidate_digest: candidate,
+            dataset_epoch: plan.dataset_epoch.clone(),
             limit: plan.query_limit,
             used: 0,
             tickets: BTreeMap::new(),
         })
+    }
+
+    pub fn validate_plan_binding(&self, plan: &ExperimentPlan) -> Result<()> {
+        if !plan.frozen {
+            return Err(Error::Invalid("query book requires a frozen plan".into()));
+        }
+        let candidate = plan
+            .candidate_digest
+            .as_deref()
+            .ok_or_else(|| Error::Invalid("query book requires a bound candidate".into()))?;
+        plan.validate()?;
+        if plan.digest()? != self.plan_digest
+            || candidate != self.candidate_digest
+            || plan.dataset_epoch != self.dataset_epoch
+        {
+            return Err(Error::Conflict(
+                "experiment plan does not match query book".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn reserve(&mut self, ticket: QueryTicket) -> Result<()> {
@@ -713,6 +736,11 @@ impl QueryBook {
         {
             return Err(Error::Conflict(
                 "ticket does not match frozen plan/candidate".into(),
+            ));
+        }
+        if ticket.dataset_epoch != self.dataset_epoch {
+            return Err(Error::Conflict(
+                "ticket does not match frozen dataset epoch".into(),
             ));
         }
         if let Some(existing) = self.tickets.get(&ticket.id) {
