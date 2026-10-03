@@ -1431,13 +1431,45 @@ async fn assert_blocked(chain: &Chain, expected_error: &str) {
         Some(expected_error),
         "{status:?}"
     );
-    // The job does not claim completion on a further step either.
-    let again =
-        LifecycleStore::cleanup_step(&fixture.admin, &fixture.store, &status.job_id, 8, 2_000)
+    // Worker does not initiate recovery. An explicit Admin retry must finish
+    // its bounded verification round and still reject this unknown record.
+    let worker = evo_core::Context::new(
+        fixture.admin.namespace(),
+        "cleanup-worker",
+        evo_core::Role::Worker,
+    )
+    .unwrap();
+    let worker_status =
+        LifecycleStore::cleanup_step(&worker, &fixture.store, &status.job_id, 8, 2_000)
             .await
             .unwrap();
-    assert_eq!(again.state, CleanupState::Failed);
+    assert_eq!(
+        worker_status.state,
+        CleanupState::Failed,
+        "{worker_status:?}"
+    );
+    assert_eq!(worker_status.last_error, status.last_error);
+    let mut again =
+        LifecycleStore::cleanup_step(&fixture.admin, &fixture.store, &status.job_id, 8, 2_001)
+            .await
+            .unwrap();
+    assert_ne!(again.state, CleanupState::Complete, "{again:?}");
+    for now in 2_002..4_000 {
+        if !matches!(again.state, CleanupState::Running | CleanupState::Pending) {
+            break;
+        }
+        again =
+            LifecycleStore::cleanup_step(&fixture.admin, &fixture.store, &status.job_id, 8, now)
+                .await
+                .unwrap();
+        assert_ne!(again.state, CleanupState::Complete, "{again:?}");
+    }
+    assert_eq!(again.state, CleanupState::Failed, "{again:?}");
     assert_eq!(again.last_error.as_deref(), Some(expected_error));
+    assert_eq!(again.job_id, status.job_id);
+    assert_eq!(again.source, status.source);
+    assert_eq!(again.watermark_seq, status.watermark_seq);
+    assert_eq!(again.watermark_digest, status.watermark_digest);
 }
 
 #[tokio::test]
