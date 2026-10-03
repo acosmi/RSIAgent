@@ -615,20 +615,18 @@ impl PartitionRegistry {
     pub fn admit(&mut self, task: &TaskIdentity) -> Result<()> {
         identifier(&task.task_id)?;
         identifier(&task.family_id)?;
-        if !self.raw.insert(task.raw_hash.clone()) {
+        if self.raw.contains(&task.raw_hash) {
             return Err(Error::Conflict("duplicate_raw_hash".into()));
         }
-        if !self.normalized.insert(task.normalized_digest.clone()) {
+        if self.normalized.contains(&task.normalized_digest) {
             return Err(Error::Conflict("near_duplicate_normalized_digest".into()));
         }
-        if let Some(existing) = self.families.get(&task.family_id) {
-            if *existing != task.data_use {
-                return Err(Error::Conflict(
-                    "family_crosses_train_test_or_data_use".into(),
-                ));
-            }
-        } else {
-            self.families.insert(task.family_id.clone(), task.data_use);
+        if let Some(existing) = self.families.get(&task.family_id)
+            && *existing != task.data_use
+        {
+            return Err(Error::Conflict(
+                "family_crosses_train_test_or_data_use".into(),
+            ));
         }
         if let Some(parent) = &task.parent_id {
             identifier(parent)?;
@@ -641,6 +639,11 @@ impl PartitionRegistry {
         if task.data_use.is_protected_holdout() && self.exposed.contains(&task.raw_hash) {
             return Err(Error::Conflict("holdout_previously_exposed".into()));
         }
+        self.raw.insert(task.raw_hash.clone());
+        self.normalized.insert(task.normalized_digest.clone());
+        self.families
+            .entry(task.family_id.clone())
+            .or_insert(task.data_use);
         Ok(())
     }
 
