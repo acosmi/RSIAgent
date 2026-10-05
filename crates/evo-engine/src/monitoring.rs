@@ -794,10 +794,7 @@ impl MonitoringCoordinator {
             .map_err(|_| Error::Invalid("cycle ordinal overflow".into()))?
             .checked_add(1)
             .ok_or_else(|| Error::Invalid("cycle ordinal overflow".into()))?;
-        let cycle_id = format!(
-            "development-cycle-{}",
-            &fingerprint(&(&scope_id, &request.report_fact_id))?[..32]
-        );
+        let cycle_id = development_cycle_id(&scope_id, &request.report_fact_id)?;
         let (pairs, has_contrast) = pair_tasks(&report)?;
         let cycle = DevelopmentCycleRecord {
             id: cycle_id.clone(),
@@ -2094,7 +2091,65 @@ async fn load_cycle(
     let cycle: DevelopmentCycleRecord =
         serde_json::from_value(value).map_err(|_| Error::Internal)?;
     validate_cycle_record(&cycle)?;
+    validate_cycle_report_binding(session, ctx, cycle_id, &cycle).await?;
     Ok(cycle)
+}
+
+fn development_cycle_id(scope_id: &str, report_fact_id: &str) -> Result<String> {
+    Ok(format!(
+        "development-cycle-{}",
+        &fingerprint(&(scope_id, report_fact_id))?[..32]
+    ))
+}
+
+/// A cycle is a projection of its original E03 report, not independent evidence.
+/// Existing schema/redaction/self-consistency errors are checked before this gate.
+/// This does not repeat the receipt/fee proof from close or alter historical reads.
+async fn validate_cycle_report_binding(
+    session: &mut Session,
+    ctx: &Context,
+    requested_cycle_id: &str,
+    cycle: &DevelopmentCycleRecord,
+) -> Result<()> {
+    if cycle.id != requested_cycle_id
+        || cycle.id != development_cycle_id(&cycle.scope_id, &cycle.report_fact_id)?
+    {
+        return Err(Error::Conflict(
+            "development cycle identity differs from its binding".into(),
+        ));
+    }
+    let fact: StageFact = session
+        .need(ctx, ARTIFACT_KIND, &cycle.report_fact_id)
+        .await?;
+    fact.validate()?;
+    require_development_observed(ctx, &fact)?;
+    if fact.artifact_id != cycle.report_fact_id {
+        return Err(Error::Conflict(
+            "development report fact differs from its stored key".into(),
+        ));
+    }
+    let report: DevelopmentRunReport = serde_json::from_value(fact.payload)
+        .map_err(|_| Error::Invalid("development fact is not a strict report".into()))?;
+    if fingerprint(&report)? != cycle.report_digest {
+        return Err(Error::Conflict(
+            "development cycle report digest changed".into(),
+        ));
+    }
+    let (pairs, has_contrast) = pair_tasks(&report)?;
+    if pairs != cycle.pairs
+        || has_contrast != cycle.has_contrast
+        || report.request_id != cycle.request_id
+        || report.candidate_bundle_digest != cycle.candidate_bundle_digest
+        || report.execution_receipt_id != cycle.execution_receipt_id
+        || canonical_strings(report.usage_record_ids.clone(), "usage record")?
+            != cycle.usage_record_ids
+        || CycleEvidence::declared_by(&report).label(report.provenance) != cycle.provenance
+    {
+        return Err(Error::Conflict(
+            "development cycle differs from its original report".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_cycle_record(cycle: &DevelopmentCycleRecord) -> Result<()> {
@@ -2305,6 +2360,12 @@ fn validate_execution_binding(
             "optimization request differs from persisted claim".into(),
         ));
     }
+    if skill_snapshot_digest(request.parent_skill)? != scope.parent_skill_digest {
+        return Err(Error::Conflict(
+            "actual parent skill differs from persisted claim".into(),
+        ));
+    }
+    request.development_request.manifest.validate()?;
     Ok(())
 }
 
