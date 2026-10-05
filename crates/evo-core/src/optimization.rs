@@ -173,6 +173,9 @@ fn diagnosis(
     kind: SkillFailureKind,
     reason: &str,
 ) -> Result<SkillFailureDiagnosis> {
+    if let Some(hypothesis) = observation.hypothesis {
+        validate_hypothesis(hypothesis)?;
+    }
     let (rule_id, support, counterexamples) = observation
         .hypothesis
         .map(|hypothesis| {
