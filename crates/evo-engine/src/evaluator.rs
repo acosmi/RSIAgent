@@ -70,11 +70,20 @@ impl Evaluator {
                 "plan must be frozen before evaluation".into(),
             ));
         }
-        if plan.candidate_digest.is_none() {
-            plan.bind_candidate(candidate)?;
+        let mut bound_plan = plan.clone();
+        if bound_plan.candidate_digest.is_none() {
+            bound_plan.bind_candidate(candidate)?;
         }
         identifier(&ticket.id)?;
-        book.reserve(ticket)
+        if bound_plan.candidate_digest.as_deref() != Some(candidate) {
+            return Err(Error::Conflict(
+                "candidate does not match frozen plan".into(),
+            ));
+        }
+        book.validate_plan_binding(&bound_plan)?;
+        book.reserve(ticket)?;
+        *plan = bound_plan;
+        Ok(())
     }
 
     pub fn grade(ctx: &Context, req: GradeRequest<'_>) -> Result<FormalEvaluation> {
@@ -90,6 +99,7 @@ impl Evaluator {
             return Err(Error::Invalid("incomplete execution is invalid".into()));
         }
         let evaluated = (|| {
+            req.book.validate_plan_binding(req.plan)?;
             let raw = empirical_bernstein(req.rows, req.alpha_i)?;
             let report = decide(req.plan, raw, req.cost_ratio, req.p95_ratio, req.safety_ok)?;
             let candidate = req
