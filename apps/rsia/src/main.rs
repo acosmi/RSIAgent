@@ -237,6 +237,20 @@ async fn main() -> Result<()> {
                 auth.management_contexts()?,
             )?;
             management.recover_pending().await?;
+            // Settled model calls whose execution close a crash lost: closed when they
+            // carry their persisted response, counted and left open when they do not.
+            let budget = service
+                .store()
+                .recover_settled_open_executions(
+                    &Context::new(&namespace, "service-admin", Role::Admin)?,
+                    evo_core::now(),
+                )
+                .await?;
+            eprintln!(
+                "rsia startup budget recovery: closed={} open_without_artifact={}",
+                budget.closed.len(),
+                budget.open_without_artifact.len()
+            );
             if !auth.is_configured() {
                 eprintln!("authentication is not configured; sensitive routes will return 503");
             }
