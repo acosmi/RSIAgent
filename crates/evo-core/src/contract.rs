@@ -342,6 +342,12 @@ pub fn compile_skill(
             "parent and baseline digests are required".into(),
         ));
     }
+    // Check both supplied inputs before any leaf can replace or discard their references.
+    for dep in parent.dependencies.iter().chain(&baseline.dependencies) {
+        if revoked.contains(dep) {
+            return Err(Error::Conflict("dependency_revoked".into()));
+        }
+    }
     let mut origins = Vec::new();
     let mut out = SkillSnapshot::empty();
     out.content = apply_leaf(
