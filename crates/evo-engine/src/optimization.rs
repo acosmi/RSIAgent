@@ -1,10 +1,7 @@
 //! Development-only optimizer orchestration ports and deterministic selection.
 
 use async_trait::async_trait;
-use evo_core::contract::{
-    CompileParts, HostCapabilities, ImproverPatch, Profile, ResolvedBundle, SkillSnapshot,
-    compile_bundle,
-};
+use evo_core::contract::{HostCapabilities, ImproverPatch, Profile, ResolvedBundle, SkillSnapshot};
 use evo_core::evidence::Purpose;
 use evo_core::optimization::{
     EditSuggestion, MAX_FINAL_EDITS, MAX_SUGGESTIONS, ModelInputPart, ModelInputRole, ModelRequest,
@@ -662,11 +659,38 @@ pub(crate) fn development_stage_fact_ids(
 
 #[async_trait]
 pub trait OptimizationJournal: Send + Sync {
+    /// Required capability: every implementation resolves actual immutable
+    /// inputs. Wrappers must forward; there is no default successful answer.
+    async fn compiler_inputs(
+        &self,
+        request: &crate::formal_authority::CompilerInputRequest,
+    ) -> Result<crate::formal_authority::VerifiedCompilerInputs>;
     /// Must commit one typed artifact and all dependency edges atomically.
     /// The implementation must return only after the transaction commits.
     async fn commit(&self, fact: StageFact) -> Result<()>;
     async fn lookup(&self, artifact_id: &str) -> Result<Option<StageFact>>;
     async fn claim(&self, fact: StageFact) -> Result<bool>;
+    async fn claim_bound(
+        &self,
+        _fact: StageFact,
+        _inputs: &crate::model::CompilerInputUse,
+    ) -> Result<bool> {
+        Err(Error::Forbidden)
+    }
+    async fn lookup_bound(
+        &self,
+        _id: &str,
+        _inputs: &crate::model::CompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        Err(Error::Forbidden)
+    }
+    async fn commit_bound(
+        &self,
+        _fact: StageFact,
+        _inputs: &crate::model::CompilerInputUse,
+    ) -> Result<()> {
+        Err(Error::Forbidden)
+    }
     async fn verify_sources(
         &self,
         selection: &evo_core::evidence::SourceSelection,
@@ -1087,15 +1111,111 @@ impl StoreOptimizationJournal {
     }
 }
 
-#[async_trait]
-impl OptimizationJournal for StoreOptimizationJournal {
-    async fn claim(&self, fact: StageFact) -> Result<bool> {
+async fn attach_fact_compiler_use(
+    s: &mut Session,
+    ctx: &Context,
+    fact: &mut StageFact,
+    inputs: &crate::model::CompilerInputUse,
+) -> Result<()> {
+    let id = inputs.artifact_id()?;
+    if let Some(old) = s.get::<serde_json::Value>(ctx, "artifact", &id).await? {
+        if crate::formal_authority::content_digest(&old)?
+            != crate::formal_authority::content_digest(inputs)?
+        {
+            return Err(Error::Conflict("compiler use was changed".into()));
+        }
+    } else {
+        s.put(ctx, "artifact", &id, ctx.actor(), inputs).await?;
+        for node in &inputs.binding.closure.nodes {
+            s.put_edge(ctx, "artifact", &id, &node.kind, &node.id)
+                .await?;
+        }
+    }
+    fact.dependencies.push(dependency("artifact", id));
+    fact.dependencies
+        .sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+    fact.dependencies
+        .dedup_by(|a, b| a.kind == b.kind && a.id == b.id);
+    Ok(())
+}
+async fn verify_fact_compiler_use(
+    s: &mut Session,
+    ctx: &Context,
+    fact: &StageFact,
+    inputs: &crate::model::CompilerInputUse,
+) -> Result<()> {
+    let id = inputs.artifact_id()?;
+    if !fact
+        .dependencies
+        .iter()
+        .any(|d| d.kind == "artifact" && d.id == id)
+    {
+        return Err(Error::Conflict(
+            "legacy unbound continuation; quarantine".into(),
+        ));
+    }
+    let old: crate::model::CompilerInputUse = s.need(ctx, "artifact", &id).await?;
+    if fingerprint(&old)? != fingerprint(inputs)? {
+        return Err(Error::Conflict(
+            "continuation compiler input mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+/// Read a persisted bound fact inside the consumer's existing transaction.
+/// The caller owns commit and may atomically create a proposal from this value.
+pub(crate) async fn read_bound_stage_fact_in_session(
+    s: &mut Session,
+    ctx: &Context,
+    id: &str,
+    inputs: &crate::model::CompilerInputUse,
+) -> Result<Option<StageFact>> {
+    inputs.verify_current(s, ctx).await?;
+    let fact = read_stage_fact(s, ctx, id).await?;
+    if let Some(fact) = &fact {
+        fact.validate()?;
+        if fact.namespace != ctx.namespace() || fact.artifact_id != id {
+            return Err(Error::Forbidden);
+        }
+        verify_fact_compiler_use(s, ctx, fact, inputs).await?;
+        if let Some(w) = fact
+            .dependencies
+            .iter()
+            .find(|d| d.kind == "revoke_watermark")
+        {
+            let sources = fact
+                .dependencies
+                .iter()
+                .filter(|d| d.kind == "run")
+                .map(|d| d.id.clone())
+                .collect::<Vec<_>>();
+            crate::evidence::validate_stored_sources(
+                s,
+                ctx,
+                &sources,
+                w.id.parse().map_err(|_| Error::Internal)?,
+            )
+            .await?;
+        }
+    }
+    Ok(fact)
+}
+impl StoreOptimizationJournal {
+    async fn claim_current(
+        &self,
+        mut fact: StageFact,
+        inputs: Option<&crate::model::CompilerInputUse>,
+    ) -> Result<bool> {
         fact.validate()?;
         if fact.namespace != self.context.namespace() {
             return Err(Error::Forbidden);
         }
         let mut session = self.store.session().await?;
-        validate_live_fact(&mut session, &self.context, &fact).await?;
+        if let Some(inputs) = inputs {
+            attach_fact_compiler_use(&mut session, &self.context, &mut fact, inputs).await?;
+            inputs.verify_current(&mut session, &self.context).await?;
+        }
+        validate_live_fact(&mut session, &self.context, &fact, inputs).await?;
         if let Some(old) = session
             .get::<StageFact>(&self.context, "artifact", &fact.artifact_id)
             .await?
@@ -1129,11 +1249,7 @@ impl OptimizationJournal for StoreOptimizationJournal {
                 &fact,
             )
             .await?;
-        for d in &fact.dependencies {
-            session
-                .put_edge(&self.context, "artifact", &fact.artifact_id, &d.kind, &d.id)
-                .await?;
-        }
+        put_stage_content_edges(&mut session, &self.context, &fact).await?;
         session
             .cache(
                 &self.context,
@@ -1150,10 +1266,20 @@ impl OptimizationJournal for StoreOptimizationJournal {
         session.commit().await?;
         Ok(true)
     }
-    async fn lookup(&self, artifact_id: &str) -> Result<Option<StageFact>> {
+    async fn lookup_current(
+        &self,
+        artifact_id: &str,
+        inputs: Option<&crate::model::CompilerInputUse>,
+    ) -> Result<Option<StageFact>> {
         let mut session = self.store.session().await?;
+        if let Some(inputs) = inputs {
+            let fact =
+                read_bound_stage_fact_in_session(&mut session, &self.context, artifact_id, inputs)
+                    .await?;
+            session.commit().await?;
+            return Ok(fact);
+        }
         let fact = read_stage_fact(&mut session, &self.context, artifact_id).await?;
-        session.commit().await?;
         if let Some(fact) = &fact {
             fact.validate()?;
             if fact.namespace != self.context.namespace() {
@@ -1170,11 +1296,166 @@ impl OptimizationJournal for StoreOptimizationJournal {
                 .iter()
                 .find(|d| d.kind == "revoke_watermark")
             {
-                self.check_live(&sources, w.id.parse().map_err(|_| Error::Internal)?)
-                    .await?;
+                crate::evidence::validate_stored_sources(
+                    &mut session,
+                    &self.context,
+                    &sources,
+                    w.id.parse().map_err(|_| Error::Internal)?,
+                )
+                .await?;
             }
         }
+        session.commit().await?;
         Ok(fact)
+    }
+    async fn commit_current(
+        &self,
+        mut fact: StageFact,
+        inputs: Option<&crate::model::CompilerInputUse>,
+    ) -> Result<()> {
+        fact.validate()?;
+        self.context.require(&[Role::Worker, Role::Admin])?;
+        if fact.namespace != self.context.namespace() {
+            return Err(Error::Forbidden);
+        }
+        let key = fact.artifact_id.clone();
+        let mut session = self.store.session().await?;
+        if let Some(inputs) = inputs {
+            attach_fact_compiler_use(&mut session, &self.context, &mut fact, inputs).await?;
+            if let Err(error) = inputs.verify_current(&mut session, &self.context).await {
+                if holds_model_output(&fact)
+                    && (run_dependency_revoked(&mut session, &self.context, &fact).await?
+                        || compiler_source_revoked(&mut session, &self.context, inputs).await?)
+                {
+                    return self.commit_redacted(session, &fact).await;
+                }
+                // A settled dispatch observation preserves accounting truth.
+                // Authority or watermark drift alone is not source deletion;
+                // consumers still require the original full current use.
+                if fact.kind != StageFactKind::DispatchObserved {
+                    return Err(Error::Conflict(
+                        "compiler authority changed before fact commit".into(),
+                    ));
+                }
+                if !matches!(
+                    error,
+                    Error::Conflict(_) | Error::Forbidden | Error::NotFound
+                ) {
+                    return Err(error);
+                }
+            }
+        }
+        validate_live_fact(&mut session, &self.context, &fact, inputs).await?;
+        if session
+            .cached::<StageFact, _>(&self.context, "optimization.stage", &key, &fact)
+            .await?
+            .is_some()
+        {
+            let old: StageFact = session
+                .get(&self.context, "artifact", &fact.artifact_id)
+                .await?
+                .ok_or_else(|| Error::Conflict("cached stage subject was deleted".into()))?;
+            old.validate()?;
+            if fingerprint(&old)? != fingerprint(&fact)? {
+                return Err(Error::Conflict("cached stage payload differs".into()));
+            }
+            session.commit().await?;
+            return Ok(());
+        }
+        if let Some(old) = session
+            .get::<StageFact>(&self.context, "artifact", &fact.artifact_id)
+            .await?
+        {
+            old.validate()?;
+            if fingerprint(&old)? != fingerprint(&fact)? {
+                return Err(Error::Conflict("immutable stage differs".into()));
+            }
+            session.commit().await?;
+            return Ok(());
+        }
+        // A fact that holds a model's answer and lands after a run it depends on was
+        // revoked is accepted, because the receipt it carries is accounting truth,
+        // but its content is not kept: the revocation cleanup only reaches what
+        // exists when it looks, so an answer stored in plaintext now could stay in
+        // the database for good. The decision is taken here, in the transaction that
+        // would write the fact, so that no revocation can fall between the check and
+        // the write.
+        if holds_model_output(&fact)
+            && run_dependency_revoked(&mut session, &self.context, &fact).await?
+        {
+            return self.commit_redacted(session, &fact).await;
+        }
+        session
+            .put(
+                &self.context,
+                "artifact",
+                &fact.artifact_id,
+                &self.owner,
+                &fact,
+            )
+            .await?;
+        put_stage_content_edges(&mut session, &self.context, &fact).await?;
+        session
+            .cache(
+                &self.context,
+                "optimization.stage",
+                &key,
+                &fact,
+                &fact.artifact_id,
+                &fact,
+            )
+            .await?;
+        session
+            .audit(
+                &self.context,
+                "optimization.stage.commit",
+                &fact.artifact_id,
+            )
+            .await?;
+        session.commit().await
+    }
+}
+
+#[async_trait]
+impl OptimizationJournal for StoreOptimizationJournal {
+    async fn claim_bound(
+        &self,
+        fact: StageFact,
+        inputs: &crate::model::CompilerInputUse,
+    ) -> Result<bool> {
+        self.claim_current(fact, Some(inputs)).await
+    }
+    async fn lookup_bound(
+        &self,
+        id: &str,
+        inputs: &crate::model::CompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        self.lookup_current(id, Some(inputs)).await
+    }
+    async fn commit_bound(
+        &self,
+        fact: StageFact,
+        inputs: &crate::model::CompilerInputUse,
+    ) -> Result<()> {
+        self.commit_current(fact, Some(inputs)).await
+    }
+
+    async fn compiler_inputs(
+        &self,
+        request: &crate::formal_authority::CompilerInputRequest,
+    ) -> Result<crate::formal_authority::VerifiedCompilerInputs> {
+        let mut session = self.store.session().await?;
+        let inputs =
+            crate::formal_authority::resolve_compiler_inputs(&mut session, &self.context, request)
+                .await?;
+        session.commit().await?;
+        Ok(inputs)
+    }
+    async fn claim(&self, fact: StageFact) -> Result<bool> {
+        self.claim_current(fact, None).await
+    }
+    async fn lookup(&self, artifact_id: &str) -> Result<Option<StageFact>> {
+        self.lookup_current(artifact_id, None).await
     }
     async fn check_live(&self, source_ids: &[String], watermark: u64) -> Result<()> {
         let mut session = self.store.session().await?;
@@ -1244,91 +1525,7 @@ impl OptimizationJournal for StoreOptimizationJournal {
         session.commit().await
     }
     async fn commit(&self, fact: StageFact) -> Result<()> {
-        fact.validate()?;
-        self.context.require(&[Role::Worker, Role::Admin])?;
-        if fact.namespace != self.context.namespace() {
-            return Err(Error::Forbidden);
-        }
-        let key = fact.artifact_id.clone();
-        let mut session = self.store.session().await?;
-        validate_live_fact(&mut session, &self.context, &fact).await?;
-        if session
-            .cached::<StageFact, _>(&self.context, "optimization.stage", &key, &fact)
-            .await?
-            .is_some()
-        {
-            let old: StageFact = session
-                .get(&self.context, "artifact", &fact.artifact_id)
-                .await?
-                .ok_or_else(|| Error::Conflict("cached stage subject was deleted".into()))?;
-            old.validate()?;
-            if fingerprint(&old)? != fingerprint(&fact)? {
-                return Err(Error::Conflict("cached stage payload differs".into()));
-            }
-            session.commit().await?;
-            return Ok(());
-        }
-        if let Some(old) = session
-            .get::<StageFact>(&self.context, "artifact", &fact.artifact_id)
-            .await?
-        {
-            old.validate()?;
-            if fingerprint(&old)? != fingerprint(&fact)? {
-                return Err(Error::Conflict("immutable stage differs".into()));
-            }
-            session.commit().await?;
-            return Ok(());
-        }
-        // A fact that holds a model's answer and lands after a run it depends on was
-        // revoked is accepted, because the receipt it carries is accounting truth,
-        // but its content is not kept: the revocation cleanup only reaches what
-        // exists when it looks, so an answer stored in plaintext now could stay in
-        // the database for good. The decision is taken here, in the transaction that
-        // would write the fact, so that no revocation can fall between the check and
-        // the write.
-        if holds_model_output(&fact)
-            && run_dependency_revoked(&mut session, &self.context, &fact).await?
-        {
-            return self.commit_redacted(session, &fact).await;
-        }
-        session
-            .put(
-                &self.context,
-                "artifact",
-                &fact.artifact_id,
-                &self.owner,
-                &fact,
-            )
-            .await?;
-        for dependency in &fact.dependencies {
-            session
-                .put_edge(
-                    &self.context,
-                    "artifact",
-                    &fact.artifact_id,
-                    &dependency.kind,
-                    &dependency.id,
-                )
-                .await?;
-        }
-        session
-            .cache(
-                &self.context,
-                "optimization.stage",
-                &key,
-                &fact,
-                &fact.artifact_id,
-                &fact,
-            )
-            .await?;
-        session
-            .audit(
-                &self.context,
-                "optimization.stage.commit",
-                &fact.artifact_id,
-            )
-            .await?;
-        session.commit().await
+        self.commit_current(fact, None).await
     }
 }
 
@@ -1355,6 +1552,23 @@ pub struct OptimizationStepRequest<'a> {
     pub bundle_context: BundleCompileContext<'a>,
     pub development_request: DevelopmentRunRequest,
     pub allow_rank_call: bool,
+}
+
+impl OptimizationStepRequest<'_> {
+    pub fn compiler_input_request(&self) -> crate::formal_authority::CompilerInputRequest {
+        crate::formal_authority::CompilerInputRequest {
+            profile: self.bundle_context.profile.clone(),
+            search_parent: self.parent_skill.clone(),
+            baseline: self.bundle_context.baseline.clone(),
+            search_parent_strategy: self.bundle_context.parent_strategy.clone(),
+            expected_parent_strategy_digest: None,
+            baseline_strategy: self.bundle_context.baseline_strategy.clone(),
+            capabilities: self.bundle_context.caps.clone(),
+            environment_digest: self.development_request.environment_digest.clone(),
+            purpose: self.model_context.purpose,
+            revoke_watermark: self.model_context.revoke_watermark,
+        }
+    }
 }
 
 /// The kind of the error that ended a step for a reason no named [`StepTerminalClass`]
@@ -1624,6 +1838,8 @@ async fn run_optimization_step_inner(
     let model = model.ok_or(Error::NotFound)?;
     let runner = runner.ok_or(Error::NotFound)?;
     let journal = journal.ok_or(Error::NotFound)?;
+    let compiler_request = request.compiler_input_request();
+    let compiler_inputs = journal.compiler_inputs(&compiler_request).await?;
     if validate_outbound_grant(request.source_selection).is_err() {
         let class = StepTerminalClass::GrantUnavailable;
         commit_terminal(
@@ -1851,7 +2067,7 @@ async fn run_optimization_step_inner(
         OptimizationJournalStage::EditCompile,
         StageFactKind::EditCompiled,
         request.model_context.request_id.clone(),
-        fingerprint(&edit_batch)?,
+        fingerprint(&(&edit_batch, compiler_inputs.binding()))?,
         serde_json::json!({}),
     )?;
     let saved_compile = journal.lookup(&compile_key.artifact_id).await?;
@@ -1904,19 +2120,14 @@ async fn run_optimization_step_inner(
         return Ok(OptimizationStepOutcome::NoChange { class });
     }
     let bundle = if let Some(saved) = &saved_compile {
-        serde_json::from_value(saved.payload["bundle"].clone()).map_err(|_| Error::Internal)?
+        let bundle =
+            serde_json::from_value(saved.payload["bundle"].clone()).map_err(|_| Error::Internal)?;
+        compiler_inputs.replay(&bundle)?;
+        bundle
     } else {
-        match compile_bundle(CompileParts {
-            profile: request.bundle_context.profile,
-            parent: request.parent_skill,
-            baseline: request.bundle_context.baseline,
-            parent_strategy: request.bundle_context.parent_strategy,
-            baseline_strategy: request.bundle_context.baseline_strategy,
-            skill_patch: &compiled.patch,
-            improver_patch: request.bundle_context.improver_patch,
-            caps: request.bundle_context.caps,
-            revoked: request.bundle_context.revoked,
-        }) {
+        match compiler_inputs
+            .compile_search_edit(&compiled.output, request.bundle_context.improver_patch)
+        {
             Ok(bundle) => bundle,
             Err(_) => {
                 let class = StepTerminalClass::BundleCompileFailed;
@@ -1932,6 +2143,12 @@ async fn run_optimization_step_inner(
             }
         }
     };
+    let mut output_request = compiler_request.clone();
+    output_request.search_parent = bundle.skill.clone();
+    journal
+        .compiler_inputs(&output_request)
+        .await?
+        .replay(&bundle)?;
     let compile_fact = StageFact {
         schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
         artifact_id: format!(
@@ -1954,7 +2171,8 @@ async fn run_optimization_step_inner(
             .iter()
             .map(|reference| dependency("run", reference.id.clone()))
             .collect(),
-        payload: serde_json::json!({"output":compiled.output,"patch":compiled.patch,"report":compiled.report,"bundle":bundle,"merge":merge_record}),
+        payload: serde_json::json!({"output":compiled.output,"patch":compiled.patch,"report":compiled.report,"bundle":bundle,
+            "merge":merge_record,"compiler_request":compiler_request,"compiler_binding":compiler_inputs.binding()}),
     };
     commit_stage(journal, compile_fact).await?;
 
@@ -2451,6 +2669,40 @@ fn recovery_fact(
     .seal()
 }
 
+/// The immutable claim input remains the authority for the whole child run.
+/// Resolving a derived search skill never selects a new profile/P/B snapshot.
+#[derive(Clone, Copy)]
+struct FixedConsolidationInputs<'a> {
+    store: &'a Store,
+    context: &'a Context,
+    original: &'a crate::model::CompilerInputUse,
+}
+impl FixedConsolidationInputs<'_> {
+    async fn resolve_current(
+        &self,
+        request: &crate::formal_authority::CompilerInputRequest,
+    ) -> Result<crate::formal_authority::VerifiedCompilerInputs> {
+        let mut expected = self.original.request.clone();
+        // The existing output replay changes only the search Skill. Every
+        // authority field and the search Strategy must still be the original A.
+        expected.search_parent = request.search_parent.clone();
+        if fingerprint(&expected)? != fingerprint(request)? {
+            return Err(Error::Conflict(
+                "consolidation compiler request differs from fixed claim".into(),
+            ));
+        }
+        let mut session = self.store.session().await?;
+        self.original
+            .verify_current(&mut session, self.context)
+            .await?;
+        let verified =
+            crate::formal_authority::resolve_compiler_inputs(&mut session, self.context, request)
+                .await?;
+        session.commit().await?;
+        Ok(verified)
+    }
+}
+
 struct RecoveryJournal<'a> {
     inner: &'a dyn OptimizationJournal,
     sources: Vec<String>,
@@ -2458,9 +2710,20 @@ struct RecoveryJournal<'a> {
     step_id: String,
     grant_id: String,
     stage_ids: std::sync::Mutex<BTreeSet<String>>,
+    compiler_use: crate::model::CompilerInputUse,
+    fixed_consolidation_inputs: Option<FixedConsolidationInputs<'a>>,
 }
 #[async_trait]
 impl OptimizationJournal for RecoveryJournal<'_> {
+    async fn compiler_inputs(
+        &self,
+        request: &crate::formal_authority::CompilerInputRequest,
+    ) -> Result<crate::formal_authority::VerifiedCompilerInputs> {
+        match self.fixed_consolidation_inputs {
+            Some(fixed) => fixed.resolve_current(request).await,
+            None => self.inner.compiler_inputs(request).await,
+        }
+    }
     async fn claim(&self, mut fact: StageFact) -> Result<bool> {
         self.check_live(&self.sources, self.watermark).await?;
         fact.dependencies
@@ -2476,7 +2739,7 @@ impl OptimizationJournal for RecoveryJournal<'_> {
         fact.dependencies
             .dedup_by(|a, b| a.kind == b.kind && a.id == b.id);
         let id = fact.artifact_id.clone();
-        let claimed = self.inner.claim(fact).await?;
+        let claimed = self.inner.claim_bound(fact, &self.compiler_use).await?;
         self.stage_ids
             .lock()
             .map_err(|_| Error::Internal)?
@@ -2485,7 +2748,7 @@ impl OptimizationJournal for RecoveryJournal<'_> {
     }
     async fn lookup(&self, id: &str) -> Result<Option<StageFact>> {
         self.check_live(&self.sources, self.watermark).await?;
-        let found = self.inner.lookup(id).await?;
+        let found = self.inner.lookup_bound(id, &self.compiler_use).await?;
         if found.is_some() {
             self.stage_ids
                 .lock()
@@ -2523,7 +2786,9 @@ impl OptimizationJournal for RecoveryJournal<'_> {
             .sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
         fact.dependencies
             .dedup_by(|a, b| a.kind == b.kind && a.id == b.id);
-        self.inner.commit(fact.clone()).await?;
+        self.inner
+            .commit_bound(fact.clone(), &self.compiler_use)
+            .await?;
         self.stage_ids
             .lock()
             .map_err(|_| Error::Internal)?
@@ -2564,13 +2829,17 @@ fn journaled_response(response: &ModelResponse) -> Result<serde_json::Value> {
 #[async_trait]
 impl ModelPort for RecoveryModel<'_> {
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
+        let bound = crate::model::BoundModelRequest::new(
+            request.clone(),
+            self.journal.compiler_use.clone(),
+        )?;
         let mut prepared = recovery_fact(
             self.context,
             journal_stage(request.stage),
             StageFactKind::DispatchPrepared,
             request.request_id.clone(),
-            fingerprint(&request)?,
-            serde_json::to_value(&request).map_err(|_| Error::Internal)?,
+            fingerprint(&bound)?,
+            serde_json::to_value(&bound).map_err(|_| Error::Internal)?,
         )?;
         let observed = recovery_fact(
             self.context,
@@ -2608,7 +2877,7 @@ impl ModelPort for RecoveryModel<'_> {
                 Some(StepTerminalClass::ModelDispatchConcurrent);
             return Err(Error::Conflict("model dispatch already claimed".into()));
         }
-        let response = match self.port.dispatch(request.clone()).await {
+        let response = match self.port.dispatch_bound(bound).await {
             Ok(r) => r,
             Err(e) => {
                 // The error is the port's own and is not kept: the outcome is unknown.
@@ -2634,7 +2903,14 @@ impl ModelPort for RecoveryModel<'_> {
             .dependencies
             .push(dependency("artifact", self.journal.step_id.clone()));
         let prepared = prepared.seal()?;
-        self.journal.inner.commit(prepared.clone()).await?;
+        self.journal
+            .inner
+            .commit_bound(prepared.clone(), &self.journal.compiler_use)
+            .await?;
+        self.journal
+            .inner
+            .lookup_bound(&prepared.artifact_id, &self.journal.compiler_use)
+            .await?;
         self.journal
             .stage_ids
             .lock()
@@ -2726,7 +3002,14 @@ impl DevRunner for RecoveryRunner<'_> {
             .dependencies
             .push(dependency("artifact", self.journal.step_id.clone()));
         let observed = observed.seal()?;
-        self.journal.inner.commit(observed.clone()).await?;
+        self.journal
+            .inner
+            .commit_bound(observed.clone(), &self.journal.compiler_use)
+            .await?;
+        self.journal
+            .inner
+            .lookup_bound(&observed.artifact_id, &self.journal.compiler_use)
+            .await?;
         self.journal
             .stage_ids
             .lock()
@@ -2816,6 +3099,18 @@ pub(crate) fn optimization_request_digest(request: &OptimizationStepRequest<'_>)
     fingerprint(&optimization_request_input(request))
 }
 
+/// Producer and consolidation consumer share the exact complete input identity.
+/// A raw request digest never authenticates its compiler authority on its own.
+pub(crate) fn optimization_bound_request_digest(
+    request: &OptimizationStepRequest<'_>,
+    inputs: &crate::model::CompilerInputUse,
+) -> Result<String> {
+    if fingerprint(&request.compiler_input_request())? != fingerprint(&inputs.request)? {
+        return Err(Error::Conflict("step and compiler request differ".into()));
+    }
+    fingerprint(&(optimization_request_digest(request)?, &inputs.binding))
+}
+
 /// Runs one ordinary optimization step. The `Consolidate` base stage belongs to
 /// the consolidation run alone (`MonitoringCoordinator::run_consolidation`): any
 /// other caller presenting it is refused before anything is journaled or
@@ -2829,23 +3124,51 @@ pub async fn run_optimization_step(
     if request.model_context.stage == ModelStage::Consolidate {
         return Err(Error::Forbidden);
     }
-    run_step(model, runner, journal, request).await
+    run_step(model, runner, journal, request, None).await
 }
 
 /// Entry of `MonitoringCoordinator::run_consolidation`. The step must carry the
 /// `Consolidate` base stage, which meters every model call of the step under the
 /// `Consolidation` budget stage; any other base stage is refused before anything
 /// is journaled or dispatched.
+// The outer Result is child admission: no StepPrepared or outbound work has
+// started. The inner Result preserves the existing paid/uncertain execution path.
 pub(crate) async fn run_consolidation_step(
     model: Option<&dyn ModelPort>,
     runner: Option<&dyn DevRunner>,
     journal: Option<&dyn OptimizationJournal>,
     request: OptimizationStepRequest<'_>,
-) -> Result<OptimizationStepOutcome> {
+    original: &crate::model::CompilerInputUse,
+    store: &Store,
+    context: &Context,
+) -> Result<Result<OptimizationStepOutcome>> {
     if request.model_context.stage != ModelStage::Consolidate {
         return Err(Error::Forbidden);
     }
-    run_step(model, runner, journal, request).await
+    let journal = journal.ok_or(Error::NotFound)?;
+    let compiler_request = request.compiler_input_request();
+    if fingerprint(&compiler_request)? != fingerprint(&original.request)? {
+        return Err(Error::Conflict(
+            "consolidation child request differs from captured claim".into(),
+        ));
+    }
+    // Retain legitimate fixture/API setup, then authenticate the original A in
+    // the actual reader Session. A fresh answer B cannot replace the claim input.
+    let fresh = journal.compiler_inputs(&compiler_request).await?;
+    let fixed = FixedConsolidationInputs {
+        store,
+        context,
+        original,
+    };
+    let verified = fixed.resolve_current(&compiler_request).await?;
+    if fingerprint(fresh.binding())? != fingerprint(&original.binding)?
+        || fingerprint(verified.binding())? != fingerprint(&original.binding)?
+    {
+        return Err(Error::Conflict(
+            "consolidation child binding differs from captured claim".into(),
+        ));
+    }
+    Ok(run_step(model, runner, Some(journal), request, Some(fixed)).await)
 }
 
 async fn run_step(
@@ -2853,16 +3176,33 @@ async fn run_step(
     runner: Option<&dyn DevRunner>,
     journal: Option<&dyn OptimizationJournal>,
     request: OptimizationStepRequest<'_>,
+    fixed_consolidation_inputs: Option<FixedConsolidationInputs<'_>>,
 ) -> Result<OptimizationStepOutcome> {
     let journal = journal.ok_or(Error::NotFound)?;
-    let input = optimization_request_input(&request);
+    let compiler_use = match fixed_consolidation_inputs {
+        Some(fixed) => fixed.original.clone(),
+        None => {
+            let inputs = journal
+                .compiler_inputs(&request.compiler_input_request())
+                .await?;
+            crate::model::CompilerInputUse::new(
+                request.compiler_input_request(),
+                inputs.binding().clone(),
+            )
+        }
+    };
+    let mut input = optimization_request_input(&request);
+    input["compiler_request"] =
+        serde_json::to_value(&compiler_use.request).map_err(|_| Error::Internal)?;
+    input["compiler_binding"] =
+        serde_json::to_value(&compiler_use.binding).map_err(|_| Error::Internal)?;
     let context = request.model_context.clone();
     let prepared = recovery_fact(
         &context,
         OptimizationJournalStage::Merge,
         StageFactKind::StepPrepared,
         context.request_id.clone(),
-        optimization_request_digest(&request)?,
+        optimization_bound_request_digest(&request, &compiler_use)?,
         input,
     )?;
     let mut terminal = recovery_fact(
@@ -2875,7 +3215,10 @@ async fn run_step(
     )?;
     // No outbound action, including a cached continuation, is allowed without the current grant.
     if validate_outbound_grant(request.source_selection).is_err() {
-        if let Some(old) = journal.lookup(&terminal.artifact_id).await? {
+        if let Some(old) = journal
+            .lookup_bound(&terminal.artifact_id, &compiler_use)
+            .await?
+        {
             if old.input_digest != terminal.input_digest {
                 return Err(Error::Conflict("terminal input differs".into()));
             }
@@ -2891,7 +3234,9 @@ async fn run_step(
         )
         .await?;
         terminal.payload = encode_outcome(&OptimizationStepOutcome::Rejected { class })?;
-        journal.commit(terminal.seal()?).await?;
+        journal
+            .commit_bound(terminal.seal()?, &compiler_use)
+            .await?;
         return Ok(OptimizationStepOutcome::Rejected { class });
     }
     journal
@@ -2918,6 +3263,8 @@ async fn run_step(
         step_id: prepared.artifact_id.clone(),
         grant_id: format!("optgrant-{}", fingerprint(request.source_selection)?),
         stage_ids: Default::default(),
+        compiler_use: compiler_use.clone(),
+        fixed_consolidation_inputs,
     };
     if let Some(old) = recovery.lookup(&prepared.artifact_id).await?
         && old.input_digest != prepared.input_digest
@@ -2975,11 +3322,140 @@ async fn run_step(
     Ok(outcome)
 }
 
+/// A stage fact also carries scalar ledger ids, comparison hashes and the
+/// namespace watermark. Those are values, not objects in `objects`. Their
+/// existing gates validate them; billing closure is verified against the root
+/// ledger by the formal issuer. Every actual content read becomes a real edge.
+async fn put_stage_content_edges(s: &mut Session, ctx: &Context, fact: &StageFact) -> Result<()> {
+    for d in &fact.dependencies {
+        match d.kind.as_str() {
+            "artifact" | "run" | "release" | "formal_parent" | "pointer" | "receipt" => {
+                // Late observations retain accounting truth after revocation;
+                // the caller redacts answers and ordinary consumers still gate.
+                s.put_edge(ctx, "artifact", &fact.artifact_id, &d.kind, &d.id)
+                    .await?;
+            }
+            "bundle" => {
+                let id = format!("formal-bundle-{}", d.id);
+                if s.get::<serde_json::Value>(ctx, "artifact", &id)
+                    .await?
+                    .is_some()
+                {
+                    s.put_edge(ctx, "artifact", &fact.artifact_id, "artifact", &id)
+                        .await?;
+                }
+            }
+            "environment"
+                if fact.stage == OptimizationJournalStage::Development
+                    && fact.kind == StageFactKind::DevelopmentRequestPrepared => {}
+            "revoke_watermark" | "execution" | "grader" | "model_receipt" => {}
+            _ => return Err(Error::Conflict("unsupported stage dependency kind".into())),
+        }
+    }
+    if let Some(value) = fact.payload.get("compiler_binding") {
+        let binding: crate::formal_authority::FormalCompilerInputBinding =
+            serde_json::from_value(value.clone()).map_err(|_| Error::Forbidden)?;
+        for r in binding.closure.nodes {
+            s.put_edge(ctx, "artifact", &fact.artifact_id, &r.kind, &r.id)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn validate_live_fact(
     session: &mut evo_storage::Session,
     context: &Context,
     fact: &StageFact,
+    original_inputs: Option<&crate::model::CompilerInputUse>,
 ) -> Result<()> {
+    let environments = fact
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.kind == "environment")
+        .collect::<Vec<_>>();
+    if !environments.is_empty() || fact.kind == StageFactKind::DevelopmentRequestPrepared {
+        if fact.stage != OptimizationJournalStage::Development
+            || fact.kind != StageFactKind::DevelopmentRequestPrepared
+            || environments.len() != 1
+        {
+            return Err(Error::Conflict(
+                "environment dependency requires one development request".into(),
+            ));
+        }
+        // The caller has verified these original inputs in this same Session.
+        // An environment digest is a value of that request, never an object id.
+        let inputs = original_inputs.ok_or(Error::Forbidden)?;
+        let request: DevelopmentRunRequest = serde_json::from_value(fact.payload.clone())
+            .map_err(|_| Error::Invalid("development request fact payload is invalid".into()))?;
+        validate_development_request(&request)?;
+        validate_digest(&environments[0].id, "stage environment digest")?;
+        if fact.namespace != request.namespace
+            || fact.episode_id != request.episode_id
+            || fact.step != request.step
+            || fact.attempt != request.attempt
+            || fact.request_id != request.request_id
+            || fact.input_digest != request.manifest.digest
+            || request.namespace != inputs.binding.namespace
+            || request.purpose != inputs.request.purpose
+            || request.purpose != inputs.binding.purpose
+            || request.revoke_watermark != inputs.request.revoke_watermark
+            || request.environment_digest != inputs.request.environment_digest
+            || request.environment_digest != inputs.binding.environment_digest
+            || environments[0].id != request.environment_digest
+        {
+            return Err(Error::Conflict(
+                "development environment differs from original compiler input".into(),
+            ));
+        }
+    }
+    if fact.kind == StageFactKind::StepPrepared && fact.payload.get("compiler_request").is_some() {
+        let request: crate::formal_authority::CompilerInputRequest =
+            serde_json::from_value(fact.payload["compiler_request"].clone())
+                .map_err(|_| Error::Forbidden)?;
+        let recorded: crate::formal_authority::FormalCompilerInputBinding =
+            serde_json::from_value(fact.payload["compiler_binding"].clone())
+                .map_err(|_| Error::Forbidden)?;
+        let verified =
+            crate::formal_authority::resolve_compiler_inputs(session, context, &request).await?;
+        if fingerprint(verified.binding())? != fingerprint(&recorded)? {
+            return Err(Error::Conflict(
+                "prepared inputs changed before claim".into(),
+            ));
+        }
+    }
+    if fact.kind == StageFactKind::DispatchPrepared
+        && fact.stage != OptimizationJournalStage::Development
+    {
+        let bound: crate::model::BoundModelRequest = serde_json::from_value(fact.payload.clone())
+            .map_err(|_| {
+            Error::Conflict("dispatch claim lacks complete compiler input".into())
+        })?;
+        bound.verify_current(session, context).await?;
+        if fact.input_digest != fingerprint(&bound)? {
+            return Err(Error::Conflict("dispatch claim input differs".into()));
+        }
+    }
+    if fact.kind == StageFactKind::EditCompiled {
+        let request: crate::formal_authority::CompilerInputRequest =
+            serde_json::from_value(fact.payload["compiler_request"].clone()).map_err(|_| {
+                Error::Conflict("edit fact lacks authenticated compiler request".into())
+            })?;
+        let bundle: ResolvedBundle =
+            serde_json::from_value(fact.payload["bundle"].clone()).map_err(|_| Error::Internal)?;
+        let inputs =
+            crate::formal_authority::resolve_compiler_inputs(session, context, &request).await?;
+        inputs.replay(&bundle)?;
+        let recorded_binding: crate::formal_authority::FormalCompilerInputBinding =
+            serde_json::from_value(fact.payload["compiler_binding"].clone())
+                .map_err(|_| Error::Forbidden)?;
+        if fingerprint(inputs.binding())? != fingerprint(&recorded_binding)? {
+            return Err(Error::Conflict(
+                "edit fact compiler binding changed before commit".into(),
+            ));
+        }
+        crate::compiler::persist_authenticated_bundle(session, context, &request, &bundle).await?;
+    }
     // Raw late receipts preserve billing/audit truth; every consumer still checks their watermark.
     // What such a receipt holds of a revoked source's answer is not kept: `commit` stores
     // it redacted (`run_dependency_revoked`).
@@ -3011,6 +3487,32 @@ fn holds_model_output(fact: &StageFact) -> bool {
         fact.kind,
         StageFactKind::DispatchObserved | StageFactKind::ResponseObserved
     ) && fact.stage != OptimizationJournalStage::Development
+}
+
+/// Full compiler content sources keep their typed identity during late receipt
+/// storage. A tombstone for another supported kind does not delete this source;
+/// an unreadable or unknown-kind tombstone fails closed.
+async fn compiler_source_revoked(
+    session: &mut Session,
+    context: &Context,
+    inputs: &crate::model::CompilerInputUse,
+) -> Result<bool> {
+    for node in &inputs.binding.closure.nodes {
+        let Some(body) = session
+            .get::<serde_json::Value>(context, "tombstone", &node.id)
+            .await?
+        else {
+            continue;
+        };
+        let tombstone = serde_json::from_value::<RevokeTombstone>(body).ok();
+        match tombstone {
+            Some(tombstone)
+                if matches!(tombstone.source_kind.as_str(), "run" | "artifact")
+                    && tombstone.source_kind != node.kind => {}
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
 }
 
 /// Whether a run `fact` depends on was revoked as a run, inside the caller's

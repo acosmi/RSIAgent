@@ -38,6 +38,7 @@ MIGRATION_SHA384 = {
     4: "5371d1f447143dbad639729f416d0983211c207f350e5ee05fd09b1f88196481f4016022fe596f4f2a39e4526b74b8e1",
     5: "d2114e8c1fa7277dc298d699fd2868eae699152b473325adbe6f233f5c72d8f5a2f546a675d61182bf58f03c1e7cacc8",
     6: "562e6392a78b82d7a1a458f12eeb05ef223c9a8e77dc9de01e78e35b52a4360e7b9bba0a6c1d767a49398fbbd5aa961e",
+    7: "631ca7337e43bac5e5341c8b857e417031595e7fe117127154e8f3ef10379f8eda2c2af7943a2cffcd8412995227adc4",
 }
 
 # Affinity, required NOT NULL, exact primary-key position. Extra, unread columns
@@ -182,7 +183,7 @@ def _verify_schema(con):
 
 def _verify_migrations(con):
     rows = con.execute(
-        "SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version LIMIT 6"
+        "SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version LIMIT 7"
     ).fetchall()
     if len(rows) != len(MIGRATION_SHA384):
         raise ReportError("migration_mismatch")

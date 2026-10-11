@@ -1,3 +1,5 @@
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use async_trait::async_trait;
 use evo_core::evidence::{
     EvidenceMember, EvidenceSet, ExecutionAttestation, Purpose, SourceCoverage, SourceSelection,
@@ -27,12 +29,12 @@ use evo_engine::optimization::{
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentSelectionDecision, DevelopmentTask,
     OPTIMIZATION_STAGE_FACT_SCHEMA, OptimizationJournal, OptimizationJournalStage,
     OptimizationStepOutcome, OptimizationStepRequest, PairedTaskResult, StageFact, StageFactKind,
-    StoreOptimizationJournal, SuggestionOutcome, run_development, run_optimization_step,
-    select_development,
+    SuggestionOutcome, run_development, run_optimization_step, select_development,
 };
 use evo_storage::Store;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
+use trusted_compiler_inputs::StoreOptimizationJournal;
 
 fn model_request() -> ModelRequest {
     ModelRequest::build(
@@ -70,6 +72,16 @@ struct FixtureModelPort;
 
 #[async_trait]
 impl ModelPort for FixtureModelPort {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let output = "[]".to_string();
         Ok(ModelResponse::Completed {
@@ -245,6 +257,16 @@ struct EditingFixtureModelPort;
 
 #[async_trait]
 impl ModelPort for EditingFixtureModelPort {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let source = request.source_closure[0].clone();
         let parent: SkillSnapshot = serde_json::from_str(
@@ -330,6 +352,46 @@ struct FixtureJournal {
 
 #[async_trait]
 impl OptimizationJournal for FixtureJournal {
+    async fn commit_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> Result<()> {
+        let current = self.compiler_inputs(&inputs.request).await?;
+        if evo_core::fingerprint(current.binding())? != evo_core::fingerprint(&inputs.binding)? {
+            return Err(Error::Forbidden);
+        }
+        self.commit(fact).await
+    }
+    async fn claim_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> Result<bool> {
+        let current = self.compiler_inputs(&inputs.request).await?;
+        if evo_core::fingerprint(current.binding())? != evo_core::fingerprint(&inputs.binding)? {
+            return Err(Error::Forbidden);
+        }
+        self.claim(fact).await
+    }
+    async fn lookup_bound(
+        &self,
+        id: &str,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        let current = self.compiler_inputs(&inputs.request).await?;
+        if evo_core::fingerprint(current.binding())? != evo_core::fingerprint(&inputs.binding)? {
+            return Err(Error::Forbidden);
+        }
+        self.lookup(id).await
+    }
+
+    async fn compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> Result<evo_engine::formal_authority::VerifiedCompilerInputs> {
+        trusted_compiler_inputs::resolve_software_fixture(request).await
+    }
     async fn claim(&self, fact: StageFact) -> Result<bool> {
         self.commit(fact).await?;
         Ok(true)
@@ -512,47 +574,49 @@ async fn g1_step_requires_journal_and_reaches_development_candidate_without_acti
             parent_family: "family-b".into(),
         },
     ];
-    let make_request = || OptimizationStepRequest {
-        evidence: &evidence,
-        source_selection: &source_selection,
-        source_bindings: &source_bindings,
-        traces: vec![
-            optimization_trace("run-failure", "family-a", TraceOutcome::TaskFailure),
-            optimization_trace("run-success", "family-b", TraceOutcome::Success),
-        ],
-        model_context: ModelRequestContext {
-            request_id: "optimizer-request".into(),
-            namespace: "tenant".into(),
-            purpose: Purpose::Development,
-            stage: ModelStage::ReflectFailure,
-            episode_id: "episode-a".into(),
-            step: 1,
-            attempt: 1,
-            parent_skill_digest: skill_snapshot_digest(&parent).unwrap(),
-            bundle_digest: hash(b"parent-bundle"),
-            source_closure: allowed.to_vec(),
-            model_digest: hash(b"fixture-model"),
-            tools_digest: hash(b"tools"),
-            rules_digest: hash(b"rules"),
-            sampling_digest: hash(b"sampling"),
-            revoke_watermark: 1,
-            max_suggestions: 4,
-        },
-        parent_skill: &parent,
-        edit_context: &edit_context,
-        edit_batch_template: edit_template.clone(),
-        protected_ranges: &[],
-        bundle_context: BundleCompileContext {
-            profile: &profile,
-            baseline: &baseline,
-            parent_strategy: &parent_strategy,
-            baseline_strategy: &baseline_strategy,
-            improver_patch: &improver_patch,
-            caps: &caps,
-            revoked: &revoked,
-        },
-        development_request: run_request(),
-        allow_rank_call: false,
+    let make_request = || {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
+            evidence: &evidence,
+            source_selection: &source_selection,
+            source_bindings: &source_bindings,
+            traces: vec![
+                optimization_trace("run-failure", "family-a", TraceOutcome::TaskFailure),
+                optimization_trace("run-success", "family-b", TraceOutcome::Success),
+            ],
+            model_context: ModelRequestContext {
+                request_id: "optimizer-request".into(),
+                namespace: "tenant".into(),
+                purpose: Purpose::Development,
+                stage: ModelStage::ReflectFailure,
+                episode_id: "episode-a".into(),
+                step: 1,
+                attempt: 1,
+                parent_skill_digest: skill_snapshot_digest(&parent).unwrap(),
+                bundle_digest: hash(b"parent-bundle"),
+                source_closure: allowed.to_vec(),
+                model_digest: hash(b"fixture-model"),
+                tools_digest: hash(b"tools"),
+                rules_digest: hash(b"rules"),
+                sampling_digest: hash(b"sampling"),
+                revoke_watermark: 1,
+                max_suggestions: 4,
+            },
+            parent_skill: &parent,
+            edit_context: &edit_context,
+            edit_batch_template: edit_template.clone(),
+            protected_ranges: &[],
+            bundle_context: BundleCompileContext {
+                profile: &profile,
+                baseline: &baseline,
+                parent_strategy: &parent_strategy,
+                baseline_strategy: &baseline_strategy,
+                improver_patch: &improver_patch,
+                caps: &caps,
+                revoked: &revoked,
+            },
+            development_request: run_request(),
+            allow_rank_call: false,
+        })
     };
     let missing = run_optimization_step(
         Some(&EditingFixtureModelPort),
@@ -668,6 +732,16 @@ async fn development_selection_uses_same_complete_manifest_and_never_formal_type
 struct CountModel(std::sync::atomic::AtomicUsize);
 #[async_trait]
 impl ModelPort for CountModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         EditingFixtureModelPort.dispatch(request).await
@@ -691,6 +765,43 @@ struct CrashJournal {
 }
 #[async_trait]
 impl OptimizationJournal for CrashJournal {
+    async fn commit_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> Result<()> {
+        if (fact.kind == self.kind && fact.stage == self.stage)
+            || self.failed.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(Error::Conflict(
+                "fixture crash before durable commit".into(),
+            ));
+        }
+        self.inner.commit_bound(fact, inputs).await
+    }
+    async fn claim_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> Result<bool> {
+        self.inner.claim_bound(fact, inputs).await
+    }
+    async fn lookup_bound(
+        &self,
+        id: &str,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        self.inner.lookup_bound(id, inputs).await
+    }
+
+    async fn compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::VerifiedCompilerInputs> {
+        self.inner.compiler_inputs(request).await
+    }
+
     async fn commit(&self, fact: StageFact) -> Result<()> {
         if (fact.kind == self.kind && fact.stage == self.stage)
             || self.failed.load(std::sync::atomic::Ordering::SeqCst)
@@ -998,6 +1109,16 @@ struct RankingFixture {
 }
 #[async_trait]
 impl ModelPort for RankingFixture {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         use std::sync::atomic::Ordering::SeqCst;
         if request.stage == ModelStage::Rank {
@@ -1231,6 +1352,16 @@ struct RevokingModel {
 }
 #[async_trait]
 impl ModelPort for RevokingModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let response = EditingFixtureModelPort.dispatch(request).await?;
@@ -1296,6 +1427,16 @@ struct TerminalFixture {
 }
 #[async_trait]
 impl ModelPort for TerminalFixture {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.mode == 2 {

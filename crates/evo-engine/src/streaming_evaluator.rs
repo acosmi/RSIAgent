@@ -106,6 +106,7 @@ pub struct RegisteredEvaluationControl {
 pub enum EvaluationEvidenceScope {
     /// Local deterministic program fixture. It cannot authorize production.
     ProgramFixture,
+    RegisteredExternalHost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +114,7 @@ pub enum EvaluationEvidenceScope {
 pub enum CostEvidenceScope {
     /// Only calls directly attached to this acceptance ticket were reconciled.
     TicketExecutionOnly,
+    CompleteEpisodeRoot,
 }
 
 impl RegisteredEvaluationControl {
@@ -918,6 +920,7 @@ pub enum AnchorEvidenceStatus {
 #[serde(rename_all = "snake_case")]
 pub enum DependencyEvidenceStatus {
     NamespaceWatermarkOnly,
+    CompleteTypedContentClosure,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -950,6 +953,87 @@ pub struct VerifiedFormalReportView {
     pub dependency_status: DependencyEvidenceStatus,
     pub promotion_eligible: bool,
     pub ineligibility_reasons: Vec<String>,
+}
+
+/// Live-use gate shared by original start_execution and the registered bridge.
+/// Historical ticket-only views deliberately do not call this new-use gate.
+pub(crate) async fn live_task_candidate_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    task: &BrokerTaskView,
+) -> Result<(crate::release_store::ReleaseCandidateRecord, String)> {
+    let ticket: EvaluationTicketV2 =
+        need_record(session, ctx, TICKET_KIND, &task.ticket_id).await?;
+    let expected = broker_view(&ticket, &task.target_id, task.side)?;
+    if fingerprint(&expected)? != fingerprint(task)? {
+        return Err(Error::Conflict("task differs from frozen ticket".into()));
+    }
+    let candidate: crate::release_store::ReleaseCandidateRecord = session
+        .need(ctx, "artifact", &ticket.candidate_digest)
+        .await?;
+    if candidate.bundle_digest != ticket.candidate_bundle_digest
+        || candidate.parent_digest != ticket.baseline_digest
+        || candidate.environment_digest != ticket.environment_digest
+        || candidate.proposer_actor != ticket.proposer_actor
+    {
+        return Err(Error::Conflict(
+            "actual candidate differs from frozen task".into(),
+        ));
+    }
+    crate::formal_authority::resolve_bundle_in_session(
+        session,
+        ctx,
+        &candidate.bundle,
+        &candidate.environment_digest,
+        candidate.revoke_watermark,
+        evo_core::evidence::Purpose::Development,
+    )
+    .await?;
+    crate::evidence::validate_stored_sources(
+        session,
+        ctx,
+        &candidate
+            .sources
+            .iter()
+            .map(|s| s.id.clone())
+            .collect::<Vec<_>>(),
+        candidate.revoke_watermark,
+    )
+    .await?;
+    for source in &candidate.sources {
+        let actual = crate::evidence::load_stored_source(session, ctx, &source.id).await?;
+        if actual.trace.source_digest != source.content_digest {
+            return Err(Error::Conflict("actual candidate source changed".into()));
+        }
+    }
+    crate::formal_authority::read_typed_closure(
+        session,
+        ctx,
+        &[("artifact".into(), candidate.id.clone())],
+    )
+    .await?;
+    let control: RegisteredEvaluationControl =
+        need_record(session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
+    if control.evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
+        let inputs = crate::formal_authority::resolve_bundle_in_session(
+            session,
+            ctx,
+            &candidate.bundle,
+            &candidate.environment_digest,
+            candidate.revoke_watermark,
+            evo_core::evidence::Purpose::Development,
+        )
+        .await?;
+        crate::formal_authority::verify_candidate_principals_from_binding(
+            session,
+            ctx,
+            inputs.binding(),
+            &candidate,
+            &control,
+        )
+        .await?;
+    }
+    Ok((candidate, control.billing_scope))
 }
 
 pub struct IndependentEvaluationControl;
@@ -1046,6 +1130,7 @@ impl IndependentEvaluationControl {
             &control,
         )
         .await?;
+        crate::formal_authority::bind_control_principals(&mut session, ctx, &control).await?;
         session
             .audit(ctx, "register_evaluation_control", &control.id)
             .await?;
@@ -1410,6 +1495,7 @@ impl IndependentEvaluationControl {
         }
         validate_status_closure(&mut session, ctx, &ticket, None).await?;
         let view = broker_view(&ticket, &request.target_id, request.side)?;
+        live_task_candidate_in_session(ctx, &mut session, &view).await?;
         if request.fence.billing_scope != control.billing_scope
             || request.fence.actual_input_digest != view.request_digest
         {
@@ -1909,6 +1995,17 @@ impl IndependentEvaluationControl {
         if is_stopping(ticket.lifecycle) {
             ticket.late_grader_receipt_ids.push(request.receipt_id);
         } else {
+            if control.evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
+                crate::formal_authority::capture_independent_grade(
+                    &mut session,
+                    ctx,
+                    &ticket,
+                    &request.target_id,
+                    &receipt.receipt_id,
+                    &fingerprint(&receipt)?,
+                )
+                .await?;
+            }
             let sequence = ticket.next_sequence;
             ticket.next_sequence = ticket
                 .next_sequence
@@ -2276,6 +2373,16 @@ impl IndependentEvaluationControl {
         session
             .audit(ctx, "complete_formal_evaluation", ticket_id)
             .await?;
+        if control.evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
+            crate::formal_authority::issue_complete_authority_in_session(
+                &mut session,
+                ctx,
+                &latest,
+                &control,
+                &formal,
+            )
+            .await?;
+        }
         session.commit().await?;
         Ok(formal)
     }
@@ -2427,6 +2534,24 @@ impl IndependentEvaluationControl {
         let formal =
             get_record::<FormalEvaluationV2>(&mut session, ctx, FORMAL_KIND, ticket_id).await?;
         validate_status_closure(&mut session, ctx, &ticket, formal.as_ref()).await?;
+        if matches!(
+            &formal,
+            Some(FormalEvaluationV2::CompleteBatch {
+                evidence_scope: EvaluationEvidenceScope::RegisteredExternalHost,
+                ..
+            })
+        ) {
+            let candidate = session
+                .need(ctx, "artifact", &ticket.candidate_digest)
+                .await?;
+            crate::formal_authority::verify_issued_authority(
+                &mut session,
+                ctx,
+                ticket_id,
+                &candidate,
+            )
+            .await?;
+        }
         session.commit().await?;
         Ok(StreamingEvaluationStatus { ticket, formal })
     }
@@ -2531,7 +2656,7 @@ async fn verified_report_view_core(
     if !matches!(verdict, Some(Verdict::Improved | Verdict::Noninferior)) {
         reasons.push("formal_verdict_not_approvable".into());
     }
-    Ok(VerifiedFormalReportView {
+    let mut view = VerifiedFormalReportView {
         report_id: report_id.into(),
         report_digest: fingerprint(&formal)?,
         variant,
@@ -2559,7 +2684,29 @@ async fn verified_report_view_core(
         dependency_status: DependencyEvidenceStatus::NamespaceWatermarkOnly,
         promotion_eligible: false,
         ineligibility_reasons: reasons,
-    })
+    };
+    if evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
+        view.ineligibility_reasons
+            .retain(|reason| reason != "program_fixture_not_production_authority");
+        if variant == VerifiedReportVariant::CompleteBatch {
+            let candidate: crate::release_store::ReleaseCandidateRecord = session
+                .need(ctx, "artifact", &ticket.candidate_digest)
+                .await?;
+            let authority = crate::formal_authority::verify_issued_authority(
+                session, ctx, report_id, &candidate,
+            )
+            .await?;
+            view.report_digest = fingerprint(&(&formal, &authority))?;
+            view.cost_evidence_scope = Some(CostEvidenceScope::CompleteEpisodeRoot);
+            view.dependency_status = DependencyEvidenceStatus::CompleteTypedContentClosure;
+            view.promotion_eligible =
+                matches!(verdict, Some(Verdict::Improved | Verdict::Noninferior))
+                    && anchor_status == AnchorEvidenceStatus::CompletePassedStoredClosure;
+            view.ineligibility_reasons
+                .retain(|reason| reason == "formal_verdict_not_approvable");
+        }
+    }
+    Ok(view)
 }
 
 async fn validate_status_closure(
@@ -3644,10 +3791,127 @@ async fn load<T: for<'de> Deserialize<'de>>(
     Ok(value)
 }
 
-fn storage_id(record_kind: &str, id: &str) -> Result<String> {
+pub(crate) fn storage_id(record_kind: &str, id: &str) -> Result<String> {
     identifier(record_kind)?;
     identifier(id)?;
     Ok(format!("e05-{}", fingerprint(&(record_kind, id))?))
+}
+
+/// Validate the actual envelope and its supported payload type. Formal values
+/// deliberately have no standalone schema: the envelope's record kind and the
+/// decoded enum jointly identify that wire, without granting authority.
+pub(crate) fn validate_content_envelope(id: &str, body: &Value) -> Result<()> {
+    if !body.is_object()
+        || !body
+            .get("payload")
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return Err(Error::Conflict(
+            "typed content envelope and payload must be JSON objects".into(),
+        ));
+    }
+    let envelope: TypedArtifactEnvelope<Value> = serde_json::from_value(body.clone())
+        .map_err(|_| Error::Conflict("unreadable typed content envelope".into()))?;
+    if envelope.schema_version != ENVELOPE_SCHEMA || envelope.id != id {
+        return Err(Error::Forbidden);
+    }
+    let p = &envelope.payload;
+    let (payload_id, schema) = match envelope.record_kind.as_str() {
+        CONTROL_KIND => {
+            let v: RegisteredEvaluationControl =
+                serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
+            v.validate()?;
+            (v.id, v.schema_version)
+        }
+        HOLDOUT_KIND => {
+            let v: ProtectedHoldoutRecord =
+                serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
+            (v.id, v.schema_version)
+        }
+        TICKET_KIND => {
+            let v: EvaluationTicketV2 =
+                serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
+            (v.id, v.schema_version)
+        }
+        FORMAL_KIND => {
+            let v: FormalEvaluationV2 =
+                serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
+            let ticket = match v {
+                FormalEvaluationV2::CompleteBatch { ticket_id, .. }
+                | FormalEvaluationV2::EarlyStopped { ticket_id, .. }
+                | FormalEvaluationV2::Invalid { ticket_id, .. } => ticket_id,
+            };
+            if storage_id(FORMAL_KIND, &ticket)? != id {
+                return Err(Error::Forbidden);
+            }
+            return Ok(());
+        }
+        EXECUTION_RECEIPT_KIND => {
+            let v: ExecutionReceiptV2 =
+                serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
+            (v.receipt_id, v.schema_version)
+        }
+        GRADER_RECEIPT_KIND => {
+            let v: IndependentGraderReceiptV2 =
+                serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
+            (v.receipt_id, v.schema_version)
+        }
+        OUTPUT_KIND => {
+            let v: ExecutionOutputArtifact =
+                serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
+            if hash(v.output_utf8.as_bytes()) != v.output_digest {
+                return Err(Error::Forbidden);
+            }
+            (v.id, v.schema_version)
+        }
+        LEDGER_KIND => {
+            let v: ExposureLedger =
+                serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
+            v.validate_restore()?;
+            (v.research_family_id, v.schema_version)
+        }
+        ALPHA_USE_KIND => {
+            let v: AlphaClaimReservation =
+                serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
+            (
+                format!("{}:{}", v.research_family_id, v.claim_id),
+                v.schema_version,
+            )
+        }
+        TICKET_RECEIPT_KIND => {
+            let v: TicketIssueReceipt =
+                serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
+            (v.ticket_id, v.schema_version)
+        }
+        RESOURCE_KIND => {
+            let v: ResourceEvidenceRecord =
+                serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
+            (v.ticket_id, v.schema_version)
+        }
+        _ => return crate::development::validate_content_envelope(id, body),
+    };
+    let supported = match envelope.record_kind.as_str() {
+        CONTROL_KIND => matches!(
+            schema.as_str(),
+            RegisteredEvaluationControl::SCHEMA | RegisteredEvaluationControl::SCHEMA_V1
+        ),
+        HOLDOUT_KIND => schema == ProtectedHoldoutRecord::SCHEMA,
+        TICKET_KIND => schema == EvaluationTicketV2::SCHEMA,
+        EXECUTION_RECEIPT_KIND => schema == "rsia.execution_receipt.v2",
+        GRADER_RECEIPT_KIND => schema == "rsia.independent_grader_receipt.v2",
+        OUTPUT_KIND => schema == "rsia.execution_output.v1",
+        LEDGER_KIND => schema == "rsia.exposure_ledger.v1",
+        ALPHA_USE_KIND => schema == "rsia.alpha_claim_reservation.v1",
+        TICKET_RECEIPT_KIND => schema == "rsia.evaluation_ticket_issue_receipt.v1",
+        RESOURCE_KIND => schema == "rsia.evaluation_resource_evidence.v1",
+        _ => false,
+    };
+    if !supported || storage_id(&envelope.record_kind, &payload_id)? != id {
+        return Err(Error::Conflict(
+            "typed envelope kind/schema/id mismatch".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn get_record<T: DeserializeOwned>(
@@ -3657,9 +3921,29 @@ async fn get_record<T: DeserializeOwned>(
     id: &str,
 ) -> Result<Option<T>> {
     let storage_id = storage_id(record_kind, id)?;
-    let envelope = session
-        .get::<TypedArtifactEnvelope<T>>(ctx, "artifact", &storage_id)
-        .await?;
+    let raw = session.get::<Value>(ctx, "artifact", &storage_id).await?;
+    if let Some(body) = &raw {
+        if !body.is_object() || !body.get("payload").is_some_and(Value::is_object) {
+            return Err(Error::Conflict(
+                "typed record must contain object envelope and payload".into(),
+            ));
+        }
+        if matches!(record_kind, CONTROL_KIND | HOLDOUT_KIND) {
+            crate::formal_authority::require_content_witness(
+                session,
+                ctx,
+                "artifact",
+                &storage_id,
+                body,
+                Role::Evaluator,
+            )
+            .await?;
+        }
+    }
+    let envelope: Option<TypedArtifactEnvelope<T>> = raw
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| Error::Conflict("typed envelope is unreadable".into()))?;
     match envelope {
         Some(envelope)
             if envelope.schema_version == ENVELOPE_SCHEMA
@@ -3673,7 +3957,7 @@ async fn get_record<T: DeserializeOwned>(
     }
 }
 
-async fn need_record<T: DeserializeOwned>(
+pub(crate) async fn need_record<T: DeserializeOwned>(
     session: &mut Session,
     ctx: &Context,
     record_kind: &str,
@@ -3701,7 +3985,13 @@ async fn put_record<T: Serialize>(
     };
     session
         .put(ctx, "artifact", &storage_id, owner, &envelope)
-        .await
+        .await?;
+    if matches!(record_kind, CONTROL_KIND | HOLDOUT_KIND) {
+        ctx.require(&[Role::Evaluator])?;
+        crate::formal_authority::attest_content(session, ctx, "artifact", &storage_id, &envelope)
+            .await?;
+    }
+    Ok(())
 }
 
 // These inner schemas add read and derivation pins, never production authority.
@@ -3773,14 +4063,18 @@ fn validate_node_shape(nodes: &[FormalDependencyNode]) -> Result<()> {
         identifier(&node.schema_version)?;
         digest(&node.content_digest, "dependency content_digest")?;
         digest(&node.outgoing_edge_digest, "outgoing_edge_digest")?;
-        if !matches!(node.kind.as_str(), "run" | "artifact")
-            || node.outgoing_edge_count > MAX_UPSTREAM_CLOSURE_NODES
+        if !matches!(
+            node.kind.as_str(),
+            "run" | "artifact" | "formal_parent" | "release" | "pointer" | "receipt"
+        ) || node.outgoing_edge_count > MAX_UPSTREAM_CLOSURE_NODES
         {
             return Err(Error::Invalid("invalid formal dependency identity".into()));
         }
         match (&node.record_kind, node.schema_version.as_str()) {
             (None, "rsia.optimization.source.v1") if node.kind == "run" => {}
             (None, RELEASE_CANDIDATE_SCHEMA) if node.kind == "artifact" => {}
+            (None, schema)
+                if crate::formal_authority::compiler_dependency_schema(&node.kind, schema) => {}
             (Some(kind), ENVELOPE_SCHEMA)
                 if node.kind == "artifact" && dependency_record_schema(kind).is_some() =>
             {
@@ -4089,7 +4383,10 @@ async fn dependency_node_identity(
             fingerprint(&authority)?,
         ));
     }
-    if kind != "artifact" {
+    if !matches!(
+        kind,
+        "artifact" | "formal_parent" | "release" | "pointer" | "receipt"
+    ) {
         return Err(Error::Invalid("unsupported formal dependency kind".into()));
     }
     let value: Value = session.need(ctx, kind, id).await?;
@@ -4100,10 +4397,33 @@ async fn dependency_node_identity(
     {
         return Err(Error::Invalid("object exceeds 4 MiB".into()));
     }
+    if kind == "artifact" && id.starts_with("optgrant-") && value.get("schema_version").is_none() {
+        // The one supported unversioned original grant has an exact core wire
+        // and canonical identity checked by the compiler authority reader.
+        crate::formal_authority::read_typed_closure(session, ctx, &[(kind.into(), id.into())])
+            .await?;
+        return Ok((
+            "rsia.legacy_source_selection.v1".into(),
+            None,
+            id.into(),
+            fingerprint(&value)?,
+        ));
+    }
     let schema = value
         .get("schema_version")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Invalid("formal dependency has no schema".into()))?;
+    if crate::formal_authority::compiler_dependency_schema(kind, schema) {
+        // New compiler input edges carry actual registered authority. The
+        // authoritative reader checks exact types, content witnesses, current
+        // principals, and every revocation edge before pinning the raw body.
+        crate::formal_authority::read_typed_closure(session, ctx, &[(kind.into(), id.into())])
+            .await?;
+        return Ok((schema.into(), None, id.into(), fingerprint(&value)?));
+    }
+    if kind != "artifact" {
+        return Err(Error::Invalid("unsupported formal dependency kind".into()));
+    }
     if schema == RELEASE_CANDIDATE_SCHEMA {
         let candidate: ReleaseCandidateRecord = session.need(ctx, kind, id).await?;
         if candidate.id != id {

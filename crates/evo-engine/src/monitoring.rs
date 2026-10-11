@@ -21,7 +21,7 @@ use crate::optimization::{
     DevelopmentSelectionDecision, OPTIMIZATION_STAGE_FACT_SCHEMA, OptimizationJournal,
     OptimizationJournalStage, OptimizationStepOutcome, OptimizationStepRequest, StageFact,
     StageFactKind, VerifiedDevelopmentObservationView, development_request_fact_id,
-    optimization_request_digest, run_consolidation_step,
+    optimization_bound_request_digest, read_bound_stage_fact_in_session, run_consolidation_step,
     verified_development_observation_in_session,
 };
 use crate::release_store::{
@@ -228,7 +228,7 @@ pub struct DevelopmentCycleRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DevelopmentReportBinding {
+pub(crate) struct DevelopmentReportBinding {
     schema_version: String,
     id: String,
     report_fact_id: String,
@@ -1064,10 +1064,99 @@ impl MonitoringCoordinator {
         request: OptimizationStepRequest<'_>,
     ) -> Result<ConsolidationRunRecord> {
         ctx.require(&[Role::Worker, Role::Admin])?;
-        let input_digest = optimization_request_digest(&request)?;
-        let (claim, scope) = {
+        let compiler_request = request.compiler_input_request();
+        // Preserve the admission order before any journal adapter can prepare
+        // compiler fixtures. Invalid actual content cannot cause setup writes.
+        {
             let mut session = store.session().await?;
             let claim = load_claim_record(&mut session, ctx, claim_id).await?;
+            let revoked_id = format!("consolidation-revoked-{}", claim.id);
+            let revoked = session
+                .get::<ConsolidationRunRecord>(ctx, ARTIFACT_KIND, &revoked_id)
+                .await?;
+            let completed = session
+                .get::<ConsolidationRunRecord>(
+                    ctx,
+                    ARTIFACT_KIND,
+                    &format!("consolidation-run-{}", claim.id),
+                )
+                .await?;
+            if let Some(existing) = revoked.as_ref().or(completed.as_ref())
+                && historical_consolidation_input_matches(&mut session, ctx, &request, existing)
+                    .await?
+            {
+                // A terminal read authenticates the complete original request
+                // against its persisted binding. It grants no new use, and
+                // must remain possible after the latest watermark changes.
+                if revoked.is_some()
+                    || validate_claim_sources(&mut session, ctx, &claim)
+                        .await
+                        .is_ok()
+                {
+                    session.commit().await?;
+                    return Ok(existing.clone());
+                }
+                let input_digest = existing.input_digest.clone();
+                drop(session);
+                return persist_terminal_run_with_id(
+                    ctx,
+                    store,
+                    claim,
+                    revoked_id,
+                    input_digest,
+                    ConsolidationRunOutcome::Revoked,
+                    ConsolidationClaimState::CompletedRevoked,
+                    "source_revoked_after_consolidation",
+                )
+                .await;
+            }
+            let completed = revoked.is_some() || completed.is_some();
+            if !completed {
+                let index: ConsolidationScopeIndex =
+                    session.need(ctx, ARTIFACT_KIND, &claim.scope_id).await?;
+                validate_execution_binding(ctx, &claim, &index, &request)?;
+            }
+            session.commit().await?;
+        }
+        // Fixture adapters may install an explicit Admin EmptyRoot before use.
+        // This preflight grants no authority: the caller Session resolves again.
+        if let Some(journal) = journal {
+            journal.compiler_inputs(&compiler_request).await?;
+        }
+        let (claim, scope, compiler_use, input_digest) = {
+            let mut session = store.session().await?;
+            let claim = load_claim_record(&mut session, ctx, claim_id).await?;
+            if journal.is_none()
+                && session
+                    .get::<ConsolidationRunRecord>(
+                        ctx,
+                        ARTIFACT_KIND,
+                        &format!("consolidation-run-{}", claim.id),
+                    )
+                    .await?
+                    .is_none()
+                && session
+                    .get::<ConsolidationRunRecord>(
+                        ctx,
+                        ARTIFACT_KIND,
+                        &format!("consolidation-revoked-{}", claim.id),
+                    )
+                    .await?
+                    .is_none()
+            {
+                let index: ConsolidationScopeIndex =
+                    session.need(ctx, ARTIFACT_KIND, &claim.scope_id).await?;
+                validate_execution_binding(ctx, &claim, &index, &request)?;
+            }
+            let verified = crate::formal_authority::resolve_compiler_inputs(
+                &mut session,
+                ctx,
+                &compiler_request,
+            )
+            .await?;
+            let compiler_use =
+                crate::model::CompilerInputUse::new(compiler_request, verified.binding().clone());
+            let input_digest = optimization_bound_request_digest(&request, &compiler_use)?;
             let revoked_id = format!("consolidation-revoked-{}", claim.id);
             if let Some(existing) = session
                 .get::<ConsolidationRunRecord>(ctx, ARTIFACT_KIND, &revoked_id)
@@ -1134,7 +1223,7 @@ impl MonitoringCoordinator {
                 return Err(error);
             }
             session.commit().await?;
-            (claim, index.scope)
+            (claim, index.scope, compiler_use, input_digest)
         };
         let root = store
             .root_budget(ctx, &scope.billing_scope)
@@ -1174,6 +1263,7 @@ impl MonitoringCoordinator {
         {
             let mut session = store.session().await?;
             let mut current = load_live_claim(&mut session, ctx, &claim.id).await?;
+            compiler_use.verify_current(&mut session, ctx).await?;
             match current.state {
                 ConsolidationClaimState::Claimed => {
                     current.state = ConsolidationClaimState::Running;
@@ -1210,8 +1300,11 @@ impl MonitoringCoordinator {
             Some(&root_bound_runner),
             Some(journal),
             request,
+            &compiler_use,
+            store,
+            ctx,
         )
-        .await;
+        .await?;
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -1302,7 +1395,7 @@ impl MonitoringCoordinator {
                 let written = persist_consolidation_proposal(
                     ctx,
                     store,
-                    journal,
+                    &compiler_use,
                     &claim,
                     CandidateMaterial {
                         bundle: &bundle,
@@ -1398,22 +1491,70 @@ impl MonitoringCoordinator {
         ctx.require(&[Role::Worker, Role::Admin])?;
         identifier(proposal_id)?;
         identifier(candidate_id)?;
-        let (proposal, provenance, reserved) = {
-            let mut session = store.session().await?;
-            let (proposal, provenance) =
-                load_stageable_proposal(&mut session, ctx, proposal_id).await?;
-            let reserved =
-                reserve_staging_binding(&mut session, ctx, &proposal, candidate_id).await?;
-            session.commit().await?;
-            (proposal, provenance, reserved)
+        let mut session = store.session().await?;
+        let (proposal, provenance) =
+            load_stageable_proposal(&mut session, ctx, proposal_id).await?;
+        crate::formal_authority::resolve_bundle_in_session(
+            &mut session,
+            ctx,
+            &proposal.candidate_bundle,
+            &proposal.environment_digest,
+            proposal.revoke_watermark,
+            evo_core::evidence::Purpose::Development,
+        )
+        .await?;
+        reserve_staging_binding(&mut session, ctx, &proposal, candidate_id).await?;
+        let candidate = ReleaseStore::stage_bundle_in_session(
+            ctx,
+            &mut session,
+            StageBundleRequest {
+                candidate_id: candidate_id.into(),
+                bundle: proposal.candidate_bundle.clone(),
+                environment_digest: proposal.environment_digest.clone(),
+                proposer_actor: ctx.actor().into(),
+                sources: proposal
+                    .sources
+                    .iter()
+                    .map(|source| TypedSourceRef {
+                        kind: "run".into(),
+                        id: source.id.clone(),
+                        content_digest: source.content_digest.clone(),
+                    })
+                    .collect(),
+                revoke_watermark: proposal.revoke_watermark,
+            },
+        )
+        .await;
+        let candidate = match candidate {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                // This exact identity refusal precedes all candidate writes.
+                // A candidate staged by another proposer that already holds
+                // this bundle still owns the proposal's reservation.
+                if matches!(&error, Error::Conflict(message)
+                    if message == "candidate id reused with different content")
+                    && session
+                        .get::<serde_json::Value>(ctx, ARTIFACT_KIND, candidate_id)
+                        .await?
+                        .is_some_and(|stored| {
+                            holds_bundle(&stored, &proposal.candidate_bundle_digest)
+                        })
+                {
+                    session.commit().await?;
+                }
+                return Err(error);
+            }
         };
-        // `stage_bundle` re-checks the source closure in its own transaction, so a
-        // revocation after the read above still cannot produce a candidate.
-        let candidate =
-            stage_reserved_candidate(ctx, store, &proposal, candidate_id, reserved, |request| {
-                ReleaseStore::stage_bundle(ctx, store, request)
-            })
+        session
+            .put_edge(
+                ctx,
+                ARTIFACT_KIND,
+                &candidate.id,
+                ARTIFACT_KIND,
+                &proposal.id,
+            )
             .await?;
+        session.commit().await?;
         Ok(StagedConsolidationCandidate {
             candidate,
             proposal_id: proposal.id,
@@ -1512,6 +1653,32 @@ struct RootBoundModelPort<'a> {
 impl ModelPort for RootBoundModelPort<'_> {
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let response = self.inner.dispatch(request).await?;
+        let actual_root = match &response {
+            ModelResponse::Completed {
+                execution_receipt, ..
+            } => Some(execution_receipt.root_budget_id.as_str()),
+            ModelResponse::Rejected {
+                dispatch: RejectedDispatch::Dispatched { receipt },
+                ..
+            } => Some(receipt.root_budget_id.as_str()),
+            ModelResponse::Rejected {
+                dispatch: RejectedDispatch::NotDispatched,
+                ..
+            } => None,
+            ModelResponse::Uncertain { root_budget_id, .. } => Some(root_budget_id.as_str()),
+        };
+        if actual_root.is_some_and(|root| root != self.root_budget_id) {
+            return Err(Error::Conflict(
+                "model dispatch escaped the consolidation root budget".into(),
+            ));
+        }
+        Ok(response)
+    }
+    async fn dispatch_bound(
+        &self,
+        request: crate::model::BoundModelRequest,
+    ) -> Result<ModelResponse> {
+        let response = self.inner.dispatch_bound(request).await?;
         let actual_root = match &response {
             ModelResponse::Completed {
                 execution_receipt, ..
@@ -2434,11 +2601,98 @@ fn consolidation_proposal_id(claim_id: &str) -> String {
     format!("consolidation-proposal-{claim_id}")
 }
 
+/// Only a historical terminal read may use the original persisted compiler
+/// binding. New execution and proposal admission still resolve current inputs.
+async fn historical_consolidation_input_matches(
+    session: &mut Session,
+    ctx: &Context,
+    request: &OptimizationStepRequest<'_>,
+    terminal: &ConsolidationRunRecord,
+) -> Result<bool> {
+    let Some(input_digest) = terminal.input_digest.as_deref() else {
+        return Ok(false);
+    };
+    let id = optimization_step_fact_id(
+        &request.model_context,
+        input_digest,
+        StageFactKind::StepPrepared,
+    )?;
+    let Some(body) = session
+        .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &id)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if body.get("schema_version").and_then(|value| value.as_str()) == Some(REDACTED_SCHEMA) {
+        return Ok(false);
+    }
+    let fact: StageFact = serde_json::from_value(body).map_err(|_| Error::Internal)?;
+    fact.validate()?;
+    if fact.namespace != ctx.namespace()
+        || fact.artifact_id != id
+        || fact.stage != OptimizationJournalStage::Merge
+        || fact.kind != StageFactKind::StepPrepared
+        || fact.input_digest != input_digest
+    {
+        return Err(Error::Conflict(
+            "historical consolidation preparation differs".into(),
+        ));
+    }
+    let inputs = crate::model::CompilerInputUse::new(
+        serde_json::from_value(fact.payload["compiler_request"].clone())
+            .map_err(|_| Error::Forbidden)?,
+        serde_json::from_value(fact.payload["compiler_binding"].clone())
+            .map_err(|_| Error::Forbidden)?,
+    );
+    let compiler_use_id = inputs.artifact_id()?;
+    if inputs.binding.schema_version != "rsia.formal_compiler_input_binding.v2"
+        || inputs.binding.namespace != ctx.namespace()
+        || !fact
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.kind == ARTIFACT_KIND && dependency.id == compiler_use_id)
+    {
+        return Err(Error::Conflict(
+            "historical consolidation lacks its bound input".into(),
+        ));
+    }
+    let persisted: crate::model::CompilerInputUse =
+        session.need(ctx, ARTIFACT_KIND, &compiler_use_id).await?;
+    if fingerprint(&persisted)? != fingerprint(&inputs)? {
+        return Err(Error::Conflict(
+            "historical consolidation compiler input differs".into(),
+        ));
+    }
+    if optimization_bound_request_digest(request, &inputs)
+        .ok()
+        .as_deref()
+        != Some(input_digest)
+    {
+        return Err(Error::Conflict(
+            if terminal.outcome == ConsolidationRunOutcome::Revoked {
+                "revoked consolidation input differs"
+            } else {
+                "completed consolidation input differs"
+            }
+            .into(),
+        ));
+    }
+    Ok(true)
+}
+
 /// Id of the optimization journal's terminal `StepCompleted` fact for a step:
 /// the same canonical identity `run_optimization_step` seals for it.
 fn optimization_terminal_fact_id(
     context: &ModelRequestContext,
     input_digest: &str,
+) -> Result<String> {
+    optimization_step_fact_id(context, input_digest, StageFactKind::StepCompleted)
+}
+
+fn optimization_step_fact_id(
+    context: &ModelRequestContext,
+    input_digest: &str,
+    kind: StageFactKind,
 ) -> Result<String> {
     Ok(StageFact {
         schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
@@ -2448,7 +2702,7 @@ fn optimization_terminal_fact_id(
         step: context.step,
         attempt: context.attempt,
         stage: OptimizationJournalStage::Merge,
-        kind: StageFactKind::StepCompleted,
+        kind,
         request_id: context.request_id.clone(),
         input_digest: input_digest.into(),
         output_digest: None,
@@ -2594,7 +2848,7 @@ fn derive_proposal_fields(
 async fn persist_consolidation_proposal(
     ctx: &Context,
     store: &Store,
-    journal: &dyn OptimizationJournal,
+    compiler_use: &crate::model::CompilerInputUse,
     claim: &ConsolidationClaim,
     material: CandidateMaterial<'_>,
 ) -> Result<ConsolidationProposal> {
@@ -2606,15 +2860,19 @@ async fn persist_consolidation_proposal(
         ));
     }
     validate_resolved_bundle_identity(material.bundle)?;
-    // The store has a single connection: journal reads open their own session, so
-    // they happen before this function's session does.
-    let terminal = journal
-        .lookup(material.terminal_fact_id)
-        .await?
-        .ok_or_else(|| Error::Conflict("optimization terminal fact is missing".into()))?;
-    verify_terminal_candidate_fact(&terminal, claim, &material)?;
-
+    // Terminal content, its original full compiler use, current authority and
+    // the proposal are read/validated/written in one caller-owned Session.
+    // No journal adapter can replace this private persisted terminal read.
     let mut session = store.session().await?;
+    let terminal = read_bound_stage_fact_in_session(
+        &mut session,
+        ctx,
+        material.terminal_fact_id,
+        compiler_use,
+    )
+    .await?
+    .ok_or_else(|| Error::Conflict("optimization terminal fact is missing".into()))?;
+    verify_terminal_candidate_fact(&terminal, claim, &material)?;
     validate_claim_sources(&mut session, ctx, claim).await?;
     let index: ConsolidationScopeIndex = session.need(ctx, ARTIFACT_KIND, &claim.scope_id).await?;
     validate_scope_index(&index)?;
@@ -2645,7 +2903,7 @@ async fn persist_consolidation_proposal(
         candidate_skill_digest: skill_snapshot_digest(&material.bundle.skill)?,
         candidate_bundle: material.bundle.clone(),
         candidate_bundle_digest: material.bundle.digest.clone(),
-        selection_digest: fingerprint(material.selection)?,
+        selection_digest: fingerprint(&terminal.payload["selection"])?,
         terminal_fact_id: material.terminal_fact_id.into(),
         sources: claim.sources.clone(),
         provenance: derived.provenance,
@@ -2841,6 +3099,7 @@ async fn load_stageable_proposal(
 /// Writes the candidate of a proposal whose candidate id is reserved, then links
 /// it to the proposal. `stage` is `ReleaseStore::stage_bundle`; it is a parameter
 /// so that the hand-back of a failed staging can be tested without a race.
+#[cfg(test)]
 async fn stage_reserved_candidate<F, Fut>(
     ctx: &Context,
     store: &Store,
@@ -3030,6 +3289,7 @@ async fn reserve_staging_binding(
 /// deleted only if it still names `candidate_id` and no candidate holding the
 /// proposal's bundle exists under that id; if one does, somebody completed the
 /// staging and the proposal is staged as that id.
+#[cfg(test)]
 async fn release_staging_binding(
     store: &Store,
     ctx: &Context,

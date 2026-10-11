@@ -194,7 +194,7 @@ class BudgetReportTests(unittest.TestCase):
             int(path.name.split("_", 1)[0]): hashlib.sha384(path.read_bytes()).hexdigest()
             for path in (ROOT / "crates/evo-storage/migrations").glob("*.sql")
         }
-        self.assertEqual(list(sorted(expected)), [1, 2, 4, 5, 6])
+        self.assertEqual(list(sorted(expected)), [1, 2, 4, 5, 6, 7])
         self.assertEqual(report.MIGRATION_SHA384, expected)
 
     def test_six_states_keep_unknown_and_exact_page_classification(self):
@@ -535,7 +535,7 @@ class BudgetReportTests(unittest.TestCase):
             self.error("migration_mismatch")
             self.db.con.execute("DELETE FROM _sqlx_migrations WHERE version=6")
             self.db.con.execute("INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time) VALUES(6,?,1,?,1)", (SECRET, bytes.fromhex(report.MIGRATION_SHA384[6])))
-        self.db.con.execute("INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time) VALUES(7,?,1,x'00',1)", (SECRET,))
+        self.db.con.execute("INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time) VALUES(8,?,1,x'00',1)", (SECRET,))
         self.error("migration_mismatch")
 
     def test_migration_actual_types_are_checked(self):
@@ -707,6 +707,8 @@ class BudgetReportTests(unittest.TestCase):
 
     def test_real_committed_uncheckpointed_wal_is_visible(self):
         self.db.con.commit()
+        self.db.close()
+        self.db.con = sqlite3.connect(self.db.path)
         self.db.con.execute("PRAGMA journal_mode=WAL")
         self.db.con.execute("PRAGMA wal_autocheckpoint=0")
         self.db.con.execute("PRAGMA wal_checkpoint(TRUNCATE)")

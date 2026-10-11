@@ -14,9 +14,10 @@
 //! - V092: No-Auto-Elevation
 //! - V098: Audit-Traceability & Golden Manifest Roundtrip
 
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use evo_core::contract::{
     CompileParts, HostCapabilities, ImproverPatch, Profile, SkillPatch, SkillSnapshot,
-    compile_bundle,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
@@ -788,20 +789,24 @@ fn candidate_bundle(content: &str) -> evo_core::contract::ResolvedBundle {
         required_capabilities: vec![],
         dependencies: vec![],
     };
-    compile_bundle(CompileParts {
-        profile: &profile,
-        parent: &parent,
-        baseline: &SkillSnapshot::empty(),
-        parent_strategy: &Strategy::default(),
-        baseline_strategy: &Strategy::default(),
-        skill_patch: &SkillPatch::default(),
-        improver_patch: &ImproverPatch::default(),
-        caps: &HostCapabilities {
-            available: BTreeSet::new(),
-            granted: BTreeSet::new(),
+    trusted_compiler_inputs::bundle(
+        CompileParts {
+            profile: &profile,
+            parent: &parent,
+            baseline: &SkillSnapshot::empty(),
+            parent_strategy: &Strategy::default(),
+            baseline_strategy: &Strategy::default(),
+            skill_patch: &SkillPatch::default(),
+            improver_patch: &ImproverPatch::default(),
+            caps: &HostCapabilities {
+                available: BTreeSet::new(),
+                granted: BTreeSet::new(),
+            },
+            revoked: &BTreeSet::new(),
         },
-        revoked: &BTreeSet::new(),
-    })
+        "n",
+        &hash(b"environment"),
+    )
     .unwrap()
 }
 
@@ -1003,6 +1008,9 @@ async fn candidate_handoff_consumes_existing_e02_candidate_without_granting_rele
         })
         .collect::<Vec<_>>();
     let matching_bundle = candidate_bundle("candidate compiled through the existing E02 path");
+    trusted_compiler_inputs::install_bundle(&store, &matching_bundle)
+        .await
+        .unwrap();
     let (material_manifest, material_files, material_binding) =
         candidate_material_package(&matching_bundle);
     let mut stage_request = persistent_stage_request(

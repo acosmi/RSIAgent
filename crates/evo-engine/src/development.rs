@@ -50,6 +50,25 @@ pub const EXECUTION_RECEIPT_KIND: &str = "development_execution_receipt_v1";
 pub const GRADER_RECEIPT_KIND: &str = "development_grader_receipt_v1";
 pub const EXECUTION_OUTPUT_KIND: &str = "development_execution_output_v1";
 pub const RUN_RECEIPT_KIND: &str = "development_run_receipt_v1";
+
+async fn verify_development_bundle_inputs(
+    s: &mut Session,
+    ctx: &Context,
+    request: &DevelopmentRunRequest,
+) -> Result<crate::compiler::AuthenticatedBundleRecord> {
+    // The pure-function runner's parent label is an experimental comparison
+    // identifier, not ordinary-P authority. Its candidate carries the full,
+    // authenticated actual P/B pair; formal host pairs are separately replayed
+    // against their registered projection in verify_formal_task_in_session.
+    crate::compiler::verify_bundle_in_session(
+        s,
+        ctx,
+        &request.candidate_bundle_digest,
+        &request.environment_digest,
+        request.revoke_watermark,
+    )
+    .await
+}
 const ENVELOPE_SCHEMA: &str = "rsia.typed_artifact_envelope.v1";
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
@@ -60,6 +79,67 @@ struct TypedArtifactEnvelope<T> {
     id: String,
     record_kind: String,
     payload: T,
+}
+
+pub(crate) fn validate_content_envelope(id: &str, body: &serde_json::Value) -> Result<()> {
+    if !body.is_object()
+        || !body
+            .get("payload")
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return Err(Error::Conflict(
+            "typed content envelope and payload must be JSON objects".into(),
+        ));
+    }
+    let e: TypedArtifactEnvelope<serde_json::Value> =
+        serde_json::from_value(body.clone()).map_err(|_| Error::Forbidden)?;
+    if e.schema_version != ENVELOPE_SCHEMA || e.id != id {
+        return Err(Error::Forbidden);
+    }
+    let (payload_id, schema) = match e.record_kind.as_str() {
+        CONTROL_KIND => {
+            let v: DevelopmentControlV1 =
+                serde_json::from_value(e.payload).map_err(|_| Error::Forbidden)?;
+            v.validate()?;
+            (v.id, v.schema_version)
+        }
+        EXECUTION_RECEIPT_KIND => {
+            let v: DevelopmentExecutionReceiptV1 =
+                serde_json::from_value(e.payload).map_err(|_| Error::Forbidden)?;
+            (v.receipt_id, v.schema_version)
+        }
+        GRADER_RECEIPT_KIND => {
+            let v: DevelopmentGraderReceiptV1 =
+                serde_json::from_value(e.payload).map_err(|_| Error::Forbidden)?;
+            (v.receipt_id, v.schema_version)
+        }
+        EXECUTION_OUTPUT_KIND => {
+            let v: DevelopmentExecutionOutputV1 =
+                serde_json::from_value(e.payload).map_err(|_| Error::Forbidden)?;
+            if hash(v.output_utf8.as_bytes()) != v.output_digest {
+                return Err(Error::Forbidden);
+            }
+            (v.id, v.schema_version)
+        }
+        RUN_RECEIPT_KIND => {
+            let v: DevelopmentRunReceiptV1 =
+                serde_json::from_value(e.payload).map_err(|_| Error::Forbidden)?;
+            (v.id, v.schema_version)
+        }
+        _ => return Err(Error::Conflict("unsupported envelope record kind".into())),
+    };
+    let expected = match e.record_kind.as_str() {
+        CONTROL_KIND => DEVELOPMENT_CONTROL_SCHEMA,
+        EXECUTION_RECEIPT_KIND => DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA,
+        GRADER_RECEIPT_KIND => DEVELOPMENT_GRADER_RECEIPT_SCHEMA,
+        EXECUTION_OUTPUT_KIND => DEVELOPMENT_EXECUTION_OUTPUT_SCHEMA,
+        RUN_RECEIPT_KIND => DEVELOPMENT_RUN_RECEIPT_SCHEMA,
+        _ => return Err(Error::Forbidden),
+    };
+    if schema != expected || storage_id(&e.record_kind, &payload_id)? != id {
+        return Err(Error::Forbidden);
+    }
+    Ok(())
 }
 
 fn digest(value: &str, name: &str) -> Result<()> {
@@ -1659,6 +1739,8 @@ pub(crate) async fn verify_observed_report_in_session(
             ));
         }
     }
+    require_live_sources(session, ctx, &control.source_ids, request.revoke_watermark).await?;
+    verify_development_bundle_inputs(session, ctx, request).await?;
     let mut outcomes = Vec::with_capacity(report.results.len());
     let mut execution_ids = BTreeSet::new();
     let mut grader_ids = BTreeSet::new();
@@ -1841,6 +1923,14 @@ impl RegisteredDevelopmentRunner {
         side: DevelopmentSide,
     ) -> Result<Option<DevelopmentExecutionReceiptV1>> {
         let mut session = self.store.session().await?;
+        require_live_sources(
+            &mut session,
+            &self.executor,
+            &control.source_ids,
+            request.revoke_watermark,
+        )
+        .await?;
+        verify_development_bundle_inputs(&mut session, &self.executor, request).await?;
         let receipt_id = execution_receipt_id(&request.request_id, &task.task_id, side)?;
         let existing = get_record::<DevelopmentExecutionReceiptV1>(
             &mut session,
@@ -1912,8 +2002,20 @@ impl RegisteredDevelopmentRunner {
             lease_until: now.checked_add(self.lease_seconds).ok_or(Error::Internal)?,
             now,
         };
-        let call = self
-            .store
+        let mut session = self.store.session().await?;
+        require_live_sources(
+            &mut session,
+            &self.executor,
+            &control.source_ids,
+            request.revoke_watermark,
+        )
+        .await?;
+        // This is the persisted original compiled request/binding, not a binding
+        // reconstructed from a later profile pointer. Recovery reloads that same
+        // immutable bundle record and refuses it if its authority is now stale.
+        let reserved_inputs =
+            verify_development_bundle_inputs(&mut session, &self.executor, request).await?;
+        let call = session
             .reserve_budget_call_with_sources_typed(
                 &self.executor,
                 &reservation,
@@ -1921,6 +2023,7 @@ impl RegisteredDevelopmentRunner {
             )
             .await?
             .map_err(evo_storage::budget::BudgetPreDispatchRefusal::into_reservation_error)?;
+        session.commit().await?;
         if matches!(
             call.state,
             BudgetCallState::Released | BudgetCallState::Cancelled
@@ -1956,7 +2059,15 @@ impl RegisteredDevelopmentRunner {
                     now: dispatch_now,
                     ..reserve_fence
                 };
-                let decision = self.begin_execution(&call, &fence).await?;
+                let decision = self
+                    .begin_bound_execution(
+                        &call,
+                        &fence,
+                        request,
+                        &control.source_ids,
+                        &reserved_inputs,
+                    )
+                    .await?;
                 let dispatch_id = decision.call.dispatch_id.clone().ok_or(Error::Internal)?;
                 let settlement = RegisteredExecutionSettlement {
                     schema_version: REGISTERED_EXECUTION_SETTLEMENT_SCHEMA.into(),
@@ -2033,30 +2144,132 @@ impl RegisteredDevelopmentRunner {
         }
     }
 
+    async fn begin_bound_execution(
+        &self,
+        original_call: &BudgetCallRecord,
+        fence: &BudgetCallFence,
+        request: &DevelopmentRunRequest,
+        source_ids: &[String],
+        reserved_inputs: &crate::compiler::AuthenticatedBundleRecord,
+    ) -> Result<BudgetDispatchDecision> {
+        let mut session = self.store.session().await?;
+        // A proven source revocation keeps the existing typed budget refusal and
+        // its exact owned Reserved release reason. Success in this branch is
+        // never committed or allowed to dispatch; it would mean the persisted
+        // call no longer represents these original sources.
+        for source_id in source_ids {
+            if session
+                .get::<serde_json::Value>(&self.executor, "tombstone", source_id)
+                .await?
+                .is_some()
+            {
+                let result = self
+                    .begin_execution_in_session(&mut session, original_call, fence)
+                    .await?;
+                return match result {
+                    Err(error) => {
+                        session.commit().await?;
+                        Err(error)
+                    }
+                    Ok(_) => Err(Error::Conflict(
+                        "revoked development sources differ from the budget call".into(),
+                    )),
+                };
+            }
+        }
+        let gate = async {
+            if reserved_inputs.bundle.digest != request.candidate_bundle_digest
+                || reserved_inputs.input.environment_digest != request.environment_digest
+                || reserved_inputs.input.revoke_watermark != request.revoke_watermark
+            {
+                return Err(Error::Conflict(
+                    "development original compiler request differs".into(),
+                ));
+            }
+            let inputs = crate::model::CompilerInputUse::new(
+                reserved_inputs.input.clone(),
+                reserved_inputs.binding.clone(),
+            );
+            inputs.verify_current(&mut session, &self.executor).await?;
+            let current =
+                verify_development_bundle_inputs(&mut session, &self.executor, request).await?;
+            if fingerprint(&current)? != fingerprint(reserved_inputs)? {
+                return Err(Error::Conflict(
+                    "development compiled inputs changed before dispatch".into(),
+                ));
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = gate {
+            // Only an exact owned Reserved fence may be released. Already-paid,
+            // dispatched/uncertain rows and outer corruption are never refunded.
+            if original_call.state == BudgetCallState::Reserved
+                && matches!(
+                    &error,
+                    Error::Conflict(_) | Error::Forbidden | Error::NotFound
+                )
+            {
+                session
+                    .release_undispatched_budget_call(
+                        &self.executor,
+                        fence,
+                        "development_pre_dispatch_v1.compiler_inputs_changed",
+                    )
+                    .await?;
+                session.commit().await?;
+            }
+            return Err(error);
+        }
+        let result = self
+            .begin_execution_in_session(&mut session, original_call, fence)
+            .await?;
+        session.commit().await?;
+        result
+    }
+
+    /// The shared budget boundary distinguishes typed, proven pre-dispatch
+    /// refusals from outer errors. Its caller owns the single transaction commit.
+    async fn begin_execution_in_session(
+        &self,
+        session: &mut Session,
+        original_call: &BudgetCallRecord,
+        fence: &BudgetCallFence,
+    ) -> Result<Result<BudgetDispatchDecision>> {
+        match session
+            .begin_budget_dispatch_typed(&self.executor, fence)
+            .await?
+        {
+            Ok(decision) => Ok(Ok(decision)),
+            Err(refusal) => {
+                if original_call.state == BudgetCallState::Reserved {
+                    session
+                        .release_undispatched_budget_call(
+                            &self.executor,
+                            fence,
+                            &format!("development_pre_dispatch_v1.{}", refusal.code()),
+                        )
+                        .await?;
+                }
+                Ok(Err(refusal.into_dispatch_error()))
+            }
+        }
+    }
+
+    // Budget-only fault injection retains its original assertions against the
+    // same transactional budget boundary. Production has no unbound entry here.
+    #[cfg(test)]
     async fn begin_execution(
         &self,
         original_call: &BudgetCallRecord,
         fence: &BudgetCallFence,
     ) -> Result<BudgetDispatchDecision> {
-        // Outer errors, including an unreadable source ref or a stale fence,
-        // cannot prove no dispatch and do not enter the cleanup boundary.
-        match self
-            .store
-            .begin_budget_dispatch_typed(&self.executor, fence)
-            .await?
-        {
-            Ok(decision) => Ok(decision),
-            Err(refusal) => {
-                let code = refusal.code();
-                self.resolve_pre_dispatch_result(
-                    original_call,
-                    fence,
-                    Err(refusal.into_dispatch_error()),
-                    code,
-                )
-                .await
-            }
-        }
+        let mut session = self.store.session().await?;
+        let result = self
+            .begin_execution_in_session(&mut session, original_call, fence)
+            .await?;
+        session.commit().await?;
+        result
     }
 
     async fn issue_run_receipt(
@@ -2164,6 +2377,7 @@ impl DevRunner for RegisteredDevelopmentRunner {
                 request.revoke_watermark,
             )
             .await?;
+            verify_development_bundle_inputs(&mut session, &self.executor, &request).await?;
             session.commit().await?;
         }
         let mut results = Vec::with_capacity(request.manifest.tasks.len());

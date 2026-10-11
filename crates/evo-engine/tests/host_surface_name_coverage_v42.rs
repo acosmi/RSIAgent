@@ -278,7 +278,7 @@ async fn complete_registration_is_idempotent_and_changed_content_conflicts() {
     .await
     .unwrap();
     assert_eq!(fingerprint(&first).unwrap(), fingerprint(&second).unwrap());
-    assert_eq!(counts(&store).await, (1, 0, 1));
+    assert_eq!(counts(&store).await, (1, 0, 2));
     let mut changed = manifest.clone();
     changed.items[0].reason = "changed mapping explanation".into();
     for (manifest, extracted) in [
@@ -291,7 +291,7 @@ async fn complete_registration_is_idempotent_and_changed_content_conflicts() {
         assert!(
             matches!(result, Err(Error::Conflict(ref message)) if message == "host surface id reused with different content")
         );
-        assert_eq!(counts(&store).await, (1, 0, 1));
+        assert_eq!(counts(&store).await, (1, 0, 2));
     }
 }
 
@@ -311,18 +311,25 @@ async fn complete_duplicate_names_keep_registration_behavior() {
     .await
     .unwrap();
     assert_eq!(record.manifest_digest, expected_digest);
-    assert_eq!(counts(&store).await, (1, 0, 1));
+    assert_eq!(counts(&store).await, (1, 0, 2));
 }
 
 #[tokio::test]
 async fn complete_legacy_record_read_from_disk_allows_a_new_run() {
     let (dir, store) = database().await;
-    let raw = seed_legacy_fixture(
+    // The body retains the legacy wire, while the explicit Admin registration
+    // adds the authenticated content witness required for new live use.
+    let record = ReleaseStore::register_host_surface(
+        &context(Role::Admin),
         &store,
-        &surface(),
-        &names(&["theme", "instruction", "model"]),
+        SURFACE_ID,
+        surface(),
+        names(&["theme", "instruction", "model"]),
     )
-    .await;
+    .await
+    .unwrap();
+    let raw = serde_json::to_value(record).unwrap();
+    assert_eq!(counts(&store).await, (1, 0, 2));
     store.close().await;
     let store = Store::open(&dir.path().join("name-coverage.sqlite3"))
         .await
@@ -333,7 +340,7 @@ async fn complete_legacy_record_read_from_disk_allows_a_new_run() {
     assert_eq!(snapshot.host_surface_digest, REFERENCE_DIGEST);
     assert!(snapshot.projection.instructions.is_empty());
     assert_eq!(snapshot.projection.tools, vec!["reference-tool"]);
-    assert_eq!(counts(&store).await, (2, 0, 2));
+    assert_eq!(counts(&store).await, (2, 0, 4));
     assert_fixture_unchanged(&store, &raw).await;
 }
 

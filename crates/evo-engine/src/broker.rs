@@ -9,7 +9,7 @@ use crate::model::{
 };
 use async_trait::async_trait;
 use evo_core::optimization::{ModelRequest, ModelStage};
-use evo_core::{Context, Error, Result, Role, hash, identifier, text};
+use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, text};
 use evo_storage::Store;
 use evo_storage::budget::{
     BudgetArtifact, BudgetCallFence, BudgetCallRecord, BudgetCallRefence, BudgetCallReservation,
@@ -118,6 +118,9 @@ struct InvalidTransportMetadata<'a> {
 
 #[async_trait]
 pub trait ModelTransport: Send + Sync {
+    fn formal_capability(&self) -> Option<crate::formal_authority::FormalTransportCapability> {
+        None
+    }
     /// `None` means no external or fixture dispatch is authorized.
     fn provenance(&self) -> Option<ModelExecutionProvenance>;
 
@@ -126,6 +129,17 @@ pub trait ModelTransport: Send + Sync {
         request: &ModelRequest,
         dispatch_id: &str,
     ) -> Result<TransportCompletion>;
+
+    /// Existing fixture transports cannot mint a formal external capture by
+    /// returning ExternalProvider from provenance(). Only the registered
+    /// production transport can construct the private completion capability.
+    async fn execute_formal(
+        &self,
+        _request: &crate::model::FormalTaskRequest,
+        _dispatch_id: &str,
+    ) -> Result<crate::formal_authority::CapturedFormalCompletion> {
+        Err(Error::Forbidden)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -183,6 +197,219 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
             config,
             clock,
         })
+    }
+
+    /// Returns the persistent billing root this trusted broker will use before
+    /// Actual formal task path: reload P/B and the frozen member, reserve inside
+    /// that Session, original start_execution fences again, perform network I/O
+    /// without a transaction, then retain usage/output even when later gates fail.
+    pub async fn dispatch_formal_task(
+        &self,
+        namespace: &str,
+        request: crate::model::FormalTaskRequest,
+    ) -> Result<crate::streaming_evaluator::ExecutionReceiptV2> {
+        let ctx = self.broker_context(namespace)?;
+        let capability = self.transport.formal_capability().ok_or(Error::Forbidden)?;
+        let now = self.now()?;
+        let call_id = format!(
+            "formal-call-{}",
+            &hash(request.task.request_digest.as_bytes())[..32]
+        );
+        let mut s = self.store.session().await?;
+        let (candidate, billing) =
+            crate::formal_authority::verify_formal_task_in_session(&ctx, &mut s, &request).await?;
+        capability
+            .validate_in_session(&mut s, &ctx, &request)
+            .await?;
+        if billing != self.config.billing_scope {
+            return Err(Error::Forbidden);
+        }
+        let token = hash(format!("{namespace}:{call_id}:{now}").as_bytes());
+        let reservation = BudgetCallReservation {
+            billing_scope: billing.clone(),
+            call_id: call_id.clone(),
+            dispatch_group_id: request.task.ticket_id.clone(),
+            stage: BudgetStage::TaskExecution,
+            actual_input_digest: request.task.request_digest.clone(),
+            request_artifact: Some(BudgetArtifact::from_serializable(
+                "rsia.formal_task_request.v1",
+                &request,
+            )?),
+            max_cost_micros: self.config.max_cost_micros,
+            lease_token: token,
+            lease_until: now
+                .checked_add(self.config.lease_seconds)
+                .ok_or(Error::Budget)?,
+            now,
+        };
+        let call = s
+            .reserve_budget_call_with_sources(
+                &ctx,
+                &reservation,
+                &candidate
+                    .sources
+                    .iter()
+                    .map(|v| v.id.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        s.commit().await?;
+        let fence = BudgetCallFence {
+            billing_scope: billing.clone(),
+            call_id: call_id.clone(),
+            actual_input_digest: request.task.request_digest.clone(),
+            lease_token: call.lease_token.clone(),
+            lease_epoch: call.lease_epoch,
+            now,
+        };
+        let decision = crate::streaming_evaluator::IndependentEvaluationControl::start_execution(
+            &ctx,
+            &self.store,
+            crate::streaming_evaluator::StartExecutionRequest {
+                ticket_id: request.task.ticket_id.clone(),
+                target_id: request.task.target_id.clone(),
+                side: request.task.side,
+                fence: fence.clone(),
+            },
+        )
+        .await?;
+        if !decision.new_dispatch {
+            return Err(Error::Conflict(
+                "formal call already dispatched; never auto-resend".into(),
+            ));
+        }
+        let dispatch_id = decision.call.dispatch_id.ok_or(Error::Internal)?;
+        let started = std::time::Instant::now();
+        let captured = match self.transport.execute_formal(&request, &dispatch_id).await {
+            Ok(value) => value,
+            Err(error) => {
+                self.store
+                    .mark_budget_call_uncertain(
+                        &ctx,
+                        &fence,
+                        "formal_provider_or_capture_unresolved",
+                    )
+                    .await?;
+                return Err(error);
+            }
+        };
+        let (completion, capture, ledger_eligible) = captured.into_parts();
+        if let Err(error) = completion.validate() {
+            self.store
+                .mark_budget_call_uncertain(&ctx, &fence, "formal_completion_invalid")
+                .await?;
+            return Err(error);
+        }
+        if capture.dispatch_id != dispatch_id
+            || capture.request_digest != request.task.request_digest
+            || capture.output_digest != hash(completion.output.as_bytes())
+            || capture.actual_model_digest != request.model_digest
+        {
+            self.store
+                .mark_budget_call_uncertain(&ctx, &fence, "formal_capture_binding_mismatch")
+                .await?;
+            return Err(Error::Conflict(
+                "formal provider/application capture differs".into(),
+            ));
+        }
+        let response = serde_json::json!({"schema_version":"rsia.formal_provider_response.v1",
+            "request_digest":request.task.request_digest,"output":completion.output,
+            "capture_id":capture.id,"capture_digest":fingerprint(&capture)?});
+        let forced_block_reason =
+            (!ledger_eligible).then(|| "formal_capture_exceeds_ledger_bound".to_string());
+        let transport_artifact = if ledger_eligible {
+            BudgetArtifact::from_serializable("rsia.actual_formal_provider_capture.v1", &capture)?
+        } else {
+            BudgetArtifact::from_serializable(
+                "rsia.unusable_formal_provider_capture.v1",
+                &serde_json::json!({
+                "schema_version":"rsia.unusable_formal_provider_capture.v1", "id":capture.id,
+                "capture_digest":fingerprint(&capture)?, "provider_response_digest":capture.provider_response_digest,
+                "provider_response_bytes":capture.provider_response_utf8.len(),
+                "reason":"formal_capture_exceeds_ledger_bound" }),
+            )?
+        };
+        let blocked_response = BudgetArtifact::from_serializable(
+            "rsia.blocked_formal_provider_response.v1",
+            &serde_json::json!({
+            "schema_version":"rsia.blocked_formal_provider_response.v1", "request_digest":request.task.request_digest,
+            "output_digest":capture.output_digest, "capture_id":capture.id, "capture_digest":fingerprint(&capture)?,
+            "reason":forced_block_reason.as_deref().unwrap_or("formal_response_not_usable") }),
+        )?;
+        let settled = self
+            .store
+            .settle_model_budget_call(
+                &ctx,
+                &BudgetCallFence {
+                    now: self.now()?,
+                    ..fence.clone()
+                },
+                &UsageCharge {
+                    amount_micros: completion.actual_cost_micros,
+                    currency: completion.currency.clone(),
+                    pricing_version: completion.pricing_version.clone(),
+                    provider_request_id: completion.provider_request_id.clone(),
+                    usage_record_id: completion.usage_record_id.clone(),
+                    output_digest: capture.output_digest.clone(),
+                },
+                &ModelCallSettlementEvidence {
+                    provenance: BudgetExecutionProvenance::ExternalProvider,
+                    actual_model_digest: Some(completion.actual_model_digest.clone()),
+                    transport_artifact,
+                    usable_response: if ledger_eligible {
+                        Some(BudgetArtifact::from_serializable(
+                            "rsia.formal_provider_response.v1",
+                            &response,
+                        )?)
+                    } else {
+                        None
+                    },
+                    blocked_response,
+                    forced_block_reason,
+                },
+            )
+            .await?;
+        self.store
+            .close_budget_call_execution(
+                &ctx,
+                &billing,
+                &call_id,
+                &dispatch_id,
+                "formal_provider_capture_persisted",
+                self.now()?,
+            )
+            .await?;
+        // Paid history is already durable. A revoke after the response cannot
+        // erase it; failure below leaves it unavailable for new authority.
+        if !settled.response_usable {
+            return Err(Error::Forbidden);
+        }
+        let mut s = self.store.session().await?;
+        crate::formal_authority::verify_formal_task_in_session(&ctx, &mut s, &request).await?;
+        crate::formal_authority::persist_formal_capture(&mut s, &ctx, &candidate.id, &capture)
+            .await?;
+        s.commit().await?;
+        crate::streaming_evaluator::IndependentEvaluationControl::record_execution_receipt(
+            &ctx,
+            &self.store,
+            crate::streaming_evaluator::ExecutionReceiptRequest {
+                receipt_id: format!("formal-execution-{}", &hash(dispatch_id.as_bytes())[..32]),
+                ticket_id: request.task.ticket_id,
+                target_id: request.task.target_id,
+                side: request.task.side,
+                request_digest: request.task.request_digest,
+                output_artifact_id: format!(
+                    "formal-output-{}",
+                    &hash(dispatch_id.as_bytes())[..32]
+                ),
+                output_utf8: completion.output,
+                budget_call_id: call_id,
+                latency_micros: u64::try_from(started.elapsed().as_micros())
+                    .map_err(|_| Error::Internal)?,
+                issued_at_unix_seconds: self.now()?,
+            },
+        )
+        .await
     }
 
     /// Returns the persistent billing root this trusted broker will use before
@@ -477,6 +704,11 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
 #[async_trait]
 impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
+        // The legacy API is a diagnostic/fixture API. A registered external
+        // capability must enter through dispatch_bound or dispatch_formal_task.
+        if self.transport.formal_capability().is_some() {
+            return Err(Error::Forbidden);
+        }
         if let Err(error) = request.validate() {
             return Ok(ModelResponse::Rejected {
                 request_id: request.request_id,
@@ -495,6 +727,13 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
             Err(refusal) => return Ok(pre_dispatch_refusal(&request, &refusal)),
         };
         if let Some(existing) = existing {
+            if existing
+                .request_artifact
+                .as_ref()
+                .is_some_and(|a| a.schema_version == "rsia.bound_model_request.v1")
+            {
+                return Err(Error::Forbidden);
+            }
             if existing.actual_input_digest != request.cache_key_digest {
                 return Ok(pre_dispatch_refusal(
                     &request,
@@ -607,6 +846,217 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
         if !decision.new_dispatch {
             return self.existing_response(&request, &root, decision.call).await;
         }
+        self.execute_committed_model(ctx, request, root, decision, fence, provenance)
+            .await
+    }
+    async fn dispatch_bound(
+        &self,
+        bound: crate::model::BoundModelRequest,
+    ) -> Result<ModelResponse> {
+        bound.validate()?;
+        let request = bound.request.clone();
+        let ctx = self.broker_context(&request.namespace)?;
+        let now = self.now()?;
+        let lease_until = now
+            .checked_add(self.config.lease_seconds)
+            .ok_or(Error::Budget)?;
+        let artifact = BudgetArtifact::from_serializable("rsia.bound_model_request.v1", &bound)?;
+        let mut session = self.store.session().await?;
+        bound.verify_current(&mut session, &ctx).await?;
+        if let Some(cap) = self.transport.formal_capability() {
+            cap.validate_optimizer_in_session(&mut session, &ctx, &bound)
+                .await?;
+        }
+        let source_ids: Vec<_> = request
+            .source_closure
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        crate::evidence::validate_stored_sources(
+            &mut session,
+            &ctx,
+            &source_ids,
+            request.revoke_watermark,
+        )
+        .await?;
+        let root = session
+            .root_budget(&ctx, &self.config.billing_scope)
+            .await?
+            .ok_or(Error::Budget)?;
+        if let Some(call) = session
+            .budget_call(&ctx, &self.config.billing_scope, &request.request_id)
+            .await?
+        {
+            if call.actual_input_digest != request.cache_key_digest
+                || call
+                    .request_artifact
+                    .as_ref()
+                    .map(fingerprint)
+                    .transpose()?
+                    != Some(fingerprint(&artifact)?)
+            {
+                return Ok(pre_dispatch_refusal(
+                    &request,
+                    &BudgetPreDispatchRefusal::CallIdReused,
+                ));
+            }
+            if call.state != BudgetCallState::Reserved {
+                let response = bound_existing_response(&request, &root, &call)?;
+                session.commit().await?;
+                // A late persisted response remains an accounting fact. Closing
+                // execution after this read cannot authorize another dispatch.
+                if call.response_artifact.is_some() && !call.execution_closed {
+                    self.store
+                        .close_budget_call_execution(
+                            &ctx,
+                            &call.billing_scope,
+                            &call.call_id,
+                            call.dispatch_id.as_deref().ok_or(Error::Internal)?,
+                            "recovered_bound_response",
+                            now,
+                        )
+                        .await?;
+                }
+                return Ok(response);
+            }
+        }
+        let Some(provenance) = self.transport.provenance() else {
+            return Ok(ModelResponse::Rejected {
+                request_id: request.request_id,
+                kind: ModelRejectionKind::Unauthorized,
+                reason: "model transport is disabled".into(),
+                dispatch: RejectedDispatch::NotDispatched,
+            });
+        };
+        let reservation = BudgetCallReservation {
+            billing_scope: self.config.billing_scope.clone(),
+            call_id: request.request_id.clone(),
+            dispatch_group_id: request.episode_id.clone(),
+            stage: model_stage_budget(request.stage),
+            actual_input_digest: request.cache_key_digest.clone(),
+            request_artifact: Some(artifact),
+            max_cost_micros: self.config.max_cost_micros,
+            lease_token: fingerprint(&(
+                self.config.actor.as_str(),
+                self.config.billing_scope.as_str(),
+                &bound,
+            ))?,
+            lease_until,
+            now,
+        };
+        let mut call = match session
+            .reserve_budget_call_with_sources_typed(&ctx, &reservation, &source_ids)
+            .await?
+        {
+            Ok(call) => call,
+            Err(refusal) => return Ok(pre_dispatch_refusal(&request, &refusal)),
+        };
+        if call.state == BudgetCallState::Reserved && now > call.lease_until {
+            call = session
+                .refence_reserved_budget_call(
+                    &ctx,
+                    &BudgetCallRefence {
+                        billing_scope: call.billing_scope.clone(),
+                        call_id: call.call_id.clone(),
+                        expected_epoch: call.lease_epoch,
+                        new_lease_token: reservation.lease_token.clone(),
+                        new_lease_until: lease_until,
+                        now,
+                    },
+                )
+                .await?;
+        }
+        let fence = BudgetCallFence {
+            billing_scope: call.billing_scope.clone(),
+            call_id: call.call_id.clone(),
+            actual_input_digest: call.actual_input_digest.clone(),
+            lease_token: call.lease_token.clone(),
+            lease_epoch: call.lease_epoch,
+            now,
+        };
+        let refusal = if root.currency != self.config.currency
+            || root.pricing_version != self.config.pricing_version
+            || self.config.max_cost_micros > root.per_call_cap_micros
+        {
+            Some("configuration_mismatch".to_string())
+        } else {
+            None
+        };
+        let decision = if let Some(reason) = refusal {
+            let released = session
+                .release_undispatched_budget_call(
+                    &ctx,
+                    &fence,
+                    &format!("{PRE_DISPATCH_REASON_PREFIX}{reason}"),
+                )
+                .await?;
+            session.commit().await?;
+            return Ok(undispatched_terminal_response(&request, &released));
+        } else {
+            match session.begin_budget_dispatch_typed(&ctx, &fence).await? {
+                Ok(decision) => decision,
+                Err(refusal) => {
+                    let released = session
+                        .release_undispatched_budget_call(
+                            &ctx,
+                            &fence,
+                            &format!("{PRE_DISPATCH_REASON_PREFIX}{}", refusal.code()),
+                        )
+                        .await?;
+                    session.commit().await?;
+                    return Ok(undispatched_terminal_response(&request, &released));
+                }
+            }
+        };
+        // This commit is the single authorization linearization point: profile,
+        // P/B, complete request, sources, lease and dispatch fence are one snapshot.
+        session.commit().await?;
+        if !decision.new_dispatch {
+            return bound_existing_response(&request, &root, &decision.call);
+        }
+        let response = self
+            .execute_committed_model(
+                ctx.clone(),
+                request.clone(),
+                root,
+                decision,
+                fence,
+                provenance,
+            )
+            .await?;
+        let mut current = self.store.session().await?;
+        if bound.verify_current(&mut current, &ctx).await.is_err() {
+            if let ModelResponse::Completed {
+                execution_receipt, ..
+            } = response
+            {
+                return Ok(ModelResponse::Rejected {
+                    request_id: request.request_id,
+                    kind: ModelRejectionKind::CancelledAfterDispatch,
+                    reason: "compiler authority changed after charged execution; receipt retained"
+                        .into(),
+                    dispatch: RejectedDispatch::Dispatched {
+                        receipt: execution_receipt,
+                    },
+                });
+            }
+            return Ok(response);
+        }
+        current.commit().await?;
+        Ok(response)
+    }
+}
+
+impl<T: ModelTransport> PersistentModelBroker<T> {
+    async fn execute_committed_model(
+        &self,
+        ctx: Context,
+        request: ModelRequest,
+        root: RootBudgetRecord,
+        decision: BudgetDispatchDecision,
+        fence: BudgetCallFence,
+        provenance: ModelExecutionProvenance,
+    ) -> Result<ModelResponse> {
         let dispatch_id = decision.call.dispatch_id.clone().ok_or(Error::Internal)?;
         let completion = match self.transport.execute(&request, &dispatch_id).await {
             Ok(completion) => completion,
@@ -832,6 +1282,99 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
         response.validate_against(&request)?;
         self.verify_persisted_response(&request, &response).await?;
         Ok(response)
+    }
+}
+
+fn bound_existing_response(
+    request: &ModelRequest,
+    root: &RootBudgetRecord,
+    call: &BudgetCallRecord,
+) -> Result<ModelResponse> {
+    if let Some(artifact) = &call.response_artifact {
+        if artifact.schema_version == "rsia.redacted.v1" {
+            if let (
+                Some(dispatch_id),
+                Some(provider_request_id),
+                Some(usage_record_id),
+                Some(provenance),
+            ) = (
+                &call.dispatch_id,
+                &call.provider_request_id,
+                &call.usage_record_id,
+                call.execution_provenance,
+            ) {
+                return Ok(ModelResponse::Rejected {
+                    request_id: request.request_id.clone(),
+                    kind: ModelRejectionKind::CancelledAfterDispatch,
+                    reason: "model response content was revoked and cannot be reused".into(),
+                    dispatch: RejectedDispatch::Dispatched {
+                        receipt: ModelExecutionReceipt {
+                            call_id: call.call_id.clone(),
+                            dispatch_id: dispatch_id.clone(),
+                            root_budget_id: root.root_budget_id.clone(),
+                            provider_request_id: provider_request_id.clone(),
+                            usage_record_id: usage_record_id.clone(),
+                            provenance: engine_provenance(provenance),
+                        },
+                    },
+                });
+            }
+        } else {
+            let response: ModelResponse =
+                serde_json::from_str(&artifact.body).map_err(|_| Error::Internal)?;
+            response.validate_against(request)?;
+            let receipt = match &response {
+                ModelResponse::Completed {
+                    execution_receipt, ..
+                } => Some(execution_receipt),
+                ModelResponse::Rejected {
+                    dispatch: RejectedDispatch::Dispatched { receipt },
+                    ..
+                } => Some(receipt),
+                _ => None,
+            };
+            if let Some(receipt) = receipt
+                && (receipt.call_id != call.call_id
+                    || call.dispatch_id.as_deref() != Some(receipt.dispatch_id.as_str())
+                    || receipt.root_budget_id != root.root_budget_id
+                    || call.provider_request_id.as_deref()
+                        != Some(receipt.provider_request_id.as_str())
+                    || call.usage_record_id.as_deref() != Some(receipt.usage_record_id.as_str())
+                    || call.execution_provenance != Some(storage_provenance(receipt.provenance)))
+            {
+                return Err(Error::Conflict(
+                    "bound cached response differs from original ledger".into(),
+                ));
+            }
+            if let ModelResponse::Completed {
+                actual_model_digest,
+                output_digest,
+                ..
+            } = &response
+                && (call.state != BudgetCallState::Finalized
+                    || call.response_usable != Some(true)
+                    || call.actual_model_digest.as_deref() != Some(actual_model_digest.as_str())
+                    || call.output_digest.as_deref() != Some(output_digest.as_str()))
+            {
+                return Err(Error::Forbidden);
+            }
+            return Ok(response);
+        }
+    }
+    match call.state {
+        BudgetCallState::Dispatched | BudgetCallState::Uncertain => Ok(ModelResponse::Uncertain {
+            request_id: request.request_id.clone(),
+            dispatch_id: call.dispatch_id.clone().ok_or(Error::Internal)?,
+            root_budget_id: root.root_budget_id.clone(),
+            provider_request_id: call.provider_request_id.clone(),
+            usage_record_id: call.usage_record_id.clone(),
+        }),
+        BudgetCallState::Released | BudgetCallState::Cancelled => {
+            Ok(undispatched_terminal_response(request, call))
+        }
+        _ => Err(Error::Conflict(
+            "bound execution lacks a usable original response".into(),
+        )),
     }
 }
 

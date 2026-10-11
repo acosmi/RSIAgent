@@ -1,12 +1,16 @@
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use evo_core::evaluation::{
     ControlCondition, ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec,
     FormalExperimentPlanV41, FormalStatisticalUnit, Money, OptimizationBudgetPlan,
     OptimizerComparisonContract, ProfileKind,
 };
+use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::holdout::{
     AnchorCoverageMatrix, CriticalCapabilityCoverage, ExposureLedger, ExposureState,
     FrozenCandidatePair, HoldoutManifest, MonetaryReservationState, SequentialMode,
 };
+use evo_core::optimization::{OptimizationTrace, TraceOutcome};
 use evo_core::sequential::{
     AlphaAllocation, EarlyStopPlan, FormalClaimKind, ResearchFamilyAlphaPlan,
 };
@@ -15,6 +19,10 @@ use evo_engine::dispatch::{
     EvaluationStartRequest, EvaluationStatusRequest, ExperimentRegisterRequest,
     IssueTicketRequestWire, ManagementDispatcher, ManagementJob, ManagementJobState,
     ManagementResult,
+};
+use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
+use evo_engine::release_store::{
+    ReleaseCandidateRecord, ReleaseStore, StageBundleRequest, TypedSourceRef,
 };
 use evo_engine::streaming_evaluator::{
     EvaluationEvidenceScope, ExecutionReceiptRequest, ExecutionReceiptV2, ExecutionSide,
@@ -139,6 +147,70 @@ async fn stored_ledger(store: &Store, context: &Context, family_id: &str) -> Exp
     serde_json::from_value(envelope["payload"].clone()).unwrap()
 }
 
+// Configuration authority is explicit Admin state. The execution receipts below
+// remain ProgramFixture evidence and cannot confer external provenance or approval.
+async fn stage_fixture_candidate(store: &Store) -> ReleaseCandidateRecord {
+    let host = Context::new("n", "host", Role::Host).unwrap();
+    let proposer = Context::new("n", "proposer", Role::Worker).unwrap();
+    let bundle = trusted_compiler_inputs::software_candidate(
+        "n",
+        &d("environment"),
+        "streaming execution fixture",
+    );
+    trusted_compiler_inputs::install_bundle(store, &bundle)
+        .await
+        .unwrap();
+    let body = "trusted streaming fixture source";
+    let source = StoredTraceAuthority {
+        schema_version: "rsia.optimization.source.v1".into(),
+        record: StoredRunRecord {
+            id: "streaming-fixture-source".into(),
+            body: body.as_bytes().to_vec(),
+            parent_family: "streaming-fixture-family".into(),
+            task_origin: TaskOrigin::TrustedRun,
+            execution_attestation: ExecutionAttestation::TrustedHost,
+            purpose: Purpose::Development,
+        },
+        trace: OptimizationTrace {
+            run_id: "streaming-fixture-source".into(),
+            parent_family: "streaming-fixture-family".into(),
+            source_digest: hash(body.as_bytes()),
+            purpose: Purpose::Development,
+            outcome: TraceOutcome::Success,
+            diagnosis: None,
+            excerpt: body.into(),
+            seed: 1,
+        },
+        excerpt_start: 0,
+        excerpt_end: body.len(),
+    };
+    store_trace_authority(store, &host, &source).await.unwrap();
+    let mut session = store.session().await.unwrap();
+    let watermark = session
+        .bump_watermark(&host, &d("streaming-fixture-watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    ReleaseStore::stage_bundle(
+        &proposer,
+        store,
+        StageBundleRequest {
+            candidate_id: d("candidate"),
+            bundle,
+            environment_digest: d("environment"),
+            proposer_actor: proposer.actor().into(),
+            sources: vec![TypedSourceRef {
+                kind: "run".into(),
+                id: source.record.id,
+                content_digest: source.trace.source_digest,
+            }],
+            revoke_watermark: watermark as u64,
+        },
+    )
+    .await
+    .unwrap()
+}
+
 async fn fixture(n: u32, sequential: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("e05.sqlite3");
@@ -164,6 +236,8 @@ async fn fixture(n: u32, sequential: bool) -> Fixture {
         )
         .await
         .unwrap();
+
+    let candidate = stage_fixture_candidate(&store).await;
 
     let mut v1 = ExperimentPlan::first_low_risk("formal-e05", 60).unwrap();
     v1.n_planned = n as usize;
@@ -280,8 +354,13 @@ async fn fixture(n: u32, sequential: bool) -> Fixture {
         .unwrap();
 
     // The candidate pair binds the actual E01 snapshot, not an arbitrary label.
-    let pair =
-        FrozenCandidatePair::new(v1.digest().unwrap(), d("candidate"), d("baseline"), 3).unwrap();
+    let pair = FrozenCandidatePair::new(
+        v1.digest().unwrap(),
+        candidate.id.clone(),
+        candidate.parent_digest.clone(),
+        3,
+    )
+    .unwrap();
     let sequential_mode = match &early {
         Some(plan) => SequentialMode::RejectOnly {
             early_stop_plan_digest: plan.digest().unwrap(),
@@ -344,7 +423,7 @@ async fn fixture(n: u32, sequential: bool) -> Fixture {
         registration_id: "control-1".into(),
         pair,
         manifest,
-        candidate_bundle_digest: d("candidate-bundle"),
+        candidate_bundle_digest: candidate.bundle_digest,
         baseline_bundle_digest: d("baseline-bundle"),
         rotating_inputs,
         anchor_inputs,

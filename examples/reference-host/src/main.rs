@@ -25,6 +25,13 @@ fn main() -> ExitCode {
             }
         }
     }
+    if task == "formal_authority" {
+        // This standalone deterministic probe has no registered external
+        // transport, independent credentials, root seal or resource meters.
+        // Actual execution uses evo-engine's formal_local_host entry point.
+        println!("{{\"task\":\"formal_authority\",\"status\":\"fixture_only\",\"evidence_scope\":\"program_fixture\",\"ordinary_p_eligible\":false,\"promotion_eligible\":false}}");
+        return ExitCode::from(3);
+    }
     if task == "code" {
         println!(
             "{{\"task\":\"code\",\"status\":\"sandbox_unavailable\",\"writes_performed\":false}}"

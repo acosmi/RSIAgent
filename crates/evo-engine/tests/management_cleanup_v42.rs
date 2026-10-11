@@ -48,6 +48,9 @@
 //! `tests/dispatch_management.rs` and `tests/streaming_evaluator.rs` (test crates
 //! cannot import each other); the originals are untouched.
 
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
+
 use evo_core::{Context, Error, Role, fingerprint};
 use evo_engine::dispatch::{
     ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
@@ -586,7 +589,12 @@ mod curriculum_fx {
             attempt: 1,
             manifest: control.manifest().unwrap(),
             parent_bundle_digest: d("parent-bundle"),
-            candidate_bundle_digest: d("candidate-bundle"),
+            candidate_bundle_digest: crate::trusted_compiler_inputs::software_candidate(
+                NAMESPACE,
+                &control.environment_digest,
+                "candidate-bundle",
+            )
+            .digest,
             environment_digest: control.environment_digest.clone(),
             grader_digest: control.grader_digest.clone(),
             rules_digest: control.rules_digest.clone(),
@@ -645,6 +653,20 @@ mod curriculum_fx {
                 .await
                 .unwrap();
             let control = control();
+            let candidate = crate::trusted_compiler_inputs::software_candidate(
+                NAMESPACE,
+                &control.environment_digest,
+                "candidate-bundle",
+            );
+            crate::trusted_compiler_inputs::persist_bundle(
+                &store,
+                NAMESPACE,
+                &candidate,
+                &control.environment_digest,
+                1,
+            )
+            .await
+            .unwrap();
             register_development_control(&admin, &store, control.clone())
                 .await
                 .unwrap();
@@ -714,14 +736,34 @@ mod curriculum_fx {
                 request_id: request.request_id.clone(),
                 input_digest: request.manifest.digest.clone(),
                 output_digest: None,
-                dependencies: extras.clone(),
+                dependencies: extras
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(StageDependency {
+                        kind: "environment".into(),
+                        id: request.environment_digest.clone(),
+                    }))
+                    .collect(),
                 payload: serde_json::to_value(request).unwrap(),
             }
             .seal()
             .unwrap();
             let observed_fact = observed_fact(request, report, extras);
-            journal.commit(request_fact.clone()).await.unwrap();
-            journal.commit(observed_fact.clone()).await.unwrap();
+            let inputs = crate::trusted_compiler_inputs::bundle_use(
+                &self.store,
+                NAMESPACE,
+                &request.candidate_bundle_digest,
+            )
+            .await
+            .unwrap();
+            journal
+                .commit_bound(request_fact.clone(), &inputs)
+                .await
+                .unwrap();
+            journal
+                .commit_bound(observed_fact.clone(), &inputs)
+                .await
+                .unwrap();
             (request_fact.artifact_id, observed_fact.artifact_id)
         }
     }

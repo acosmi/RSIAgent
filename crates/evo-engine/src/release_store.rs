@@ -33,7 +33,8 @@ pub struct TypedSourceRef {
     pub content_digest: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StageBundleRequest {
     pub candidate_id: String,
     pub bundle: ResolvedBundle,
@@ -192,6 +193,15 @@ pub struct TrustedHostExecutionReceipt {
     pub used_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedCompilerBinding {
+    pub id: String,
+    pub schema_version: String,
+    pub candidate_id: String,
+    pub binding: crate::formal_authority::FormalCompilerInputBinding,
+}
+
 pub struct ReleaseStore;
 
 impl ReleaseStore {
@@ -236,6 +246,17 @@ impl ReleaseStore {
         store: &Store,
         request: StageBundleRequest,
     ) -> Result<ReleaseCandidateRecord> {
+        let mut session = store.session().await?;
+        let candidate = Self::stage_bundle_in_session(ctx, &mut session, request).await?;
+        session.commit().await?;
+        Ok(candidate)
+    }
+
+    pub(crate) async fn stage_bundle_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        request: StageBundleRequest,
+    ) -> Result<ReleaseCandidateRecord> {
         ctx.require(&[Role::Worker, Role::Admin])?;
         validate_stage_request(ctx, &request)?;
         let candidate = ReleaseCandidateRecord {
@@ -250,18 +271,41 @@ impl ReleaseStore {
             revoke_watermark: request.revoke_watermark,
             bundle: request.bundle,
         };
-        let mut session = store.session().await?;
-        validate_candidate_sources(&mut session, ctx, &candidate).await?;
-        if let Some(existing) = session
+        let existing = session
             .get::<ReleaseCandidateRecord>(ctx, "artifact", &candidate.id)
-            .await?
+            .await?;
+        if let Some(existing) = &existing
+            && fingerprint(&existing)? != fingerprint(&candidate)?
         {
-            if fingerprint(&existing)? != fingerprint(&candidate)? {
-                return Err(Error::Conflict(
-                    "candidate id reused with different content".into(),
-                ));
-            }
-            session.commit().await?;
+            return Err(Error::Conflict(
+                "candidate id reused with different content".into(),
+            ));
+        }
+        let binding = crate::formal_authority::resolve_bundle_in_session(
+            session,
+            ctx,
+            &candidate.bundle,
+            &candidate.environment_digest,
+            candidate.revoke_watermark,
+            evo_core::evidence::Purpose::Development,
+        )
+        .await?;
+        validate_candidate_sources(session, ctx, &candidate).await?;
+        crate::compiler::persist_authenticated_bundle(
+            session,
+            ctx,
+            &binding.request_for_search_parent(candidate.bundle.skill.clone()),
+            &candidate.bundle,
+        )
+        .await?;
+        if let Some(existing) = existing {
+            crate::formal_authority::bind_candidate_principal_from_binding(
+                session,
+                ctx,
+                binding.binding(),
+                &existing,
+            )
+            .await?;
             return Ok(existing);
         }
         session
@@ -272,10 +316,50 @@ impl ReleaseStore {
                 .put_edge(ctx, "artifact", &candidate.id, &source.kind, &source.id)
                 .await?;
         }
+        let binding_id = format!(
+            "compiler-binding-{}",
+            fingerprint(&(&candidate.id, &candidate.bundle_digest))?
+        );
+        let binding_record = PersistedCompilerBinding {
+            id: binding_id.clone(),
+            schema_version: "rsia.persisted_compiler_binding.v1".into(),
+            candidate_id: candidate.id.clone(),
+            binding: binding.binding().clone(),
+        };
+        if let Some(old) = session
+            .get::<serde_json::Value>(ctx, "artifact", &binding_id)
+            .await?
+        {
+            if crate::formal_authority::content_digest(&old)?
+                != crate::formal_authority::content_digest(&binding_record)?
+            {
+                return Err(Error::Conflict(
+                    "compiler binding identity collision".into(),
+                ));
+            }
+        } else {
+            session
+                .put(ctx, "artifact", &binding_id, ctx.actor(), &binding_record)
+                .await?;
+            for node in &binding.binding().closure.nodes {
+                session
+                    .put_edge(ctx, "artifact", &binding_id, &node.kind, &node.id)
+                    .await?;
+            }
+        }
+        session
+            .put_edge(ctx, "artifact", &candidate.id, "artifact", &binding_id)
+            .await?;
+        crate::formal_authority::bind_candidate_principal_from_binding(
+            session,
+            ctx,
+            binding.binding(),
+            &candidate,
+        )
+        .await?;
         session
             .audit(ctx, "release.candidate.stage", &candidate.id)
             .await?;
-        session.commit().await?;
         Ok(candidate)
     }
 
@@ -321,6 +405,7 @@ impl ReleaseStore {
             state: PersistentReleaseState::Approved,
         };
         let release = put_release_approval_idempotent(&mut session, ctx, release).await?;
+        crate::formal_authority::record_parent_approval(&mut session, ctx, &release).await?;
         if release.state != PersistentReleaseState::Approved {
             session.commit().await?;
             return Ok(release);
@@ -329,7 +414,16 @@ impl ReleaseStore {
             .put_edge(ctx, "release", &release.id, "artifact", &candidate.id)
             .await?;
         session
-            .put_edge(ctx, "release", &release.id, "artifact", &release.report_id)
+            .put_edge(
+                ctx,
+                "release",
+                &release.id,
+                "artifact",
+                &crate::streaming_evaluator::storage_id(
+                    "formal_evaluation_v2",
+                    &release.report_id,
+                )?,
+            )
             .await?;
         session.audit(ctx, "release.approve", &release.id).await?;
         session.commit().await?;
@@ -349,9 +443,7 @@ impl ReleaseStore {
         }
         revalidate_release(&mut session, ctx, &release).await?;
         release.state = PersistentReleaseState::Canary;
-        session
-            .put(ctx, "release", release_id, ctx.actor(), &release)
-            .await?;
+        write_release_state(&mut session, ctx, &release).await?;
         session.audit(ctx, "release.canary", release_id).await?;
         session.commit().await?;
         Ok(release)
@@ -387,15 +479,20 @@ impl ReleaseStore {
                     "expected parent release is not active".into(),
                 ));
             }
+            require_body_witness(
+                &mut session,
+                ctx,
+                "release",
+                previous_id,
+                &previous,
+                Role::Admin,
+            )
+            .await?;
             previous.state = PersistentReleaseState::Superseded;
-            session
-                .put(ctx, "release", previous_id, ctx.actor(), &previous)
-                .await?;
+            write_release_state(&mut session, ctx, &previous).await?;
         }
         release.state = PersistentReleaseState::Active;
-        session
-            .put(ctx, "release", release_id, ctx.actor(), &release)
-            .await?;
+        write_release_state(&mut session, ctx, &release).await?;
         session.audit(ctx, "release.activate", release_id).await?;
         session.commit().await?;
         Ok(release)
@@ -441,12 +538,14 @@ impl ReleaseStore {
                     "host surface id reused with different content".into(),
                 ));
             }
+            require_body_witness(&mut session, ctx, "artifact", id, &existing, Role::Admin).await?;
             session.commit().await?;
             return Ok(existing);
         }
         session
             .put(ctx, "artifact", id, ctx.actor(), &record)
             .await?;
+        crate::formal_authority::attest_content(&mut session, ctx, "artifact", id, &record).await?;
         session.audit(ctx, "host_surface.register", id).await?;
         session.commit().await?;
         Ok(record)
@@ -491,6 +590,15 @@ impl ReleaseStore {
         surface
             .manifest
             .validate_against_extraction(&surface.extracted)?;
+        require_body_witness(
+            &mut session,
+            ctx,
+            "artifact",
+            &request.host_surface_id,
+            &surface,
+            Role::Admin,
+        )
+        .await?;
         if surface.manifest.host != request.system_snapshot.host_id
             || surface.manifest.host_version != request.system_snapshot.host_version
         {
@@ -564,6 +672,14 @@ impl ReleaseStore {
                 .put_edge(ctx, "artifact", &snapshot_id, "release", release_id)
                 .await?;
         }
+        crate::formal_authority::attest_content(
+            &mut session,
+            ctx,
+            "artifact",
+            &snapshot_id,
+            &record,
+        )
+        .await?;
         session
             .audit(ctx, "release.prepare_run", &snapshot_id)
             .await?;
@@ -600,6 +716,42 @@ impl ReleaseStore {
         identifier(run_id)?;
         let snapshot_id = format!("run-snapshot-{run_id}");
         let snapshot: RunApplicationSnapshot = session.need(ctx, "artifact", &snapshot_id).await?;
+        require_body_witness(
+            session,
+            ctx,
+            "artifact",
+            &snapshot_id,
+            &snapshot,
+            Role::Host,
+        )
+        .await?;
+        if snapshot.schema_version != RUN_APPLICATION_SCHEMA
+            || snapshot.id != snapshot_id
+            || snapshot.run_id != run_id
+            || snapshot.system_snapshot.profile_id != snapshot.profile_id
+            || snapshot.environment_digest != snapshot.system_snapshot.digest()?
+            || snapshot.request_digest != fingerprint(&snapshot.request_material)?
+            || snapshot.request_material.instructions != snapshot.projection.instructions
+            || snapshot.request_material.tools != snapshot.projection.tools
+            || snapshot.request_material.mandatory_context_digest
+                != snapshot.system_snapshot.mandatory_context_digest
+        {
+            return Err(Error::Conflict(
+                "restored run application binding differs".into(),
+            ));
+        }
+        let surface: HostSurfaceRecord = session
+            .need(ctx, "artifact", &snapshot.host_surface_id)
+            .await?;
+        require_body_witness(session, ctx, "artifact", &surface.id, &surface, Role::Admin).await?;
+        surface
+            .manifest
+            .validate_against_extraction(&surface.extracted)?;
+        if surface.manifest_digest != snapshot.host_surface_digest
+            || surface.manifest_digest != fingerprint(&surface.manifest)?
+        {
+            return Err(Error::Conflict("host surface changed".into()));
+        }
         if let Some(release_id) = &snapshot.release_id {
             let release: PersistentRelease = session.need(ctx, "release", release_id).await?;
             if !matches!(
@@ -672,6 +824,15 @@ impl ReleaseStore {
                         })?;
                     let execution: TrustedHostExecutionReceipt =
                         session.need(ctx, "artifact", execution_id).await?;
+                    require_body_witness(
+                        &mut session,
+                        ctx,
+                        "artifact",
+                        execution_id,
+                        &execution,
+                        Role::Host,
+                    )
+                    .await?;
                     if execution.run_id != run_id
                         || execution.request_digest != actual_request_digest
                         || execution.environment_digest != snapshot.environment_digest
@@ -720,12 +881,14 @@ impl ReleaseStore {
                     "host application id reused with different facts".into(),
                 ));
             }
+            require_body_witness(&mut session, ctx, "receipt", &id, &existing, Role::Host).await?;
             session.commit().await?;
             return Ok(existing);
         }
         session
             .put(ctx, "receipt", &id, ctx.actor(), &record)
             .await?;
+        crate::formal_authority::attest_content(&mut session, ctx, "receipt", &id, &record).await?;
         session.audit(ctx, "release.applied_request", &id).await?;
         session.commit().await?;
         Ok(record)
@@ -768,12 +931,29 @@ impl ReleaseStore {
                     "host execution receipt id reused with different facts".into(),
                 ));
             }
+            require_body_witness(
+                &mut session,
+                ctx,
+                "artifact",
+                &receipt.id,
+                &existing,
+                Role::Host,
+            )
+            .await?;
             session.commit().await?;
             return Ok(());
         }
         session
             .put(ctx, "artifact", &receipt.id, ctx.actor(), &receipt)
             .await?;
+        crate::formal_authority::attest_content(
+            &mut session,
+            ctx,
+            "artifact",
+            &receipt.id,
+            &receipt,
+        )
+        .await?;
         session
             .audit(ctx, "host.execution_receipt", &receipt.id)
             .await?;
@@ -800,6 +980,15 @@ impl ReleaseStore {
         }
         let mut current: PersistentRelease = session.need(ctx, "release", &current_id).await?;
         let mut target: PersistentRelease = session.need(ctx, "release", target_release_id).await?;
+        require_body_witness(
+            &mut session,
+            ctx,
+            "release",
+            &current.id,
+            &current,
+            Role::Admin,
+        )
+        .await?;
         if target.profile_id != profile_id
             || target.environment_digest != environment_digest
             || target.state != PersistentReleaseState::Superseded
@@ -821,12 +1010,8 @@ impl ReleaseStore {
         .await?;
         current.state = PersistentReleaseState::RolledBack;
         target.state = PersistentReleaseState::Active;
-        session
-            .put(ctx, "release", &current.id, ctx.actor(), &current)
-            .await?;
-        session
-            .put(ctx, "release", &target.id, ctx.actor(), &target)
-            .await?;
+        write_release_state(&mut session, ctx, &current).await?;
+        write_release_state(&mut session, ctx, &target).await?;
         session
             .audit(ctx, "release.rollback", target_release_id)
             .await?;
@@ -933,9 +1118,9 @@ fn validate_verified_report_identity(
         || view.anchor_status != AnchorEvidenceStatus::CompletePassedStoredClosure
         || view.anchor_evidence_digest.is_none()
         || view.resource_evidence_digest.is_none()
-        || view.evidence_scope == EvaluationEvidenceScope::ProgramFixture
-        || view.cost_evidence_scope == Some(CostEvidenceScope::TicketExecutionOnly)
-        || view.dependency_status == DependencyEvidenceStatus::NamespaceWatermarkOnly
+        || view.evidence_scope != EvaluationEvidenceScope::RegisteredExternalHost
+        || view.cost_evidence_scope != Some(CostEvidenceScope::CompleteEpisodeRoot)
+        || view.dependency_status != DependencyEvidenceStatus::CompleteTypedContentClosure
         || !view.promotion_eligible
     {
         return Err(Error::Forbidden);
@@ -979,21 +1164,51 @@ async fn put_release_approval_idempotent(
     ctx: &Context,
     proposed: PersistentRelease,
 ) -> Result<PersistentRelease> {
+    if let Some(existing) = existing_release_approval_content(session, ctx, &proposed).await? {
+        // Content identity alone never authorizes a formal release.
+        require_body_witness(
+            session,
+            ctx,
+            "release",
+            &existing.id,
+            &existing,
+            Role::Admin,
+        )
+        .await?;
+        return Ok(existing);
+    }
+    write_release_state(session, ctx, &proposed).await?;
+    Ok(proposed)
+}
+
+/// Shared persisted identity/idempotence primitive. It cannot create a release
+/// or authorize a formal parent; the formal wrapper adds the registered guard.
+async fn existing_release_approval_content(
+    session: &mut Session,
+    ctx: &Context,
+    proposed: &PersistentRelease,
+) -> Result<Option<PersistentRelease>> {
     if let Some(existing) = session
         .get::<PersistentRelease>(ctx, "release", &proposed.id)
         .await?
     {
-        if same_release_approval_identity(&existing, &proposed) {
-            return Ok(existing);
+        if same_release_approval_identity(&existing, proposed) {
+            require_body_content_witness(
+                session,
+                ctx,
+                "release",
+                &existing.id,
+                &existing,
+                Role::Admin,
+            )
+            .await?;
+            return Ok(Some(existing));
         }
         return Err(Error::Conflict(
             "release id reused with different approval evidence".into(),
         ));
     }
-    session
-        .put(ctx, "release", &proposed.id, ctx.actor(), &proposed)
-        .await?;
-    Ok(proposed)
+    Ok(None)
 }
 
 fn same_release_approval_identity(left: &PersistentRelease, right: &PersistentRelease) -> bool {
@@ -1054,15 +1269,81 @@ fn validate_persisted_approval_binding(
     Ok(())
 }
 
+// Internal writer only: callers have already checked the formal approval or
+// the permitted state transition. This does not register a parent selection.
+async fn write_release_state(
+    session: &mut Session,
+    ctx: &Context,
+    release: &PersistentRelease,
+) -> Result<()> {
+    ctx.require(&[Role::Admin])?;
+    crate::formal_authority::bind_release_principal(session, ctx, release).await?;
+    crate::formal_authority::attest_registered_content(
+        session,
+        ctx,
+        "release",
+        &release.id,
+        release,
+    )
+    .await?;
+    write_release_content(session, ctx, release).await
+}
+
+/// Actual production content mutation and latest private-audit witness. This
+/// private primitive has no candidate/report/principal or formal-parent power.
+async fn write_release_content(
+    session: &mut Session,
+    ctx: &Context,
+    release: &PersistentRelease,
+) -> Result<()> {
+    ctx.require(&[Role::Admin])?;
+    session
+        .put(ctx, "release", &release.id, ctx.actor(), release)
+        .await?;
+    crate::formal_authority::write_content_witness(session, ctx, "release", &release.id, release)
+        .await
+}
+
+async fn require_body_content_witness<T: Serialize>(
+    session: &mut Session,
+    ctx: &Context,
+    kind: &str,
+    id: &str,
+    body: &T,
+    role: Role,
+) -> Result<serde_json::Value> {
+    let value = serde_json::to_value(body).map_err(|_| Error::Internal)?;
+    crate::formal_authority::require_content_witness(session, ctx, kind, id, &value, role).await?;
+    Ok(value)
+}
+
+async fn require_body_witness<T: Serialize>(
+    session: &mut Session,
+    ctx: &Context,
+    kind: &str,
+    id: &str,
+    body: &T,
+    role: Role,
+) -> Result<()> {
+    let value = require_body_content_witness(session, ctx, kind, id, body, role).await?;
+    if role == Role::Admin {
+        crate::formal_authority::require_registered_body_authority(session, ctx, kind, id, &value)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn revalidate_release(
     session: &mut Session,
     ctx: &Context,
     release: &PersistentRelease,
 ) -> Result<()> {
+    require_body_witness(session, ctx, "release", &release.id, release, Role::Admin).await?;
     let candidate: ReleaseCandidateRecord =
         session.need(ctx, "artifact", &release.candidate_id).await?;
     validate_candidate_sources(session, ctx, &candidate).await?;
     validate_persisted_approval_binding(release, &candidate)?;
+    crate::formal_authority::verify_release_principal(session, ctx, release, &candidate).await?;
     let view = if ctx.role() == Role::Host {
         verified_report_view_for_host_in_session(ctx, session, &release.report_id).await?
     } else {
@@ -1077,19 +1358,56 @@ async fn load_pointer(
     ctx: &Context,
     profile_id: &str,
 ) -> Result<PersistentProfilePointer> {
+    let pointer = load_pointer_content(session, ctx, profile_id).await?;
+    if session
+        .get::<serde_json::Value>(ctx, "pointer", &pointer.id)
+        .await?
+        .is_some()
+    {
+        let value = serde_json::to_value(&pointer).map_err(|_| Error::Internal)?;
+        crate::formal_authority::require_registered_body_authority(
+            session,
+            ctx,
+            "pointer",
+            &pointer.id,
+            &value,
+        )
+        .await?;
+    }
+    Ok(pointer)
+}
+
+// Identity/default handling and private content witness, shared by the formal
+// loader and component CAS tests. A returned pointer is not formal authority.
+async fn load_pointer_content(
+    session: &mut Session,
+    ctx: &Context,
+    profile_id: &str,
+) -> Result<PersistentProfilePointer> {
     identifier(profile_id)?;
     let id = format!("profile-pointer-{profile_id}");
-    Ok(session
-        .get(ctx, "pointer", &id)
+    if let Some(pointer) = session
+        .get::<PersistentProfilePointer>(ctx, "pointer", &id)
         .await?
-        .unwrap_or(PersistentProfilePointer {
+    {
+        require_body_content_witness(session, ctx, "pointer", &id, &pointer, Role::Admin).await?;
+        if pointer.id != id
+            || pointer.profile_id != profile_id
+            || pointer.schema_version != PROFILE_POINTER_SCHEMA
+        {
+            return Err(Error::Conflict("profile pointer identity mismatch".into()));
+        }
+        Ok(pointer)
+    } else {
+        Ok(PersistentProfilePointer {
             id,
             schema_version: PROFILE_POINTER_SCHEMA.into(),
             profile_id: profile_id.into(),
             active_release_id: None,
             active_bundle_digest: None,
             epoch: 0,
-        }))
+        })
+    }
 }
 
 fn cas_pointer(
@@ -1132,10 +1450,32 @@ async fn cas_pointer_in_session(
         next_release_id,
         next_bundle_digest,
     )?;
-    session
-        .put(ctx, "pointer", &pointer.id, ctx.actor(), &pointer)
-        .await?;
+    // Authenticate the complete new pointer before any business-row mutation.
+    crate::formal_authority::attest_registered_content(
+        session,
+        ctx,
+        "pointer",
+        &pointer.id,
+        &pointer,
+    )
+    .await?;
+    write_pointer_content(session, ctx, &pointer).await?;
     Ok(pointer)
+}
+
+/// Shared production put/witness step. The caller owns the same transaction
+/// that read and compared the epoch; only the formal wrapper authorizes use.
+async fn write_pointer_content(
+    session: &mut Session,
+    ctx: &Context,
+    pointer: &PersistentProfilePointer,
+) -> Result<()> {
+    ctx.require(&[Role::Admin])?;
+    session
+        .put(ctx, "pointer", &pointer.id, ctx.actor(), pointer)
+        .await?;
+    crate::formal_authority::write_content_witness(session, ctx, "pointer", &pointer.id, pointer)
+        .await
 }
 
 fn baseline_projection(snapshot: &SystemSnapshot) -> RunProjection {
@@ -1204,38 +1544,36 @@ mod tests {
         let right_admin = admin.clone();
         let left = async move {
             let mut session = left_store.session().await?;
-            let pointer = cas_pointer_in_session(
-                &mut session,
-                &left_admin,
-                "p1",
-                0,
-                None,
-                "release-left".into(),
-                "a".repeat(64),
-            )
-            .await?;
+            // Component CAS: the same production read/compare/put+witness
+            // primitives and one real Session, without formal registration.
+            let mut pointer = load_pointer_content(&mut session, &left_admin, "p1").await?;
+            cas_pointer(&mut pointer, 0, None, "release-left".into(), "a".repeat(64))?;
+            write_pointer_content(&mut session, &left_admin, &pointer).await?;
             session.commit().await?;
             Ok::<_, Error>(pointer)
         };
         let right = async move {
             let mut session = right_store.session().await?;
-            let pointer = cas_pointer_in_session(
-                &mut session,
-                &right_admin,
-                "p1",
+            // Component CAS: the same production read/compare/put+witness
+            // primitives and one real Session, without formal registration.
+            let mut pointer = load_pointer_content(&mut session, &right_admin, "p1").await?;
+            cas_pointer(
+                &mut pointer,
                 0,
                 None,
                 "release-right".into(),
                 "b".repeat(64),
-            )
-            .await?;
+            )?;
+            write_pointer_content(&mut session, &right_admin, &pointer).await?;
             session.commit().await?;
             Ok::<_, Error>(pointer)
         };
         let (left, right) = tokio::join!(left, right);
         assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
         let mut session = store.session().await.unwrap();
-        let pointer = load_pointer(&mut session, &admin, "p1").await.unwrap();
+        let pointer = load_pointer_content(&mut session, &admin, "p1")
+            .await
+            .unwrap();
         session.commit().await.unwrap();
         assert_eq!(pointer.epoch, 1);
     }
@@ -1346,8 +1684,9 @@ mod tests {
             state: PersistentReleaseState::Active,
         };
         let mut session = store.session().await.unwrap();
-        session
-            .put(&admin, "release", &existing.id, admin.actor(), &existing)
+        // This fixture exercises the actual private content/idempotence primitives,
+        // not the formal writer or a formal P issuer.
+        write_release_content(&mut session, &admin, &existing)
             .await
             .unwrap();
         session.commit().await.unwrap();
@@ -1357,8 +1696,9 @@ mod tests {
         proposed.expected_parent_release_id = Some("new-current-parent".into());
         proposed.expected_pointer_epoch = 99;
         let mut session = store.session().await.unwrap();
-        let returned = put_release_approval_idempotent(&mut session, &admin, proposed)
+        let returned = existing_release_approval_content(&mut session, &admin, &proposed)
             .await
+            .unwrap()
             .unwrap();
         session.commit().await.unwrap();
         assert_eq!(returned.state, PersistentReleaseState::Active);
@@ -1368,9 +1708,287 @@ mod tests {
         conflicting.report_digest = "f".repeat(64);
         let mut session = store.session().await.unwrap();
         assert!(
-            put_release_approval_idempotent(&mut session, &admin, conflicting)
+            existing_release_approval_content(&mut session, &admin, &conflicting)
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn authorized_state_writes_keep_latest_witness_and_reject_old_body_replay() {
+        // A component test of the actual production Admin content writer. No candidate, report or
+        // formal_parent is created, and this record cannot confer ordinary P.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state-witness.sqlite3"))
+            .await
+            .unwrap();
+        let admin = Context::new("n", "approver", Role::Admin).unwrap();
+        let worker = Context::new("n", "worker", Role::Worker).unwrap();
+        let mut current = PersistentRelease {
+            id: "component-release".into(),
+            schema_version: PERSISTENT_RELEASE_SCHEMA.into(),
+            candidate_id: "absent-candidate".into(),
+            bundle_digest: "a".repeat(64),
+            environment_digest: "b".repeat(64),
+            profile_id: "p".into(),
+            parent_digest: "c".repeat(64),
+            baseline_bundle_digest: "d".repeat(64),
+            report_id: "absent-report".into(),
+            report_digest: "e".repeat(64),
+            proposer_actor: "proposer".into(),
+            evaluator_actor: "evaluator".into(),
+            approved_by: "approver".into(),
+            expected_parent_release_id: None,
+            expected_pointer_epoch: 0,
+            state: PersistentReleaseState::Approved,
+        };
+        let mut prior = None;
+        for state in [
+            PersistentReleaseState::Approved,
+            PersistentReleaseState::Canary,
+            PersistentReleaseState::Active,
+            PersistentReleaseState::Superseded,
+            PersistentReleaseState::RolledBack,
+            PersistentReleaseState::Active,
+        ] {
+            current.state = state;
+            let mut session = store.session().await.unwrap();
+            write_release_content(&mut session, &admin, &current)
+                .await
+                .unwrap();
+            require_body_content_witness(
+                &mut session,
+                &worker,
+                "release",
+                &current.id,
+                &current,
+                Role::Admin,
+            )
+            .await
+            .unwrap();
+            assert!(
+                session
+                    .get::<serde_json::Value>(&worker, "formal_parent", &current.bundle_digest)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            session.commit().await.unwrap();
+            if let Some(old) = &prior {
+                let mut session = store.session().await.unwrap();
+                session
+                    .put(&worker, "release", &current.id, "approver", old)
+                    .await
+                    .unwrap();
+                let operation = format!(
+                    "formal.admin.content.v1.{}",
+                    fingerprint(&("n", "release", &current.id)).unwrap()
+                );
+                let entity = fingerprint(&(
+                    "n",
+                    "release",
+                    &current.id,
+                    crate::formal_authority::content_digest(old).unwrap(),
+                ))
+                .unwrap();
+                session.audit(&worker, &operation, &entity).await.unwrap();
+                assert!(
+                    require_body_content_witness(
+                        &mut session,
+                        &worker,
+                        "release",
+                        &current.id,
+                        old,
+                        Role::Admin
+                    )
+                    .await
+                    .is_err()
+                );
+                session
+                    .put(&worker, "release", &current.id, "worker", &current)
+                    .await
+                    .unwrap();
+                require_body_content_witness(
+                    &mut session,
+                    &worker,
+                    "release",
+                    &current.id,
+                    &current,
+                    Role::Admin,
+                )
+                .await
+                .unwrap();
+                session.commit().await.unwrap();
+            }
+            prior = Some(current.clone());
+        }
+        let mut session = store.session().await.unwrap();
+        assert!(
+            write_release_content(&mut session, &worker, &current)
+                .await
+                .is_err()
+        );
+        drop(session);
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn content_primitives_never_authorize_formal_writes_and_missing_inputs_leave_no_side_effects()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("formal-guard.sqlite3"))
+            .await
+            .unwrap();
+        let admin = Context::new("n", "approver", Role::Admin).unwrap();
+        let worker = Context::new("n", "worker", Role::Worker).unwrap();
+        let component = PersistentRelease {
+            id: "component-only".into(),
+            schema_version: PERSISTENT_RELEASE_SCHEMA.into(),
+            candidate_id: "missing-candidate".into(),
+            bundle_digest: "a".repeat(64),
+            environment_digest: "b".repeat(64),
+            profile_id: "unregistered-profile".into(),
+            parent_digest: "c".repeat(64),
+            baseline_bundle_digest: "d".repeat(64),
+            report_id: "missing-report".into(),
+            report_digest: "e".repeat(64),
+            proposer_actor: "worker".into(),
+            evaluator_actor: "evaluator".into(),
+            approved_by: "approver".into(),
+            expected_parent_release_id: None,
+            expected_pointer_epoch: 0,
+            state: PersistentReleaseState::Approved,
+        };
+        let mut session = store.session().await.unwrap();
+        write_release_content(&mut session, &admin, &component)
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+
+        // A real Admin content witness is insufficient for any formal consumer.
+        assert!(matches!(
+            ReleaseStore::approve_verified(
+                &admin,
+                &store,
+                &component.candidate_id,
+                &component.report_id
+            )
+            .await,
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            ReleaseStore::advance_canary(&admin, &store, &component.id).await,
+            Err(Error::NotFound)
+        ));
+        let mut changed = component.clone();
+        changed.state = PersistentReleaseState::Canary;
+        let mut session = store.session().await.unwrap();
+        assert!(matches!(
+            write_release_state(&mut session, &admin, &changed).await,
+            Err(Error::NotFound)
+        ));
+        // Deliberately commit after the rejected call: no changed business body
+        // or new content witness was written before the missing-candidate gate.
+        session.commit().await.unwrap();
+        let mut session = store.session().await.unwrap();
+        let kept: PersistentRelease = session
+            .need(&admin, "release", &component.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            fingerprint(&kept).unwrap(),
+            fingerprint(&component).unwrap()
+        );
+        require_body_content_witness(
+            &mut session,
+            &worker,
+            "release",
+            &component.id,
+            &component,
+            Role::Admin,
+        )
+        .await
+        .unwrap();
+        assert!(
+            require_body_content_witness(
+                &mut session,
+                &worker,
+                "release",
+                &changed.id,
+                &changed,
+                Role::Admin
+            )
+            .await
+            .is_err()
+        );
+        assert!(matches!(
+            put_release_approval_idempotent(&mut session, &admin, component.clone()).await,
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            revalidate_release(&mut session, &admin, &component).await,
+            Err(Error::NotFound)
+        ));
+        session.commit().await.unwrap();
+
+        let mut session = store.session().await.unwrap();
+        assert!(matches!(
+            cas_pointer_in_session(
+                &mut session,
+                &admin,
+                &component.profile_id,
+                0,
+                None,
+                component.id.clone(),
+                component.bundle_digest.clone()
+            )
+            .await,
+            Err(Error::NotFound)
+        ));
+        // Missing registered profile/opaque authority cannot leak a pointer,
+        // even when the caller commits the failed operation's Session.
+        session.commit().await.unwrap();
+        let mut session = store.session().await.unwrap();
+        let pointer_id = format!("profile-pointer-{}", component.profile_id);
+        assert!(
+            session
+                .get::<serde_json::Value>(&admin, "pointer", &pointer_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            session
+                .get::<serde_json::Value>(&admin, "formal_parent", &component.bundle_digest)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut attempted_pointer =
+            load_pointer_content(&mut session, &admin, &component.profile_id)
+                .await
+                .unwrap();
+        cas_pointer(
+            &mut attempted_pointer,
+            0,
+            None,
+            component.id.clone(),
+            component.bundle_digest.clone(),
+        )
+        .unwrap();
+        assert!(
+            require_body_content_witness(
+                &mut session,
+                &admin,
+                "pointer",
+                &pointer_id,
+                &attempted_pointer,
+                Role::Admin
+            )
+            .await
+            .is_err()
+        );
+        session.commit().await.unwrap();
+        store.close().await;
     }
 }

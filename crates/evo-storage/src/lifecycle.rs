@@ -864,12 +864,149 @@ async fn redact_late_budget_calls(
     Ok(open)
 }
 
+// Exact AG093 budget wire, read only to destroy replay content during E08.
+// This cannot grant compiler authority or dispatch a model.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalBoundModelRequest {
+    schema_version: String,
+    request: evo_core::optimization::ModelRequest,
+    compiler_use: HistoricalCompilerInputUse,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalCompilerInputUse {
+    schema_version: String,
+    request: HistoricalCompilerInputRequest,
+    binding: HistoricalFormalCompilerInputBinding,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalCompilerInputRequest {
+    profile: evo_core::contract::Profile,
+    /// Search parent is distinct from the approved control-plane P.
+    search_parent: evo_core::contract::SkillSnapshot,
+    baseline: evo_core::contract::SkillSnapshot,
+    /// Generation strategy of the search parent, not authority for approved P.
+    search_parent_strategy: evo_core::Strategy,
+    expected_parent_strategy_digest: Option<String>,
+    baseline_strategy: evo_core::Strategy,
+    capabilities: evo_core::contract::HostCapabilities,
+    environment_digest: String,
+    purpose: evo_core::evidence::Purpose,
+    revoke_watermark: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalFormalCompilerInputBinding {
+    schema_version: String,
+    namespace: String,
+    profile_registration_id: String,
+    profile_digest: String,
+    parent_digest: String,
+    baseline_digest: String,
+    parent_skill_digest: String,
+    parent_strategy_digest: String,
+    search_parent_skill_digest: String,
+    search_parent_strategy_digest: String,
+    baseline_skill_digest: String,
+    baseline_strategy_digest: String,
+    environment_digest: String,
+    capabilities_digest: String,
+    purpose: evo_core::evidence::Purpose,
+    application_order: Vec<String>,
+    watermark: Option<(i64, String)>,
+    live_profile_pointer_digest: Option<String>,
+    closure: HistoricalTypedContentClosure,
+    binding_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalTypedContentRef {
+    kind: String,
+    id: String,
+    schema_version: String,
+    content_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalTypedContentEdge {
+    from_kind: String,
+    from_id: String,
+    to_kind: String,
+    to_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalTypedContentClosure {
+    nodes: Vec<HistoricalTypedContentRef>,
+    edges: Vec<HistoricalTypedContentEdge>,
+    digest: String,
+}
+
+fn bound_budget_request_source_ids(body: &str) -> Result<Vec<String>> {
+    let mut bound: HistoricalBoundModelRequest = serde_json::from_str(body).map_err(internal)?;
+    bound.request.validate()?;
+    let input = &bound.compiler_use.request;
+    let binding = &mut bound.compiler_use.binding;
+    let binding_digest = std::mem::take(&mut binding.binding_digest);
+    if bound.schema_version != "rsia.bound_model_request.v1"
+        || bound.compiler_use.schema_version != "rsia.optimization.compiler_use.v1"
+        || binding.schema_version != "rsia.formal_compiler_input_binding.v2"
+        || bound.request.namespace != binding.namespace
+        || bound.request.purpose != input.purpose
+        || bound.request.purpose != binding.purpose
+        || bound.request.parent_skill_digest
+            != evo_core::skill_edit::skill_snapshot_digest(&input.search_parent)?
+        || bound.request.revoke_watermark != input.revoke_watermark
+        || input.revoke_watermark
+            != binding
+                .watermark
+                .as_ref()
+                .map(|w| u64::try_from(w.0))
+                .transpose()
+                .map_err(|_| Error::Invalid("negative compiler watermark".into()))?
+                .unwrap_or(0)
+        || input.profile.parent_digest != binding.parent_digest
+        || input.profile.baseline_digest != binding.baseline_digest
+        || input.environment_digest != binding.environment_digest
+        || input
+            .expected_parent_strategy_digest
+            .as_ref()
+            .is_some_and(|expected| expected != &binding.parent_strategy_digest)
+        || fingerprint(&input.search_parent)? != binding.search_parent_skill_digest
+        || fingerprint(&input.search_parent_strategy)? != binding.search_parent_strategy_digest
+        || fingerprint(&input.baseline)? != binding.baseline_skill_digest
+        || fingerprint(&input.baseline_strategy)? != binding.baseline_strategy_digest
+        || fingerprint(&input.capabilities)? != binding.capabilities_digest
+        || binding.closure.digest != fingerprint(&(&binding.closure.nodes, &binding.closure.edges))?
+        || binding_digest != fingerprint(binding)?
+    {
+        return Err(Error::Invalid(
+            "bound model request cleanup identity mismatch".into(),
+        ));
+    }
+    Ok(bound
+        .request
+        .source_closure
+        .into_iter()
+        .map(|source| source.id)
+        .collect())
+}
+
 /// The source ids a budget call's request names; `None` for a request schema the
 /// cleanup cannot read. The twin of the parsing in `expand_budget_scan`: the two
 /// must accept the same schemas and read the same fields, or the recheck would
 /// not be a recheck of that scan.
 fn budget_request_source_ids(schema: &str, body: &str) -> Result<Option<Vec<String>>> {
     let ids = match schema {
+        "rsia.bound_model_request.v1" => bound_budget_request_source_ids(body)?,
         "rsia.model_request.artifact.v1" => {
             let value: serde_json::Value = serde_json::from_str(body).map_err(internal)?;
             value
@@ -1441,54 +1578,20 @@ async fn expand_budget_scan(
             continue;
         }
         let body: String = row.try_get("request_artifact_body").map_err(internal)?;
-        let source_ids = match schema.as_str() {
-            "rsia.model_request.artifact.v1" => {
-                let value: serde_json::Value = serde_json::from_str(&body).map_err(internal)?;
-                value
-                    .get("source_closure")
-                    .and_then(|value| value.as_array())
-                    .ok_or_else(|| Error::Invalid("model request lacks source closure".into()))?
-                    .iter()
-                    .map(|value| {
-                        value
-                            .get("id")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_owned)
-                            .ok_or_else(|| Error::Invalid("model request source id missing".into()))
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            }
-            crate::budget::REGISTERED_EXECUTION_REQUEST_SCHEMA => {
-                let value: serde_json::Value = serde_json::from_str(&body).map_err(internal)?;
-                value
-                    .get("source_ids")
-                    .and_then(|value| value.as_array())
-                    .ok_or_else(|| {
-                        Error::Invalid("registered execution request lacks source ids".into())
-                    })?
-                    .iter()
-                    .map(|value| {
-                        value.as_str().map(str::to_owned).ok_or_else(|| {
-                            Error::Invalid("registered execution source id missing".into())
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            }
-            _ => {
-                mark_unknown_scope(
-                    tx,
-                    ctx,
-                    job_id,
-                    &TypedObjectRef {
-                        kind: "reservation".into(),
-                        id: call_id,
-                    },
-                    &format!("unknown_budget_request_schema:{schema}"),
-                    now,
-                )
-                .await?;
-                continue;
-            }
+        let Some(source_ids) = budget_request_source_ids(&schema, &body)? else {
+            mark_unknown_scope(
+                tx,
+                ctx,
+                job_id,
+                &TypedObjectRef {
+                    kind: "reservation".into(),
+                    id: call_id,
+                },
+                &format!("unknown_budget_request_schema:{schema}"),
+                now,
+            )
+            .await?;
+            continue;
         };
         if source_ids.iter().any(|value| value == &source.id) {
             let reference = crate::budget::index_budget_call_ref_in_tx(

@@ -2412,6 +2412,170 @@ impl Session {
         .map_err(internal)?;
         Ok(())
     }
+    /// Checks a content witness against the entire private namespace audit
+    /// chain in the caller's transaction. The operation must identify a logical
+    /// subject (including schema/version and namespace/kind/id); the entity is
+    /// the caller's digest of that subject's complete current content.
+    ///
+    /// Only the latest event for this exact role and operation can match. A
+    /// different role cannot mint or supersede its witness. Public objects and
+    /// self-reported issuer fields are never consulted. This returns a scoped
+    /// fact, without changing the caller's role or committing its Session.
+    pub async fn has_role_audit_witness(
+        &mut self,
+        ctx: &Context,
+        role: evo_core::Role,
+        operation: &str,
+        entity: &str,
+    ) -> Result<bool> {
+        if operation.is_empty() {
+            return Err(Error::Invalid(
+                "audit witness operation must identify a logical subject".into(),
+            ));
+        }
+        if entity.len() != 64
+            || !entity
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Error::Invalid(
+                "audit witness entity must be a content digest".into(),
+            ));
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AuditPayload<'a> {
+            #[serde(borrow)]
+            actor: std::borrow::Cow<'a, str>,
+            role: evo_core::Role,
+            #[serde(borrow)]
+            operation: std::borrow::Cow<'a, str>,
+            #[serde(borrow)]
+            entity: std::borrow::Cow<'a, str>,
+            timestamp: i64,
+        }
+        let invalid_chain = || Error::Conflict("audit chain or payload mismatch".into());
+        // A finite snapshot, not a new audit-history capacity. Legitimate
+        // histories may exceed the 10000 business-event collection bound.
+        let snapshot = sqlx::query(
+            "SELECT COUNT(*) AS row_count,COALESCE(MAX(seq),0) AS watermark FROM audit WHERE namespace=?",
+        )
+        .bind(ctx.namespace())
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        let count: i64 = snapshot.try_get("row_count").map_err(internal)?;
+        let watermark: i64 = snapshot.try_get("watermark").map_err(internal)?;
+        if count < 0 || watermark < 0 {
+            return Err(invalid_chain());
+        }
+        let mut scanned = 0_i64;
+        let mut after = 0_i64;
+        let mut previous = String::new();
+        let mut latest_matches = false;
+        loop {
+            // Only bounded metadata is fetched in a page. Payload allocation
+            // is checked against the actual row's byte length; chunks prevent
+            // the driver from first allocating an unchecked whole payload.
+            let rows = sqlx::query(
+                "SELECT seq,typeof(payload) AS payload_type,length(CAST(payload AS BLOB)) AS payload_bytes,substr(previous_hash,1,65) AS previous_hash,length(CAST(previous_hash AS BLOB)) AS previous_bytes,substr(digest,1,65) AS digest,length(CAST(digest AS BLOB)) AS digest_bytes FROM audit WHERE namespace=? AND seq>? AND seq<=? ORDER BY seq LIMIT 64",
+            )
+            .bind(ctx.namespace())
+            .bind(after)
+            .bind(watermark)
+            .fetch_all(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let sequence: i64 = row.try_get("seq").map_err(internal)?;
+                let payload_type: String = row.try_get("payload_type").map_err(internal)?;
+                let payload_bytes: i64 = row.try_get("payload_bytes").map_err(internal)?;
+                let prev: String = row.try_get("previous_hash").map_err(internal)?;
+                let prev_bytes: i64 = row.try_get("previous_bytes").map_err(internal)?;
+                let digest: String = row.try_get("digest").map_err(internal)?;
+                let digest_bytes: i64 = row.try_get("digest_bytes").map_err(internal)?;
+                if sequence <= after
+                    || sequence > watermark
+                    || scanned >= count
+                    || payload_type != "text"
+                    || payload_bytes <= 0
+                    || prev_bytes != i64::try_from(prev.len()).map_err(internal)?
+                    || prev != previous
+                    || digest_bytes != 64
+                    || digest.len() != 64
+                    || !digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(invalid_chain());
+                }
+                let payload_len = usize::try_from(payload_bytes).map_err(|_| invalid_chain())?;
+                let prefix_len = previous.len().checked_add(1).ok_or_else(invalid_chain)?;
+                let capacity = prefix_len
+                    .checked_add(payload_len)
+                    .ok_or_else(invalid_chain)?;
+                let mut authenticated = Vec::new();
+                // This bound is the actual finite payload plus its hash prefix,
+                // not an invented maximum number of historic audit events.
+                authenticated.try_reserve_exact(capacity).map_err(|_| {
+                    Error::Conflict("audit payload cannot fit available addressable memory".into())
+                })?;
+                authenticated.extend_from_slice(previous.as_bytes());
+                authenticated.push(b'\n');
+                let mut offset = 0_usize;
+                while offset < payload_len {
+                    let length = (payload_len - offset).min(8192);
+                    let chunk: Vec<u8> = sqlx::query_scalar(
+                        "SELECT substr(CAST(payload AS BLOB),?,?) FROM audit WHERE namespace=? AND seq=?",
+                    )
+                    .bind(i64::try_from(offset).map_err(internal)?.checked_add(1).ok_or_else(invalid_chain)?)
+                    .bind(i64::try_from(length).map_err(internal)?)
+                    .bind(ctx.namespace())
+                    .bind(sequence)
+                    .fetch_optional(&mut *self.tx)
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(invalid_chain)?;
+                    if chunk.len() != length {
+                        return Err(invalid_chain());
+                    }
+                    authenticated.extend_from_slice(&chunk);
+                    offset = offset.checked_add(length).ok_or_else(invalid_chain)?;
+                }
+                if authenticated.len() != capacity || hash(&authenticated) != digest {
+                    return Err(invalid_chain());
+                }
+                let raw_payload = &authenticated[prefix_len..];
+                if raw_payload
+                    .iter()
+                    .copied()
+                    .find(|byte| !matches!(*byte, b' ' | b'\t' | b'\n' | b'\r'))
+                    != Some(b'{')
+                {
+                    return Err(invalid_chain());
+                }
+                let payload: AuditPayload<'_> =
+                    serde_json::from_slice(raw_payload).map_err(|_| invalid_chain())?;
+                if payload.timestamp < 0 || identifier(payload.actor.as_ref()).is_err() {
+                    return Err(invalid_chain());
+                }
+                if payload.role == role && payload.operation.as_ref() == operation {
+                    latest_matches = payload.entity.as_ref() == entity;
+                }
+                previous = digest;
+                after = sequence;
+                scanned = scanned.checked_add(1).ok_or_else(invalid_chain)?;
+            }
+        }
+        if scanned != count || after != watermark {
+            return Err(invalid_chain());
+        }
+        Ok(latest_matches)
+    }
+
     pub async fn audit(&mut self, ctx: &Context, operation: &str, entity: &str) -> Result<()> {
         let prev: Option<String> = sqlx::query_scalar(
             "SELECT digest FROM audit WHERE namespace=? ORDER BY seq DESC LIMIT 1",
@@ -2523,6 +2687,39 @@ impl Session {
             return Err(Error::Conflict(format!(
                 "outgoing dependency edges exceed {limit}; refused, not truncated"
             )));
+        }
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("dst_kind").map_err(internal)?,
+                    row.try_get("dst_id").map_err(internal)?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Actual outbound typed edges in the authenticated namespace. A caller
+    /// receives the complete bounded set or an error, never a truncated closure.
+    /// These rows do not attest the existence, schema or authority of either node.
+    pub async fn dependency_edges(
+        &mut self,
+        ctx: &Context,
+        src_kind: &str,
+        src_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        identifier(src_kind)?;
+        identifier(src_id)?;
+        let rows = sqlx::query(
+            "SELECT dst_kind,dst_id FROM dependencies WHERE namespace=? AND src_kind=? AND src_id=? ORDER BY dst_kind,dst_id LIMIT 10001",
+        )
+        .bind(ctx.namespace())
+        .bind(src_kind)
+        .bind(src_id)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        if rows.len() > 10_000 {
+            return Err(Error::Conflict("dependency edge limit exceeded".into()));
         }
         rows.into_iter()
             .map(|row| {

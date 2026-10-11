@@ -1,3 +1,5 @@
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use async_trait::async_trait;
 use evo_core::contract::{HostCapabilities, ImproverPatch, Profile, SkillSnapshot};
 use evo_core::evaluation::DataUse;
@@ -31,11 +33,12 @@ use evo_engine::model::{
 use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentTask, OptimizationJournal,
-    OptimizationStepRequest, PairedTaskResult, StageFact, StageFactKind, StoreOptimizationJournal,
+    OptimizationStepRequest, PairedTaskResult, StageFact, StageFactKind,
 };
 use evo_storage::Store;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use trusted_compiler_inputs::StoreOptimizationJournal;
 
 fn world() -> ExplorationWorldV1 {
     let parent_skill = hash(b"parent-skill");
@@ -163,6 +166,16 @@ struct NoChangeModel;
 
 #[async_trait]
 impl ModelPort for NoChangeModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let output = "[]".to_string();
         Ok(ModelResponse::Completed {
@@ -188,6 +201,16 @@ struct EditingFixtureModel;
 
 #[async_trait]
 impl ModelPort for EditingFixtureModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let parent: SkillSnapshot = serde_json::from_str(
             &request
@@ -260,6 +283,16 @@ struct CountingEditingFixtureModel(AtomicUsize);
 
 #[async_trait]
 impl ModelPort for CountingEditingFixtureModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.0.fetch_add(1, Ordering::SeqCst);
         EditingFixtureModel.dispatch(request).await
@@ -271,6 +304,16 @@ struct NotFoundAfterDispatchModel(AtomicUsize);
 
 #[async_trait]
 impl ModelPort for NotFoundAfterDispatchModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, _: ModelRequest) -> Result<ModelResponse> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Err(Error::NotFound)
@@ -311,6 +354,16 @@ struct CountingNoChangeModel(AtomicUsize);
 
 #[async_trait]
 impl ModelPort for CountingNoChangeModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.0.fetch_add(1, Ordering::SeqCst);
         NoChangeModel.dispatch(request).await
@@ -335,6 +388,38 @@ struct CrashAfterDispatchJournal {
 
 #[async_trait]
 impl OptimizationJournal for CrashAfterDispatchJournal {
+    async fn commit_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> Result<()> {
+        if fact.kind == StageFactKind::StepCompleted && !self.failed.swap(true, Ordering::SeqCst) {
+            return Err(Error::Internal);
+        }
+        self.inner.commit_bound(fact, inputs).await
+    }
+    async fn claim_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> Result<bool> {
+        self.inner.claim_bound(fact, inputs).await
+    }
+    async fn lookup_bound(
+        &self,
+        artifact_id: &str,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        self.inner.lookup_bound(artifact_id, inputs).await
+    }
+
+    async fn compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::VerifiedCompilerInputs> {
+        self.inner.compiler_inputs(request).await
+    }
+
     async fn commit(&self, fact: StageFact) -> Result<()> {
         if fact.kind == StageFactKind::StepCompleted && !self.failed.swap(true, Ordering::SeqCst) {
             return Err(Error::Internal);
@@ -477,6 +562,21 @@ async fn coordinator_calls_the_existing_optimization_consumer_before_observing()
         dependencies: vec![],
     };
     let mut registered_world = world();
+    let compiler_fixture = trusted_compiler_inputs::inputs(
+        "n",
+        "profile",
+        parent.clone(),
+        Strategy::default(),
+        HostCapabilities {
+            available: Default::default(),
+            granted: Default::default(),
+        },
+        &hash(b"environment"),
+    );
+    trusted_compiler_inputs::install(&_store, &compiler_fixture)
+        .await
+        .unwrap();
+    registered_world.approved_parent_digest = compiler_fixture.profile.parent_digest.clone();
     registered_world.parent_skill_digest = skill_snapshot_digest(&parent).unwrap();
     registered_world.context_signature = evo_core::fingerprint(&(
         &registered_world.parent_skill_digest,
@@ -553,7 +653,7 @@ async fn coordinator_calls_the_existing_optimization_consumer_before_observing()
     let initial_parent_bundle = hash(b"parent-bundle");
     macro_rules! request {
         ($world:expr, $step:expr, $request_id:literal, $dev_id:literal, $idempotency:literal, $parent:ident, $edit_context:ident, $parent_bundle:ident) => {
-            OptimizationStepRequest {
+            trusted_compiler_inputs::request(OptimizationStepRequest {
                 evidence: &evidence,
                 source_selection: &source_selection,
                 source_bindings: &bindings,
@@ -634,7 +734,7 @@ async fn coordinator_calls_the_existing_optimization_consumer_before_observing()
                     idempotency_key: $idempotency.into(),
                 },
                 allow_rank_call: false,
-            }
+            })
         };
     }
     let candidate_model = CountingEditingFixtureModel::default();
@@ -768,6 +868,7 @@ async fn coordinator_calls_the_existing_optimization_consumer_before_observing()
 
     let mut claimed_world = world();
     claimed_world.id = "world-claimed".into();
+    claimed_world.approved_parent_digest = compiler_fixture.profile.parent_digest.clone();
     claimed_world.parent_skill_digest = skill_snapshot_digest(&parent).unwrap();
     claimed_world.context_signature = evo_core::fingerprint(&(
         &claimed_world.parent_skill_digest,
@@ -846,6 +947,7 @@ async fn coordinator_calls_the_existing_optimization_consumer_before_observing()
 
     let mut crash_world = world();
     crash_world.id = "world-crash".into();
+    crash_world.approved_parent_digest = compiler_fixture.profile.parent_digest.clone();
     crash_world.parent_skill_digest = skill_snapshot_digest(&parent).unwrap();
     crash_world.context_signature = evo_core::fingerprint(&(
         &crash_world.parent_skill_digest,
@@ -921,6 +1023,7 @@ async fn coordinator_calls_the_existing_optimization_consumer_before_observing()
 
     let mut not_found_world = world();
     not_found_world.id = "world-model-not-found".into();
+    not_found_world.approved_parent_digest = compiler_fixture.profile.parent_digest.clone();
     not_found_world.parent_skill_digest = skill_snapshot_digest(&parent).unwrap();
     not_found_world.context_signature = evo_core::fingerprint(&(
         &not_found_world.parent_skill_digest,
@@ -991,6 +1094,7 @@ async fn coordinator_calls_the_existing_optimization_consumer_before_observing()
 
     let mut binding_world = world();
     binding_world.id = "world-binding".into();
+    binding_world.approved_parent_digest = compiler_fixture.profile.parent_digest.clone();
     binding_world.parent_skill_digest = skill_snapshot_digest(&parent).unwrap();
     binding_world.context_signature = evo_core::fingerprint(&(
         &binding_world.parent_skill_digest,
@@ -1215,6 +1319,21 @@ async fn run_next_refuses_a_new_node_at_capacity_before_any_model_call() {
         dependencies: vec![],
     };
     let mut registered_world = world();
+    let compiler_fixture = trusted_compiler_inputs::inputs(
+        "n",
+        "profile",
+        parent.clone(),
+        Strategy::default(),
+        HostCapabilities {
+            available: Default::default(),
+            granted: Default::default(),
+        },
+        &hash(b"environment"),
+    );
+    trusted_compiler_inputs::install(&store, &compiler_fixture)
+        .await
+        .unwrap();
+    registered_world.approved_parent_digest = compiler_fixture.profile.parent_digest;
     registered_world.parent_skill_digest = skill_snapshot_digest(&parent).unwrap();
     registered_world.context_signature = evo_core::fingerprint(&(
         &registered_world.parent_skill_digest,
@@ -1286,7 +1405,7 @@ async fn run_next_refuses_a_new_node_at_capacity_before_any_model_call() {
     let parent_bundle = hash(b"parent-bundle");
     macro_rules! request {
         () => {
-            OptimizationStepRequest {
+            trusted_compiler_inputs::request(OptimizationStepRequest {
                 evidence: &evidence,
                 source_selection: &source_selection,
                 source_bindings: &bindings,
@@ -1367,7 +1486,7 @@ async fn run_next_refuses_a_new_node_at_capacity_before_any_model_call() {
                     idempotency_key: "capacity-dev-idempotency-1".into(),
                 },
                 allow_rank_call: false,
-            }
+            })
         };
     }
     // The model port counts every dispatch; the refusal must happen first.

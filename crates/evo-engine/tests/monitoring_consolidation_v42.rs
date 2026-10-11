@@ -7,6 +7,8 @@
 //! development report) and `tests/development_receipts.rs` (driving a cleanup
 //! job to `Complete`), because test crates cannot import one another.
 
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use async_trait::async_trait;
 use evo_core::contract::{
     CapabilityLevel, HostCapabilities, HostSurfaceManifest, ImproverPatch, Profile, SkillSnapshot,
@@ -45,7 +47,6 @@ use evo_engine::optimization::{
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentSelection,
     DevelopmentSelectionDecision, DevelopmentTask, OptimizationJournal, OptimizationJournalStage,
     OptimizationStepRequest, PairedTaskResult, StageDependency, StageFact, StageFactKind,
-    StoreOptimizationJournal,
 };
 use evo_engine::release_store::{
     PrepareRunRequest, ReleaseCandidateRecord, ReleaseStore, StageBundleRequest,
@@ -60,6 +61,7 @@ use evo_storage::lifecycle::{CleanupState, CleanupStatus, LifecycleStore, TypedO
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use trusted_compiler_inputs::StoreOptimizationJournal;
 
 const TENANT: &str = "tenant";
 const SCOPE: &str = "billing-scope";
@@ -535,6 +537,16 @@ impl EditingModelPort {
 
 #[async_trait]
 impl ModelPort for EditingModelPort {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> evo_core::Result<ModelResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let source = request.source_closure[0].clone();
@@ -881,7 +893,7 @@ impl StepMaterial {
         sequence: u32,
         with_traces: bool,
     ) -> OptimizationStepRequest<'a> {
-        OptimizationStepRequest {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
             evidence: &self.evidence,
             source_selection: &self.selection,
             source_bindings: &self.bindings,
@@ -943,7 +955,7 @@ impl StepMaterial {
                 idempotency_key: format!("consolidation-idempotency-{sequence}"),
             },
             allow_rank_call: false,
-        }
+        })
     }
 }
 
@@ -1163,6 +1175,16 @@ struct RevokingModelPort {
 
 #[async_trait]
 impl ModelPort for RevokingModelPort {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> evo_core::Result<ModelResponse> {
         if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
             return Err(Error::Conflict(
@@ -1222,6 +1244,38 @@ struct FailingJournal {
 
 #[async_trait]
 impl OptimizationJournal for FailingJournal {
+    async fn commit_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<()> {
+        if self.commits.fetch_add(1, Ordering::SeqCst) == self.fail_on_commit {
+            return Err(Error::NotFound);
+        }
+        self.inner.commit_bound(fact, inputs).await
+    }
+    async fn claim_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<bool> {
+        self.inner.claim_bound(fact, inputs).await
+    }
+    async fn lookup_bound(
+        &self,
+        artifact_id: &str,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<Option<StageFact>> {
+        self.inner.lookup_bound(artifact_id, inputs).await
+    }
+
+    async fn compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::VerifiedCompilerInputs> {
+        self.inner.compiler_inputs(request).await
+    }
+
     async fn commit(&self, fact: StageFact) -> evo_core::Result<()> {
         if self.commits.fetch_add(1, Ordering::SeqCst) == self.fail_on_commit {
             return Err(Error::NotFound);
@@ -1255,31 +1309,77 @@ impl OptimizationJournal for FailingJournal {
     }
 }
 
-/// Journal that reports a forged `StepCompleted` fact, to show the proposal only
-/// accepts the terminal fact that really holds this candidate.
+/// Corrupts the actual stored terminal after its authenticated journal commit.
+/// The proposal's private Session read must reject the same three forgeries.
 type Forge = fn(&mut StageFact);
 
 struct ForgedTerminalJournal {
     inner: StoreOptimizationJournal,
+    store: Store,
+    context: Context,
+    original: std::sync::Mutex<Option<StageFact>>,
     forge: Forge,
 }
 
 #[async_trait]
 impl OptimizationJournal for ForgedTerminalJournal {
+    async fn commit_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<()> {
+        self.inner.commit_bound(fact.clone(), inputs).await?;
+        if fact.kind == StageFactKind::StepCompleted && fact.payload["status"] == "candidate" {
+            let mut session = self.store.session().await?;
+            let original: StageFact = session
+                .need(&self.context, "artifact", &fact.artifact_id)
+                .await?;
+            *self.original.lock().unwrap() = Some(original.clone());
+            let mut stored = original;
+            (self.forge)(&mut stored);
+            stored.output_digest = None;
+            stored = stored.seal()?;
+            session
+                .put(
+                    &self.context,
+                    "artifact",
+                    &stored.artifact_id,
+                    self.context.actor(),
+                    &stored,
+                )
+                .await?;
+            session.commit().await?;
+        }
+        Ok(())
+    }
+    async fn claim_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<bool> {
+        self.inner.claim_bound(fact, inputs).await
+    }
+    async fn lookup_bound(
+        &self,
+        artifact_id: &str,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<Option<StageFact>> {
+        self.inner.lookup_bound(artifact_id, inputs).await
+    }
+
+    async fn compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::VerifiedCompilerInputs> {
+        self.inner.compiler_inputs(request).await
+    }
+
     async fn commit(&self, fact: StageFact) -> evo_core::Result<()> {
         self.inner.commit(fact).await
     }
 
     async fn lookup(&self, artifact_id: &str) -> evo_core::Result<Option<StageFact>> {
-        let Some(mut fact) = self.inner.lookup(artifact_id).await? else {
-            return Ok(None);
-        };
-        if fact.kind == StageFactKind::StepCompleted && fact.payload["status"] == "candidate" {
-            (self.forge)(&mut fact);
-            fact.output_digest = None;
-            fact = fact.seal()?;
-        }
-        Ok(Some(fact))
+        self.inner.lookup(artifact_id).await
     }
 
     async fn claim(&self, fact: StageFact) -> evo_core::Result<bool> {
@@ -1705,7 +1805,10 @@ async fn a_candidate_outcome_freezes_a_proposal_with_its_fields_and_edges() {
         selection.candidate_bundle_digest,
         proposal.candidate_bundle_digest
     );
-    assert_eq!(proposal.selection_digest, fingerprint(&selection).unwrap());
+    assert_eq!(
+        proposal.selection_digest,
+        fingerprint(&fact.payload["selection"]).unwrap()
+    );
 
     // Dependency edges point at the claim, the terminal fact and every source run.
     let on_claim = dependents_of(&fixture.store, &fixture.worker, "artifact", &run.claim.id).await;
@@ -1957,6 +2060,9 @@ async fn a_terminal_fact_that_does_not_hold_the_candidate_writes_no_proposal() {
         let run = Run::claimed(true).await;
         let forged = ForgedTerminalJournal {
             inner: run.fixture.journal(),
+            store: run.fixture.store.clone(),
+            context: run.fixture.worker.clone(),
+            original: std::sync::Mutex::new(None),
             forge,
         };
         let refused = run.run_with(&run.claim, &run.model, &forged, 1, true).await;
@@ -1977,6 +2083,21 @@ async fn a_terminal_fact_that_does_not_hold_the_candidate_writes_no_proposal() {
         )
         .unwrap();
         assert_eq!(claim.state, ConsolidationClaimState::Running, "{name}");
+        // Repair only the deliberately corrupted stored terminal. The original
+        // cache and complete compiler use are retained for the honest reconnect.
+        let original = forged.original.lock().unwrap().take().unwrap();
+        let mut session = run.fixture.store.session().await.unwrap();
+        session
+            .put(
+                &run.fixture.worker,
+                "artifact",
+                &original.artifact_id,
+                run.fixture.worker.actor(),
+                &original,
+            )
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
         // With the honest journal the very same request replays the Candidate
         // without dispatching again and completes normally.
         let calls = run.model.calls.load(Ordering::SeqCst);

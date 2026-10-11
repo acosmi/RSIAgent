@@ -5,6 +5,8 @@
 //! The fixtures mirror `tests/optimization.rs`: a real SQLite store, Host-issued
 //! source authority, fixture model and development runner ports with counters.
 
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use async_trait::async_trait;
 use evo_core::contract::{HostCapabilities, ImproverPatch, Profile, SkillSnapshot};
 use evo_core::evidence::{EvidenceSet, ExecutionAttestation, Purpose, SourceSelection, TaskOrigin};
@@ -38,7 +40,7 @@ use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentTask, OPTIMIZATION_STAGE_FACT_SCHEMA,
     OptimizationStepOutcome, OptimizationStepRequest, PairedTaskResult, StepTerminalClass,
-    StoreOptimizationJournal, run_optimization_step,
+    run_optimization_step,
 };
 use evo_storage::Store;
 use evo_storage::budget::RootBudgetAuthorization;
@@ -48,6 +50,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
+use trusted_compiler_inputs::StoreOptimizationJournal;
 
 const NS: &str = "tenant";
 
@@ -314,7 +317,7 @@ impl GroupFixture {
     }
 
     fn request(&self) -> OptimizationStepRequest<'_> {
-        OptimizationStepRequest {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
             evidence: &self.evidence,
             source_selection: &self.selection,
             source_bindings: &self.bindings,
@@ -335,7 +338,7 @@ impl GroupFixture {
             },
             development_request: self.development_request.clone(),
             allow_rank_call: false,
-        }
+        })
     }
 }
 
@@ -637,6 +640,16 @@ impl ScriptedModel {
 
 #[async_trait]
 impl ModelPort for ScriptedModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.total.fetch_add(1, SeqCst);
         *self

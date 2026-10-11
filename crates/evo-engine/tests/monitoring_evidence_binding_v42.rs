@@ -6,6 +6,10 @@
 //! Host environment remains ProgramFixture. The registered pure-function control
 //! proves typed development receipts only, never real-provider benefit or approval.
 
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
+use trusted_compiler_inputs::StoreOptimizationJournal;
+
 use async_trait::async_trait;
 use evo_core::contract::{
     CapabilityLevel, HostCapabilities, HostSurfaceManifest, ImproverPatch, Profile, SkillSnapshot,
@@ -47,7 +51,7 @@ use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, OPTIMIZATION_STAGE_FACT_SCHEMA,
     OptimizationJournal, OptimizationJournalStage, OptimizationStepRequest, PairedTaskResult,
-    StageDependency, StageFact, StageFactKind, StoreOptimizationJournal,
+    StageDependency, StageFact, StageFactKind,
 };
 use evo_engine::release_store::{PrepareRunRequest, ReleaseStore, TrustedHostExecutionEvidence};
 use evo_engine::streaming_evaluator::{FixedGraderMethod, FixedGraderSpec};
@@ -240,7 +244,12 @@ fn build_request(
         attempt: 1,
         manifest: control.manifest().unwrap(),
         parent_bundle_digest: d("parent-bundle"),
-        candidate_bundle_digest: d(&format!("candidate-bundle-{request_id}")),
+        candidate_bundle_digest: trusted_compiler_inputs::software_candidate(
+            TENANT,
+            &control.environment_digest,
+            &format!("candidate-bundle-{request_id}"),
+        )
+        .digest,
         environment_digest: control.environment_digest.clone(),
         grader_digest: control.grader_digest.clone(),
         rules_digest: control.rules_digest.clone(),
@@ -291,7 +300,13 @@ fn request_fact(request: &DevelopmentRunRequest) -> StageFact {
         request_id: request.request_id.clone(),
         input_digest: request.manifest.digest.clone(),
         output_digest: None,
-        dependencies: journal_extras(),
+        dependencies: journal_extras()
+            .into_iter()
+            .chain(std::iter::once(StageDependency {
+                kind: "environment".into(),
+                id: request.environment_digest.clone(),
+            }))
+            .collect(),
         payload: serde_json::to_value(request).unwrap(),
     }
     .seal()
@@ -569,6 +584,21 @@ impl Fixture {
             &format!("cycle-episode-{n}"),
             n,
         );
+        let candidate = trusted_compiler_inputs::software_candidate(
+            TENANT,
+            &self.control.environment_digest,
+            &format!("candidate-bundle-{}", request.request_id),
+        );
+        assert_eq!(candidate.digest, request.candidate_bundle_digest);
+        trusted_compiler_inputs::persist_bundle(
+            &self.store,
+            TENANT,
+            &candidate,
+            &self.control.environment_digest,
+            request.revoke_watermark,
+        )
+        .await
+        .unwrap();
         let report = self.runner().run(request.clone()).await.unwrap();
         assert_eq!(
             report.provenance,
@@ -577,8 +607,21 @@ impl Fixture {
         let journal = self.journal();
         let request_fact = request_fact(&request);
         let observed = observed_fact(&request, &report, true);
-        journal.commit(request_fact.clone()).await.unwrap();
-        journal.commit(observed.clone()).await.unwrap();
+        let inputs = trusted_compiler_inputs::bundle_use(
+            &self.store,
+            TENANT,
+            &request.candidate_bundle_digest,
+        )
+        .await
+        .unwrap();
+        journal
+            .commit_bound(request_fact.clone(), &inputs)
+            .await
+            .unwrap();
+        journal
+            .commit_bound(observed.clone(), &inputs)
+            .await
+            .unwrap();
         Staged {
             request,
             report,
@@ -805,6 +848,16 @@ impl EditingModelPort {
 
 #[async_trait]
 impl ModelPort for EditingModelPort {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> evo_core::Result<ModelResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.requests.lock().unwrap().push(request.clone());
@@ -1159,7 +1212,7 @@ impl StepMaterial {
         sequence: u32,
         with_traces: bool,
     ) -> OptimizationStepRequest<'a> {
-        OptimizationStepRequest {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
             evidence: &self.evidence,
             source_selection: &self.selection,
             source_bindings: &self.bindings,
@@ -1221,7 +1274,7 @@ impl StepMaterial {
                 idempotency_key: format!("consolidation-idempotency-{sequence}"),
             },
             allow_rank_call: false,
-        }
+        })
     }
 }
 
@@ -2264,4 +2317,621 @@ async fn completed_runs_keep_the_original_historical_read_behavior() {
         matches!(MonitoringCoordinator::run_consolidation(&fixture.worker, &fixture.store, &claim.id, None, None, None, changed).await, Err(Error::Conflict(ref message)) if message == "completed consolidation input differs")
     );
     assert_eq!(before, logical_snapshot(&fixture.database));
+}
+
+/// Fault placement is after the real terminal commit. Legacy lookup is counted
+/// and refused so a proposal must load its terminal in its own private Session.
+struct ProposalBoundaryJournal<'a> {
+    inner: &'a dyn OptimizationJournal,
+    store: Store,
+    admin: Context,
+    switch_pointer: bool,
+    legacy_lookups: AtomicUsize,
+    terminal: Mutex<Option<StageFact>>,
+    paid_ledger_digest: Mutex<Option<String>>,
+}
+
+#[async_trait]
+impl OptimizationJournal for ProposalBoundaryJournal<'_> {
+    async fn compiler_inputs(
+        &self,
+        r: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::VerifiedCompilerInputs> {
+        self.inner.compiler_inputs(r).await
+    }
+    async fn commit(&self, fact: StageFact) -> evo_core::Result<()> {
+        self.inner.commit(fact).await
+    }
+    async fn lookup(&self, _id: &str) -> evo_core::Result<Option<StageFact>> {
+        self.legacy_lookups.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Forbidden)
+    }
+    async fn claim(&self, fact: StageFact) -> evo_core::Result<bool> {
+        self.inner.claim(fact).await
+    }
+    async fn claim_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<bool> {
+        self.inner.claim_bound(fact, inputs).await
+    }
+    async fn lookup_bound(
+        &self,
+        id: &str,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<Option<StageFact>> {
+        self.inner.lookup_bound(id, inputs).await
+    }
+    async fn commit_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<()> {
+        self.inner.commit_bound(fact.clone(), inputs).await?;
+        if fact.kind == StageFactKind::StepCompleted && fact.payload["status"] == "candidate" {
+            let stored = self
+                .inner
+                .lookup_bound(&fact.artifact_id, inputs)
+                .await?
+                .ok_or(Error::NotFound)?;
+            *self.terminal.lock().unwrap() = Some(stored);
+            let mut s = self.store.session().await?;
+            let root = s
+                .root_budget(&self.admin, SCOPE)
+                .await?
+                .ok_or(Error::Budget)?;
+            let calls = s
+                .budget_calls_for_group(&self.admin, SCOPE, &fact.episode_id)
+                .await?;
+            *self.paid_ledger_digest.lock().unwrap() = Some(fingerprint(&(&root, &calls))?);
+            let watermark = s.watermark(&self.admin).await?;
+            if self.switch_pointer {
+                let id = format!("profile-pointer-{}", inputs.request.profile.id);
+                let pointer = evo_engine::release_store::PersistentProfilePointer {
+                    id: id.clone(),
+                    schema_version: evo_engine::release_store::PROFILE_POINTER_SCHEMA.into(),
+                    profile_id: inputs.request.profile.id.clone(),
+                    active_release_id: None,
+                    active_bundle_digest: None,
+                    epoch: 1,
+                };
+                s.put(&self.admin, "pointer", &id, self.admin.actor(), &pointer)
+                    .await?;
+                let operation = format!(
+                    "formal.admin.content.v1.{}",
+                    fingerprint(&(self.admin.namespace(), "pointer", &id))?
+                );
+                let entity = fingerprint(&(
+                    self.admin.namespace(),
+                    "pointer",
+                    &id,
+                    evo_engine::formal_authority::content_digest(&pointer)?,
+                ))?;
+                s.audit(&self.admin, &operation, &entity).await?;
+            }
+            assert_eq!(s.watermark(&self.admin).await?, watermark);
+            s.commit().await?;
+        }
+        Ok(())
+    }
+    async fn verify_sources(
+        &self,
+        s: &SourceSelection,
+        e: &EvidenceSet,
+        b: &[TrustedSourceBinding],
+        t: &[OptimizationTrace],
+        w: u64,
+    ) -> evo_core::Result<()> {
+        self.inner.verify_sources(s, e, b, t, w).await
+    }
+    async fn check_live(&self, ids: &[String], w: u64) -> evo_core::Result<()> {
+        self.inner.check_live(ids, w).await
+    }
+}
+
+#[tokio::test]
+async fn candidate_proposal_uses_the_full_terminal_binding_and_current_authority_in_its_session() {
+    for switch_pointer in [false, true] {
+        let fixture = Fixture::new().await;
+        let claim = fixture.claimed().await;
+        let material = StepMaterial::new(&fixture).await;
+        let model = EditingModelPort::new("first");
+        let runner = LedgerDevRunner::new(&fixture, true);
+        let inner = fixture.journal();
+        let journal = ProposalBoundaryJournal {
+            inner: &inner,
+            store: fixture.store.clone(),
+            admin: fixture.admin.clone(),
+            switch_pointer,
+            legacy_lookups: AtomicUsize::new(0),
+            terminal: Mutex::new(None),
+            paid_ledger_digest: Mutex::new(None),
+        };
+        let result = MonitoringCoordinator::run_consolidation(
+            &fixture.worker,
+            &fixture.store,
+            &claim.id,
+            Some(&model),
+            Some(&runner),
+            Some(&journal),
+            material.request(&fixture, &claim.id, 1, true),
+        )
+        .await;
+        let terminal = journal
+            .terminal
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the real Candidate terminal committed");
+        terminal.validate().unwrap();
+        assert_eq!(journal.legacy_lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+        let mut s = fixture.store.session().await.unwrap();
+        let persisted: StageFact = s
+            .need(&fixture.worker, "artifact", &terminal.artifact_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            fingerprint(&persisted).unwrap(),
+            fingerprint(&terminal).unwrap()
+        );
+        let root = s.root_budget(&fixture.admin, SCOPE).await.unwrap().unwrap();
+        let calls = s
+            .budget_calls_for_group(&fixture.admin, SCOPE, &claim.id)
+            .await
+            .unwrap();
+        assert!(root.spent_micros >= 10);
+        assert_eq!(root.reserved_micros, 0);
+        assert_eq!(
+            fingerprint(&(&root, &calls)).unwrap(),
+            journal.paid_ledger_digest.lock().unwrap().clone().unwrap()
+        );
+        assert_eq!(
+            s.watermark(&fixture.worker).await.unwrap().map(|w| w.0),
+            Some(1)
+        );
+        s.commit().await.unwrap();
+        if switch_pointer {
+            assert!(matches!(result, Err(Error::Conflict(ref message))
+                if message == "compiler authority changed before continuation"));
+            assert!(
+                artifacts_with_schema(
+                    &fixture.store,
+                    &fixture.worker,
+                    evo_engine::monitoring::CONSOLIDATION_PROPOSAL_SCHEMA
+                )
+                .await
+                .is_empty()
+            );
+            let mut s = fixture.store.session().await.unwrap();
+            assert!(
+                s.get::<ConsolidationRunRecord>(
+                    &fixture.worker,
+                    "artifact",
+                    &format!("consolidation-run-{}", claim.id)
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            s.commit().await.unwrap();
+        } else {
+            let run = result.unwrap();
+            assert_eq!(run.outcome, ConsolidationRunOutcome::Candidate);
+            assert_eq!(
+                run.input_digest.as_deref(),
+                Some(terminal.input_digest.as_str())
+            );
+            let mut s = fixture.store.session().await.unwrap();
+            let proposal: evo_engine::monitoring::ConsolidationProposal = s
+                .need(
+                    &fixture.worker,
+                    "artifact",
+                    run.proposal_id.as_deref().unwrap(),
+                )
+                .await
+                .unwrap();
+            let stored_claim: ConsolidationClaim = s
+                .need(&fixture.worker, "artifact", &claim.id)
+                .await
+                .unwrap();
+            assert_eq!(stored_claim.execution_input_digest, run.input_digest);
+            assert_eq!(proposal.terminal_fact_id, terminal.artifact_id);
+            assert_eq!(
+                proposal.candidate_bundle_digest,
+                terminal.payload["bundle"]["digest"].as_str().unwrap()
+            );
+            assert_eq!(
+                proposal.selection_digest,
+                fingerprint(&terminal.payload["selection"]).unwrap()
+            );
+            assert_eq!(
+                proposal.provenance,
+                EnvironmentEvidenceScope::ProgramFixture
+            );
+            let compiler_id = terminal
+                .dependencies
+                .iter()
+                .find(|d| d.kind == "artifact" && d.id.starts_with("compiler-use-"))
+                .expect("full original compiler use");
+            let inputs: evo_engine::model::CompilerInputUse = s
+                .need(&fixture.worker, "artifact", &compiler_id.id)
+                .await
+                .unwrap();
+            inputs
+                .verify_current(&mut s, &fixture.worker)
+                .await
+                .unwrap();
+            s.commit().await.unwrap();
+            let again = MonitoringCoordinator::run_consolidation(
+                &fixture.worker,
+                &fixture.store,
+                &claim.id,
+                None,
+                None,
+                None,
+                material.request(&fixture, &claim.id, 1, true),
+            )
+            .await
+            .unwrap();
+            assert_eq!(again, run);
+            assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+        }
+        fixture.store.close().await;
+    }
+}
+
+async fn advance_handoff_fixture_pointer(
+    s: &mut evo_storage::Session,
+    admin: &Context,
+    profile_id: &str,
+) -> evo_core::Result<()> {
+    let id = format!("profile-pointer-{profile_id}");
+    let mut pointer = s
+        .get::<evo_engine::release_store::PersistentProfilePointer>(admin, "pointer", &id)
+        .await?
+        .unwrap_or(evo_engine::release_store::PersistentProfilePointer {
+            id: id.clone(),
+            schema_version: evo_engine::release_store::PROFILE_POINTER_SCHEMA.into(),
+            profile_id: profile_id.into(),
+            active_release_id: None,
+            active_bundle_digest: None,
+            epoch: 0,
+        });
+    pointer.epoch = pointer.epoch.checked_add(1).ok_or(Error::Internal)?;
+    s.put(admin, "pointer", &id, admin.actor(), &pointer)
+        .await?;
+    let operation = format!(
+        "formal.admin.content.v1.{}",
+        fingerprint(&(admin.namespace(), "pointer", &id))?
+    );
+    let entity = fingerprint(&(
+        admin.namespace(),
+        "pointer",
+        &id,
+        evo_engine::formal_authority::content_digest(&pointer)?,
+    ))?;
+    s.audit(admin, &operation, &entity).await
+}
+
+/// The second compiler read is the real child entry, after Monitoring committed
+/// Running/A. The hook changes an actually witnessed pointer, never a terminal.
+struct RunningClaimHandoffJournal<'a> {
+    inner: &'a dyn OptimizationJournal,
+    store: Store,
+    admin: Context,
+    claim_id: String,
+    database: std::path::PathBuf,
+    switch_pointer: bool,
+    compiler_reads: AtomicUsize,
+    original_a: Mutex<Option<evo_engine::model::CompilerInputUse>>,
+    running_claim: Mutex<Option<ConsolidationClaim>>,
+    boundary_budget: Mutex<Option<evo_storage::budget::RootBudgetMonetarySnapshot>>,
+    post_setup_snapshot: Mutex<Option<String>>,
+    child_fresh_binding: Mutex<Option<evo_engine::formal_authority::FormalCompilerInputBinding>>,
+    bound_uses: Mutex<Vec<String>>,
+}
+impl RunningClaimHandoffJournal<'_> {
+    fn observe_original_bound_use(&self, inputs: &evo_engine::model::CompilerInputUse) {
+        let a = self
+            .original_a
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("real initial compiler input A");
+        assert_eq!(fingerprint(inputs).unwrap(), fingerprint(&a).unwrap());
+        self.bound_uses
+            .lock()
+            .unwrap()
+            .push(fingerprint(inputs).unwrap());
+    }
+}
+#[async_trait]
+impl OptimizationJournal for RunningClaimHandoffJournal<'_> {
+    async fn compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::VerifiedCompilerInputs> {
+        let read = self.compiler_reads.fetch_add(1, Ordering::SeqCst);
+        if read == 1 {
+            let a = self
+                .original_a
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("initial A resolved successfully");
+            assert_eq!(fingerprint(request)?, fingerprint(&a.request)?);
+            let mut s = self.store.session().await?;
+            let claim: ConsolidationClaim = s.need(&self.admin, "artifact", &self.claim_id).await?;
+            assert_eq!(claim.state, ConsolidationClaimState::Running);
+            assert!(claim.execution_input_digest.is_some());
+            let watermark = s.watermark(&self.admin).await?;
+            assert_eq!(watermark, a.binding.watermark);
+            let budget = s.root_budget_monetary_snapshot(&self.admin, SCOPE).await?;
+            assert!(budget.calls.is_empty());
+            assert_eq!(budget.root.spent_micros, 0);
+            assert_eq!(budget.root.reserved_micros, 0);
+            let all: Vec<Value> = s.list(&self.admin, "artifact").await?;
+            assert!(
+                !all.iter()
+                    .any(|v| v["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA
+                        && v["episode_id"] == self.claim_id)
+            );
+            *self.running_claim.lock().unwrap() = Some(claim);
+            *self.boundary_budget.lock().unwrap() = Some(budget);
+            if self.switch_pointer {
+                let id = format!("profile-pointer-{}", request.profile.id);
+                let before: evo_engine::release_store::PersistentProfilePointer =
+                    s.need(&self.admin, "pointer", &id).await?;
+                advance_handoff_fixture_pointer(&mut s, &self.admin, &request.profile.id).await?;
+                let after: evo_engine::release_store::PersistentProfilePointer =
+                    s.need(&self.admin, "pointer", &id).await?;
+                assert_eq!(after.epoch, before.epoch + 1);
+                assert_eq!(after.active_release_id, before.active_release_id);
+                assert_eq!(after.active_bundle_digest, before.active_bundle_digest);
+                assert_eq!(after.profile_id, before.profile_id);
+            }
+            assert_eq!(s.watermark(&self.admin).await?, watermark);
+            s.commit().await?;
+        }
+        let verified = self.inner.compiler_inputs(request).await?;
+        if read == 0 {
+            *self.original_a.lock().unwrap() = Some(evo_engine::model::CompilerInputUse::new(
+                request.clone(),
+                verified.binding().clone(),
+            ));
+        } else if read == 1 {
+            let a = self.original_a.lock().unwrap().clone().unwrap();
+            assert_eq!(
+                fingerprint(verified.binding())? == fingerprint(&a.binding)?,
+                !self.switch_pointer
+            );
+            *self.child_fresh_binding.lock().unwrap() = Some(verified.binding().clone());
+            // Existing complete logical oracle is reached only after the real
+            // Admin update and successful fresh child resolve. Setup failure
+            // cannot stand in for the production fixed-A refusal.
+            *self.post_setup_snapshot.lock().unwrap() = Some(logical_snapshot(&self.database));
+        }
+        Ok(verified)
+    }
+    async fn commit(&self, fact: StageFact) -> evo_core::Result<()> {
+        self.inner.commit(fact).await
+    }
+    async fn lookup(&self, id: &str) -> evo_core::Result<Option<StageFact>> {
+        self.inner.lookup(id).await
+    }
+    async fn claim(&self, fact: StageFact) -> evo_core::Result<bool> {
+        self.inner.claim(fact).await
+    }
+    async fn claim_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<bool> {
+        self.observe_original_bound_use(inputs);
+        self.inner.claim_bound(fact, inputs).await
+    }
+    async fn lookup_bound(
+        &self,
+        id: &str,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<Option<StageFact>> {
+        self.observe_original_bound_use(inputs);
+        self.inner.lookup_bound(id, inputs).await
+    }
+    async fn commit_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<()> {
+        self.observe_original_bound_use(inputs);
+        self.inner.commit_bound(fact, inputs).await
+    }
+    async fn verify_sources(
+        &self,
+        s: &SourceSelection,
+        e: &EvidenceSet,
+        b: &[TrustedSourceBinding],
+        t: &[OptimizationTrace],
+        w: u64,
+    ) -> evo_core::Result<()> {
+        self.inner.verify_sources(s, e, b, t, w).await
+    }
+    async fn check_live(&self, ids: &[String], w: u64) -> evo_core::Result<()> {
+        self.inner.check_live(ids, w).await
+    }
+}
+
+#[tokio::test]
+async fn running_claim_keeps_original_compiler_use_across_the_child_handoff() {
+    for switch_pointer in [false, true] {
+        let fixture = Fixture::new().await;
+        let claim = fixture.claimed().await;
+        let material = StepMaterial::new(&fixture).await;
+        let request = material.request(&fixture, &claim.id, 1, true);
+        let compiler_request = request.compiler_input_request();
+        trusted_compiler_inputs::install_request(&fixture.store, &compiler_request)
+            .await
+            .unwrap();
+        let mut s = fixture.store.session().await.unwrap();
+        advance_handoff_fixture_pointer(&mut s, &fixture.admin, &compiler_request.profile.id)
+            .await
+            .unwrap();
+        s.commit().await.unwrap();
+        let model = EditingModelPort::new("first");
+        let runner = LedgerDevRunner::new(&fixture, true);
+        let inner = fixture.journal();
+        let journal = RunningClaimHandoffJournal {
+            inner: &inner,
+            store: fixture.store.clone(),
+            admin: fixture.admin.clone(),
+            claim_id: claim.id.clone(),
+            database: fixture.database.clone(),
+            switch_pointer,
+            compiler_reads: AtomicUsize::new(0),
+            original_a: Mutex::new(None),
+            running_claim: Mutex::new(None),
+            boundary_budget: Mutex::new(None),
+            post_setup_snapshot: Mutex::new(None),
+            child_fresh_binding: Mutex::new(None),
+            bound_uses: Mutex::new(Vec::new()),
+        };
+        let result = MonitoringCoordinator::run_consolidation(
+            &fixture.worker,
+            &fixture.store,
+            &claim.id,
+            Some(&model),
+            Some(&runner),
+            Some(&journal),
+            request,
+        )
+        .await;
+        assert_eq!(journal.compiler_reads.load(Ordering::SeqCst), 2);
+        let a = journal.original_a.lock().unwrap().clone().unwrap();
+        let running = journal
+            .running_claim
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("actual Running commit reached child entry");
+        let child = journal
+            .child_fresh_binding
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("fresh child resolution succeeded");
+        assert_eq!(a.binding.parent_digest, child.parent_digest);
+        assert_eq!(a.binding.baseline_digest, child.baseline_digest);
+        assert_eq!(a.binding.watermark, child.watermark);
+        assert_eq!(
+            fingerprint(&a.binding).unwrap() == fingerprint(&child).unwrap(),
+            !switch_pointer
+        );
+        let mut s = fixture.store.session().await.unwrap();
+        assert_eq!(
+            s.watermark(&fixture.worker).await.unwrap(),
+            a.binding.watermark
+        );
+        let current_claim: ConsolidationClaim = s
+            .need(&fixture.worker, "artifact", &claim.id)
+            .await
+            .unwrap();
+        let budget = s
+            .root_budget_monetary_snapshot(&fixture.admin, SCOPE)
+            .await
+            .unwrap();
+        let all: Vec<Value> = s.list(&fixture.worker, "artifact").await.unwrap();
+        let step_facts = all
+            .iter()
+            .filter(|v| {
+                v["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA && v["episode_id"] == claim.id
+            })
+            .collect::<Vec<_>>();
+        let stored_run = s
+            .get::<ConsolidationRunRecord>(
+                &fixture.worker,
+                "artifact",
+                &format!("consolidation-run-{}", claim.id),
+            )
+            .await
+            .unwrap();
+        s.commit().await.unwrap();
+        if switch_pointer {
+            assert!(matches!(result, Err(Error::Conflict(ref message))
+                if message == "compiler authority changed before continuation"));
+            assert_eq!(
+                fingerprint(&current_claim).unwrap(),
+                fingerprint(&running).unwrap()
+            );
+            assert_eq!(
+                budget,
+                journal.boundary_budget.lock().unwrap().clone().unwrap()
+            );
+            assert!(
+                step_facts.is_empty(),
+                "no StepPrepared, claim or dispatch fact may be derived under B"
+            );
+            assert!(stored_run.is_none());
+            assert!(
+                artifacts_with_schema(
+                    &fixture.store,
+                    &fixture.worker,
+                    evo_engine::monitoring::CONSOLIDATION_PROPOSAL_SCHEMA
+                )
+                .await
+                .is_empty()
+            );
+            assert_eq!(port_counts(&model, &runner), (1, 0, 1, 0));
+            assert!(journal.bound_uses.lock().unwrap().is_empty());
+            assert_eq!(
+                logical_snapshot(&fixture.database),
+                journal.post_setup_snapshot.lock().unwrap().clone().unwrap()
+            );
+        } else {
+            let run = result.unwrap();
+            assert_eq!(run.outcome, ConsolidationRunOutcome::Candidate);
+            assert_eq!(run.input_digest, running.execution_input_digest);
+            assert_eq!(stored_run.unwrap(), run);
+            assert!(!journal.bound_uses.lock().unwrap().is_empty());
+            assert!(model.calls.load(Ordering::SeqCst) > 0);
+            assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+            let prepared_body = step_facts
+                .iter()
+                .find(|v| v["kind"] == "step_prepared")
+                .expect("real StepPrepared");
+            let prepared: StageFact = serde_json::from_value((**prepared_body).clone()).unwrap();
+            assert_eq!(Some(prepared.input_digest), running.execution_input_digest);
+            let prepared_binding: evo_engine::formal_authority::FormalCompilerInputBinding =
+                serde_json::from_value(prepared.payload["compiler_binding"].clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&prepared_binding).unwrap(),
+                serde_json::to_value(&a.binding).unwrap()
+            );
+            assert_eq!(
+                fingerprint(&prepared_binding).unwrap(),
+                fingerprint(&a.binding).unwrap()
+            );
+            for body in step_facts
+                .iter()
+                .filter(|v| v["kind"] == "dispatch_prepared" && v["stage"] != "development")
+            {
+                let bound: evo_engine::model::BoundModelRequest =
+                    serde_json::from_value(body["payload"].clone()).unwrap();
+                assert_eq!(
+                    fingerprint(&bound.compiler_use).unwrap(),
+                    fingerprint(&a).unwrap()
+                );
+            }
+            let proposal = value(
+                &fixture.store,
+                &fixture.worker,
+                "artifact",
+                run.proposal_id.as_deref().unwrap(),
+            )
+            .await;
+            assert_eq!(proposal["provenance"], "program_fixture");
+        }
+        fixture.store.close().await;
+    }
 }

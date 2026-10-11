@@ -18,6 +18,8 @@
 //! pin is the cycle-level input of that rule, `DevelopmentCycleRecord::provenance`
 //! (the derivation matrix itself is unit-tested in `monitoring.rs`).
 
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use async_trait::async_trait;
 use evo_core::contract::{
     CapabilityLevel, HostCapabilities, HostSurfaceManifest, ImproverPatch, Profile, SkillSnapshot,
@@ -59,8 +61,7 @@ use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, OPTIMIZATION_STAGE_FACT_SCHEMA,
     OptimizationJournal, OptimizationJournalStage, OptimizationStepRequest, PairedTaskResult,
-    StageDependency, StageFact, StageFactKind, StoreOptimizationJournal,
-    verify_development_observation,
+    StageDependency, StageFact, StageFactKind, verify_development_observation,
 };
 use evo_engine::release_store::{PrepareRunRequest, ReleaseStore, TrustedHostExecutionEvidence};
 use evo_engine::streaming_evaluator::{FixedGraderMethod, FixedGraderSpec};
@@ -71,6 +72,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use trusted_compiler_inputs::StoreOptimizationJournal;
 
 const TENANT: &str = "tenant";
 const SCOPE: &str = "billing-scope";
@@ -250,7 +252,12 @@ fn build_request(
         attempt: 1,
         manifest: control.manifest().unwrap(),
         parent_bundle_digest: d("parent-bundle"),
-        candidate_bundle_digest: d(&format!("candidate-bundle-{request_id}")),
+        candidate_bundle_digest: trusted_compiler_inputs::software_candidate(
+            TENANT,
+            &control.environment_digest,
+            &format!("candidate-bundle-{request_id}"),
+        )
+        .digest,
         environment_digest: control.environment_digest.clone(),
         grader_digest: control.grader_digest.clone(),
         rules_digest: control.rules_digest.clone(),
@@ -301,7 +308,13 @@ fn request_fact(request: &DevelopmentRunRequest) -> StageFact {
         request_id: request.request_id.clone(),
         input_digest: request.manifest.digest.clone(),
         output_digest: None,
-        dependencies: journal_extras(),
+        dependencies: journal_extras()
+            .into_iter()
+            .chain(std::iter::once(StageDependency {
+                kind: "environment".into(),
+                id: request.environment_digest.clone(),
+            }))
+            .collect(),
         payload: serde_json::to_value(request).unwrap(),
     }
     .seal()
@@ -580,6 +593,21 @@ impl Fixture {
             &format!("cycle-episode-{n}"),
             n,
         );
+        let candidate = trusted_compiler_inputs::software_candidate(
+            TENANT,
+            &self.control.environment_digest,
+            &format!("candidate-bundle-{}", request.request_id),
+        );
+        assert_eq!(candidate.digest, request.candidate_bundle_digest);
+        trusted_compiler_inputs::persist_bundle(
+            &self.store,
+            TENANT,
+            &candidate,
+            &self.control.environment_digest,
+            request.revoke_watermark,
+        )
+        .await
+        .unwrap();
         let report = self.runner().run(request.clone()).await.unwrap();
         assert_eq!(
             report.provenance,
@@ -588,8 +616,21 @@ impl Fixture {
         let journal = self.journal();
         let request_fact = request_fact(&request);
         let observed = observed_fact(&request, &report, true);
-        journal.commit(request_fact.clone()).await.unwrap();
-        journal.commit(observed.clone()).await.unwrap();
+        let inputs = trusted_compiler_inputs::bundle_use(
+            &self.store,
+            TENANT,
+            &request.candidate_bundle_digest,
+        )
+        .await
+        .unwrap();
+        journal
+            .commit_bound(request_fact.clone(), &inputs)
+            .await
+            .unwrap();
+        journal
+            .commit_bound(observed.clone(), &inputs)
+            .await
+            .unwrap();
         Staged {
             request,
             report,
@@ -842,12 +883,27 @@ impl Fixture {
             )
             .await;
         }
-        let journal = self.journal();
+        // Deliberately untrusted stored evidence bypasses the trusted journal
+        // writer so this reader counterexample reaches its original E03 gate.
+        // Healthy stage_trusted uses complete authenticated compiler input.
         if with_request_half {
-            journal.commit(request_fact(&request)).await.unwrap();
+            let request_half = request_fact(&request);
+            put_artifact(
+                &self.store,
+                &self.worker,
+                &request_half.artifact_id,
+                &serde_json::to_value(&request_half).unwrap(),
+            )
+            .await;
         }
         let observed = observed_fact(&request, &report, false);
-        journal.commit(observed.clone()).await.unwrap();
+        put_artifact(
+            &self.store,
+            &self.worker,
+            &observed.artifact_id,
+            &serde_json::to_value(&observed).unwrap(),
+        )
+        .await;
         observed.artifact_id
     }
 }
@@ -904,6 +960,16 @@ struct EditingModelPort {
 
 #[async_trait]
 impl ModelPort for EditingModelPort {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> evo_core::Result<ModelResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let source = request.source_closure[0].clone();
@@ -1123,7 +1189,7 @@ impl StepMaterial {
         claim_id: &str,
         sequence: u32,
     ) -> OptimizationStepRequest<'a> {
-        OptimizationStepRequest {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
             evidence: &self.evidence,
             source_selection: &self.selection,
             source_bindings: &self.bindings,
@@ -1181,7 +1247,7 @@ impl StepMaterial {
                 idempotency_key: format!("consolidation-idempotency-{sequence}"),
             },
             allow_rank_call: false,
-        }
+        })
     }
 }
 
