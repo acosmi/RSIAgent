@@ -72,8 +72,10 @@ async fn immutable<T: Serialize>(
     }
     s.put(ctx, kind, id, ctx.actor(), body).await
 }
+/// The canonical content digest: exactly `evo_core::canonical_fingerprint`
+/// (object keys sorted at every depth), never a second implementation.
 pub fn content_digest<T: Serialize>(body: &T) -> Result<String> {
-    fingerprint(&serde_json::to_value(body).map_err(|_| Error::Internal)?)
+    evo_core::canonical_fingerprint(body)
 }
 
 pub(crate) async fn write_content_witness<T: Serialize>(
@@ -4260,6 +4262,8 @@ pub(crate) async fn issue_complete_authority_in_session(
         );
         let grade: IndependentGradeCapture =
             attested_read(s, ctx, "artifact", &grade_id, Role::Evaluator).await?;
+        // The capture names the canonical digest of the stored receipt itself:
+        // any changed field, or a capture of another digest, fails closed.
         let original: Value = crate::streaming_evaluator::need_record(
             s,
             ctx,
@@ -4267,7 +4271,7 @@ pub(crate) async fn issue_complete_authority_in_session(
             grader_receipt_id,
         )
         .await?;
-        if grade.grader_receipt_digest != fingerprint(&original)?
+        if grade.grader_receipt_digest != evo_core::canonical_fingerprint(&original)?
             || grade.grader_uid != host.grader_uid
             || grade.grader_principal != host.grader_principal
             || grade.grader_code_digest != host.grader_code_digest
