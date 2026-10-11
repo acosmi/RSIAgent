@@ -13,8 +13,13 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      PYTHONOPTIMIZE: '0'
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Toolchain
         run: rustup show && rustc --version && cargo --version
       - name: Resolve dependencies
@@ -43,18 +48,52 @@ jobs:
         id: smoke_workspace
         continue-on-error: true
         run: python3 scripts/smoke_workspace.py > out/smoke-workspace.txt 2>&1
+      - name: Python unit tests
+        id: python_tests
+        continue-on-error: true
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' > out/python-tests.txt 2>&1
+      - name: Statistics reference
+        id: statistics_reference
+        continue-on-error: true
+        run: python3 scripts/statistics_reference.py > out/statistics-reference.txt 2>&1
+      - name: Fixed migration checksums
+        id: migration_checksums
+        continue-on-error: true
+        run: |
+          python3 - > out/migration-checksums.txt 2>&1 <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          expected = {
+              "0005_root_budget.sql": "c7bd918e6a2d123ce1548769f138b71d08140ef314736be7f1bee8e8bb385329",
+              "0006_revoke_cleanup.sql": "2cb41c47cc872cbd5438e0d351f022966a150de879818bd8ac7df5967d3e0610",
+          }
+          for name, digest in expected.items():
+              path = Path("crates/evo-storage/migrations") / name
+              actual = hashlib.sha256(path.read_bytes()).hexdigest()
+              if actual != digest:
+                  raise SystemExit(f"Migration checksum mismatch: {path}: {actual} != {digest}")
+              print(f"{path}: {actual} OK")
+          PY
       - name: CLI smoke
         id: smoke
         continue-on-error: true
         run: |
           cargo build --locked -p rsia
           python3 scripts/smoke_cli.py target/debug/rsia > out/smoke-cli.txt 2>&1
-      - name: Collect source and reports
+      - name: Baseline test inventory
+        id: inventory
+        continue-on-error: true
         if: always()
         run: |
           mkdir -p out
-          cargo fmt --all || true
-          python3 scripts/inventory_baseline_tests.py --ledger docs/implementation-ledger.md --source-sha "$GITHUB_SHA" --test-log out/tests.txt > out/baseline-tests.json || echo 'INVENTORY_FAILED' > out/baseline-tests.json
+          python3 scripts/inventory_baseline_tests.py --ledger docs/implementation-ledger.md --source-sha "$GITHUB_SHA" --test-log out/tests.txt > out/baseline-tests.json 2> out/baseline-tests.stderr.txt
+      - name: Collect source and reports
+        id: archive
+        continue-on-error: true
+        if: always()
+        run: |
+          mkdir -p out
           tar --exclude=.git --exclude=target --exclude=out -czf out/source.tar.gz .
       - uses: actions/upload-artifact@v4
         if: always()
@@ -71,10 +110,21 @@ jobs:
           CLIPPY: ${{ steps.clippy.outcome }}
           SMOKE_WORKSPACE: ${{ steps.smoke_workspace.outcome }}
           SMOKE: ${{ steps.smoke.outcome }}
+          PYTHON_TESTS: ${{ steps.python_tests.outcome }}
+          STATISTICS_REFERENCE: ${{ steps.statistics_reference.outcome }}
+          MIGRATION_CHECKSUMS: ${{ steps.migration_checksums.outcome }}
+          INVENTORY: ${{ steps.inventory.outcome }}
+          ARCHIVE: ${{ steps.archive.outcome }}
         run: |
+          set -e
           test "$FORMAT" = success
           test "$CHECK" = success
           test "$TESTS" = success
           test "$CLIPPY" = success
           test "$SMOKE_WORKSPACE" = success
           test "$SMOKE" = success
+          test "$PYTHON_TESTS" = success
+          test "$STATISTICS_REFERENCE" = success
+          test "$MIGRATION_CHECKSUMS" = success
+          test "$INVENTORY" = success
+          test "$ARCHIVE" = success
