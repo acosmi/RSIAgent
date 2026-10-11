@@ -1,6 +1,7 @@
 //! Transactional typed documents, idempotency, audit and disposable FTS5 indexes.
 //! This crate never connects to a model or executes candidate content.
 pub mod budget;
+pub mod dependency_read;
 pub mod lifecycle;
 pub mod replay;
 pub mod typed_budget;
