@@ -13,11 +13,16 @@ import shutil
 import sqlite3
 import stat
 import sys
+import time
 import uuid
 
 BACKUP_SCHEMA = "rsia.backup.v2"
 DELTA_SCHEMA = "rsia.revoke_delta.v1"
 KNOWN_MIGRATIONS = [1, 2, 4, 5, 6, 7]
+# A backup may stop at a strict prefix of KNOWN_MIGRATIONS only once it holds the
+# root budget ledger: protected_facts compares the root_budget% tables 0005 creates.
+ROOT_BUDGET_MIGRATION = 5
+MIGRATIONS_RECORD_SCHEMA = "rsia.restore_migrations.v1"
 
 class IsolationError(Exception):
     pass
@@ -162,17 +167,31 @@ def readonly(path):
     con.execute("PRAGMA query_only=ON")
     return con
 
-def current_migrations():
+def sqlx_description(file_name):
+    # sqlx-core 0.8.6 migrate/source.rs resolve_blocking, which sqlx::migrate! also uses:
+    # split once at "_", strip the type suffix with trim_end_matches, then "_" -> " ".
+    rest = file_name.split("_",1)[1]
+    suffix = ".up.sql" if rest.endswith(".up.sql") else ".down.sql" if rest.endswith(".down.sql") else ".sql"
+    while rest.endswith(suffix):
+        rest = rest[:-len(suffix)]
+    return rest.replace("_"," ")
+
+def code_migrations():
+    """version -> (sqlx description, file bytes, SHA-384 hex): each file read once."""
     folder = Path(__file__).resolve().parents[1]/"crates/evo-storage/migrations"
     found = {}
     for path in folder.glob("*.sql"):
         version = int(path.name.split("_",1)[0])
         if version in found:
             raise IsolationError("duplicate code migration")
-        found[version] = hashlib.sha384(path.read_bytes()).hexdigest()
+        raw = path.read_bytes()
+        found[version] = (sqlx_description(path.name), raw, hashlib.sha384(raw).hexdigest())
     if sorted(found) != KNOWN_MIGRATIONS:
         raise IsolationError("unsupported current migration set")
     return found
+
+def current_migrations():
+    return {version: checksum for version,(_,_,checksum) in code_migrations().items()}
 
 def verify_db_schema(con, expected):
     rows = con.execute("SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version").fetchall()
@@ -180,6 +199,28 @@ def verify_db_schema(con, expected):
         raise IsolationError("database migration checksums differ from current code")
     if con.execute("PRAGMA integrity_check").fetchone() != ("ok",):
         raise IsolationError("database integrity failed")
+
+def missing_migrations(versions):
+    """The versions a backup on `versions` lacks, in order; [] for the current set.
+
+    Only the current set or a strict prefix of it that already holds the root
+    budget ledger (0005) is restorable. A gap, an unknown or future version and an
+    older prefix stay isolated."""
+    if not versions or versions != KNOWN_MIGRATIONS[:len(versions)]:
+        raise IsolationError("unsupported manifest migrations: not a prefix of the current migration set")
+    if versions[-1] < ROOT_BUDGET_MIGRATION:
+        raise IsolationError("backup predates the root budget ledger (0005); protected facts cannot be verified")
+    return KNOWN_MIGRATIONS[len(versions):]
+
+def verify_backup_migrations(con, versions, expected):
+    """The backup database holds exactly the manifest's ledger, every row successful
+    with the current file's checksum, and passes the integrity check."""
+    rows = con.execute("SELECT version,success FROM _sqlx_migrations ORDER BY version").fetchall()
+    if [version for version,_ in rows] != versions:
+        raise IsolationError("backup database migrations differ from its manifest")
+    if any(success!=1 for _,success in rows):
+        raise IsolationError("backup database has an unsuccessful migration")
+    verify_db_schema(con,{version: expected[version] for version in versions})
 
 def verify_manifest(backup):
     manifest, raw = load_json(safe_member(backup,"backup-manifest.json"))
@@ -196,8 +237,9 @@ def verify_manifest(backup):
     for entry in manifest["watermarks"]: verify_watermark_entry(entry)
     expected = current_migrations()
     migrations = manifest.get("migrations",[])
-    if [m["version"] for m in migrations] != KNOWN_MIGRATIONS:
-        raise IsolationError("unsupported manifest migrations")
+    versions = [m["version"] for m in migrations]
+    # The current set, or a strict prefix the restore upgrades before publication.
+    missing_migrations(versions)
     if any(m.get("success") is not True or m.get("checksum_hex")!=expected[m["version"]] for m in migrations):
         raise IsolationError("manifest migration checksums differ from current code")
     entries = [manifest["database"], *manifest["blobs"]]
@@ -235,7 +277,7 @@ def verify_manifest(backup):
     if not watermarks:
         raise IsolationError("missing backup watermark")
     with readonly(backup/"rsia.sqlite3") as con:
-        verify_db_schema(con,expected)
+        verify_backup_migrations(con,versions,expected)
         if dict((n,(s,d)) for n,s,d in con.execute("SELECT namespace,seq,digest FROM revoke_watermark")) != watermarks:
             raise IsolationError("manifest/database watermark mismatch")
     return manifest,raw,watermarks
@@ -353,6 +395,53 @@ def replay_delta(database,events):
                 con.execute("INSERT INTO revoke_cleanup_frontier(namespace,job_id,node_kind,node_id) VALUES(?,?,?,?)",(e["namespace"],job_id,kind,e["source_id"]))
             con.execute("INSERT INTO revoke_cleanup_events(namespace,job_id,node_kind,node_id,event_kind,event_at,details) VALUES(?,?,?,?,?,?,?)",(e["namespace"],job_id,e["source_kind"],e["source_id"],"logical_block_restored",e["created_at"],json.dumps({"watermark_seq":e["seq"],"watermark_digest":e["digest"]})))
 
+def apply_missing_migrations(database,versions):
+    """Upgrade the private restore copy from a strict prefix to the current migration set.
+
+    Does what sqlx 0.8.6 does when Store::open runs sqlx::migrate! (Migrator::run_direct,
+    SqliteConnection::apply), with foreign keys ON as Store::open connects: in version
+    order, one transaction per migration runs the file's SQL and inserts its ledger row
+    (version, description derived from the file name, success TRUE, checksum = SHA-384
+    of the file bytes, execution_time -1); after the commit execution_time becomes the
+    elapsed nanoseconds. The upgraded copy must then pass the full-set check again.
+    Returns [{"version","checksum_sha384"}] of the applied migrations."""
+    missing=missing_migrations(versions)
+    if not missing:
+        return []
+    code=code_migrations()
+    applied=[]
+    con=sqlite3.connect(database,isolation_level=None)
+    try:
+        con.execute("PRAGMA foreign_keys=ON")
+        for version in missing:
+            description,raw,checksum=code[version]
+            sql=raw.decode("utf-8")
+            started=time.perf_counter_ns()
+            try:
+                # executescript() hands each statement to SQLite's own parser, as sqlx does.
+                # It would commit a transaction that is already open, so BEGIN goes first.
+                con.executescript("BEGIN IMMEDIATE;\n"+sql)
+                if not con.in_transaction:
+                    raise IsolationError(f"migration {version} ended its own transaction")
+                con.execute("INSERT INTO _sqlx_migrations ( version, description, success, checksum, execution_time ) VALUES ( ?, ?, TRUE, ?, -1 )",(version,description,bytes.fromhex(checksum)))
+                con.execute("COMMIT")
+            except BaseException:
+                if con.in_transaction:
+                    try: con.execute("ROLLBACK")
+                    except sqlite3.Error: pass
+                raise
+            elapsed=time.perf_counter_ns()-started
+            con.execute("UPDATE _sqlx_migrations SET execution_time = ? WHERE version = ?",(elapsed,version))
+            applied.append({"version":version,"checksum_sha384":checksum})
+    finally:
+        con.close()
+    check=readonly(database)
+    try:
+        verify_db_schema(check,{version: entry[2] for version,entry in code.items()})
+    finally:
+        check.close()
+    return applied
+
 def publish_exclusive(source,dest):
     libc=ctypes.CDLL(None,use_errno=True)
     if sys.platform=="darwin":
@@ -390,6 +479,10 @@ def main():
                 shutil.copyfileobj(reader,writer);writer.flush();os.fsync(writer.fileno())
             if target.stat().st_size!=entry["bytes"] or sha256_file(target)!=entry["sha256"]:
                 raise IsolationError("copied member digest differs")
+        # A backup on a strict migration prefix is upgraded here, inside the private copy,
+        # before the anchor comparison, the delta replay and publication (plan §11).
+        source_versions=[m["version"] for m in manifest["migrations"]]
+        applied=apply_missing_migrations(temp/"rsia.sqlite3",source_versions)
         # Re-read the independent anchor immediately before applying/publishing.
         latest_events,latest_anchor=verify_delta(Path(args.revoke_delta),raw,base,args.trusted_revocations_db,backup,temp/"rsia.sqlite3")
         if events!=latest_events or anchor_receipt["control_plane_digest"]!=latest_anchor["control_plane_digest"]:
@@ -399,6 +492,11 @@ def main():
         with (temp/"restore.json").open("x") as receipt:
             receipt.write(json.dumps({"schema_version":"rsia.restore_receipt.v2","backup_manifest_sha256":hashlib.sha256(raw).hexdigest(),"replayed_revoke_events":len(events),"isolated":False,"trusted_anchor":anchor_receipt,"receipt_scope":"local_only_not_for_export"})+"\n")
             receipt.flush();os.fsync(receipt.fileno())
+        if applied:
+            # Operator-facing side record; restore.json and the startup gate are unchanged.
+            with (temp/"restore.migrations.json").open("x") as record:
+                record.write(json.dumps({"schema":MIGRATIONS_RECORD_SCHEMA,"source_versions":source_versions,"applied":applied,"current_versions":KNOWN_MIGRATIONS})+"\n")
+                record.flush();os.fsync(record.fileno())
         for directory,_,_ in os.walk(temp,topdown=False):
             directory_fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)
             try: os.fsync(directory_fd)
@@ -407,7 +505,7 @@ def main():
     except (IsolationError,OSError,sqlite3.Error,ValueError,KeyError,TypeError) as error:
         shutil.rmtree(temp,ignore_errors=True)
         print(f"ISOLATE {error}; not mounting",file=sys.stderr);return 1
-    print(f"RESTORE_OK events={len(events)}");return 0
+    print(f"RESTORE_OK events={len(events)} migrations_applied={','.join(str(m['version']) for m in applied) or 'none'}");return 0
 
 if __name__=="__main__":
     raise SystemExit(main())
