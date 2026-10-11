@@ -555,38 +555,34 @@ struct RankedAction<'a> {
     waited: u32,
 }
 
-pub fn decide_elastic(
-    policy: &ElasticPolicyV1,
+/// The legal opportunities of one decision round (plan §7.1.1): the actions of
+/// `legal` that stay legal once core holds them to the frozen caps, the budget and
+/// the observed prefix, in the order `legal` lists them. A policy cannot add one.
+/// `decide_elastic` ranks exactly these, and online exploration and replay advance
+/// their fairness waits over exactly these: only an opportunity that was legal and
+/// skipped while others were legal waits, and online and replay share this one
+/// restricted filter as they share the decision (only the transition executor
+/// differs).
+///
+/// An action is no opportunity when it is past the depth cap, when no node is left
+/// under the budget or the node cap, when it has no authorized cost bound or one over
+/// the remaining root budget (an unknown cost is never zero), when it is a Recover
+/// that is not eligible (no recovery dispatch left, a line whose repair already
+/// failed, a failure that is not a reset repairable one of its episode, or an episode
+/// at its repair cap), or when its structure does not fit the prefix.
+///
+/// An unsupported legal-action schema and a malformed or duplicate action identity
+/// are errors. `prefix`, `budget` and `caps` are taken as given: `decide_elastic`
+/// validates them before it calls this.
+pub fn legal_candidates<'a>(
     prefix: &PrefixViewV2,
-    legal: &LegalActionsV1,
+    legal: &'a LegalActionsV1,
     budget: &BudgetViewV1,
     caps: &ExplorationCapsV1,
-    simulation: SimulationContext,
-) -> Result<BatchActionV1> {
-    policy.validate()?;
-    prefix.validate()?;
-    caps.validate()?;
-    if prefix.nodes_used > caps.max_nodes
-        || prefix.nodes.iter().any(|node| node.depth > caps.max_depth)
-    {
-        return Err(Error::Invalid(
-            "revealed prefix exceeds the frozen exploration caps".into(),
-        ));
-    }
-    let width = simulation.width()?;
-    if matches!(simulation, SimulationContext::Online { .. }) && width != caps.w_online {
-        return Err(Error::Invalid(
-            "online width differs from frozen caps".into(),
-        ));
-    }
+) -> Result<Vec<&'a LegalActionV1>> {
     if legal.schema_version != "rsia.legal_actions.v1" {
         return Err(Error::Invalid("unsupported legal action schema".into()));
     }
-    let waits: std::collections::BTreeMap<_, _> = prefix
-        .waits
-        .iter()
-        .map(|wait| (wait.action_seq, wait.waited_rounds))
-        .collect();
     let node_by_seq: std::collections::BTreeMap<_, _> = prefix
         .nodes
         .iter()
@@ -597,7 +593,7 @@ pub fn decide_elastic(
         .iter()
         .filter_map(|node| node.search_parent_seq)
         .collect();
-    let mut ranked = Vec::new();
+    let mut candidates = Vec::new();
     let mut action_ids = std::collections::BTreeSet::new();
     let mut action_seqs = std::collections::BTreeSet::new();
     for action in &legal.actions {
@@ -681,6 +677,49 @@ pub fn decide_elastic(
                 }
             }
         }
+        candidates.push(action);
+    }
+    Ok(candidates)
+}
+
+pub fn decide_elastic(
+    policy: &ElasticPolicyV1,
+    prefix: &PrefixViewV2,
+    legal: &LegalActionsV1,
+    budget: &BudgetViewV1,
+    caps: &ExplorationCapsV1,
+    simulation: SimulationContext,
+) -> Result<BatchActionV1> {
+    policy.validate()?;
+    prefix.validate()?;
+    caps.validate()?;
+    if prefix.nodes_used > caps.max_nodes
+        || prefix.nodes.iter().any(|node| node.depth > caps.max_depth)
+    {
+        return Err(Error::Invalid(
+            "revealed prefix exceeds the frozen exploration caps".into(),
+        ));
+    }
+    let width = simulation.width()?;
+    if matches!(simulation, SimulationContext::Online { .. }) && width != caps.w_online {
+        return Err(Error::Invalid(
+            "online width differs from frozen caps".into(),
+        ));
+    }
+    let waits: std::collections::BTreeMap<_, _> = prefix
+        .waits
+        .iter()
+        .map(|wait| (wait.action_seq, wait.waited_rounds))
+        .collect();
+    let node_by_seq: std::collections::BTreeMap<_, _> = prefix
+        .nodes
+        .iter()
+        .map(|node| (node.node_seq, node))
+        .collect();
+    // The shared filter refuses an unsupported legal-action schema and a malformed or
+    // duplicate action identity; what it returns are this round's legal opportunities.
+    let mut ranked = Vec::new();
+    for action in legal_candidates(prefix, legal, budget, caps)? {
         let value = action_value(action, prefix, &node_by_seq)?;
         ranked.push(RankedAction {
             action,

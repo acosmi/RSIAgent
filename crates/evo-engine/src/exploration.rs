@@ -21,7 +21,7 @@ use evo_core::strategy::{
     ExplorationPolicy, FailureKind, HistoryQuery, LegalActionV1, LegalActionsV1, MAX_NODES,
     MAX_REPAIR, ObservedStatus, OpportunityWait, OptimizationHistoryEntry, PrefixNodeV2,
     PrefixView, PrefixViewV2, RetryDecision, SimulationContext, decide_elastic,
-    deterministic_retry_decision, select_optimization_history,
+    deterministic_retry_decision, legal_candidates, select_optimization_history,
 };
 use evo_core::{Context, Error, Result, Role, Validate, fingerprint, identifier};
 use evo_storage::{Session, Store};
@@ -1399,6 +1399,29 @@ impl PersistentCoordinator {
                 "the exploration node of a dispatch already exists".into(),
             ));
         }
+        // The legal opportunities of the decision round this dispatch completes (plan
+        // §7.1.1: fairness waits move per completed round, and only a legal opportunity
+        // waits): the structural actions above that evo-core's shared filter leaves
+        // legal on the prefix, budget and caps `pure_decision` hands `decide_elastic`,
+        // read before this settlement spends anything. An action over the remaining
+        // root budget, or a Recover with no recovery dispatch left or past the depth
+        // cap, is no opportunity: it neither waits nor stays among the waits. The replay
+        // moves its waits over the same filter.
+        let opportunity_seqs: Vec<u32> = {
+            let prefix = prefix_projection(&world, &existing_nodes, &facts)?;
+            let budget = BudgetViewV1 {
+                remaining_nodes: world
+                    .caps
+                    .max_nodes
+                    .saturating_sub(existing_nodes.len() as u8),
+                remaining_recovery_dispatches: world.remaining_recovery_dispatches,
+                remaining_root_micros: world.remaining_root_micros,
+            };
+            legal_candidates(&prefix, &legal, &budget, &world.caps)?
+                .into_iter()
+                .map(|action| action.action_seq)
+                .collect()
+        };
         let (search_parent_seq, branch_seq, depth) = node_placement(&action);
         // A Recover spends a recovery dispatch whatever it ends in, and it is spent even
         // when there is nothing to repair: it was dispatched.
@@ -1495,12 +1518,7 @@ impl PersistentCoordinator {
             1
         };
         world.decision_round = world.decision_round.saturating_add(1);
-        let available_action_seqs: Vec<u32> = legal
-            .actions
-            .iter()
-            .map(|action| action.action_seq)
-            .collect();
-        update_waits(&mut world, action.action_seq, &available_action_seqs);
+        update_waits(&mut world, action.action_seq, &opportunity_seqs);
         dispatch.state = if matches!(node.node.status, ObservedStatus::UsageUncertain) {
             ExplorationDispatchState::Uncertain
         } else {
