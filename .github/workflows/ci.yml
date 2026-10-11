@@ -67,6 +67,7 @@ jobs:
           expected = {
               "0005_root_budget.sql": "c7bd918e6a2d123ce1548769f138b71d08140ef314736be7f1bee8e8bb385329",
               "0006_revoke_cleanup.sql": "2cb41c47cc872cbd5438e0d351f022966a150de879818bd8ac7df5967d3e0610",
+              "0007_formal_parent_kind.sql": "edb992c10210f3a86fea9ca3f26f1ba90b552b94083f84a2b87dca011ddc6d51",
           }
           for name, digest in expected.items():
               path = Path("crates/evo-storage/migrations") / name
@@ -81,6 +82,10 @@ jobs:
         run: |
           cargo build --locked -p rsia
           python3 scripts/smoke_cli.py target/debug/rsia > out/smoke-cli.txt 2>&1
+      - name: MCP stdio contract tests
+        id: mcp_stdio
+        continue-on-error: true
+        run: python3 scripts/test_mcp_stdio.py target/debug/rsia > out/mcp-stdio.txt 2>&1
       - name: Baseline test inventory
         id: inventory
         continue-on-error: true
@@ -110,6 +115,7 @@ jobs:
           CLIPPY: ${{ steps.clippy.outcome }}
           SMOKE_WORKSPACE: ${{ steps.smoke_workspace.outcome }}
           SMOKE: ${{ steps.smoke.outcome }}
+          MCP_STDIO: ${{ steps.mcp_stdio.outcome }}
           PYTHON_TESTS: ${{ steps.python_tests.outcome }}
           STATISTICS_REFERENCE: ${{ steps.statistics_reference.outcome }}
           MIGRATION_CHECKSUMS: ${{ steps.migration_checksums.outcome }}
@@ -123,6 +129,7 @@ jobs:
           test "$CLIPPY" = success
           test "$SMOKE_WORKSPACE" = success
           test "$SMOKE" = success
+          test "$MCP_STDIO" = success
           test "$PYTHON_TESTS" = success
           test "$STATISTICS_REFERENCE" = success
           test "$MIGRATION_CHECKSUMS" = success

@@ -276,7 +276,20 @@ class StdioHost:
 class McpStdioTests(unittest.TestCase):
     binary: Path
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        # main() sets `binary` from argv; under plain `unittest discover` fall back
+        # to RSIA_BINARY. Absence is reported per test in setUp (skipped, not error).
+        if getattr(cls, "binary", None) is None:
+            env = os.environ.get("RSIA_BINARY")
+            if env:
+                cls.binary = Path(env).resolve(strict=True)
+
     def setUp(self) -> None:
+        if getattr(type(self), "binary", None) is None:
+            raise unittest.SkipTest(
+                "rsia binary not provided; run scripts/test_mcp_stdio.py <binary> or set RSIA_BINARY"
+            )
         self.directory = tempfile.TemporaryDirectory(prefix="rsia-mcp-stdio-")
         self.addCleanup(self.directory.cleanup)
         self.data = Path(self.directory.name) / "rsia.sqlite3"
