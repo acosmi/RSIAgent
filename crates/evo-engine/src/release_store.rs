@@ -891,6 +891,39 @@ async fn validate_candidate_sources(
     Ok(())
 }
 
+/// Reader-side validation of an immutable staged candidate. The formal
+/// Evaluator is distinct from the proposer; stage_bundle alone enforces the
+/// writer's actor. Read authority and all source checks use the caller's Session.
+pub(crate) async fn validate_candidate_read_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    candidate: &ReleaseCandidateRecord,
+) -> Result<()> {
+    if candidate.schema_version != RELEASE_CANDIDATE_SCHEMA {
+        return Err(Error::Invalid(
+            "unsupported release candidate schema".into(),
+        ));
+    }
+    identifier(&candidate.id)?;
+    identifier(&candidate.profile_id)?;
+    identifier(&candidate.proposer_actor)?;
+    validate_digest(&candidate.environment_digest, "environment_digest")?;
+    validate_digest(&candidate.bundle_digest, "bundle_digest")?;
+    validate_digest(&candidate.parent_digest, "parent_digest")?;
+    validate_resolved_bundle_identity(&candidate.bundle)?;
+    if candidate.bundle_digest != candidate.bundle.digest
+        || candidate.profile_id != candidate.bundle.profile_id
+        || candidate.parent_digest != candidate.bundle.parent_digest
+        || candidate.sources.is_empty()
+        || canonical_sources(candidate.sources.clone())? != candidate.sources
+    {
+        return Err(Error::Conflict(
+            "release candidate identity is incomplete or noncanonical".into(),
+        ));
+    }
+    validate_candidate_sources(session, ctx, candidate).await
+}
+
 fn validate_verified_report_identity(
     candidate: &ReleaseCandidateRecord,
     view: &crate::streaming_evaluator::VerifiedFormalReportView,

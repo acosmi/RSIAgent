@@ -2490,6 +2490,50 @@ impl Session {
         Ok(())
     }
 
+    /// Complete outgoing content dependencies of one physical typed object, in
+    /// this namespace and transaction. LIMIT+1 detects overflow before returning
+    /// anything: a revocation reader must never mistake a prefix for the closure.
+    pub async fn outgoing_edges_bounded(
+        &mut self,
+        ctx: &Context,
+        src_kind: &str,
+        src_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        identifier(src_kind)?;
+        identifier(src_id)?;
+        if !(1..=10_000).contains(&limit) {
+            return Err(Error::Invalid(
+                "outgoing edge limit must be 1..=10000".into(),
+            ));
+        }
+        let rows = sqlx::query(
+            "SELECT dst_kind,dst_id FROM dependencies
+             WHERE namespace=? AND src_kind=? AND src_id=?
+             ORDER BY dst_kind COLLATE BINARY,dst_id COLLATE BINARY LIMIT ?",
+        )
+        .bind(ctx.namespace())
+        .bind(src_kind)
+        .bind(src_id)
+        .bind(i64::try_from(limit + 1).map_err(|_| Error::Internal)?)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        if rows.len() > limit {
+            return Err(Error::Conflict(format!(
+                "outgoing dependency edges exceed {limit}; refused, not truncated"
+            )));
+        }
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("dst_kind").map_err(internal)?,
+                    row.try_get("dst_id").map_err(internal)?,
+                ))
+            })
+            .collect()
+    }
+
     pub async fn dependents(
         &mut self,
         ctx: &Context,
