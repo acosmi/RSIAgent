@@ -45,13 +45,42 @@ IDENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 STATUS_RANK = {"planned": 0, "blocked": 1, "in_progress": 1, "implemented_not_verified": 2, "verified": 3}
 # Optional per-record PR state. When present it must agree with merged_sha (merged <=> merged_sha set).
 PR_STATES = {"draft", "open", "closed", "merged"}
+# Records of pull requests numbered above this value (fifth round onward) must carry `execution`; earlier records may
+# omit it and are not backfilled or guessed.
+EXECUTION_REQUIRED_ABOVE_PR = 141
+# Machine fields must not read as execution records when they are not (plan E16.6: a derived index that conflicts with
+# the body is rejected, and E00: real exit codes only). `command`, `exit_code` and `log_path` describe the declared
+# single target; the optional record-level `execution` object states what was literally run. The meaning of every such
+# field is pinned here and must be restated verbatim in the manifest's top-level `field_semantics`.
+FIELD_SEMANTICS = {
+    "command": "declared single-target checker command; syntax validated, not necessarily the literally executed command",
+    "exit_code": "exit code of the controller gate run that covered the declared target",
+    "log_path": "local evidence file containing that target's result (controller test log or acceptance receipt)",
+    "execution": (
+        f"optional record-level object, required when the pull request number is above {EXECUTION_REQUIRED_ABOVE_PR}, stating what was actually run: "
+        "runner (ctrl_verify.sh, codex_task or other), command (the literally executed command), scope (workspace or single_target), "
+        "exit_code (the integer exit code of that command) and evidence (the log_path or the identifier of the summary line inside the "
+        "acceptance receipt); command, exit_code and log_path of the record keep describing the declared target; "
+        "earlier records are neither backfilled nor guessed"
+    ),
+    "production_consumer": (
+        "optional record-level marker: none_library_only means the recorded module has no production caller in engine/http/mcp/apps "
+        "as of the commit named in the record scope; wired means a production caller exists; an absent marker means this was not assessed"
+    ),
+}
+EXECUTION_KEYS = {"runner", "command", "scope", "exit_code", "evidence"}
+EXECUTION_RUNNERS = {"ctrl_verify.sh", "codex_task", "other"}
+EXECUTION_SCOPES = {"workspace", "single_target"}
+# `execution.command` must be what was run, not the declared single-target command copied a second time.
+DECLARED_COMMAND_PREFIX = "cargo test --locked --offline"
+PRODUCTION_CONSUMER_VALUES = {"wired", "none_library_only"}
 # Closed key sets per object type, derived from reports/support-scope.json (rsia.support_scope.v2).
 # Keys that the checker reads but the current manifest does not yet use (completion_evidence_refs,
 # verification_evidence_refs, pr_state) are listed so legitimate progress stays registrable.
 ROOT_KEYS = {
-    "schema_version", "plan_version", "plan_sha256", "plan_lineage", "derived_index_notice", "declaration", "not_full_route_complete",
-    "legacy_equivalence_unverified", "dimensions", "blocked", "explicitly_out_of_scope_until_revised", "optional_disabled",
-    "overall_remaining", "e_scopes", "traceability", "trace_index_coverage",
+    "schema_version", "plan_version", "plan_sha256", "plan_lineage", "derived_index_notice", "field_semantics", "declaration",
+    "not_full_route_complete", "legacy_equivalence_unverified", "dimensions", "blocked", "explicitly_out_of_scope_until_revised",
+    "optional_disabled", "overall_remaining", "e_scopes", "traceability", "trace_index_coverage",
 }
 LINEAGE_KEYS = {"version", "file", "sha256"}
 DIMENSION_KEYS = {"engineering", "host", "model", "effect", "deploy"}
@@ -60,6 +89,7 @@ SCOPE_KEYS = {"title", "status", "status_reason", "implementation_files", "scena
 EVIDENCE_KEYS = {
     "id", "description", "plan_version", "plan_sha256", "plan_recheck", "source_sha", "pr", "merged_sha", "pr_state", "test_entry", "command",
     "input_digest", "exit_code", "log_path", "actual_result", "scope", "risk", "rollback", "record_source", "input_ref",
+    "execution", "production_consumer",
 }
 TRACEABILITY_KEYS = {"b_commitments", "u_commitments", "k_commitments", "so_sources", "v_scenarios"}
 COMMITMENT_KEYS = {
@@ -277,6 +307,53 @@ def resolve_cargo_target(repo_root: Path, command: Any, packages: dict[str, tupl
     inspect_relative(repo_root, full, "cargo test target", True)
     return full
 
+def validate_field_semantics(value: Any) -> None:
+    """The manifest must state, machine-readably, what the execution-looking fields mean (plan E16.6: derived JSON may not be a second truth)."""
+    if not isinstance(value, dict):
+        raise CheckerError("field_semantics: must be an object stating what command, exit_code, log_path, execution and production_consumer mean")
+    known_keys(value, set(FIELD_SEMANTICS), "field_semantics")
+    for key, expected in FIELD_SEMANTICS.items():
+        if key not in value:
+            raise CheckerError(f"field_semantics: missing the definition of {key!r}")
+        if value[key] != expected:
+            raise CheckerError(f"field_semantics.{key} differs from the definition pinned by the checker; a machine field may not be redefined to read as stronger evidence than it is")
+
+def validate_execution(record: dict[str, Any], identifier: str, pr_number: int) -> None:
+    """Record-level `execution`: what was literally run, kept apart from the declared single target in command/exit_code/log_path."""
+    if "execution" not in record:
+        if pr_number > EXECUTION_REQUIRED_ABOVE_PR:
+            raise CheckerError(
+                f"{identifier}: PR #{pr_number} is above #{EXECUTION_REQUIRED_ABOVE_PR}, so the record must carry an 'execution' object "
+                "(runner, literally executed command, scope, real exit code, evidence); command/exit_code/log_path only describe the declared target"
+            )
+        return
+    what = f"{identifier} execution"
+    execution = known_keys(record["execution"], EXECUTION_KEYS, what)
+    missing = sorted(EXECUTION_KEYS - set(execution))
+    if missing:
+        raise CheckerError(f"{what}: missing key(s) {missing}")
+    runner = execution["runner"]
+    if not isinstance(runner, str) or runner not in EXECUTION_RUNNERS:
+        raise CheckerError(f"{what}: runner must be one of {sorted(EXECUTION_RUNNERS)}, got {runner!r}")
+    scope = execution["scope"]
+    if not isinstance(scope, str) or scope not in EXECUTION_SCOPES:
+        raise CheckerError(f"{what}: scope must be one of {sorted(EXECUTION_SCOPES)}, got {scope!r}")
+    command = nonempty(execution["command"], f"{what} command")
+    if " ".join(command.split()).startswith(DECLARED_COMMAND_PREFIX):
+        raise CheckerError(f"{what}: command must be the literally executed command, not the declared single-target form ({DECLARED_COMMAND_PREFIX} ...) copied again")
+    exit_code = execution["exit_code"]
+    if type(exit_code) is not int:
+        raise CheckerError(f"{what}: exit_code must be the integer exit code of the executed command, got {exit_code!r}")
+    nonempty(execution["evidence"], f"{what} evidence")
+
+def validate_production_consumer(record: dict[str, Any], identifier: str) -> None:
+    """Optional marker separating modules with a production caller from library-only ones; an absent marker claims nothing."""
+    if "production_consumer" not in record:
+        return
+    value = record["production_consumer"]
+    if not isinstance(value, str) or value not in PRODUCTION_CONSUMER_VALUES:
+        raise CheckerError(f"{identifier}: production_consumer must be one of {sorted(PRODUCTION_CONSUMER_VALUES)} when present, got {value!r}")
+
 def expected_v_to_e() -> dict[str, set[str]]:
     result = {f"V{i:03}": set() for i in range(1, 99)}
     for task, scenarios in EXPECTED_E_SCENARIOS.items():
@@ -345,9 +422,12 @@ def validate_evidence(record: Any, task: str, repo_root: Path, packages: dict[st
         raise CheckerError(f"{identifier}: verified execution must have integer exit_code 0")
     for field in ("description", "actual_result", "scope", "risk", "rollback"):
         nonempty(record.get(field), f"{identifier} {field}")
+    validate_execution(record, identifier, int(PR_RE.fullmatch(pr).group(1)))
+    validate_production_consumer(record, identifier)
     return identifier
 
 def validate_refs(refs: Any, what: str, evidence_owner: dict[str, str], relevant_tasks: set[str]) -> set[str]:
+    """Every ref must be a unique, existing evidence record id (V, B/U/K and SO refs all pass through here) owned by a task mapped to the entry."""
     values = string_set(refs, what)
     unknown = values - set(evidence_owner)
     if unknown:
@@ -384,6 +464,7 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
         raise CheckerError(f"manifest top level is not bound to the current plan {PLAN_VERSION} ({PLAN_SHA256}); historical lineage digests are accepted only inside evidence records")
     known_keys(manifest, ROOT_KEYS, "manifest root")
     validate_plan_lineage(manifest.get("plan_lineage"))
+    validate_field_semantics(manifest.get("field_semantics"))
     known_keys(manifest.get("dimensions"), DIMENSION_KEYS, "dimensions")
     if manifest.get("declaration") != "subset_only" or manifest.get("not_full_route_complete") is not True or manifest.get("legacy_equivalence_unverified") is not True or manifest.get("dimensions", {}).get("effect") != "not_claimed":
         raise CheckerError("manifest overstates completion/effect or drops legacy limitation")

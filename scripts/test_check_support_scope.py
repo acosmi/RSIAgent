@@ -25,6 +25,18 @@ def _write(path: Path, content: str = "stub\n") -> None:
 def _valid_manifest_dict() -> dict:
     return copy.deepcopy(json.loads((REAL_ROOT / "reports/support-scope.json").read_text(encoding="utf-8")))
 
+def _valid_execution(**overrides) -> dict:
+    """A well-formed record-level `execution` object (AG-102): the literally executed command, not the declared target."""
+    execution = {
+        "runner": "ctrl_verify.sh",
+        "command": "cargom test --workspace --locked --no-fail-fast",
+        "scope": "workspace",
+        "exit_code": 0,
+        "evidence": "out/fixture/ctrl-fixture.log.test",
+    }
+    execution.update(overrides)
+    return execution
+
 def _fresh_record(base: dict, task: str, name: str, stem: str) -> dict:
     """Copy an existing record but give it its own id, PR, source, log, input and record_source."""
     record = copy.deepcopy(base)
@@ -42,6 +54,7 @@ def _fresh_record(base: dict, task: str, name: str, stem: str) -> dict:
             "input_ref": f"out/fixture/{stem}-input.json",
             "input_digest": hashlib.sha256(stem.encode()).hexdigest(),
             "record_source": f"out/fixture/{stem}-acceptance.json",
+            "execution": _valid_execution(),  # PR 999 is above #141, so the record must say what was literally run
         }
     )
     return record
@@ -174,6 +187,7 @@ class ValidManifestTests(unittest.TestCase):
                     "record_source": "out/future/acceptance.json",
                     "actual_result": "fixture record exercises schema extensibility",
                     "scope": "synthetic structural fixture only",
+                    "execution": _valid_execution(evidence="out/future/test.log"),  # PR 999 is above #141
                 }
             )
             manifest["e_scopes"]["E03"]["verified_subscopes"].append(new_record)
@@ -767,6 +781,282 @@ class PlanLineageTests(unittest.TestCase):
         v097 = next(entry for entry in manifest["traceability"]["v_scenarios"] if entry["id"] == "V097")
         v097["e_tasks"].remove("E09")
         self.assertIn("V097: E responsibility differs", self._errors(manifest)[0])
+
+class HonestMachineFieldTests(unittest.TestCase):
+    """AG-102 (plan E16.6 L1461, E00 L1185): machine fields must not read as stronger evidence than they are.
+
+    command/exit_code/log_path describe the declared single target; the record-level `execution` object states what was
+    literally run and is required from PR #142 on; production_consumer registers library-only modules; evidence refs must
+    name real records."""
+
+    CARD_COMMAND = "declared single-target checker command; syntax validated, not necessarily the literally executed command"
+    CARD_EXIT_CODE = "exit code of the controller gate run that covered the declared target"
+    CARD_LOG_PATH = "local evidence file containing that target's result (controller test log or acceptance receipt)"
+
+    def _errors(self, manifest: dict) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            report = css.run_check(repo.root, "reports/support-scope.json", None)
+        self.assertFalse(report.structure_valid, "manipulated manifest must be rejected")
+        return report.errors
+
+    def _assert_valid(self, manifest: dict) -> css.CheckReport:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            report = css.run_check(repo.root, "reports/support-scope.json", None)
+        self.assertTrue(report.structure_valid, report.errors)
+        return report
+
+    def _with_fresh_record(self, pr: int = 142, **overrides) -> tuple[dict, dict]:
+        """The real manifest plus one fresh unmerged E13 record of the given PR number (the record object is shared with the manifest)."""
+        manifest = _valid_manifest_dict()
+        e13 = manifest["e_scopes"]["E13"]
+        record = _fresh_record(e13["verified_subscopes"][0], "E13", "ag102_fixture", "e13-ag102")
+        record["pr"] = f"https://github.com/acosmi/RSIAgent/pull/{pr}"
+        record.update(overrides)
+        e13["verified_subscopes"].append(record)
+        return manifest, record
+
+    def _v_refs(self, manifest: dict, vid: str) -> list:
+        return next(entry for entry in manifest["traceability"]["v_scenarios"] if entry["id"] == vid)["related_evidence_refs"]
+
+    # field_semantics
+
+    def test_real_manifest_declares_the_pinned_field_semantics(self):
+        semantics = _valid_manifest_dict()["field_semantics"]
+        self.assertEqual(semantics, css.FIELD_SEMANTICS)
+        self.assertEqual(set(semantics), {"command", "exit_code", "log_path", "execution", "production_consumer"})
+        self.assertEqual(semantics["command"], self.CARD_COMMAND)
+        self.assertEqual(semantics["exit_code"], self.CARD_EXIT_CODE)
+        self.assertEqual(semantics["log_path"], self.CARD_LOG_PATH)
+        self.assertIn("field_semantics", css.ROOT_KEYS)
+        self.assertTrue({"execution", "production_consumer"} <= css.EVIDENCE_KEYS)
+
+    def test_rejects_missing_field_semantics(self):
+        manifest = _valid_manifest_dict()
+        del manifest["field_semantics"]
+        self.assertIn(
+            "field_semantics: must be an object stating what command, exit_code, log_path, execution and production_consumer mean",
+            self._errors(manifest)[0],
+        )
+
+    def test_cli_exits_nonzero_when_field_semantics_is_missing(self):
+        manifest = _valid_manifest_dict()
+        del manifest["field_semantics"]
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+        self.assertEqual(code, 1)
+        self.assertFalse(payload["structure_valid"])
+        self.assertIn("field_semantics", payload["errors"][0])
+
+    def test_rejects_non_object_incomplete_redefined_or_extended_field_semantics(self):
+        for value in (None, [], "command means executed", 7):
+            with self.subTest(value=value):
+                manifest = _valid_manifest_dict()
+                manifest["field_semantics"] = value
+                self.assertIn("field_semantics: must be an object", self._errors(manifest)[0])
+        for key in css.FIELD_SEMANTICS:
+            with self.subTest(missing=key):
+                manifest = _valid_manifest_dict()
+                del manifest["field_semantics"][key]
+                self.assertIn(f"field_semantics: missing the definition of '{key}'", self._errors(manifest)[0])
+            for label, replacement in (("redefined", "the command that was executed and passed"), ("null", None), ("empty", "")):
+                with self.subTest(key=key, replaced=label):
+                    manifest = _valid_manifest_dict()
+                    manifest["field_semantics"][key] = replacement
+                    self.assertIn(f"field_semantics.{key} differs from the definition pinned by the checker", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        manifest["field_semantics"]["effect"] = "improved"
+        self.assertIn("field_semantics: unknown key(s) ['effect']", self._errors(manifest)[0])
+
+    # record-level execution
+
+    def test_rejects_record_above_pr_141_without_execution(self):
+        for number in (142, 143, 999):
+            with self.subTest(pr=number):
+                manifest, record = self._with_fresh_record(number)
+                del record["execution"]
+                self.assertIn(
+                    f"{record['id']}: PR #{number} is above #141, so the record must carry an 'execution' object",
+                    self._errors(manifest)[0],
+                )
+
+    def test_execution_stays_optional_up_to_pr_141(self):
+        self.assertEqual(css.EXECUTION_REQUIRED_ABOVE_PR, 141)
+        manifest, record = self._with_fresh_record(141)
+        del record["execution"]
+        self._assert_valid(manifest)
+
+    def test_older_record_with_a_malformed_execution_is_still_rejected(self):
+        manifest, record = self._with_fresh_record(141, execution=_valid_execution(exit_code="0"))
+        self.assertIn(f"{record['id']} execution: exit_code must be the integer exit code of the executed command", self._errors(manifest)[0])
+
+    def test_valid_record_above_pr_141_with_execution_passes(self):
+        manifest, record = self._with_fresh_record(142)
+        self.assertEqual(record["execution"], _valid_execution())
+        self.assertGreater(int(record["pr"].rsplit("/", 1)[1]), css.EXECUTION_REQUIRED_ABOVE_PR)
+        self._assert_valid(manifest)
+        for runner in sorted(css.EXECUTION_RUNNERS):
+            for scope in sorted(css.EXECUTION_SCOPES):
+                with self.subTest(runner=runner, scope=scope):
+                    manifest, _ = self._with_fresh_record(142, execution=_valid_execution(runner=runner, scope=scope))
+                    self._assert_valid(manifest)
+
+    def test_rejects_execution_command_that_copies_the_declared_target(self):
+        copies = [
+            "cargo test --locked --offline -p evo-core --test evaluation_v41",
+            "cargo test --locked --offline",
+            "  cargo   test --locked   --offline -p evo-core --lib hosts::tests  ",
+            "cargo test\t--locked --offline -p evo-core --test evaluation_v41",
+        ]
+        for command in copies:
+            with self.subTest(command=command):
+                manifest, record = self._with_fresh_record(142, execution=_valid_execution(command=command))
+                self.assertIn(f"{record['id']} execution: command must be the literally executed command", self._errors(manifest)[0])
+        for command in ("cargom test --workspace --locked --no-fail-fast", "cargo test --locked -p evo-core --test evaluation_v41", "cargo test --workspace --locked"):
+            with self.subTest(command=command):
+                manifest, _ = self._with_fresh_record(142, execution=_valid_execution(command=command))
+                self._assert_valid(manifest)
+
+    def test_rejects_non_integer_execution_exit_code(self):
+        for value in ("0", 0.0, 1.5, True, False, None, [], {}):
+            with self.subTest(value=value):
+                manifest, record = self._with_fresh_record(142, execution=_valid_execution(exit_code=value))
+                self.assertIn(f"{record['id']} execution: exit_code must be the integer exit code of the executed command", self._errors(manifest)[0])
+
+    def test_execution_exit_code_records_the_real_value_even_when_nonzero(self):
+        """E00: real exit codes. A workspace run that also hits unrelated failing binaries exits nonzero; recording that must stay possible."""
+        for code in (0, 1, 101, 134, -1):
+            with self.subTest(exit_code=code):
+                manifest, _ = self._with_fresh_record(142, execution=_valid_execution(exit_code=code))
+                self._assert_valid(manifest)
+
+    def test_rejects_malformed_execution_objects(self):
+        base = _valid_execution()
+        # (case, execution object, error text that must follow "<record id> execution")
+        cases = [
+            ("null", None, ": must be an object"),
+            ("list", [], ": must be an object"),
+            ("string", "ctrl_verify.sh", ": must be an object"),
+            ("unknown key", {**base, "verdict": "pass"}, ": unknown key(s) ['verdict']"),
+            ("runner outside the set", _valid_execution(runner="manual"), ": runner must be one of ['codex_task', 'ctrl_verify.sh', 'other']"),
+            ("runner null", _valid_execution(runner=None), ": runner must be one of"),
+            ("runner unhashable", _valid_execution(runner=["ctrl_verify.sh"]), ": runner must be one of"),
+            ("scope outside the set", _valid_execution(scope="all"), ": scope must be one of ['single_target', 'workspace']"),
+            ("scope unhashable", _valid_execution(scope={}), ": scope must be one of"),
+            ("empty command", _valid_execution(command=""), " command: must be a non-empty string"),
+            ("blank command", _valid_execution(command="   "), " command: must be a non-empty string"),
+            ("list command", _valid_execution(command=["cargom", "test"]), " command: must be a non-empty string"),
+            ("empty evidence", _valid_execution(evidence=""), " evidence: must be a non-empty string"),
+            ("null evidence", _valid_execution(evidence=None), " evidence: must be a non-empty string"),
+        ]
+        for key in sorted(css.EXECUTION_KEYS):
+            cases.append((f"missing {key}", {k: v for k, v in base.items() if k != key}, f": missing key(s) ['{key}']"))
+        for name, execution, expected in cases:
+            with self.subTest(case=name):
+                manifest, record = self._with_fresh_record(142, execution=execution)
+                self.assertIn(f"{record['id']} execution{expected}", self._errors(manifest)[0])
+
+    # production_consumer
+
+    def test_rejects_invalid_production_consumer(self):
+        for value in ("yes", "library_only", "", "WIRED", None, True, 1, ["wired"], {}):
+            with self.subTest(value=value):
+                manifest, record = self._with_fresh_record(142, production_consumer=value)
+                self.assertIn(
+                    f"{record['id']}: production_consumer must be one of ['none_library_only', 'wired'] when present",
+                    self._errors(manifest)[0],
+                )
+
+    def test_accepts_both_production_consumer_values_and_their_absence(self):
+        self.assertEqual(css.PRODUCTION_CONSUMER_VALUES, {"wired", "none_library_only"})
+        for value in sorted(css.PRODUCTION_CONSUMER_VALUES):
+            with self.subTest(value=value):
+                manifest, _ = self._with_fresh_record(142, production_consumer=value)
+                self._assert_valid(manifest)
+        manifest, record = self._with_fresh_record(142)
+        self.assertNotIn("production_consumer", record)
+        self._assert_valid(manifest)
+
+    def test_real_manifest_registers_the_four_library_only_modules(self):
+        sentence = " Library-only as of e727d1c: no production caller in engine/http/mcp/apps."
+        by_pr = {
+            int(record["pr"].rsplit("/", 1)[1]): record
+            for scope in _valid_manifest_dict()["e_scopes"].values()
+            for record in scope["verified_subscopes"]
+        }
+        for number, record_id in {
+            125: "E04.ag077_local_scoped_acceptance",
+            128: "E16.1.ag076_local_scoped_acceptance",
+            130: "E16.1.ag070_local_scoped_acceptance",
+            131: "E08.ag075_local_scoped_acceptance",
+        }.items():
+            with self.subTest(pr=number):
+                record = by_pr[number]
+                self.assertEqual(record["id"], record_id)
+                self.assertEqual(record["production_consumer"], "none_library_only")
+                self.assertTrue(record["scope"].endswith(sentence), record["scope"])
+
+    # related_evidence_refs
+
+    def test_rejects_related_evidence_ref_naming_a_missing_record(self):
+        def v_scenario(manifest: dict) -> str:
+            self._v_refs(manifest, "V002").append("E02.no_such_record")
+            return "V002 evidence refs: unknown evidence refs ['E02.no_such_record']"
+
+        def commitment(manifest: dict) -> str:
+            entry = manifest["traceability"]["b_commitments"][0]
+            entry["related_evidence_refs"].append("E02.no_such_record")
+            return f"{entry['id']} evidence refs: unknown evidence refs ['E02.no_such_record']"
+
+        def so_source(manifest: dict) -> str:
+            entry = manifest["traceability"]["so_sources"][0]
+            entry.setdefault("verification_evidence_refs", []).append("E03.no_such_record")
+            return f"{entry['id']} evidence refs: unknown evidence refs ['E03.no_such_record']"
+
+        def near_miss(manifest: dict) -> str:
+            self._v_refs(manifest, "V002").append("E02.ag055_v1_wire_golden")
+            return "V002 evidence refs: unknown evidence refs ['E02.ag055_v1_wire_golden']"
+
+        for name, mutate in (("v_scenario", v_scenario), ("commitment", commitment), ("so_source", so_source), ("near-miss id", near_miss)):
+            with self.subTest(case=name):
+                manifest = _valid_manifest_dict()
+                expected = mutate(manifest)
+                self.assertIn(expected, self._errors(manifest)[0])
+
+    def test_rejects_duplicate_related_evidence_refs(self):
+        manifest = _valid_manifest_dict()
+        refs = self._v_refs(manifest, "V002")
+        refs.append(refs[0])
+        self.assertIn("V002 evidence refs: duplicate id", self._errors(manifest)[0])
+
+    def test_rejects_ref_to_a_record_owned_by_a_task_the_scenario_does_not_map(self):
+        """Pre-existing owner-task rule (validate_refs): the AG-058 record belongs to E14, so only V scenarios mapped to E14 may cite it."""
+        ag058 = "E14.ag058_current_description_boundaries"
+        for vid in ("V001", "V002", "V017", "V032", "V037"):
+            with self.subTest(scenario=vid):
+                manifest = _valid_manifest_dict()
+                self._v_refs(manifest, vid).append(ag058)
+                self.assertIn(f"{vid} evidence refs: evidence refs are outside the mapped E scope: ['{ag058}']", self._errors(manifest)[0])
+        for vid in ("V033", "V035"):
+            self.assertIn(ag058, self._v_refs(_valid_manifest_dict(), vid))
+
+    def test_ag102_traceability_backfill_is_present(self):
+        manifest = _valid_manifest_dict()
+        backfill = {
+            "E02.ag055_v1_wire_goldens": ["V002"],
+            # The record's scope text also names V001/V002/V017/V032/V037, but those scenarios map to other E tasks and
+            # the owner-task rule above rejects them; only the E14-mapped V033/V035 can carry it.
+            "E14.ag058_current_description_boundaries": ["V033", "V035"],
+            "E01.ag057_explicit_sample_registration": ["V010", "V011", "V012", "V013", "V084", "V085", "V096", "V097"],
+            "E16.2.ag071_known_marker_utf8_blocking": ["V067"],
+            "E16.2.ag085_utf8_privacy_boundary_regressions": ["V067"],
+        }
+        for record_id, scenarios in backfill.items():
+            for vid in scenarios:
+                with self.subTest(record=record_id, scenario=vid):
+                    self.assertIn(record_id, self._v_refs(manifest, vid))
 
 class PathSafetyTests(unittest.TestCase):
     def test_rejects_dot_dot_path_escape(self):

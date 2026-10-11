@@ -38,6 +38,15 @@ const ALLOWED_STATUSES: &[&str] = &[
     "verified",
     "explicitly_out_of_scope",
 ];
+/// Records of pull requests numbered above this value (fifth round onward) must carry
+/// `execution`; earlier records may omit it and are not backfilled or guessed.
+const EXECUTION_REQUIRED_ABOVE_PR: u64 = 141;
+const EXECUTION_KEYS: &[&str] = &["command", "evidence", "exit_code", "runner", "scope"];
+const EXECUTION_RUNNERS: &[&str] = &["ctrl_verify.sh", "codex_task", "other"];
+const EXECUTION_SCOPES: &[&str] = &["workspace", "single_target"];
+/// `execution.command` must be what was run, not the declared single-target command copied again.
+const DECLARED_COMMAND_PREFIX: &str = "cargo test --locked --offline";
+const PRODUCTION_CONSUMER_VALUES: &[&str] = &["wired", "none_library_only"];
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -352,6 +361,72 @@ fn expected_merge_for_pr(pr: u64) -> Result<Option<&'static str>, String> {
     })
 }
 
+/// Record-level `execution` states what was literally run, apart from the declared single target
+/// in `command`/`exit_code`/`log_path`. Required above PR 141; checked strictly whenever present.
+fn validate_execution(id: &str, record: &Value, pr_number: u64) -> Result<(), String> {
+    let Some(execution) = record.get("execution") else {
+        if pr_number > EXECUTION_REQUIRED_ABOVE_PR {
+            return Err(format!(
+                "{id}: PR #{pr_number} is above #{EXECUTION_REQUIRED_ABOVE_PR}, so the record must carry an execution object stating what was literally run"
+            ));
+        }
+        return Ok(());
+    };
+    let object = execution
+        .as_object()
+        .ok_or_else(|| format!("{id} execution must be an object"))?;
+    let keys: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+    let expected: BTreeSet<&str> = EXECUTION_KEYS.iter().copied().collect();
+    if keys != expected {
+        return Err(format!(
+            "{id} execution keys differ: missing={:?} extra={:?}",
+            expected.difference(&keys).collect::<Vec<_>>(),
+            keys.difference(&expected).collect::<Vec<_>>()
+        ));
+    }
+    for (field, allowed) in [("runner", EXECUTION_RUNNERS), ("scope", EXECUTION_SCOPES)] {
+        match object[field].as_str() {
+            Some(text) if allowed.contains(&text) => {}
+            _ => {
+                return Err(format!(
+                    "{id} execution {field} must be one of {allowed:?}, got {}",
+                    object[field]
+                ));
+            }
+        }
+    }
+    let command = nonempty_string(&object["command"], &format!("{id} execution command"))?;
+    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.starts_with(DECLARED_COMMAND_PREFIX) {
+        return Err(format!(
+            "{id} execution command must be the literally executed command, not the declared single-target form copied again"
+        ));
+    }
+    let exit_code = &object["exit_code"];
+    let is_integer = exit_code.is_i64() || exit_code.is_u64();
+    if !is_integer {
+        return Err(format!(
+            "{id} execution exit_code must be the integer exit code of the executed command, got {exit_code}"
+        ));
+    }
+    nonempty_string(&object["evidence"], &format!("{id} execution evidence"))?;
+    Ok(())
+}
+
+/// Optional marker separating modules with a production caller from library-only ones; an absent
+/// marker claims nothing.
+fn validate_production_consumer(id: &str, record: &Value) -> Result<(), String> {
+    let Some(value) = record.get("production_consumer") else {
+        return Ok(());
+    };
+    match value.as_str() {
+        Some(text) if PRODUCTION_CONSUMER_VALUES.contains(&text) => Ok(()),
+        _ => Err(format!(
+            "{id} production_consumer must be one of {PRODUCTION_CONSUMER_VALUES:?} when present, got {value}"
+        )),
+    }
+}
+
 fn validate_evidence_record(record: &Value, task: &str, root: &Path) -> Result<String, String> {
     let id = nonempty_string(&record["id"], &format!("{task} evidence id"))?;
     nonempty_string(&record["description"], &format!("{id} description"))?;
@@ -434,6 +509,8 @@ fn validate_evidence_record(record: &Value, task: &str, root: &Path) -> Result<S
             target.display()
         ));
     }
+    validate_execution(id, record, pr_number)?;
+    validate_production_consumer(id, record)?;
     Ok(id.to_string())
 }
 
@@ -1086,6 +1163,58 @@ fn validate_plan_lineage(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Pinned meaning of the execution-looking machine fields; the manifest's top-level
+/// `field_semantics` must restate it verbatim (plan E16.6: a derived index may not be a second
+/// source of truth).
+fn expected_field_semantics() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "command",
+            "declared single-target checker command; syntax validated, not necessarily the literally executed command".to_string(),
+        ),
+        (
+            "exit_code",
+            "exit code of the controller gate run that covered the declared target".to_string(),
+        ),
+        (
+            "log_path",
+            "local evidence file containing that target's result (controller test log or acceptance receipt)".to_string(),
+        ),
+        (
+            "execution",
+            format!("optional record-level object, required when the pull request number is above {EXECUTION_REQUIRED_ABOVE_PR}, stating what was actually run: runner (ctrl_verify.sh, codex_task or other), command (the literally executed command), scope (workspace or single_target), exit_code (the integer exit code of that command) and evidence (the log_path or the identifier of the summary line inside the acceptance receipt); command, exit_code and log_path of the record keep describing the declared target; earlier records are neither backfilled nor guessed"),
+        ),
+        (
+            "production_consumer",
+            "optional record-level marker: none_library_only means the recorded module has no production caller in engine/http/mcp/apps as of the commit named in the record scope; wired means a production caller exists; an absent marker means this was not assessed".to_string(),
+        ),
+    ]
+}
+
+fn validate_field_semantics(value: &Value) -> Result<(), String> {
+    let object = value.as_object().ok_or(
+        "field_semantics must be an object stating what command, exit_code, log_path, execution and production_consumer mean",
+    )?;
+    let expected = expected_field_semantics();
+    let actual_keys: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+    let expected_keys: BTreeSet<&str> = expected.iter().map(|(key, _)| *key).collect();
+    if actual_keys != expected_keys {
+        return Err(format!(
+            "field_semantics keys differ: missing={:?} extra={:?}",
+            expected_keys.difference(&actual_keys).collect::<Vec<_>>(),
+            actual_keys.difference(&expected_keys).collect::<Vec<_>>()
+        ));
+    }
+    for (key, text) in &expected {
+        if object[*key] != text.as_str() {
+            return Err(format!(
+                "field_semantics.{key} differs from the definition pinned by the checker"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_manifest(value: &Value, root: &Path) -> Result<(), String> {
     if value["schema_version"] != "rsia.support_scope.v2"
         || value["plan_version"] != PLAN_VERSION
@@ -1096,6 +1225,7 @@ fn validate_manifest(value: &Value, root: &Path) -> Result<(), String> {
         ));
     }
     validate_plan_lineage(&value["plan_lineage"])?;
+    validate_field_semantics(&value["field_semantics"])?;
     if value["declaration"] != "subset_only"
         || value["not_full_route_complete"] != true
         || value["legacy_equivalence_unverified"] != true
@@ -1482,4 +1612,287 @@ fn planned_scope_can_omit_files_only_with_explicit_remaining_reason() {
         validate_manifest(&started, &root).is_err(),
         "a started scope without implementation files was accepted"
     );
+}
+
+fn well_formed_execution() -> Value {
+    serde_json::json!({
+        "runner": "ctrl_verify.sh",
+        "command": "cargom test --workspace --locked --no-fail-fast",
+        "scope": "workspace",
+        "exit_code": 0,
+        "evidence": "out/fixture/ctrl-fixture.log.test",
+    })
+}
+
+/// Validates a synthetic record of PR 142 (above the threshold) that carries the given `execution`.
+fn execution_result(execution: Value) -> Result<(), String> {
+    let record = serde_json::json!({ "execution": execution });
+    validate_execution("X.record", &record, 142)
+}
+
+#[test]
+fn field_semantics_must_be_present_and_equal_the_pinned_text() {
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    validate_manifest(&baseline, &root).unwrap();
+    let pinned = expected_field_semantics();
+    assert_eq!(pinned.len(), 5);
+    assert_eq!(
+        baseline["field_semantics"].as_object().unwrap().len(),
+        pinned.len()
+    );
+
+    let mut missing = load_manifest(&root);
+    missing.as_object_mut().unwrap().remove("field_semantics");
+    let error = validate_manifest(&missing, &root)
+        .expect_err("a manifest without field_semantics was accepted");
+    assert!(
+        error.contains("field_semantics must be an object"),
+        "{error}"
+    );
+
+    for replacement in [
+        Value::Null,
+        serde_json::json!([]),
+        serde_json::json!("command means executed"),
+    ] {
+        let mut value = load_manifest(&root);
+        value["field_semantics"] = replacement;
+        assert!(validate_manifest(&value, &root).is_err());
+    }
+
+    for (key, _) in &pinned {
+        let mut dropped = load_manifest(&root);
+        dropped["field_semantics"]
+            .as_object_mut()
+            .unwrap()
+            .remove(*key);
+        assert!(
+            validate_manifest(&dropped, &root).is_err(),
+            "field_semantics without {key} was accepted"
+        );
+        for replacement in [
+            Value::Null,
+            Value::String(String::new()),
+            Value::String("the command that was executed and passed".into()),
+        ] {
+            let mut redefined = load_manifest(&root);
+            redefined["field_semantics"][*key] = replacement;
+            let error = validate_manifest(&redefined, &root)
+                .expect_err("a redefined field meaning was accepted");
+            assert!(
+                error.contains(&format!("field_semantics.{key} differs")),
+                "{error}"
+            );
+        }
+    }
+
+    let mut extended = load_manifest(&root);
+    extended["field_semantics"]["effect"] = Value::String("improved".into());
+    assert!(validate_manifest(&extended, &root).is_err());
+}
+
+#[test]
+fn execution_is_required_above_pr_141_and_optional_up_to_it() {
+    assert_eq!(EXECUTION_REQUIRED_ABOVE_PR, 141);
+    let bare = serde_json::json!({});
+    validate_execution("X.record", &bare, 141).expect("execution must stay optional up to PR 141");
+    validate_execution("X.record", &bare, 40).expect("older records are not backfilled");
+    for number in [142, 143, 999] {
+        let error = validate_execution("X.record", &bare, number)
+            .expect_err("a record above PR 141 without execution was accepted");
+        assert!(
+            error.contains(&format!("PR #{number} is above #141")),
+            "{error}"
+        );
+    }
+
+    for runner in EXECUTION_RUNNERS {
+        for scope in EXECUTION_SCOPES {
+            let mut execution = well_formed_execution();
+            execution["runner"] = Value::String((*runner).into());
+            execution["scope"] = Value::String((*scope).into());
+            execution_result(execution).unwrap();
+        }
+    }
+
+    // Optional is not unchecked: a malformed execution is rejected for older PRs as well.
+    let mut malformed = well_formed_execution();
+    malformed["exit_code"] = Value::String("0".into());
+    let record = serde_json::json!({ "execution": malformed });
+    assert!(validate_execution("X.record", &record, 141).is_err());
+}
+
+#[test]
+fn execution_rejects_malformed_objects() {
+    for not_an_object in [
+        Value::Null,
+        serde_json::json!([]),
+        serde_json::json!("ctrl_verify.sh"),
+    ] {
+        let error =
+            execution_result(not_an_object).expect_err("a non-object execution was accepted");
+        assert!(error.contains("execution must be an object"), "{error}");
+    }
+
+    let mut unknown_key = well_formed_execution();
+    unknown_key["verdict"] = Value::String("pass".into());
+    let error = execution_result(unknown_key).expect_err("an unknown execution key was accepted");
+    assert!(error.contains("keys differ"), "{error}");
+
+    for key in EXECUTION_KEYS {
+        let mut missing = well_formed_execution();
+        missing.as_object_mut().unwrap().remove(*key);
+        let error = execution_result(missing)
+            .expect_err("an execution without a required key was accepted");
+        assert!(error.contains("keys differ"), "{key}: {error}");
+    }
+
+    for (field, invalid) in [
+        ("runner", Value::String("manual".into())),
+        ("runner", Value::Null),
+        ("runner", serde_json::json!(["ctrl_verify.sh"])),
+        ("scope", Value::String("all".into())),
+        ("scope", serde_json::json!({})),
+    ] {
+        let mut execution = well_formed_execution();
+        execution[field] = invalid;
+        let error =
+            execution_result(execution).expect_err("an unregistered runner or scope was accepted");
+        assert!(
+            error.contains(&format!("{field} must be one of")),
+            "{error}"
+        );
+    }
+
+    for invalid in [
+        serde_json::json!(""),
+        serde_json::json!("   "),
+        serde_json::json!(["cargom", "test"]),
+        Value::Null,
+    ] {
+        let mut execution = well_formed_execution();
+        execution["command"] = invalid;
+        assert!(execution_result(execution).is_err());
+    }
+
+    for invalid in [serde_json::json!(""), Value::Null, serde_json::json!(7)] {
+        let mut execution = well_formed_execution();
+        execution["evidence"] = invalid;
+        assert!(execution_result(execution).is_err());
+    }
+}
+
+#[test]
+fn execution_command_must_not_repeat_the_declared_single_target_form() {
+    for copied in [
+        "cargo test --locked --offline -p evo-core --test evaluation_v41",
+        "cargo test --locked --offline",
+        "  cargo   test --locked   --offline -p evo-core --lib hosts::tests  ",
+        "cargo test\t--locked --offline -p evo-core --test evaluation_v41",
+    ] {
+        let mut execution = well_formed_execution();
+        execution["command"] = Value::String(copied.into());
+        let error = execution_result(execution)
+            .expect_err("the declared target copied as the executed command was accepted");
+        assert!(error.contains("literally executed command"), "{error}");
+    }
+    for actual in [
+        "cargom test --workspace --locked --no-fail-fast",
+        "cargo test --locked -p evo-core --test evaluation_v41",
+        "cargo test --workspace --locked",
+    ] {
+        let mut execution = well_formed_execution();
+        execution["command"] = Value::String(actual.into());
+        execution_result(execution).unwrap();
+    }
+}
+
+#[test]
+fn execution_exit_code_must_be_an_integer_but_may_record_a_real_nonzero_value() {
+    for invalid in [
+        serde_json::json!("0"),
+        serde_json::json!(0.0),
+        serde_json::json!(1.5),
+        serde_json::json!(true),
+        serde_json::json!(false),
+        Value::Null,
+        serde_json::json!([]),
+        serde_json::json!({}),
+    ] {
+        let mut execution = well_formed_execution();
+        execution["exit_code"] = invalid;
+        let error = execution_result(execution).expect_err("a non-integer exit code was accepted");
+        assert!(
+            error.contains("exit_code must be the integer exit code"),
+            "{error}"
+        );
+    }
+    // E00: real exit codes. A workspace run that also hits unrelated failing binaries exits
+    // nonzero, and recording that honestly must stay possible.
+    for code in [0_i64, 1, 101, 134, -1] {
+        let mut execution = well_formed_execution();
+        execution["exit_code"] = serde_json::json!(code);
+        execution_result(execution).unwrap();
+    }
+}
+
+#[test]
+fn production_consumer_accepts_only_registered_values() {
+    validate_production_consumer("X.record", &serde_json::json!({})).unwrap();
+    for value in PRODUCTION_CONSUMER_VALUES {
+        let record = serde_json::json!({ "production_consumer": value });
+        validate_production_consumer("X.record", &record).unwrap();
+    }
+    for invalid in [
+        serde_json::json!("yes"),
+        serde_json::json!("library_only"),
+        serde_json::json!(""),
+        serde_json::json!("WIRED"),
+        Value::Null,
+        serde_json::json!(true),
+        serde_json::json!(1),
+        serde_json::json!(["wired"]),
+        serde_json::json!({}),
+    ] {
+        let record = serde_json::json!({ "production_consumer": invalid });
+        let error = validate_production_consumer("X.record", &record)
+            .expect_err("an unregistered production_consumer was accepted");
+        assert!(
+            error.contains("production_consumer must be one of"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn new_record_fields_are_validated_through_the_manifest() {
+    let root = repo_root();
+    let mut malformed = load_manifest(&root);
+    malformed["e_scopes"]["E01"]["verified_subscopes"][0]["execution"] =
+        Value::String("ctrl_verify.sh".into());
+    let error = validate_manifest(&malformed, &root)
+        .expect_err("a malformed execution on an older record was accepted");
+    assert!(error.contains("execution must be an object"), "{error}");
+
+    let mut well_formed = load_manifest(&root);
+    well_formed["e_scopes"]["E01"]["verified_subscopes"][0]["execution"] = well_formed_execution();
+    validate_manifest(&well_formed, &root).unwrap();
+
+    let mut unregistered = load_manifest(&root);
+    unregistered["e_scopes"]["E01"]["verified_subscopes"][0]["production_consumer"] =
+        Value::String("maybe".into());
+    let error = validate_manifest(&unregistered, &root)
+        .expect_err("an unregistered production_consumer was accepted");
+    assert!(
+        error.contains("production_consumer must be one of"),
+        "{error}"
+    );
+
+    for value in PRODUCTION_CONSUMER_VALUES {
+        let mut registered = load_manifest(&root);
+        registered["e_scopes"]["E01"]["verified_subscopes"][0]["production_consumer"] =
+            Value::String((*value).into());
+        validate_manifest(&registered, &root).unwrap();
+    }
 }
