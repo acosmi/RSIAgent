@@ -90,7 +90,7 @@
       ],
       "remaining": [
         "historical packages and T001-T126 assertions are unavailable; legacy equivalence remains unverified",
-        "engineering: CI/inventory gate AG-056 is locally implemented but publication is blocked by missing OAuth workflow scope; full source/history reconciliation remains"
+        "engineering: AG056 CI/inventory workflow is merged as PR129; actual Actions execution and full source/history reconciliation remain unverified"
       ]
     },
     "E01": {
@@ -169,7 +169,9 @@
       "status_reason": "full host application and multi-skill production behavior remain unverified",
       "implementation_files": [
         "crates/evo-core/src/skill_edit.rs",
-        "crates/evo-engine/src/compiler.rs"
+        "crates/evo-engine/src/compiler.rs",
+        "crates/evo-core/tests/baseline_dependency_revocation_v42.rs",
+        "crates/evo-engine/tests/compiler_input_binding_v42.rs"
       ],
       "scenarios": [
         "V002",
@@ -291,6 +293,50 @@
           "rollback": "revert PR #110 through an independent revert PR; accepted-head parent 6f0e5fa35b582f0f4cde4207ddf59d65a51b180a; retain immutable evidence, frozen plans, costs and revocation state",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-065-2787e0c.json"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source 39d2d865c203ca45dd278efa591c934abffb0165; actual merge tree equals accepted tree 8780055d1bccd9006af8d0133fff613249bfc963. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-core --test baseline_dependency_revocation_v42",
+          "description": "Fixed parent/baseline input known revoked direct dependencies",
+          "exit_code": 0,
+          "id": "E02.ag092_local_scoped_acceptance",
+          "input_digest": "12418343e9751e0d6b84a0e2f74c80c99875949aa40362dc6b37497d3706f426",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-092-39d2d86.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG092-existing-current27df8c2-fixed39d2d86-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+          "merged_sha": "77ef86294b7760fc7495d12d4029ca8a3567bc5e",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/138",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #138; retain source, costs, revocation history and original QA. Accepted parent 27df8c2cfccbefa6544b55b697c10abbb6c0a61c.",
+          "scope": "E02; Fixed parent/baseline input known revoked direct dependencies software/component boundary only.",
+          "source_sha": "39d2d865c203ca45dd278efa591c934abffb0165",
+          "test_entry": "crates/evo-core/tests/baseline_dependency_revocation_v42.rs"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source 49806d7faf703aab7e7e467c4bd5518969a24e55; actual merged tree equals accepted e666f1eae9c628e615a041933766fc05e433f872. Whole workspace includes the complete named Rust target; 2 credited independent counters passed normal compile and whole execution with actual storage observations and healthy controls. Optional A1 is uncredited: obsolete unrelated-watermark healthy-control assumption; exact native failure retained. The declaration does not execute offline or treat retired programs as present.",
+          "command": "cargo test --locked --offline -p evo-engine --test compiler_input_binding_v42",
+          "description": "Stored formal compiler P/B input and source authorization, exact closure, revocation and caller-Session refence software binding",
+          "exit_code": 0,
+          "id": "E02.ag093_local_scoped_acceptance",
+          "input_digest": "a49497a329107544d388d01a10cdd13447e6b4cc7d07535478fc02f93ec0b0df",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-093-49806d7.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG093-existing-currentc04850d-fixed49806d7-ROOT-fresh14-actual-Task-accepted-conditional-admin-merge-r2-20261011.json",
+          "merged_sha": "f6904dcd2d4f3b46b3311886fd4dcecd8a2f711c",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/140",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "No transitive complete current E/V route, real independent OS principals, real provider/production host, model benefit, adoption, deployment or whole v4.2 acceptance. Rejected earlier Source/native failures and all original uncommitted input stay historical.",
+          "rollback": "Reviewed revert of PR #140; preserve source, costs, watermark history and original QA. Accepted parent c04850d702d43aecb52b57c94e2770a4c6c594c1.",
+          "scope": "E02/E08/E16.1 software binding and associated compatibility only; explicit Admin EmptyRoot fixtures have no ordinary-P principal/provider/effect credit.",
+          "source_sha": "49806d7faf703aab7e7e467c4bd5518969a24e55",
+          "test_entry": "crates/evo-engine/tests/compiler_input_binding_v42.rs"
         }
       ],
       "remaining": [
@@ -307,7 +353,8 @@
         "crates/evo-engine/src/optimization.rs",
         "crates/evo-engine/src/model.rs",
         "crates/evo-engine/src/evidence.rs",
-        "crates/evo-engine/src/development.rs"
+        "crates/evo-engine/src/development.rs",
+        "crates/evo-core/tests/diagnosis_hypothesis_structure_v42.rs"
       ],
       "scenarios": [
         "V004",
@@ -372,6 +419,28 @@
           "rollback": "revert PR #63 (merge 3e2fc06) through an independent revert PR; accepted-stack rollback point 0d6ec3d; persisted revocation, budget, cost and audit facts are not rolled back",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-016-b1d008f.json"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source d0958acfdd234007056aec09277cca676b87dd52; actual merge tree equals accepted tree 7c512b5b7e318d7b4a4a4096a2ca365ddb7e0e0f. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-core --test diagnosis_hypothesis_structure_v42",
+          "description": "Copied diagnosis RuleHypothesis structural input refusal",
+          "exit_code": 0,
+          "id": "E03.ag079_local_scoped_acceptance",
+          "input_digest": "3e11220b7e82ca7212f0839a1fc849fd172e0c6789b0b5e137d89b9d91cd661f",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-079-d0958ac.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/ag079-currentd56e-headd0958-ROOT-all18-necessary-SC0-finite-Task-PASS_LOCAL_TASK-and-only-epoch-release-r1-20261005.json",
+          "merged_sha": "9f0c40215a2d7a67ba66e5427cee71ca5228bde1",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/121",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #121; retain source, costs, revocation history and original QA. Accepted parent d56e2bef5cd552e0055d532f1e1908ed24921dcf.",
+          "scope": "E03; Copied diagnosis RuleHypothesis structural input refusal software/component boundary only.",
+          "source_sha": "d0958acfdd234007056aec09277cca676b87dd52",
+          "test_entry": "crates/evo-core/tests/diagnosis_hypothesis_structure_v42.rs"
         }
       ],
       "remaining": [
@@ -386,7 +455,9 @@
       "implementation_files": [
         "crates/evo-storage/src/budget.rs",
         "crates/evo-engine/src/broker.rs",
-        "crates/evo-engine/src/executor.rs"
+        "crates/evo-engine/src/executor.rs",
+        "crates/evo-storage/tests/budget_sql_fault_rollback_v42.rs",
+        "crates/evo-storage/tests/e16_budget_binding_v42.rs"
       ],
       "scenarios": [
         "V007",
@@ -445,6 +516,50 @@
           "rollback": "revert PR #104 through an independent revert PR; accepted-head parent ba01a2e8489ceef6d1350f0babdac46d816071ec; retain immutable evidence, frozen plans, costs and revocation state",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-054-f6aa729.json"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source cd19f84b85712447820b893a8c72bf7d011cd0e7; actual merge tree equals accepted tree 3953fee4404251447c6bd5311adae4ed5c242ae8. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-storage --test budget_sql_fault_rollback_v42",
+          "description": "Root budget authorization rollback on owned event aborts",
+          "exit_code": 0,
+          "id": "E04.ag082_local_scoped_acceptance",
+          "input_digest": "6eb66e1363dad3d81ba5a25027b5f0720071518d8af8ff36101163095c41fdfe",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-082-cd19f84.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG082-current618ad834-headcd19f84b-Source2-ROOT-all12-necessary-SourceSC-RuntimeSC0-PASS_LOCAL_TASK-and-only-epoch-release-r1-20261006.json",
+          "merged_sha": "5295769892af37988d6bc739bdfb49a834a3f7aa",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/124",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #124; retain source, costs, revocation history and original QA. Accepted parent 618ad834ff73e878898fb64681a4efc323b84ac0.",
+          "scope": "E04; Root budget authorization rollback on owned event aborts software/component boundary only.",
+          "source_sha": "cd19f84b85712447820b893a8c72bf7d011cd0e7",
+          "test_entry": "crates/evo-storage/tests/budget_sql_fault_rollback_v42.rs"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source 26d3fe400ee1aad36082081eda6c60f3ee1a17f7; actual merge tree equals accepted tree cb47a8c5f22bbfea3a21e63ea6830478603a3694. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-storage --test e16_budget_binding_v42",
+          "description": "Typed E16 budget source snapshots, cleanup and recovery",
+          "exit_code": 0,
+          "id": "E04.ag077_local_scoped_acceptance",
+          "input_digest": "4baadeaf4705ceb06cfbbe70968543f8daa553cfd5148a74dc2fb63cc2eafaad",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-077-26d3fe4.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG077-existing-PR125-current529-fixed26d3-ROOT-fresh12-actual-current-main-Task-accepted-conditional-admin-merge-r1-20261011.json",
+          "merged_sha": "349879148c1f31fd1ebbee639aeff334a3762855",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/125",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #125; retain source, costs, revocation history and original QA. Accepted parent 5295769892af37988d6bc739bdfb49a834a3f7aa.",
+          "scope": "E04; Typed E16 budget source snapshots, cleanup and recovery software/component boundary only.",
+          "source_sha": "26d3fe400ee1aad36082081eda6c60f3ee1a17f7",
+          "test_entry": "crates/evo-storage/tests/e16_budget_binding_v42.rs"
         }
       ],
       "remaining": [
@@ -461,7 +576,13 @@
         "crates/evo-core/src/sequential.rs",
         "crates/evo-engine/src/evaluator.rs",
         "crates/evo-engine/src/streaming_evaluator.rs",
-        "crates/evo-core/src/evaluation.rs"
+        "crates/evo-core/src/evaluation.rs",
+        "crates/evo-engine/tests/evaluator_plan_binding_v42.rs",
+        "crates/evo-engine/tests/formal_candidate_dependency_binding_v42.rs",
+        "crates/evo-engine/tests/complete_batch_statistics_binding_v42.rs",
+        "crates/evo-engine/tests/early_stop_certificate_binding_v42.rs",
+        "crates/evo-engine/tests/invalid_formal_reason_binding_v42.rs",
+        "crates/evo-engine/tests/late_grader_stop_preservation_v42.rs"
       ],
       "scenarios": [
         "V010",
@@ -542,6 +663,138 @@
           "rollback": "Revert PR #116 through a reviewed independent revert; accepted-head parent 9b9084a328b78d7376247b78cc26e75235a09afa; retain immutable evidence, revocation/exposure history, costs and audit facts.",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-083-215811f.json"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source 4ed8d9d886b8e5c1f45d2477478de53fe5ee6348; actual merge tree equals accepted tree db94c2ae2addeb25ddeaf470454940c1a3473e5a. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-engine --test evaluator_plan_binding_v42",
+          "description": "QueryBook and Evaluator frozen plan binding",
+          "exit_code": 0,
+          "id": "E05.ag080_local_scoped_acceptance",
+          "input_digest": "a47bf32311931541139dd5f031d3f59c3c3af782e43b0f051da3cf08155acef2",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-080-4ed8d9d.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/ag080-current90d3dcb-head4ed8d9d-ROOT-all12-necessary-SOURCE-RuntimeSC0-memory-only-PASS_LOCAL_TASK-and-only-epoch-release-r1-20261006.json",
+          "merged_sha": "618ad834ff73e878898fb64681a4efc323b84ac0",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/123",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #123; retain source, costs, revocation history and original QA. Accepted parent 90d3dcbef822b17abaffffbcc866b863336c4024.",
+          "scope": "E05; QueryBook and Evaluator frozen plan binding software/component boundary only.",
+          "source_sha": "4ed8d9d886b8e5c1f45d2477478de53fe5ee6348",
+          "test_entry": "crates/evo-engine/tests/evaluator_plan_binding_v42.rs"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source fde3dd4b91e9f6f68f93f7b8fe54ec2e74a08fe8; actual merge tree equals accepted tree 19c1e41131a3624619cc01a4bf7f13c8a151ed9c. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-engine --test formal_candidate_dependency_binding_v42",
+          "description": "Formal frozen candidate direct dependency and revocation binding",
+          "exit_code": 0,
+          "id": "E05.ag087_local_scoped_acceptance",
+          "input_digest": "be4f1d4132db5c697fa668429ce432f900496e94726366efe8d2ffa87ea22272",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-087-fde3dd4.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG087-existing-current77152-fixedfde3dd4-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+          "merged_sha": "8cbf82cb9a715a8b28070c6a7823b16093865425",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/133",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #133; retain source, costs, revocation history and original QA. Accepted parent 77152d77c96f497ebf2c0123e985f0832fa3cbd0.",
+          "scope": "E05; Formal frozen candidate direct dependency and revocation binding software/component boundary only.",
+          "source_sha": "fde3dd4b91e9f6f68f93f7b8fe54ec2e74a08fe8",
+          "test_entry": "crates/evo-engine/tests/formal_candidate_dependency_binding_v42.rs"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source e538b9664fb9199fead8f2298a27e38da686cd7b; actual merge tree equals accepted tree 202b1f627c9cdc0597165b989bfb025bb1a05ea0. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-engine --test complete_batch_statistics_binding_v42",
+          "description": "Complete-batch reports bound to retained actual statistics",
+          "exit_code": 0,
+          "id": "E05.ag088_local_scoped_acceptance",
+          "input_digest": "351df7e0a52086493572aef533b888bb0991e3790f64564f70c944f9603aa31c",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-088-e538b96.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG088-existing-current8cbf82c-fixede538b96-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+          "merged_sha": "bd20099a01c64b87b9a75707a95c785486bb4fda",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/134",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #134; retain source, costs, revocation history and original QA. Accepted parent 8cbf82cb9a715a8b28070c6a7823b16093865425.",
+          "scope": "E05; Complete-batch reports bound to retained actual statistics software/component boundary only.",
+          "source_sha": "e538b9664fb9199fead8f2298a27e38da686cd7b",
+          "test_entry": "crates/evo-engine/tests/complete_batch_statistics_binding_v42.rs"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source 6040bf338e3a9a929f036c3e57891729e775f6fe; actual merge tree equals accepted tree 8a091b458aa236242919697613e7442d879c4373. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-engine --test early_stop_certificate_binding_v42",
+          "description": "Early-stop reports bound to their actual first certificate",
+          "exit_code": 0,
+          "id": "E05.ag089_local_scoped_acceptance",
+          "input_digest": "e0e3c2ab6317ca52eb600a8cc910d53e0511b32f4eb9afd743153aaf6f806969",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-089-6040bf3.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG089-existing-currentbd20099-fixed6040bf3-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+          "merged_sha": "c9aa71e7516e369672b0e5127e675d72eb199304",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/135",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #135; retain source, costs, revocation history and original QA. Accepted parent bd20099a01c64b87b9a75707a95c785486bb4fda.",
+          "scope": "E05; Early-stop reports bound to their actual first certificate software/component boundary only.",
+          "source_sha": "6040bf338e3a9a929f036c3e57891729e775f6fe",
+          "test_entry": "crates/evo-engine/tests/early_stop_certificate_binding_v42.rs"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source a9944434b45f4c59c46329a69e5d9c8be4a60ac8; actual merge tree equals accepted tree 105ca5015416343c040597f44e7e83031323dad9. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-engine --test invalid_formal_reason_binding_v42",
+          "description": "Invalid formal reasons bound to actual paid Some-ticket facts",
+          "exit_code": 0,
+          "id": "E05.ag090_local_scoped_acceptance",
+          "input_digest": "1759655da2268ffe9071f656f15c6cc3137fd41404cc88da0aba796432293c2f",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-090-a994443.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG090-existing-currentc9aa71e-fixeda994443-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+          "merged_sha": "1f1b593d5475043e707e17195222d82f2c5281eb",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/136",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #136; retain source, costs, revocation history and original QA. Accepted parent c9aa71e7516e369672b0e5127e675d72eb199304.",
+          "scope": "E05; Invalid formal reasons bound to actual paid Some-ticket facts software/component boundary only.",
+          "source_sha": "a9944434b45f4c59c46329a69e5d9c8be4a60ac8",
+          "test_entry": "crates/evo-engine/tests/invalid_formal_reason_binding_v42.rs"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source 730f242cd4fe076c4d751e3f823cc8a9385fbb93; actual merge tree equals accepted tree 199c75ef378da51ea954af656545f31a260ddc6f. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-engine --test late_grader_stop_preservation_v42",
+          "description": "Confirmed early stop preserved after a late grader error",
+          "exit_code": 0,
+          "id": "E05.ag091_local_scoped_acceptance",
+          "input_digest": "549180e578ecab85419fb93cdf0d4087f4700278cb5605ce2f3610c3e570384c",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-091-730f242.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG091-existing-current1f1b593-fixed730f242-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+          "merged_sha": "27df8c2cfccbefa6544b55b697c10abbb6c0a61c",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/137",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #137; retain source, costs, revocation history and original QA. Accepted parent 1f1b593d5475043e707e17195222d82f2c5281eb.",
+          "scope": "E05; Confirmed early stop preserved after a late grader error software/component boundary only.",
+          "source_sha": "730f242cd4fe076c4d751e3f823cc8a9385fbb93",
+          "test_entry": "crates/evo-engine/tests/late_grader_stop_preservation_v42.rs"
         }
       ],
       "remaining": [
@@ -555,7 +808,8 @@
       "status_reason": "production approval/canary/Active is blocked by non-production evaluation evidence",
       "implementation_files": [
         "crates/evo-engine/src/release_store.rs",
-        "crates/evo-engine/src/releases.rs"
+        "crates/evo-engine/src/releases.rs",
+        "crates/evo-engine/tests/candidate_review.rs"
       ],
       "scenarios": [
         "V014",
@@ -602,6 +856,28 @@
           "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
           "record_source": "out/implementation-v4.1-20260919/controller-e06-acceptance.json",
           "input_ref": "out/implementation-v4.1-20260919/controller-e06-final-input.json"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source 3c5ae3d6dacf74b7b91a7bf5527226c561ca688c; actual merge tree equals accepted tree 331ac2b5c166adc167e83eb0aa9ffccc8a7d24eb. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-engine --test candidate_review",
+          "description": "Stored candidate and stage-fact review without granting approval",
+          "exit_code": 0,
+          "id": "E06.ag084_local_scoped_acceptance",
+          "input_digest": "11fdf14efc51e39817a21ca5b34bcceb25ec82f8b3d738f94082f000285fff0f",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-084-3c5ae3d.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG084-existing-current349-fixed3c5-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+          "merged_sha": "ea02f116fe2172dcba621a60bf9b141237e1ba45",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/126",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #126; retain source, costs, revocation history and original QA. Accepted parent 349879148c1f31fd1ebbee639aeff334a3762855.",
+          "scope": "E06; Stored candidate and stage-fact review without granting approval software/component boundary only.",
+          "source_sha": "3c5ae3d6dacf74b7b91a7bf5527226c561ca688c",
+          "test_entry": "crates/evo-engine/tests/candidate_review.rs"
         }
       ],
       "remaining": [
@@ -762,7 +1038,10 @@
       "implementation_files": [
         "crates/evo-storage/src/lifecycle.rs",
         "crates/evo-engine/src/lifecycle.rs",
-        "scripts/restore_backup.py"
+        "scripts/restore_backup.py",
+        "crates/evo-storage/tests/failed_cleanup_resume_v42.rs",
+        "crates/evo-engine/tests/broker_cache_revoke_v42.rs",
+        "crates/evo-storage/tests/dependency_read_v42.rs"
       ],
       "scenarios": [
         "V017",
@@ -1024,6 +1303,72 @@
           "rollback": "revert PR #113 through an independent revert PR; accepted-head parent 200c43bc19368ff52b064e67eb1b14e35f096d39; retain evidence, costs, dispatch history and revocation state",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-068-7575491.json"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source 9edf57e896a1b13fc7f57cf5a6392657a23da9a9; actual merge tree equals accepted tree 42de782cd2fcc6745c9f88acff9d2adba71c35d0. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-storage --test failed_cleanup_resume_v42",
+          "description": "Durable Failed-cleanup full-frontier Admin retry and Worker continuation",
+          "exit_code": 0,
+          "id": "E08.ag069_local_scoped_acceptance",
+          "input_digest": "8fae26aea4fbd9038fc19f6e282d8602dc860be8678210af7bd55d9c3b9f83eb",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-069-9edf57e.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/ag069-current-ddde-9edf-ROOT-task-acceptance.actual-20261003.json",
+          "merged_sha": "5ee01d1e2ebb2401fe94530ff286801239940259",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/118",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #118; retain source, costs, revocation history and original QA. Accepted parent ddde63c6ab98a2528258d265999bb902a08b0f55.",
+          "scope": "E08; Durable Failed-cleanup full-frontier Admin retry and Worker continuation software/component boundary only.",
+          "source_sha": "9edf57e896a1b13fc7f57cf5a6392657a23da9a9",
+          "test_entry": "crates/evo-storage/tests/failed_cleanup_resume_v42.rs"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source b67ca370b0dca0163465bb8037bf940c2ae38b79; actual merge tree equals accepted tree 00b78c590d369f7649061d4b3ccbd713fc79264d. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-engine --test broker_cache_revoke_v42",
+          "description": "Completed model cache source-revocation refusal",
+          "exit_code": 0,
+          "id": "E08.ag073_local_scoped_acceptance",
+          "input_digest": "e5dbbaccdc2e6572c6011032d654b0e92c942031d217997599fb823911688132",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-073-b67ca37.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/ag073-fixedb67ca-ROOT-R51-local-Task-accepted-scope-corrected-r2-20261003.json",
+          "merged_sha": "06fb166b006e5479a80e04dc14998109c30b0d42",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/119",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #119; retain source, costs, revocation history and original QA. Accepted parent 5ee01d1e2ebb2401fe94530ff286801239940259.",
+          "scope": "E08; Completed model cache source-revocation refusal software/component boundary only.",
+          "source_sha": "b67ca370b0dca0163465bb8037bf940c2ae38b79",
+          "test_entry": "crates/evo-engine/tests/broker_cache_revoke_v42.rs"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source 8a92e578527b6334b5fb776abf46c5bc9a88e4b7; actual merge tree equals accepted tree 2cfe492ce726c7ce1e44ca0cc9736c857b2bc072. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-storage --test dependency_read_v42",
+          "description": "Direct typed import source/result dependency binding",
+          "exit_code": 0,
+          "id": "E08.ag075_local_scoped_acceptance",
+          "input_digest": "7d940277f3f534775adfb8c60054927ed70b84277d9707fff4cd55fab9744141",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-075-8a92e57.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG075-existing-current1132-fixed8a92e57-ROOT-fresh12-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+          "merged_sha": "aa831fba2d09d0ef2d0755c3d7a08971b8f6667f",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/131",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #131; retain source, costs, revocation history and original QA. Accepted parent 1132b6b4b6e0016540339ba65219daf1ceb35fb8.",
+          "scope": "E08; Direct typed import source/result dependency binding software/component boundary only.",
+          "source_sha": "8a92e578527b6334b5fb776abf46c5bc9a88e4b7",
+          "test_entry": "crates/evo-storage/tests/dependency_read_v42.rs"
         }
       ],
       "remaining": [
@@ -1031,7 +1376,7 @@
         "awaiting plan clarification: physical SQLite free-page/WAL erasure is not a declared guarantee",
         "engineering: other late writes, stage_bundle and typed dependency-edge completeness remain; AG-059 closes resolved manifest prewrite checking only",
         "production disaster recovery, Linux deployment and future object scopes remain unverified",
-        "local only, not merged: AG069 old Failed-job recovery, AG073 cached-response freshness and AG075 bounded E16 typed-edge diagnostics passed controller acceptance; their accepted heads are not current main. AG077 typed budget binding/cleanup/restore remains in progress"
+        "AG069/073/075 and AG077 are merged scoped software evidence. Their historical accepted results do not establish a transitive complete current E08 route, future-object scope, production disaster recovery or physical free-page/WAL erasure."
       ]
     },
     "E09": {
@@ -1042,7 +1387,8 @@
         "crates/evo-core/src/strategy.rs",
         "crates/evo-engine/src/exploration.rs",
         "crates/evo-engine/src/groups.rs",
-        "crates/evo-engine/src/practice.rs"
+        "crates/evo-engine/src/practice.rs",
+        "crates/evo-engine/tests/replay_legal_prefix_v42.rs"
       ],
       "scenarios": [
         "V019",
@@ -1282,6 +1628,28 @@
           "rollback": "revert PR #97 through an independent revert PR; accepted-stack rollback point 229fea802d8184eb03c7f53f979a78200284b47b; preserve revocation, budget, cost and audit facts",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-048-f178dc2.json"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source 313598036461304fe1b081e91115bdbd2c779752; actual merge tree equals accepted tree 16de199ce2d66f4909b094603fd8def8207abb71. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-engine --test replay_legal_prefix_v42",
+          "description": "Replay deepen eligibility and waits from the observed legal prefix",
+          "exit_code": 0,
+          "id": "E09.ag074_local_scoped_acceptance",
+          "input_digest": "e4686ced10ab554f49b580631321c073d2c5ea892129586a297b8ae4df3ee5a1",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-074-3135980.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG074-existing-currentEA02-fixed3135980-ROOT-fresh14-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+          "merged_sha": "aa51b1102e1886cbaf7b025d37b98ca30b6e2d3d",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/127",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #127; retain source, costs, revocation history and original QA. Accepted parent ea02f116fe2172dcba621a60bf9b141237e1ba45.",
+          "scope": "E09; Replay deepen eligibility and waits from the observed legal prefix software/component boundary only.",
+          "source_sha": "313598036461304fe1b081e91115bdbd2c779752",
+          "test_entry": "crates/evo-engine/tests/replay_legal_prefix_v42.rs"
         }
       ],
       "remaining": [
@@ -1559,7 +1927,8 @@
       "status_reason": "consolidation closure, trusted-cycle trigger, a separate consolidation budget stage and bounded terminal categories are verified program sub-scopes (AG-022/028/030/031); no production cycle driver or management entry; real longitudinal provider execution and effect remain unverified",
       "implementation_files": [
         "crates/evo-engine/src/broker.rs",
-        "crates/evo-engine/src/monitoring.rs"
+        "crates/evo-engine/src/monitoring.rs",
+        "crates/evo-engine/tests/monitoring_evidence_binding_v42.rs"
       ],
       "scenarios": [
         "V016",
@@ -1685,6 +2054,28 @@
           "rollback": "revert PR #78 (merge 84d8a70) through an independent revert PR; accepted-stack rollback point 43984ab; persisted revocation, budget, cost and audit facts are not rolled back",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-031-892ed1c.json"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source c2f89f42ebb06703ee70af96fd5cf7e56082c722; actual merge tree equals accepted tree a1f45196ab08bd0aaac4a401bf49d20e8e9d33c6. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-engine --test monitoring_evidence_binding_v42",
+          "description": "Monitoring/consolidation original report and execution input binding",
+          "exit_code": 0,
+          "id": "E13.ag081_local_scoped_acceptance",
+          "input_digest": "aac9c5cffd8b1427c544d8610aee080e77fec741e7105da5de6528eaa0ae40d0",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-081-c2f89f4.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/ag081-current9f0c-headc2f89f42-ROOT-all12-necessary-SC0-finite-Task-PASS_LOCAL_TASK-and-only-epoch-release-r1-20261005.json",
+          "merged_sha": "90d3dcbef822b17abaffffbcc866b863336c4024",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/122",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #122; retain source, costs, revocation history and original QA. Accepted parent 9f0c40215a2d7a67ba66e5427cee71ca5228bde1.",
+          "scope": "E13; Monitoring/consolidation original report and execution input binding software/component boundary only.",
+          "source_sha": "c2f89f42ebb06703ee70af96fd5cf7e56082c722",
+          "test_entry": "crates/evo-engine/tests/monitoring_evidence_binding_v42.rs"
         }
       ],
       "remaining": [
@@ -1819,7 +2210,9 @@
       "status_reason": "durable import readers are verified and merged; AG068 adds a registered native-authority cleanup subset. The complete import-to-development-candidate-to-new-use-to-revocation chain remains required and incomplete; unverified import history is permitted as development material and is not trusted application evidence",
       "implementation_files": [
         "crates/evo-engine/src/import.rs",
-        "crates/evo-core/src/evidence.rs"
+        "crates/evo-core/src/evidence.rs",
+        "crates/evo-core/tests/import_fixture_v42.rs",
+        "crates/evo-engine/tests/import_development_material_v42.rs"
       ],
       "scenarios": [
         "V005",
@@ -1858,10 +2251,54 @@
           "rollback": "disable new imports and withdraw the sub-scope through an independent revert PR while retaining incurred costs, revocation and audit facts",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/verify-20260930/qa/s2-input-E16.1.json"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source 1355e95f598bf7d1f490d6d1d295a1e29c855c0c; actual merge tree equals accepted tree cd7b8f0db394eb2d5a417d34b5680d9edd27160a. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-core --test import_fixture_v42",
+          "description": "Bounded content-driven import ProgramFixture",
+          "exit_code": 0,
+          "id": "E16.1.ag076_local_scoped_acceptance",
+          "input_digest": "7c35c464e55005999b3d959c847edf8b90549d3290e4fce3e1882b424c106fd3",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-076-1355e95.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG076-existing-currentAA51-fixed1355e95-ROOT-fresh12-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+          "merged_sha": "1177c91931689794a7d28b614adc01d3a0435e46",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/128",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #128; retain source, costs, revocation history and original QA. Accepted parent aa51b1102e1886cbaf7b025d37b98ca30b6e2d3d.",
+          "scope": "E16.1; Bounded content-driven import ProgramFixture software/component boundary only.",
+          "source_sha": "1355e95f598bf7d1f490d6d1d295a1e29c855c0c",
+          "test_entry": "crates/evo-core/tests/import_fixture_v42.rs"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source 887d97a345e947c754dd01c0fd0e1dd15b635d5c; actual merge tree equals accepted tree 40a7da9bf227bfa26b8d44bf6ce49d19037986aa. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-engine --test import_development_material_v42",
+          "description": "Bounded local development-material reader",
+          "exit_code": 0,
+          "id": "E16.1.ag070_local_scoped_acceptance",
+          "input_digest": "b22d74557ec1e8d8ba3627921a49cf165cfb3c6e7477b411e1bc94d44221d78e",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-070-887d97a.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG070-existing-current3ad-fixed887d97a-ROOT-standard8-head38-parent36-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+          "merged_sha": "1132b6b4b6e0016540339ba65219daf1ceb35fb8",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/130",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #130; retain source, costs, revocation history and original QA. Accepted parent 3ad643ca2a1cf57f4e7bc1c0f032eef2663902b5.",
+          "scope": "E16.1; Bounded local development-material reader software/component boundary only.",
+          "source_sha": "887d97a345e947c754dd01c0fd0e1dd15b635d5c",
+          "test_entry": "crates/evo-engine/tests/import_development_material_v42.rs"
         }
       ],
       "remaining": [
-        "engineering: complete three-reader import learning, persistent provenance/candidate, development selection, real subsequent content use and revocation chain remain incomplete; local accepted AG070 material reading and AG076 executable ProgramFixture core are unmerged, and AG077 typed budget plumbing is in progress",
+        "engineering: AG070 imported development material, AG076 ProgramFixture and AG077 typed budget plumbing are merged. Complete three-reader import learning, persistent provenance/candidate, development selection, real subsequent content use and revocation chain still require scope-specific acceptance.",
         "evidence boundary: imported history does not create trusted run/AppliedReceipt/FormalEvaluation/Active authority; ProgramFixture cannot substitute for real approval or benefit evidence"
       ]
     },
@@ -2231,7 +2668,7 @@
         "no real sandbox; deployment-safety evidence is local only; Linux not exercised",
         "pending revoke cleanup jobs are not driven at startup; residual dispatched calls are not turned uncertain at startup; outbound-network consistency is unchecked",
         "capacity limits for internal objects added in round 2 (consolidation claims/proposals, practice sets, skill-group jobs, meta trials) are not registered in plan section 3.3.1; a plan revision must come first",
-        "AG077 typed budget source/restore binding and AG078 read-only unresolved-bill report are local work in progress, not merged support claims"
+        "AG077 budget source/restore and AG078 read-only unresolved-bill report are merged software subsets; they do not establish a real sandbox, provider transport, paid reconciliation or production deployment."
       ]
     },
     "E16.6": {
@@ -2275,11 +2712,34 @@
           "rollback": "revert PR #60 (merge dc036d5) through an independent revert PR; accepted-stack rollback point 0c43e0f; persisted revocation, budget, cost and audit facts are not rolled back",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-012-2e5c668.json"
+        },
+        {
+          "actual_result": "ROOT accepted fixed source 908eb85b33d590889a75885c9d9b20c3dad927b8; actual merge tree equals accepted tree 426065da2aefd359b9e2808b67c1be969f46acb7. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
+          "command": "cargo test --locked --offline -p evo-core --test support_scope",
+          "description": "Partial evidence registry and unchanged historical evidence records",
+          "exit_code": 0,
+          "id": "E16.6.ag086_local_scoped_acceptance",
+          "input_digest": "7db828d1da99c22ece28a8ea876f60f8af3c0f8ce98ebe95bcfb44f7e4c57356",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-086-908eb85.json",
+          "log_path": "out/audit-20260930/qa/takeover-20261002/AG086-existing-currentAA831-fixed908eb85-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+          "merged_sha": "77152d77c96f497ebf2c0123e985f0832fa3cbd0",
+          "plan_recheck": "not_affected",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_version": "v4.2",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/132",
+          "pr_state": "merged",
+          "record_source": "docs/implementation-ledger.md",
+          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
+          "rollback": "Reviewed revert of PR #132; retain source, costs, revocation history and original QA. Accepted parent aa831fba2d09d0ef2d0755c3d7a08971b8f6667f.",
+          "scope": "E16.6; Partial evidence registry and unchanged historical evidence records software/component boundary only.",
+          "source_sha": "908eb85b33d590889a75885c9d9b20c3dad927b8",
+          "test_entry": "crates/evo-core/tests/support_scope.rs"
         }
       ],
       "remaining": [
         "the index does not close E16; full-route completion, real-host, sandbox and effect evidence remain unavailable",
-        "AG-013 (#59), AG-023 (#68) and the ledger PR #65 are recorded in the ledger only: their evidence (scripts and binary-crate unit tests) is outside the checker's single-target cargo test grammar"
+        "AG-013 (#59), AG-023 (#68) and the ledger PR #65 are recorded in the ledger only: their evidence (scripts and binary-crate unit tests) is outside the checker's single-target cargo test grammar",
+        "AG056 CI and AG078 Python budget reporting plus the transparent status-character frontend are ledger-only deliveries outside the single-target Rust evidence grammar. The index remains a non-normative subset declaration."
       ]
     },
     "E16": {
@@ -2426,7 +2886,10 @@
         ],
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E06.controller_acceptance"
+          "E06.controller_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2455,7 +2918,9 @@
           "crates/evo-core/src/skill_edit.rs"
         ],
         "related_evidence_refs": [
-          "E02.controller_acceptance"
+          "E02.controller_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2492,7 +2957,10 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E06.controller_acceptance",
-          "E07.controller_acceptance"
+          "E07.controller_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2523,7 +2991,9 @@
         ],
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2553,7 +3023,8 @@
           "crates/evo-engine/src/optimization.rs"
         ],
         "related_evidence_refs": [
-          "E03.controller_acceptance"
+          "E03.controller_acceptance",
+          "E03.ag079_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2584,7 +3055,8 @@
           "crates/evo-engine/src/meta.rs"
         ],
         "related_evidence_refs": [
-          "E03.controller_acceptance"
+          "E03.controller_acceptance",
+          "E03.ag079_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2617,7 +3089,10 @@
         ],
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance"
+          "E16.1.durable_import_controller_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2649,7 +3124,8 @@
         ],
         "related_evidence_refs": [
           "E06.controller_acceptance",
-          "E16.3.seed_install_reset_controller_acceptance"
+          "E16.3.seed_install_reset_controller_acceptance",
+          "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2684,7 +3160,8 @@
           "crates/evo-engine/src/meta_experiment.rs"
         ],
         "related_evidence_refs": [
-          "E06.controller_acceptance"
+          "E06.controller_acceptance",
+          "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2720,7 +3197,11 @@
         ],
         "related_evidence_refs": [
           "E08.controller_acceptance",
-          "E16.2.durable_staging_publish_controller_acceptance"
+          "E16.2.durable_staging_publish_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance",
+          "E16.6.ag086_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       }
@@ -2758,7 +3239,10 @@
           "E09.controller_acceptance",
           "E10.controller_acceptance",
           "E10.replay_management_controller_acceptance",
-          "E11.controller_acceptance"
+          "E11.controller_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2818,7 +3302,8 @@
         ],
         "related_evidence_refs": [
           "E12.controller_acceptance",
-          "E13.controller_acceptance"
+          "E13.controller_acceptance",
+          "E13.ag081_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2848,7 +3333,9 @@
         ],
         "related_evidence_refs": [
           "E04.controller_acceptance",
-          "E12.controller_acceptance"
+          "E12.controller_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2881,7 +3368,14 @@
         "related_evidence_refs": [
           "E01.controller_acceptance",
           "E05.controller_acceptance",
-          "E06.controller_acceptance"
+          "E06.controller_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2913,7 +3407,15 @@
         "related_evidence_refs": [
           "E01.controller_acceptance",
           "E04.controller_acceptance",
-          "E05.controller_acceptance"
+          "E05.controller_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2941,7 +3443,8 @@
           "crates/evo-engine/src/exploration.rs"
         ],
         "related_evidence_refs": [
-          "E09.controller_acceptance"
+          "E09.controller_acceptance",
+          "E09.ag074_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -2989,7 +3492,15 @@
           "E09.controller_acceptance",
           "E10.controller_acceptance",
           "E10.replay_management_controller_acceptance",
-          "E12.controller_acceptance"
+          "E12.controller_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E16.6.ag086_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       }
@@ -3028,7 +3539,13 @@
           "E03.controller_acceptance",
           "E04.controller_acceptance",
           "E07.controller_acceptance",
-          "E13.controller_acceptance"
+          "E13.controller_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E13.ag081_local_scoped_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -3058,7 +3575,9 @@
         ],
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E09.controller_acceptance"
+          "E09.controller_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -3093,7 +3612,12 @@
           "E02.controller_acceptance",
           "E03.controller_acceptance",
           "E06.controller_acceptance",
-          "E09.controller_acceptance"
+          "E09.controller_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -3133,7 +3657,19 @@
           "E05.controller_acceptance",
           "E08.controller_acceptance",
           "E09.controller_acceptance",
-          "E13.controller_acceptance"
+          "E13.controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E13.ag081_local_scoped_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -3169,7 +3705,16 @@
           "E05.controller_acceptance",
           "E06.controller_acceptance",
           "E09.controller_acceptance",
-          "E13.controller_acceptance"
+          "E13.controller_acceptance",
+          "E13.ag081_local_scoped_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -3236,7 +3781,10 @@
           "E09.controller_acceptance",
           "E10.controller_acceptance",
           "E10.replay_management_controller_acceptance",
-          "E12.controller_acceptance"
+          "E12.controller_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -3266,7 +3814,9 @@
         ],
         "related_evidence_refs": [
           "E06.controller_acceptance",
-          "E09.controller_acceptance"
+          "E09.controller_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -3306,7 +3856,9 @@
           "E01.controller_acceptance",
           "E04.controller_acceptance",
           "E07.controller_acceptance",
-          "E11.controller_acceptance"
+          "E11.controller_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -3344,7 +3896,14 @@
         "related_evidence_refs": [
           "E00.controller_acceptance",
           "E05.controller_acceptance",
-          "E06.controller_acceptance"
+          "E06.controller_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       }
@@ -3758,7 +4317,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E00.controller_acceptance"
+          "E00.controller_acceptance",
+          "E16.6.ag086_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3774,7 +4334,9 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3792,7 +4354,9 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E07.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3806,7 +4370,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E03.controller_acceptance"
+          "E03.controller_acceptance",
+          "E03.ag079_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3824,7 +4389,12 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance"
+          "E16.1.durable_import_controller_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3840,7 +4410,10 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance"
+          "E16.1.durable_import_controller_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3856,7 +4429,9 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E04.controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3872,7 +4447,9 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E04.controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3890,7 +4467,11 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E04.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3908,7 +4489,13 @@
         "related_evidence_refs": [
           "E01.controller_acceptance",
           "E05.controller_acceptance",
-          "E07.controller_acceptance"
+          "E07.controller_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3924,7 +4511,13 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E01.controller_acceptance",
-          "E05.controller_acceptance"
+          "E05.controller_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3940,7 +4533,13 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E01.controller_acceptance",
-          "E05.controller_acceptance"
+          "E05.controller_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3956,7 +4555,13 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E01.controller_acceptance",
-          "E05.controller_acceptance"
+          "E05.controller_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3974,7 +4579,8 @@
         "related_evidence_refs": [
           "E06.controller_acceptance",
           "E07.controller_acceptance",
-          "E16.3.seed_install_reset_controller_acceptance"
+          "E16.3.seed_install_reset_controller_acceptance",
+          "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -3991,7 +4597,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E06.controller_acceptance",
-          "E07.controller_acceptance"
+          "E07.controller_acceptance",
+          "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4009,7 +4616,9 @@
         "related_evidence_refs": [
           "E06.controller_acceptance",
           "E07.controller_acceptance",
-          "E13.controller_acceptance"
+          "E13.controller_acceptance",
+          "E13.ag081_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4033,7 +4642,14 @@
           "E08.controller_acceptance",
           "E16.1.durable_import_controller_acceptance",
           "E16.2.durable_staging_publish_controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4051,7 +4667,10 @@
         "related_evidence_refs": [
           "E08.controller_acceptance",
           "E16.3.seed_install_reset_controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4065,7 +4684,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E09.controller_acceptance"
+          "E09.controller_acceptance",
+          "E09.ag074_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4082,7 +4702,8 @@
         "related_evidence_refs": [
           "E09.controller_acceptance",
           "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance"
+          "E10.replay_management_controller_acceptance",
+          "E09.ag074_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4116,7 +4737,8 @@
           "E09.controller_acceptance",
           "E10.controller_acceptance",
           "E10.replay_management_controller_acceptance",
-          "E11.controller_acceptance"
+          "E11.controller_acceptance",
+          "E09.ag074_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4145,7 +4767,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E09.controller_acceptance"
+          "E09.controller_acceptance",
+          "E09.ag074_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4162,7 +4785,8 @@
         "related_evidence_refs": [
           "E09.controller_acceptance",
           "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance"
+          "E10.replay_management_controller_acceptance",
+          "E09.ag074_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4213,7 +4837,13 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E05.controller_acceptance",
-          "E11.controller_acceptance"
+          "E11.controller_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4269,7 +4899,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E13.controller_acceptance"
+          "E13.controller_acceptance",
+          "E13.ag081_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4341,7 +4972,8 @@
         "related_evidence_refs": [
           "E13.controller_acceptance",
           "E16.4.real_store_rejection_controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E13.ag081_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4363,7 +4995,13 @@
           "E08.controller_acceptance",
           "E13.controller_acceptance",
           "E16.3.seed_install_reset_controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E13.ag081_local_scoped_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4382,7 +5020,8 @@
         "related_evidence_refs": [
           "E16.2.durable_staging_publish_controller_acceptance",
           "E16.4.real_store_rejection_controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E16.6.ag086_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4428,7 +5067,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E07.controller_acceptance",
-          "E11.controller_acceptance"
+          "E11.controller_acceptance",
+          "E16.6.ag086_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4442,7 +5082,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E02.controller_acceptance"
+          "E02.controller_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4456,7 +5098,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E02.controller_acceptance"
+          "E02.controller_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4470,7 +5114,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E02.controller_acceptance"
+          "E02.controller_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4484,7 +5130,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E02.controller_acceptance"
+          "E02.controller_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4502,7 +5150,10 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E06.controller_acceptance",
-          "E07.controller_acceptance"
+          "E07.controller_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4516,7 +5167,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E02.controller_acceptance"
+          "E02.controller_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4530,7 +5183,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E06.controller_acceptance"
+          "E06.controller_acceptance",
+          "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4544,7 +5198,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E06.controller_acceptance"
+          "E06.controller_acceptance",
+          "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4560,7 +5215,10 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance"
+          "E16.1.durable_import_controller_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4576,7 +5234,10 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance"
+          "E16.1.durable_import_controller_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4590,7 +5251,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E16.1.durable_import_controller_acceptance"
+          "E16.1.durable_import_controller_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4606,7 +5269,10 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance"
+          "E16.1.durable_import_controller_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4622,7 +5288,10 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance"
+          "E16.1.durable_import_controller_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4640,7 +5309,13 @@
         "related_evidence_refs": [
           "E03.controller_acceptance",
           "E08.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance"
+          "E16.1.durable_import_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4654,7 +5329,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E03.controller_acceptance"
+          "E03.controller_acceptance",
+          "E03.ag079_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4668,7 +5344,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E03.controller_acceptance"
+          "E03.controller_acceptance",
+          "E03.ag079_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4684,7 +5361,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E06.controller_acceptance",
-          "E07.controller_acceptance"
+          "E07.controller_acceptance",
+          "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4700,7 +5378,9 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4730,7 +5410,9 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4760,7 +5442,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E06.controller_acceptance",
-          "E16.3.seed_install_reset_controller_acceptance"
+          "E16.3.seed_install_reset_controller_acceptance",
+          "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4836,7 +5519,10 @@
         "related_evidence_refs": [
           "E08.controller_acceptance",
           "E16.2.durable_staging_publish_controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4854,7 +5540,8 @@
         "related_evidence_refs": [
           "E06.controller_acceptance",
           "E07.controller_acceptance",
-          "E16.2.durable_staging_publish_controller_acceptance"
+          "E16.2.durable_staging_publish_controller_acceptance",
+          "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4869,7 +5556,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E00.controller_acceptance"
+          "E00.controller_acceptance",
+          "E16.6.ag086_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4884,7 +5572,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E00.controller_acceptance"
+          "E00.controller_acceptance",
+          "E16.6.ag086_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4901,7 +5590,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E00.controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E16.6.ag086_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4914,7 +5604,9 @@
         "status": "implemented_not_verified",
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E16.6.ag086_local_scoped_acceptance"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -4933,7 +5625,11 @@
           "E06.controller_acceptance",
           "E08.controller_acceptance",
           "E16.2.durable_staging_publish_controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4947,7 +5643,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E16.1.durable_import_controller_acceptance"
+          "E16.1.durable_import_controller_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4965,7 +5663,8 @@
         "related_evidence_refs": [
           "E06.controller_acceptance",
           "E07.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance",
+          "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4983,7 +5682,10 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E06.controller_acceptance",
-          "E16.3.seed_install_reset_controller_acceptance"
+          "E16.3.seed_install_reset_controller_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4997,7 +5699,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E02.controller_acceptance"
+          "E02.controller_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5012,7 +5716,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E00.controller_acceptance"
+          "E00.controller_acceptance",
+          "E16.6.ag086_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5040,7 +5745,14 @@
           "E10.controller_acceptance",
           "E10.replay_management_controller_acceptance",
           "E11.controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5063,7 +5775,13 @@
           "E08.controller_acceptance",
           "E12.controller_acceptance",
           "E13.controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E13.ag081_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5086,7 +5804,14 @@
           "E04.controller_acceptance",
           "E08.controller_acceptance",
           "E12.controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5113,7 +5838,20 @@
           "E06.controller_acceptance",
           "E08.controller_acceptance",
           "E13.controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E13.ag081_local_scoped_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5141,7 +5879,21 @@
           "E05.controller_acceptance",
           "E06.controller_acceptance",
           "E08.controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5168,7 +5920,15 @@
           "E09.controller_acceptance",
           "E10.controller_acceptance",
           "E10.replay_management_controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5195,7 +5955,15 @@
           "E07.controller_acceptance",
           "E13.controller_acceptance",
           "E16.1.durable_import_controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E13.ag081_local_scoped_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5216,7 +5984,11 @@
           "E02.controller_acceptance",
           "E03.controller_acceptance",
           "E07.controller_acceptance",
-          "E09.controller_acceptance"
+          "E09.controller_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5241,7 +6013,12 @@
           "E06.controller_acceptance",
           "E07.controller_acceptance",
           "E09.controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5271,7 +6048,23 @@
           "E09.controller_acceptance",
           "E13.controller_acceptance",
           "E16.1.durable_import_controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E13.ag081_local_scoped_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5302,7 +6095,18 @@
           "E13.controller_acceptance",
           "E16.2.durable_staging_publish_controller_acceptance",
           "E16.3.seed_install_reset_controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance"
+          "E16.4.real_store_rejection_controller_acceptance",
+          "E13.ag081_local_scoped_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5327,7 +6131,12 @@
           "E08.controller_acceptance",
           "E16.2.durable_staging_publish_controller_acceptance",
           "E16.3.seed_install_reset_controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5348,7 +6157,12 @@
           "E02.controller_acceptance",
           "E04.controller_acceptance",
           "E09.controller_acceptance",
-          "E12.controller_acceptance"
+          "E12.controller_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5387,7 +6201,24 @@
           "E11.controller_acceptance",
           "E12.controller_acceptance",
           "E13.controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E13.ag081_local_scoped_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5406,7 +6237,11 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E06.controller_acceptance",
-          "E09.controller_acceptance"
+          "E09.controller_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5448,7 +6283,18 @@
           "E11.controller_acceptance",
           "E12.controller_acceptance",
           "E13.controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E08.ag069_local_scoped_acceptance",
+          "E08.ag073_local_scoped_acceptance",
+          "E03.ag079_local_scoped_acceptance",
+          "E13.ag081_local_scoped_acceptance",
+          "E04.ag082_local_scoped_acceptance",
+          "E04.ag077_local_scoped_acceptance",
+          "E06.ag084_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E08.ag075_local_scoped_acceptance",
+          "E02.ag092_local_scoped_acceptance",
+          "E02.ag093_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5474,7 +6320,15 @@
           "E05.controller_acceptance",
           "E07.controller_acceptance",
           "E11.controller_acceptance",
-          "E13.controller_acceptance"
+          "E13.controller_acceptance",
+          "E13.ag081_local_scoped_acceptance",
+          "E05.ag080_local_scoped_acceptance",
+          "E09.ag074_local_scoped_acceptance",
+          "E05.ag087_local_scoped_acceptance",
+          "E05.ag088_local_scoped_acceptance",
+          "E05.ag089_local_scoped_acceptance",
+          "E05.ag090_local_scoped_acceptance",
+          "E05.ag091_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5500,7 +6354,10 @@
           "E16.2.durable_staging_publish_controller_acceptance",
           "E16.3.seed_install_reset_controller_acceptance",
           "E16.4.real_store_rejection_controller_acceptance",
-          "E16.5.gate_functions_controller_acceptance"
+          "E16.5.gate_functions_controller_acceptance",
+          "E16.1.ag076_local_scoped_acceptance",
+          "E16.1.ag070_local_scoped_acceptance",
+          "E16.6.ag086_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       }
