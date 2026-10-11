@@ -1,10 +1,9 @@
-//! AG-103 (E09/E10; plan §7.1.1, §7.3, §7.5): the replay moves its fairness waits only
+//! AG-103 (E09/E10; plan §7.1.1, §7.4, §7.5): the replay moves its fairness waits only
 //! over legal opportunities, the actions evo-core's shared filter (`legal_candidates`)
 //! leaves legal in a completed decision round, the filter the decision ranks and online
 //! exploration moves its waits over. An action that filter excluded in a round (no
 //! authorized cost bound, past the depth cap, a Recover that is not eligible, a
-//! successor of a parent that cannot have one) neither waits nor stays among the waits;
-//! an action a batch made available enters at zero until a round judges it.
+//! successor of a parent that cannot have one) neither waits nor stays among the waits.
 //!
 //! What a replay selects, reveals and scores, how it ends and whether its support is
 //! complete are as they were: the worlds below pin them value for value. A report stored
@@ -13,6 +12,15 @@
 //! one stays verified and idempotent (the AG-064/AG-074 handling of old reports). Worlds
 //! and sources are synthetic fixtures, not real model executions or evidence of formal
 //! benefit.
+//!
+//! Not declared: two boundaries, recorded as the replay behaves, not claimed as a
+//! contract.
+//!
+//! * An action a batch made available has met no decision round yet. It enters the waits
+//!   at zero and stays there for one round, until a completed round judges it; when the
+//!   replay ends first, it stays at zero in the final prefix. It never waits a round.
+//! * An action that becomes ineligible only after the last completed round keeps the wait
+//!   entry it had, as before this change: no later round judges it.
 use evo_core::evidence::Purpose;
 use evo_core::hash;
 use evo_core::replay::*;
@@ -370,7 +378,8 @@ fn a_depth_capped_world_still_stops_by_policy_and_keeps_its_quality() {
     assert_eq!(report.attainment_auc_micros, Some(400_000));
     assert_eq!(report.q_auc_sim_micros, Some(400_000));
     assert_eq!(report.score_v2_micros, Some(375_000));
-    // The deepening past the cap never waited a round.
+    // The deepening past the cap never waited a round. The policy stop leaves it at zero
+    // in the final prefix (the first boundary above, not declared).
     assert!(
         report
             .revealed_prefix
@@ -421,10 +430,11 @@ fn an_ineligible_recover_and_a_successor_of_a_failed_parent_never_wait() {
         &excluded_successor_steps(),
     );
     // Round 1 reveals the failure and so makes its Recover 2 and its deepening 5
-    // available: no round has judged them yet, they enter at zero, and root 3, a legal
-    // opportunity of round 1 that was not chosen, waits one round. Round 2 excludes 2
-    // and 5 (an environment that was not reset, a parent that is no valid node): from
-    // then on neither waits nor stays among the waits.
+    // available: no round has judged them yet, so they enter at zero (the first boundary
+    // above, not declared), and root 3, a legal opportunity of round 1 that was not
+    // chosen, waits one round. Round 2 excludes 2 and 5 (an environment that was not
+    // reset, a parent that is no valid node): from then on neither waits nor stays among
+    // the waits.
     let after: [&[(u32, u32)]; 5] = [&[(2, 0), (3, 1), (5, 0)], &[(4, 0)], &[(6, 0)], &[], &[]];
     for (probes, expected) in (1..=5u8).zip(after) {
         let report = run(&w, &profile(probes), &caps());

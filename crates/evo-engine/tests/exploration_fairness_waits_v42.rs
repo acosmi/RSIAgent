@@ -7,6 +7,15 @@
 //! waits. A world without such a root keeps exactly the waits it had. The decisions, the
 //! actions offered and the stop are unchanged.
 //!
+//! Not declared: a boundary, recorded as online exploration behaves, not claimed as a
+//! contract. An action that becomes ineligible only after the last completed round (a
+//! root the last dispatch left over the remaining root budget, for instance) keeps the
+//! wait entry it had, as before this change: no later round judges it. The replay's
+//! other boundary, an action entering the waits at zero before any round judged it, has
+//! no online counterpart, since online waits list only actions offered in a completed
+//! round. That the chosen action keeps the entry it had until the next completed round
+//! is how the coordinator always kept its waits; this change leaves it as it was.
+//!
 //! Real SQLite store, a fixture model that suggests no edit (so every step ends with no
 //! change, in a terminal node that cannot be deepened) and a runner that is never
 //! reached; no provider, zero monetary cost. The harness is copied from
