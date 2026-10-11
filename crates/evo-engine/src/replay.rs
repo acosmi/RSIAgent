@@ -434,6 +434,12 @@ fn available_actions<'a>(
         .iter()
         .map(|node| node.node_seq)
         .collect();
+    let expanded_parents: BTreeSet<u32> = state
+        .prefix
+        .nodes
+        .iter()
+        .filter_map(|node| node.search_parent_seq)
+        .collect();
     let opened_branches: BTreeSet<u32> = state
         .prefix
         .nodes
@@ -454,6 +460,7 @@ fn available_actions<'a>(
             }
             ActionKindV1::Deepen { parent_node_seq } => {
                 revealed_nodes.contains(parent_node_seq)
+                    && !expanded_parents.contains(parent_node_seq)
                     && state.context_by_node.get(parent_node_seq)
                         == Some(&action.parent_context_signature)
             }
