@@ -12,8 +12,12 @@
 //! authenticated records (principal-set observation, principal actions,
 //! provider captures, meter readings, episode cost) in the exact shapes and
 //! content witnesses those principals write. Every product reader and
-//! verifier runs unchanged. The ticket is issued before the Worker stages the
-//! candidate (the unbound ticket wire, without GA-18 candidate/fact pins).
+//! verifier runs unchanged. The AG-095 cases issue the ticket before the
+//! Worker stages the candidate (the unbound ticket wire, without GA-18
+//! candidate/fact pins). The AG-109 cases follow the true-source order (L288:
+//! candidates frozen, then the ticket): the candidate is staged and every
+//! principal action written first, so the ticket binds the candidate and GA-18
+//! attaches each later execution and grader receipt to it.
 //! This is a software fixture: no real external host, provider, model, paid
 //! execution, benefit or release chain is claimed.
 #[path = "support/trusted_compiler_inputs.rs"]
@@ -35,14 +39,15 @@ use evo_core::holdout::{
 };
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
 use evo_core::sequential::{AlphaAllocation, FormalClaimKind, ResearchFamilyAlphaPlan};
-use evo_core::{Context, Role, Strategy, fingerprint, hash};
+use evo_core::{Context, Error, Role, Strategy, fingerprint, hash};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::formal_authority::{
     EpisodeCostRecord, FormalAuthorityIssuer, FormalProviderCaptureRecord, FormalRegistry,
-    FrozenCompilerProfile, IndependentGradeCapture, METER_SCHEMA, PRINCIPAL_ACTION_SCHEMA,
-    PRINCIPALS_SCHEMA, RegisteredExternalProvider, RegisteredFormalHost, RegisteredPrincipal,
-    RegisteredPrincipalSet, RegisteredResourceInstrumentation, TypedContentRef, content_digest,
-    prepare_formal_task,
+    FrozenCompilerProfile, IndependentGradeCapture, IssuedFormalAuthority, METER_SCHEMA,
+    PRINCIPAL_ACTION_SCHEMA, PRINCIPALS_SCHEMA, RegisteredExternalProvider, RegisteredFormalHost,
+    RegisteredPrincipal, RegisteredPrincipalSet, RegisteredResourceInstrumentation,
+    TypedContentClosure, TypedContentEdge, TypedContentRef, content_digest, prepare_formal_task,
+    read_typed_closure,
 };
 use evo_engine::release_store::{
     ReleaseCandidateRecord, ReleaseStore, StageBundleRequest, TypedSourceRef,
@@ -52,7 +57,8 @@ use evo_engine::streaming_evaluator::{
     EvaluationEvidenceScope, EvaluationTicketV2, ExecutionReceiptRequest, ExecutionSide,
     FixedGraderMethod, FixedGraderSpec, FrozenOracleEntry, IndependentEvaluationControl,
     IndependentGraderReceiptV2, IssueTicketRequest, ProtectedHoldoutRecord, ProtectedInputRef,
-    RegisteredEvaluationControl, StartExecutionRequest, TicketLifecycle, VerifiedReportVariant,
+    RegisteredEvaluationControl, StartExecutionRequest, TargetState, TicketLifecycle,
+    VerifiedReportVariant, verified_report_view_in_session,
 };
 use evo_storage::budget::{
     BudgetArtifact, BudgetCallFence, BudgetCallReservation, BudgetExecutionProvenance, BudgetStage,
@@ -61,7 +67,7 @@ use evo_storage::budget::{
 use evo_storage::{Session, Store};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -88,6 +94,14 @@ const CONTROL_KIND: &str = "registered_evaluation_control_v41";
 const TICKET_KIND: &str = "evaluation_ticket_v2";
 const FORMAL_KIND: &str = "formal_evaluation_v2";
 const GRADER_RECEIPT_KIND: &str = "independent_grader_receipt_v2";
+const EXECUTION_RECEIPT_KIND: &str = "execution_receipt_v2";
+const HOLDOUT_KIND: &str = "protected_holdout_v41";
+const OUTPUT_KIND: &str = "evaluation_execution_output_v1";
+const RESOURCE_KIND: &str = "evaluation_resource_evidence_v1";
+/// The exact refusals the AG-109 cases name.
+const EDGES_DIFFER: &str = "formal fact dependency edges differ";
+const CYCLE: &str = "typed content dependency cycle";
+const AUTHORITY_MISSING: &str = "issued formal authority missing for external-host report";
 
 fn d(label: &str) -> String {
     hash(label.as_bytes())
@@ -618,9 +632,44 @@ async fn persist_captures(
     s.commit().await.unwrap();
 }
 
+/// When the Worker stages the candidate relative to ticket issue. Candidate
+/// presence is decided once, at issue: staged first, the ticket binds it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TicketOrder {
+    /// AG-095's historical order: the unbound ticket wire.
+    IssuedBeforeStage,
+    /// The true-source order (L288): the candidate is frozen, then the ticket.
+    StagedBeforeIssue,
+}
+
+/// The registered grader registers the frozen holdout and issues the ticket.
+async fn register_and_issue(store: &Store, holdout: ProtectedHoldoutRecord) -> EvaluationTicketV2 {
+    let grader = ctx(Role::Evaluator, GRADER);
+    IndependentEvaluationControl::register_holdout(&grader, store, holdout)
+        .await
+        .unwrap();
+    IndependentEvaluationControl::issue_ticket(
+        &grader,
+        store,
+        IssueTicketRequest {
+            ticket_id: TICKET.into(),
+            registration_id: CONTROL_ID.into(),
+            holdout_id: HOLDOUT_ID.into(),
+            issued_at_unix_seconds: 5,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// The AG-095 batch: the ticket is issued before the candidate is staged.
+async fn prepare() -> Fx {
+    prepare_in(TicketOrder::IssuedBeforeStage).await
+}
+
 /// Registers, executes and grades one complete batch and records its sealed
 /// complete-episode cost. The ticket ends ReadyForFinal and the store closed.
-async fn prepare() -> Fx {
+async fn prepare_in(order: TicketOrder) -> Fx {
     let db_dir = tempfile::tempdir().unwrap();
     let db = db_dir.path().join("ag095.sqlite3");
     // The registered grader workspace is private to this test user (0700).
@@ -976,26 +1025,16 @@ async fn prepare() -> Fx {
         oracle_payload_digest: fingerprint(&oracle_entries).unwrap(),
         oracle_entries,
     };
-    let grader = ctx(Role::Evaluator, GRADER);
-    IndependentEvaluationControl::register_holdout(&grader, &store, holdout)
-        .await
-        .unwrap();
-    let ticket = IndependentEvaluationControl::issue_ticket(
-        &grader,
-        &store,
-        IssueTicketRequest {
-            ticket_id: TICKET.into(),
-            registration_id: CONTROL_ID.into(),
-            holdout_id: HOLDOUT_ID.into(),
-            issued_at_unix_seconds: 5,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(ticket.candidate_dependency_binding.is_none());
+    let mut holdout = Some(holdout);
+    let mut issued = None;
+    if order == TicketOrder::IssuedBeforeStage {
+        let ticket = register_and_issue(&store, holdout.take().unwrap()).await;
+        assert!(ticket.candidate_dependency_binding.is_none());
+        issued = Some(ticket);
+    }
 
-    // Worker stage after the ticket: the unbound ticket wire, without GA-18
-    // candidate/fact pins.
+    // Worker stage: after the ticket, the unbound ticket wire without GA-18
+    // candidate/fact pins; before it (L288), the candidate the ticket binds.
     let candidate = ReleaseStore::stage_bundle(
         &ctx(Role::Worker, PROPOSER),
         &store,
@@ -1094,6 +1133,16 @@ async fn prepare() -> Fx {
     )
     .await;
     s.commit().await.unwrap();
+    // L288: every principal action over the candidate closure precedes the
+    // ticket, whose GA-18 binding pins that closure.
+    let ticket = match issued {
+        Some(ticket) => ticket,
+        None => {
+            let ticket = register_and_issue(&store, holdout.take().unwrap()).await;
+            assert!(ticket.candidate_dependency_binding.is_some());
+            ticket
+        }
+    };
 
     // Registered host executions of every frozen member, both sides.
     let targets: Vec<String> = (0..ROTATING)
@@ -1524,4 +1573,563 @@ async fn changed_stored_receipt_or_capture_digest_refuses_authority_issuance() {
         assert_eq!(finalize(&fx, &db).unwrap_err(), "forbidden");
         assert_nothing_issued(&db).await;
     }
+}
+
+// AG-109: the bound ticket wire (true-source order L288). Every helper below
+// reads or edits only this test's own temporary database or its copies.
+
+/// The stored ticket, as the grader reads it.
+async fn stored_ticket(store: &Store) -> EvaluationTicketV2 {
+    let mut s = store.session().await.unwrap();
+    let envelope: Value = s
+        .need(
+            &ctx(Role::Evaluator, GRADER),
+            "artifact",
+            &storage_id(TICKET_KIND, TICKET),
+        )
+        .await
+        .unwrap();
+    s.commit().await.unwrap();
+    serde_json::from_value(envelope["payload"].clone()).unwrap()
+}
+
+/// The typed content closure rooted at the stored ticket envelope, read
+/// in-process; the store is closed again before any grader process runs.
+async fn ticket_closure(db: &Path) -> Result<TypedContentClosure, Error> {
+    let store = Store::open(db).await.unwrap();
+    let mut s = store.session().await.unwrap();
+    let closure = read_typed_closure(
+        &mut s,
+        &ctx(Role::Evaluator, GRADER),
+        &[("artifact".into(), storage_id(TICKET_KIND, TICKET))],
+    )
+    .await;
+    drop(s);
+    store.close().await;
+    closure
+}
+
+/// Every (kind, id) reachable from `roots` over the stored dependency edges,
+/// walked here independently of the typed closure reader.
+async fn reachable(s: &mut Session, roots: &[(String, String)]) -> BTreeSet<(String, String)> {
+    let grader = ctx(Role::Evaluator, GRADER);
+    let mut seen = BTreeSet::new();
+    let mut pending = roots.to_vec();
+    while let Some(node) = pending.pop() {
+        if seen.insert(node.clone()) {
+            pending.extend(s.dependency_edges(&grader, &node.0, &node.1).await.unwrap());
+        }
+    }
+    seen
+}
+
+async fn add_artifact_edge(db: &Path, from: &str, to: &str) {
+    let store = Store::open(db).await.unwrap();
+    let mut s = store.session().await.unwrap();
+    s.put_edge(
+        &ctx(Role::Evaluator, GRADER),
+        "artifact",
+        from,
+        "artifact",
+        to,
+    )
+    .await
+    .unwrap();
+    s.commit().await.unwrap();
+    store.close().await;
+}
+
+/// Runs a script on this test's own temporary SQLite file through the
+/// workspace's Python runtime, as the GA-18 tests do: no product writer and
+/// no new Rust dependency.
+fn own_sqlite(db: &Path, script: &str, args: &[&str]) -> String {
+    let output = Command::new("python3")
+        .args(["-B", "-c", script])
+        .arg(db)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// Deletes the rows `sql` selects on a closed database copy; returns the count.
+fn delete_rows(db: &Path, sql: &str, args: &[&str]) -> String {
+    let mut argv = vec![sql];
+    argv.extend_from_slice(args);
+    own_sqlite(
+        db,
+        "import sqlite3,sys\ncon=sqlite3.connect(sys.argv[1])\ncount=con.execute(sys.argv[2],sys.argv[3:]).rowcount\ncon.commit()\nprint(count)",
+        &argv,
+    )
+    .trim()
+    .to_string()
+}
+
+/// Every stored row, read only (the GA-18 tests' catalog).
+fn catalog(db: &Path) -> String {
+    own_sqlite(
+        db,
+        r#"
+import sqlite3,sys,json
+con=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+result=[]
+for (table,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall():
+    quoted='"'+table.replace('"','""')+'"'
+    columns=[row[1] for row in con.execute('PRAGMA table_info('+quoted+')')]
+    rows=[]
+    for row in con.execute('SELECT * FROM '+quoted):
+        rows.append(json.dumps([[type(value).__name__,value.hex() if isinstance(value,bytes) else value] for value in row],sort_keys=True))
+    result.append([table,columns,sorted(rows)])
+print(json.dumps(result,sort_keys=True))
+"#,
+        &[],
+    )
+}
+
+/// Every reader of the bound report: status (grader and Administrator), both
+/// release-side views, the approval's own in-session view (RS:381) and the
+/// approval itself.
+async fn bound_report_reads(
+    store: &Store,
+    candidate_id: &str,
+) -> Vec<(&'static str, Result<(), Error>)> {
+    let grader = ctx(Role::Evaluator, GRADER);
+    let admin = ctx(Role::Admin, ADMIN);
+    let mut reads = vec![
+        (
+            "grader status",
+            IndependentEvaluationControl::status(&grader, store, TICKET)
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "admin status",
+            IndependentEvaluationControl::status(&admin, store, TICKET)
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "grader view",
+            IndependentEvaluationControl::verified_report_view(&grader, store, TICKET)
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "admin view",
+            IndependentEvaluationControl::verified_report_view(&admin, store, TICKET)
+                .await
+                .map(|_| ()),
+        ),
+    ];
+    let mut s = store.session().await.unwrap();
+    reads.push((
+        "approval view",
+        verified_report_view_in_session(&admin, &mut s, TICKET)
+            .await
+            .map(|_| ()),
+    ));
+    drop(s);
+    reads.push((
+        "approval",
+        ReleaseStore::approve_verified(&admin, store, candidate_id, TICKET)
+            .await
+            .map(|_| ()),
+    ));
+    reads
+}
+
+/// Every reader refuses the copy with exactly `message` and writes nothing.
+async fn assert_reads_refused(db: &Path, candidate_id: &str, message: &str) {
+    let store = Store::open(db).await.unwrap();
+    let before = catalog(db);
+    for (reader, result) in bound_report_reads(&store, candidate_id).await {
+        assert!(
+            matches!(&result, Err(Error::Conflict(text)) if text == message),
+            "{reader}: {result:?}"
+        );
+    }
+    assert_eq!(catalog(db), before, "refused reads wrote state");
+    store.close().await;
+}
+
+/// AG-109 T1 + T5 (E05 L1257; L288; L564). In the true-source order the
+/// ticket binds the staged candidate, and GA-18 attaches each later execution
+/// and grader receipt to it: the ticket -> receipt edges close a 2-cycle per
+/// execution receipt (ticket -> receipt -> ticket) and a 3-cycle per graded
+/// pair side (ticket -> grader receipt -> receipt -> ticket). The typed closure
+/// exempts exactly those attachment edges from its acyclicity check, so the
+/// complete batch issues authority, and every closure node is one distinct
+/// physical object.
+#[tokio::test]
+async fn bound_ticket_complete_batch_issues_authority_through_attachment_cycles() {
+    let fx = prepare_in(TicketOrder::StagedBeforeIssue).await;
+    // The ticket's closure is the part of the issuance closure that the
+    // attachment edges make cyclic; read it in-process before finalization.
+    let direct = ticket_closure(&fx.db).await;
+    let issued = finalize(&fx, &fx.db);
+    println!(
+        "AG109_T1 ticket_closure={:?} finalize={:?}",
+        direct.as_ref().map(|closure| closure.nodes.len()),
+        issued.as_ref().map(|formal| formal["variant"].clone()),
+    );
+    let direct = direct.unwrap_or_else(|error| panic!("bound ticket closure refused: {error:?}"));
+    let formal = issued.unwrap_or_else(|reason| {
+        panic!("bound complete-batch authority issuance refused: {reason}")
+    });
+    assert_eq!(formal["variant"], "complete_batch");
+    assert_eq!(formal["evidence_scope"], "registered_external_host");
+    assert_eq!(formal["verdict"], "improved");
+
+    let store = Store::open(&fx.db).await.unwrap();
+    let ticket = stored_ticket(&store).await;
+    assert!(ticket.candidate_dependency_binding.is_some());
+    assert_eq!(ticket.lifecycle, TicketLifecycle::CompleteBatch);
+    let admin = ctx(Role::Admin, ADMIN);
+    let authority = FormalAuthorityIssuer::revalidate(&admin, &store, TICKET, &fx.candidate.id)
+        .await
+        .unwrap();
+    assert_eq!(authority.report_id, TICKET);
+    assert_eq!(authority.candidate_id, fx.candidate.id);
+    assert_eq!(authority.grader_captures.len(), fx.graded.len());
+    assert_eq!(authority.provider_captures.len(), 2 * fx.graded.len());
+
+    // T5: both cycle shapes are in the issued closure for every member.
+    let ticket_id = storage_id(TICKET_KIND, TICKET);
+    let edges: BTreeSet<(String, String)> = authority
+        .closure
+        .edges
+        .iter()
+        .map(|edge| (edge.from_id.clone(), edge.to_id.clone()))
+        .collect();
+    let (mut two_cycles, mut three_cycles) = (0, 0);
+    for target in &ticket.targets {
+        let TargetState::Completed {
+            candidate_receipt_id,
+            baseline_receipt_id,
+            grader_receipt_id,
+            ..
+        } = &target.state
+        else {
+            panic!("target {} is not complete", target.target_id);
+        };
+        let grade = storage_id(GRADER_RECEIPT_KIND, grader_receipt_id);
+        assert!(edges.contains(&(ticket_id.clone(), grade.clone())));
+        for receipt_id in [candidate_receipt_id, baseline_receipt_id] {
+            let receipt = storage_id(EXECUTION_RECEIPT_KIND, receipt_id);
+            let closes = edges.contains(&(receipt.clone(), ticket_id.clone()));
+            if closes && edges.contains(&(ticket_id.clone(), receipt.clone())) {
+                two_cycles += 1;
+            }
+            if closes && edges.contains(&(grade.clone(), receipt.clone())) {
+                three_cycles += 1;
+            }
+        }
+    }
+    assert_eq!(two_cycles, 2 * ticket.targets.len());
+    assert_eq!(three_cycles, 2 * ticket.targets.len());
+    // Each node is one distinct physical (kind, id): exactly the objects an
+    // independent walk over the stored edges reaches from the closure roots.
+    let nodes: BTreeSet<(String, String)> = authority
+        .closure
+        .nodes
+        .iter()
+        .map(|node| (node.kind.clone(), node.id.clone()))
+        .collect();
+    assert_eq!(nodes.len(), authority.closure.nodes.len());
+    let ticket_nodes: BTreeSet<(String, String)> = direct
+        .nodes
+        .iter()
+        .map(|node| (node.kind.clone(), node.id.clone()))
+        .collect();
+    assert_eq!(ticket_nodes.len(), direct.nodes.len());
+    let mut s = store.session().await.unwrap();
+    assert_eq!(reachable(&mut s, &authority.closure_roots).await, nodes);
+    assert_eq!(
+        reachable(&mut s, &[("artifact".into(), ticket_id.clone())]).await,
+        ticket_nodes
+    );
+    s.commit().await.unwrap();
+    assert!(ticket_nodes.is_subset(&nodes));
+    println!(
+        "AG109_T5 closure_nodes={} ticket_closure_nodes={} two_cycles={two_cycles} three_cycles={three_cycles}",
+        nodes.len(),
+        ticket_nodes.len()
+    );
+    store.close().await;
+}
+
+/// AG-109 T2 (F). The issuer writes report -> principal action in the
+/// finalize transaction; that edge is part of the bound report's exact edge
+/// set, so status, both release-side views and the approval's own in-session
+/// view (RS:381) read the report. The approval itself stops only at a later
+/// gate, never at the report's edges.
+#[tokio::test]
+async fn bound_ticket_issued_report_is_read_by_status_views_and_approval() {
+    let fx = prepare_in(TicketOrder::StagedBeforeIssue).await;
+    finalize(&fx, &fx.db).unwrap_or_else(|reason| {
+        panic!("bound complete-batch authority issuance refused: {reason}")
+    });
+    let store = Store::open(&fx.db).await.unwrap();
+    let grader = ctx(Role::Evaluator, GRADER);
+    let report = storage_id(FORMAL_KIND, TICKET);
+    let mut s = store.session().await.unwrap();
+    let authority: IssuedFormalAuthority = s
+        .need(&grader, "artifact", &format!("formal-authority-{TICKET}"))
+        .await
+        .unwrap();
+    // The issuer's canonical action over the report, Evaluator role.
+    assert_eq!(
+        authority.report_principal_action_id,
+        format!(
+            "principal-action-{}",
+            fingerprint(&("artifact", &report, Role::Evaluator)).unwrap()
+        )
+    );
+    let mut expected = vec![
+        ("artifact".to_string(), storage_id(TICKET_KIND, TICKET)),
+        ("artifact".to_string(), storage_id(RESOURCE_KIND, TICKET)),
+        (
+            "artifact".to_string(),
+            authority.report_principal_action_id.clone(),
+        ),
+    ];
+    expected.sort();
+    assert_eq!(
+        s.outgoing_edges_bounded(&grader, "artifact", &report, 10_000)
+            .await
+            .unwrap(),
+        expected
+    );
+    s.commit().await.unwrap();
+
+    let status = IndependentEvaluationControl::status(&grader, &store, TICKET)
+        .await
+        .unwrap();
+    assert!(status.ticket.candidate_dependency_binding.is_some());
+    assert_eq!(status.ticket.lifecycle, TicketLifecycle::CompleteBatch);
+    let admin = ctx(Role::Admin, ADMIN);
+    for reader in [&admin, &grader] {
+        let view = IndependentEvaluationControl::verified_report_view(reader, &store, TICKET)
+            .await
+            .unwrap();
+        assert_eq!(view.variant, VerifiedReportVariant::CompleteBatch);
+        assert_eq!(view.verdict, Some(Verdict::Improved));
+        assert_eq!(
+            view.anchor_status,
+            AnchorEvidenceStatus::CompletePassedStoredClosure
+        );
+        assert_eq!(
+            view.evidence_scope,
+            EvaluationEvidenceScope::RegisteredExternalHost
+        );
+        assert_eq!(
+            view.cost_evidence_scope,
+            Some(CostEvidenceScope::CompleteEpisodeRoot)
+        );
+        assert_eq!(
+            view.dependency_status,
+            DependencyEvidenceStatus::CompleteTypedContentClosure
+        );
+        assert!(view.promotion_eligible, "{:?}", view.ineligibility_reasons);
+        assert_eq!(view.candidate_digest, fx.candidate.id);
+        assert_eq!(view.candidate_bundle_digest, fx.candidate.bundle_digest);
+        assert_eq!(view.approver_actor, ADMIN);
+    }
+    let reads = bound_report_reads(&store, &fx.candidate.id).await;
+    for (reader, result) in &reads[..reads.len() - 1] {
+        assert!(result.is_ok(), "{reader}: {result:?}");
+    }
+    let (_, approval) = &reads[reads.len() - 1];
+    println!("AG109_T2 approve_verified={approval:?}");
+    assert!(
+        !matches!(approval, Err(Error::Conflict(text)) if text == EDGES_DIFFER || text == CYCLE),
+        "{approval:?}"
+    );
+    store.close().await;
+}
+
+/// AG-109 T3 (L1257; mirrors the GA-18 strictness case). The bound report's
+/// edge set stays exact with the issued principal action in it: one extra
+/// report edge, or the issued principal-action edge missing, refuses every
+/// reader; so does an external-host report whose issued authority is absent.
+/// Refused reads write nothing.
+#[tokio::test]
+async fn bound_ticket_report_edge_set_stays_exact_with_the_issued_principal_action() {
+    let fx = prepare_in(TicketOrder::StagedBeforeIssue).await;
+    finalize(&fx, &fx.db).unwrap_or_else(|reason| {
+        panic!("bound complete-batch authority issuance refused: {reason}")
+    });
+    let report = storage_id(FORMAL_KIND, TICKET);
+    let action = format!(
+        "principal-action-{}",
+        fingerprint(&("artifact", &report, Role::Evaluator)).unwrap()
+    );
+    {
+        // One more report edge, to the logical ticket id.
+        let (_dir, db) = copy_database(&fx);
+        add_artifact_edge(&db, &report, TICKET).await;
+        assert_reads_refused(&db, &fx.candidate.id, EDGES_DIFFER).await;
+    }
+    {
+        let (_dir, db) = copy_database(&fx);
+        assert_eq!(
+            delete_rows(
+                &db,
+                "DELETE FROM dependencies WHERE namespace=? AND src_kind='artifact' AND src_id=? AND dst_kind='artifact' AND dst_id=?",
+                &[NS, &report, &action],
+            ),
+            "1"
+        );
+        assert_reads_refused(&db, &fx.candidate.id, EDGES_DIFFER).await;
+    }
+    {
+        let (_dir, db) = copy_database(&fx);
+        assert_eq!(
+            delete_rows(
+                &db,
+                "DELETE FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+                &[NS, &format!("formal-authority-{TICKET}")],
+            ),
+            "1"
+        );
+        assert_reads_refused(&db, &fx.candidate.id, AUTHORITY_MISSING).await;
+    }
+}
+
+/// AG-109 T5' (L618/V048). Only the ticket -> execution/grader receipt
+/// attachment edges are exempt. In the same bound graph a cycle of other edges
+/// stays a typed content dependency cycle: an output naming its own execution
+/// receipt, or the holdout naming the ticket. Issuance stays refused and
+/// nothing is issued.
+#[tokio::test]
+async fn bound_ticket_cycles_of_other_edges_are_still_refused() {
+    let fx = prepare_in(TicketOrder::StagedBeforeIssue).await;
+    let store = Store::open(&fx.db).await.unwrap();
+    let ticket = stored_ticket(&store).await;
+    let TargetState::Completed {
+        candidate_receipt_id,
+        ..
+    } = &ticket.targets[0].state
+    else {
+        panic!("first target is not complete");
+    };
+    let receipt = storage_id(EXECUTION_RECEIPT_KIND, candidate_receipt_id);
+    let mut s = store.session().await.unwrap();
+    let envelope: Value = s
+        .need(&ctx(Role::Evaluator, GRADER), "artifact", &receipt)
+        .await
+        .unwrap();
+    s.commit().await.unwrap();
+    store.close().await;
+    let output = storage_id(
+        OUTPUT_KIND,
+        envelope["payload"]["output_artifact_id"].as_str().unwrap(),
+    );
+    for (from, to) in [
+        (output, receipt),
+        (
+            storage_id(HOLDOUT_KIND, HOLDOUT_ID),
+            storage_id(TICKET_KIND, TICKET),
+        ),
+    ] {
+        let (_dir, db) = copy_database(&fx);
+        add_artifact_edge(&db, &from, &to).await;
+        let refused = ticket_closure(&db).await;
+        assert!(
+            matches!(&refused, Err(Error::Conflict(text)) if text == CYCLE),
+            "{from} -> {to}: {:?}",
+            refused.map(|closure| closure.nodes.len())
+        );
+        assert_eq!(
+            finalize(&fx, &db).unwrap_err(),
+            "conflict",
+            "{from} -> {to}"
+        );
+        assert_nothing_issued(&db).await;
+    }
+}
+
+/// AG-109 T4. Leaving attachment edges out of the acyclicity check cannot
+/// touch an acyclic closure's bytes: nodes in (kind, id) order with their
+/// stored schema and body digest, edges in edge order, and the digest over
+/// exactly those two lists. The printed digest is compared between the AG-095
+/// parent and this change.
+#[tokio::test]
+async fn acyclic_typed_closure_keeps_its_exact_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("db")).await.unwrap();
+    let worker = ctx(Role::Worker, "worker");
+    let mut s = store.session().await.unwrap();
+    let mut ids = Vec::new();
+    for episode in ["a", "b", "c", "d"] {
+        let fact = evo_engine::optimization::StageFact {
+            schema_version: evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+            artifact_id: "pending".into(),
+            namespace: NS.into(),
+            episode_id: episode.into(),
+            step: 0,
+            attempt: 0,
+            stage: evo_engine::optimization::OptimizationJournalStage::Merge,
+            kind: evo_engine::optimization::StageFactKind::StepPrepared,
+            request_id: episode.into(),
+            input_digest: hash(episode.as_bytes()),
+            output_digest: None,
+            dependencies: vec![],
+            payload: json!({"request":episode}),
+        }
+        .seal()
+        .unwrap();
+        s.put(
+            &worker,
+            "artifact",
+            &fact.artifact_id,
+            worker.actor(),
+            &fact,
+        )
+        .await
+        .unwrap();
+        ids.push(fact.artifact_id);
+    }
+    // A diamond: 0 -> 1 -> 3 and 0 -> 2 -> 3.
+    let pairs = [(0, 1), (0, 2), (1, 3), (2, 3)];
+    for (from, to) in pairs {
+        s.put_edge(&worker, "artifact", &ids[from], "artifact", &ids[to])
+            .await
+            .unwrap();
+    }
+    let closure = read_typed_closure(&mut s, &worker, &[("artifact".into(), ids[0].clone())])
+        .await
+        .unwrap();
+    println!("AG109_T4 acyclic closure digest={}", closure.digest);
+    let mut nodes = Vec::new();
+    for id in &ids {
+        let body: Value = s.need(&worker, "artifact", id).await.unwrap();
+        nodes.push(TypedContentRef {
+            kind: "artifact".into(),
+            id: id.clone(),
+            schema_version: evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+            content_digest: fingerprint(&body).unwrap(),
+        });
+    }
+    nodes.sort();
+    let mut edges: Vec<_> = pairs
+        .iter()
+        .map(|(from, to)| TypedContentEdge {
+            from_kind: "artifact".into(),
+            from_id: ids[*from].clone(),
+            to_kind: "artifact".into(),
+            to_id: ids[*to].clone(),
+        })
+        .collect();
+    edges.sort();
+    assert_eq!(closure.nodes, nodes);
+    assert_eq!(closure.edges, edges);
+    assert_eq!(closure.digest, fingerprint(&(&nodes, &edges)).unwrap());
+    drop(s);
+    store.close().await;
 }

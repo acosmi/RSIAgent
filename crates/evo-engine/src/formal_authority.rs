@@ -453,6 +453,12 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
 }
 /// Traverses every typed edge, including releases and intermediate controls.
 /// Missing objects, unsupported schema, cycles and conflicting identities fail.
+/// One edge class takes no part in the cycle check: the GA-18 attachment edge
+/// from a bound `evaluation_ticket_v2` to an `execution_receipt_v2` or
+/// `independent_grader_receipt_v2` written after issue, judged from both
+/// validated envelope bodies. It is still traversed and kept in the closure's
+/// edges and digest; any cycle of other edges (a Skill or StageFact dependency
+/// cycle, L618/V048) still fails.
 pub async fn read_typed_closure(
     s: &mut Session,
     ctx: &Context,
@@ -468,6 +474,9 @@ pub async fn read_typed_closure(
     let mut nodes = BTreeMap::new();
     let mut edges = BTreeSet::new();
     let mut total_bytes = 0usize;
+    // Validated E05 envelopes at either end of a GA-18 attachment edge.
+    let mut tickets = BTreeSet::new();
+    let mut attached_facts = BTreeSet::new();
     while let Some((kind, id)) = pending.pop() {
         identifier(&kind)?;
         identifier(&id)?;
@@ -492,6 +501,17 @@ pub async fn read_typed_closure(
             ));
         }
         let schema = supported_node_schema(&kind, &id, &body)?;
+        if schema == "rsia.typed_artifact_envelope.v1" {
+            match body["record_kind"].as_str() {
+                Some("evaluation_ticket_v2") => {
+                    tickets.insert((kind.clone(), id.clone()));
+                }
+                Some("execution_receipt_v2" | "independent_grader_receipt_v2") => {
+                    attached_facts.insert((kind.clone(), id.clone()));
+                }
+                _ => {}
+            }
+        }
         let authority_role = match schema.as_str() {
             PROFILE_SCHEMA
             | ROOT_SCHEMA
@@ -557,16 +577,19 @@ pub async fn read_typed_closure(
             },
         );
     }
-    // Kahn's algorithm detects a real directed cycle without recursion.
+    // Kahn's algorithm detects a real directed cycle without recursion. A
+    // ticket -> receipt attachment edge is not counted, so only a cycle it
+    // closes is accepted; output order and digest below never depend on this.
     let mut degrees: BTreeMap<_, usize> = nodes.keys().cloned().map(|key| (key, 0)).collect();
     let mut children: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
     for edge in &edges {
+        let parent = (edge.from_kind.clone(), edge.from_id.clone());
         let child = (edge.to_kind.clone(), edge.to_id.clone());
+        if tickets.contains(&parent) && attached_facts.contains(&child) {
+            continue;
+        }
         *degrees.get_mut(&child).ok_or(Error::NotFound)? += 1;
-        children
-            .entry((edge.from_kind.clone(), edge.from_id.clone()))
-            .or_default()
-            .push(child);
+        children.entry(parent).or_default().push(child);
     }
     let mut ready: Vec<_> = degrees
         .iter()

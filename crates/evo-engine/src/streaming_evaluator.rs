@@ -2899,14 +2899,13 @@ async fn validate_status_closure(
                         vec![artifact_edge(TICKET_KIND, &ticket.id)?],
                     )
                     .await?;
+                    let report_edges =
+                        bound_complete_report_edges(session, ctx, ticket, &control).await?;
                     require_exact_fact_edges(
                         session,
                         ctx,
                         &storage_id(FORMAL_KIND, &ticket.id)?,
-                        vec![
-                            artifact_edge(TICKET_KIND, &ticket.id)?,
-                            artifact_edge(RESOURCE_KIND, &ticket.id)?,
-                        ],
+                        report_edges,
                     )
                     .await?;
                     if bind_stored_facts_in_session(session, ctx, ticket)
@@ -4805,6 +4804,49 @@ async fn put_fact_edges(
 
 fn artifact_edge(kind: &str, logical_id: &str) -> Result<(String, String)> {
     Ok(("artifact".into(), storage_id(kind, logical_id)?))
+}
+
+/// The exact outgoing edges of a bound complete report: its ticket and its
+/// resource evidence and, for a registered external host, the principal
+/// action the issuer records over the report in the same finalize
+/// transaction. The action id is read from the persisted issued authority,
+/// never recomputed here; the set stays exact either way (E05 L1257).
+async fn bound_complete_report_edges(
+    session: &mut Session,
+    ctx: &Context,
+    ticket: &EvaluationTicketV2,
+    control: &RegisteredEvaluationControl,
+) -> Result<Vec<(String, String)>> {
+    let mut edges = vec![
+        artifact_edge(TICKET_KIND, &ticket.id)?,
+        artifact_edge(RESOURCE_KIND, &ticket.id)?,
+    ];
+    if control.evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
+        edges.push((
+            "artifact".into(),
+            issued_report_principal_action(session, ctx, &ticket.id).await?,
+        ));
+    }
+    Ok(edges)
+}
+
+/// Read only: the report principal action named by the persisted
+/// `IssuedFormalAuthority` of this ticket. Its authenticity is checked by
+/// `verify_issued_authority`; a missing or unreadable record is a Conflict.
+async fn issued_report_principal_action(
+    session: &mut Session,
+    ctx: &Context,
+    ticket_id: &str,
+) -> Result<String> {
+    let missing =
+        || Error::Conflict("issued formal authority missing for external-host report".into());
+    let authority = session
+        .get::<Value>(ctx, "artifact", &format!("formal-authority-{ticket_id}"))
+        .await?
+        .ok_or_else(missing)?;
+    let authority: crate::formal_authority::IssuedFormalAuthority =
+        serde_json::from_value(authority).map_err(|_| missing())?;
+    Ok(authority.report_principal_action_id)
 }
 
 async fn require_exact_fact_edges(
