@@ -659,6 +659,27 @@ pub struct SealedRootBudgetEvidence {
     pub sealed_at: i64,
 }
 
+/// A budget call named by its key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetCallKey {
+    pub billing_scope: String,
+    pub call_id: String,
+}
+
+/// What one run of `Store::recover_settled_open_executions` did. Both lists are in
+/// key order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettledOpenRecovery {
+    /// The finalized calls with a persisted response whose execution this run closed.
+    pub closed: Vec<BudgetCallKey>,
+    /// The finalized calls whose execution is open and that carry no persisted
+    /// response. Nothing shows that their execution ended, so they are left open
+    /// for an Admin to close or reconcile explicitly.
+    pub open_without_artifact: Vec<BudgetCallKey>,
+}
+
 impl Store {
     pub async fn authorize_root_budget(
         &self,
@@ -1702,6 +1723,120 @@ impl Store {
             .ok_or(Error::Internal)?;
         tx.commit().await.map_err(internal)?;
         Ok(updated)
+    }
+
+    /// Recovers the execution closes a crash lost; `rsia serve` runs it at startup.
+    ///
+    /// A model call is settled (its charge booked and its response persisted) and its
+    /// execution closed in two commits. A crash between them leaves the call finalized
+    /// with its execution open, and only a replay of the same request closes it then.
+    /// A call that is never replayed holds its billing root: the dispatch gate counts
+    /// it as active, so every later call of the root is refused with
+    /// `root_concurrency_limit`, and the monetary snapshot reports it as
+    /// `ExecutionOpen`.
+    ///
+    /// This reads the finalized calls whose execution is open, of every namespace, in
+    /// the billing scopes `ctx` is a member of, page by page in key order, so that it
+    /// depends on no scan of a fixed size (plan E08: the cleanup goes on after a
+    /// crash). What it does with a call is derived from the call row alone, as plan
+    /// §7.2.1 rebuilds its recovery queue from durable records and keeps no fact source
+    /// of its own:
+    ///
+    /// * a call that carries a persisted response, usable, blocked or redacted, had its
+    ///   charge booked and its execution ended. It is closed through
+    ///   `close_budget_call_execution` with the reason
+    ///   `recovered_persisted_response_at_startup`, which writes the three execution
+    ///   columns and one `execution_closed` event and no amount, state or response
+    ///   (plan §11.5: recovery restores the cost state of what was dispatched; E08: no
+    ///   real bill is cleared). A finalized call with an open execution always holds
+    ///   its dispatch id: the dispatch writes it in the update that opens the execution.
+    /// * a call that carries no response is listed in `open_without_artifact` and left
+    ///   open: nothing shows that its execution ended (plan §6.6: a status does not
+    ///   report as exited what may not have exited), so an Admin closes or reconciles
+    ///   it explicitly (E04: what is unknown is left to a manual reconciliation and
+    ///   nothing is feigned).
+    ///
+    /// Dispatched and uncertain calls are not read (plan §6.6: a dispatched call whose
+    /// cost is unknown stays uncertain until it is reconciled), nor are closed calls,
+    /// so a second run closes nothing and writes nothing. The calls of a root `ctx` is
+    /// not a member of are neither read nor listed, as an Admin outside a root reads
+    /// and closes none of its calls. Only an Admin runs it. An error stops the run,
+    /// and the calls it closed before stay closed.
+    pub async fn recover_settled_open_executions(
+        &self,
+        ctx: &Context,
+        now: i64,
+    ) -> Result<SettledOpenRecovery> {
+        // The reason this recovery records its closes with, and the calls it reads at
+        // a time.
+        const REASON: &str = "recovered_persisted_response_at_startup";
+        const PAGE: i64 = 128;
+        ctx.require(&[Role::Admin])?;
+        valid_time(now)?;
+        let mut recovery = SettledOpenRecovery::default();
+        let mut cursor: Option<(String, String)> = None;
+        loop {
+            let (after_scope, after_call) = match &cursor {
+                Some((scope, call)) => (Some(scope.as_str()), Some(call.as_str())),
+                None => (None, None),
+            };
+            // A page is read and released before anything is closed: the store has a
+            // single connection, and every close takes it in a transaction of its own.
+            let mut tx = self.pool.begin().await.map_err(internal)?;
+            let rows = sqlx::query(
+                "SELECT billing_scope,call_id,dispatch_id,
+                   response_artifact_body IS NOT NULL AS has_response
+                 FROM root_budget_calls
+                 WHERE state='finalized' AND execution_closed=0
+                   AND ((response_artifact_body IS NOT NULL AND dispatch_id IS NOT NULL)
+                     OR response_artifact_body IS NULL)
+                   AND EXISTS(SELECT 1 FROM root_budget_namespaces AS member
+                     WHERE member.billing_scope=root_budget_calls.billing_scope
+                       AND member.namespace=?)
+                   AND (? IS NULL OR billing_scope>? OR (billing_scope=? AND call_id>?))
+                 ORDER BY billing_scope,call_id LIMIT ?",
+            )
+            .bind(ctx.namespace())
+            .bind(after_scope)
+            .bind(after_scope)
+            .bind(after_scope)
+            .bind(after_call)
+            .bind(PAGE)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(internal)?;
+            tx.commit().await.map_err(internal)?;
+            if rows.is_empty() {
+                return Ok(recovery);
+            }
+            for row in &rows {
+                let key = BudgetCallKey {
+                    billing_scope: row.try_get("billing_scope").map_err(internal)?,
+                    call_id: row.try_get("call_id").map_err(internal)?,
+                };
+                cursor = Some((key.billing_scope.clone(), key.call_id.clone()));
+                if row.try_get::<i64, _>("has_response").map_err(internal)? == 0 {
+                    recovery.open_without_artifact.push(key);
+                    continue;
+                }
+                let dispatch_id: String = row.try_get("dispatch_id").map_err(internal)?;
+                let call = self
+                    .close_budget_call_execution(
+                        ctx,
+                        &key.billing_scope,
+                        &key.call_id,
+                        &dispatch_id,
+                        REASON,
+                        now,
+                    )
+                    .await?;
+                // A call its own caller closed after the page was read is closed, but
+                // not by this run.
+                if call.execution_close_reason.as_deref() == Some(REASON) {
+                    recovery.closed.push(key);
+                }
+            }
+        }
     }
 
     pub async fn stop_root_budget(
