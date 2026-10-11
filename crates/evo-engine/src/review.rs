@@ -10,7 +10,8 @@ use crate::model::CompilerInputUse;
 use crate::optimization::{
     DevelopmentRunRequest, DevelopmentSelection, DevelopmentSelectionDecision,
     OptimizationJournalStage, StageFact, StageFactKind, StepTerminalClass,
-    development_request_fact_id, verified_development_observation_in_session,
+    development_request_fact_id, edit_compiled_input_digest,
+    verified_development_observation_in_session,
 };
 use crate::release_store::{RELEASE_CANDIDATE_SCHEMA, ReleaseStore, TypedSourceRef};
 use crate::streaming_evaluator::{
@@ -2116,7 +2117,17 @@ fn validate_compiled(
     let mut batch = prepared.edit_template.clone();
     batch.evidence = compiled.merge.evidence.clone();
     batch.edits = compiled.merge.edits.clone();
-    if fact.input_digest != fingerprint(&batch).map_err(material_error)? {
+    // One digest rule for this field (plan §5.2, AG-108): the producer's own
+    // `edit_compiled_input_digest`. A fact compiled under an authenticated
+    // compiler binding is digested together with that binding (plan §5.1); a
+    // fact without the compiler keys keeps the old algorithm. Mirroring
+    // StepPrepared (`read_prepared`), a mixed shape is never guessed.
+    let binding = match (&compiled.compiler_request, &compiled.compiler_binding) {
+        (Some(_), Some(binding)) => Some(binding),
+        (None, None) => None,
+        _ => return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid)),
+    };
+    if fact.input_digest != edit_compiled_input_digest(&batch, binding).map_err(material_error)? {
         return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
     }
     let report = &compiled.report;
