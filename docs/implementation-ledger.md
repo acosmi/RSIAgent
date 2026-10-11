@@ -46,6 +46,22 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 ### 判定
 第四轮合并内容可追溯且结构一致，但 main fa570e0 不满足文档化的测试闸门，并含已核实的 High 缺陷；本台账不声称第四轮"验收通过"。上述返修卡的验收以文档化环境的八项闸门全 0 与至少两个主控反例为准，合并后在本台账登记 merged_sha 与树核对结果。
 
+## 2026-10-11 第五轮首批合并登记（截至 PR #148）
+
+第五轮由两个 Claude 主控窗口并行：一个窗口负责第四轮缺陷 R1–R5 的返修（AG-095–AG-101，另含 AG-105–AG-109），本窗口负责台账、索引诚实字段、恢复升级与公平等待修复（AG-094/AG-102/AG-103/AG-104/AG-110/AG-111）。两窗口共用磁盘闸门（任一编译前空闲 ≥ 8 GiB、同一时刻只跑一个构建、全工作区测试互斥）。本节登记截至 #148 的合并事实；索引记录（reports/support-scope.json）对 #144/#145/#146 的登记按 AG-102 引入的机器字段规则执行（pr > 141 的记录带 `execution` 对象，记录级 `command/exit_code/log_path` 只描述声明的单目标）。
+
+### 合并协议与授权
+- 用户于 2026-10-11 13:35Z 与 15:25Z 指令："交付通过后 admin 批准合并"。据此，验收 7.1–7.5 全部通过的 PR 由主控执行 `gh pr merge <N> --merge --match-head-commit <验收 head> --subject "Merge AG-xxx <题> (#N) [skip ci]" --admin`；合并后核对 merged 树与验收 head 树相等。#142/#144/#145/#146 由返修窗口合并，#148 由本窗口合并，均为 admin 合并、两父提交、树相等。
+- 文档化验收环境：默认 profile（opt-level 0）、默认测试线程栈、无 RUST_MIN_STACK、`--locked`、不 `--offline`、每次验收使用全新 target。#146 之前 main 的全工作区测试在该环境下有 7 个 evo-engine 测试二进制栈溢出（#140 引入），各 PR 的验收如实记录为 test 退出码 101 + 其余二进制全部通过；#146 合并后首次全绿。
+
+### 逐任务摘要
+- **#142 AG-098（CI Python 闸门、MCP stdio 步骤、迁移 0007 校验和）**：head 2236ad1944138642dd7f0ba4fadb3c613adec07d → merged e727d1c65d87de36d85983e606c34b725f5ff94e（2026-10-11T13:46:05Z）。无 Rust 改动；Python/CI 门在 head 上全部退出 0（discover Ran 141 OK skipped=47；MCP stdio 47/47）；Rust 测试门沿用 fa570e0 的全量结果（crates/、apps/、Cargo.* 与 fa570e0 完全相同），未声称本 PR 新跑。按先例（#98/#102/#107/#112/#115/#120/#129/#139/#141）不进索引记录。
+- **#144 AG-097（已结算调用在拒绝撤销缓存内容前先记录恢复关闭）**：head 98431d59d765f0c16a5b736147de4735d2adbe2b（交付 29d35927 于 fa570e0，叠放到 e727d1c6 补丁字节一致）→ merged 184764302e64ca3871fc68103bd07abec1125918（14:52:30Z）。全量：fmt/clippy 0，test 101（128 二进制 1630 通过 0 失败 = 父 1627 + 新 3，7 个已知溢出二进制不变），build/smokes/checker/unittest 0；主控反例 2 个 head 通过、父 e727d1c6 失败。索引记录 E04.ag097_broker_close_before_refuse（V007/V008/V086/V096）。
+- **#145 AG-096（撤销清理把不可读的历史预算请求行隔离为未知作用域而非回滚命名空间）**：head 4fd5701ad6677c0c441fd376eec953e001fc7012（叠放到 18476430 补丁字节一致）→ merged 7d39ef7350615be82d698d6914d03856fa0df97c（16:06:26Z）。全量：fmt/clippy 0，test 101（129 二进制 1639 通过 0 失败 = 父 1630 + 新 9，溢出集合不变），其余 0；反例 2 个 head 通过、基线 18476430 失败。索引记录 E08.ag096_unreadable_bound_request_isolated（V017/V018/V075/V096）。
+- **#146 AG-099（装箱 step 路径 async future，7 个 evo-engine 测试二进制在默认测试栈内完成）**：head 45377b9d78c373fbd68b89221ba138e9eed114ab（叠放到 7d39ef73）→ merged 98776f1717b37a47e4a7fcc4349ff0faff68ce1b。全量首次全绿：fmt/clippy 0，test 0（136 二进制 1741 通过 0 失败，溢出 0），其余 0；反例：7 个此前溢出目标在 head 全部通过（102 项），在基线 7d39ef73 全部溢出。索引记录 E00.ag099_step_future_default_test_stack（V001/V080；test_entry 取 step_terminal_classes_v42）。
+- **#148 AG-102（索引机器字段：声明目标与实际执行证据分离）**：base e727d1c → head 971d4eb3d9abd79aeb02374d4393c6da67e00cc0（叠放到 98776f17 补丁字节一致）→ merged 1ef0b2163fe9b6c46c9d49b558e6e25c0e13ab12（16:52:06Z）。改动仅 4 文件（reports/support-scope.json、scripts/check_support_scope.py、scripts/test_check_support_scope.py、crates/evo-core/tests/support_scope.rs）：顶层 `field_semantics` 钉死 command/exit_code/log_path/execution/production_consumer 的含义；pr > 141 记录必须带 `execution{runner, command, scope, exit_code, evidence}`；`production_consumer=none_library_only` 标注 #125/#128/#130/#131 四条记录（截至 e727d1c 无 engine/http/mcp/apps 生产调用方）；追溯回填 13 处（#103→V002；#105→V033/V035；#106→V010–V013/V084/V085/V096/V097；#114+#117→V067）；92 条旧记录除上述四条外字节不变。全量：8 项退出码全 0，136 二进制 1748 通过（父 1741 + 7），Python discover 160 OK；索引篡改探针 6 例在 head 全部被拒、其中 2 例在父树被接受（真反例）。按先例不进索引记录。登记的偏差：Python 检查器按所属任务规则拒绝 AG-058 对 V001/V002/V017/V032/V037 的引用而 Rust 镜像仅查引用存在，两者在该规则上不一致，未在本 PR 修复。
+- 清理：各 PR 验收 target 已删除；分支删除按用户命令清单执行。
+
 ## 2026-10-11 第四轮在途收尾与最终证据索引
 
 按用户最后指令停止新增任务，仅接收原在途交付、必要关联返修和本次收尾台账。原在途产品与透明3D状态小人前端均已实际合并，当前产品主线为 f6904dcd2d4f3b46b3311886fd4dcecd8a2f711c。第四轮 #98 至 #140 已合并；本次三文件台账自身以此主线为父，仍须独立全量与两项原索引反例通过后按固定 head 合并。
@@ -74,6 +90,9 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 | [#137](https://github.com/acosmi/RSIAgent/pull/137) | AG091 | 730f242cd4fe076c4d751e3f823cc8a9385fbb93 | 27df8c2cfccbefa6544b55b697c10abbb6c0a61c | E05 |
 | [#138](https://github.com/acosmi/RSIAgent/pull/138) | AG092 | 39d2d865c203ca45dd278efa591c934abffb0165 | 77ef86294b7760fc7495d12d4029ca8a3567bc5e | E02 |
 | [#140](https://github.com/acosmi/RSIAgent/pull/140) | AG093 | 49806d7faf703aab7e7e467c4bd5518969a24e55 | f6904dcd2d4f3b46b3311886fd4dcecd8a2f711c | E02 |
+| [#144](https://github.com/acosmi/RSIAgent/pull/144) | AG097 | 98431d59d765f0c16a5b736147de4735d2adbe2b | 184764302e64ca3871fc68103bd07abec1125918 | E04 |
+| [#145](https://github.com/acosmi/RSIAgent/pull/145) | AG096 | 4fd5701ad6677c0c441fd376eec953e001fc7012 | 7d39ef7350615be82d698d6914d03856fa0df97c | E08 |
+| [#146](https://github.com/acosmi/RSIAgent/pull/146) | AG099 | 45377b9d78c373fbd68b89221ba138e9eed114ab | 98776f1717b37a47e4a7fcc4349ff0faff68ce1b | E00 |
 
 | E任务 | 默认完整范围状态 | 已验子范围记录数 |
 |---|---|---|

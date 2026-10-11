@@ -93,6 +93,35 @@
           "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/implementation-v4.1-20260919/controller-e00.json"
+        },
+        {
+          "id": "E00.ag099_step_future_default_test_stack",
+          "description": "Step-path async futures are boxed so the seven evo-engine test binaries complete on the default test-thread stack in the documented environment",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "45377b9d78c373fbd68b89221ba138e9eed114ab",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/146",
+          "merged_sha": "98776f1717b37a47e4a7fcc4349ff0faff68ce1b",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/step_terminal_classes_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test step_terminal_classes_v42",
+          "input_digest": "7da6067fa70bff632d62c42aec3644b71c8e0f0ae10c896f6e707e5c95647c77",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag094/ctrl-ag094-final.step_terminal_classes_v42.log",
+          "actual_result": "peer-window controller acceptance at 45377b9 (restacked onto 7d39ef73; fresh target): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 136 binaries 1741 passed / 0 failed / 0 stack overflow (parent 7d39ef73: 129 binaries 1639 passed plus 7 binaries aborting on stack overflow: exploration_recovery_counting_v42, exploration_trust_v42, exploration_v41, meta_trial_v42, monitoring, monitoring_consolidation_v42, step_terminal_classes_v42), build rsia 0, both smokes 0, checker 0, unittest 0; controller probes: the 7 previously overflowing targets all pass on head (102 tests) and all overflow on base 7d39ef73. Declared target covered with exit 0 by this window's AG-094 full run on the merged tree: out/audit-20260930/qa/accept-ag094/ctrl-ag094-final.step_terminal_classes_v42.log.",
+          "scope": "E00; E00 L1185 (real exit codes), section 6.2 L611 (explicit per-step failure end); V001/V080 subset: the workspace test suite completes in the documented environment (default profiles, default 2 MiB test-thread stack, no RUST_MIN_STACK, no opt-level override) because step-path futures in development.rs, exploration.rs, monitoring.rs and optimization.rs are boxed; product semantics unchanged beyond stack usage",
+          "risk": "No claim about other toolchains, opt levels or platforms, no performance claim, no change of any E/V completion, effect or release",
+          "rollback": "revert PR #146 through an independent revert PR; accepted-head parent 7d39ef7350615be82d698d6914d03856fa0df97c; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-099-45377b9.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-099 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-099-45377b9.log.test"
+          }
         }
       ],
       "remaining": [
@@ -568,6 +597,35 @@
           "scope": "E04; Typed E16 budget source snapshots, cleanup and recovery software/component boundary only. Library-only as of e727d1c: no production caller in engine/http/mcp/apps.",
           "source_sha": "26d3fe400ee1aad36082081eda6c60f3ee1a17f7",
           "test_entry": "crates/evo-storage/tests/e16_budget_binding_v42.rs"
+        },
+        {
+          "id": "E04.ag097_broker_close_before_refuse",
+          "description": "Settled model calls record their recovery close before the cached-replay path refuses revoked content",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "98431d59d765f0c16a5b736147de4735d2adbe2b",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/144",
+          "merged_sha": "184764302e64ca3871fc68103bd07abec1125918",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/broker_cache_revoke_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test broker_cache_revoke_v42",
+          "input_digest": "21dcae75c1b08a76ea60ea0d5e51efe1bde0a67ccb3a8192ad11d14023eefc60",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag094/ctrl-ag094-final.broker_cache_revoke_v42.log",
+          "actual_result": "peer controller acceptance at 98431d5 (fresh target): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 101 with 1630 passed / 0 failed (parent e727d1c 1627 + 3 new) and the 7 known evo-engine stack-overflow binaries unchanged, build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes pass on head and fail on parent e727d1c (settled call left open after refused replays / corrupt artifact). Declared target covered with exit 0 by this window's AG-094 full run on the merged tree after AG-099 (out/audit-20260930/qa/accept-ag094/ctrl-ag094-final.broker_cache_revoke_v42.log).",
+          "scope": "E04; sections 11 L1077, 6.6 L706, 7.2.1 L831, E04 L1243; V007/V008/V086/V096 subset: a settled call whose close was lost records the recovery close (recovered_persisted_model_response) before any content decision on the cached-replay path, so the same billing scope can dispatch again; refusal forms (Rejected after cleanup, Uncertain on legacy rows) unchanged; no other write",
+          "risk": "No real provider or billing, no exhaustive concurrency, no dispatch-side revocation rules, no dispatch_bound recovery, no management exit for calls never replayed; no full E/V, effect or release claim",
+          "rollback": "revert PR #144 through an independent revert PR; accepted-head parent e727d1c65d87de36d85983e606c34b725f5ff94e; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-097-98431d5.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-097 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 101,
+            "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-097-98431d5.log.test"
+          }
         }
       ],
       "remaining": [
@@ -1378,6 +1436,35 @@
           "scope": "E08; Direct typed import source/result dependency binding software/component boundary only. Library-only as of e727d1c: no production caller in engine/http/mcp/apps.",
           "source_sha": "8a92e578527b6334b5fb776abf46c5bc9a88e4b7",
           "test_entry": "crates/evo-storage/tests/dependency_read_v42.rs"
+        },
+        {
+          "id": "E08.ag096_unreadable_bound_request_isolated",
+          "description": "Revoke cleanup isolates an unreadable historical budget request as an unknown scope instead of rolling back the namespace",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "4fd5701ad6677c0c441fd376eec953e001fc7012",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/145",
+          "merged_sha": "7d39ef7350615be82d698d6914d03856fa0df97c",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-storage/tests/cleanup_unreadable_bound_request_v42.rs",
+          "command": "cargo test --locked --offline -p evo-storage --test cleanup_unreadable_bound_request_v42",
+          "input_digest": "bd3687adc3dbe887c2c83ff402029441ab65170b824ab405a3d8c1a95480b926",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag094/ctrl-ag094-final.cleanup_unreadable_bound_request_v42.log",
+          "actual_result": "peer-window controller acceptance at 4fd5701 (restacked onto 18476430, patch byte-identical; fresh target): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 101 with 129 binaries 1639 passed / 0 failed (parent 18476430: 1630) and the same 7 evo-engine stack-overflow binaries as the parent (#140 set, fixed by AG-099), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-ag096-claude/append.rs) pass on head and fail on base 18476430 (cleanup rolled back with Internal). Declared target covered with exit 0 by this window's AG-094 full run on the merged tree after AG-099: out/audit-20260930/qa/accept-ag094/ctrl-ag094-final.cleanup_unreadable_bound_request_v42.log.",
+          "scope": "E08; E08 L1299 (post-crash continued cleanup; unknown watermark enters isolated diagnosis), E08 L1301 (no cleaning of real bills, no rewriting of historical failures), sections 11/11.5; V017/V018/V075/V096 subset: the shared budget-request reader (lifecycle.rs budget_request_source_ids) reads only the source closure from strict JSON; an unreadable body of a known schema (invalid or duplicate-key JSON, missing/other wire version, missing or mistyped closure or id) becomes Unknown(\"unreadable_budget_request:<schema>\") recorded persistently and no longer rolls back the namespace cleanup; readable rows, bills and watermark history unchanged; use-path checks (validate, fingerprints, unknown fields) no longer gate the destructive cleanup",
+          "risk": "No real provider or billing, no automatic repair of the isolated row, no claim about unknown-field or fingerprint-mismatch bodies beyond what the 9 new tests pin, no exhaustive crash-point coverage, no full E/V, effect or release claim",
+          "rollback": "revert PR #145 through an independent revert PR; accepted-head parent 184764302e64ca3871fc68103bd07abec1125918; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-096-4fd5701.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-096 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 101,
+            "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-096-4fd5701.log.test"
+          }
         }
       ],
       "remaining": [
@@ -4329,7 +4416,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E00.controller_acceptance",
-          "E16.6.ag086_local_scoped_acceptance"
+          "E16.6.ag086_local_scoped_acceptance",
+          "E00.ag099_step_future_default_test_stack"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4443,7 +4531,8 @@
           "E04.controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E04.ag082_local_scoped_acceptance",
-          "E04.ag077_local_scoped_acceptance"
+          "E04.ag077_local_scoped_acceptance",
+          "E04.ag097_broker_close_before_refuse"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4461,7 +4550,8 @@
           "E04.controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E04.ag082_local_scoped_acceptance",
-          "E04.ag077_local_scoped_acceptance"
+          "E04.ag077_local_scoped_acceptance",
+          "E04.ag097_broker_close_before_refuse"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4665,7 +4755,8 @@
           "E06.ag084_local_scoped_acceptance",
           "E16.1.ag076_local_scoped_acceptance",
           "E16.1.ag070_local_scoped_acceptance",
-          "E08.ag075_local_scoped_acceptance"
+          "E08.ag075_local_scoped_acceptance",
+          "E08.ag096_unreadable_bound_request_isolated"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4686,7 +4777,8 @@
           "E16.5.gate_functions_controller_acceptance",
           "E08.ag069_local_scoped_acceptance",
           "E08.ag073_local_scoped_acceptance",
-          "E08.ag075_local_scoped_acceptance"
+          "E08.ag075_local_scoped_acceptance",
+          "E08.ag096_unreadable_bound_request_isolated"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5651,7 +5743,8 @@
           "E08.ag069_local_scoped_acceptance",
           "E08.ag073_local_scoped_acceptance",
           "E06.ag084_local_scoped_acceptance",
-          "E08.ag075_local_scoped_acceptance"
+          "E08.ag075_local_scoped_acceptance",
+          "E08.ag096_unreadable_bound_request_isolated"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5739,7 +5832,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E00.controller_acceptance",
-          "E16.6.ag086_local_scoped_acceptance"
+          "E16.6.ag086_local_scoped_acceptance",
+          "E00.ag099_step_future_default_test_stack"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5952,7 +6046,8 @@
           "E09.ag074_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E04.ag097_broker_close_before_refuse"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6319,7 +6414,9 @@
           "E08.ag075_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance",
-          "E01.ag057_explicit_sample_registration"
+          "E01.ag057_explicit_sample_registration",
+          "E04.ag097_broker_close_before_refuse",
+          "E08.ag096_unreadable_bound_request_isolated"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
