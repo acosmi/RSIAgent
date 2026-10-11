@@ -44,6 +44,7 @@ const FORMAL_KIND: &str = "formal_evaluation_v2";
 const OUTPUT_KIND: &str = "evaluation_execution_output_v1";
 const RESOURCE_KIND: &str = "evaluation_resource_evidence_v1";
 const ENVELOPE_SCHEMA: &str = "rsia.typed_artifact_envelope.v1";
+const STATISTICS_CHANGED: &str = "formal_complete_batch_statistics_changed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -783,7 +784,7 @@ pub struct IndependentGraderReceiptV2 {
     pub issued_at_unix_seconds: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BernsteinReportWire {
     pub stats_version: String,
@@ -2073,25 +2074,7 @@ impl IndependentEvaluationControl {
                 _ => None,
             })
             .collect();
-        let alpha = control.alpha_plan.allocation(
-            &control.fixed_sample_claim_id,
-            &control.attempt_id,
-            FormalClaimKind::FixedSampleGain,
-        )?;
-        let alpha = alpha
-            .parse::<f64>()
-            .map_err(|_| Error::Invalid("invalid fixed-sample alpha".into()))?;
-        let raw = empirical_bernstein(&rows, alpha)?;
-        let mut bound_v1_plan = control.v1_plan_snapshot.clone();
-        bound_v1_plan.bind_candidate(ticket.candidate_digest.clone())?;
-        if bound_v1_plan.digest()? != ticket.bound_v1_plan_digest {
-            return Err(Error::Conflict("bound v1 plan digest mismatch".into()));
-        }
-        let report = postprocess_complete_report(
-            &control.schema_version,
-            ticket.profile,
-            decide(&bound_v1_plan, raw, cost_ratio, p95_ratio, true)?,
-        )?;
+        let report = derive_complete_report(&ticket, &control, &rows, cost_ratio, p95_ratio)?;
         let anchor_evidence_digest = anchor_evidence_digest(&ticket)?;
         let resource_evidence = ResourceEvidenceRecord {
             schema_version: "rsia.evaluation_resource_evidence.v1".into(),
@@ -2141,6 +2124,7 @@ impl IndependentEvaluationControl {
                 ));
             }
         }
+        let mut verified_calls = Vec::new();
         for expected in &resource_evidence.calls {
             let actual = session
                 .budget_call(ctx, &control.billing_scope, &expected.call_id)
@@ -2150,6 +2134,27 @@ impl IndependentEvaluationControl {
                 return Err(Error::Conflict(
                     "execution usage changed during finalization".into(),
                 ));
+            }
+            if latest.candidate_dependency_binding.is_some() {
+                verified_calls.push(actual);
+            }
+        }
+        if latest.candidate_dependency_binding.is_some() {
+            let expected_report = recompute_bound_complete_report_in_session(
+                &mut session,
+                ctx,
+                &latest,
+                &latest_control,
+                &latest_holdout,
+                &verified_calls,
+            )
+            .await?;
+            if expected_report != BernsteinReportWire::from_report(&report)?
+                || expected_report.verdict != report.verdict
+                || resource_evidence.cost_scope != CostEvidenceScope::TicketExecutionOnly
+                || latest.evidence_scope != latest_control.evidence_scope
+            {
+                return Err(Error::Conflict(STATISTICS_CHANGED.into()));
             }
         }
         session
@@ -2688,6 +2693,8 @@ async fn validate_status_closure(
             }
         }
         Some(FormalEvaluationV2::CompleteBatch {
+            evidence_scope,
+            cost_evidence_scope,
             ticket_id,
             ticket_digest,
             manifest_digest,
@@ -2697,7 +2704,8 @@ async fn validate_status_closure(
             anchor_evidence_digest: report_anchor_digest,
             resource_evidence_digest,
             stored_dependency_binding,
-            ..
+            verdict,
+            report,
         }) => {
             match (
                 &ticket.candidate_dependency_binding,
@@ -2819,6 +2827,18 @@ async fn validate_status_closure(
                 if expected_by_id != actual_by_id {
                     return Err(Error::Conflict("actual resource evidence changed".into()));
                 }
+                let expected_report = recompute_bound_complete_report_in_session(
+                    session, ctx, ticket, &control, &holdout, &actual,
+                )
+                .await?;
+                if report != &expected_report
+                    || *verdict != expected_report.verdict
+                    || *evidence_scope != ticket.evidence_scope
+                    || *evidence_scope != control.evidence_scope
+                    || *cost_evidence_scope != CostEvidenceScope::TicketExecutionOnly
+                {
+                    return Err(Error::Conflict(STATISTICS_CHANGED.into()));
+                }
             }
         }
         Some(FormalEvaluationV2::Invalid {
@@ -2849,6 +2869,228 @@ async fn validate_status_closure(
         None => {}
     }
     Ok(())
+}
+
+fn derive_complete_report(
+    ticket: &EvaluationTicketV2,
+    control: &RegisteredEvaluationControl,
+    rows: &[ClusterObservation],
+    cost_ratio: f64,
+    p95_ratio: f64,
+) -> Result<BernsteinReport> {
+    let alpha = control.alpha_plan.allocation(
+        &control.fixed_sample_claim_id,
+        &control.attempt_id,
+        FormalClaimKind::FixedSampleGain,
+    )?;
+    let alpha = alpha
+        .parse::<f64>()
+        .map_err(|_| Error::Invalid("invalid fixed-sample alpha".into()))?;
+    let raw = empirical_bernstein(rows, alpha)?;
+    let mut bound_v1_plan = control.v1_plan_snapshot.clone();
+    bound_v1_plan.bind_candidate(ticket.candidate_digest.clone())?;
+    if bound_v1_plan.digest()? != ticket.bound_v1_plan_digest {
+        return Err(Error::Conflict("bound v1 plan digest mismatch".into()));
+    }
+    postprocess_complete_report(
+        &control.schema_version,
+        ticket.profile,
+        decide(&bound_v1_plan, raw, cost_ratio, p95_ratio, true)?,
+    )
+}
+
+// The caller first validates the full candidate/content/dependency closure.
+// Only current facts from its Session supply statistics; the formal report
+// stays outside its own upstream content pins and supplies no numeric input.
+async fn recompute_bound_complete_report_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    ticket: &EvaluationTicketV2,
+    control: &RegisteredEvaluationControl,
+    holdout: &ProtectedHoldoutRecord,
+    calls: &[BudgetCallRecord],
+) -> Result<BernsteinReportWire> {
+    let changed = || Error::Conflict(STATISTICS_CHANGED.into());
+    let planned_n = usize::try_from(ticket.n_planned).map_err(|_| changed())?;
+    if ticket.candidate_dependency_binding.is_none()
+        || !matches!(
+            ticket.lifecycle,
+            TicketLifecycle::ReadyForFinal | TicketLifecycle::CompleteBatch
+        )
+        || planned_n != control.v1_plan_snapshot.n_planned
+        || ticket.n_planned != control.formal_plan.n_planned
+        || planned_n != holdout.manifest.ordered_task_cluster_ids.len()
+        || !anchors_passed(ticket)
+    {
+        return Err(changed());
+    }
+    let actual_by_id: BTreeMap<_, _> = calls
+        .iter()
+        .map(|call| (call.call_id.as_str(), call))
+        .collect();
+    if actual_by_id.len() != calls.len() {
+        return Err(changed());
+    }
+    let mut sequences = BTreeSet::new();
+    let mut clusters = BTreeSet::new();
+    let mut receipt_ids = BTreeSet::new();
+    let mut grader_ids = BTreeSet::new();
+    let mut used_call_ids = BTreeSet::new();
+    let mut rows = Vec::new();
+    let mut candidate_cost = 0i128;
+    let mut baseline_cost = 0i128;
+    let mut candidate_latencies = Vec::new();
+    let mut baseline_latencies = Vec::new();
+    for target in &ticket.targets {
+        let TargetState::Completed {
+            candidate_receipt_id,
+            baseline_receipt_id,
+            grader_receipt_id,
+            completion_sequence,
+            ..
+        } = &target.state
+        else {
+            return Err(changed());
+        };
+        if !sequences.insert(*completion_sequence) || !grader_ids.insert(grader_receipt_id.as_str())
+        {
+            return Err(changed());
+        }
+        let grader =
+            validate_completed_target_evidence(session, ctx, ticket, control, holdout, target)
+                .await?;
+        if grader.schema_version != "rsia.independent_grader_receipt.v2"
+            || grader.receipt_id != *grader_receipt_id
+        {
+            return Err(changed());
+        }
+        if let EvaluationTargetKind::Rotating { cluster_id } = &target.kind {
+            if !clusters.insert(cluster_id.as_str()) {
+                return Err(changed());
+            }
+            rows.push(ClusterObservation {
+                cluster_id: cluster_id.clone(),
+                d: (i64::from(grader.candidate_score_micros)
+                    - i64::from(grader.baseline_score_micros)) as f64
+                    / 1_000_000.0,
+                weight: 1.0,
+            });
+        }
+        for (receipt_id, side) in [
+            (candidate_receipt_id, ExecutionSide::Candidate),
+            (baseline_receipt_id, ExecutionSide::Baseline),
+        ] {
+            if !receipt_ids.insert(receipt_id.as_str()) {
+                return Err(changed());
+            }
+            let receipt: ExecutionReceiptV2 =
+                need_record(session, ctx, EXECUTION_RECEIPT_KIND, receipt_id).await?;
+            let bundle_digest = match side {
+                ExecutionSide::Candidate => &ticket.candidate_bundle_digest,
+                ExecutionSide::Baseline => &ticket.baseline_bundle_digest,
+            };
+            let expected_request = request_digest(
+                ticket,
+                target,
+                side,
+                bundle_digest,
+                &ticket.environment_digest,
+            )?;
+            if receipt.schema_version != "rsia.execution_receipt.v2"
+                || receipt.receipt_id != *receipt_id
+                || receipt.executor_actor != ticket.executor_actor
+                || receipt.request_digest != expected_request
+            {
+                return Err(changed());
+            }
+            let call = actual_by_id
+                .get(receipt.budget_call_id.as_str())
+                .ok_or_else(changed)?;
+            let amount = call.actual_cost_micros.ok_or_else(changed)?;
+            if !used_call_ids.insert(call.call_id.as_str())
+                || call.billing_scope != control.billing_scope
+                || call.namespace != ctx.namespace()
+                || call.dispatch_group_id != ticket.id
+                || call.stage != BudgetStage::TaskExecution
+                || call.actual_input_digest != expected_request
+                || call.output_digest.as_deref() != Some(receipt.output_digest.as_str())
+                || call.state != BudgetCallState::Finalized
+                || !call.execution_closed
+                || call.dispatch_id.is_none()
+                || call.dispatched_at.is_none()
+                || call.finalized_at.is_none()
+                || call.execution_closed_at.is_none()
+                || amount < 0
+                || call.actual_currency.as_deref()
+                    != Some(control.optimization_budget.root_total.currency.as_str())
+                || call.actual_pricing_version.as_deref()
+                    != Some(
+                        control
+                            .optimization_budget
+                            .root_total
+                            .pricing_version
+                            .as_str(),
+                    )
+            {
+                return Err(changed());
+            }
+            // Historical closure does not require a live lease or open root.
+            // A late usage settlement may occur after execution has closed.
+            let amount = i128::from(amount);
+            match side {
+                ExecutionSide::Candidate => {
+                    candidate_cost = candidate_cost.checked_add(amount).ok_or_else(changed)?;
+                    candidate_latencies.push(receipt.latency_micros);
+                }
+                ExecutionSide::Baseline => {
+                    baseline_cost = baseline_cost.checked_add(amount).ok_or_else(changed)?;
+                    baseline_latencies.push(receipt.latency_micros);
+                }
+            }
+        }
+    }
+    let target_count = u64::try_from(ticket.targets.len()).map_err(|_| changed())?;
+    if !sequences.iter().copied().eq(1..=target_count)
+        || ticket.next_sequence != target_count.checked_add(1).ok_or_else(changed)?
+        || rows.len() != planned_n
+        || !rows
+            .iter()
+            .map(|row| &row.cluster_id)
+            .eq(holdout.manifest.ordered_task_cluster_ids.iter())
+        || used_call_ids.len() != actual_by_id.len()
+        || baseline_cost <= 0
+        || candidate_cost < 0
+    {
+        return Err(changed());
+    }
+    if let Some(early) = &control.early_stop_plan {
+        early.validate_against(&control.alpha_plan)?;
+        if early.ordered_cluster_ids != holdout.manifest.ordered_task_cluster_ids {
+            return Err(changed());
+        }
+        // Replay actual callback order. The existing pending map consumes the
+        // frozen continuous prefix, including valid reverse callback arrival.
+        let (decision, stream) = rebuild_stream(ticket, early, &control.alpha_plan)?;
+        if decision != EarlyStopDecision::FinalFixedSample || stream.k() != ticket.n_planned {
+            return Err(changed());
+        }
+    }
+    let baseline_p95 = p95(&mut baseline_latencies)?;
+    let candidate_p95 = p95(&mut candidate_latencies)?;
+    if baseline_p95 == 0 {
+        return Err(changed());
+    }
+    let report = derive_complete_report(
+        ticket,
+        control,
+        &rows,
+        candidate_cost as f64 / baseline_cost as f64,
+        candidate_p95 as f64 / baseline_p95 as f64,
+    )?;
+    if report.n != planned_n {
+        return Err(changed());
+    }
+    BernsteinReportWire::from_report(&report)
 }
 
 async fn validate_completed_target_evidence(
