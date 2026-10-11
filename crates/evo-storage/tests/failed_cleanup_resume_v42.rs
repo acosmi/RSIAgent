@@ -889,7 +889,28 @@ async fn both_scan_cursors_reset_before_old_blockers_and_accounting_never_rewind
     let mut f = Fixture::new().await;
     source(&f.store, NS, "source").await;
     for scope in ["scope-a", "scope-z"] {
-        budget_call(&f.store, scope, "same-call", "rsia.unknown_request.v9").await;
+        // AG-107 fixture (independent review: plan §7.2.1 L831 rechecks a queued
+        // call before dispatch, §11.3 L1112 isolates what is missing, and the
+        // AG-107 card): the dispatch now refuses a call reserved without a source
+        // list whose request cannot be read, so this old blocker (it was reserved
+        // as `rsia.unknown_request.v9`) is dispatched and settled with a readable
+        // request and then made unreadable with the test-only `set_request`, so
+        // the cleanup still meets a billed call whose request it cannot read.
+        // Replacement coverage: `budget_ref_missing_fail_closed_v42.rs` (T2).
+        budget_call(
+            &f.store,
+            scope,
+            "same-call",
+            "rsia.model_request.artifact.v1",
+        )
+        .await;
+        set_request(
+            &f.path,
+            scope,
+            "same-call",
+            &json!({"input":"BUDGET-SECRET"}).to_string(),
+        )
+        .await;
     }
     let mut session = f.store.session().await.unwrap();
     for id in ["world-a", "world-z"] {
@@ -1164,7 +1185,28 @@ async fn sql_failure_during_retry_rolls_back_state_frontier_and_retry_event() {
 async fn raw_json_parser_failure_is_isolated_and_cannot_fake_complete() {
     let mut f = Fixture::new().await;
     source(&f.store, NS, "source").await;
-    budget_call(&f.store, "scope-a", "call", "rsia.unknown_request.v9").await;
+    // AG-107 fixture (independent review: plan §7.2.1 L831 rechecks a queued call
+    // before dispatch, §11.3 L1112 isolates what is missing, and the AG-107 card):
+    // the dispatch now refuses a call reserved without a source list whose request
+    // cannot be read, so the blocker of the first round (it was reserved as
+    // `rsia.unknown_request.v9`) is dispatched and settled with a readable request
+    // and then made unreadable with the test-only `set_request`, so the cleanup
+    // still meets a billed call whose request it cannot read. Replacement
+    // coverage: `budget_ref_missing_fail_closed_v42.rs` (T2).
+    budget_call(
+        &f.store,
+        "scope-a",
+        "call",
+        "rsia.model_request.artifact.v1",
+    )
+    .await;
+    set_request(
+        &f.path,
+        "scope-a",
+        "call",
+        &json!({"input":"BUDGET-SECRET"}).to_string(),
+    )
+    .await;
     let old = drain_failed(&f.store, NS, begin(&f.store, NS, "source").await).await;
     set_request(&f.path, "scope-a", "call", "{").await;
     let before = snapshot(&f.path, NS).await;

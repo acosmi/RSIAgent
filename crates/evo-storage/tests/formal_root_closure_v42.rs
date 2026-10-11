@@ -183,10 +183,18 @@ async fn fixture_money_never_becomes_ordinary_p_and_incompatible_charge_keeps_it
         let (_dir, store, admin, _, _) = setup().await;
         let host = ctx("ns-b", "trusted-test-host", Role::Host);
         let mut request = reservation("fixture", BudgetStage::FormalEvaluation, 2);
+        // AG-107 fixture (independent review: plan §7.2.1 L831 rechecks a queued
+        // call before dispatch, §11.3 L1112 isolates what is missing, and the AG-107
+        // card): a call reserved without a source list is judged at dispatch by the
+        // closure its request names, and a request the closure reader cannot read
+        // (this case used `test.model_request.v1`) now fails closed. The fixture
+        // money tested here does not depend on that schema, so the request is a
+        // model request artifact that names no source. Replacement coverage for the
+        // unreadable request: `budget_ref_missing_fail_closed_v42.rs` (T2).
         request.request_artifact = Some(
             BudgetArtifact::from_serializable(
-                "test.model_request.v1",
-                &json!({"fixture":true,"input":"frozen"}),
+                "rsia.model_request.artifact.v1",
+                &json!({"fixture":true,"source_closure":[],"input":"frozen"}),
             )
             .unwrap(),
         );

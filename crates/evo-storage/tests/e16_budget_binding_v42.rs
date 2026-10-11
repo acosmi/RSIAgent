@@ -175,8 +175,19 @@ async fn baseline_artifact_id_on_legacy_run_only_is_not_an_artifact_gate() {
     session.commit().await.unwrap();
 }
 
+/// Corrected by AG-107 (plan §18.4 L2156: a wrong assertion is corrected with an
+/// independent review reason and replacement coverage). This case used to pin a
+/// defect as legacy behavior: with its budget call reference deleted, the late
+/// output of a call over a revoked run was settled as usable and stored. Plan §11
+/// (L1077) says a late output over a deleted source forms no usable candidate while
+/// its real cost is still booked, and §11.5 (L1132) that the late result of a
+/// dispatched call cannot regain validity while its cost is reconciled; the review
+/// reason is the AG-107 task card. A missing reference no longer shrinks the
+/// closure: the settlement reads the closure the persisted request names, finds
+/// `run-b` revoked, books the charge and blocks the output. Replacement coverage:
+/// `budget_ref_missing_fail_closed_v42.rs` (dispatch and settlement, T1-T4).
 #[tokio::test]
-async fn baseline_deleted_legacy_ref_can_leave_revoked_late_output_usable() {
+async fn deleted_legacy_ref_still_blocks_revoked_late_output_and_books_its_cost() {
     let (_dir, store) = database().await;
     put(
         &store,
@@ -220,13 +231,21 @@ async fn baseline_deleted_legacy_ref_can_leave_revoked_late_output_usable() {
         )
         .await
         .unwrap();
-    assert!(settlement.response_usable);
+    assert!(!settlement.response_usable);
+    assert_eq!(
+        settlement.response_block_reason.as_deref(),
+        Some("source_revoked")
+    );
     assert!(
-        settlement
+        !settlement
             .response_artifact
             .body
             .contains("RESPONSE-MARKER")
     );
+    assert!(settlement.response_artifact.body.contains("BLOCKED-MARKER"));
+    let transport = settlement.call.transport_artifact.as_ref().unwrap();
+    assert_eq!(transport.schema_version, "rsia.redacted.v1");
+    assert!(!transport.body.contains("TRANSPORT-MARKER"));
     assert_eq!(settlement.call.actual_cost_micros, Some(9));
     assert_eq!(settlement.call.dispatch_id, dispatched.dispatch_id);
     let root = store

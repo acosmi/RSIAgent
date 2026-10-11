@@ -1147,19 +1147,24 @@ async fn an_unreadable_source_closure_fails_the_settlement_and_leaves_the_cost_r
 // A call that carries no registered closure
 // ---------------------------------------------------------------------------
 
-/// A call reserved without a source list (`reserve_budget_call`; the evaluator
-/// reserves its calls this way) has no budget call reference for the settlement to
-/// read, so its settlement is what it was: usable, stored as sent. The cleanup
-/// rescan is its backstop. It finds the call by the closure its request body names
-/// and redacts what the call holds, which the first half shows. The second half
-/// shows that a call the rescan has already reached is covered at settlement: the
-/// rescan registers the closure it read before it redacts the request.
-///
-/// A call with no registered closure that the rescan can not reach (its request
-/// names no revoked source, or it was reserved after the cleanup completed) is
-/// still not covered; that boundary is not claimed.
+/// A call reserved without a source list (`reserve_budget_call`) has no budget call
+/// reference. Corrected by AG-107 (plan §18.4 L2156: a wrong assertion is corrected
+/// with an independent review reason and replacement coverage): this case used to
+/// pin that such a call is settled as it was, usable and stored as sent, with the
+/// cleanup rescan as its only backstop. Plan §11 (L1077) says a late output over a
+/// deleted source forms no usable candidate while its real cost is still booked,
+/// and §11.5 (L1132) that the late result of a dispatched call cannot regain
+/// validity while its cost is reconciled; the review reason is the AG-107 task
+/// card. With no registered closure the settlement reads the closure the persisted
+/// request names, so the first half shows the late response blocked at the
+/// settlement (booked, its transport redacted, its output stored nowhere) and the
+/// cleanup rescan, which finds the call by that same closure, still redacting what
+/// the call holds. The second half shows that a call the rescan has already reached
+/// is covered by the closure the rescan registers before it redacts the request.
+/// Replacement coverage: `budget_ref_missing_fail_closed_v42.rs` (a request whose
+/// closure cannot be read fails closed at the dispatch and at the settlement).
 #[tokio::test]
-async fn a_call_without_a_registered_closure_is_settled_as_before_and_the_rescan_is_its_backstop() {
+async fn a_call_without_a_registered_closure_is_blocked_by_the_closure_its_request_names() {
     // The response arrives before the rescan reaches the call.
     let (_dir, path, store) = database().await;
     put_run(&store, SOURCE).await;
@@ -1182,10 +1187,18 @@ async fn a_call_without_a_registered_closure_is_settled_as_before_and_the_rescan
         .await
         .unwrap();
     assert!(
-        settled.response_usable,
-        "nothing to read: settled as before"
+        !settled.response_usable,
+        "the closure the request names was not read"
     );
-    assert!(!found_in(&path, OUTPUT).await.is_empty());
+    assert_eq!(
+        settled.response_block_reason.as_deref(),
+        Some("source_revoked")
+    );
+    let stored = call_of(&store, "call-1").await;
+    let defects = stored_defects(&path, &stored, &evidence).await;
+    assert!(defects.is_empty(), "{defects:#?}");
+    assert_eq!(stored.actual_cost_micros, Some(10));
+    assert_eq!(micros(&store).await, (0, 10));
 
     complete_cleanup(&store, &status.job_id).await;
     let finished = call_of(&store, "call-1").await;
@@ -1202,11 +1215,8 @@ async fn a_call_without_a_registered_closure_is_settled_as_before_and_the_rescan
         assert_eq!(artifact.unwrap().schema_version, REDACTED_SCHEMA);
     }
     assert!(
-        found_in(&path, OUTPUT)
-            .await
-            .iter()
-            .all(|place| place.starts_with("file")),
-        "the rows still hold the output: {:?}",
+        found_in(&path, OUTPUT).await.is_empty(),
+        "the output is readable in {:?}",
         found_in(&path, OUTPUT).await
     );
     assert_eq!(finished.actual_cost_micros, Some(10));
