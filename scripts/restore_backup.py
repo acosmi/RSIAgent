@@ -253,6 +253,7 @@ def protected_facts(con,namespaces):
         if kind in ("budget","reservation","evaluation","receipt") or schema in (
             "rsia.typed_artifact_envelope.v1","rsia.exploration_artifact_envelope.v1",
             "rsia.optimization.stage_fact.v1","rsia.budget_call_ref.v1",
+            "rsia.budget_call_e16_ref.v1",
             "rsia.e16.export_attempt.v1","rsia.e16.delivery_audit.v1",
             "rsia.e16.export_attempt.v2","rsia.e16.delivery_audit.v2",
             "rsia.monitoring.consolidation_claim.v1","rsia.monitoring.consolidation_run.v1",

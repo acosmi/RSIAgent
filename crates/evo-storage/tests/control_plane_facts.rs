@@ -458,7 +458,9 @@ fn the_exported_selectors_are_the_restore_scripts() {
     // Pinned here; the engine's startup_gate_v42 test asserts these against the
     // script source itself.
     assert_eq!(PROTECTED_OBJECT_KINDS.len(), 4);
-    assert_eq!(PROTECTED_SCHEMA_VERSIONS.len(), 8);
+    assert_eq!(PROTECTED_SCHEMA_VERSIONS.len(), 9);
+    // E16 budget refs preserve the original source snapshots through recovery.
+    assert!(PROTECTED_SCHEMA_VERSIONS.contains(&"rsia.budget_call_e16_ref.v1"));
     assert!(ROOT_BUDGET_TABLE_QUERY.contains("LIKE 'root_budget%'"));
     let facts: Option<ControlPlaneFacts> = None;
     assert!(facts.is_none());

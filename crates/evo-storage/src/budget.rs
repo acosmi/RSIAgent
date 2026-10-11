@@ -7,6 +7,7 @@ use super::lifecycle::RevokeTombstone;
 use super::{
     MVP_MAX_ACTIVE_LEASES, Session, Store, count_active_leases, internal, mvp_capacity_exceeded,
 };
+use crate::typed_budget::{self, E16CallMode};
 use evo_core::evaluation::OptimizationStage;
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, text};
 use serde::{Deserialize, Serialize};
@@ -700,6 +701,13 @@ impl Store {
         if require_budget_caller(ctx).is_err() {
             return Ok(Err(BudgetPreDispatchRefusal::Unauthorized));
         }
+        if request
+            .request_artifact
+            .as_ref()
+            .is_some_and(typed_budget::request_marks_e16)
+        {
+            return Err(typed_budget::mode_mismatch());
+        }
         if let Err(refusal) = validate_reservation_typed(request)? {
             return Ok(Err(refusal));
         }
@@ -709,174 +717,137 @@ impl Store {
         };
         let mut tx = self.pool.begin().await.map_err(internal)?;
         if let Some(existing) = load_call(&mut tx, &request.billing_scope, &request.call_id).await?
+            && existing.namespace == ctx.namespace()
+            && typed_budget::call_mode_in_tx(&mut tx, &existing).await? != E16CallMode::Legacy
         {
-            if !same_reservation(ctx, &existing, request) {
-                return Ok(Err(BudgetPreDispatchRefusal::CallIdReused));
-            }
-            if !source_ids.is_empty()
-                && let Err(refusal) =
-                    ensure_budget_call_ref_typed(&mut tx, ctx, &existing, &source_ids).await?
-            {
-                return Ok(Err(refusal));
-            }
+            return Err(typed_budget::mode_mismatch());
+        }
+        if typed_budget::new_ref_exists_in_tx(
+            &mut tx,
+            ctx.namespace(),
+            &request.billing_scope,
+            &request.call_id,
+        )
+        .await?
+        {
+            return Err(typed_budget::mode_mismatch());
+        }
+        let outcome = reserve_budget_call_in_tx_typed(&mut tx, ctx, request, &source_ids).await?;
+        if outcome.is_ok() {
             tx.commit().await.map_err(internal)?;
-            return Ok(Ok(existing));
         }
-        // The revocation tombstone is committed before its cleanup runs, so it is
-        // read here, in the transaction that would write the reservation and its
-        // request body: nothing below has run when a source is refused.
-        if any_run_source_revoked(&mut tx, ctx.namespace(), &source_ids).await? {
-            return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
-        }
-        let row = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
-            .bind(&request.billing_scope)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(internal)?;
-        let Some(row) = row else {
-            return Ok(Err(BudgetPreDispatchRefusal::RootAuthorizationMissing));
-        };
-        if !namespace_allowed(&mut tx, &request.billing_scope, ctx.namespace()).await? {
-            return Ok(Err(BudgetPreDispatchRefusal::Unauthorized));
-        }
-        if row.try_get::<i64, _>("stopped").map_err(internal)? != 0 {
-            return Ok(Err(BudgetPreDispatchRefusal::RootStopped));
-        }
-        let per_call_cap: i64 = row.try_get("per_call_cap_micros").map_err(internal)?;
-        let total_limit: i64 = row.try_get("total_limit_micros").map_err(internal)?;
-        let spent: i64 = row.try_get("spent_micros").map_err(internal)?;
-        let reserved: i64 = row.try_get("reserved_micros").map_err(internal)?;
-        if request.max_cost_micros > per_call_cap {
-            return Ok(Err(BudgetPreDispatchRefusal::PerCallCapExceeded));
-        }
-        let committed = spent
-            .checked_add(reserved)
-            .and_then(|value| value.checked_add(request.max_cost_micros));
-        let Some(committed) = committed else {
-            return Ok(Err(BudgetPreDispatchRefusal::BudgetArithmeticOverflow));
-        };
-        if committed > total_limit {
-            return Ok(Err(BudgetPreDispatchRefusal::RootBudgetExhausted));
-        }
-        match load_dispatch_group(&mut tx, &request.billing_scope, &request.dispatch_group_id)
-            .await?
-        {
-            Some(group) => {
-                if group.owner_namespace != ctx.namespace() {
-                    return Ok(Err(BudgetPreDispatchRefusal::GroupNamespaceMismatch));
-                }
-                if group.stopped {
-                    return Ok(Err(BudgetPreDispatchRefusal::GroupStopped));
-                }
-            }
-            None => {
-                sqlx::query(
-                    "INSERT INTO root_budget_dispatch_groups(
-                       billing_scope,dispatch_group_id,owner_namespace,created_at
-                     ) VALUES(?,?,?,?)",
-                )
-                .bind(&request.billing_scope)
-                .bind(&request.dispatch_group_id)
-                .bind(ctx.namespace())
-                .bind(request.now)
-                .execute(&mut *tx)
-                .await
-                .map_err(internal)?;
-                insert_event(
-                    &mut tx,
-                    &request.billing_scope,
-                    None,
-                    "dispatch_group_created",
-                    request.now,
-                    json!({
-                        "dispatch_group_id": request.dispatch_group_id,
-                        "owner_namespace": ctx.namespace(),
-                    }),
-                )
-                .await?;
-            }
-        }
-        let (request_schema, request_digest, request_body) = request
+        Ok(outcome)
+    }
+
+    /// Reserve the independent E16 mode atomically with its complete raw-byte
+    /// source bindings. This snapshot is not import/use/outbound authorization.
+    pub async fn reserve_e16_budget_call(
+        &self,
+        ctx: &Context,
+        request: &BudgetCallReservation,
+    ) -> Result<BudgetCallRecord> {
+        ctx.require(&[Role::Host, Role::Admin])?;
+        let binding = request
             .request_artifact
             .as_ref()
-            .map(|artifact| {
-                (
-                    Some(artifact.schema_version.as_str()),
-                    Some(artifact.digest.as_str()),
-                    Some(artifact.body.as_str()),
-                )
-            })
-            .unwrap_or((None, None, None));
-        // E16.5: a reserved call holds a lease until `lease_until`. Refuse the
-        // new lease when the instance already holds the MVP maximum (counted
-        // across every namespace, F24); nothing below this point runs, so no
-        // reservation or event row is written.
-        let active_leases = count_active_leases(&mut tx, request.now).await?;
-        if active_leases >= MVP_MAX_ACTIVE_LEASES {
-            return Ok(Err(BudgetPreDispatchRefusal::ActiveLeaseCapacity {
-                used: active_leases,
-                limit: MVP_MAX_ACTIVE_LEASES,
-            }));
-        }
-        let Some(next_reserved) = reserved.checked_add(request.max_cost_micros) else {
-            return Ok(Err(BudgetPreDispatchRefusal::BudgetArithmeticOverflow));
-        };
-        sqlx::query("UPDATE root_budgets SET reserved_micros=? WHERE billing_scope=?")
-            .bind(next_reserved)
-            .bind(&request.billing_scope)
-            .execute(&mut *tx)
-            .await
-            .map_err(internal)?;
-        sqlx::query(
-            "INSERT INTO root_budget_calls(
-               billing_scope,call_id,dispatch_group_id,namespace,stage,actual_input_digest,
-               request_artifact_schema,request_artifact_digest,request_artifact_body,reserved_micros,state,
-               lease_token,lease_epoch,lease_until,execution_closed,created_at
-             ) VALUES(?,?,?,?,?,?,?,?,?,?,'reserved',?,1,?,1,?)",
-        )
-        .bind(&request.billing_scope)
-        .bind(&request.call_id)
-        .bind(&request.dispatch_group_id)
-        .bind(ctx.namespace())
-        .bind(request.stage.as_str())
-        .bind(&request.actual_input_digest)
-        .bind(request_schema)
-        .bind(request_digest)
-        .bind(request_body)
-        .bind(request.max_cost_micros)
-        .bind(&request.lease_token)
-        .bind(request.lease_until)
-        .bind(request.now)
-        .execute(&mut *tx)
-        .await
-        .map_err(internal)?;
-        insert_event(
-            &mut tx,
-            &request.billing_scope,
-            Some(&request.call_id),
-            "reserved",
-            request.now,
-            json!({
-                "namespace": ctx.namespace(),
-                "dispatch_group_id": request.dispatch_group_id,
-                "stage": request.stage,
-                "actual_input_digest": request.actual_input_digest,
-                "reserved_micros": request.max_cost_micros,
-                "lease_epoch": 1,
-            }),
-        )
-        .await?;
-        let call = load_call(&mut tx, &request.billing_scope, &request.call_id)
-            .await?
-            .ok_or(Error::Internal)?;
-        if !source_ids.is_empty()
-            && let Err(refusal) =
-                ensure_budget_call_ref_typed(&mut tx, ctx, &call, &source_ids).await?
+            .and_then(typed_budget::parse_request)
+            .ok_or_else(typed_budget::request_invalid)?;
+        if binding.namespace != ctx.namespace()
+            || binding.billing_scope != request.billing_scope
+            || binding.call_id != request.call_id
+            || binding.input_artifact.digest != request.actual_input_digest
         {
-            return Ok(Err(refusal));
+            return Err(typed_budget::request_invalid());
+        }
+        if let Err(refusal) = validate_reservation_typed(request)? {
+            return Err(match refusal {
+                BudgetPreDispatchRefusal::InvalidRequest { .. }
+                | BudgetPreDispatchRefusal::InvalidArtifactDigest => {
+                    typed_budget::request_invalid()
+                }
+                other => other.into_reservation_error(),
+            });
+        }
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let existing = load_call(&mut tx, &request.billing_scope, &request.call_id).await?;
+        if let Some(call) = &existing {
+            require_call_access(&mut tx, ctx, call).await?;
+            if call.namespace != ctx.namespace() {
+                return Err(Error::Forbidden);
+            }
+            if typed_budget::call_mode_in_tx(&mut tx, call).await? != E16CallMode::E16 {
+                return Err(typed_budget::mode_mismatch());
+            }
+            if !typed_budget::call_sources_live_in_tx(&mut tx, call).await? {
+                return Err(typed_budget::sources_unavailable());
+            }
+        } else {
+            let legacy_digest = fingerprint(&(
+                "rsia.budget_call_ref.v1",
+                ctx.namespace(),
+                &request.billing_scope,
+                &request.call_id,
+            ))?;
+            let legacy_exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM objects WHERE namespace=? AND kind='artifact' AND id=?)")
+                .bind(ctx.namespace()).bind(format!("budget-ref-{}", &legacy_digest[..32]))
+                .fetch_one(&mut *tx).await.map_err(internal)?;
+            if legacy_exists != 0
+                || typed_budget::new_ref_exists_in_tx(
+                    &mut tx,
+                    ctx.namespace(),
+                    &request.billing_scope,
+                    &request.call_id,
+                )
+                .await?
+            {
+                return Err(typed_budget::mode_mismatch());
+            }
+        }
+        if !typed_budget::snapshots_live_in_tx(&mut tx, ctx.namespace(), &binding.object_refs)
+            .await?
+        {
+            return Err(typed_budget::sources_unavailable());
+        }
+        let call = reserve_budget_call_in_tx_typed(&mut tx, ctx, request, &[])
+            .await?
+            .map_err(BudgetPreDispatchRefusal::into_reservation_error)?;
+        if existing.is_none() {
+            typed_budget::create_ref_in_tx(&mut tx, ctx, &call).await?;
         }
         tx.commit().await.map_err(internal)?;
-        Ok(Ok(call))
+        Ok(call)
+    }
+
+    /// The explicit new-mode content outlet. Historical budget getters and
+    /// accounting transitions are not authorization to reuse their bodies.
+    pub async fn consume_e16_budget_response(
+        &self,
+        ctx: &Context,
+        billing_scope: &str,
+        call_id: &str,
+    ) -> Result<BudgetArtifact> {
+        ctx.require(&[Role::Host, Role::Admin])?;
+        identifier(billing_scope)?;
+        identifier(call_id)?;
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let call = load_call(&mut tx, billing_scope, call_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        require_call_access(&mut tx, ctx, &call).await?;
+        if typed_budget::call_mode_in_tx(&mut tx, &call).await? != E16CallMode::E16 {
+            return Err(typed_budget::mode_mismatch());
+        }
+        if !typed_budget::call_sources_live_in_tx(&mut tx, &call).await?
+            || call.response_usable != Some(true)
+        {
+            return Err(typed_budget::sources_unavailable());
+        }
+        let response = call
+            .response_artifact
+            .filter(|artifact| artifact.schema_version != "rsia.redacted.v1")
+            .ok_or_else(typed_budget::sources_unavailable)?;
+        tx.commit().await.map_err(internal)?;
+        Ok(response)
     }
 
     pub async fn refence_reserved_budget_call(
@@ -1055,6 +1026,9 @@ impl Store {
             return Err(Error::NotFound);
         }
         fence_call(&call, fence, false)?;
+        if typed_budget::call_mode_in_tx(&mut tx, &call).await? != E16CallMode::Legacy {
+            return Err(typed_budget::mode_mismatch());
+        }
         if !matches!(
             call.stage,
             BudgetStage::DevelopmentExecution | BudgetStage::DevelopmentScoring
@@ -1206,10 +1180,23 @@ impl Store {
         fence_call(&call, fence, false)?;
         if call.response_artifact.is_some() {
             ensure_same_charge(&call, charge)?;
+            match typed_budget::call_mode_in_tx(&mut tx, &call).await? {
+                E16CallMode::Mismatch => return Err(typed_budget::mode_mismatch()),
+                E16CallMode::E16 => {
+                    if !typed_budget::call_sources_live_in_tx(&mut tx, &call).await? {
+                        return Err(typed_budget::sources_unavailable());
+                    }
+                }
+                E16CallMode::Legacy => {}
+            }
             ensure_same_model_settlement(&call, evidence)?;
             let settlement = settlement_from_call(call, false)?;
             tx.commit().await.map_err(internal)?;
             return Ok(settlement);
+        }
+        let e16_mode = typed_budget::call_mode_in_tx(&mut tx, &call).await?;
+        if e16_mode == E16CallMode::Mismatch {
+            return Err(typed_budget::mode_mismatch());
         }
         if call.state != BudgetCallState::Dispatched {
             return Err(Error::Conflict(
@@ -1242,9 +1229,23 @@ impl Store {
         .map_err(internal)?;
         // The tombstone is committed before the cleanup starts, so a source is revoked
         // from the moment `begin_revoke` commits, whatever the cleanup has done since.
-        let source_ids = registered_source_ids(&mut tx, &call).await?;
-        let source_revoked = any_run_source_revoked(&mut tx, &call.namespace, &source_ids).await?;
-        let preexisting_block = if source_revoked {
+        let (source_revoked, e16_unavailable) = match e16_mode {
+            E16CallMode::Mismatch => return Err(typed_budget::mode_mismatch()),
+            E16CallMode::E16 => (
+                false,
+                !typed_budget::call_sources_live_in_tx(&mut tx, &call).await?,
+            ),
+            E16CallMode::Legacy => {
+                let source_ids = registered_source_ids(&mut tx, &call).await?;
+                (
+                    any_run_source_revoked(&mut tx, &call.namespace, &source_ids).await?,
+                    false,
+                )
+            }
+        };
+        let preexisting_block = if e16_unavailable {
+            Some(typed_budget::E16_SOURCE_UNAVAILABLE)
+        } else if source_revoked {
             Some(SOURCE_REVOKED)
         } else if fence.now > call.lease_until {
             Some("lease_expired")
@@ -1284,22 +1285,47 @@ impl Store {
         // stored as its redaction, whichever reason won the chain above: the stored
         // digest is that of the redaction (every read of the row rechecks it against
         // the stored body) and the redaction names the digest of the body it replaces.
-        let redacted_transport = if source_revoked {
-            redacted_artifact(Some(&evidence.transport_artifact), SOURCE_REVOKED)?
+        let redaction_reason = if e16_unavailable {
+            typed_budget::E16_SOURCE_UNAVAILABLE
+        } else {
+            SOURCE_REVOKED
+        };
+        let redacted_transport = if source_revoked || e16_unavailable {
+            redacted_artifact(Some(&evidence.transport_artifact), redaction_reason)?
         } else {
             None
         };
         let transport = redacted_transport
             .as_ref()
             .unwrap_or(&evidence.transport_artifact);
+        // Invalid E16 sources never leave request or arbitrary blocked-response
+        // content in either the persisted row or the settlement's nested call.
+        let redacted_response = if e16_unavailable {
+            redacted_artifact(Some(response), typed_budget::E16_SOURCE_UNAVAILABLE)?
+        } else {
+            None
+        };
+        let response = redacted_response.as_ref().unwrap_or(response);
+        let request = if e16_unavailable {
+            redacted_artifact(
+                call.request_artifact.as_ref(),
+                typed_budget::E16_SOURCE_UNAVAILABLE,
+            )?
+        } else {
+            call.request_artifact.clone()
+        };
         sqlx::query(
             "UPDATE root_budget_calls SET
+               request_artifact_schema=?,request_artifact_digest=?,request_artifact_body=?,
                execution_provenance=?,actual_model_digest=?,
                transport_artifact_schema=?,transport_artifact_digest=?,transport_artifact_body=?,
                response_artifact_schema=?,response_artifact_digest=?,response_artifact_body=?,
                response_usable=?,response_block_reason=?
              WHERE billing_scope=? AND call_id=?",
         )
+        .bind(request.as_ref().map(|value| value.schema_version.as_str()))
+        .bind(request.as_ref().map(|value| value.digest.as_str()))
+        .bind(request.as_ref().map(|value| value.body.as_str()))
         .bind(evidence.provenance.as_str())
         .bind(&evidence.actual_model_digest)
         .bind(&transport.schema_version)
@@ -1329,6 +1355,10 @@ impl Store {
             // so the revocation is recorded here whichever that was. The digest of
             // the transport as the provider sent it is a digest, not content.
             details["source_revoked"] = json!(true);
+            details["transport_original_digest"] = json!(evidence.transport_artifact.digest);
+        }
+        if e16_unavailable {
+            details["e16_source_unavailable"] = json!(true);
             details["transport_original_digest"] = json!(evidence.transport_artifact.digest);
         }
         insert_event(
@@ -1775,6 +1805,77 @@ pub(crate) async fn redact_budget_call_content_in_tx(
     call_id: &str,
     reason: &str,
 ) -> Result<BudgetCallRecord> {
+    redact_budget_call_content_with_block_in_tx(
+        tx,
+        ctx,
+        billing_scope,
+        call_id,
+        reason,
+        SOURCE_REVOKED,
+    )
+    .await
+}
+
+/// New-mode cleanup reports only actual content/flag changes as progress.
+pub(crate) async fn redact_e16_budget_call_content_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    billing_scope: &str,
+    call_id: &str,
+) -> Result<bool> {
+    let call = load_call(tx, billing_scope, call_id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    require_call_access(tx, ctx, &call).await?;
+    let needs_redaction = [
+        &call.request_artifact,
+        &call.transport_artifact,
+        &call.response_artifact,
+    ]
+    .into_iter()
+    .any(|artifact| {
+        artifact
+            .as_ref()
+            .is_some_and(|a| a.schema_version != "rsia.redacted.v1")
+    }) || call.response_usable == Some(true);
+    if !needs_redaction {
+        return Ok(false);
+    }
+    // Keep the settlement's higher-priority pricing/forced/overflow/overrun reason.
+    let block_reason = call
+        .response_block_reason
+        .as_deref()
+        .filter(|reason| {
+            !matches!(
+                *reason,
+                "lease_expired"
+                    | "root_stopped"
+                    | "dispatch_group_stopped"
+                    | SOURCE_REVOKED
+                    | typed_budget::E16_SOURCE_UNAVAILABLE
+            )
+        })
+        .unwrap_or(typed_budget::E16_SOURCE_UNAVAILABLE);
+    redact_budget_call_content_with_block_in_tx(
+        tx,
+        ctx,
+        billing_scope,
+        call_id,
+        typed_budget::E16_SOURCE_UNAVAILABLE,
+        block_reason,
+    )
+    .await?;
+    Ok(true)
+}
+
+pub(crate) async fn redact_budget_call_content_with_block_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    billing_scope: &str,
+    call_id: &str,
+    reason: &str,
+    block_reason: &str,
+) -> Result<BudgetCallRecord> {
     require_budget_caller(ctx)?;
     identifier(billing_scope)?;
     identifier(call_id)?;
@@ -1792,7 +1893,7 @@ pub(crate) async fn redact_budget_call_content_in_tx(
            transport_artifact_schema=?,transport_artifact_digest=?,transport_artifact_body=?,
            response_artifact_schema=?,response_artifact_digest=?,response_artifact_body=?,
            response_usable=CASE WHEN response_artifact_body IS NULL THEN response_usable ELSE 0 END,
-           response_block_reason=CASE WHEN response_artifact_body IS NULL THEN response_block_reason ELSE 'source_revoked' END
+           response_block_reason=CASE WHEN response_artifact_body IS NULL THEN response_block_reason ELSE ? END
          WHERE billing_scope=? AND call_id=?",
     )
     .bind(request.as_ref().map(|value| value.schema_version.as_str()))
@@ -1804,6 +1905,7 @@ pub(crate) async fn redact_budget_call_content_in_tx(
     .bind(response.as_ref().map(|value| value.schema_version.as_str()))
     .bind(response.as_ref().map(|value| value.digest.as_str()))
     .bind(response.as_ref().map(|value| value.body.as_str()))
+    .bind(block_reason)
     .bind(billing_scope)
     .bind(call_id)
     .execute(&mut **tx)
@@ -1922,6 +2024,177 @@ async fn budget_call_scopes_for_group_in_tx(
     .map_err(internal)
 }
 
+async fn reserve_budget_call_in_tx_typed(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    request: &BudgetCallReservation,
+    source_ids: &[String],
+) -> BudgetPreDispatchResult<BudgetCallRecord> {
+    if let Some(existing) = load_call(tx, &request.billing_scope, &request.call_id).await? {
+        if !same_reservation(ctx, &existing, request) {
+            return Ok(Err(BudgetPreDispatchRefusal::CallIdReused));
+        }
+        if !source_ids.is_empty()
+            && let Err(refusal) =
+                ensure_budget_call_ref_typed(tx, ctx, &existing, source_ids).await?
+        {
+            return Ok(Err(refusal));
+        }
+        return Ok(Ok(existing));
+    }
+    // The revocation tombstone is committed before its cleanup runs, so it is
+    // read here, in the transaction that would write the reservation and its
+    // request body: nothing below has run when a source is refused.
+    if any_run_source_revoked(tx, ctx.namespace(), source_ids).await? {
+        return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
+    }
+    let row = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
+        .bind(&request.billing_scope)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(internal)?;
+    let Some(row) = row else {
+        return Ok(Err(BudgetPreDispatchRefusal::RootAuthorizationMissing));
+    };
+    if !namespace_allowed(tx, &request.billing_scope, ctx.namespace()).await? {
+        return Ok(Err(BudgetPreDispatchRefusal::Unauthorized));
+    }
+    if row.try_get::<i64, _>("stopped").map_err(internal)? != 0 {
+        return Ok(Err(BudgetPreDispatchRefusal::RootStopped));
+    }
+    let per_call_cap: i64 = row.try_get("per_call_cap_micros").map_err(internal)?;
+    let total_limit: i64 = row.try_get("total_limit_micros").map_err(internal)?;
+    let spent: i64 = row.try_get("spent_micros").map_err(internal)?;
+    let reserved: i64 = row.try_get("reserved_micros").map_err(internal)?;
+    if request.max_cost_micros > per_call_cap {
+        return Ok(Err(BudgetPreDispatchRefusal::PerCallCapExceeded));
+    }
+    let committed = spent
+        .checked_add(reserved)
+        .and_then(|value| value.checked_add(request.max_cost_micros));
+    let Some(committed) = committed else {
+        return Ok(Err(BudgetPreDispatchRefusal::BudgetArithmeticOverflow));
+    };
+    if committed > total_limit {
+        return Ok(Err(BudgetPreDispatchRefusal::RootBudgetExhausted));
+    }
+    match load_dispatch_group(tx, &request.billing_scope, &request.dispatch_group_id).await? {
+        Some(group) => {
+            if group.owner_namespace != ctx.namespace() {
+                return Ok(Err(BudgetPreDispatchRefusal::GroupNamespaceMismatch));
+            }
+            if group.stopped {
+                return Ok(Err(BudgetPreDispatchRefusal::GroupStopped));
+            }
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO root_budget_dispatch_groups(
+                       billing_scope,dispatch_group_id,owner_namespace,created_at
+                     ) VALUES(?,?,?,?)",
+            )
+            .bind(&request.billing_scope)
+            .bind(&request.dispatch_group_id)
+            .bind(ctx.namespace())
+            .bind(request.now)
+            .execute(&mut **tx)
+            .await
+            .map_err(internal)?;
+            insert_event(
+                tx,
+                &request.billing_scope,
+                None,
+                "dispatch_group_created",
+                request.now,
+                json!({
+                    "dispatch_group_id": request.dispatch_group_id,
+                    "owner_namespace": ctx.namespace(),
+                }),
+            )
+            .await?;
+        }
+    }
+    let (request_schema, request_digest, request_body) = request
+        .request_artifact
+        .as_ref()
+        .map(|artifact| {
+            (
+                Some(artifact.schema_version.as_str()),
+                Some(artifact.digest.as_str()),
+                Some(artifact.body.as_str()),
+            )
+        })
+        .unwrap_or((None, None, None));
+    // E16.5: a reserved call holds a lease until `lease_until`. Refuse the
+    // new lease when the instance already holds the MVP maximum (counted
+    // across every namespace, F24); nothing below this point runs, so no
+    // reservation or event row is written.
+    let active_leases = count_active_leases(tx, request.now).await?;
+    if active_leases >= MVP_MAX_ACTIVE_LEASES {
+        return Ok(Err(BudgetPreDispatchRefusal::ActiveLeaseCapacity {
+            used: active_leases,
+            limit: MVP_MAX_ACTIVE_LEASES,
+        }));
+    }
+    let Some(next_reserved) = reserved.checked_add(request.max_cost_micros) else {
+        return Ok(Err(BudgetPreDispatchRefusal::BudgetArithmeticOverflow));
+    };
+    sqlx::query("UPDATE root_budgets SET reserved_micros=? WHERE billing_scope=?")
+        .bind(next_reserved)
+        .bind(&request.billing_scope)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+    sqlx::query(
+            "INSERT INTO root_budget_calls(
+               billing_scope,call_id,dispatch_group_id,namespace,stage,actual_input_digest,
+               request_artifact_schema,request_artifact_digest,request_artifact_body,reserved_micros,state,
+               lease_token,lease_epoch,lease_until,execution_closed,created_at
+             ) VALUES(?,?,?,?,?,?,?,?,?,?,'reserved',?,1,?,1,?)",
+        )
+        .bind(&request.billing_scope)
+        .bind(&request.call_id)
+        .bind(&request.dispatch_group_id)
+        .bind(ctx.namespace())
+        .bind(request.stage.as_str())
+        .bind(&request.actual_input_digest)
+        .bind(request_schema)
+        .bind(request_digest)
+        .bind(request_body)
+        .bind(request.max_cost_micros)
+        .bind(&request.lease_token)
+        .bind(request.lease_until)
+        .bind(request.now)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+    insert_event(
+        tx,
+        &request.billing_scope,
+        Some(&request.call_id),
+        "reserved",
+        request.now,
+        json!({
+            "namespace": ctx.namespace(),
+            "dispatch_group_id": request.dispatch_group_id,
+            "stage": request.stage,
+            "actual_input_digest": request.actual_input_digest,
+            "reserved_micros": request.max_cost_micros,
+            "lease_epoch": 1,
+        }),
+    )
+    .await?;
+    let call = load_call(tx, &request.billing_scope, &request.call_id)
+        .await?
+        .ok_or(Error::Internal)?;
+    if !source_ids.is_empty()
+        && let Err(refusal) = ensure_budget_call_ref_typed(tx, ctx, &call, source_ids).await?
+    {
+        return Ok(Err(refusal));
+    }
+    Ok(Ok(call))
+}
+
 async fn begin_budget_dispatch_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     ctx: &Context,
@@ -1955,6 +2228,17 @@ async fn begin_budget_dispatch_in_tx_typed(
     // A mismatched epoch/token/digest is still an outer error. It is not the
     // expiry of this lease and must never authorize releasing another lease.
     fence_call(&call, fence, false)?;
+    let e16_mode = typed_budget::call_mode_in_tx(tx, &call).await?;
+    match e16_mode {
+        E16CallMode::Mismatch => return Err(typed_budget::mode_mismatch()),
+        E16CallMode::E16 => {
+            ctx.require(&[Role::Host, Role::Admin])?;
+            if !typed_budget::call_sources_live_in_tx(tx, &call).await? {
+                return Err(typed_budget::sources_unavailable());
+            }
+        }
+        E16CallMode::Legacy => {}
+    }
     if call.state != BudgetCallState::Reserved {
         return Ok(Ok(BudgetDispatchDecision {
             call,
@@ -2873,7 +3157,7 @@ async fn load_dispatch_group(
     .transpose()
 }
 
-async fn load_call(
+pub(crate) async fn load_call(
     tx: &mut Transaction<'_, Sqlite>,
     billing_scope: &str,
     call_id: &str,
