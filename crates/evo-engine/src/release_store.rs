@@ -195,6 +195,42 @@ pub struct TrustedHostExecutionReceipt {
 pub struct ReleaseStore;
 
 impl ReleaseStore {
+    /// A read-only Admin gate; staging and release transitions retain their
+    /// existing identity rules. Reviewers need not be the candidate's proposer.
+    pub(crate) async fn read_review_candidate_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        id: &str,
+    ) -> Result<ReleaseCandidateRecord> {
+        ctx.require(&[Role::Admin])?;
+        identifier(id)?;
+        let candidate: ReleaseCandidateRecord = session.need(ctx, "artifact", id).await?;
+        if candidate.schema_version != RELEASE_CANDIDATE_SCHEMA {
+            return Err(Error::NotFound);
+        }
+        if candidate.id != id
+            || candidate.bundle_digest != candidate.bundle.digest
+            || candidate.profile_id != candidate.bundle.profile_id
+            || candidate.parent_digest != candidate.bundle.parent_digest
+            || candidate.sources.is_empty()
+        {
+            return Err(Error::Invalid("invalid review candidate material".into()));
+        }
+        identifier(&candidate.profile_id)?;
+        identifier(&candidate.proposer_actor)?;
+        validate_digest(&candidate.bundle_digest, "bundle digest")?;
+        validate_digest(&candidate.environment_digest, "environment digest")?;
+        validate_digest(&candidate.parent_digest, "parent digest")?;
+        validate_digest(&candidate.bundle.baseline_digest, "baseline digest")?;
+        validate_resolved_bundle_identity(&candidate.bundle)?;
+        candidate.bundle.skill.validate()?;
+        if canonical_sources(candidate.sources.clone())? != candidate.sources {
+            return Err(Error::Invalid("noncanonical review sources".into()));
+        }
+        validate_candidate_sources(session, ctx, &candidate).await?;
+        Ok(candidate)
+    }
+
     pub async fn stage_bundle(
         ctx: &Context,
         store: &Store,

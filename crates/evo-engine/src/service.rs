@@ -138,6 +138,26 @@ impl HostService {
         &self.store
     }
 
+    /// Pure identity gate, also used before HTTP review DTO parsing.
+    pub fn authorize_review(&self, caller: &Context) -> Result<()> {
+        if caller.require(&[Role::Admin]).is_err()
+            || caller.namespace() != self.trusted_host.namespace()
+        {
+            return Err(Error::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Review existing facts as the Admin of this gateway's trusted namespace.
+    pub async fn review(
+        &self,
+        caller: &Context,
+        request: crate::review::ReviewRequest,
+    ) -> Result<crate::review::ReviewResponse> {
+        self.authorize_review(caller)?;
+        crate::review::review_stored(caller, &self.store, request).await
+    }
+
     /// Prepares currently in flight in this process.
     pub fn inflight_prepare(&self) -> u64 {
         self.inflight_prepare.load(Ordering::Acquire)
