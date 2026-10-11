@@ -2648,6 +2648,7 @@ async fn validate_status_closure(
     }
     match formal {
         Some(FormalEvaluationV2::EarlyStopped {
+            evidence_scope,
             ticket_id,
             ticket_digest,
             certificate,
@@ -2690,6 +2691,20 @@ async fn validate_status_closure(
                 return Err(Error::Conflict(
                     "early-stop issuer receipt is absent from the stored ticket".into(),
                 ));
+            }
+            if ticket.candidate_dependency_binding.is_some() {
+                if *evidence_scope != ticket.evidence_scope {
+                    return Err(Error::Conflict(EARLY_CERTIFICATE_CHANGED.into()));
+                }
+                validate_bound_early_certificate_in_session(
+                    session,
+                    ctx,
+                    ticket,
+                    &control,
+                    &holdout,
+                    certificate,
+                )
+                .await?;
             }
         }
         Some(FormalEvaluationV2::CompleteBatch {
@@ -3188,6 +3203,401 @@ async fn validate_completed_target_evidence(
         ));
     }
     Ok(grader)
+}
+
+const EARLY_CERTIFICATE_CHANGED: &str = "formal_early_stop_certificate_changed";
+
+// Recompute the first stop from this Session's actual accepted receipts.
+// The formal/pending copies supply no numeric or decision input.
+async fn validate_bound_early_certificate_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    ticket: &EvaluationTicketV2,
+    control: &RegisteredEvaluationControl,
+    holdout: &ProtectedHoldoutRecord,
+    certificate: &EarlyStopCertificate,
+) -> Result<()> {
+    let changed = || Error::Conflict(EARLY_CERTIFICATE_CHANGED.into());
+    if ticket.candidate_dependency_binding.is_none()
+        || ticket.lifecycle != TicketLifecycle::EarlyStopped
+        || certificate.usage_uncertain()
+    {
+        return Err(changed());
+    }
+    ticket.validate()?;
+    control.validate()?;
+    holdout.validate_against(control)?;
+    let pending = ticket.pending_certificate.as_ref().ok_or_else(changed)?;
+    let mut bound_plan = control.v1_plan_snapshot.clone();
+    bound_plan.bind_candidate(ticket.candidate_digest.clone())?;
+    pending.validate_shape()?;
+    if fingerprint(pending)? != fingerprint(certificate)?
+        || ticket.registration_id != control.id
+        || ticket.holdout_id != holdout.id
+        || ticket.registration_digest != control.digest()?
+        || ticket.manifest_digest != holdout.manifest.digest()?
+        || ticket.v1_plan_snapshot_digest != control.v1_plan_snapshot.digest()?
+        || ticket.bound_v1_plan_digest != bound_plan.digest()?
+        || ticket.formal_plan_digest != control.formal_plan.digest()?
+        || ticket.alpha_plan_digest != control.alpha_plan.digest()?
+        || ticket.research_family_id != control.alpha_plan.research_family_id
+        || ticket.attempt_id != control.attempt_id
+        || ticket.profile != control.formal_plan.profile
+        || ticket.candidate_digest != holdout.pair.candidate_digest
+        || ticket.baseline_digest != holdout.pair.baseline_digest
+        || ticket.candidate_bundle_digest != holdout.candidate_bundle_digest
+        || ticket.baseline_bundle_digest != holdout.baseline_bundle_digest
+        || ticket.environment_digest != holdout.manifest.environment_digest
+        || ticket.executor_actor != control.executor_actor
+        || ticket.evaluator_actor != control.evaluator_actor
+        || ticket.evidence_scope != control.evidence_scope
+        || ticket.n_planned != control.formal_plan.n_planned
+        || ticket.n_planned as usize != holdout.manifest.ordered_task_cluster_ids.len()
+    {
+        return Err(changed());
+    }
+    let inputs = holdout
+        .rotating_inputs
+        .iter()
+        .map(|input| (input, false))
+        .chain(holdout.anchor_inputs.iter().map(|input| (input, true)))
+        .collect::<Vec<_>>();
+    if ticket.targets.len() != inputs.len()
+        || ticket
+            .targets
+            .iter()
+            .zip(inputs)
+            .any(|(target, (input, anchor))| {
+                target.target_id != input.target_id
+                    || target.input_artifact_id != input.input_artifact_id
+                    || target.input_digest != input.input_digest
+                    || match &target.kind {
+                        EvaluationTargetKind::Rotating { cluster_id } => {
+                            anchor || cluster_id != &input.cluster_or_anchor_id
+                        }
+                        EvaluationTargetKind::Anchor { anchor_id } => {
+                            !anchor || anchor_id != &input.cluster_or_anchor_id
+                        }
+                    }
+            })
+    {
+        return Err(changed());
+    }
+    let mut stream = match &control.early_stop_plan {
+        Some(plan) => {
+            plan.validate_against(&control.alpha_plan)?;
+            if plan.ordered_cluster_ids != holdout.manifest.ordered_task_cluster_ids {
+                return Err(changed());
+            }
+            Some(SequentialRejectOnly::open(
+                plan.clone(),
+                &control.alpha_plan,
+            )?)
+        }
+        None => None,
+    };
+    let calls = session
+        .budget_calls_for_group(ctx, &control.billing_scope, &ticket.id)
+        .await?;
+    if session
+        .budget_call_scopes_for_group(ctx, &ticket.id)
+        .await?
+        != vec![control.billing_scope.clone()]
+    {
+        return Err(changed());
+    }
+    let by_id = calls
+        .iter()
+        .map(|call| (call.call_id.as_str(), call))
+        .collect::<BTreeMap<_, _>>();
+    if by_id.len() != calls.len() {
+        return Err(changed());
+    }
+    for call in &calls {
+        if call.billing_scope != control.billing_scope
+            || call.namespace != ctx.namespace()
+            || call.dispatch_group_id != ticket.id
+            || call.stage != BudgetStage::TaskExecution
+        {
+            return Err(changed());
+        }
+        match call.state {
+            BudgetCallState::Finalized => {
+                if !call.execution_closed
+                    || call.dispatch_id.is_none()
+                    || call.dispatched_at.is_none()
+                    || call.finalized_at.is_none()
+                    || call.execution_closed_at.is_none()
+                    || !call.actual_cost_micros.is_some_and(|amount| amount >= 0)
+                    || call.actual_currency.as_deref()
+                        != Some(control.optimization_budget.root_total.currency.as_str())
+                    || call.actual_pricing_version.as_deref()
+                        != Some(
+                            control
+                                .optimization_budget
+                                .root_total
+                                .pricing_version
+                                .as_str(),
+                        )
+                {
+                    return Err(changed());
+                }
+            }
+            BudgetCallState::Released | BudgetCallState::Cancelled => {
+                if call.dispatch_id.is_some() || call.dispatched_at.is_some() {
+                    return Err(changed());
+                }
+            }
+            _ => return Err(changed()),
+        }
+    }
+    let mut used_calls = BTreeSet::new();
+    let mut receipt_ids = BTreeSet::new();
+    let mut grader_ids = BTreeSet::new();
+    let mut sequences = BTreeSet::new();
+    let mut events = Vec::new();
+    for target in &ticket.targets {
+        match &target.state {
+            TargetState::Completed {
+                candidate_receipt_id,
+                baseline_receipt_id,
+                grader_receipt_id,
+                completion_sequence,
+                ..
+            } => {
+                if !sequences.insert(*completion_sequence)
+                    || !grader_ids.insert(grader_receipt_id.as_str())
+                {
+                    return Err(changed());
+                }
+                let grader = validate_completed_target_evidence(
+                    session, ctx, ticket, control, holdout, target,
+                )
+                .await?;
+                if grader.schema_version != "rsia.independent_grader_receipt.v2"
+                    || grader.receipt_id != *grader_receipt_id
+                {
+                    return Err(changed());
+                }
+                valid_time(grader.issued_at_unix_seconds)?;
+                for (id, side) in [
+                    (candidate_receipt_id, ExecutionSide::Candidate),
+                    (baseline_receipt_id, ExecutionSide::Baseline),
+                ] {
+                    if !receipt_ids.insert(id.as_str()) {
+                        return Err(changed());
+                    }
+                    let receipt: ExecutionReceiptV2 =
+                        need_record(session, ctx, EXECUTION_RECEIPT_KIND, id).await?;
+                    let bundle = match side {
+                        ExecutionSide::Candidate => &ticket.candidate_bundle_digest,
+                        ExecutionSide::Baseline => &ticket.baseline_bundle_digest,
+                    };
+                    let request =
+                        request_digest(ticket, target, side, bundle, &ticket.environment_digest)?;
+                    let call = by_id
+                        .get(receipt.budget_call_id.as_str())
+                        .ok_or_else(changed)?;
+                    if receipt.schema_version != "rsia.execution_receipt.v2"
+                        || receipt.receipt_id != *id
+                        || receipt.executor_actor != ticket.executor_actor
+                        || receipt.request_digest != request
+                        || !used_calls.insert(call.call_id.as_str())
+                        || call.state != BudgetCallState::Finalized
+                        || call.actual_input_digest != request
+                        || call.output_digest.as_deref() != Some(receipt.output_digest.as_str())
+                    {
+                        return Err(changed());
+                    }
+                }
+                events.push((*completion_sequence, target, grader));
+            }
+            TargetState::CancelledAfterDispatch {
+                candidate,
+                baseline,
+            } => {
+                for slot in [candidate, baseline].into_iter().flatten() {
+                    let call = by_id
+                        .get(slot.budget_call_id.as_str())
+                        .ok_or_else(changed)?;
+                    let bundle = match slot.side {
+                        ExecutionSide::Candidate => &ticket.candidate_bundle_digest,
+                        ExecutionSide::Baseline => &ticket.baseline_bundle_digest,
+                    };
+                    let request = request_digest(
+                        ticket,
+                        target,
+                        slot.side,
+                        bundle,
+                        &ticket.environment_digest,
+                    )?;
+                    if !used_calls.insert(call.call_id.as_str())
+                        || slot.request_digest != request
+                        || call.actual_input_digest != request
+                    {
+                        return Err(changed());
+                    }
+                    match &slot.phase {
+                        ExecutionSlotPhase::Dispatched {
+                            dispatch_id,
+                            dispatched_at_unix_seconds,
+                        } if call.state == BudgetCallState::Finalized
+                            && call.dispatch_id.as_deref() == Some(dispatch_id.as_str())
+                            && call.dispatched_at == Some(*dispatched_at_unix_seconds) => {}
+                        ExecutionSlotPhase::ReservedBound
+                            if matches!(
+                                call.state,
+                                BudgetCallState::Released | BudgetCallState::Cancelled
+                            ) => {}
+                        _ => return Err(changed()),
+                    }
+                }
+            }
+            TargetState::NotDispatched { released_call_ids } => {
+                for id in released_call_ids {
+                    let call = by_id.get(id.as_str()).ok_or_else(changed)?;
+                    if !used_calls.insert(call.call_id.as_str())
+                        || !matches!(
+                            call.state,
+                            BudgetCallState::Released | BudgetCallState::Cancelled
+                        )
+                    {
+                        return Err(changed());
+                    }
+                }
+            }
+            _ => return Err(changed()),
+        }
+    }
+    // Already recorded unattributed calls remain paid/audit facts; they do not
+    // become accepted statistical units or disappear from terminal accounting.
+    for id in &ticket.unattributed_budget_call_ids {
+        if !by_id.contains_key(id.as_str()) || !used_calls.insert(id.as_str()) {
+            return Err(changed());
+        }
+    }
+    let count = u64::try_from(events.len()).map_err(|_| changed())?;
+    if count == 0
+        || !sequences.iter().copied().eq(1..=count)
+        || ticket.next_sequence != count.checked_add(1).ok_or_else(changed)?
+        || used_calls.len() != by_id.len()
+    {
+        return Err(changed());
+    }
+    events.sort_by_key(|(sequence, _, _)| *sequence);
+    let ledger: ExposureLedger =
+        need_record(session, ctx, LEDGER_KIND, &ticket.research_family_id).await?;
+    ledger.validate_restore()?;
+    let entry = ledger
+        .entries
+        .iter()
+        .find(|entry| entry.ticket_id == ticket.id)
+        .ok_or_else(changed)?;
+    let first_feedback_at = events[0]
+        .2
+        .issued_at_unix_seconds
+        .checked_mul(1_000)
+        .ok_or_else(changed)?;
+    if ledger.research_family_id != ticket.research_family_id
+        || ledger.alpha_plan_digest != ticket.alpha_plan_digest
+        || entry.manifest_digest != ticket.manifest_digest
+        || entry.candidate_pair_digest != holdout.manifest.candidate_pair_digest
+        || entry.epoch_id != holdout.manifest.epoch_id
+        || entry.slice_id != holdout.manifest.slice_id
+        || entry.task_cluster_ids != holdout.manifest.ordered_task_cluster_ids
+        || entry.monetary_state != MonetaryReservationState::Finalized
+        || !matches!(
+            &entry.state,
+            ExposureState::FeedbackUsed { used_at_unix_ms } if *used_at_unix_ms == first_feedback_at
+        )
+    {
+        return Err(changed());
+    }
+    let mut first_stop = None;
+    for (position, (sequence, target, grader)) in events.iter().enumerate() {
+        let decision = match &target.kind {
+            EvaluationTargetKind::Anchor { .. }
+                if grader.anchor_result == Some(AnchorResult::CriticalRegression) =>
+            {
+                EarlyStopDecision::CriticalRegression
+            }
+            EvaluationTargetKind::Rotating { cluster_id } => match stream.as_mut() {
+                Some(stream) => stream.record_complete_unit(CompletePairedUnit {
+                    cluster_id: cluster_id.clone(),
+                    baseline_score_micros: grader.baseline_score_micros,
+                    candidate_score_micros: grader.candidate_score_micros,
+                })?,
+                None => EarlyStopDecision::Continue,
+            },
+            _ => EarlyStopDecision::Continue,
+        };
+        if decision.is_early_stop() {
+            if position + 1 != events.len() {
+                return Err(changed());
+            }
+            let (k, lcb, ucb, prefix) = if decision == EarlyStopDecision::CriticalRegression {
+                (0, None, None, fingerprint(&Vec::<String>::new())?)
+            } else {
+                let stream = stream.as_ref().ok_or_else(changed)?;
+                let bound = stream.boundary()?.ok_or_else(changed)?;
+                let wire = bound.to_wire()?;
+                (
+                    bound.k,
+                    Some(wire.lcb),
+                    Some(wire.ucb),
+                    stream.completed_prefix_digest()?,
+                )
+            };
+            first_stop = Some((
+                decision,
+                k,
+                lcb,
+                ucb,
+                prefix,
+                grader,
+                sequence.checked_add(1).ok_or_else(changed)?,
+            ));
+            break;
+        }
+    }
+    let (decision, k, lcb, ucb, prefix, issuer, stop_sequence) = first_stop.ok_or_else(changed)?;
+    let expected = EarlyStopCertificate::from_verified_parts(EarlyStopCertificateParts {
+        ticket_id: ticket.id.clone(),
+        v1_plan_snapshot_digest: ticket.v1_plan_snapshot_digest.clone(),
+        early_stop_plan_digest: control
+            .early_stop_plan
+            .as_ref()
+            .map(EarlyStopPlan::digest)
+            .transpose()?
+            .unwrap_or(control.formal_plan.digest()?),
+        alpha_plan_digest: ticket.alpha_plan_digest.clone(),
+        manifest_digest: ticket.manifest_digest.clone(),
+        slice_id: holdout.manifest.slice_id.clone(),
+        candidate_digest: ticket.candidate_digest.clone(),
+        baseline_digest: ticket.baseline_digest.clone(),
+        grader_digest: control.grader_digest.clone(),
+        issuer_receipt_digest: fingerprint(issuer)?,
+        k,
+        lcb,
+        ucb,
+        completed_prefix_digest: prefix,
+        // This is the frozen stop snapshot, not the later reconciled targets.
+        member_terminal_digest: ticket
+            .stop_member_terminal_digest
+            .clone()
+            .ok_or_else(changed)?,
+        stop_reason: decision,
+        stopped_at_unix_ms: issuer
+            .issued_at_unix_seconds
+            .checked_mul(1_000)
+            .ok_or_else(changed)?,
+        stop_sequence,
+        usage_uncertain: false,
+    })?;
+    if fingerprint(&expected)? != fingerprint(certificate)? {
+        return Err(changed());
+    }
+    Ok(())
 }
 
 fn anchor_evidence_digest(ticket: &EvaluationTicketV2) -> Result<String> {
@@ -5197,6 +5607,21 @@ async fn maybe_store_early_formal(
             .pending_certificate
             .clone()
             .ok_or_else(|| Error::Invalid("early-stopped ticket lacks certificate".into()))?;
+        if ticket.candidate_dependency_binding.is_some() {
+            let control: RegisteredEvaluationControl =
+                need_record(session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
+            let holdout: ProtectedHoldoutRecord =
+                need_record(session, ctx, HOLDOUT_KIND, &ticket.holdout_id).await?;
+            validate_bound_early_certificate_in_session(
+                session,
+                ctx,
+                ticket,
+                &control,
+                &holdout,
+                &certificate,
+            )
+            .await?;
+        }
         let formal = FormalEvaluationV2::EarlyStopped {
             evidence_scope: ticket.evidence_scope,
             ticket_id: ticket.id.clone(),
