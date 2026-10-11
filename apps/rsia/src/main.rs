@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use evo_core::contract::{
     CapabilityLevel, HostCapabilities, HostSurfaceManifest, SurfaceCoverage, SurfaceItem,
     SystemSnapshot,
@@ -21,6 +21,92 @@ use std::{
 const GATEWAY_HOST_ACTOR: &str = "reference-host-gateway";
 const REFERENCE_SURFACE_ID: &str = "reference-host-surface-v1";
 
+async fn review_client(
+    kind: ReviewKindArgument,
+    id: String,
+    detail: ReviewDetailArgument,
+    url: String,
+    auth_token: String,
+) -> Result<()> {
+    let mut base =
+        reqwest::Url::parse(&url).map_err(|_| anyhow::anyhow!("invalid review service URL"))?;
+    let host = base.host_str().unwrap_or("").trim_matches(['[', ']']);
+    let local = host == "localhost"
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| match ip {
+            std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+            std::net::IpAddr::V6(ip) => {
+                ip.is_loopback()
+                    || ip.segments()[0] & 0xfe00 == 0xfc00
+                    || ip.segments()[0] & 0xffc0 == 0xfe80
+            }
+        });
+    if !local
+        || !matches!(base.scheme(), "http" | "https")
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+        || !matches!(base.path(), "" | "/")
+    {
+        bail!("review service URL must identify an authorized local or private HTTP service");
+    }
+    if auth_token.len() < 16 || auth_token.len() > 4096 || auth_token.chars().any(char::is_control)
+    {
+        bail!("invalid review authentication");
+    }
+    let request = evo_engine::review::ReviewRequest {
+        kind: match kind {
+            ReviewKindArgument::TypedCandidate => evo_engine::review::ReviewKind::TypedCandidate,
+            ReviewKindArgument::StageFact => evo_engine::review::ReviewKind::StageFact,
+            ReviewKindArgument::FormalReport => evo_engine::review::ReviewKind::FormalReport,
+        },
+        id,
+        detail: match detail {
+            ReviewDetailArgument::Metadata => evo_engine::review::ReviewDetail::Metadata,
+            ReviewDetailArgument::Exact => evo_engine::review::ReviewDetail::Exact,
+        },
+    };
+    base.set_path("/v1/review");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|_| anyhow::anyhow!("review HTTP client unavailable"))?;
+    let response = client
+        .post(base)
+        .bearer_auth(&auth_token)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("review HTTP request failed"))?;
+    let status = response.status();
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| anyhow::anyhow!("invalid review HTTP response"))?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    if !status.is_success() {
+        bail!("review HTTP request was not successful");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum ReviewKindArgument {
+    TypedCandidate,
+    StageFact,
+    FormalReport,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum ReviewDetailArgument {
+    Metadata,
+    Exact,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "rsia", version, about = "Bounded RSIA host service")]
 struct Cli {
@@ -30,6 +116,19 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Review stored material through the authenticated HTTP service.
+    Review {
+        #[arg(long, value_enum)]
+        kind: ReviewKindArgument,
+        #[arg(long)]
+        id: String,
+        #[arg(long, value_enum, default_value = "metadata")]
+        detail: ReviewDetailArgument,
+        #[arg(long, default_value = "http://127.0.0.1:7788")]
+        url: String,
+        #[arg(long, env = "RSIA_MANAGEMENT_TOKEN", hide_env_values = true)]
+        auth_token: String,
+    },
     /// Serve the authenticated HTTP API. No token means every sensitive route returns 503.
     Serve {
         #[arg(long, default_value = DEFAULT_BIND)]
@@ -86,6 +185,15 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Review {
+            kind,
+            id,
+            detail,
+            url,
+            auth_token,
+        } => {
+            review_client(kind, id, detail, url, auth_token).await?;
+        }
         Command::Serve {
             bind,
             data,
@@ -457,7 +565,7 @@ mod tests {
                     trusted_revocations_db,
                     ..
                 } => trusted_revocations_db,
-                Command::Manage { .. } => panic!("unexpected subcommand"),
+                Command::Manage { .. } | Command::Review { .. } => panic!("unexpected subcommand"),
             };
             assert_eq!(anchor, Some(PathBuf::from("/anchor/rsia.sqlite3")));
             // absent by default
@@ -470,7 +578,7 @@ mod tests {
                     trusted_revocations_db,
                     ..
                 } => assert_eq!(trusted_revocations_db, None),
-                Command::Manage { .. } => panic!("unexpected subcommand"),
+                Command::Manage { .. } | Command::Review { .. } => panic!("unexpected subcommand"),
             }
         }
         let manage = ["rsia", "manage", "job.status", "--auth-token", "token"];
@@ -530,7 +638,7 @@ mod tests {
         for command in ["serve", "mcp"] {
             let data = match Cli::try_parse_from(["rsia", command]).unwrap().command {
                 Command::Serve { data, .. } | Command::Mcp { data, .. } => data,
-                Command::Manage { .. } => panic!("unexpected subcommand"),
+                Command::Manage { .. } | Command::Review { .. } => panic!("unexpected subcommand"),
             };
             assert_eq!(data, Path::new("rsia.sqlite3"), "{command}");
             assert_eq!(lock_directory(&data), Path::new("."), "{command}");

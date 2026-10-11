@@ -14,6 +14,7 @@ use axum::{
 use evo_core::{Context, Error, Feedback, Inspect, Prepare, Proposal, Role, hash, identifier};
 use evo_engine::evidence::StoredTraceAuthority;
 use evo_engine::release_store::{AppliedRequestMaterial, TrustedHostExecutionEvidence};
+use evo_engine::review::{ReviewRequest, ReviewResponse};
 use evo_engine::service::{HostPrepareConfig, HostService};
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -133,6 +134,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/v1/tools/feedback", post(feedback))
         .route("/v1/tools/propose", post(propose))
         .route("/v1/tools/inspect", post(inspect))
+        .route("/v1/review", post(review))
         .route("/v1/host/trace", post(record_trace))
         .route("/v1/host/snapshot", post(read_snapshot))
         .route("/v1/host/application", post(record_application))
@@ -185,6 +187,33 @@ async fn inspect(
     let caller = state.auth.authenticate(&headers)?;
     let request: Inspect = strict_typed(&body, "invalid_inspect_payload")?;
     Ok(Json(state.service.inspect(&caller, request).await?))
+}
+
+async fn review(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> std::result::Result<Json<ReviewResponse>, HttpError> {
+    let caller = state.auth.authenticate(&headers)?;
+    state
+        .service
+        .authorize_review(&caller)
+        .map_err(|_| HttpError::new(StatusCode::NOT_FOUND, "review_unavailable"))?;
+    let value = parse_unique_value(&body, "invalid_review_payload")?;
+    let request: ReviewRequest = serde_json::from_value(value)
+        .map_err(|_| HttpError::new(StatusCode::BAD_REQUEST, "invalid_review_payload"))?;
+    let response = state
+        .service
+        .review(&caller, request)
+        .await
+        .map_err(|error| match error {
+            Error::Forbidden | Error::NotFound => {
+                HttpError::new(StatusCode::NOT_FOUND, "review_unavailable")
+            }
+            Error::Invalid(_) => HttpError::new(StatusCode::BAD_REQUEST, "invalid_review_payload"),
+            _ => HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "review_internal_error"),
+        })?;
+    Ok(Json(response))
 }
 
 #[derive(Debug, Deserialize)]
