@@ -5,7 +5,7 @@ mod trusted_compiler_inputs;
 
 use evo_core::contract::{
     CompileParts, HostCapabilities, ImproverPatch, Profile, ResolvedBundle, SkillPatch,
-    SkillSnapshot,
+    SkillSnapshot, compile_bundle,
 };
 use evo_core::evaluation::{
     ControlCondition, ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec,
@@ -35,7 +35,7 @@ use evo_engine::evidence::{
 use evo_engine::optimization::{
     DevelopmentManifest, DevelopmentRunRequest, DevelopmentSelection, DevelopmentSelectionDecision,
     DevelopmentTask, OptimizationJournal, OptimizationJournalStage, StageDependency, StageFact,
-    StageFactKind, StepTerminalClass, StoreOptimizationJournal,
+    StageFactKind, StepTerminalClass, StoreOptimizationJournal, edit_compiled_input_digest,
 };
 use evo_engine::release_store::{
     ReleaseCandidateRecord, ReleaseStore, StageBundleRequest, TypedSourceRef,
@@ -333,6 +333,8 @@ struct EditFixture {
     context: ModelRequestContext,
     development: DevelopmentRunRequest,
     bundle: ResolvedBundle,
+    /// The compiler-input binding both facts were written under.
+    binding: evo_engine::formal_authority::FormalCompilerInputBinding,
 }
 fn dependencies(
     fixture: &MaterialFixture,
@@ -623,10 +625,15 @@ async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> Edit
         .compile_search_edit(&compiled.output, &ImproverPatch::default())
         .unwrap();
     let payload = json!({"output":compiled.output,"patch":compiled.patch,"report":compiled.report,"bundle":bundle,"merge":merged,"compiler_request":compiler_request,"compiler_binding":compiler_use.binding});
+    // AG-108 (plan §5.1 L455, §5.2 L459): the digest of an EditCompiled fact is the
+    // one shared rule that binds the compiled batch to its compiler binding, as the
+    // producer writes it. This fixture used to hand-roll the bare `fingerprint(&batch)`
+    // that no production fact carries (plan §18.4 L2156: corrected, with independent
+    // coverage in the AG-108 tests below).
     let compiled = fact(
         StageFactKind::EditCompiled,
         OptimizationJournalStage::EditCompile,
-        fingerprint(&batch).unwrap(),
+        edit_compiled_input_digest(&batch, Some(&compiler_use.binding)).unwrap(),
         dependencies(fixture, &grant_id, Some(&prepared.artifact_id)),
         payload,
     );
@@ -646,6 +653,7 @@ async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> Edit
         context,
         development,
         bundle,
+        binding: compiler_use.binding.clone(),
     }
 }
 fn edit(
@@ -1120,7 +1128,10 @@ async fn scope_pb_span_digest_and_output_corruption_never_yield_a_complete_diff(
                     serde_json::from_value(candidate.payload["merge"]["evidence"].clone()).unwrap();
                 batch.edits =
                     serde_json::from_value(candidate.payload["merge"]["edits"].clone()).unwrap();
-                candidate.input_digest = fingerprint(&batch).unwrap();
+                // AG-108: re-digest under the production rule so this case still
+                // reaches the UTF-8 span check instead of a stale-digest refusal.
+                candidate.input_digest =
+                    edit_compiled_input_digest(&batch, Some(&stored.binding)).unwrap();
             }
             "removed_digest" => {
                 candidate.payload["report"]["edits"][0]["removed_digest"] =
@@ -1467,6 +1478,324 @@ async fn support_limit_refuses_the_whole_recipe_without_truncation() {
     .await;
     assert!(response.payload.is_none() && response.gaps.contains(&ReviewGap::SupportLimit));
     assert_eq!(catalog(&fixture.db_path), before);
+}
+
+// AG-108 (plan §5.1 L453/L455, §5.2 L459, V070 L1578): an EditCompiled fact has one
+// input_digest rule. The producer digests the compiled batch together with its
+// compiler binding; review verifies that same rule (`edit_compiled_input_digest`),
+// and facts stored before compiler bindings existed keep the bare-batch algorithm.
+
+/// One content edit at the head of the parent's `content` ("ab" -> "new").
+fn head_replace(parent: &SkillSnapshot) -> Vec<SkillTextEdit> {
+    vec![edit(
+        parent,
+        SkillTextField::Content,
+        0,
+        2,
+        TextEditOperation::Replace { text: "new".into() },
+    )]
+}
+
+/// The batch an EditCompiled fact digests: the prepared template completed with
+/// the merged evidence and edits that the fact itself stores (what review rebuilds).
+fn stored_batch(template: &SkillEditBatch, compiled: &StageFact) -> SkillEditBatch {
+    let mut batch = template.clone();
+    batch.evidence = serde_json::from_value(compiled.payload["merge"]["evidence"].clone()).unwrap();
+    batch.edits = serde_json::from_value(compiled.payload["merge"]["edits"].clone()).unwrap();
+    batch
+}
+
+/// The two facts of `stored` in their pre-binding shape: no compiler_* payload
+/// keys, StepPrepared digested as its bare payload, EditCompiled digested as its
+/// bare batch, and a bundle compiled the way such facts were written.
+fn pre_binding_facts(fixture: &MaterialFixture, stored: &EditFixture) -> (StageFact, StageFact) {
+    let mut prepared = stored.prepared.clone();
+    let mut compiled = stored.compiled.clone();
+    for payload in [&mut prepared.payload, &mut compiled.payload] {
+        for key in ["compiler_request", "compiler_binding"] {
+            assert!(payload.as_object_mut().unwrap().remove(key).is_some());
+        }
+    }
+    prepared.input_digest = fingerprint(&prepared.payload).unwrap();
+    let profile: Profile = serde_json::from_value(prepared.payload["profile"].clone()).unwrap();
+    let patch: SkillPatch = serde_json::from_value(compiled.payload["patch"].clone()).unwrap();
+    let bundle = compile_bundle(CompileParts {
+        profile: &profile,
+        parent: &fixture.parent,
+        baseline: &fixture.baseline,
+        parent_strategy: &fixture.parent_strategy,
+        baseline_strategy: &fixture.baseline_strategy,
+        skill_patch: &patch,
+        improver_patch: &ImproverPatch::default(),
+        caps: &fixture.caps,
+        revoked: &BTreeSet::new(),
+    })
+    .unwrap();
+    compiled.payload["bundle"] = serde_json::to_value(&bundle).unwrap();
+    compiled.input_digest = fingerprint(&stored_batch(&stored.template, &compiled)).unwrap();
+    (prepared.seal().unwrap(), compiled.seal().unwrap())
+}
+
+#[tokio::test]
+async fn a_production_edit_compiled_fact_reviews_to_an_exact_diff_under_the_one_digest_rule() {
+    // Before AG-108 review compared the bare batch while the producer digests
+    // (batch, compiler binding), so every production EditCompiled came back as
+    // material_invalid with no payload and no diff.
+    let fixture = material_fixture(parent()).await;
+    let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+    let batch = stored_batch(&stored.template, &stored.compiled);
+    // The producer's formula, spelled out here independently of the shared rule.
+    let producer = fingerprint(&(&batch, &stored.binding)).unwrap();
+    assert_eq!(stored.compiled.input_digest, producer);
+    // The shared rule: its bound branch is byte-identical to the producer's former
+    // inline expression, so routing the producer through it leaves the written
+    // bytes unchanged; its unbound branch is the pre-binding algorithm; and the
+    // two never coincide.
+    assert_eq!(
+        edit_compiled_input_digest(&batch, Some(&stored.binding)).unwrap(),
+        producer
+    );
+    let pre_binding = fingerprint(&batch).unwrap();
+    assert_eq!(
+        edit_compiled_input_digest(&batch, None).unwrap(),
+        pre_binding
+    );
+    assert_ne!(producer, pre_binding);
+
+    let before = catalog(&fixture.db_path);
+    let metadata = review(
+        &fixture,
+        ReviewKind::StageFact,
+        &stored.compiled.artifact_id,
+        ReviewDetail::Metadata,
+    )
+    .await;
+    assert!(
+        metadata.payload.is_some() && !metadata.diff_complete,
+        "the default detail lost a producer-written fact: {:?}",
+        metadata.gaps
+    );
+    assert_metadata(&as_json(&metadata));
+    let exact = review(
+        &fixture,
+        ReviewKind::StageFact,
+        &stored.compiled.artifact_id,
+        ReviewDetail::Exact,
+    )
+    .await;
+    assert!(
+        !exact.gaps.contains(&ReviewGap::MaterialInvalid),
+        "a fact written under the producer's digest rule was refused: {:?}",
+        exact.gaps
+    );
+    assert!(
+        exact.payload.is_some(),
+        "no payload for a producer-written fact: {:?}",
+        exact.gaps
+    );
+    assert!(
+        exact.diff_complete,
+        "expected a fully bound exact stored diff: {:?}",
+        exact.gaps
+    );
+    let value = as_json(&exact);
+    let materials = &value["payload"]["materials"];
+    assert_eq!(materials["diff"]["edits"][0]["removed"]["display"], "ab");
+    assert_eq!(materials["diff"]["edits"][0]["inserted"]["display"], "new");
+    assert_eq!(
+        materials["bundle"]["skill"]["content"]["display"],
+        "new中文🙂cd"
+    );
+    assert_eq!(
+        catalog(&fixture.db_path),
+        before,
+        "review changed the business catalog"
+    );
+}
+
+#[tokio::test]
+async fn edit_compiled_facts_stored_before_compiler_bindings_keep_the_old_digest_rule() {
+    // Guard case (plan §5.1 L453), green before and after AG-108: a fact stored
+    // without compiler_* payload keys digests the bare batch, keeps that old
+    // algorithm and interpretation, and still reviews to a complete exact diff.
+    let fixture = material_fixture(parent()).await;
+    let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+    let (prepared, compiled) = pre_binding_facts(&fixture, &stored);
+    assert!(compiled.payload.get("compiler_request").is_none());
+    assert!(compiled.payload.get("compiler_binding").is_none());
+    // The old algorithm, spelled out independently of the shared rule.
+    assert_eq!(
+        compiled.input_digest,
+        fingerprint(&stored_batch(&stored.template, &compiled)).unwrap()
+    );
+    assert_ne!(compiled.input_digest, stored.compiled.input_digest);
+    replace_fact(&fixture, &prepared).await;
+    replace_fact(&fixture, &compiled).await;
+
+    let before = catalog(&fixture.db_path);
+    let exact = review(
+        &fixture,
+        ReviewKind::StageFact,
+        &compiled.artifact_id,
+        ReviewDetail::Exact,
+    )
+    .await;
+    assert!(
+        exact.payload.is_some() && exact.diff_complete,
+        "a pre-binding fact must keep reviewing under its own rule: {:?}",
+        exact.gaps
+    );
+    assert!(!exact.gaps.contains(&ReviewGap::MaterialInvalid));
+    let value = as_json(&exact);
+    let diff = &value["payload"]["materials"]["diff"];
+    assert_eq!(diff["edits"][0]["removed"]["display"], "ab");
+    assert_eq!(diff["edits"][0]["inserted"]["display"], "new");
+    assert_eq!(catalog(&fixture.db_path), before);
+}
+
+#[tokio::test]
+async fn edit_compiled_changed_after_its_digest_is_refused_by_the_digest_alone() {
+    let fixture = material_fixture(parent()).await;
+    let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+    // A change every other review check accepts: the anchor "ab" occurs exactly
+    // once in the parent field and covers the edited span, and the applied
+    // report carries no anchor. Only the digest can notice it.
+    let mut tampered = stored.compiled.clone();
+    tampered.payload["merge"]["edits"][0]["exact_anchor"] = json!({"text": "ab"});
+    // Seal refreshes the payload digest only; input_digest stays the producer's.
+    let tampered = tampered.seal().unwrap();
+    assert_eq!(tampered.input_digest, stored.compiled.input_digest);
+    replace_fact(&fixture, &tampered).await;
+    let before = catalog(&fixture.db_path);
+    let refused = review(
+        &fixture,
+        ReviewKind::StageFact,
+        &tampered.artifact_id,
+        ReviewDetail::Exact,
+    )
+    .await;
+    assert!(refused.payload.is_none() && !refused.diff_complete);
+    assert!(
+        refused.gaps.contains(&ReviewGap::MaterialInvalid),
+        "an edit changed after its digest was accepted: {:?}",
+        refused.gaps
+    );
+    assert_eq!(catalog(&fixture.db_path), before);
+
+    // Control: the identical payload under a digest recomputed by the shared rule
+    // reviews completely, so the refusal above came from the digest comparison.
+    let mut resealed = tampered.clone();
+    resealed.input_digest = edit_compiled_input_digest(
+        &stored_batch(&stored.template, &resealed),
+        Some(&stored.binding),
+    )
+    .unwrap();
+    assert_ne!(resealed.input_digest, stored.compiled.input_digest);
+    let resealed = resealed.seal().unwrap();
+    replace_fact(&fixture, &resealed).await;
+    let accepted = review(
+        &fixture,
+        ReviewKind::StageFact,
+        &resealed.artifact_id,
+        ReviewDetail::Exact,
+    )
+    .await;
+    assert!(
+        accepted.payload.is_some() && accepted.diff_complete,
+        "the control lost more than the digest: {:?}",
+        accepted.gaps
+    );
+}
+
+#[tokio::test]
+async fn an_edit_compiled_is_never_accepted_under_the_other_shapes_digest_rule() {
+    // One rule per shape (plan §5.2 L459) and no cross acceptance: a fact that
+    // carries the compiler keys must hold the bound digest, a fact without them
+    // the bare-batch digest.
+    let fixture = material_fixture(parent()).await;
+    let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+    let batch = stored_batch(&stored.template, &stored.compiled);
+
+    // Compiler keys present, bare-batch digest: exactly what review accepted
+    // before AG-108 and no producer ever writes.
+    let mut bare = stored.compiled.clone();
+    bare.input_digest = fingerprint(&batch).unwrap();
+    let bare = bare.seal().unwrap();
+    replace_fact(&fixture, &bare).await;
+    let refused = review(
+        &fixture,
+        ReviewKind::StageFact,
+        &bare.artifact_id,
+        ReviewDetail::Exact,
+    )
+    .await;
+    assert!(refused.payload.is_none() && !refused.diff_complete);
+    assert!(
+        refused.gaps.contains(&ReviewGap::MaterialInvalid),
+        "a fact with compiler keys was accepted under the bare-batch rule: {:?}",
+        refused.gaps
+    );
+
+    // No compiler keys, bound digest.
+    let (prepared, mut unbound) = pre_binding_facts(&fixture, &stored);
+    unbound.input_digest = fingerprint(&(&batch, &stored.binding)).unwrap();
+    let unbound = unbound.seal().unwrap();
+    replace_fact(&fixture, &prepared).await;
+    replace_fact(&fixture, &unbound).await;
+    let refused = review(
+        &fixture,
+        ReviewKind::StageFact,
+        &unbound.artifact_id,
+        ReviewDetail::Exact,
+    )
+    .await;
+    assert!(refused.payload.is_none() && !refused.diff_complete);
+    assert!(
+        refused.gaps.contains(&ReviewGap::MaterialInvalid),
+        "a fact without compiler keys was accepted under the bound rule: {:?}",
+        refused.gaps
+    );
+}
+
+#[tokio::test]
+async fn an_edit_compiled_with_only_one_compiler_key_is_refused_whichever_rule_sealed_it() {
+    // Plan §5.1 L453: no guessing between the bound and the pre-binding rule.
+    // Review refuses a mixed shape at the (request, binding) pair check against
+    // StepPrepared, and validate_compiled keeps the same (Some, Some) / (None, None)
+    // match that read_prepared uses, so it could not pick a rule either.
+    for dropped in ["compiler_request", "compiler_binding"] {
+        let fixture = material_fixture(parent()).await;
+        let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+        let mut mixed = stored.compiled.clone();
+        assert!(
+            mixed
+                .payload
+                .as_object_mut()
+                .unwrap()
+                .remove(dropped)
+                .is_some()
+        );
+        let batch = stored_batch(&stored.template, &mixed);
+        for rule in [Some(&stored.binding), None] {
+            let mut candidate = mixed.clone();
+            candidate.input_digest = edit_compiled_input_digest(&batch, rule).unwrap();
+            let candidate = candidate.seal().unwrap();
+            replace_fact(&fixture, &candidate).await;
+            let response = review(
+                &fixture,
+                ReviewKind::StageFact,
+                &candidate.artifact_id,
+                ReviewDetail::Exact,
+            )
+            .await;
+            assert!(
+                response.payload.is_none() && !response.diff_complete,
+                "mixed shape without {dropped} (bound rule: {}) was reviewed",
+                rule.is_some()
+            );
+            assert!(response.gaps.contains(&ReviewGap::MaterialInvalid));
+        }
+    }
 }
 
 // Existing E05 setup semantics, isolated here so review verification can compare

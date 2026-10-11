@@ -2094,7 +2094,7 @@ async fn run_optimization_step_inner(
         OptimizationJournalStage::EditCompile,
         StageFactKind::EditCompiled,
         request.model_context.request_id.clone(),
-        fingerprint(&(&edit_batch, compiler_inputs.binding()))?,
+        edit_compiled_input_digest(&edit_batch, Some(compiler_inputs.binding()))?,
         serde_json::json!({}),
     )?;
     let saved_compile = journal.lookup(&compile_key.artifact_id).await?;
@@ -2666,6 +2666,33 @@ fn call_stage(base: ModelStage, otherwise: ModelStage) -> ModelStage {
         ModelStage::Consolidate
     } else {
         otherwise
+    }
+}
+
+/// The one `StageFact.input_digest` rule of an `EditCompiled` fact (plan §5.2:
+/// a public field has exactly one digest rule). The producer
+/// (`run_optimization_step`) and the stored-review reader
+/// (`review::validate_compiled`) both call this function, so the digest the
+/// producer writes is, by construction, the digest review recomputes (V070,
+/// AG-108).
+///
+/// * `Some(binding)`: a fact compiled under an authenticated compiler-input
+///   binding. The digest covers the complete compiled batch AND that binding,
+///   so any change of either is a different effective digest (plan §5.1: a
+///   signature binds the actual final request/composition).
+/// * `None`: a fact stored before compiler bindings existed. It keeps its old
+///   algorithm and interpretation (plan §5.1: old v1 objects keep their
+///   algorithm).
+///
+/// The hashed value of each branch is carried by every stored fact; it must
+/// never change.
+pub fn edit_compiled_input_digest(
+    batch: &SkillEditBatch,
+    binding: Option<&crate::formal_authority::FormalCompilerInputBinding>,
+) -> Result<String> {
+    match binding {
+        Some(binding) => fingerprint(&(batch, binding)),
+        None => fingerprint(batch),
     }
 }
 
