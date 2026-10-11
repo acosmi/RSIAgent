@@ -389,20 +389,40 @@ fn actual_export_material(text: &str) -> Value {
     json!({"request": request, "prepared": actual})
 }
 
+/// `AG085_GOLDEN_DIR` must be an absolute path inside the repository's `out/` tree: this
+/// checkout's own `out/`, or the `out/` that encloses a worktree nested inside it. The
+/// check is lexical, so it creates nothing and needs no path to exist.
+fn is_authorized_golden_directory(directory: &Path) -> bool {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("evo-engine sits two levels below the repository root");
+    let mut out_trees = vec![root.join("out")];
+    out_trees.extend(
+        root.ancestors()
+            .skip(1)
+            .filter(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new("out")))
+            .map(Path::to_path_buf),
+    );
+    let climbs = directory
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir));
+    directory.is_absolute()
+        && !climbs
+        && out_trees
+            .iter()
+            .any(|out| directory.starts_with(out) && directory != out.as_path())
+}
+
 fn write_actual_golden(name: &str, material: Value) {
     let Some(directory) = std::env::var_os("AG085_GOLDEN_DIR") else {
         return;
     };
     let directory = PathBuf::from(directory);
     assert!(
-        directory
-            == Path::new(
-                "/Users/wrok/Desktop/RSIAgent/out/scratch/ag-085-impl/parent-phase/golden-parent"
-            )
-            || directory
-                == Path::new(
-                    "/Users/wrok/Desktop/RSIAgent/out/scratch/ag-085-impl/head-phase/golden-head"
-                )
+        is_authorized_golden_directory(&directory),
+        "AG085_GOLDEN_DIR must be an absolute path inside the repository out/ tree, got {}",
+        directory.display()
     );
     std::fs::create_dir_all(&directory).expect("create authorized own golden directory");
     let mut bytes = serde_json::to_vec_pretty(&material).expect("serialize actual golden material");

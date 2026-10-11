@@ -104,7 +104,14 @@ git clone https://github.com/acosmi/RSIAgent.git && cd RSIAgent
 cat docs/implementation-ledger.md
 ```
 
-CLI 入口（`apps/rsia`）目前只打印进行中引导，**不会**拉起完整服务。在写稳定教程前，以台账为准。
+CLI 入口（`apps/rsia`）将 `serve` 接到 HTTP 服务，将 `mcp` 接到启动时固定 Agent 身份的四个 stdio MCP 工具，将 `manage` 接到经鉴权的 HTTP 管理作业，将 `review` 接到经鉴权的 HTTP 已存材料审阅。默认引导使用禁用的模型传输与 `ToolOnly` 能力；未配置 HTTP 鉴权时，敏感请求以 503 拒绝。这些入口不代表已达到生产就绪；当前支持范围请以台账为准。
+
+`apps/rsia/src/main.rs` 中定义的子命令：
+
+- `rsia serve` — 提供经鉴权的 HTTP API（`--bind` 默认 `127.0.0.1:7788`，`--data` 默认 `rsia.sqlite3`，`--namespace` 默认 `default`）。
+- `rsia mcp` — 通过 stdio 运行四个 MCP 工具，Agent 身份在启动时固定（`--data` 默认 `rsia.sqlite3`，`--namespace` 默认 `default`，`--actor` 默认 `stdio-agent`）。
+- `rsia manage <operation>` — 通过 HTTP 服务提交或查看经鉴权的管理作业（`--url` 默认 `http://127.0.0.1:7788`；必须提供 `--auth-token` 或环境变量 `RSIA_MANAGEMENT_TOKEN`；另接受 `--request-file` 与 `--job-id`）。
+- `rsia review --kind <typed_candidate|stage_fact|formal_report> --id <id> [--detail metadata|exact] [--url <url>] [--auth-token <token>]` — 通过经鉴权的 HTTP 服务审阅已存材料（`--detail` 默认 `metadata`，`--url` 默认 `http://127.0.0.1:7788`；必须提供 `--auth-token` 或环境变量 `RSIA_MANAGEMENT_TOKEN`）。
 
 ### 目标宿主流程（设计）
 
@@ -144,7 +151,7 @@ HTTP 默认绑定（启用后）：`127.0.0.1:7788`。
 ## 仓库结构
 
 ```
-apps/rsia           CLI / 进程入口（今日为引导）
+apps/rsia           CLI / 进程入口（serve / mcp / manage / review）
 crates/evo-core     纯契约与验收规则
 crates/evo-storage  持久化
 crates/evo-engine   受控改进与评估

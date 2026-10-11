@@ -104,7 +104,14 @@ git clone https://github.com/acosmi/RSIAgent.git && cd RSIAgent
 cat docs/implementation-ledger.md
 ```
 
-The CLI entry (`apps/rsia`) wires `serve` to the HTTP service, `mcp` to the four stdio MCP tools with a startup-fixed Agent identity, and `manage` to authenticated HTTP management jobs. The default bootstrap uses a disabled model transport and `ToolOnly` capabilities; without configured HTTP authentication, sensitive requests are refused with 503. These entry points do not establish production readiness; consult the ledger for the current support scope.
+The CLI entry (`apps/rsia`) wires `serve` to the HTTP service, `mcp` to the four stdio MCP tools with a startup-fixed Agent identity, `manage` to authenticated HTTP management jobs, and `review` to authenticated HTTP review of stored material. The default bootstrap uses a disabled model transport and `ToolOnly` capabilities; without configured HTTP authentication, sensitive requests are refused with 503. These entry points do not establish production readiness; consult the ledger for the current support scope.
+
+Subcommands defined in `apps/rsia/src/main.rs`:
+
+- `rsia serve` — serves the authenticated HTTP API (`--bind` defaults to `127.0.0.1:7788`, `--data` to `rsia.sqlite3`, `--namespace` to `default`).
+- `rsia mcp` — runs the four MCP tools over stdio with a startup-fixed Agent identity (`--data` defaults to `rsia.sqlite3`, `--namespace` to `default`, `--actor` to `stdio-agent`).
+- `rsia manage <operation>` — submits or inspects authenticated management jobs through the HTTP service (`--url` defaults to `http://127.0.0.1:7788`; `--auth-token`, or the `RSIA_MANAGEMENT_TOKEN` environment variable, is required; `--request-file` and `--job-id` are also accepted).
+- `rsia review --kind <typed_candidate|stage_fact|formal_report> --id <id> [--detail metadata|exact] [--url <url>] [--auth-token <token>]` — reviews stored material through the authenticated HTTP service (`--detail` defaults to `metadata`, `--url` to `http://127.0.0.1:7788`, and `--auth-token`, or the `RSIA_MANAGEMENT_TOKEN` environment variable, is required).
 
 ### Target host flow (designed)
 
@@ -144,7 +151,7 @@ Candidate states include: Proposed → Validated → AcceptancePassed → Approv
 ## Repository layout
 
 ```
-apps/rsia           CLI / process entry (serve / mcp / manage)
+apps/rsia           CLI / process entry (serve / mcp / manage / review)
 crates/evo-core     Pure contracts & acceptance rules
 crates/evo-storage  Persistence
 crates/evo-engine   Controlled improvement & evaluation
