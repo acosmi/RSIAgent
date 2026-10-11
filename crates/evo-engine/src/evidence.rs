@@ -518,3 +518,15 @@ pub async fn load_stored_source(
     authority.validate()?;
     Ok(authority)
 }
+
+/// Owner-only local material from a fixed persisted E16 result. The snapshot is
+/// unreviewed, cannot be dispatched to a model, and grants no future-use authority.
+pub async fn read_persisted_imported_development_material(
+    context: &evo_core::Context,
+    store: &evo_storage::Store,
+    request: &evo_core::evidence::ImportMaterialReadRequest,
+) -> Result<evo_core::evidence::ImportedDevelopmentMaterial> {
+    crate::import::PersistentImportService::new(store.clone())
+        .read_local_development_material(context, request)
+        .await
+}

@@ -481,6 +481,277 @@ pub fn invalidate_jobs_if_source_revoked(
     Ok(pending.to_vec())
 }
 
+/// E16 object identity. Every variant names an `artifact`, never a trusted run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImportArtifactSchema {
+    #[serde(rename = "rsia.e16.source_selection.v1")]
+    SourceSelection,
+    #[serde(rename = "rsia.e16.import_source.v1")]
+    ImportSource,
+    #[serde(rename = "rsia.e16.import_result.v1")]
+    ImportResult,
+}
+
+impl ImportArtifactSchema {
+    pub fn storage_kind(self) -> &'static str {
+        "artifact"
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceSelection => "rsia.e16.source_selection.v1",
+            Self::ImportSource => "rsia.e16.import_source.v1",
+            Self::ImportResult => "rsia.e16.import_result.v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportArtifactRef {
+    pub schema: ImportArtifactSchema,
+    pub id: String,
+    /// Fingerprint of the entire typed persisted object, not its raw blob.
+    pub object_digest: String,
+}
+
+fn import_material_digest(value: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::Invalid("invalid import material SHA-256".into()));
+    }
+    Ok(())
+}
+
+impl ImportArtifactRef {
+    pub fn validate(&self) -> Result<()> {
+        identifier(&self.id)?;
+        let prefix = match self.schema {
+            ImportArtifactSchema::SourceSelection => "e16sel-",
+            ImportArtifactSchema::ImportSource => "e16src-",
+            ImportArtifactSchema::ImportResult => "e16res-",
+        };
+        if self.id.strip_prefix(prefix).is_none_or(|suffix| {
+            suffix.len() != 24
+                || !suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return Err(Error::Invalid("expected opaque import artifact id".into()));
+        }
+        import_material_digest(&self.object_digest)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportedSourceBinding {
+    pub artifact: ImportArtifactRef,
+    /// Registered immutable raw digest. Unreadable sources remain dependencies;
+    /// this field alone does not claim that they parsed or executed successfully.
+    pub raw_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportEventKey {
+    pub source_id: String,
+    pub event_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportMaterialReadRequest {
+    pub result: ImportArtifactRef,
+    pub events: Vec<ImportEventKey>,
+}
+
+impl ImportMaterialReadRequest {
+    pub fn validate(&self) -> Result<()> {
+        self.result.validate()?;
+        if self.result.schema != ImportArtifactSchema::ImportResult
+            || self.events.len() > MAX_EXCERPTS
+        {
+            return Err(Error::Invalid(
+                "invalid local import material selection".into(),
+            ));
+        }
+        let mut keys = BTreeSet::new();
+        for key in &self.events {
+            identifier(&key.source_id)?;
+            if !keys.insert(key) {
+                return Err(Error::Invalid("duplicate import event key".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportedMaterialExcerpt {
+    pub source_id: String,
+    pub event_index: usize,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub raw_fragment_digest: String,
+    /// Digest of the normalized content reconstructed with the pinned reader
+    /// and the original import's event limit, before this local projection.
+    pub normalized_content_digest: String,
+    pub content_digest: String,
+    pub role: String,
+    pub kind: String,
+    pub content: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportMaterialCursor {
+    pub event: ImportEventKey,
+    /// UTF-8 byte offset in the reconstructed normalized content. Informational:
+    /// this API does not accept offsets or promise resumable pagination.
+    pub byte_offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportProjectionCoverage {
+    pub requested_events: usize,
+    pub returned_excerpts: usize,
+    pub serialized_excerpt_bytes: usize,
+    pub partial: bool,
+    pub next: Option<ImportMaterialCursor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportMaterialPrivacyStatus {
+    Unreviewed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportMaterialDispatchPolicy {
+    NoModelDispatch,
+}
+
+/// Local data snapshot, not an outbound, execution, or future-use authority.
+/// Every future consumer must reload live sources and independently authorize use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportedDevelopmentMaterial {
+    pub namespace: String,
+    pub revoke_watermark: u64,
+    pub result: ImportArtifactRef,
+    pub selection: ImportArtifactRef,
+    pub sources: Vec<ImportedSourceBinding>,
+    pub evidence_set_id: String,
+    pub evidence_digest: String,
+    pub aggregate_summary: AggregateSummary,
+    pub independent_cluster_count: usize,
+    pub excerpts: Vec<ImportedMaterialExcerpt>,
+    pub projection_coverage: ImportProjectionCoverage,
+    pub digest: String,
+    pub task_origin: TaskOrigin,
+    pub execution_attestation: ExecutionAttestation,
+    pub purpose: Purpose,
+    pub privacy_status: ImportMaterialPrivacyStatus,
+    pub dispatch_policy: ImportMaterialDispatchPolicy,
+}
+
+impl ImportedDevelopmentMaterial {
+    /// Shape and deterministic binding only; this is not a live storage gate.
+    pub fn validate(&self) -> Result<()> {
+        identifier(&self.namespace)?;
+        identifier(&self.evidence_set_id)?;
+        import_material_digest(&self.evidence_digest)?;
+        self.result.validate()?;
+        self.selection.validate()?;
+        if self.result.schema != ImportArtifactSchema::ImportResult
+            || self.selection.schema != ImportArtifactSchema::SourceSelection
+            || self.sources.is_empty()
+            || self.sources.len() > MAX_DISCOVERED_FILES
+            || self.task_origin != TaskOrigin::ImportedHistory
+            || self.execution_attestation != ExecutionAttestation::UnverifiedImport
+            || self.purpose != Purpose::Development
+            || self.independent_cluster_count != self.aggregate_summary.unique_clusters
+            || self.aggregate_summary.total_sources > self.sources.len()
+        {
+            return Err(Error::Invalid(
+                "invalid local imported material identity".into(),
+            ));
+        }
+        let mut source_ids = BTreeSet::new();
+        for source in &self.sources {
+            source.artifact.validate()?;
+            import_material_digest(&source.raw_digest)?;
+            if source.artifact.schema != ImportArtifactSchema::ImportSource
+                || !source_ids.insert(source.artifact.id.as_str())
+            {
+                return Err(Error::Invalid(
+                    "invalid import material source closure".into(),
+                ));
+            }
+        }
+        let coverage = &self.projection_coverage;
+        let bytes = serde_json::to_vec(&self.excerpts)
+            .map_err(|_| Error::Internal)?
+            .len();
+        if coverage.requested_events > MAX_EXCERPTS
+            || self.excerpts.len() > coverage.requested_events
+            || coverage.returned_excerpts != self.excerpts.len()
+            || coverage.serialized_excerpt_bytes != bytes
+            || bytes > MAX_TOTAL_EXCERPT_BYTES
+            || coverage.partial != coverage.next.is_some()
+            || (!coverage.partial
+                && (self.excerpts.len() != coverage.requested_events
+                    || self.excerpts.iter().any(|excerpt| excerpt.truncated)))
+        {
+            return Err(Error::Invalid("invalid import projection coverage".into()));
+        }
+        let mut keys = BTreeSet::new();
+        for excerpt in &self.excerpts {
+            if !source_ids.contains(excerpt.source_id.as_str())
+                || excerpt.byte_start >= excerpt.byte_end
+                || !keys.insert((excerpt.source_id.as_str(), excerpt.event_index))
+            {
+                return Err(Error::Invalid(
+                    "invalid import material excerpt binding".into(),
+                ));
+            }
+            import_material_digest(&excerpt.raw_fragment_digest)?;
+            import_material_digest(&excerpt.normalized_content_digest)?;
+            import_material_digest(&excerpt.content_digest)?;
+            if crate::hash(excerpt.content.as_bytes()) != excerpt.content_digest
+                || (!excerpt.truncated
+                    && excerpt.content_digest != excerpt.normalized_content_digest)
+            {
+                return Err(Error::Invalid(
+                    "import material content digest mismatch".into(),
+                ));
+            }
+        }
+        if coverage
+            .next
+            .as_ref()
+            .is_some_and(|cursor| !source_ids.contains(cursor.event.source_id.as_str()))
+        {
+            return Err(Error::Invalid("invalid import material cursor".into()));
+        }
+        import_material_digest(&self.digest)?;
+        let mut unsigned = self.clone();
+        unsigned.digest.clear();
+        if fingerprint(&unsigned)? != self.digest {
+            return Err(Error::Invalid("import material digest mismatch".into()));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
