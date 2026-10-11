@@ -23,6 +23,9 @@ const MODEL_REQUEST_ARTIFACT_SCHEMA: &str = "rsia.model_request.artifact.v1";
 const MODEL_TRANSPORT_ARTIFACT_SCHEMA: &str = "rsia.model_transport.artifact.v1";
 const MODEL_RESPONSE_ARTIFACT_SCHEMA: &str = "rsia.model_response.artifact.v1";
 const PRE_DISPATCH_REASON_PREFIX: &str = "broker_pre_dispatch_v1.";
+/// The close a bound replay records for a settled call whose execution close was
+/// lost between its settlement commit and its close commit.
+const BOUND_RECOVERY_CLOSE_REASON: &str = "recovered_bound_response";
 
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
@@ -606,6 +609,73 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         Ok(())
     }
 
+    /// The bound path's recovery close, recorded by `dispatch_bound` before it
+    /// opens its Session: the close is a Store write that takes the pool's single
+    /// connection, and the Session's authority and source checks may refuse the
+    /// replay, which must not leave a settled call holding its billing root.
+    /// Only the same key closes: the stored input digest must equal this
+    /// request's and, unless the revocation cleanup redacted it, so must the
+    /// stored bound request artifact, the pair the Session's idempotency check
+    /// compares; any other reuse of the call id is left to that check. The call
+    /// must have been dispatched, still be open and hold a persisted response,
+    /// the evidence that its execution ended; a call without one is not closed
+    /// here. Like the legacy close it changes no charge, usage, receipt or
+    /// response column, authorizes no content and no dispatch, and writes
+    /// nothing for a call that is already closed.
+    async fn close_settled_bound_execution(
+        &self,
+        ctx: &Context,
+        request: &ModelRequest,
+        artifact: &BudgetArtifact,
+        now: i64,
+    ) -> Result<()> {
+        // A typed access refusal is not decided here: the Session's read refuses
+        // such a replay exactly as before.
+        let Ok(Some(call)) = self
+            .store
+            .budget_call_typed(ctx, &self.config.billing_scope, &request.request_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        // A request artifact the revocation cleanup redacted no longer holds the
+        // request, so its fingerprint cannot match; the input digest alone then
+        // names the call, as on the legacy path. The accounting close does not
+        // depend on whether the content is still there (plan §11, §7.2.1).
+        let redacted = call
+            .request_artifact
+            .as_ref()
+            .is_some_and(|stored| stored.schema_version == "rsia.redacted.v1");
+        if call.actual_input_digest != request.cache_key_digest
+            || (!redacted
+                && call
+                    .request_artifact
+                    .as_ref()
+                    .map(fingerprint)
+                    .transpose()?
+                    != Some(fingerprint(artifact)?))
+            || call.state == BudgetCallState::Reserved
+            || call.response_artifact.is_none()
+            || call.execution_closed
+        {
+            return Ok(());
+        }
+        let Some(dispatch_id) = call.dispatch_id.as_deref() else {
+            return Ok(());
+        };
+        self.store
+            .close_budget_call_execution(
+                ctx,
+                &call.billing_scope,
+                &call.call_id,
+                dispatch_id,
+                BOUND_RECOVERY_CLOSE_REASON,
+                now,
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn existing_response(
         &self,
         request: &ModelRequest,
@@ -879,6 +949,11 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
             .checked_add(self.config.lease_seconds)
             .ok_or(Error::Budget)?;
         let artifact = BudgetArtifact::from_serializable("rsia.bound_model_request.v1", &bound)?;
+        // Accounting before content (plan §11, §6.6, E04): a same-key replay of a
+        // settled call records its lost close before the checks below, which may
+        // refuse it; their refusal and its return value are unchanged.
+        self.close_settled_bound_execution(&ctx, &request, &artifact, now)
+            .await?;
         let mut session = self.store.session().await?;
         bound.verify_current(&mut session, &ctx).await?;
         if let Some(cap) = self.transport.formal_capability() {
@@ -923,6 +998,8 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
                 session.commit().await?;
                 // A late persisted response remains an accounting fact. Closing
                 // execution after this read cannot authorize another dispatch.
+                // The close before the Session normally recorded it already; this
+                // one still covers a call that changed between that read and this.
                 if call.response_artifact.is_some() && !call.execution_closed {
                     self.store
                         .close_budget_call_execution(
@@ -930,7 +1007,7 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
                             &call.billing_scope,
                             &call.call_id,
                             call.dispatch_id.as_deref().ok_or(Error::Internal)?,
-                            "recovered_bound_response",
+                            BOUND_RECOVERY_CLOSE_REASON,
                             now,
                         )
                         .await?;
