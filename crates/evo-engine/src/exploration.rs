@@ -9,8 +9,9 @@ use crate::model::ModelPort;
 use crate::optimization::{
     DevRunner, DevelopmentExecutionProvenance, DevelopmentRunReport, DevelopmentSelection,
     OptimizationJournal, OptimizationStepOutcome, OptimizationStepRequest, StageFact,
-    StageFactKind, StepTerminalClass, development_stage_fact_ids, optimization_request_digest,
-    run_optimization_step, verified_development_observation_in_session,
+    StageFactKind, StepFuture, StepTerminalClass, development_stage_fact_ids,
+    optimization_request_digest, resolve_compiler_inputs_boxed, run_optimization_step,
+    verified_development_observation_in_session,
 };
 use evo_core::contract::ResolvedBundle;
 use evo_core::evaluation::DataUse;
@@ -970,7 +971,19 @@ impl PersistentCoordinator {
     /// cannot succeed is refused before the claim is written. Only a failure of the
     /// store returns an error once the claim is written; the claim then stays open,
     /// and the same request resumes it.
-    pub async fn run_next(
+    ///
+    /// The returned future is boxed (`StepFuture`); awaiting it is the same call.
+    pub fn run_next<'a>(
+        &'a self,
+        model: Option<&'a dyn ModelPort>,
+        runner: Option<&'a dyn DevRunner>,
+        journal: Option<&'a dyn OptimizationJournal>,
+        request: OptimizationStepRequest<'a>,
+    ) -> StepFuture<'a, CoordinatorStepResult> {
+        Box::pin(self.run_next_unboxed(model, runner, journal, request))
+    }
+
+    async fn run_next_unboxed(
         &self,
         model: Option<&dyn ModelPort>,
         runner: Option<&dyn DevRunner>,
@@ -984,7 +997,7 @@ impl PersistentCoordinator {
         }
         {
             let mut session = self.store.session().await?;
-            let inputs = crate::formal_authority::resolve_compiler_inputs(
+            let inputs = resolve_compiler_inputs_boxed(
                 &mut session,
                 &self.context,
                 &request.compiler_input_request(),
@@ -1067,7 +1080,7 @@ impl PersistentCoordinator {
             &fingerprint(&(world_id.as_str(), action_seq))?[..32]
         );
         let mut session = self.store.session().await?;
-        let inputs = crate::formal_authority::resolve_compiler_inputs(
+        let inputs = resolve_compiler_inputs_boxed(
             &mut session,
             &self.context,
             &request.compiler_input_request(),
