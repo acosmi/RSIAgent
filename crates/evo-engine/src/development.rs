@@ -16,7 +16,7 @@ use crate::evidence::{load_stored_source, validate_stored_sources};
 use crate::optimization::{
     DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest, DevelopmentRunReport,
     DevelopmentRunRequest, DevelopmentTask, PairedTaskResult, StageDependency, StageFact,
-    validate_development_request,
+    StepFuture, validate_development_request,
 };
 use crate::streaming_evaluator::{FixedGraderSpec, grade_fixed_output};
 use async_trait::async_trait;
@@ -51,23 +51,23 @@ pub const GRADER_RECEIPT_KIND: &str = "development_grader_receipt_v1";
 pub const EXECUTION_OUTPUT_KIND: &str = "development_execution_output_v1";
 pub const RUN_RECEIPT_KIND: &str = "development_run_receipt_v1";
 
-async fn verify_development_bundle_inputs(
-    s: &mut Session,
-    ctx: &Context,
-    request: &DevelopmentRunRequest,
-) -> Result<crate::compiler::AuthenticatedBundleRecord> {
+/// Boxed (`StepFuture`): the development runner awaits it on the step path.
+fn verify_development_bundle_inputs<'a>(
+    s: &'a mut Session,
+    ctx: &'a Context,
+    request: &'a DevelopmentRunRequest,
+) -> StepFuture<'a, crate::compiler::AuthenticatedBundleRecord> {
     // The pure-function runner's parent label is an experimental comparison
     // identifier, not ordinary-P authority. Its candidate carries the full,
     // authenticated actual P/B pair; formal host pairs are separately replayed
     // against their registered projection in verify_formal_task_in_session.
-    crate::compiler::verify_bundle_in_session(
+    Box::pin(crate::compiler::verify_bundle_in_session(
         s,
         ctx,
         &request.candidate_bundle_digest,
         &request.environment_digest,
         request.revoke_watermark,
-    )
-    .await
+    ))
 }
 const ENVELOPE_SCHEMA: &str = "rsia.typed_artifact_envelope.v1";
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;

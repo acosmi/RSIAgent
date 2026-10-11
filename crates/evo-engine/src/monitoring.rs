@@ -20,9 +20,10 @@ use crate::optimization::{
     DevRunner, DevelopmentExecutionProvenance, DevelopmentRunReport, DevelopmentSelection,
     DevelopmentSelectionDecision, OPTIMIZATION_STAGE_FACT_SCHEMA, OptimizationJournal,
     OptimizationJournalStage, OptimizationStepOutcome, OptimizationStepRequest, StageFact,
-    StageFactKind, VerifiedDevelopmentObservationView, development_request_fact_id,
-    optimization_bound_request_digest, read_bound_stage_fact_in_session, run_consolidation_step,
-    verified_development_observation_in_session,
+    StageFactKind, StepFuture, VerifiedDevelopmentObservationView, development_request_fact_id,
+    optimization_bound_request_digest, read_bound_stage_fact_in_session,
+    resolve_compiler_inputs_boxed, run_consolidation_step,
+    verified_development_observation_in_session, verify_compiler_use_boxed,
 };
 use crate::release_store::{
     HostApplicationRecord, RELEASE_CANDIDATE_SCHEMA, ReleaseCandidateRecord, ReleaseStore,
@@ -1054,7 +1055,23 @@ impl MonitoringCoordinator {
     /// must be [`ModelStage::Consolidate`]: that is what meters every model call
     /// of the step under the `Consolidation` budget stage, inside the claim's root
     /// budget. Any other base stage is `Forbidden` before the claim is taken.
-    pub async fn run_consolidation(
+    ///
+    /// The returned future is boxed (`StepFuture`); awaiting it is the same call.
+    pub fn run_consolidation<'a>(
+        ctx: &'a Context,
+        store: &'a Store,
+        claim_id: &'a str,
+        model: Option<&'a dyn ConsolidationModelPort>,
+        runner: Option<&'a dyn ConsolidationDevRunner>,
+        journal: Option<&'a dyn OptimizationJournal>,
+        request: OptimizationStepRequest<'a>,
+    ) -> StepFuture<'a, ConsolidationRunRecord> {
+        Box::pin(Self::run_consolidation_unboxed(
+            ctx, store, claim_id, model, runner, journal, request,
+        ))
+    }
+
+    async fn run_consolidation_unboxed(
         ctx: &Context,
         store: &Store,
         claim_id: &str,
@@ -1148,12 +1165,8 @@ impl MonitoringCoordinator {
                     session.need(ctx, ARTIFACT_KIND, &claim.scope_id).await?;
                 validate_execution_binding(ctx, &claim, &index, &request)?;
             }
-            let verified = crate::formal_authority::resolve_compiler_inputs(
-                &mut session,
-                ctx,
-                &compiler_request,
-            )
-            .await?;
+            let verified =
+                resolve_compiler_inputs_boxed(&mut session, ctx, &compiler_request).await?;
             let compiler_use =
                 crate::model::CompilerInputUse::new(compiler_request, verified.binding().clone());
             let input_digest = optimization_bound_request_digest(&request, &compiler_use)?;
@@ -1263,7 +1276,7 @@ impl MonitoringCoordinator {
         {
             let mut session = store.session().await?;
             let mut current = load_live_claim(&mut session, ctx, &claim.id).await?;
-            compiler_use.verify_current(&mut session, ctx).await?;
+            verify_compiler_use_boxed(&compiler_use, &mut session, ctx).await?;
             match current.state {
                 ConsolidationClaimState::Claimed => {
                     current.state = ConsolidationClaimState::Running;
@@ -1482,7 +1495,23 @@ impl MonitoringCoordinator {
     /// staging hands its reservation back, so a refusal never wedges a proposal.
     /// Fixture-backed proposals may be staged; their provenance is carried on the
     /// proposal and on the result, and formal approval refuses fixture evidence.
-    pub async fn stage_consolidation_candidate(
+    ///
+    /// The returned future is boxed (`StepFuture`); awaiting it is the same call.
+    pub fn stage_consolidation_candidate<'a>(
+        ctx: &'a Context,
+        store: &'a Store,
+        proposal_id: &'a str,
+        candidate_id: &'a str,
+    ) -> StepFuture<'a, StagedConsolidationCandidate> {
+        Box::pin(Self::stage_consolidation_candidate_unboxed(
+            ctx,
+            store,
+            proposal_id,
+            candidate_id,
+        ))
+    }
+
+    async fn stage_consolidation_candidate_unboxed(
         ctx: &Context,
         store: &Store,
         proposal_id: &str,

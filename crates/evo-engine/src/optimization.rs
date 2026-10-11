@@ -16,6 +16,8 @@ use evo_storage::lifecycle::{RevokeTombstone, redacted_object_body};
 use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::compiler::compile_skill_edits;
 use crate::model::{ModelExecutionReceipt, ModelPort, ModelRejectionKind, ModelResponse};
@@ -1170,7 +1172,7 @@ pub(crate) async fn read_bound_stage_fact_in_session(
     id: &str,
     inputs: &crate::model::CompilerInputUse,
 ) -> Result<Option<StageFact>> {
-    inputs.verify_current(s, ctx).await?;
+    verify_compiler_use_boxed(inputs, s, ctx).await?;
     let fact = read_stage_fact(s, ctx, id).await?;
     if let Some(fact) = &fact {
         fact.validate()?;
@@ -1201,7 +1203,17 @@ pub(crate) async fn read_bound_stage_fact_in_session(
     Ok(fact)
 }
 impl StoreOptimizationJournal {
-    async fn claim_current(
+    // `claim_current`, `lookup_current` and `commit_current` return boxed
+    // futures (`StepFuture`); each body is the `*_unboxed` method below it.
+    fn claim_current<'a>(
+        &'a self,
+        fact: StageFact,
+        inputs: Option<&'a crate::model::CompilerInputUse>,
+    ) -> StepFuture<'a, bool> {
+        Box::pin(self.claim_current_unboxed(fact, inputs))
+    }
+
+    async fn claim_current_unboxed(
         &self,
         mut fact: StageFact,
         inputs: Option<&crate::model::CompilerInputUse>,
@@ -1213,7 +1225,7 @@ impl StoreOptimizationJournal {
         let mut session = self.store.session().await?;
         if let Some(inputs) = inputs {
             attach_fact_compiler_use(&mut session, &self.context, &mut fact, inputs).await?;
-            inputs.verify_current(&mut session, &self.context).await?;
+            verify_compiler_use_boxed(inputs, &mut session, &self.context).await?;
         }
         validate_live_fact(&mut session, &self.context, &fact, inputs).await?;
         if let Some(old) = session
@@ -1266,7 +1278,15 @@ impl StoreOptimizationJournal {
         session.commit().await?;
         Ok(true)
     }
-    async fn lookup_current(
+    fn lookup_current<'a>(
+        &'a self,
+        artifact_id: &'a str,
+        inputs: Option<&'a crate::model::CompilerInputUse>,
+    ) -> StepFuture<'a, Option<StageFact>> {
+        Box::pin(self.lookup_current_unboxed(artifact_id, inputs))
+    }
+
+    async fn lookup_current_unboxed(
         &self,
         artifact_id: &str,
         inputs: Option<&crate::model::CompilerInputUse>,
@@ -1308,7 +1328,15 @@ impl StoreOptimizationJournal {
         session.commit().await?;
         Ok(fact)
     }
-    async fn commit_current(
+    fn commit_current<'a>(
+        &'a self,
+        fact: StageFact,
+        inputs: Option<&'a crate::model::CompilerInputUse>,
+    ) -> StepFuture<'a, ()> {
+        Box::pin(self.commit_current_unboxed(fact, inputs))
+    }
+
+    async fn commit_current_unboxed(
         &self,
         mut fact: StageFact,
         inputs: Option<&crate::model::CompilerInputUse>,
@@ -1322,7 +1350,8 @@ impl StoreOptimizationJournal {
         let mut session = self.store.session().await?;
         if let Some(inputs) = inputs {
             attach_fact_compiler_use(&mut session, &self.context, &mut fact, inputs).await?;
-            if let Err(error) = inputs.verify_current(&mut session, &self.context).await {
+            if let Err(error) = verify_compiler_use_boxed(inputs, &mut session, &self.context).await
+            {
                 if holds_model_output(&fact)
                     && (run_dependency_revoked(&mut session, &self.context, &fact).await?
                         || compiler_source_revoked(&mut session, &self.context, inputs).await?)
@@ -1445,9 +1474,7 @@ impl OptimizationJournal for StoreOptimizationJournal {
         request: &crate::formal_authority::CompilerInputRequest,
     ) -> Result<crate::formal_authority::VerifiedCompilerInputs> {
         let mut session = self.store.session().await?;
-        let inputs =
-            crate::formal_authority::resolve_compiler_inputs(&mut session, &self.context, request)
-                .await?;
+        let inputs = resolve_compiler_inputs_boxed(&mut session, &self.context, request).await?;
         session.commit().await?;
         Ok(inputs)
     }
@@ -2692,12 +2719,8 @@ impl FixedConsolidationInputs<'_> {
             ));
         }
         let mut session = self.store.session().await?;
-        self.original
-            .verify_current(&mut session, self.context)
-            .await?;
-        let verified =
-            crate::formal_authority::resolve_compiler_inputs(&mut session, self.context, request)
-                .await?;
+        verify_compiler_use_boxed(self.original, &mut session, self.context).await?;
+        let verified = resolve_compiler_inputs_boxed(&mut session, self.context, request).await?;
         session.commit().await?;
         Ok(verified)
     }
@@ -3111,20 +3134,76 @@ pub(crate) fn optimization_bound_request_digest(
     fingerprint(&(optimization_request_digest(request)?, &inputs.binding))
 }
 
+/// The future of a step-path call, kept on the heap.
+///
+/// A caller that awaits an inline `async fn` future reserves that whole state
+/// machine in its own frame, and an unoptimized build (`opt-level = 0`) keeps
+/// its own stack slots for it at every await site. The step path nests the
+/// optimization step, its compiler-input reads and the exploration and
+/// monitoring consumers, so inline it no longer fits a default 2 MiB thread
+/// stack. A boxed future costs the caller one pointer. The boxed future is the
+/// same future: same order, same errors, same outcome.
+pub(crate) type StepFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// [`crate::formal_authority::resolve_compiler_inputs`], boxed (`StepFuture`).
+pub(crate) fn resolve_compiler_inputs_boxed<'a>(
+    session: &'a mut Session,
+    context: &'a Context,
+    request: &'a crate::formal_authority::CompilerInputRequest,
+) -> StepFuture<'a, crate::formal_authority::VerifiedCompilerInputs> {
+    Box::pin(crate::formal_authority::resolve_compiler_inputs(
+        session, context, request,
+    ))
+}
+
+/// [`crate::model::CompilerInputUse::verify_current`], boxed (`StepFuture`).
+pub(crate) fn verify_compiler_use_boxed<'a>(
+    inputs: &'a crate::model::CompilerInputUse,
+    session: &'a mut Session,
+    context: &'a Context,
+) -> StepFuture<'a, ()> {
+    Box::pin(inputs.verify_current(session, context))
+}
+
+/// [`crate::model::BoundModelRequest::verify_current`], boxed (`StepFuture`).
+fn verify_bound_request_boxed<'a>(
+    bound: &'a crate::model::BoundModelRequest,
+    session: &'a mut Session,
+    context: &'a Context,
+) -> StepFuture<'a, ()> {
+    Box::pin(bound.verify_current(session, context))
+}
+
+/// [`crate::compiler::persist_authenticated_bundle`], boxed (`StepFuture`).
+fn persist_authenticated_bundle_boxed<'a>(
+    session: &'a mut Session,
+    context: &'a Context,
+    request: &'a crate::formal_authority::CompilerInputRequest,
+    bundle: &'a ResolvedBundle,
+) -> StepFuture<'a, crate::formal_authority::VerifiedCompilerInputs> {
+    Box::pin(crate::compiler::persist_authenticated_bundle(
+        session, context, request, bundle,
+    ))
+}
+
 /// Runs one ordinary optimization step. The `Consolidate` base stage belongs to
 /// the consolidation run alone (`MonitoringCoordinator::run_consolidation`): any
 /// other caller presenting it is refused before anything is journaled or
 /// dispatched.
-pub async fn run_optimization_step(
-    model: Option<&dyn ModelPort>,
-    runner: Option<&dyn DevRunner>,
-    journal: Option<&dyn OptimizationJournal>,
-    request: OptimizationStepRequest<'_>,
-) -> Result<OptimizationStepOutcome> {
-    if request.model_context.stage == ModelStage::Consolidate {
-        return Err(Error::Forbidden);
-    }
-    run_step(model, runner, journal, request, None).await
+///
+/// The returned future is boxed (`StepFuture`); awaiting it is the same call.
+pub fn run_optimization_step<'a>(
+    model: Option<&'a dyn ModelPort>,
+    runner: Option<&'a dyn DevRunner>,
+    journal: Option<&'a dyn OptimizationJournal>,
+    request: OptimizationStepRequest<'a>,
+) -> StepFuture<'a, OptimizationStepOutcome> {
+    Box::pin(async move {
+        if request.model_context.stage == ModelStage::Consolidate {
+            return Err(Error::Forbidden);
+        }
+        run_step(model, runner, journal, request, None).await
+    })
 }
 
 /// Entry of `MonitoringCoordinator::run_consolidation`. The step must carry the
@@ -3133,7 +3212,21 @@ pub async fn run_optimization_step(
 /// is journaled or dispatched.
 // The outer Result is child admission: no StepPrepared or outbound work has
 // started. The inner Result preserves the existing paid/uncertain execution path.
-pub(crate) async fn run_consolidation_step(
+pub(crate) fn run_consolidation_step<'a>(
+    model: Option<&'a dyn ModelPort>,
+    runner: Option<&'a dyn DevRunner>,
+    journal: Option<&'a dyn OptimizationJournal>,
+    request: OptimizationStepRequest<'a>,
+    original: &'a crate::model::CompilerInputUse,
+    store: &'a Store,
+    context: &'a Context,
+) -> StepFuture<'a, Result<OptimizationStepOutcome>> {
+    Box::pin(run_consolidation_step_unboxed(
+        model, runner, journal, request, original, store, context,
+    ))
+}
+
+async fn run_consolidation_step_unboxed(
     model: Option<&dyn ModelPort>,
     runner: Option<&dyn DevRunner>,
     journal: Option<&dyn OptimizationJournal>,
@@ -3171,7 +3264,23 @@ pub(crate) async fn run_consolidation_step(
     Ok(run_step(model, runner, Some(journal), request, Some(fixed)).await)
 }
 
-async fn run_step(
+fn run_step<'a>(
+    model: Option<&'a dyn ModelPort>,
+    runner: Option<&'a dyn DevRunner>,
+    journal: Option<&'a dyn OptimizationJournal>,
+    request: OptimizationStepRequest<'a>,
+    fixed_consolidation_inputs: Option<FixedConsolidationInputs<'a>>,
+) -> StepFuture<'a, OptimizationStepOutcome> {
+    Box::pin(run_step_unboxed(
+        model,
+        runner,
+        journal,
+        request,
+        fixed_consolidation_inputs,
+    ))
+}
+
+async fn run_step_unboxed(
     model: Option<&dyn ModelPort>,
     runner: Option<&dyn DevRunner>,
     journal: Option<&dyn OptimizationJournal>,
@@ -3363,7 +3472,22 @@ async fn put_stage_content_edges(s: &mut Session, ctx: &Context, fact: &StageFac
     Ok(())
 }
 
-async fn validate_live_fact(
+/// Boxed (`StepFuture`); the body is `validate_live_fact_unboxed`.
+fn validate_live_fact<'a>(
+    session: &'a mut evo_storage::Session,
+    context: &'a Context,
+    fact: &'a StageFact,
+    original_inputs: Option<&'a crate::model::CompilerInputUse>,
+) -> StepFuture<'a, ()> {
+    Box::pin(validate_live_fact_unboxed(
+        session,
+        context,
+        fact,
+        original_inputs,
+    ))
+}
+
+async fn validate_live_fact_unboxed(
     session: &mut evo_storage::Session,
     context: &Context,
     fact: &StageFact,
@@ -3416,8 +3540,7 @@ async fn validate_live_fact(
         let recorded: crate::formal_authority::FormalCompilerInputBinding =
             serde_json::from_value(fact.payload["compiler_binding"].clone())
                 .map_err(|_| Error::Forbidden)?;
-        let verified =
-            crate::formal_authority::resolve_compiler_inputs(session, context, &request).await?;
+        let verified = resolve_compiler_inputs_boxed(session, context, &request).await?;
         if fingerprint(verified.binding())? != fingerprint(&recorded)? {
             return Err(Error::Conflict(
                 "prepared inputs changed before claim".into(),
@@ -3431,7 +3554,7 @@ async fn validate_live_fact(
             .map_err(|_| {
             Error::Conflict("dispatch claim lacks complete compiler input".into())
         })?;
-        bound.verify_current(session, context).await?;
+        verify_bound_request_boxed(&bound, session, context).await?;
         if fact.input_digest != fingerprint(&bound)? {
             return Err(Error::Conflict("dispatch claim input differs".into()));
         }
@@ -3443,8 +3566,7 @@ async fn validate_live_fact(
             })?;
         let bundle: ResolvedBundle =
             serde_json::from_value(fact.payload["bundle"].clone()).map_err(|_| Error::Internal)?;
-        let inputs =
-            crate::formal_authority::resolve_compiler_inputs(session, context, &request).await?;
+        let inputs = resolve_compiler_inputs_boxed(session, context, &request).await?;
         inputs.replay(&bundle)?;
         let recorded_binding: crate::formal_authority::FormalCompilerInputBinding =
             serde_json::from_value(fact.payload["compiler_binding"].clone())
@@ -3454,7 +3576,7 @@ async fn validate_live_fact(
                 "edit fact compiler binding changed before commit".into(),
             ));
         }
-        crate::compiler::persist_authenticated_bundle(session, context, &request, &bundle).await?;
+        persist_authenticated_bundle_boxed(session, context, &request, &bundle).await?;
     }
     // Raw late receipts preserve billing/audit truth; every consumer still checks their watermark.
     // What such a receipt holds of a revoked source's answer is not kept: `commit` stores
