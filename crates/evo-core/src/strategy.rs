@@ -592,6 +592,11 @@ pub fn decide_elastic(
         .iter()
         .map(|node| (node.node_seq, node))
         .collect();
+    let expanded_parents: std::collections::BTreeSet<_> = prefix
+        .nodes
+        .iter()
+        .filter_map(|node| node.search_parent_seq)
+        .collect();
     let mut ranked = Vec::new();
     let mut action_ids = std::collections::BTreeSet::new();
     let mut action_seqs = std::collections::BTreeSet::new();
@@ -658,6 +663,7 @@ pub fn decide_elastic(
                 if parent.branch_seq != action.branch_seq
                     || parent.depth.checked_add(1) != Some(action.target_depth)
                     || !matches!(parent.status, ObservedStatus::Valid { .. })
+                    || expanded_parents.contains(parent_node_seq)
                 {
                     continue;
                 }
