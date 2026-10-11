@@ -1,6 +1,12 @@
 //! Persistent v4.1 independent evaluation control plane.
 //! Stored role/evidence bindings are rechecked at every transition; caller JSON
 //! and replay/self-report artifacts cannot mint a formal evaluation.
+use crate::evidence::load_stored_source;
+use crate::release_store::{
+    RELEASE_CANDIDATE_SCHEMA, ReleaseCandidateRecord, TypedSourceRef,
+    validate_candidate_read_in_session,
+};
+use crate::revocation_gate::{MAX_UPSTREAM_CLOSURE_NODES, judge_dependency};
 use evo_core::evaluation::{
     BernsteinReport, ClusterObservation, ExperimentPlan, FormalExperimentPlanV41,
     OptimizationBudgetPlan, OptimizerComparisonContract, ProfileKind, Verdict, decide,
@@ -522,6 +528,12 @@ pub struct EvaluationTicketV2 {
     pub unattributed_budget_call_ids: Vec<String>,
     pub invalid_reasons: Vec<String>,
     pub issued_at_unix_seconds: i64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_candidate_binding"
+    )]
+    pub candidate_dependency_binding: Option<FormalCandidateDependencyBinding>,
 }
 
 impl EvaluationTicketV2 {
@@ -561,6 +573,9 @@ impl EvaluationTicketV2 {
             (&self.issue_receipt_digest, "issue_receipt_digest"),
         ] {
             digest(value, name)?;
+        }
+        if let Some(binding) = &self.candidate_dependency_binding {
+            binding.validate()?;
         }
         valid_time(self.issued_at_unix_seconds)?;
         if self.targets.is_empty() || self.next_sequence == 0 {
@@ -841,6 +856,12 @@ pub enum FormalEvaluationV2 {
         report: BernsteinReportWire,
         anchor_evidence_digest: String,
         resource_evidence_digest: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_stored_binding"
+        )]
+        stored_dependency_binding: Option<FormalStoredDependencyBinding>,
     },
     EarlyStopped {
         evidence_scope: EvaluationEvidenceScope,
@@ -1107,6 +1128,8 @@ impl IndependentEvaluationControl {
                 "ticket must be issued after control and manifest registration facts".into(),
             ));
         }
+        let issue_control_digest = fingerprint(&control)?;
+        let issue_holdout_digest = fingerprint(&holdout)?;
         session.commit().await?;
         validate_root_budget(ctx, store, &control).await?;
         let mut session = store.session().await?;
@@ -1114,6 +1137,46 @@ impl IndependentEvaluationControl {
             need_record(&mut session, ctx, CONTROL_KIND, &request.registration_id).await?;
         let holdout: ProtectedHoldoutRecord =
             need_record(&mut session, ctx, HOLDOUT_KIND, &request.holdout_id).await?;
+        control.validate()?;
+        holdout.validate_against(&control)?;
+        if control.evaluator_actor != ctx.actor() {
+            return Err(Error::Forbidden);
+        }
+        if fingerprint(&control)? != issue_control_digest
+            || fingerprint(&holdout)? != issue_holdout_digest
+        {
+            return Err(Error::Conflict(
+                "registration facts changed during ticket issue".into(),
+            ));
+        }
+        let candidate_dependency_binding =
+            bind_candidate_in_session(&mut session, ctx, &control, &holdout).await?;
+        if candidate_dependency_binding.is_some() {
+            let existing = collect_dependency_nodes(
+                &mut session,
+                ctx,
+                vec![
+                    ("artifact".into(), holdout.pair.candidate_digest.clone()),
+                    artifact_edge(HOLDOUT_KIND, &holdout.id)?,
+                ],
+            )
+            .await?;
+            let new_claims = control
+                .alpha_plan
+                .allocations
+                .iter()
+                .filter(|allocation| allocation.attempt_id == control.attempt_id)
+                .count();
+            // Capacity accounting for this transaction's actual ticket, issue
+            // receipt and claim writes is not a content snapshot or future proof.
+            if existing.len().saturating_add(2).saturating_add(new_claims)
+                > MAX_UPSTREAM_CLOSURE_NODES
+            {
+                return Err(Error::Conflict(
+                    "formal dependency closure exceeds 10000 nodes; refused, not truncated".into(),
+                ));
+            }
+        }
         if get_record::<EvaluationTicketV2>(&mut session, ctx, TICKET_KIND, &request.ticket_id)
             .await?
             .is_some()
@@ -1245,6 +1308,7 @@ impl IndependentEvaluationControl {
             unattributed_budget_call_ids: Vec::new(),
             invalid_reasons: Vec::new(),
             issued_at_unix_seconds: request.issued_at_unix_seconds,
+            candidate_dependency_binding,
         };
         ticket.validate()?;
         put_record(
@@ -1283,6 +1347,16 @@ impl IndependentEvaluationControl {
                 &storage_id(HOLDOUT_KIND, &holdout.id)?,
             )
             .await?;
+        if ticket.candidate_dependency_binding.is_some() {
+            let edges = required_ticket_edges(&mut session, ctx, &ticket, &control).await?;
+            put_fact_edges(
+                &mut session,
+                ctx,
+                &storage_id(TICKET_KIND, &ticket.id)?,
+                edges,
+            )
+            .await?;
+        }
         session
             .audit(ctx, "issue_evaluation_ticket", &request.ticket_id)
             .await?;
@@ -1298,7 +1372,9 @@ impl IndependentEvaluationControl {
         side: ExecutionSide,
     ) -> Result<BrokerTaskView> {
         ctx.require(&[Role::Worker, Role::Host])?;
-        let ticket: EvaluationTicketV2 = load(store, ctx, TICKET_KIND, ticket_id).await?;
+        let mut session = store.session().await?;
+        let ticket: EvaluationTicketV2 =
+            need_record(&mut session, ctx, TICKET_KIND, ticket_id).await?;
         if ticket.executor_actor != ctx.actor()
             || matches!(
                 ticket.lifecycle,
@@ -1311,7 +1387,10 @@ impl IndependentEvaluationControl {
         {
             return Err(Error::Forbidden);
         }
-        broker_view(&ticket, target_id, side)
+        validate_status_closure(&mut session, ctx, &ticket, None).await?;
+        let view = broker_view(&ticket, target_id, side)?;
+        session.commit().await?;
+        Ok(view)
     }
 
     pub async fn start_execution(
@@ -1328,6 +1407,7 @@ impl IndependentEvaluationControl {
         if ticket.executor_actor != ctx.actor() || is_stopping(ticket.lifecycle) {
             return Err(Error::Forbidden);
         }
+        validate_status_closure(&mut session, ctx, &ticket, None).await?;
         let view = broker_view(&ticket, &request.target_id, request.side)?;
         if request.fence.billing_scope != control.billing_scope
             || request.fence.actual_input_digest != view.request_digest
@@ -1485,6 +1565,9 @@ impl IndependentEvaluationControl {
         let mut session = store.session().await?;
         let mut latest: EvaluationTicketV2 =
             need_record(&mut session, ctx, TICKET_KIND, &request.ticket_id).await?;
+        if !is_stopping(latest.lifecycle) {
+            validate_status_closure(&mut session, ctx, &latest, None).await?;
+        }
         if let Some(existing) = get_record::<ExecutionReceiptV2>(
             &mut session,
             ctx,
@@ -1537,6 +1620,25 @@ impl IndependentEvaluationControl {
             &receipt,
         )
         .await?;
+        if latest.candidate_dependency_binding.is_some() && !is_stopping(latest.lifecycle) {
+            put_fact_edges(
+                &mut session,
+                ctx,
+                &storage_id(EXECUTION_RECEIPT_KIND, &receipt.receipt_id)?,
+                vec![
+                    artifact_edge(TICKET_KIND, &latest.id)?,
+                    artifact_edge(OUTPUT_KIND, &output.id)?,
+                ],
+            )
+            .await?;
+            put_fact_edges(
+                &mut session,
+                ctx,
+                &storage_id(TICKET_KIND, &latest.id)?,
+                vec![artifact_edge(EXECUTION_RECEIPT_KIND, &receipt.receipt_id)?],
+            )
+            .await?;
+        }
         if is_stopping(latest.lifecycle) {
             validate_started_slot(
                 latest.target(&request.target_id)?,
@@ -1569,6 +1671,14 @@ impl IndependentEvaluationControl {
             &latest,
         )
         .await?;
+        if latest.candidate_dependency_binding.is_some() && !is_stopping(latest.lifecycle) {
+            collect_dependency_nodes(
+                &mut session,
+                ctx,
+                vec![artifact_edge(TICKET_KIND, &latest.id)?],
+            )
+            .await?;
+        }
         session.commit().await?;
         Ok(receipt)
     }
@@ -1592,6 +1702,11 @@ impl IndependentEvaluationControl {
             || ctx.actor() == ticket.approver_actor
         {
             return Err(Error::Forbidden);
+        }
+        let bind_accepted_facts =
+            ticket.candidate_dependency_binding.is_some() && !is_stopping(ticket.lifecycle);
+        if !is_stopping(ticket.lifecycle) {
+            validate_status_closure(&mut session, ctx, &ticket, None).await?;
         }
         let candidate: ExecutionReceiptV2 = need_record(
             &mut session,
@@ -1758,6 +1873,25 @@ impl IndependentEvaluationControl {
             &receipt,
         )
         .await?;
+        if bind_accepted_facts {
+            put_fact_edges(
+                &mut session,
+                ctx,
+                &storage_id(GRADER_RECEIPT_KIND, &receipt.receipt_id)?,
+                vec![
+                    artifact_edge(EXECUTION_RECEIPT_KIND, &candidate.receipt_id)?,
+                    artifact_edge(EXECUTION_RECEIPT_KIND, &baseline.receipt_id)?,
+                ],
+            )
+            .await?;
+            put_fact_edges(
+                &mut session,
+                ctx,
+                &storage_id(TICKET_KIND, &ticket.id)?,
+                vec![artifact_edge(GRADER_RECEIPT_KIND, &receipt.receipt_id)?],
+            )
+            .await?;
+        }
         if is_stopping(ticket.lifecycle) {
             ticket.late_grader_receipt_ids.push(request.receipt_id);
         } else {
@@ -1818,6 +1952,14 @@ impl IndependentEvaluationControl {
             &ticket,
         )
         .await?;
+        if bind_accepted_facts {
+            collect_dependency_nodes(
+                &mut session,
+                ctx,
+                vec![artifact_edge(TICKET_KIND, &ticket.id)?],
+            )
+            .await?;
+        }
         maybe_store_early_formal(&mut session, ctx, &ticket).await?;
         session.commit().await?;
         Ok(receipt)
@@ -1848,6 +1990,7 @@ impl IndependentEvaluationControl {
             ));
         }
         let mut calls = Vec::new();
+        let mut execution_content_pins = BTreeMap::new();
         let mut candidate_cost = 0i128;
         let mut baseline_cost = 0i128;
         let mut candidate_latencies = Vec::new();
@@ -1869,6 +2012,7 @@ impl IndependentEvaluationControl {
             ] {
                 let receipt: ExecutionReceiptV2 =
                     load(store, ctx, EXECUTION_RECEIPT_KIND, receipt_id).await?;
+                execution_content_pins.insert(receipt_id.clone(), fingerprint(&receipt)?);
                 let call = store
                     .budget_call(ctx, &control.billing_scope, &receipt.budget_call_id)
                     .await?
@@ -1972,6 +2116,42 @@ impl IndependentEvaluationControl {
                 "registered control digest changed during finalization".into(),
             ));
         }
+        // Revalidate actual facts after external cost/statistical precomputation,
+        // before stop, settlement, resource, ticket or formal writes.
+        validate_status_closure(&mut session, ctx, &latest, None).await?;
+        let latest_holdout: ProtectedHoldoutRecord =
+            need_record(&mut session, ctx, HOLDOUT_KIND, &latest.holdout_id).await?;
+        for target in &latest.targets {
+            validate_completed_target_evidence(
+                &mut session,
+                ctx,
+                &latest,
+                &latest_control,
+                &latest_holdout,
+                target,
+            )
+            .await?;
+        }
+        for (receipt_id, expected_digest) in execution_content_pins {
+            let actual: ExecutionReceiptV2 =
+                need_record(&mut session, ctx, EXECUTION_RECEIPT_KIND, &receipt_id).await?;
+            if fingerprint(&actual)? != expected_digest {
+                return Err(Error::Conflict(
+                    "execution receipt changed during finalization".into(),
+                ));
+            }
+        }
+        for expected in &resource_evidence.calls {
+            let actual = session
+                .budget_call(ctx, &control.billing_scope, &expected.call_id)
+                .await?
+                .ok_or(Error::NotFound)?;
+            if fingerprint(&actual)? != fingerprint(expected)? {
+                return Err(Error::Conflict(
+                    "execution usage changed during finalization".into(),
+                ));
+            }
+        }
         session
             .stop_dispatch_group(
                 ctx,
@@ -2019,6 +2199,26 @@ impl IndependentEvaluationControl {
             &resource_evidence,
         )
         .await?;
+        if latest.candidate_dependency_binding.is_some() {
+            put_fact_edges(
+                &mut session,
+                ctx,
+                &storage_id(RESOURCE_KIND, ticket_id)?,
+                vec![artifact_edge(TICKET_KIND, ticket_id)?],
+            )
+            .await?;
+        }
+        put_record(
+            &mut session,
+            ctx,
+            TICKET_KIND,
+            ticket_id,
+            ctx.actor(),
+            &latest,
+        )
+        .await?;
+        let stored_dependency_binding =
+            bind_stored_facts_in_session(&mut session, ctx, &latest).await?;
         let formal = FormalEvaluationV2::CompleteBatch {
             evidence_scope: control.evidence_scope,
             cost_evidence_scope: CostEvidenceScope::TicketExecutionOnly,
@@ -2032,16 +2232,8 @@ impl IndependentEvaluationControl {
             report: BernsteinReportWire::from_report(&report)?,
             anchor_evidence_digest,
             resource_evidence_digest,
+            stored_dependency_binding,
         };
-        put_record(
-            &mut session,
-            ctx,
-            TICKET_KIND,
-            ticket_id,
-            ctx.actor(),
-            &latest,
-        )
-        .await?;
         put_record(
             &mut session,
             ctx,
@@ -2051,6 +2243,18 @@ impl IndependentEvaluationControl {
             &formal,
         )
         .await?;
+        if latest.candidate_dependency_binding.is_some() {
+            put_fact_edges(
+                &mut session,
+                ctx,
+                &storage_id(FORMAL_KIND, ticket_id)?,
+                vec![
+                    artifact_edge(TICKET_KIND, ticket_id)?,
+                    artifact_edge(RESOURCE_KIND, ticket_id)?,
+                ],
+            )
+            .await?;
+        }
         session
             .audit(ctx, "complete_formal_evaluation", ticket_id)
             .await?;
@@ -2351,11 +2555,43 @@ async fn validate_status_closure(
         need_record(session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
     let holdout: ProtectedHoldoutRecord =
         need_record(session, ctx, HOLDOUT_KIND, &ticket.holdout_id).await?;
+    validate_candidate_binding_in_session(session, ctx, ticket, &control, &holdout).await?;
+    if ticket.candidate_dependency_binding.is_some() && formal.is_some() {
+        // The report stays outside stored content pins to avoid self hashing.
+        // Judge its own revocation before traversing the remaining facts.
+        let formal_id = storage_id(FORMAL_KIND, &ticket.id)?;
+        if judge_dependency(ctx, session, "artifact", &formal_id)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Forbidden);
+        }
+    }
+    control.validate()?;
+    holdout.validate_against(&control)?;
     let issue: TicketIssueReceipt =
         need_record(session, ctx, TICKET_RECEIPT_KIND, &ticket.id).await?;
     let mut expected_bound_plan = control.v1_plan_snapshot.clone();
     expected_bound_plan.bind_candidate(ticket.candidate_digest.clone())?;
-    if ticket.registration_digest != control.digest()?
+    if ticket.registration_id != control.id
+        || ticket.holdout_id != holdout.id
+        || ticket.proposer_actor != control.proposer_actor
+        || ticket.evaluator_actor != control.evaluator_actor
+        || ticket.executor_actor != control.executor_actor
+        || ticket.approver_actor != control.approver_actor
+        || ticket.evidence_scope != control.evidence_scope
+        || ticket.attempt_id != control.attempt_id
+        || ticket.research_family_id != control.alpha_plan.research_family_id
+        || ticket.alpha_plan_digest != control.alpha_plan.digest()?
+        || ticket.formal_plan_digest != control.formal_plan.digest()?
+        || ticket.v1_plan_snapshot_digest != control.v1_plan_snapshot.digest()?
+        || ticket.candidate_bundle_digest != holdout.candidate_bundle_digest
+        || ticket.baseline_bundle_digest != holdout.baseline_bundle_digest
+        || issue.schema_version != "rsia.evaluation_ticket_issue_receipt.v1"
+        || issue.registration_digest != ticket.registration_digest
+        || issue.manifest_digest != ticket.manifest_digest
+        || issue.issued_at_unix_seconds != ticket.issued_at_unix_seconds
+        || ticket.registration_digest != control.digest()?
         || ticket.manifest_digest != holdout.manifest.digest()?
         || ticket.issue_receipt_digest != fingerprint(&issue)?
         || issue.ticket_id != ticket.id
@@ -2370,6 +2606,40 @@ async fn validate_status_closure(
         return Err(Error::Conflict(
             "stored ticket dependency closure does not match".into(),
         ));
+    }
+    if ticket.candidate_dependency_binding.is_some() {
+        let expected_inputs = holdout
+            .rotating_inputs
+            .iter()
+            .map(|input| (input, false))
+            .chain(holdout.anchor_inputs.iter().map(|input| (input, true)))
+            .collect::<Vec<_>>();
+        if ticket.targets.len() != expected_inputs.len()
+            || ticket
+                .targets
+                .iter()
+                .zip(expected_inputs)
+                .any(|(target, (input, is_anchor))| {
+                    target.target_id != input.target_id
+                        || target.input_artifact_id != input.input_artifact_id
+                        || target.input_digest != input.input_digest
+                        || match &target.kind {
+                            EvaluationTargetKind::Rotating { cluster_id } => {
+                                is_anchor || cluster_id != &input.cluster_or_anchor_id
+                            }
+                            EvaluationTargetKind::Anchor { anchor_id } => {
+                                !is_anchor || anchor_id != &input.cluster_or_anchor_id
+                            }
+                        }
+                })
+        {
+            return Err(Error::Conflict(
+                "frozen ticket input identity differs".into(),
+            ));
+        }
+        validate_bound_fact_edges(session, ctx, ticket, &control).await?;
+        collect_dependency_nodes(session, ctx, vec![artifact_edge(TICKET_KIND, &ticket.id)?])
+            .await?;
     }
     match formal {
         Some(FormalEvaluationV2::EarlyStopped {
@@ -2426,8 +2696,43 @@ async fn validate_status_closure(
             environment_digest,
             anchor_evidence_digest: report_anchor_digest,
             resource_evidence_digest,
+            stored_dependency_binding,
             ..
         }) => {
+            match (
+                &ticket.candidate_dependency_binding,
+                stored_dependency_binding,
+            ) {
+                (Some(_), Some(binding)) => {
+                    binding.validate()?;
+                    require_exact_fact_edges(
+                        session,
+                        ctx,
+                        &storage_id(RESOURCE_KIND, &ticket.id)?,
+                        vec![artifact_edge(TICKET_KIND, &ticket.id)?],
+                    )
+                    .await?;
+                    require_exact_fact_edges(
+                        session,
+                        ctx,
+                        &storage_id(FORMAL_KIND, &ticket.id)?,
+                        vec![
+                            artifact_edge(TICKET_KIND, &ticket.id)?,
+                            artifact_edge(RESOURCE_KIND, &ticket.id)?,
+                        ],
+                    )
+                    .await?;
+                    if bind_stored_facts_in_session(session, ctx, ticket)
+                        .await?
+                        .as_ref()
+                        != Some(binding)
+                    {
+                        return Err(Error::Conflict(STORED_CHANGED.into()));
+                    }
+                }
+                (None, None) => {}
+                _ => return Err(Error::Conflict(STORED_CHANGED.into())),
+            }
             if ticket.lifecycle != TicketLifecycle::CompleteBatch
                 || ticket_id != &ticket.id
                 || ticket_digest != &fingerprint(ticket)?
@@ -2497,6 +2802,23 @@ async fn validate_status_closure(
                     != expected_calls.keys().map(String::as_str).collect()
             {
                 return Err(Error::Conflict("resource evidence closure mismatch".into()));
+            }
+            if ticket.candidate_dependency_binding.is_some() {
+                let actual = session
+                    .budget_calls_for_group(ctx, &control.billing_scope, &ticket.id)
+                    .await?;
+                let expected_by_id = resource
+                    .calls
+                    .iter()
+                    .map(|call| Ok((call.call_id.clone(), fingerprint(call)?)))
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                let actual_by_id = actual
+                    .iter()
+                    .map(|call| Ok((call.call_id.clone(), fingerprint(call)?)))
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                if expected_by_id != actual_by_id {
+                    return Err(Error::Conflict("actual resource evidence changed".into()));
+                }
             }
         }
         Some(FormalEvaluationV2::Invalid {
@@ -2706,6 +3028,992 @@ async fn put_record<T: Serialize>(
     session
         .put(ctx, "artifact", &storage_id, owner, &envelope)
         .await
+}
+
+// These inner schemas add read and derivation pins, never production authority.
+const CANDIDATE_BINDING_SCHEMA: &str = "rsia.formal_candidate_dependency_binding.v1";
+const STORED_BINDING_SCHEMA: &str = "rsia.formal_stored_dependency_binding.v1";
+const CANDIDATE_CHANGED: &str = "formal_candidate_dependency_binding_changed";
+const STORED_CHANGED: &str = "formal_stored_dependency_binding_changed";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormalDependencyNode {
+    pub kind: String,
+    /// Actual objects key, including e05-<fingerprint((record_kind,logical_id))>.
+    pub id: String,
+    pub schema_version: String,
+    pub record_kind: Option<String>,
+    pub logical_id: String,
+    /// Full typed record fingerprint; for a run this pins StoredTraceAuthority,
+    /// separately from TypedSourceRef.content_digest (the trace body digest).
+    pub content_digest: String,
+    pub outgoing_edge_digest: String,
+    pub outgoing_edge_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormalCandidateDependencyBinding {
+    pub schema_version: String,
+    pub namespace: String,
+    pub candidate_id: String,
+    pub candidate_record_digest: String,
+    pub bundle_digest: String,
+    pub parent_digest: String,
+    pub profile_id: String,
+    pub environment_digest: String,
+    pub proposer_actor: String,
+    pub sources: Vec<TypedSourceRef>,
+    pub revoke_watermark_seq: i64,
+    pub revoke_watermark_digest: String,
+    pub nodes: Vec<FormalDependencyNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormalStoredDependencyBinding {
+    pub schema_version: String,
+    pub namespace: String,
+    pub candidate_binding_digest: String,
+    pub ticket_id: String,
+    pub ticket_physical_id: String,
+    pub ticket_digest: String,
+    pub resource_physical_id: String,
+    /// Complete actual fact slice, excluding the report itself. The final ticket
+    /// has already been written when this is derived; no future placeholders or
+    /// whole shared ExposureLedger are part of the snapshot.
+    pub nodes: Vec<FormalDependencyNode>,
+}
+
+fn validate_node_shape(nodes: &[FormalDependencyNode]) -> Result<()> {
+    if nodes.is_empty() || nodes.len() > MAX_UPSTREAM_CLOSURE_NODES {
+        return Err(Error::Invalid(
+            "invalid formal dependency node count".into(),
+        ));
+    }
+    let mut previous = None;
+    for node in nodes {
+        identifier(&node.id)?;
+        identifier(&node.logical_id)?;
+        identifier(&node.schema_version)?;
+        digest(&node.content_digest, "dependency content_digest")?;
+        digest(&node.outgoing_edge_digest, "outgoing_edge_digest")?;
+        if !matches!(node.kind.as_str(), "run" | "artifact")
+            || node.outgoing_edge_count > MAX_UPSTREAM_CLOSURE_NODES
+        {
+            return Err(Error::Invalid("invalid formal dependency identity".into()));
+        }
+        match (&node.record_kind, node.schema_version.as_str()) {
+            (None, "rsia.optimization.source.v1") if node.kind == "run" => {}
+            (None, RELEASE_CANDIDATE_SCHEMA) if node.kind == "artifact" => {}
+            (Some(kind), ENVELOPE_SCHEMA)
+                if node.kind == "artifact" && dependency_record_schema(kind).is_some() =>
+            {
+                if storage_id(kind, &node.logical_id)? != node.id {
+                    return Err(Error::Invalid(
+                        "dependency physical identity differs".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported formal dependency schema".into(),
+                ));
+            }
+        }
+        if node.record_kind.is_none() && node.logical_id != node.id {
+            return Err(Error::Invalid("dependency logical identity differs".into()));
+        }
+        let key = (&node.kind, &node.id);
+        if previous.is_some_and(|prior| prior >= key) {
+            return Err(Error::Invalid(
+                "formal dependency nodes must be canonical".into(),
+            ));
+        }
+        previous = Some(key);
+    }
+    Ok(())
+}
+
+impl FormalCandidateDependencyBinding {
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != CANDIDATE_BINDING_SCHEMA {
+            return Err(Error::Invalid(
+                "unsupported formal candidate binding schema".into(),
+            ));
+        }
+        for id in [
+            &self.namespace,
+            &self.candidate_id,
+            &self.profile_id,
+            &self.proposer_actor,
+        ] {
+            identifier(id)?;
+        }
+        for value in [
+            &self.candidate_record_digest,
+            &self.bundle_digest,
+            &self.parent_digest,
+            &self.environment_digest,
+            &self.revoke_watermark_digest,
+        ] {
+            digest(value, "candidate dependency digest")?;
+        }
+        if self.revoke_watermark_seq < 0 || self.sources.is_empty() {
+            return Err(Error::Invalid(
+                "candidate binding lacks source or watermark identity".into(),
+            ));
+        }
+        let mut previous = None;
+        for source in &self.sources {
+            identifier(&source.id)?;
+            digest(&source.content_digest, "source content_digest")?;
+            let key = (&source.kind, &source.id);
+            if source.kind != "run" || previous.is_some_and(|prior| prior >= key) {
+                return Err(Error::Invalid(
+                    "candidate binding sources must be canonical and distinct".into(),
+                ));
+            }
+            previous = Some(key);
+        }
+        validate_node_shape(&self.nodes)?;
+        if !self.nodes.iter().any(|node| {
+            node.kind == "artifact"
+                && node.id == self.candidate_id
+                && node.schema_version == RELEASE_CANDIDATE_SCHEMA
+                && node.content_digest == self.candidate_record_digest
+        }) || self.sources.iter().any(|source| {
+            !self
+                .nodes
+                .iter()
+                .any(|node| node.kind == source.kind && node.id == source.id)
+        }) {
+            return Err(Error::Invalid(
+                "candidate binding lacks complete source identity".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl FormalStoredDependencyBinding {
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != STORED_BINDING_SCHEMA {
+            return Err(Error::Invalid(
+                "unsupported formal stored binding schema".into(),
+            ));
+        }
+        identifier(&self.namespace)?;
+        identifier(&self.ticket_id)?;
+        digest(&self.candidate_binding_digest, "candidate_binding_digest")?;
+        digest(&self.ticket_digest, "stored ticket_digest")?;
+        if self.ticket_physical_id != storage_id(TICKET_KIND, &self.ticket_id)?
+            || self.resource_physical_id != storage_id(RESOURCE_KIND, &self.ticket_id)?
+        {
+            return Err(Error::Invalid(
+                "stored binding physical identity differs".into(),
+            ));
+        }
+        validate_node_shape(&self.nodes)?;
+        for (id, kind) in [
+            (&self.ticket_physical_id, TICKET_KIND),
+            (&self.resource_physical_id, RESOURCE_KIND),
+        ] {
+            if !self.nodes.iter().any(|node| {
+                node.kind == "artifact"
+                    && &node.id == id
+                    && node.record_kind.as_deref() == Some(kind)
+            }) {
+                return Err(Error::Invalid(
+                    "stored binding lacks required actual fact".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn deserialize_candidate_binding<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<FormalCandidateDependencyBinding>, D::Error> {
+    // Deserialize T, not Option<T>: a present null must fail. #[serde(default)]
+    // alone handles the historical absent field, preserving its serialized bytes.
+    let binding = FormalCandidateDependencyBinding::deserialize(deserializer)?;
+    binding.validate().map_err(D::Error::custom)?;
+    Ok(Some(binding))
+}
+
+fn deserialize_stored_binding<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<FormalStoredDependencyBinding>, D::Error> {
+    let binding = FormalStoredDependencyBinding::deserialize(deserializer)?;
+    binding.validate().map_err(D::Error::custom)?;
+    Ok(Some(binding))
+}
+
+fn dependency_record_schema(kind: &str) -> Option<&'static str> {
+    match kind {
+        CONTROL_KIND => Some(RegisteredEvaluationControl::SCHEMA),
+        HOLDOUT_KIND => Some(ProtectedHoldoutRecord::SCHEMA),
+        TICKET_KIND => Some(EvaluationTicketV2::SCHEMA),
+        TICKET_RECEIPT_KIND => Some("rsia.evaluation_ticket_issue_receipt.v1"),
+        ALPHA_USE_KIND => Some("rsia.alpha_claim_reservation.v1"),
+        EXECUTION_RECEIPT_KIND => Some("rsia.execution_receipt.v2"),
+        GRADER_RECEIPT_KIND => Some("rsia.independent_grader_receipt.v2"),
+        OUTPUT_KIND => Some("rsia.execution_output.v1"),
+        RESOURCE_KIND => Some("rsia.evaluation_resource_evidence.v1"),
+        // Formal reports and shared exposure ledgers cannot be upstream facts of
+        // their own report. No arbitrary schema or SQL budget row is accepted.
+        _ => None,
+    }
+}
+
+fn validate_dependency_payload_identity(kind: &str, payload: &Value) -> Result<()> {
+    let (ids, digests, timestamp): (&[&str], &[&str], Option<&str>) = match kind {
+        TICKET_RECEIPT_KIND => (
+            &["ticket_id", "evaluator_actor"],
+            &["registration_digest", "manifest_digest"],
+            Some("issued_at_unix_seconds"),
+        ),
+        ALPHA_USE_KIND => (
+            &["research_family_id", "claim_id", "attempt_id", "ticket_id"],
+            &[],
+            None,
+        ),
+        EXECUTION_RECEIPT_KIND => (
+            &[
+                "receipt_id",
+                "ticket_id",
+                "target_id",
+                "output_artifact_id",
+                "budget_call_id",
+                "executor_actor",
+            ],
+            &[
+                "request_digest",
+                "bundle_digest",
+                "environment_digest",
+                "output_digest",
+            ],
+            Some("issued_at_unix_seconds"),
+        ),
+        GRADER_RECEIPT_KIND => (
+            &[
+                "receipt_id",
+                "ticket_id",
+                "target_id",
+                "candidate_execution_receipt_id",
+                "baseline_execution_receipt_id",
+                "evaluator_actor",
+            ],
+            &[
+                "candidate_output_digest",
+                "baseline_output_digest",
+                "oracle_digest",
+                "grader_digest",
+                "scored_output_pair_digest",
+            ],
+            Some("issued_at_unix_seconds"),
+        ),
+        OUTPUT_KIND => (&["id", "ticket_id", "target_id"], &["output_digest"], None),
+        RESOURCE_KIND => (&["ticket_id", "billing_scope"], &[], None),
+        // These full native validators also validate the rest of their contracts.
+        CONTROL_KIND | HOLDOUT_KIND | TICKET_KIND => (&[], &[], None),
+        _ => {
+            return Err(Error::Invalid(
+                "unsupported formal dependency record kind".into(),
+            ));
+        }
+    };
+    for field in ids {
+        identifier(
+            payload
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Invalid(format!("formal dependency lacks {field}")))?,
+        )?;
+    }
+    for field in digests {
+        digest(
+            payload
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Invalid(format!("formal dependency lacks {field}")))?,
+            field,
+        )?;
+    }
+    if let Some(field) = timestamp {
+        valid_time(
+            payload
+                .get(field)
+                .and_then(Value::as_i64)
+                .ok_or_else(|| Error::Invalid(format!("formal dependency lacks {field}")))?,
+        )?;
+    }
+    if kind == GRADER_RECEIPT_KIND {
+        for field in ["candidate_score_micros", "baseline_score_micros"] {
+            if payload
+                .get(field)
+                .and_then(Value::as_u64)
+                .is_none_or(|value| value > 1_000_000)
+            {
+                return Err(Error::Invalid(
+                    "formal dependency score is out of bounds".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn typed_node_fingerprint<T: DeserializeOwned + Serialize>(
+    session: &mut Session,
+    ctx: &Context,
+    physical_id: &str,
+    kind: &str,
+    logical_id: &str,
+) -> Result<String> {
+    let envelope: TypedArtifactEnvelope<T> = session.need(ctx, "artifact", physical_id).await?;
+    if envelope.schema_version != ENVELOPE_SCHEMA
+        || envelope.id != physical_id
+        || envelope.record_kind != kind
+        || storage_id(kind, logical_id)? != physical_id
+    {
+        return Err(Error::Conflict(
+            "formal dependency typed identity mismatch".into(),
+        ));
+    }
+    fingerprint(&envelope)
+}
+
+async fn dependency_node_identity(
+    session: &mut Session,
+    ctx: &Context,
+    kind: &str,
+    id: &str,
+) -> Result<(String, Option<String>, String, String)> {
+    if judge_dependency(ctx, session, kind, id).await?.is_some() {
+        return Err(Error::Forbidden);
+    }
+    if kind == "run" {
+        let authority = load_stored_source(session, ctx, id).await?;
+        if authority.record.id != id {
+            return Err(Error::Conflict("source authority id differs".into()));
+        }
+        if serde_json::to_vec(&authority)
+            .map_err(|_| Error::Internal)?
+            .len()
+            > 4 * 1024 * 1024
+        {
+            return Err(Error::Invalid("object exceeds 4 MiB".into()));
+        }
+        return Ok((
+            authority.schema_version.clone(),
+            None,
+            id.into(),
+            fingerprint(&authority)?,
+        ));
+    }
+    if kind != "artifact" {
+        return Err(Error::Invalid("unsupported formal dependency kind".into()));
+    }
+    let value: Value = session.need(ctx, kind, id).await?;
+    if serde_json::to_vec(&value)
+        .map_err(|_| Error::Internal)?
+        .len()
+        > 4 * 1024 * 1024
+    {
+        return Err(Error::Invalid("object exceeds 4 MiB".into()));
+    }
+    let schema = value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Invalid("formal dependency has no schema".into()))?;
+    if schema == RELEASE_CANDIDATE_SCHEMA {
+        let candidate: ReleaseCandidateRecord = session.need(ctx, kind, id).await?;
+        if candidate.id != id {
+            return Err(Error::Conflict(
+                "candidate physical identity differs".into(),
+            ));
+        }
+        validate_candidate_read_in_session(session, ctx, &candidate).await?;
+        return Ok((schema.into(), None, id.into(), fingerprint(&candidate)?));
+    }
+    if schema != ENVELOPE_SCHEMA {
+        return Err(Error::Invalid(
+            "unsupported formal dependency schema".into(),
+        ));
+    }
+    let envelope: TypedArtifactEnvelope<Value> = serde_json::from_value(value)
+        .map_err(|_| Error::Invalid("invalid formal typed dependency".into()))?;
+    let record_kind = envelope.record_kind.as_str();
+    let expected_schema = dependency_record_schema(record_kind)
+        .ok_or_else(|| Error::Invalid("unsupported formal dependency record kind".into()))?;
+    let payload = &envelope.payload;
+    let actual_schema = payload.get("schema_version").and_then(Value::as_str);
+    if actual_schema != Some(expected_schema)
+        && !(record_kind == CONTROL_KIND
+            && actual_schema == Some(RegisteredEvaluationControl::SCHEMA_V1))
+    {
+        return Err(Error::Invalid(
+            "unsupported formal dependency inner schema".into(),
+        ));
+    }
+    validate_dependency_payload_identity(record_kind, payload)?;
+    let logical_field = match record_kind {
+        CONTROL_KIND | HOLDOUT_KIND | TICKET_KIND | OUTPUT_KIND => "id",
+        EXECUTION_RECEIPT_KIND | GRADER_RECEIPT_KIND => "receipt_id",
+        _ => "ticket_id",
+    };
+    let logical_id = if record_kind == ALPHA_USE_KIND {
+        let family = payload
+            .get("research_family_id")
+            .and_then(Value::as_str)
+            .ok_or(Error::Internal)?;
+        let claim = payload
+            .get("claim_id")
+            .and_then(Value::as_str)
+            .ok_or(Error::Internal)?;
+        identifier(family)?;
+        identifier(claim)?;
+        format!("{family}:{claim}")
+    } else {
+        payload
+            .get(logical_field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Invalid("formal dependency lacks logical identity".into()))?
+            .into()
+    };
+    let content = match record_kind {
+        CONTROL_KIND => {
+            let control: RegisteredEvaluationControl =
+                need_record(session, ctx, CONTROL_KIND, &logical_id).await?;
+            control.validate()?;
+            typed_node_fingerprint::<RegisteredEvaluationControl>(
+                session,
+                ctx,
+                id,
+                record_kind,
+                &logical_id,
+            )
+            .await?
+        }
+        HOLDOUT_KIND => {
+            let holdout: ProtectedHoldoutRecord =
+                need_record(session, ctx, HOLDOUT_KIND, &logical_id).await?;
+            let control: RegisteredEvaluationControl =
+                need_record(session, ctx, CONTROL_KIND, &holdout.registration_id).await?;
+            holdout.validate_against(&control)?;
+            typed_node_fingerprint::<ProtectedHoldoutRecord>(
+                session,
+                ctx,
+                id,
+                record_kind,
+                &logical_id,
+            )
+            .await?
+        }
+        TICKET_KIND => {
+            let ticket: EvaluationTicketV2 =
+                need_record(session, ctx, TICKET_KIND, &logical_id).await?;
+            ticket.validate()?;
+            typed_node_fingerprint::<EvaluationTicketV2>(session, ctx, id, record_kind, &logical_id)
+                .await?
+        }
+        TICKET_RECEIPT_KIND => {
+            typed_node_fingerprint::<TicketIssueReceipt>(session, ctx, id, record_kind, &logical_id)
+                .await?
+        }
+        ALPHA_USE_KIND => {
+            typed_node_fingerprint::<AlphaClaimReservation>(
+                session,
+                ctx,
+                id,
+                record_kind,
+                &logical_id,
+            )
+            .await?
+        }
+        EXECUTION_RECEIPT_KIND => {
+            typed_node_fingerprint::<ExecutionReceiptV2>(session, ctx, id, record_kind, &logical_id)
+                .await?
+        }
+        GRADER_RECEIPT_KIND => {
+            typed_node_fingerprint::<IndependentGraderReceiptV2>(
+                session,
+                ctx,
+                id,
+                record_kind,
+                &logical_id,
+            )
+            .await?
+        }
+        OUTPUT_KIND => {
+            let output: ExecutionOutputArtifact =
+                need_record(session, ctx, OUTPUT_KIND, &logical_id).await?;
+            if output.output_digest != hash(output.output_utf8.as_bytes())
+                || output.output_utf8.is_empty()
+                || output.output_utf8.len() > 256 * 1024
+            {
+                return Err(Error::Conflict(
+                    "formal dependency output bytes changed".into(),
+                ));
+            }
+            typed_node_fingerprint::<ExecutionOutputArtifact>(
+                session,
+                ctx,
+                id,
+                record_kind,
+                &logical_id,
+            )
+            .await?
+        }
+        RESOURCE_KIND => {
+            let resource: ResourceEvidenceRecord =
+                need_record(session, ctx, RESOURCE_KIND, &logical_id).await?;
+            if resource.cost_scope != CostEvidenceScope::TicketExecutionOnly
+                || resource.calls.is_empty()
+            {
+                return Err(Error::Invalid(
+                    "formal resource identity is incomplete".into(),
+                ));
+            }
+            let mut call_ids = BTreeSet::new();
+            for expected in &resource.calls {
+                identifier(&expected.call_id)?;
+                if expected.dispatch_group_id != resource.ticket_id
+                    || expected.billing_scope != resource.billing_scope
+                    || !call_ids.insert(&expected.call_id)
+                {
+                    return Err(Error::Conflict(
+                        "formal resource call identity differs".into(),
+                    ));
+                }
+                let actual = session
+                    .budget_call(ctx, &resource.billing_scope, &expected.call_id)
+                    .await?
+                    .ok_or(Error::NotFound)?;
+                if fingerprint(&actual)? != fingerprint(expected)? {
+                    return Err(Error::Conflict("actual resource evidence changed".into()));
+                }
+            }
+            typed_node_fingerprint::<ResourceEvidenceRecord>(
+                session,
+                ctx,
+                id,
+                record_kind,
+                &logical_id,
+            )
+            .await?
+        }
+        _ => {
+            return Err(Error::Invalid(
+                "unsupported formal dependency record kind".into(),
+            ));
+        }
+    };
+    Ok((
+        ENVELOPE_SCHEMA.into(),
+        Some(envelope.record_kind),
+        logical_id,
+        content,
+    ))
+}
+
+async fn collect_dependency_nodes(
+    session: &mut Session,
+    ctx: &Context,
+    roots: Vec<(String, String)>,
+) -> Result<Vec<FormalDependencyNode>> {
+    let mut seen = BTreeSet::new();
+    let mut pending: BTreeSet<_> = roots.into_iter().collect();
+    let mut nodes = Vec::new();
+    while let Some((kind, id)) = pending.pop_first() {
+        if !seen.insert((kind.clone(), id.clone())) {
+            continue;
+        }
+        // Unknown and missing typed nodes count too, before their refusal. Cycles
+        // and diamonds deduplicate over kind+physical id, across all roots.
+        if seen.len() > MAX_UPSTREAM_CLOSURE_NODES {
+            return Err(Error::Conflict(
+                "formal dependency closure exceeds 10000 nodes; refused, not truncated".into(),
+            ));
+        }
+        let edges = session
+            .outgoing_edges_bounded(ctx, &kind, &id, MAX_UPSTREAM_CLOSURE_NODES)
+            .await?;
+        for edge in &edges {
+            if !seen.contains(edge) {
+                pending.insert(edge.clone());
+            }
+        }
+        if seen.len() + pending.len() > MAX_UPSTREAM_CLOSURE_NODES {
+            return Err(Error::Conflict(
+                "formal dependency closure exceeds 10000 nodes; refused, not truncated".into(),
+            ));
+        }
+        let (schema_version, record_kind, logical_id, content_digest) =
+            dependency_node_identity(session, ctx, &kind, &id).await?;
+        nodes.push(FormalDependencyNode {
+            kind,
+            id,
+            schema_version,
+            record_kind,
+            logical_id,
+            content_digest,
+            outgoing_edge_digest: fingerprint(&edges)?,
+            outgoing_edge_count: edges.len(),
+        });
+    }
+    nodes.sort_by(|left, right| (&left.kind, &left.id).cmp(&(&right.kind, &right.id)));
+    Ok(nodes)
+}
+
+fn candidate_matches_frozen(
+    candidate: &ReleaseCandidateRecord,
+    control: &RegisteredEvaluationControl,
+    holdout: &ProtectedHoldoutRecord,
+) -> Result<()> {
+    if candidate.id != holdout.pair.candidate_digest
+        || candidate.bundle_digest != holdout.candidate_bundle_digest
+        || candidate.parent_digest != holdout.pair.baseline_digest
+        || candidate.environment_digest != holdout.manifest.environment_digest
+        || candidate.proposer_actor != control.proposer_actor
+    {
+        return Err(Error::Conflict(
+            "formal candidate differs from the frozen pair".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn bind_candidate_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    control: &RegisteredEvaluationControl,
+    holdout: &ProtectedHoldoutRecord,
+) -> Result<Option<FormalCandidateDependencyBinding>> {
+    // Presence is decided once at issue, never by a subsequent read of an old
+    // unbound ticket. A malformed present candidate cannot become legacy None.
+    let Some(candidate) = session
+        .get::<ReleaseCandidateRecord>(ctx, "artifact", &holdout.pair.candidate_digest)
+        .await?
+    else {
+        return Ok(None);
+    };
+    candidate_matches_frozen(&candidate, control, holdout)?;
+    // Tombstones are checked before watermark/body/edge traversal, including
+    // begin_revoke where the source body and all dependent objects still exist.
+    for source in &candidate.sources {
+        if judge_dependency(ctx, session, &source.kind, &source.id)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Forbidden);
+        }
+    }
+    validate_candidate_read_in_session(session, ctx, &candidate).await?;
+    let watermark = session
+        .watermark(ctx)
+        .await?
+        .ok_or_else(|| Error::Conflict("missing source revoke watermark".into()))?;
+    digest(&watermark.1, "revoke watermark digest")?;
+    let edges = session
+        .outgoing_edges_bounded(ctx, "artifact", &candidate.id, MAX_UPSTREAM_CLOSURE_NODES)
+        .await?;
+    for source in &candidate.sources {
+        if !edges.contains(&(source.kind.clone(), source.id.clone())) {
+            return Err(Error::Conflict(
+                "candidate lacks an actual direct source edge".into(),
+            ));
+        }
+    }
+    let binding = FormalCandidateDependencyBinding {
+        schema_version: CANDIDATE_BINDING_SCHEMA.into(),
+        namespace: ctx.namespace().into(),
+        candidate_id: candidate.id.clone(),
+        candidate_record_digest: fingerprint(&candidate)?,
+        bundle_digest: candidate.bundle_digest.clone(),
+        parent_digest: candidate.parent_digest.clone(),
+        profile_id: candidate.profile_id.clone(),
+        environment_digest: candidate.environment_digest.clone(),
+        proposer_actor: candidate.proposer_actor.clone(),
+        sources: candidate.sources.clone(),
+        revoke_watermark_seq: watermark.0,
+        revoke_watermark_digest: watermark.1,
+        nodes: collect_dependency_nodes(session, ctx, vec![("artifact".into(), candidate.id)])
+            .await?,
+    };
+    binding.validate()?;
+    Ok(Some(binding))
+}
+
+async fn validate_candidate_binding_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    ticket: &EvaluationTicketV2,
+    control: &RegisteredEvaluationControl,
+    holdout: &ProtectedHoldoutRecord,
+) -> Result<()> {
+    let Some(binding) = &ticket.candidate_dependency_binding else {
+        return Ok(());
+    };
+    binding.validate()?;
+    let candidate: ReleaseCandidateRecord =
+        session.need(ctx, "artifact", &binding.candidate_id).await?;
+    // Full immutable pin FIRST: stripping S2 while keeping its edges, watermark
+    // and bundle cannot silently change the frozen source set or its authority.
+    if fingerprint(&candidate)? != binding.candidate_record_digest {
+        return Err(Error::Conflict(CANDIDATE_CHANGED.into()));
+    }
+    for source in &binding.sources {
+        if judge_dependency(ctx, session, &source.kind, &source.id)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Forbidden);
+        }
+    }
+    if binding.namespace != ctx.namespace()
+        || binding.candidate_id != ticket.candidate_digest
+        || binding.bundle_digest != ticket.candidate_bundle_digest
+        || binding.parent_digest != ticket.baseline_digest
+        || binding.environment_digest != ticket.environment_digest
+        || binding.proposer_actor != ticket.proposer_actor
+    {
+        return Err(Error::Conflict(CANDIDATE_CHANGED.into()));
+    }
+    let current = bind_candidate_in_session(session, ctx, control, holdout).await?;
+    if current.as_ref() != Some(binding) {
+        return Err(Error::Conflict(CANDIDATE_CHANGED.into()));
+    }
+    Ok(())
+}
+
+async fn put_fact_edges(
+    session: &mut Session,
+    ctx: &Context,
+    src_id: &str,
+    edges: Vec<(String, String)>,
+) -> Result<()> {
+    for (kind, id) in edges {
+        session
+            .put_edge(ctx, "artifact", src_id, &kind, &id)
+            .await?;
+    }
+    Ok(())
+}
+
+fn artifact_edge(kind: &str, logical_id: &str) -> Result<(String, String)> {
+    Ok(("artifact".into(), storage_id(kind, logical_id)?))
+}
+
+async fn require_exact_fact_edges(
+    session: &mut Session,
+    ctx: &Context,
+    src_id: &str,
+    mut expected: Vec<(String, String)>,
+) -> Result<()> {
+    expected.sort();
+    expected.dedup();
+    if session
+        .outgoing_edges_bounded(ctx, "artifact", src_id, MAX_UPSTREAM_CLOSURE_NODES)
+        .await?
+        != expected
+    {
+        return Err(Error::Conflict(
+            "formal fact dependency edges differ".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn required_ticket_edges(
+    session: &mut Session,
+    ctx: &Context,
+    ticket: &EvaluationTicketV2,
+    control: &RegisteredEvaluationControl,
+) -> Result<Vec<(String, String)>> {
+    let mut edges = vec![
+        ("artifact".into(), ticket.candidate_digest.clone()),
+        artifact_edge(HOLDOUT_KIND, &ticket.holdout_id)?,
+        artifact_edge(TICKET_RECEIPT_KIND, &ticket.id)?,
+    ];
+    for allocation in control
+        .alpha_plan
+        .allocations
+        .iter()
+        .filter(|item| item.attempt_id == ticket.attempt_id)
+    {
+        let id = format!(
+            "{}:{}",
+            control.alpha_plan.research_family_id, allocation.claim_id
+        );
+        let actual: AlphaClaimReservation = need_record(session, ctx, ALPHA_USE_KIND, &id).await?;
+        if actual.schema_version != "rsia.alpha_claim_reservation.v1"
+            || actual.research_family_id != ticket.research_family_id
+            || actual.claim_id != allocation.claim_id
+            || actual.attempt_id != ticket.attempt_id
+            || actual.ticket_id != ticket.id
+        {
+            return Err(Error::Conflict(
+                "formal alpha reservation identity differs".into(),
+            ));
+        }
+        edges.push(artifact_edge(ALPHA_USE_KIND, &id)?);
+    }
+    for target in &ticket.targets {
+        match &target.state {
+            TargetState::Completed {
+                candidate_receipt_id,
+                baseline_receipt_id,
+                grader_receipt_id,
+                ..
+            } => {
+                for id in [candidate_receipt_id, baseline_receipt_id] {
+                    edges.push(artifact_edge(EXECUTION_RECEIPT_KIND, id)?);
+                }
+                edges.push(artifact_edge(GRADER_RECEIPT_KIND, grader_receipt_id)?);
+            }
+            TargetState::Running {
+                candidate,
+                baseline,
+            }
+            | TargetState::RunningUsageUnknown {
+                candidate,
+                baseline,
+            }
+            | TargetState::CancelledAfterDispatch {
+                candidate,
+                baseline,
+            } => {
+                for slot in [candidate, baseline].into_iter().flatten() {
+                    if let Some(id) = &slot.receipt_id {
+                        edges.push(artifact_edge(EXECUTION_RECEIPT_KIND, id)?);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(edges)
+}
+
+async fn validate_bound_fact_edges(
+    session: &mut Session,
+    ctx: &Context,
+    ticket: &EvaluationTicketV2,
+    control: &RegisteredEvaluationControl,
+) -> Result<()> {
+    if ticket.candidate_dependency_binding.is_none() {
+        return Ok(());
+    }
+    let ticket_edges = required_ticket_edges(session, ctx, ticket, control).await?;
+    require_exact_fact_edges(
+        session,
+        ctx,
+        &storage_id(TICKET_KIND, &ticket.id)?,
+        ticket_edges,
+    )
+    .await?;
+    require_exact_fact_edges(
+        session,
+        ctx,
+        &storage_id(HOLDOUT_KIND, &ticket.holdout_id)?,
+        vec![artifact_edge(CONTROL_KIND, &ticket.registration_id)?],
+    )
+    .await?;
+    for target in &ticket.targets {
+        let mut receipt_ids = Vec::new();
+        match &target.state {
+            TargetState::Completed {
+                candidate_receipt_id,
+                baseline_receipt_id,
+                grader_receipt_id,
+                ..
+            } => {
+                receipt_ids.extend([candidate_receipt_id, baseline_receipt_id]);
+                require_exact_fact_edges(
+                    session,
+                    ctx,
+                    &storage_id(GRADER_RECEIPT_KIND, grader_receipt_id)?,
+                    vec![
+                        artifact_edge(EXECUTION_RECEIPT_KIND, candidate_receipt_id)?,
+                        artifact_edge(EXECUTION_RECEIPT_KIND, baseline_receipt_id)?,
+                    ],
+                )
+                .await?;
+            }
+            TargetState::Running {
+                candidate,
+                baseline,
+            }
+            | TargetState::RunningUsageUnknown {
+                candidate,
+                baseline,
+            }
+            | TargetState::CancelledAfterDispatch {
+                candidate,
+                baseline,
+            } => {
+                receipt_ids.extend(
+                    [candidate, baseline]
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|slot| slot.receipt_id.as_ref()),
+                );
+            }
+            _ => {}
+        }
+        for id in receipt_ids {
+            let receipt: ExecutionReceiptV2 =
+                need_record(session, ctx, EXECUTION_RECEIPT_KIND, id).await?;
+            require_exact_fact_edges(
+                session,
+                ctx,
+                &storage_id(EXECUTION_RECEIPT_KIND, id)?,
+                vec![
+                    artifact_edge(TICKET_KIND, &ticket.id)?,
+                    artifact_edge(OUTPUT_KIND, &receipt.output_artifact_id)?,
+                ],
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn bind_stored_facts_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    ticket: &EvaluationTicketV2,
+) -> Result<Option<FormalStoredDependencyBinding>> {
+    let Some(candidate) = &ticket.candidate_dependency_binding else {
+        return Ok(None);
+    };
+    let ticket_physical_id = storage_id(TICKET_KIND, &ticket.id)?;
+    let resource_physical_id = storage_id(RESOURCE_KIND, &ticket.id)?;
+    let binding = FormalStoredDependencyBinding {
+        schema_version: STORED_BINDING_SCHEMA.into(),
+        namespace: ctx.namespace().into(),
+        candidate_binding_digest: fingerprint(candidate)?,
+        ticket_id: ticket.id.clone(),
+        ticket_digest: fingerprint(ticket)?,
+        nodes: collect_dependency_nodes(
+            session,
+            ctx,
+            vec![
+                ("artifact".into(), ticket_physical_id.clone()),
+                ("artifact".into(), resource_physical_id.clone()),
+            ],
+        )
+        .await?,
+        ticket_physical_id,
+        resource_physical_id,
+    };
+    binding.validate()?;
+    Ok(Some(binding))
 }
 
 async fn control_billing_scope(
