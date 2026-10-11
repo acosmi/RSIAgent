@@ -20,7 +20,9 @@ use evo_core::sequential::{
     CompletePairedUnit, EarlyStopCertificate, EarlyStopCertificateParts, EarlyStopDecision,
     EarlyStopPlan, FormalClaimKind, ResearchFamilyAlphaPlan, SequentialRejectOnly,
 };
-use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier};
+use evo_core::{
+    Context, Error, Result, Role, canonical_fingerprint, fingerprint, hash, identifier,
+};
 use evo_storage::budget::{
     BudgetCallFence, BudgetCallRecord, BudgetCallState, BudgetDispatchDecision, BudgetStage,
 };
@@ -1996,13 +1998,15 @@ impl IndependentEvaluationControl {
             ticket.late_grader_receipt_ids.push(request.receipt_id);
         } else {
             if control.evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
+                // Issuance recomputes this from the stored receipt: one
+                // canonical rule on both sides, not declaration order here.
                 crate::formal_authority::capture_independent_grade(
                     &mut session,
                     ctx,
                     &ticket,
                     &request.target_id,
                     &receipt.receipt_id,
-                    &fingerprint(&receipt)?,
+                    &canonical_fingerprint(&receipt)?,
                 )
                 .await?;
             }

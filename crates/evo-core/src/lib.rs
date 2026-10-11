@@ -113,6 +113,17 @@ pub fn hash(v: &[u8]) -> String {
 pub fn fingerprint<T: Serialize>(v: &T) -> Result<String> {
     Ok(hash(&serde_json::to_vec(v).map_err(|_| Error::Internal)?))
 }
+/// The one canonical content digest. The body is first converted to a
+/// `serde_json::Value`, whose objects are `BTreeMap`s (serde_json
+/// `preserve_order` is not enabled), so every object key at every depth is
+/// sorted before [`fingerprint`] hashes it. A typed struct, the same body read
+/// back from storage as a `Value`, and the same content stored in another key
+/// order therefore share one digest; struct field declaration order cannot
+/// change it. `evo_engine::formal_authority::content_digest` is this function.
+/// A digest written by one side and checked by another side uses this rule.
+pub fn canonical_fingerprint<T: Serialize>(v: &T) -> Result<String> {
+    fingerprint(&serde_json::to_value(v).map_err(|_| Error::Internal)?)
+}
 pub fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -801,6 +812,47 @@ mod tests {
             v.candidate_units = 100;
         }
         assert!(!evaluate(&p, &AcceptancePolicy::default()).unwrap().passed);
+    }
+    #[test]
+    fn canonical_fingerprint_sorts_every_object_key_for_typed_and_value_bodies() {
+        #[derive(Serialize)]
+        struct Inner {
+            zeta: u8,
+            alpha: Option<u8>,
+        }
+        #[derive(Serialize)]
+        struct Outer {
+            schema_version: &'static str,
+            inner: Inner,
+            anchors: Vec<Inner>,
+        }
+        let typed = Outer {
+            schema_version: "v",
+            inner: Inner {
+                zeta: 3,
+                alpha: Some(1),
+            },
+            anchors: vec![Inner {
+                zeta: 2,
+                alpha: None,
+            }],
+        };
+        let sorted = r#"{"anchors":[{"alpha":null,"zeta":2}],"inner":{"alpha":1,"zeta":3},"schema_version":"v"}"#;
+        let canonical = canonical_fingerprint(&typed).unwrap();
+        // Fails loudly if serde_json preserve_order is ever enabled.
+        assert_eq!(canonical, hash(sorted.as_bytes()));
+        let stored: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();
+        assert_eq!(canonical_fingerprint(&stored).unwrap(), canonical);
+        assert_eq!(fingerprint(&stored).unwrap(), canonical);
+        // Declaration order is a different encoding of the same content.
+        assert_ne!(fingerprint(&typed).unwrap(), canonical);
+        let mut absent = stored.clone();
+        absent["anchors"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("alpha");
+        assert_ne!(canonical_fingerprint(&absent).unwrap(), canonical);
     }
     #[test]
     fn chinese_and_code_tokenization() {
