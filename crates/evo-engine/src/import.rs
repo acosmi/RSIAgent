@@ -2,9 +2,12 @@
 //! Strict implementation of v4.1 §6.3, §5.6, §13.1 E16.1.
 use evo_core::evidence::{
     AggregateSummary, EvidenceLocator, EvidenceMember, EvidenceSet, ExecutionAttestation,
+    ImportArtifactRef, ImportArtifactSchema, ImportMaterialCursor, ImportMaterialDispatchPolicy,
+    ImportMaterialPrivacyStatus, ImportMaterialReadRequest, ImportProjectionCoverage,
+    ImportedDevelopmentMaterial, ImportedMaterialExcerpt, ImportedSourceBinding,
     MAX_DISCOVERED_FILES, MAX_EVENT_BYTES, MAX_EXCERPTS, MAX_HEADER_PROBE_BYTES,
-    MAX_TOTAL_EXCERPT_BYTES, MAX_TOTAL_READ_BYTES, SourceCoverage, SourceSelection, TaskOrigin,
-    assert_authorized_path,
+    MAX_TOTAL_EXCERPT_BYTES, MAX_TOTAL_READ_BYTES, Purpose, SourceCoverage, SourceSelection,
+    TaskOrigin, assert_authorized_path,
 };
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, now};
 use evo_storage::Store;
@@ -2502,6 +2505,352 @@ impl PersistentImportService {
         Ok(fragment)
     }
 
+    /// Read an owner's local, unreviewed E16 development snapshot. No model,
+    /// candidate, approval, or durable artifact is produced by this consumer.
+    pub async fn read_local_development_material(
+        &self,
+        ctx: &Context,
+        request: &ImportMaterialReadRequest,
+    ) -> Result<ImportedDevelopmentMaterial> {
+        self.read_local_material_at_boundary(ctx, request, std::future::ready(Ok(())))
+            .await
+    }
+
+    // Private boundary future permits deterministic tests of committed DB
+    // changes after byte reconstruction. The public entry supplies only Ready.
+    async fn read_local_material_at_boundary<F>(
+        &self,
+        ctx: &Context,
+        request: &ImportMaterialReadRequest,
+        boundary: F,
+    ) -> Result<ImportedDevelopmentMaterial>
+    where
+        F: std::future::Future<Output = Result<()>>,
+    {
+        ctx.require(&[Role::Admin])?;
+        request.validate()?;
+        let snapshot = self
+            .load_local_material_snapshot(ctx, &request.result)
+            .await?;
+        let rebuilt = self.reconstruct_local_import(ctx, &snapshot).await?;
+        let events: Vec<_> = rebuilt.events.iter().map(persisted_local_event).collect();
+        let state = import_attempt_state(&rebuilt);
+        if fingerprint(&(
+            &rebuilt.evidence_set,
+            &rebuilt.aggregate_summary,
+            &events,
+            &rebuilt.locators,
+            state,
+        ))? != fingerprint(&(
+            &snapshot.result.payload.evidence_set,
+            &snapshot.result.payload.aggregate_summary,
+            &snapshot.result.payload.event_records,
+            &snapshot.result.payload.locators,
+            snapshot.result.payload.state,
+        ))? {
+            return Err(Error::Conflict(
+                "persisted import derivation mismatch".into(),
+            ));
+        }
+        let evidence = rebuilt.evidence_set.as_ref().ok_or_else(|| {
+            Error::Invalid("import produced no usable development material".into())
+        })?;
+        let (excerpts, projection_coverage) =
+            project_local_import_events(request, &rebuilt.events)?;
+        let mut material = ImportedDevelopmentMaterial {
+            namespace: ctx.namespace().into(),
+            revoke_watermark: snapshot.result.revoke_watermark,
+            result: request.result.clone(),
+            selection: import_artifact_ref(
+                ImportArtifactSchema::SourceSelection,
+                &snapshot.selection,
+            )?,
+            sources: snapshot
+                .sources
+                .iter()
+                .map(|source| {
+                    Ok(ImportedSourceBinding {
+                        artifact: import_artifact_ref(ImportArtifactSchema::ImportSource, source)?,
+                        raw_digest: source.payload.raw_digest.clone(),
+                    })
+                })
+                .collect::<Result<_>>()?,
+            evidence_set_id: evidence.id.clone(),
+            evidence_digest: evidence.digest.clone(),
+            aggregate_summary: rebuilt.aggregate_summary,
+            independent_cluster_count: evidence.independent_clusters.len(),
+            excerpts,
+            projection_coverage,
+            digest: String::new(),
+            task_origin: TaskOrigin::ImportedHistory,
+            execution_attestation: ExecutionAttestation::UnverifiedImport,
+            purpose: Purpose::Development,
+            privacy_status: ImportMaterialPrivacyStatus::Unreviewed,
+            dispatch_policy: ImportMaterialDispatchPolicy::NoModelDispatch,
+        };
+        material.digest = fingerprint(&material)?;
+        material.validate()?;
+        boundary.await?;
+        let current = self
+            .load_local_material_snapshot(ctx, &request.result)
+            .await?;
+        if fingerprint(&(&snapshot.result, &snapshot.selection, &snapshot.sources))?
+            != fingerprint(&(&current.result, &current.selection, &current.sources))?
+        {
+            return Err(Error::Conflict(
+                "import material sources changed while reading".into(),
+            ));
+        }
+        Ok(material)
+    }
+
+    async fn load_local_material_snapshot(
+        &self,
+        ctx: &Context,
+        pinned: &ImportArtifactRef,
+    ) -> Result<LocalImportSnapshot> {
+        let mut session = self.store.session().await?;
+        let result: ImportResultRecord =
+            session.need(ctx, IMPORT_ARTIFACT_KIND, &pinned.id).await?;
+        validate_result_record(ctx, &result)?;
+        if result.id != pinned.id
+            || fingerprint(&result)? != pinned.object_digest
+            || result.input_digest != fingerprint(&result.source_refs)?
+        {
+            return Err(Error::Conflict(
+                "fixed import result identity mismatch".into(),
+            ));
+        }
+        let selection: SourceSelectionRecord = session
+            .need(ctx, IMPORT_ARTIFACT_KIND, &result.payload.selection_id)
+            .await?;
+        validate_selection_record(ctx, &selection)?;
+        if selection.id != result.payload.selection_id
+            || selection.payload.purpose != Purpose::Development
+            || result.id != format!("e16res-{}", &hash(selection.id.as_bytes())[..24])
+            || result.owner_actor != selection.owner_actor
+            || result.request_key != selection.request_key
+            || result.revoke_watermark != selection.revoke_watermark
+            || selection.payload.import_source_ids.len() > MAX_DISCOVERED_FILES
+            || selection
+                .payload
+                .import_source_ids
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != selection.payload.import_source_ids.len()
+            || selection.payload.import_source_ids
+                != selection
+                    .source_refs
+                    .iter()
+                    .map(|source| source.id.clone())
+                    .collect::<Vec<_>>()
+        {
+            return Err(Error::Conflict(
+                "local import selection identity mismatch".into(),
+            ));
+        }
+        let sources = load_and_validate_source_records(&mut session, ctx, &selection).await?;
+        let mut specs = Vec::new();
+        for (key, source) in selection.payload.import_source_ids.iter().zip(&sources) {
+            let spec = ImportSourceSpec {
+                source_id: source.payload.logical_source_id.clone(),
+                path: source.payload.authorized_path.clone(),
+                reader: source.payload.reader,
+                expected_digest: source.payload.raw_digest.clone(),
+            };
+            if source.id != *key
+                || source.id != import_source_id(&selection.id, &spec.source_id)
+                || source.owner_actor != selection.owner_actor
+                || source.request_key != selection.request_key
+                || source.revoke_watermark != selection.revoke_watermark
+                || source.payload.purpose != Purpose::Development
+                || source.payload.reader_version != source.payload.reader.as_label()
+                || source.input_digest != fingerprint(&(&spec, spec.expected_digest.as_str()))?
+            {
+                return Err(Error::Conflict(
+                    "local import source identity mismatch".into(),
+                ));
+            }
+            specs.push(spec);
+        }
+        let registration = ImportRegistrationRequest {
+            schema_version: IMPORT_REGISTRATION_SCHEMA.into(),
+            request_key: selection.request_key.clone(),
+            roots: selection.payload.roots.clone(),
+            purpose: selection.payload.purpose,
+            allow_model_excerpts: selection.payload.allow_model_excerpts,
+            outbound_authorized: selection.payload.outbound_authorized,
+            retention_scope: selection.payload.retention_scope,
+            sources: specs,
+        };
+        validate_registration_request(&registration)?;
+        if selection.input_digest != fingerprint(&registration)?
+            || selection.id != format!("e16sel-{}", &fingerprint(&registration)?[..24])
+        {
+            return Err(Error::Conflict(
+                "local import registration digest mismatch".into(),
+            ));
+        }
+        let expected_refs = std::iter::once(Ok(ImportTypedRef {
+            kind: "source_selection".into(),
+            id: selection.id.clone(),
+            content_digest: fingerprint(&selection)?,
+        }))
+        .chain(sources.iter().map(|source| {
+            Ok(ImportTypedRef {
+                kind: "import_source".into(),
+                id: source.id.clone(),
+                content_digest: fingerprint(source)?,
+            })
+        }))
+        .collect::<Result<Vec<_>>>()?;
+        if result.source_refs != expected_refs {
+            return Err(Error::Conflict(
+                "local import result closure mismatch".into(),
+            ));
+        }
+        validate_live_import_sources(&mut session, ctx, &selection, &sources).await?;
+        let roots: Vec<_> = std::iter::once(result.id.clone())
+            .chain(std::iter::once(selection.id.clone()))
+            .chain(sources.iter().map(|source| source.id.clone()))
+            .map(|id| ("artifact".to_string(), id))
+            .collect();
+        for (kind, id) in &roots {
+            if crate::revocation_gate::judge_dependency(ctx, &mut session, kind, id)
+                .await?
+                .is_some()
+            {
+                return Err(Error::Forbidden);
+            }
+        }
+        if crate::revocation_gate::judge_upstream(ctx, &mut session, &roots)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Forbidden);
+        }
+        session.commit().await?;
+        Ok(LocalImportSnapshot {
+            result,
+            selection,
+            sources,
+        })
+    }
+
+    async fn reconstruct_local_import(
+        &self,
+        ctx: &Context,
+        snapshot: &LocalImportSnapshot,
+    ) -> Result<ImportAttempt> {
+        let mut remaining = MAX_TOTAL_READ_BYTES;
+        let mut ready = Vec::new();
+        let mut owned = Vec::new();
+        let mut unavailable = SourceCoverage {
+            discovery_exhausted: true,
+            files_known: true,
+            ..SourceCoverage::default()
+        };
+        for source in &snapshot.sources {
+            match source.payload.status {
+                ImportSourceReadStatus::Prepared => {
+                    return Err(Error::Conflict("import source is still Prepared".into()));
+                }
+                ImportSourceReadStatus::Ready => {}
+                ImportSourceReadStatus::Missing => {
+                    unavailable.missing += 1;
+                    continue;
+                }
+                ImportSourceReadStatus::PermissionDenied => {
+                    unavailable.permission_denied += 1;
+                    continue;
+                }
+                ImportSourceReadStatus::ZeroRecords => {
+                    unavailable.zero_records += 1;
+                    continue;
+                }
+                ImportSourceReadStatus::TooLarge => {
+                    unavailable.event_truncated += 1;
+                    unavailable.outbound_truncated += 1;
+                    continue;
+                }
+                ImportSourceReadStatus::SourceChanged | ImportSourceReadStatus::InvalidFile => {
+                    unavailable.parsed_fail += 1;
+                    unavailable.bytes_read = unavailable
+                        .bytes_read
+                        .saturating_add(source.payload.byte_len);
+                    continue;
+                }
+            }
+            let len = usize::try_from(source.payload.byte_len)
+                .map_err(|_| Error::Invalid("invalid import source length".into()))?;
+            let charge = len
+                .checked_add(1)
+                .filter(|charge| *charge <= remaining)
+                .ok_or_else(|| {
+                    Error::Invalid(
+                        "fixed import cannot be verified within local read budget".into(),
+                    )
+                })?;
+            remaining -= charge;
+            let bytes = self
+                .store
+                .read_blob(ctx, &source.payload.raw_blob_digest, len)
+                .await?;
+            if bytes.len() != len || hash(&bytes) != source.payload.raw_digest {
+                return Err(Error::Conflict("source_changed".into()));
+            }
+            ready.push(source);
+            owned.push(bytes);
+        }
+        let pinned: Vec<_> = ready
+            .iter()
+            .zip(&owned)
+            .map(|(source, bytes)| PinnedSourceBytes {
+                source_name: &source.id,
+                raw_bytes: bytes,
+                reader: source.payload.reader,
+                cluster_hint: Some(&source.payload.logical_source_id),
+            })
+            .collect();
+        let selection = SourceSelection {
+            roots: snapshot.selection.payload.roots.clone(),
+            run_ids: ready.iter().map(|source| source.id.clone()).collect(),
+            purpose: Purpose::Development,
+            allow_model_excerpts: snapshot.selection.payload.allow_model_excerpts
+                && snapshot.selection.payload.outbound_authorized
+                && snapshot.selection.payload.retention_scope
+                    == ImportRetentionScope::LocalWithAuthorizedExcerpts,
+        };
+        let mut rebuilt = if pinned.is_empty() {
+            ImportAttempt {
+                evidence_set: None,
+                aggregate_summary: AggregateSummary {
+                    coverage: SourceCoverage {
+                        discovery_exhausted: true,
+                        files_known: true,
+                        ..SourceCoverage::default()
+                    },
+                    ..AggregateSummary::default()
+                },
+                events: Vec::new(),
+                locators: Vec::new(),
+            }
+        } else {
+            ingest_selected_sources(&selection, &pinned, None, true)?
+        };
+        merge_coverage(&mut rebuilt.aggregate_summary.coverage, &unavailable);
+        if let Some(set) = rebuilt.evidence_set.take() {
+            rebuilt.evidence_set = Some(EvidenceSet::build(
+                set.id,
+                set.members,
+                rebuilt.aggregate_summary.coverage.clone(),
+                set.independent_clusters,
+            )?);
+        }
+        Ok(rebuilt)
+    }
+
     async fn load_live_selection(
         &self,
         ctx: &Context,
@@ -2517,6 +2866,158 @@ impl PersistentImportService {
         session.commit().await?;
         Ok((selection, sources))
     }
+}
+
+struct LocalImportSnapshot {
+    result: ImportResultRecord,
+    selection: SourceSelectionRecord,
+    sources: Vec<ImportSourceRecord>,
+}
+
+fn import_artifact_ref<T: Serialize>(
+    schema: ImportArtifactSchema,
+    record: &ImportEnvelope<T>,
+) -> Result<ImportArtifactRef> {
+    Ok(ImportArtifactRef {
+        schema,
+        id: record.id.clone(),
+        object_digest: fingerprint(record)?,
+    })
+}
+
+fn persisted_local_event(event: &ImportedEvent) -> PersistedImportEvent {
+    PersistedImportEvent {
+        source_id: event.source_id.clone(),
+        event_index: event.event_index,
+        byte_start: event.byte_start,
+        byte_end: event.byte_end,
+        raw_fragment_digest: event.raw_fragment_digest.clone(),
+        normalized_content_digest: hash(event.content.as_bytes()),
+        role: event.role.clone(),
+        kind: event.kind.clone(),
+    }
+}
+
+fn import_attempt_state(attempt: &ImportAttempt) -> ImportResultState {
+    if attempt.evidence_set.is_none() {
+        ImportResultState::Failed
+    } else if attempt.aggregate_summary.coverage.complete() {
+        ImportResultState::Complete
+    } else {
+        ImportResultState::Partial
+    }
+}
+
+fn project_local_import_events(
+    request: &ImportMaterialReadRequest,
+    events: &[ImportedEvent],
+) -> Result<(Vec<ImportedMaterialExcerpt>, ImportProjectionCoverage)> {
+    // Resolve every requested key before clipping: an invalid trailing request
+    // cannot hide behind the byte limit of an earlier excerpt.
+    let selected = request
+        .events
+        .iter()
+        .map(|key| {
+            events
+                .iter()
+                .find(|event| {
+                    event.source_id == key.source_id && event.event_index == key.event_index
+                })
+                .ok_or(Error::NotFound)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut excerpts = Vec::new();
+    let mut next = None;
+    for (key, event) in request.events.iter().zip(selected) {
+        if event.role.len().saturating_add(event.kind.len()) > MAX_TOTAL_EXCERPT_BYTES {
+            next = Some(ImportMaterialCursor {
+                event: key.clone(),
+                byte_offset: 0,
+            });
+            break;
+        }
+        let mut excerpt = ImportedMaterialExcerpt {
+            source_id: event.source_id.clone(),
+            event_index: event.event_index,
+            byte_start: event.byte_start,
+            byte_end: event.byte_end,
+            raw_fragment_digest: event.raw_fragment_digest.clone(),
+            normalized_content_digest: hash(event.content.as_bytes()),
+            content_digest: hash(event.content.as_bytes()),
+            role: event.role.clone(),
+            kind: event.kind.clone(),
+            content: event.content.clone(),
+            truncated: false,
+        };
+        excerpts.push(excerpt.clone());
+        if serde_json::to_vec(&excerpts)
+            .map_err(|_| Error::Internal)?
+            .len()
+            <= MAX_TOTAL_EXCERPT_BYTES
+        {
+            continue;
+        }
+        excerpts.pop();
+        excerpt.content.clear();
+        excerpt.content_digest = hash(b"");
+        excerpt.truncated = true;
+        excerpts.push(excerpt.clone());
+        if serde_json::to_vec(&excerpts)
+            .map_err(|_| Error::Internal)?
+            .len()
+            > MAX_TOTAL_EXCERPT_BYTES
+        {
+            excerpts.pop();
+            next = Some(ImportMaterialCursor {
+                event: key.clone(),
+                byte_offset: 0,
+            });
+            break;
+        }
+        // Search actual serialized array bytes, including escaping and metadata.
+        let boundaries: Vec<_> = event
+            .content
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .collect();
+        let mut low = 0usize;
+        let mut high = boundaries.len();
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            let end = boundaries[middle - 1];
+            excerpt.content = event.content[..end].into();
+            excerpt.content_digest = hash(excerpt.content.as_bytes());
+            *excerpts.last_mut().ok_or(Error::Internal)? = excerpt.clone();
+            if serde_json::to_vec(&excerpts)
+                .map_err(|_| Error::Internal)?
+                .len()
+                <= MAX_TOTAL_EXCERPT_BYTES
+            {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        let end = if low == 0 { 0 } else { boundaries[low - 1] };
+        excerpt.content = event.content[..end].into();
+        excerpt.content_digest = hash(excerpt.content.as_bytes());
+        *excerpts.last_mut().ok_or(Error::Internal)? = excerpt;
+        next = Some(ImportMaterialCursor {
+            event: key.clone(),
+            byte_offset: end,
+        });
+        break;
+    }
+    let coverage = ImportProjectionCoverage {
+        requested_events: request.events.len(),
+        returned_excerpts: excerpts.len(),
+        serialized_excerpt_bytes: serde_json::to_vec(&excerpts)
+            .map_err(|_| Error::Internal)?
+            .len(),
+        partial: next.is_some(),
+        next,
+    };
+    Ok((excerpts, coverage))
 }
 
 fn validate_registration_request(request: &ImportRegistrationRequest) -> Result<()> {
@@ -2908,5 +3409,172 @@ mod tests {
         ]);
         assert_eq!(plain, BTreeSet::from(["a".to_string(), "b".to_string()]));
         assert!(independent_clusters(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod local_material_boundary_tests {
+    use super::*;
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        Store,
+        Context,
+        PersistentImportService,
+        SourceSelectionRecord,
+        ImportResultRecord,
+        ImportMaterialReadRequest,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let admin = Context::new("boundary-tenant", "admin", Role::Admin).unwrap();
+        let store = Store::open(&directory.path().join("import.sqlite3"))
+            .await
+            .unwrap();
+        let mut session = store.session().await.unwrap();
+        session
+            .bump_watermark(&admin, &hash(b"boundary watermark"))
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let bytes = br#"{"role":"user","content":"boundary observation"}"#;
+        let path = directory.path().join("history.jsonl");
+        tokio::fs::write(&path, bytes).await.unwrap();
+        let service = PersistentImportService::new(store.clone());
+        let selection = service
+            .register(
+                &admin,
+                ImportRegistrationRequest {
+                    schema_version: IMPORT_REGISTRATION_SCHEMA.into(),
+                    request_key: "boundary-registration".into(),
+                    roots: vec![directory.path().to_string_lossy().into_owned()],
+                    purpose: Purpose::Development,
+                    allow_model_excerpts: false,
+                    outbound_authorized: false,
+                    retention_scope: ImportRetentionScope::LocalPrivate,
+                    sources: vec![ImportSourceSpec {
+                        source_id: "incident.try1".into(),
+                        path: path.to_string_lossy().into_owned(),
+                        reader: SourceFormat::ClaudeFixture,
+                        expected_digest: hash(bytes),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let result = service.execute(&admin, &selection.id).await.unwrap();
+        let request = ImportMaterialReadRequest {
+            result: import_artifact_ref(ImportArtifactSchema::ImportResult, &result).unwrap(),
+            events: vec![evo_core::evidence::ImportEventKey {
+                source_id: selection.payload.import_source_ids[0].clone(),
+                event_index: 0,
+            }],
+        };
+        (directory, store, admin, service, selection, result, request)
+    }
+
+    #[tokio::test]
+    async fn material_boundary_refuses_committed_revoke_and_watermark_changes() {
+        let (_directory, store, admin, service, selection, result, request) = fixture().await;
+        let boundary = async {
+            let status = evo_storage::lifecycle::LifecycleStore::begin_revoke(
+                &admin,
+                &store,
+                evo_storage::lifecycle::TypedObjectRef {
+                    kind: "artifact".into(),
+                    id: selection.payload.import_source_ids[0].clone(),
+                },
+                "revoked after byte reconstruction",
+                10,
+            )
+            .await?;
+            assert_eq!(status.state, evo_storage::lifecycle::CleanupState::Pending);
+            Ok(())
+        };
+        assert!(
+            service
+                .read_local_material_at_boundary(&admin, &request, boundary)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            result.payload.generation_status,
+            "blocked_external_generation_conditions_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn material_boundary_reloads_result_and_unselected_source_after_reconstruction() {
+        for change_result in [true, false] {
+            let (_directory, store, admin, service, selection, result, mut request) =
+                fixture().await;
+            request.events.clear(); // Every source is unselected in this boundary test.
+            let boundary = async {
+                let mut session = store.session().await?;
+                if change_result {
+                    let mut value: Value = session.need(&admin, "artifact", &result.id).await?;
+                    value["updated_at"] = (result.updated_at + 1).into();
+                    session
+                        .put(&admin, "artifact", &result.id, admin.actor(), &value)
+                        .await?;
+                } else {
+                    let id = &selection.payload.import_source_ids[0];
+                    let mut value: Value = session.need(&admin, "artifact", id).await?;
+                    value["updated_at"] = (selection.updated_at + 1).into();
+                    session
+                        .put(&admin, "artifact", id, admin.actor(), &value)
+                        .await?;
+                }
+                session.commit().await
+            };
+            assert!(
+                service
+                    .read_local_material_at_boundary(&admin, &request, boundary)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn material_boundary_refuses_committed_upstream_tombstone_without_watermark_change() {
+        let (_directory, store, admin, service, selection, _result, request) = fixture().await;
+        let boundary = async {
+            let mut session = store.session().await?;
+            let upstream = "upstream-gate-fixture";
+            session
+                .put(
+                    &admin,
+                    "run",
+                    upstream,
+                    admin.actor(),
+                    &serde_json::json!({"id":upstream,"body":"gate fixture only"}),
+                )
+                .await?;
+            session
+                .put_edge(
+                    &admin,
+                    "artifact",
+                    &selection.payload.import_source_ids[0],
+                    "run",
+                    upstream,
+                )
+                .await?;
+            session
+                .put(
+                    &admin,
+                    "tombstone",
+                    upstream,
+                    admin.actor(),
+                    &serde_json::json!({"id":upstream,"source_kind":"run"}),
+                )
+                .await?;
+            session.commit().await
+        };
+        assert!(matches!(
+            service
+                .read_local_material_at_boundary(&admin, &request, boundary)
+                .await,
+            Err(Error::Forbidden)
+        ));
     }
 }
