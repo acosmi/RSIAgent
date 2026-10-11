@@ -3,7 +3,7 @@
 //! Monetary values are integer micros in the root's authorized currency/pricing
 //! version. No floating-point conversion occurs here.
 
-use super::lifecycle::RevokeTombstone;
+use super::lifecycle::{BudgetRequestSources, RevokeTombstone, budget_request_source_ids};
 use super::{
     MVP_MAX_ACTIVE_LEASES, Session, Store, count_active_leases, internal, mvp_capacity_exceeded,
 };
@@ -760,10 +760,15 @@ impl Store {
         Ok(root)
     }
 
-    /// Reserves a call with no registered source closure. Such a call has no source
-    /// for a revocation tombstone to refuse, at the reservation or at the dispatch;
-    /// the revocation cleanup rescans the request bodies of the calls that carry no
-    /// closure. A call derived from runs belongs on `reserve_budget_call_with_sources`.
+    /// Reserves a call with no registered source closure. The reservation has no
+    /// source for a revocation tombstone to refuse. The dispatch and the model
+    /// settlement of the call read the closure its persisted request names instead
+    /// (`begin_budget_dispatch`): a request that names a revoked run is refused at the
+    /// dispatch and blocked at the settlement, a request whose closure cannot be read
+    /// fails closed, and a call whose request names no source, or that carries no
+    /// request, is not refused for its sources. The revocation cleanup rescans the
+    /// request bodies of the calls that carry no closure. A call derived from runs
+    /// belongs on `reserve_budget_call_with_sources`.
     pub async fn reserve_budget_call(
         &self,
         ctx: &Context,
@@ -977,9 +982,16 @@ impl Store {
     }
 
     /// Moves a reserved call to dispatched. Besides the lease, the root and the
-    /// dispatch group, the registered source closure is read: a call over a source
-    /// revoked as a `run` is not dispatched and the decision is `Cancelled`, the
-    /// one a caller releases the undispatched reservation on.
+    /// dispatch group, the source closure of the call is read: the registered one
+    /// (its budget call reference) or, for a legacy call whose reference is missing,
+    /// the closure its persisted request names, read as the revocation cleanup reads
+    /// it. A call over a source revoked as a `run` is not dispatched and the decision
+    /// is `Cancelled`, the one a caller releases the undispatched reservation on. A
+    /// missing reference does not shrink the closure to nothing: when the request
+    /// cannot be read for a closure, the dispatch fails closed with
+    /// `Conflict("budget_sources_unverifiable")` and writes nothing (plan §7.2.1: a
+    /// revocation rechecks a queued action before dispatch). A call whose request
+    /// names no source, or that carries no request, is not refused for its sources.
     pub async fn begin_budget_dispatch(
         &self,
         ctx: &Context,
@@ -1210,12 +1222,15 @@ impl Store {
     /// Atomically accounts a model charge and stores the exact request/transport/response facts.
     /// Stop and lease state are re-read in this transaction after the provider await.
     ///
-    /// The source closure registered for the call (its budget call reference) is
-    /// read in this transaction too. A response can arrive after a source was revoked
-    /// as a `run`, and the cleanup never reads a call whose request it has already
-    /// redacted, so nothing else would stop its output from being stored as it came
-    /// (plan §11: a late output forms no usable candidate, its real cost is still
-    /// booked). When any source of the call is revoked:
+    /// The source closure of the call is read in this transaction too, as the
+    /// dispatch reads it: the registered one (its budget call reference) or, for a
+    /// legacy call whose reference is missing, the closure its persisted request
+    /// names. A response can arrive after a source was revoked as a `run`, and the
+    /// cleanup never reads a call whose request it has already redacted, so nothing
+    /// else would stop its output from being stored as it came (plan §11: a late
+    /// output forms no usable candidate, its real cost is still booked; §11.5: the
+    /// late result of a dispatched call cannot regain validity). When any source of
+    /// the call is revoked:
     ///
     /// * the charge is booked exactly as without a revocation;
     /// * the response is blocked, so the usable response, which carries the output,
@@ -1226,11 +1241,16 @@ impl Store {
     /// * the transport body, which carries the output too, is stored as its
     ///   `rsia.redacted.v1` redaction whichever reason is recorded.
     ///
-    /// A call with no registered closure has no source to judge here; the cleanup
-    /// rescan, which finds a call by the closure its request names, is its backstop.
-    /// A closure that cannot be read fails the settlement with `Internal` and writes
-    /// nothing, like the dispatch: the call stays dispatched and its cost can still
-    /// be reconciled (`reconcile_budget_call_cost`).
+    /// A missing reference does not shrink the closure to nothing. When the request
+    /// of such a call cannot be read for a closure, whether a source was revoked
+    /// cannot be told, and the settlement fails closed the same way: the charge is
+    /// booked, the response is blocked as `budget_sources_unverifiable` (in the place
+    /// of `source_revoked`) and the transport is stored as its redaction. A request
+    /// that names no source has no source to judge. The cleanup rescan, which finds a
+    /// call by the closure its request names, still redacts what the call holds. A
+    /// reference that exists but cannot be read fails the settlement with `Internal`
+    /// and writes nothing, like the dispatch: the call stays dispatched and its cost
+    /// can still be reconciled (`reconcile_budget_call_cost`).
     pub async fn settle_model_budget_call(
         &self,
         ctx: &Context,
@@ -1299,24 +1319,30 @@ impl Store {
         .map_err(internal)?;
         // The tombstone is committed before the cleanup starts, so a source is revoked
         // from the moment `begin_revoke` commits, whatever the cleanup has done since.
-        let (source_revoked, e16_unavailable) = match e16_mode {
+        // A legacy call whose reference is missing is judged by the closure its request
+        // names; when that cannot be read the call is `unverifiable`.
+        let (source_revoked, unverifiable, e16_unavailable) = match e16_mode {
             E16CallMode::Mismatch => return Err(typed_budget::mode_mismatch()),
             E16CallMode::E16 => (
                 false,
+                false,
                 !typed_budget::call_sources_live_in_tx(&mut tx, &call).await?,
             ),
-            E16CallMode::Legacy => {
-                let source_ids = registered_source_ids(&mut tx, &call).await?;
-                (
+            E16CallMode::Legacy => match legacy_call_sources(&mut tx, &call).await? {
+                LegacyCallSources::Named(source_ids) => (
                     any_run_source_revoked(&mut tx, &call.namespace, &source_ids).await?,
                     false,
-                )
-            }
+                    false,
+                ),
+                LegacyCallSources::Unverifiable => (false, true, false),
+            },
         };
         let preexisting_block = if e16_unavailable {
             Some(typed_budget::E16_SOURCE_UNAVAILABLE)
         } else if source_revoked {
             Some(SOURCE_REVOKED)
+        } else if unverifiable {
+            Some(BUDGET_SOURCES_UNVERIFIABLE)
         } else if fence.now > call.lease_until {
             Some("lease_expired")
         } else if root_stopped != 0 {
@@ -1351,16 +1377,19 @@ impl Store {
         } else {
             &evidence.blocked_response
         };
-        // The transport body carries the model output. Over a revoked source it is
-        // stored as its redaction, whichever reason won the chain above: the stored
-        // digest is that of the redaction (every read of the row rechecks it against
-        // the stored body) and the redaction names the digest of the body it replaces.
+        // The transport body carries the model output. Over a revoked source, or a
+        // closure that cannot be verified, it is stored as its redaction, whichever
+        // reason won the chain above: the stored digest is that of the redaction (every
+        // read of the row rechecks it against the stored body) and the redaction names
+        // the digest of the body it replaces.
         let redaction_reason = if e16_unavailable {
             typed_budget::E16_SOURCE_UNAVAILABLE
+        } else if unverifiable {
+            BUDGET_SOURCES_UNVERIFIABLE
         } else {
             SOURCE_REVOKED
         };
-        let redacted_transport = if source_revoked || e16_unavailable {
+        let redacted_transport = if source_revoked || unverifiable || e16_unavailable {
             redacted_artifact(Some(&evidence.transport_artifact), redaction_reason)?
         } else {
             None
@@ -1425,6 +1454,11 @@ impl Store {
             // so the revocation is recorded here whichever that was. The digest of
             // the transport as the provider sent it is a digest, not content.
             details["source_revoked"] = json!(true);
+            details["transport_original_digest"] = json!(evidence.transport_artifact.digest);
+        }
+        if unverifiable {
+            // Recorded whichever reason the row carries, as a revocation is.
+            details[BUDGET_SOURCES_UNVERIFIABLE] = json!(true);
             details["transport_original_digest"] = json!(evidence.transport_artifact.digest);
         }
         if e16_unavailable {
@@ -3027,7 +3061,20 @@ async fn begin_budget_dispatch_in_tx_typed(
     // itself and would send it, so the revocation is read here, in the transaction
     // that records the dispatch (plan §11: block outbound before the cleanup).
     // `Cancelled` is the decision a caller already releases the reservation on.
-    let source_ids = registered_source_ids(tx, &call).await?;
+    // A legacy call whose reference is missing is judged by the closure its request
+    // names, and one whose closure cannot be read is not sent out (plan §7.2.1: a
+    // revocation rechecks a queued action before dispatch).
+    let source_ids = match e16_mode {
+        E16CallMode::Legacy => match legacy_call_sources(tx, &call).await? {
+            LegacyCallSources::Named(source_ids) => source_ids,
+            LegacyCallSources::Unverifiable => return Err(sources_unverifiable()),
+        },
+        // An E16 call carries no legacy reference (`call_sources_live_in_tx` refused
+        // one above) and its sources were judged above; this read is as it was.
+        E16CallMode::E16 | E16CallMode::Mismatch => {
+            registered_source_ids(tx, &call).await?.unwrap_or_default()
+        }
+    };
     if any_run_source_revoked(tx, &call.namespace, &source_ids).await? {
         return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
     }
@@ -3668,16 +3715,18 @@ async fn any_run_source_revoked(
 /// The source closure registered for `call` when it was reserved: the
 /// `source_ids` of its budget call reference (the id is derived exactly as
 /// `ensure_budget_call_ref` derives it, from the call's own namespace, billing
-/// scope and call id). Empty for a call that was reserved without a closure, which
-/// has no reference. The cleanup preserves the reference as a historical
-/// accounting fact, so it is still readable after the cleanup completes. A
-/// reference that does not decode fails the dispatch and the settlement with
-/// `Internal`, as it does in `ensure_budget_call_ref`: it is neither trusted nor
-/// guessed at.
+/// scope and call id), or `None` when there is no reference. A missing reference is
+/// not an empty closure: a call reserved without a closure has none, and neither
+/// has a call whose reference was lost or deleted, and the two cannot be told apart
+/// here (`legacy_call_sources` reads the request of such a call). The cleanup
+/// preserves the reference as a historical accounting fact, so it is still
+/// readable after the cleanup completes. A reference that does not decode fails the
+/// dispatch and the settlement with `Internal`, as it does in
+/// `ensure_budget_call_ref`: it is neither trusted nor guessed at.
 async fn registered_source_ids(
     tx: &mut Transaction<'_, Sqlite>,
     call: &BudgetCallRecord,
-) -> Result<Vec<String>> {
+) -> Result<Option<Vec<String>>> {
     let digest = fingerprint(&(
         "rsia.budget_call_ref.v1",
         &call.namespace,
@@ -3693,10 +3742,66 @@ async fn registered_source_ids(
     .await
     .map_err(internal)?;
     let Some(body) = body else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let reference: BudgetCallRef = serde_json::from_str(&body).map_err(internal)?;
-    Ok(reference.source_ids)
+    Ok(Some(reference.source_ids))
+}
+
+/// The sources a legacy call is judged by, at its dispatch and at its model
+/// settlement.
+enum LegacyCallSources {
+    /// Checked against the revocation tombstones (`any_run_source_revoked`).
+    Named(Vec<String>),
+    /// The reference is missing and the request cannot be read for a closure:
+    /// whether the call is free of a revoked source cannot be told.
+    Unverifiable,
+}
+
+/// The sources of a legacy call: its registered closure when it has a budget call
+/// reference; otherwise the closure its persisted request names, read by the one
+/// reader the revocation cleanup reads request bodies with
+/// (`budget_request_source_ids`), so the gates and the cleanup accept the same
+/// schemas and read the same fields.
+///
+/// Every production reservation registers a closure, so a reference missing there
+/// was lost or deleted, and it must not shrink the closure to nothing (plan §7.2.1:
+/// a revocation rechecks a queued action before dispatch; §11 and §11.5: a late
+/// output over a deleted source forms no usable candidate, its cost is still
+/// booked). A request the reader cannot read (a schema it does not read, a closure
+/// it cannot read, a redaction) is `Unverifiable`. A request that names no source
+/// is an empty closure, and so is a call with no request at all: the ledger holds
+/// nothing of it that could name a source, and the cleanup has nothing of it to
+/// rescan (such calls are reserved without a closure at the library level only;
+/// every production reservation carries its request).
+async fn legacy_call_sources(
+    tx: &mut Transaction<'_, Sqlite>,
+    call: &BudgetCallRecord,
+) -> Result<LegacyCallSources> {
+    if let Some(source_ids) = registered_source_ids(tx, call).await? {
+        return Ok(LegacyCallSources::Named(source_ids));
+    }
+    let Some(request) = &call.request_artifact else {
+        return Ok(LegacyCallSources::Named(Vec::new()));
+    };
+    Ok(
+        match budget_request_source_ids(&request.schema_version, &request.body) {
+            BudgetRequestSources::Named(source_ids) => LegacyCallSources::Named(source_ids),
+            BudgetRequestSources::Unknown(_) => LegacyCallSources::Unverifiable,
+        },
+    )
+}
+
+/// The refusal of the dispatch, and the reason a response is blocked with and a
+/// redaction is made for at the settlement, of a legacy call whose closure cannot
+/// be verified (`LegacyCallSources::Unverifiable`).
+const BUDGET_SOURCES_UNVERIFIABLE: &str = "budget_sources_unverifiable";
+
+/// A determinate refusal kept in the outer result: a new refusal variant would
+/// widen the typed pre-dispatch API (`BudgetPreDispatchRefusal`) its callers match
+/// exhaustively.
+fn sources_unverifiable() -> Error {
+    Error::Conflict(BUDGET_SOURCES_UNVERIFIABLE.into())
 }
 
 /// The reason a response is blocked with, and a redaction is made for, when a source
@@ -3811,11 +3916,17 @@ fn ensure_same_model_settlement(
         &evidence.blocked_response
     };
     // Over a revoked source the transport body is stored as its redaction (by the
-    // settlement, and by the cleanup alike), which names the digest of the body it
+    // settlement, and by the cleanup alike), and so it is over a closure that cannot
+    // be verified (by the settlement); the redaction names the digest of the body it
     // replaces: the same evidence is still the same evidence.
     let same_transport = call.transport_artifact.as_ref() == Some(&evidence.transport_artifact)
         || call.transport_artifact
-            == redacted_artifact(Some(&evidence.transport_artifact), SOURCE_REVOKED)?;
+            == redacted_artifact(Some(&evidence.transport_artifact), SOURCE_REVOKED)?
+        || call.transport_artifact
+            == redacted_artifact(
+                Some(&evidence.transport_artifact),
+                BUDGET_SOURCES_UNVERIFIABLE,
+            )?;
     if call.execution_provenance != Some(evidence.provenance)
         || call.actual_model_digest != evidence.actual_model_digest
         || !same_transport

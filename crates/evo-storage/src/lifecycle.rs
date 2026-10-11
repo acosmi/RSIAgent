@@ -870,7 +870,7 @@ async fn redact_late_budget_calls(
 
 /// What the stored request of a budget call says about the sources it was built
 /// from, as far as the revocation cleanup can read it.
-enum BudgetRequestSources {
+pub(crate) enum BudgetRequestSources {
     /// The ids of the sources the request names.
     Named(Vec<String>),
     /// Whether the request names a revoked source cannot be told: the diagnostic
@@ -898,7 +898,7 @@ enum BudgetRequestSources {
 /// with the rest of its namespace (plan §11: the revocation is written first, then
 /// cleaned page by page and nothing is skipped silently; §11.5, E08: what cannot
 /// be classified is isolated).
-fn budget_request_source_ids(schema: &str, body: &str) -> BudgetRequestSources {
+pub(crate) fn budget_request_source_ids(schema: &str, body: &str) -> BudgetRequestSources {
     let read = || parse_strict_json(body).ok();
     let ids = match schema {
         "rsia.bound_model_request.v1" => read().as_ref().and_then(bound_request_closure_ids),

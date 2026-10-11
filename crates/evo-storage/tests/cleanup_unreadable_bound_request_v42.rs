@@ -573,8 +573,9 @@ async fn source_exists(path: &Path) -> bool {
 // Scenarios
 // ---------------------------------------------------------------------------
 
-/// The request of the irregular call: bytes the budget API accepts, or bytes only
-/// a damaged database holds (written over a complete request after it settled).
+/// The request of the irregular call: bytes the budget API accepts at the
+/// reservation, or bytes only a damaged database holds. Both are written over a
+/// complete request after it settled (`assert_isolated`).
 enum Stored {
     Accepted(Value),
     AcceptedText(String),
@@ -591,15 +592,22 @@ enum Stored {
 /// deleted. No accounting fact moves.
 async fn assert_isolated(case: &str, bad: Stored) {
     let mut f = Fixture::new().await;
-    match bad {
-        Stored::Accepted(value) => settle(&f.store, BAD, artifact(value.to_string())).await,
-        Stored::AcceptedText(text) => settle(&f.store, BAD, artifact(text)).await,
-        Stored::Damaged(text) => {
-            let complete = complete_bound(BAD.1, &[SOURCE]).to_string();
-            settle(&f.store, BAD, artifact(complete)).await;
-            damage_request(&f.path, BAD, &text).await;
-        }
-    }
+    // AG-107 fixture (independent review: plan §7.2.1 L831 rechecks a queued call
+    // before dispatch, §11.3 L1112 isolates what is missing, and the AG-107 card):
+    // the dispatch now refuses a call reserved without a source list whose request
+    // closure cannot be read (`budget_sources_unverifiable`), so accepted irregular
+    // bytes can no longer be dispatched and billed through the API. Like damaged
+    // bytes, they are written over the settled complete request with the
+    // test-only `damage_request`, so the cleanup still meets a billed call whose
+    // request it cannot read. Replacement coverage for the refused dispatch:
+    // `budget_ref_missing_fail_closed_v42.rs` (T2).
+    let text = match bad {
+        Stored::Accepted(value) => value.to_string(),
+        Stored::AcceptedText(text) | Stored::Damaged(text) => text,
+    };
+    let complete = complete_bound(BAD.1, &[SOURCE]).to_string();
+    settle(&f.store, BAD, artifact(complete)).await;
+    damage_request(&f.path, BAD, &text).await;
     settle(
         &f.store,
         GOOD,
@@ -837,13 +845,27 @@ async fn unreadable_requests_of_the_other_known_schemas_are_isolated_the_same_wa
     const MODEL: CallKey = ("scope-0-model", "call-model");
     const REGISTERED: CallKey = ("scope-0-registered", "call-registered");
     let mut f = Fixture::new().await;
+    // AG-107 fixture (independent review: plan §7.2.1 L831 rechecks a queued call
+    // before dispatch, §11.3 L1112 isolates what is missing, and the AG-107 card):
+    // the dispatch now refuses a call reserved without a source list whose request
+    // closure cannot be read, so each call is settled with a readable request of
+    // its schema that names no source, and the irregular body is then written over
+    // it with the test-only `damage_request`, so the cleanup still meets billed
+    // calls whose requests it cannot read. Replacement coverage for the refused
+    // dispatch: `budget_ref_missing_fail_closed_v42.rs` (T2).
     settle(
         &f.store,
         MODEL,
         artifact_of(
             "rsia.model_request.artifact.v1",
-            json!({"source_closure": SOURCE, "input": format!("{SECRET}-model")}).to_string(),
+            json!({"source_closure": [], "input": format!("{SECRET}-model")}).to_string(),
         ),
+    )
+    .await;
+    damage_request(
+        &f.path,
+        MODEL,
+        &json!({"source_closure": SOURCE, "input": format!("{SECRET}-model")}).to_string(),
     )
     .await;
     settle(
@@ -851,8 +873,14 @@ async fn unreadable_requests_of_the_other_known_schemas_are_isolated_the_same_wa
         REGISTERED,
         artifact_of(
             REGISTERED_EXECUTION_REQUEST_SCHEMA,
-            json!({"source_ids": [7], "input": format!("{SECRET}-registered")}).to_string(),
+            json!({"source_ids": [], "input": format!("{SECRET}-registered")}).to_string(),
         ),
+    )
+    .await;
+    damage_request(
+        &f.path,
+        REGISTERED,
+        &json!({"source_ids": [7], "input": format!("{SECRET}-registered")}).to_string(),
     )
     .await;
     settle(

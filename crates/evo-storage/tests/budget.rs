@@ -625,10 +625,18 @@ async fn model_request_charge_and_response_artifacts_settle_atomically_and_idemp
         .await
         .unwrap();
     let mut request = reservation("model-call", 20, 1);
+    // AG-107 fixture (independent review: plan §7.2.1 L831 rechecks a queued call
+    // before dispatch, §11.3 L1112 isolates what is missing, and the AG-107 card):
+    // a call reserved without a source list is judged at dispatch by the closure
+    // its request names, and a request the closure reader cannot read (this case
+    // used `test.model_request.v1`) now fails closed. The atomic settlement tested
+    // here does not depend on that schema, so the request is a model request
+    // artifact that names no source. Replacement coverage for the unreadable
+    // request: `budget_ref_missing_fail_closed_v42.rs` (T2).
     request.request_artifact = Some(
         BudgetArtifact::from_serializable(
-            "test.model_request.v1",
-            &serde_json::json!({"request_id":"model-call","input":"frozen"}),
+            "rsia.model_request.artifact.v1",
+            &serde_json::json!({"request_id":"model-call","source_closure":[],"input":"frozen"}),
         )
         .unwrap(),
     );
