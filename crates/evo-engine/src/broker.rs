@@ -551,8 +551,9 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
     }
 
     /// Judge the validated request's full source closure in one read-only
-    /// snapshot, before recovery can close an execution. Missing budget refs do
-    /// not shrink that closure; billing and dispatched receipts remain facts.
+    /// snapshot. It decides only whether cached content may be returned: the
+    /// recovery close is already recorded. Missing budget refs do not shrink
+    /// that closure; billing and dispatched receipts remain facts.
     async fn ensure_cached_response_sources_live(&self, request: &ModelRequest) -> Result<()> {
         let ctx = self.broker_context(&request.namespace)?;
         let dependencies = request
@@ -578,6 +579,33 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         session.commit().await
     }
 
+    /// Records the close a settled call lost between its settlement commit and
+    /// its close commit. A persisted response, usable, blocked or redacted, means
+    /// the charge is booked and the execution has ended; the close states that
+    /// accounting fact and changes no charge, usage, receipt or response column.
+    /// An already closed call is not written.
+    async fn close_recovered_execution(
+        &self,
+        request: &ModelRequest,
+        call: &BudgetCallRecord,
+    ) -> Result<()> {
+        if call.execution_closed {
+            return Ok(());
+        }
+        let dispatch_id = call.dispatch_id.as_deref().ok_or(Error::Internal)?;
+        self.store
+            .close_budget_call_execution(
+                &self.broker_context(&request.namespace)?,
+                &call.billing_scope,
+                &call.call_id,
+                dispatch_id,
+                "recovered_persisted_model_response",
+                self.now()?,
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn existing_response(
         &self,
         request: &ModelRequest,
@@ -585,6 +613,9 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         call: BudgetCallRecord,
     ) -> Result<ModelResponse> {
         if let Some(artifact) = call.response_artifact.clone() {
+            // Close before any content decision (plan §11, §6.6): a refused or
+            // redacted replay must not leave a settled call active on its root.
+            self.close_recovered_execution(request, &call).await?;
             if artifact.schema_version == "rsia.redacted.v1" {
                 if let (
                     Some(dispatch_id),
@@ -626,19 +657,6 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
             response.validate_against(request)?;
             if matches!(response, ModelResponse::Completed { .. }) {
                 self.ensure_cached_response_sources_live(request).await?;
-            }
-            if !call.execution_closed {
-                let dispatch_id = call.dispatch_id.as_deref().ok_or(Error::Internal)?;
-                self.store
-                    .close_budget_call_execution(
-                        &self.broker_context(&request.namespace)?,
-                        &call.billing_scope,
-                        &call.call_id,
-                        dispatch_id,
-                        "recovered_persisted_model_response",
-                        self.now()?,
-                    )
-                    .await?;
             }
             self.verify_persisted_response(request, &response).await?;
             return Ok(response);

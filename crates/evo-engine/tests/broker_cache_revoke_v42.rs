@@ -1,5 +1,7 @@
 //! AG-073: a completed fixture call stays charged, but its cached body cannot be
 //! read after any request source or upstream source is revoked (§11/E08).
+//! AG-097: a refused replay of a settled call whose close was lost still records
+//! that close first, so the call stops holding its billing root (§11, §6.6, E04).
 //! These tests use the real broker, SQLite ledger, and begin_revoke. Hand-written
 //! dependency edges and corrupt records are explicitly gate fixtures; they do
 //! not claim to authenticate evidence or demonstrate physical content removal.
@@ -865,16 +867,22 @@ async fn settle_open(
 }
 
 #[tokio::test]
-async fn revoked_settled_open_execution_refuses_without_closing_or_any_table_write() {
+async fn revoked_settled_open_execution_closes_then_refuses_without_other_writes() {
     let mut fixture = Fixture::new().await;
     let request = request("revoked-open-execution", &[A, B]);
     settle_open(&fixture, &request, true, false).await;
     begin(&fixture.store, NS, "run", B).await;
-    assert_usable(&fixture.call(&request).await, false);
+    let settled = fixture.call(&request).await;
+    assert_usable(&settled, false);
+    // AG-097: the first refusal records the lost close and nothing else.
+    let before = sqlite_snapshot(&fixture.path);
+    assert_unavailable(fixture.broker().dispatch(request.clone()).await);
+    assert_only_recovery_close(&before, &sqlite_snapshot(&fixture.path), &settled);
+    assert_usable(&fixture.call(&request).await, true);
     fixture.refuse_unchanged(&request).await;
     fixture.reopen().await;
     fixture.refuse_unchanged(&request).await;
-    assert_usable(&fixture.call(&request).await, false);
+    assert_usable(&fixture.call(&request).await, true);
 }
 
 #[tokio::test]
@@ -912,8 +920,13 @@ async fn revoked_legacy_settlement_without_reference_still_uses_request_sources(
     let request = request("legacy-revoked-open", &[A, B]);
     settle_open(&fixture, &request, false, false).await;
     begin(&fixture.store, NS, "run", B).await;
+    // AG-097: the first refusal records the lost close and nothing else.
+    let settled = fixture.call(&request).await;
+    let before = sqlite_snapshot(&fixture.path);
+    assert_unavailable(fixture.broker().dispatch(request.clone()).await);
+    assert_only_recovery_close(&before, &sqlite_snapshot(&fixture.path), &settled);
     fixture.refuse_unchanged(&request).await;
-    assert_usable(&fixture.call(&request).await, false);
+    assert_usable(&fixture.call(&request).await, true);
 }
 
 #[tokio::test]
@@ -1012,4 +1025,272 @@ async fn actual_cleanup_redacted_cache_keeps_existing_dispatched_rejection() {
     assert_same_response(&broker.dispatch(request).await.unwrap(), &actual);
     assert_eq!(sqlite_snapshot(&fixture.path), before);
     fixture.assert_accounting(0, 10).await;
+}
+
+// ---------------------------------------------------------------------------
+// AG-097: a refused replay closes the settled execution before refusing content
+// ---------------------------------------------------------------------------
+
+/// The reason the broker records when replay recovers a persisted response.
+const RECOVERY_CLOSE: &str = "recovered_persisted_model_response";
+
+fn column(table: &Value, name: &str) -> usize {
+    table["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|column| column == name)
+        .unwrap_or_else(|| panic!("snapshot column {name} is missing"))
+}
+
+/// Rows in the order `sqlite_snapshot` writes them: Python's `sorted` over lists
+/// of `quote()` strings, which compares code points like `String` does.
+fn sort_rows(rows: &mut [Value]) {
+    let key = |row: &Value| {
+        row.as_array()
+            .unwrap()
+            .iter()
+            .map(|cell| cell.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    rows.sort_by_key(key);
+}
+
+/// What a refused replay of a settled, still open call may write: the call's
+/// three execution-close columns, one `execution_closed` ledger event and the
+/// events AUTOINCREMENT counter. Every other table, the root totals and the
+/// call's state, charge, usage, receipt and response columns stay identical.
+fn assert_only_recovery_close(before: &Value, after: &Value, call: &BudgetCallRecord) {
+    let mut expected = before.clone();
+    let quoted_call = json!(format!("'{}'", call.call_id));
+    let calls = &mut expected["root_budget_calls"];
+    let (call_id, closed, closed_at, reason) = (
+        column(calls, "call_id"),
+        column(calls, "execution_closed"),
+        column(calls, "execution_closed_at"),
+        column(calls, "execution_close_reason"),
+    );
+    let row = calls["rows"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row[call_id] == quoted_call)
+        .unwrap();
+    assert_eq!(row[closed], json!("0"), "fixture execution was not open");
+    row[closed] = json!("1");
+    row[closed_at] = json!("20");
+    row[reason] = json!(format!("'{RECOVERY_CLOSE}'"));
+    let events = &after["root_budget_events"];
+    let previous = before["root_budget_events"]["rows"].as_array().unwrap();
+    let added = events["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| !previous.contains(row))
+        .collect::<Vec<_>>();
+    assert_eq!(added.len(), 1, "unexpected ledger events: {added:?}");
+    let event = added[0];
+    assert_eq!(event[column(events, "call_id")], quoted_call);
+    assert_eq!(
+        event[column(events, "event_kind")],
+        json!("'execution_closed'")
+    );
+    assert_eq!(event[column(events, "event_at")], json!("20"));
+    let details = event[column(events, "details")].as_str().unwrap();
+    let details: Value =
+        serde_json::from_str(&details[1..details.len() - 1].replace("''", "'")).unwrap();
+    assert_eq!(
+        details,
+        json!({"dispatch_id": call.dispatch_id, "reason": RECOVERY_CLOSE})
+    );
+    let rows = expected["root_budget_events"]["rows"]
+        .as_array_mut()
+        .unwrap();
+    rows.push(event.clone());
+    sort_rows(rows);
+    let sequence = &mut expected["sqlite_sequence"];
+    let (name, seq) = (column(sequence, "name"), column(sequence, "seq"));
+    let rows = sequence["rows"].as_array_mut().unwrap();
+    rows.iter_mut()
+        .find(|row| row[name] == json!("'root_budget_events'"))
+        .unwrap()[seq] = event[column(events, "seq")].clone();
+    sort_rows(rows);
+    assert_eq!(
+        *after, expected,
+        "the refused replay changed more than its recovery close"
+    );
+}
+
+/// The next call on the same billing root, through the real broker. Its begin
+/// must not meet `root_concurrency_limit`: it is dispatched once, and its own
+/// charge is booked beside the refused call's unchanged one.
+async fn next_call_on_same_root_dispatches(fixture: &Fixture) {
+    let next = request("same-root-next", &[A]);
+    let response = fixture.broker().dispatch(next.clone()).await.unwrap();
+    assert!(
+        matches!(response, ModelResponse::Completed { .. }),
+        "the refused call still holds the billing root: {response:?}"
+    );
+    assert_eq!(fixture.transport.calls.load(Ordering::SeqCst), 2);
+    assert_usable(&fixture.call(&next).await, true);
+    let root = fixture
+        .store
+        .root_budget(&context(NS, Role::Admin), SCOPE)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((root.reserved_micros, root.spent_micros), (0, 20));
+}
+
+/// Runs the real revocation cleanup job to completion.
+async fn finish_cleanup(fixture: &Fixture, job_id: &str) {
+    for now in 31..200 {
+        let status =
+            LifecycleStore::cleanup_step(&context(NS, Role::Admin), &fixture.store, job_id, 8, now)
+                .await
+                .unwrap();
+        if status.state == CleanupState::Complete {
+            return;
+        }
+        assert_ne!(status.state, CleanupState::Failed);
+    }
+    panic!("cleanup job {job_id} did not complete");
+}
+
+/// Gate fixture: one parameterized SQL write with the store closed. It models a
+/// legacy ledger row that no current API writes; it is not a product path.
+async fn gate_sql(fixture: &mut Fixture, sql: &str, parameters: &[&str]) {
+    fixture.store.close().await;
+    let script = r#"import sqlite3,sys
+con=sqlite3.connect(sys.argv[1])
+with con:
+    changed=con.execute(sys.argv[2],sys.argv[3:]).rowcount
+con.close()
+assert changed==1,changed
+"#;
+    let output = Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg("-c")
+        .arg(script)
+        .arg(&fixture.path)
+        .arg(sql)
+        .args(parameters)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fixture.store = Store::open(&fixture.path).await.unwrap();
+}
+
+/// Counterexample (§11, §6.6, E04). Settlement and close are separate commits;
+/// here the close was lost and then a request source was revoked. The replay
+/// refuses the content but first records the close, an accounting fact, so the
+/// settled call no longer counts as active and the next call can begin.
+#[tokio::test]
+async fn revoked_settled_open_execution_closes_and_frees_the_billing_root() {
+    let fixture = Fixture::new().await;
+    let refused = request("revoked-open-root", &[A, B]);
+    let completed = settle_open(&fixture, &refused, true, false).await;
+    begin(&fixture.store, NS, "run", B).await;
+    let settled = fixture.call(&refused).await;
+    assert_usable(&settled, false);
+    let before = sqlite_snapshot(&fixture.path);
+    assert_unavailable(fixture.broker().dispatch(refused.clone()).await);
+    let after = sqlite_snapshot(&fixture.path);
+    next_call_on_same_root_dispatches(&fixture).await;
+    assert_only_recovery_close(&before, &after, &settled);
+    assert_usable(&fixture.call(&refused).await, true);
+    assert_unavailable(fixture.broker().dispatch(refused.clone()).await);
+    fixture
+        .broker()
+        .verify_receipt(&refused, receipt(&completed))
+        .await
+        .unwrap();
+}
+
+/// The cleanup redacted the settled call while its close was still lost. The
+/// redacted branch records the same close first and keeps its dispatched
+/// rejection with the original receipt; no content is returned.
+#[tokio::test]
+async fn redacted_settled_open_execution_closes_and_keeps_dispatched_rejection() {
+    let fixture = Fixture::new().await;
+    let refused = request("redacted-open-root", &[A, B]);
+    let completed = settle_open(&fixture, &refused, true, false).await;
+    let job_id = begin(&fixture.store, NS, "run", B).await;
+    finish_cleanup(&fixture, &job_id).await;
+    let redacted = fixture.call(&refused).await;
+    assert_eq!(
+        redacted.response_artifact.as_ref().unwrap().schema_version,
+        "rsia.redacted.v1"
+    );
+    assert_eq!(redacted.response_usable, Some(false));
+    assert!(!redacted.execution_closed);
+    let before = sqlite_snapshot(&fixture.path);
+    let broker = fixture.broker();
+    let actual = broker.dispatch(refused.clone()).await.unwrap();
+    let after = sqlite_snapshot(&fixture.path);
+    assert_same_response(
+        &actual,
+        &ModelResponse::Rejected {
+            request_id: refused.request_id.clone(),
+            kind: ModelRejectionKind::CancelledAfterDispatch,
+            reason: "model response content was revoked and cannot be reused".into(),
+            dispatch: RejectedDispatch::Dispatched {
+                receipt: receipt(&completed).clone(),
+            },
+        },
+    );
+    next_call_on_same_root_dispatches(&fixture).await;
+    assert_only_recovery_close(&before, &after, &redacted);
+    broker
+        .verify_receipt(&refused, receipt(&completed))
+        .await
+        .unwrap();
+    let replayed = sqlite_snapshot(&fixture.path);
+    assert_same_response(&broker.dispatch(refused).await.unwrap(), &actual);
+    assert_eq!(sqlite_snapshot(&fixture.path), replayed);
+}
+
+/// The redacted branch's other form, over a gate-fixture legacy row: a redacted
+/// settled call without provenance keeps its `Uncertain` form and is closed
+/// first. Its known charge stays booked; nothing is refunded.
+#[tokio::test]
+async fn redacted_open_execution_without_provenance_closes_and_keeps_uncertain_form() {
+    let mut fixture = Fixture::new().await;
+    let refused = request("redacted-open-legacy", &[A, B]);
+    settle_open(&fixture, &refused, true, false).await;
+    let job_id = begin(&fixture.store, NS, "run", B).await;
+    finish_cleanup(&fixture, &job_id).await;
+    gate_sql(
+        &mut fixture,
+        "UPDATE root_budget_calls SET execution_provenance=NULL
+         WHERE billing_scope=? AND call_id=?",
+        &[SCOPE, refused.request_id.as_str()],
+    )
+    .await;
+    let legacy = fixture.call(&refused).await;
+    assert_eq!(
+        legacy.response_artifact.as_ref().unwrap().schema_version,
+        "rsia.redacted.v1"
+    );
+    assert_eq!(legacy.execution_provenance, None);
+    assert!(!legacy.execution_closed);
+    let before = sqlite_snapshot(&fixture.path);
+    let actual = fixture.broker().dispatch(refused.clone()).await.unwrap();
+    let after = sqlite_snapshot(&fixture.path);
+    assert_same_response(
+        &actual,
+        &ModelResponse::Uncertain {
+            request_id: refused.request_id.clone(),
+            dispatch_id: legacy.dispatch_id.clone().unwrap(),
+            root_budget_id: "root-1".into(),
+            provider_request_id: legacy.provider_request_id.clone(),
+            usage_record_id: legacy.usage_record_id.clone(),
+        },
+    );
+    next_call_on_same_root_dispatches(&fixture).await;
+    assert_only_recovery_close(&before, &after, &legacy);
 }
