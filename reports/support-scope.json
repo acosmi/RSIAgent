@@ -456,11 +456,12 @@
     "E05": {
       "title": "Independent Evaluator, Continuous Prefix, Early Stopping",
       "status": "blocked",
-      "status_reason": "real provider samples, independent processes and complete optimization cost proof remain unavailable",
+      "status_reason": "Pure in-memory admission rejection atomicity is verified in AG083/#116; real provider samples, independent processes and complete optimization cost proof remain unavailable",
       "implementation_files": [
         "crates/evo-core/src/sequential.rs",
         "crates/evo-engine/src/evaluator.rs",
-        "crates/evo-engine/src/streaming_evaluator.rs"
+        "crates/evo-engine/src/streaming_evaluator.rs",
+        "crates/evo-core/src/evaluation.rs"
       ],
       "scenarios": [
         "V010",
@@ -519,6 +520,28 @@
           "rollback": "revert PR #100 through an independent revert PR; accepted-head parent 3aa3804db4ec39a72f38a8ec00cc7e6f9e92b360; preserve immutable evidence, revocation, budget, cost and audit facts",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-052-652d7ca.json"
+        },
+        {
+          "id": "E05.ag083_partition_admission_rejection_atomicity",
+          "description": "Rejected in-memory partition admissions add no partial raw, normalized or family registrations",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "215811ff8848817e72f0e3226b81d57e0fef35ea",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/116",
+          "merged_sha": "7fa290883136f30fcdc87ff5a4de293aa0714507",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-core/tests/partition_admission_atomic_v42.rs",
+          "command": "cargo test --locked --offline -p evo-core --test partition_admission_atomic_v42",
+          "input_digest": "dffe2f91c22a4f48731a0b387e2950c517612031cad76b9bc1b14e0b0fdf4417",
+          "exit_code": 0,
+          "log_path": "out/scratch/ag-083-impl/current-fixed-single-clippy-repair-full8-direct-root-run-r1-user-continue-20261003/full-workspace-MAIN-original-native.json",
+          "actual_result": "ROOT final tree f4cf6018329b46c0633ba3a8a6ccd374bd6b6e94: full8 exits all0; partition_admission_atomic_v42 31 passed / 0 failed; 98 workspace result groups sum to 1314 passed / 0 failed; Python48 passed. Two independently frozen retry probes each pass on current source and each fail on actual parent9b9084a328b78d7376247b78cc26e75235a09afa with exit101 after both ordinary no-run controls exit0. Failures assert unconsumed raw/family state. Fixed accepted HEAD215811ff8848817e72f0e3226b81d57e0fef35ea merged in PR116 as7fa290883136f30fcdc87ff5a4de293aa0714507 with identical accepted tree.",
+          "scope": "E05; section3.2 L265-L269 and3.2.2 L292/L294, E05 L1253/L1257, V011 L1511/V031 L1531/V084.c,d L1641-L1643: pure in-memory single-admit rejection atomicity with existing purpose/exposure contracts preserved.",
+          "risk": "Pure in-memory PartitionRegistry::admit rejection consistency only; preserve successful registrations, sticky exposure, first-error priority and existing field contracts. Rejected calls no longer leave partial new raw/normalized/family members. No persistence or production wiring, source authenticity, full contamination/epoch machinery, migration of old partial state, full V011/V031/V084/E05, benefit/approval/release claim.",
+          "rollback": "Revert PR #116 through a reviewed independent revert; accepted-head parent 9b9084a328b78d7376247b78cc26e75235a09afa; retain immutable evidence, revocation/exposure history, costs and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-083-215811f.json"
         }
       ],
       "remaining": [
@@ -1845,7 +1868,7 @@
     "E16.2": {
       "title": "Asset Package Safety, Privacy Gates, Foreign Metadata Isolation",
       "status": "in_progress",
-      "status_reason": "controller verified and merged the durable staging and local_namespace export sub-scope (PR #54, merged 16c2817); real third-party packages and real remote destruction remain open; F08 compared to the proposal text only",
+      "status_reason": "Durable staging and local_namespace export remain verified from PR #54; AG071/#114 verifies known-marker UTF-8-safe blocking and AG085/#117 adds boundary and public-API refusal regressions for the unchanged scanner; real third-party packages and real remote destruction remain open; F08 compared to the proposal text only",
       "implementation_files": [
         "crates/evo-engine/src/packages.rs"
       ],
@@ -1884,6 +1907,50 @@
           "rollback": "disable package staging and export and withdraw the sub-scope through an independent revert PR while retaining published-blob, revocation and audit facts",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/verify-20260930/qa/s2-input-E16.2.json"
+        },
+        {
+          "id": "E16.2.ag071_known_marker_utf8_blocking",
+          "description": "Known-marker privacy findings remain blocked with UTF-8-safe byte-limited snippets",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "53dd17677a38abab26d31f1a57778b7fca9694e6",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/114",
+          "merged_sha": "c0c4dbd3f6f0464c6cb492c0eb298496fd88b9de",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/privacy_utf8_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test privacy_utf8_v42",
+          "input_digest": "0273ae0b27ef500358322f8e0000310a3cfb1f393c804414048b4000dda65836",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/ctrl-ag071-53dd176.log.test",
+          "actual_result": "ROOT independent full8 at 53dd17677a38abab26d31f1a57778b7fca9694e6: all exits 0; privacy_utf8_v42 10 passed / 0 failed; 97 workspace result groups sum to 1283 passed / 0 failed; Python checker 48 passed. Two independent ROOT public-API probes pass on head, while both fail on actual parent 212c78488b403397eaebaa65a6d280b9c6be3899 with exit101 after ordinary compilation; parent logs retain 15 real UTF-8 panics. Actual PR114 merged as c0c4dbd3f6f0464c6cb492c0eb298496fd88b9de with accepted tree596687aa3d8380ee70ba4a121a90bcb42edf05bd.",
+          "scope": "E16.2; section11.2 L1104, E16.2 L1427/L1429, V067 L1575: known-marker blocking remains valid for UTF-8 text within original snippet byte caps.",
+          "risk": "Only known-marker UTF-8-safe blocking at §11.2/E16.2/V067. Original 12/24/16-byte caps, marker order, matching, error policy and ASCII output remain. Scanning is incomplete and reports may contain original snippets. No absolute no-leak, broader scanner coverage, permission to export, full import-learning/V076, new V075, model/effect/deployment/release claim.",
+          "rollback": "Revert PR #114 through a reviewed independent revert; accepted-head parent 212c78488b403397eaebaa65a6d280b9c6be3899; retain immutable evidence, revocation/exposure history, costs and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-071-53dd176.json"
+        },
+        {
+          "id": "E16.2.ag085_utf8_privacy_boundary_regressions",
+          "description": "UTF-8 privacy boundary and public-API refusal regressions for the unchanged parent scanner",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "9f7038d1d033de500d858b188bbf344086821b1d",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/117",
+          "merged_sha": "ddde63c6ab98a2528258d265999bb902a08b0f55",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/privacy_utf8_boundary_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test privacy_utf8_boundary_v42",
+          "input_digest": "6cc428709baa5da6aa5dfe99c0aba02576ec8ec51d0ce4f4b8c435091916364c",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/takeover-20261002/ag085-current7fa-full8-direct-ROOT-run-r1-20261003/full-workspace-test-MAIN-original-native.json",
+          "actual_result": "ROOT fresh full8 at exact rebased HEAD9f7038d1d033de500d858b188bbf344086821b1d: all exits0; privacy_utf8_boundary_v42 12 passed / 0 failed; 99 workspace result groups sum to1326 passed / 0 failed; Python48 passed. Two public-API probes each pass on both head and actual parent7fa290883136f30fcdc87ff5a4de293aa0714507. Four separate source copies compile normally with exit0; boundary-retreat and metadata-name-gate mutants each produce semantic exit101 with0 passed /1 failed /1 filtered. Scanner is byte-identical to parent containing AG071. Actual PR117 merged asddde63c6ab98a2528258d265999bb902a08b0f55 with accepted tree10725a0c6a86397adfbd415bd81581f399626554.",
+          "scope": "E16.2; section11.2 L1104, E16.2 L1427/L1429, V067 L1575: 12 UTF-8 boundary, original byte/digest identity and privacy refusal regressions; actual parent scanner unchanged.",
+          "risk": "Test-only 12-test UTF-8 boundary/privacy rejection regression subset at §11.2/E16.2/V067. Scanner equals actual parent containing AG071. Both parent independent probes are positive, and semantic red cases are isolated mutants after ordinary compile0. No new scanner policy, redaction/authorization implementation, broad privacy route, absence of leaks, real host/model/effect/deployment/release claim. Optional golden writer remains explicitly selected local allowlist, not exercised in full8.",
+          "rollback": "Revert PR #117 through a reviewed independent revert; accepted-head parent 7fa290883136f30fcdc87ff5a4de293aa0714507; retain immutable evidence, revocation/exposure history, costs and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-085-9f7038d.json"
         }
       ],
       "remaining": [
@@ -2170,7 +2237,7 @@
     "E16.6": {
       "title": "Release, Support Scope Manifest & Truth Ledger",
       "status": "in_progress",
-      "status_reason": "the v4.2 derived index preserves historical records and binds round-2, round-3 and twelve round-4 accepted product subsets to fixed source and merge identities; local-only accepted heads are not registered as merged; it does not close E16",
+      "status_reason": "The v4.2 derived index preserves all 69 prior evidence objects and now has 72 records, including fifteen round-4 accepted product subsets bound to actual source and merge identities; local-only accepted heads remain separate; this does not close E16 or the full route",
       "implementation_files": [
         "reports/support-scope.json",
         "crates/evo-core/tests/support_scope.rs"
