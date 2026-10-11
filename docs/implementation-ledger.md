@@ -3,8 +3,64 @@
 唯一规范入口（方案正文仅本地）：`RSIAgent-v4.2定稿-工程实施方案-2026-09-30.md`。
 plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455`。谱系：v4.1 `RSIAgent-v4.1定稿-工程实施方案-2026-09-19.md`（SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，2026-09-30 归档至本地 `archive/2026-09-30-pre-v4.2/`）→ v4.2。历史验证记录保留其验证时的 plan_sha256（真源 §18.8）。
 本台账是实施与证据索引，不另立规范；历史 PR、测试和旧台账不决定当前规则。
-用户于 2026-09-19 明确确认 v4.1 替代 v4，并授权将本台账上传远程；方案正文、内部合同、归档及 QA 原始材料只保留本地。2026-10-01 第四轮由 Codex 主控持续推进；实施子代理统一使用 gpt-6.1-sol，逐卡记录思考档位。每个任务独立 PR；主控全量复跑及至少两个反例通过后，以固定 head 按依赖顺序合并并核对合并树。历史轮次的合并操作者按各节原始记录保留。Actions派发、付费运行和部署/发布未授权。
+用户于 2026-09-19 明确确认 v4.1 替代 v4，并授权将本台账上传远程；方案正文、内部合同、归档及 QA 原始材料只保留本地。2026-10-01 第四轮由 Codex 主控持续推进；实施子代理统一使用 gpt-6.1-sol，逐卡记录思考档位。每个任务独立 PR；主控全量复跑及至少两个反例通过后，以固定 head 按依赖顺序合并并核对合并树。历史轮次的合并操作者按各节原始记录保留。2026-10-11 起第五轮由 Claude Fable 5.1 主控，子代理按任务规模使用 Claude Sonnet 5.5 / Opus 5.5；第四轮二次验收结论见下一节。Actions派发、付费运行和部署/发布未授权。
 
+
+## 2026-10-11 第四轮二次验收结论、合并协议偏离登记与第五轮首批返修队列（AG-094）
+
+第五轮自 2026-10-11 起由 Claude Fable 5.1 主控（Claude Code），子代理按任务规模使用 Claude Sonnet 5.5 / Claude Opus 5.5；验收一律在文档化环境执行（默认 profile、默认测试线程栈），合并只用 `--merge` 并以固定 head 线性叠放。本节只折入已有结论，不改产品代码、索引或检查器。逐项记录保留在本地 out/audit-20260930/claude-r4-second-acceptance-20261011.md 与 ledger-draft-r5.md。
+
+### 范围与方法
+对第四轮（Codex 主控）合并到 main 的 PR #98–#141 共 44 项做独立二次验收：用 git/gh 逐项核对合并提交、验收 head 与树；核对 reports/support-scope.json 登记与 GitHub；解析第四轮主控全量日志、探针日志与 Task 回执；在全新 worktree 与全新 target 上按文档化环境（cards/_common.md 与 ctrl_verify.sh：CARGO_INCREMENTAL=0、DEV/TEST_DEBUG=0、opt-level 默认 0、不设 RUST_MIN_STACK）复跑 main fa570e0 的八项闸门；四个只读审查子代理分区审阅新增代码，High 级发现由主控静态核实。
+
+### 结构性核验：通过
+- 44 个合并提交的树均等于其验收 head 的树；除 #122 外，每个验收 head 的父提交等于合并时的 main。#122 以旧公开 head 0e8ff93b 三方合并，合并树等于第四轮本地叠放后验收的 head c2f89f42 的树（索引登记的 source_sha 也是 c2f89f42）。
+- 索引 92 条记录（72 旧 + 20 新）；第四轮 35 个产品 PR 的 source_sha/merged_sha 与 GitHub 一致；未登记项为台账 PR（#98/#102/#107/#112/#115/#132/#141）、CI（#129）、前端（#139）与 Python 预算报告（#120）。检查器在 main：exit 0、structure_valid、errors 0、needs_verification 134（均为"manifest 断言未自动核 Git 祖先"或"旧记录缺本地输入清单"的边界说明，不是缺陷清单）。
+- 第四轮清单提及的 88 个主控日志全部存在，26 个全量日志 failed=0；AG052–AG079 的 Rust/Python 探针日志在 head 通过、修缺陷类在父树失败；#120–#141 的 Task 回执 parent/tree 与 git 一致，Rust 通过数链自 1363（#120）升至 1729（#140）。
+- 真源条款引用抽查无错引；fa570e0 树中无 out/、archive/ 与方案正文；Cargo.lock 与各 Cargo.toml 在 8043026..fa570e0 无改动；产品 PR 与台账 PR 互不越界。
+
+### 文档化环境全量复跑：测试闸门未通过
+- fmt、clippy -D warnings、build rsia、smoke_workspace、smoke_cli、support-scope 检查器、检查器单测 7 项退出码均为 0。
+- `cargo test --workspace --locked` 退出 101：135 个测试组中 128 个正常结束（1627 通过 / 0 失败），7 个 evo-engine 测试二进制（exploration_recovery_counting_v42、exploration_trust_v42、exploration_v41、meta_trial_v42、monitoring、monitoring_consolidation_v42、step_terminal_classes_v42）在 optimization/exploration step 路径的测试处线程栈溢出中止，102 个测试未执行。仅加 RUST_MIN_STACK=16777216 复跑这 7 组，102 个全部通过，合计 1729，与第四轮计数一致，说明是 async 状态机栈帧过大而非无限递归。
+- 原因：第四轮自 #130 起的全部验收回执都带未公开的 CARGO_PROFILE_DEV_OPT_LEVEL=1 与 CARGO_PROFILE_TEST_OPT_LEVEL=1，opt-level 1 缩小了栈帧、掩盖了溢出；第三轮末 8043026 在 opt-level 0 下通过。第五轮主控二分：#140 合并的父提交 c04850d7 上同 7 组在默认栈全部通过（99/0），fa570e0 上溢出，回归由 #140 引入。GitHub CI（ubuntu、默认 profile、2 MiB 测试线程栈）同样会失败。
+- 判定：main fa570e0 在文档化环境下不满足测试闸门；第四轮"1729 全通过"只在未公开的 opt-level 1 下成立。
+
+### 合并协议偏离登记（第四轮；不影响各合并树与验收树的一致性）
+1. #119 合并提交标题未以 `[skip ci]` 结尾（正文含有，未触发 Actions）。
+2. #120 合并提交使用默认标题、无 `[skip ci]`，触发 Actions "Rust CI"（2026-10-05，success）。
+3. #121 以 squash 单父提交合并（9f0c402），标题被追加 "(#121)"，Co-Authored-By 丢失；树等于验收 head d0958ac 的树。
+4. #122 以旧公开 head 0e8ff93b 三方合并、默认标题，触发 Actions（2026-10-05，success）；合并树等于本地叠放验收 head c2f89f42 的树，但第四轮状态表记的是公开 head。
+5. #123、#124 以 rebase 单父提交合并（618ad83、5295769），树等于验收 head；#123 提交丢失 Co-Authored-By。
+6. 其余 38 项均为 `--merge` 两父合并、标题以 `[skip ci]` 结尾、head 已叠放。
+- 其它过程偏差：第四轮清单缺 #120/#121/#122/#124 专节；2 个证据文件（AG076 全量日志、AG079 审阅交付 JSON）当前哈希在任何记录中都找不到（证据保管链轻微断点）；第四轮收尾报告称工作树/分支已清理，与现场不符（37 个 worktree、34 个本地分支、3 个远端分支残留，第五轮已导出两处未提交改动为补丁后清理）；可再生测试二进制被压缩归档（5.6 GiB）与 10–42 MB 的 JSON 回执导致磁盘耗尽，已由用户与第五轮主控回收。
+
+### 已核实缺陷与第五轮首批返修卡（均为失败关闭或闸门缺陷，未发现放行坏数据的路径）
+- AG-095（R1，#140，E05/E13）：外部宿主完整批次授权的 grader 回执摘要写入用 typed 声明序、校验用 serde_json::Value 排序键，两种编码的 SHA-256 必不相等，RegisteredExternalHost 的授权签发必然 Forbidden，唯一晋级路径在 main 不可达；无成功路径测试。
+- AG-096（R2，#125/#113 线，E08/§11）：撤销清理解析历史 bound_model_request 行失败时以 Err 回滚整个命名空间的清理事务且不记 last_error，一条坏历史行即可阻塞该命名空间的清理。
+- AG-097（R3，#119/#104，E04/§11）：缓存撤销闸位于 execution 关闭之前，已结算未关闭的调用在来源撤销后永不关闭，整个计费根被 RootConcurrencyLimit 卡住且无运维出口。
+- AG-098（R4，#129，E00）：CI 的 Python 单测步骤用 discover 会把 scripts/test_mcp_stdio.py 的 47 个用例一并发现，无二进制时 AttributeError，CI 按构造即红（#129 之后全部提交 [skip ci]，CI 从未运行）；迁移 0007 校验和未钉入 CI。
+- AG-099（R5，#140，E00/E09）：上节 7 个测试二进制的栈溢出；只做结构性改动（拆分/Box::pin step 路径上的大 async 函数），不改 profile、不设 RUST_MIN_STACK、不改测试。
+- 待裁决（Medium，裁决后再派）：无候选记录即签发 legacy 票据的 bound/unbound 双模式；v2 完整批次永不输出 Regressed 且理由文本陈述未做的 UCB 检查；并发冲突对 call id 的永久拒绝；派发与回放的撤销规则不一致；约 3.5k 行无生产调用方的模块（E16 typed 预算闸、导入 fixture、依赖完整性）需接线或登记为 library-only；索引 command/exit_code 为占位而非实际执行记录；公开台账中的本机绝对路径清洗；0007 之前备份无升级路径；README 缺 `review` 子命令说明。
+- 待用户：前端 status-character 是否进入 CI；本地 5.6 GiB JSON 回执是否保留。
+
+### 判定
+第四轮合并内容可追溯且结构一致，但 main fa570e0 不满足文档化的测试闸门，并含已核实的 High 缺陷；本台账不声称第四轮"验收通过"。上述返修卡的验收以文档化环境的八项闸门全 0 与至少两个主控反例为准，合并后在本台账登记 merged_sha 与树核对结果。
+
+## 2026-10-11 第五轮首批合并登记（截至 PR #148）
+
+第五轮由两个 Claude 主控窗口并行：一个窗口负责第四轮缺陷 R1–R5 的返修（AG-095–AG-101，另含 AG-105–AG-109），本窗口负责台账、索引诚实字段、恢复升级与公平等待修复（AG-094/AG-102/AG-103/AG-104/AG-110/AG-111）。两窗口共用磁盘闸门（任一编译前空闲 ≥ 8 GiB、同一时刻只跑一个构建、全工作区测试互斥）。本节登记截至 #148 的合并事实；索引记录（reports/support-scope.json）对 #144/#145/#146 的登记按 AG-102 引入的机器字段规则执行（pr > 141 的记录带 `execution` 对象，记录级 `command/exit_code/log_path` 只描述声明的单目标）。
+
+### 合并协议与授权
+- 用户于 2026-10-11 13:35Z 与 15:25Z 指令："交付通过后 admin 批准合并"。据此，验收 7.1–7.5 全部通过的 PR 由主控执行 `gh pr merge <N> --merge --match-head-commit <验收 head> --subject "Merge AG-xxx <题> (#N) [skip ci]" --admin`；合并后核对 merged 树与验收 head 树相等。#142/#144/#145/#146 由返修窗口合并，#148 由本窗口合并，均为 admin 合并、两父提交、树相等。
+- 文档化验收环境：默认 profile（opt-level 0）、默认测试线程栈、无 RUST_MIN_STACK、`--locked`、不 `--offline`、每次验收使用全新 target。#146 之前 main 的全工作区测试在该环境下有 7 个 evo-engine 测试二进制栈溢出（#140 引入），各 PR 的验收如实记录为 test 退出码 101 + 其余二进制全部通过；#146 合并后首次全绿。
+
+### 逐任务摘要
+- **#142 AG-098（CI Python 闸门、MCP stdio 步骤、迁移 0007 校验和）**：head 2236ad1944138642dd7f0ba4fadb3c613adec07d → merged e727d1c65d87de36d85983e606c34b725f5ff94e（2026-10-11T13:46:05Z）。无 Rust 改动；Python/CI 门在 head 上全部退出 0（discover Ran 141 OK skipped=47；MCP stdio 47/47）；Rust 测试门沿用 fa570e0 的全量结果（crates/、apps/、Cargo.* 与 fa570e0 完全相同），未声称本 PR 新跑。按先例（#98/#102/#107/#112/#115/#120/#129/#139/#141）不进索引记录。
+- **#144 AG-097（已结算调用在拒绝撤销缓存内容前先记录恢复关闭）**：head 98431d59d765f0c16a5b736147de4735d2adbe2b（交付 29d35927 于 fa570e0，叠放到 e727d1c6 补丁字节一致）→ merged 184764302e64ca3871fc68103bd07abec1125918（14:52:30Z）。全量：fmt/clippy 0，test 101（128 二进制 1630 通过 0 失败 = 父 1627 + 新 3，7 个已知溢出二进制不变），build/smokes/checker/unittest 0；主控反例 2 个 head 通过、父 e727d1c6 失败。索引记录 E04.ag097_broker_close_before_refuse（V007/V008/V086/V096）。
+- **#145 AG-096（撤销清理把不可读的历史预算请求行隔离为未知作用域而非回滚命名空间）**：head 4fd5701ad6677c0c441fd376eec953e001fc7012（叠放到 18476430 补丁字节一致）→ merged 7d39ef7350615be82d698d6914d03856fa0df97c（16:06:26Z）。全量：fmt/clippy 0，test 101（129 二进制 1639 通过 0 失败 = 父 1630 + 新 9，溢出集合不变），其余 0；反例 2 个 head 通过、基线 18476430 失败。索引记录 E08.ag096_unreadable_bound_request_isolated（V017/V018/V075/V096）。
+- **#146 AG-099（装箱 step 路径 async future，7 个 evo-engine 测试二进制在默认测试栈内完成）**：head 45377b9d78c373fbd68b89221ba138e9eed114ab（叠放到 7d39ef73）→ merged 98776f1717b37a47e4a7fcc4349ff0faff68ce1b。全量首次全绿：fmt/clippy 0，test 0（136 二进制 1741 通过 0 失败，溢出 0），其余 0；反例：7 个此前溢出目标在 head 全部通过（102 项），在基线 7d39ef73 全部溢出。索引记录 E00.ag099_step_future_default_test_stack（V001/V080；test_entry 取 step_terminal_classes_v42）。
+- **#148 AG-102（索引机器字段：声明目标与实际执行证据分离）**：base e727d1c → head 971d4eb3d9abd79aeb02374d4393c6da67e00cc0（叠放到 98776f17 补丁字节一致）→ merged 1ef0b2163fe9b6c46c9d49b558e6e25c0e13ab12（16:52:06Z）。改动仅 4 文件（reports/support-scope.json、scripts/check_support_scope.py、scripts/test_check_support_scope.py、crates/evo-core/tests/support_scope.rs）：顶层 `field_semantics` 钉死 command/exit_code/log_path/execution/production_consumer 的含义；pr > 141 记录必须带 `execution{runner, command, scope, exit_code, evidence}`；`production_consumer=none_library_only` 标注 #125/#128/#130/#131 四条记录（截至 e727d1c 无 engine/http/mcp/apps 生产调用方）；追溯回填 13 处（#103→V002；#105→V033/V035；#106→V010–V013/V084/V085/V096/V097；#114+#117→V067）；92 条旧记录除上述四条外字节不变。全量：8 项退出码全 0，136 二进制 1748 通过（父 1741 + 7），Python discover 160 OK；索引篡改探针 6 例在 head 全部被拒、其中 2 例在父树被接受（真反例）。按先例不进索引记录。登记的偏差：Python 检查器按所属任务规则拒绝 AG-058 对 V001/V002/V017/V032/V037 的引用而 Rust 镜像仅查引用存在，两者在该规则上不一致，未在本 PR 修复。
+- 清理：各 PR 验收 target 已删除；分支删除按用户命令清单执行。
 
 ## 2026-10-11 第四轮在途收尾与最终证据索引
 
@@ -34,6 +90,9 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 | [#137](https://github.com/acosmi/RSIAgent/pull/137) | AG091 | 730f242cd4fe076c4d751e3f823cc8a9385fbb93 | 27df8c2cfccbefa6544b55b697c10abbb6c0a61c | E05 |
 | [#138](https://github.com/acosmi/RSIAgent/pull/138) | AG092 | 39d2d865c203ca45dd278efa591c934abffb0165 | 77ef86294b7760fc7495d12d4029ca8a3567bc5e | E02 |
 | [#140](https://github.com/acosmi/RSIAgent/pull/140) | AG093 | 49806d7faf703aab7e7e467c4bd5518969a24e55 | f6904dcd2d4f3b46b3311886fd4dcecd8a2f711c | E02 |
+| [#144](https://github.com/acosmi/RSIAgent/pull/144) | AG097 | 98431d59d765f0c16a5b736147de4735d2adbe2b | 184764302e64ca3871fc68103bd07abec1125918 | E04 |
+| [#145](https://github.com/acosmi/RSIAgent/pull/145) | AG096 | 4fd5701ad6677c0c441fd376eec953e001fc7012 | 7d39ef7350615be82d698d6914d03856fa0df97c | E08 |
+| [#146](https://github.com/acosmi/RSIAgent/pull/146) | AG099 | 45377b9d78c373fbd68b89221ba138e9eed114ab | 98776f1717b37a47e4a7fcc4349ff0faff68ce1b | E00 |
 
 | E任务 | 默认完整范围状态 | 已验子范围记录数 |
 |---|---|---|
