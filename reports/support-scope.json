@@ -15,6 +15,13 @@
     }
   ],
   "derived_index_notice": "This file is a checked derivative; the pinned v4.2 plan (lineage v4.1→v4.2) remains the sole normative source.",
+  "field_semantics": {
+    "command": "declared single-target checker command; syntax validated, not necessarily the literally executed command",
+    "exit_code": "exit code of the controller gate run that covered the declared target",
+    "log_path": "local evidence file containing that target's result (controller test log or acceptance receipt)",
+    "execution": "optional record-level object, required when the pull request number is above 141, stating what was actually run: runner (ctrl_verify.sh, codex_task or other), command (the literally executed command), scope (workspace or single_target), exit_code (the integer exit code of that command) and evidence (the log_path or the identifier of the summary line inside the acceptance receipt); command, exit_code and log_path of the record keep describing the declared target; earlier records are neither backfilled nor guessed",
+    "production_consumer": "optional record-level marker: none_library_only means the recorded module has no production caller in engine/http/mcp/apps as of the commit named in the record scope; wired means a production caller exists; an absent marker means this was not assessed"
+  },
   "declaration": "subset_only",
   "not_full_route_complete": true,
   "legacy_equivalence_unverified": true,
@@ -554,10 +561,11 @@
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/125",
           "pr_state": "merged",
+          "production_consumer": "none_library_only",
           "record_source": "docs/implementation-ledger.md",
           "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
           "rollback": "Reviewed revert of PR #125; retain source, costs, revocation history and original QA. Accepted parent 5295769892af37988d6bc739bdfb49a834a3f7aa.",
-          "scope": "E04; Typed E16 budget source snapshots, cleanup and recovery software/component boundary only.",
+          "scope": "E04; Typed E16 budget source snapshots, cleanup and recovery software/component boundary only. Library-only as of e727d1c: no production caller in engine/http/mcp/apps.",
           "source_sha": "26d3fe400ee1aad36082081eda6c60f3ee1a17f7",
           "test_entry": "crates/evo-storage/tests/e16_budget_binding_v42.rs"
         }
@@ -1363,10 +1371,11 @@
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/131",
           "pr_state": "merged",
+          "production_consumer": "none_library_only",
           "record_source": "docs/implementation-ledger.md",
           "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
           "rollback": "Reviewed revert of PR #131; retain source, costs, revocation history and original QA. Accepted parent 1132b6b4b6e0016540339ba65219daf1ceb35fb8.",
-          "scope": "E08; Direct typed import source/result dependency binding software/component boundary only.",
+          "scope": "E08; Direct typed import source/result dependency binding software/component boundary only. Library-only as of e727d1c: no production caller in engine/http/mcp/apps.",
           "source_sha": "8a92e578527b6334b5fb776abf46c5bc9a88e4b7",
           "test_entry": "crates/evo-storage/tests/dependency_read_v42.rs"
         }
@@ -2267,10 +2276,11 @@
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/128",
           "pr_state": "merged",
+          "production_consumer": "none_library_only",
           "record_source": "docs/implementation-ledger.md",
           "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
           "rollback": "Reviewed revert of PR #128; retain source, costs, revocation history and original QA. Accepted parent aa51b1102e1886cbaf7b025d37b98ca30b6e2d3d.",
-          "scope": "E16.1; Bounded content-driven import ProgramFixture software/component boundary only.",
+          "scope": "E16.1; Bounded content-driven import ProgramFixture software/component boundary only. Library-only as of e727d1c: no production caller in engine/http/mcp/apps.",
           "source_sha": "1355e95f598bf7d1f490d6d1d295a1e29c855c0c",
           "test_entry": "crates/evo-core/tests/import_fixture_v42.rs"
         },
@@ -2289,10 +2299,11 @@
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/130",
           "pr_state": "merged",
+          "production_consumer": "none_library_only",
           "record_source": "docs/implementation-ledger.md",
           "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
           "rollback": "Reviewed revert of PR #130; retain source, costs, revocation history and original QA. Accepted parent 3ad643ca2a1cf57f4e7bc1c0f032eef2663902b5.",
-          "scope": "E16.1; Bounded local development-material reader software/component boundary only.",
+          "scope": "E16.1; Bounded local development-material reader software/component boundary only. Library-only as of e727d1c: no production caller in engine/http/mcp/apps.",
           "source_sha": "887d97a345e947c754dd01c0fd0e1dd15b635d5c",
           "test_entry": "crates/evo-engine/tests/import_development_material_v42.rs"
         }
@@ -4336,7 +4347,8 @@
           "E02.controller_acceptance",
           "E16.4.real_store_rejection_controller_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E02.ag055_v1_wire_goldens"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4495,7 +4507,8 @@
           "E05.ag088_local_scoped_acceptance",
           "E05.ag089_local_scoped_acceptance",
           "E05.ag090_local_scoped_acceptance",
-          "E05.ag091_local_scoped_acceptance"
+          "E05.ag091_local_scoped_acceptance",
+          "E01.ag057_explicit_sample_registration"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4517,7 +4530,8 @@
           "E05.ag088_local_scoped_acceptance",
           "E05.ag089_local_scoped_acceptance",
           "E05.ag090_local_scoped_acceptance",
-          "E05.ag091_local_scoped_acceptance"
+          "E05.ag091_local_scoped_acceptance",
+          "E01.ag057_explicit_sample_registration"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4539,7 +4553,8 @@
           "E05.ag088_local_scoped_acceptance",
           "E05.ag089_local_scoped_acceptance",
           "E05.ag090_local_scoped_acceptance",
-          "E05.ag091_local_scoped_acceptance"
+          "E05.ag091_local_scoped_acceptance",
+          "E01.ag057_explicit_sample_registration"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4561,7 +4576,8 @@
           "E05.ag088_local_scoped_acceptance",
           "E05.ag089_local_scoped_acceptance",
           "E05.ag090_local_scoped_acceptance",
-          "E05.ag091_local_scoped_acceptance"
+          "E05.ag091_local_scoped_acceptance",
+          "E01.ag057_explicit_sample_registration"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4914,7 +4930,9 @@
         "status": "planned",
         "verification_status": "planned",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E14.ag058_current_description_boundaries"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -4942,7 +4960,9 @@
         "status": "planned",
         "verification_status": "planned",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E14.ag058_current_description_boundaries"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -5487,7 +5507,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E16.2.durable_staging_publish_controller_acceptance"
+          "E16.2.durable_staging_publish_controller_acceptance",
+          "E16.2.ag071_known_marker_utf8_blocking",
+          "E16.2.ag085_utf8_privacy_boundary_regressions"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5851,7 +5873,8 @@
           "E05.ag090_local_scoped_acceptance",
           "E05.ag091_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E01.ag057_explicit_sample_registration"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5893,7 +5916,8 @@
           "E05.ag090_local_scoped_acceptance",
           "E05.ag091_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E01.ag057_explicit_sample_registration"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6294,7 +6318,8 @@
           "E09.ag074_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E01.ag057_explicit_sample_registration"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6328,7 +6353,8 @@
           "E05.ag088_local_scoped_acceptance",
           "E05.ag089_local_scoped_acceptance",
           "E05.ag090_local_scoped_acceptance",
-          "E05.ag091_local_scoped_acceptance"
+          "E05.ag091_local_scoped_acceptance",
+          "E01.ag057_explicit_sample_registration"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
