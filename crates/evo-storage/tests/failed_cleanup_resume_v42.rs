@@ -872,7 +872,8 @@ async fn set_request(path: &Path, scope: &str, id: &str, body: &str) {
     let mut c = connection(path).await;
     // Fixture body correction/corruption; no cleanup state or accounting writes.
     // Deliberately damaged bytes need a test-only bypass of the JSON CHECK; the
-    // production cleanup must still reject them and roll its transaction back.
+    // production cleanup must still never read them: it isolates the call
+    // (`blocked_unknown_scope`) and leaves the bytes as they are.
     if serde_json::from_str::<Value>(body).is_err() {
         sqlx::query("PRAGMA ignore_check_constraints=ON")
             .execute(&mut c)
@@ -1160,19 +1161,51 @@ async fn sql_failure_during_retry_rolls_back_state_frontier_and_retry_event() {
 }
 
 #[tokio::test]
-async fn raw_json_parser_failure_cannot_commit_a_retry_or_fake_complete() {
+async fn raw_json_parser_failure_is_isolated_and_cannot_fake_complete() {
     let mut f = Fixture::new().await;
     source(&f.store, NS, "source").await;
     budget_call(&f.store, "scope-a", "call", "rsia.unknown_request.v9").await;
     let old = drain_failed(&f.store, NS, begin(&f.store, NS, "source").await).await;
     set_request(&f.path, "scope-a", "call", "{").await;
     let before = snapshot(&f.path, NS).await;
-    assert!(
-        LifecycleStore::cleanup_step(&context(NS, Role::Admin), &f.store, &old.job_id, 1, 300)
-            .await
-            .is_err()
+    let money = accounting(&f.path).await;
+    // The retry round commits and the scan goes past the unreadable request: it
+    // is isolated like a request of an unknown schema, never read and never
+    // trusted, so the job cannot report Complete.
+    let isolated = page(&f.store, NS, Role::Admin, &old.job_id, 300).await;
+    assert_eq!(isolated.state, CleanupState::Failed, "{isolated:?}");
+    assert_eq!(
+        isolated.last_error.as_deref(),
+        Some("unreadable_budget_request:rsia.model_request.artifact.v1")
     );
-    assert_eq!(snapshot(&f.path, NS).await, before);
+    let after = snapshot(&f.path, NS).await;
+    assert_eq!(events(&after, &old.job_id, RETRY).len(), 1);
+    let blocked = events(&after, &old.job_id, "blocked_unknown_scope");
+    assert_eq!(
+        blocked.len(),
+        events(&before, &old.job_id, "blocked_unknown_scope").len() + 1
+    );
+    let isolation = blocked.last().unwrap();
+    assert_eq!(isolation["kind"], "reservation");
+    assert_eq!(isolation["id"], "call");
+    assert_eq!(
+        isolation["details"]["error"],
+        "unreadable_budget_request:rsia.model_request.artifact.v1"
+    );
+    for unchanged in ["objects", "edges", "watermark", "cache"] {
+        assert_eq!(after[unchanged], before[unchanged], "{unchanged}");
+    }
+    let mut c = connection(&f.path).await;
+    let body: String = sqlx::query_scalar(
+        "SELECT request_artifact_body FROM root_budget_calls
+         WHERE billing_scope='scope-a' AND call_id='call'",
+    )
+    .fetch_one(&mut c)
+    .await
+    .unwrap();
+    c.close().await.unwrap();
+    assert_eq!(body, "{");
+    assert_eq!(accounting(&f.path).await, money);
     set_request(
         &f.path,
         "scope-a",
