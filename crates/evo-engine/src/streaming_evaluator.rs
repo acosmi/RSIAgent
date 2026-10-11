@@ -1706,6 +1706,13 @@ impl IndependentEvaluationControl {
         }
         let bind_accepted_facts =
             ticket.candidate_dependency_binding.is_some() && !is_stopping(ticket.lifecycle);
+        // A delayed grading error cannot replace an already confirmed bound stop.
+        let preserve_confirmed_stop = ticket.candidate_dependency_binding.is_some()
+            && matches!(
+                ticket.lifecycle,
+                TicketLifecycle::Draining | TicketLifecycle::EarlyStopped
+            )
+            && ticket.pending_certificate.is_some();
         if !is_stopping(ticket.lifecycle) {
             validate_status_closure(&mut session, ctx, &ticket, None).await?;
         }
@@ -1748,16 +1755,18 @@ impl IndependentEvaluationControl {
         ) {
             Ok(score) => score,
             Err(error) => {
-                invalidate_in_session(
-                    &mut session,
-                    ctx,
-                    &control,
-                    &mut ticket,
-                    "candidate_output_schema_invalid",
-                    request.issued_at_unix_seconds,
-                )
-                .await?;
-                session.commit().await?;
+                if !preserve_confirmed_stop {
+                    invalidate_in_session(
+                        &mut session,
+                        ctx,
+                        &control,
+                        &mut ticket,
+                        "candidate_output_schema_invalid",
+                        request.issued_at_unix_seconds,
+                    )
+                    .await?;
+                    session.commit().await?;
+                }
                 return Err(error);
             }
         };
@@ -1768,32 +1777,36 @@ impl IndependentEvaluationControl {
         ) {
             Ok(score) => score,
             Err(error) => {
-                invalidate_in_session(
-                    &mut session,
-                    ctx,
-                    &control,
-                    &mut ticket,
-                    "baseline_output_schema_invalid",
-                    request.issued_at_unix_seconds,
-                )
-                .await?;
-                session.commit().await?;
+                if !preserve_confirmed_stop {
+                    invalidate_in_session(
+                        &mut session,
+                        ctx,
+                        &control,
+                        &mut ticket,
+                        "baseline_output_schema_invalid",
+                        request.issued_at_unix_seconds,
+                    )
+                    .await?;
+                    session.commit().await?;
+                }
                 return Err(error);
             }
         };
         let anchor_result = match target_kind {
             EvaluationTargetKind::Rotating { .. } => None,
             EvaluationTargetKind::Anchor { .. } if baseline_score_micros != 1_000_000 => {
-                invalidate_in_session(
-                    &mut session,
-                    ctx,
-                    &control,
-                    &mut ticket,
-                    "baseline_anchor_invalid",
-                    request.issued_at_unix_seconds,
-                )
-                .await?;
-                session.commit().await?;
+                if !preserve_confirmed_stop {
+                    invalidate_in_session(
+                        &mut session,
+                        ctx,
+                        &control,
+                        &mut ticket,
+                        "baseline_anchor_invalid",
+                        request.issued_at_unix_seconds,
+                    )
+                    .await?;
+                    session.commit().await?;
+                }
                 return Err(Error::Invalid(
                     "baseline failed a frozen critical anchor; comparison is invalid".into(),
                 ));
