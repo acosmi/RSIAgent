@@ -2857,9 +2857,10 @@ async fn validate_status_closure(
             }
         }
         Some(FormalEvaluationV2::Invalid {
+            evidence_scope,
             ticket_id,
             ticket_digest,
-            ..
+            reasons,
         }) => {
             if ticket.lifecycle != TicketLifecycle::Invalid
                 || ticket_id != &ticket.id
@@ -2868,6 +2869,14 @@ async fn validate_status_closure(
                 return Err(Error::Conflict(
                     "invalid formal evaluation dependency closure mismatch".into(),
                 ));
+            }
+            if ticket.candidate_dependency_binding.is_some()
+                && (reasons.is_empty()
+                    || reasons != &ticket.invalid_reasons
+                    || *evidence_scope != ticket.evidence_scope
+                    || *evidence_scope != control.evidence_scope)
+            {
+                return Err(Error::Conflict("formal_invalid_outcome_changed".into()));
             }
         }
         None if matches!(
