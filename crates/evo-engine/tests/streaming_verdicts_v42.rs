@@ -915,13 +915,100 @@ async fn v2_improved_batch_reads_back_and_a_valid_staged_candidate_cannot_promot
     assert_release_forbidden(&fixture).await;
 }
 
+// Same decide() input as the finalized batch, for arbitrary cluster differences.
+fn raw_decision_for(fixture: &Fixture, diffs: &[f64]) -> BernsteinReport {
+    let mut plan = fixture.control.v1_plan_snapshot.clone();
+    plan.bind_candidate(d("candidate")).unwrap();
+    let rows: Vec<_> = diffs
+        .iter()
+        .enumerate()
+        .map(|(index, diff)| ClusterObservation {
+            cluster_id: format!("cluster-{index}"),
+            d: *diff,
+            weight: 1.0,
+        })
+        .collect();
+    decide(
+        &plan,
+        empirical_bernstein(&rows, 0.04).unwrap(),
+        fixture.candidate_cost as f64 / 10.0,
+        1.0,
+        true,
+    )
+    .unwrap()
+}
+
+// UCB recomputed from the stored report's own decimals: mean + radius, the
+// mirror of section 3.4's LCB = mean - radius at the same alpha_i.
+fn stored_ucb(formal: &FormalEvaluationV2) -> f64 {
+    let FormalEvaluationV2::CompleteBatch { report, .. } = formal else {
+        panic!("expected complete batch, got {formal:?}");
+    };
+    report.mean.parse::<f64>().unwrap() + report.radius.parse::<f64>().unwrap()
+}
+
+// Twenty independent clusters, every d = -1 (candidate wrong, baseline right),
+// alpha_i = 0.04, R = 2 (section 3.4, L331-332):
+//   mean   = -1, s^2 = 0
+//   ln     = ln(2 / 0.04) = 3.912023005
+//   radius = sqrt(2 * 0 * ln / 20) + 7 * 2 * ln / (3 * 19) = 0.960847756
+//   LCB    = max(mean - radius, -1) = -1, so decide() reports negative_lcb
+//   UCB    = mean + radius = -0.039152244, which is below zero
+// E05 L1257 confirms an average regression exactly when the UCB is below zero.
 #[tokio::test]
-async fn v2_negative_lcb_is_not_a_confirmed_regression() {
+async fn v2_regression_is_confirmed_when_the_ucb_is_below_zero() {
     let fixture = fixture(V2, ProfileKind::QualityGain, 10).await;
-    assert_eq!(raw_decision(&fixture, false).verdict, Verdict::Regressed);
+    let raw = raw_decision(&fixture, false);
+    assert_eq!(raw.verdict, Verdict::Regressed);
+    assert_eq!(raw.reasons, vec!["negative_lcb"]);
     complete(&fixture, false).await;
     let formal = finalize(&fixture).await;
     let (verdict, reasons) = batch(&formal);
+    let ucb = stored_ucb(&formal);
+    println!("v2 n=20 d=-1 alpha=0.04 ucb={ucb:.9} verdict={verdict:?} reasons={reasons:?}");
+    assert!((ucb - (raw.mean + raw.radius)).abs() < 1e-12);
+    assert!((ucb + 0.039_152_244).abs() < 1e-8);
+    assert!(ucb < 0.0);
+    assert_eq!(verdict, Verdict::Regressed);
+    assert_eq!(
+        *reasons,
+        vec!["negative_lcb", "regression_confirmed_ucb_below_zero"]
+    );
+    assert_readback(&fixture, &formal).await;
+    assert_release_forbidden(&fixture).await;
+}
+
+// One tie moves the same plan off the boundary: nineteen clusters at d = -1 and
+// r19 at d = 0 (candidate and baseline both right), alpha_i = 0.04, R = 2:
+//   mean   = -19/20 = -0.95
+//   s^2    = (19 * 0.05^2 + 0.95^2) / 20 * 20 / 19 = 0.05
+//   radius = sqrt(2 * 0.05 * 3.912023005 / 20) + 7 * 2 * 3.912023005 / (3 * 19)
+//          = 0.139857 + 0.960848 = 1.100705
+//   LCB    = max(mean - radius, -1) = -1, so decide() still reports negative_lcb
+//   UCB    = mean + radius = +0.150705, which is not below zero
+// The clamped LCB makes mean - LCB = 0.05, not the radius; using it as the
+// radius would give a UCB of -0.90 and wrongly confirm this regression.
+#[tokio::test]
+async fn v2_regression_is_not_confirmed_when_the_ucb_is_not_below_zero() {
+    let fixture = fixture(V2, ProfileKind::QualityGain, 10).await;
+    let mut diffs = vec![-1.0; 19];
+    diffs.push(0.0);
+    let raw = raw_decision_for(&fixture, &diffs);
+    assert_eq!(raw.verdict, Verdict::Regressed);
+    assert_eq!(raw.reasons, vec!["negative_lcb"]);
+    rotating(&fixture, 0, 19, false).await;
+    grade_target(&fixture, "r19", "ok", "ok", 20).await;
+    grade_target(&fixture, "a0", "ok", "ok", 21).await;
+    let formal = finalize(&fixture).await;
+    let (verdict, reasons) = batch(&formal);
+    let ucb = stored_ucb(&formal);
+    println!(
+        "v2 n=20 19x(d=-1)+1x(d=0) alpha=0.04 ucb={ucb:.9} verdict={verdict:?} reasons={reasons:?}"
+    );
+    assert!((ucb - (raw.mean + raw.radius)).abs() < 1e-12);
+    assert!((ucb - 0.150_705_236).abs() < 1e-8);
+    assert!(ucb >= 0.0);
+    assert!(raw.mean - raw.lcb < raw.radius);
     assert_eq!(verdict, Verdict::Inconclusive);
     assert_eq!(
         *reasons,
@@ -930,6 +1017,32 @@ async fn v2_negative_lcb_is_not_a_confirmed_regression() {
             "regression_not_confirmed_ucb_boundary_not_crossed"
         ]
     );
+    assert_readback(&fixture, &formal).await;
+}
+
+// A confirmed regression keeps decide()'s other reasons, still sorted and unique:
+// a candidate costing 1.2x the baseline adds cost_over_limit (max_cost_ratio is
+// 1.10); the d = -1 statistics and the UCB are those of the first test above.
+#[tokio::test]
+async fn v2_confirmed_regression_keeps_other_reasons_sorted_and_unique() {
+    let fixture = fixture(V2, ProfileKind::QualityGain, 12).await;
+    let raw = raw_decision(&fixture, false);
+    assert_eq!(raw.verdict, Verdict::Regressed);
+    assert_eq!(raw.reasons, vec!["cost_over_limit", "negative_lcb"]);
+    complete(&fixture, false).await;
+    let formal = finalize(&fixture).await;
+    let (verdict, reasons) = batch(&formal);
+    println!("v2 n=20 d=-1 cost=1.2x verdict={verdict:?} reasons={reasons:?}");
+    assert_eq!(verdict, Verdict::Regressed);
+    assert_eq!(
+        *reasons,
+        vec![
+            "cost_over_limit",
+            "negative_lcb",
+            "regression_confirmed_ucb_below_zero"
+        ]
+    );
+    assert!(reasons.windows(2).all(|pair| pair[0] < pair[1]));
     assert_readback(&fixture, &formal).await;
 }
 

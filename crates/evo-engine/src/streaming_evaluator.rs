@@ -6018,10 +6018,23 @@ fn postprocess_complete_report(
             } else if report.verdict == Verdict::Regressed
                 && report.reasons.iter().any(|reason| reason == "negative_lcb")
             {
-                report.verdict = Verdict::Inconclusive;
-                report
-                    .reasons
-                    .push("regression_not_confirmed_ucb_boundary_not_crossed".into());
+                // E05 L1257: an average regression is confirmed only when the
+                // UCB is below zero. decide() reports Regressed from a negative
+                // mean and LCB alone, so the UCB check happens here and the
+                // stored reason names the check that was actually made.
+                if regression_ucb(&report) < 0.0 {
+                    report
+                        .reasons
+                        .push("regression_confirmed_ucb_below_zero".into());
+                } else {
+                    report.verdict = Verdict::Inconclusive;
+                    report
+                        .reasons
+                        .push("regression_not_confirmed_ucb_boundary_not_crossed".into());
+                }
+                // Keep decide()'s sorted, deduplicated reasons after appending.
+                report.reasons.sort();
+                report.reasons.dedup();
             }
         }
         _ => {
@@ -6031,6 +6044,16 @@ fn postprocess_complete_report(
         }
     }
     Ok(report)
+}
+
+/// One-sided upper confidence bound on the mean paired difference: the mirror
+/// of the section 3.4 LCB, `UCB = mean + radius`, with the same `radius` (same
+/// alpha_i, s^2, n and R) that `empirical_bernstein` stored in the report. The
+/// radius is read from the report rather than recovered as `mean - lcb`,
+/// because the stored `lcb` is clamped at -1 and then `mean - lcb` is not it.
+/// A non-finite bound never compares below zero, so it confirms nothing.
+fn regression_ucb(report: &BernsteinReport) -> f64 {
+    report.mean + report.radius
 }
 
 fn p95(values: &mut [u64]) -> Result<u64> {
