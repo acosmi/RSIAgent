@@ -17,6 +17,9 @@
 //! already in flight when its source was revoked is usable, and whether it is
 //! redacted at settlement. That is a separate change; only the accounting is.
 
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
+
 use async_trait::async_trait;
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{
@@ -581,6 +584,20 @@ impl Fixture {
             .await
             .unwrap();
         let control = control();
+        let candidate = crate::trusted_compiler_inputs::software_candidate(
+            NAMESPACE,
+            &control.environment_digest,
+            "candidate-bundle",
+        );
+        crate::trusted_compiler_inputs::persist_bundle(
+            &store,
+            NAMESPACE,
+            &candidate,
+            &control.environment_digest,
+            1,
+        )
+        .await
+        .unwrap();
         register_development_control(&admin, &store, control.clone())
             .await
             .unwrap();
@@ -623,7 +640,12 @@ impl Fixture {
             attempt: 1,
             manifest: self.control.manifest().unwrap(),
             parent_bundle_digest: d("parent-bundle"),
-            candidate_bundle_digest: d("candidate-bundle"),
+            candidate_bundle_digest: crate::trusted_compiler_inputs::software_candidate(
+                NAMESPACE,
+                &self.control.environment_digest,
+                "candidate-bundle",
+            )
+            .digest,
             environment_digest: self.control.environment_digest.clone(),
             grader_digest: self.control.grader_digest.clone(),
             rules_digest: self.control.rules_digest.clone(),

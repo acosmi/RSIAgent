@@ -1,13 +1,18 @@
 //! The first two tests are the actual existing-API parent positive control and
 //! route semantic red. Their original parent run is separately preserved.
 use evo_core::contract::{
-    CapabilityLevel, CompileParts, HostCapabilities, ImproverPatch, Profile, SkillPatch,
-    SkillSnapshot, SystemSnapshot, compile_bundle,
+    CapabilityLevel, CompileParts, HostCapabilities, ImproverPatch, Profile, SkillSnapshot,
+    SystemSnapshot, compile_bundle,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
 use evo_core::{Context, Role, Strategy, fingerprint, hash};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
+use evo_engine::formal_authority::{
+    EmptyRootAuthorization, FormalRegistry, FrozenCompilerProfile, HOST_SCHEMA, PROFILE_SCHEMA,
+    PROVIDER_SCHEMA, ROOT_SCHEMA, RegisteredExternalProvider, RegisteredFormalHost,
+    empty_root_strategy,
+};
 use evo_engine::release_store::{
     ReleaseCandidateRecord, ReleaseStore, StageBundleRequest, TypedSourceRef,
 };
@@ -61,6 +66,137 @@ fn source(id: &str, body: &str) -> StoredTraceAuthority {
     }
 }
 
+// Explicit Admin configuration for this software-only stored-review fixture.
+// The unavailable workspaces and credentials cannot execute an external provider.
+async fn registered_review_bundle(
+    store: &Store,
+    namespace: &str,
+    snapshot: &SystemSnapshot,
+    parent: &SkillSnapshot,
+    capabilities: &HostCapabilities,
+) -> evo_core::contract::ResolvedBundle {
+    let profile_id = snapshot.profile_id.as_str();
+    let environment = snapshot.digest().unwrap();
+    let scope = evo_core::fingerprint(&(namespace, snapshot, capabilities)).unwrap();
+    let host = RegisteredFormalHost {
+        id: format!("fixture-host-registration-{scope}"),
+        schema_version: HOST_SCHEMA.into(),
+        namespace: namespace.into(),
+        host_id: snapshot.host_id.clone(),
+        host_version: snapshot.host_version.clone(),
+        code_digest: hash(b"fixture-program-code"),
+        grader_code_digest: hash(b"fixture-grader-code"),
+        host_uid: 10001,
+        grader_uid: 10002,
+        administrator_uid: 10003,
+        host_workspace: "/unavailable/fixture-host".into(),
+        grader_workspace: "/unavailable/fixture-grader".into(),
+        grader_credential_environment_key: "RSIA_FIXTURE_UNAVAILABLE_GRADER_KEY".into(),
+        host_principal: hash(b"fixture-host-principal"),
+        grader_principal: hash(b"fixture-grader-principal"),
+        administrator_principal: hash(b"fixture-admin-principal"),
+        worker_principal: hash(b"fixture-worker-principal"),
+        credential_binding_digest: hash(b"fixture-config-only"),
+        isolated_workspace_digest: hash(b"fixture-host-workspace"),
+        grader_workspace_digest: hash(b"fixture-grader-workspace"),
+        snapshot: snapshot.clone(),
+        capabilities: capabilities.clone(),
+        host_surface_digest: hash(b"fixture-surface"),
+        adapter_digest: hash(b"fixture-adapter"),
+        authorized_by: "fixture-admin".into(),
+    };
+    let provider = RegisteredExternalProvider {
+        id: format!("fixture-provider-{scope}"),
+        schema_version: PROVIDER_SCHEMA.into(),
+        namespace: namespace.into(),
+        host_registration_id: host.id.clone(),
+        endpoint: "https://fixture.invalid/v1/chat/completions".into(),
+        provider_model: "fixture-model".into(),
+        model_digest: hash(b"fixture-model"),
+        transport_code_digest: host.code_digest.clone(),
+        credential_environment_key: "RSIA_FIXTURE_UNAVAILABLE_PROVIDER_KEY".into(),
+        credential_principal: host.host_principal.clone(),
+        currency: "USD".into(),
+        pricing_version: "fixture-pricing".into(),
+        input_micros_per_million_tokens: 1,
+        output_micros_per_million_tokens: 1,
+        max_output_tokens: 256,
+        authorized_by: "fixture-admin".into(),
+    };
+    let frozen = FrozenCompilerProfile {
+        id: format!("fixture-profile-{scope}"),
+        schema_version: PROFILE_SCHEMA.into(),
+        namespace: namespace.into(),
+        profile_id: profile_id.into(),
+        version: 1,
+        host_registration_id: host.id.clone(),
+        provider_registration_id: provider.id.clone(),
+        resource_instrumentation_id: None,
+        system_snapshot: host.snapshot.clone(),
+        capabilities: capabilities.clone(),
+        environment_digest: environment,
+        baseline_skill: SkillSnapshot::empty(),
+        baseline_strategy: Strategy::default(),
+        dependencies: vec![],
+        purpose: Purpose::Development,
+        application_order: vec!["mandatory_context".into(), "skill".into(), "task".into()],
+        authorized_by: "fixture-admin".into(),
+    };
+    let root = EmptyRootAuthorization {
+        id: format!("fixture-root-{scope}"),
+        schema_version: ROOT_SCHEMA.into(),
+        namespace: namespace.into(),
+        profile_registration_id: frozen.id.clone(),
+        profile_digest: fingerprint(&frozen).unwrap(),
+        host_registration_id: host.id.clone(),
+        skill: SkillSnapshot::empty(),
+        strategy: empty_root_strategy(),
+        authorized_by: "fixture-admin".into(),
+    };
+    let profile = Profile {
+        id: profile_id.into(),
+        evolution_enabled: true,
+        parent_digest: root.digest().unwrap(),
+        baseline_digest: frozen.baseline_digest().unwrap(),
+    };
+    let admin = Context::new(namespace, "fixture-admin", Role::Admin).unwrap();
+    FormalRegistry::register_host(&admin, store, host)
+        .await
+        .unwrap();
+    FormalRegistry::register_provider(&admin, store, provider)
+        .await
+        .unwrap();
+    FormalRegistry::freeze_profile(&admin, store, frozen.clone())
+        .await
+        .unwrap();
+    FormalRegistry::authorize_empty_root(&admin, store, root.clone())
+        .await
+        .unwrap();
+    let strategy = Strategy::default();
+    compile_bundle(CompileParts {
+        profile: &profile,
+        parent: &root.skill,
+        baseline: &frozen.baseline_skill,
+        parent_strategy: &root.strategy,
+        baseline_strategy: &frozen.baseline_strategy,
+        skill_patch: &evo_core::contract::rebase_skill_patch(&root.skill, parent).unwrap(),
+        improver_patch: &ImproverPatch {
+            instruction: evo_core::contract::PatchOp::Set {
+                value: strategy.instruction,
+            },
+            max_candidates: evo_core::contract::PatchOp::Set {
+                value: strategy.max_candidates,
+            },
+            max_rounds: evo_core::contract::PatchOp::Set {
+                value: strategy.max_rounds,
+            },
+        },
+        caps: &frozen.capabilities,
+        revoked: &BTreeSet::new(),
+    })
+    .unwrap()
+}
+
 async fn fixture() -> (tempfile::TempDir, HttpState) {
     let guard = tempfile::tempdir().unwrap();
     let store = Store::open(&guard.path().join("review-fixture.sqlite3"))
@@ -86,12 +222,6 @@ async fn fixture() -> (tempfile::TempDir, HttpState) {
     );
     session.commit().await.unwrap();
 
-    let profile = Profile {
-        id: PROFILE_ID.into(),
-        evolution_enabled: true,
-        parent_digest: d("parent"),
-        baseline_digest: d("baseline"),
-    };
     let parent = SkillSnapshot {
         content: "Complete stored review rule. 中文🙂".into(),
         applicability: "Relevant stored review fixture.".into(),
@@ -104,18 +234,7 @@ async fn fixture() -> (tempfile::TempDir, HttpState) {
         granted: BTreeSet::new(),
     };
     // Fixture setup only. The review operation itself must never compile.
-    let bundle = compile_bundle(CompileParts {
-        profile: &profile,
-        parent: &parent,
-        baseline: &SkillSnapshot::empty(),
-        parent_strategy: &Strategy::default(),
-        baseline_strategy: &Strategy::default(),
-        skill_patch: &SkillPatch::default(),
-        improver_patch: &ImproverPatch::default(),
-        caps: &caps,
-        revoked: &BTreeSet::new(),
-    })
-    .unwrap();
+
     let system_snapshot = SystemSnapshot {
         schema_version: "rsia.system_snapshot.v2".into(),
         profile_id: PROFILE_ID.into(),
@@ -125,6 +244,8 @@ async fn fixture() -> (tempfile::TempDir, HttpState) {
         tools: vec![],
         mandatory_context_digest: d("mandatory"),
     };
+    let bundle =
+        registered_review_bundle(&store, NAMESPACE, &system_snapshot, &parent, &caps).await;
     let staged = ReleaseStore::stage_bundle(
         &proposer,
         &store,

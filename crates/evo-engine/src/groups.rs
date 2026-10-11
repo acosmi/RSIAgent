@@ -147,6 +147,12 @@ pub async fn run_skill_group_job(
     let scopes = groups.iter().map(group_scope).collect::<Result<Vec<_>>>()?;
     validate_group_separation(&scopes)?;
     let journal = journal.ok_or(Error::NotFound)?;
+    // Validate every group before the first group's model, runner or claim.
+    for group in &groups {
+        journal
+            .compiler_inputs(&group.request.compiler_input_request())
+            .await?;
+    }
 
     let mut outcomes = Vec::with_capacity(groups.len());
     for (group, scope) in groups.into_iter().zip(scopes) {

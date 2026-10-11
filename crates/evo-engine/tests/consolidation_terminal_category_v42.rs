@@ -22,6 +22,8 @@
 //! another; the provider is a scripted transport behind the real
 //! `PersistentModelBroker`, so the model calls reach the real ledger.
 
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use async_trait::async_trait;
 use evo_core::contract::{
     CapabilityLevel, HostCapabilities, HostSurfaceManifest, ImproverPatch, Profile, SkillSnapshot,
@@ -55,7 +57,7 @@ use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentTask, OPTIMIZATION_STAGE_FACT_SCHEMA,
     OptimizationJournal, OptimizationJournalStage, OptimizationStepRequest, PairedTaskResult,
-    StageDependency, StageFact, StageFactKind, StoreOptimizationJournal,
+    StageDependency, StageFact, StageFactKind,
 };
 use evo_engine::release_store::{PrepareRunRequest, ReleaseStore, TrustedHostExecutionEvidence};
 use evo_storage::Store;
@@ -66,6 +68,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use trusted_compiler_inputs::StoreOptimizationJournal;
 
 const TENANT: &str = "tenant";
 const SCOPE: &str = "billing-scope";
@@ -776,7 +779,7 @@ impl StepMaterial {
 
     /// The optimization request of `episode` (a claim id for a consolidation).
     fn request<'a>(&'a self, fixture: &'a Fixture, episode: &str) -> OptimizationStepRequest<'a> {
-        OptimizationStepRequest {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
             evidence: &self.evidence,
             source_selection: &self.selection,
             source_bindings: &self.bindings,
@@ -834,7 +837,7 @@ impl StepMaterial {
                 idempotency_key: "consolidation-idempotency-1".into(),
             },
             allow_rank_call: false,
-        }
+        })
     }
 }
 

@@ -217,3 +217,36 @@ fn documented_sequential_values_fit_the_existing_explicit_contract() {
         -snapshot.noninferior_bound
     );
 }
+
+#[test]
+fn complete_episode_cost_requires_all_observed_dimensions_and_declared_sources() {
+    use evo_core::evaluation::CompleteEpisodeCostMeasurements;
+    let complete = CompleteEpisodeCostMeasurements {
+        episode_id: "episode".into(),
+        cpu_nanoseconds: Some(0),
+        storage_byte_seconds: Some(0),
+        retained_history_bytes: Some(0),
+        human_nanoseconds: Some(0),
+        gray_release_nanoseconds: Some(0),
+        measurement_sources: vec!["actual-meter-record".into()],
+    };
+    complete.validate_complete().unwrap();
+    for dimension in 0..7 {
+        let mut absent = complete.clone();
+        match dimension {
+            0 => absent.cpu_nanoseconds = None,
+            1 => absent.storage_byte_seconds = None,
+            2 => absent.retained_history_bytes = None,
+            3 => absent.human_nanoseconds = None,
+            4 => absent.gray_release_nanoseconds = None,
+            5 => absent.measurement_sources.clear(),
+            _ => absent
+                .measurement_sources
+                .push("actual-meter-record".into()),
+        }
+        assert!(absent.validate_complete().is_err(), "dimension {dimension}");
+    }
+    let mut wire = serde_json::to_value(&complete).unwrap();
+    wire["ordinary_p_eligible"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<CompleteEpisodeCostMeasurements>(wire).is_err());
+}

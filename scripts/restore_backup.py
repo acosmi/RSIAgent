@@ -17,7 +17,7 @@ import uuid
 
 BACKUP_SCHEMA = "rsia.backup.v2"
 DELTA_SCHEMA = "rsia.revoke_delta.v1"
-KNOWN_MIGRATIONS = [1, 2, 4, 5, 6]
+KNOWN_MIGRATIONS = [1, 2, 4, 5, 6, 7]
 
 class IsolationError(Exception):
     pass

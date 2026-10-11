@@ -6,6 +6,9 @@
 //! attempts; the deterministic registered runner cannot produce that, so
 //! `ContrastRunner` writes honest E03 receipts with chosen outputs.
 
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
+
 use async_trait::async_trait;
 use evo_core::curriculum::{CurriculumControlProfileV1, LearnerStateV2};
 use evo_core::evaluation::DataUse;
@@ -198,7 +201,12 @@ fn build_request(
         attempt: 1,
         manifest: control.manifest().unwrap(),
         parent_bundle_digest: d("parent-bundle"),
-        candidate_bundle_digest: d("candidate-bundle"),
+        candidate_bundle_digest: crate::trusted_compiler_inputs::software_candidate(
+            NAMESPACE,
+            &control.environment_digest,
+            "candidate-bundle",
+        )
+        .digest,
         environment_digest: control.environment_digest.clone(),
         grader_digest: control.grader_digest.clone(),
         rules_digest: control.rules_digest.clone(),
@@ -260,6 +268,20 @@ impl Fixture {
             CONTROL_ID,
             DevelopmentEvidenceScope::RegisteredPureFunctionExecution,
         );
+        let candidate = crate::trusted_compiler_inputs::software_candidate(
+            NAMESPACE,
+            &control.environment_digest,
+            "candidate-bundle",
+        );
+        crate::trusted_compiler_inputs::persist_bundle(
+            &store,
+            NAMESPACE,
+            &candidate,
+            &control.environment_digest,
+            1,
+        )
+        .await
+        .unwrap();
         register_development_control(&admin, &store, control.clone())
             .await
             .unwrap();
@@ -371,14 +393,34 @@ impl Fixture {
             request_id: request.request_id.clone(),
             input_digest: request.manifest.digest.clone(),
             output_digest: None,
-            dependencies: extras.clone(),
+            dependencies: extras
+                .iter()
+                .cloned()
+                .chain(std::iter::once(StageDependency {
+                    kind: "environment".into(),
+                    id: request.environment_digest.clone(),
+                }))
+                .collect(),
             payload: serde_json::to_value(request).unwrap(),
         }
         .seal()
         .unwrap();
         let observed_fact = observed_fact(request, report, extras);
-        journal.commit(request_fact.clone()).await.unwrap();
-        journal.commit(observed_fact.clone()).await.unwrap();
+        let inputs = crate::trusted_compiler_inputs::bundle_use(
+            &self.store,
+            NAMESPACE,
+            &request.candidate_bundle_digest,
+        )
+        .await
+        .unwrap();
+        journal
+            .commit_bound(request_fact.clone(), &inputs)
+            .await
+            .unwrap();
+        journal
+            .commit_bound(observed_fact.clone(), &inputs)
+            .await
+            .unwrap();
         (request_fact.artifact_id, observed_fact.artifact_id)
     }
 }
@@ -850,7 +892,12 @@ fn practice_request(set_id: &str, plan: PracticePlan) -> PracticeRunRequest {
         plan,
         episode_id: format!("practice-episode-{set_id}"),
         step: 1,
-        bundle_digest: d("practice-bundle"),
+        bundle_digest: crate::trusted_compiler_inputs::software_candidate(
+            NAMESPACE,
+            &d("environment"),
+            "candidate-bundle",
+        )
+        .digest,
         revoke_watermark: 1,
         created_at: 10,
     }

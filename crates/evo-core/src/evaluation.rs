@@ -4,6 +4,43 @@ use crate::{Error, Result, fingerprint, identifier, text};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Missing measurements are represented by None and cannot be interpreted as zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteEpisodeCostMeasurements {
+    pub episode_id: String,
+    pub cpu_nanoseconds: Option<u64>,
+    pub storage_byte_seconds: Option<u64>,
+    pub retained_history_bytes: Option<u64>,
+    pub human_nanoseconds: Option<u64>,
+    pub gray_release_nanoseconds: Option<u64>,
+    pub measurement_sources: Vec<String>,
+}
+impl CompleteEpisodeCostMeasurements {
+    pub fn validate_complete(&self) -> Result<()> {
+        identifier(&self.episode_id)?;
+        if self.cpu_nanoseconds.is_none()
+            || self.storage_byte_seconds.is_none()
+            || self.retained_history_bytes.is_none()
+            || self.human_nanoseconds.is_none()
+            || self.gray_release_nanoseconds.is_none()
+            || self.measurement_sources.is_empty()
+        {
+            return Err(Error::Conflict(
+                "complete episode cost measurements unavailable".into(),
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for source in &self.measurement_sources {
+            identifier(source)?;
+            if !seen.insert(source) {
+                return Err(Error::Conflict("duplicate cost measurement source".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub const PLAN_SCHEMA: &str = "rsia.experiment_plan.v1";
 pub const OBJECTIVE_V1: &str = "rsia.attainment_auc.v1";
 pub const STATS_HOEFFDING_V1: &str = "rsia.hoeffding.v1";

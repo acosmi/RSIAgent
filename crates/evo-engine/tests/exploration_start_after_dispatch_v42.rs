@@ -37,6 +37,8 @@
 //!
 //! Fixtures are copied from `dispatch_management.rs`, `exploration_trust_v42.rs`
 //! and `meta_inheritance_v42.rs`; those files are unchanged.
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use async_trait::async_trait;
 use evo_core::contract::{HostCapabilities, ImproverPatch, Profile, SkillSnapshot};
 use evo_core::evidence::{
@@ -71,13 +73,14 @@ use evo_engine::model::{
 use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentTask, OptimizationStepRequest,
-    PairedTaskResult, StoreOptimizationJournal,
+    PairedTaskResult,
 };
 use evo_storage::Store;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::Notify;
+use trusted_compiler_inputs::StoreOptimizationJournal;
 
 /// What the world is registered with. The two root opportunities cost different
 /// amounts on purpose: what a dispatch spent is read from its own fact, never
@@ -121,6 +124,24 @@ fn trace(run: &str, family: &str, outcome: TraceOutcome) -> OptimizationTrace {
         excerpt: run.into(),
         seed: 1,
     }
+}
+
+// The registered world freezes the same explicit Admin empty root as its
+// optimization request. Search nodes still carry their own complete Skill.
+fn actual_fixture_parent_digest() -> String {
+    trusted_compiler_inputs::inputs(
+        "n",
+        "profile",
+        parent_skill(),
+        Strategy::default(),
+        HostCapabilities {
+            available: Default::default(),
+            granted: Default::default(),
+        },
+        &evo_core::hash(b"environment"),
+    )
+    .profile
+    .parent_digest
 }
 
 fn parent_skill() -> SkillSnapshot {
@@ -190,6 +211,16 @@ struct EditingFixtureModel;
 
 #[async_trait]
 impl ModelPort for EditingFixtureModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let parent: SkillSnapshot = serde_json::from_str(
             &request
@@ -263,6 +294,16 @@ struct FailingModel;
 
 #[async_trait]
 impl ModelPort for FailingModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, _: ModelRequest) -> Result<ModelResponse> {
         Err(Error::NotFound)
     }
@@ -277,6 +318,16 @@ struct HangingModel {
 
 #[async_trait]
 impl ModelPort for HangingModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, _: ModelRequest) -> Result<ModelResponse> {
         self.entered.notify_one();
         std::future::pending().await
@@ -376,7 +427,7 @@ impl Fixture {
             "profile",
             "skill",
             "v1",
-            hash(b"approved-parent"),
+            actual_fixture_parent_digest(),
             hash(b"baseline"),
             &parent,
             allowed.clone(),
@@ -408,7 +459,7 @@ impl Fixture {
             profile: Profile {
                 id: "profile".into(),
                 evolution_enabled: true,
-                parent_digest: hash(b"approved-parent"),
+                parent_digest: actual_fixture_parent_digest(),
                 baseline_digest: hash(b"baseline"),
             },
             parent_strategy: Strategy::default(),
@@ -432,7 +483,7 @@ impl Fixture {
             "profile",
             "skill",
             "v1",
-            hash(b"approved-parent"),
+            actual_fixture_parent_digest(),
             hash(b"baseline"),
             skill,
             self.allowed.clone(),
@@ -464,7 +515,7 @@ impl Fixture {
         step: u32,
         tag: &str,
     ) -> OptimizationStepRequest<'a> {
-        OptimizationStepRequest {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
             evidence: &self.evidence,
             source_selection: &self.source_selection,
             source_bindings: &self.bindings,
@@ -500,7 +551,7 @@ impl Fixture {
                 skill_id: "skill".into(),
                 skill_version: "v1".into(),
                 input_digest: skill_snapshot_digest(parent).unwrap(),
-                approved_parent_digest: hash(b"approved-parent"),
+                approved_parent_digest: actual_fixture_parent_digest(),
                 safe_baseline_digest: hash(b"baseline"),
                 evidence: EvidenceClosure {
                     support: vec![],
@@ -545,7 +596,7 @@ impl Fixture {
                 idempotency_key: format!("dev-idempotency-{tag}"),
             },
             allow_rank_call: false,
-        }
+        })
     }
 }
 
@@ -580,7 +631,7 @@ fn world_for(id: &str) -> ExplorationWorldV1 {
     ExplorationWorldV1 {
         schema_version: ExplorationWorldV1::SCHEMA.into(),
         id: id.into(),
-        approved_parent_digest: hash(b"approved-parent"),
+        approved_parent_digest: actual_fixture_parent_digest(),
         context_signature,
         parent_skill_digest,
         parent_bundle_digest: parent_bundle,

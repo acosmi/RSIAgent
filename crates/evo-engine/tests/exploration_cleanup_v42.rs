@@ -15,6 +15,8 @@
 //! Not covered (and not claimed): records written before the edges existed have
 //! none and nothing back-fills them (`a_record_without_the_edge_...` pins that
 //! boundary), and the cleanup's redaction rules themselves, which are unchanged.
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use async_trait::async_trait;
 use evo_core::contract::{HostCapabilities, ImproverPatch, Profile, SkillSnapshot};
 use evo_core::evaluation::DataUse;
@@ -49,7 +51,7 @@ use evo_engine::model::{
 use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentTask, OptimizationStepRequest,
-    PairedTaskResult, StoreOptimizationJournal,
+    PairedTaskResult,
 };
 use evo_storage::Store;
 use evo_storage::lifecycle::{CleanupState, CleanupStatus};
@@ -58,6 +60,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
+use trusted_compiler_inputs::StoreOptimizationJournal;
 
 const WORLD: &str = "exploration_world_v1";
 const NODE: &str = "exploration_node_v1";
@@ -99,6 +102,24 @@ fn trace(run: &str, family: &str, outcome: TraceOutcome) -> OptimizationTrace {
         excerpt: run.into(),
         seed: 1,
     }
+}
+
+// The registered world freezes the same explicit Admin empty root as its
+// optimization request. Search nodes still carry their own complete Skill.
+fn actual_fixture_parent_digest() -> String {
+    trusted_compiler_inputs::inputs(
+        "n",
+        "profile",
+        parent_skill(),
+        Strategy::default(),
+        HostCapabilities {
+            available: Default::default(),
+            granted: Default::default(),
+        },
+        &evo_core::hash(b"environment"),
+    )
+    .profile
+    .parent_digest
 }
 
 fn parent_skill() -> SkillSnapshot {
@@ -143,7 +164,7 @@ fn world_for(id: &str, runs: &[&str]) -> ExplorationWorldV1 {
     ExplorationWorldV1 {
         schema_version: ExplorationWorldV1::SCHEMA.into(),
         id: id.into(),
-        approved_parent_digest: hash(b"approved-parent"),
+        approved_parent_digest: actual_fixture_parent_digest(),
         context_signature,
         parent_skill_digest,
         parent_bundle_digest: parent_bundle,
@@ -246,6 +267,16 @@ struct EditingFixtureModel;
 
 #[async_trait]
 impl ModelPort for EditingFixtureModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let parent: SkillSnapshot = serde_json::from_str(
             &request
@@ -319,6 +350,16 @@ struct CountingModel(AtomicUsize);
 
 #[async_trait]
 impl ModelPort for CountingModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.0.fetch_add(1, Ordering::SeqCst);
         EditingFixtureModel.dispatch(request).await
@@ -334,6 +375,16 @@ struct HangingModel {
 
 #[async_trait]
 impl ModelPort for HangingModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, _: ModelRequest) -> Result<ModelResponse> {
         self.entered.notify_one();
         std::future::pending().await
@@ -350,6 +401,16 @@ struct RevokingModel {
 
 #[async_trait]
 impl ModelPort for RevokingModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         if !self.revoked.swap(true, Ordering::SeqCst) {
             revoke(&self.store, "run-failure").await;
@@ -451,7 +512,7 @@ impl Fixture {
             "profile",
             "skill",
             "v1",
-            hash(b"approved-parent"),
+            actual_fixture_parent_digest(),
             hash(b"baseline"),
             &parent,
             allowed.clone(),
@@ -483,7 +544,7 @@ impl Fixture {
             profile: Profile {
                 id: "profile".into(),
                 evolution_enabled: true,
-                parent_digest: hash(b"approved-parent"),
+                parent_digest: actual_fixture_parent_digest(),
                 baseline_digest: hash(b"baseline"),
             },
             parent_strategy: Strategy::default(),
@@ -502,7 +563,7 @@ impl Fixture {
     /// A request against the world's own parent skill/bundle, i.e. for a
     /// `Widen` action. `tag` keeps the request/idempotency ids distinct.
     fn request(&self, world_id: &str, step: u32, tag: &str) -> OptimizationStepRequest<'_> {
-        OptimizationStepRequest {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
             evidence: &self.evidence,
             source_selection: &self.source_selection,
             source_bindings: &self.bindings,
@@ -538,7 +599,7 @@ impl Fixture {
                 skill_id: "skill".into(),
                 skill_version: "v1".into(),
                 input_digest: skill_snapshot_digest(&self.parent).unwrap(),
-                approved_parent_digest: hash(b"approved-parent"),
+                approved_parent_digest: actual_fixture_parent_digest(),
                 safe_baseline_digest: hash(b"baseline"),
                 evidence: EvidenceClosure {
                     support: vec![],
@@ -583,7 +644,7 @@ impl Fixture {
                 idempotency_key: format!("dev-idempotency-{tag}"),
             },
             allow_rank_call: false,
-        }
+        })
     }
 }
 
@@ -660,7 +721,7 @@ fn history(entry_id: &str, sequence: u64) -> OptimizationHistoryEntry {
     OptimizationHistoryEntry {
         entry_id: entry_id.into(),
         sequence,
-        parent_digest: hash(b"approved-parent"),
+        parent_digest: actual_fixture_parent_digest(),
         environment_digest: hash(b"env"),
         task_family: "family".into(),
         source_watermark: 1,
@@ -1016,6 +1077,23 @@ async fn probe(
     fresh: (u32, &str),
     reconnect: Option<(u32, &str)>,
 ) -> Probe {
+    // Both callers are negative probes after a real revocation. Authenticate
+    // their input at the current same-store watermark without changing the world.
+    let watermark = {
+        let mut session = env.store.session().await.unwrap();
+        let (sequence, _) = session
+            .watermark(&worker())
+            .await
+            .unwrap()
+            .expect("negative exploration probe requires an existing watermark");
+        let watermark = u64::try_from(sequence)
+            .expect("negative exploration probe watermark must be nonnegative");
+        session.commit().await.unwrap();
+        watermark
+    };
+    let mut fresh_request = env.fixture.request(world_id, fresh.0, fresh.1);
+    fresh_request.model_context.revoke_watermark = watermark;
+    fresh_request.development_request.revoke_watermark = watermark;
     let counting = CountingModel::default();
     let decide_next = env
         .coordinator
@@ -1028,17 +1106,22 @@ async fn probe(
             Some(&counting),
             Some(&ImprovingFixtureRunner),
             Some(&env.journal),
-            env.fixture.request(world_id, fresh.0, fresh.1),
+            fresh_request,
         )
         .await
         .map(|value| format!("{value:?}"));
     let reconnect_run_next = match reconnect {
-        Some((step, tag)) => Some(
-            env.coordinator
-                .run_next(None, None, None, env.fixture.request(world_id, step, tag))
-                .await
-                .map(|value| format!("{value:?}")),
-        ),
+        Some((step, tag)) => {
+            let mut request = env.fixture.request(world_id, step, tag);
+            request.model_context.revoke_watermark = watermark;
+            request.development_request.revoke_watermark = watermark;
+            Some(
+                env.coordinator
+                    .run_next(None, None, Some(&env.journal), request)
+                    .await
+                    .map(|value| format!("{value:?}")),
+            )
+        }
         None => None,
     };
     let decision_view = verified_world_decision_view(&admin(), &env.store, world_id)
@@ -1262,7 +1345,7 @@ async fn a_redacted_record_is_named_by_its_kind_and_id_not_reported_as_internal(
     assert_eq!(chain.nodes, donor_chain.nodes);
     assert_eq!(chain.dispatches, donor_chain.dispatches);
     assert_eq!(chain.history, donor_chain.history);
-    let parent = hash(b"approved-parent");
+    let parent = actual_fixture_parent_digest();
     let environment = hash(b"env");
     let query = HistoryQuery {
         parent_digest: &parent,
@@ -1313,7 +1396,7 @@ async fn a_redacted_record_is_named_by_its_kind_and_id_not_reported_as_internal(
             .run_next(
                 None,
                 None,
-                None,
+                Some(&env.journal),
                 env.fixture.request("world-chain", 1, "world-chain-1"),
             )
             .await,
@@ -1441,15 +1524,15 @@ async fn reconnecting_a_dispatch_adds_no_edge_and_no_duplicate() {
     assert_eq!(to_world, 6);
     let world_before = raw_record(&env.store, WORLD, "world-chain").await;
 
-    // The same request again, without any port: the stored terminal dispatch
-    // answers it and nothing is written.
+    // The same request again, without execution model/runner ports but with
+    // the same-store authenticated journal: the terminal dispatch writes nothing.
     for _ in 0..2 {
         let again = env
             .coordinator
             .run_next(
                 None,
                 None,
-                None,
+                Some(&env.journal),
                 env.fixture.request("world-chain", 1, "world-chain-1"),
             )
             .await
@@ -1537,7 +1620,7 @@ async fn resuming_a_claimed_dispatch_adds_exactly_its_node_edge() {
         .run_next(
             None,
             None,
-            None,
+            Some(&env.journal),
             env.fixture.request("world-resume", 1, "resume-1"),
         )
         .await

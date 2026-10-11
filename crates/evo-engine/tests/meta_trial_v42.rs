@@ -23,6 +23,8 @@
 //! `an_uncertain_call_of_one_stream_holds_the_roots_concurrency_slot_against_the_other`
 //! pin), an isolated workspace, an Improver approval registry, the next-job
 //! binding and `meta.start`.
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use async_trait::async_trait;
 use evo_core::contract::{HostCapabilities, ImproverPatch, Profile, SkillSnapshot};
 use evo_core::evaluation::DataUse;
@@ -67,7 +69,7 @@ use evo_engine::model::{
 use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentTask, OptimizationStepRequest,
-    PairedTaskResult, StoreOptimizationJournal,
+    PairedTaskResult,
 };
 use evo_storage::Store;
 use evo_storage::budget::{
@@ -79,6 +81,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
+use trusted_compiler_inputs::StoreOptimizationJournal;
 
 const TENANT: &str = "n";
 const SCOPE: &str = "scope-1";
@@ -145,6 +148,22 @@ fn parent_skill() -> SkillSnapshot {
     }
 }
 
+fn actual_fixture_parent_digest() -> String {
+    trusted_compiler_inputs::inputs(
+        TENANT,
+        "profile",
+        parent_skill(),
+        Strategy::default(),
+        HostCapabilities {
+            available: BTreeSet::new(),
+            granted: BTreeSet::new(),
+        },
+        &hash(b"environment"),
+    )
+    .profile
+    .parent_digest
+}
+
 fn policy_focus_one() -> ElasticPolicyV1 {
     ElasticPolicyV1 {
         max_focus_actions: 1,
@@ -193,7 +212,7 @@ fn world_for(id: &str, policy: ElasticPolicyV1) -> ExplorationWorldV1 {
     ExplorationWorldV1 {
         schema_version: ExplorationWorldV1::SCHEMA.into(),
         id: id.into(),
-        approved_parent_digest: hash(b"approved-parent"),
+        approved_parent_digest: actual_fixture_parent_digest(),
         context_signature,
         parent_skill_digest,
         parent_bundle_digest: parent_bundle,
@@ -434,6 +453,16 @@ struct HangingModel {
 
 #[async_trait]
 impl ModelPort for HangingModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, _: ModelRequest) -> Result<ModelResponse> {
         self.entered.notify_one();
         std::future::pending().await
@@ -504,7 +533,7 @@ impl Fixture {
             "profile",
             "skill",
             "v1",
-            hash(b"approved-parent"),
+            actual_fixture_parent_digest(),
             hash(b"baseline"),
             &parent,
             allowed.clone(),
@@ -536,7 +565,7 @@ impl Fixture {
             profile: Profile {
                 id: "profile".into(),
                 evolution_enabled: true,
-                parent_digest: hash(b"approved-parent"),
+                parent_digest: actual_fixture_parent_digest(),
                 baseline_digest: hash(b"baseline"),
             },
             parent_strategy: Strategy::default(),
@@ -555,7 +584,7 @@ impl Fixture {
     /// A request against the world's own parent skill/bundle, i.e. for a
     /// `Widen` action. `request_id` is the optimizer request id of the step.
     fn request(&self, world_id: &str, step: u32, request_id: &str) -> OptimizationStepRequest<'_> {
-        OptimizationStepRequest {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
             evidence: &self.evidence,
             source_selection: &self.source_selection,
             source_bindings: &self.bindings,
@@ -591,7 +620,7 @@ impl Fixture {
                 skill_id: "skill".into(),
                 skill_version: "v1".into(),
                 input_digest: skill_snapshot_digest(&self.parent).unwrap(),
-                approved_parent_digest: hash(b"approved-parent"),
+                approved_parent_digest: actual_fixture_parent_digest(),
                 safe_baseline_digest: hash(b"baseline"),
                 evidence: EvidenceClosure {
                     support: vec![],
@@ -636,7 +665,7 @@ impl Fixture {
                 idempotency_key: format!("dev-idempotency-{request_id}"),
             },
             allow_rank_call: false,
-        }
+        })
     }
 }
 
@@ -845,8 +874,8 @@ fn history(entry_id: &str, sequence: u64) -> OptimizationHistoryEntry {
     OptimizationHistoryEntry {
         entry_id: entry_id.into(),
         sequence,
-        parent_digest: hash(b"approved-parent"),
-        environment_digest: hash(b"env"),
+        parent_digest: actual_fixture_parent_digest(),
+        environment_digest: hash(b"environment"),
         task_family: "family".into(),
         source_watermark: 1,
         input_digest: hash(b"input"),
@@ -1491,10 +1520,11 @@ async fn two_real_streams_share_no_journal_dispatch_node_history_or_cache_key() 
         for call in calls {
             assert_eq!(call.dispatch_group_id, world_id);
             assert_eq!(call.state, BudgetCallState::Finalized);
-            let request: ModelRequest =
+            let bound: evo_engine::model::BoundModelRequest =
                 serde_json::from_str(&call.request_artifact.as_ref().unwrap().body).unwrap();
-            assert_eq!(request.episode_id, world_id);
-            assert_eq!(request.cache_key_digest, call.actual_input_digest);
+            bound.validate().unwrap();
+            assert_eq!(bound.request.episode_id, world_id);
+            assert_eq!(bound.request.cache_key_digest, call.actual_input_digest);
         }
     }
     let ids = |calls: &[BudgetCallRecord]| -> BTreeSet<String> {
@@ -1514,8 +1544,8 @@ async fn two_real_streams_share_no_journal_dispatch_node_history_or_cache_key() 
     assert_eq!(ids(&old_calls).len() + ids(&new_calls).len(), 6);
 
     // Development history is per world, and a stream does not see the other's.
-    let parent = hash(b"approved-parent");
-    let environment = hash(b"env");
+    let parent = actual_fixture_parent_digest();
+    let environment = hash(b"environment");
     let query = HistoryQuery {
         parent_digest: &parent,
         environment_digest: &environment,
@@ -1652,8 +1682,10 @@ async fn a_request_id_reused_across_streams_is_refused_by_the_budget_layer() {
     // here the same call id
     // but the episode of the new stream. Built from the very request the old
     // stream's call stored, with only the stream's world changed.
-    let stored: ModelRequest =
+    let bound: evo_engine::model::BoundModelRequest =
         serde_json::from_str(&old_calls[0].request_artifact.as_ref().unwrap().body).unwrap();
+    bound.validate().unwrap();
+    let stored = bound.request.clone();
     assert_eq!(stored.request_id, old_calls[0].call_id);
     let reused = ModelRequest::build(
         ModelRequestContext {
@@ -1678,7 +1710,14 @@ async fn a_request_id_reused_across_streams_is_refused_by_the_budget_layer() {
     )
     .unwrap();
     assert_ne!(reused.cache_key_digest, stored.cache_key_digest);
-    match env.broker.dispatch(reused).await.unwrap() {
+    match env
+        .broker
+        .dispatch_bound(
+            evo_engine::model::BoundModelRequest::new(reused, bound.compiler_use).unwrap(),
+        )
+        .await
+        .unwrap()
+    {
         ModelResponse::Rejected {
             kind,
             reason,

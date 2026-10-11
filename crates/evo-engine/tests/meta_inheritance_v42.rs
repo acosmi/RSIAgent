@@ -7,6 +7,8 @@
 //! Not covered (and not claimed): inherited benefit, the same-S0 old/new
 //! successor comparison, an Improver approval registry or job type, and
 //! `meta.start` (still blocked).
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use async_trait::async_trait;
 use evo_core::contract::{HostCapabilities, ImproverPatch, Profile, SkillSnapshot};
 use evo_core::evidence::{
@@ -47,7 +49,7 @@ use evo_engine::model::{
 use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentTask, OptimizationStepRequest,
-    PairedTaskResult, StoreOptimizationJournal,
+    PairedTaskResult,
 };
 use evo_engine::replay::{LiveWorldAuthority, run_replay};
 use evo_storage::Store;
@@ -55,6 +57,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::Notify;
+use trusted_compiler_inputs::StoreOptimizationJournal;
 
 const DISPATCH_V2: &str = "rsia.exploration_dispatch.v2";
 const DISPATCH_V1: &str = "rsia.exploration_dispatch.v1";
@@ -99,6 +102,22 @@ fn parent_skill() -> SkillSnapshot {
     }
 }
 
+fn actual_fixture_parent_digest() -> String {
+    trusted_compiler_inputs::inputs(
+        "n",
+        "profile",
+        parent_skill(),
+        Strategy::default(),
+        HostCapabilities {
+            available: BTreeSet::new(),
+            granted: BTreeSet::new(),
+        },
+        &hash(b"environment"),
+    )
+    .profile
+    .parent_digest
+}
+
 fn policy_focus_one() -> ElasticPolicyV1 {
     ElasticPolicyV1 {
         max_focus_actions: 1,
@@ -128,7 +147,7 @@ fn world_for(id: &str, policy: ElasticPolicyV1) -> ExplorationWorldV1 {
     ExplorationWorldV1 {
         schema_version: ExplorationWorldV1::SCHEMA.into(),
         id: id.into(),
-        approved_parent_digest: hash(b"approved-parent"),
+        approved_parent_digest: actual_fixture_parent_digest(),
         context_signature,
         parent_skill_digest,
         parent_bundle_digest: parent_bundle,
@@ -232,6 +251,16 @@ struct EditingFixtureModel;
 
 #[async_trait]
 impl ModelPort for EditingFixtureModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let parent: SkillSnapshot = serde_json::from_str(
             &request
@@ -305,6 +334,16 @@ struct FailingModel;
 
 #[async_trait]
 impl ModelPort for FailingModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, _: ModelRequest) -> Result<ModelResponse> {
         Err(Error::NotFound)
     }
@@ -319,6 +358,16 @@ struct HangingModel {
 
 #[async_trait]
 impl ModelPort for HangingModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, _: ModelRequest) -> Result<ModelResponse> {
         self.entered.notify_one();
         std::future::pending().await
@@ -418,7 +467,7 @@ impl Fixture {
             "profile",
             "skill",
             "v1",
-            hash(b"approved-parent"),
+            actual_fixture_parent_digest(),
             hash(b"baseline"),
             &parent,
             allowed.clone(),
@@ -450,7 +499,7 @@ impl Fixture {
             profile: Profile {
                 id: "profile".into(),
                 evolution_enabled: true,
-                parent_digest: hash(b"approved-parent"),
+                parent_digest: actual_fixture_parent_digest(),
                 baseline_digest: hash(b"baseline"),
             },
             parent_strategy: Strategy::default(),
@@ -469,7 +518,7 @@ impl Fixture {
     /// A request against the world's own parent skill/bundle, i.e. for a
     /// `Widen` action. `tag` keeps the request/idempotency ids distinct.
     fn request(&self, world_id: &str, step: u32, tag: &str) -> OptimizationStepRequest<'_> {
-        OptimizationStepRequest {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
             evidence: &self.evidence,
             source_selection: &self.source_selection,
             source_bindings: &self.bindings,
@@ -505,7 +554,7 @@ impl Fixture {
                 skill_id: "skill".into(),
                 skill_version: "v1".into(),
                 input_digest: skill_snapshot_digest(&self.parent).unwrap(),
-                approved_parent_digest: hash(b"approved-parent"),
+                approved_parent_digest: actual_fixture_parent_digest(),
                 safe_baseline_digest: hash(b"baseline"),
                 evidence: EvidenceClosure {
                     support: vec![],
@@ -550,7 +599,7 @@ impl Fixture {
                 idempotency_key: format!("dev-idempotency-{tag}"),
             },
             allow_rank_call: false,
-        }
+        })
     }
 }
 
@@ -565,10 +614,19 @@ struct Env {
 async fn env() -> Env {
     let (dir, store) = seeded_store().await;
     let worker = Context::new("n", "worker", Role::Worker).unwrap();
+    let fixture = Fixture::new();
+    trusted_compiler_inputs::install_request(
+        &store,
+        &fixture
+            .request("fixture-registration", 1, "fixture-registration")
+            .compiler_input_request(),
+    )
+    .await
+    .unwrap();
     Env {
         coordinator: PersistentCoordinator::new(store.clone(), worker.clone(), "worker").unwrap(),
         journal: StoreOptimizationJournal::new(store.clone(), worker, "worker").unwrap(),
-        fixture: Fixture::new(),
+        fixture,
         store,
         _dir: dir,
     }
@@ -1928,7 +1986,7 @@ fn replay_world() -> ReplayWorldV2 {
             generation_signature: d("generation-v1"),
             world_context_signature: d("world-context"),
             baseline_context_signature: d("baseline"),
-            approved_parent_digest: d("approved-parent"),
+            approved_parent_digest: actual_fixture_parent_digest(),
             model_digest: d("model"),
             tools_digest: d("tools"),
             scorer_digest: d("scorer"),

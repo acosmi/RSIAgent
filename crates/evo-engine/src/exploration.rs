@@ -977,6 +977,37 @@ impl PersistentCoordinator {
         journal: Option<&dyn OptimizationJournal>,
         request: OptimizationStepRequest<'_>,
     ) -> Result<CoordinatorStepResult> {
+        if let Some(journal) = journal {
+            journal
+                .compiler_inputs(&request.compiler_input_request())
+                .await?;
+        }
+        {
+            let mut session = self.store.session().await?;
+            let inputs = crate::formal_authority::resolve_compiler_inputs(
+                &mut session,
+                &self.context,
+                &request.compiler_input_request(),
+            )
+            .await?;
+            let world: ExplorationWorldV1 = need_record(
+                &mut session,
+                &self.context,
+                WORLD_RECORD_KIND,
+                &request.model_context.episode_id,
+            )
+            .await?;
+            world.validate()?;
+            check_world_live(&mut session, &self.context, &world).await?;
+            if world.approved_parent_digest != inputs.binding().parent_digest
+                || world.environment_digest != inputs.binding().environment_digest
+            {
+                return Err(Error::Conflict(
+                    "exploration world differs from actual P/B authority".into(),
+                ));
+            }
+            session.commit().await?;
+        }
         let world_id = request.model_context.episode_id.clone();
         let request_digest = optimization_request_digest(&request)?;
         // The two facts the observation gate reads once the step is done. A pure
@@ -1036,10 +1067,23 @@ impl PersistentCoordinator {
             &fingerprint(&(world_id.as_str(), action_seq))?[..32]
         );
         let mut session = self.store.session().await?;
+        let inputs = crate::formal_authority::resolve_compiler_inputs(
+            &mut session,
+            &self.context,
+            &request.compiler_input_request(),
+        )
+        .await?;
         let world: ExplorationWorldV1 =
             need_record(&mut session, &self.context, WORLD_RECORD_KIND, &world_id).await?;
         world.validate()?;
         check_world_live(&mut session, &self.context, &world).await?;
+        if world.approved_parent_digest != inputs.binding().parent_digest
+            || world.environment_digest != inputs.binding().environment_digest
+        {
+            return Err(Error::Conflict(
+                "exploration world differs from actual P/B authority".into(),
+            ));
+        }
         let mut history = Vec::with_capacity(world.history_ids.len());
         for entry_id in &world.history_ids {
             history.push(
@@ -3060,6 +3104,64 @@ pub(crate) fn storage_id(record_kind: &str, id: &str) -> Result<String> {
     identifier(record_kind)?;
     identifier(id)?;
     Ok(format!("e09-{}", fingerprint(&(record_kind, id))?))
+}
+
+pub(crate) fn validate_content_envelope(id: &str, body: &serde_json::Value) -> Result<()> {
+    if !body.is_object()
+        || !body
+            .get("payload")
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return Err(Error::Conflict(
+            "typed content envelope and payload must be JSON objects".into(),
+        ));
+    }
+    let e: ArtifactEnvelope<serde_json::Value> =
+        serde_json::from_value(body.clone()).map_err(|_| Error::Forbidden)?;
+    if e.schema_version != ENVELOPE_SCHEMA || e.id != id {
+        return Err(Error::Forbidden);
+    }
+    let payload_id = match e.record_kind.as_str() {
+        WORLD_RECORD_KIND => {
+            let v: ExplorationWorldV1 =
+                serde_json::from_value(e.payload).map_err(|_| Error::Forbidden)?;
+            v.validate()?;
+            v.id
+        }
+        NODE_RECORD_KIND => {
+            let v: PersistentSearchNode =
+                serde_json::from_value(e.payload).map_err(|_| Error::Forbidden)?;
+            if v.schema_version != "rsia.exploration_node.v1" {
+                return Err(Error::Forbidden);
+            }
+            node_id_for(&v.world_id, v.node.node_seq)
+        }
+        DISPATCH_RECORD_KIND => {
+            let v: ExplorationDispatchFact =
+                serde_json::from_value(e.payload).map_err(|_| Error::Forbidden)?;
+            if v.schema_version != DISPATCH_SCHEMA {
+                return Err(Error::Conflict("unsupported dispatch version".into()));
+            }
+            v.id
+        }
+        HISTORY_RECORD_KIND => {
+            let v: OptimizationHistoryEntry =
+                serde_json::from_value(e.payload).map_err(|_| Error::Forbidden)?;
+            if v.data_use != DataUse::Development {
+                return Err(Error::Forbidden);
+            }
+            v.entry_id
+        }
+        _ => {
+            return Err(Error::Conflict(
+                "unsupported exploration envelope kind".into(),
+            ));
+        }
+    };
+    if storage_id(&e.record_kind, &payload_id)? != id {
+        return Err(Error::Conflict("exploration content alias".into()));
+    }
+    Ok(())
 }
 
 /// Reads the stored body of one exploration record as an envelope.

@@ -2,6 +2,11 @@
 //! transactions; neither its internal fingerprints nor hidden payloads are DTOs.
 
 use crate::evidence::{load_stored_source, validate_stored_sources};
+use crate::formal_authority::{
+    CompilerInputRequest, FormalCompilerInputBinding, VerifiedCompilerInputs,
+    resolve_compiler_inputs,
+};
+use crate::model::CompilerInputUse;
 use crate::optimization::{
     DevelopmentRunRequest, DevelopmentSelection, DevelopmentSelectionDecision,
     OptimizationJournalStage, StageFact, StageFactKind, StepTerminalClass,
@@ -1215,6 +1220,10 @@ struct PreparedMaterial {
     revoked: BTreeSet<String>,
     development: DevelopmentRunRequest,
     allow_rank: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compiler_request: Option<CompilerInputRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compiler_binding: Option<FormalCompilerInputBinding>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1225,6 +1234,10 @@ struct CompiledMaterial {
     report: EditApplyReport,
     bundle: ResolvedBundle,
     merge: MergeRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compiler_request: Option<CompilerInputRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compiler_binding: Option<FormalCompilerInputBinding>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1430,16 +1443,23 @@ async fn read_stage(
             return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
         }
         for dependency in &fact.dependencies {
-            check_edge(
-                ctx,
-                session,
-                set,
-                "artifact",
-                &fact_id,
-                &dependency.kind,
-                &dependency.id,
-            )
-            .await?;
+            // Match the producer's content-edge registry. Watermarks and E03
+            // ledger ids are scalar values validated by their existing gates.
+            if matches!(
+                dependency.kind.as_str(),
+                "run" | "artifact" | "release" | "formal_parent" | "pointer" | "receipt"
+            ) {
+                check_edge(
+                    ctx,
+                    session,
+                    set,
+                    "artifact",
+                    &fact_id,
+                    &dependency.kind,
+                    &dependency.id,
+                )
+                .await?;
+            }
             match dependency.kind.as_str() {
                 "run" => {
                     source_ids.insert(dependency.id.clone());
@@ -1459,6 +1479,9 @@ async fn read_stage(
                     {
                         queue.push_back(dependency.id.clone());
                     }
+                }
+                "release" | "formal_parent" | "pointer" | "receipt" => {
+                    capture(ctx, session, set, &dependency.kind, &dependency.id).await?;
                 }
                 "revoke_watermark" => {
                     let expected = dependency
@@ -1497,9 +1520,12 @@ async fn read_stage(
     if prepared_facts.len() > 1 {
         return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
     }
-    let prepared = match prepared_facts.first() {
-        Some(fact) => Some(read_prepared(ctx, session, set, &facts, fact).await?),
-        None => None,
+    let (prepared, compiler_inputs) = match prepared_facts.first() {
+        Some(fact) => {
+            let (material, inputs) = read_prepared(ctx, session, set, &facts, fact).await?;
+            (Some(material), inputs)
+        }
+        None => (None, None),
     };
     let mut view = StageView {
         facts: Vec::new(),
@@ -1554,7 +1580,19 @@ async fn read_stage(
         }
         if let Some(compile_fact) = compile_facts.first() {
             let compiled: CompiledMaterial = decode(&compile_fact.payload)?;
-            validate_compiled(&prepared, compile_fact, &compiled)?;
+            if fingerprint(&(&compiled.compiler_request, &compiled.compiler_binding))
+                .map_err(material_error)?
+                != fingerprint(&(&prepared.compiler_request, &prepared.compiler_binding))
+                    .map_err(material_error)?
+            {
+                return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
+            }
+            if let (Some(request), Some(binding)) =
+                (&compiled.compiler_request, &compiled.compiler_binding)
+            {
+                capture_compiler_use(ctx, session, set, compile_fact, request, binding).await?;
+            }
+            validate_compiled(&prepared, compile_fact, &compiled, compiler_inputs.as_ref())?;
             view.bundle = Some(project_bundle(projection, &compiled.bundle)?);
             view.merge = Some(project_merge(projection, &prepared, &compiled.merge)?);
             let (diff, visible) = project_diff(projection, &prepared, &compiled)?;
@@ -1686,10 +1724,24 @@ async fn read_prepared(
     set: &mut ReadSet,
     facts: &BTreeMap<String, StageFact>,
     fact: &StageFact,
-) -> ReadResult<PreparedMaterial> {
+) -> ReadResult<(PreparedMaterial, Option<VerifiedCompilerInputs>)> {
     let material: PreparedMaterial = decode(&fact.payload)?;
     let context = &material.context;
-    if fact.input_digest != fingerprint(&fact.payload).map_err(material_error)?
+    let expected_input = match (&material.compiler_request, &material.compiler_binding) {
+        (Some(_), Some(binding)) => {
+            let mut raw = fact.payload.clone();
+            let fields = raw
+                .as_object_mut()
+                .ok_or(ReadFailure::Gap(ReviewGap::MaterialInvalid))?;
+            fields.remove("compiler_request");
+            fields.remove("compiler_binding");
+            fingerprint(&(fingerprint(&raw).map_err(material_error)?, binding))
+                .map_err(material_error)?
+        }
+        (None, None) => fingerprint(&fact.payload).map_err(material_error)?,
+        _ => return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid)),
+    };
+    if fact.input_digest != expected_input
         || context.namespace != ctx.namespace()
         || context.namespace != fact.namespace
         || context.episode_id != fact.episode_id
@@ -1772,6 +1824,45 @@ async fn read_prepared(
     {
         return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
     }
+    let compiler_inputs = match (&material.compiler_request, &material.compiler_binding) {
+        (Some(request), Some(binding)) => {
+            // All shadow fields remain part of the original optimization input.
+            // Its current typed authority is read in this caller Session; no
+            // compiler material, dispatch, or authorization is persisted here.
+            let expected_request = CompilerInputRequest {
+                profile: material.profile.clone(),
+                search_parent: material.parent.clone(),
+                baseline: material.baseline.clone(),
+                search_parent_strategy: material.parent_strategy.clone(),
+                expected_parent_strategy_digest: None,
+                baseline_strategy: material.baseline_strategy.clone(),
+                capabilities: material.caps.clone(),
+                environment_digest: development.environment_digest.clone(),
+                purpose: context.purpose,
+                revoke_watermark: context.revoke_watermark,
+            };
+            if fingerprint(request).map_err(material_error)?
+                != fingerprint(&expected_request).map_err(material_error)?
+            {
+                return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
+            }
+            let actual = resolve_compiler_inputs(session, ctx, request)
+                .await
+                .map_err(|error| match error {
+                    Error::Internal => ReadFailure::Internal,
+                    _ => ReadFailure::Gap(ReviewGap::SourceChanged),
+                })?;
+            if fingerprint(actual.binding()).map_err(material_error)?
+                != fingerprint(binding).map_err(material_error)?
+            {
+                return Err(ReadFailure::Gap(ReviewGap::SourceChanged));
+            }
+            capture_compiler_use(ctx, session, set, fact, request, binding).await?;
+            Some(actual)
+        }
+        (None, None) => None,
+        _ => return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid)),
+    };
     let grant_id = format!(
         "optgrant-{}",
         fingerprint(&material.selection).map_err(material_error)?
@@ -1888,7 +1979,68 @@ async fn read_prepared(
             return Err(ReadFailure::Gap(ReviewGap::ReferenceUnavailable));
         }
     }
-    Ok(material)
+    Ok((material, compiler_inputs))
+}
+
+async fn capture_compiler_use(
+    ctx: &Context,
+    session: &mut Session,
+    set: &mut ReadSet,
+    fact: &StageFact,
+    request: &CompilerInputRequest,
+    binding: &FormalCompilerInputBinding,
+) -> ReadResult<()> {
+    let expected = CompilerInputUse::new(request.clone(), binding.clone());
+    let id = expected.artifact_id().map_err(material_error)?;
+    if !fact
+        .dependencies
+        .iter()
+        .any(|dependency| dependency.kind == "artifact" && dependency.id == id)
+    {
+        return Err(ReadFailure::Gap(ReviewGap::ReferenceUnavailable));
+    }
+    check_edge(
+        ctx,
+        session,
+        set,
+        "artifact",
+        &fact.artifact_id,
+        "artifact",
+        &id,
+    )
+    .await?;
+    let stored: CompilerInputUse = decode(&capture(ctx, session, set, "artifact", &id).await?)?;
+    if fingerprint(&stored).map_err(material_error)?
+        != fingerprint(&expected).map_err(material_error)?
+    {
+        return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
+    }
+    for node in &binding.closure.nodes {
+        check_edge(
+            ctx,
+            session,
+            set,
+            "artifact",
+            &fact.artifact_id,
+            &node.kind,
+            &node.id,
+        )
+        .await?;
+        capture(ctx, session, set, &node.kind, &node.id).await?;
+    }
+    for edge in &binding.closure.edges {
+        check_edge(
+            ctx,
+            session,
+            set,
+            &edge.from_kind,
+            &edge.from_id,
+            &edge.to_kind,
+            &edge.to_id,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn validate_evidence(
@@ -1926,6 +2078,7 @@ fn validate_compiled(
     prepared: &PreparedMaterial,
     fact: &StageFact,
     compiled: &CompiledMaterial,
+    compiler_inputs: Option<&VerifiedCompilerInputs>,
 ) -> ReadResult<()> {
     unique_ids(&compiled.merge.input_suggestion_ids)?;
     unique_ids(&compiled.merge.selected_suggestion_ids)?;
@@ -2132,6 +2285,37 @@ fn validate_compiled(
     {
         return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
     }
+    if let Some(inputs) = compiler_inputs {
+        // Pure semantic reconstruction of an already stored bundle: the
+        // producer rebases S's complete output on authenticated P. Reuse that
+        // rule without creating any source, authorization, or dispatch fact.
+        let expected = inputs
+            .compile_search_edit(&compiled.output, &prepared.improver)
+            .map_err(material_error)?;
+        if fingerprint(&expected).map_err(material_error)?
+            != fingerprint(&compiled.bundle).map_err(material_error)?
+        {
+            return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
+        }
+    } else {
+        validate_legacy_origins(prepared, compiled)?;
+    }
+    if !prepared.caps.allows(&compiled.output.required_capabilities)
+        || compiled
+            .output
+            .dependencies
+            .iter()
+            .any(|d| prepared.revoked.contains(d))
+    {
+        return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
+    }
+    Ok(())
+}
+
+fn validate_legacy_origins(
+    prepared: &PreparedMaterial,
+    compiled: &CompiledMaterial,
+) -> ReadResult<()> {
     for origin in &compiled.bundle.origins {
         let expected = match origin.field.as_str() {
             "skill.content" => compiled.patch.content.name(),
@@ -2147,15 +2331,6 @@ fn validate_compiled(
         if origin.op != expected {
             return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
         }
-    }
-    if !prepared.caps.allows(&compiled.output.required_capabilities)
-        || compiled
-            .output
-            .dependencies
-            .iter()
-            .any(|d| prepared.revoked.contains(d))
-    {
-        return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
     }
     Ok(())
 }

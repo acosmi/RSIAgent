@@ -1,10 +1,11 @@
 //! Versioned complete-batch verdicts and frozen registration compatibility.
 // The execution fixture is copied from streaming_evaluator.rs; all model calls
 // are local deterministic receipts, not provider invocations.
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use evo_core::Strategy;
 use evo_core::contract::{
     CompileParts, HostCapabilities, ImproverPatch, Profile, SkillPatch, SkillSnapshot,
-    compile_bundle,
 };
 use evo_core::evaluation::{
     BernsteinReport, ClusterObservation, ControlCondition, ExperimentPlan, FixedOptimizerArm,
@@ -225,8 +226,13 @@ async fn unregistered_fixture(schema: &str, profile: ProfileKind, candidate_cost
         created_at_unix_seconds: 2,
     };
     // The candidate pair binds the actual E01 snapshot, not an arbitrary label.
-    let pair =
-        FrozenCandidatePair::new(v1.digest().unwrap(), d("candidate"), d("baseline"), 3).unwrap();
+    let pair = FrozenCandidatePair::new(
+        v1.digest().unwrap(),
+        d("candidate"),
+        release_bundle().parent_digest,
+        3,
+    )
+    .unwrap();
     let sequential_mode = match &early {
         Some(plan) => SequentialMode::RejectOnly {
             early_stop_plan_digest: plan.digest().unwrap(),
@@ -296,7 +302,7 @@ async fn unregistered_fixture(schema: &str, profile: ProfileKind, candidate_cost
         oracle_payload_digest: evo_core::fingerprint(&oracle_entries).unwrap(),
         oracle_entries,
     };
-    Fixture {
+    let fixture = Fixture {
         _dir: dir,
         db_path,
         store,
@@ -306,7 +312,9 @@ async fn unregistered_fixture(schema: &str, profile: ProfileKind, candidate_cost
         holdout,
         control,
         candidate_cost,
-    }
+    };
+    stage_fixture_candidate(&fixture).await;
+    fixture
 }
 
 async fn execute_output(
@@ -646,27 +654,35 @@ fn release_bundle() -> evo_core::contract::ResolvedBundle {
         required_capabilities: vec![],
         dependencies: vec![],
     };
-    compile_bundle(CompileParts {
-        profile: &profile,
-        parent: &parent,
-        baseline: &SkillSnapshot::empty(),
-        parent_strategy: &Strategy::default(),
-        baseline_strategy: &Strategy::default(),
-        skill_patch: &SkillPatch::default(),
-        improver_patch: &ImproverPatch::default(),
-        caps: &HostCapabilities {
-            available: BTreeSet::new(),
-            granted: BTreeSet::new(),
+    trusted_compiler_inputs::bundle(
+        CompileParts {
+            profile: &profile,
+            parent: &parent,
+            baseline: &SkillSnapshot::empty(),
+            parent_strategy: &Strategy::default(),
+            baseline_strategy: &Strategy::default(),
+            skill_patch: &SkillPatch::default(),
+            improver_patch: &ImproverPatch::default(),
+            caps: &HostCapabilities {
+                available: BTreeSet::new(),
+                granted: BTreeSet::new(),
+            },
+            revoked: &BTreeSet::new(),
         },
-        revoked: &BTreeSet::new(),
-    })
+        "n",
+        &d("environment"),
+    )
     .unwrap()
 }
 
-async fn assert_release_forbidden(fixture: &Fixture) {
+async fn stage_fixture_candidate(
+    fixture: &Fixture,
+) -> evo_engine::release_store::ReleaseCandidateRecord {
     let host = Context::new("n", "host", Role::Host).unwrap();
     let proposer = Context::new("n", "proposer", Role::Worker).unwrap();
-    let approver = Context::new("n", "approver", Role::Admin).unwrap();
+    trusted_compiler_inputs::install_bundle(&fixture.store, &release_bundle())
+        .await
+        .unwrap();
     let body = "trusted release source";
     let source = StoredTraceAuthority {
         schema_version: "rsia.optimization.source.v1".into(),
@@ -700,7 +716,7 @@ async fn assert_release_forbidden(fixture: &Fixture) {
         .await
         .unwrap();
     session.commit().await.unwrap();
-    let candidate = ReleaseStore::stage_bundle(
+    ReleaseStore::stage_bundle(
         &proposer,
         &fixture.store,
         StageBundleRequest {
@@ -717,7 +733,17 @@ async fn assert_release_forbidden(fixture: &Fixture) {
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+}
+
+async fn assert_release_forbidden(fixture: &Fixture) {
+    let approver = Context::new("n", "approver", Role::Admin).unwrap();
+    let mut session = fixture.store.session().await.unwrap();
+    let candidate: evo_engine::release_store::ReleaseCandidateRecord = session
+        .need(&approver, "artifact", &d("candidate"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
     let view = IndependentEvaluationControl::verified_report_view(
         &fixture.evaluator,
         &fixture.store,
@@ -1028,25 +1054,28 @@ async fn switching_a_frozen_control_version_is_rejected_before_formal_writes() {
     for (schema, replacement) in [(V1, V2), (V2, V1)] {
         let fixture = fixture(schema, ProfileKind::QualityGain, 10).await;
         complete(&fixture, true).await;
-        let mut envelope = stored(
-            &fixture,
-            "registered_evaluation_control_v41",
-            &fixture.control.id,
-        )
-        .await;
-        envelope["payload"]["schema_version"] = json!(replacement);
+        let mut replacement_control = fixture.control.clone();
+        replacement_control.schema_version = replacement.into();
+        // Corrupt only this fixture's current registration while retaining the
+        // ticket's original frozen digest. Re-register through the same trusted
+        // Evaluator entry so missing body authority cannot mask the digest gate.
         let mut session = fixture.store.session().await.unwrap();
         session
-            .put(
+            .delete(
                 &fixture.evaluator,
                 "artifact",
                 &storage_id("registered_evaluation_control_v41", &fixture.control.id),
-                fixture.evaluator.actor(),
-                &envelope,
             )
             .await
             .unwrap();
         session.commit().await.unwrap();
+        IndependentEvaluationControl::register_control(
+            &fixture.evaluator,
+            &fixture.store,
+            replacement_control,
+        )
+        .await
+        .unwrap();
         assert!(matches!(IndependentEvaluationControl::finalize_complete(
             &fixture.evaluator, &fixture.store, &fixture.ticket_id, 1_000,
         ).await, Err(Error::Conflict(message)) if message.contains("control") && message.contains("digest")));

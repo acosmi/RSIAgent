@@ -1,8 +1,10 @@
 //! Delayed grading errors retain the confirmed first-stop endpoint and real audit.
 //! These fixtures execute local software APIs; they do not prove provider authority.
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
+
 use evo_core::contract::{
     CompileParts, HostCapabilities, ImproverPatch, Profile, SkillPatch, SkillSnapshot,
-    compile_bundle,
 };
 use evo_core::evaluation::{
     ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec, FormalExperimentPlanV41,
@@ -89,20 +91,24 @@ fn bundle() -> evo_core::contract::ResolvedBundle {
         required_capabilities: vec![],
         dependencies: vec![],
     };
-    compile_bundle(CompileParts {
-        profile: &profile,
-        parent: &parent,
-        baseline: &SkillSnapshot::empty(),
-        parent_strategy: &Strategy::default(),
-        baseline_strategy: &Strategy::default(),
-        skill_patch: &SkillPatch::default(),
-        improver_patch: &ImproverPatch::default(),
-        caps: &HostCapabilities {
-            available: BTreeSet::new(),
-            granted: BTreeSet::new(),
+    trusted_compiler_inputs::bundle(
+        CompileParts {
+            profile: &profile,
+            parent: &parent,
+            baseline: &SkillSnapshot::empty(),
+            parent_strategy: &Strategy::default(),
+            baseline_strategy: &Strategy::default(),
+            skill_patch: &SkillPatch::default(),
+            improver_patch: &ImproverPatch::default(),
+            caps: &HostCapabilities {
+                available: BTreeSet::new(),
+                granted: BTreeSet::new(),
+            },
+            revoked: &BTreeSet::new(),
         },
-        revoked: &BTreeSet::new(),
-    })
+        NAMESPACE,
+        &digest("fixture-environment"),
+    )
     .unwrap()
 }
 
@@ -288,7 +294,7 @@ async fn fixture(case: &str, schema: &str, sequential: bool) -> Fixture {
     let pair = FrozenCandidatePair::new(
         v1.digest().unwrap(),
         digest("fixture-candidate"),
-        digest("fixture-baseline"),
+        bundle().parent_digest,
         3,
     )
     .unwrap();
@@ -418,6 +424,9 @@ async fn stage_candidate(fixture: &Fixture) {
         .await
         .unwrap();
     session.commit().await.unwrap();
+    trusted_compiler_inputs::install_bundle(&fixture.store, &bundle())
+        .await
+        .unwrap();
     ReleaseStore::stage_bundle(
         &proposer,
         &fixture.store,
@@ -574,6 +583,11 @@ async fn issue(fixture: &Fixture, bound: bool) {
     .await
     .unwrap();
     assert_eq!(ticket.candidate_dependency_binding.is_some(), bound);
+    if !bound {
+        // The historical ticket keeps its original unbound wire. Its later
+        // executions still require a genuinely registered current candidate.
+        stage_candidate(fixture).await;
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

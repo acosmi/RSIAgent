@@ -1,9 +1,11 @@
 //! Software fixtures for the GA-18 candidate/source and actual stored fact pins.
 //! These local receipts are ProgramFixture, never production or provider proof.
 use evo_core::Strategy;
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
+
 use evo_core::contract::{
     CompileParts, HostCapabilities, ImproverPatch, Profile, SkillPatch, SkillSnapshot,
-    compile_bundle,
 };
 use evo_core::evaluation::{
     ControlCondition, ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec,
@@ -223,8 +225,13 @@ async fn unregistered_fixture(n: u32) -> Fixture {
         created_at_unix_seconds: 2,
     };
     // The candidate pair binds the actual E01 snapshot, not an arbitrary label.
-    let pair =
-        FrozenCandidatePair::new(v1.digest().unwrap(), d("candidate"), d("baseline"), 3).unwrap();
+    let pair = FrozenCandidatePair::new(
+        v1.digest().unwrap(),
+        d("candidate"),
+        release_bundle().parent_digest,
+        3,
+    )
+    .unwrap();
     let sequential_mode = match &early {
         Some(plan) => SequentialMode::RejectOnly {
             early_stop_plan_digest: plan.digest().unwrap(),
@@ -496,20 +503,24 @@ fn release_bundle() -> evo_core::contract::ResolvedBundle {
         required_capabilities: vec![],
         dependencies: vec![],
     };
-    compile_bundle(CompileParts {
-        profile: &profile,
-        parent: &parent,
-        baseline: &SkillSnapshot::empty(),
-        parent_strategy: &Strategy::default(),
-        baseline_strategy: &Strategy::default(),
-        skill_patch: &SkillPatch::default(),
-        improver_patch: &ImproverPatch::default(),
-        caps: &HostCapabilities {
-            available: BTreeSet::new(),
-            granted: BTreeSet::new(),
+    trusted_compiler_inputs::bundle(
+        CompileParts {
+            profile: &profile,
+            parent: &parent,
+            baseline: &SkillSnapshot::empty(),
+            parent_strategy: &Strategy::default(),
+            baseline_strategy: &Strategy::default(),
+            skill_patch: &SkillPatch::default(),
+            improver_patch: &ImproverPatch::default(),
+            caps: &HostCapabilities {
+                available: BTreeSet::new(),
+                granted: BTreeSet::new(),
+            },
+            revoked: &BTreeSet::new(),
         },
-        revoked: &BTreeSet::new(),
-    })
+        "n",
+        &d("environment"),
+    )
     .unwrap()
 }
 
@@ -564,6 +575,9 @@ async fn stage(fx: &Fixture) {
             .unwrap(),
     };
     session.commit().await.unwrap();
+    trusted_compiler_inputs::install_bundle(&fx.store, &release_bundle())
+        .await
+        .unwrap();
     ReleaseStore::stage_bundle(
         &proposer,
         &fx.store,
@@ -611,6 +625,11 @@ async fn issue(fx: &Fixture) -> evo_core::Result<EvaluationTicketV2> {
 async fn ready(n: u32, bound: bool) -> Fixture {
     let fx = prepared(n, bound).await;
     issue(&fx).await.unwrap();
+    if !bound {
+        // Preserve historical ticket-only wire while satisfying new-use
+        // admission with a registered candidate issued after the ticket.
+        stage(&fx).await;
+    }
     for index in 0..n {
         grade_target(&fx, &format!("r{index}"), "ok", "wrong", index + 1).await;
     }
@@ -1205,7 +1224,7 @@ async fn canonical_extra_source_edges_are_included_and_revoked_even_when_not_dir
     let ticket = issue(&fx).await.unwrap();
     let binding = ticket.candidate_dependency_binding.unwrap();
     assert_eq!(binding.sources.len(), 2);
-    assert_eq!(binding.nodes.len(), 4);
+    assert_eq!(binding.nodes.len(), 11);
     assert!(
         binding
             .nodes
@@ -1233,7 +1252,7 @@ async fn cycles_and_diamonds_deduplicate_complete_typed_closure() {
     }
     let ticket = issue(&fx).await.unwrap();
     let binding = ticket.candidate_dependency_binding.unwrap();
-    assert_eq!(binding.nodes.len(), 4);
+    assert_eq!(binding.nodes.len(), 11);
     assert_eq!(
         binding
             .nodes
@@ -1241,17 +1260,32 @@ async fn cycles_and_diamonds_deduplicate_complete_typed_closure() {
             .map(|node| (&node.kind, &node.id))
             .collect::<BTreeSet<_>>()
             .len(),
-        4
+        11
     );
     let root = binding
         .nodes
         .iter()
         .find(|node| node.id == fx.holdout.pair.candidate_digest)
         .unwrap();
-    assert_eq!(root.outgoing_edge_count, 2);
+    assert_eq!(root.outgoing_edge_count, 3);
     assert_eq!(
         root.outgoing_edge_digest,
-        fingerprint(&vec![("run", "S1"), ("run", "S2")]).unwrap()
+        fingerprint(&vec![
+            (
+                "artifact".to_string(),
+                format!(
+                    "compiler-binding-{}",
+                    fingerprint(&(
+                        &fx.holdout.pair.candidate_digest,
+                        &fx.holdout.candidate_bundle_digest,
+                    ))
+                    .unwrap()
+                )
+            ),
+            ("run".to_string(), "S1".to_string()),
+            ("run".to_string(), "S2".to_string()),
+        ])
+        .unwrap()
     );
     IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
         .await
@@ -1676,7 +1710,8 @@ async fn overall_typed_node_bound_accepts_exact_ten_thousand_and_refuses_one_mor
     // Direct own-database adversarial graph seeding exercises closure capacity
     // independently of the separate normal-ingestion MVP run count. Every node
     // is still a real, fully valid StoredTraceAuthority; no placeholder is proof.
-    for extra in [9991, 9992] {
+    // The seven compiler authorization nodes occupy real closure capacity.
+    for extra in [9984, 9985] {
         let fx = prepared(2, true).await;
         let template = serde_json::to_string(&source("graph-template")).unwrap();
         own_sqlite(
@@ -1690,8 +1725,7 @@ for i in range(count):
     con.execute('INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,?,?,?,?)',('n','run',node,'host',json.dumps(doc)))
     previous='S1' if i==0 else f'node-{i-1:05}'
     con.execute('INSERT INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id) VALUES(?,?,?,?,?)',('n','run',previous,'run',node))
-# Last-to-first cycle and another root-to-last diamond do not add nodes.
-con.execute('INSERT INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id) VALUES(?,?,?,?,?)',('n','run',f'node-{count-1:05}','run','S1'))
+# A second root-to-last edge forms a lawful diamond without adding nodes.
 con.execute('INSERT INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id) VALUES(?,?,?,?,?)',('n','run','S2','run',f'node-{count-1:05}'))
 con.commit()
 "#,
@@ -1699,7 +1733,7 @@ con.commit()
         );
         let before = catalog(&fx).await;
         let result = issue(&fx).await;
-        if extra == 9991 {
+        if extra == 9984 {
             let ticket = result.unwrap();
             assert_eq!(
                 ticket

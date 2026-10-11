@@ -18,6 +18,8 @@
 //! cannot import one another; the transport is scripted instead of a model port so
 //! every model call reaches the real `PersistentModelBroker` and the real ledger.
 
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use async_trait::async_trait;
 use evo_core::contract::{
     CapabilityLevel, HostCapabilities, HostSurfaceManifest, ImproverPatch, Profile, SkillSnapshot,
@@ -40,19 +42,21 @@ use evo_engine::evidence::{
     StoredRunRecord, StoredTraceAuthority, ingest_trusted_run_records, store_source_selection,
     store_trace_authority,
 };
-use evo_engine::model::{ModelExecutionProvenance, ModelPort, ModelResponse};
+use evo_engine::model::{
+    BoundModelRequest, CompilerInputUse, ModelExecutionProvenance, ModelPort, ModelResponse,
+};
 use evo_engine::monitoring::{
     ClaimOutcome, CompleteDevelopmentCycleRequest, ConsolidationClaim, ConsolidationClaimState,
-    ConsolidationDevRunner, ConsolidationRunOutcome, ConsolidationRunRecord,
-    DevelopmentCycleRecord, EnvironmentEvidenceScope, MonitoringCoordinator,
-    RecordEnvironmentRequest, RecordedEnvironment,
+    ConsolidationDevRunner, ConsolidationModelPort, ConsolidationRunOutcome,
+    ConsolidationRunRecord, DevelopmentCycleRecord, EnvironmentEvidenceScope,
+    MonitoringCoordinator, RecordEnvironmentRequest, RecordedEnvironment,
 };
 use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentTask, OPTIMIZATION_STAGE_FACT_SCHEMA,
     OptimizationJournal, OptimizationJournalStage, OptimizationStepOutcome,
     OptimizationStepRequest, PairedTaskResult, StageDependency, StageFact, StageFactKind,
-    StoreOptimizationJournal, run_optimization_step,
+    run_optimization_step,
 };
 use evo_engine::release_store::{PrepareRunRequest, ReleaseStore, TrustedHostExecutionEvidence};
 use evo_storage::Store;
@@ -65,6 +69,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use trusted_compiler_inputs::StoreOptimizationJournal;
 
 const TENANT: &str = "tenant";
 const SCOPE: &str = "billing-scope";
@@ -1067,7 +1072,7 @@ impl StepMaterial {
         episode: &str,
         shape: Shape,
     ) -> OptimizationStepRequest<'a> {
-        OptimizationStepRequest {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
             evidence: &self.evidence,
             source_selection: &self.selection,
             source_bindings: &self.bindings,
@@ -1129,7 +1134,7 @@ impl StepMaterial {
                 idempotency_key: "consolidation-idempotency-1".into(),
             },
             allow_rank_call: shape.rank,
-        }
+        })
     }
 }
 
@@ -1329,6 +1334,32 @@ impl ModelTransport for ScriptedTransport {
     }
 }
 
+/// Records the complete request RecoveryModel actually supplies, then forwards
+/// it to the same broker without replacing its compiler authority.
+struct RecordingModelPort<'a> {
+    broker: &'a PersistentModelBroker<ScriptedTransport>,
+    bound: &'a Mutex<Vec<BoundModelRequest>>,
+}
+
+#[async_trait]
+impl ModelPort for RecordingModelPort<'_> {
+    async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
+        self.broker.dispatch(request).await
+    }
+
+    async fn dispatch_bound(&self, request: BoundModelRequest) -> Result<ModelResponse> {
+        self.bound.lock().unwrap().push(request.clone());
+        self.broker.dispatch_bound(request).await
+    }
+}
+
+#[async_trait]
+impl ConsolidationModelPort for RecordingModelPort<'_> {
+    async fn trusted_budget_binding(&self, namespace: &str) -> Result<BudgetPortBinding> {
+        self.broker.budget_binding(namespace).await
+    }
+}
+
 /// A fixture, its step material and a real broker over the scripted transport.
 struct World {
     fixture: Fixture,
@@ -1339,6 +1370,8 @@ struct World {
     provider_calls: Arc<AtomicUsize>,
     /// The requests those calls carried.
     seen: Arc<Mutex<Vec<ModelRequest>>>,
+    /// Complete incoming requests, before the broker dispatches the provider.
+    bound: Mutex<Vec<BoundModelRequest>>,
 }
 
 impl World {
@@ -1374,6 +1407,7 @@ impl World {
             runner,
             provider_calls,
             seen,
+            bound: Mutex::new(Vec::new()),
         }
     }
 
@@ -1389,11 +1423,15 @@ impl World {
         claim: &ConsolidationClaim,
         shape: Shape,
     ) -> Result<ConsolidationRunRecord> {
+        let model = RecordingModelPort {
+            broker: &self.broker,
+            bound: &self.bound,
+        };
         MonitoringCoordinator::run_consolidation(
             &self.fixture.worker,
             &self.fixture.store,
             &claim.id,
-            Some(&self.broker),
+            Some(&model),
             Some(&self.runner),
             Some(&self.fixture.journal()),
             self.material.request(&self.fixture, &claim.id, shape),
@@ -1403,8 +1441,12 @@ impl World {
 
     /// An ordinary E03 step over `episode`, through the same broker.
     async fn ordinary(&self, episode: &str, shape: Shape) -> Result<OptimizationStepOutcome> {
+        let model = RecordingModelPort {
+            broker: &self.broker,
+            bound: &self.bound,
+        };
         run_optimization_step(
-            Some(&self.broker),
+            Some(&model),
             Some(&self.runner),
             Some(&self.fixture.journal()),
             self.material.request(&self.fixture, episode, shape),
@@ -1772,6 +1814,12 @@ async fn inject(injection: Injection, expected: Expected) -> Injected {
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].stage, ModelStage::Consolidate);
     assert_eq!(seen[0].request_id, call.call_id);
+    let bound = world.bound.lock().unwrap().clone();
+    assert_eq!(bound.len(), 1);
+    assert_eq!(
+        fingerprint(&bound[0].request).unwrap(),
+        fingerprint(&seen[0]).unwrap()
+    );
     let root = world.root().await;
     assert_eq!(root.root_budget_id, ROOT);
     Injected {
@@ -1795,8 +1843,12 @@ impl Injected {
             .await
             .unwrap();
         assert_eq!(again, self.record);
-        let request = self.world.seen.lock().unwrap()[0].clone();
-        let redispatched = self.world.broker.dispatch(request).await.unwrap();
+        let request = self.world.bound.lock().unwrap()[0].clone();
+        assert_eq!(
+            fingerprint(&request.request).unwrap(),
+            fingerprint(&self.world.seen.lock().unwrap()[0]).unwrap()
+        );
+        let redispatched = self.world.broker.dispatch_bound(request).await.unwrap();
         assert_eq!(
             self.world.provider_calls(),
             1,
@@ -1949,4 +2001,314 @@ async fn a_late_consolidation_answer_is_billed_and_never_used() {
         run.assert_never_redispatched().await,
         ModelResponse::Rejected { .. }
     ));
+}
+
+/// Builds a full typed preparation against the journal's real, current original
+/// compiler input. The content dependencies are actual stored run records.
+async fn environment_preparation(world: &World, episode: &str) -> (StageFact, CompilerInputUse) {
+    let journal = world.fixture.journal();
+    let step = world.material.request(
+        &world.fixture,
+        episode,
+        Shape::at(ModelStage::ReflectFailure),
+    );
+    let compiler_request = step.compiler_input_request();
+    let verified = journal.compiler_inputs(&compiler_request).await.unwrap();
+    let inputs = CompilerInputUse::new(compiler_request, verified.binding().clone());
+    let request = step.development_request.clone();
+    let mut dependencies = vec![
+        StageDependency {
+            kind: "bundle".into(),
+            id: request.parent_bundle_digest.clone(),
+        },
+        StageDependency {
+            kind: "bundle".into(),
+            id: request.candidate_bundle_digest.clone(),
+        },
+        StageDependency {
+            kind: "environment".into(),
+            id: request.environment_digest.clone(),
+        },
+        StageDependency {
+            kind: "grader".into(),
+            id: request.grader_digest.clone(),
+        },
+        StageDependency {
+            kind: "artifact".into(),
+            id: inputs.artifact_id().unwrap(),
+        },
+        StageDependency {
+            kind: "revoke_watermark".into(),
+            id: request.revoke_watermark.to_string(),
+        },
+    ];
+    dependencies.extend(
+        world
+            .material
+            .selection
+            .run_ids
+            .iter()
+            .map(|id| StageDependency {
+                kind: "run".into(),
+                id: id.clone(),
+            }),
+    );
+    dependencies.sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+    dependencies.dedup_by(|a, b| a.kind == b.kind && a.id == b.id);
+    let fact = StageFact {
+        schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+        artifact_id: String::new(),
+        namespace: request.namespace.clone(),
+        episode_id: request.episode_id.clone(),
+        step: request.step,
+        attempt: request.attempt,
+        stage: OptimizationJournalStage::Development,
+        kind: StageFactKind::DevelopmentRequestPrepared,
+        request_id: request.request_id.clone(),
+        input_digest: request.manifest.digest.clone(),
+        output_digest: None,
+        dependencies,
+        payload: serde_json::to_value(&request).unwrap(),
+    }
+    .seal()
+    .unwrap();
+    (fact, inputs)
+}
+
+#[tokio::test]
+async fn a_bound_development_environment_remains_a_scalar_with_real_content_edges() {
+    let world = World::new(Script::PLAIN).await;
+    let journal = world.fixture.journal();
+    let (fact, inputs) = environment_preparation(&world, "environment-positive").await;
+    let root = world.root().await;
+    journal.commit_bound(fact.clone(), &inputs).await.unwrap();
+    let stored = journal.reload(&fact.artifact_id).await.unwrap();
+    assert_eq!(fingerprint(&stored).unwrap(), fingerprint(&fact).unwrap());
+    assert_eq!(
+        fingerprint(
+            &journal
+                .lookup_bound(&fact.artifact_id, &inputs)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        fingerprint(&fact).unwrap()
+    );
+    let mut session = world.fixture.store.session().await.unwrap();
+    let edges = session
+        .dependency_edges(&world.fixture.worker, "artifact", &fact.artifact_id)
+        .await
+        .unwrap();
+    assert!(edges.contains(&("artifact".into(), inputs.artifact_id().unwrap())));
+    for id in &world.material.selection.run_ids {
+        assert!(edges.contains(&("run".into(), id.clone())));
+    }
+    let compiler_edges = session
+        .dependency_edges(
+            &world.fixture.worker,
+            "artifact",
+            &inputs.artifact_id().unwrap(),
+        )
+        .await
+        .unwrap();
+    for node in &inputs.binding.closure.nodes {
+        assert!(compiler_edges.contains(&(node.kind.clone(), node.id.clone())));
+    }
+    assert!(
+        !edges
+            .iter()
+            .any(|(kind, id)| kind == "environment" || id == &inputs.request.environment_digest)
+    );
+    assert!(
+        session
+            .get::<Value>(
+                &world.fixture.worker,
+                "artifact",
+                &inputs.request.environment_digest
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let cached: StageFact = session
+        .cached(
+            &world.fixture.worker,
+            "optimization.stage",
+            &fact.artifact_id,
+            &fact,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fingerprint(&cached).unwrap(), fingerprint(&fact).unwrap());
+    session.commit().await.unwrap();
+    journal.commit_bound(fact.clone(), &inputs).await.unwrap();
+    assert_eq!(
+        fingerprint(&journal.reload(&fact.artifact_id).await.unwrap()).unwrap(),
+        fingerprint(&fact).unwrap()
+    );
+    assert_eq!(world.root().await, root);
+    assert_eq!(world.provider_calls(), 0);
+    assert_eq!(world.runner.calls.load(Ordering::SeqCst), 0);
+    assert!(world.bound.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_environment_preparations_leave_no_partial_journal_or_dispatch() {
+    let world = World::new(Script::PLAIN).await;
+    let journal = world.fixture.journal();
+    let (original, inputs) = environment_preparation(&world, "environment-negative").await;
+    let mut session = world.fixture.store.session().await.unwrap();
+    let before: Vec<Value> = session
+        .list(&world.fixture.worker, "artifact")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let root = world.root().await;
+    for case in [
+        "short-digest",
+        "uppercase-digest",
+        "dependency-mismatch",
+        "payload-original-mismatch",
+        "purpose-mismatch",
+        "watermark-mismatch",
+        "scope-mismatch",
+        "wrong-stage",
+        "wrong-kind",
+        "unknown-kind",
+        "missing-binding",
+        "missing-environment",
+    ] {
+        let mut fact = original.clone();
+        fact.episode_id = format!("environment-{case}");
+        fact.request_id = format!("environment-request-{case}");
+        fact.payload["episode_id"] = json!(fact.episode_id);
+        fact.payload["request_id"] = json!(fact.request_id);
+        match case {
+            "short-digest" => {
+                fact.dependencies
+                    .iter_mut()
+                    .find(|d| d.kind == "environment")
+                    .unwrap()
+                    .id = "abc".into()
+            }
+            "uppercase-digest" => {
+                fact.dependencies
+                    .iter_mut()
+                    .find(|d| d.kind == "environment")
+                    .unwrap()
+                    .id = "A".repeat(64)
+            }
+            "dependency-mismatch" => {
+                fact.dependencies
+                    .iter_mut()
+                    .find(|d| d.kind == "environment")
+                    .unwrap()
+                    .id = d("other-environment")
+            }
+            "payload-original-mismatch" => {
+                let other = d("other-environment");
+                fact.dependencies
+                    .iter_mut()
+                    .find(|d| d.kind == "environment")
+                    .unwrap()
+                    .id = other.clone();
+                fact.payload["environment_digest"] = json!(other);
+            }
+            "purpose-mismatch" => fact.payload["purpose"] = json!(Purpose::Generation),
+            "watermark-mismatch" => fact.payload["revoke_watermark"] = json!(2),
+            "scope-mismatch" => fact.payload["episode_id"] = json!("unrelated-episode"),
+            "wrong-stage" => fact.stage = OptimizationJournalStage::Merge,
+            "wrong-kind" => fact.kind = StageFactKind::TerminalNoChange,
+            "unknown-kind" => fact.dependencies.push(StageDependency {
+                kind: "unknown_environment".into(),
+                id: d("unknown-environment"),
+            }),
+            "missing-environment" => fact.dependencies.retain(|d| d.kind != "environment"),
+            "missing-binding" => {}
+            _ => unreachable!(),
+        }
+        // Every negative is canonical and has a fresh payload digest, so refusal
+        // must come from the live gate, not an intentionally stale seal.
+        let fact = fact.seal().unwrap();
+        fact.validate().unwrap();
+        let rejected = if case == "missing-binding" {
+            journal.commit(fact.clone()).await
+        } else {
+            journal.commit_bound(fact.clone(), &inputs).await
+        };
+        assert!(
+            matches!(
+                rejected,
+                Err(Error::Conflict(_)) | Err(Error::Invalid(_)) | Err(Error::Forbidden)
+            ),
+            "{case}: {rejected:?}"
+        );
+        let mut session = world.fixture.store.session().await.unwrap();
+        assert!(
+            session
+                .get::<Value>(&world.fixture.worker, "artifact", &fact.artifact_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "{case}"
+        );
+        assert!(
+            session
+                .get::<Value>(
+                    &world.fixture.worker,
+                    "artifact",
+                    &inputs.artifact_id().unwrap()
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "{case}"
+        );
+        let cached: Option<StageFact> = session
+            .cached(
+                &world.fixture.worker,
+                "optimization.stage",
+                &fact.artifact_id,
+                &fact,
+            )
+            .await
+            .unwrap();
+        assert!(cached.is_none(), "{case}");
+        assert!(
+            session
+                .dependency_edges(&world.fixture.worker, "artifact", &fact.artifact_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{case}"
+        );
+        assert!(
+            session
+                .dependency_edges(
+                    &world.fixture.worker,
+                    "artifact",
+                    &inputs.artifact_id().unwrap()
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "{case}"
+        );
+        let after: Vec<Value> = session
+            .list(&world.fixture.worker, "artifact")
+            .await
+            .unwrap();
+        assert_eq!(
+            fingerprint(&after).unwrap(),
+            fingerprint(&before).unwrap(),
+            "{case}"
+        );
+        session.commit().await.unwrap();
+        assert_eq!(world.root().await, root, "{case}");
+        assert_eq!(world.provider_calls(), 0, "{case}");
+        assert_eq!(world.runner.calls.load(Ordering::SeqCst), 0, "{case}");
+        assert!(world.bound.lock().unwrap().is_empty(), "{case}");
+    }
 }

@@ -2,6 +2,8 @@
 //! observation gate, E12 consumption, and revocation. Real SQLite store,
 //! no model, no provider, zero monetary cost.
 
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use evo_core::curriculum::{CurriculumControlProfileV1, LearnerStateV2};
 use evo_core::evaluation::DataUse;
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
@@ -157,7 +159,12 @@ fn build_request(
         attempt: 1,
         manifest: control.manifest().unwrap(),
         parent_bundle_digest: d("parent-bundle"),
-        candidate_bundle_digest: d("candidate-bundle"),
+        candidate_bundle_digest: trusted_compiler_inputs::software_candidate(
+            NAMESPACE,
+            &control.environment_digest,
+            "registered development fixture",
+        )
+        .digest,
         environment_digest: control.environment_digest.clone(),
         grader_digest: control.grader_digest.clone(),
         rules_digest: control.rules_digest.clone(),
@@ -219,6 +226,20 @@ impl Fixture {
             CONTROL_ID,
             DevelopmentEvidenceScope::RegisteredPureFunctionExecution,
         );
+        let candidate = trusted_compiler_inputs::software_candidate(
+            NAMESPACE,
+            &control.environment_digest,
+            "registered development fixture",
+        );
+        trusted_compiler_inputs::persist_bundle(
+            &store,
+            NAMESPACE,
+            &candidate,
+            &control.environment_digest,
+            1,
+        )
+        .await
+        .unwrap();
         register_development_control(&admin, &store, control.clone())
             .await
             .unwrap();
@@ -265,6 +286,18 @@ impl Fixture {
         request: &DevelopmentRunRequest,
         report: &DevelopmentRunReport,
     ) -> (String, String) {
+        let mut session = self.store.session().await.unwrap();
+        let original = evo_engine::compiler::verify_bundle_in_session(
+            &mut session,
+            &self.admin,
+            &request.candidate_bundle_digest,
+            &request.environment_digest,
+            request.revoke_watermark,
+        )
+        .await
+        .unwrap();
+        session.commit().await.unwrap();
+        let inputs = evo_engine::model::CompilerInputUse::new(original.input, original.binding);
         let journal =
             StoreOptimizationJournal::new(self.store.clone(), self.admin.clone(), "admin").unwrap();
         let extras = vec![
@@ -289,6 +322,11 @@ impl Fixture {
                 id: "optstage-step-fixture".into(),
             },
         ];
+        let mut request_dependencies = extras.clone();
+        request_dependencies.push(StageDependency {
+            kind: "environment".into(),
+            id: request.environment_digest.clone(),
+        });
         let request_fact = StageFact {
             schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
             artifact_id: String::new(),
@@ -301,14 +339,20 @@ impl Fixture {
             request_id: request.request_id.clone(),
             input_digest: request.manifest.digest.clone(),
             output_digest: None,
-            dependencies: extras.clone(),
+            dependencies: request_dependencies,
             payload: serde_json::to_value(request).unwrap(),
         }
         .seal()
         .unwrap();
         let observed_fact = observed_fact(request, report, extras);
-        journal.commit(request_fact.clone()).await.unwrap();
-        journal.commit(observed_fact.clone()).await.unwrap();
+        journal
+            .commit_bound(request_fact.clone(), &inputs)
+            .await
+            .unwrap();
+        journal
+            .commit_bound(observed_fact.clone(), &inputs)
+            .await
+            .unwrap();
         (request_fact.artifact_id, observed_fact.artifact_id)
     }
 }
@@ -1625,4 +1669,169 @@ async fn ag054_public_receipt_clock_failure_after_begin_keeps_finalized_zero_cos
             .as_deref()
             .is_some_and(|reason| reason.starts_with("development_pre_dispatch_v1."))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registered_runner_rechecks_the_reserved_bundle_before_dispatch_without_a_watermark_change()
+{
+    for switch_pointer in [false, true] {
+        let fixture = Fixture::new().await;
+        let request = fixture.request();
+        let mut s = fixture.store.session().await.unwrap();
+        let original: evo_engine::compiler::AuthenticatedBundleRecord = s
+            .need(
+                &fixture.executor,
+                "artifact",
+                &format!("formal-bundle-{}", request.candidate_bundle_digest),
+            )
+            .await
+            .unwrap();
+        let watermark = s.watermark(&fixture.executor).await.unwrap();
+        s.commit().await.unwrap();
+        let paused = Arc::new(tokio::sync::Notify::new());
+        let clock_paused = paused.clone();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (resume, waiting) = std::sync::mpsc::channel();
+        let waiting = std::sync::Mutex::new(waiting);
+        let runner = RegisteredDevelopmentRunner::with_clock(
+            fixture.store.clone(),
+            fixture.executor.clone(),
+            fixture.grader.clone(),
+            CONTROL_ID,
+            600,
+            Arc::new(move || {
+                if reads.fetch_add(1, Ordering::SeqCst) == 1 {
+                    // The second clock read follows the committed reserve and
+                    // precedes the actual dispatch boundary. No target runs here.
+                    clock_paused.notify_one();
+                    if tokio::task::block_in_place(|| {
+                        waiting
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(30))
+                    })
+                    .is_err()
+                    {
+                        return -1;
+                    }
+                }
+                100
+            }),
+        )
+        .unwrap();
+        let running_request = request.clone();
+        let running = tokio::spawn(async move { runner.run(running_request).await });
+        tokio::time::timeout(std::time::Duration::from_secs(30), paused.notified())
+            .await
+            .unwrap();
+        let call_id = execution_budget_call_id(
+            &request.request_id,
+            &fixture.control.tasks[0].task_id,
+            DevelopmentSide::Parent,
+        )
+        .unwrap();
+        let mut s = fixture.store.session().await.unwrap();
+        let reserved = s
+            .budget_call(&fixture.admin, SCOPE, &call_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let was_reserved_without_dispatch =
+            reserved.state == BudgetCallState::Reserved && reserved.dispatch_id.is_none();
+        if switch_pointer {
+            let id = format!("profile-pointer-{}", original.input.profile.id);
+            let pointer = evo_engine::release_store::PersistentProfilePointer {
+                id: id.clone(),
+                schema_version: evo_engine::release_store::PROFILE_POINTER_SCHEMA.into(),
+                profile_id: original.input.profile.id.clone(),
+                active_release_id: None,
+                active_bundle_digest: None,
+                epoch: 1,
+            };
+            s.put(
+                &fixture.admin,
+                "pointer",
+                &id,
+                fixture.admin.actor(),
+                &pointer,
+            )
+            .await
+            .unwrap();
+            let operation = format!(
+                "formal.admin.content.v1.{}",
+                fingerprint(&(NAMESPACE, "pointer", &id)).unwrap()
+            );
+            let entity = fingerprint(&(
+                NAMESPACE,
+                "pointer",
+                &id,
+                evo_engine::formal_authority::content_digest(&pointer).unwrap(),
+            ))
+            .unwrap();
+            s.audit(&fixture.admin, &operation, &entity).await.unwrap();
+        }
+        let after_pointer_watermark = s.watermark(&fixture.admin).await.unwrap();
+        s.commit().await.unwrap();
+        resume.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            was_reserved_without_dispatch,
+            "fault placement must follow the real Reserved commit"
+        );
+        assert_eq!(after_pointer_watermark, watermark);
+        let call = fixture
+            .store
+            .budget_call(&fixture.admin, SCOPE, &call_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let root = fixture
+            .store
+            .root_budget(&fixture.admin, SCOPE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.reserved_micros, 0);
+        assert_eq!(root.spent_micros, 0);
+        if switch_pointer {
+            assert!(matches!(result, Err(Error::Conflict(ref message))
+                if message == "compiler authority changed before continuation"));
+            assert_eq!(call.state, BudgetCallState::Released);
+            assert_eq!(
+                call.terminal_reason.as_deref(),
+                Some("development_pre_dispatch_v1.compiler_inputs_changed")
+            );
+            assert_eq!(call.dispatch_id, None);
+            assert_eq!(call.actual_cost_micros, None);
+            let receipt_id = execution_receipt_id(
+                &request.request_id,
+                &fixture.control.tasks[0].task_id,
+                DevelopmentSide::Parent,
+            )
+            .unwrap();
+            assert!(matches!(
+                load_execution_receipt(&fixture.store, &fixture.executor, &receipt_id).await,
+                Err(Error::NotFound)
+            ));
+        } else {
+            let report = result.unwrap();
+            assert_eq!(
+                report.provenance,
+                DevelopmentExecutionProvenance::RegisteredPureFunction
+            );
+            assert_eq!(report.results.len(), fixture.control.tasks.len());
+            assert_eq!(
+                report.usage_record_ids.len(),
+                fixture.control.tasks.len() * 2
+            );
+            assert_eq!(call.state, BudgetCallState::Finalized);
+            assert_eq!(call.actual_cost_micros, Some(0));
+            assert!(call.execution_closed);
+            assert!(call.dispatch_id.is_some());
+        }
+        fixture.store.close().await;
+    }
 }

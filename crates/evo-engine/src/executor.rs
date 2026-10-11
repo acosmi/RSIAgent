@@ -6,6 +6,88 @@ use std::path::Path;
 
 pub const CODE_EXECUTION: &str = "disabled";
 
+/// Observed OS identity, constructed only by the trusted fixed runtime check.
+/// Role names and caller-provided PIDs cannot construct this capability.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ObservedProcessIdentity {
+    pub pid: u32,
+    pub uid: u32,
+    pub executable_digest: String,
+    pub workspace: String,
+}
+pub(crate) fn observe_registered_process(
+    uid: u32,
+    code: &str,
+    workspace: &str,
+) -> Result<ObservedProcessIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::fs::canonicalize(workspace).map_err(|_| Error::Forbidden)?;
+    let cwd = std::env::current_dir().map_err(|_| Error::Internal)?;
+    let metadata = std::fs::metadata(&path).map_err(|_| Error::Forbidden)?;
+    if cwd != path || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(Error::Forbidden);
+    }
+    // Fixed platform utility; no shell or candidate-controlled executable.
+    let observed = std::process::Command::new("/usr/bin/id")
+        .arg("-u")
+        .env_clear()
+        .output()
+        .map_err(|_| Error::Internal)?;
+    if !observed.status.success() {
+        return Err(Error::Forbidden);
+    }
+    let observed_uid: u32 = std::str::from_utf8(&observed.stdout)
+        .map_err(|_| Error::Internal)?
+        .trim()
+        .parse()
+        .map_err(|_| Error::Internal)?;
+    let executable = std::env::current_exe().map_err(|_| Error::Internal)?;
+    let bytes = std::fs::read(executable).map_err(|_| Error::Internal)?;
+    let actual_digest = evo_core::hash(&bytes);
+    if observed_uid != uid || actual_digest != code {
+        return Err(Error::Forbidden);
+    }
+    Ok(ObservedProcessIdentity {
+        pid: std::process::id(),
+        uid,
+        executable_digest: actual_digest,
+        workspace: path.to_string_lossy().into_owned(),
+    })
+}
+
+/// Kernel peer credentials are obtained from the connected Unix socket. No
+/// JSON field, Role, actor alias, PID or environment variable can mint this.
+#[derive(Debug, Clone)]
+pub(crate) struct ObservedPeerIdentity {
+    uid: u32,
+    gid: u32,
+    pid: Option<u32>,
+}
+impl ObservedPeerIdentity {
+    pub(crate) fn uid(&self) -> u32 {
+        self.uid
+    }
+    pub(crate) fn gid(&self) -> u32 {
+        self.gid
+    }
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+}
+pub(crate) fn observe_kernel_peer(stream: &tokio::net::UnixStream) -> Result<ObservedPeerIdentity> {
+    let cred = stream.peer_cred().map_err(|_| Error::Forbidden)?;
+    let pid = cred
+        .pid()
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| Error::Forbidden)?;
+    Ok(ObservedPeerIdentity {
+        uid: cred.uid(),
+        gid: cred.gid(),
+        pid,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetPhase {

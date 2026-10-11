@@ -1,3 +1,5 @@
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use async_trait::async_trait;
 use evo_core::contract::{
     CapabilityLevel, HostCapabilities, HostSurfaceManifest, ImproverPatch, Profile, SkillSnapshot,
@@ -31,7 +33,7 @@ use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentTask, OptimizationJournal,
     OptimizationJournalStage, OptimizationStepRequest, PairedTaskResult, StageDependency,
-    StageFact, StageFactKind, StoreOptimizationJournal,
+    StageFact, StageFactKind,
 };
 use evo_engine::release_store::{PrepareRunRequest, ReleaseStore, TrustedHostExecutionEvidence};
 use evo_storage::Store;
@@ -43,6 +45,7 @@ use evo_storage::lifecycle::{LifecycleStore, TypedObjectRef};
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use trusted_compiler_inputs::StoreOptimizationJournal;
 
 fn d(value: &str) -> String {
     hash(value.as_bytes())
@@ -430,6 +433,17 @@ async fn stage_report(
     .seal()
     .unwrap();
     let id = fact.artifact_id.clone();
+    if forbidden_dependency {
+        // Explicit corrupt persisted input for the monitoring refusal probe.
+        // Current stage admission correctly refuses this unknown dependency.
+        let mut session = store.session().await.unwrap();
+        session
+            .put(worker, "artifact", &id, worker.actor(), &fact)
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        return id;
+    }
     StoreOptimizationJournal::new(store.clone(), worker.clone(), worker.actor())
         .unwrap()
         .commit(fact)
@@ -457,6 +471,16 @@ impl Default for CountingModelPort {
 
 #[async_trait]
 impl ModelPort for CountingModelPort {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, _request: ModelRequest) -> evo_core::Result<ModelResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Err(Error::Conflict("model must not be dispatched".into()))
@@ -481,6 +505,16 @@ struct RevokingModelPort {
 
 #[async_trait]
 impl ModelPort for RevokingModelPort {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> evo_core::Result<ModelResponse> {
         let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
         if attempt > 0 {
@@ -575,6 +609,39 @@ struct FailAfterStoreJournal<'a> {
 
 #[async_trait]
 impl OptimizationJournal for FailAfterStoreJournal<'_> {
+    async fn commit_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<()> {
+        let index = self.commits.fetch_add(1, Ordering::SeqCst);
+        if index == self.fail_on_commit {
+            return Err(Error::NotFound);
+        }
+        self.inner.commit_bound(fact, inputs).await
+    }
+    async fn claim_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<bool> {
+        self.inner.claim_bound(fact, inputs).await
+    }
+    async fn lookup_bound(
+        &self,
+        artifact_id: &str,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> evo_core::Result<Option<StageFact>> {
+        self.inner.lookup_bound(artifact_id, inputs).await
+    }
+
+    async fn compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::VerifiedCompilerInputs> {
+        self.inner.compiler_inputs(request).await
+    }
+
     async fn commit(&self, fact: StageFact) -> evo_core::Result<()> {
         let index = self.commits.fetch_add(1, Ordering::SeqCst);
         if index == self.fail_on_commit {
@@ -1005,60 +1072,62 @@ async fn real_e03_no_change_and_zero_budget_paths_never_dispatch_or_write_active
     .unwrap();
     let model = CountingModelPort::default();
     let runner = CountingDevRunner::default();
-    let make_request = |claim_id: &str, sequence: u32| OptimizationStepRequest {
-        evidence: &evidence,
-        source_selection: &selection,
-        source_bindings: &bindings,
-        traces: vec![],
-        model_context: ModelRequestContext {
-            request_id: format!("consolidation-request-{sequence}"),
-            namespace: "tenant".into(),
-            purpose: Purpose::Development,
-            stage: ModelStage::Consolidate,
-            episode_id: claim_id.into(),
-            step: sequence,
-            attempt: 1,
-            parent_skill_digest: fixture.parent_skill_digest.clone(),
-            bundle_digest: fixture.parent_bundle_digest.clone(),
-            source_closure: allowed.clone(),
-            model_digest: d("fixture-model"),
-            tools_digest: d("tools"),
-            rules_digest: d("rules"),
-            sampling_digest: d("sampling"),
-            revoke_watermark: 1,
-            max_suggestions: 4,
-        },
-        parent_skill: &fixture.parent_skill,
-        edit_context: &edit_context,
-        edit_batch_template: edit_template.clone(),
-        protected_ranges: &[],
-        bundle_context: BundleCompileContext {
-            profile: &profile,
-            baseline: &baseline,
-            parent_strategy: &parent_strategy,
-            baseline_strategy: &baseline_strategy,
-            improver_patch: &improver_patch,
-            caps: &caps,
-            revoked: &revoked,
-        },
-        development_request: DevelopmentRunRequest {
-            request_id: format!("consolidation-development-{sequence}"),
-            namespace: "tenant".into(),
-            purpose: Purpose::Development,
-            episode_id: claim_id.into(),
-            step: sequence,
-            attempt: 1,
-            manifest: fixture.manifest.clone(),
-            parent_bundle_digest: fixture.parent_bundle_digest.clone(),
-            candidate_bundle_digest: d(&format!("candidate-{sequence}")),
-            environment_digest: fixture.environment.environment.environment_digest.clone(),
-            grader_digest: fixture.grader_digest.clone(),
-            rules_digest: d("rules"),
-            tools_digest: d("tools"),
-            revoke_watermark: 1,
-            idempotency_key: format!("consolidation-idempotency-{sequence}"),
-        },
-        allow_rank_call: false,
+    let make_request = |claim_id: &str, sequence: u32| {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
+            evidence: &evidence,
+            source_selection: &selection,
+            source_bindings: &bindings,
+            traces: vec![],
+            model_context: ModelRequestContext {
+                request_id: format!("consolidation-request-{sequence}"),
+                namespace: "tenant".into(),
+                purpose: Purpose::Development,
+                stage: ModelStage::Consolidate,
+                episode_id: claim_id.into(),
+                step: sequence,
+                attempt: 1,
+                parent_skill_digest: fixture.parent_skill_digest.clone(),
+                bundle_digest: fixture.parent_bundle_digest.clone(),
+                source_closure: allowed.clone(),
+                model_digest: d("fixture-model"),
+                tools_digest: d("tools"),
+                rules_digest: d("rules"),
+                sampling_digest: d("sampling"),
+                revoke_watermark: 1,
+                max_suggestions: 4,
+            },
+            parent_skill: &fixture.parent_skill,
+            edit_context: &edit_context,
+            edit_batch_template: edit_template.clone(),
+            protected_ranges: &[],
+            bundle_context: BundleCompileContext {
+                profile: &profile,
+                baseline: &baseline,
+                parent_strategy: &parent_strategy,
+                baseline_strategy: &baseline_strategy,
+                improver_patch: &improver_patch,
+                caps: &caps,
+                revoked: &revoked,
+            },
+            development_request: DevelopmentRunRequest {
+                request_id: format!("consolidation-development-{sequence}"),
+                namespace: "tenant".into(),
+                purpose: Purpose::Development,
+                episode_id: claim_id.into(),
+                step: sequence,
+                attempt: 1,
+                manifest: fixture.manifest.clone(),
+                parent_bundle_digest: fixture.parent_bundle_digest.clone(),
+                candidate_bundle_digest: d(&format!("candidate-{sequence}")),
+                environment_digest: fixture.environment.environment.environment_digest.clone(),
+                grader_digest: fixture.grader_digest.clone(),
+                rules_digest: d("rules"),
+                tools_digest: d("tools"),
+                revoke_watermark: 1,
+                idempotency_key: format!("consolidation-idempotency-{sequence}"),
+            },
+            allow_rank_call: false,
+        })
     };
     let wrong_model = CountingModelPort {
         calls: AtomicUsize::new(0),

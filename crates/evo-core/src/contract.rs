@@ -530,6 +530,159 @@ fn apply_leaf<T: Clone + Serialize>(
     Ok(value)
 }
 
+/// Replays a v2 bundle against the complete authenticated P/B values. The
+/// caller supplies authority; this function proves the deterministic value
+/// contract and never grants Store, release or model authority.
+pub fn replay_resolved_bundle(
+    bundle: &ResolvedBundle,
+    parent: &SkillSnapshot,
+    baseline: &SkillSnapshot,
+    parent_strategy: &Strategy,
+    baseline_strategy: &Strategy,
+    caps: &HostCapabilities,
+    revoked: &BTreeSet<String>,
+) -> Result<()> {
+    let mut origins = BTreeMap::new();
+    for origin in &bundle.origins {
+        if origins.insert(origin.field.as_str(), origin).is_some() {
+            return Err(Error::Conflict("duplicate bundle origin".into()));
+        }
+    }
+    const FIELDS: [&str; 8] = [
+        "skill.content",
+        "skill.applicability",
+        "skill.counterexample",
+        "skill.required_capabilities",
+        "skill.dependencies",
+        "improver.instruction",
+        "improver.max_candidates",
+        "improver.max_rounds",
+    ];
+    if origins.len() != FIELDS.len() || FIELDS.iter().any(|field| !origins.contains_key(field)) {
+        return Err(Error::Invalid(
+            "bundle requires exactly eight known origins".into(),
+        ));
+    }
+    fn leaf<T: Clone>(
+        origin: &ValueOrigin,
+        value: &T,
+        parent: &str,
+        baseline: &str,
+    ) -> Result<PatchOp<T>> {
+        match (
+            origin.layer,
+            origin.op.as_str(),
+            origin.source_digest.as_str(),
+        ) {
+            (OriginLayer::Parent, "inherit", source) if source == parent => Ok(PatchOp::Inherit),
+            (OriginLayer::Baseline, "reset_to_baseline", source) if source == baseline => {
+                Ok(PatchOp::ResetToBaseline)
+            }
+            (OriginLayer::Explicit, "set", "set") => Ok(PatchOp::Set {
+                value: value.clone(),
+            }),
+            _ => Err(Error::Conflict(
+                "origin operation/source/layer mismatch".into(),
+            )),
+        }
+    }
+    let p = bundle.parent_digest.as_str();
+    let b = bundle.baseline_digest.as_str();
+    let skill_patch = SkillPatch {
+        content: leaf(origins["skill.content"], &bundle.skill.content, p, b)?,
+        applicability: leaf(
+            origins["skill.applicability"],
+            &bundle.skill.applicability,
+            p,
+            b,
+        )?,
+        counterexample: leaf(
+            origins["skill.counterexample"],
+            &bundle.skill.counterexample,
+            p,
+            b,
+        )?,
+        required_capabilities: leaf(
+            origins["skill.required_capabilities"],
+            &bundle.skill.required_capabilities,
+            p,
+            b,
+        )?,
+        dependencies: leaf(
+            origins["skill.dependencies"],
+            &bundle.skill.dependencies,
+            p,
+            b,
+        )?,
+    };
+    let improver_patch = ImproverPatch {
+        instruction: leaf(
+            origins["improver.instruction"],
+            &bundle.improver.instruction,
+            p,
+            b,
+        )?,
+        max_candidates: leaf(
+            origins["improver.max_candidates"],
+            &bundle.improver.max_candidates,
+            p,
+            b,
+        )?,
+        max_rounds: leaf(
+            origins["improver.max_rounds"],
+            &bundle.improver.max_rounds,
+            p,
+            b,
+        )?,
+    };
+    let rebuilt = compile_bundle(CompileParts {
+        profile: &Profile {
+            id: bundle.profile_id.clone(),
+            evolution_enabled: true,
+            parent_digest: p.into(),
+            baseline_digest: b.into(),
+        },
+        parent,
+        baseline,
+        parent_strategy,
+        baseline_strategy,
+        skill_patch: &skill_patch,
+        improver_patch: &improver_patch,
+        caps,
+        revoked,
+    })?;
+    if fingerprint(&rebuilt)? != fingerprint(bundle)? {
+        return Err(Error::Conflict("complete bundle replay differs".into()));
+    }
+    Ok(())
+}
+
+/// Re-express a complete edit of a search parent relative to authenticated P.
+/// Untouched search-parent fields are preserved, including references.
+pub fn rebase_skill_patch(parent: &SkillSnapshot, desired: &SkillSnapshot) -> Result<SkillPatch> {
+    parent.validate()?;
+    desired.validate()?;
+    fn op<T: Clone + PartialEq>(parent: &T, desired: &T) -> PatchOp<T> {
+        if parent == desired {
+            PatchOp::Inherit
+        } else {
+            PatchOp::Set {
+                value: desired.clone(),
+            }
+        }
+    }
+    Ok(SkillPatch {
+        content: op(&parent.content, &desired.content),
+        applicability: op(&parent.applicability, &desired.applicability),
+        counterexample: op(&parent.counterexample, &desired.counterexample),
+        required_capabilities: op(
+            &parent.required_capabilities,
+            &desired.required_capabilities,
+        ),
+        dependencies: op(&parent.dependencies, &desired.dependencies),
+    })
+}
+
 pub fn project_run(
     bundle: &ResolvedBundle,
     snapshot: &SystemSnapshot,

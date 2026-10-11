@@ -59,6 +59,8 @@
 //! (`exercise_late_revocation`: its hand-written tombstone is the unreadable one
 //! above, so the late `DispatchObserved` it checks is now the redacted object).
 
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use async_trait::async_trait;
 use evo_core::contract::{HostCapabilities, ImproverPatch, Profile, SkillSnapshot};
 use evo_core::evidence::{
@@ -90,7 +92,7 @@ use evo_engine::optimization::{
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentTask, OPTIMIZATION_STAGE_FACT_SCHEMA,
     OptimizationJournal, OptimizationJournalStage, OptimizationStepOutcome,
     OptimizationStepRequest, PairedTaskResult, StageDependency, StageFact, StageFactKind,
-    StoreOptimizationJournal, SuggestionOutcome, run_optimization_step,
+    SuggestionOutcome, run_optimization_step,
 };
 use evo_storage::Store;
 use evo_storage::budget::{BudgetCallState, RootBudgetAuthorization};
@@ -102,6 +104,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use trusted_compiler_inputs::StoreOptimizationJournal;
 
 const NAMESPACE: &str = "n";
 const SCOPE: &str = "scope-1";
@@ -371,7 +374,7 @@ impl Fixture {
         episode: &str,
         tag: &str,
     ) -> OptimizationStepRequest<'a> {
-        OptimizationStepRequest {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
             evidence: &self.evidence,
             source_selection: &self.source_selection,
             source_bindings: &self.bindings,
@@ -444,7 +447,7 @@ impl Fixture {
                 idempotency_key: format!("dev-idempotency-{tag}"),
             },
             allow_rank_call: false,
-        }
+        })
     }
 }
 
@@ -519,6 +522,16 @@ impl MarkerModel {
 
 #[async_trait]
 impl ModelPort for MarkerModel {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.0.fetch_add(1, Ordering::SeqCst);
         let output = suggestions_output(&request)?;
@@ -713,6 +726,16 @@ impl<M> InFlightModel<M> {
 
 #[async_trait]
 impl<M: ModelPort> ModelPort for InFlightModel<M> {
+    // This is an explicit deterministic fixture adapter. Its receipts retain
+    // Fixture provenance; the production broker verifies the full use itself.
+    async fn dispatch_bound(
+        &self,
+        request: evo_engine::model::BoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let first = {
             let mut requests = self.requests.lock().unwrap();
@@ -797,6 +820,51 @@ impl RecordingJournal {
 
 #[async_trait]
 impl OptimizationJournal for RecordingJournal {
+    async fn commit_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> Result<()> {
+        let mut fact = fact;
+        fact.dependencies
+            .push(dep("artifact", &inputs.artifact_id()?));
+        fact.dependencies
+            .sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+        fact.dependencies
+            .dedup_by(|a, b| a.kind == b.kind && a.id == b.id);
+        self.given.lock().unwrap().push(fact.clone());
+        self.inner.commit_bound(fact, inputs).await
+    }
+    async fn claim_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> Result<bool> {
+        let mut fact = fact;
+        fact.dependencies
+            .push(dep("artifact", &inputs.artifact_id()?));
+        fact.dependencies
+            .sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+        fact.dependencies
+            .dedup_by(|a, b| a.kind == b.kind && a.id == b.id);
+        self.given.lock().unwrap().push(fact.clone());
+        self.inner.claim_bound(fact, inputs).await
+    }
+    async fn lookup_bound(
+        &self,
+        artifact_id: &str,
+        inputs: &evo_engine::model::CompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        self.inner.lookup_bound(artifact_id, inputs).await
+    }
+
+    async fn compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::VerifiedCompilerInputs> {
+        self.inner.compiler_inputs(request).await
+    }
+
     async fn commit(&self, fact: StageFact) -> Result<()> {
         self.given.lock().unwrap().push(fact.clone());
         self.inner.commit(fact).await

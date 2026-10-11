@@ -14,6 +14,7 @@ pub mod evaluator;
 pub mod evidence;
 pub mod executor;
 pub mod exploration;
+pub mod formal_authority;
 pub mod groups;
 pub mod hosts;
 pub mod import;

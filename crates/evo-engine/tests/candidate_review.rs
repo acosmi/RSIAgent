@@ -1,8 +1,11 @@
 //! Head-only stored-review acceptance; the old-API HTTP parent baseline is
 //! separately preserved by ROOT. All writes below are isolated fixture setup.
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
+
 use evo_core::contract::{
     CompileParts, HostCapabilities, ImproverPatch, Profile, ResolvedBundle, SkillPatch,
-    SkillSnapshot, compile_bundle,
+    SkillSnapshot,
 };
 use evo_core::evaluation::{
     ControlCondition, ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec,
@@ -120,6 +123,21 @@ struct MaterialFixture {
     candidate: ReleaseCandidateRecord,
 }
 async fn material_fixture(parent: SkillSnapshot) -> MaterialFixture {
+    let baseline = SkillSnapshot {
+        content: "Safe baseline rule".into(),
+        applicability: "Safe baseline applies".into(),
+        counterexample: "Safe baseline counterexample".into(),
+        required_capabilities: parent.required_capabilities.clone(),
+        dependencies: parent.dependencies.clone(),
+    };
+    material_fixture_with_inputs(parent, baseline, Strategy::default(), Strategy::default()).await
+}
+async fn material_fixture_with_inputs(
+    parent: SkillSnapshot,
+    baseline: SkillSnapshot,
+    parent_strategy: Strategy,
+    baseline_strategy: Strategy,
+) -> MaterialFixture {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("stored-review.sqlite3");
     let store = Store::open(&db_path).await.unwrap();
@@ -131,6 +149,13 @@ async fn material_fixture(parent: SkillSnapshot) -> MaterialFixture {
     ];
     for authority in &sources {
         store_trace_authority(&store, &host, authority)
+            .await
+            .unwrap();
+    }
+    // Search-parent dependency labels are real trusted content reads under the
+    // new compiler contract, including the oversized projection control.
+    for id in &parent.dependencies {
+        store_trace_authority(&store, &host, &source(id, "registered compiler dependency"))
             .await
             .unwrap();
     }
@@ -149,29 +174,35 @@ async fn material_fixture(parent: SkillSnapshot) -> MaterialFixture {
         parent_digest: d("declared-parent"),
         baseline_digest: d("declared-baseline"),
     };
-    let baseline = SkillSnapshot {
-        content: "Safe baseline rule".into(),
-        applicability: "Safe baseline applies".into(),
-        counterexample: "Safe baseline counterexample".into(),
-        required_capabilities: parent.required_capabilities.clone(),
-        dependencies: parent.dependencies.clone(),
-    };
     let caps = HostCapabilities {
         available: parent.required_capabilities.iter().cloned().collect(),
         granted: parent.required_capabilities.iter().cloned().collect(),
     };
-    let bundle = compile_bundle(CompileParts {
-        profile: &profile,
-        parent: &parent,
-        baseline: &baseline,
-        parent_strategy: &Strategy::default(),
-        baseline_strategy: &Strategy::default(),
-        skill_patch: &SkillPatch::default(),
-        improver_patch: &ImproverPatch::default(),
-        caps: &caps,
-        revoked: &BTreeSet::new(),
-    })
+    let bundle = trusted_compiler_inputs::bundle(
+        CompileParts {
+            profile: &profile,
+            parent: &parent,
+            baseline: &baseline,
+            parent_strategy: &parent_strategy,
+            baseline_strategy: &baseline_strategy,
+            skill_patch: &SkillPatch::default(),
+            improver_patch: &ImproverPatch::default(),
+            caps: &caps,
+            revoked: &BTreeSet::new(),
+        },
+        NS,
+        &d("environment"),
+    )
     .unwrap();
+    let profile = Profile {
+        id: bundle.profile_id.clone(),
+        evolution_enabled: true,
+        parent_digest: bundle.parent_digest.clone(),
+        baseline_digest: bundle.baseline_digest.clone(),
+    };
+    trusted_compiler_inputs::install_bundle(&store, &bundle)
+        .await
+        .unwrap();
     let proposer = ctx("proposer", Role::Worker);
     let candidate = ReleaseStore::stage_bundle(
         &proposer,
@@ -203,8 +234,8 @@ async fn material_fixture(parent: SkillSnapshot) -> MaterialFixture {
         profile,
         parent,
         baseline,
-        parent_strategy: Strategy::default(),
-        baseline_strategy: Strategy::default(),
+        parent_strategy,
+        baseline_strategy,
         caps,
         sources,
         candidate,
@@ -359,6 +390,56 @@ fn fact(
     .unwrap()
 }
 async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> EditFixture {
+    let incumbent = trusted_compiler_inputs::bundle(
+        CompileParts {
+            profile: &fixture.profile,
+            parent: &fixture.parent,
+            baseline: &fixture.baseline,
+            parent_strategy: &fixture.parent_strategy,
+            baseline_strategy: &fixture.baseline_strategy,
+            skill_patch: &SkillPatch::default(),
+            improver_patch: &ImproverPatch::default(),
+            caps: &fixture.caps,
+            revoked: &BTreeSet::new(),
+        },
+        NS,
+        &d("environment"),
+    )
+    .unwrap();
+    trusted_compiler_inputs::install_bundle(&fixture.store, &incumbent)
+        .await
+        .unwrap();
+    let profile = Profile {
+        id: incumbent.profile_id.clone(),
+        evolution_enabled: true,
+        parent_digest: incumbent.parent_digest.clone(),
+        baseline_digest: incumbent.baseline_digest.clone(),
+    };
+    let compiler_request = evo_engine::formal_authority::CompilerInputRequest {
+        profile: profile.clone(),
+        search_parent: fixture.parent.clone(),
+        baseline: fixture.baseline.clone(),
+        search_parent_strategy: fixture.parent_strategy.clone(),
+        expected_parent_strategy_digest: None,
+        baseline_strategy: fixture.baseline_strategy.clone(),
+        capabilities: fixture.caps.clone(),
+        environment_digest: d("environment"),
+        purpose: Purpose::Development,
+        revoke_watermark: 1,
+    };
+    let mut session = fixture.store.session().await.unwrap();
+    let verified = evo_engine::formal_authority::resolve_compiler_inputs(
+        &mut session,
+        &fixture.admin,
+        &compiler_request,
+    )
+    .await
+    .unwrap();
+    let compiler_use = evo_engine::model::CompilerInputUse::new(
+        compiler_request.clone(),
+        verified.binding().clone(),
+    );
+    session.commit().await.unwrap();
     let source_refs: Vec<_> = fixture
         .sources
         .iter()
@@ -413,11 +494,11 @@ async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> Edit
     session.commit().await.unwrap();
     let trusted = TrustedEditContext::new(
         NS,
-        &fixture.profile.id,
+        &profile.id,
         "skill-review",
         "v1",
-        &fixture.profile.parent_digest,
-        &fixture.profile.baseline_digest,
+        &profile.parent_digest,
+        &profile.baseline_digest,
         &fixture.parent,
         source_refs.clone(),
     )
@@ -426,12 +507,12 @@ async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> Edit
         schema_version: SKILL_EDIT_SCHEMA.into(),
         compiler_version: SKILL_EDIT_COMPILER_VERSION.into(),
         namespace: NS.into(),
-        profile_id: fixture.profile.id.clone(),
+        profile_id: profile.id.clone(),
         skill_id: "skill-review".into(),
         skill_version: "v1".into(),
         input_digest: skill_snapshot_digest(&fixture.parent).unwrap(),
-        approved_parent_digest: fixture.profile.parent_digest.clone(),
-        safe_baseline_digest: fixture.profile.baseline_digest.clone(),
+        approved_parent_digest: profile.parent_digest.clone(),
+        safe_baseline_digest: profile.baseline_digest.clone(),
         evidence: EvidenceClosure {
             support: vec![],
             counterexamples: vec![],
@@ -448,7 +529,7 @@ async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> Edit
         step: 1,
         attempt: 1,
         parent_skill_digest: template.input_digest.clone(),
-        bundle_digest: d("incumbent-bundle"),
+        bundle_digest: incumbent.digest.clone(),
         source_closure: source_refs.clone(),
         model_digest: d("model"),
         tools_digest: d("tools"),
@@ -482,16 +563,23 @@ async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> Edit
         revoke_watermark: 1,
         idempotency_key: "dev-idempotency".into(),
     };
-    let prepared_payload = json!({"evidence":evidence,"selection":selection,
+    let mut prepared_payload = json!({"evidence":evidence,"selection":selection,
         "bindings":fixture.sources.iter().map(|s| (&s.record.id,&s.trace.source_digest,&s.record.parent_family)).collect::<Vec<_>>(),
         "traces":fixture.sources.iter().map(|s| s.trace.clone()).collect::<Vec<_>>(),"context":context,"parent":fixture.parent,
-        "trusted_edit_context":format!("{trusted:?}"),"edit_template":template,"protected_ranges":"[]","profile":fixture.profile,
+        "trusted_edit_context":format!("{trusted:?}"),"edit_template":template,"protected_ranges":"[]","profile":profile,
         "baseline":fixture.baseline,"parent_strategy":fixture.parent_strategy,"baseline_strategy":fixture.baseline_strategy,
         "improver":ImproverPatch::default(),"caps":fixture.caps,"revoked":BTreeSet::<String>::new(),"development":development,"allow_rank":false});
+    let input_digest = fingerprint(&(
+        fingerprint(&prepared_payload).unwrap(),
+        &compiler_use.binding,
+    ))
+    .unwrap();
+    prepared_payload["compiler_request"] = serde_json::to_value(&compiler_request).unwrap();
+    prepared_payload["compiler_binding"] = serde_json::to_value(&compiler_use.binding).unwrap();
     let prepared = fact(
         StageFactKind::StepPrepared,
         OptimizationJournalStage::Merge,
-        fingerprint(&prepared_payload).unwrap(),
+        input_digest,
         dependencies(fixture, &grant_id, None),
         prepared_payload,
     );
@@ -501,7 +589,15 @@ async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> Edit
         fixture.admin.actor(),
     )
     .unwrap();
-    journal.commit(prepared.clone()).await.unwrap();
+    journal
+        .commit_bound(prepared.clone(), &compiler_use)
+        .await
+        .unwrap();
+    let prepared = journal
+        .lookup_bound(&prepared.artifact_id, &compiler_use)
+        .await
+        .unwrap()
+        .unwrap();
     let selected: Vec<_> = (0..edits.len())
         .map(|i| format!("suggestion-{i}"))
         .collect();
@@ -523,19 +619,10 @@ async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> Edit
     batch.edits = merged.edits.clone();
     // The existing compiler runs in fixture setup, never inside review.
     let compiled = compile_skill_edit_batch(&fixture.parent, &trusted, &batch, &[]).unwrap();
-    let bundle = compile_bundle(CompileParts {
-        profile: &fixture.profile,
-        parent: &fixture.parent,
-        baseline: &fixture.baseline,
-        parent_strategy: &fixture.parent_strategy,
-        baseline_strategy: &fixture.baseline_strategy,
-        skill_patch: &compiled.patch,
-        improver_patch: &ImproverPatch::default(),
-        caps: &fixture.caps,
-        revoked: &BTreeSet::new(),
-    })
-    .unwrap();
-    let payload = json!({"output":compiled.output,"patch":compiled.patch,"report":compiled.report,"bundle":bundle,"merge":merged});
+    let bundle = verified
+        .compile_search_edit(&compiled.output, &ImproverPatch::default())
+        .unwrap();
+    let payload = json!({"output":compiled.output,"patch":compiled.patch,"report":compiled.report,"bundle":bundle,"merge":merged,"compiler_request":compiler_request,"compiler_binding":compiler_use.binding});
     let compiled = fact(
         StageFactKind::EditCompiled,
         OptimizationJournalStage::EditCompile,
@@ -543,7 +630,15 @@ async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> Edit
         dependencies(fixture, &grant_id, Some(&prepared.artifact_id)),
         payload,
     );
-    journal.commit(compiled.clone()).await.unwrap();
+    journal
+        .commit_bound(compiled.clone(), &compiler_use)
+        .await
+        .unwrap();
+    let compiled = journal
+        .lookup_bound(&compiled.artifact_id, &compiler_use)
+        .await
+        .unwrap()
+        .unwrap();
     EditFixture {
         prepared,
         compiled,
@@ -1052,7 +1147,9 @@ async fn scope_pb_span_digest_and_output_corruption_never_yield_a_complete_diff(
         assert!(response.payload.is_none());
         assert!(
             response.gaps.contains(&ReviewGap::MaterialInvalid)
-                || response.gaps.contains(&ReviewGap::UnsupportedSchema)
+                || response.gaps.contains(&ReviewGap::UnsupportedSchema),
+            "corruption {corruption} produced gaps {:?}",
+            response.gaps
         );
     }
 }
@@ -1294,10 +1391,17 @@ async fn support_limit_refuses_the_whole_recipe_without_truncation() {
     large_projection.dependencies = (0..32)
         .map(|i| format!("dependency-{i:02}-{}", "x".repeat(100)))
         .collect();
-    let mut fixture = material_fixture(large_projection.clone()).await;
-    fixture.baseline = large_projection;
-    fixture.parent_strategy.instruction = "\"".repeat(8192);
-    fixture.baseline_strategy = fixture.parent_strategy.clone();
+    let strategy = Strategy {
+        instruction: "\"".repeat(8192),
+        ..Strategy::default()
+    };
+    let fixture = material_fixture_with_inputs(
+        large_projection.clone(),
+        large_projection,
+        strategy.clone(),
+        strategy,
+    )
+    .await;
     let stored = seed_edit(
         &fixture,
         vec![edit(
@@ -1539,9 +1643,17 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
         .await
         .unwrap();
 
-    // The candidate pair binds the actual E01 snapshot, not an arbitrary label.
-    let pair =
-        FrozenCandidatePair::new(v1.digest().unwrap(), d("candidate"), d("baseline"), 3).unwrap();
+    // The historical ticket remains unbound; subsequent software execution
+    // still needs a real, registered candidate with the frozen pair identity.
+    let candidate =
+        trusted_compiler_inputs::software_candidate(NS, &d("environment"), "candidate-bundle");
+    let pair = FrozenCandidatePair::new(
+        v1.digest().unwrap(),
+        d("candidate"),
+        candidate.parent_digest.clone(),
+        3,
+    )
+    .unwrap();
     let sequential_mode = match &early {
         Some(plan) => SequentialMode::RejectOnly {
             early_stop_plan_digest: plan.digest().unwrap(),
@@ -1604,7 +1716,7 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
         registration_id: "control-1".into(),
         pair,
         manifest,
-        candidate_bundle_digest: d("candidate-bundle"),
+        candidate_bundle_digest: candidate.digest.clone(),
         baseline_bundle_digest: d("baseline-bundle"),
         rotating_inputs,
         anchor_inputs,
@@ -1622,6 +1734,39 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
             registration_id: "control-1".into(),
             holdout_id: "holdout-1".into(),
             issued_at_unix_seconds: 5,
+        },
+    )
+    .await
+    .unwrap();
+    let host = ctx("host", Role::Host);
+    let authority = source("formal-fixture-source", "formal fixture development source");
+    store_trace_authority(&store, &host, &authority)
+        .await
+        .unwrap();
+    let mut session = store.session().await.unwrap();
+    let watermark = session
+        .bump_watermark(&admin, &d("formal-fixture-watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    trusted_compiler_inputs::install_bundle(&store, &candidate)
+        .await
+        .unwrap();
+    let proposer = ctx("proposer", Role::Worker);
+    ReleaseStore::stage_bundle(
+        &proposer,
+        &store,
+        StageBundleRequest {
+            candidate_id: holdout.pair.candidate_digest.clone(),
+            bundle: candidate,
+            environment_digest: holdout.manifest.environment_digest.clone(),
+            proposer_actor: proposer.actor().into(),
+            sources: vec![TypedSourceRef {
+                kind: "run".into(),
+                id: authority.record.id,
+                content_digest: authority.trace.source_digest,
+            }],
+            revoke_watermark: watermark as u64,
         },
     )
     .await

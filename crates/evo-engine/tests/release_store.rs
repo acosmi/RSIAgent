@@ -1,6 +1,8 @@
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
 use evo_core::contract::{
     CapabilityLevel, CompileParts, HostCapabilities, HostSurfaceManifest, ImproverPatch, Profile,
-    SkillPatch, SkillSnapshot, SurfaceCoverage, SurfaceItem, SystemSnapshot, compile_bundle,
+    SkillPatch, SkillSnapshot, SurfaceCoverage, SurfaceItem, SystemSnapshot,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
@@ -36,20 +38,24 @@ fn bundle(profile_id: &str, content: &str) -> evo_core::contract::ResolvedBundle
         required_capabilities: vec![],
         dependencies: vec![],
     };
-    compile_bundle(CompileParts {
-        profile: &profile,
-        parent: &parent,
-        baseline: &SkillSnapshot::empty(),
-        parent_strategy: &Strategy::default(),
-        baseline_strategy: &Strategy::default(),
-        skill_patch: &SkillPatch::default(),
-        improver_patch: &ImproverPatch::default(),
-        caps: &HostCapabilities {
-            available: BTreeSet::new(),
-            granted: BTreeSet::new(),
+    trusted_compiler_inputs::bundle(
+        CompileParts {
+            profile: &profile,
+            parent: &parent,
+            baseline: &SkillSnapshot::empty(),
+            parent_strategy: &Strategy::default(),
+            baseline_strategy: &Strategy::default(),
+            skill_patch: &SkillPatch::default(),
+            improver_patch: &ImproverPatch::default(),
+            caps: &HostCapabilities {
+                available: BTreeSet::new(),
+                granted: BTreeSet::new(),
+            },
+            revoked: &BTreeSet::new(),
         },
-        revoked: &BTreeSet::new(),
-    })
+        "n",
+        &system("p1").digest().unwrap(),
+    )
     .unwrap()
 }
 
@@ -110,6 +116,9 @@ fn authority(id: &str, body: &str) -> StoredTraceAuthority {
 
 async fn setup_sources(store: &Store, namespace: &str) -> (Context, Context, Vec<TypedSourceRef>) {
     let host = ctx(namespace, "host", Role::Host);
+    trusted_compiler_inputs::install_bundle(store, &bundle("p1", "setup"))
+        .await
+        .unwrap();
     let proposer = ctx(namespace, "proposer", Role::Worker);
     let first = authority("run-1", "first trusted trace");
     let second = authority("run-2", "second trusted trace");
@@ -595,4 +604,132 @@ fn release_envelopes_reject_unknown_json_and_bundle_digest_tampering() {
     assert!(serde_json::from_value::<ReleaseCandidateRecord>(value).is_err());
     record.bundle.digest = d("tampered");
     assert!(evo_engine::releases::validate_resolved_bundle_identity(&record.bundle).is_err());
+}
+
+#[tokio::test]
+async fn restored_host_snapshot_rejects_resealed_public_object_without_host_witness() {
+    let (_dir, store) = database().await;
+    let admin = ctx("n", "admin", Role::Admin);
+    let host = ctx("n", "host", Role::Host);
+    let worker = ctx("n", "worker", Role::Worker);
+    ReleaseStore::register_host_surface(&admin, &store, "surface", surface(), vec!["model".into()])
+        .await
+        .unwrap();
+    let snapshot = ReleaseStore::prepare_run(
+        &host,
+        &store,
+        PrepareRunRequest {
+            run_id: "baseline-run".into(),
+            profile_id: "p1".into(),
+            system_snapshot: system("p1"),
+            host_surface_id: "surface".into(),
+            host_capabilities: HostCapabilities {
+                available: Default::default(),
+                granted: Default::default(),
+            },
+            task_input_digest: d("task"),
+            evolution_enabled: false,
+            capability_level: CapabilityLevel::ToolOnly,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(snapshot.release_id.is_none());
+    ReleaseStore::read_run_snapshot(&host, &store, "baseline-run")
+        .await
+        .unwrap();
+    let mut forged = snapshot.clone();
+    forged.request_material.task_input_digest = d("other-task");
+    forged.request_digest = evo_core::fingerprint(&forged.request_material).unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&worker, "artifact", &forged.id, "host", &forged)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert!(
+        ReleaseStore::read_run_snapshot(&host, &store, "baseline-run")
+            .await
+            .is_err()
+    );
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&worker, "artifact", &snapshot.id, "worker", &snapshot)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let restored = ReleaseStore::read_run_snapshot(&host, &store, "baseline-run")
+        .await
+        .unwrap();
+    assert_eq!(
+        evo_core::fingerprint(&restored).unwrap(),
+        evo_core::fingerprint(&snapshot).unwrap()
+    );
+    store.close().await;
+}
+
+#[tokio::test]
+async fn typed_host_surface_requires_actual_admin_witness_and_correct_kind() {
+    let (_dir, store) = database().await;
+    let admin = ctx("n", "admin", Role::Admin);
+    let worker = ctx("n", "worker", Role::Worker);
+    let record = ReleaseStore::register_host_surface(
+        &admin,
+        &store,
+        "surface",
+        surface(),
+        vec!["model".into()],
+    )
+    .await
+    .unwrap();
+    let mut session = store.session().await.unwrap();
+    evo_engine::formal_authority::read_typed_closure(
+        &mut session,
+        &worker,
+        &[("artifact".into(), "surface".into())],
+    )
+    .await
+    .unwrap();
+    session
+        .put(&worker, "pointer", &record.id, "admin", &record)
+        .await
+        .unwrap();
+    assert!(
+        evo_engine::formal_authority::read_typed_closure(
+            &mut session,
+            &worker,
+            &[("pointer".into(), "surface".into())]
+        )
+        .await
+        .is_err()
+    );
+    let mut forged = record.clone();
+    forged.manifest.source_digest = d("replaced source");
+    forged.manifest_digest = evo_core::fingerprint(&forged.manifest).unwrap();
+    session
+        .put(&worker, "artifact", &record.id, "admin", &forged)
+        .await
+        .unwrap();
+    assert!(
+        evo_engine::formal_authority::read_typed_closure(
+            &mut session,
+            &worker,
+            &[("artifact".into(), "surface".into())]
+        )
+        .await
+        .is_err()
+    );
+    session
+        .put(&worker, "artifact", &record.id, "worker", &record)
+        .await
+        .unwrap();
+    evo_engine::formal_authority::read_typed_closure(
+        &mut session,
+        &worker,
+        &[("artifact".into(), "surface".into())],
+    )
+    .await
+    .unwrap();
+    session.commit().await.unwrap();
+    store.close().await;
 }
