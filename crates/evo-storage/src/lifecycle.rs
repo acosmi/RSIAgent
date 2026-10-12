@@ -734,11 +734,13 @@ async fn scan_e16_budget_call(
 /// The `__budget_scan` of a job reads `root_budget_calls` once; a call reserved
 /// after it passed holds its request body (and the model input in it) although it
 /// names the revoked source. Same criterion as `expand_budget_scan`: redact the
-/// request of every unredacted call of the namespace whose source closure holds
-/// the source, index its budget call reference and queue that reference; a call
-/// whose request schema or body cannot be read is isolated (`mark_unknown_scope`,
-/// which fails the job) and left as it is. Redacts at most `limit` calls; returns
-/// whether it redacted or isolated any.
+/// request of every unredacted call of the namespace whose source closure
+/// (`budget_call_source_closure`) holds the source, index its budget call
+/// reference and queue that reference; a call whose closure cannot be read (a
+/// reference that does not decode, or no reference and a request whose schema or
+/// body cannot be read) is isolated (`mark_unknown_scope`, which fails the job) and
+/// left as it is. Redacts at most `limit` calls; returns whether it
+/// redacted or isolated any.
 async fn redact_late_budget_calls(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     ctx: &Context,
@@ -793,7 +795,10 @@ async fn redact_late_budget_calls(
             if schema == "rsia.redacted.v1" {
                 continue;
             }
-            let source_ids = match budget_request_source_ids(&schema, &body) {
+            let closure =
+                budget_call_source_closure(tx, ctx, &billing_scope, &call_id, &schema, &body)
+                    .await?;
+            let source_ids = match closure {
                 BudgetRequestSources::Named(source_ids) => source_ids,
                 BudgetRequestSources::Unknown(error) => {
                     mark_unknown_scope(
@@ -878,11 +883,58 @@ pub(crate) enum BudgetRequestSources {
     Unknown(String),
 }
 
+/// The source closure the revocation cleanup judges an unredacted legacy budget
+/// call by, in `expand_budget_scan` and in its recheck `redact_late_budget_calls`,
+/// in the order the legacy dispatch and settlement gates read it
+/// (`legacy_call_sources`): the closure registered in the call's budget call
+/// reference when it has one (`registered_call_source_ids`), whatever its request
+/// says; otherwise the closure its stored request names
+/// (`budget_request_source_ids`). A request of a schema that names no closure,
+/// such as the formal task request the broker stores, is judged by its registered
+/// closure: a call unrelated to the revoked source is left as it is, a call that
+/// depends on it is redacted. A call without a reference whose request cannot be
+/// read is `Unknown`, and isolated (plan §11, §11.3, §11.5; E08).
+///
+/// So is a call whose reference is stored but does not decode
+/// (`unreadable_budget_call_ref:<schema>`): its closure is neither trusted nor
+/// guessed at, and the request is not read in its place (plan §11.5: isolate what
+/// lacks the facts it is judged by; E16.2: a dependency source that cannot be
+/// resolved is isolated). The legacy gates refuse the same call with `Internal` and write
+/// nothing (`registered_source_ids`); the cleanup isolates it instead, records it
+/// (`mark_unknown_scope`: a `Failed` job an Admin can retry) and goes on with the
+/// rest of its namespace, because an error here would roll the whole step back and
+/// leave the job running with no diagnostic, unreachable by a retry (AG-096). The
+/// two answers differ on purpose.
+async fn budget_call_source_closure(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ctx: &Context,
+    billing_scope: &str,
+    call_id: &str,
+    schema: &str,
+    body: &str,
+) -> Result<BudgetRequestSources> {
+    match crate::budget::registered_call_source_ids(tx, ctx.namespace(), billing_scope, call_id)
+        .await?
+    {
+        crate::budget::RegisteredCallSources::Named(source_ids) => {
+            Ok(BudgetRequestSources::Named(source_ids))
+        }
+        crate::budget::RegisteredCallSources::Missing => {
+            Ok(budget_request_source_ids(schema, body))
+        }
+        crate::budget::RegisteredCallSources::Undecodable(_) => Ok(BudgetRequestSources::Unknown(
+            format!("unreadable_budget_call_ref:{schema}"),
+        )),
+    }
+}
+
 /// The sources a budget call's stored request names. This is the one reader of
-/// request bodies for `expand_budget_scan` and for its recheck
-/// `redact_late_budget_calls`, so the two accept the same schemas and read the
-/// same fields: the `source_closure[*].id` of a model request (for a bound
-/// request, of its `request`) and the `source_ids` of a registered execution.
+/// request bodies for the revocation cleanup (`budget_call_source_closure`, in
+/// `expand_budget_scan` and in its recheck `redact_late_budget_calls`) and for the
+/// legacy gates (`legacy_call_sources`), and both read a request only for a call
+/// without a budget call reference: a registered closure comes first. It reads the
+/// `source_closure[*].id` of a model request (for a bound request, of its
+/// `request`) and the `source_ids` of a registered execution.
 /// Nothing else in a request is read: its input, its digests and a bound
 /// request's compiler binding are checked on the use path, so a request that
 /// names a revoked source is cleaned whether or not it would still be accepted
@@ -1481,7 +1533,9 @@ async fn expand_budget_scan(
             continue;
         }
         let body: String = row.try_get("request_artifact_body").map_err(internal)?;
-        let source_ids = match budget_request_source_ids(&schema, &body) {
+        let closure =
+            budget_call_source_closure(tx, ctx, &billing_scope, &call_id, &schema, &body).await?;
+        let source_ids = match closure {
             BudgetRequestSources::Named(source_ids) => source_ids,
             BudgetRequestSources::Unknown(error) => {
                 mark_unknown_scope(
