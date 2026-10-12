@@ -369,7 +369,7 @@ class RejectionTests(unittest.TestCase):
     def test_rejects_range_or_trace_chain_disconnect(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = _valid_manifest_dict()
-            manifest["trace_index_coverage"]["E16.6"]["ranges"].remove("V001–V098")
+            manifest["trace_index_coverage"]["E16.6"]["ranges"].remove("V001–V120")
             repo = FixtureRepo(Path(tmp), manifest)
             self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
         with tempfile.TemporaryDirectory() as tmp:
@@ -462,7 +462,7 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
         e15["verified_subscopes"].append(borrowed)
         errors = self._errors(manifest)
         self.assertIn(
-            f"E15.controller_acceptance: log_path {borrowed['log_path']!r} duplicates evidence E13.controller_acceptance of task E13",
+            f"E15.controller_acceptance: log_path {borrowed['log_path']!r} duplicates evidence {e13['verified_subscopes'][0]['id']} of task E13",
             errors[0],
         )
         with self.subTest(variant="same test run re-logged under another task"):
@@ -474,7 +474,7 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
             e15["verified_subscopes"].append(rerun)
             errors = self._errors(manifest)
             self.assertIn(
-                f"the same test run ({rerun['test_entry']} at source_sha {rerun['source_sha']}) is already claimed by E13.controller_acceptance of task E13",
+                f"the same test run ({rerun['test_entry']} at source_sha {rerun['source_sha']}) is already claimed by {e13['verified_subscopes'][0]['id']} of task E13",
                 errors[0],
             )
         with self.subTest(variant="evidence id namespaced under a foreign task"):
@@ -506,7 +506,7 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
         first_so = manifest["traceability"]["so_sources"][0]["id"]
         cases = [
             ("scope entry", ("e_scopes", "E13"), "effect", "E13 scope entry: unknown key(s) ['effect']"),
-            ("evidence record", ("e_scopes", "E13", "verified_subscopes", 0), "verdict", "E13 evidence E13.controller_acceptance: unknown key(s) ['verdict']"),
+            ("evidence record", ("e_scopes", "E13", "verified_subscopes", 0), "verdict", f"E13 evidence {_valid_manifest_dict()['e_scopes']['E13']['verified_subscopes'][0]['id']}: unknown key(s) ['verdict']"),
             ("v_scenario", ("traceability", "v_scenarios", 0), "benefit", f"{first_v}: unknown key(s) ['benefit']"),
             ("commitment", ("traceability", "b_commitments", 0), "effect", f"{first_b}: unknown key(s) ['effect']"),
             ("so_source", ("traceability", "so_sources", 0), "effect", f"{first_so}: unknown key(s) ['effect']"),
@@ -530,27 +530,30 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
     def test_rejects_merged_sha_inconsistent_with_manifest_merge_facts(self):
         def pr47(manifest: dict) -> dict:
             record = manifest["e_scopes"]["E16.4"]["verified_subscopes"][0]
-            self.assertTrue(record["pr"].endswith("/47"))
+            self.assertEqual(record["pr_state"], "merged")
             return record
 
         merged_pr47 = pr47(_valid_manifest_dict())
         self.assertEqual(merged_pr47["pr_state"], "merged")
         self.assertTrue(merged_pr47["merged_sha"])
         pr47_id = merged_pr47["id"]
+        target_pr = merged_pr47["pr"].rsplit("/", 1)[1]
+        other = _valid_manifest_dict()["e_scopes"]["E13"]["verified_subscopes"][0]
+        other_pr = other["pr"].rsplit("/", 1)[1]
         with self.subTest(variant="merged_sha copied from another PR's merge commit"):
             manifest = _valid_manifest_dict()
             record = pr47(manifest)
             record["merged_sha"] = manifest["e_scopes"]["E13"]["verified_subscopes"][0]["merged_sha"]
             errors = self._errors(manifest)
             self.assertIn(
-                f"{pr47_id}: merged_sha {record['merged_sha']} is already recorded as the merge commit of PR #42 (E13.controller_acceptance)",
+                f"{pr47_id}: merged_sha {record['merged_sha']} is already recorded as the merge commit of PR #{other_pr} ({other['id']})",
                 errors[0],
             )
         with self.subTest(variant="merged_sha equal to another PR's source_sha"):
             manifest = _valid_manifest_dict()
             pr47(manifest)["merged_sha"] = manifest["e_scopes"]["E13"]["verified_subscopes"][0]["source_sha"]
             errors = self._errors(manifest)
-            self.assertIn("is the source_sha of PR #42 (E13.controller_acceptance), not a merge of PR #47", errors[0])
+            self.assertIn(f"is the source_sha of PR #{other_pr} ({other['id']}), not a merge of PR #{target_pr}", errors[0])
         with self.subTest(variant="same PR merged in one record and unmerged in another"):
             manifest = _valid_manifest_dict()
             second = _fresh_record(pr47(manifest), "E16.4", "second_controller_acceptance", "pr47-second")
@@ -558,7 +561,7 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
             manifest["e_scopes"]["E16.4"]["verified_subscopes"].append(second)
             errors = self._errors(manifest)
             self.assertIn(
-                f"E16.4.second_controller_acceptance: PR #47 carries merged_sha None here but {merged_pr47['merged_sha']!r} in {pr47_id}",
+                f"E16.4.second_controller_acceptance: PR #{target_pr} carries merged_sha None here but {merged_pr47['merged_sha']!r} in {pr47_id}",
                 errors[0],
             )
         with self.subTest(variant="merged_sha on a record whose pr_state is draft"):
@@ -590,7 +593,7 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
         report = self._assert_valid(manifest)
         self.assertTrue(
             any(
-                f"{record['id']}: merged_sha {record['merged_sha']} for PR #47 (pr_state unrecorded) is a manifest assertion" in item
+                f"{record['id']}: merged_sha {record['merged_sha']} for PR #{record['pr'].rsplit('/', 1)[1]} (pr_state unrecorded) is a manifest assertion" in item
                 for item in report.needs_verification
             ),
             report.needs_verification,
@@ -641,8 +644,9 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
     def test_genuinely_merged_pr_with_consistent_state_is_allowed(self):
         manifest = _valid_manifest_dict()
         e10 = manifest["e_scopes"]["E10"]
-        merged_record = e10["verified_subscopes"][1]
-        self.assertTrue(merged_record["pr"].endswith("/43") and merged_record["merged_sha"])
+        merged_record = e10["verified_subscopes"][0]
+        self.assertEqual(merged_record["pr_state"], "merged")
+        self.assertTrue(css.HEX40.fullmatch(merged_record["merged_sha"]))
         merged_record["pr_state"] = "merged"
         sibling = _fresh_record(merged_record, "E10", "replay_management_second_target", "e10-second")
         sibling.update(
@@ -657,14 +661,16 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
         )
         e10["verified_subscopes"].append(sibling)
         report = self._assert_valid(manifest)
-        self.assertTrue(any("for PR #43 (pr_state merged) is a manifest assertion" in item for item in report.needs_verification))
+        self.assertTrue(any(f"for PR #{merged_record['pr'].rsplit('/', 1)[1]} (pr_state merged) is a manifest assertion" in item for item in report.needs_verification))
 
 class PlanLineageTests(unittest.TestCase):
-    """v4.1→v4.2 lineage binding (plan §18.8): the top level binds the current plan, historical records
+    """v4.1→v4.2→v4.3 lineage binding (plan §18.9): the top level binds the current plan, historical records
     keep the lineage pair they were verified against, digests outside the lineage are rejected."""
 
     V41_SHA = "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150"
     V42_SHA = "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455"
+
+    V43_SHA = "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7"
 
     def _errors(self, manifest: dict) -> list[str]:
         with tempfile.TemporaryDirectory() as tmp:
@@ -681,18 +687,19 @@ class PlanLineageTests(unittest.TestCase):
         return report
 
     def test_constants_bind_the_current_plan_and_register_the_lineage(self):
-        self.assertEqual(css.PLAN_VERSION, "v4.2")
-        self.assertEqual(css.PLAN_SHA256, self.V42_SHA)
-        self.assertEqual(list(css.PLAN_LINEAGE), ["v4.1", "v4.2"])
+        self.assertEqual(css.PLAN_VERSION, "v4.3")
+        self.assertEqual(css.PLAN_SHA256, self.V43_SHA)
+        self.assertEqual(list(css.PLAN_LINEAGE), ["v4.1", "v4.2", "v4.3"])
         self.assertEqual(css.PLAN_LINEAGE["v4.1"]["sha256"], self.V41_SHA)
-        self.assertEqual(css.PLAN_LINEAGE["v4.2"]["sha256"], css.PLAN_SHA256)
-        self.assertEqual(css.PLAN_RECHECK_VALUES, {"not_affected", "required", "rechecked_v4.2"})
+        self.assertEqual(css.PLAN_LINEAGE["v4.2"]["sha256"], self.V42_SHA)
+        self.assertEqual(css.PLAN_LINEAGE["v4.3"]["sha256"], css.PLAN_SHA256)
+        self.assertEqual(css.PLAN_RECHECK_VALUES, {"not_affected", "required", "rechecked_v4.2", "rechecked_v4.3"})
 
     def test_rejects_top_level_still_bound_to_v41(self):
         manifest = _valid_manifest_dict()
         manifest["plan_version"], manifest["plan_sha256"] = "v4.1", self.V41_SHA
         errors = self._errors(manifest)
-        self.assertIn("manifest top level is not bound to the current plan v4.2", errors[0])
+        self.assertIn("manifest top level is not bound to the current plan v4.3", errors[0])
 
     def test_records_bound_to_either_lineage_pair_are_accepted(self):
         manifest = _valid_manifest_dict()
@@ -707,7 +714,7 @@ class PlanLineageTests(unittest.TestCase):
             ("v4.2 version paired with the v4.1 digest", {"plan_version": "v4.2"}, f"plan_sha256 '{self.V41_SHA}' is not the registered digest of plan v4.2"),
             ("v4.1 version paired with the v4.2 digest", {"plan_sha256": self.V42_SHA}, f"plan_sha256 '{self.V42_SHA}' is not the registered digest of plan v4.1"),
             ("digest outside the lineage", {"plan_sha256": "a" * 64}, f"plan_sha256 '{'a' * 64}' is not the registered digest of plan v4.1"),
-            ("unregistered version", {"plan_version": "v4.0"}, "plan_version 'v4.0' is outside the registered plan lineage ['v4.1', 'v4.2']"),
+            ("unregistered version", {"plan_version": "v4.0"}, "plan_version 'v4.0' is outside the registered plan lineage ['v4.1', 'v4.2', 'v4.3']"),
         ]
         for name, patch, expected in cases:
             with self.subTest(case=name):
@@ -726,30 +733,58 @@ class PlanLineageTests(unittest.TestCase):
                 manifest = _valid_manifest_dict()
                 manifest["e_scopes"]["E01"]["verified_subscopes"][0]["plan_recheck"] = value
                 errors = self._errors(manifest)
-                self.assertIn("E01.controller_acceptance: plan_recheck must be one of ['not_affected', 'rechecked_v4.2', 'required']", errors[0])
+                self.assertIn("E01.controller_acceptance: plan_recheck must be one of ['not_affected', 'rechecked_v4.2', 'rechecked_v4.3', 'required']", errors[0])
 
     def test_touched_tasks_require_recheck_marker_but_untouched_records_may_omit_it(self):
-        for task in ("E00", "E16.5"):
-            with self.subTest(task=task, variant="marker downgraded to not_affected"):
-                manifest = _valid_manifest_dict()
-                record = manifest["e_scopes"][task]["verified_subscopes"][0]
-                self.assertEqual(record["plan_recheck"], "rechecked_v4.2")
-                record["plan_recheck"] = "not_affected"
-                errors = self._errors(manifest)
-                self.assertIn(f"{record['id']}: task {task} is touched by the v4.2 revision", errors[0])
-            with self.subTest(task=task, variant="marker missing"):
-                manifest = _valid_manifest_dict()
-                del manifest["e_scopes"][task]["verified_subscopes"][0]["plan_recheck"]
-                self._errors(manifest)
-        manifest = _valid_manifest_dict()
-        del manifest["e_scopes"]["E01"]["verified_subscopes"][0]["plan_recheck"]
-        self._assert_valid(manifest)
-        # A touched-task record re-verified against v4.2 itself needs no recheck marker.
-        manifest = _valid_manifest_dict()
+        baseline = _valid_manifest_dict()
+        for task in sorted(css.PLAN_RECHECK_TASKS):
+            if not baseline["e_scopes"][task]["verified_subscopes"]:
+                continue
+            for marker in (None, "not_affected", "rechecked_v4.2"):
+                with self.subTest(task=task, marker=marker):
+                    manifest = copy.deepcopy(baseline)
+                    record = manifest["e_scopes"][task]["verified_subscopes"][0]
+                    self.assertEqual(record["plan_recheck"], "rechecked_v4.3")
+                    if marker is None:
+                        del record["plan_recheck"]
+                    else:
+                        record["plan_recheck"] = marker
+                    errors = self._errors(manifest)
+                    self.assertIn(f"{record['id']}: task {task} is touched by the v4.3 revision", errors[0])
+        for task in ("E17", "E18"):
+            manifest = copy.deepcopy(baseline)
+            manifest["e_scopes"][task]["verified_subscopes"][0].pop("plan_recheck", None)
+            self._assert_valid(manifest)
+        # A new record actually verified against the current plan does not need a historical recheck.
+        manifest = copy.deepcopy(baseline)
         record = manifest["e_scopes"]["E00"]["verified_subscopes"][0]
-        record.update({"plan_version": "v4.2", "plan_sha256": self.V42_SHA})
-        del record["plan_recheck"]
+        record.update({"plan_version": "v4.3", "plan_sha256": self.V43_SHA})
+        record.pop("plan_recheck", None)
         self._assert_valid(manifest)
+
+    def test_recheck_tasks_match_all_v43_landing_tasks(self):
+        expected = {f"E{i:02}" for i in range(17)} | {f"E16.{i}" for i in range(1, 7)}
+        self.assertEqual(css.PLAN_RECHECK_TASKS, expected)
+
+    def test_v43_scenarios_are_complete_and_not_execution_credit(self):
+        manifest = _valid_manifest_dict()
+        mapping = css.expected_v_to_e()
+        self.assertEqual(set(mapping), {f"V{i:03}" for i in range(1, 121)})
+        self.assertEqual(mapping["V107"], {"E02", "E16", "E16.4"})
+        # Registering the new scenario family alone cannot confer execution credit.
+        tampered = copy.deepcopy(manifest)
+        unexecuted = tampered["traceability"]["v_scenarios"][-1]
+        unexecuted.update({"status": "verified", "verification_status": "verified", "related_evidence_refs": [], "remaining": ""})
+        self._errors(tampered)
+        for variant in ("missing", "duplicate", "wrong owner"):
+            tampered = copy.deepcopy(manifest)
+            if variant == "missing":
+                tampered["traceability"]["v_scenarios"].pop()
+            elif variant == "duplicate":
+                tampered["traceability"]["v_scenarios"].append(copy.deepcopy(tampered["traceability"]["v_scenarios"][-1]))
+            else:
+                tampered["traceability"]["v_scenarios"][-1]["e_tasks"] = ["E17"]
+            self._errors(tampered)
 
     def test_rejects_missing_or_wrong_plan_lineage(self):
         cases = [
@@ -760,7 +795,7 @@ class PlanLineageTests(unittest.TestCase):
             ("wrong current digest", lambda m: m["plan_lineage"][1].__setitem__("sha256", self.V41_SHA)),
             ("wrong historical file", lambda m: m["plan_lineage"][0].__setitem__("file", "RSIAgent-v4.1.md")),
             ("unknown key", lambda m: m["plan_lineage"][1].__setitem__("effect", "improved")),
-            ("extra future version", lambda m: m["plan_lineage"].append({"version": "v4.3", "file": "future.md", "sha256": "b" * 64})),
+            ("extra future version", lambda m: m["plan_lineage"].append({"version": "v4.4", "file": "future.md", "sha256": "b" * 64})),
             ("malformed digest", lambda m: m["plan_lineage"][0].__setitem__("sha256", "45F3")),
         ]
         for name, mutate in cases:

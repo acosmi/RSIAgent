@@ -1,7 +1,7 @@
 {
   "schema_version": "rsia.support_scope.v2",
-  "plan_version": "v4.2",
-  "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+  "plan_version": "v4.3",
+  "plan_sha256": "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7",
   "plan_lineage": [
     {
       "version": "v4.1",
@@ -12,9 +12,14 @@
       "version": "v4.2",
       "file": "RSIAgent-v4.2定稿-工程实施方案-2026-09-30.md",
       "sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455"
+    },
+    {
+      "version": "v4.3",
+      "file": "RSIAgent-v4.3定稿-工程实施方案-2026-10-12.md",
+      "sha256": "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7"
     }
   ],
-  "derived_index_notice": "This file is a checked derivative; the pinned v4.2 plan (lineage v4.1→v4.2) remains the sole normative source.",
+  "derived_index_notice": "This file is a checked derivative; the pinned v4.3 plan (lineage v4.1→v4.2→v4.3) remains the sole normative source.",
   "field_semantics": {
     "command": "declared single-target checker command; syntax validated, not necessarily the literally executed command",
     "exit_code": "exit code of the controller gate run that covered the declared target",
@@ -69,7 +74,9 @@
         "V072",
         "V073",
         "V080",
-        "V098"
+        "V098",
+        "V113",
+        "V116"
       ],
       "verified_subscopes": [
         {
@@ -77,7 +84,7 @@
           "description": "fixed baseline directed regression only",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "rechecked_v4.2",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "ef8244dae4b5dd173987e78915500cc997dcd9b0",
           "pr": "https://github.com/acosmi/RSIAgent/pull/29",
           "merged_sha": "28f892c3d68591d201a8029345257f051fb123ef",
@@ -99,7 +106,7 @@
           "description": "Step-path async futures are boxed so the seven evo-engine test binaries complete on the default test-thread stack in the documented environment",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "45377b9d78c373fbd68b89221ba138e9eed114ab",
           "pr": "https://github.com/acosmi/RSIAgent/pull/146",
           "merged_sha": "98776f1717b37a47e4a7fcc4349ff0faff68ce1b",
@@ -146,7 +153,10 @@
         "V084",
         "V085",
         "V096",
-        "V097"
+        "V097",
+        "V103",
+        "V114",
+        "V118"
       ],
       "verified_subscopes": [
         {
@@ -154,7 +164,7 @@
           "description": "statistical and holdout contract subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "c5ac47d506a98a9feb0b65fac6815e80087c8f49",
           "pr": "https://github.com/acosmi/RSIAgent/pull/30",
           "merged_sha": "faec991036f03f27cf6d2ad3db86f841815fc828",
@@ -176,7 +186,7 @@
           "description": "Explicit sample input and evaluation preregistration requirements",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "9150d8807d107f1ad24daa59b90f7de14f092477",
           "pr": "https://github.com/acosmi/RSIAgent/pull/106",
           "merged_sha": "279ee7c5290fabbb20cbd16b7e53c5ac2b71c188",
@@ -239,7 +249,13 @@
         "V093",
         "V094",
         "V095",
-        "V096"
+        "V096",
+        "V100",
+        "V101",
+        "V107",
+        "V108",
+        "V109",
+        "V120"
       ],
       "verified_subscopes": [
         {
@@ -247,7 +263,7 @@
           "description": "bounded atomic edit/compiler subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "79af6c515b3afdf36778ee57ba2f140a22a3c0e0",
           "pr": "https://github.com/acosmi/RSIAgent/pull/31",
           "merged_sha": "dfc861ce7572f8f9f49a8aaf9f0cc1687cba57f9",
@@ -269,7 +285,7 @@
           "description": "v1 wire and tool descriptor regression goldens",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "c0ea35de8b028f849f89008f7edca2852e412812",
           "pr": "https://github.com/acosmi/RSIAgent/pull/103",
           "merged_sha": "ba01a2e8489ceef6d1350f0babdac46d816071ec",
@@ -287,33 +303,11 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-055-c0ea35d.json"
         },
         {
-          "id": "E02.ag062_required_improver_baselines",
-          "description": "Required baseline labels at independent Improver compilation",
-          "plan_version": "v4.2",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
-          "source_sha": "e6e7eec47a3494425a1842604c154d8695089222",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/108",
-          "merged_sha": "6f0e5fa35b582f0f4cde4207ddf59d65a51b180a",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-core/tests/improver_required_baselines_v42.rs",
-          "command": "cargo test --locked --offline -p evo-core --test improver_required_baselines_v42",
-          "input_digest": "ad35eaa9900b9a03fd40ab70d40e0d46e59c85d34b6dec62f73f8667b5b7b854",
-          "exit_code": 0,
-          "log_path": "out/audit-20260930/qa/ctrl-ag062-e6e7eec.log.test",
-          "actual_result": "controller independent full re-run at e6e7eec: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; improver_required_baselines_v42 13 passed / 0 failed; workspace 91 result lines, 1215 passed / 0 failed; checker unittest 48 passed; two root probes pass on head and both fail after successful compilation on the actual parent; 13 new core tests",
-          "scope": "E02; sections 5.3 L473/L487-L491 and 5.1 L453/L455, E02 L1211/L1215; V046 missing P/B labels and V043 legal three-state compatibility: both nonempty labels are required after the original parent/baseline checks, even for all-Set patches",
-          "risk": "Does not authenticate P/B contents, digests, approval, existence, revocation or profile binding; no full FieldContract or consumer coverage, real host, effect or release",
-          "rollback": "revert PR #108 through an independent revert PR; accepted-head parent 3f9ed595bdcd8bf241bc73fb83640d277947810a; retain immutable evidence, frozen plans, costs and revocation state",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-062-e6e7eec.json"
-        },
-        {
           "id": "E02.ag065_host_surface_name_coverage",
           "description": "Host surface reverse name coverage",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "2787e0c19f4b73298e73c0ddead0f959ceb6bfef",
           "pr": "https://github.com/acosmi/RSIAgent/pull/110",
           "merged_sha": "eb275812f09dd8850ad4edac08a2282cb5e82112",
@@ -340,7 +334,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-092-39d2d86.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG092-existing-current27df8c2-fixed39d2d86-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
           "merged_sha": "77ef86294b7760fc7495d12d4029ca8a3567bc5e",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/138",
@@ -362,7 +356,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-093-49806d7.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG093-existing-currentc04850d-fixed49806d7-ROOT-fresh14-actual-Task-accepted-conditional-admin-merge-r2-20261011.json",
           "merged_sha": "f6904dcd2d4f3b46b3311886fd4dcecd8a2f711c",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/140",
@@ -409,7 +403,9 @@
         "V089",
         "V090",
         "V094",
-        "V096"
+        "V096",
+        "V106",
+        "V108"
       ],
       "verified_subscopes": [
         {
@@ -417,7 +413,7 @@
           "description": "program-fixture optimization consumer subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "727e9cca8d4118dd207b1ad5ab043c2b6229fef7",
           "pr": "https://github.com/acosmi/RSIAgent/pull/32",
           "merged_sha": "9b13237af884c525652813ea508eb8c5f100d6f8",
@@ -439,7 +435,7 @@
           "description": "trusted development execution/grader receipt schemas, registered pure-function runner and observation gate",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "b1d008f985b1568dcfce92237c8016866c4b0646",
           "pr": "https://github.com/acosmi/RSIAgent/pull/63",
           "merged_sha": "3e2fc067190077b8cf8401875d6c627b8d9e13fc",
@@ -466,7 +462,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-079-d0958ac.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/ag079-currentd56e-headd0958-ROOT-all18-necessary-SC0-finite-Task-PASS_LOCAL_TASK-and-only-epoch-release-r1-20261005.json",
           "merged_sha": "9f0c40215a2d7a67ba66e5427cee71ca5228bde1",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/121",
@@ -487,7 +483,7 @@
     "E04": {
       "title": "Persistent Root Budget, Broker, Cancellation & Reconciliation",
       "status": "in_progress",
-      "status_reason": "engineering: no actual provider transport or qualified isolated runner is wired to the accepted budget/broker subset",
+      "status_reason": "engineering: formal_local_host has an external provider transport wired; no qualified isolated runner is wired to the accepted budget/broker subset",
       "implementation_files": [
         "crates/evo-storage/src/budget.rs",
         "crates/evo-engine/src/broker.rs",
@@ -506,7 +502,13 @@
         "V087",
         "V093",
         "V094",
-        "V096"
+        "V096",
+        "V101",
+        "V103",
+        "V106",
+        "V110",
+        "V111",
+        "V112"
       ],
       "verified_subscopes": [
         {
@@ -514,7 +516,7 @@
           "description": "persistent root budget and accounting subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "f02e535798423aaef930e915b2af081c110adf0e",
           "pr": "https://github.com/acosmi/RSIAgent/pull/33",
           "merged_sha": "c1cf6a2e91253218033b5883a11baa02c85a5d43",
@@ -536,7 +538,7 @@
           "description": "Typed pre-dispatch refusals and safe reserved-call cleanup",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "f6aa729a467f10f8b15b2d7b20e9a9d1c7d80351",
           "pr": "https://github.com/acosmi/RSIAgent/pull/104",
           "merged_sha": "9b08c4b2fd882abab65f48ea0af8f23b13a3b50d",
@@ -563,7 +565,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-082-cd19f84.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG082-current618ad834-headcd19f84b-Source2-ROOT-all12-necessary-SourceSC-RuntimeSC0-PASS_LOCAL_TASK-and-only-epoch-release-r1-20261006.json",
           "merged_sha": "5295769892af37988d6bc739bdfb49a834a3f7aa",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/124",
@@ -585,7 +587,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-077-26d3fe4.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG077-existing-PR125-current529-fixed26d3-ROOT-fresh12-actual-current-main-Task-accepted-conditional-admin-merge-r1-20261011.json",
           "merged_sha": "349879148c1f31fd1ebbee639aeff334a3762855",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/125",
@@ -597,64 +599,6 @@
           "scope": "E04; Typed E16 budget source snapshots, cleanup and recovery software/component boundary only. Library-only as of e727d1c: no production caller in engine/http/mcp/apps.",
           "source_sha": "26d3fe400ee1aad36082081eda6c60f3ee1a17f7",
           "test_entry": "crates/evo-storage/tests/e16_budget_binding_v42.rs"
-        },
-        {
-          "id": "E04.ag097_broker_close_before_refuse",
-          "description": "Settled model calls record their recovery close before the cached-replay path refuses revoked content",
-          "plan_version": "v4.2",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
-          "source_sha": "98431d59d765f0c16a5b736147de4735d2adbe2b",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/144",
-          "merged_sha": "184764302e64ca3871fc68103bd07abec1125918",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/broker_cache_revoke_v42.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test broker_cache_revoke_v42",
-          "input_digest": "21dcae75c1b08a76ea60ea0d5e51efe1bde0a67ccb3a8192ad11d14023eefc60",
-          "exit_code": 0,
-          "log_path": "out/audit-20260930/qa/accept-ag094/ctrl-ag094-final.broker_cache_revoke_v42.log",
-          "actual_result": "peer controller acceptance at 98431d5 (fresh target): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 101 with 1630 passed / 0 failed (parent e727d1c 1627 + 3 new) and the 7 known evo-engine stack-overflow binaries unchanged, build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes pass on head and fail on parent e727d1c (settled call left open after refused replays / corrupt artifact). Declared target covered with exit 0 by this window's AG-094 full run on the merged tree after AG-099 (out/audit-20260930/qa/accept-ag094/ctrl-ag094-final.broker_cache_revoke_v42.log).",
-          "scope": "E04; sections 11 L1077, 6.6 L706, 7.2.1 L831, E04 L1243; V007/V008/V086/V096 subset: a settled call whose close was lost records the recovery close (recovered_persisted_model_response) before any content decision on the cached-replay path, so the same billing scope can dispatch again; refusal forms (Rejected after cleanup, Uncertain on legacy rows) unchanged; no other write",
-          "risk": "No real provider or billing, no exhaustive concurrency, no dispatch-side revocation rules, no dispatch_bound recovery, no management exit for calls never replayed; no full E/V, effect or release claim",
-          "rollback": "revert PR #144 through an independent revert PR; accepted-head parent e727d1c65d87de36d85983e606c34b725f5ff94e; retain immutable evidence, frozen plans, costs and revocation state",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-097-98431d5.json",
-          "execution": {
-            "runner": "ctrl_verify.sh",
-            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-097 cargom test --workspace --locked --no-fail-fast",
-            "scope": "workspace",
-            "exit_code": 101,
-            "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-097-98431d5.log.test"
-          }
-        },
-        {
-          "id": "E04.ag105_broker_bound_recovery_close_v42",
-          "description": "Settled bound model calls close their execution before a replay is refused, freeing the root for the next call",
-          "plan_version": "v4.2",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
-          "source_sha": "9862bbd7c6e1945ea0f7b6431db4dcab7a4db346",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/149",
-          "merged_sha": "7dc89bffc49d8fe4c5d97e7ccd56d3d0ad597f1c",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/broker_bound_recovery_close_v42.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test broker_bound_recovery_close_v42",
-          "input_digest": "d1f1c986d03b94e9f0a134b1d3326f87f116bb34272a40b167bc9bf5da51808b",
-          "exit_code": 0,
-          "log_path": "out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.broker_bound_recovery_close_v42.log",
-          "actual_result": "peer-window controller acceptance at 9862bbd (restacked onto 94076d78, patch byte-identical; fresh target): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 138 binaries 1762 passed / 0 failed / 0 overflow (parent 94076d78: 137 binaries 1756 passed; new 6), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-ag105-claude/append.rs) pass on head and fail on base 94076d78. Declared target covered with exit 0 by this window's AG-113 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.broker_bound_recovery_close_v42.log).",
-          "scope": "E04; E04 L1239–1245 (root budget state machine), sections 7.2.1 L831, 6.6 L705/L709, 11 L1077; V096 subset: a settled bound call whose persisted artifact is corrupt or whose source was revoked/redacted records its close before the refused replay, so the root concurrency slot is released; refusal forms unchanged",
-          "risk": "No real provider or billing, no exhaustive concurrency, no dispatch-side revocation rules, no full E/V, effect or release claim",
-          "rollback": "revert PR #149 through an independent revert PR; accepted-head parent 94076d789f40347ab8263176044f041824c061fb; retain immutable evidence, frozen plans, costs and revocation state",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-105-9862bbd.json",
-          "execution": {
-            "runner": "ctrl_verify.sh",
-            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-105 cargom test --workspace --locked --no-fail-fast",
-            "scope": "workspace",
-            "exit_code": 0,
-            "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-105-9862bbd.log.test"
-          }
         }
       ],
       "remaining": [
@@ -690,7 +634,10 @@
         "V090",
         "V091",
         "V094",
-        "V097"
+        "V097",
+        "V101",
+        "V104",
+        "V114"
       ],
       "verified_subscopes": [
         {
@@ -698,7 +645,7 @@
           "description": "program-fixture streaming evaluation subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "86e53b9add040192c4db0334c04c15316cf32e66",
           "pr": "https://github.com/acosmi/RSIAgent/pull/34",
           "merged_sha": "63824fff2e8d0cd0767d31140d064972542f6b53",
@@ -720,7 +667,7 @@
           "description": "Versioned complete-batch verdict preservation",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "652d7cac0d6cf1fa086e96b6ac9554ed6326b1da",
           "pr": "https://github.com/acosmi/RSIAgent/pull/100",
           "merged_sha": "43f0022478d58dd8a8e6492cffb3aa24463b3fce",
@@ -742,7 +689,7 @@
           "description": "Rejected in-memory partition admissions add no partial raw, normalized or family registrations",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "215811ff8848817e72f0e3226b81d57e0fef35ea",
           "pr": "https://github.com/acosmi/RSIAgent/pull/116",
           "merged_sha": "7fa290883136f30fcdc87ff5a4de293aa0714507",
@@ -769,7 +716,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-080-4ed8d9d.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/ag080-current90d3dcb-head4ed8d9d-ROOT-all12-necessary-SOURCE-RuntimeSC0-memory-only-PASS_LOCAL_TASK-and-only-epoch-release-r1-20261006.json",
           "merged_sha": "618ad834ff73e878898fb64681a4efc323b84ac0",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/123",
@@ -791,7 +738,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-087-fde3dd4.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG087-existing-current77152-fixedfde3dd4-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
           "merged_sha": "8cbf82cb9a715a8b28070c6a7823b16093865425",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/133",
@@ -813,7 +760,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-088-e538b96.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG088-existing-current8cbf82c-fixede538b96-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
           "merged_sha": "bd20099a01c64b87b9a75707a95c785486bb4fda",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/134",
@@ -835,7 +782,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-089-6040bf3.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG089-existing-currentbd20099-fixed6040bf3-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
           "merged_sha": "c9aa71e7516e369672b0e5127e675d72eb199304",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/135",
@@ -857,7 +804,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-090-a994443.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG090-existing-currentc9aa71e-fixeda994443-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
           "merged_sha": "1f1b593d5475043e707e17195222d82f2c5281eb",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/136",
@@ -879,7 +826,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-091-730f242.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG091-existing-current1f1b593-fixed730f242-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
           "merged_sha": "27df8c2cfccbefa6544b55b697c10abbb6c0a61c",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/137",
@@ -896,7 +843,7 @@
           "description": "Independent grader receipts for external-host authority bind a canonical sorted-value digest; forged or rebound digests are refused",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "d73acb6f4ddce9bbdca0702eab783e54cf41ad90",
           "pr": "https://github.com/acosmi/RSIAgent/pull/147",
           "merged_sha": "1706cb04049c0306676a17fd34fd021717c5669b",
@@ -925,7 +872,7 @@
           "description": "A v2 complete-batch regression is confirmed only when the upper confidence bound is below zero",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "78075a1101db12e5f3591622f0499ecf2b7b66bf",
           "pr": "https://github.com/acosmi/RSIAgent/pull/152",
           "merged_sha": "f355ec389513685097e2c4d85dfd0c062e29e915",
@@ -954,7 +901,7 @@
           "description": "External-host authority is issued and read on a bound ticket; a stray resource edge refuses every bound reader after issuance",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "e573eaa3a8cea90932f806ca455bf8a3963e1a3d",
           "pr": "https://github.com/acosmi/RSIAgent/pull/153",
           "merged_sha": "42decd1a17585c366b249104b0bbea700361d003",
@@ -983,7 +930,7 @@
           "description": "A ticket issue under any control schema (v1 or v2) binds the frozen candidate dependency; with no candidate record the issue is refused rather than degraded",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "afa1928e7f9367fd125bfac40cd8115dbe7a17ac",
           "pr": "https://github.com/acosmi/RSIAgent/pull/157",
           "merged_sha": "647c7ce8361215632d62a42a8bf87d9df2bf3c2d",
@@ -1012,7 +959,7 @@
           "description": "Grader and execution receipts that arrive after the formal report is final are kept for audit without changing the report; a late grading error no longer changes a final report's reasons",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "ad9660c2ec45d67260a2fd124c4b3456f63c99fd",
           "pr": "https://github.com/acosmi/RSIAgent/pull/163",
           "merged_sha": "4d1fd6cb43fbe64db81177d336b6dae3f061ca98",
@@ -1072,31 +1019,12 @@
         "V091",
         "V094",
         "V095",
-        "V096"
+        "V096",
+        "V100",
+        "V108",
+        "V119"
       ],
       "verified_subscopes": [
-        {
-          "id": "E06.controller_acceptance",
-          "description": "guarded release and snapshot subset",
-          "plan_version": "v4.1",
-          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
-          "source_sha": "071c54d53488f8d9a75cc7148d82ed5f9efb3253",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/35",
-          "merged_sha": "c017e6a32da3cdf692c3321dd29d6510edada0c4",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/release_store.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test release_store",
-          "input_digest": "0ec7af70de6ede4fa340ee8835bc38c283fe33a050e0bdf724d2ac78a5a9f684",
-          "exit_code": 0,
-          "log_path": "out/implementation-v4.1-20260919/controller-e06-final-tests.log",
-          "actual_result": "7 release integration tests passed",
-          "scope": "guarded release and snapshot subset",
-          "risk": "production approval/canary/Active is blocked by non-production evaluation evidence",
-          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
-          "record_source": "out/implementation-v4.1-20260919/controller-e06-acceptance.json",
-          "input_ref": "out/implementation-v4.1-20260919/controller-e06-final-input.json"
-        },
         {
           "actual_result": "ROOT accepted fixed source 3c5ae3d6dacf74b7b91a7bf5527226c561ca688c; actual merge tree equals accepted tree 331ac2b5c166adc167e83eb0aa9ffccc8a7d24eb. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
           "command": "cargo test --locked --offline -p evo-engine --test candidate_review",
@@ -1107,7 +1035,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-084-3c5ae3d.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG084-existing-current349-fixed3c5-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
           "merged_sha": "ea02f116fe2172dcba621a60bf9b141237e1ba45",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/126",
@@ -1124,7 +1052,7 @@
           "description": "A production-written EditCompiled fact reaches stored review with its exact diff, and a one-byte change of it is refused",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "2fc3187dc1e1fdcdc9caee3b635157f4d23529b3",
           "pr": "https://github.com/acosmi/RSIAgent/pull/161",
           "merged_sha": "5401effdfadf048dd4537fdf1e1ca843b9482ac3",
@@ -1180,7 +1108,9 @@
         "V089",
         "V091",
         "V096",
-        "V097"
+        "V097",
+        "V112",
+        "V114"
       ],
       "verified_subscopes": [
         {
@@ -1188,7 +1118,7 @@
           "description": "local protocol and disabled-model subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "0ed5ec915f438764217e9bd059bb99c401dce26e",
           "pr": "https://github.com/acosmi/RSIAgent/pull/36",
           "merged_sha": "794cf0f517a57e48166ef2ad44cb5762f3a61d5e",
@@ -1210,7 +1140,7 @@
           "description": "curriculum.step management consumer with an idempotent probe-schedule receipt and read-side reverification",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "3a0e26af88744f93bc0a1874aafc5ac6f67595e4",
           "pr": "https://github.com/acosmi/RSIAgent/pull/61",
           "merged_sha": "b220971c4e5ad44453c9d3e5787fbdfda6eb01ac",
@@ -1232,7 +1162,7 @@
           "description": "exploration.start management consumer with idempotent world registration and read-side decision reverification",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "71c0fa8a79e34b1cfec1c2bb61728fbfc6703138",
           "pr": "https://github.com/acosmi/RSIAgent/pull/64",
           "merged_sha": "f8fa1a19d5e968f83a52385ecb43d07d56442610",
@@ -1254,7 +1184,7 @@
           "description": "management jobs and private inputs joined to the cleanup closure; submissions with revoked dependencies rejected",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "d2929c7e16c0f535068922bd16945a8dbfdbcb3a",
           "pr": "https://github.com/acosmi/RSIAgent/pull/74",
           "merged_sha": "c72aae14c9f35c1bcc090b5a374d2696d57dacfc",
@@ -1276,7 +1206,7 @@
           "description": "management submissions derived from a revoked source's closure are rejected at submit",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "f7946f02407bb5694f08bd9f357425e2f1ad2262",
           "pr": "https://github.com/acosmi/RSIAgent/pull/89",
           "merged_sha": "cc85b5c71cec06763909fb0efa33c4e296b6178d",
@@ -1298,7 +1228,7 @@
           "description": "EditCompiled review verifies the producer's input_digest rule before exposing an exact diff",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "f853917248fb025abe3144dc79420fa695644517",
           "pr": "https://github.com/acosmi/RSIAgent/pull/150",
           "merged_sha": "94076d789f40347ab8263176044f041824c061fb",
@@ -1357,7 +1287,12 @@
         "V090",
         "V092",
         "V094",
-        "V096"
+        "V096",
+        "V099",
+        "V100",
+        "V102",
+        "V110",
+        "V111"
       ],
       "verified_subscopes": [
         {
@@ -1365,7 +1300,7 @@
           "description": "offline revocation and backup/restore subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "644d95dd85490bc716f837d7148d7245bce0b2c3",
           "pr": "https://github.com/acosmi/RSIAgent/pull/37",
           "merged_sha": "b0662ca1b7a2fe27d4a4622918679eed4934e214",
@@ -1387,7 +1322,7 @@
           "description": "a second revocation source with the same id gets a named Conflict; run/import_source id collisions refused at creation",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "f15a42fe94426a49e8967869f8087a99837fd4a5",
           "pr": "https://github.com/acosmi/RSIAgent/pull/82",
           "merged_sha": "8d959dee844fb16f0763b0684ba3adf48ad75f1f",
@@ -1409,7 +1344,7 @@
           "description": "revocation cleanup completes only at the closure fixpoint",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "fee5897ff45070fc198c0f46daac9e364ce7e38d",
           "pr": "https://github.com/acosmi/RSIAgent/pull/83",
           "merged_sha": "51db9b6c9a251def4e6566c96641ed8b63d43a85",
@@ -1431,7 +1366,7 @@
           "description": "no new reservation or dispatch on revoked sources; settlement still booked",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "e06bfdd513efbbf87952bd8c822e2de12e803df7",
           "pr": "https://github.com/acosmi/RSIAgent/pull/85",
           "merged_sha": "f4b1ef66340412f5c0edf69a48549cd1386324cf",
@@ -1449,33 +1384,11 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-038-e06bfdd.json"
         },
         {
-          "id": "E08.ag037_economic_replay_cleanup",
-          "description": "economic replay records preserved by cleanup; start re-verifies sources before writing the job",
-          "plan_version": "v4.2",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
-          "source_sha": "0c1bacd1752e20a7f1de2ab6058fec6271781d8f",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/86",
-          "merged_sha": "16bdb08e1ac118e3e732a912358add468c49173b",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/replay_economic_cleanup_v42.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test replay_economic_cleanup_v42",
-          "input_digest": "2f54dc0657ac2cece521f86e4bc92c51c63bce4b3af0f0bccb842872f43bff3c",
-          "exit_code": 0,
-          "log_path": "out/audit-20260930/qa/ctrl-stack-ag037-0c1bacd.log.test",
-          "actual_result": "controller full re-run at 0c1bacd (ctrl_verify.sh: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast with the rsproxy mirror, not --offline, build, both smokes, support-scope checker and unittest): replay_economic_cleanup_v42 9 passed / 0 failed; workspace 73 test binaries 933 passed / 0 failed; test exit 0",
-          "scope": "four replay_economic record kinds preserved; cleanup through an economic experiment reaches Complete; start re-verifies sources in the writing session",
-          "risk": "economic records are not restore-protected; write_started_job is #[doc(hidden)] pub",
-          "rollback": "revert PR #86 (merge 16bdb08) through an independent revert PR; accepted-stack rollback point d4837f5; persisted revocation, budget, cost and audit facts are not rolled back",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-037-0c1bacd.json"
-        },
-        {
           "id": "E08.ag043_late_response_revoked",
           "description": "responses settled after revocation are billed, unusable and leave no plaintext",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "b1c1bdefaf8e538f36287ca9b287c3aa2f41f18d",
           "pr": "https://github.com/acosmi/RSIAgent/pull/88",
           "merged_sha": "ca117c45d87986500b38bc5afee3d6e161fea4f5",
@@ -1497,7 +1410,7 @@
           "description": "stage facts written after revocation are stored redacted",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "e7c0d0f94c2915cc95663f8673d6c62f87ada2e6",
           "pr": "https://github.com/acosmi/RSIAgent/pull/90",
           "merged_sha": "ecdfe31faabb21a368f08d341b2a6e15223b0849",
@@ -1515,33 +1428,11 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-045-e7c0d0f.json"
         },
         {
-          "id": "E08.ag046_write_side_revocation",
-          "description": "Grants and package/seed sources use a shared write-side revocation gate",
-          "plan_version": "v4.2",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
-          "source_sha": "229fea802d8184eb03c7f53f979a78200284b47b",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/96",
-          "merged_sha": "49d5b85ec4fa757144213573c585087798324e91",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/write_side_revocation_gate_v42.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test write_side_revocation_gate_v42",
-          "input_digest": "69e8f85e56d6264a9d840b428d6d0aacad092f1c86d8d12ae3bad45e491598fd",
-          "exit_code": 0,
-          "log_path": "out/audit-20260930/qa/ctrl-ag046-229fea8.log.test",
-          "actual_result": "controller full re-run at 229fea8 (ctrl_verify.sh: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy, not --offline, build, both smokes, support-scope checker and unittest): write_side_revocation_gate_v42 13 passed / 0 failed; workspace 85 result lines 1101 passed / 0 failed; test exit 0",
-          "scope": "E08; plan sections 11.3/11.5 lines 1110/1132; V017/V075: grants and new package/seed writes reject revoked source references or upstream closure before writing; existing package/seed reads, exports and handoff use the same namespace/kind-precise gate; malformed tombstones and closure overflow fail closed",
-          "risk": "Manifest dependency_refs are still checked after the first write; storage publication kind precision, kind-keyed tombstones, stage_bundle, other late writes, physical residue and production callers are not claimed; grant existence/trust stays a consumer responsibility",
-          "rollback": "revert PR #96 through an independent revert PR; accepted-head parent e2c9107142413c0ba304b5090692b56037958f40; preserve revocation, budget, cost and audit facts",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-046-229fea8.json"
-        },
-        {
           "id": "E08.ag053_bounded_dependency_snapshots",
           "description": "Bounded dependency snapshot recursion",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "a2c62326c7ca87a724da16ee4cfd133462b49dbe",
           "pr": "https://github.com/acosmi/RSIAgent/pull/99",
           "merged_sha": "3aa3804db4ec39a72f38a8ec00cc7e6f9e92b360",
@@ -1559,33 +1450,11 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-053-a2c6232.json"
         },
         {
-          "id": "E08.ag059_manifest_prewrite_gate",
-          "description": "Manifest dependencies checked before package writes",
-          "plan_version": "v4.2",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
-          "source_sha": "8257e6a73304c250b545ead3c0bc9409cf2daa35",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/101",
-          "merged_sha": "296b5a07a7bf911d02454b683d5732e9d38e3ae5",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/write_side_revocation_gate_v42.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test write_side_revocation_gate_v42",
-          "input_digest": "abf5d40aba4546aff5490af3098279bb0f37688ba55719e2125d207a4fe3608d",
-          "exit_code": 0,
-          "log_path": "out/audit-20260930/qa/ctrl-ag059-8257e6a.log.test",
-          "actual_result": "controller independent full re-run at 8257e6a: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; write_side_revocation_gate_v42 21 passed / 0 failed; workspace 87 result lines, 1150 passed / 0 failed; checker unittest 48 passed; test exit 0",
-          "scope": "E08/E16.2; sections 11.3 L1110 and 11.5 L1132, E08 L1295/L1299; V017/V075: resolved manifest and request source refs are checked jointly before first package write; revoked inputs leave no Prepared envelope, audit, edge or blob; V038 existing joint closure bound; missing manifest refs retain quarantine semantics",
-          "risk": "Storage publication still has the documented id-only other-kind tombstone late-refusal residue; no physical erasure, unknown-schema cleanup, real host support, production performance, Linux, effect or full E/V claim",
-          "rollback": "revert PR #101 through an independent revert PR; accepted-head parent 43f0022478d58dd8a8e6492cffb3aa24463b3fce; preserve immutable evidence, revocation, budget, cost and audit facts",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-059-8257e6a.json"
-        },
-        {
           "id": "E08.ag068_native_authority_cleanup",
           "description": "Registered native authority successors are cleaned in new revocation jobs",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "75754911a01aab756d5f17b9d6fef8bb3959de33",
           "pr": "https://github.com/acosmi/RSIAgent/pull/113",
           "merged_sha": "212c78488b403397eaebaa65a6d280b9c6be3899",
@@ -1612,7 +1481,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-069-9edf57e.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/ag069-current-ddde-9edf-ROOT-task-acceptance.actual-20261003.json",
           "merged_sha": "5ee01d1e2ebb2401fe94530ff286801239940259",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/118",
@@ -1634,7 +1503,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-073-b67ca37.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/ag073-fixedb67ca-ROOT-R51-local-Task-accepted-scope-corrected-r2-20261003.json",
           "merged_sha": "06fb166b006e5479a80e04dc14998109c30b0d42",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/119",
@@ -1656,7 +1525,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-075-8a92e57.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG075-existing-current1132-fixed8a92e57-ROOT-fresh12-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
           "merged_sha": "aa831fba2d09d0ef2d0755c3d7a08971b8f6667f",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/131",
@@ -1674,7 +1543,7 @@
           "description": "Revoke cleanup isolates an unreadable historical budget request as an unknown scope instead of rolling back the namespace",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "4fd5701ad6677c0c441fd376eec953e001fc7012",
           "pr": "https://github.com/acosmi/RSIAgent/pull/145",
           "merged_sha": "7d39ef7350615be82d698d6914d03856fa0df97c",
@@ -1703,7 +1572,7 @@
           "description": "The legacy budget gate judges lost-reference calls by their request closure and fails closed when the closure cannot be verified",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "7cc0e962936956ddab4acd5d6a25bf8cf14d336f",
           "pr": "https://github.com/acosmi/RSIAgent/pull/151",
           "merged_sha": "63113ac95b01f78863da0f75c5a93e5bfa2dd9d8",
@@ -1732,7 +1601,7 @@
           "description": "Serve startup closes the settled budget calls whose execution close a crash lost, freeing closable roots without touching listed ones",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "71cae0cfd8919f523514d382e0b966171c5e3f97",
           "pr": "https://github.com/acosmi/RSIAgent/pull/154",
           "merged_sha": "aece7299d0078e5704bd74ed3ae04e828f3e2c6d",
@@ -1761,7 +1630,7 @@
           "description": "restore accepts a backup whose manifest and database ledger are a strict prefix of the current migration set, applies the missing migrations inside the private restore copy before anchor comparison, delta replay and publication; the anchor and the startup gate keep the exact current set",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "a2705252894c61aaa1972f0596a279e2f36c2ab5",
           "pr": "https://github.com/acosmi/RSIAgent/pull/159",
           "merged_sha": "a78a1e60a4298cd3ca57598a7aba7c5c84a8a721",
@@ -1790,7 +1659,7 @@
           "description": "Revocation cleanup judges a legacy budget call's closure by its registered source reference, so a formal call no longer fails every cleanup and a dependent one is redacted",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "92f12e1642bd0f5c07ad6f4e431635a46f1671d8",
           "pr": "https://github.com/acosmi/RSIAgent/pull/162",
           "merged_sha": "5718bf5c0389588781b8dd2e76518da7daab6fd5",
@@ -1850,7 +1719,10 @@
         "V094",
         "V095",
         "V096",
-        "V097"
+        "V097",
+        "V100",
+        "V105",
+        "V106"
       ],
       "verified_subscopes": [
         {
@@ -1858,7 +1730,7 @@
           "description": "deterministic program-fixture exploration subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "c71db74efd83a7dc2866b0f446049adcb4b8d3bd",
           "pr": "https://github.com/acosmi/RSIAgent/pull/38",
           "merged_sha": "7a8a35908a2f7cc72ed601cbc902a2e4b49120bf",
@@ -1880,7 +1752,7 @@
           "description": "plan section 7.7 skill-group job orchestration: at most two groups, isolated, combination only as a marker",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "c841d1a126dc51ffca424ff72e79105b4d8c5166",
           "pr": "https://github.com/acosmi/RSIAgent/pull/69",
           "merged_sha": "31566ce87203b44c44b72986233af1c02fbe5cda",
@@ -1902,7 +1774,7 @@
           "description": "exploration nodes, dispatch facts and history entries joined to the revocation cleanup closure",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "605d92abf21eedf9ef48a3704a49de14c8c2513d",
           "pr": "https://github.com/acosmi/RSIAgent/pull/71",
           "merged_sha": "9519c26f049afff63154fb2337893217b18b7e3c",
@@ -1924,7 +1796,7 @@
           "description": "plan section 8.5 same-task comparative practice (PracticeAttemptSetV1)",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "6a906355fdfb33a9e663123092a3938340850cbd",
           "pr": "https://github.com/acosmi/RSIAgent/pull/73",
           "merged_sha": "7ad4994c7a9208f523612d305660dc8ca9529620",
@@ -1946,7 +1818,7 @@
           "description": "run_next records only E03-gated development evidence as Valid",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "04e63092f2995c3668e14640c985012fd6a6a2b2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/80",
           "merged_sha": "9e3e350ed5fbef2975117f12a7f8d3ca3b9cdcbf",
@@ -1968,7 +1840,7 @@
           "description": "legal actions and prefix hygiene: Deepen needs Trusted, expanded parents are not re-deepened, best-ancestor rule aligned with replay",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "d4837f5f53c4ecae67f8e528b3e4e9f06758ef0a",
           "pr": "https://github.com/acosmi/RSIAgent/pull/84",
           "merged_sha": "42f89bd602db0c2783de38d87d91e80cd65f220b",
@@ -1990,7 +1862,7 @@
           "description": "immutable registration fingerprint and exact registration-time counters",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "c44aa8d7db9d79f0b62379239e06184e49b5f73b",
           "pr": "https://github.com/acosmi/RSIAgent/pull/87",
           "merged_sha": "32a2f5090fe5136b21c7d3454f53964b36990247",
@@ -2012,7 +1884,7 @@
           "description": "post-payment paths converge to one terminal node; deterministic failures rejected before payment; facts bound to nodes",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "4254e6d9408dfe4bdba4526a19de4987e6244198",
           "pr": "https://github.com/acosmi/RSIAgent/pull/91",
           "merged_sha": "a38b1452ede8fc5755bcab65686edd2f2817b51a",
@@ -2030,33 +1902,11 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-041-4254e6d.json"
         },
         {
-          "id": "E09.ag042_recovery_counting",
-          "description": "recovery counts derived from dispatch facts and lineage, aligned with replay",
-          "plan_version": "v4.2",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
-          "source_sha": "3d68d30a43c3fc0582053d48cf14ac35c3d4e841",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/92",
-          "merged_sha": "696252faf8ef2b2391102f4e6b0e9c0ee20c53d5",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/exploration_recovery_counting_v42.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test exploration_recovery_counting_v42",
-          "input_digest": "f45b183b4fa9625b1202ae4a16af5c00da44bd174ffbc9c45b62bb158ca2d4f7",
-          "exit_code": 0,
-          "log_path": "out/audit-20260930/qa/ctrl-stack-ag042-3d68d30.log.test",
-          "actual_result": "controller full re-run at 3d68d30 (ctrl_verify.sh: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast with the rsproxy mirror, not --offline, build, both smokes, support-scope checker and unittest): exploration_recovery_counting_v42 15 passed / 0 failed; workspace 81 test binaries 1064 passed / 0 failed; test exit 0",
-          "scope": "rfd and recovery_dispatches_used derived as replay does; dispatched_repairs counted per episode; failure nodes are never rewritten; Recover is offered only for supported categories with remaining episode and rfd budget",
-          "risk": "episode membership is read from stored node state (renaming a sibling root's episode reopens a spent repair, queued as AG-047); production does not yet produce repairable failures",
-          "rollback": "revert PR #92 (merge 696252f) through an independent revert PR; accepted-stack rollback point e7c0d0f; persisted revocation, budget, cost and audit facts are not rolled back",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-042-3d68d30.json"
-        },
-        {
           "id": "E09.ag048_terminal_classes",
           "description": "Optimization step terminals use closed typed classes and fixed codes",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "f178dc239b619746b07b74241a756dce4897f059",
           "pr": "https://github.com/acosmi/RSIAgent/pull/97",
           "merged_sha": "804302602efe575d92973be20c532d264019f9aa",
@@ -2074,33 +1924,11 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-048-f178dc2.json"
         },
         {
-          "actual_result": "ROOT accepted fixed source 313598036461304fe1b081e91115bdbd2c779752; actual merge tree equals accepted tree 16de199ce2d66f4909b094603fd8def8207abb71. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
-          "command": "cargo test --locked --offline -p evo-engine --test replay_legal_prefix_v42",
-          "description": "Replay deepen eligibility and waits from the observed legal prefix",
-          "exit_code": 0,
-          "id": "E09.ag074_local_scoped_acceptance",
-          "input_digest": "e4686ced10ab554f49b580631321c073d2c5ea892129586a297b8ae4df3ee5a1",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-074-3135980.json",
-          "log_path": "out/audit-20260930/qa/takeover-20261002/AG074-existing-currentEA02-fixed3135980-ROOT-fresh14-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
-          "merged_sha": "aa51b1102e1886cbaf7b025d37b98ca30b6e2d3d",
-          "plan_recheck": "not_affected",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_version": "v4.2",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/127",
-          "pr_state": "merged",
-          "record_source": "docs/implementation-ledger.md",
-          "risk": "Partial software evidence only; no transitive current full route, ordinary-P OS principal, real provider/production host, model benefit, promotion, deployment or whole E/V/v4.2 acceptance. Historical parent outcomes stay historical; program paths in earlier receipts may have been retired after owned-target cleanup.",
-          "rollback": "Reviewed revert of PR #127; retain source, costs, revocation history and original QA. Accepted parent ea02f116fe2172dcba621a60bf9b141237e1ba45.",
-          "scope": "E09; Replay deepen eligibility and waits from the observed legal prefix software/component boundary only.",
-          "source_sha": "313598036461304fe1b081e91115bdbd2c779752",
-          "test_entry": "crates/evo-engine/tests/replay_legal_prefix_v42.rs"
-        },
-        {
           "id": "E09.ag103_fairness_waits_legal_set_v42",
           "description": "Core exposes the pre-selection legality filter as legal_candidates; elastic allocation ranks only its output and online exploration advances fairness waits only over the legal set of the decision round",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "d8a71327018e3995f786bed3dd93e852c858e3ce",
           "pr": "https://github.com/acosmi/RSIAgent/pull/158",
           "merged_sha": "4036c0d2d11a01ddcdcb2940d0b00f0f00975656",
@@ -2154,59 +1982,18 @@
         "V081",
         "V086",
         "V094",
-        "V096"
+        "V096",
+        "V104",
+        "V105",
+        "V106"
       ],
       "verified_subscopes": [
-        {
-          "id": "E10.controller_acceptance",
-          "description": "immutable offline replay subset",
-          "plan_version": "v4.1",
-          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
-          "source_sha": "77177cd5ffa87de5152a3295974ae41fc86498d4",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/39",
-          "merged_sha": "96e62412809610a72d2ab593aaca59a8bcebd6d2",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/replay_v41.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test replay_v41",
-          "input_digest": "26b42788f1b711b379950abebb298ceda646a79c3f7b7a4a092c804be8416f08",
-          "exit_code": 0,
-          "log_path": "out/implementation-v4.1-20260919/controller-e10-engine-integration.log",
-          "actual_result": "13 replay integration tests passed",
-          "scope": "immutable offline replay subset",
-          "risk": "online target-environment effect and production release remain unverified",
-          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
-          "record_source": "out/implementation-v4.1-20260919/controller-e10-acceptance.json",
-          "input_ref": "out/implementation-v4.1-20260919/controller-e10-final-input.json"
-        },
-        {
-          "id": "E10.replay_management_controller_acceptance",
-          "description": "replay.run management consumer only",
-          "plan_version": "v4.1",
-          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
-          "source_sha": "0aef9345679e674988e67e4208c60aba63b5271b",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/43",
-          "merged_sha": "59afd1663a0d5f5212077dd92beaaf7920cde0ff",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/dispatch_management.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test dispatch_management",
-          "input_digest": "e8898207d56a4c952e1edefe11c5204728118d736638eefeb15bcb894ec94dad",
-          "exit_code": 0,
-          "log_path": "out/review-antigravity-20260919/ag001-engine.log",
-          "actual_result": "13 dispatch management tests passed; replay_v41 was separately regressed",
-          "scope": "replay.run management consumer only",
-          "risk": "exploration.start, curriculum.step and meta.start remain blocked; no production effect",
-          "rollback": "disable replay.run dispatch while retaining stored replay reports and revocation facts",
-          "record_source": "out/review-antigravity-20260919/ag001-acceptance.json",
-          "input_ref": "out/review-antigravity-20260919/ag001-input.json"
-        },
         {
           "id": "E10.ag032_replay_redacted_reads",
           "description": "replay read paths name redacted records; the submit check compares tombstone source_kind",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "8954b6c86cbe1bc1a5c0b957828080b59f1d1704",
           "pr": "https://github.com/acosmi/RSIAgent/pull/79",
           "merged_sha": "b262bbb2a0ea9ead68bc33fe1e58235e85bcffea",
@@ -2222,57 +2009,6 @@
           "rollback": "revert PR #79 (merge b262bbb) through an independent revert PR; accepted-stack rollback point 892ed1c; persisted revocation, budget, cost and audit facts are not rolled back",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-032-8954b6c.json"
-        },
-        {
-          "id": "E10.ag064_replay_episode_recovery",
-          "description": "Replay recovery facts, lineage eligibility and batch episode bound",
-          "plan_version": "v4.2",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
-          "source_sha": "437af3fc7e414a3509bbb3f9d2cc8a614f231616",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/109",
-          "merged_sha": "c6e13e906ea888916294e6deac77c37f4391225f",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/replay_recovery_contract_v42.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test replay_recovery_contract_v42",
-          "input_digest": "875f78f9d6b8d4b97c772edda20d59d8ad7265c486eb306eb3f1397b6a1099b1",
-          "exit_code": 0,
-          "log_path": "out/audit-20260930/qa/ctrl-ag064-437af3f.log.test",
-          "actual_result": "controller independent full re-run at 437af3f: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; replay_recovery_contract_v42 10 passed / 0 failed; workspace 95 result lines, 1263 passed / 0 failed; checker unittest 48 passed; two root probes pass on head and both fail after successful compilation on the actual parent; 4 new core and 10 new engine tests; three actual old-program report fixtures and unchanged stored-history assertions",
-          "scope": "E09/E10; sections 7.1 L785/L787, 7.1.1 L791-L809, 7.2.1 L825-L831, E10 L1323-L1329, 5.1 L453 and 7.4.1 L853-L855; V024/V081/V086.b/d subset: derive per-episode counters from observed Recover targets, project after the whole batch, reject exhausted failure lineages and duplicate episodes in a batch",
-          "risk": "No production repair templates/reset/leases/billing, arbitrary-prefix authentication, full legal-action filtering, normal Deepen expanded-parent rule or PolicyStop classification. Old affected reports remain statically readable but semantic verification and same-ID reruns reject; no migration, overwrite, full E/V, effect or release",
-          "rollback": "revert PR #109 through an independent revert PR; accepted-head parent eb275812f09dd8850ad4edac08a2282cb5e82112; retain immutable evidence, frozen plans, costs and revocation state",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-064-437af3f.json"
-        },
-        {
-          "id": "E10.ag103_replay_fairness_waits_legal_set_v42",
-          "description": "Replay and online exploration advance a fairness wait only for an opportunity that was legal in a completed decision round and was skipped, through one core filter",
-          "plan_version": "v4.2",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
-          "source_sha": "d8a71327018e3995f786bed3dd93e852c858e3ce",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/158",
-          "merged_sha": "4036c0d2d11a01ddcdcb2940d0b00f0f00975656",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/replay_fairness_waits_v42.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test replay_fairness_waits_v42",
-          "input_digest": "4544043ec94a7bb600a7eb89c1853a3f7a2c1b7abe7d8251f84123606dfe9c8d",
-          "exit_code": 0,
-          "log_path": "out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.replay_fairness_waits_v42.log",
-          "actual_result": "this-window controller acceptance at d8a71327 (restacked 647c7ce8 onto c39cbd62, before/after patches byte-identical 90833 B; fresh target under a 1.5 GiB disk watchdog): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 143 binaries 1805 passed / 0 failed / 0 overflow (parent c39cbd62: 140 binaries 1789 passed; new 16: fairness_waits_legal_set_v42 5, replay_fairness_waits_v42 9, exploration_fairness_waits_v42 2), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-ag103/append.rs: a root with unknown cost and a depth-capped deepening never accumulate a fairness wait) pass on head and fail on parent c39cbd62 (both accumulate a wait). Declared target covered with exit 0 by this window's AG-115 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.replay_fairness_waits_v42.log).",
-          "scope": "E10; plan §7.1.1 L797/L805 (fairness waits advance over the candidate set of the completed decision round, after the pre-selection legality and budget filter) with E09 §7.1.1 and E10 L1327 (replay and online share one restricted decision function); V020/V022/V023/V025/V081/V086 subset: waits count only legal, skipped opportunities; Stop reason, terminals, complete_support, scoring, probe_budget counting and report ids unchanged",
-          "risk": "No claim on the undefined PolicyStop/WorldExhausted contract items, Stop reason refinement, legacy report migration, full E09/E10 route or any gain",
-          "rollback": "revert PR #158 through an independent revert PR; accepted-head parent c39cbd626faf4a4c9c0dd1dd104f67282b915f45; retain immutable evidence, frozen plans, costs and revocation state",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-103-d8a7132.json",
-          "execution": {
-            "runner": "ctrl_verify.sh",
-            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-103 cargom test --workspace --locked --no-fail-fast",
-            "scope": "workspace",
-            "exit_code": 0,
-            "evidence": "out/audit-20260930/qa/accept-ag103/ctrl-ag103-final.log.test"
-          }
         }
       ],
       "remaining": [
@@ -2298,7 +2034,9 @@
         "V081",
         "V094",
         "V096",
-        "V097"
+        "V097",
+        "V104",
+        "V118"
       ],
       "verified_subscopes": [
         {
@@ -2306,7 +2044,7 @@
           "description": "static economics and blocked-path subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "289d9204c6d76018080a9221967eebe5848e2b8d",
           "pr": "https://github.com/acosmi/RSIAgent/pull/40",
           "merged_sha": "09b3ebe8bad12d59bd3c2f926d3050802372e96f",
@@ -2348,7 +2086,8 @@
         "V083",
         "V093",
         "V094",
-        "V096"
+        "V096",
+        "V109"
       ],
       "verified_subscopes": [
         {
@@ -2356,7 +2095,7 @@
           "description": "offline zero-budget curriculum rejection subset",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "e612fcb9563c8e320e011e6d06f026b9730f561c",
           "pr": "https://github.com/acosmi/RSIAgent/pull/41",
           "merged_sha": "b1127a228c4a40248631ed417aba0ad7ea1a0884",
@@ -2378,7 +2117,7 @@
           "description": "curriculum envelope record kinds classified for revocation cleanup",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "2df06e77f6dd1442fe1f04f07a6a2e8d79f5a8ee",
           "pr": "https://github.com/acosmi/RSIAgent/pull/72",
           "merged_sha": "15b140ddef25c8e794d586fecae56f129226a5c6",
@@ -2400,7 +2139,7 @@
           "description": "Text proposals remain unverified and topic selection precedes budget reservation with typed errors",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "a4a60c8eb0f808cfb6492e867fe82e96d66af95d",
           "pr": "https://github.com/acosmi/RSIAgent/pull/94",
           "merged_sha": "4a8487413cb8fe51ee16b91a538a71816997adfb",
@@ -2444,37 +2183,17 @@
         "V091",
         "V094",
         "V096",
-        "V097"
+        "V097",
+        "V100",
+        "V109"
       ],
       "verified_subscopes": [
-        {
-          "id": "E13.controller_acceptance",
-          "description": "persistent program-fixture monitoring subset",
-          "plan_version": "v4.1",
-          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
-          "source_sha": "2c79608fb1d30f7592b742e972c209cb9208fabc",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/42",
-          "merged_sha": "2e209dcea36d63610c59d3797e039f35d063ec89",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/monitoring.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test monitoring",
-          "input_digest": "b896f96de03af66c4c3e96cc5049e6dbe1b65a7e405e9f8439bcf705c749a709",
-          "exit_code": 0,
-          "log_path": "out/implementation-v4.1-20260919/controller-e13-tests.log",
-          "actual_result": "10 monitoring tests passed",
-          "scope": "persistent program-fixture monitoring subset",
-          "risk": "real longitudinal provider execution and effect remain unverified",
-          "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
-          "record_source": "out/implementation-v4.1-20260919/controller-e13-acceptance.json",
-          "input_ref": "out/implementation-v4.1-20260919/controller-e13-input.json"
-        },
         {
           "id": "E13.ag022_consolidation_closure",
           "description": "E13 consolidation: monitoring revocation closure, pure pass/fail pairing v2, persisted proposals and one staged candidate",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "551aa33a8efdd0f92f5cfbf30820493443bbc020",
           "pr": "https://github.com/acosmi/RSIAgent/pull/70",
           "merged_sha": "c81b258b6f890ab78bc9c7111798f75560c2ea23",
@@ -2492,33 +2211,11 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-022-551aa33.json"
         },
         {
-          "id": "E13.ag028_consolidation_trigger",
-          "description": "E13 consolidation trigger: E03-gated trusted cycles, self-trigger guard and close-and-trigger",
-          "plan_version": "v4.2",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
-          "source_sha": "145f9cff261de6dbac9bbede1bf28080101bec3d",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/75",
-          "merged_sha": "6a23cb3697f656e1f5132cbe62ae766b4c0383f0",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/monitoring_trusted_cycle_v42.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test monitoring_trusted_cycle_v42",
-          "input_digest": "649b0515207cffa3a378a63850e2b08a9b3d95b9c05b8de3259896acafa7297a",
-          "exit_code": 0,
-          "log_path": "out/audit-20260930/qa/ctrl-stack-ag028-145f9cf.log.test",
-          "actual_result": "controller full re-run at 145f9cf (ctrl_verify.sh: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast with the rsproxy mirror, not --offline, build, both smokes, support-scope checker and unittest): monitoring_trusted_cycle_v42 13 passed / 0 failed; workspace 57 test binaries 708 passed / 0 failed; test exit 0",
-          "scope": "non-fixture reports pass the E03 gate in the same session; typed receipt edges; self-trigger guard on consolidation claims and their tombstones; close_development_cycle_and_trigger; RegisteredDevelopmentRunner implements ConsolidationDevRunner",
-          "risk": "no production cycle driver or management entry; the real chain only reaches NoContrast or Rejected",
-          "rollback": "revert PR #75 (merge 6a23cb3) through an independent revert PR; accepted-stack rollback point 2df06e7; persisted revocation, budget, cost and audit facts are not rolled back",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-028-145f9cf.json"
-        },
-        {
           "id": "E13.ag030_consolidation_budget_stage",
           "description": "V096.a: consolidation calls billed under their own budget stage",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "400f707805084199a9046008a52a2afd6c038f96",
           "pr": "https://github.com/acosmi/RSIAgent/pull/77",
           "merged_sha": "887b1d714581ae8a71d45243d38be1759697600d",
@@ -2540,7 +2237,7 @@
           "description": "bounded deterministic consolidation terminal category",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "892ed1cebaf50ea3a7ae2a38ddd05d70313637b1",
           "pr": "https://github.com/acosmi/RSIAgent/pull/78",
           "merged_sha": "84d8a7054c2428db0f821fcd478c615b09ade76b",
@@ -2567,7 +2264,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-081-c2f89f4.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/ag081-current9f0c-headc2f89f42-ROOT-all12-necessary-SC0-finite-Task-PASS_LOCAL_TASK-and-only-epoch-release-r1-20261005.json",
           "merged_sha": "90d3dcbef822b17abaffffbcc866b863336c4024",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/122",
@@ -2605,7 +2302,9 @@
         "V092",
         "V094",
         "V096",
-        "V097"
+        "V097",
+        "V118",
+        "V119"
       ],
       "verified_subscopes": [
         {
@@ -2613,7 +2312,7 @@
           "description": "E14 increment 1: bounded ElasticPolicy, decision digests, ImproverContentV2 and dispatch-derived MechanismUsageRecordV1",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "3dd88787cd1910ad3eafc1da50a6a883b1adba3a",
           "pr": "https://github.com/acosmi/RSIAgent/pull/66",
           "merged_sha": "5a0ef4419c51687534baa3296dbbf7e310a5d810",
@@ -2635,7 +2334,7 @@
           "description": "E14.2a MetaTrial fork (program scope)",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "c5c04bad5c349f00c815bb02c9a3eccc439b0da7",
           "pr": "https://github.com/acosmi/RSIAgent/pull/81",
           "merged_sha": "d9b3f6f5234ad14da18956a78c804e4c6818fa10",
@@ -2657,7 +2356,7 @@
           "description": "Current CLI, meta and cleanup description boundaries",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "4edb5b79220fe443d700808b99da9b9f6590a910",
           "pr": "https://github.com/acosmi/RSIAgent/pull/105",
           "merged_sha": "5337f4b17558b4c95176885d39f2518142d965b9",
@@ -2699,7 +2398,8 @@
         "V085",
         "V092",
         "V096",
-        "V097"
+        "V097",
+        "V118"
       ],
       "verified_subscopes": [],
       "remaining": [
@@ -2729,31 +2429,10 @@
         "V076",
         "V087",
         "V090",
-        "V098"
+        "V098",
+        "V117"
       ],
       "verified_subscopes": [
-        {
-          "id": "E16.1.durable_import_controller_acceptance",
-          "description": "durable source import: three pinned readers, persistent registration with authorization, cluster independence, revocation cleanup",
-          "plan_version": "v4.1",
-          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
-          "source_sha": "b6861a756bf1a2a5660cb9d6e0663b4385242104",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/44",
-          "merged_sha": "acda31895bb1cb42cf7985b907a4c600429573d0",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/import_v41.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test import_v41",
-          "input_digest": "4f1153a9ae6f63b5c44698bbc09e439be4445c9be24af2cbd92fbe9332bd9820",
-          "exit_code": 0,
-          "log_path": "out/verify-20260930/qa/s2-pr44fix-ctrl-0.log",
-          "actual_result": "34 import_v41 tests passed (the log also carries a 7-test optimization run that is not part of this record)",
-          "scope": "durable source import: three pinned readers, persistent registration with authorization, cluster independence, revocation cleanup; no trusted run, AppliedReceipt, FormalEvaluation or Active from imports",
-          "risk": "full real migration chain remains unverified: ImportedHistory/UnverifiedImport does not yield a trusted run, AppliedReceipt, FormalEvaluation or Active",
-          "rollback": "disable new imports and withdraw the sub-scope through an independent revert PR while retaining incurred costs, revocation and audit facts",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/verify-20260930/qa/s2-input-E16.1.json"
-        },
         {
           "actual_result": "ROOT accepted fixed source 1355e95f598bf7d1f490d6d1d295a1e29c855c0c; actual merge tree equals accepted tree cd7b8f0db394eb2d5a417d34b5680d9edd27160a. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
           "command": "cargo test --locked --offline -p evo-core --test import_fixture_v42",
@@ -2764,7 +2443,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-076-1355e95.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG076-existing-currentAA51-fixed1355e95-ROOT-fresh12-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
           "merged_sha": "1177c91931689794a7d28b614adc01d3a0435e46",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/128",
@@ -2787,7 +2466,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-070-887d97a.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG070-existing-current3ad-fixed887d97a-ROOT-standard8-head38-parent36-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
           "merged_sha": "1132b6b4b6e0016540339ba65219daf1ceb35fb8",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/130",
@@ -2824,7 +2503,9 @@
         "V075",
         "V091",
         "V092",
-        "V098"
+        "V098",
+        "V102",
+        "V117"
       ],
       "verified_subscopes": [
         {
@@ -2832,7 +2513,7 @@
           "description": "durable staging, registered blob publish, local_namespace export delivery, E16 cleanup with live-reference blob retention",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "c57397f4ffbf9bff39c32a17e67e962bff3a8d45",
           "pr": "https://github.com/acosmi/RSIAgent/pull/54",
           "merged_sha": "16c2817bc192bf71535d2c99d867873e6e85bcf8",
@@ -2854,7 +2535,7 @@
           "description": "Known-marker privacy findings remain blocked with UTF-8-safe byte-limited snippets",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "53dd17677a38abab26d31f1a57778b7fca9694e6",
           "pr": "https://github.com/acosmi/RSIAgent/pull/114",
           "merged_sha": "c0c4dbd3f6f0464c6cb492c0eb298496fd88b9de",
@@ -2876,7 +2557,7 @@
           "description": "UTF-8 privacy boundary and public-API refusal regressions for the unchanged parent scanner",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "9f7038d1d033de500d858b188bbf344086821b1d",
           "pr": "https://github.com/acosmi/RSIAgent/pull/117",
           "merged_sha": "ddde63c6ab98a2528258d265999bb902a08b0f55",
@@ -2916,7 +2597,8 @@
         "V078",
         "V091",
         "V092",
-        "V098"
+        "V098",
+        "V115"
       ],
       "verified_subscopes": [
         {
@@ -2924,7 +2606,7 @@
           "description": "seed B/L/U install and reset staging",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "c57397f4ffbf9bff39c32a17e67e962bff3a8d45",
           "pr": "https://github.com/acosmi/RSIAgent/pull/54",
           "merged_sha": "16c2817bc192bf71535d2c99d867873e6e85bcf8",
@@ -2969,37 +2651,18 @@
         "V077",
         "V087",
         "V091",
-        "V098"
+        "V098",
+        "V101",
+        "V107",
+        "V108"
       ],
       "verified_subscopes": [
-        {
-          "id": "E16.4.real_store_rejection_controller_acceptance",
-          "description": "real-store rejection of unverified Claude surfaces, trusted host record reload and structure checks",
-          "plan_version": "v4.1",
-          "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "not_affected",
-          "source_sha": "11b42d277f861726b5e885c0ab08f305bc62169d",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/47",
-          "merged_sha": "1c824e6614667da4dc7ea74e96b46adfd1d2c089",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/hosts_v41.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test hosts_v41",
-          "input_digest": "ade71c7f5c639bc57ff3ea0116e94bdc4567265c124529a130d376233a3a8df2",
-          "exit_code": 0,
-          "log_path": "out/verify-20260930/qa/s2-restack47-final-3.log",
-          "actual_result": "7 hosts_v41 tests passed (the log also carries a 7-test release_store run that is not part of this record)",
-          "scope": "real-store rejection of unverified Claude surfaces, trusted host record reload and structure checks only; no real Claude Code host",
-          "risk": "real Claude Code version, handshake, four-tool smoke, reconnect and cancellation remain unavailable; E16.4 stays blocked without real Claude Code evidence",
-          "rollback": "revert PR #47 through an independent revert PR while retaining reference-host evidence and immutable facts",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/verify-20260930/qa/s2-input-E16.4.json"
-        },
         {
           "id": "E16.4.ag066_local_stdio_harness",
           "description": "Local MCP stdio process harness with frozen v1 protocol",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "1d0d93d1dc42deae83056bfc8602fd3bf2760f3d",
           "pr": "https://github.com/acosmi/RSIAgent/pull/111",
           "merged_sha": "200c43bc19368ff52b064e67eb1b14e35f096d39",
@@ -3054,7 +2717,15 @@
         "V092",
         "V094",
         "V096",
-        "V098"
+        "V098",
+        "V099",
+        "V101",
+        "V102",
+        "V104",
+        "V110",
+        "V113",
+        "V116",
+        "V120"
       ],
       "verified_subscopes": [
         {
@@ -3062,7 +2733,7 @@
           "description": "capacity, recovery-closure and deployment-safety gate functions",
           "plan_version": "v4.1",
           "plan_sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150",
-          "plan_recheck": "rechecked_v4.2",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "5ed6088deec727fb70cbb2186766d45c616e8047",
           "pr": "https://github.com/acosmi/RSIAgent/pull/48",
           "merged_sha": "4980aa498baa80fd82e83441839e606859fa4065",
@@ -3084,7 +2755,7 @@
           "description": "MVP capacity gates wired into six real entry points with instance-wide counting",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "0d6ec3dd94954be7c01a140463b12062be686e6c",
           "pr": "https://github.com/acosmi/RSIAgent/pull/62",
           "merged_sha": "9c3ec979fd2ee3c53dfbf4ddf96967e94808b11e",
@@ -3106,7 +2777,7 @@
           "description": "startup recovery quarantine gate and deployment gate wired into rsia serve/mcp",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "3f96c53da1003b5358d68208dc3b963977f31f7f",
           "pr": "https://github.com/acosmi/RSIAgent/pull/67",
           "merged_sha": "5c4f81dca79373c6871449aed287f61fb1f3cbc2",
@@ -3128,7 +2799,7 @@
           "description": "restore protection extended to this round's action, idempotency and invalidation facts",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "43984ab3ecc0833e435bb25ddc4b6b3f2adadbf5",
           "pr": "https://github.com/acosmi/RSIAgent/pull/76",
           "merged_sha": "7120842a1f586ae394b76e146c8298f11bec52bc",
@@ -3150,7 +2821,7 @@
           "description": "Economic replay records included in restore protection by exact schema",
           "plan_version": "v4.2",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "source_sha": "4bdc8844738356ba70f9cbbfca1143d2bde94efe",
           "pr": "https://github.com/acosmi/RSIAgent/pull/95",
           "merged_sha": "e2c9107142413c0ba304b5090692b56037958f40",
@@ -3178,7 +2849,7 @@
     "E16.6": {
       "title": "Release, Support Scope Manifest & Truth Ledger",
       "status": "in_progress",
-      "status_reason": "The v4.2 derived index preserves all 69 prior evidence objects and now has 72 records, including fifteen round-4 accepted product subsets bound to actual source and merge identities; local-only accepted heads remain separate; this does not close E16 or the full route",
+      "status_reason": "The v4.3 derived index keeps 91 historical evidence records: 89 unchanged in-scope records rechecked against v4.3 and 2 out-of-scope optional rejection records; 18 records whose accepted behavior changed are withdrawn from verified_subscopes, with their original facts retained in the local recheck ledger; this does not close E16 or the full route",
       "implementation_files": [
         "reports/support-scope.json",
         "crates/evo-core/tests/support_scope.rs"
@@ -3192,31 +2863,10 @@
         "V073",
         "V074",
         "V080",
-        "V098"
+        "V098",
+        "V116"
       ],
       "verified_subscopes": [
-        {
-          "id": "E16.6.ag012_plan_v42_index_binding",
-          "description": "derived index, checker and index test bound to plan v4.2 with the v4.1->v4.2 lineage",
-          "plan_version": "v4.2",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "not_affected",
-          "source_sha": "2e5c6682c33b629fd9ce9cda30578f0d4eb99866",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/60",
-          "merged_sha": "dc036d5f4dd5d870fb0ca98bdfe1ef6ec626140b",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-core/tests/support_scope.rs",
-          "command": "cargo test --locked --offline -p evo-core --test support_scope",
-          "input_digest": "e280ef17eea24f2c0abcc05f1b296488c07bcc65119337d22ddca280217e3b6f",
-          "exit_code": 0,
-          "log_path": "out/audit-20260930/qa/ctrl-reg-ag012-2e5c668.log",
-          "actual_result": "single-target controller run at 2e5c668 on 2026-10-01 (cargom test --locked -p evo-core --test support_scope; cargom = cargo with the rsproxy mirror source replacement, not --offline): support_scope 14 passed / 0 failed, exit 0",
-          "scope": "top-level v4.2 binding, registered lineage, record-level lineage pairs and plan_recheck markers in reports/support-scope.json, scripts/check_support_scope.py and the evo-core support_scope test; E09 carries V097",
-          "risk": "structural derivative checks only: the index declares subset_only and does not authenticate git ancestry, logs, licenses or effects",
-          "rollback": "revert PR #60 (merge dc036d5) through an independent revert PR; accepted-stack rollback point 0c43e0f; persisted revocation, budget, cost and audit facts are not rolled back",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-012-2e5c668.json"
-        },
         {
           "actual_result": "ROOT accepted fixed source 908eb85b33d590889a75885c9d9b20c3dad927b8; actual merge tree equals accepted tree 426065da2aefd359b9e2808b67c1be969f46acb7. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
           "command": "cargo test --locked --offline -p evo-core --test support_scope",
@@ -3227,7 +2877,7 @@
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-086-908eb85.json",
           "log_path": "out/audit-20260930/qa/takeover-20261002/AG086-existing-currentAA831-fixed908eb85-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
           "merged_sha": "77152d77c96f497ebf2c0123e985f0832fa3cbd0",
-          "plan_recheck": "not_affected",
+          "plan_recheck": "rechecked_v4.3",
           "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
           "plan_version": "v4.2",
           "pr": "https://github.com/acosmi/RSIAgent/pull/132",
@@ -3272,7 +2922,29 @@
         "V095",
         "V096",
         "V097",
-        "V098"
+        "V098",
+        "V099",
+        "V100",
+        "V101",
+        "V102",
+        "V103",
+        "V104",
+        "V105",
+        "V106",
+        "V107",
+        "V108",
+        "V109",
+        "V110",
+        "V111",
+        "V112",
+        "V113",
+        "V114",
+        "V115",
+        "V116",
+        "V117",
+        "V118",
+        "V119",
+        "V120"
       ],
       "verified_subscopes": [],
       "remaining": [
@@ -3390,7 +3062,6 @@
         ],
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E06.controller_acceptance",
           "E06.ag084_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance"
@@ -3460,7 +3131,6 @@
         ],
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E06.controller_acceptance",
           "E07.controller_acceptance",
           "E06.ag084_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
@@ -3495,7 +3165,6 @@
         ],
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance"
         ],
@@ -3593,7 +3262,6 @@
         ],
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E16.1.ag076_local_scoped_acceptance",
           "E16.1.ag070_local_scoped_acceptance"
@@ -3627,7 +3295,6 @@
           "crates/evo-engine/src/seeds.rs"
         ],
         "related_evidence_refs": [
-          "E06.controller_acceptance",
           "E16.3.seed_install_reset_controller_acceptance",
           "E06.ag084_local_scoped_acceptance"
         ],
@@ -3664,7 +3331,6 @@
           "crates/evo-engine/src/meta_experiment.rs"
         ],
         "related_evidence_refs": [
-          "E06.controller_acceptance",
           "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
@@ -3741,10 +3407,7 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E09.controller_acceptance",
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
           "E11.controller_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance"
         ],
@@ -3775,8 +3438,6 @@
           "crates/evo-core/src/replay_economics.rs"
         ],
         "related_evidence_refs": [
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
           "E11.controller_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
@@ -3806,7 +3467,6 @@
         ],
         "related_evidence_refs": [
           "E12.controller_acceptance",
-          "E13.controller_acceptance",
           "E13.ag081_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
@@ -3872,7 +3532,6 @@
         "related_evidence_refs": [
           "E01.controller_acceptance",
           "E05.controller_acceptance",
-          "E06.controller_acceptance",
           "E05.ag080_local_scoped_acceptance",
           "E06.ag084_local_scoped_acceptance",
           "E05.ag087_local_scoped_acceptance",
@@ -3947,8 +3606,7 @@
           "crates/evo-engine/src/exploration.rs"
         ],
         "related_evidence_refs": [
-          "E09.controller_acceptance",
-          "E09.ag074_local_scoped_acceptance"
+          "E09.controller_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -3994,11 +3652,8 @@
           "E00.controller_acceptance",
           "E05.controller_acceptance",
           "E09.controller_acceptance",
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
           "E12.controller_acceptance",
           "E05.ag080_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E16.6.ag086_local_scoped_acceptance",
           "E05.ag087_local_scoped_acceptance",
           "E05.ag088_local_scoped_acceptance",
@@ -4043,7 +3698,6 @@
           "E03.controller_acceptance",
           "E04.controller_acceptance",
           "E07.controller_acceptance",
-          "E13.controller_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E13.ag081_local_scoped_acceptance",
           "E04.ag082_local_scoped_acceptance",
@@ -4080,8 +3734,7 @@
         "related_evidence_refs": [
           "E03.controller_acceptance",
           "E09.controller_acceptance",
-          "E03.ag079_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance"
+          "E03.ag079_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -4115,11 +3768,9 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E03.controller_acceptance",
-          "E06.controller_acceptance",
           "E09.controller_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E06.ag084_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance"
         ],
@@ -4161,13 +3812,11 @@
           "E05.controller_acceptance",
           "E08.controller_acceptance",
           "E09.controller_acceptance",
-          "E13.controller_acceptance",
           "E08.ag069_local_scoped_acceptance",
           "E08.ag073_local_scoped_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E13.ag081_local_scoped_acceptance",
           "E05.ag080_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E05.ag087_local_scoped_acceptance",
           "E05.ag088_local_scoped_acceptance",
@@ -4207,13 +3856,10 @@
         ],
         "related_evidence_refs": [
           "E05.controller_acceptance",
-          "E06.controller_acceptance",
           "E09.controller_acceptance",
-          "E13.controller_acceptance",
           "E13.ag081_local_scoped_acceptance",
           "E05.ag080_local_scoped_acceptance",
           "E06.ag084_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E05.ag087_local_scoped_acceptance",
           "E05.ag088_local_scoped_acceptance",
           "E05.ag089_local_scoped_acceptance",
@@ -4283,12 +3929,9 @@
         "related_evidence_refs": [
           "E04.controller_acceptance",
           "E09.controller_acceptance",
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
           "E12.controller_acceptance",
           "E04.ag082_local_scoped_acceptance",
-          "E04.ag077_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance"
+          "E04.ag077_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -4317,10 +3960,8 @@
           "crates/evo-engine/src/exploration.rs"
         ],
         "related_evidence_refs": [
-          "E06.controller_acceptance",
           "E09.controller_acceptance",
-          "E06.ag084_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance"
+          "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -4400,7 +4041,6 @@
         "related_evidence_refs": [
           "E00.controller_acceptance",
           "E05.controller_acceptance",
-          "E06.controller_acceptance",
           "E05.ag080_local_scoped_acceptance",
           "E06.ag084_local_scoped_acceptance",
           "E05.ag087_local_scoped_acceptance",
@@ -4839,7 +4479,6 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance",
           "E02.ag055_v1_wire_goldens"
@@ -4860,7 +4499,6 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E07.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance"
         ],
@@ -4895,7 +4533,6 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E16.1.ag076_local_scoped_acceptance",
           "E16.1.ag070_local_scoped_acceptance",
@@ -4916,7 +4553,6 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E16.1.ag076_local_scoped_acceptance",
           "E16.1.ag070_local_scoped_acceptance"
@@ -4937,8 +4573,7 @@
           "E04.controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E04.ag082_local_scoped_acceptance",
-          "E04.ag077_local_scoped_acceptance",
-          "E04.ag097_broker_close_before_refuse"
+          "E04.ag077_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4956,8 +4591,7 @@
           "E04.controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E04.ag082_local_scoped_acceptance",
-          "E04.ag077_local_scoped_acceptance",
-          "E04.ag097_broker_close_before_refuse"
+          "E04.ag077_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4975,7 +4609,6 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E04.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance",
           "E04.ag082_local_scoped_acceptance",
           "E04.ag077_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
@@ -5100,7 +4733,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E06.controller_acceptance",
           "E07.controller_acceptance",
           "E16.3.seed_install_reset_controller_acceptance",
           "E06.ag084_local_scoped_acceptance"
@@ -5119,7 +4751,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E06.controller_acceptance",
           "E07.controller_acceptance",
           "E06.ag084_local_scoped_acceptance"
         ],
@@ -5137,9 +4768,7 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E06.controller_acceptance",
           "E07.controller_acceptance",
-          "E13.controller_acceptance",
           "E13.ag081_local_scoped_acceptance",
           "E06.ag084_local_scoped_acceptance"
         ],
@@ -5161,9 +4790,7 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E06.controller_acceptance",
           "E08.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance",
           "E16.2.durable_staging_publish_controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E08.ag069_local_scoped_acceptance",
@@ -5213,8 +4840,7 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E09.controller_acceptance",
-          "E09.ag074_local_scoped_acceptance"
+          "E09.controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5230,11 +4856,7 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E09.controller_acceptance",
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
-          "E09.ag074_local_scoped_acceptance",
-          "E09.ag103_fairness_waits_legal_set_v42",
-          "E10.ag103_replay_fairness_waits_legal_set_v42"
+          "E09.ag103_fairness_waits_legal_set_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5247,10 +4869,7 @@
         "status": "implemented_not_verified",
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance"
-        ],
+        "related_evidence_refs": [],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -5266,12 +4885,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E09.controller_acceptance",
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
           "E11.controller_acceptance",
-          "E09.ag074_local_scoped_acceptance",
-          "E09.ag103_fairness_waits_legal_set_v42",
-          "E10.ag103_replay_fairness_waits_legal_set_v42"
+          "E09.ag103_fairness_waits_legal_set_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5284,11 +4899,7 @@
         "status": "implemented_not_verified",
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
-          "E10.ag103_replay_fairness_waits_legal_set_v42"
-        ],
+        "related_evidence_refs": [],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -5301,8 +4912,7 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E09.controller_acceptance",
-          "E09.ag074_local_scoped_acceptance"
+          "E09.controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5318,11 +4928,7 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E09.controller_acceptance",
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
-          "E09.ag074_local_scoped_acceptance",
-          "E09.ag103_fairness_waits_legal_set_v42",
-          "E10.ag103_replay_fairness_waits_legal_set_v42"
+          "E09.ag103_fairness_waits_legal_set_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5338,8 +4944,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
           "E11.controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
@@ -5355,8 +4959,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
           "E11.controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
@@ -5435,7 +5037,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E13.controller_acceptance",
           "E13.ag081_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
@@ -5510,8 +5111,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E13.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E13.ag081_local_scoped_acceptance"
         ],
@@ -5533,7 +5132,6 @@
         "related_evidence_refs": [
           "E04.controller_acceptance",
           "E08.controller_acceptance",
-          "E13.controller_acceptance",
           "E16.3.seed_install_reset_controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E08.ag069_local_scoped_acceptance",
@@ -5560,7 +5158,6 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E16.2.durable_staging_publish_controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E16.6.ag086_local_scoped_acceptance"
         ],
@@ -5690,7 +5287,6 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E06.controller_acceptance",
           "E07.controller_acceptance",
           "E06.ag084_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
@@ -5724,7 +5320,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E06.controller_acceptance",
           "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
@@ -5739,7 +5334,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E06.controller_acceptance",
           "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
@@ -5756,7 +5350,6 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E16.1.ag076_local_scoped_acceptance",
           "E16.1.ag070_local_scoped_acceptance"
@@ -5775,7 +5368,6 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E16.1.ag076_local_scoped_acceptance",
           "E16.1.ag070_local_scoped_acceptance"
@@ -5792,7 +5384,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E16.1.durable_import_controller_acceptance",
           "E16.1.ag076_local_scoped_acceptance",
           "E16.1.ag070_local_scoped_acceptance"
         ],
@@ -5810,7 +5401,6 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E16.1.ag076_local_scoped_acceptance",
           "E16.1.ag070_local_scoped_acceptance"
@@ -5829,7 +5419,6 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E03.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E16.1.ag076_local_scoped_acceptance",
           "E16.1.ag070_local_scoped_acceptance"
@@ -5850,7 +5439,6 @@
         "related_evidence_refs": [
           "E03.controller_acceptance",
           "E08.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance",
           "E08.ag069_local_scoped_acceptance",
           "E08.ag073_local_scoped_acceptance",
           "E03.ag079_local_scoped_acceptance",
@@ -5901,7 +5489,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E06.controller_acceptance",
           "E07.controller_acceptance",
           "E06.ag084_local_scoped_acceptance"
         ],
@@ -5919,7 +5506,6 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance"
         ],
@@ -5934,9 +5520,7 @@
         "status": "implemented_not_verified",
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [
-          "E16.4.real_store_rejection_controller_acceptance"
-        ],
+        "related_evidence_refs": [],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -5951,7 +5535,6 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance"
         ],
@@ -5982,7 +5565,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E06.controller_acceptance",
           "E16.3.seed_install_reset_controller_acceptance",
           "E06.ag084_local_scoped_acceptance"
         ],
@@ -6081,7 +5663,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E06.controller_acceptance",
           "E07.controller_acceptance",
           "E16.2.durable_staging_publish_controller_acceptance",
           "E06.ag084_local_scoped_acceptance",
@@ -6167,7 +5748,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E06.controller_acceptance",
           "E08.controller_acceptance",
           "E16.2.durable_staging_publish_controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
@@ -6189,7 +5769,6 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E16.1.durable_import_controller_acceptance",
           "E16.1.ag076_local_scoped_acceptance",
           "E16.1.ag070_local_scoped_acceptance"
         ],
@@ -6207,9 +5786,7 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E06.controller_acceptance",
           "E07.controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance",
           "E06.ag084_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
@@ -6227,7 +5804,6 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E06.controller_acceptance",
           "E16.3.seed_install_reset_controller_acceptance",
           "E06.ag084_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
@@ -6286,22 +5862,17 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E06.controller_acceptance",
           "E08.controller_acceptance",
           "E09.controller_acceptance",
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
           "E11.controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E08.ag069_local_scoped_acceptance",
           "E08.ag073_local_scoped_acceptance",
           "E06.ag084_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance",
           "E09.ag103_fairness_waits_legal_set_v42",
-          "E10.ag103_replay_fairness_waits_legal_set_v42",
           "E08.ag104_restore_prefix_migration_upgrade_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
@@ -6324,7 +5895,6 @@
           "E02.controller_acceptance",
           "E08.controller_acceptance",
           "E12.controller_acceptance",
-          "E13.controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E08.ag069_local_scoped_acceptance",
           "E08.ag073_local_scoped_acceptance",
@@ -6386,9 +5956,7 @@
           "E01.controller_acceptance",
           "E02.controller_acceptance",
           "E05.controller_acceptance",
-          "E06.controller_acceptance",
           "E08.controller_acceptance",
-          "E13.controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E08.ag069_local_scoped_acceptance",
           "E08.ag073_local_scoped_acceptance",
@@ -6433,7 +6001,6 @@
           "E02.controller_acceptance",
           "E04.controller_acceptance",
           "E05.controller_acceptance",
-          "E06.controller_acceptance",
           "E08.controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E08.ag069_local_scoped_acceptance",
@@ -6479,20 +6046,15 @@
           "E04.controller_acceptance",
           "E08.controller_acceptance",
           "E09.controller_acceptance",
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E08.ag069_local_scoped_acceptance",
           "E08.ag073_local_scoped_acceptance",
           "E04.ag082_local_scoped_acceptance",
           "E04.ag077_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance",
-          "E04.ag097_broker_close_before_refuse",
-          "E09.ag103_fairness_waits_legal_set_v42",
-          "E10.ag103_replay_fairness_waits_legal_set_v42"
+          "E09.ag103_fairness_waits_legal_set_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6517,9 +6079,6 @@
           "E03.controller_acceptance",
           "E04.controller_acceptance",
           "E07.controller_acceptance",
-          "E13.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E13.ag081_local_scoped_acceptance",
           "E04.ag082_local_scoped_acceptance",
@@ -6550,7 +6109,6 @@
           "E07.controller_acceptance",
           "E09.controller_acceptance",
           "E03.ag079_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance"
         ],
@@ -6574,13 +6132,11 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E03.controller_acceptance",
-          "E06.controller_acceptance",
           "E07.controller_acceptance",
           "E09.controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E06.ag084_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance"
         ],
@@ -6610,15 +6166,12 @@
           "E05.controller_acceptance",
           "E08.controller_acceptance",
           "E09.controller_acceptance",
-          "E13.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E08.ag069_local_scoped_acceptance",
           "E08.ag073_local_scoped_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E13.ag081_local_scoped_acceptance",
           "E05.ag080_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E16.1.ag076_local_scoped_acceptance",
           "E16.1.ag070_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
@@ -6653,17 +6206,13 @@
         "related_evidence_refs": [
           "E02.controller_acceptance",
           "E05.controller_acceptance",
-          "E06.controller_acceptance",
           "E07.controller_acceptance",
           "E09.controller_acceptance",
-          "E13.controller_acceptance",
           "E16.2.durable_staging_publish_controller_acceptance",
           "E16.3.seed_install_reset_controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance",
           "E13.ag081_local_scoped_acceptance",
           "E05.ag080_local_scoped_acceptance",
           "E06.ag084_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E05.ag087_local_scoped_acceptance",
           "E05.ag088_local_scoped_acceptance",
           "E05.ag089_local_scoped_acceptance",
@@ -6724,7 +6273,6 @@
           "E12.controller_acceptance",
           "E04.ag082_local_scoped_acceptance",
           "E04.ag077_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance"
         ],
@@ -6757,14 +6305,10 @@
           "E03.controller_acceptance",
           "E04.controller_acceptance",
           "E05.controller_acceptance",
-          "E06.controller_acceptance",
           "E08.controller_acceptance",
           "E09.controller_acceptance",
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
           "E11.controller_acceptance",
           "E12.controller_acceptance",
-          "E13.controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E08.ag069_local_scoped_acceptance",
           "E08.ag073_local_scoped_acceptance",
@@ -6774,7 +6318,6 @@
           "E04.ag082_local_scoped_acceptance",
           "E04.ag077_local_scoped_acceptance",
           "E06.ag084_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E05.ag087_local_scoped_acceptance",
           "E05.ag088_local_scoped_acceptance",
@@ -6800,10 +6343,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E02.controller_acceptance",
-          "E06.controller_acceptance",
           "E09.controller_acceptance",
           "E06.ag084_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance"
         ],
@@ -6838,15 +6379,11 @@
           "E02.controller_acceptance",
           "E03.controller_acceptance",
           "E04.controller_acceptance",
-          "E06.controller_acceptance",
           "E07.controller_acceptance",
           "E08.controller_acceptance",
           "E09.controller_acceptance",
-          "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance",
           "E11.controller_acceptance",
           "E12.controller_acceptance",
-          "E13.controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E08.ag069_local_scoped_acceptance",
           "E08.ag073_local_scoped_acceptance",
@@ -6855,14 +6392,11 @@
           "E04.ag082_local_scoped_acceptance",
           "E04.ag077_local_scoped_acceptance",
           "E06.ag084_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance",
           "E01.ag057_explicit_sample_registration",
-          "E04.ag097_broker_close_before_refuse",
           "E08.ag096_unreadable_bound_request_isolated",
-          "E04.ag105_broker_bound_recovery_close_v42",
           "E08.ag107_budget_ref_missing_fail_closed_v42",
           "E08.ag106_budget_startup_recovery_v42"
         ],
@@ -6890,10 +6424,8 @@
           "E05.controller_acceptance",
           "E07.controller_acceptance",
           "E11.controller_acceptance",
-          "E13.controller_acceptance",
           "E13.ag081_local_scoped_acceptance",
           "E05.ag080_local_scoped_acceptance",
-          "E09.ag074_local_scoped_acceptance",
           "E05.ag087_local_scoped_acceptance",
           "E05.ag088_local_scoped_acceptance",
           "E05.ag089_local_scoped_acceptance",
@@ -6921,16 +6453,340 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E00.controller_acceptance",
-          "E16.1.durable_import_controller_acceptance",
           "E16.2.durable_staging_publish_controller_acceptance",
           "E16.3.seed_install_reset_controller_acceptance",
-          "E16.4.real_store_rejection_controller_acceptance",
           "E16.5.gate_functions_controller_acceptance",
           "E16.1.ag076_local_scoped_acceptance",
           "E16.1.ag070_local_scoped_acceptance",
           "E16.6.ag086_local_scoped_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+      },
+      {
+        "id": "V099",
+        "specification_status": "included",
+        "e_tasks": [
+          "E08",
+          "E16.5",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V100",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E06",
+          "E08",
+          "E09",
+          "E13",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V101",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E04",
+          "E05",
+          "E16.4",
+          "E16.5",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V102",
+        "specification_status": "included",
+        "e_tasks": [
+          "E08",
+          "E16.2",
+          "E16.5",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V103",
+        "specification_status": "included",
+        "e_tasks": [
+          "E01",
+          "E04",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V104",
+        "specification_status": "included",
+        "e_tasks": [
+          "E05",
+          "E10",
+          "E11",
+          "E16.5",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V105",
+        "specification_status": "included",
+        "e_tasks": [
+          "E09",
+          "E10",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V106",
+        "specification_status": "included",
+        "e_tasks": [
+          "E03",
+          "E04",
+          "E09",
+          "E10",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V107",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E16.4",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V108",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E03",
+          "E06",
+          "E16.4",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V109",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E12",
+          "E13",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V110",
+        "specification_status": "included",
+        "e_tasks": [
+          "E04",
+          "E08",
+          "E16.5",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V111",
+        "specification_status": "included",
+        "e_tasks": [
+          "E04",
+          "E08",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V112",
+        "specification_status": "included",
+        "e_tasks": [
+          "E04",
+          "E07",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V113",
+        "specification_status": "included",
+        "e_tasks": [
+          "E00",
+          "E16.5",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V114",
+        "specification_status": "included",
+        "e_tasks": [
+          "E01",
+          "E05",
+          "E07",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V115",
+        "specification_status": "included",
+        "e_tasks": [
+          "E16.3",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V116",
+        "specification_status": "included",
+        "e_tasks": [
+          "E00",
+          "E16.5",
+          "E16.6",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V117",
+        "specification_status": "included",
+        "e_tasks": [
+          "E16.1",
+          "E16.2",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V118",
+        "specification_status": "included",
+        "e_tasks": [
+          "E01",
+          "E11",
+          "E14",
+          "E15",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V119",
+        "specification_status": "included",
+        "e_tasks": [
+          "E06",
+          "E14",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+      },
+      {
+        "id": "V120",
+        "specification_status": "included",
+        "e_tasks": [
+          "E02",
+          "E16.5",
+          "E16"
+        ],
+        "status": "planned",
+        "verification_status": "planned",
+        "effect_status": "not_claimed",
+        "related_evidence_refs": [],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
       }
     ]
   },
@@ -6940,7 +6796,7 @@
       "ranges": [
         "K01–K10",
         "SO01–SO18",
-        "V087–V098"
+        "V087–V120"
       ]
     },
     "E16.6": {
@@ -6952,7 +6808,7 @@
         "SO01–SO18",
         "E00–E18",
         "E16.1–E16.6",
-        "V001–V098"
+        "V001–V120"
       ]
     }
   }
