@@ -62,6 +62,26 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 - **#148 AG-102（索引机器字段：声明目标与实际执行证据分离）**：base e727d1c → head 971d4eb3d9abd79aeb02374d4393c6da67e00cc0（叠放到 98776f17 补丁字节一致）→ merged 1ef0b2163fe9b6c46c9d49b558e6e25c0e13ab12（16:52:06Z）。改动仅 4 文件（reports/support-scope.json、scripts/check_support_scope.py、scripts/test_check_support_scope.py、crates/evo-core/tests/support_scope.rs）：顶层 `field_semantics` 钉死 command/exit_code/log_path/execution/production_consumer 的含义；pr > 141 记录必须带 `execution{runner, command, scope, exit_code, evidence}`；`production_consumer=none_library_only` 标注 #125/#128/#130/#131 四条记录（截至 e727d1c 无 engine/http/mcp/apps 生产调用方）；追溯回填 13 处（#103→V002；#105→V033/V035；#106→V010–V013/V084/V085/V096/V097；#114+#117→V067）；92 条旧记录除上述四条外字节不变。全量：8 项退出码全 0，136 二进制 1748 通过（父 1741 + 7），Python discover 160 OK；索引篡改探针 6 例在 head 全部被拒、其中 2 例在父树被接受（真反例）。按先例不进索引记录。登记的偏差：Python 检查器按所属任务规则拒绝 AG-058 对 V001/V002/V017/V032/V037 的引用而 Rust 镜像仅查引用存在，两者在该规则上不一致，未在本 PR 修复。
 - 清理：各 PR 验收 target 已删除；分支删除按用户命令清单执行。
 
+## 2026-10-11 第五轮第二批合并登记（截至 PR #155）
+
+本节登记 #143 之后至 #155 的合并事实。验收环境与合并协议同首批（文档化环境、全新 target、admin 合并、树相等核对）。两窗口共用构建互斥锁与 1.5 GiB 低磁盘看门狗；本窗口编译门为空闲 ≥ 8 GiB，返修窗口冷 target ≥ 6.5 GiB、暖 target 上的探针运行 ≥ 4.0 GiB。索引记录按 AG-102 机器字段规则登记：pr > 141 的记录带 `execution`（返修窗口验收时字面执行的命令、真实退出码与日志）；记录级 `command/exit_code/log_path` 只描述声明的单目标，由本台账 PR 的验收全量覆盖并以逐目标摘录日志为证。
+
+### 逐任务摘要
+- **#143 AG-094（台账 + 索引登记）**：base e727d1c → 最终叠放 1706cb04，验收 head 35826bbb0035aab5e91f46c8acf5f77f1b315a85 → merged ab2f41003483aec2c2067cd1fed65b119bd0da3b（17:49:01Z）。折入第四轮二次验收结论与第五轮首批队列；登记 #144/#145/#146（E04/E08/E00 记录，各带 execution 与主控输入回执）、support_scope.rs 钉值、顶表行。全量 137 二进制 1751 通过（= 父）。索引篡改探针 5 例被拒；登记一处 Python 检查器缺口（merged_sha 等于自身 source_sha 不被 Python 拒绝、由 Rust 钉值表拒绝），列为后续小卡。台账 PR 按先例不进索引。
+- **#147 AG-095（独立 grader 回执的规范摘要绑定外部宿主权威）**：head d73acb6f（叠放 1ef0b216，补丁字节一致）→ merged 1706cb04（17:24:52Z）。全量 137 二进制 1751 通过（父 1748 + 3）；反例 2 个 head 通过、基线 1ef0b216 失败。索引记录 E05.ag095_canonical_grader_receipt_digest（V010/V011/V012/V013/V084/V085）。
+- **#149 AG-105（已结算 bound 调用在拒绝重放前先关闭执行）**：首版验收时主控反例 P2 在 head 失败，退回实施者修复一处（预读身份检查对脱敏请求跳过指纹比较）；修复版 head 9862bbd7（叠放 94076d78）→ merged 7dc89bff。全量 138 二进制 1762 通过（父 1756 + 6）；反例 2 个 head 通过、基线失败。索引记录 E04.ag105_broker_bound_recovery_close_v42（V096）。
+- **#150 AG-108（EditCompiled 审阅核验生产者的 input_digest 规则）**：head f8539172（叠放 ab2f4100）→ merged 94076d78（18:35:46Z）。全量 137 二进制 1756 通过（父 1751 + 5）；反例 2 个 head 通过、基线失败。索引记录 E07.ag108_candidate_review（V070）。
+- **#151 AG-107（旧预算门按请求闭包判断丢失引用的调用，无法核验则关闭）**：head 7cc0e962（叠放 7dc89bff）→ merged 63113ac9。全量 139 二进制 1771 通过（父 1762 + 9）；反例 2 个 head 通过、基线失败。索引记录 E08.ag107_budget_ref_missing_fail_closed_v42（V096；scope 同时引 E03 L1229）。
+- **#152 AG-101（v2 完整批次回归仅在 UCB 低于零时确认）**：head 78075a11（叠放 63113ac9）→ merged f355ec38。全量 139 二进制 1773 通过（父 1771 + 2，另修正 1 个既有用例）；反例 2 个 head 通过、基线失败。索引记录 E05.ag101_streaming_verdicts_v42（V010/V011/V012/V084）。
+- **#153 AG-109（在绑定票据上签发与读取外部宿主权威）**：head e573eaa3（叠放 f355ec38）→ merged 42decd1a。全量 139 二进制 1778 通过（父 1773 + 5）；反例 2 个 head 通过、基线失败。索引记录 E05.ag109_external_host_authority_bound_ticket（V010/V012/V084/V085）；其声明目标与 #147 同为 formal_external_host_authority_v42，两条记录各自指向本次验收日志的独立摘录（.ag095 / .ag109）。
+- **#154 AG-106（serve 启动时关闭崩溃丢失执行关闭的已结算预算调用）**：head 71cae0cf（叠放 42decd1a，补丁字节一致）→ merged aece7299（23:24:51Z）。全量 140 二进制 1785 通过（父 1778 + 7）；反例 2 个 head 通过、基线因新 API 不存在不编译（基线证据）。索引记录 E08.ag106_budget_startup_recovery_v42（V096）。
+- **#155 AG-110（公开台账与测试助手去本机路径、README 子命令）**：base ab2f4100 → 叠放 aece7299，验收 head d0cf8773 → merged ac57058e（23:59:55Z）。台账 444 处路径替换（字节级两种实现一致）、privacy_utf8_boundary_v42.rs 的硬编码路径守卫改写为"绝对路径且位于仓库 out/ 树内"、README.md/README.zh-CN.md 列出 review/serve/mcp/manage 的 clap 参数与默认值。全量 140 二进制 1785 通过（= 父）；探针：台账 `/Users/<login>` 计数 0、两份 README 含四个子命令、测试文件无本机路径。按先例不进索引。
+
+### 更正与说明
+- 本台账 2026-10-01 AG-052 条目中"v2 保留 Improved/Invalid/原 Inconclusive，negative_lcb 不称确认退化"描述的是 #100 合并时的行为；自 #152（AG-101）起，complete_batch v2 在 UCB 低于零时确认 regressed，其余情形为 Inconclusive（原因 regression_not_confirmed_ucb_boundary_not_crossed）。原句保留为历史记录，不改写。
+- 索引记录 E05.ag052_versioned_batch_verdicts 的 actual_result 写明 "streaming_verdicts_v42 10 passed"，是 #100 验收时该测试文件的用例数，为那次运行的事实，不随后续改动更新；#152 之后该文件为 12 个用例，由 E05.ag101_streaming_verdicts_v42 记录承载。
+- #142、#143、#148、#155 为非产品 PR，按先例只在台账登记。
+
 ## 2026-10-11 第四轮在途收尾与最终证据索引
 
 按用户最后指令停止新增任务，仅接收原在途交付、必要关联返修和本次收尾台账。原在途产品与透明3D状态小人前端均已实际合并，当前产品主线为 f6904dcd2d4f3b46b3311886fd4dcecd8a2f711c。第四轮 #98 至 #140 已合并；本次三文件台账自身以此主线为父，仍须独立全量与两项原索引反例通过后按固定 head 合并。
@@ -93,6 +113,13 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 | [#144](https://github.com/acosmi/RSIAgent/pull/144) | AG097 | 98431d59d765f0c16a5b736147de4735d2adbe2b | 184764302e64ca3871fc68103bd07abec1125918 | E04 |
 | [#145](https://github.com/acosmi/RSIAgent/pull/145) | AG096 | 4fd5701ad6677c0c441fd376eec953e001fc7012 | 7d39ef7350615be82d698d6914d03856fa0df97c | E08 |
 | [#146](https://github.com/acosmi/RSIAgent/pull/146) | AG099 | 45377b9d78c373fbd68b89221ba138e9eed114ab | 98776f1717b37a47e4a7fcc4349ff0faff68ce1b | E00 |
+| [#147](https://github.com/acosmi/RSIAgent/pull/147) | AG095 | d73acb6f4ddce9bbdca0702eab783e54cf41ad90 | 1706cb04049c0306676a17fd34fd021717c5669b | E05 |
+| [#149](https://github.com/acosmi/RSIAgent/pull/149) | AG105 | 9862bbd7c6e1945ea0f7b6431db4dcab7a4db346 | 7dc89bffc49d8fe4c5d97e7ccd56d3d0ad597f1c | E04 |
+| [#150](https://github.com/acosmi/RSIAgent/pull/150) | AG108 | f853917248fb025abe3144dc79420fa695644517 | 94076d789f40347ab8263176044f041824c061fb | E07 |
+| [#151](https://github.com/acosmi/RSIAgent/pull/151) | AG107 | 7cc0e962936956ddab4acd5d6a25bf8cf14d336f | 63113ac95b01f78863da0f75c5a93e5bfa2dd9d8 | E08 |
+| [#152](https://github.com/acosmi/RSIAgent/pull/152) | AG101 | 78075a1101db12e5f3591622f0499ecf2b7b66bf | f355ec389513685097e2c4d85dfd0c062e29e915 | E05 |
+| [#153](https://github.com/acosmi/RSIAgent/pull/153) | AG109 | e573eaa3a8cea90932f806ca455bf8a3963e1a3d | 42decd1a17585c366b249104b0bbea700361d003 | E05 |
+| [#154](https://github.com/acosmi/RSIAgent/pull/154) | AG106 | 71cae0cfd8919f523514d382e0b966171c5e3f97 | aece7299d0078e5704bd74ed3ae04e828f3e2c6d | E08 |
 
 | E任务 | 默认完整范围状态 | 已验子范围记录数 |
 |---|---|---|
