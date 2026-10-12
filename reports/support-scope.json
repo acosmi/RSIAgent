@@ -1006,6 +1006,35 @@
             "exit_code": 0,
             "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-100-afa1928.log.test"
           }
+        },
+        {
+          "id": "E05.ag118_late_receipts_after_final_report_v42",
+          "description": "Grader and execution receipts that arrive after the formal report is final are kept for audit without changing the report; a late grading error no longer changes a final report's reasons",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "ad9660c2ec45d67260a2fd124c4b3456f63c99fd",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/163",
+          "merged_sha": "4d1fd6cb43fbe64db81177d336b6dae3f061ca98",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/late_grader_after_final_report_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test late_grader_after_final_report_v42",
+          "input_digest": "842d57ec66c92d3885df0934a798c743c628fdae6ad6c8d9101c4d0584898e9b",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r6-ctrl-ag-118-ad9660c.late_grader_after_final_report_v42.log",
+          "actual_result": "controller acceptance at ad9660c (two commits on parent 5718bf5c = main, no restack; fresh target under the shared 8 GiB gate and 1.5 GiB watchdog): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 147 binaries 1840 passed / 0 failed / 0 overflow on the default test stack (parent 146 binaries 1824 passed; new 1 binary 16 tests), build rsia 0, both smokes 0, checker 0, unittest 0; implementer baseline pin on the default stack 1 passed / 15 failed, unchanged formal_candidate_dependency_binding_v42 27/0 on the parent; read-only review before acceptance found no blocking issue; 3 controller probes (qa/probe-claude-ag118/append.rs) pass on head and fail on parent 5718bf5c",
+          "scope": "E05; section 6.6 L705/L707, L696, V085 subset (L1600, L1653 V085.d, L1655 V085.e), L1828 R33: once the formal report of a ticket is final (CompleteBatch, Invalid, or an EarlyStopped target the stop had scored), a late grader receipt is stored with one audit entry and the ticket, its fact edges and the report stay byte for byte; a late grading error there returns the same error with one audit entry and no second invalidation; after an Invalid report a late execution receipt keeps only its receipt and output with one audit entry; after an EarlyStopped report a late execution receipt is recorded on the ticket and the report is re-derived with an unchanged certificate, owned by the ticket's evaluator",
+          "risk": "No repair or migration of stored reports that already read as conflicts, no review projection of audit-only late receipts, no real grader or host, no full E05/V085, effect or release claim; one existing assertion was replaced by stronger ones under ruling D3 (L1189)",
+          "rollback": "revert PR #163 through an independent revert PR; accepted-head parent 5718bf5c0389588781b8dd2e76518da7daab6fd5; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/claude-input-ag-118-ad9660c.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-claude-ag-118 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r6-ctrl-ag-118-ad9660c.log.test"
+          }
         }
       ],
       "remaining": [
@@ -1089,6 +1118,35 @@
           "scope": "E06; Stored candidate and stage-fact review without granting approval software/component boundary only.",
           "source_sha": "3c5ae3d6dacf74b7b91a7bf5527226c561ca688c",
           "test_entry": "crates/evo-engine/tests/candidate_review.rs"
+        },
+        {
+          "id": "E06.ag116_edit_compiled_produce_review_v42",
+          "description": "A production-written EditCompiled fact reaches stored review with its exact diff, and a one-byte change of it is refused",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "2fc3187dc1e1fdcdc9caee3b635157f4d23529b3",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/161",
+          "merged_sha": "5401effdfadf048dd4537fdf1e1ca843b9482ac3",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/edit_compiled_produce_review_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test edit_compiled_produce_review_v42",
+          "input_digest": "1b43cc31a2794496d4eb2b2757b12e4526659a8169ba260c0d7bbf5d9b44c18e",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r6-ctrl-ag-116-2fc3187.edit_compiled_produce_review_v42.log",
+          "actual_result": "controller acceptance at 2fc3187 (parent 8f4fe54b = main, no restack; fresh target under the shared 8 GiB gate and 1.5 GiB watchdog): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 145 binaries 1813 passed / 0 failed / 0 overflow (parent 144 binaries 1810 passed; new 1 binary 3 tests), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-claude-ag116/append.rs) pass on head and both fail on the pre-AG-108 tree 7d39ef73 with material_invalid, showing the test detects the defect AG-108 fixed",
+          "scope": "E06/E07 review view (plan section 6.5 L688); V070 subset (L1578); sections 5.1 L455, 5.2 L459, L101: an EditCompiled stage fact written by the real optimization step (run_optimization_step through StoreOptimizationJournal) reviews through review_stored to its exact diff, its input_digest equals the one shared rule over the stored batch and compiler binding, a one-byte change (resealed or not) is refused as material_invalid, and the production StepPrepared fact reviews fully bound",
+          "risk": "Test-only change; no real model, no CLI/HTTP review path, no other stage facts, no full E06/E07/V070, effect or release claim; the fixture seeds its revoke watermark as a hash because stored review requires a 64-hex digest",
+          "rollback": "revert PR #161 through an independent revert PR; accepted-head parent 8f4fe54bca7157623f40d723fbbc938ae85ac98c; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/claude-input-ag-116-2fc3187.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-claude-ag-116 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r6-ctrl-ag-116-2fc3187.log.test"
+          }
         }
       ],
       "remaining": [
@@ -1725,6 +1783,35 @@
             "scope": "workspace",
             "exit_code": 0,
             "evidence": "out/audit-20260930/qa/accept-ag104/ctrl-ag104-final.log.test"
+          }
+        },
+        {
+          "id": "E08.ag117_formal_call_revoke_cleanup_v42",
+          "description": "Revocation cleanup judges a legacy budget call's closure by its registered source reference, so a formal call no longer fails every cleanup and a dependent one is redacted",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "92f12e1642bd0f5c07ad6f4e431635a46f1671d8",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/162",
+          "merged_sha": "5718bf5c0389588781b8dd2e76518da7daab6fd5",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-storage/tests/formal_call_revoke_cleanup_v42.rs",
+          "command": "cargo test --locked --offline -p evo-storage --test formal_call_revoke_cleanup_v42",
+          "input_digest": "d6300167bf33d73505ca4470521f1f8544637499af7f8fdc165c16618b384949",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r6-ctrl-ag-117-92f12e1.formal_call_revoke_cleanup_v42.log",
+          "actual_result": "controller acceptance at 92f12e1 (parent 5401effd = main, no restack; fresh target under the shared 8 GiB gate and 1.5 GiB watchdog): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 146 binaries 1824 passed / 0 failed / 0 overflow (parent 145 binaries 1813 passed; new 1 binary 11 tests), build rsia 0, both smokes 0, checker 0, unittest 0; implementer baseline pin 4 passed / 7 failed on the parent; read-only review before acceptance found no blocking issue; 2 controller probes (qa/probe-claude-ag117/append.rs) pass on head and fail on parent 5401effd with the job Failed on unknown_budget_request_schema:rsia.formal_task_request.v1",
+          "scope": "E08 (evo-storage, L1293); V017 (L1517) and V018 (L1518) subset; L835, L1077, L1110, L1132/L1134, E16.2 L1429, E08 L1295/L1299: the revocation cleanup scan and its late recheck read a legacy budget call's closure from its registered reference first, as the dispatch and settlement gates do, and fall back to the request body only without one; a formal call unrelated to the revoked source is left byte for byte and the job completes; a formal call over it is redacted with its accounting and reference kept; an undecodable reference isolates only its row",
+          "risk": "No claim for empty-closure formal calls, automatic recovery of jobs already failed (an Admin retry is required), the E16 path, real providers, full E08/V017/V018, effect or release; known observable effect: reading a redacted formal request artifact on the formal authority path answers Forbidden",
+          "rollback": "revert PR #162 through an independent revert PR; accepted-head parent 5401effdfadf048dd4537fdf1e1ca843b9482ac3; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/claude-input-ag-117-92f12e1.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-claude-ag-117 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r6-ctrl-ag-117-92f12e1.log.test"
           }
         }
       ],
@@ -5087,7 +5174,8 @@
           "E16.1.ag070_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E08.ag096_unreadable_bound_request_isolated",
-          "E08.ag104_restore_prefix_migration_upgrade_v42"
+          "E08.ag104_restore_prefix_migration_upgrade_v42",
+          "E08.ag117_formal_call_revoke_cleanup_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5110,7 +5198,8 @@
           "E08.ag073_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E08.ag096_unreadable_bound_request_isolated",
-          "E08.ag104_restore_prefix_migration_upgrade_v42"
+          "E08.ag104_restore_prefix_migration_upgrade_v42",
+          "E08.ag117_formal_call_revoke_cleanup_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5996,7 +6085,8 @@
           "E07.controller_acceptance",
           "E16.2.durable_staging_publish_controller_acceptance",
           "E06.ag084_local_scoped_acceptance",
-          "E07.ag108_candidate_review"
+          "E07.ag108_candidate_review",
+          "E06.ag116_edit_compiled_produce_review_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6363,7 +6453,8 @@
           "E01.ag057_explicit_sample_registration",
           "E05.ag095_canonical_grader_receipt_digest",
           "E05.ag109_external_host_authority_bound_ticket",
-          "E05.ag100_formal_candidate_dependency_binding_v42"
+          "E05.ag100_formal_candidate_dependency_binding_v42",
+          "E05.ag118_late_receipts_after_final_report_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
