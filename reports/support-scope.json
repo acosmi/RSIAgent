@@ -977,6 +977,35 @@
             "exit_code": 0,
             "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-109-e573eaa.log.test"
           }
+        },
+        {
+          "id": "E05.ag100_formal_candidate_dependency_binding_v42",
+          "description": "A ticket issue under any control schema (v1 or v2) binds the frozen candidate dependency; with no candidate record the issue is refused rather than degraded",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "afa1928e7f9367fd125bfac40cd8115dbe7a17ac",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/157",
+          "merged_sha": "647c7ce8361215632d62a42a8bf87d9df2bf3c2d",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/formal_candidate_dependency_binding_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test formal_candidate_dependency_binding_v42",
+          "input_digest": "48033046991de444cd7417a05292628c709e873cb78ef0a8068445f077a21e3c",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.formal_candidate_dependency_binding_v42.log",
+          "actual_result": "peer-window controller acceptance at afa1928 (restacked c1107de2 onto ac57058e, content identical line by line; fresh target under a 1.5 GiB disk watchdog): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 140 binaries 1789 passed / 0 failed / 0 overflow (parent ac57058e: 140 binaries 1785 passed; new 4), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-ag100-claude/append.rs) pass on head and fail on base ac57058e (issue without a candidate record still issued; legacy ticket Blocked instead of zero writes). Declared target covered with exit 0 by this window's AG-115 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.formal_candidate_dependency_binding_v42.log).",
+          "scope": "E05; E05 L1247–1260, sections 5.7 and 10.2; V010/V012/V084/V085 subset: every ticket issue under any control schema (v1 or v2) binds the frozen candidate dependency; when the candidate record is missing the issue is refused (formal_candidate_record_missing_at_issue) with no catalog writes, instead of degrading",
+          "risk": "No real external host or grader process, no claim beyond the recorded tests, no full E05 route, effect or release claim",
+          "rollback": "revert PR #157 through an independent revert PR; accepted-head parent ac57058e3d8b1a5be4371ee686f8b78f2af274f5; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-100-afa1928.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-100 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-100-afa1928.log.test"
+          }
         }
       ],
       "remaining": [
@@ -1668,6 +1697,35 @@
             "exit_code": 0,
             "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-106-71cae0c.log.test"
           }
+        },
+        {
+          "id": "E08.ag104_restore_prefix_migration_upgrade_v42",
+          "description": "restore accepts a backup whose manifest and database ledger are a strict prefix of the current migration set, applies the missing migrations inside the private restore copy before anchor comparison, delta replay and publication; the anchor and the startup gate keep the exact current set",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "a2705252894c61aaa1972f0596a279e2f36c2ab5",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/159",
+          "merged_sha": "a78a1e60a4298cd3ca57598a7aba7c5c84a8a721",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-storage/tests/restore_prefix_upgrade_v42.rs",
+          "command": "cargo test --locked --offline -p evo-storage --test restore_prefix_upgrade_v42",
+          "input_digest": "6b925b49efe5e8fd1d2f4ef2ee7425bbfe68d1b784fec4e73b8660c511d2909e",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.restore_prefix_upgrade_v42.log",
+          "actual_result": "this-window controller acceptance at a2705252 (restacked 647c7ce8 onto 4036c0d2, before/after patches byte-identical 85061 B; fresh target under a 1.5 GiB disk watchdog): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 144 binaries 1810 passed / 0 failed / 0 overflow (parent 4036c0d2: 143 binaries 1805 passed; new 5 in restore_prefix_upgrade_v42), build rsia 0, both smokes 0, checker 0, unittest 0; pure-Python suites re-run by the controller on the head: scripts.test_restore_backup 17 OK, discover 177 run OK (47 skipped MCP stdio cases without a binary); protected_facts and verify_delta of scripts/restore_backup.py byte-identical to main; 2 controller probes (qa/probe-ag104/append.rs: a 0001-0005 prefix backup is published with sqlx-shaped ledger rows for 0006/0007; a 0001-0006 prefix backup writes the exact restore.migrations.json and keeps the v2 restore.json keys) pass on head and fail on parent 4036c0d2 (the old script isolates both). Declared target covered with exit 0 by this window's AG-115 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.restore_prefix_upgrade_v42.log).",
+          "scope": "E08; plan §11 L1079 (restore to a new directory, register the new migrations, backfill and index verification before publication), §11.3 L1112 and E08 L1299; V017/V018/V038/V081/V082 subset: strict-prefix backups (0001-0005 or 0001-0006, every row successful with the current file SHA-384) are upgraded in the private copy the way sqlx 0.8.6 migrates; gaps, unknown or future versions, changed checksums, unsuccessful rows, prefixes before 0005 and manifest/database mismatches stay isolated",
+          "risk": "No claim on backups before 0005, disk-exhaustion scenarios, automation of the operational upgrade flow (stop writes, shadow comparison, per-profile enablement), full E08 route or any gain",
+          "rollback": "revert PR #159 through an independent revert PR; accepted-head parent 4036c0d2d11a01ddcdcb2940d0b00f0f00975656; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-104-a270525.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-104 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/accept-ag104/ctrl-ag104-final.log.test"
+          }
         }
       ],
       "remaining": [
@@ -1949,6 +2007,35 @@
           "scope": "E09; Replay deepen eligibility and waits from the observed legal prefix software/component boundary only.",
           "source_sha": "313598036461304fe1b081e91115bdbd2c779752",
           "test_entry": "crates/evo-engine/tests/replay_legal_prefix_v42.rs"
+        },
+        {
+          "id": "E09.ag103_fairness_waits_legal_set_v42",
+          "description": "Core exposes the pre-selection legality filter as legal_candidates; elastic allocation ranks only its output and online exploration advances fairness waits only over the legal set of the decision round",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "d8a71327018e3995f786bed3dd93e852c858e3ce",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/158",
+          "merged_sha": "4036c0d2d11a01ddcdcb2940d0b00f0f00975656",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-core/tests/fairness_waits_legal_set_v42.rs",
+          "command": "cargo test --locked --offline -p evo-core --test fairness_waits_legal_set_v42",
+          "input_digest": "4544043ec94a7bb600a7eb89c1853a3f7a2c1b7abe7d8251f84123606dfe9c8d",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.fairness_waits_legal_set_v42.log",
+          "actual_result": "this-window controller acceptance at d8a71327 (restacked 647c7ce8 onto c39cbd62, before/after patches byte-identical 90833 B; fresh target under a 1.5 GiB disk watchdog): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 143 binaries 1805 passed / 0 failed / 0 overflow (parent c39cbd62: 140 binaries 1789 passed; new 16: fairness_waits_legal_set_v42 5, replay_fairness_waits_v42 9, exploration_fairness_waits_v42 2), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-ag103/append.rs: a root with unknown cost and a depth-capped deepening never accumulate a fairness wait) pass on head and fail on parent c39cbd62 (both accumulate a wait). Declared target covered with exit 0 by this window's AG-115 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.fairness_waits_legal_set_v42.log).",
+          "scope": "E09; plan §7.1.1 L797 (illegal and unaffordable actions are removed before selection) and L805 (fairness waits advance by completed decision rounds); V020/V022/V025/V081/V086 subset: legal_candidates holds the schema, identity, caps, budget, cost, Recover-eligibility and structure checks; decide_elastic decisions unchanged",
+          "risk": "No claim on Stop reason refinement, legacy report migration, full E09 route or any gain",
+          "rollback": "revert PR #158 through an independent revert PR; accepted-head parent c39cbd626faf4a4c9c0dd1dd104f67282b915f45; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-103-d8a7132.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-103 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/accept-ag103/ctrl-ag103-final.log.test"
+          }
         }
       ],
       "remaining": [
@@ -2070,6 +2157,35 @@
           "rollback": "revert PR #109 through an independent revert PR; accepted-head parent eb275812f09dd8850ad4edac08a2282cb5e82112; retain immutable evidence, frozen plans, costs and revocation state",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-064-437af3f.json"
+        },
+        {
+          "id": "E10.ag103_replay_fairness_waits_legal_set_v42",
+          "description": "Replay and online exploration advance a fairness wait only for an opportunity that was legal in a completed decision round and was skipped, through one core filter",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "d8a71327018e3995f786bed3dd93e852c858e3ce",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/158",
+          "merged_sha": "4036c0d2d11a01ddcdcb2940d0b00f0f00975656",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/replay_fairness_waits_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test replay_fairness_waits_v42",
+          "input_digest": "4544043ec94a7bb600a7eb89c1853a3f7a2c1b7abe7d8251f84123606dfe9c8d",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.replay_fairness_waits_v42.log",
+          "actual_result": "this-window controller acceptance at d8a71327 (restacked 647c7ce8 onto c39cbd62, before/after patches byte-identical 90833 B; fresh target under a 1.5 GiB disk watchdog): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 143 binaries 1805 passed / 0 failed / 0 overflow (parent c39cbd62: 140 binaries 1789 passed; new 16: fairness_waits_legal_set_v42 5, replay_fairness_waits_v42 9, exploration_fairness_waits_v42 2), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-ag103/append.rs: a root with unknown cost and a depth-capped deepening never accumulate a fairness wait) pass on head and fail on parent c39cbd62 (both accumulate a wait). Declared target covered with exit 0 by this window's AG-115 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.replay_fairness_waits_v42.log).",
+          "scope": "E10; plan §7.1.1 L797/L805 (fairness waits advance over the candidate set of the completed decision round, after the pre-selection legality and budget filter) with E09 §7.1.1 and E10 L1327 (replay and online share one restricted decision function); V020/V022/V023/V025/V081/V086 subset: waits count only legal, skipped opportunities; Stop reason, terminals, complete_support, scoring, probe_budget counting and report ids unchanged",
+          "risk": "No claim on the undefined PolicyStop/WorldExhausted contract items, Stop reason refinement, legacy report migration, full E09/E10 route or any gain",
+          "rollback": "revert PR #158 through an independent revert PR; accepted-head parent c39cbd626faf4a4c9c0dd1dd104f67282b915f45; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-103-d8a7132.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-103 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/accept-ag103/ctrl-ag103-final.log.test"
+          }
         }
       ],
       "remaining": [
@@ -4804,7 +4920,8 @@
           "E01.ag057_explicit_sample_registration",
           "E05.ag095_canonical_grader_receipt_digest",
           "E05.ag101_streaming_verdicts_v42",
-          "E05.ag109_external_host_authority_bound_ticket"
+          "E05.ag109_external_host_authority_bound_ticket",
+          "E05.ag100_formal_candidate_dependency_binding_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4855,7 +4972,8 @@
           "E01.ag057_explicit_sample_registration",
           "E05.ag095_canonical_grader_receipt_digest",
           "E05.ag101_streaming_verdicts_v42",
-          "E05.ag109_external_host_authority_bound_ticket"
+          "E05.ag109_external_host_authority_bound_ticket",
+          "E05.ag100_formal_candidate_dependency_binding_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4968,7 +5086,8 @@
           "E16.1.ag076_local_scoped_acceptance",
           "E16.1.ag070_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
-          "E08.ag096_unreadable_bound_request_isolated"
+          "E08.ag096_unreadable_bound_request_isolated",
+          "E08.ag104_restore_prefix_migration_upgrade_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4990,7 +5109,8 @@
           "E08.ag069_local_scoped_acceptance",
           "E08.ag073_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
-          "E08.ag096_unreadable_bound_request_isolated"
+          "E08.ag096_unreadable_bound_request_isolated",
+          "E08.ag104_restore_prefix_migration_upgrade_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5023,7 +5143,9 @@
           "E09.controller_acceptance",
           "E10.controller_acceptance",
           "E10.replay_management_controller_acceptance",
-          "E09.ag074_local_scoped_acceptance"
+          "E09.ag074_local_scoped_acceptance",
+          "E09.ag103_fairness_waits_legal_set_v42",
+          "E10.ag103_replay_fairness_waits_legal_set_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5058,7 +5180,9 @@
           "E10.controller_acceptance",
           "E10.replay_management_controller_acceptance",
           "E11.controller_acceptance",
-          "E09.ag074_local_scoped_acceptance"
+          "E09.ag074_local_scoped_acceptance",
+          "E09.ag103_fairness_waits_legal_set_v42",
+          "E10.ag103_replay_fairness_waits_legal_set_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5073,7 +5197,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E10.controller_acceptance",
-          "E10.replay_management_controller_acceptance"
+          "E10.replay_management_controller_acceptance",
+          "E10.ag103_replay_fairness_waits_legal_set_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5106,7 +5231,9 @@
           "E09.controller_acceptance",
           "E10.controller_acceptance",
           "E10.replay_management_controller_acceptance",
-          "E09.ag074_local_scoped_acceptance"
+          "E09.ag074_local_scoped_acceptance",
+          "E09.ag103_fairness_waits_legal_set_v42",
+          "E10.ag103_replay_fairness_waits_legal_set_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5325,7 +5452,8 @@
           "E13.ag081_local_scoped_acceptance",
           "E04.ag082_local_scoped_acceptance",
           "E04.ag077_local_scoped_acceptance",
-          "E08.ag075_local_scoped_acceptance"
+          "E08.ag075_local_scoped_acceptance",
+          "E08.ag104_restore_prefix_migration_upgrade_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6081,7 +6209,10 @@
           "E09.ag074_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E09.ag103_fairness_waits_legal_set_v42",
+          "E10.ag103_replay_fairness_waits_legal_set_v42",
+          "E08.ag104_restore_prefix_migration_upgrade_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6110,7 +6241,8 @@
           "E13.ag081_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E08.ag104_restore_prefix_migration_upgrade_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6184,7 +6316,8 @@
           "E01.ag057_explicit_sample_registration",
           "E05.ag095_canonical_grader_receipt_digest",
           "E05.ag101_streaming_verdicts_v42",
-          "E05.ag109_external_host_authority_bound_ticket"
+          "E05.ag109_external_host_authority_bound_ticket",
+          "E05.ag100_formal_candidate_dependency_binding_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6229,7 +6362,8 @@
           "E02.ag093_local_scoped_acceptance",
           "E01.ag057_explicit_sample_registration",
           "E05.ag095_canonical_grader_receipt_digest",
-          "E05.ag109_external_host_authority_bound_ticket"
+          "E05.ag109_external_host_authority_bound_ticket",
+          "E05.ag100_formal_candidate_dependency_binding_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6265,7 +6399,9 @@
           "E08.ag075_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance",
-          "E04.ag097_broker_close_before_refuse"
+          "E04.ag097_broker_close_before_refuse",
+          "E09.ag103_fairness_waits_legal_set_v42",
+          "E10.ag103_replay_fairness_waits_legal_set_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
