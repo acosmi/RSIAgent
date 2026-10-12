@@ -82,6 +82,26 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 - 索引记录 E05.ag052_versioned_batch_verdicts 的 actual_result 写明 "streaming_verdicts_v42 10 passed"，是 #100 验收时该测试文件的用例数，为那次运行的事实，不随后续改动更新；#152 之后该文件为 12 个用例，由 E05.ag101_streaming_verdicts_v42 记录承载。
 - #142、#143、#148、#155 为非产品 PR，按先例只在台账登记。
 
+## 2026-10-12 第五轮收尾登记（截至 PR #159）
+
+本节登记 #155 之后的合并事实并收口第五轮。用户 2026-10-12 00:10Z 指令：第五轮不再新增任务，完成在途项后收尾；第六阶段改由另一主控窗口执行，Claude 负责二次验收与修正。验收环境与合并协议不变（文档化环境：默认 profile、默认测试线程栈；全新 target；admin 合并、树相等核对；两窗口共用构建互斥锁、≥ 8 GiB 编译门与 1.5 GiB 低磁盘看门狗）。索引记录按 AG-102 机器字段规则登记；记录级 `command/exit_code/log_path` 只描述声明的单目标，由本台账 PR 的验收全量覆盖并以逐目标摘录日志为证。
+
+### 逐任务摘要
+- **#156 AG-113（台账 + 索引登记第二批）**：base ac57058e → 叠放 647c7ce8，验收 head 4042fcbc28f4f5b1b782ed1b9c25d58ac1396669 → merged c39cbd626faf4a4c9c0dd1dd104f67282b915f45（2026-10-12 01:58:29Z）。登记 #147/#149–#154 七条索引记录（各带 execution 与主控输入回执）、support_scope.rs 钉值、顶表行与第二批摘要。全量 140 二进制 1789 通过（= 父）；索引篡改探针对新记录全部被拒。台账 PR 按先例不进索引。
+- **#157 AG-100（任意 control schema（v1/v2）下票据签发绑定冻结候选依赖，无候选记录即拒绝）**：head afa1928e（叠放 ac57058e，内容逐行一致）→ merged 647c7ce8（2026-10-12 01:01:56Z，返修窗口验收、admin 合并）。全量 140 二进制 1789 通过（父 1785 + 4）；反例 2 个 head 通过、基线失败（无候选记录仍签发 / 旧票据 Blocked 而非零写入）。索引记录 E05.ag100_formal_candidate_dependency_binding_v42（V010/V012/V084/V085），由本台账 PR 登记（#157 合并时其条目尚未到达，故未进 #156）。
+- **#158 AG-103（公平等待只计核心过滤后的合法机会，在线探索与回放共用一个核心过滤器）**：base 98776f17 → 叠放 c39cbd62，验收 head d8a71327018e3995f786bed3dd93e852c858e3ce → merged 4036c0d2d11a01ddcdcb2940d0b00f0f00975656（2026-10-12 02:51:38Z）。裁决 D2（方案 L797 选择前剔除非法/预算不足动作；L805 公平等待按已完成的决策轮推进）：等待只对"已完成决策轮中合法且被跳过"的机会累计；evo-core 抽出 `legal_candidates`，decide_elastic 只排序其输出，决策不变；replay/exploration 共用该过滤。全量 143 二进制 1805 通过（父 140/1789 + 3 二进制 16 测试）；主控反例 2 个（P1 无费用根不累计 waits；P2 深度上限加深不累计 waits）head 通过、父树失败。索引记录 E09.ag103_fairness_waits_legal_set_v42（V020/V022/V025/V081/V086，目标 fairness_waits_legal_set_v42）与 E10.ag103_replay_fairness_waits_legal_set_v42（V020/V022/V023/V025/V081/V086，目标 replay_fairness_waits_v42）。
+- **#159 AG-104（restore 在严格迁移前缀上升级备份后再发布）**：base e727d1c → 叠放 4036c0d2，验收 head a2705252894c61aaa1972f0596a279e2f36c2ab5 → merged a78a1e60a4298cd3ca57598a7aba7c5c84a8a721（2026-10-12 05:43:11Z）。scripts/restore_backup.py 接受清单与数据库账本为当前迁移集严格前缀（0001-0005 或 0001-0006，全部成功且校验和匹配）的备份，在私有恢复副本内按 sqlx 0.8.6 的方式补跑缺失迁移后再做锚点比对、增量重放与发布；缺口/未知版本/校验和变化/未成功行/0005 之前的前缀/清单与库不一致仍隔离；可信锚点与启动门不变。全量 144 二进制 1810 通过（父 143/1805 + 1 二进制 5 测试）；主控反例 2 个 head 通过、父树失败。索引记录 E08.ag104_restore_prefix_migration_upgrade_v42（V017/V018/V038/V081/V082，目标 restore_prefix_upgrade_v42）。
+
+### 第五轮总结
+- 合并的 PR（按合并顺序）：#142 AG-098、#144 AG-097、#145 AG-096、#146 AG-099、#148 AG-102、#147 AG-095、#143 AG-094、#150 AG-108、#149 AG-105、#151 AG-107、#152 AG-101、#153 AG-109、#154 AG-106、#155 AG-110、#157 AG-100、#156 AG-113、#158 AG-103、#159 AG-104，以及本收尾台账 PR（AG-115）。每个 PR 的验收 head / merged_sha 见本台账顶表与各节摘要。
+- 第五轮末次文档化环境全量（第五轮产品主线 = a78a1e60a4298cd3ca57598a7aba7c5c84a8a721（#159 合并提交，本收尾 PR 的父；本 PR 合并后的 main 为其 merge commit，见 PR 正文验收段））：144 个测试二进制、1810 通过、0 失败（AG-104 验收 head a2705252，与 a78a1e60 同树；本 PR 自身的验收全量见其 PR 正文验收段）；fmt、clippy、build、两 smoke、checker、unittest 全 0；support checker structure_valid、errors 0。
+- 修复的第四轮缺陷：R1–R5（AG-095–AG-101）与 AG-105–AG-109 已全部合并；main 测试闸门自 #146（AG-099）起在默认栈下绿。
+- 未派发（转第六阶段）：AG-111 台账尾部压缩为逐任务摘要；AG-114 Python 检查器拒绝 merged_sha 等于自身 source_sha 并与 Rust 钉值表共享合并事实；Python/Rust 校验器对 V 引用所属任务规则的统一；返修窗口 7 项候选。
+- 残留与待用户：(1) 待用户：user-commands.md 的远端分支删除（ag-102/094/110/113/103/104）与清理节；仓外磁盘占用（~/.codex 历史库与 rollout、Docker、Codex worktree 构建产物）；本地 5.6 GiB JSON 回执是否保留；queue-r5.md 待用户裁决项（E12 选题受资产影响规则、GB16 其余未定义项、GA10 typed HostSurface 合同、GA21 取消语义、GC6 失败优先级语义、继承第三/四轮项）。(2) 已知缺口：Python 检查器不拒绝 merged_sha 等于自身 source_sha（Rust 钉值表拒）→ AG-114；Python 与 Rust 对 V 引用所属任务规则不一致；AG-111 台账尾部压缩未做；AG-103 两条未声明边界（新可用动作入零、末轮后失格动作保留等待项）；AG-104 不声明 0005 前备份、磁盘耗尽与运维升级自动化。(3) 环境：本机 rustup minimal profile 下 rust-objcopy strip 警告（非 lint）；两窗口共用的 ≥8 GiB 门与 1.5 GiB 看门狗记录于本地台账。
+
+### 第六阶段交接
+- 第六阶段自 2026-10-12 01:1xZ 由另一 Claude 主控窗口（Opus 5.5）按本地 claude-start-prompt-r6.md 执行，编号自 AG-116；与第五轮收尾并行期间共用构建互斥锁与编译门，第五轮编译序列结束前不起 cargo。第五轮的 Claude 窗口在第六阶段结束后做二次验收与修正。
+
 ## 2026-10-11 第四轮在途收尾与最终证据索引
 
 按用户最后指令停止新增任务，仅接收原在途交付、必要关联返修和本次收尾台账。原在途产品与透明3D状态小人前端均已实际合并，当前产品主线为 f6904dcd2d4f3b46b3311886fd4dcecd8a2f711c。第四轮 #98 至 #140 已合并；本次三文件台账自身以此主线为父，仍须独立全量与两项原索引反例通过后按固定 head 合并。
@@ -120,6 +140,9 @@ plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1
 | [#152](https://github.com/acosmi/RSIAgent/pull/152) | AG101 | 78075a1101db12e5f3591622f0499ecf2b7b66bf | f355ec389513685097e2c4d85dfd0c062e29e915 | E05 |
 | [#153](https://github.com/acosmi/RSIAgent/pull/153) | AG109 | e573eaa3a8cea90932f806ca455bf8a3963e1a3d | 42decd1a17585c366b249104b0bbea700361d003 | E05 |
 | [#154](https://github.com/acosmi/RSIAgent/pull/154) | AG106 | 71cae0cfd8919f523514d382e0b966171c5e3f97 | aece7299d0078e5704bd74ed3ae04e828f3e2c6d | E08 |
+| [#157](https://github.com/acosmi/RSIAgent/pull/157) | AG100 | afa1928e7f9367fd125bfac40cd8115dbe7a17ac | 647c7ce8361215632d62a42a8bf87d9df2bf3c2d | E05 |
+| [#158](https://github.com/acosmi/RSIAgent/pull/158) | AG103 | d8a71327018e3995f786bed3dd93e852c858e3ce | 4036c0d2d11a01ddcdcb2940d0b00f0f00975656 | E09/E10 |
+| [#159](https://github.com/acosmi/RSIAgent/pull/159) | AG104 | a2705252894c61aaa1972f0596a279e2f36c2ab5 | a78a1e60a4298cd3ca57598a7aba7c5c84a8a721 | E08 |
 
 | E任务 | 默认完整范围状态 | 已验子范围记录数 |
 |---|---|---|
