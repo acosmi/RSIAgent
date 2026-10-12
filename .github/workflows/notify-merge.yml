@@ -1,0 +1,14 @@
+name: notify-merge
+on:
+  pull_request:
+    types: [closed]
+jobs:
+  notify:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -sf -X POST "https://api2.cursor.sh/automations/webhook/aa6a72de-742e-5146-978d-b5a01ee6c101" \
+            -H "Authorization: Bearer ${{ secrets.GROKBOT_WEBHOOK_KEY }}" \
+            -H "Content-Type: application/json" \
+            --data-binary @"$GITHUB_EVENT_PATH"
