@@ -1,0 +1,27 @@
+{
+  "schema_version": "rsia.ci_egress_register.v1",
+  "entries": [
+    {
+      "id": "notify_merge",
+      "workflow": ".github/workflows/notify-merge.yml",
+      "workflow_sha256": "468dfeef8130ca28043cb755df1651f82db56af1f154bc60233bc06d6a654eaa",
+      "job": "notify",
+      "step_index": 0,
+      "purpose": "Existing merge notification to the repository owner automation",
+      "recipient": "https://api2.cursor.sh/automations/webhook/aa6a72de-742e-5146-978d-b5a01ee6c101",
+      "trigger": "pull_request closed, only if merged == true",
+      "method": "POST",
+      "content_type": "application/json",
+      "data_scope": "Complete GitHub pull_request event JSON from GITHUB_EVENT_PATH; includes PR title/body, author, repository and commit metadata",
+      "secret_names": [
+        "GROKBOT_WEBHOOK_KEY"
+      ],
+      "confirmed": true,
+      "confirmation": {
+        "authority": "direct_user_confirmation_current_session",
+        "observed_at": "2026-10-12T23:05:53.222058+00:00",
+        "scope": "existing unchanged merge notification and its registration"
+      }
+    }
+  ]
+}

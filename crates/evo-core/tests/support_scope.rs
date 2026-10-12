@@ -1,5 +1,5 @@
 //! Strict derived support-scope verification for E16.6 (V071/V072/V074/V080/V098).
-//! The current plan (lineage v4.1→v4.2, plan §18.8) remains normative; this test rejects
+//! The current plan (lineage v4.1→v4.2→v4.3, plan §18.9) remains normative; this test rejects
 //! incomplete or inflated indexes. Historical evidence records keep the lineage digest they
 //! were verified against; only the top level must bind the current plan.
 
@@ -7,9 +7,9 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-const PLAN_VERSION: &str = "v4.2";
-const PLAN_SHA: &str = "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455";
-/// Registered plan lineage (plan §18.8) as (version, file, sha256), oldest first; the last
+const PLAN_VERSION: &str = "v4.3";
+const PLAN_SHA: &str = "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7";
+/// Registered plan lineage (plan §18.9) as (version, file, sha256), oldest first; the last
 /// entry is the current binding.
 const PLAN_LINEAGE: &[(&str, &str, &str)] = &[
     (
@@ -22,12 +22,21 @@ const PLAN_LINEAGE: &[(&str, &str, &str)] = &[
         "RSIAgent-v4.2定稿-工程实施方案-2026-09-30.md",
         "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
     ),
+    (
+        "v4.3",
+        "RSIAgent-v4.3定稿-工程实施方案-2026-10-12.md",
+        "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7",
+    ),
 ];
 /// Optional per-record recheck marker; a missing key means not_affected and "required" never passes.
-const PLAN_RECHECKED: &str = "rechecked_v4.2";
-const PLAN_RECHECK_VALUES: &[&str] = &["not_affected", "required", PLAN_RECHECKED];
-/// Tasks whose historical records are touched by the v4.2 revision (plan §19.4).
-const PLAN_RECHECK_TASKS: &[&str] = &["E00", "E16.5", "E16.6"];
+const PLAN_RECHECKED: &str = "rechecked_v4.3";
+const PLAN_RECHECK_VALUES: &[&str] =
+    &["not_affected", "required", "rechecked_v4.2", PLAN_RECHECKED];
+/// Exact E-task union of v4.3 plan §19.5 landing points, regardless of behavior changes.
+const PLAN_RECHECK_TASKS: &[&str] = &[
+    "E00", "E01", "E02", "E03", "E04", "E05", "E06", "E07", "E08", "E09", "E10", "E11", "E12",
+    "E13", "E14", "E15", "E16", "E16.1", "E16.2", "E16.3", "E16.4", "E16.5", "E16.6",
+];
 const SKILLOPT_REPO: &str = "https://github.com/microsoft/SkillOpt.git";
 const SKILLOPT_COMMIT: &str = "79124b37e9a6371e13b753f8bcd7adb1e493ade1";
 const ALLOWED_STATUSES: &[&str] = &[
@@ -62,29 +71,29 @@ fn load_manifest(root: &Path) -> Value {
 
 fn expected_e_scenarios() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     [
-        ("E00", "V001 V071 V072 V073 V080 V098"),
-        ("E01", "V010 V011 V012 V013 V084 V085 V096 V097"),
-        ("E02", "V002 V003 V005 V009 V043 V044 V045 V046 V047 V048 V060 V062 V078 V079 V081 V082 V083 V084 V085 V086 V087 V088 V089 V090 V091 V092 V093 V094 V095 V096"),
-        ("E03", "V004 V005 V006 V017 V051 V052 V054 V055 V056 V057 V058 V087 V088 V089 V090 V094 V096"),
-        ("E04", "V007 V008 V009 V038 V083 V085 V086 V087 V093 V094 V096"),
-        ("E05", "V010 V011 V012 V013 V028 V084 V085 V090 V091 V094 V097"),
-        ("E06", "V014 V015 V016 V017 V047 V049 V050 V059 V064 V070 V075 V077 V078 V081 V084 V085 V089 V091 V094 V095 V096"),
-        ("E07", "V003 V010 V014 V015 V016 V042 V047 V059 V070 V077 V087 V088 V089 V091 V096 V097"),
-        ("E08", "V017 V018 V038 V056 V069 V075 V081 V082 V083 V084 V085 V086 V090 V092 V094 V096"),
-        ("E09", "V019 V020 V022 V024 V025 V081 V086 V088 V089 V090 V091 V093 V094 V095 V096 V097"),
-        ("E10", "V020 V021 V022 V023 V025 V026 V027 V081 V086 V094 V096"),
-        ("E11", "V022 V026 V027 V028 V042 V081 V094 V096 V097"),
-        ("E12", "V029 V030 V031 V034 V082 V083 V093 V094 V096"),
-        ("E13", "V016 V032 V037 V038 V082 V084 V087 V090 V091 V094 V096 V097"),
-        ("E14", "V015 V033 V034 V035 V036 V086 V090 V092 V094 V096 V097"),
-        ("E15", "V026 V033 V035 V036 V042 V085 V092 V096 V097"),
-        ("E16", "V081 V082 V083 V084 V085 V086 V087 V088 V089 V090 V091 V092 V093 V094 V095 V096 V097 V098"),
-        ("E16.1", "V005 V006 V017 V051 V052 V053 V054 V055 V056 V076 V087 V090 V098"),
-        ("E16.2", "V017 V039 V066 V067 V068 V069 V070 V075 V091 V092 V098"),
-        ("E16.3", "V014 V018 V038 V063 V064 V065 V078 V091 V092 V098"),
-        ("E16.4", "V002 V003 V009 V037 V039 V060 V061 V062 V077 V087 V091 V098"),
-        ("E16.5", "V007 V008 V017 V018 V037 V038 V039 V066 V069 V073 V075 V081 V082 V083 V084 V085 V086 V089 V090 V092 V094 V096 V098"),
-        ("E16.6", "V001 V039 V042 V071 V072 V073 V074 V080 V098"),
+        ("E00", "V001 V071 V072 V073 V080 V098 V113 V116"),
+        ("E01", "V010 V011 V012 V013 V084 V085 V096 V097 V103 V114 V118"),
+        ("E02", "V002 V003 V005 V009 V043 V044 V045 V046 V047 V048 V060 V062 V078 V079 V081 V082 V083 V084 V085 V086 V087 V088 V089 V090 V091 V092 V093 V094 V095 V096 V100 V101 V107 V108 V109 V120"),
+        ("E03", "V004 V005 V006 V017 V051 V052 V054 V055 V056 V057 V058 V087 V088 V089 V090 V094 V096 V106 V108"),
+        ("E04", "V007 V008 V009 V038 V083 V085 V086 V087 V093 V094 V096 V101 V103 V106 V110 V111 V112"),
+        ("E05", "V010 V011 V012 V013 V028 V084 V085 V090 V091 V094 V097 V101 V104 V114"),
+        ("E06", "V014 V015 V016 V017 V047 V049 V050 V059 V064 V070 V075 V077 V078 V081 V084 V085 V089 V091 V094 V095 V096 V100 V108 V119"),
+        ("E07", "V003 V010 V014 V015 V016 V042 V047 V059 V070 V077 V087 V088 V089 V091 V096 V097 V112 V114"),
+        ("E08", "V017 V018 V038 V056 V069 V075 V081 V082 V083 V084 V085 V086 V090 V092 V094 V096 V099 V100 V102 V110 V111"),
+        ("E09", "V019 V020 V022 V024 V025 V081 V086 V088 V089 V090 V091 V093 V094 V095 V096 V097 V100 V105 V106"),
+        ("E10", "V020 V021 V022 V023 V025 V026 V027 V081 V086 V094 V096 V104 V105 V106"),
+        ("E11", "V022 V026 V027 V028 V042 V081 V094 V096 V097 V104 V118"),
+        ("E12", "V029 V030 V031 V034 V082 V083 V093 V094 V096 V109"),
+        ("E13", "V016 V032 V037 V038 V082 V084 V087 V090 V091 V094 V096 V097 V100 V109"),
+        ("E14", "V015 V033 V034 V035 V036 V086 V090 V092 V094 V096 V097 V118 V119"),
+        ("E15", "V026 V033 V035 V036 V042 V085 V092 V096 V097 V118"),
+        ("E16", "V081 V082 V083 V084 V085 V086 V087 V088 V089 V090 V091 V092 V093 V094 V095 V096 V097 V098 V099 V100 V101 V102 V103 V104 V105 V106 V107 V108 V109 V110 V111 V112 V113 V114 V115 V116 V117 V118 V119 V120"),
+        ("E16.1", "V005 V006 V017 V051 V052 V053 V054 V055 V056 V076 V087 V090 V098 V117"),
+        ("E16.2", "V017 V039 V066 V067 V068 V069 V070 V075 V091 V092 V098 V102 V117"),
+        ("E16.3", "V014 V018 V038 V063 V064 V065 V078 V091 V092 V098 V115"),
+        ("E16.4", "V002 V003 V009 V037 V039 V060 V061 V062 V077 V087 V091 V098 V101 V107 V108"),
+        ("E16.5", "V007 V008 V017 V018 V037 V038 V039 V066 V069 V073 V075 V081 V082 V083 V084 V085 V086 V089 V090 V092 V094 V096 V098 V099 V101 V102 V104 V110 V113 V116 V120"),
+        ("E16.6", "V001 V039 V042 V071 V072 V073 V074 V080 V098 V116"),
         ("E17", "V040"),
         ("E18", "V041"),
     ]
@@ -1058,7 +1067,7 @@ fn validate_so_sources(
 }
 
 fn expected_v_to_e() -> BTreeMap<String, BTreeSet<String>> {
-    let mut result: BTreeMap<String, BTreeSet<String>> = (1..=98)
+    let mut result: BTreeMap<String, BTreeSet<String>> = (1..=120)
         .map(|i| (format!("V{i:03}"), BTreeSet::new()))
         .collect();
     for (task, scenarios) in expected_e_scenarios() {
@@ -1085,7 +1094,7 @@ fn validate_v_scenarios(
     let actual_ids: BTreeSet<String> = by_id.keys().map(|id| (*id).to_string()).collect();
     let expected_ids: BTreeSet<String> = expected.keys().cloned().collect();
     if actual_ids != expected_ids {
-        return Err("V001-V098 exact set is incomplete".into());
+        return Err("V001-V120 exact set is incomplete".into());
     }
     for (id, expected_tasks) in &expected {
         let entry = by_id[id.as_str()];
@@ -1129,7 +1138,7 @@ fn validate_trace_index_coverage(value: &Value) -> Result<(), String> {
     }
     if object["E00"]["purpose"] != "index_consistency_only_not_scenario_execution"
         || string_set(&object["E00"]["ranges"], "E00 trace ranges")?
-            != split_set("K01–K10 SO01–SO18 V087–V098")
+            != split_set("K01–K10 SO01–SO18 V087–V120")
     {
         return Err(format!(
             "E00 trace-only responsibility differs from plan {PLAN_VERSION}"
@@ -1137,7 +1146,7 @@ fn validate_trace_index_coverage(value: &Value) -> Result<(), String> {
     }
     if object["E16.6"]["purpose"] != "complete_derived_index_coverage_not_scenario_execution"
         || string_set(&object["E16.6"]["ranges"], "E16.6 trace ranges")?
-            != split_set("B01–B10 U01–U08 K01–K10 SO01–SO18 E00–E18 E16.1–E16.6 V001–V098")
+            != split_set("B01–B10 U01–U08 K01–K10 SO01–SO18 E00–E18 E16.1–E16.6 V001–V120")
     {
         return Err(format!(
             "E16.6 complete index responsibility differs from plan {PLAN_VERSION}"
@@ -1323,9 +1332,9 @@ fn historical_records_keep_lineage_digests_but_top_level_must_be_current() {
     mismatched["e_scopes"]["E01"]["verified_subscopes"][0]["plan_version"] =
         Value::String(PLAN_VERSION.into());
     let error = validate_manifest(&mismatched, &root)
-        .expect_err("a v4.2 version paired with the v4.1 digest was accepted");
+        .expect_err("a v4.3 version paired with the v4.1 digest was accepted");
     assert!(
-        error.contains("not the registered digest of plan v4.2"),
+        error.contains("not the registered digest of plan v4.3"),
         "{error}"
     );
 
@@ -1353,7 +1362,7 @@ fn historical_records_keep_lineage_digests_but_top_level_must_be_current() {
     let error = validate_manifest(&stale_top, &root)
         .expect_err("a top level still bound to v4.1 was accepted");
     assert!(
-        error.contains("not bound to the current plan v4.2"),
+        error.contains("not bound to the current plan v4.3"),
         "{error}"
     );
 }
@@ -1376,14 +1385,21 @@ fn rejects_pending_or_unknown_plan_recheck_markers() {
         Value::String("improved".into());
     assert!(validate_manifest(&unknown, &root).is_err());
 
-    let mut untouched_without_marker = load_manifest(&root);
-    untouched_without_marker["e_scopes"]["E01"]["verified_subscopes"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("plan_recheck");
-    validate_manifest(&untouched_without_marker, &root).unwrap();
+    for task in ["E17", "E18"] {
+        let mut untouched = load_manifest(&root);
+        untouched["e_scopes"][task]["verified_subscopes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("plan_recheck");
+        validate_manifest(&untouched, &root).unwrap();
+    }
 
-    for task in ["E00", "E16.5"] {
+    for task in PLAN_RECHECK_TASKS.iter().copied().filter(|task| {
+        !load_manifest(&root)["e_scopes"][*task]["verified_subscopes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    }) {
         let mut downgraded = load_manifest(&root);
         let record = &mut downgraded["e_scopes"][task]["verified_subscopes"][0];
         assert_eq!(record["plan_recheck"], PLAN_RECHECKED);
@@ -1391,6 +1407,13 @@ fn rejects_pending_or_unknown_plan_recheck_markers() {
         assert!(
             validate_manifest(&downgraded, &root).is_err(),
             "{task}: a v4.1 record of a touched task without a recheck was accepted"
+        );
+        let mut previous_recheck = load_manifest(&root);
+        previous_recheck["e_scopes"][task]["verified_subscopes"][0]["plan_recheck"] =
+            Value::String("rechecked_v4.2".into());
+        assert!(
+            validate_manifest(&previous_recheck, &root).is_err(),
+            "{task}: a previous-plan marker was accepted in place of a v4.3 recheck"
         );
         let mut missing = load_manifest(&root);
         missing["e_scopes"][task]["verified_subscopes"][0]
@@ -1432,11 +1455,61 @@ fn rejects_missing_or_unregistered_plan_lineage() {
         .as_array_mut()
         .unwrap()
         .push(serde_json::json!({
-            "version": "v4.3",
+            "version": "v4.4",
             "file": "future.md",
             "sha256": "b".repeat(64),
         }));
     assert!(validate_manifest(&extended, &root).is_err());
+}
+
+#[test]
+fn v43_recheck_tasks_cover_every_landing_task_except_optional_extensions() {
+    let actual: BTreeSet<String> = PLAN_RECHECK_TASKS
+        .iter()
+        .map(|task| task.to_string())
+        .collect();
+    let expected: BTreeSet<String> = expected_e_ids()
+        .into_iter()
+        .filter(|task| task != "E17" && task != "E18")
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn v43_scenarios_are_registered_without_execution_credit_and_reject_tampering() {
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let mapping = expected_v_to_e();
+    assert_eq!(mapping.len(), 120);
+    assert_eq!(mapping["V107"], split_set("E02 E16 E16.4"));
+    let mut unexecuted = baseline.clone();
+    unexecuted["traceability"]["v_scenarios"][119]["status"] = serde_json::json!("verified");
+    unexecuted["traceability"]["v_scenarios"][119]["verification_status"] =
+        serde_json::json!("verified");
+    unexecuted["traceability"]["v_scenarios"][119]["related_evidence_refs"] = serde_json::json!([]);
+    unexecuted["traceability"]["v_scenarios"][119]["remaining"] = serde_json::json!("");
+    assert!(validate_manifest(&unexecuted, &root).is_err());
+    let mut missing = baseline.clone();
+    missing["traceability"]["v_scenarios"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    assert!(validate_manifest(&missing, &root).is_err());
+    let mut duplicate = baseline.clone();
+    let last = duplicate["traceability"]["v_scenarios"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    duplicate["traceability"]["v_scenarios"]
+        .as_array_mut()
+        .unwrap()
+        .push(last);
+    assert!(validate_manifest(&duplicate, &root).is_err());
+    let mut wrong_owner = baseline;
+    wrong_owner["traceability"]["v_scenarios"][119]["e_tasks"] = serde_json::json!(["E17"]);
+    assert!(validate_manifest(&wrong_owner, &root).is_err());
 }
 
 #[test]

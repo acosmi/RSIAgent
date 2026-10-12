@@ -1,7 +1,7 @@
 # RSIAgent 实施台账
 
-唯一规范入口（方案正文仅本地）：`RSIAgent-v4.2定稿-工程实施方案-2026-09-30.md`。
-plan_version：`v4.2`；plan_sha256：`70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455`。谱系：v4.1 `RSIAgent-v4.1定稿-工程实施方案-2026-09-19.md`（SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，2026-09-30 归档至本地 `archive/2026-09-30-pre-v4.2/`）→ v4.2。历史验证记录保留其验证时的 plan_sha256（真源 §18.8）。
+唯一规范入口（方案正文仅本地）：`RSIAgent-v4.3定稿-工程实施方案-2026-10-12.md`。
+plan_version：`v4.3`；plan_sha256：`73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7`。谱系：v4.1 `RSIAgent-v4.1定稿-工程实施方案-2026-09-19.md`（SHA-256 `45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150`，2026-09-30 归档至本地 `archive/2026-09-30-pre-v4.2/`）→ v4.2 `RSIAgent-v4.2定稿-工程实施方案-2026-09-30.md`（SHA-256 `70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455`，2026-10-12 归档至本地 `archive/2026-10-12-pre-v4.3/`）→ v4.3。历史验证记录保留其验证时的 plan_version/plan_sha256（真源 §18.9）。
 本台账是实施与证据索引，不另立规范；历史 PR、测试和旧台账不决定当前规则。
 用户于 2026-09-19 明确确认 v4.1 替代 v4，并授权将本台账上传远程；方案正文、内部合同、归档及 QA 原始材料只保留本地。2026-10-01 第四轮由 Codex 主控持续推进；实施子代理统一使用 gpt-6.1-sol，逐卡记录思考档位。每个任务独立 PR；主控全量复跑及至少两个反例通过后，以固定 head 按依赖顺序合并并核对合并树。历史轮次的合并操作者按各节原始记录保留。2026-10-11 起第五轮由 Claude Fable 5.1 主控，子代理按任务规模使用 Claude Sonnet 5.5 / Opus 5.5；2026-10-12 起第六阶段由 Claude Opus 5.5 主控，实施与侦察子代理一律 Claude Opus 5.5（effort high），验收通过的 PR 由主控按用户授权以固定 head admin 合并；第四轮二次验收结论见下一节。Actions派发、付费运行和部署/发布未授权。
 
@@ -1897,7 +1897,7 @@ AG071的两份具体产品代码向公共仓库推送，被自动审批在执行
 - 两白名单文件+688/-6完整预审，交付与冻结SHA一致。产品仅private UTF8 endpoint helper和3调用(+12/-6)；new privacy_utf8_v42 676行10测试。ASCII窗口12/24/16、marker/顺序/等级/错误/时间policy不变。
 - 全新target-ctrl-ag071独立八门全0，ctrl-ag071-53dd176.log*；逐行独立求和97结果行=92测试二进制+5doc组，1283/0=实际父1273+10，Python48。CARGO_BUILD_JOBS=2仅限制构建并发，所有要求命令/断言保持。root localhost完整全量/双smoke实际通过。
 - 两root自写反例：frozen source e4c6a606f217a36c29f8f800c8e5e7024ddfac2b22e922c7224187d62d07c4f7，append b136b3ba853541286710b15713b23cb1f77785351820bed1c02d38dea95a3b05；head ctrl-ag071-adversarial-head-53dd176.log 2/0 exit0；实际父 ctrl-ag071-adversarial-base-212c784.log 0/2 exit101，双方成功编译且WT clean。P1真实export metadata name/dependency.version_req/nonprimary source-id共9输入JSON往返，P2foreign approval/evaluation notes共6输入manifest往返；旧树15实际UTF8 panic，head均精确privacy Error，入参字节不变、Clean正例仍通过。最初root ForeignMetadata::default编译设置错误保留invalid-default-setup，不算产品红灯。
-- 实施报告qa/impl-ag071/implementation-report.md SHA256406e5e9b5ddec53e1e0054311fbfbd0038f252fed9be292b2da83e0f14fcab73；最终baseline2/8、504边界184panic、固定10/0、38ASCII findings逐字段快照、两变异101与cmp0已核。首新test误把C:/Users/双命中当单命中只修新test且重跑原product baseline；原错误保留。初workspace1268/5明确HTTP EPERM，R1同命令1273/0；CLI初1仅readiness超时不伪称stderr EPERM，提权同命令0。
+- 实施报告qa/impl-ag071/implementation-report.md SHA256406e5e9b5ddec53e1e0054311fbfbd0038f252fed9be292b2da83e0f14fcab73；最终baseline2/8、504边界184panic、固定10/0、38ASCII findings逐字段快照、两变异101与cmp0已核。首新test误把 Windows 用户目录样例的两条扫描规则命中当单命中，只修新test且重跑原product baseline；原错误保留。初workspace1268/5明确HTTP EPERM，R1同命令1273/0；CLI初1仅readiness超时不伪称stderr EPERM，提权同命令0。
 - 本地verified子范围仅§11.2L1104/E16.2L1427,L1429/V067已知隐私模式的UTF8安全阻断。不声明更广扫描覆盖、绝对无泄漏、授权出站、完整导入学习链/V076、V075新验证、真实模型/效果/发行。privacy报告本身可能含原snippet，政策未改。回滚参考父212c78488b403397eaebaa65a6d280b9c6be3899，不还原已脱敏内容、费用、审计或撤销事实。
 - 产品返修0、R1环境裁决1，卡e20c8b42c67a88fbc9072491947da2b82396b9e3a445b288d89cdde5512c56a9/R1 f36826c8159b9cd97e248a46c5eb704de3e54eb3188389296addd328350adcf7。child与root两次原精确push均在创建进程前被自动审批拒绝，未外发、未绕通道；root新事实复核仍要求具体payload公共目的地授权，待用户明确。无PR/未合并/不可填写merged_sha或纳入已合并汇总；保留完整本地结果可复审。
 
@@ -8633,3 +8633,132 @@ ROOT 当前固定 H 完整八门均 native0，Rust1729/135groups 无 ignored/fil
 同一在途 AG093 的重复网络断连经有据转移给最终机械返修 owner；只做三文件兼容和 Python WAL fixture 的两行 commit-close-reopen，266其他文件不变，完整46断言不删不弱。先前 r1 实际 ENOSPC/link101、Source 与 QA/RAW/SQLite 均保留；当前已结束两个自有 target 清理实际 allocated3405299712bytes，free_after9057959936bytes，原54未提交/231REG/46DIR exact。清理接收 qa/takeover-20261002/ROOT-AG093-PR140-accepted-ended-two-targets-retirement-actual-r1-20261011.json，169051bytes/SHAdc901343dfb033b76752221ac6e56a07e2fe87fdd7ffce1357e5581b456547a6；仅可再生缓存，非其他仓库清理。
 
 前端 PR139 已合并；此前15自有干净已合并工作树/分支和另外4已合并且 main 可达的旧远端引用均按真实证据退役，未提交/不可达历史源不删。当前产品在途已全部接收，只执行 startup§5 规定的三个台账/索引文件、独立完整8门及原索引2反例、最后 PR/交接。rsiagent-30 已取消，无新增功能/派单/持续目标自动恢复。当前 needs_verification228 与完整 v4.2 未完成状态保留；本次收尾不冒称真实 OS principal/provider/生产宿主、收益、采用或发布验收。
+
+
+## 2026-10-12 第七阶段 v4.3 切换与历史逐条复核（AG-124）
+
+当前入口按§18.9切换至v4.3，谱系v4.1→v4.2→v4.3。v4.2已原字节归档至本地archive/2026-10-12-pre-v4.3/，摘要仍为70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455。Q-01–Q-26、29行改写表及实现缺陷见当前正文§19.5；裁决依据为本地v43/decision-table.md文末更正及v43/ledger.md。正文、归档及原始QA不上传。
+
+派生索引、Python/Rust检查器覆盖全部23个落点任务及V001–V120。新增22族V仅planned，无执行或效果信用。历史版本、摘要、输入、源码/合并SHA、命令、计数和日志不改：91条保留记录中89条已按当前条款复核、2条E17/E18范围外；18条改变行为的完整原对象留存本地qa/codex-r7-ag124/withdrawn-records.json并撤出verified_subscopes，关联引用同步撤下。原始侦察与主控核正分开留证。E04仅更正formal_local_host已有外部provider transport接线事实，合格隔离runner未接线仍保留。
+
+AG-124状态为implemented_not_verified，首次验收和固定head合并事实由本地codex-r7-acceptance.md留证，待Claude独立二次验收。不得声明二次验收、完整E/V、真实提供商/宿主/沙箱、实验效果、收益或发行。§18.9现有notify-merge外发已由用户在本会话明确批准并登记于docs/ci-egress-register.json：原工作流合并后将完整GitHub pull_request事件JSON（PR标题/正文/作者/仓库/提交元数据）POST至既有Cursor webhook，使用GROKBOT_WEBHOOK_KEY密钥名。接收方、密钥与数据范围不改，未读取密钥值；CI逐步强制核对检查器仍待Q24后续任务。登记schema表示待二次验收裁决。
+
+### 范围解释与待二次验收裁决
+
+- AG097/105被撤的断言是未脱敏缓存拒绝前补execution_close；§11.3.1/V102.b要求该入口零写入。§11.6/V111.b对严格同bound身份已脱敏请求的恰好一次关闭仍保留，不扩成一般豁免。
+- AG065 exact clone按§5.5.1保留名称信用；短source_digest夹具不授Q25来源绑定信用。AG039不从Recover辅助用例扩大Deepen范围，AG070不从native格式setup扩大有界物料范围，AG092不从P/B夹具扩成摘要合法性。解释待二验，新义务另卡。
+- 原不可变ctrl_verify.sh固定v4.2根路径；本地副本只适配PLAN一行，八门及原始子日志保留，待二验。不改原脚本、不冒称它读取v4.3通过。
+
+### 109条逐条判定（源码行号为基线main 6a5b5ebf，真源行号为当前v4.3）
+
+| E | 完整 record id | 判定 | Q／现读真源依据 | 实际测试／源文件行号与理由 |
+|---|---|---|---|---|
+| E00 | E00.controller_acceptance | 行为未变 | Q15/Q18/Q24；E00 L1523–1525；§18.9 L2832 | `crates/evo-engine/src/evaluator.rs:182–273`：定向拒绝不完整行、票据失配、无效统计；未声明新 CI、许可或工具链义务。 |
+| E00 | E00.ag099_step_future_default_test_stack | 行为未变 | Q26；E00 L1523；§18.9 L2832 | `crates/evo-engine/tests/step_terminal_classes_v42.rs:1476–1960,2407–2547`：装箱降低 step future 栈占用，终态与决策语义保持；新 V 注册不使旧默认栈执行证据失效。 |
+| E01 | E01.controller_acceptance | 行为未变 | Q04/Q16/Q22；E01 L1541–1543；§19.5 L2970 | `crates/evo-core/tests/evaluation_v41.rs:122–264,388–531`：连续前缀、UCB、研究族额度、锚点和零预算静态合同；统计公式未改，新计划绑定／任务登记另验。 |
+| E01 | E01.ag057_explicit_sample_registration | 行为未变 | Q16/Q22；E01 L1541–1543 | `crates/evo-core/tests/evaluation_contract_v42.rs:60–123`：显式 n 保留、越界拒绝、旧 v1 字节不变；不把显式 60 当正式功效达标。 |
+| E02 | E02.controller_acceptance | 行为未变 | Q25；E02 L1557–1559 | `crates/evo-core/tests/skill_edit.rs:92–154,442–571`：UTF-8 前像、锚点、整包原子性和确定性；新摘要字段登记不改变这些编辑行为。 |
+| E02 | E02.ag055_v1_wire_goldens | 行为未变 | Q08/Q26；§5.5.1 L595；E02 L1557 | `crates/evo-core/tests/v1_golden.rs:39–56,83–142,145–243`：旧请求、Strategy、Evaluation 的固定字节／缺省和拒绝未知字段；v1 golden 保留。 |
+| E02 | E02.ag062_required_improver_baselines | 行为被改变 | Q25；§5.1.2 L517；E02 L1559 | `crates/evo-core/tests/improver_required_baselines_v42.rs:415–452`：明确接受 `"P"`、`"B"`、空白、任意中文标签及 129 字符标签进入 `*_digest`／`source_digest`；新摘要通则禁止该边界。 |
+| E02 | E02.ag065_host_surface_name_coverage | 行为未变 | Q08；§5.5.1 L595；Q25 新义务另验 | `crates/evo-core/tests/host_surface_name_coverage_v42.rs:39–99`，`crates/evo-engine/tests/host_surface_name_coverage_v42.rs:299–314`：名称遗漏拒绝，重复项是原项 exact clone；真源明确保留完全相同重复项。旧 source_digest 夹具争议另列。 |
+| E02 | E02.ag092_local_scoped_acceptance | 行为未变 | Q03/Q25；§11.3.1 L1397–1403；§18.9 L2832 | `crates/evo-core/tests/baseline_dependency_revocation_v42.rs:196–315,428–512`：已知 P/B 直接依赖撤销不可被 Set/Reset 隐藏；未声明可信闭包或摘要合法性。 |
+| E02 | E02.ag093_local_scoped_acceptance | 行为未变 | Q25；E02 L1557–1559；§18.9 L2832 | `crates/evo-engine/tests/compiler_input_binding_v42.rs:41–155,158–335`：原输入解析、权威见证、typed 版本与绑定；显式 Admin fixture 无普通 P、provider 或效果信用。 |
+| E03 | E03.controller_acceptance | 行为未变 | Q07/Q19；E03 L1573–1575 | `crates/evo-engine/tests/optimization.rs:496–708,710–835`：程序 fixture 单步消费者、journal 与开发选择；不声明 Tool-only 挂载或生产失败铸造。 |
+| E03 | E03.ag016_development_receipts | 行为未变 | Q07；E03 L1573；§18.9 L2832 | `crates/evo-engine/tests/development_receipts.rs:451–828,1283–1440`：分离执行／评分身份、服务器重评分、受信观察门与撤销；新增修复模板／重置收据另验。 |
+| E03 | E03.ag079_local_scoped_acceptance | 行为未变 | Q07/Q25；E03 L1573–1575 | `crates/evo-core/tests/diagnosis_hypothesis_structure_v42.rs:368–447,462–490`：复制假设前结构拒绝、七类原因、重复引用；合法 fixture 摘要为 hash，不授予修复资格。 |
+| E04 | E04.controller_acceptance | 行为未变 | Q04/Q09；§6.1.1 L715–722；E04 L1589–1591 | `crates/evo-storage/tests/budget.rs:74–410,456–517`：持久根预留／dispatch／结算、取消已派发不退款；不是内存 `RootBudget::cancel` 覆盖 Dispatched 的缺陷。 |
+| E04 | E04.ag054_typed_predispatch | 行为未变 | Q09/Q12；§6.1.1 L720；§11.6 L1448–1450 | `crates/evo-engine/tests/broker.rs:247–378,982–1260`：已知首派前拒绝、仅 Reserved 释放、Dispatched/Uncertain 保留；脱敏严格形状新增守卫另验。 |
+| E04 | E04.ag082_local_scoped_acceptance | 行为未变 | Q04；E04 L1589–1591；§18.9 L2832 | `crates/evo-storage/tests/budget_sql_fault_rollback_v42.rs:584–592`：单／多 namespace 根授权事件失败回滚与同请求恢复；新阶段计划绑定不改变事务回滚。 |
+| E04 | E04.ag077_local_scoped_acceptance | 行为未变 | Q03/Q12；E04 L1591；E08 L1653 | `crates/evo-storage/tests/e16_budget_binding_v42.rs:140–243`：typed E16 来源快照及引用丢失后的费用／清理；记录明确 library-only，不等于生产三闸闭包已验。 |
+| E04 | E04.ag097_broker_close_before_refuse | 行为被改变 | Q03；§11.3.1 L1397–1403；V102.b L2235 | `crates/evo-engine/tests/broker_cache_revoke_v42.rs:870–885,1193–1211`：未脱敏已结算缓存，begin_revoke 后被拒仍先写 execution_close；违背被拒缓存入口全表零写入。严格同身份已脱敏关闭特例保留。 |
+| E04 | E04.ag105_broker_bound_recovery_close_v42 | 行为被改变 | Q03；§11.3.1 L1401；V102.b L2235；§11.6 L1450 | `crates/evo-engine/tests/broker_bound_recovery_close_v42.rs:891–934`：未脱敏来源撤销的 bound replay，拒绝前补关闭；整条撤回，`945–1001` 的已脱敏同身份收口义务不取消。 |
+| E05 | E05.controller_acceptance | 行为未变 | Q05/Q09/Q16；E05 L1605–1609 | `crates/evo-engine/tests/streaming_evaluator.rs:748–1067,1242–1459`：真实 receipt、乱序连续前缀、停机阻断、费用／曝光保留；新增历史判定版本表另验。 |
+| E05 | E05.ag052_versioned_batch_verdicts | 行为未变 | Q05；§5.1.1 L505–513；E05 L1605 | `crates/evo-engine/tests/streaming_verdicts_v42.rs:815–958,1085–1164`：显式控制版本、v1 固定字节与新统计后处理；没有把所有旧回放 v2 可消费性并入该范围。 |
+| E05 | E05.ag083_partition_admission_rejection_atomicity | 行为未变 | Q16；E05 L1605–1607；§18.9 L2832 | `crates/evo-core/tests/partition_admission_atomic_v42.rs:165–398,771–851`：拒绝无部分成员／家族写入，曝光历史保留；新受控任务登记另验。 |
+| E05 | E05.ag080_local_scoped_acceptance | 行为未变 | Q05；E05 L1605 | `crates/evo-engine/tests/evaluator_plan_binding_v42.rs:136–317,452–650`：QueryBook／Evaluator 冻结计划绑定、失配前拒绝，不增加正式收益信用。 |
+| E05 | E05.ag087_local_scoped_acceptance | 行为未变 | Q03/Q05；§11.3.1 L1397–1403；E05 L1605 | `crates/evo-engine/tests/formal_candidate_dependency_binding_v42.rs:923–1256,1416–1494`：固定候选与完整来源绑定，拒绝不写票据／费用／曝光；新版本表另验。 |
+| E05 | E05.ag088_local_scoped_acceptance | 行为未变 | Q05；E05 L1605；§19.5 L2970 | `crates/evo-engine/tests/complete_batch_statistics_binding_v42.rs:1062–1081`：报告均值篡改拒绝，消费真实统计；公式与判定顺序保留。 |
+| E05 | E05.ag089_local_scoped_acceptance | 行为未变 | Q05；§5.1.1 L505–513；E05 L1605 | `crates/evo-engine/tests/early_stop_certificate_binding_v42.rs:1271–1465,1531–1655`：绑定实际首个证书、前缀与迟到费用；不声称持久版本谱系新增义务已验。 |
+| E05 | E05.ag090_local_scoped_acceptance | 行为未变 | Q05/Q09；E05 L1605；§6.6 L880–884 | `crates/evo-engine/tests/invalid_formal_reason_binding_v42.rs:1225–1301`：invalid 理由绑定实际 Some-ticket 付费事实，替换／重排拒绝。 |
+| E05 | E05.ag091_local_scoped_acceptance | 行为未变 | Q09；§6.6 L880–884；E05 L1605 | `crates/evo-engine/tests/late_grader_stop_preservation_v42.rs:1115–1197,1411–1561`：迟到 grader 错误不撤销已确认早停，费用和未决状态保存。 |
+| E05 | E05.ag095_canonical_grader_receipt_digest | 行为未变 | Q25；§5.1.2 L517；E05 L1605 | `crates/evo-engine/tests/formal_external_host_authority_v42.rs:1451–1640`：排序值的可重算 receipt 摘要、capture 绑定与伪造拒绝；符合新摘要方向。 |
+| E05 | E05.ag101_streaming_verdicts_v42 | 行为未变 | Q05；E05 L1605；§19.5 L2970 | `crates/evo-engine/tests/streaming_verdicts_v42.rs:959–1048`：仅 UCB<0 确认退化，成本越限／重启不覆盖该结论；统计规则未改。 |
+| E05 | E05.ag109_external_host_authority_bound_ticket | 行为未变 | Q03/Q05；E05 L1605；§11.3.1 L1397–1403 | `crates/evo-engine/tests/formal_external_host_authority_v42.rs:1829–2121`：已 staging 候选票据发行、权威边精确集、额外不一致边拒绝；不新增正式发布效果。 |
+| E05 | E05.ag100_formal_candidate_dependency_binding_v42 | 行为未变 | Q05；E05 L1605 | `crates/evo-engine/tests/formal_candidate_dependency_binding_v42.rs:1746–1856`：任何控制 schema 缺候选时首写前拒绝，不退回旧无绑定路径。 |
+| E05 | E05.ag118_late_receipts_after_final_report_v42 | 行为未变 | Q09；§6.6 L880–884；E05 L1605 | `crates/evo-engine/tests/late_grader_after_final_report_v42.rs:1685–1773`：最终报告后迟到 receipt／错误只留实际审计，原报告或证书保留；符合不可覆盖副作用事实方向。 |
+| E06 | E06.controller_acceptance | 行为被改变 | Q19；§5.5.2 L618–620；E06 L1623 | `crates/evo-engine/tests/release_store.rs:74–88,300–318,384–402,509–519`：v1 `host.model=supported` 搭配 ToolOnly／Attached 快照接受；新 manifest 能力上限改变这些正向行为。 |
+| E06 | E06.ag084_local_scoped_acceptance | 行为未变 | Q02/Q19；E06 L1617–1623 | `crates/evo-engine/tests/candidate_review.rs:707–966,1084–1311`：只读候选／stage-fact 审阅，不给予历史、正式评测或批准信用；新发布登记／attached 门另验。 |
+| E06 | E06.ag116_edit_compiled_produce_review_v42 | 行为未变 | Q25；§5.1.2 L517；E06 L1617 | `crates/evo-engine/tests/edit_compiled_produce_review_v42.rs:715–882`：真实 producer 规则计算摘要，一字节变更拒绝；StepPrepared 物料绑定未改。 |
+| E07 | E07.controller_acceptance | 行为未变 | Q09/Q14/Q16；§6.1.1 L715–720；E07 L1637–1639 | `crates/evo-http/tests/service.rs:178–426`：认证／身份／幂等与 disabled-model 范围；`394–423` 是 blocked 后 cancel 仍 blocked，无已提交业务结果被覆盖。 |
+| E07 | E07.ag015_curriculum_step_consumer | 行为未变 | Q02/Q09/Q10；§6.1.1 L716；§18.9 L2832 | `crates/evo-engine/tests/dispatch_management.rs:1235–1757`：Admin curriculum.step、原子 probe／状态／边／receipt 与终态重核；`1728–1757` 取消在 claim 前，无业务副作用。 |
+| E07 | E07.ag017_exploration_start_consumer | 行为未变 | Q02/Q09；§6.1.1 L716；§18.9 L2832 | `crates/evo-engine/tests/dispatch_management.rs:2290–3071`：Admin world 注册、幂等纯决策与来源边；`3035–3071` queued-before-claim cancel，不固定提交后覆盖。 |
+| E07 | E07.ag027_management_cleanup_closure | 行为未变 | Q03/Q09；§11.3.1 L1397–1403；§6.1.1 L720 | `crates/evo-engine/tests/management_cleanup_v42.rs:1828–2031,3177–3445`：job 保留、private input 脱敏、已撤销依赖提交前拒绝；清理不是可取消业务作业。 |
+| E07 | E07.ag044_submit_upstream_gate | 行为未变 | Q03；§11.3.1 L1397–1403 | `crates/evo-engine/tests/submit_upstream_gate_v42.rs:1811–1880,2152–2342,2407–2538`：完整有界上游闭包、kind 精确、拒绝零写入；同 key 仍取历史 job。 |
+| E07 | E07.ag108_candidate_review | 行为未变 | Q25；§5.1.2 L517；E06 L1617 | `crates/evo-engine/tests/candidate_review.rs:1540–1793`：producer 原规则摘要才给 exact diff，bare-rule／混合 compiler-key 形状拒绝。 |
+| E08 | E08.controller_acceptance | 行为未变 | Q03/Q11/Q13；E08 L1653–1655 | `crates/evo-storage/tests/lifecycle.rs:246–460,1027–1238,1408–1466`：即时封锁、分页清理、不可逆费用保留、独立锚恢复；新物理残留／权限／锁义务另验。 |
+| E08 | E08.ag036_revocation_source_collision | 行为未变 | Q03；§11.3.1 L1395–1400 | `crates/evo-storage/tests/revocation_source_collision.rs:262–307,312–365`：已有另一 kind tombstone 的第二次撤销 Conflict／NotFound，旧水位／对象／作业／全表不变；不把存量同 id 冲突隔离新增义务标已验。 |
+| E08 | E08.ag035_cleanup_fixpoint | 行为未变 | Q03；E08 L1653–1655 | `crates/evo-storage/tests/cleanup_fixpoint.rs:235–342,586–775`：Complete 前重扫晚依赖和预算请求，未知对象失败、重启续清；新增入口登记另验。 |
+| E08 | E08.ag038_budget_revoke_gate | 行为未变 | Q03/Q09；§11.3.1 L1397–1403；§6.1.1 L720 | `crates/evo-storage/tests/budget_revoke_gate.rs:345–500,585–726,779–913`：首写前预留守卫、kind 精确、已派发实际费用继续结算；不授予未脱敏缓存拒绝前关闭信用。 |
+| E08 | E08.ag037_economic_replay_cleanup | 行为被改变 | Q05/Q06；§7.4.3 L1088；§5.1.1 L512 | `crates/evo-engine/tests/replay_economic_cleanup_v42.rs:465–482,1244–1261`：v2 report 进入经济 experiment／真实 start 的成功控制；现在 legacy 选择必须被登记／启动拒绝。 |
+| E08 | E08.ag043_late_response_revoked | 行为未变 | Q03/Q12；§11.6 L1441–1452；E08 L1653 | `crates/evo-storage/tests/late_settlement_revoked.rs:1–18` 及该目标结算测试：已派发迟到费用保留、response 封锁、transport 脱敏；不把新派发拒绝等同已发生费用删除。 |
+| E08 | E08.ag045_late_stage_fact_redaction | 行为未变 | Q03/Q12；§11.5；E08 L1653–1655 | `crates/evo-engine/tests/late_stage_fact_redaction_v42.rs:1385–1515,1518–1563,2149–2156`：已派发观察事实脱敏、kind 精确、真实费用留存；budget 工件新五字段守卫另验。 |
+| E08 | E08.ag046_write_side_revocation | 行为被改变 | Q03；§11.3.1 L1399–1401；V102.b L2235 | `crates/evo-engine/tests/write_side_revocation_gate_v42.rs:2768–2860`：known_boundary 固定另一 kind tombstone 导致首写后 Forbidden，且 Prepared 剩一条；新规则要求精确 kind／拒绝零写入。 |
+| E08 | E08.ag053_bounded_dependency_snapshots | 行为未变 | Q03/Q01；§11.3.1 L1398；E08 L1653 | `crates/evo-storage/tests/local_export.rs:135–199,304–611`：依赖快照与 blob 前检有界、namespace／顺序／指纹保持；发布锁／权限新增义务另验。 |
+| E08 | E08.ag059_manifest_prewrite_gate | 行为被改变 | Q03；§11.3.1 L1399–1401 | `crates/evo-engine/tests/write_side_revocation_gate_v42.rs:2179–2323,2768–2808`：正常联合门零写入之外，同目标仍把另一 kind 的晚拒及 Prepared／audit／edge 残留固定为 known boundary；整条不能拆取继续计入。 |
+| E08 | E08.ag068_native_authority_cleanup | 行为未变 | Q03/Q20；E08 L1653；§18.9 L2832 | `crates/evo-engine/tests/import_source_successor_cleanup_v42.rs:374–392,395–505,796–864`：有效内部原生权威的 typed 后继逻辑清理；不是把内部权威 schema 当 Trace 交换格式。 |
+| E08 | E08.ag069_local_scoped_acceptance | 行为未变 | Q02/Q03；§6.1.1 L720；E08 L1653 | `crates/evo-storage/tests/failed_cleanup_resume_v42.rs:248–463,888–1183`：Admin 修复后整前沿重试、Worker 续清与旧失败历史保留；生产 cleanup.continue 新入口另验。 |
+| E08 | E08.ag073_local_scoped_acceptance | 行为未变 | Q03；§11.3.1 L1397–1403 | `crates/evo-engine/tests/broker_cache_revoke_v42.rs:376–610,676–706`：已完成缓存对直接／上游来源撤销拒绝、不重付；不把后来 AG097 增加的补 close 计入本记录。 |
+| E08 | E08.ag075_local_scoped_acceptance | 行为未变 | Q03；E08 L1653；§18.9 L2832 | `crates/evo-storage/tests/dependency_read_v42.rs:35–153,155–243`：typed 来源／结果边、分页和 namespace 精确只读绑定；明确 library-only。 |
+| E08 | E08.ag096_unreadable_bound_request_isolated | 行为未变 | Q12/Q25；§11.6 L1452；E08 L1653 | `crates/evo-storage/tests/cleanup_unreadable_bound_request_v42.rs:698–842,972–1054`：破损 JSON／版本／closure 单行隔离；未知非来源字段不阻碍破坏性清理，不授予 use-path 合法性。 |
+| E08 | E08.ag107_budget_ref_missing_fail_closed_v42 | 行为未变 | Q03/Q12；§11.3.1 L1398–1400；E08 L1653 | `crates/evo-storage/tests/budget_ref_missing_fail_closed_v42.rs:518–830`：引用丢失仍由存储来源闭包阻断撤销／不可核验派发，迟到费用结算并封锁。 |
+| E08 | E08.ag106_budget_startup_recovery_v42 | 行为未变 | Q09/Q13；§6.1.1 L722；E08 L1653–1655 | `crates/evo-storage/tests/budget_startup_recovery_v42.rs:565–822,899–958`：启动补已结算失落 close、第二遍不写、不可收口仍留持有；新正式宿主持锁启动接线另验。 |
+| E08 | E08.ag104_restore_prefix_migration_upgrade_v42 | 行为未变 | Q15；E08 L1653；§16.7 L2686 | `crates/evo-storage/tests/restore_prefix_upgrade_v42.rs:835–924,969–1046`：已登记 checksum 的严格旧迁移前缀升级，gap／未知／失败迁移隔离；不重新生成锁或放宽旧备份。 |
+| E08 | E08.ag117_formal_call_revoke_cleanup_v42 | 行为未变 | Q03/Q12；E08 L1653；§11.6 L1448 | `crates/evo-storage/tests/formal_call_revoke_cleanup_v42.rs:619–856,1204–1268`：清理使用已登记来源引用、保留账单／关闭事实、不相关行不变；新内容 use-path 守卫另验。 |
+| E09 | E09.controller_acceptance | 行为未变 | Q02/Q07；E09 L1669–1671 | `crates/evo-engine/tests/exploration_v41.rs:495–552,1164–1268`：确定性程序 fixture 协调、真实调用既有单步消费者、历史与中间节点拒发布；未声明新增修复资格。 |
+| E09 | E09.ag021_skill_group_jobs | 行为未变 | Q01/Q02；§3.3.2 L331；E09 L1669 | `crates/evo-engine/tests/skill_groups_v42.rs:863–1028,1271–1301`：最多两组、先验全请求校验、组间失败隔离、共根预算；新增部署并发对象容量另验。 |
+| E09 | E09.ag024_exploration_cleanup_edges | 行为未变 | Q03；E09 L1665；E08 L1653 | `crates/evo-engine/tests/exploration_cleanup_v42.rs:1187–1200,1514–1725,1769–1937`：node／dispatch／history 首写同事务 world 边与脱敏读拒绝；未引入新可修复来源信用。 |
+| E09 | E09.ag026_practice_attempt_sets | 行为未变 | Q01/Q02；§3.3.2 L331；E09 L1669 | `crates/evo-engine/tests/practice_v42.rs:957–1212,2425–2764`：K1／授权单集 K3、不增独立 n／周期、并发一集与缓存非新实践；新增实例总集容量另验。 |
+| E09 | E09.ag033_run_next_trusted_gate | 行为未变 | Q07；§7.2.2 L1012–1017；E09 L1671 | `crates/evo-engine/tests/exploration_trust_v42.rs:1497–1803,2194–2315`：fixture／伪证非有效观测，真实 receipts 才可加深／提候选，无改动 hard_failure／not_observed；符合新非观测终态。 |
+| E09 | E09.ag039_legal_actions | 行为未变 | Q07；§7.2.2 L1012–1022 | `crates/evo-engine/tests/exploration_legal_actions_v42.rs:1656–1895`：声明仅 Trusted Deepen、已展开父不重复加深、child best 继承；`1981–2042` 的 Recover 辅助回归不扩大该 scope。 |
+| E09 | E09.ag040_exploration_registration | 行为未变 | Q02/Q07；E09 L1665–1671 | `crates/evo-engine/tests/exploration_start_after_dispatch_v42.rs:1146–1331,1664–1792,2410–2474`：不可变注册指纹、真实 dispatch 反推计数与成本、重注册／status 原事实绑定。 |
+| E09 | E09.ag041_postpaid_convergence | 行为未变 | Q07/Q09；E09 L1669；§6.1.1 L720 | `crates/evo-engine/tests/exploration_postpaid_v42.rs:1311–1583,1735–1964`：已付费后的前缀／claim 漂移或目标丢失收为唯一 Uncertain，支付事实不丢；新增首派前修复授权另验。 |
+| E09 | E09.ag042_recovery_counting | 行为被改变 | Q07；§7.2.3 L1026–1030 | `crates/evo-engine/tests/exploration_recovery_counting_v42.rs:1503–1542,2759–2765`：原 scope 包括 Recover 资格；直接改 storage status、任意 episode／模板 hash／reset bool 即开放 Implementation 等 Recover，缺可信定位、登记模板和重置收据。 |
+| E09 | E09.ag048_terminal_classes | 行为未变 | Q07；§7.2.2 L1010–1017 | `crates/evo-engine/tests/step_terminal_classes_v42.rs:2337–2404,2407–2547`：显式 no_change／kept_incumbent class，无有效候选、不可 Deepen／提最终候选；类别与非观测行为一致。 |
+| E09 | E09.ag074_local_scoped_acceptance | 行为被改变 | Q05/Q06；§7.4.3 L1088 | `crates/evo-engine/tests/replay_legal_prefix_v42.rs:578–637,639–698`：旧 v2 未受影响报告仍 verified／可同 ID 幂等重算；新规则所有 v2 一律 legacy，不能恢复消费性。 |
+| E09 | E09.ag103_fairness_waits_legal_set_v42 | 行为未变 | Q06/Q07；E09 L1669–1671 | `crates/evo-core/tests/fairness_waits_legal_set_v42.rs:419–471,473–514,579–636`：公平等待只对完成轮中的合法跳过机会，纯过滤和决定等价；不是持久 v2 report 消费信用。 |
+| E10 | E10.controller_acceptance | 行为被改变 | Q05/Q06；§7.4.2 L1075–1084；§7.4.3 L1088 | `crates/evo-engine/tests/replay_v41.rs:356–424,678–789`：固定旧 PolicyStop／WorldExhausted 分流并正向 verified v2 持久报告；新终止次序及全部 v2 legacy 改变范围。 |
+| E10 | E10.replay_management_controller_acceptance | 行为被改变 | Q05/Q06；§7.4.3 L1088 | `crates/evo-engine/tests/dispatch_management.rs:719–803,1011–1073`：replay.run 生成／消费现 v2 report，status／崩溃恢复按当前报告复验；须随 v3／legacy 新合同重验。 |
+| E10 | E10.ag032_replay_redacted_reads | 行为未变 | Q03/Q05；§5.1.1 L508–509；§11.3.1 L1399–1400 | `crates/evo-engine/tests/replay_redacted_reads_v42.rs:909–1231,1314–1514`：声明仅各清理阶段 redacted 命名 Conflict 和精确 kind／不可读拒绝；legacy 仍可读／审计／清理，不给当前 verified 信用。 |
+| E10 | E10.ag064_replay_episode_recovery | 行为被改变 | Q05/Q06/Q07；§7.4.3 L1088 | `crates/evo-engine/tests/replay_recovery_contract_v42.rs:711–757,759–782`：实际旧 v2 单次恢复报告仍 verified／可同 ID 重跑；全部 v2 legacy 合同改变其正向解释。 |
+| E10 | E10.ag103_replay_fairness_waits_legal_set_v42 | 行为被改变 | Q05/Q06；§7.4.2 L1075–1084；§7.4.3 L1088 | `crates/evo-engine/tests/replay_fairness_waits_v42.rs:357–392,636–721,723–759`：固定旧深度帽终态及旧 v2 verified／幂等；纯公平过滤保留不代表整条持久回放范围未变。 |
+| E11 | E11.controller_acceptance | 行为未变 | Q05/Q21/Q22；E11 L1701–1703 | `crates/evo-core/tests/replay_economics.rs:188–264,266–303`：静态完整成本、unknown 非零、盈亏平衡与不发布边界；不包含实际 legacy selection 登记／启动正向消费。 |
+| E12 | E12.controller_acceptance | 行为未变 | Q10；§8.1.1 L1197；E12 L1717–1719 | `crates/evo-engine/tests/curriculum_v41.rs:150–209,211–313,315–359`：零预算、无 sandbox、untyped／missing fact 拒绝；没有把回归写成 failure_gap 的成功断言。 |
+| E12 | E12.ag025_curriculum_cleanup | 行为未变 | Q03/Q10；E08 L1653；E12 L1717 | `crates/evo-engine/tests/curriculum_cleanup_v42.rs:879–989,991–1250,1628–1673`：既有九类记录保留／脱敏分类、来源闭包和续清；v3 失败状态／三臂新对象另验。 |
+| E12 | E12.ag050_curriculum_priority | 行为未变 | Q04/Q10；E12 L1717–1719 | `crates/evo-engine/tests/curriculum_priority_fixes_v42.rs:127–175,199–213`：旧内存 step 先选题再预留、typed 错误与文本不自签 oracle；不声明生产 LearnerState v3 或可学习分支已通。 |
+| E13 | E13.controller_acceptance | 行为被改变 | Q19；§5.5.2 L620；E06 L1623 | `crates/evo-engine/tests/monitoring.rs:58–71,149–167,860–878`：v1 host.model supported 即接受 Attached run；新 attached 必须 v2 skill.content／正确 consumer／行为证明。 |
+| E13 | E13.ag022_consolidation_closure | 行为未变 | Q02/Q10；E13 L1729–1735 | `crates/evo-engine/tests/monitoring_consolidation_v42.rs:1430–1531,1723–1851,2386–2512,2766–2991`：pass/fail 配对、proposal／唯一 staging、来源闭包；新生产 trigger/run 和复验选题另验。 |
+| E13 | E13.ag028_consolidation_trigger | 行为被改变 | Q02；§6.1.2 L777 | `crates/evo-engine/tests/monitoring_trusted_cycle_v42.rs:1866–1884`：四周期后仅 claim generation2、claim_ids=[2]，明确把 generation1 永久静默跳过固定为成功；新要求 no_contrast／generation_expired 显式终结。 |
+| E13 | E13.ag030_consolidation_budget_stage | 行为未变 | Q04/Q09；§3.5.1 L424；§6.1.1 L720 | `crates/evo-engine/tests/consolidation_budget_stage_v42.rs:377–430,1568–1766,1869–2004`：Consolidate⇔Consolidation 一致、错误阶段拒绝、实际 timeout／cancel 费用保留；新计划绑定另验。 |
+| E13 | E13.ag031_bounded_terminal_category | 行为未变 | Q02/Q09；E13 L1733–1735 | `crates/evo-engine/tests/consolidation_terminal_category_v42.rs:133–257,1164–1336`：128-byte UTF-8 安全类别、长拒绝／uncertain 收口；不把业务取消覆盖已提交结果算信用。 |
+| E13 | E13.ag081_local_scoped_acceptance | 行为未变 | Q10/Q25；E13 L1733；§5.1.2 L517 | `crates/evo-engine/tests/monitoring_evidence_binding_v42.rs:1475–1583,1793–1968,2032–2095`：原 report、pair、执行输入和 receipt 的实际绑定／篡改拒绝；新失败当前性另验。 |
+| E14 | E14.ag019_exploration_policy_inheritance | 行为未变 | Q23/Q22；§5.7.1 L661；E14 L1749–1751 | `crates/evo-engine/tests/meta_inheritance_v42.rs:749–870,1027–1307,1754–2060`：受限 policy、实际 dispatch 的 policy/caps 摘要与机制使用，不靠 used flag；新机制资产发布另验。 |
+| E14 | E14.ag034_metatrial_fork | 行为未变 | Q01/Q22/Q23；E14 L1749–1751 | `crates/evo-engine/tests/meta_trial_v42.rs:1005–1157,1407–1646,1832–1936,2731–2858`：同 S0 双流，仅 id/policy 不同、费用／事实隔离、撤销／恢复；未声明统计收益或冻结合同通过。 |
+| E14 | E14.ag058_current_description_boundaries | 行为未变 | Q02/Q23；E14 L1749–1751；§18.9 L2832 | `crates/evo-engine/tests/meta_trial_v42.rs:2647–2728,3223–3261`：描述与消费者事实校正、可变消耗不改不可变注册身份；未对未接入口授予信用。 |
+| E16.1 | E16.1.durable_import_controller_acceptance | 行为被改变 | Q20；§11.2.1 L1381–1385；E16.1 L1797 | `crates/evo-engine/tests/import_v41.rs:209–214,362–374`：声明三个 pinned readers，正向接受缺 exporter／event seq／coverage 的 native Trace，后一例连 run_id 也缺；新交换合同收紧。 |
+| E16.1 | E16.1.ag076_local_scoped_acceptance | 行为未变 | Q20/Q25；E16.1 L1793–1797；§18.9 L2832 | `crates/evo-core/tests/import_fixture_v42.rs:283–327,607–737,1024–1095`：有界 material 的实际程序 fixture 操作／匹配／闭包／编码；不声明源格式读取器或可信执行。 |
+| E16.1 | E16.1.ag070_local_scoped_acceptance | 行为未变 | Q20新增格式义务另验；§18.9 L2832；待二次验收裁决 | `crates/evo-engine/tests/import_development_material_v42.rs:326–380`：原scope仅bounded local development-material reader；`29–35`的native格式注册在setup，不把setup或整目标用例数扩成源格式支持信用。有界物料、摘要/截断和只读行为保留，新入口格式另验。 |
+| E16.2 | E16.2.durable_staging_publish_controller_acceptance | 行为未变 | Q03/Q15/Q17/Q20；E16.2 L1803–1807；§18.9 L2832 | `crates/evo-engine/tests/packages_v41.rs:873–982,1155–1309,1768–1894`：目录包 durable staging／publish、真实摘要、来源撤销与本地交付；不授予 ZIP 解析、native Trace 导出或新内置 catalog 信用。 |
+| E16.2 | E16.2.ag071_known_marker_utf8_blocking | 行为未变 | Q03/Q20；E16.2 L1803；§18.9 L2832 | `crates/evo-engine/tests/privacy_utf8_v42.rs:156–204,517–655`：原 byte cap 内敏感 marker UTF-8 安全阻断、首写前拒绝；没有改变隐私政策。 |
+| E16.2 | E16.2.ag085_utf8_privacy_boundary_regressions | 行为未变 | Q20；E16.2 L1803；§18.9 L2832 | `crates/evo-engine/tests/privacy_utf8_boundary_v42.rs:120–151,321–343,445–483`：12 个真实 UTF-8 边界、原内容／摘要与拒绝回归；原 scanner 未改。 |
+| E16.3 | E16.3.seed_install_reset_controller_acceptance | 行为未变 | Q17；§11.1.1 L1363；E16.3 L1813–1817 | `crates/evo-engine/tests/seeds_v41.rs:33–160,434–502`：B/L/U 均为 hash、双方完整 asset/kind/publisher 身份；安装／reset staging 不 auto-Active。短 B／缺身份库单测不在本记录。 |
+| E16.4 | E16.4.real_store_rejection_controller_acceptance | 行为被改变 | Q19；§5.5.2 L618–620；E16.4 L1827 | `crates/evo-engine/tests/hosts_v41.rs:32–67,183–218` 与 `crates/evo-engine/src/hosts.rs:45–71`：结构 fixture 将 RSIA 自身四工具列 supported，并建立 v1 supported ToolOnly run；新零 supported／RSIA 工具非宿主面规则改变该宽记录。 |
+| E16.4 | E16.4.ag066_local_stdio_harness | 行为未变 | Q09/Q19；§6.1.1 L713；E16.4 L1825–1827 | `crates/evo-mcp/tests/service.rs:76–174,177–218`：本地 subprocess SDK handshake、四工具 schema、persist/reconnect、重复键首派前拒绝；未给真实 Claude、attached、取消能力信用。 |
+| E16.5 | E16.5.gate_functions_controller_acceptance | 行为未变 | Q01/Q11/Q13；E16.5 L1833–1837 | `crates/evo-engine/tests/capacity_v41.rs:137–284,286–486,544–794`：既有容量／恢复／部署纯函数边界，拒绝 sandbox bool 冒充证据；新对象、权限、可信时钟及真实启动义务另验。 |
+| E16.5 | E16.5.ag014_capacity_gates_wired | 行为未变 | Q01；§3.3.2 L331；E16.5 L1835–1837 | `crates/evo-engine/tests/capacity_v41.rs:796–867`，`crates/evo-engine/tests/dispatch_management.rs:1914–1965`，`crates/evo-engine/tests/packages_v41.rs:2248–2309`：原对象限值与跨 namespace 容量一致；不授予新增内部对象容量。 |
+| E16.5 | E16.5.ag018_startup_recovery_gate | 行为未变 | Q11/Q13；§7.3.1 L1040；E16.5 L1833–1837 | `crates/evo-engine/tests/startup_gate_v42.rs:296–624,625–808,1354–1437`：已有 serve gate 只读复核、独立锚、锁占用拒绝、无覆盖准入回执；正式宿主新接线／文件模式另验。 |
+| E16.5 | E16.5.ag029_restore_coverage | 行为未变 | Q03/Q05；E16.5 L1833–1837 | `crates/evo-engine/tests/restore_coverage_v42.rs:1024–1207,1385–1430,1510–1570`：现有 action schema Rust/Python 选择集合相等、锚前进隔离；新对象按后续实际引入增补，不改旧事实。 |
+| E16.5 | E16.5.ag051_economic_restore | 行为未变 | Q05/Q06；§5.1.1 L508–512；E16.5 L1833 | `crates/evo-engine/tests/restore_economic_v42.rs:1248–1346,1487–1622`：只声明经济记录保护／恢复精确事实；旧派生记录原样保留，不声称 legacy 可用于新选择或实验。 |
+| E16.6 | E16.6.ag012_plan_v42_index_binding | 行为被改变 | Q26；§18.9 L2830–2832；E16.6 L1847 | `crates/evo-core/tests/support_scope.rs:1307–1466`：明确当前顶层 v4.2、旧谱系／recheck 集合／V098 入口；当前唯一入口改 v4.3、复核并集及 V120。 |
+| E16.6 | E16.6.ag086_local_scoped_acceptance | 行为未变 | Q26；E16.6 L1843；§18.9 L2832 | `crates/evo-core/tests/support_scope.rs:1712–1740,1857–1914`：partial registry、execution 字段语法及旧事实不回填；具体当前版本绑定由 AG124 更新，不改此历史字段合同。 |
+| E17 | E17.disabled_rejection_controller_acceptance | 范围外 | §18.9 L2830–2832；E17 L1851–1859 | `crates/evo-core/tests/e17_rejection_v41.rs:7–60,192–202`：默认关闭、不可自评分／改最终 grader；不在 §19.5 落点并集。 |
+| E18 | E18.disabled_rejection_controller_acceptance | 范围外 | §18.9 L2830–2832；E18 L1865–1873 | `crates/evo-core/tests/e18_rejection_v41.rs:8–13,163–255,407–416`：默认关闭、保护路径／审批／隔离与自动合并拒绝；不在 §19.5 落点并集。 |

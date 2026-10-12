@@ -17,21 +17,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-PLAN_VERSION = "v4.2"
-PLAN_SHA256 = "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455"
-# Registered plan lineage (plan §18.8), oldest first; the last entry is the current binding. The manifest
+PLAN_VERSION = "v4.3"
+PLAN_SHA256 = "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7"
+# Registered plan lineage (plan §18.9), oldest first; the last entry is the current binding. The manifest
 # top level and the external plan file must be the current version. Historical evidence records keep the
 # plan_version/plan_sha256 they were verified against and are accepted only as a registered pair.
 PLAN_LINEAGE = {
     "v4.1": {"file": "RSIAgent-v4.1定稿-工程实施方案-2026-09-19.md", "sha256": "45f3ba068b988cc502a96c15bd737e1688084dd21de33c2dee633f484531e150"},
     "v4.2": {"file": "RSIAgent-v4.2定稿-工程实施方案-2026-09-30.md", "sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455"},
+    "v4.3": {"file": "RSIAgent-v4.3定稿-工程实施方案-2026-10-12.md", "sha256": "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7"},
 }
-# Optional per-record recheck marker (plan §18.8). Missing means not_affected. "required" is a pending
-# obligation and never passes; records of the tasks touched by the v4.2 revision (§19.4) that are still
+# Optional per-record recheck marker (plan §18.9). Missing means not_affected. "required" is a pending
+# obligation and never passes; records of the tasks touched by the v4.3 revision (§19.5) that are still
 # bound to an older lineage digest must carry PLAN_RECHECKED.
-PLAN_RECHECKED = "rechecked_v4.2"
-PLAN_RECHECK_VALUES = {"not_affected", "required", PLAN_RECHECKED}
-PLAN_RECHECK_TASKS = {"E00", "E16.5", "E16.6"}
+PLAN_RECHECKED = "rechecked_v4.3"
+PLAN_RECHECK_VALUES = {"not_affected", "required", "rechecked_v4.2", PLAN_RECHECKED}
+# Exact E-task union of plan §19.5 landing points; do not narrow to changed behaviors.
+PLAN_RECHECK_TASKS = {"E00", "E01", "E02", "E03", "E04", "E05", "E06", "E07", "E08", "E09", "E10", "E11", "E12", "E13", "E14", "E15", "E16", "E16.1", "E16.2", "E16.3", "E16.4", "E16.5", "E16.6"}
 SCHEMA_VERSION = "rsia.support_scope.v2"
 STATUSES = {"planned", "in_progress", "blocked", "implemented_not_verified", "verified", "explicitly_out_of_scope"}
 SKILLOPT_REPO = "https://github.com/microsoft/SkillOpt.git"
@@ -104,29 +106,29 @@ LOCAL_USE_KEYS = {"mode", "artifacts"}
 V_SCENARIO_KEYS = {"id", "specification_status", "e_tasks", "status", "verification_status", "effect_status", "related_evidence_refs", "remaining", "completion_evidence_refs"}
 
 EXPECTED_E_SCENARIOS = {
-    "E00": "V001 V071 V072 V073 V080 V098",
-    "E01": "V010 V011 V012 V013 V084 V085 V096 V097",
-    "E02": "V002 V003 V005 V009 V043 V044 V045 V046 V047 V048 V060 V062 V078 V079 V081 V082 V083 V084 V085 V086 V087 V088 V089 V090 V091 V092 V093 V094 V095 V096",
-    "E03": "V004 V005 V006 V017 V051 V052 V054 V055 V056 V057 V058 V087 V088 V089 V090 V094 V096",
-    "E04": "V007 V008 V009 V038 V083 V085 V086 V087 V093 V094 V096",
-    "E05": "V010 V011 V012 V013 V028 V084 V085 V090 V091 V094 V097",
-    "E06": "V014 V015 V016 V017 V047 V049 V050 V059 V064 V070 V075 V077 V078 V081 V084 V085 V089 V091 V094 V095 V096",
-    "E07": "V003 V010 V014 V015 V016 V042 V047 V059 V070 V077 V087 V088 V089 V091 V096 V097",
-    "E08": "V017 V018 V038 V056 V069 V075 V081 V082 V083 V084 V085 V086 V090 V092 V094 V096",
-    "E09": "V019 V020 V022 V024 V025 V081 V086 V088 V089 V090 V091 V093 V094 V095 V096 V097",
-    "E10": "V020 V021 V022 V023 V025 V026 V027 V081 V086 V094 V096",
-    "E11": "V022 V026 V027 V028 V042 V081 V094 V096 V097",
-    "E12": "V029 V030 V031 V034 V082 V083 V093 V094 V096",
-    "E13": "V016 V032 V037 V038 V082 V084 V087 V090 V091 V094 V096 V097",
-    "E14": "V015 V033 V034 V035 V036 V086 V090 V092 V094 V096 V097",
-    "E15": "V026 V033 V035 V036 V042 V085 V092 V096 V097",
-    "E16": "V081 V082 V083 V084 V085 V086 V087 V088 V089 V090 V091 V092 V093 V094 V095 V096 V097 V098",
-    "E16.1": "V005 V006 V017 V051 V052 V053 V054 V055 V056 V076 V087 V090 V098",
-    "E16.2": "V017 V039 V066 V067 V068 V069 V070 V075 V091 V092 V098",
-    "E16.3": "V014 V018 V038 V063 V064 V065 V078 V091 V092 V098",
-    "E16.4": "V002 V003 V009 V037 V039 V060 V061 V062 V077 V087 V091 V098",
-    "E16.5": "V007 V008 V017 V018 V037 V038 V039 V066 V069 V073 V075 V081 V082 V083 V084 V085 V086 V089 V090 V092 V094 V096 V098",
-    "E16.6": "V001 V039 V042 V071 V072 V073 V074 V080 V098",
+    "E00": "V001 V071 V072 V073 V080 V098 V113 V116",
+    "E01": "V010 V011 V012 V013 V084 V085 V096 V097 V103 V114 V118",
+    "E02": "V002 V003 V005 V009 V043 V044 V045 V046 V047 V048 V060 V062 V078 V079 V081 V082 V083 V084 V085 V086 V087 V088 V089 V090 V091 V092 V093 V094 V095 V096 V100 V101 V107 V108 V109 V120",
+    "E03": "V004 V005 V006 V017 V051 V052 V054 V055 V056 V057 V058 V087 V088 V089 V090 V094 V096 V106 V108",
+    "E04": "V007 V008 V009 V038 V083 V085 V086 V087 V093 V094 V096 V101 V103 V106 V110 V111 V112",
+    "E05": "V010 V011 V012 V013 V028 V084 V085 V090 V091 V094 V097 V101 V104 V114",
+    "E06": "V014 V015 V016 V017 V047 V049 V050 V059 V064 V070 V075 V077 V078 V081 V084 V085 V089 V091 V094 V095 V096 V100 V108 V119",
+    "E07": "V003 V010 V014 V015 V016 V042 V047 V059 V070 V077 V087 V088 V089 V091 V096 V097 V112 V114",
+    "E08": "V017 V018 V038 V056 V069 V075 V081 V082 V083 V084 V085 V086 V090 V092 V094 V096 V099 V100 V102 V110 V111",
+    "E09": "V019 V020 V022 V024 V025 V081 V086 V088 V089 V090 V091 V093 V094 V095 V096 V097 V100 V105 V106",
+    "E10": "V020 V021 V022 V023 V025 V026 V027 V081 V086 V094 V096 V104 V105 V106",
+    "E11": "V022 V026 V027 V028 V042 V081 V094 V096 V097 V104 V118",
+    "E12": "V029 V030 V031 V034 V082 V083 V093 V094 V096 V109",
+    "E13": "V016 V032 V037 V038 V082 V084 V087 V090 V091 V094 V096 V097 V100 V109",
+    "E14": "V015 V033 V034 V035 V036 V086 V090 V092 V094 V096 V097 V118 V119",
+    "E15": "V026 V033 V035 V036 V042 V085 V092 V096 V097 V118",
+    "E16": "V081 V082 V083 V084 V085 V086 V087 V088 V089 V090 V091 V092 V093 V094 V095 V096 V097 V098 V099 V100 V101 V102 V103 V104 V105 V106 V107 V108 V109 V110 V111 V112 V113 V114 V115 V116 V117 V118 V119 V120",
+    "E16.1": "V005 V006 V017 V051 V052 V053 V054 V055 V056 V076 V087 V090 V098 V117",
+    "E16.2": "V017 V039 V066 V067 V068 V069 V070 V075 V091 V092 V098 V102 V117",
+    "E16.3": "V014 V018 V038 V063 V064 V065 V078 V091 V092 V098 V115",
+    "E16.4": "V002 V003 V009 V037 V039 V060 V061 V062 V077 V087 V091 V098 V101 V107 V108",
+    "E16.5": "V007 V008 V017 V018 V037 V038 V039 V066 V069 V073 V075 V081 V082 V083 V084 V085 V086 V089 V090 V092 V094 V096 V098 V099 V101 V102 V104 V110 V113 V116 V120",
+    "E16.6": "V001 V039 V042 V071 V072 V073 V074 V080 V098 V116",
     "E17": "V040",
     "E18": "V041",
 }
@@ -355,7 +357,7 @@ def validate_production_consumer(record: dict[str, Any], identifier: str) -> Non
         raise CheckerError(f"{identifier}: production_consumer must be one of {sorted(PRODUCTION_CONSUMER_VALUES)} when present, got {value!r}")
 
 def expected_v_to_e() -> dict[str, set[str]]:
-    result = {f"V{i:03}": set() for i in range(1, 99)}
+    result = {f"V{i:03}": set() for i in range(1, 121)}
     for task, scenarios in EXPECTED_E_SCENARIOS.items():
         for scenario in scenarios:
             result[scenario].add(task)
@@ -474,8 +476,8 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
     out_of_scope = string_set(manifest.get("explicitly_out_of_scope_until_revised"), "explicitly_out_of_scope_until_revised")
     trace_coverage = manifest.get("trace_index_coverage")
     expected_coverage = {
-        "E00": {"purpose": "index_consistency_only_not_scenario_execution", "ranges": {"K01–K10", "SO01–SO18", "V087–V098"}},
-        "E16.6": {"purpose": "complete_derived_index_coverage_not_scenario_execution", "ranges": {"B01–B10", "U01–U08", "K01–K10", "SO01–SO18", "E00–E18", "E16.1–E16.6", "V001–V098"}},
+        "E00": {"purpose": "index_consistency_only_not_scenario_execution", "ranges": {"K01–K10", "SO01–SO18", "V087–V120"}},
+        "E16.6": {"purpose": "complete_derived_index_coverage_not_scenario_execution", "ranges": {"B01–B10", "U01–U08", "K01–K10", "SO01–SO18", "E00–E18", "E16.1–E16.6", "V001–V120"}},
     }
     if not isinstance(trace_coverage, dict) or set(trace_coverage) != set(expected_coverage):
         raise CheckerError("trace_index_coverage must separately contain E00 and E16.6")
@@ -618,7 +620,7 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
         raise CheckerError("v_scenarios must be an array")
     v_by_id = {entry.get("id"): entry for entry in v_entries if isinstance(entry, dict)}
     if len(v_by_id) != len(v_entries) or set(v_by_id) != set(expected_v):
-        raise CheckerError("V001-V098 must be exact and duplicate-free")
+        raise CheckerError("V001-V120 must be exact and duplicate-free")
     for vid, tasks in expected_v.items():
         entry = v_by_id[vid]
         known_keys(entry, V_SCENARIO_KEYS, vid)
