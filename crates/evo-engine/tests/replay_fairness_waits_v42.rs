@@ -680,13 +680,19 @@ async fn the_affected_old_report_stays_readable_but_recomputation_cannot_overwri
         old_member.round_best_quality_micros,
         new_member.round_best_quality_micros
     );
-    assert_eq!(old_member.final_quality_micros, new_member.final_quality_micros);
+    assert_eq!(
+        old_member.final_quality_micros,
+        new_member.final_quality_micros
+    );
     assert_eq!(old_member.terminal, ReplayTerminal::PolicyStop);
     assert_eq!(new_member.terminal, ReplayTerminal::PolicyStop);
     assert_eq!(old_member.terminal_reason, new_member.terminal_reason);
     assert_eq!(old_member.coverage, new_member.coverage);
     assert!(new_member.coverage.complete_support);
-    assert_eq!(old_member.attainment_auc_micros, new_member.attainment_auc_micros);
+    assert_eq!(
+        old_member.attainment_auc_micros,
+        new_member.attainment_auc_micros
+    );
     assert_eq!(old_member.score_v2_micros, Some(690_000));
     assert_eq!(new_member.score_v2_micros, Some(690_000));
     assert_eq!(waits(old_member), vec![(2, 4)]);

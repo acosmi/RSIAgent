@@ -347,7 +347,12 @@ fn rounds() -> Vec<Round> {
     rounds.push(round(
         "a_deepen_on_another_branch_depth_or_parent",
         p,
-        vec![other_branch, other_depth, unrevealed, widen(2, 2, Some(COST))],
+        vec![
+            other_branch,
+            other_depth,
+            unrevealed,
+            widen(2, 2, Some(COST)),
+        ],
         &[2],
     ));
 
@@ -439,14 +444,8 @@ fn an_action_core_excludes_has_no_say_in_the_decision() {
                 simulation,
             )
             .unwrap();
-            let only_kept = decide_on(
-                &round.prefix,
-                &kept,
-                &round.budget,
-                &round.caps,
-                simulation,
-            )
-            .unwrap();
+            let only_kept =
+                decide_on(&round.prefix, &kept, &round.budget, &round.caps, simulation).unwrap();
             // Taking every excluded action out of the offer leaves the decision as it is.
             assert_eq!(
                 serde_json::to_value(&all).unwrap(),
@@ -524,7 +523,10 @@ fn the_shared_filter_refuses_what_the_decision_refuses() {
     same_id.action_id = "deepen-3".into();
     let same_seq = widen(3, 4, Some(COST));
     let refused = [
-        (wrong_schema, "invalid input: unsupported legal action schema"),
+        (
+            wrong_schema,
+            "invalid input: unsupported legal action schema",
+        ),
         (
             // Identities are checked on every offered action, an excluded one too.
             offer(vec![widen(2, 2, None), malformed]),
@@ -649,11 +651,7 @@ fn the_decision_is_what_it_was_before_the_filter_was_shared() {
     assert_eq!(
         decided(
             &p,
-            vec![
-                deepen(3, &root),
-                widen(2, 2, None),
-                widen(4, 4, Some(COST))
-            ],
+            vec![deepen(3, &root), widen(2, 2, None), widen(4, 4, Some(COST))],
             &budget(),
             &caps(),
             SIMULATIONS[3],

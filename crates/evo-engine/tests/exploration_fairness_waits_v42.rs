@@ -37,8 +37,8 @@ use evo_core::skill_edit::{
     TrustedEditContext, skill_snapshot_digest,
 };
 use evo_core::strategy::{
-    ActionKindV1, BatchActionV1, ElasticPolicyV1, ExplorationCapsV1, LegalActionV1,
-    LegalActionsV1, SimulationContext,
+    ActionKindV1, BatchActionV1, ElasticPolicyV1, ExplorationCapsV1, LegalActionV1, LegalActionsV1,
+    SimulationContext,
 };
 use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, hash};
 use evo_engine::evidence::{
@@ -577,7 +577,10 @@ impl Env {
             )
             .await
             .unwrap();
-        assert!(model.0.load(Ordering::SeqCst) > 0, "the step was not paid for");
+        assert!(
+            model.0.load(Ordering::SeqCst) > 0,
+            "the step was not paid for"
+        );
         assert!(result.node_id.is_some(), "the dispatch was not settled");
         result
     }
@@ -605,7 +608,11 @@ async fn a_root_over_the_remaining_budget_neither_waits_nor_stays_among_the_wait
         .await
         .unwrap();
     // Root 2 costs more than the world may spend: the first legal root is root 1.
-    let first = env.coordinator.decide_next("world-over-budget").await.unwrap();
+    let first = env
+        .coordinator
+        .decide_next("world-over-budget")
+        .await
+        .unwrap();
     assert_eq!(dispatched_seq(&first.action), 1);
     let step = env.dispatch("world-over-budget", 1, "over-1").await;
     assert_eq!(dispatched_seq(&step.decision.action), 1);
