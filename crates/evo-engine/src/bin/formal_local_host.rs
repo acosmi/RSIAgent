@@ -3,6 +3,7 @@
 //! the registered transport and the observed OS principal/workspace.
 use evo_core::{Context, Error, Result, Role};
 use evo_engine::broker::{BrokerConfig, PersistentModelBroker};
+use evo_engine::data_directory_lock::mount_gate;
 use evo_engine::formal_authority::{
     FormalAuthorityIssuer, RegisteredExternalTransport, TypedContentRef, prepare_formal_task,
 };
@@ -189,8 +190,16 @@ async fn run() -> Result<serde_json::Value> {
     // These launch fields are trusted supervisor input. Skill and task text
     // enter only the fixed request projection and never choose a role or path.
     let ctx = Context::new(namespace, actor, role)?;
+    let (_data_lock, gate) = mount_gate(std::path::Path::new(database), None)
+        .await
+        .map_err(|error| Error::Conflict(error.to_string()))?;
     let store = Store::open(std::path::Path::new(database)).await?;
-    let result = execute(&ctx, &store, command).await;
+    let result = async {
+        gate.admit()
+            .map_err(|error| Error::Conflict(error.to_string()))?;
+        execute(&ctx, &store, command).await
+    }
+    .await;
     store.close().await;
     result
 }
@@ -326,26 +335,35 @@ async fn authority(
     if metadata.uid() != host.grader_uid || metadata.mode() & 0o002 != 0 || path.exists() {
         return Err(Error::Forbidden);
     }
-    let listener = tokio::net::UnixListener::bind(path).map_err(|_| Error::Forbidden)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
-        .map_err(|_| Error::Forbidden)?;
+    let (_data_lock, gate) = mount_gate(std::path::Path::new(&database), None)
+        .await
+        .map_err(|error| Error::Conflict(error.to_string()))?;
     let store = Store::open(std::path::Path::new(&database)).await?;
-    let result=async {
-        let mut completed=0u16;let mut refused=0u16;
-        for _ in 0..connections {
-            let (stream,_)=tokio::time::timeout(std::time::Duration::from_secs(300),listener.accept()).await
-                .map_err(|_|Error::Cancelled)?.map_err(|_|Error::Internal)?;
-            match service.serve_connection(&store,stream).await {Ok(_)=>completed+=1,Err(_)=>refused+=1}
-        }
-        Ok(serde_json::json!({"schema_version":"rsia.finite_principal_authority_run.v1","completed":completed,"refused":refused,
-            "ordinary_p_eligible":false,"note":"Authentication does not replace formal evaluation, full costs or operator approval."}))
+    let result = async {
+        gate.admit().map_err(|error| Error::Conflict(error.to_string()))?;
+        let listener = tokio::net::UnixListener::bind(path).map_err(|_| Error::Forbidden)?;
+        let serving = async {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
+                .map_err(|_| Error::Forbidden)?;
+            let mut completed = 0u16;
+            let mut refused = 0u16;
+            for _ in 0..connections {
+                let (stream, _) = tokio::time::timeout(std::time::Duration::from_secs(300), listener.accept()).await
+                    .map_err(|_| Error::Cancelled)?.map_err(|_| Error::Internal)?;
+                match service.serve_connection(&store, stream).await {
+                    Ok(_) => completed += 1,
+                    Err(_) => refused += 1,
+                }
+            }
+            Ok(serde_json::json!({"schema_version":"rsia.finite_principal_authority_run.v1","completed":completed,"refused":refused,
+                "ordinary_p_eligible":false,"note":"Authentication does not replace formal evaluation, full costs or operator approval."}))
+        }.await;
+        drop(listener);
+        // Only this invocation's successfully bound socket is removed.
+        std::fs::remove_file(path).map_err(|_| Error::Internal)?;
+        serving
     }.await;
     store.close().await;
-    drop(listener);
-    // Only remove the socket this invocation created, never replace an existing
-    // socket or delete an operator workspace/configuration.
-    let cleanup = std::fs::remove_file(path).map_err(|_| Error::Internal);
-    cleanup?;
     result
 }
 async fn operator(

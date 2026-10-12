@@ -1280,16 +1280,17 @@ impl Store {
             .busy_timeout(Duration::from_secs(5))
             .disable_statement_logging();
         // One connection serializes state transitions, including read/modify/write budget transactions.
-        // The CLI also takes an OS file lock: separate daemons must not share a data directory.
+        // Production entry points hold a shared data-directory OS lock until close.
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect_with(opts)
-            .await
-            .map_err(internal)?;
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .map_err(internal)?;
+            .connect_lazy_with(opts);
+        // Retain the pool even when connecting/migrating fails. Dropping its
+        // last handle does not await background connection shutdown, so it
+        // must be explicitly closed before the caller releases its OS guard.
+        if let Err(error) = sqlx::migrate!("./migrations").run(&pool).await {
+            pool.close().await;
+            return Err(internal(error));
+        }
         Ok(Self {
             pool,
             root,

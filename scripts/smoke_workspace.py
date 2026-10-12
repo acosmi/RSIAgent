@@ -9,6 +9,7 @@ import hashlib
 import re
 import sys
 from pathlib import Path
+from check_production_store_open import check_tree
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_MEMBERS = [
@@ -99,6 +100,9 @@ def main() -> int:
     occupied = set(numbers)
     while nxt in occupied or nxt in RESERVED_MIGRATION_NUMBERS:
         nxt += 1
+    writer_errors = check_tree(ROOT)
+    if writer_errors:
+        return fail("production writer admission: " + "; ".join(writer_errors))
     print("SMOKE_WORKSPACE_OK")
     print(f"migrations={','.join(names)}")
     print(

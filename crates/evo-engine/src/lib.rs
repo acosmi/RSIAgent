@@ -7,6 +7,7 @@ pub mod closed_loop;
 pub mod compiler;
 pub mod curriculum;
 pub mod curriculum_profiles;
+pub mod data_directory_lock;
 pub mod dependency_integrity;
 pub mod development;
 pub mod dispatch;
