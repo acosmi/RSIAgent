@@ -1163,8 +1163,8 @@ mod e05_fx {
         OptimizerComparisonContract,
     };
     use evo_core::holdout::{
-        AnchorCoverageMatrix, CriticalCapabilityCoverage, FrozenCandidatePair, HoldoutManifest,
-        SequentialMode,
+        AnchorCoverageMatrix, CriticalCapabilityCoverage, ExposureLedger, FrozenCandidatePair,
+        HoldoutManifest, SequentialMode,
     };
     use evo_core::sequential::{AlphaAllocation, FormalClaimKind, ResearchFamilyAlphaPlan};
     use evo_engine::dispatch::{
@@ -1172,9 +1172,10 @@ mod e05_fx {
         IssueTicketRequestWire,
     };
     use evo_engine::streaming_evaluator::{
-        EvaluationEvidenceScope, FixedGraderMethod, FixedGraderSpec, FrozenOracleEntry,
-        IndependentEvaluationControl, IssueTicketRequest, ProtectedHoldoutRecord,
-        ProtectedInputRef, RegisteredEvaluationControl,
+        EvaluationEvidenceScope, EvaluationTarget, EvaluationTargetKind, EvaluationTicketV2,
+        FixedGraderMethod, FixedGraderSpec, FrozenOracleEntry, IndependentEvaluationControl,
+        ProtectedHoldoutRecord, ProtectedInputRef, RegisteredEvaluationControl, TargetState,
+        TicketLifecycle,
     };
     use evo_storage::budget::RootBudgetAuthorization;
 
@@ -1210,8 +1211,9 @@ mod e05_fx {
         pub control: RegisteredEvaluationControl,
     }
 
-    /// The control, the holdout and one issued ticket, registered directly. The
-    /// first rotating input of the holdout names `first_input_artifact` (an
+    /// The control and the holdout, registered directly, and one ticket stored
+    /// as a pre-AG-100 issue stored it (`persist_legacy_ticket`). The first
+    /// rotating input of the holdout names `first_input_artifact` (an
     /// operator-supplied reference to an input artifact); the others are opaque
     /// ids of artifacts that do not exist.
     pub async fn fixture(first_input_artifact: &str) -> E05 {
@@ -1407,26 +1409,235 @@ mod e05_fx {
         IndependentEvaluationControl::register_holdout(&evaluator, &store, holdout.clone())
             .await
             .unwrap();
-        let ticket = IndependentEvaluationControl::issue_ticket(
-            &evaluator,
-            &store,
-            IssueTicketRequest {
-                ticket_id: "ticket-1".into(),
-                registration_id: "control-1".into(),
-                holdout_id: "holdout-1".into(),
-                issued_at_unix_seconds: 5,
-            },
-        )
-        .await
-        .unwrap();
+        persist_legacy_ticket(&store, &evaluator, &control, &holdout, "ticket-1", 5).await;
         E05 {
             _dir: dir,
             store,
             evaluator,
-            ticket_id: ticket.id,
+            ticket_id: "ticket-1".into(),
             holdout,
             control,
         }
+    }
+
+    /// The issue receipt and alpha reservation the engine stores, mirrored in
+    /// their declared field order (the engine keeps both types private).
+    #[derive(serde::Serialize)]
+    struct TicketIssueReceipt {
+        schema_version: String,
+        ticket_id: String,
+        registration_digest: String,
+        manifest_digest: String,
+        evaluator_actor: String,
+        issued_at_unix_seconds: i64,
+    }
+
+    #[derive(serde::Serialize)]
+    struct AlphaClaimReservation {
+        schema_version: String,
+        research_family_id: String,
+        claim_id: String,
+        attempt_id: String,
+        ticket_id: String,
+    }
+
+    /// The product's typed artifact envelope, in its declared field order.
+    #[derive(serde::Serialize)]
+    struct Envelope<'a, T> {
+        schema_version: &'a str,
+        id: &'a str,
+        record_kind: &'a str,
+        payload: &'a T,
+    }
+
+    fn storage_id(record_kind: &str, id: &str) -> String {
+        format!("e05-{}", fingerprint(&(record_kind, id)).unwrap())
+    }
+
+    async fn put_record<T: serde::Serialize>(
+        session: &mut evo_storage::Session,
+        evaluator: &Context,
+        record_kind: &str,
+        id: &str,
+        payload: &T,
+    ) {
+        let storage = storage_id(record_kind, id);
+        let envelope = Envelope {
+            schema_version: "rsia.typed_artifact_envelope.v1",
+            id: &storage,
+            record_kind,
+            payload,
+        };
+        session
+            .put(
+                evaluator,
+                "artifact",
+                &storage,
+                evaluator.actor(),
+                &envelope,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The pre-AG-100 history (L696: a stored record keeps its original
+    /// interpretation and is never upgraded): the unbound ticket an issue
+    /// stored when no candidate was recorded. AG-100 refuses that issue and
+    /// this fixture stages no candidate, so it writes that issue's rows as the
+    /// issue wrote them, in one transaction: the alpha reservations, the
+    /// exposure ledger, the issue receipt, the ticket, its ticket -> holdout
+    /// edge and the audit entry. The control, the holdout and the ticket keep
+    /// having no edge to any run.
+    async fn persist_legacy_ticket(
+        store: &Store,
+        evaluator: &Context,
+        control: &RegisteredEvaluationControl,
+        holdout: &ProtectedHoldoutRecord,
+        ticket_id: &str,
+        issued_at_unix_seconds: i64,
+    ) {
+        let plan = &control.alpha_plan;
+        let mut ledger = ExposureLedger::new(
+            plan.research_family_id.clone(),
+            plan.digest().unwrap(),
+            control.v1_plan_snapshot.query_limit,
+        )
+        .unwrap();
+        ledger.reserve(ticket_id, &holdout.manifest).unwrap();
+        let mut session = store.session().await.unwrap();
+        for allocation in &plan.allocations {
+            if allocation.attempt_id != control.attempt_id {
+                continue;
+            }
+            let reservation = AlphaClaimReservation {
+                schema_version: "rsia.alpha_claim_reservation.v1".into(),
+                research_family_id: plan.research_family_id.clone(),
+                claim_id: allocation.claim_id.clone(),
+                attempt_id: allocation.attempt_id.clone(),
+                ticket_id: ticket_id.into(),
+            };
+            let id = format!("{}:{}", plan.research_family_id, allocation.claim_id);
+            put_record(
+                &mut session,
+                evaluator,
+                "alpha_claim_reservation_v1",
+                &id,
+                &reservation,
+            )
+            .await;
+        }
+        let registration_digest = control.digest().unwrap();
+        let manifest_digest = holdout.manifest.digest().unwrap();
+        let receipt = TicketIssueReceipt {
+            schema_version: "rsia.evaluation_ticket_issue_receipt.v1".into(),
+            ticket_id: ticket_id.into(),
+            registration_digest: registration_digest.clone(),
+            manifest_digest: manifest_digest.clone(),
+            evaluator_actor: evaluator.actor().into(),
+            issued_at_unix_seconds,
+        };
+        let mut bound_v1_plan = control.v1_plan_snapshot.clone();
+        bound_v1_plan
+            .bind_candidate(holdout.pair.candidate_digest.clone())
+            .unwrap();
+        let rotating = holdout
+            .rotating_inputs
+            .iter()
+            .map(|input| EvaluationTarget {
+                target_id: input.target_id.clone(),
+                kind: EvaluationTargetKind::Rotating {
+                    cluster_id: input.cluster_or_anchor_id.clone(),
+                },
+                input_artifact_id: input.input_artifact_id.clone(),
+                input_digest: input.input_digest.clone(),
+                state: TargetState::Planned,
+            });
+        let anchors = holdout.anchor_inputs.iter().map(|input| EvaluationTarget {
+            target_id: input.target_id.clone(),
+            kind: EvaluationTargetKind::Anchor {
+                anchor_id: input.cluster_or_anchor_id.clone(),
+            },
+            input_artifact_id: input.input_artifact_id.clone(),
+            input_digest: input.input_digest.clone(),
+            state: TargetState::Planned,
+        });
+        let ticket = EvaluationTicketV2 {
+            schema_version: EvaluationTicketV2::SCHEMA.into(),
+            id: ticket_id.into(),
+            registration_id: control.id.clone(),
+            registration_digest,
+            holdout_id: holdout.id.clone(),
+            manifest_digest,
+            v1_plan_snapshot_digest: control.formal_plan.v1_plan_snapshot_digest.clone(),
+            bound_v1_plan_digest: bound_v1_plan.digest().unwrap(),
+            formal_plan_digest: control.formal_plan.digest().unwrap(),
+            profile: control.formal_plan.profile,
+            n_planned: control.formal_plan.n_planned,
+            research_family_id: plan.research_family_id.clone(),
+            alpha_plan_digest: plan.digest().unwrap(),
+            candidate_digest: holdout.pair.candidate_digest.clone(),
+            baseline_digest: holdout.pair.baseline_digest.clone(),
+            candidate_bundle_digest: holdout.candidate_bundle_digest.clone(),
+            baseline_bundle_digest: holdout.baseline_bundle_digest.clone(),
+            environment_digest: holdout.manifest.environment_digest.clone(),
+            proposer_actor: control.proposer_actor.clone(),
+            evaluator_actor: control.evaluator_actor.clone(),
+            executor_actor: control.executor_actor.clone(),
+            approver_actor: control.approver_actor.clone(),
+            issue_receipt_digest: fingerprint(&receipt).unwrap(),
+            evidence_scope: control.evidence_scope,
+            attempt_id: control.attempt_id.clone(),
+            targets: rotating.chain(anchors).collect(),
+            lifecycle: TicketLifecycle::Reserved,
+            next_sequence: 1,
+            pending_certificate: None,
+            stop_member_terminal_digest: None,
+            late_execution_receipt_ids: Vec::new(),
+            late_grader_receipt_ids: Vec::new(),
+            unattributed_budget_call_ids: Vec::new(),
+            invalid_reasons: Vec::new(),
+            issued_at_unix_seconds,
+            candidate_dependency_binding: None,
+        };
+        put_record(
+            &mut session,
+            evaluator,
+            "exposure_ledger_v1",
+            &plan.research_family_id,
+            &ledger,
+        )
+        .await;
+        put_record(
+            &mut session,
+            evaluator,
+            "evaluation_ticket_issue_receipt_v1",
+            ticket_id,
+            &receipt,
+        )
+        .await;
+        put_record(
+            &mut session,
+            evaluator,
+            "evaluation_ticket_v2",
+            ticket_id,
+            &ticket,
+        )
+        .await;
+        session
+            .put_edge(
+                evaluator,
+                "artifact",
+                &storage_id("evaluation_ticket_v2", ticket_id),
+                "artifact",
+                &storage_id("protected_holdout_v41", &holdout.id),
+            )
+            .await
+            .unwrap();
+        session
+            .audit(evaluator, "issue_evaluation_ticket", ticket_id)
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
     }
 
     impl E05 {

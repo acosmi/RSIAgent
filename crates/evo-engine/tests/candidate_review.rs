@@ -1972,8 +1972,8 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
         .await
         .unwrap();
 
-    // The historical ticket remains unbound; subsequent software execution
-    // still needs a real, registered candidate with the frozen pair identity.
+    // The candidate the ticket binds: a real, registered software candidate
+    // with the frozen pair identity, staged before the ticket (L288).
     let candidate =
         trusted_compiler_inputs::software_candidate(NS, &d("environment"), "candidate-bundle");
     let pair = FrozenCandidatePair::new(
@@ -2055,18 +2055,8 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
     IndependentEvaluationControl::register_holdout(&evaluator, &store, holdout.clone())
         .await
         .unwrap();
-    let ticket = IndependentEvaluationControl::issue_ticket(
-        &evaluator,
-        &store,
-        IssueTicketRequest {
-            ticket_id: "ticket-1".into(),
-            registration_id: "control-1".into(),
-            holdout_id: "holdout-1".into(),
-            issued_at_unix_seconds: 5,
-        },
-    )
-    .await
-    .unwrap();
+    // True-source order (L288): the candidate is staged, then the ticket is
+    // issued and binds it (AG-100 issues no ticket without a candidate record).
     let host = ctx("host", Role::Host);
     let authority = source("formal-fixture-source", "formal fixture development source");
     store_trace_authority(&store, &host, &authority)
@@ -2100,6 +2090,19 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
     )
     .await
     .unwrap();
+    let ticket = IndependentEvaluationControl::issue_ticket(
+        &evaluator,
+        &store,
+        IssueTicketRequest {
+            ticket_id: "ticket-1".into(),
+            registration_id: "control-1".into(),
+            holdout_id: "holdout-1".into(),
+            issued_at_unix_seconds: 5,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(ticket.candidate_dependency_binding.is_some());
     FormalFixture {
         _dir: dir,
         db_path,

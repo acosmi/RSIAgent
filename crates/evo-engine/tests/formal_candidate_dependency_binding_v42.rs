@@ -595,7 +595,13 @@ async fn stage(fx: &Fixture) {
 }
 
 async fn prepared(n: u32, bound: bool) -> Fixture {
-    let fx = unregistered_fixture(n).await;
+    prepared_under(RegisteredEvaluationControl::SCHEMA, n, bound).await
+}
+
+/// The same registered fixture under an explicit control schema.
+async fn prepared_under(schema: &str, n: u32, bound: bool) -> Fixture {
+    let mut fx = unregistered_fixture(n).await;
+    fx.control.schema_version = schema.into();
     IndependentEvaluationControl::register_control(&fx.evaluator, &fx.store, fx.control.clone())
         .await
         .unwrap();
@@ -624,11 +630,13 @@ async fn issue(fx: &Fixture) -> evo_core::Result<EvaluationTicketV2> {
 
 async fn ready(n: u32, bound: bool) -> Fixture {
     let fx = prepared(n, bound).await;
-    issue(&fx).await.unwrap();
-    if !bound {
-        // Preserve historical ticket-only wire while satisfying new-use
-        // admission with a registered candidate issued after the ticket.
-        stage(&fx).await;
+    if bound {
+        issue(&fx).await.unwrap();
+    } else {
+        // AG-100: without a candidate record no ticket is issued. The
+        // historical ticket-only wire is the one a pre-AG-100 issue stored.
+        assert_issue_refused_without_candidate(&fx).await;
+        persist_legacy_ticket(&fx).await;
     }
     for index in 0..n {
         grade_target(&fx, &format!("r{index}"), "ok", "wrong", index + 1).await;
@@ -797,6 +805,118 @@ print(result.rowcount)
         &[src, dst],
     );
     assert_eq!(count.trim(), "1");
+}
+
+/// AG-100's refusal of an issue that has no candidate record to bind.
+const CANDIDATE_RECORD_MISSING: &str = "formal_candidate_record_missing_at_issue";
+
+/// The stored ticket row, serialized in the product envelope's field order.
+#[derive(Serialize)]
+struct TicketEnvelope {
+    schema_version: String,
+    id: String,
+    record_kind: String,
+    payload: EvaluationTicketV2,
+}
+
+/// Rewrites the freshly issued ticket row in place (same row, revision 1) and
+/// deletes the named bound-only edges; refuses unless the stored body is the
+/// expected bound row and only ticket -> holdout remains afterwards.
+const LEGACY_TICKET_SQL: &str = r#"
+import sqlite3,sys
+db,ns,ticket,bound,legacy,holdout=sys.argv[1:7]
+remove=sys.argv[7:]
+con=sqlite3.connect(db)
+row=con.execute("SELECT body,revision FROM objects WHERE namespace=? AND kind='artifact' AND id=?",(ns,ticket)).fetchone()
+assert row==(bound,1),row
+con.execute("UPDATE objects SET body=? WHERE namespace=? AND kind='artifact' AND id=?",(legacy,ns,ticket))
+for dst in remove:
+    count=con.execute("DELETE FROM dependencies WHERE namespace=? AND src_kind='artifact' AND src_id=? AND dst_kind='artifact' AND dst_id=?",(ns,ticket,dst)).rowcount
+    assert count==1,(dst,count)
+left=con.execute("SELECT dst_kind,dst_id FROM dependencies WHERE namespace=? AND src_kind='artifact' AND src_id=?",(ns,ticket)).fetchall()
+assert left==[('artifact',holdout)],left
+con.commit()
+con.close()
+print(len(remove))
+"#;
+
+/// AG-100 (L564, L1055/L1057): with no candidate record no ticket is
+/// issued. The refusal precedes every write: the whole database is unchanged
+/// and the ticket does not exist.
+async fn assert_issue_refused_without_candidate(fx: &Fixture) {
+    let before = catalog(fx).await;
+    let result = issue(fx)
+        .await
+        .map(|ticket| ticket.candidate_dependency_binding.is_some());
+    assert!(
+        matches!(&result, Err(Error::Conflict(message)) if message == CANDIDATE_RECORD_MISSING),
+        "{result:?}"
+    );
+    assert_eq!(catalog(fx).await, before, "a refused issue wrote state");
+    assert!(matches!(
+        IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id).await,
+        Err(Error::NotFound)
+    ));
+}
+
+/// The pre-AG-100 history (L696: a stored record keeps its original
+/// interpretation and is never upgraded): the unbound ticket an issue stored
+/// when no candidate was recorded. AG-100 refuses that issue, so the fixture
+/// persists exactly its rows. The candidate is staged and the ticket issued
+/// bound (true-source order, L288); before any execution the stored envelope
+/// is rewritten in place without the binding and the bound-only issue edges
+/// (ticket -> candidate, -> issue receipt, -> alpha reservations) are
+/// deleted. The ledger, reservations, issue receipt, ticket -> holdout edge
+/// and audit entry are the ones both issues write.
+async fn persist_legacy_ticket(fx: &Fixture) {
+    stage(fx).await;
+    let ticket = issue(fx).await.unwrap();
+    assert!(ticket.candidate_dependency_binding.is_some());
+    let id = sid("evaluation_ticket_v2", &fx.ticket_id);
+    let mut envelope = TicketEnvelope {
+        schema_version: "rsia.typed_artifact_envelope.v1".into(),
+        id: id.clone(),
+        record_kind: "evaluation_ticket_v2".into(),
+        payload: ticket,
+    };
+    let bound = serde_json::to_string(&envelope).unwrap();
+    envelope.payload.candidate_dependency_binding = None;
+    let legacy = serde_json::to_string(&envelope).unwrap();
+    let mut args = vec![
+        "n".to_string(),
+        id,
+        bound,
+        legacy,
+        sid("protected_holdout_v41", &fx.holdout.id),
+        fx.holdout.pair.candidate_digest.clone(),
+        sid("evaluation_ticket_issue_receipt_v1", &fx.ticket_id),
+    ];
+    let plan = &fx.control.alpha_plan;
+    for allocation in &plan.allocations {
+        if allocation.attempt_id == fx.control.attempt_id {
+            let claim = format!("{}:{}", plan.research_family_id, allocation.claim_id);
+            args.push(sid("alpha_claim_reservation_v1", &claim));
+        }
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let removed = own_sqlite(fx, LEGACY_TICKET_SQL, &args);
+    assert_eq!(removed.trim(), (args.len() - 5).to_string());
+}
+
+/// The stored outgoing edges of the ticket.
+async fn ticket_edges(fx: &Fixture) -> Vec<(String, String)> {
+    let mut session = fx.store.session().await.unwrap();
+    let edges = session
+        .outgoing_edges_bounded(
+            &fx.evaluator,
+            "artifact",
+            &sid("evaluation_ticket_v2", &fx.ticket_id),
+            100,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    edges
 }
 
 #[tokio::test]
@@ -1567,6 +1687,8 @@ impl Serialize for LegacyFormal<'_> {
 
 #[tokio::test]
 async fn legacy_absence_preserves_exact_parent_bytes_fingerprints_and_never_upgrades_later() {
+    // AG-100: the unstaged issue is refused without a write; the ticket is
+    // the pre-AG-100 unbound one, persisted as stored (L696).
     let fx = ready(2, false).await;
     let formal = finalize(&fx).await;
     let ticket = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
@@ -1614,6 +1736,122 @@ async fn legacy_absence_preserves_exact_parent_bytes_fingerprints_and_never_upgr
     IndependentEvaluationControl::verified_report_view(&fx.evaluator, &fx.store, &fx.ticket_id)
         .await
         .unwrap();
+}
+
+/// AG-100 T1 (L564, L1055/L1057). A ticket requested while no candidate
+/// record exists is refused under both control schemas before any write: the
+/// whole database is unchanged and no ticket exists. Before AG-100 this issue
+/// stored an unbound legacy ticket. Every outcome is collected first.
+#[tokio::test]
+async fn issue_without_a_candidate_record_is_refused_for_every_control_schema_before_any_write() {
+    let mut actual = Vec::new();
+    for schema in [
+        RegisteredEvaluationControl::SCHEMA,
+        RegisteredEvaluationControl::SCHEMA_V1,
+    ] {
+        let fx = prepared_under(schema, 2, false).await;
+        let before = catalog(&fx).await;
+        let issued = issue(&fx)
+            .await
+            .map(|ticket| ticket.candidate_dependency_binding.is_some());
+        let unchanged = catalog(&fx).await == before;
+        let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+            .await
+            .map(|status| status.ticket.candidate_dependency_binding.is_some());
+        println!(
+            "AG100_T1 schema={schema} issue_bound={issued:?} catalog_unchanged={unchanged} status_bound={status:?}"
+        );
+        actual.push((schema, issued, unchanged, status));
+    }
+    for (schema, issued, unchanged, status) in actual {
+        assert!(
+            matches!(&issued, Err(Error::Conflict(message)) if message == CANDIDATE_RECORD_MISSING),
+            "{schema}: {issued:?}"
+        );
+        assert!(unchanged, "{schema}: a refused issue wrote state");
+        assert!(
+            matches!(status, Err(Error::NotFound)),
+            "{schema}: {status:?}"
+        );
+    }
+}
+
+/// AG-100 T2 (L288, L564). With the candidate staged first the ticket is
+/// issued under both control schemas and binds it: the binding names the
+/// frozen candidate, status reads the same ticket, and the stored ticket
+/// edges include ticket -> candidate.
+#[tokio::test]
+async fn issue_after_the_candidate_is_staged_binds_it_for_every_control_schema() {
+    for schema in [
+        RegisteredEvaluationControl::SCHEMA,
+        RegisteredEvaluationControl::SCHEMA_V1,
+    ] {
+        let fx = prepared_under(schema, 2, true).await;
+        let ticket = issue(&fx).await.unwrap();
+        let binding = ticket.candidate_dependency_binding.as_ref().unwrap();
+        assert_eq!(binding.candidate_id, fx.holdout.pair.candidate_digest);
+        assert_eq!(binding.namespace, "n");
+        let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            fingerprint(&status.ticket).unwrap(),
+            fingerprint(&ticket).unwrap()
+        );
+        assert!(
+            ticket_edges(&fx)
+                .await
+                .contains(&("artifact".into(), fx.holdout.pair.candidate_digest.clone()))
+        );
+    }
+}
+
+/// AG-100 T3 (L696). A ticket stored unbound before AG-100 keeps its original
+/// interpretation: status reads it unbound with its original wire, the
+/// executor's task is served, its only stored edge is ticket -> holdout, and
+/// none of these reads writes or upgrades it although its candidate is
+/// registered now.
+#[tokio::test]
+async fn persisted_legacy_ticket_is_read_unbound_and_served_as_stored() {
+    let fx = prepared(2, false).await;
+    persist_legacy_ticket(&fx).await;
+    let before = catalog(&fx).await;
+    let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+        .await
+        .unwrap();
+    assert!(status.ticket.candidate_dependency_binding.is_none());
+    assert_eq!(status.ticket.lifecycle, TicketLifecycle::Reserved);
+    assert!(status.formal.is_none());
+    let wire = serde_json::to_value(&status.ticket).unwrap();
+    assert!(wire.get("candidate_dependency_binding").is_none());
+    assert_eq!(
+        serde_json::to_vec(&status.ticket).unwrap(),
+        serde_json::to_vec(&LegacyTicket(&status.ticket)).unwrap()
+    );
+    assert_eq!(
+        ticket_edges(&fx).await,
+        vec![(
+            "artifact".to_string(),
+            sid("protected_holdout_v41", &fx.holdout.id)
+        )]
+    );
+    IndependentEvaluationControl::broker_task(
+        &fx.worker,
+        &fx.store,
+        &fx.ticket_id,
+        "r0",
+        ExecutionSide::Candidate,
+    )
+    .await
+    .unwrap();
+    let again = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        fingerprint(&again.ticket).unwrap(),
+        fingerprint(&status.ticket).unwrap()
+    );
+    assert_eq!(catalog(&fx).await, before, "legacy reads wrote state");
 }
 
 #[tokio::test]

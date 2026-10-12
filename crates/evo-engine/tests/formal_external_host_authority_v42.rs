@@ -12,12 +12,12 @@
 //! authenticated records (principal-set observation, principal actions,
 //! provider captures, meter readings, episode cost) in the exact shapes and
 //! content witnesses those principals write. Every product reader and
-//! verifier runs unchanged. The AG-095 cases issue the ticket before the
-//! Worker stages the candidate (the unbound ticket wire, without GA-18
-//! candidate/fact pins). The AG-109 cases follow the true-source order (L288:
+//! verifier runs unchanged. Every batch follows the true-source order (L288:
 //! candidates frozen, then the ticket): the candidate is staged and every
 //! principal action written first, so the ticket binds the candidate and GA-18
-//! attaches each later execution and grader receipt to it.
+//! attaches each later execution and grader receipt to it. AG-100: a ticket
+//! requested before the Worker stages the candidate (AG-095's former order,
+//! which issued the unbound wire) is refused before any write.
 //! This is a software fixture: no real external host, provider, model, paid
 //! execution, benefit or release chain is claimed.
 #[path = "support/trusted_compiler_inputs.rs"]
@@ -632,24 +632,26 @@ async fn persist_captures(
     s.commit().await.unwrap();
 }
 
-/// When the Worker stages the candidate relative to ticket issue. Candidate
-/// presence is decided once, at issue: staged first, the ticket binds it.
+/// When the Worker stages the candidate relative to the ticket request.
+/// Candidate presence is decided once, at issue: staged first, the ticket
+/// binds it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TicketOrder {
-    /// AG-095's historical order: the unbound ticket wire.
-    IssuedBeforeStage,
+    /// AG-100: AG-095's former order, the ticket requested before the
+    /// candidate is staged, under the given control schema. No candidate
+    /// record, no ticket: the issue is refused and writes nothing.
+    RequestedBeforeStage(&'static str),
     /// The true-source order (L288): the candidate is frozen, then the ticket.
     StagedBeforeIssue,
 }
 
-/// The registered grader registers the frozen holdout and issues the ticket.
-async fn register_and_issue(store: &Store, holdout: ProtectedHoldoutRecord) -> EvaluationTicketV2 {
-    let grader = ctx(Role::Evaluator, GRADER);
-    IndependentEvaluationControl::register_holdout(&grader, store, holdout)
-        .await
-        .unwrap();
+/// AG-100's refusal of an issue that has no candidate record to bind.
+const CANDIDATE_RECORD_MISSING: &str = "formal_candidate_record_missing_at_issue";
+
+/// The registered grader's ticket request.
+async fn request_ticket(store: &Store) -> Result<EvaluationTicketV2, Error> {
     IndependentEvaluationControl::issue_ticket(
-        &grader,
+        &ctx(Role::Evaluator, GRADER),
         store,
         IssueTicketRequest {
             ticket_id: TICKET.into(),
@@ -659,17 +661,61 @@ async fn register_and_issue(store: &Store, holdout: ProtectedHoldoutRecord) -> E
         },
     )
     .await
-    .unwrap()
 }
 
-/// The AG-095 batch: the ticket is issued before the candidate is staged.
-async fn prepare() -> Fx {
-    prepare_in(TicketOrder::IssuedBeforeStage).await
+/// The registered grader registers the frozen holdout and issues the ticket.
+async fn register_and_issue(store: &Store, holdout: ProtectedHoldoutRecord) -> EvaluationTicketV2 {
+    let grader = ctx(Role::Evaluator, GRADER);
+    IndependentEvaluationControl::register_holdout(&grader, store, holdout)
+        .await
+        .unwrap();
+    request_ticket(store).await.unwrap()
 }
 
-/// Registers, executes and grades one complete batch and records its sealed
-/// complete-episode cost. The ticket ends ReadyForFinal and the store closed.
+/// AG-100 (L288, L564, L1055/L1057): the registered grader registers the
+/// frozen holdout and requests the ticket before the Worker stages the
+/// candidate. With no candidate record to bind the issue is refused before
+/// any write: the whole database is unchanged and the ticket does not exist.
+async fn assert_issue_refused_before_stage(
+    store: &Store,
+    db: &Path,
+    holdout: ProtectedHoldoutRecord,
+) {
+    let grader = ctx(Role::Evaluator, GRADER);
+    IndependentEvaluationControl::register_holdout(&grader, store, holdout)
+        .await
+        .unwrap();
+    let before = catalog(db);
+    let result = request_ticket(store)
+        .await
+        .map(|ticket| ticket.candidate_dependency_binding.is_some());
+    let unchanged = catalog(db) == before;
+    let status = IndependentEvaluationControl::status(&grader, store, TICKET)
+        .await
+        .map(|status| status.ticket.candidate_dependency_binding.is_some());
+    println!(
+        "AG100_T95 issue_bound={result:?} catalog_unchanged={unchanged} status_bound={status:?}"
+    );
+    assert!(
+        matches!(&result, Err(Error::Conflict(message)) if message == CANDIDATE_RECORD_MISSING),
+        "{result:?}"
+    );
+    assert!(unchanged, "a refused issue wrote state");
+    assert!(matches!(status, Err(Error::NotFound)), "{status:?}");
+}
+
+/// Registers, executes and grades one complete batch in the true-source order
+/// and records its sealed complete-episode cost. The ticket ends
+/// ReadyForFinal and the store closed.
 async fn prepare_in(order: TicketOrder) -> Fx {
+    prepare_or_refuse(order)
+        .await
+        .expect("the true-source order prepares a complete batch")
+}
+
+/// The batch of `prepare_in`; for `RequestedBeforeStage` it stops after the
+/// refused request (`None`), before the Worker stages the candidate.
+async fn prepare_or_refuse(order: TicketOrder) -> Option<Fx> {
     let db_dir = tempfile::tempdir().unwrap();
     let db = db_dir.path().join("ag095.sqlite3");
     // The registered grader workspace is private to this test user (0700).
@@ -918,7 +964,11 @@ async fn prepare_in(order: TicketOrder) -> Fx {
         method: FixedGraderMethod::ExactJsonAnswerV1,
     };
     let control = RegisteredEvaluationControl {
-        schema_version: RegisteredEvaluationControl::SCHEMA.into(),
+        schema_version: match order {
+            TicketOrder::RequestedBeforeStage(schema) => schema,
+            TicketOrder::StagedBeforeIssue => RegisteredEvaluationControl::SCHEMA,
+        }
+        .into(),
         id: CONTROL_ID.into(),
         v1_plan_snapshot: v1.clone(),
         formal_plan,
@@ -1025,16 +1075,13 @@ async fn prepare_in(order: TicketOrder) -> Fx {
         oracle_payload_digest: fingerprint(&oracle_entries).unwrap(),
         oracle_entries,
     };
-    let mut holdout = Some(holdout);
-    let mut issued = None;
-    if order == TicketOrder::IssuedBeforeStage {
-        let ticket = register_and_issue(&store, holdout.take().unwrap()).await;
-        assert!(ticket.candidate_dependency_binding.is_none());
-        issued = Some(ticket);
+    if order != TicketOrder::StagedBeforeIssue {
+        assert_issue_refused_before_stage(&store, &db, holdout).await;
+        store.close().await;
+        return None;
     }
 
-    // Worker stage: after the ticket, the unbound ticket wire without GA-18
-    // candidate/fact pins; before it (L288), the candidate the ticket binds.
+    // Worker stage (L288): the candidate the ticket binds, before the ticket.
     let candidate = ReleaseStore::stage_bundle(
         &ctx(Role::Worker, PROPOSER),
         &store,
@@ -1135,14 +1182,8 @@ async fn prepare_in(order: TicketOrder) -> Fx {
     s.commit().await.unwrap();
     // L288: every principal action over the candidate closure precedes the
     // ticket, whose GA-18 binding pins that closure.
-    let ticket = match issued {
-        Some(ticket) => ticket,
-        None => {
-            let ticket = register_and_issue(&store, holdout.take().unwrap()).await;
-            assert!(ticket.candidate_dependency_binding.is_some());
-            ticket
-        }
-    };
+    let ticket = register_and_issue(&store, holdout).await;
+    assert!(ticket.candidate_dependency_binding.is_some());
 
     // Registered host executions of every frozen member, both sides.
     let targets: Vec<String> = (0..ROTATING)
@@ -1298,7 +1339,7 @@ async fn prepare_in(order: TicketOrder) -> Fx {
     }
     s.commit().await.unwrap();
     store.close().await;
-    fx
+    Some(fx)
 }
 
 fn copy_database(fx: &Fx) -> (tempfile::TempDir, PathBuf) {
@@ -1389,9 +1430,27 @@ async fn assert_nothing_issued(db: &Path) {
     store.close().await;
 }
 
+/// AG-100 (L288, L564): the registered external host's ticket requested
+/// before the Worker stages the candidate (AG-095's former order) is refused
+/// under both control schemas before any write; no batch is prepared.
+#[tokio::test]
+async fn ticket_requested_before_the_candidate_is_staged_is_refused_without_writes() {
+    for schema in [
+        RegisteredEvaluationControl::SCHEMA,
+        RegisteredEvaluationControl::SCHEMA_V1,
+    ] {
+        assert!(
+            prepare_or_refuse(TicketOrder::RequestedBeforeStage(schema))
+                .await
+                .is_none()
+        );
+    }
+}
+
 #[tokio::test]
 async fn registered_external_host_complete_batch_issues_authority_and_release_view_recognizes_it() {
-    let fx = prepare().await;
+    // AG-100: the true-source order (L288); the ticket binds the candidate.
+    let fx = prepare_in(TicketOrder::StagedBeforeIssue).await;
     let formal = finalize(&fx, &fx.db)
         .unwrap_or_else(|reason| panic!("complete-batch authority issuance refused: {reason}"));
     assert_eq!(formal["variant"], "complete_batch");
@@ -1485,7 +1544,8 @@ async fn registered_external_host_complete_batch_issues_authority_and_release_vi
 
 #[tokio::test]
 async fn changed_stored_receipt_or_capture_digest_refuses_authority_issuance() {
-    let fx = prepare().await;
+    // AG-100: the true-source order (L288); the ticket binds the candidate.
+    let fx = prepare_in(TicketOrder::StagedBeforeIssue).await;
     let rotating = fx.graded["r0"].clone();
     let other = fx.graded["r1"].clone();
 
