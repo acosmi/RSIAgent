@@ -2249,10 +2249,34 @@ async fn revocation_preserves_dispatched_unknown_usage_and_late_receipt_settleme
     )
     .unwrap();
     assert_eq!(stored_ticket.lifecycle, TicketLifecycle::Invalid);
+    // AG-118: after the Invalid report is final the late receipt and its
+    // output are audit evidence only; the ticket keeps the bytes its report
+    // pins at invalidation, and one audit entry names the receipt.
+    assert!(stored_ticket.late_execution_receipt_ids.is_empty());
+    let formal = raw(&fx, "artifact", &sid("formal_evaluation_v2", &fx.ticket_id)).await;
     assert_eq!(
-        stored_ticket.late_execution_receipt_ids,
-        vec![late.receipt_id.clone()]
+        formal["payload"]["ticket_digest"],
+        json!(fingerprint(&stored_ticket).unwrap())
     );
+    let stored_receipt = raw(
+        &fx,
+        "artifact",
+        &sid("execution_receipt_v2", &late.receipt_id),
+    )
+    .await;
+    assert_eq!(stored_receipt["payload"], json!(late));
+    let output_id = sid("evaluation_execution_output_v1", &late.output_artifact_id);
+    assert_eq!(
+        raw(&fx, "artifact", &output_id).await["payload"]["output_digest"],
+        json!(late.output_digest)
+    );
+    let audit = r#"
+import json,sqlite3,sys
+con=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+rows=[json.loads(p) for (p,) in con.execute("SELECT payload FROM audit WHERE namespace=?",(sys.argv[2],))]
+print(sum(1 for r in rows if r['operation']=='late_execution_receipt_after_formal' and r['entity']==sys.argv[3]))
+"#;
+    assert_eq!(own_sqlite(&fx, audit, &["n", &late.receipt_id]).trim(), "1");
     let mut session = fx.store.session().await.unwrap();
     assert!(
         session
