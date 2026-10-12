@@ -1743,6 +1743,22 @@ impl IndependentEvaluationControl {
                 &receipt.budget_call_id,
                 &receipt.request_digest,
             )?;
+            // AG-118 (§6.6 L705/L707): once an Invalid report is final (its
+            // reasons fixed, no re-derivation), the paid late result keeps its
+            // stored receipt and output as audit evidence; the ticket, its
+            // edges and the report stay as persisted. EarlyStopped keeps the
+            // AG-091 path of the grader side: the receipt joins the ticket's
+            // late list and the report is re-derived below with an unchanged
+            // certificate. Draining keeps it for settle_after_stop. A
+            // CompleteBatch ticket has no started slot left, so
+            // validate_started_slot above already refused it.
+            if latest.lifecycle == TicketLifecycle::Invalid {
+                session
+                    .audit(ctx, LATE_EXECUTION_AFTER_FORMAL_AUDIT, &receipt.receipt_id)
+                    .await?;
+                session.commit().await?;
+                return Ok(receipt);
+            }
             latest.late_execution_receipt_ids.push(request.receipt_id);
         } else {
             validate_started_slot(
@@ -1776,6 +1792,8 @@ impl IndependentEvaluationControl {
             )
             .await?;
         }
+        // AG-118: an EarlyStopped report pins the ticket it was derived from.
+        maybe_store_early_formal(&mut session, ctx, &latest).await?;
         session.commit().await?;
         Ok(receipt)
     }
@@ -1828,6 +1846,8 @@ impl IndependentEvaluationControl {
         .await?;
         validate_execution_pair(&ticket, &request.target_id, &candidate, &baseline)?;
         let target_kind = ticket.target(&request.target_id)?.kind.clone();
+        // AG-118: decided from the stored ticket alone, before any grading.
+        let after_final_report = late_grading_after_final_report(&ticket, &request.target_id)?;
         let candidate_output: ExecutionOutputArtifact = need_record(
             &mut session,
             ctx,
@@ -1851,7 +1871,9 @@ impl IndependentEvaluationControl {
         ) {
             Ok(score) => score,
             Err(error) => {
-                if !preserve_confirmed_stop {
+                if after_final_report {
+                    audit_late_grading_error(session, ctx, &request.receipt_id).await?;
+                } else if !preserve_confirmed_stop {
                     invalidate_in_session(
                         &mut session,
                         ctx,
@@ -1873,7 +1895,9 @@ impl IndependentEvaluationControl {
         ) {
             Ok(score) => score,
             Err(error) => {
-                if !preserve_confirmed_stop {
+                if after_final_report {
+                    audit_late_grading_error(session, ctx, &request.receipt_id).await?;
+                } else if !preserve_confirmed_stop {
                     invalidate_in_session(
                         &mut session,
                         ctx,
@@ -1891,7 +1915,9 @@ impl IndependentEvaluationControl {
         let anchor_result = match target_kind {
             EvaluationTargetKind::Rotating { .. } => None,
             EvaluationTargetKind::Anchor { .. } if baseline_score_micros != 1_000_000 => {
-                if !preserve_confirmed_stop {
+                if after_final_report {
+                    audit_late_grading_error(session, ctx, &request.receipt_id).await?;
+                } else if !preserve_confirmed_stop {
                     invalidate_in_session(
                         &mut session,
                         ctx,
@@ -1956,6 +1982,25 @@ impl IndependentEvaluationControl {
             return Err(Error::Conflict(
                 "grader receipt id reused with different evidence".into(),
             ));
+        }
+        // AG-118 (§6.6 L705/L707): after the formal report is final the late
+        // grading is retained as audit evidence only. The final ticket, its
+        // fact edges and its report stay exactly as persisted.
+        if after_final_report {
+            put_record(
+                &mut session,
+                ctx,
+                GRADER_RECEIPT_KIND,
+                &request.receipt_id,
+                ctx.actor(),
+                &receipt,
+            )
+            .await?;
+            session
+                .audit(ctx, LATE_GRADER_AFTER_FINAL_AUDIT, &receipt.receipt_id)
+                .await?;
+            session.commit().await?;
+            return Ok(receipt);
         }
         if !is_stopping(ticket.lifecycle) {
             validate_target_receipt_pair(
@@ -5509,6 +5554,51 @@ fn is_stopping(state: TicketLifecycle) -> bool {
     )
 }
 
+/// Audit operation naming an execution receipt kept outside a final Invalid
+/// report.
+const LATE_EXECUTION_AFTER_FORMAL_AUDIT: &str = "late_execution_receipt_after_formal";
+/// Audit operation naming a grader receipt kept outside a final report (L707).
+const LATE_GRADER_AFTER_FINAL_AUDIT: &str = "late_grader_receipt_after_final_report";
+/// Audit operation naming a grader request whose outputs could not be graded
+/// after the formal report was final.
+const LATE_GRADER_ERROR_AFTER_FINAL_AUDIT: &str = "late_grader_error_after_final_report";
+
+/// AG-118 (§6.6 L705): once the formal report is final its reasons are fixed.
+/// A late grading error neither invalidates again nor appends a reason; one
+/// audit entry names the request by its receipt id (the requested id, as no
+/// receipt is stored), committed alone before the caller returns the same
+/// error. Reachable for an unscored Invalid target with a late output. A
+/// CompleteBatch target, or one an early stop had scored, cannot get there:
+/// a completed target accepts no new execution receipt (validate_started_slot,
+/// set_running_receipt), and its stored pair already graded successfully
+/// under the same fixed grader and frozen oracle.
+async fn audit_late_grading_error(
+    mut session: Session,
+    ctx: &Context,
+    receipt_id: &str,
+) -> Result<()> {
+    session
+        .audit(ctx, LATE_GRADER_ERROR_AFTER_FINAL_AUDIT, receipt_id)
+        .await?;
+    session.commit().await
+}
+
+/// AG-118: whether a grader receipt arrives after the formal report is final.
+/// Each of these lifecycles is persisted in the same transaction as its formal
+/// report. Any CompleteBatch or Invalid target qualifies; for EarlyStopped
+/// only a target the stop had already scored, as the AG-091 path keeps a
+/// later result for an unscored target on the ticket and re-derives its report.
+fn late_grading_after_final_report(ticket: &EvaluationTicketV2, target_id: &str) -> Result<bool> {
+    Ok(match ticket.lifecycle {
+        TicketLifecycle::CompleteBatch | TicketLifecycle::Invalid => true,
+        TicketLifecycle::EarlyStopped => matches!(
+            ticket.target(target_id)?.state,
+            TargetState::Completed { .. }
+        ),
+        _ => false,
+    })
+}
+
 fn rotating_complete(ticket: &EvaluationTicketV2) -> bool {
     ticket.targets.iter().all(|target| {
         !matches!(target.kind, EvaluationTargetKind::Rotating { .. })
@@ -6026,7 +6116,17 @@ async fn maybe_store_early_formal(
             ticket_digest: fingerprint(ticket)?,
             certificate,
         };
-        put_record(session, ctx, FORMAL_KIND, &ticket.id, ctx.actor(), &formal).await?;
+        // The ticket's evaluator owns its report, also when a late execution
+        // receipt re-derives it; every other caller is that evaluator.
+        put_record(
+            session,
+            ctx,
+            FORMAL_KIND,
+            &ticket.id,
+            ticket.evaluator_actor.as_str(),
+            &formal,
+        )
+        .await?;
     }
     Ok(())
 }
