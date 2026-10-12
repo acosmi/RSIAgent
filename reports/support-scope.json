@@ -626,6 +626,35 @@
             "exit_code": 101,
             "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-097-98431d5.log.test"
           }
+        },
+        {
+          "id": "E04.ag105_broker_bound_recovery_close_v42",
+          "description": "Settled bound model calls close their execution before a replay is refused, freeing the root for the next call",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "9862bbd7c6e1945ea0f7b6431db4dcab7a4db346",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/149",
+          "merged_sha": "7dc89bffc49d8fe4c5d97e7ccd56d3d0ad597f1c",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/broker_bound_recovery_close_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test broker_bound_recovery_close_v42",
+          "input_digest": "d1f1c986d03b94e9f0a134b1d3326f87f116bb34272a40b167bc9bf5da51808b",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.broker_bound_recovery_close_v42.log",
+          "actual_result": "peer-window controller acceptance at 9862bbd (restacked onto 94076d78, patch byte-identical; fresh target): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 138 binaries 1762 passed / 0 failed / 0 overflow (parent 94076d78: 137 binaries 1756 passed; new 6), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-ag105-claude/append.rs) pass on head and fail on base 94076d78. Declared target covered with exit 0 by this window's AG-113 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.broker_bound_recovery_close_v42.log).",
+          "scope": "E04; E04 L1239–1245 (root budget state machine), sections 7.2.1 L831, 6.6 L705/L709, 11 L1077; V096 subset: a settled bound call whose persisted artifact is corrupt or whose source was revoked/redacted records its close before the refused replay, so the root concurrency slot is released; refusal forms unchanged",
+          "risk": "No real provider or billing, no exhaustive concurrency, no dispatch-side revocation rules, no full E/V, effect or release claim",
+          "rollback": "revert PR #149 through an independent revert PR; accepted-head parent 94076d789f40347ab8263176044f041824c061fb; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-105-9862bbd.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-105 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-105-9862bbd.log.test"
+          }
         }
       ],
       "remaining": [
@@ -861,6 +890,93 @@
           "scope": "E05; Confirmed early stop preserved after a late grader error software/component boundary only.",
           "source_sha": "730f242cd4fe076c4d751e3f823cc8a9385fbb93",
           "test_entry": "crates/evo-engine/tests/late_grader_stop_preservation_v42.rs"
+        },
+        {
+          "id": "E05.ag095_canonical_grader_receipt_digest",
+          "description": "Independent grader receipts for external-host authority bind a canonical sorted-value digest; forged or rebound digests are refused",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "d73acb6f4ddce9bbdca0702eab783e54cf41ad90",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/147",
+          "merged_sha": "1706cb04049c0306676a17fd34fd021717c5669b",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/formal_external_host_authority_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test formal_external_host_authority_v42",
+          "input_digest": "4178f2ea1724b8695de729da3a0553be9224957b03399e51b4532b6849908399",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.formal_external_host_authority_v42.ag095.log",
+          "actual_result": "peer-window controller acceptance at d73acb6 (restacked onto 1ef0b216, patch byte-identical; fresh target): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 137 binaries 1751 passed / 0 failed / 0 overflow (parent 1ef0b216: 136 binaries 1748), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-ag095-claude/append.rs) pass on head and fail on base 1ef0b216. Declared target covered with exit 0 by this window's AG-113 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.formal_external_host_authority_v42.ag095.log).",
+          "scope": "E05; E05 L1253 (grader and executor in separate processes/identities), L1257 (forged ticket/plan/slice/statistics object relations must be refused), section 6.6 L710; V010/V011/V012/V013/V084/V085 subset: the independent grader receipt for external-host authority binds a canonical digest over sorted values; every capture names that digest and the batch it was issued for; rebinding to the canonical digest is a no-op and a forged receipt digest is refused",
+          "risk": "No real external host, no real grader process boundary beyond the test harness, no full E05/E06 route, effect or release claim",
+          "rollback": "revert PR #147 through an independent revert PR; accepted-head parent 1ef0b2163fe9b6c46c9d49b558e6e25c0e13ab12; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-095-d73acb6.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-095 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-095-d73acb6.log.test"
+          }
+        },
+        {
+          "id": "E05.ag101_streaming_verdicts_v42",
+          "description": "A v2 complete-batch regression is confirmed only when the upper confidence bound is below zero",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "78075a1101db12e5f3591622f0499ecf2b7b66bf",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/152",
+          "merged_sha": "f355ec389513685097e2c4d85dfd0c062e29e915",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/streaming_verdicts_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test streaming_verdicts_v42",
+          "input_digest": "af329e4442f713dd7735858388bedab37230afec78f9f879f85a65ab1f95391d",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.streaming_verdicts_v42.log",
+          "actual_result": "peer-window controller acceptance at 78075a1 (restacked onto 63113ac9, patch byte-identical; fresh target): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 139 binaries 1773 passed / 0 failed / 0 overflow (parent 63113ac9: 139 binaries 1771 passed; new 2), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-ag101-claude/append.rs) pass on head and fail on base 63113ac9. Declared target covered with exit 0 by this window's AG-113 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.streaming_verdicts_v42.log).",
+          "scope": "E05; E05 L1247–1260, section 3.4; V010/V011/V012/V084 subset: complete_batch v2 reports regressed only when the UCB crosses below zero (cost over limit at 1.5x and store reopen both preserve the confirmed verdict); otherwise Inconclusive with regression_not_confirmed_ucb_boundary_not_crossed",
+          "risk": "No new statistics beyond the recorded tests, no claim on other batch versions, no full E05 route, effect or release claim",
+          "rollback": "revert PR #152 through an independent revert PR; accepted-head parent 63113ac95b01f78863da0f75c5a93e5bfa2dd9d8; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-101-78075a1.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-101 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-101-78075a1.log.test"
+          }
+        },
+        {
+          "id": "E05.ag109_external_host_authority_bound_ticket",
+          "description": "External-host authority is issued and read on a bound ticket; a stray resource edge refuses every bound reader after issuance",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "e573eaa3a8cea90932f806ca455bf8a3963e1a3d",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/153",
+          "merged_sha": "42decd1a17585c366b249104b0bbea700361d003",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/formal_external_host_authority_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test formal_external_host_authority_v42",
+          "input_digest": "8a5e56b06b1477de0255b895a5787170b13014e0d200b8265c724b800af68965",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.formal_external_host_authority_v42.ag109.log",
+          "actual_result": "peer-window controller acceptance at e573eaa (restacked onto f355ec38; patch content and hunk headers identical; fresh target): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 139 binaries 1778 passed / 0 failed / 0 overflow (parent f355ec38: 139 binaries 1773 passed; new 5), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-ag109-claude/append.rs) pass on head and fail on base f355ec38 (bound issuance refused: conflict). Declared target covered with exit 0 by this window's AG-113 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.formal_external_host_authority_v42.ag109.log); the same binary also carries #147's tests, recorded separately.",
+          "scope": "E05; E05 L1247–1260 (L1257: forged ticket/plan/slice/statistics object relations must be refused), sections 3.2.2 L288 (ordering), 5.7 L564 (one-way digest dependency), 5.3 L509, E08 L1295 (typed dependency edge integrity); V010/V012/V084/V085 subset: bound issuance of external-host authority succeeds on two copies and binds the staged candidate; after issuance a stray resource edge refuses every bound reader",
+          "risk": "No real external host or grader process, no claim beyond the recorded tests, no full E05/E08 route, effect or release claim",
+          "rollback": "revert PR #153 through an independent revert PR; accepted-head parent f355ec389513685097e2c4d85dfd0c062e29e915; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-109-e573eaa.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-109 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-109-e573eaa.log.test"
+          }
         }
       ],
       "remaining": [
@@ -1089,6 +1205,35 @@
           "rollback": "revert PR #89 (merge cc85b5c) through an independent revert PR; accepted-stack rollback point c44aa8d; persisted revocation, budget, cost and audit facts are not rolled back",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-044-f7946f0.json"
+        },
+        {
+          "id": "E07.ag108_candidate_review",
+          "description": "EditCompiled review verifies the producer's input_digest rule before exposing an exact diff",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "f853917248fb025abe3144dc79420fa695644517",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/150",
+          "merged_sha": "94076d789f40347ab8263176044f041824c061fb",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/candidate_review.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test candidate_review",
+          "input_digest": "82cc813a6252987342dd08c963a7021ecc76348e9511065f44fbfa336a0d3f5d",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.candidate_review.log",
+          "actual_result": "peer-window controller acceptance at f853917 (restacked onto ab2f4100, patch byte-identical; fresh target): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 137 binaries 1756 passed / 0 failed / 0 overflow (parent ab2f4100: 137 binaries 1751 passed; new 5), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-ag108-claude/append.rs) pass on head and fail on base ab2f4100. Declared target covered with exit 0 by this window's AG-113 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.candidate_review.log).",
+          "scope": "E06/E07 review view (L688; V070 L1578), sections 5.1 L451–455 and 5.2 L459; V070 subset: review_stored reproduces an EditCompiled fact's exact diff only when the fact carries the producer digest computed by the producer's own rule; a bare-rule digest beside compiler keys or a tampered batch digest is reported material_invalid",
+          "risk": "No UI, no claim about other fact kinds or producers, no full E06/E07 route, effect or release claim",
+          "rollback": "revert PR #150 through an independent revert PR; accepted-head parent ab2f41003483aec2c2067cd1fed65b119bd0da3b; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-108-f853917.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-108 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-108-f853917.log.test"
+          }
         }
       ],
       "remaining": [
@@ -1464,6 +1609,64 @@
             "scope": "workspace",
             "exit_code": 101,
             "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-096-4fd5701.log.test"
+          }
+        },
+        {
+          "id": "E08.ag107_budget_ref_missing_fail_closed_v42",
+          "description": "The legacy budget gate judges lost-reference calls by their request closure and fails closed when the closure cannot be verified",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "7cc0e962936956ddab4acd5d6a25bf8cf14d336f",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/151",
+          "merged_sha": "63113ac95b01f78863da0f75c5a93e5bfa2dd9d8",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-storage/tests/budget_ref_missing_fail_closed_v42.rs",
+          "command": "cargo test --locked --offline -p evo-storage --test budget_ref_missing_fail_closed_v42",
+          "input_digest": "cc019e90066e3b109b7c32f1178b61108abdb2c20225239e6ef708ba518bd6b4",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.budget_ref_missing_fail_closed_v42.log",
+          "actual_result": "peer-window controller acceptance at 7cc0e96 (restacked onto 7dc89bff, patch byte-identical; fresh target): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 139 binaries 1771 passed / 0 failed / 0 overflow (parent 7dc89bff: 138 binaries 1762 passed; new 9), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-ag107-claude/append.rs) pass on head and fail on base 7dc89bff. Declared target covered with exit 0 by this window's AG-113 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.budget_ref_missing_fail_closed_v42.log).",
+          "scope": "E08; E03 L1229 (source closure), E08 L1299 (deletion closure), sections 11 L1077, 11.3 L1110, 11.5 L1132, 7.2.1 L831, 6.7.4 L761; V096 subset: a bound request whose budget reference is lost is judged by its stored source closure; a closure containing a revoked source, or an unverifiable closure, is refused at the source gate instead of reaching dispatch",
+          "risk": "No real provider or billing, no repair of lost references, no exhaustive legacy-row coverage, no full E/V, effect or release claim",
+          "rollback": "revert PR #151 through an independent revert PR; accepted-head parent 7dc89bffc49d8fe4c5d97e7ccd56d3d0ad597f1c; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-107-7cc0e96.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-107 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-107-7cc0e96.log.test"
+          }
+        },
+        {
+          "id": "E08.ag106_budget_startup_recovery_v42",
+          "description": "Serve startup closes the settled budget calls whose execution close a crash lost, freeing closable roots without touching listed ones",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "not_affected",
+          "source_sha": "71cae0cfd8919f523514d382e0b966171c5e3f97",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/154",
+          "merged_sha": "aece7299d0078e5704bd74ed3ae04e828f3e2c6d",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-storage/tests/budget_startup_recovery_v42.rs",
+          "command": "cargo test --locked --offline -p evo-storage --test budget_startup_recovery_v42",
+          "input_digest": "aa059e852fb0ba73c2cba3c9d8470b628026b3a9bd779668b34594a3b2fd7232",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.budget_startup_recovery_v42.log",
+          "actual_result": "peer-window controller acceptance at 71cae0c (restacked onto 42decd1a, patch byte-identical; fresh target under a 1.5 GiB disk watchdog): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 140 binaries 1785 passed / 0 failed / 0 overflow (parent 42decd1a: 139 binaries 1778 passed; new 7), build rsia 0, both smokes 0, checker 0, unittest 0; 2 controller probes (qa/probe-ag106-claude/append.rs) pass on head; on base 42decd1a the probe file does not compile because the recovery API is absent (baseline evidence). Declared target covered with exit 0 by this window's AG-113 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag113/ctrl-ag113-final.budget_startup_recovery_v42.log).",
+          "scope": "E08; E08 L1295–1301 (deletion closure, post-crash continued cleanup), E04 L1239–1245 (root budget state machine), sections 7.2.1 L825, 11.5 L1134, 6.6 L705/L709, 6.7.4 L763; V096 subset: at serve startup, settled budget calls whose execution close was lost to a crash are closed once through reopened stores, a second start writes nothing, closable roots are freed and listed roots stay held",
+          "risk": "No real provider or billing, no claim about crash points other than the recorded ones, no full E04/E08 route, effect or release claim",
+          "rollback": "revert PR #154 through an independent revert PR; accepted-head parent 42decd1a17585c366b249104b0bbea700361d003; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-106-71cae0c.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-106 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-106-71cae0c.log.test"
           }
         }
       ],
@@ -4598,7 +4801,10 @@
           "E05.ag089_local_scoped_acceptance",
           "E05.ag090_local_scoped_acceptance",
           "E05.ag091_local_scoped_acceptance",
-          "E01.ag057_explicit_sample_registration"
+          "E01.ag057_explicit_sample_registration",
+          "E05.ag095_canonical_grader_receipt_digest",
+          "E05.ag101_streaming_verdicts_v42",
+          "E05.ag109_external_host_authority_bound_ticket"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4621,7 +4827,9 @@
           "E05.ag089_local_scoped_acceptance",
           "E05.ag090_local_scoped_acceptance",
           "E05.ag091_local_scoped_acceptance",
-          "E01.ag057_explicit_sample_registration"
+          "E01.ag057_explicit_sample_registration",
+          "E05.ag095_canonical_grader_receipt_digest",
+          "E05.ag101_streaming_verdicts_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4644,7 +4852,10 @@
           "E05.ag089_local_scoped_acceptance",
           "E05.ag090_local_scoped_acceptance",
           "E05.ag091_local_scoped_acceptance",
-          "E01.ag057_explicit_sample_registration"
+          "E01.ag057_explicit_sample_registration",
+          "E05.ag095_canonical_grader_receipt_digest",
+          "E05.ag101_streaming_verdicts_v42",
+          "E05.ag109_external_host_authority_bound_ticket"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -4667,7 +4878,8 @@
           "E05.ag089_local_scoped_acceptance",
           "E05.ag090_local_scoped_acceptance",
           "E05.ag091_local_scoped_acceptance",
-          "E01.ag057_explicit_sample_registration"
+          "E01.ag057_explicit_sample_registration",
+          "E05.ag095_canonical_grader_receipt_digest"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5655,7 +5867,8 @@
           "E06.controller_acceptance",
           "E07.controller_acceptance",
           "E16.2.durable_staging_publish_controller_acceptance",
-          "E06.ag084_local_scoped_acceptance"
+          "E06.ag084_local_scoped_acceptance",
+          "E07.ag108_candidate_review"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5968,7 +6181,10 @@
           "E05.ag091_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance",
-          "E01.ag057_explicit_sample_registration"
+          "E01.ag057_explicit_sample_registration",
+          "E05.ag095_canonical_grader_receipt_digest",
+          "E05.ag101_streaming_verdicts_v42",
+          "E05.ag109_external_host_authority_bound_ticket"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6011,7 +6227,9 @@
           "E05.ag091_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance",
-          "E01.ag057_explicit_sample_registration"
+          "E01.ag057_explicit_sample_registration",
+          "E05.ag095_canonical_grader_receipt_digest",
+          "E05.ag109_external_host_authority_bound_ticket"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6416,7 +6634,10 @@
           "E02.ag093_local_scoped_acceptance",
           "E01.ag057_explicit_sample_registration",
           "E04.ag097_broker_close_before_refuse",
-          "E08.ag096_unreadable_bound_request_isolated"
+          "E08.ag096_unreadable_bound_request_isolated",
+          "E04.ag105_broker_bound_recovery_close_v42",
+          "E08.ag107_budget_ref_missing_fail_closed_v42",
+          "E08.ag106_budget_startup_recovery_v42"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
