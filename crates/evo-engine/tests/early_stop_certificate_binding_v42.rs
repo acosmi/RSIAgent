@@ -598,11 +598,8 @@ async fn grade(
     .unwrap();
 }
 
-async fn issue(fixture: &Fixture, bound: bool) {
-    if bound {
-        stage_candidate(fixture).await;
-    }
-    let ticket = IndependentEvaluationControl::issue_ticket(
+async fn request_ticket(fixture: &Fixture) -> evo_core::Result<EvaluationTicketV2> {
+    IndependentEvaluationControl::issue_ticket(
         &fixture.evaluator,
         &fixture.store,
         IssueTicketRequest {
@@ -613,13 +610,128 @@ async fn issue(fixture: &Fixture, bound: bool) {
         },
     )
     .await
-    .unwrap();
-    assert_eq!(ticket.candidate_dependency_binding.is_some(), bound);
-    if !bound {
-        // The historical ticket keeps its original unbound wire. Its later
-        // executions still require a genuinely registered current candidate.
+}
+
+async fn issue(fixture: &Fixture, bound: bool) {
+    let ticket = if bound {
         stage_candidate(fixture).await;
+        request_ticket(fixture).await.unwrap()
+    } else {
+        // AG-100: without a candidate record no ticket is issued. The
+        // historical ticket keeps its original unbound wire, persisted as a
+        // pre-AG-100 issue stored it. Its later executions still require a
+        // genuinely registered current candidate.
+        assert_issue_refused_without_candidate(fixture).await;
+        persist_legacy_ticket(fixture).await
+    };
+    assert_eq!(ticket.candidate_dependency_binding.is_some(), bound);
+}
+
+/// AG-100's refusal of an issue that has no candidate record to bind.
+const CANDIDATE_RECORD_MISSING: &str = "formal_candidate_record_missing_at_issue";
+
+/// AG-100 (L564, L1055/L1057): with no candidate record no ticket is
+/// issued. The refusal precedes every write: the whole database is unchanged
+/// and the ticket does not exist.
+async fn assert_issue_refused_without_candidate(fixture: &Fixture) {
+    let before = catalog(&fixture.db_path);
+    let result = request_ticket(fixture)
+        .await
+        .map(|ticket| ticket.candidate_dependency_binding.is_some());
+    assert!(
+        matches!(&result, Err(Error::Conflict(message)) if message == CANDIDATE_RECORD_MISSING),
+        "{result:?}"
+    );
+    assert_eq!(
+        catalog(&fixture.db_path),
+        before,
+        "a refused issue wrote state"
+    );
+    assert!(matches!(
+        IndependentEvaluationControl::status(&fixture.evaluator, &fixture.store, TICKET_ID).await,
+        Err(Error::NotFound)
+    ));
+}
+
+/// Rewrites the freshly issued ticket row in place (same row, revision 1) and
+/// deletes the named bound-only edges; refuses unless the stored body is the
+/// expected bound row and only ticket -> holdout remains afterwards.
+const LEGACY_TICKET_SQL: &str = r#"
+import sqlite3,sys
+db,ns,ticket,bound,legacy,holdout=sys.argv[1:7]
+remove=sys.argv[7:]
+con=sqlite3.connect(db)
+row=con.execute("SELECT body,revision FROM objects WHERE namespace=? AND kind='artifact' AND id=?",(ns,ticket)).fetchone()
+assert row==(bound,1),row
+con.execute("UPDATE objects SET body=? WHERE namespace=? AND kind='artifact' AND id=?",(legacy,ns,ticket))
+for dst in remove:
+    count=con.execute("DELETE FROM dependencies WHERE namespace=? AND src_kind='artifact' AND src_id=? AND dst_kind='artifact' AND dst_id=?",(ns,ticket,dst)).rowcount
+    assert count==1,(dst,count)
+left=con.execute("SELECT dst_kind,dst_id FROM dependencies WHERE namespace=? AND src_kind='artifact' AND src_id=?",(ns,ticket)).fetchall()
+assert left==[('artifact',holdout)],left
+con.commit()
+con.close()
+print(len(remove))
+"#;
+
+/// The pre-AG-100 history (L696: a stored record keeps its original
+/// interpretation and is never upgraded): the unbound ticket an issue stored
+/// when no candidate was recorded. AG-100 refuses that issue, so the fixture
+/// persists exactly its rows. The candidate is staged and the ticket issued
+/// bound (true-source order, L288); before any execution the stored envelope
+/// is rewritten in place without the binding and the bound-only issue edges
+/// (ticket -> candidate, -> issue receipt, -> alpha reservations) are
+/// deleted. The ledger, reservations, issue receipt, ticket -> holdout edge
+/// and audit entry are the ones both issues write. Returns the stored ticket.
+async fn persist_legacy_ticket(fixture: &Fixture) -> EvaluationTicketV2 {
+    stage_candidate(fixture).await;
+    let ticket = request_ticket(fixture).await.unwrap();
+    assert!(ticket.candidate_dependency_binding.is_some());
+    let id = physical_id(TICKET_KIND, TICKET_ID);
+    let mut envelope = Envelope {
+        schema_version: "rsia.typed_artifact_envelope.v1".to_string(),
+        id: id.clone(),
+        record_kind: TICKET_KIND.to_string(),
+        payload: ticket,
+    };
+    let bound = serde_json::to_string(&envelope).unwrap();
+    envelope.payload.candidate_dependency_binding = None;
+    let legacy = serde_json::to_string(&envelope).unwrap();
+    let mut args = vec![
+        NAMESPACE.to_string(),
+        id,
+        bound,
+        legacy,
+        physical_id("protected_holdout_v41", &fixture.holdout.id),
+        fixture.holdout.pair.candidate_digest.clone(),
+        physical_id("evaluation_ticket_issue_receipt_v1", TICKET_ID),
+    ];
+    let plan = &fixture.control.alpha_plan;
+    for allocation in &plan.allocations {
+        if allocation.attempt_id == fixture.control.attempt_id {
+            let claim = format!("{}:{}", plan.research_family_id, allocation.claim_id);
+            args.push(physical_id("alpha_claim_reservation_v1", &claim));
+        }
     }
+    let output = Command::new("python3")
+        .args(["-B", "-c", LEGACY_TICKET_SQL])
+        .arg(&fixture.db_path)
+        .args(&args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        (args.len() - 5).to_string()
+    );
+    IndependentEvaluationControl::status(&fixture.evaluator, &fixture.store, TICKET_ID)
+        .await
+        .unwrap()
+        .ticket
 }
 
 async fn before_futility_stop(fixture: &Fixture, bound: bool) {

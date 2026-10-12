@@ -1239,6 +1239,14 @@ impl IndependentEvaluationControl {
         }
         let candidate_dependency_binding =
             bind_candidate_in_session(&mut session, ctx, &control, &holdout).await?;
+        // Every issued ticket binds its frozen candidate (L564). Without a
+        // candidate record there is nothing to bind: the issue is refused here,
+        // before its first write and under every control schema, instead of
+        // issuing an unbound ticket (L1055/L1057). Stored unbound tickets keep
+        // their original interpretation (L696).
+        if candidate_dependency_binding.is_none() {
+            return Err(Error::Conflict(CANDIDATE_RECORD_MISSING.into()));
+        }
         if candidate_dependency_binding.is_some() {
             let existing = collect_dependency_nodes(
                 &mut session,
@@ -4002,6 +4010,8 @@ const CANDIDATE_BINDING_SCHEMA: &str = "rsia.formal_candidate_dependency_binding
 const STORED_BINDING_SCHEMA: &str = "rsia.formal_stored_dependency_binding.v1";
 const CANDIDATE_CHANGED: &str = "formal_candidate_dependency_binding_changed";
 const STORED_CHANGED: &str = "formal_stored_dependency_binding_changed";
+/// An issue with no candidate record to bind (AG-100).
+const CANDIDATE_RECORD_MISSING: &str = "formal_candidate_record_missing_at_issue";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
