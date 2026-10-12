@@ -3847,40 +3847,72 @@ async fn any_run_source_revoked(
     Ok(false)
 }
 
-/// The source closure registered for `call` when it was reserved: the
-/// `source_ids` of its budget call reference (the id is derived exactly as
-/// `ensure_budget_call_ref` derives it, from the call's own namespace, billing
-/// scope and call id), or `None` when there is no reference. A missing reference is
-/// not an empty closure: a call reserved without a closure has none, and neither
-/// has a call whose reference was lost or deleted, and the two cannot be told apart
-/// here (`legacy_call_sources` reads the request of such a call). The cleanup
-/// preserves the reference as a historical accounting fact, so it is still
-/// readable after the cleanup completes. A reference that does not decode fails the
-/// dispatch and the settlement with `Internal`, as it does in
-/// `ensure_budget_call_ref`: it is neither trusted nor guessed at.
-async fn registered_source_ids(
+/// What the budget call reference of a legacy call registers as its source
+/// closure (`registered_call_source_ids`).
+pub(crate) enum RegisteredCallSources {
+    /// The call has no reference. A missing reference is not an empty closure: a
+    /// call reserved without a closure has none, and neither has a call whose
+    /// reference was lost or deleted, and the two cannot be told apart here.
+    Missing,
+    /// The `source_ids` of the reference: the closure registered when the call was
+    /// reserved, the authoritative closure of the call.
+    Named(Vec<String>),
+    /// A reference is stored and does not decode: it is neither trusted nor guessed
+    /// at. The decoding error is kept for the caller's diagnostic.
+    Undecodable(serde_json::Error),
+}
+
+/// The source closure registered for the call `call_id` of `billing_scope` in
+/// `namespace` when it was reserved: the `source_ids` of its budget call
+/// reference, whose id is derived exactly as `ensure_budget_call_ref` derives it,
+/// from the call's own namespace, billing scope and call id. The cleanup preserves
+/// the reference as a historical accounting fact, so it is still readable after the
+/// cleanup completes.
+///
+/// This is the one reader of the reference for the legacy dispatch and settlement
+/// gates (`legacy_call_sources`) and for the revocation cleanup's budget scan and
+/// its recheck, so the gates and the cleanup judge a call by the same registered
+/// closure, and fall back to the persisted request only when there is no reference.
+pub(crate) async fn registered_call_source_ids(
     tx: &mut Transaction<'_, Sqlite>,
-    call: &BudgetCallRecord,
-) -> Result<Option<Vec<String>>> {
-    let digest = fingerprint(&(
-        "rsia.budget_call_ref.v1",
-        &call.namespace,
-        &call.billing_scope,
-        &call.call_id,
-    ))?;
+    namespace: &str,
+    billing_scope: &str,
+    call_id: &str,
+) -> Result<RegisteredCallSources> {
+    let digest = fingerprint(&("rsia.budget_call_ref.v1", namespace, billing_scope, call_id))?;
     let body: Option<String> = sqlx::query_scalar(
         "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
     )
-    .bind(&call.namespace)
+    .bind(namespace)
     .bind(format!("budget-ref-{}", &digest[..32]))
     .fetch_optional(&mut **tx)
     .await
     .map_err(internal)?;
     let Some(body) = body else {
-        return Ok(None);
+        return Ok(RegisteredCallSources::Missing);
     };
-    let reference: BudgetCallRef = serde_json::from_str(&body).map_err(internal)?;
-    Ok(Some(reference.source_ids))
+    Ok(match serde_json::from_str::<BudgetCallRef>(&body) {
+        Ok(reference) => RegisteredCallSources::Named(reference.source_ids),
+        Err(error) => RegisteredCallSources::Undecodable(error),
+    })
+}
+
+/// The source closure registered for `call` when it was reserved
+/// (`registered_call_source_ids`), or `None` when there is no reference
+/// (`legacy_call_sources` reads the request of such a call). A reference that does
+/// not decode fails the dispatch and the settlement with `Internal`, as it does in
+/// `ensure_budget_call_ref`: it is neither trusted nor guessed at.
+async fn registered_source_ids(
+    tx: &mut Transaction<'_, Sqlite>,
+    call: &BudgetCallRecord,
+) -> Result<Option<Vec<String>>> {
+    match registered_call_source_ids(tx, &call.namespace, &call.billing_scope, &call.call_id)
+        .await?
+    {
+        RegisteredCallSources::Missing => Ok(None),
+        RegisteredCallSources::Named(source_ids) => Ok(Some(source_ids)),
+        RegisteredCallSources::Undecodable(error) => Err(internal(error)),
+    }
 }
 
 /// The sources a legacy call is judged by, at its dispatch and at its model
