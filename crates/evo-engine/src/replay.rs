@@ -11,7 +11,7 @@ use evo_core::replay::{
 use evo_core::strategy::{
     ActionKindV1, BatchActionV1, BudgetViewV1, ElasticPolicyV1, ExplorationCapsV1, LegalActionV1,
     LegalActionsV1, ObservedStatus, OpportunityWait, PrefixNodeV2, PrefixViewV2, SimulationContext,
-    decide_elastic,
+    decide_elastic, legal_candidates,
 };
 use evo_core::{Context, Error, Result, fingerprint, identifier};
 use evo_storage::Store;
@@ -161,7 +161,15 @@ pub fn run_replay(
                 ..
             } => {
                 let chosen = resolve_batch(&available, &action_ids, &action_seqs, profile.w_sim)?;
-                let batch_terminal = reveal_batch(world, &mut state, &available, &chosen)?;
+                // The legal opportunities of this decision round: what the shared core
+                // filter leaves legal of the same inputs, the very set the decision ranked.
+                let opportunities: BTreeSet<u32> =
+                    legal_candidates(&state.prefix, &legal, &budget, caps)?
+                        .into_iter()
+                        .map(|action| action.action_seq)
+                        .collect();
+                let batch_terminal =
+                    reveal_batch(world, &mut state, &available, &opportunities, &chosen)?;
                 if let Some(terminal) = batch_terminal {
                     break terminal;
                 }
@@ -535,6 +543,7 @@ fn reveal_batch(
     world: &ReplayWorldV2,
     state: &mut ReplayState,
     previous_available: &[&ReplayActionSpecV1],
+    round_opportunities: &BTreeSet<u32>,
     chosen: &[&ReplayActionSpecV1],
 ) -> Result<Option<(ReplayTerminal, String)>> {
     let mut qualities = Vec::with_capacity(chosen.len());
@@ -641,6 +650,7 @@ fn reveal_batch(
     update_waits(
         &mut state.prefix,
         previous_available,
+        round_opportunities,
         chosen,
         &next_available,
     );
@@ -751,9 +761,18 @@ fn update_focus(prefix: &mut PrefixViewV2, chosen: &[&ReplayActionSpecV1]) {
     }
 }
 
+/// Moves the fairness waits on by one completed decision round (plan §7.1.1: waits
+/// move per completed round, and only a legal opportunity waits). An action waits one
+/// round more when it was a legal opportunity of the round (`round_opportunities`,
+/// what the shared core filter left legal for the decision) and the batch did not
+/// choose it. An action the filter excluded in the round (no authorized cost bound,
+/// past the depth cap, a Recover that is not eligible, a successor the prefix cannot
+/// have) is no opportunity: it neither waits nor stays among the waits. An action the
+/// batch made available has met no decision round yet and enters at zero.
 fn update_waits(
     prefix: &mut PrefixViewV2,
     previous: &[&ReplayActionSpecV1],
+    round_opportunities: &BTreeSet<u32>,
     chosen: &[&ReplayActionSpecV1],
     next: &[&ReplayActionSpecV1],
 ) {
@@ -766,9 +785,12 @@ fn update_waits(
     let chosen: BTreeSet<_> = chosen.iter().map(|item| item.record_seq).collect();
     prefix.waits = next
         .iter()
+        .filter(|item| {
+            !previous.contains(&item.record_seq) || round_opportunities.contains(&item.record_seq)
+        })
         .map(|item| OpportunityWait {
             action_seq: item.record_seq,
-            waited_rounds: if previous.contains(&item.record_seq)
+            waited_rounds: if round_opportunities.contains(&item.record_seq)
                 && !chosen.contains(&item.record_seq)
             {
                 old.get(&item.record_seq).copied().unwrap_or(0) + 1
