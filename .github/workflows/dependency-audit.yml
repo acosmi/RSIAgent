@@ -12,14 +12,34 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      RUSTUP_TOOLCHAIN: '1.98.1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Require committed lock
+        run: |
+          test -f Cargo.lock
+          test ! -L Cargo.lock
+          git cat-file -e HEAD:Cargo.lock
+          git diff --exit-code HEAD -- Cargo.lock
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Build input contract
+        id: build_inputs
+        run: python3 scripts/check_build_inputs.py
+      - name: Exact Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose
+          cargo --version
+          python3 scripts/check_build_inputs.py --check-runtime
       - name: Prepare report
         run: |
           mkdir -p audit-report
           git rev-parse HEAD > audit-report/source-commit.txt
-          rustc --version > audit-report/toolchain.txt
-          if [ -f Cargo.lock ]; then cargo fetch --locked; else cargo generate-lockfile; fi
+          rustc --version --verbose > audit-report/toolchain.txt
+          cargo fetch --locked
           cp Cargo.lock audit-report/Cargo.lock
       - name: Install pinned audit tool
         run: cargo install cargo-audit --version 0.22.2 --locked
@@ -37,8 +57,12 @@ jobs:
           rows=[{'name':x['name'],'version':x['version'],'license':x.get('license'),'source':x.get('source'),'license_file':x.get('license_file')} for x in p]
           json.dump({'packages':sorted(rows,key=lambda x:(x['name'],x['version'])),'license_counts':dict(Counter(x['license'] or 'UNDECLARED' for x in rows)),'notice':'Metadata inventory is not legal clearance. The project owner must select the project license before redistribution.'},open('audit-report/licenses.json','w'),ensure_ascii=False,indent=2)
           PY
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - name: Locked inputs remain unchanged
+        id: locked_inputs
+        if: always() && steps.build_inputs.outcome == 'success'
+        run: python3 scripts/check_build_inputs.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && steps.build_inputs.outcome == 'success' && steps.locked_inputs.outcome == 'success'
         with:
           name: dependency-audit-${{ github.sha }}
           path: audit-report/
