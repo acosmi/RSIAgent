@@ -1092,6 +1092,131 @@ def smoke_bare_data_path(binary: Path, root: Path) -> None:
         require_data_files(directory, label)
 
 
+
+def smoke_formal_single_writer(binary: Path, root: Path) -> None:
+    """Exercise both directions with actual CLI and finite formal subprocesses."""
+    import fcntl
+    import signal
+    formal = binary.with_name("formal_local_host")
+    if not formal.is_file():
+        fail("formal_local_host must be built by the workspace test before writer smoke")
+
+    def command(data: Path) -> str:
+        return json.dumps({"operation": "finalize", "database": str(data),
+            "namespace": "smoke", "actor": "grader", "ticket_id": "missing-ticket"})
+
+    def refuse(completed: subprocess.CompletedProcess[str], label: str) -> None:
+        formal_command = Path(completed.args[0]) == formal
+        correct_reason = (json.loads(completed.stderr) == {"status": "refused", "reason": "conflict"}
+            if formal_command else "already locked" in completed.stderr)
+        if completed.returncode == 0 or completed.stdout or not correct_reason:
+            fail(f"{label} did not refuse the live writer: {completed!r}")
+
+    served = root / "service-versus-formal"
+    served.mkdir()
+    port = free_port()
+    service = subprocess.Popen([str(binary), "serve", "--bind", f"127.0.0.1:{port}",
+        "--data", str(served / "service.sqlite3"), "--namespace", "smoke", "--auth-token", AGENT_TOKEN],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        wait_http(f"http://127.0.0.1:{port}")
+        staging = served / ".blob-staging" / "live-writer"
+        staging.mkdir(parents=True)
+        (staging / "payload.tmp").write_bytes(b"live payload must survive refusal")
+        before = tree_digest(served)
+        refused = subprocess.run([str(formal)], input=command(served / "other.sqlite3"),
+            capture_output=True, text=True, timeout=10)
+        refuse(refused, "formal while CLI owns the directory")
+        if tree_digest(served) != before:
+            fail("refused formal writer changed the CLI directory")
+    finally:
+        stop(service)
+
+    for crash in (False, True):
+        directory = root / ("formal-crash-release" if crash else "formal-versus-cli")
+        directory.mkdir()
+        data = directory / "formal.sqlite3"
+        blocker = sqlite3.connect(data, timeout=1)
+        process = None
+        paused = False
+        try:
+            blocker.execute("PRAGMA journal_mode=WAL")
+            blocker.execute("CREATE TABLE fixture (n INTEGER)")
+            blocker.commit()
+            # Keep Store::open awaiting migration while its OS lock is held.
+            # This fixture supplies no formal identity or evaluation eligibility.
+            blocker.execute("BEGIN IMMEDIATE")
+            process = subprocess.Popen([str(formal)], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            assert process.stdin is not None
+            process.stdin.write(command(data))
+            process.stdin.close()
+            process.stdin = None
+            deadline = time.monotonic() + 3
+            while True:
+                held = False
+                lock_path = directory / ".rsia.lock"
+                if lock_path.exists():
+                    with lock_path.open("r+b") as lock:
+                        try:
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            held = True
+                        else:
+                            fcntl.flock(lock, fcntl.LOCK_UN)
+                if held:
+                    break
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    fail("formal process did not hold its data-directory OS lock before open")
+                time.sleep(0.01)
+            if crash:
+                stop(process)
+            else:
+                # Stop only this fixture child once its OS lock is observed;
+                # its own WAL/SHM initialization must not confound refusal.
+                process.send_signal(signal.SIGSTOP)
+                paused = True
+                stopped, status = os.waitpid(process.pid, os.WUNTRACED)
+                if stopped != process.pid or not os.WIFSTOPPED(status):
+                    fail("the owned formal fixture child did not stop while retaining its lock")
+                before = tree_digest(directory)
+                for entry in ("serve", "mcp"):
+                    args = [str(binary), entry, "--data", str(directory / "./another.sqlite3"), "--namespace", "smoke"]
+                    if entry == "serve":
+                        args += ["--bind", f"127.0.0.1:{free_port()}"]
+                    refuse(subprocess.run(args, input="", capture_output=True,
+                        text=True, timeout=10), f"{entry} while formal owns the directory")
+                refuse(subprocess.run([str(formal)], input=command(directory / "another.sqlite3"),
+                    capture_output=True, text=True, timeout=10), "second formal writer")
+                after = tree_digest(directory)
+                if after != before:
+                    changed = sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
+                    fail(f"refused CLI/stdio/formal changed the first formal writer's directory: {changed}")
+                process.send_signal(signal.SIGCONT)
+                paused = False
+            blocker.rollback()
+            if not crash:
+                stdout, stderr = process.communicate(timeout=15)
+                if process.returncode == 0 or stdout or json.loads(stderr).get("status") != "refused":
+                    fail("finite formal error path did not close normally after the fixture released SQLite")
+            # Success/error exit and process death must both release the OS lock.
+            with (directory / ".rsia.lock").open("r+b") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            reopened = subprocess.run([str(formal)], input=command(data),
+                capture_output=True, text=True, timeout=15)
+            if reopened.returncode == 0 or json.loads(reopened.stderr).get("status") != "refused":
+                fail("finite formal error did not terminate after the preceding process exited")
+            if blocker.execute("SELECT COUNT(*) FROM _sqlx_migrations").fetchone()[0] == 0:
+                fail("writer did not finish opening the database after its predecessor exited")
+        finally:
+            blocker.close()
+            if process is not None and process.poll() is None:
+                if paused:
+                    process.send_signal(signal.SIGCONT)
+                stop(process)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print("usage: smoke_cli.py <rsia-binary>", file=sys.stderr)
@@ -1138,6 +1263,7 @@ def main(argv: list[str]) -> int:
             smoke_mcp(binary, root)
             smoke_mcp_duplicate(binary, root)
             smoke_bare_data_path(binary, root)
+            smoke_formal_single_writer(binary, root)
             smoke_recovery_gate(binary, root)
             smoke_restore_admission(binary, root)
     except Exception as error:

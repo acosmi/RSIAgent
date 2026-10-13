@@ -5,15 +5,16 @@ use evo_core::contract::{
     SystemSnapshot,
 };
 use evo_core::{Context, Role, hash};
+use evo_engine::data_directory_lock::DataDirectoryLock;
 use evo_engine::release_store::ReleaseStore;
 use evo_engine::service::{HostPrepareConfig, HostService};
-use evo_engine::startup_gate::{DATA_LOCK_FILE, GateDecision, StartupGate, data_directory};
+use evo_engine::startup_gate::GateDecision;
+#[cfg(test)]
+use evo_engine::startup_gate::{DATA_LOCK_FILE, data_directory};
 use evo_http::{AuthIdentity, AuthRegistry, DEFAULT_BIND, HttpState};
 use evo_storage::Store;
-use fs2::FileExt;
 use std::{
     collections::BTreeSet,
-    fs::{File, OpenOptions},
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -208,66 +209,73 @@ async fn main() -> Result<()> {
         } => {
             let (_data_lock, gate) = mount_gate(&data, trusted_revocations_db.as_deref()).await?;
             let (service, prepare_config) = bootstrap(&data, &namespace).await?;
-            gate.admit()?;
-            let mut entries = Vec::new();
-            if let Some(token) = auth_token {
-                entries.push((token, AuthIdentity::new(&namespace, &actor, Role::Agent)?));
-            }
-            if let Some(token) = host_token {
-                entries.push((
-                    token,
-                    AuthIdentity::new(&namespace, GATEWAY_HOST_ACTOR, Role::Host)?,
-                ));
-            }
-            if let Some(token) = admin_token {
-                entries.push((
-                    token,
-                    AuthIdentity::new(&namespace, "service-admin", Role::Admin)?,
-                ));
-            }
-            if let Some(token) = evaluator_token {
-                entries.push((
-                    token,
-                    AuthIdentity::new(&namespace, &evaluator_actor, Role::Evaluator)?,
-                ));
-            }
-            let auth = AuthRegistry::from_plaintext(entries)?;
-            let management = evo_engine::dispatch::ManagementDispatcher::new(
-                service.store().clone(),
-                auth.management_contexts()?,
-            )?;
-            management.recover_pending().await?;
-            // Settled model calls whose execution close a crash lost: closed when they
-            // carry their persisted response, counted and left open when they do not.
-            let budget = service
-                .store()
-                .recover_settled_open_executions(
-                    &Context::new(&namespace, "service-admin", Role::Admin)?,
-                    evo_core::now(),
+            let mounted_store = service.store().clone();
+            let serving: Result<()> = async {
+                gate.admit()?;
+                let mut entries = Vec::new();
+                if let Some(token) = auth_token {
+                    entries.push((token, AuthIdentity::new(&namespace, &actor, Role::Agent)?));
+                }
+                if let Some(token) = host_token {
+                    entries.push((
+                        token,
+                        AuthIdentity::new(&namespace, GATEWAY_HOST_ACTOR, Role::Host)?,
+                    ));
+                }
+                if let Some(token) = admin_token {
+                    entries.push((
+                        token,
+                        AuthIdentity::new(&namespace, "service-admin", Role::Admin)?,
+                    ));
+                }
+                if let Some(token) = evaluator_token {
+                    entries.push((
+                        token,
+                        AuthIdentity::new(&namespace, &evaluator_actor, Role::Evaluator)?,
+                    ));
+                }
+                let auth = AuthRegistry::from_plaintext(entries)?;
+                let management = evo_engine::dispatch::ManagementDispatcher::new(
+                    service.store().clone(),
+                    auth.management_contexts()?,
+                )?;
+                management.recover_pending().await?;
+                // Settled model calls whose execution close a crash lost: closed when they
+                // carry their persisted response, counted and left open when they do not.
+                let budget = service
+                    .store()
+                    .recover_settled_open_executions(
+                        &Context::new(&namespace, "service-admin", Role::Admin)?,
+                        evo_core::now(),
+                    )
+                    .await?;
+                eprintln!(
+                    "rsia startup budget recovery: closed={} open_without_artifact={}",
+                    budget.closed.len(),
+                    budget.open_without_artifact.len()
+                );
+                if !auth.is_configured() {
+                    eprintln!("authentication is not configured; sensitive routes will return 503");
+                }
+                let listener = tokio::net::TcpListener::bind(bind)
+                    .await
+                    .with_context(|| format!("failed to bind {bind}"))?;
+                eprintln!("rsia http listening on {}", listener.local_addr()?);
+                axum::serve(
+                    listener,
+                    evo_http::router(HttpState {
+                        service,
+                        prepare_config,
+                        auth,
+                        management,
+                    }),
                 )
                 .await?;
-            eprintln!(
-                "rsia startup budget recovery: closed={} open_without_artifact={}",
-                budget.closed.len(),
-                budget.open_without_artifact.len()
-            );
-            if !auth.is_configured() {
-                eprintln!("authentication is not configured; sensitive routes will return 503");
+                Ok(())
             }
-            let listener = tokio::net::TcpListener::bind(bind)
-                .await
-                .with_context(|| format!("failed to bind {bind}"))?;
-            eprintln!("rsia http listening on {}", listener.local_addr()?);
-            axum::serve(
-                listener,
-                evo_http::router(HttpState {
-                    service,
-                    prepare_config,
-                    auth,
-                    management,
-                }),
-            )
-            .await?;
+            .await;
+            mounted_store.close().await;
+            serving?;
         }
         Command::Mcp {
             data,
@@ -277,12 +285,19 @@ async fn main() -> Result<()> {
         } => {
             let (_data_lock, gate) = mount_gate(&data, trusted_revocations_db.as_deref()).await?;
             let (service, prepare_config) = bootstrap(&data, &namespace).await?;
-            gate.admit()?;
-            let caller = Context::new(&namespace, &actor, Role::Agent)?;
-            let server = evo_mcp::McpHost::new(service, caller, prepare_config)?;
-            evo_mcp::serve_stdio(server)
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let mounted_store = service.store().clone();
+            let serving: Result<()> = async {
+                gate.admit()?;
+                let caller = Context::new(&namespace, &actor, Role::Agent)?;
+                let server = evo_mcp::McpHost::new(service, caller, prepare_config)?;
+                evo_mcp::serve_stdio(server)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                Ok(())
+            }
+            .await;
+            mounted_store.close().await;
+            serving?;
         }
         Command::Manage {
             operation,
@@ -358,13 +373,10 @@ async fn mount_gate(
     data: &Path,
     trusted_revocations_db: Option<&Path>,
 ) -> Result<(DataDirectoryLock, GateDecision)> {
-    let gate = StartupGate::new(data, trusted_revocations_db);
-    gate.evaluate().await?;
-    let lock = DataDirectoryLock::acquire(data)?;
-    let decision = gate.evaluate().await?;
+    let mounted = evo_engine::data_directory_lock::mount_gate(data, trusted_revocations_db).await?;
     // stderr only: stdout is the MCP JSON-RPC channel.
-    eprintln!("{}", decision.startup_line());
-    Ok((lock, decision))
+    eprintln!("{}", mounted.1.startup_line());
+    Ok(mounted)
 }
 
 /// The directory the data-directory lock is taken in, before it is created and
@@ -372,90 +384,64 @@ async fn mount_gate(
 /// not a second computation of it: a bare file name (the `--data` default) is the
 /// current directory, where the gate also looks for the restore receipt. An empty
 /// parent must never reach `canonicalize`, which rejects it.
+#[cfg(test)]
 fn lock_directory(data: &Path) -> PathBuf {
     data_directory(data)
 }
 
-struct DataDirectoryLock {
-    _file: File,
-}
-
-impl DataDirectoryLock {
-    fn acquire(data: &Path) -> Result<Self> {
-        let directory = lock_directory(data);
-        std::fs::create_dir_all(&directory)
-            .with_context(|| format!("failed to create data directory {}", directory.display()))?;
-        let directory = directory
-            .canonicalize()
-            .with_context(|| format!("failed to resolve data directory {}", directory.display()))?;
-        let lock_path = directory.join(DATA_LOCK_FILE);
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .with_context(|| format!("failed to open data lock {}", lock_path.display()))?;
-        if let Err(error) = FileExt::try_lock_exclusive(&file) {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                bail!(
-                    "data directory is already locked by another RSIA process: {}",
-                    directory.display()
-                );
-            }
-            return Err(error)
-                .with_context(|| format!("failed to lock data directory {}", directory.display()));
-        }
-        Ok(Self { _file: file })
-    }
-}
-
 async fn bootstrap(data: &Path, namespace: &str) -> Result<(HostService, HostPrepareConfig)> {
     let store = Store::open(data).await?;
-    let host = Context::new(namespace, GATEWAY_HOST_ACTOR, Role::Host)?;
-    let admin = Context::new(namespace, "service-admin", Role::Admin)?;
-    let manifest = HostSurfaceManifest {
-        schema_version: "rsia.host_surface.v1".into(),
-        host: "reference-host".into(),
-        host_version: "1.0.0".into(),
-        adapter_version: "1.0.0".into(),
-        source_digest: hash(b"rsia-reference-host-surface-v1"),
-        items: vec![SurfaceItem {
-            name: "model".into(),
-            coverage: SurfaceCoverage::Supported,
-            mapped_field: Some("host.model".into()),
-            consumer: Some("reference-host".into()),
-            reason: "fixed disabled-model reference adapter".into(),
-        }],
-    };
-    ReleaseStore::register_host_surface(
-        &admin,
-        &store,
-        REFERENCE_SURFACE_ID,
-        manifest,
-        vec!["model".into()],
-    )
-    .await?;
-    let prepare_config = HostPrepareConfig {
-        profile_id: "default".into(),
-        system_snapshot: SystemSnapshot {
-            schema_version: "rsia.system_snapshot.v2".into(),
-            profile_id: "default".into(),
-            host_id: "reference-host".into(),
+    let initialized: Result<(HostService, HostPrepareConfig)> = async {
+        let host = Context::new(namespace, GATEWAY_HOST_ACTOR, Role::Host)?;
+        let admin = Context::new(namespace, "service-admin", Role::Admin)?;
+        let manifest = HostSurfaceManifest {
+            schema_version: "rsia.host_surface.v1".into(),
+            host: "reference-host".into(),
             host_version: "1.0.0".into(),
-            model_id: "disabled".into(),
-            tools: vec!["read_config".into()],
-            mandatory_context_digest: hash(b"reference-host-mandatory-context-v1"),
-        },
-        host_surface_id: REFERENCE_SURFACE_ID.into(),
-        host_capabilities: HostCapabilities {
-            available: ["fs_read".into()].into_iter().collect::<BTreeSet<_>>(),
-            granted: ["fs_read".into()].into_iter().collect::<BTreeSet<_>>(),
-        },
-        evolution_enabled: true,
-        capability_level: CapabilityLevel::ToolOnly,
-    };
-    Ok((HostService::new(store, host)?, prepare_config))
+            adapter_version: "1.0.0".into(),
+            source_digest: hash(b"rsia-reference-host-surface-v1"),
+            items: vec![SurfaceItem {
+                name: "model".into(),
+                coverage: SurfaceCoverage::Supported,
+                mapped_field: Some("host.model".into()),
+                consumer: Some("reference-host".into()),
+                reason: "fixed disabled-model reference adapter".into(),
+            }],
+        };
+        ReleaseStore::register_host_surface(
+            &admin,
+            &store,
+            REFERENCE_SURFACE_ID,
+            manifest,
+            vec!["model".into()],
+        )
+        .await?;
+        let prepare_config = HostPrepareConfig {
+            profile_id: "default".into(),
+            system_snapshot: SystemSnapshot {
+                schema_version: "rsia.system_snapshot.v2".into(),
+                profile_id: "default".into(),
+                host_id: "reference-host".into(),
+                host_version: "1.0.0".into(),
+                model_id: "disabled".into(),
+                tools: vec!["read_config".into()],
+                mandatory_context_digest: hash(b"reference-host-mandatory-context-v1"),
+            },
+            host_surface_id: REFERENCE_SURFACE_ID.into(),
+            host_capabilities: HostCapabilities {
+                available: ["fs_read".into()].into_iter().collect::<BTreeSet<_>>(),
+                granted: ["fs_read".into()].into_iter().collect::<BTreeSet<_>>(),
+            },
+            evolution_enabled: true,
+            capability_level: CapabilityLevel::ToolOnly,
+        };
+        Ok((HostService::new(store.clone(), host)?, prepare_config))
+    }
+    .await;
+    if initialized.is_err() {
+        store.close().await;
+    }
+    initialized
 }
 
 #[cfg(test)]
