@@ -80,10 +80,12 @@ class FixtureRepo:
                     continue
                 _write(root / path)
         members = ["crates/evo-core", "crates/evo-storage", "crates/evo-engine", "crates/evo-http", "crates/evo-mcp", "apps/rsia"]
-        _write(root / "Cargo.toml", "[workspace]\nmembers = [" + ",".join(json.dumps(x) for x in members) + "]\n")
+        _write(root / "Cargo.toml", "[workspace]\nmembers = [" + ",".join(json.dumps(x) for x in members) + ']\n[workspace.package]\npublish = false\nlicense-file = "LICENSE"\n')
+        _write(root / "LICENSE", (REAL_ROOT / "LICENSE").read_text())
+        _write(root / "README.md", "## License\n\n" + css.PROJECT_LICENSE_README + "\n")
         for member in members:
             name = member.rsplit("/", 1)[1]
-            _write(root / member / "Cargo.toml", f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2024"\n')
+            _write(root / member / "Cargo.toml", f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2024"\nlicense-file.workspace = true\npublish.workspace = true\n')
             _write(root / member / "src/lib.rs", "pub mod evaluator;\npub mod hosts;\n")
         self.write_manifest(self.manifest)
     def write_manifest(self, manifest: dict, rel: str = "reports/support-scope.json") -> None:
@@ -1137,6 +1139,149 @@ class PathSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp))
             self.assertFalse(css.run_check(repo.root, "../support-scope.json", None).structure_valid)
+
+
+
+class ProjectLicenseTests(unittest.TestCase):
+    def with_repo(self, check):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = FixtureRepo(Path(tmp))
+            check(fixture)
+
+    def assert_refused(self, fixture):
+        with self.assertRaises(css.CheckerError):
+            css.validate_project_license(fixture.manifest, fixture.root)
+
+    def test_healthy_metadata_only_and_full_manifest(self):
+        def check(f):
+            metadata = css.validate_project_license_metadata(f.root)
+            self.assertEqual(metadata["sha256"], css.PROJECT_LICENSE_SHA256)
+            self.assertEqual(metadata["members"], css.PROJECT_LICENSE_MEMBERS)
+            self.assertEqual(set(metadata), {"schema_version", "status", "path", "sha256", "members"})
+            css.validate_manifest(f.manifest, f.root)
+            code, result = _run_cli(["--repo-root", str(f.root), "--project-license-metadata-only"])
+            self.assertEqual((code, result), (0, metadata))
+        self.with_repo(check)
+
+    def test_missing_license_is_refused(self):
+        def check(f):
+            (f.root / "LICENSE").unlink()
+            self.assert_refused(f)
+        self.with_repo(check)
+
+    def test_changed_license_even_with_coordinated_manifest_hash_is_refused(self):
+        def check(f):
+            (f.root / "LICENSE").write_text("MIT\n")
+            f.manifest["project_license"]["sha256"] = hashlib.sha256(b"MIT\n").hexdigest()
+            self.assert_refused(f)
+        self.with_repo(check)
+
+    def test_manifest_stale_hash_and_closed_fields_are_refused(self):
+        def check(f):
+            original = copy.deepcopy(f.manifest["project_license"])
+            for altered in [None, {}, {**original, "extra":False}, {**original, "status":"MIT"},
+                            {**original, "path":"../LICENSE"}, {**original, "sha256":True},
+                            {**original, "sha256":original["sha256"].upper()}, {**original, "sha256":"0"*64}]:
+                with self.subTest(altered=altered):
+                    f.manifest["project_license"] = altered
+                    self.assert_refused(f)
+            f.manifest["project_license"] = original
+            css.validate_project_license(f.manifest, f.root)
+        self.with_repo(check)
+
+    def test_member_direct_license_and_publish_override_are_refused(self):
+        def check(f):
+            for member in css.PROJECT_LICENSE_MEMBERS:
+                p = f.root / member / "Cargo.toml"
+                healthy = p.read_text()
+                for before, after in [('license-file.workspace = true','license = "MIT"'),
+                                      ('publish.workspace = true','publish = true')]:
+                    with self.subTest(member=member, after=after):
+                        p.write_text(healthy.replace(before, after))
+                        self.assert_refused(f)
+                p.write_text(healthy)
+            css.validate_project_license(f.manifest, f.root)
+        self.with_repo(check)
+
+    def test_member_inheritance_requires_exact_bool_table(self):
+        def check(f):
+            p = f.root / "crates/evo-core/Cargo.toml"
+            healthy = p.read_text()
+            for field in ("publish", "license-file"):
+                for bad in ('1', '0', 'false', '"true"', '[true]'):
+                    with self.subTest(field=field, bad=bad):
+                        p.write_text(healthy.replace(f'{field}.workspace = true', f'{field}.workspace = {bad}'))
+                        self.assert_refused(f)
+                p.write_text(healthy.replace(f'{field}.workspace = true', f'{field} = {{workspace=true, extra=false}}'))
+                self.assert_refused(f)
+            p.write_text(healthy)
+            css.validate_project_license(f.manifest, f.root)
+        self.with_repo(check)
+
+    def test_root_requires_false_publish_and_no_parallel_license(self):
+        def check(f):
+            p = f.root / "Cargo.toml"
+            healthy = p.read_text()
+            for bad in ('0', 'true', '"false"'):
+                p.write_text(healthy.replace('publish = false', f'publish = {bad}'))
+                self.assert_refused(f)
+            p.write_text(healthy + 'license = "MIT"\n')
+            self.assert_refused(f)
+            p.write_text(healthy.replace('license-file = "LICENSE"', 'license-file = "other"'))
+            self.assert_refused(f)
+        self.with_repo(check)
+
+    def test_workspace_exact_members_and_duplicate_toml_keys(self):
+        def check(f):
+            p = f.root / "Cargo.toml"
+            healthy = p.read_text()
+            for bad in [healthy.replace('"apps/rsia"', '"apps/rsia", "apps/rsia"'),
+                        healthy.replace('"apps/rsia"', '"extra"'), healthy + 'publish = false\n']:
+                p.write_text(bad)
+                self.assert_refused(f)
+        self.with_repo(check)
+
+    def test_readme_unset_duplicate_and_extra_license_text_are_refused(self):
+        def check(f):
+            p = f.root / "README.md"
+            healthy = p.read_text()
+            for bad in ['## License\n\nunset\n', healthy + '\n## License\n\nMIT\n',
+                        healthy + '\nYou may redistribute this project.\n',
+                        healthy + '\n## Project redistribution grant\n\nThis project is released under the MIT License.\n',
+                        healthy + '\n# Project open-source release\n\nMIT\n']:
+                p.write_text(bad)
+                self.assert_refused(f)
+            p.write_text('## Third-party notices\n\nUpstream MIT notice remains applicable.\n\n' + healthy)
+            css.validate_project_license(f.manifest, f.root)
+        self.with_repo(check)
+
+    def test_license_readme_and_cargo_symlinks_are_refused(self):
+        def check(f):
+            for relative in ('LICENSE', 'README.md', 'Cargo.toml', 'crates/evo-core/Cargo.toml'):
+                path = f.root / relative
+                saved = path.read_bytes()
+                target = path.with_name(path.name + '.real')
+                path.rename(target)
+                path.symlink_to(target.name)
+                self.assert_refused(f)
+                path.unlink()
+                target.rename(path)
+                self.assertEqual(path.read_bytes(), saved)
+        self.with_repo(check)
+
+    def test_raw_duplicate_license_keys_are_not_collapsed(self):
+        for raw in ['{"project_license":{},"project_license":{}}',
+                    '{"project_license":{"status":"MIT","status":"proprietary_unreleased"}}']:
+            with self.assertRaises(css.CheckerError):
+                css.load_json_strict(raw)
+
+    def test_metadata_only_forbids_manifest_and_truth_arguments(self):
+        def check(f):
+            for extra in (['--manifest', 'reports/support-scope.json'], ['--source-of-truth', 'truth.md']):
+                with self.assertRaises(SystemExit) as caught:
+                    css.main(['--repo-root', str(f.root), '--project-license-metadata-only'] + extra)
+                self.assertEqual(caught.exception.code, 2)
+        self.with_repo(check)
 
 class RealRepositoryTests(unittest.TestCase):
     def test_real_manifest_report(self):

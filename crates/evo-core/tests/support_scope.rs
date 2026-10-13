@@ -3,6 +3,7 @@
 //! incomplete or inflated indexes. Historical evidence records keep the lineage digest they
 //! were verified against; only the top level must bind the current plan.
 
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -65,8 +66,150 @@ fn load_manifest(root: &Path) -> Value {
     let path = root.join("reports/support-scope.json");
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("support-scope.json must exist at {path:?}: {error}"));
-    serde_json::from_str(&content)
-        .unwrap_or_else(|error| panic!("support-scope.json must be valid JSON: {error}"))
+    load_json_strict(&content)
+        .unwrap_or_else(|error| panic!("support-scope.json must be valid unique-key JSON: {error}"))
+}
+
+/// Preserve the existing Value API while rejecting duplicate keys in original bytes.
+struct UniqueJson(Value);
+
+impl<'de> Deserialize<'de> for UniqueJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct UniqueVisitor;
+        impl<'de> serde::de::Visitor<'de> for UniqueVisitor {
+            type Value = UniqueJson;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("JSON with unique object keys")
+            }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Bool(value)))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Number(value.into())))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Number(value.into())))
+            }
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|number| UniqueJson(Value::Number(number)))
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::String(value.into())))
+            }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::String(value)))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Null))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(UniqueJson(value)) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(UniqueJson(Value::Array(values)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate JSON key: {key}"
+                        )));
+                    }
+                    let UniqueJson(value) = map.next_value()?;
+                    values.insert(key, value);
+                }
+                Ok(UniqueJson(Value::Object(values)))
+            }
+        }
+        deserializer.deserialize_any(UniqueVisitor)
+    }
+}
+
+fn load_json_strict(content: &str) -> Result<Value, String> {
+    serde_json::from_str::<UniqueJson>(content)
+        .map(|value| value.0)
+        .map_err(|error| format!("invalid unique-key JSON: {error}"))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectLicenseMetadata {
+    schema_version: String,
+    status: String,
+    path: String,
+    sha256: String,
+    members: Vec<String>,
+}
+
+fn validate_project_license(value: &Value, root: &Path) -> Result<(), String> {
+    const REVIEWED_SHA: &str = "683f49c7897397fbb819924185fc8cb4c2212cf5987faa7a39ab16f0aae1c86b";
+    let license = value["project_license"]
+        .as_object()
+        .ok_or("project_license must be an object")?;
+    if license.keys().cloned().collect::<BTreeSet<_>>() != split_set("path sha256 status")
+        || license["status"] != "proprietary_unreleased"
+        || license["path"] != "LICENSE"
+        || license["sha256"].as_str() != Some(REVIEWED_SHA)
+    {
+        return Err("project_license must bind the reviewed proprietary_unreleased LICENSE".into());
+    }
+    validate_repo_file(root, "LICENSE", "project LICENSE")?;
+    validate_repo_file(
+        root,
+        "scripts/check_support_scope.py",
+        "project license checker",
+    )?;
+    let body = std::fs::read(root.join("LICENSE"))
+        .map_err(|error| format!("cannot read LICENSE: {error}"))?;
+    if evo_core::hash(&body) != REVIEWED_SHA {
+        return Err("project LICENSE differs from the reviewed text".into());
+    }
+    let output = std::process::Command::new("python3.12")
+        .arg(root.join("scripts/check_support_scope.py"))
+        .arg("--repo-root")
+        .arg(root)
+        .arg("--project-license-metadata-only")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot run read-only project metadata check: {error}"))?;
+    if !output.status.success() {
+        return Err("read-only project metadata check failed".into());
+    }
+    let raw = std::str::from_utf8(&output.stdout).map_err(|_| "project metadata is not UTF-8")?;
+    // The derived strict struct rejects duplicate/unknown fields and trailing JSON.
+    let metadata: ProjectLicenseMetadata =
+        serde_json::from_str(raw).map_err(|error| format!("invalid project metadata: {error}"))?;
+    let expected: Vec<String> = [
+        "apps/rsia",
+        "crates/evo-core",
+        "crates/evo-engine",
+        "crates/evo-http",
+        "crates/evo-mcp",
+        "crates/evo-storage",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    if metadata.schema_version != "rsia.project_license_metadata.v1"
+        || metadata.status != "proprietary_unreleased"
+        || metadata.path != "LICENSE"
+        || metadata.sha256 != REVIEWED_SHA
+        || metadata.members != expected
+    {
+        return Err("project metadata does not match LICENSE and six workspace members".into());
+    }
+    Ok(())
 }
 
 fn expected_e_scenarios() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
@@ -1255,6 +1398,7 @@ fn validate_manifest(value: &Value, root: &Path) -> Result<(), String> {
             "support index top level is not bound to the current plan {PLAN_VERSION}"
         ));
     }
+    validate_project_license(value, root)?;
     validate_plan_lineage(&value["plan_lineage"])?;
     validate_field_semantics(&value["field_semantics"])?;
     if value["declaration"] != "subset_only"
@@ -1990,4 +2134,38 @@ fn new_record_fields_are_validated_through_the_manifest() {
             Value::String((*value).into());
         validate_manifest(&registered, &root).unwrap();
     }
+}
+
+#[test]
+fn project_license_rejects_unreviewed_or_malformed_manifest_binding() {
+    let root = repo_root();
+    let value = load_manifest(&root);
+    validate_project_license(&value, &root).unwrap();
+    for replacement in [
+        Value::Null,
+        serde_json::json!({"status":"MIT","path":"LICENSE","sha256":"683f49c7897397fbb819924185fc8cb4c2212cf5987faa7a39ab16f0aae1c86b"}),
+        serde_json::json!({"status":"proprietary_unreleased","path":"../LICENSE","sha256":"683f49c7897397fbb819924185fc8cb4c2212cf5987faa7a39ab16f0aae1c86b"}),
+        serde_json::json!({"status":"proprietary_unreleased","path":"LICENSE","sha256":true}),
+        serde_json::json!({"status":"proprietary_unreleased","path":"LICENSE","sha256":"683f49c7897397fbb819924185fc8cb4c2212cf5987faa7a39ab16f0aae1c86b","extra":false}),
+    ] {
+        let mut changed = value.clone();
+        changed["project_license"] = replacement;
+        assert!(validate_manifest(&changed, &root).is_err());
+    }
+}
+
+#[test]
+fn project_license_raw_json_rejects_duplicates_at_every_depth() {
+    for raw in [
+        r#"{"project_license":{},"project_license":{}}"#,
+        r#"{"project_license":{"status":"MIT","status":"proprietary_unreleased"}}"#,
+        r#"[{"sha256":"a","sha256":"b"}]"#,
+        r#"{"valid":true} {"trailing":true}"#,
+    ] {
+        assert!(load_json_strict(raw).is_err(), "accepted: {raw}");
+    }
+    assert_eq!(
+        load_json_strict(r#"{"scalars":[true,null,-1,2,0.5,"text"]}"#).unwrap(),
+        serde_json::json!({"scalars":[true,null,-1,2,0.5,"text"]})
+    );
 }
