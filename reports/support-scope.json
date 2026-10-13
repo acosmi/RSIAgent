@@ -367,6 +367,34 @@
           "scope": "E02/E08/E16.1 software binding and associated compatibility only; explicit Admin EmptyRoot fixtures have no ordinary-P principal/provider/effect credit.",
           "source_sha": "49806d7faf703aab7e7e467c4bd5518969a24e55",
           "test_entry": "crates/evo-engine/tests/compiler_input_binding_v42.rs"
+        },
+        {
+          "id": "E02.ag126_v43_host_surface_duplicates",
+          "description": "Frozen host_surface v1 rejects same-name unequal items and preserves identical clones and golden bytes",
+          "plan_version": "v4.3",
+          "plan_sha256": "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7",
+          "source_sha": "d04a71c2a70b2266d33cb9a444bbdd3339121f55",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/167",
+          "merged_sha": "1ce4c0fc00b46f72d91b7595bd7911a9f3627c67",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-core/tests/host_surface_duplicates_v43.rs",
+          "command": "cargo test --locked --offline -p evo-core --test host_surface_duplicates_v43",
+          "input_digest": "c25b421feedadbd646f70fd6778b0ce233595decd78722d24d2b80d15ad5eb0d",
+          "input_ref": "out/audit-20260930/qa/inputs/codex-input-ag-126-d04a71c2.json",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/codex-r7-ag128/excerpt-final-ag126-core-host-surface-d04a71c2.log",
+          "actual_result": "host_surface_duplicates_v43: 4 passed / 0 failed, recorded within the final fresh workspace gate at d04a71c2a70b2266d33cb9a444bbdd3339121f55: 150 test binaries / 1858 passed / 0 failed, eight exits 0, Python checker unittest 69 passed. The unique excerpt copies the original full .test target result; it is not a separate execution. State remains implemented_not_verified with technical first acceptance passed; independent second acceptance not executed.",
+          "scope": "E02; v4.3 §5.5.1 and V107.a L2273, local frozen-v1 duplicate subset only",
+          "risk": "No typed v2 surface, upgrades, supported consumer mapping, Q19 product gate, real host, whole E/V, second acceptance, effects, benefits or release",
+          "rollback": "Independent reviewed revert of PR #167; accepted parent 40c70df8e71e7d23a3f2ff373852451604b48ec4; retain original source, QA, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=\"$PWD/out/work-20260930/target-codex-ag126-final-d04a71c2\" bash out/audit-20260930/qa/codex-r7-guarded.sh \"$PWD/out/work-20260930/target-codex-ag126-final-d04a71c2\" 8192 --full -- bash \"$PWD/out/audit-20260930/qa/codex-r7-ctrl_verify.sh\" \"$PWD/out/work-20260930/ag-126\" \"$PWD/out/work-20260930/target-codex-ag126-final-d04a71c2\" \"$PWD/out/audit-20260930/qa/codex-r7-ag126/accept-final-d04a71c2.log\"",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/codex-r7-ag126/accept-final-d04a71c2.log"
+          }
         }
       ],
       "remaining": [
@@ -532,28 +560,6 @@
           "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/implementation-v4.1-20260919/controller-e04-final-input.json"
-        },
-        {
-          "id": "E04.ag054_typed_predispatch",
-          "description": "Typed pre-dispatch refusals and safe reserved-call cleanup",
-          "plan_version": "v4.2",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "rechecked_v4.3",
-          "source_sha": "f6aa729a467f10f8b15b2d7b20e9a9d1c7d80351",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/104",
-          "merged_sha": "9b08c4b2fd882abab65f48ea0af8f23b13a3b50d",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-engine/tests/broker.rs",
-          "command": "cargo test --locked --offline -p evo-engine --test broker",
-          "input_digest": "6341f8fad1ced29375cd8c3a6cb6db77c4ec4ed96be32165d73ccadbf884cd27",
-          "exit_code": 0,
-          "log_path": "out/audit-20260930/qa/ctrl-ag054-f6aa729.log.test",
-          "actual_result": "controller independent full re-run at f6aa729: fmt, clippy -D warnings, cargom test --workspace --locked --no-fail-fast via rsproxy (not --offline), build, both smokes, support-scope checker and unittest all exit 0; broker 21 passed / 0 failed; workspace 89 result lines, 1195 passed / 0 failed; checker unittest 48 passed; two controller probes pass on head and both fail on actual parent; AG054 parent probes fail after successful compilation, exercising typed identity and cleanup-error behavior",
-          "scope": "E04; sections 7.2 L819 and 7.2.1 L827/L831, E04 L1239/L1243; V008/V086/V096 subset: known pre-dispatch causes, versioned durable refusal replay, legacy API mapping and full-fence cleanup limited to Reserved; unknown cost remains charged/reserved, empty-source legacy retry retains stored sources",
-          "risk": "No generic database/commit-failure classification, no unknown-cost refund; target execution error tested through private helper, not real process fault. No real provider bills, sandbox, complete recovery, exhaustive concurrency, full E/V, effect or release",
-          "rollback": "revert PR #104 through an independent revert PR; accepted-head parent ba01a2e8489ceef6d1350f0babdac46d816071ec; retain immutable evidence, frozen plans, costs and revocation state",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-054-f6aa729.json"
         },
         {
           "actual_result": "ROOT accepted fixed source cd19f84b85712447820b893a8c72bf7d011cd0e7; actual merge tree equals accepted tree 3953fee4404251447c6bd5311adae4ed5c242ae8. The named Rust target is included in the recorded whole workspace execution; original independent boundary cases and failures retain their recorded scope. Complete result/RAW bindings are in the immutable ROOT Task receipt. This declaration does not execute the checker grammar command or treat retired compiled paths as present.",
@@ -2622,6 +2628,35 @@
           "rollback": "disable seed install and reset staging and withdraw the sub-scope through an independent revert PR while retaining install baselines, revocation and audit facts",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/verify-20260930/qa/s2-input-E16.3.json"
+        },
+        {
+          "id": "E16.3.ag127_v43_seed_classification",
+          "description": "Pure B/L/U classification fails closed for malformed content digests or missing identity and preserves valid relationships",
+          "plan_version": "v4.3",
+          "plan_sha256": "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7",
+          "source_sha": "c32affbf5d9a09c78ce754c3f4c8904ff64c09aa",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/168",
+          "merged_sha": "9faa0b529fdb600b8c0e1e6d6cc866d278889353",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/seed_classification_v43.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test seed_classification_v43",
+          "input_digest": "18fe078193d3956009aa42647f189c4dff4c5d81048b0a3ce939fb86dfec3da8",
+          "input_ref": "out/audit-20260930/qa/inputs/codex-input-ag-127-c32affbf-public-execution-r2.json",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/codex-r7-ag127/public-execution-r2-c32affbf.log",
+          "actual_result": "seed_classification_v43: 6 passed / 0 failed, actual public-safe single-target execution at c32affbf5d9a09c78ce754c3f4c8904ff64c09aa, cargo exit 0 and guard exit 0. This log is exclusive to this record. Original final fresh workspace 151 test binaries / 1864 passed / 0 failed, eight exits 0 and Python69 are credited only to out/audit-20260930/qa/inputs/codex-input-ag-127-c32affbf.json (SHA-256 7369a561900395436c8e5c225dbdd40494860171cef75e7f93d6049230e2baa9), not relabelled from this six-case run. Source and exact parent/merge tree are bound by the immutable execution supplement. State remains implemented_not_verified with technical first acceptance passed; independent second acceptance not executed.",
+          "scope": "E16.3; v4.3 §11.1.1 L1367, V063 L1955 and V115.c L2341, pure classification subset only",
+          "risk": "No production classify caller, seed catalog or I0 wiring, source digest recomputation, install/reset integration, whole E/V, second acceptance, effects, benefits or release; uncertain L/U classification interpretation remains pending second acceptance",
+          "rollback": "Independent reviewed revert of PR #168; accepted parent 1ce4c0fc00b46f72d91b7595bd7911a9f3627c67; retain original source, QA, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "execution": {
+            "runner": "other",
+            "command": "CARGO_TARGET_DIR=\"$PWD/out/work-20260930/target-codex-ag127-public-execution-r2-c32affbf\" CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 bash \"$PWD/out/audit-20260930/qa/codex-r7-guarded.sh\" \"$PWD/out/work-20260930/target-codex-ag127-public-execution-r2-c32affbf\" 8192 -- cargom test --locked --manifest-path \"$PWD/out/work-20260930/ag-127/Cargo.toml\" -p evo-engine --test seed_classification_v43 > \"$PWD/out/audit-20260930/qa/codex-r7-ag127/public-execution-r2-c32affbf.log\" 2>&1",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/codex-r7-ag127/public-execution-r2-c32affbf.log"
+          },
+          "production_consumer": "none_library_only"
         }
       ],
       "remaining": [
@@ -2678,6 +2713,34 @@
           "rollback": "revert PR #111 through an independent revert PR; accepted-head parent e7ec4904b42e8c6f0d20e425b3bdc77c3109c180; retain evidence, costs, dispatch history and revocation state",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-066-1d0d93d.json"
+        },
+        {
+          "id": "E16.4.ag126_v43_host_surface_record",
+          "description": "Local host_surface record schema read gate and live reload preserve existing role, witness and prepare guards",
+          "plan_version": "v4.3",
+          "plan_sha256": "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7",
+          "source_sha": "d04a71c2a70b2266d33cb9a444bbdd3339121f55",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/167",
+          "merged_sha": "1ce4c0fc00b46f72d91b7595bd7911a9f3627c67",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/host_surface_duplicates_v43.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test host_surface_duplicates_v43",
+          "input_digest": "c25b421feedadbd646f70fd6778b0ce233595decd78722d24d2b80d15ad5eb0d",
+          "input_ref": "out/audit-20260930/qa/inputs/codex-input-ag-126-d04a71c2.json",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/codex-r7-ag128/excerpt-final-ag126-engine-host-surface-d04a71c2.log",
+          "actual_result": "host_surface_duplicates_v43: 5 passed / 0 failed, recorded within the final fresh workspace gate at d04a71c2a70b2266d33cb9a444bbdd3339121f55: 150 test binaries / 1858 passed / 0 failed, eight exits 0, Python checker unittest 69 passed. The unique excerpt copies the original full .test target result; it is not a separate execution. State remains implemented_not_verified with technical first acceptance passed; independent second acceptance not executed.",
+          "scope": "E16.4; v4.3 §5.5.1, E16.4 L1819–1827 and V107.a L2273, local record subset only",
+          "risk": "Real Claude Code host remains blocked; no typed v2, upgrade or complete Q19 gate, whole E/V, second acceptance, effects, benefits or release; schema reading and legacy reload interpretation remains pending second acceptance",
+          "rollback": "Independent reviewed revert of PR #167; accepted parent 40c70df8e71e7d23a3f2ff373852451604b48ec4; retain original source, QA, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=\"$PWD/out/work-20260930/target-codex-ag126-final-d04a71c2\" bash out/audit-20260930/qa/codex-r7-guarded.sh \"$PWD/out/work-20260930/target-codex-ag126-final-d04a71c2\" 8192 --full -- bash \"$PWD/out/audit-20260930/qa/codex-r7-ctrl_verify.sh\" \"$PWD/out/work-20260930/ag-126\" \"$PWD/out/work-20260930/target-codex-ag126-final-d04a71c2\" \"$PWD/out/audit-20260930/qa/codex-r7-ag126/accept-final-d04a71c2.log\"",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/codex-r7-ag126/accept-final-d04a71c2.log"
+          }
         }
       ],
       "remaining": [
@@ -2837,6 +2900,34 @@
           "rollback": "revert PR #95 through an independent revert PR; accepted-head parent 4a8487413cb8fe51ee16b91a538a71816997adfb; preserve revocation, budget, cost and audit facts",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-051-4bdc884.json"
+        },
+        {
+          "id": "E16.5.ag125_v43_single_writer",
+          "description": "Local OS single-writer directory ownership, production entry gates, explicit store close and live-writer preservation",
+          "plan_version": "v4.3",
+          "plan_sha256": "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7",
+          "source_sha": "ef2076d8e1eea7c406613c42369028c9bcaece26",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/166",
+          "merged_sha": "40c70df8e71e7d23a3f2ff373852451604b48ec4",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/single_writer_v43.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test single_writer_v43",
+          "input_digest": "20cfc8660225ae78426f450b1b3b6d1d5cf571b9cef70a776195f9a9c16cc51c",
+          "input_ref": "out/audit-20260930/qa/inputs/codex-input-ag-125-ef2076d8.json",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/codex-r7-ag128/excerpt-final-ag125-single-writer-ef2076d8.log",
+          "actual_result": "single_writer_v43: 7 passed / 0 failed, recorded within the final fresh workspace gate at ef2076d8e1eea7c406613c42369028c9bcaece26: 148 test binaries / 1849 passed / 0 failed, eight exits 0, Python checker unittest 69 passed. The unique excerpt copies the original full .test target result; it is not a separate execution. State remains implemented_not_verified with technical first acceptance passed; independent second acceptance not executed.",
+          "scope": "E16.5; v4.3 §7.3.1 L1038–1046 and V110.a L2297, local single-writer subset only",
+          "risk": "No V110.b permissions or V110.c persistent clock floor; no all-platform, real host/sandbox, whole E/V, second acceptance, effects, benefits or release",
+          "rollback": "Independent reviewed revert of PR #166; accepted parent 2c35d2e0f663064de2f5ee76c46154db7a50cf63; retain original source, QA, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=\"$PWD/out/work-20260930/target-codex-ag125-final-ef2076d8\" bash out/audit-20260930/qa/codex-r7-guarded.sh \"$PWD/out/work-20260930/target-codex-ag125-final-ef2076d8\" 8192 --full -- bash \"$PWD/out/audit-20260930/qa/codex-r7-ctrl_verify.sh\" \"$PWD/out/work-20260930/ag-125\" \"$PWD/out/work-20260930/target-codex-ag125-final-ef2076d8\" \"$PWD/out/audit-20260930/qa/codex-r7-ag125/accept-final-ef2076d8.log\"",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/codex-r7-ag125/accept-final-ef2076d8.log"
+          }
         }
       ],
       "remaining": [
@@ -2849,7 +2940,7 @@
     "E16.6": {
       "title": "Release, Support Scope Manifest & Truth Ledger",
       "status": "in_progress",
-      "status_reason": "The v4.3 derived index keeps 91 historical evidence records: 89 unchanged in-scope records rechecked against v4.3 and 2 out-of-scope optional rejection records; 18 records whose accepted behavior changed are withdrawn from verified_subscopes, with their original facts retained in the local recheck ledger; this does not close E16 or the full route",
+      "status_reason": "The v4.3 derived index keeps 90 historical evidence records: 88 unchanged in-scope records rechecked against v4.3 and 2 out-of-scope optional rejection records; 19 records whose accepted behavior changed are withdrawn from verified_subscopes, with their original facts retained in the local recheck ledger; this does not close E16 or the full route; AG128-R1 corrects AG054 old-clock compensation credit without crediting an unverified new clock fix",
       "implementation_files": [
         "reports/support-scope.json",
         "crates/evo-core/tests/support_scope.rs"
@@ -5550,7 +5641,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E16.3.seed_install_reset_controller_acceptance"
+          "E16.3.seed_install_reset_controller_acceptance",
+          "E16.3.ag127_v43_seed_classification"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6596,7 +6688,10 @@
         "status": "planned",
         "verification_status": "planned",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E02.ag126_v43_host_surface_duplicates",
+          "E16.4.ag126_v43_host_surface_record"
+        ],
         "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
       },
       {
@@ -6642,7 +6737,9 @@
         "status": "planned",
         "verification_status": "planned",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E16.5.ag125_v43_single_writer"
+        ],
         "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
       },
       {
@@ -6712,7 +6809,9 @@
         "status": "planned",
         "verification_status": "planned",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E16.3.ag127_v43_seed_classification"
+        ],
         "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
       },
       {

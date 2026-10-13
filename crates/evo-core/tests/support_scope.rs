@@ -382,6 +382,9 @@ fn expected_merge_for_pr(pr: u64) -> Result<Option<&'static str>, String> {
         161 => Some("5401effdfadf048dd4537fdf1e1ca843b9482ac3"),
         162 => Some("5718bf5c0389588781b8dd2e76518da7daab6fd5"),
         163 => Some("4d1fd6cb43fbe64db81177d336b6dae3f061ca98"),
+        166 => Some("40c70df8e71e7d23a3f2ff373852451604b48ec4"),
+        167 => Some("1ce4c0fc00b46f72d91b7595bd7911a9f3627c67"),
+        168 => Some("9faa0b529fdb600b8c0e1e6d6cc866d278889353"),
         _ => return Err(format!("no reviewed merge status for PR {pr}")),
     })
 }
