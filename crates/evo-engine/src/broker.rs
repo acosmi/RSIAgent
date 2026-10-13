@@ -9,7 +9,9 @@ use crate::model::{
 };
 use async_trait::async_trait;
 use evo_core::optimization::{ModelRequest, ModelStage};
-use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, text};
+use evo_core::{
+    Context, Error, Result, Role, canonical_fingerprint, fingerprint, hash, identifier, text,
+};
 use evo_storage::Store;
 use evo_storage::budget::{
     BudgetArtifact, BudgetCallFence, BudgetCallRecord, BudgetCallRefence, BudgetCallReservation,
@@ -26,6 +28,56 @@ const PRE_DISPATCH_REASON_PREFIX: &str = "broker_pre_dispatch_v1.";
 /// The close a bound replay records for a settled call whose execution close was
 /// lost between its settlement commit and its close commit.
 const BOUND_RECOVERY_CLOSE_REASON: &str = "recovered_bound_response";
+
+const BOUND_REQUEST_ARTIFACT_SCHEMA: &str = "rsia.bound_model_request.v1";
+const REDACTED_ARTIFACT_SCHEMA: &str = "rsia.redacted.v1";
+
+/// Only the registered five-field redaction can carry a former request identity.
+/// Reading through Value would hide repeated fields in historical bodies.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RedactedRequestIdentity {
+    schema_version: String,
+    state: String,
+    reason: String,
+    original_schema: String,
+    original_digest: String,
+}
+
+fn redacted_request_identity(artifact: &BudgetArtifact) -> Option<RedactedRequestIdentity> {
+    if artifact.schema_version != REDACTED_ARTIFACT_SCHEMA
+        || hash(artifact.body.as_bytes()) != artifact.digest
+    {
+        return None;
+    }
+    let identity: RedactedRequestIdentity = serde_json::from_str(&artifact.body).ok()?;
+    if identity.schema_version != REDACTED_ARTIFACT_SCHEMA
+        || identity.state != "source_revoked"
+        || identity.reason.chars().count() > 512
+        || !matches!(
+            identity.reason.as_str(),
+            "source_revoked" | "budget_sources_unverifiable" | "e16_source_unavailable"
+        )
+        || identifier(&identity.original_schema).is_err()
+        || !is_sha256(&identity.original_digest)
+        || canonical_fingerprint(&identity).ok()? != artifact.digest
+    {
+        return None;
+    }
+    Some(identity)
+}
+
+/// A redaction retains a qualified request identity, never its original content.
+fn same_request_artifact(stored: &BudgetArtifact, current: &BudgetArtifact) -> Result<bool> {
+    if stored.schema_version == REDACTED_ARTIFACT_SCHEMA {
+        Ok(redacted_request_identity(stored).is_some_and(|identity| {
+            identity.original_schema == current.schema_version
+                && identity.original_digest == current.digest
+        }))
+    } else {
+        Ok(fingerprint(stored)? == fingerprint(current)?)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
@@ -614,9 +666,9 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
     /// connection, and the Session's authority and source checks may refuse the
     /// replay, which must not leave a settled call holding its billing root.
     /// Only the same key closes: the stored input digest must equal this
-    /// request's and, unless the revocation cleanup redacted it, so must the
-    /// stored bound request artifact, the pair the Session's idempotency check
-    /// compares; any other reuse of the call id is left to that check. The call
+    /// request's, and the stored bound artifact must match. A redaction instead
+    /// requires both original_schema and original_digest to match this request
+    /// artifact; any other reuse of the call id is left to the Session's check. The call
     /// must have been dispatched, still be open and hold a persisted response,
     /// the evidence that its execution ended; a call without one is not closed
     /// here. Like the legacy close it changes no charge, usage, receipt or
@@ -638,26 +690,20 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         else {
             return Ok(());
         };
-        // A request artifact the revocation cleanup redacted no longer holds the
-        // request, so its fingerprint cannot match; the input digest alone then
-        // names the call, as on the legacy path. The accounting close does not
-        // depend on whether the content is still there (plan §11, §7.2.1).
-        let redacted = call
-            .request_artifact
-            .as_ref()
-            .is_some_and(|stored| stored.schema_version == "rsia.redacted.v1");
         if call.actual_input_digest != request.cache_key_digest
-            || (!redacted
-                && call
-                    .request_artifact
-                    .as_ref()
-                    .map(fingerprint)
-                    .transpose()?
-                    != Some(fingerprint(artifact)?))
             || call.state == BudgetCallState::Reserved
             || call.response_artifact.is_none()
             || call.execution_closed
         {
+            return Ok(());
+        }
+        let Some(stored) = call.request_artifact.as_ref() else {
+            return Ok(());
+        };
+        // A redaction preserves the original body digest, never its content.
+        // Both halves of the request identity must match before this one close.
+        let same_request = same_request_artifact(stored, artifact)?;
+        if !same_request {
             return Ok(());
         }
         let Some(dispatch_id) = call.dispatch_id.as_deref() else {
@@ -815,11 +861,13 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
             Err(refusal) => return Ok(pre_dispatch_refusal(&request, &refusal)),
         };
         if let Some(existing) = existing {
-            if existing
-                .request_artifact
-                .as_ref()
-                .is_some_and(|a| a.schema_version == "rsia.bound_model_request.v1")
-            {
+            if existing.request_artifact.as_ref().is_some_and(|artifact| {
+                artifact.schema_version == BOUND_REQUEST_ARTIFACT_SCHEMA
+                    || (artifact.schema_version == REDACTED_ARTIFACT_SCHEMA
+                        && redacted_request_identity(artifact).is_none_or(|identity| {
+                            identity.original_schema == BOUND_REQUEST_ARTIFACT_SCHEMA
+                        }))
+            }) {
                 return Err(Error::Forbidden);
             }
             if existing.actual_input_digest != request.cache_key_digest {
@@ -984,9 +1032,9 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
                 || call
                     .request_artifact
                     .as_ref()
-                    .map(fingerprint)
+                    .map(|stored| same_request_artifact(stored, &artifact))
                     .transpose()?
-                    != Some(fingerprint(&artifact)?)
+                    != Some(true)
             {
                 return Ok(pre_dispatch_refusal(
                     &request,
