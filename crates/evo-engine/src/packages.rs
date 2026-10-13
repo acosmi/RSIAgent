@@ -255,7 +255,7 @@ fn privacy_snippet(text: &str, start: usize, max_bytes: usize) -> &str {
     &text[start..end]
 }
 
-pub fn scan_privacy(text: &str) -> RedactionReport {
+pub fn scan_privacy(text: &str) -> Result<RedactionReport> {
     let mut findings = Vec::new();
 
     // 1. Private keys
@@ -404,17 +404,17 @@ pub fn scan_privacy(text: &str) -> RedactionReport {
         RedactionStatus::Clean
     };
 
-    RedactionReport {
-        scanned_at: now(),
+    Ok(RedactionReport {
+        scanned_at: now()?,
         findings_count: findings.len(),
         status,
         disclaimer: PRIVACY_DISCLAIMER.into(),
         findings,
-    }
+    })
 }
 
 pub fn privacy_block(text: &str) -> Result<()> {
-    let report = scan_privacy(text);
+    let report = scan_privacy(text)?;
     if report.status == RedactionStatus::Blocked {
         return Err(Error::Invalid(format!(
             "privacy_gate: {}",
@@ -833,7 +833,7 @@ pub fn export_package(
         ("asset_id", req.asset_id.as_str()),
     ];
     for (field_name, field_val) in metadata_fields {
-        let report = scan_privacy(field_val);
+        let report = scan_privacy(field_val)?;
         if report.status == RedactionStatus::Blocked {
             return Err(Error::Invalid(format!(
                 "privacy_gate: sensitive content detected in metadata field '{field_name}'"
@@ -849,7 +849,7 @@ pub fn export_package(
             ("dependency.version_req", dep.version_req.as_str()),
         ];
         for (field_name, field_val) in dep_fields {
-            let report = scan_privacy(field_val);
+            let report = scan_privacy(field_val)?;
             if report.status == RedactionStatus::Blocked {
                 return Err(Error::Invalid(format!(
                     "privacy_gate: sensitive content detected in metadata field '{field_name}'"
@@ -859,7 +859,7 @@ pub fn export_package(
         }
     }
     for src in &req.referenced_source_ids {
-        let report = scan_privacy(src);
+        let report = scan_privacy(src)?;
         if report.status == RedactionStatus::Blocked {
             return Err(Error::Invalid(
                 "privacy_gate: sensitive content detected in referenced_source_id".into(),
@@ -881,7 +881,7 @@ pub fn export_package(
 
         let text_content = std::str::from_utf8(content)
             .map_err(|_| Error::Invalid(format!("non-utf8 content in file: {path}")))?;
-        let report = scan_privacy(text_content);
+        let report = scan_privacy(text_content)?;
         if report.status == RedactionStatus::Blocked {
             return Err(Error::Invalid(format!(
                 "privacy_gate: sensitive content detected in file '{path}'"
@@ -917,7 +917,7 @@ pub fn export_package(
     };
 
     let redaction_report = RedactionReport {
-        scanned_at: now(),
+        scanned_at: now()?,
         findings_count: all_findings.len(),
         status: redaction_status,
         disclaimer: PRIVACY_DISCLAIMER.into(),
@@ -1515,13 +1515,14 @@ impl PersistentPackageStore {
         } else {
             // E16.5: a new staged asset is a new derivation. Measure and refuse
             // inside this session so the count and the insert cannot race.
-            let usage: V41CapacityUsage = session.capacity_usage_v41(unix_now_secs()).await?.into();
+            let usage: V41CapacityUsage =
+                session.capacity_usage_v41(unix_now_secs()?).await?.into();
             admit_field(
                 CapacityField::StagedPackages,
                 usage.staged_packages,
                 &CapacityLimits::default(),
             )?;
-            let timestamp = now();
+            let timestamp = now()?;
             let envelope = E16Envelope {
                 schema_version: E16_STAGED_ASSET_SCHEMA.into(),
                 id: id.clone(),
@@ -1592,7 +1593,7 @@ impl PersistentPackageStore {
         } else {
             StagedAssetState::Staged
         };
-        current.updated_at = now();
+        current.updated_at = now()?;
         put_envelope(&mut session, ctx, &current).await?;
         session
             .audit(ctx, "e16.staged_asset.finalize", &current.id)
@@ -1689,7 +1690,7 @@ impl PersistentPackageStore {
             return Err(Error::Conflict("staged asset is terminal".into()));
         }
         envelope.payload.state = StagedAssetState::Aborted;
-        envelope.updated_at = now();
+        envelope.updated_at = now()?;
         put_envelope(&mut session, ctx, &envelope).await?;
         session.audit(ctx, "e16.staged_asset.abort", id).await?;
         session.commit().await?;
@@ -1842,7 +1843,7 @@ impl PersistentPackageStore {
             None => {}
         }
         current_staged.payload.candidate_ref = Some(candidate_id.into());
-        current_staged.updated_at = now();
+        current_staged.updated_at = now()?;
         put_envelope(&mut session, ctx, &current_staged).await?;
         session
             .put_edge(
@@ -1947,7 +1948,7 @@ impl PersistentPackageStore {
             return Err(Error::Conflict("staged asset watermark is stale".into()));
         }
         verify_sources(&mut session, ctx, &staged.source_refs).await?;
-        let timestamp = now();
+        let timestamp = now()?;
         let envelope = E16Envelope {
             schema_version: E16_EXPORT_ATTEMPT_SCHEMA.into(),
             id,
@@ -2095,7 +2096,7 @@ impl PersistentPackageStore {
         current.payload.state = ExportAttemptState::Completed;
         current.payload.delivery_audit_id = Some(audit_id.clone());
         current.payload.completion_receipt_digest = Some(receipt.completion_receipt_digest.clone());
-        current.updated_at = now();
+        current.updated_at = now()?;
         let audit = E16Envelope {
             schema_version: E16_DELIVERY_AUDIT_SCHEMA.into(),
             id: audit_id.clone(),
@@ -2108,8 +2109,8 @@ impl PersistentPackageStore {
                 current.payload.destination_scope.as_str(),
                 receipt.completion_receipt_digest.as_str(),
             ))?,
-            created_at: now(),
-            updated_at: now(),
+            created_at: now()?,
+            updated_at: now()?,
             source_refs: current.source_refs.clone(),
             revoke_watermark: current_watermark,
             payload: DeliveryAuditPayload {
@@ -2122,7 +2123,7 @@ impl PersistentPackageStore {
                 delivered_bytes: receipt.delivered_bytes,
                 completion_receipt_digest: receipt.completion_receipt_digest.clone(),
                 delivered_to: current.payload.destination_scope.clone(),
-                delivered_at: now(),
+                delivered_at: now()?,
                 watermark_at_delivery: current_watermark,
                 revoked: false,
                 revocation_notice_sent: false,
@@ -2145,6 +2146,7 @@ impl PersistentPackageStore {
         {
             Ok(actual) if actual == receipt => Ok((current, audit, actual)),
             Ok(_) => Err(Error::Conflict("local export receipt differs".into())),
+            Err(Error::ClockRegressed) => Err(Error::ClockRegressed),
             Err(error) => {
                 let mut session = store.session().await?;
                 let raced: E16Envelope<ExportAttemptPayload> =
@@ -2196,7 +2198,7 @@ impl PersistentPackageStore {
             return Err(Error::Conflict("completed export is immutable".into()));
         }
         attempt.payload.state = ExportAttemptState::Aborted;
-        attempt.updated_at = now();
+        attempt.updated_at = now()?;
         session.commit().await?;
         let value = serde_json::to_value(&attempt).map_err(|_| Error::Internal)?;
         store

@@ -227,8 +227,8 @@ pub fn admit_v41(u: &V41CapacityUsage) -> Result<()> {
 }
 
 /// Current unix time in seconds as the lease clock for capacity measurement.
-pub fn unix_now_secs() -> u64 {
-    u64::try_from(evo_core::now()).unwrap_or(0)
+pub fn unix_now_secs() -> Result<u64> {
+    u64::try_from(evo_core::now()?).map_err(|_| Error::ClockRegressed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

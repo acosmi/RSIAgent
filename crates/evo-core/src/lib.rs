@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 pub type Result<T> = std::result::Result<T, Error>;
+pub mod clock;
 pub mod contract;
 pub mod curriculum;
 pub mod evaluation;
@@ -33,6 +34,8 @@ pub enum Error {
     Budget,
     #[error("execution cancelled or lease lost")]
     Cancelled,
+    #[error("clock_regressed")]
+    ClockRegressed,
     #[error("internal storage or transport failure")]
     Internal,
 }
@@ -124,11 +127,8 @@ pub fn fingerprint<T: Serialize>(v: &T) -> Result<String> {
 pub fn canonical_fingerprint<T: Serialize>(v: &T) -> Result<String> {
     fingerprint(&serde_json::to_value(v).map_err(|_| Error::Internal)?)
 }
-pub fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+pub fn now() -> Result<i64> {
+    clock::unix_seconds_at(std::time::SystemTime::now())
 }
 pub trait Validate {
     fn validate(&self) -> Result<()>;

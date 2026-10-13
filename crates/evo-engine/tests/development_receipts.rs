@@ -973,10 +973,58 @@ async fn ag054_public_development_lease_refusal_releases_one_micro() {
     .await;
 }
 
-#[tokio::test]
-async fn ag054_public_development_second_clock_failure_releases_one_micro() {
+fn clock_failure_sqlite_snapshot(path: &std::path::Path) -> serde_json::Value {
+    let script = r#"import json,sqlite3,struct,sys
+from pathlib import Path
+con=sqlite3.connect(Path(sys.argv[1]).resolve().as_uri()+'?mode=ro',uri=True)
+con.text_factory=bytes
+con.execute('PRAGMA query_only=ON')
+con.execute('BEGIN')
+def quoted(name):
+    return '"'+name.replace('"','""')+'"'
+def cell(kind,value):
+    kind=kind.decode('ascii')
+    if kind in ('text','blob'):
+        data=value.hex()
+    elif kind=='integer':
+        data=str(value)
+    elif kind=='real':
+        data=struct.pack('>d',value).hex()
+    elif kind=='null':
+        data=''
+    else:
+        raise ValueError('unknown SQLite storage class')
+    return [kind,data]
+result={}
+for (raw_name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+    name=raw_name.decode('utf-8')
+    columns=[row[1].decode('utf-8') for row in con.execute('PRAGMA table_info('+quoted(name)+')')]
+    projection=','.join('typeof('+quoted(column)+'),'+quoted(column) for column in columns)
+    rows=con.execute('SELECT '+projection+' FROM '+quoted(name)).fetchall()
+    result[name]={'columns':columns,'rows':sorted([[cell(row[i],row[i+1]) for i in range(0,len(row),2)] for row in rows])}
+con.rollback()
+con.close()
+print(json.dumps(result,sort_keys=True))
+"#;
+    let output = std::process::Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg("-c")
+        .arg(script)
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+async fn assert_development_clock_refusal_preserves_reservation(negative: i64) {
     let fixture = Fixture::new().await;
     let reads = Arc::new(AtomicUsize::new(0));
+    let failure_snapshot = Arc::new(std::sync::Mutex::new(None));
+    let captured = failure_snapshot.clone();
+    let path = fixture._dir.path().join("development.sqlite3");
+    let clock_path = path.clone();
+    let clock_reads = reads.clone();
     let runner = RegisteredDevelopmentRunner::with_clock(
         fixture.store.clone(),
         fixture.executor.clone(),
@@ -984,24 +1032,64 @@ async fn ag054_public_development_second_clock_failure_releases_one_micro() {
         CONTROL_ID,
         600,
         Arc::new(move || {
-            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            if clock_reads.fetch_add(1, Ordering::SeqCst) == 0 {
                 100
             } else {
-                -1
+                *captured.lock().unwrap() = Some(clock_failure_sqlite_snapshot(&clock_path));
+                negative
             }
         }),
     )
     .unwrap();
+    let request = fixture.request();
+    let error = runner.run(request.clone()).await.unwrap_err();
+    assert!(matches!(error, Error::ClockRegressed), "{error:?}");
+    assert_eq!(error.to_string(), "clock_regressed");
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    let before = failure_snapshot.lock().unwrap().clone().unwrap();
+    assert_eq!(clock_failure_sqlite_snapshot(&path), before);
+
+    let task = &fixture.control.tasks[0];
+    let call_id =
+        execution_budget_call_id(&request.request_id, &task.task_id, DevelopmentSide::Parent)
+            .unwrap();
+    let call = fixture
+        .store
+        .budget_call(&fixture.executor, SCOPE, &call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.state, BudgetCallState::Reserved);
+    assert_eq!(call.terminal_reason, None);
+    assert_eq!(call.dispatch_id, None);
+    assert_eq!(call.actual_cost_micros, None);
+    assert_eq!(call.response_artifact, None);
+    let root = fixture
+        .store
+        .root_budget(&fixture.executor, SCOPE)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(root.reserved_micros, 1);
+    assert_eq!(root.spent_micros, 0);
+    let receipt_id =
+        execution_receipt_id(&request.request_id, &task.task_id, DevelopmentSide::Parent).unwrap();
     assert!(matches!(
-        runner.run(fixture.request()).await,
-        Err(Error::Invalid(_))
+        load_execution_receipt(&fixture.store, &fixture.executor, &receipt_id).await,
+        Err(Error::NotFound)
     ));
-    assert_development_reservation_released(
-        &fixture,
-        "development_pre_dispatch_v1.clock_failed",
-        0,
-    )
-    .await;
+    // No implicit retry or release follows a rejected clock sample.
+    fixture.store.close().await;
+}
+
+#[tokio::test]
+async fn ag129_second_clock_failure_preserves_reserved_micro_without_new_records() {
+    assert_development_clock_refusal_preserves_reservation(-1).await;
+}
+
+#[tokio::test]
+async fn ag129_minimum_second_clock_preserves_reserved_micro_without_new_records() {
+    assert_development_clock_refusal_preserves_reservation(i64::MIN).await;
 }
 
 #[tokio::test]
@@ -1618,6 +1706,10 @@ async fn ag054_public_cancelled_development_call_retries_keep_terminal_facts() {
 async fn ag054_public_receipt_clock_failure_after_begin_keeps_finalized_zero_cost_facts() {
     let fixture = Fixture::new().await;
     let reads = Arc::new(AtomicUsize::new(0));
+    let failure_snapshot = Arc::new(std::sync::Mutex::new(None));
+    let captured = failure_snapshot.clone();
+    let path = fixture._dir.path().join("development.sqlite3");
+    let clock_path = path.clone();
     let runner = RegisteredDevelopmentRunner::with_clock(
         fixture.store.clone(),
         fixture.executor.clone(),
@@ -1628,15 +1720,17 @@ async fn ag054_public_receipt_clock_failure_after_begin_keeps_finalized_zero_cos
             if reads.fetch_add(1, Ordering::SeqCst) < 2 {
                 100
             } else {
+                *captured.lock().unwrap() = Some(clock_failure_sqlite_snapshot(&clock_path));
                 -1
             }
         }),
     )
     .unwrap();
-    assert!(matches!(
-        runner.run(fixture.request()).await,
-        Err(Error::Invalid(_))
-    ));
+    let error = runner.run(fixture.request()).await.unwrap_err();
+    assert!(matches!(error, Error::ClockRegressed), "{error:?}");
+    assert_eq!(error.to_string(), "clock_regressed");
+    let before = failure_snapshot.lock().unwrap().clone().unwrap();
+    assert_eq!(clock_failure_sqlite_snapshot(&path), before);
     let call_id = execution_budget_call_id(
         &fixture.request().request_id,
         &fixture.control.tasks[0].task_id,
@@ -1669,6 +1763,16 @@ async fn ag054_public_receipt_clock_failure_after_begin_keeps_finalized_zero_cos
             .as_deref()
             .is_some_and(|reason| reason.starts_with("development_pre_dispatch_v1."))
     );
+    let receipt_id = execution_receipt_id(
+        &fixture.request().request_id,
+        &fixture.control.tasks[0].task_id,
+        DevelopmentSide::Parent,
+    )
+    .unwrap();
+    assert!(matches!(
+        load_execution_receipt(&fixture.store, &fixture.executor, &receipt_id).await,
+        Err(Error::NotFound)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1833,5 +1937,49 @@ async fn registered_runner_rechecks_the_reserved_bundle_before_dispatch_without_
             assert!(call.dispatch_id.is_some());
         }
         fixture.store.close().await;
+    }
+}
+
+#[test]
+fn ag129_snapshot_preserves_nul_text_real_bits_and_storage_classes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot.sqlite3");
+    let output = std::process::Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg("-c")
+        .arg(
+            "import math,sqlite3,sys\n\
+             con=sqlite3.connect(sys.argv[1])\n\
+             con.execute('CREATE TABLE samples(value)')\n\
+             values=['prefix\\x00a','prefix\\x00b',7,'7',1.0,math.nextafter(1.0,math.inf),None,b'',b'\\x00']\n\
+             con.executemany('INSERT INTO samples(value) VALUES(?)',[(value,) for value in values])\n\
+             con.commit()\n\
+             con.close()\n",
+        )
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let snapshot = clock_failure_sqlite_snapshot(&path);
+    let rows = snapshot["samples"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 9);
+    let unique: std::collections::BTreeSet<_> =
+        rows.iter().map(serde_json::Value::to_string).collect();
+    assert_eq!(unique.len(), 9);
+    for expected in [
+        serde_json::json!([["text", "7072656669780061"]]),
+        serde_json::json!([["text", "7072656669780062"]]),
+        serde_json::json!([["integer", "7"]]),
+        serde_json::json!([["text", "37"]]),
+        serde_json::json!([["real", "3ff0000000000000"]]),
+        serde_json::json!([["real", "3ff0000000000001"]]),
+        serde_json::json!([["null", ""]]),
+        serde_json::json!([["blob", ""]]),
+        serde_json::json!([["blob", "00"]]),
+    ] {
+        assert!(
+            rows.contains(&expected),
+            "lost logical SQLite value {expected}"
+        );
     }
 }

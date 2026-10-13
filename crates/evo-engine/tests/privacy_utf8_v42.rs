@@ -108,7 +108,7 @@ fn check_family(family: &Family) {
                 let text = format!("{prefix}{body}");
                 checked += 1;
                 // Collect every baseline panic; any collected panic fails the test.
-                let report = match catch_unwind(|| scan_privacy(&text)) {
+                let report = match catch_unwind(|| scan_privacy(&text).unwrap()) {
                     Ok(report) => report,
                     Err(_) => {
                         panicked.push(text);
@@ -186,7 +186,7 @@ fn fixed_literal_snippets_cover_each_partial_scalar_offset() {
         ("sk-a🙂béX", "sk-a🙂béX", 12),
     ];
     for (text, expected, cap) in cases {
-        let report = scan_privacy(text);
+        let report = scan_privacy(text).unwrap();
         assert_eq!(report.status, RedactionStatus::Blocked);
         if text == "C:/Users/abcdefghijkl🙂X" {
             assert_eq!(report.findings_count, 2);
@@ -398,9 +398,9 @@ fn full_ascii_report_matches_baseline_snapshot_except_clock() {
         .join(" | ");
     text.push_str(" | TODO: secret | FIXME: token | sk-second-match-must-not-replace-first");
     assert!(text.is_ascii());
-    let before = now();
-    let mut report = scan_privacy(&text);
-    let after = now();
+    let before = now().unwrap();
+    let mut report = scan_privacy(&text).unwrap();
+    let after = now().unwrap();
     assert!((before..=after).contains(&report.scanned_at));
     let mut findings = baseline
         .iter()
@@ -475,7 +475,11 @@ fn mixed_unicode_findings_keep_order_details_and_first_match() {
         ),
     ];
     expected.push(warning_finding());
-    assert_report(&scan_privacy(text), RedactionStatus::Blocked, &expected);
+    assert_report(
+        &scan_privacy(text).unwrap(),
+        RedactionStatus::Blocked,
+        &expected,
+    );
 }
 
 #[test]
@@ -486,7 +490,7 @@ fn unicode_clean_warning_and_case_sensitive_policy_are_unchanged() {
         "SK-example GHP_example",
         "中文.todo",
     ] {
-        assert_report(&scan_privacy(text), RedactionStatus::Clean, &[]);
+        assert_report(&scan_privacy(text).unwrap(), RedactionStatus::Clean, &[]);
         assert!(privacy_block(text).is_ok());
     }
     for text in [
@@ -495,13 +499,13 @@ fn unicode_clean_warning_and_case_sensitive_policy_are_unchanged() {
         "TODO: secret FIXME: token 🙂",
     ] {
         assert_report(
-            &scan_privacy(text),
+            &scan_privacy(text).unwrap(),
             RedactionStatus::Warning,
             &[warning_finding()],
         );
         assert!(privacy_block(text).is_ok());
     }
-    let report = scan_privacy("中文🙂 PASSWORD=样例");
+    let report = scan_privacy("中文🙂 PASSWORD=样例").unwrap();
     assert_report(
         &report,
         RedactionStatus::Blocked,

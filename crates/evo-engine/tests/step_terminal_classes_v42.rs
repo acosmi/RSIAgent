@@ -4398,3 +4398,229 @@ async fn bound_transport_outcome_unknown_is_preserved_and_never_automatically_re
     assert_eq!(call.actual_cost_micros, None);
     store.close().await;
 }
+
+// The trusted clock callback freezes the refusal boundary; the store's healthy
+// system clock models a later recovery, not a request-controlled time source.
+fn ag129_r6_sqlite_snapshot(path: &std::path::Path) -> serde_json::Value {
+    let script = r#"import json,sqlite3,struct,sys
+from pathlib import Path
+con=sqlite3.connect(Path(sys.argv[1]).resolve().as_uri()+'?mode=ro',uri=True)
+con.text_factory=bytes
+con.execute('PRAGMA query_only=ON')
+con.execute('BEGIN')
+def quoted(name):
+    return '"'+name.replace('"','""')+'"'
+def cell(kind,value):
+    kind=kind.decode('ascii')
+    if kind in ('text','blob'):
+        data=value.hex()
+    elif kind=='integer':
+        data=str(value)
+    elif kind=='real':
+        data=struct.pack('>d',value).hex()
+    elif kind=='null':
+        data=''
+    else:
+        raise ValueError('unknown SQLite storage class')
+    return [kind,data]
+result={}
+for (raw_name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+    name=raw_name.decode('utf-8')
+    columns=[row[1].decode('utf-8') for row in con.execute('PRAGMA table_info('+quoted(name)+')')]
+    projection=','.join('typeof('+quoted(column)+'),'+quoted(column) for column in columns)
+    rows=con.execute('SELECT '+projection+' FROM '+quoted(name)).fetchall()
+    result[name]={'columns':columns,'rows':sorted([[cell(row[i],row[i+1]) for i in range(0,len(row),2)] for row in rows])}
+con.rollback()
+con.close()
+print(json.dumps(result,sort_keys=True))
+"#;
+    let output = std::process::Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg("-c")
+        .arg(script)
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn ag129_optimization_preserves_broker_clock_refusal_over_uncertain_terminal() {
+    let fixture = Fixture::new();
+    let (_dir, path, store) = seeded_store(fixture.outcomes).await;
+    repair_root(&store).await;
+    let request = fixture.request("clock-refusal-world", 1, "clock-refusal-step");
+    trusted_compiler_inputs::install_request(&store, &request.compiler_input_request())
+        .await
+        .unwrap();
+    let journal = StoreOptimizationJournal::new(store.clone(), worker(), "worker").unwrap();
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let reads = std::sync::Arc::new(AtomicUsize::new(0));
+    let clock_reads = reads.clone();
+    let snapshot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let captured = snapshot.clone();
+    let clock_path = path.clone();
+    let broker = evo_engine::broker::PersistentModelBroker::with_clock(
+        store.clone(),
+        RepairBoundTransport {
+            calls: calls.clone(),
+            fail: true,
+        },
+        evo_engine::broker::BrokerConfig {
+            billing_scope: "binding-scope".into(),
+            actor: "host".into(),
+            currency: "USD".into(),
+            pricing_version: "price".into(),
+            max_cost_micros: 20,
+            lease_seconds: 60,
+        },
+        std::sync::Arc::new(move || {
+            if clock_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                100
+            } else {
+                *captured.lock().unwrap() = Some(ag129_r6_sqlite_snapshot(&clock_path));
+                -1
+            }
+        }),
+    )
+    .unwrap();
+    let runner = ScriptedRunner::new(RunnerScript::Scores(500_000, 600_000, true, true));
+    let result = run_optimization_step(Some(&broker), Some(&runner), Some(&journal), request).await;
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runner.calls(), 0);
+    let before = snapshot.lock().unwrap().clone().unwrap();
+    assert_eq!(ag129_r6_sqlite_snapshot(&path), before);
+    assert_eq!(result.unwrap_err().to_string(), "clock_regressed");
+    let mut session = store.session().await.unwrap();
+    let budget_calls = session
+        .budget_calls_for_group(&host(), "binding-scope", "clock-refusal-world")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(budget_calls.len(), 1);
+    let call = &budget_calls[0];
+    assert_eq!(call.state, evo_storage::budget::BudgetCallState::Dispatched);
+    assert!(call.dispatch_id.is_some());
+    assert_eq!(call.terminal_reason, None);
+    assert_eq!(call.actual_cost_micros, None);
+    assert_eq!(call.response_artifact, None);
+    assert!(!call.execution_closed);
+    let root = store
+        .root_budget(&host(), "binding-scope")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(root.reserved_micros, 20);
+    assert_eq!(root.spent_micros, 0);
+    let facts = stage_facts(&store).await;
+    assert!(fact_of(&facts, StageFactKind::StepCompleted).is_empty());
+    assert!(fact_of(&facts, StageFactKind::DispatchObserved).is_empty());
+    assert_eq!(ag129_r6_sqlite_snapshot(&path), before);
+    store.close().await;
+}
+
+async fn ag129_r7_exploration_clock_refusal(post_dispatch: bool) {
+    let env = Env::new().await;
+    let world = world_for("clock-refused-world");
+    env.register(&world).await.unwrap();
+    repair_root(&env.store).await;
+    let reads = std::sync::Arc::new(AtomicUsize::new(0));
+    let clock_reads = reads.clone();
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let snapshot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let captured = snapshot.clone();
+    let clock_path = env.path.clone();
+    let broker = evo_engine::broker::PersistentModelBroker::with_clock(
+        env.store.clone(),
+        RepairBoundTransport {
+            calls: calls.clone(),
+            fail: true,
+        },
+        evo_engine::broker::BrokerConfig {
+            billing_scope: "binding-scope".into(),
+            actor: "host".into(),
+            currency: "USD".into(),
+            pricing_version: "price".into(),
+            max_cost_micros: 20,
+            lease_seconds: 60,
+        },
+        std::sync::Arc::new(move || {
+            let index = clock_reads.fetch_add(1, Ordering::SeqCst);
+            if post_dispatch && index == 0 {
+                100
+            } else {
+                let mut slot = captured.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(ag129_r6_sqlite_snapshot(&clock_path));
+                }
+                -1
+            }
+        }),
+    )
+    .unwrap();
+    let runner = ScriptedRunner::new(RunnerScript::Scores(500_000, 600_000, true, true));
+    let result = env
+        .coordinator
+        .run_next(
+            Some(&broker),
+            Some(&runner),
+            Some(&env.journal),
+            env.fixture.request(&world.id, 1, "clock-refused-step"),
+        )
+        .await;
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        if post_dispatch { 2 } else { 1 }
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        if post_dispatch { 1 } else { 0 }
+    );
+    assert_eq!(runner.calls(), 0);
+    let before = snapshot.lock().unwrap().clone().unwrap();
+    assert_eq!(ag129_r6_sqlite_snapshot(&env.path), before);
+    assert_eq!(result.unwrap_err().to_string(), "clock_regressed");
+    let stored: ExplorationWorldV1 =
+        serde_json::from_value(payload(&env.store, "exploration_world_v1", &world.id).await)
+            .unwrap();
+    assert!(stored.node_ids.is_empty());
+    assert_eq!(stored.dispatch_ids.len(), 1);
+    assert_eq!(stored.remaining_root_micros, world.remaining_root_micros);
+    assert_eq!(stored.decision_round, world.decision_round);
+    let mut session = env.store.session().await.unwrap();
+    let budget_calls = session
+        .budget_calls_for_group(&host(), "binding-scope", &world.id)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(budget_calls.len(), if post_dispatch { 1 } else { 0 });
+    if let Some(call) = budget_calls.first() {
+        assert_eq!(call.state, evo_storage::budget::BudgetCallState::Dispatched);
+        assert!(call.dispatch_id.is_some());
+        assert_eq!(call.actual_cost_micros, None);
+        assert_eq!(call.response_artifact, None);
+        assert!(!call.execution_closed);
+    }
+    let root = env
+        .store
+        .root_budget(&host(), "binding-scope")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(root.reserved_micros, if post_dispatch { 20 } else { 0 });
+    assert_eq!(root.spent_micros, 0);
+    assert_eq!(ag129_r6_sqlite_snapshot(&env.path), before);
+    env.store.close().await;
+}
+
+#[tokio::test]
+async fn ag129_exploration_returns_initial_clock_refusal_without_new_node_or_round() {
+    ag129_r7_exploration_clock_refusal(false).await;
+}
+
+#[tokio::test]
+async fn ag129_exploration_keeps_dispatched_budget_on_clock_refusal_without_settlement() {
+    ag129_r7_exploration_clock_refusal(true).await;
+}

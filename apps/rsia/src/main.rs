@@ -246,7 +246,7 @@ async fn main() -> Result<()> {
                     .store()
                     .recover_settled_open_executions(
                         &Context::new(&namespace, "service-admin", Role::Admin)?,
-                        evo_core::now(),
+                        evo_core::now()?,
                     )
                     .await?;
                 eprintln!(

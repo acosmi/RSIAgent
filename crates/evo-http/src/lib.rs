@@ -480,6 +480,7 @@ impl From<Error> for HttpError {
             Error::Conflict(_) => Self::new(StatusCode::CONFLICT, "conflict"),
             Error::Budget => Self::new(StatusCode::TOO_MANY_REQUESTS, "budget_unavailable"),
             Error::Cancelled => Self::new(StatusCode::CONFLICT, "cancelled"),
+            Error::ClockRegressed => Self::new(StatusCode::CONFLICT, "clock_regressed"),
             Error::Internal => Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         }
     }
@@ -509,5 +510,17 @@ mod tests {
     fn body_cannot_mint_admin() {
         assert!(reject_body_identity(&json!({"actor":"root","role":"admin"})).is_err());
         assert!(reject_body_identity(&json!({"goal":"x"})).is_ok());
+    }
+    #[tokio::test]
+    async fn clock_regression_is_a_409_with_only_its_public_code() {
+        let response = HttpError::from(Error::ClockRegressed).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            json!({"error":{"code":"clock_regressed"}})
+        );
     }
 }

@@ -21,6 +21,93 @@ pub const HOST_SCHEMA: &str = "rsia.registered_formal_host.v1";
 pub const PROVIDER_SCHEMA: &str = "rsia.registered_external_provider.v1";
 pub const METER_SCHEMA: &str = "rsia.registered_resource_instrumentation.v1";
 
+#[derive(Serialize, Deserialize)]
+enum OperatorRefusalStatus {
+    #[serde(rename = "refused")]
+    Refused,
+}
+#[derive(Serialize, Deserialize)]
+enum OperatorRefusalSchema {
+    #[serde(rename = "rsia.formal_operator_refusal.v1")]
+    V1,
+}
+#[derive(Serialize, Deserialize)]
+enum OperatorRefusalCode {
+    #[serde(rename = "clock_regressed")]
+    ClockRegressed,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedOperatorRefusal {
+    schema_version: OperatorRefusalSchema,
+    code: OperatorRefusalCode,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorClockRefusal {
+    status: OperatorRefusalStatus,
+    error: TypedOperatorRefusal,
+}
+
+// Only an authenticated execute result chooses this private refusal packet.
+fn operator_response(result: &Result<Value>) -> Result<Value> {
+    match result {
+        Ok(value) => Ok(serde_json::json!({"status":"complete","value":value})),
+        Err(Error::ClockRegressed) => serde_json::to_value(OperatorClockRefusal {
+            status: OperatorRefusalStatus::Refused,
+            error: TypedOperatorRefusal {
+                schema_version: OperatorRefusalSchema::V1,
+                code: OperatorRefusalCode::ClockRegressed,
+            },
+        })
+        .map_err(|_| Error::Internal),
+        Err(_) => Ok(serde_json::json!({"status":"refused"})),
+    }
+}
+
+async fn write_operator_response<W: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut W,
+    result: &Result<Value>,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let response = operator_response(result)?;
+    let body = serde_json::to_vec(&response).map_err(|_| Error::Internal)?;
+    if body.len() > 1024 * 1024 {
+        return Err(Error::Internal);
+    }
+    stream
+        .write_u32(u32::try_from(body.len()).map_err(|_| Error::Internal)?)
+        .await
+        .map_err(|_| Error::Internal)?;
+    stream.write_all(&body).await.map_err(|_| Error::Internal)?;
+    Ok(())
+}
+
+fn operator_result_after_response(result: Result<Value>, response: Result<()>) -> Result<Value> {
+    // An already determined clock refusal must reach the authority loop even
+    // when the authenticated peer can no longer receive its response.
+    if matches!(&result, Err(Error::ClockRegressed)) {
+        return result;
+    }
+    response?;
+    result
+}
+
+/// Read only after the caller has authenticated the authority socket's peer.
+/// This private wire adds a closed clock refusal, with no request-time source.
+#[doc(hidden)]
+pub fn decode_formal_operator_response(bytes: &[u8]) -> Result<Value> {
+    let response: Value = serde_json::from_slice(bytes).map_err(|_| Error::Internal)?;
+    if response["status"] == "complete" {
+        return Ok(response);
+    }
+    // Decode the special packet from bytes: Value would have lost duplicate keys.
+    if serde_json::from_slice::<OperatorClockRefusal>(bytes).is_ok() {
+        return Err(Error::ClockRegressed);
+    }
+    Err(Error::Forbidden)
+}
+
 fn digest(value: &str) -> Result<()> {
     if value.len() != 64
         || !value
@@ -1753,7 +1840,7 @@ impl PrincipalAuthorityService {
         store: &Store,
         mut stream: tokio::net::UnixStream,
     ) -> Result<Value> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncReadExt;
         let peer = crate::executor::observe_kernel_peer(&stream)?;
         let size = tokio::time::timeout(std::time::Duration::from_secs(30), stream.read_u32())
             .await
@@ -1796,20 +1883,8 @@ impl PrincipalAuthorityService {
         let result = OPERATOR_CREDENTIAL
             .scope(cap, self.execute(store, &ctx, envelope.command))
             .await;
-        let response = match &result {
-            Ok(value) => serde_json::json!({"status":"complete","value":value}),
-            Err(_) => serde_json::json!({"status":"refused"}),
-        };
-        let body = serde_json::to_vec(&response).map_err(|_| Error::Internal)?;
-        if body.len() > 1024 * 1024 {
-            return Err(Error::Internal);
-        }
-        stream
-            .write_u32(u32::try_from(body.len()).map_err(|_| Error::Internal)?)
-            .await
-            .map_err(|_| Error::Internal)?;
-        stream.write_all(&body).await.map_err(|_| Error::Internal)?;
-        result
+        let response = write_operator_response(&mut stream, &result).await;
+        operator_result_after_response(result, response)
     }
     async fn execute(
         &self,
@@ -4827,5 +4902,151 @@ mod principal_and_meter_repair_tests {
             .is_err()
         );
         assert!(OPERATOR_CREDENTIAL.try_with(|_| ()).is_err());
+    }
+
+    #[test]
+    fn ag129_operator_clock_wire_is_closed_and_ordinary_responses_stay_exact() {
+        // This unit sample validates the boundary; it is not a real host clock failure.
+        let clock = evo_core::clock::unix_seconds_at(
+            std::time::UNIX_EPOCH - std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+        let packet = operator_response(&Err(clock)).unwrap();
+        assert_eq!(
+            packet,
+            serde_json::json!({"status":"refused","error":{
+                "schema_version":"rsia.formal_operator_refusal.v1","code":"clock_regressed"
+            }})
+        );
+        assert_eq!(
+            decode_formal_operator_response(&serde_json::to_vec(&packet).unwrap())
+                .unwrap_err()
+                .to_string(),
+            "clock_regressed"
+        );
+        let value = serde_json::json!({"old":"value","counter":7});
+        let healthy = operator_response(&Ok(value.clone())).unwrap();
+        assert_eq!(
+            healthy,
+            serde_json::json!({"status":"complete","value":value})
+        );
+        assert_eq!(
+            decode_formal_operator_response(&serde_json::to_vec(&healthy).unwrap()).unwrap(),
+            healthy
+        );
+        for error in [
+            Error::Forbidden,
+            Error::NotFound,
+            Error::Internal,
+            Error::Budget,
+            Error::Cancelled,
+            Error::Conflict("old error".into()),
+            Error::Invalid("clock_regressed is only text".into()),
+        ] {
+            let refused = operator_response(&Err(error)).unwrap();
+            assert_eq!(refused, serde_json::json!({"status":"refused"}));
+            assert!(matches!(
+                decode_formal_operator_response(&serde_json::to_vec(&refused).unwrap()),
+                Err(Error::Forbidden)
+            ));
+        }
+    }
+
+    #[test]
+    fn ag129_operator_never_maps_text_or_malformed_clock_packets_to_clock() {
+        for bytes in [
+            br#"{"status":"refused","reason":"clock_regressed"}"#.as_slice(),
+            br#"{"status":"refused","error":{"code":"clock_regressed"}}"#,
+            br#"{"status":"refused","error":{"schema_version":"other","code":"clock_regressed"}}"#,
+            br#"{"status":"refused","error":{"schema_version":"rsia.formal_operator_refusal.v1","code":"other"}}"#,
+            br#"{"status":"refused","error":{"schema_version":"rsia.formal_operator_refusal.v1","code":"clock_regressed","message":"x"}}"#,
+            br#"{"status":"refused","error":{"schema_version":"rsia.formal_operator_refusal.v1","code":"clock_regressed"},"extra":0}"#,
+            br#"{"status":"refused","status":"refused","error":{"schema_version":"rsia.formal_operator_refusal.v1","code":"clock_regressed"}}"#,
+            br#"{"status":"refused","error":{"schema_version":"rsia.formal_operator_refusal.v1","code":"clock_regressed","code":"clock_regressed"}}"#,
+        ] {
+            assert!(matches!(
+                decode_formal_operator_response(bytes),
+                Err(Error::Forbidden)
+            ));
+        }
+    }
+
+    struct BrokenPipeOperatorResponse {
+        successful_writes_before_failure: usize,
+        writes: usize,
+    }
+    impl tokio::io::AsyncWrite for BrokenPipeOperatorResponse {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            if self.writes <= self.successful_writes_before_failure {
+                std::task::Poll::Ready(Ok(bytes.len()))
+            } else {
+                std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+            }
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn ag129_r8_clock_refusal_survives_broken_pipe_response() {
+        // Injected native boundary unit: neither a real system bad clock nor a host run.
+        for successful_writes_before_failure in [0, 1] {
+            let clock = evo_core::clock::unix_seconds_at(
+                std::time::UNIX_EPOCH - std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+            let result = Err(clock);
+            let mut stream = BrokenPipeOperatorResponse {
+                successful_writes_before_failure,
+                writes: 0,
+            };
+            let response = write_operator_response(&mut stream, &result).await;
+            assert!(matches!(&response, Err(Error::Internal)));
+            assert_eq!(stream.writes, successful_writes_before_failure + 1);
+            let refused = operator_result_after_response(result, response).unwrap_err();
+            assert!(matches!(&refused, Error::ClockRegressed));
+            assert_eq!(refused.to_string(), "clock_regressed");
+        }
+    }
+
+    #[tokio::test]
+    async fn ag129_r8_ordinary_response_io_failure_is_not_swallowed() {
+        // The fixed BrokenPipe writer is a unit fixture, not a real host/provider receipt.
+        for successful_writes_before_failure in [0, 1] {
+            for result in [
+                Ok(serde_json::json!({"old":"value","counter":7})),
+                Err(Error::Forbidden),
+                Err(Error::Budget),
+                Err(Error::Cancelled),
+                Err(Error::Invalid("clock_regressed is only text".into())),
+            ] {
+                let mut stream = BrokenPipeOperatorResponse {
+                    successful_writes_before_failure,
+                    writes: 0,
+                };
+                let response = write_operator_response(&mut stream, &result).await;
+                assert!(matches!(&response, Err(Error::Internal)));
+                assert_eq!(stream.writes, successful_writes_before_failure + 1);
+                assert!(matches!(
+                    operator_result_after_response(result, response),
+                    Err(Error::Internal)
+                ));
+            }
+        }
     }
 }

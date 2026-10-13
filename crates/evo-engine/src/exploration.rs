@@ -1212,7 +1212,7 @@ impl PersistentCoordinator {
                 // inside the session, before the dispatch fact and before any
                 // model call, when the namespace already holds the MVP maximum.
                 let usage: V41CapacityUsage =
-                    session.capacity_usage_v41(unix_now_secs()).await?.into();
+                    session.capacity_usage_v41(unix_now_secs()?).await?.into();
                 admit_field(
                     CapacityField::ExplorationNodes,
                     usage.exploration_nodes,
@@ -1273,6 +1273,9 @@ impl PersistentCoordinator {
         session.commit().await?;
         let task_count = request.development_request.manifest.tasks.len();
         let outcome = run_optimization_step(model, runner, journal, request).await;
+        if matches!(&outcome, Err(Error::ClockRegressed)) {
+            return Err(Error::ClockRegressed);
+        }
         // From here the step is paid for and its dispatch is claimed. The claim never
         // stays open because of what this call finds: it ends in a terminal state of
         // the dispatch (exactly one node, the cost of its action spent), whatever the
@@ -1940,7 +1943,9 @@ fn verdict_for_gate_error(error: &Error) -> CandidateVerdict {
         Error::Forbidden | Error::Conflict(_) | Error::NotFound | Error::Invalid(_) => {
             CandidateVerdict::Rejected
         }
-        Error::Budget | Error::Cancelled | Error::Internal => CandidateVerdict::Unverified,
+        Error::ClockRegressed | Error::Budget | Error::Cancelled | Error::Internal => {
+            CandidateVerdict::Unverified
+        }
     }
 }
 

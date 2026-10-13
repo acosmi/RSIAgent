@@ -306,7 +306,7 @@ pub fn safe_reset_to_baseline(
         publisher: record.publisher.clone(),
         asset_id: record.asset_id.clone(),
         target_digest: record.baseline_digest.clone(),
-        staged_at: now(),
+        staged_at: now()?,
         requires_evaluation: true,
         is_active: false,
     })
@@ -329,7 +329,7 @@ impl StagingSession {
         identifier(publisher)?;
         identifier(asset_id)?;
         Ok(Self {
-            session_id: format!("stage_{}_{}", asset_id, now()),
+            session_id: format!("stage_{}_{}", asset_id, now()?),
             publisher: publisher.into(),
             asset_id: asset_id.into(),
             new_digest: new_digest.into(),
@@ -469,7 +469,7 @@ impl PersistentSeedStore {
                 return Self::read_install(ctx, store, &existing.id).await;
             }
         } else {
-            let timestamp = now();
+            let timestamp = now()?;
             let envelope = E16Envelope {
                 schema_version: E16_SEED_INSTALL_SCHEMA.into(),
                 id: id.clone(),
@@ -558,7 +558,7 @@ impl PersistentSeedStore {
         }
         verify_sources(&mut session, ctx, &current.source_refs).await?;
         current.payload.status = SeedStatus::Installed;
-        current.updated_at = now();
+        current.updated_at = now()?;
         put_envelope(&mut session, ctx, &current).await?;
         session
             .audit(ctx, "e16.seed_install.finalize", &current.id)
@@ -708,7 +708,7 @@ impl PersistentSeedStore {
             session.commit().await?;
             return Ok(existing);
         }
-        let timestamp = now();
+        let timestamp = now()?;
         let envelope = E16Envelope {
             schema_version: E16_STAGED_ASSET_SCHEMA.into(),
             id,
