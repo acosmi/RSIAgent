@@ -73,7 +73,7 @@ fn assert_dynamic_finding(
     expected_snippet: &str,
     label: &str,
 ) {
-    let report = observe(label, || scan_privacy(text));
+    let report = observe(label, || scan_privacy(text).unwrap());
     assert_eq!(report.status, RedactionStatus::Blocked, "{label}");
     assert_eq!(report.findings_count, report.findings.len());
     assert_eq!(report.disclaimer, PRIVACY_DISCLAIMER);
@@ -179,7 +179,7 @@ fn warning_finding() -> PrivacyFinding {
 #[test]
 fn clean_and_warning_unicode_keep_the_original_classification() {
     let clean = "é 中 🧪 café cafe\u{301}\r\n普通开发说明";
-    let report = observe("clean Unicode", || scan_privacy(clean));
+    let report = observe("clean Unicode", || scan_privacy(clean).unwrap());
     assert_eq!(report.status, RedactionStatus::Clean);
     assert_eq!(report.findings_count, 0);
     assert!(report.findings.is_empty());
@@ -187,7 +187,7 @@ fn clean_and_warning_unicode_keep_the_original_classification() {
     assert!(observe("clean Unicode gate", || privacy_block(clean)).is_ok());
 
     let warning = "é中🧪 前置 TODO: secret 后置";
-    let report = observe("warning Unicode", || scan_privacy(warning));
+    let report = observe("warning Unicode", || scan_privacy(warning).unwrap());
     assert_eq!(report.status, RedactionStatus::Warning);
     assert_eq!(report.findings_count, 1);
     assert_eq!(report.findings, vec![warning_finding()]);
@@ -197,7 +197,9 @@ fn clean_and_warning_unicode_keep_the_original_classification() {
 
 #[test]
 fn ascii_multiple_findings_keep_rule_order_details_and_exact_snippets() {
-    let report = observe("ASCII multiple findings", || scan_privacy(ASCII_MULTI));
+    let report = observe("ASCII multiple findings", || {
+        scan_privacy(ASCII_MULTI).unwrap()
+    });
     let mut expected = vec![PrivacyFinding {
         rule: "private_key".into(),
         severity: FindingSeverity::Block,
@@ -361,7 +363,7 @@ fn report_without_only_actual_time(report: RedactionReport) -> Value {
 }
 
 fn actual_scan_material(text: &str) -> Value {
-    let report = observe("actual golden scan", || scan_privacy(text));
+    let report = observe("actual golden scan", || scan_privacy(text).unwrap());
     let gate = observe("actual golden privacy gate", || privacy_block(text));
     let gate = match gate {
         Ok(()) => json!({"result": "ok"}),

@@ -3031,3 +3031,157 @@ async fn an_unknown_monitoring_schema_still_fails_the_cleanup_job_closed() {
             .unwrap();
     assert_eq!(again.state, CleanupState::Failed);
 }
+
+// The trusted clock callback freezes the refusal boundary; the store's healthy
+// system clock models a later recovery, not a request-controlled time source.
+fn ag129_r6_sqlite_snapshot(path: &std::path::Path) -> serde_json::Value {
+    let script = r#"import json,sqlite3,struct,sys
+from pathlib import Path
+con=sqlite3.connect(Path(sys.argv[1]).resolve().as_uri()+'?mode=ro',uri=True)
+con.text_factory=bytes
+con.execute('PRAGMA query_only=ON')
+con.execute('BEGIN')
+def quoted(name):
+    return '"'+name.replace('"','""')+'"'
+def cell(kind,value):
+    kind=kind.decode('ascii')
+    if kind in ('text','blob'):
+        data=value.hex()
+    elif kind=='integer':
+        data=str(value)
+    elif kind=='real':
+        data=struct.pack('>d',value).hex()
+    elif kind=='null':
+        data=''
+    else:
+        raise ValueError('unknown SQLite storage class')
+    return [kind,data]
+result={}
+for (raw_name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+    name=raw_name.decode('utf-8')
+    columns=[row[1].decode('utf-8') for row in con.execute('PRAGMA table_info('+quoted(name)+')')]
+    projection=','.join('typeof('+quoted(column)+'),'+quoted(column) for column in columns)
+    rows=con.execute('SELECT '+projection+' FROM '+quoted(name)).fetchall()
+    result[name]={'columns':columns,'rows':sorted([[cell(row[i],row[i+1]) for i in range(0,len(row),2)] for row in rows])}
+con.rollback()
+con.close()
+print(json.dumps(result,sort_keys=True))
+"#;
+    let output = std::process::Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg("-c")
+        .arg(script)
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+struct Ag129ClockFailureTransport {
+    calls: std::sync::Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl evo_engine::broker::ModelTransport for Ag129ClockFailureTransport {
+    fn provenance(&self) -> Option<ModelExecutionProvenance> {
+        Some(ModelExecutionProvenance::Fixture)
+    }
+
+    async fn execute(
+        &self,
+        _request: &ModelRequest,
+        _dispatch_id: &str,
+    ) -> evo_core::Result<evo_engine::broker::TransportCompletion> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Internal)
+    }
+}
+
+#[tokio::test]
+async fn ag129_consolidation_propagates_broker_clock_refusal_without_claim_terminal() {
+    let fixture = Fixture::new().await;
+    let claim = fixture.claimed().await;
+    let material = StepMaterial::new(&fixture).await;
+    let journal = fixture.journal();
+    let runner = LedgerDevRunner::new(&fixture, true);
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let reads = std::sync::Arc::new(AtomicUsize::new(0));
+    let clock_reads = reads.clone();
+    let snapshot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let captured = snapshot.clone();
+    let clock_path = fixture.database.clone();
+    let broker = evo_engine::broker::PersistentModelBroker::with_clock(
+        fixture.store.clone(),
+        Ag129ClockFailureTransport {
+            calls: calls.clone(),
+        },
+        evo_engine::broker::BrokerConfig {
+            billing_scope: SCOPE.into(),
+            actor: "worker".into(),
+            currency: "USD".into(),
+            pricing_version: "pricing-v1".into(),
+            max_cost_micros: 20,
+            lease_seconds: 60,
+        },
+        std::sync::Arc::new(move || {
+            if clock_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                100
+            } else {
+                *captured.lock().unwrap() = Some(ag129_r6_sqlite_snapshot(&clock_path));
+                -1
+            }
+        }),
+    )
+    .unwrap();
+    let result = MonitoringCoordinator::run_consolidation(
+        &fixture.worker,
+        &fixture.store,
+        &claim.id,
+        Some(&broker),
+        Some(&runner),
+        Some(&journal),
+        material.request(&fixture, &claim.id, 1, true),
+    )
+    .await;
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let before = snapshot.lock().unwrap().clone().unwrap();
+    assert_eq!(ag129_r6_sqlite_snapshot(&fixture.database), before);
+    assert_eq!(result.unwrap_err().to_string(), "clock_regressed");
+    let mut session = fixture.store.session().await.unwrap();
+    let current: ConsolidationClaim = session
+        .need(&fixture.worker, "artifact", &claim.id)
+        .await
+        .unwrap();
+    let artifacts: Vec<Value> = session.list(&fixture.worker, "artifact").await.unwrap();
+    let budget_calls = session
+        .budget_calls_for_group(&fixture.worker, SCOPE, &claim.id)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(current.state, ConsolidationClaimState::Running);
+    assert!(current.execution_input_digest.is_some());
+    assert!(!artifacts.iter().any(|record| {
+        record["schema_version"] == "rsia.monitoring.consolidation_run.v1"
+            && record["claim_id"] == claim.id
+    }));
+    assert_eq!(budget_calls.len(), 1);
+    let call = &budget_calls[0];
+    assert_eq!(call.state, evo_storage::budget::BudgetCallState::Dispatched);
+    assert!(call.dispatch_id.is_some());
+    assert_eq!(call.terminal_reason, None);
+    assert_eq!(call.actual_cost_micros, None);
+    assert_eq!(call.response_artifact, None);
+    assert!(!call.execution_closed);
+    let root = fixture
+        .store
+        .root_budget(&fixture.worker, SCOPE)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(root.reserved_micros, 20);
+    assert_eq!(root.spent_micros, 0);
+    assert_eq!(ag129_r6_sqlite_snapshot(&fixture.database), before);
+    fixture.store.close().await;
+}

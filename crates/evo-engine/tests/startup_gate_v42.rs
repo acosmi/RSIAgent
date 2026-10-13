@@ -442,7 +442,7 @@ async fn a_verified_restore_is_admitted_once_and_then_needs_no_anchor() {
         pending.verified_facts_digest
     );
     let admitted_at = admission["admitted_at"].as_i64().unwrap();
-    assert!((evo_core::now() - admitted_at).abs() < 300);
+    assert!((evo_core::now().unwrap() - admitted_at).abs() < 300);
     no_admission_temp_files(&fixture.restored);
 
     // Second start: the admission record is enough, and the anchor is not needed.

@@ -745,6 +745,7 @@ fn error_class(error: &Error) -> &'static str {
         Error::Conflict(_) => "conflict",
         Error::Budget => "budget",
         Error::Cancelled => "cancelled",
+        Error::ClockRegressed => "clock_regressed",
         Error::Internal => "internal",
     }
 }
@@ -1226,6 +1227,7 @@ async fn run_attempts(
         let cache_hit = attempt_already_executed(store, ctx, &development.request_id).await?;
         let report = match runner.run(development.clone()).await {
             Ok(report) => report,
+            Err(Error::ClockRegressed) => return Err(Error::ClockRegressed),
             Err(error) => return Ok((attempts, Some(runner_stop_reason(number, &error)))),
         };
         match record_attempt(ctx, store, &control.id, &development, &report, cache_hit).await {
@@ -1236,6 +1238,7 @@ async fn run_attempts(
                     return Ok((attempts, stop));
                 }
             }
+            Err(Error::ClockRegressed) => return Err(Error::ClockRegressed),
             Err(error) => {
                 let reason = format!("attempt_unverified:{number}:{}", error_class(&error));
                 return Ok((attempts, Some(reason)));

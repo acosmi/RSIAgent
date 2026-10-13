@@ -662,7 +662,7 @@ impl MetaTrialCoordinator {
         request: MetaTrialForkRequest,
     ) -> Result<MetaTrialV1> {
         ctx.require(&[Role::Admin, Role::Worker])?;
-        let plan = request.plan(evo_core::now())?;
+        let plan = request.plan(evo_core::now()?)?;
         store
             .root_budget(ctx, &plan.trial.billing_scope)
             .await?

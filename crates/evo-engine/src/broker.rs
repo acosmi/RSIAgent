@@ -167,7 +167,7 @@ pub struct PersistentModelBroker<T> {
     store: Store,
     transport: T,
     config: BrokerConfig,
-    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    clock: Arc<dyn Fn() -> Result<i64> + Send + Sync>,
 }
 
 impl PersistentModelBroker<DisabledModelTransport> {
@@ -198,7 +198,7 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
             store,
             transport,
             config,
-            clock,
+            clock: Arc::new(move || Ok(clock())),
         })
     }
 
@@ -546,9 +546,9 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
     }
 
     fn now(&self) -> Result<i64> {
-        let now = (self.clock)();
+        let now = (self.clock)()?;
         if now < 0 {
-            return Err(Error::Invalid("broker clock returned negative time".into()));
+            return Err(Error::ClockRegressed);
         }
         Ok(now)
     }

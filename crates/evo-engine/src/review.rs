@@ -369,7 +369,7 @@ fn material_error(_: Error) -> ReadFailure {
 }
 fn storage_error(error: Error) -> ReadFailure {
     match error {
-        Error::Internal => ReadFailure::Internal,
+        Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
         _ => ReadFailure::Gap(ReviewGap::ReferenceUnavailable),
     }
 }
@@ -841,7 +841,7 @@ async fn read_candidate(
         .await
         .map_err(|error| match error {
             Error::NotFound | Error::Forbidden => ReadFailure::Unavailable,
-            Error::Internal => ReadFailure::Internal,
+            Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
             Error::Conflict(_) => ReadFailure::Gap(ReviewGap::SourceChanged),
             _ => ReadFailure::Gap(ReviewGap::MaterialInvalid),
         })?;
@@ -1002,7 +1002,7 @@ async fn read_formal(
     let view = verified_report_view_in_session(ctx, session, id)
         .await
         .map_err(|e| match e {
-            Error::Internal => ReadFailure::Internal,
+            Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
             Error::NotFound | Error::Forbidden => ReadFailure::Gap(ReviewGap::ReferenceUnavailable),
             _ => ReadFailure::Gap(ReviewGap::MaterialInvalid),
         })?;
@@ -1468,7 +1468,7 @@ async fn read_stage(
                     load_stored_source(session, ctx, &dependency.id)
                         .await
                         .map_err(|e| match e {
-                            Error::Internal => ReadFailure::Internal,
+                            Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
                             _ => ReadFailure::Gap(ReviewGap::SourceChanged),
                         })?;
                 }
@@ -1501,7 +1501,7 @@ async fn read_stage(
                     validate_stored_sources(session, ctx, &ids, expected)
                         .await
                         .map_err(|e| match e {
-                            Error::Internal => ReadFailure::Internal,
+                            Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
                             _ => ReadFailure::Gap(ReviewGap::SourceChanged),
                         })?;
                 }
@@ -1652,7 +1652,7 @@ async fn read_stage(
                     )
                     .await
                     .map_err(|e| match e {
-                        Error::Internal => ReadFailure::Internal,
+                        Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
                         _ => ReadFailure::Gap(ReviewGap::ReferenceUnavailable),
                     })?;
                     if verified.episode_id != root.episode_id
@@ -1850,7 +1850,7 @@ async fn read_prepared(
             let actual = resolve_compiler_inputs(session, ctx, request)
                 .await
                 .map_err(|error| match error {
-                    Error::Internal => ReadFailure::Internal,
+                    Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
                     _ => ReadFailure::Gap(ReviewGap::SourceChanged),
                 })?;
             if fingerprint(actual.binding()).map_err(material_error)?
@@ -1913,7 +1913,7 @@ async fn read_prepared(
     )
     .await
     .map_err(|e| match e {
-        Error::Internal => ReadFailure::Internal,
+        Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
         _ => ReadFailure::Gap(ReviewGap::SourceChanged),
     })?;
     for source_id in &material.selection.run_ids {

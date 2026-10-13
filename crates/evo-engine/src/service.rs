@@ -195,7 +195,7 @@ impl HostService {
     /// clean up.
     async fn admit_new_run(&self, session: &mut Session) -> Result<()> {
         let others_in_flight = self.inflight_prepare().saturating_sub(1);
-        let usage: V41CapacityUsage = session.capacity_usage_v41(unix_now_secs()).await?.into();
+        let usage: V41CapacityUsage = session.capacity_usage_v41(unix_now_secs()?).await?.into();
         let usage = usage.with_inflight_prepare(others_in_flight);
         let limits = CapacityLimits::default();
         for field in CapacityField::MVP_DERIVE {
@@ -307,7 +307,7 @@ impl HostService {
             capabilities: request.capabilities.clone(),
             status: "prepared".into(),
             source: "trusted_host_snapshot".into(),
-            created_at: now(),
+            created_at: now()?,
         };
         let skills = self.projection_skills(&snapshot).await?;
         let mut limitations = vec!["model_transport_disabled".into()];
@@ -536,7 +536,7 @@ impl HostService {
             improver_version: "unavailable".into(),
             evaluation_id: None,
             approved_by: None,
-            created_at: now(),
+            created_at: now()?,
         };
         session
             .put(caller, "candidate", &id, caller.actor(), &candidate)

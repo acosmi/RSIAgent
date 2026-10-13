@@ -2578,6 +2578,7 @@ impl Session {
     }
 
     pub async fn audit(&mut self, ctx: &Context, operation: &str, entity: &str) -> Result<()> {
+        let timestamp = now()?;
         let prev: Option<String> = sqlx::query_scalar(
             "SELECT digest FROM audit WHERE namespace=? ORDER BY seq DESC LIMIT 1",
         )
@@ -2586,7 +2587,7 @@ impl Session {
         .await
         .map_err(internal)?;
         let prev = prev.unwrap_or_default();
-        let payload=json!({"actor":ctx.actor(),"role":ctx.role(),"operation":operation,"entity":entity,"timestamp":now()}).to_string();
+        let payload=json!({"actor":ctx.actor(),"role":ctx.role(),"operation":operation,"entity":entity,"timestamp":timestamp}).to_string();
         let digest = hash(format!("{prev}\n{payload}").as_bytes());
         sqlx::query("INSERT INTO audit(namespace,payload,previous_hash,digest) VALUES(?,?,?,?)")
             .bind(ctx.namespace())

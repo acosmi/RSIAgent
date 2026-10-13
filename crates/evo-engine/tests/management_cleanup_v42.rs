@@ -2295,7 +2295,7 @@ fn holding_job() -> ManagementJob {
         error_code: None,
         cancel_requested: false,
         lease_token: Some("live-lease".into()),
-        lease_until: evo_core::now().saturating_add(60),
+        lease_until: evo_core::now().unwrap().saturating_add(60),
         generation: 1,
         diagnostics: vec![],
         created_at: 1,

@@ -2848,3 +2848,125 @@ async fn set_and_registration_storage_ids_and_attempt_requests_are_stable() {
     assert_eq!(registration.plan_digest, fingerprint(&plan).unwrap());
     registration.binds_plan(&plan).unwrap();
 }
+
+// The trusted clock callback freezes the refusal boundary; the store's healthy
+// system clock models a later recovery, not a request-controlled time source.
+fn ag129_r6_sqlite_snapshot(path: &std::path::Path) -> serde_json::Value {
+    let script = r#"import json,sqlite3,struct,sys
+from pathlib import Path
+con=sqlite3.connect(Path(sys.argv[1]).resolve().as_uri()+'?mode=ro',uri=True)
+con.text_factory=bytes
+con.execute('PRAGMA query_only=ON')
+con.execute('BEGIN')
+def quoted(name):
+    return '"'+name.replace('"','""')+'"'
+def cell(kind,value):
+    kind=kind.decode('ascii')
+    if kind in ('text','blob'):
+        data=value.hex()
+    elif kind=='integer':
+        data=str(value)
+    elif kind=='real':
+        data=struct.pack('>d',value).hex()
+    elif kind=='null':
+        data=''
+    else:
+        raise ValueError('unknown SQLite storage class')
+    return [kind,data]
+result={}
+for (raw_name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+    name=raw_name.decode('utf-8')
+    columns=[row[1].decode('utf-8') for row in con.execute('PRAGMA table_info('+quoted(name)+')')]
+    projection=','.join('typeof('+quoted(column)+'),'+quoted(column) for column in columns)
+    rows=con.execute('SELECT '+projection+' FROM '+quoted(name)).fetchall()
+    result[name]={'columns':columns,'rows':sorted([[cell(row[i],row[i+1]) for i in range(0,len(row),2)] for row in rows])}
+con.rollback()
+con.close()
+print(json.dumps(result,sort_keys=True))
+"#;
+    let output = std::process::Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg("-c")
+        .arg(script)
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn ag129_practice_propagates_registered_clock_refusal_without_terminal_writes() {
+    let fixture = Fixture::new().await;
+    let request = practice_request("set-clock-refused", plan_k1());
+    let development = practice_attempt_request(&fixture.control, &request, 1).unwrap();
+    let path = fixture._dir.path().join("practice.sqlite3");
+    let clock_path = path.clone();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let clock_reads = reads.clone();
+    let snapshot = Arc::new(Mutex::new(None));
+    let captured = snapshot.clone();
+    let runner = RegisteredDevelopmentRunner::with_clock(
+        fixture.store.clone(),
+        fixture.executor.clone(),
+        fixture.grader.clone(),
+        CONTROL_ID,
+        600,
+        Arc::new(move || {
+            if clock_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                100
+            } else {
+                *captured.lock().unwrap() = Some(ag129_r6_sqlite_snapshot(&clock_path));
+                -1
+            }
+        }),
+    )
+    .unwrap();
+    let result = run_practice_set(&fixture.admin, &fixture.store, &runner, request.clone()).await;
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    let before = snapshot.lock().unwrap().clone().unwrap();
+    assert_eq!(ag129_r6_sqlite_snapshot(&path), before);
+    assert_eq!(result.unwrap_err().to_string(), "clock_regressed");
+    let task = &fixture.control.tasks[0];
+    let call_id = execution_budget_call_id(
+        &development.request_id,
+        &task.task_id,
+        DevelopmentSide::Parent,
+    )
+    .unwrap();
+    let call = fixture
+        .store
+        .budget_call(&fixture.executor, SCOPE, &call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.state, evo_storage::budget::BudgetCallState::Reserved);
+    assert_eq!(call.terminal_reason, None);
+    assert_eq!(call.dispatch_id, None);
+    assert_eq!(call.actual_cost_micros, None);
+    assert_eq!(call.response_artifact, None);
+    let root = fixture
+        .store
+        .root_budget(&fixture.executor, SCOPE)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(root.reserved_micros, 1);
+    assert_eq!(root.spent_micros, 0);
+    let receipt_id = evo_engine::development::execution_receipt_id(
+        &development.request_id,
+        &task.task_id,
+        DevelopmentSide::Parent,
+    )
+    .unwrap();
+    assert!(matches!(
+        load_execution_receipt(&fixture.store, &fixture.executor, &receipt_id).await,
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        load_practice_attempt_set(&fixture.store, &fixture.admin, &request.set_id).await,
+        Err(Error::NotFound)
+    ));
+    assert_eq!(ag129_r6_sqlite_snapshot(&path), before);
+    fixture.store.close().await;
+}

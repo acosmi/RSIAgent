@@ -102,6 +102,7 @@ async fn main() -> std::process::ExitCode {
                 Error::Invalid(_) => "invalid",
                 Error::Conflict(_) => "conflict",
                 Error::Cancelled => "cancelled",
+                Error::ClockRegressed => "clock_regressed",
                 Error::Internal => "internal",
             };
             eprintln!("{{\"status\":\"refused\",\"reason\":\"{code}\"}}");
@@ -303,7 +304,7 @@ async fn execute(ctx: &Context, store: &Store, command: Command) -> Result<serde
                 ctx,
                 store,
                 &ticket_id,
-                evo_core::now(),
+                evo_core::now()?,
             )
             .await?,
         )
@@ -352,6 +353,7 @@ async fn authority(
                     .map_err(|_| Error::Cancelled)?.map_err(|_| Error::Internal)?;
                 match service.serve_connection(&store, stream).await {
                     Ok(_) => completed += 1,
+                    Err(Error::ClockRegressed) => return Err(Error::ClockRegressed),
                     Err(_) => refused += 1,
                 }
             }
@@ -360,7 +362,14 @@ async fn authority(
         }.await;
         drop(listener);
         // Only this invocation's successfully bound socket is removed.
-        std::fs::remove_file(path).map_err(|_| Error::Internal)?;
+        let cleanup = std::fs::remove_file(path).map_err(|_| Error::Internal);
+        if matches!(&serving, Err(Error::ClockRegressed)) {
+            if cleanup.is_err() {
+                tracing::warn!("authority socket cleanup failed after clock refusal");
+            }
+            return Err(Error::ClockRegressed);
+        }
+        cleanup?;
         serving
     }.await;
     store.close().await;
@@ -412,10 +421,5 @@ async fn operator(
         .read_exact(&mut response)
         .await
         .map_err(|_| Error::Internal)?;
-    let response: serde_json::Value =
-        serde_json::from_slice(&response).map_err(|_| Error::Internal)?;
-    if response["status"] != "complete" {
-        return Err(Error::Forbidden);
-    }
-    Ok(response)
+    evo_engine::formal_authority::decode_formal_operator_response(&response)
 }

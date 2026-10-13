@@ -551,16 +551,15 @@ fn write_admission(dir: &Path, pending: &PendingAdmission) -> Result<(), Startup
         anchor_path_local_only: pending.anchor_path_local_only.clone(),
         verified_facts_digest: pending.verified_facts_digest.clone(),
         namespaces: pending.namespaces.clone(),
-        admitted_at: evo_core::now(),
+        admitted_at: evo_core::now().map_err(|error| failed("clock_regressed", &error))?,
         scope: RECEIPT_SCOPE.into(),
     };
     let mut bytes = serde_json::to_vec(&record)
         .map_err(|error| failed("cannot serialize the admission record", &error))?;
     bytes.push(b'\n');
 
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
+    let unique = evo_core::clock::unix_nanos_at(std::time::SystemTime::now())
+        .map_err(|error| failed("clock_regressed", &error))?;
     let temp = dir.join(format!(
         ".{RESTORE_ADMISSION_FILE}.tmp-{}-{unique}",
         std::process::id()

@@ -1012,6 +1012,7 @@ pub(crate) async fn backup_consistent(store: &Store, destination: &Path) -> Resu
     if destination.exists() {
         return Err(Error::Conflict("backup destination already exists".into()));
     }
+    evo_core::now()?;
     let parent = destination.parent().unwrap_or(Path::new("."));
     tokio::fs::create_dir_all(parent).await.map_err(internal)?;
     let name = destination
@@ -1089,7 +1090,7 @@ async fn backup_into_temp(store: &Store, temp: &Path) -> Result<()> {
         blobs,
         migrations,
         watermarks,
-        created_at: evo_core::now(),
+        created_at: evo_core::now()?,
     };
     let manifest_path = temp.join("backup-manifest.json");
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(internal)?;

@@ -1825,7 +1825,7 @@ fn live_running_job() -> ManagementJob {
         error_code: None,
         cancel_requested: false,
         lease_token: Some("live-lease".into()),
-        lease_until: now().saturating_add(60),
+        lease_until: now().unwrap().saturating_add(60),
         generation: 1,
         diagnostics: vec![],
         created_at: 1,
@@ -2017,7 +2017,7 @@ async fn management_claim_waits_while_ten_budget_leases_are_live() {
         )
         .await
         .unwrap();
-    let clock = now();
+    let clock = now().unwrap();
     let mut calls = Vec::new();
     for index in 0..MAX_ACTIVE_LEASES {
         let call_id = format!("lease-{index}");

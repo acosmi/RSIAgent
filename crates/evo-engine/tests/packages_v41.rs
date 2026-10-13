@@ -270,7 +270,7 @@ fn test_v067_privacy_blocks_sensitive_patterns() {
     ];
 
     for input in sensitive_inputs {
-        let report = scan_privacy(input);
+        let report = scan_privacy(input).unwrap();
         assert_eq!(
             report.status,
             RedactionStatus::Blocked,
@@ -288,13 +288,13 @@ fn test_v067_privacy_blocks_sensitive_patterns() {
 #[test]
 fn test_v067_privacy_clean_content_and_warnings() {
     let clean_text = "# Skill Definition\nApply step by step reasoning.\n";
-    let report = scan_privacy(clean_text);
+    let report = scan_privacy(clean_text).unwrap();
     assert_eq!(report.status, RedactionStatus::Clean);
     assert_eq!(report.findings_count, 0);
     assert!(privacy_block(clean_text).is_ok());
 
     let warning_text = "# Draft Note\nTODO: secret token management should be reviewed\n";
-    let warn_report = scan_privacy(warning_text);
+    let warn_report = scan_privacy(warning_text).unwrap();
     assert_eq!(warn_report.status, RedactionStatus::Warning);
     assert_eq!(warn_report.findings[0].severity, FindingSeverity::Warning);
     // Warnings do not block

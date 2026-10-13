@@ -1724,7 +1724,7 @@ impl PersistentImportService {
             }
             existing
         } else {
-            let timestamp = now();
+            let timestamp = now()?;
             let mut prepared_sources = Vec::with_capacity(request.sources.len());
             for source in &request.sources {
                 let id = import_source_id(&selection_id, &source.source_id);
@@ -1826,7 +1826,7 @@ impl PersistentImportService {
             .await?;
         let mut finalized_selection = selection;
         finalized_selection.source_refs = source_record_refs(&source_records)?;
-        finalized_selection.updated_at = now();
+        finalized_selection.updated_at = now()?;
         let mut session = self.store.session().await?;
         if let Some(cached) = session
             .cached::<SourceSelectionRecord, _>(
@@ -2146,7 +2146,7 @@ impl PersistentImportService {
         current.payload.observed_digest = observed_digest;
         current.payload.byte_len = byte_len;
         current.payload.blob_published = blob_published;
-        current.updated_at = now();
+        current.updated_at = now()?;
         validate_source_record(ctx, &current)?;
         session
             .put(

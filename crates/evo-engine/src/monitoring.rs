@@ -901,8 +901,11 @@ impl MonitoringCoordinator {
         request: CompleteDevelopmentCycleRequest,
     ) -> Result<CycleTriggerOutcome> {
         let cycle = Self::close_development_cycle(ctx, store, request).await?;
-        let trigger =
-            trigger_from_claim(Self::claim_consolidation(ctx, store, &cycle.scope_id).await);
+        let claimed = Self::claim_consolidation(ctx, store, &cycle.scope_id).await;
+        if matches!(&claimed, Err(Error::ClockRegressed)) {
+            return Err(Error::ClockRegressed);
+        }
+        let trigger = trigger_from_claim(claimed);
         Ok(CycleTriggerOutcome { cycle, trigger })
     }
 
@@ -1320,6 +1323,7 @@ impl MonitoringCoordinator {
         .await?;
         let outcome = match outcome {
             Ok(outcome) => outcome,
+            Err(Error::ClockRegressed) => return Err(Error::ClockRegressed),
             Err(error) => {
                 let revoked = {
                     let mut session = store.session().await?;
@@ -1420,6 +1424,7 @@ impl MonitoringCoordinator {
                 .await;
                 match written {
                     Ok(proposal) => proposal_id = Some(proposal.id),
+                    Err(Error::ClockRegressed) => return Err(Error::ClockRegressed),
                     Err(error) => {
                         let revoked = {
                             let mut session = store.session().await?;
@@ -2490,6 +2495,7 @@ fn error_category(error: &Error) -> &'static str {
         Error::Budget => "budget",
         Error::Conflict(_) => "conflict",
         Error::Cancelled => "cancelled",
+        Error::ClockRegressed => "clock_regressed",
         Error::Internal => "internal",
     }
 }

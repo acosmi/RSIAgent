@@ -3010,7 +3010,7 @@ pub(crate) async fn redact_budget_call_content_with_block_in_tx(
         billing_scope,
         Some(call_id),
         "content_redacted",
-        evo_core::now(),
+        evo_core::now()?,
         json!({"reason":reason,"accounting_state_preserved":true}),
     )
     .await?;

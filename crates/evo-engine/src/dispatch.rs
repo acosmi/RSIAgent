@@ -552,7 +552,7 @@ impl ManagementDispatcher {
                 .await;
             }
         };
-        let outcome = execute_request(&ctx, &self.store, &job, request).await;
+        let outcome = execute_request(&ctx, &self.store, &job, request).await?;
         finish_claim(&ctx, &self.store, &job, outcome).await
     }
 
@@ -578,7 +578,7 @@ impl ManagementDispatcher {
                 continue;
             }
             if is_terminal(job.state)
-                || (job.state == ManagementJobState::Running && job.lease_until > now())
+                || (job.state == ManagementJobState::Running && job.lease_until > now()?)
             {
                 session.commit().await?;
                 return Ok((trusted.clone(), None));
@@ -589,7 +589,7 @@ impl ManagementDispatcher {
             // A refused job stays Queued (retriable): the wait is recorded
             // once on the job and the claim is retried after a short delay.
             let usage: crate::capacity::V41CapacityUsage = session
-                .capacity_usage_v41(crate::capacity::unix_now_secs())
+                .capacity_usage_v41(crate::capacity::unix_now_secs()?)
                 .await?
                 .into();
             let limits = crate::capacity::CapacityLimits::default();
@@ -613,7 +613,7 @@ impl ManagementDispatcher {
                     job.diagnostics.push(ManagementDiagnostic {
                         code: error_code(&refusal).into(),
                         observed_generation: job.generation,
-                        recorded_at: now(),
+                        recorded_at: now()?,
                     });
                     job.step = Self::CAPACITY_WAIT_STEP.into();
                     session
@@ -632,9 +632,9 @@ impl ManagementDispatcher {
                 .generation
                 .checked_add(1)
                 .ok_or_else(|| Error::Conflict("management job generation overflow".into()))?;
-            let token = hash(format!("{}\0{}\0{}", job.id, job.generation, now()).as_bytes());
+            let token = hash(format!("{}\0{}\0{}", job.id, job.generation, now()?).as_bytes());
             job.lease_token = Some(token);
-            job.lease_until = now().saturating_add(60);
+            job.lease_until = now()?.saturating_add(60);
             job.state = ManagementJobState::Running;
             job.step = "claimed".into();
             session
@@ -661,6 +661,9 @@ impl ManagementDispatcher {
     }
 
     async fn record_background_error(&self, job_id: &str, error: &Error) -> Result<()> {
+        if matches!(error, Error::ClockRegressed) {
+            return Err(Error::ClockRegressed);
+        }
         for context in self.trusted_contexts.iter() {
             let mut session = self.store.session().await?;
             let Some(value) = session.get::<Value>(context, "job", job_id).await? else {
@@ -685,7 +688,7 @@ impl ManagementDispatcher {
                 job.diagnostics.push(ManagementDiagnostic {
                     code: error_code(error).into(),
                     observed_generation: job.generation,
-                    recorded_at: now(),
+                    recorded_at: now()?,
                 });
                 if job.state == ManagementJobState::Queued {
                     job.state = ManagementJobState::Failed;
@@ -788,7 +791,7 @@ async fn persist_management(
         lease_until: 0,
         generation: 0,
         diagnostics: Vec::new(),
-        created_at: now(),
+        created_at: now()?,
     };
     session
         .put(ctx, "artifact", &private_id, ctx.actor(), &private)
@@ -857,7 +860,7 @@ async fn execute_request(
     store: &Store,
     claimed: &ManagementJob,
     request: ParsedRequest,
-) -> JobOutcome {
+) -> Result<JobOutcome> {
     let mut job = claimed.clone();
     let result = match request {
         ParsedRequest::ExperimentRegister(request) => {
@@ -883,17 +886,24 @@ async fn execute_request(
             Ok(())
         }
     };
+    execution_outcome(job, result)
+}
+
+fn execution_outcome(mut job: ManagementJob, result: Result<()>) -> Result<JobOutcome> {
+    if matches!(&result, Err(Error::ClockRegressed)) {
+        return Err(Error::ClockRegressed);
+    }
     if let Err(error) = result {
         job.state = ManagementJobState::Failed;
         job.step = "failed".into();
         job.error_code = Some(error_code(&error).into());
     }
-    JobOutcome {
+    Ok(JobOutcome {
         state: job.state,
         step: job.step,
         result: job.result,
         error_code: job.error_code,
-    }
+    })
 }
 
 async fn run_experiment_register(
@@ -1369,7 +1379,7 @@ fn ensure_fence(current: &ManagementJob, claimed: &ManagementJob) -> Result<()> 
     if current.state != ManagementJobState::Running
         || current.generation != claimed.generation
         || current.lease_token != claimed.lease_token
-        || current.lease_until <= now()
+        || current.lease_until <= now()?
     {
         return Err(Error::Conflict("management job lease fence changed".into()));
     }
@@ -1547,6 +1557,7 @@ fn error_code(error: &Error) -> &'static str {
         Error::Conflict(_) => "conflict",
         Error::Budget => "budget_unavailable",
         Error::Cancelled => "cancelled",
+        Error::ClockRegressed => "clock_regressed",
         Error::Internal => "internal_error",
     }
 }
@@ -1616,7 +1627,7 @@ mod tests {
             error_code: None,
             cancel_requested: false,
             lease_token: Some("active-lease".into()),
-            lease_until: now().saturating_add(60),
+            lease_until: now().unwrap().saturating_add(60),
             generation: 2,
             diagnostics: vec![],
             created_at: 1,
@@ -1788,6 +1799,136 @@ mod tests {
                 assert!(message.contains("run run-revoked"), "{message}")
             }
             other => panic!("expected the revoked run to refuse the set, got {other:?}"),
+        }
+    }
+
+    fn ag129_r7_sqlite_snapshot(path: &std::path::Path) -> serde_json::Value {
+        let script = r#"import json,sqlite3,struct,sys
+from pathlib import Path
+con=sqlite3.connect(Path(sys.argv[1]).resolve().as_uri()+'?mode=ro',uri=True)
+con.text_factory=bytes
+con.execute('PRAGMA query_only=ON')
+con.execute('BEGIN')
+def quoted(name):
+    return '"'+name.replace('"','""')+'"'
+def cell(kind,value):
+    kind=kind.decode('ascii')
+    if kind in ('text','blob'):
+        data=value.hex()
+    elif kind=='integer':
+        data=str(value)
+    elif kind=='real':
+        data=struct.pack('>d',value).hex()
+    elif kind=='null':
+        data=''
+    else:
+        raise ValueError('unknown SQLite storage class')
+    return [kind,data]
+result={}
+for (raw_name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+    name=raw_name.decode('utf-8')
+    columns=[row[1].decode('utf-8') for row in con.execute('PRAGMA table_info('+quoted(name)+')')]
+    projection=','.join('typeof('+quoted(column)+'),'+quoted(column) for column in columns)
+    rows=con.execute('SELECT '+projection+' FROM '+quoted(name)).fetchall()
+    result[name]={'columns':columns,'rows':sorted([[cell(row[i],row[i+1]) for i in range(0,len(row),2)] for row in rows])}
+con.rollback()
+con.close()
+print(json.dumps(result,sort_keys=True))
+"#;
+        let output = std::process::Command::new("python3")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .arg("-c")
+            .arg(script)
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    fn ag129_unit_clock_error() -> Error {
+        // Trusted input-level conversion only; this never changes the host clock.
+        evo_core::clock::unix_seconds_at(std::time::UNIX_EPOCH - std::time::Duration::from_secs(1))
+            .unwrap_err()
+    }
+
+    fn ag129_unit_job(state: ManagementJobState) -> ManagementJob {
+        ManagementJob {
+            id: "management-clock-boundary".into(),
+            schema_version: JOB_SCHEMA.into(),
+            operation: "meta.start".into(),
+            request_key: "clock-boundary".into(),
+            payload_digest: "a".repeat(64),
+            owner_actor: "admin".into(),
+            owner_role: Role::Admin,
+            state,
+            step: "claimed".into(),
+            private_input_ref: "management-clock-input".into(),
+            result: None,
+            error_code: None,
+            cancel_requested: false,
+            lease_token: Some("original-lease".into()),
+            lease_until: 100,
+            generation: 2,
+            diagnostics: vec![],
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn ag129_private_outcome_propagates_clock_and_keeps_other_failure_diagnostics() {
+        let clock = ag129_unit_clock_error();
+        let refused =
+            execution_outcome(ag129_unit_job(ManagementJobState::Running), Err(clock)).unwrap_err();
+        assert_eq!(refused.to_string(), "clock_regressed");
+        for (error, code) in [
+            (Error::Internal, "internal_error"),
+            (Error::Forbidden, "forbidden"),
+            (Error::Budget, "budget_unavailable"),
+            (Error::Conflict("old refusal".into()), "conflict"),
+            (Error::Cancelled, "cancelled"),
+            (Error::NotFound, "not_found"),
+            (Error::Invalid("old invalid".into()), "invalid_input"),
+        ] {
+            let result =
+                execution_outcome(ag129_unit_job(ManagementJobState::Running), Err(error)).unwrap();
+            assert_eq!(result.state, ManagementJobState::Failed);
+            assert_eq!(result.step, "failed");
+            assert_eq!(result.error_code.as_deref(), Some(code));
+            assert!(result.result.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn ag129_clock_background_error_keeps_queued_and_running_job_tables() {
+        for state in [ManagementJobState::Queued, ManagementJobState::Running] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("clock-job.sqlite3");
+            let store = Store::open(&path).await.unwrap();
+            let admin = Context::new("n", "admin", Role::Admin).unwrap();
+            let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+            let job = ag129_unit_job(state);
+            let mut session = store.session().await.unwrap();
+            session
+                .put(&admin, "job", &job.id, admin.actor(), &job)
+                .await
+                .unwrap();
+            session.commit().await.unwrap();
+            let before = ag129_r7_sqlite_snapshot(&path);
+            let error = dispatcher
+                .record_background_error(&job.id, &ag129_unit_clock_error())
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "clock_regressed");
+            assert_eq!(ag129_r7_sqlite_snapshot(&path), before);
+            let mut session = store.session().await.unwrap();
+            let after: ManagementJob = session.need(&admin, "job", &job.id).await.unwrap();
+            session.commit().await.unwrap();
+            assert_eq!(
+                serde_json::to_value(after).unwrap(),
+                serde_json::to_value(job).unwrap()
+            );
+            store.close().await;
         }
     }
 }

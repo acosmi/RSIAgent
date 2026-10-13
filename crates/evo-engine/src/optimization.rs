@@ -1639,7 +1639,7 @@ impl From<&Error> for StepErrorKind {
             Error::Budget => Self::Budget,
             Error::Conflict(_) => Self::Conflict,
             Error::Cancelled => Self::Cancelled,
-            Error::Internal => Self::Internal,
+            Error::ClockRegressed | Error::Internal => Self::Internal,
         }
     }
 }
@@ -3431,6 +3431,10 @@ async fn run_step_unboxed(
     };
     let result =
         run_optimization_step_inner(Some(&model), Some(&runner), Some(&recovery), request).await;
+    // A refused clock forbids a terminal write even if a later audit clock recovers.
+    if matches!(&result, Err(Error::ClockRegressed)) {
+        return Err(Error::ClockRegressed);
+    }
     let outcome = if let Some(class) = uncertain.into_inner().map_err(|_| Error::Internal)? {
         OptimizationStepOutcome::Uncertain { class }
     } else {

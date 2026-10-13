@@ -1860,7 +1860,7 @@ pub struct RegisteredDevelopmentRunner {
     grader: Context,
     control_id: String,
     lease_seconds: i64,
-    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    clock: Arc<dyn Fn() -> Result<i64> + Send + Sync>,
 }
 
 impl RegisteredDevelopmentRunner {
@@ -1871,7 +1871,7 @@ impl RegisteredDevelopmentRunner {
         control_id: impl Into<String>,
         lease_seconds: i64,
     ) -> Result<Self> {
-        Self::with_clock(
+        Self::with_result_clock(
             store,
             executor,
             grader,
@@ -1888,6 +1888,24 @@ impl RegisteredDevelopmentRunner {
         control_id: impl Into<String>,
         lease_seconds: i64,
         clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Result<Self> {
+        Self::with_result_clock(
+            store,
+            executor,
+            grader,
+            control_id,
+            lease_seconds,
+            Arc::new(move || Ok(clock())),
+        )
+    }
+
+    fn with_result_clock(
+        store: Store,
+        executor: Context,
+        grader: Context,
+        control_id: impl Into<String>,
+        lease_seconds: i64,
+        clock: Arc<dyn Fn() -> Result<i64> + Send + Sync>,
     ) -> Result<Self> {
         executor.require(&[Role::Worker, Role::Host])?;
         grader.require(&[Role::Evaluator])?;
@@ -1910,8 +1928,10 @@ impl RegisteredDevelopmentRunner {
     }
 
     fn now(&self) -> Result<i64> {
-        let now = (self.clock)();
-        valid_time(now)?;
+        let now = (self.clock)()?;
+        if now < 0 {
+            return Err(Error::ClockRegressed);
+        }
         Ok(now)
     }
 
@@ -2030,9 +2050,9 @@ impl RegisteredDevelopmentRunner {
         ) {
             return Err(Error::Cancelled);
         }
-        // This clock was validated before reserve. On a later clock failure it
-        // still supplies a nonnegative release time; ownership is rechecked by
-        // storage using all of the original digest/token/epoch fence.
+        // This validated reserve sample remains the fence for non-clock
+        // pre-dispatch failures. ClockRegressed returns without a compensating
+        // time-stamped write; the original reservation is retained.
         let reserve_fence = BudgetCallFence {
             billing_scope: call.billing_scope.clone(),
             call_id: call.call_id.clone(),
@@ -2129,6 +2149,7 @@ impl RegisteredDevelopmentRunner {
     ) -> Result<T> {
         match result {
             Ok(value) => Ok(value),
+            Err(Error::ClockRegressed) => Err(Error::ClockRegressed),
             Err(error) => {
                 if original_call.state == BudgetCallState::Reserved {
                     self.store
@@ -2628,6 +2649,8 @@ mod pre_dispatch_tests {
         assert_eq!(fixture.reserved().await, 0);
     }
 
+    // Historical Invalid injection preserves the generic-error cleanup contract.
+    // A real wall-clock refusal is ClockRegressed, covered by the public controls.
     #[tokio::test]
     async fn injected_clock_failure_uses_validated_reserve_time_and_returns_original_error() {
         let fixture = CleanupFixture::new().await;

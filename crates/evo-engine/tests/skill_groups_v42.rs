@@ -2010,3 +2010,108 @@ async fn groups_that_share_a_request_id_would_reuse_the_brokers_call_id() {
     }
     assert_eq!(transport.load(SeqCst), calls_after_first);
 }
+
+fn ag129_r7_sqlite_snapshot(path: &std::path::Path) -> serde_json::Value {
+    let script = r#"import json,sqlite3,struct,sys
+from pathlib import Path
+con=sqlite3.connect(Path(sys.argv[1]).resolve().as_uri()+'?mode=ro',uri=True)
+con.text_factory=bytes
+con.execute('PRAGMA query_only=ON')
+con.execute('BEGIN')
+def quoted(name):
+    return '"'+name.replace('"','""')+'"'
+def cell(kind,value):
+    kind=kind.decode('ascii')
+    if kind in ('text','blob'):
+        data=value.hex()
+    elif kind=='integer':
+        data=str(value)
+    elif kind=='real':
+        data=struct.pack('>d',value).hex()
+    elif kind=='null':
+        data=''
+    else:
+        raise ValueError('unknown SQLite storage class')
+    return [kind,data]
+result={}
+for (raw_name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+    name=raw_name.decode('utf-8')
+    columns=[row[1].decode('utf-8') for row in con.execute('PRAGMA table_info('+quoted(name)+')')]
+    projection=','.join('typeof('+quoted(column)+'),'+quoted(column) for column in columns)
+    rows=con.execute('SELECT '+projection+' FROM '+quoted(name)).fetchall()
+    result[name]={'columns':columns,'rows':sorted([[cell(row[i],row[i+1]) for i in range(0,len(row),2)] for row in rows])}
+con.rollback()
+con.close()
+print(json.dumps(result,sort_keys=True))
+"#;
+    let output = std::process::Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg("-c")
+        .arg(script)
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn ag129_two_groups_stop_on_real_broker_clock_refusal_before_second_group() {
+    let (world, _original_broker, _) = budget_world(100).await;
+    let reads = Arc::new(AtomicUsize::new(0));
+    let clock_reads = reads.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let snapshot = Arc::new(Mutex::new(None));
+    let captured = snapshot.clone();
+    let clock_path = world.path.clone();
+    let broker = PersistentModelBroker::with_clock(
+        world.store.clone(),
+        EditingTransport {
+            calls: calls.clone(),
+        },
+        BrokerConfig {
+            billing_scope: "scope-1".into(),
+            actor: "trusted-broker".into(),
+            currency: "USD".into(),
+            pricing_version: "price-v1".into(),
+            max_cost_micros: 20,
+            lease_seconds: 60,
+        },
+        Arc::new(move || {
+            if clock_reads.fetch_add(1, SeqCst) == 0 {
+                *captured.lock().unwrap() = Some(ag129_r7_sqlite_snapshot(&clock_path));
+                -1
+            } else {
+                // A later healthy sample cannot resume the same two-group job.
+                100
+            }
+        }),
+    )
+    .unwrap();
+    let runner = ScriptedRunner::default();
+    let result = run_skill_group_job(
+        Some(&broker),
+        Some(&runner),
+        Some(&world.journal),
+        job([&world.groups[0], &world.groups[1]]),
+    )
+    .await;
+    assert_eq!(reads.load(SeqCst), 1);
+    assert_eq!(calls.load(SeqCst), 0);
+    assert_eq!(runner.calls(), 0);
+    let before = snapshot.lock().unwrap().clone().unwrap();
+    assert_eq!(ag129_r7_sqlite_snapshot(&world.path), before);
+    assert_eq!(result.unwrap_err().to_string(), "clock_regressed");
+    let facts = world.stage_facts().await;
+    assert!(facts_of(&facts, &world.groups[1].episode_id).is_empty());
+    let root = world
+        .store
+        .root_budget(&world.worker, "scope-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(root.reserved_micros, 0);
+    assert_eq!(root.spent_micros, 0);
+    assert_eq!(ag129_r7_sqlite_snapshot(&world.path), before);
+    world.store.close().await;
+}

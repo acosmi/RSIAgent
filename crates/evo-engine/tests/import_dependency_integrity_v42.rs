@@ -693,16 +693,21 @@ async fn actual_cleanup_redaction_is_history_only_and_deleted_blob_is_not_missin
             id: f.sources[1].id.clone(),
         },
         "revoke private source",
-        evo_core::now(),
+        evo_core::now().unwrap(),
     )
     .await
     .unwrap();
     let mut finished = status;
     for _ in 0..100 {
-        finished =
-            LifecycleStore::cleanup_step(&f.ctx, &f.store, &finished.job_id, 1, evo_core::now())
-                .await
-                .unwrap();
+        finished = LifecycleStore::cleanup_step(
+            &f.ctx,
+            &f.store,
+            &finished.job_id,
+            1,
+            evo_core::now().unwrap(),
+        )
+        .await
+        .unwrap();
         if matches!(
             finished.state,
             CleanupState::Complete | CleanupState::Failed

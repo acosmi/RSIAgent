@@ -356,6 +356,7 @@ fn structured_error(error: Error) -> CallToolResult {
         Error::Conflict(_) => "conflict",
         Error::Budget => "budget_unavailable",
         Error::Cancelled => "cancelled",
+        Error::ClockRegressed => "clock_regressed",
         Error::Internal => "internal_error",
     };
     CallToolResult::structured_error(json!({"error":{"code":code}}))
@@ -375,5 +376,14 @@ mod tests {
         for descriptor in tools {
             assert!(serde_json::to_vec(&descriptor).unwrap().len() <= V1_TOOL_DESCRIPTOR_MAX);
         }
+    }
+    #[test]
+    fn clock_regression_is_a_structured_tool_refusal() {
+        let result = structured_error(Error::ClockRegressed);
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap(),
+            json!({"error":{"code":"clock_regressed"}})
+        );
     }
 }

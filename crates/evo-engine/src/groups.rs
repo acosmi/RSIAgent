@@ -117,7 +117,8 @@ struct GroupScope {
 ///
 /// `Err` means the job was refused before any group started: a malformed job
 /// (`Invalid`), groups that are not separate enough (`Conflict`) or no journal
-/// (`NotFound`). `Ok` means every group was run or replayed from its journal
+/// (`NotFound`). A clock refusal also stops a started job before any next group.
+/// `Ok` means every group was run or replayed from its journal
 /// and has an outcome, whatever that outcome is. The ports are only used by a
 /// group that still has work to do: a group whose step is already recorded is
 /// answered from the journal alone, so `None` ports replay a finished job.
@@ -157,6 +158,9 @@ pub async fn run_skill_group_job(
     let mut outcomes = Vec::with_capacity(groups.len());
     for (group, scope) in groups.into_iter().zip(scopes) {
         let result = run_optimization_step(model, runner, Some(journal), group.request).await;
+        if matches!(&result, Err(Error::ClockRegressed)) {
+            return Err(Error::ClockRegressed);
+        }
         outcomes.push(group_outcome(scope, result));
     }
     let candidates: Vec<SkillGroupCandidate> = outcomes
