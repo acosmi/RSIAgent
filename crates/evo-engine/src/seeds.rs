@@ -43,40 +43,47 @@ pub struct SeedTriple {
 }
 
 pub fn classify(t: &SeedTriple) -> SeedClass {
-    if t.bundled.is_none() {
-        return SeedClass::CorruptBaseline;
+    let (Some(b), Some(l), Some(u), Some(id_b), Some(id_l), Some(kind_b), Some(kind_l)) = (
+        t.bundled.as_deref(),
+        t.local.as_deref(),
+        t.upstream.as_deref(),
+        t.asset_id_bundled.as_deref(),
+        t.asset_id_local.as_deref(),
+        t.kind_bundled.as_deref(),
+        t.kind_local.as_deref(),
+    ) else {
+        return SeedClass::Unknown;
+    };
+    // Shape checks establish comparability, never publisher trust or proof of
+    // source bytes. Those remain the installation/catalog consumer's guards.
+    if [(b, "baseline"), (l, "local"), (u, "upstream")]
+        .into_iter()
+        .any(|(value, name)| validate_digest(value, name).is_err())
+        || [
+            t.publisher_bundled.as_str(),
+            t.publisher_local.as_str(),
+            id_b,
+            id_l,
+        ]
+        .into_iter()
+        .any(|value| identifier(value).is_err())
+        || !matches!(kind_b, "improver" | "skill" | "harness")
+        || !matches!(kind_l, "improver" | "skill" | "harness")
+    {
+        return SeedClass::Unknown;
     }
-    let b_digest = t.bundled.as_deref().unwrap_or("");
-    if b_digest.len() != 64 || !b_digest.chars().all(|c| c.is_ascii_hexdigit()) {
-        // Corrupt or non-digest baseline marker
-        if !b_digest.is_empty() && b_digest.len() < 10 {
-            // legacy short strings in test are allowed if alphanumeric
-        } else if b_digest.len() != 64 {
-            return SeedClass::CorruptBaseline;
-        }
-    }
-
     if !t.local_marked {
         return SeedClass::MissingMarker;
     }
-    if t.publisher_bundled != t.publisher_local {
+    if t.publisher_bundled != t.publisher_local || id_b != id_l || kind_b != kind_l {
         return SeedClass::SameNameDifferentPublisher;
     }
-    if matches!((&t.asset_id_bundled, &t.asset_id_local), (Some(id_b), Some(id_l)) if id_b != id_l)
-    {
-        return SeedClass::SameNameDifferentPublisher;
-    }
-    if matches!((&t.kind_bundled, &t.kind_local), (Some(k_b), Some(k_l)) if k_b != k_l) {
-        return SeedClass::SameNameDifferentPublisher;
-    }
-
-    match (&t.local, &t.upstream, &t.bundled) {
-        (Some(l), Some(u), Some(b)) if l == u && l == b => SeedClass::Unmodified,
-        (Some(l), Some(u), Some(b)) if l == u && l != b => SeedClass::IdenticalToUpstream,
-        (Some(l), Some(u), Some(b)) if l == b && u != b => SeedClass::UpstreamNewer,
-        (Some(l), Some(u), Some(b)) if l != b && u == b => SeedClass::LocallyEdited,
-        (Some(l), Some(u), Some(b)) if l != b && u != b => SeedClass::BothChanged,
-        (Some(l), _, Some(b)) if l == b => SeedClass::Unmodified,
+    match (l, u, b) {
+        (l, u, b) if l == u && l == b => SeedClass::Unmodified,
+        (l, u, b) if l == u && l != b => SeedClass::IdenticalToUpstream,
+        (l, u, b) if l == b && u != b => SeedClass::UpstreamNewer,
+        (l, u, b) if l != b && u == b => SeedClass::LocallyEdited,
+        (l, u, b) if l != b && u != b => SeedClass::BothChanged,
         _ => SeedClass::Unknown,
     }
 }
@@ -751,16 +758,16 @@ mod tests {
     #[test]
     fn branches_and_no_silent_activate() {
         let t = SeedTriple {
-            bundled: Some("a".into()),
-            local: Some("a".into()),
-            upstream: Some("b".into()),
+            bundled: Some(hash(b"baseline")),
+            local: Some(hash(b"baseline")),
+            upstream: Some(hash(b"upstream")),
             local_marked: true,
             publisher_bundled: "p".into(),
             publisher_local: "p".into(),
-            asset_id_bundled: None,
-            asset_id_local: None,
-            kind_bundled: None,
-            kind_local: None,
+            asset_id_bundled: Some("seed-identity".into()),
+            asset_id_local: Some("seed-identity".into()),
+            kind_bundled: Some("skill".into()),
+            kind_local: Some("skill".into()),
         };
         assert_eq!(classify(&t), SeedClass::UpstreamNewer);
         assert!(auto_activate(classify(&t)).is_err());

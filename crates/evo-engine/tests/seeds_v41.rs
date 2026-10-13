@@ -145,14 +145,14 @@ fn test_v063_blu_all_branches() {
     t_missing_marker.local_marked = false;
     assert_eq!(classify(&t_missing_marker), SeedClass::MissingMarker);
 
-    // 9. Corrupt baseline -> CorruptBaseline
+    // 9. Missing or corrupt baseline -> Unknown
     let mut t_corrupt = t_unmod.clone();
     t_corrupt.bundled = None;
-    assert_eq!(classify(&t_corrupt), SeedClass::CorruptBaseline);
+    assert_eq!(classify(&t_corrupt), SeedClass::Unknown);
 
     let mut t_corrupt_str = t_unmod;
     t_corrupt_str.bundled = Some("not_a_valid_64_hex_hash_for_sure_1234567890".into());
-    assert_eq!(classify(&t_corrupt_str), SeedClass::CorruptBaseline);
+    assert_eq!(classify(&t_corrupt_str), SeedClass::Unknown);
 }
 
 // ---------------------------------------------------------------------------
