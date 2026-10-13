@@ -15,18 +15,33 @@ jobs:
     timeout-minutes: 25
     env:
       PYTHONOPTIMIZE: '0'
+      RUSTUP_TOOLCHAIN: '1.98.1'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Require committed lock
+        run: |
+          test -f Cargo.lock
+          test ! -L Cargo.lock
+          git cat-file -e HEAD:Cargo.lock
+          git diff --exit-code HEAD -- Cargo.lock
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
-      - name: Toolchain
-        run: rustup show && rustc --version && cargo --version
+      - name: Build input contract
+        id: build_inputs
+        run: python3 scripts/check_build_inputs.py
+      - name: Exact Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose
+          cargo --version
+          python3 scripts/check_build_inputs.py --check-runtime
       - name: Resolve dependencies
         run: |
           mkdir -p out
-          if [ -f Cargo.lock ]; then cargo fetch --locked; else cargo generate-lockfile; fi
-          rustc --version > out/toolchain.txt
+          cargo fetch --locked
+          rustc --version --verbose > out/toolchain.txt
+          python3 scripts/check_build_inputs.py --json > out/build-inputs.json
           git rev-parse HEAD > out/source-commit.txt
       - name: Format check
         id: format
@@ -93,15 +108,19 @@ jobs:
         run: |
           mkdir -p out
           python3 scripts/inventory_baseline_tests.py --ledger docs/implementation-ledger.md --source-sha "$GITHUB_SHA" --test-log out/tests.txt > out/baseline-tests.json 2> out/baseline-tests.stderr.txt
+      - name: Locked inputs remain unchanged
+        id: locked_inputs
+        if: always() && steps.build_inputs.outcome == 'success'
+        run: python3 scripts/check_build_inputs.py
       - name: Collect source and reports
         id: archive
         continue-on-error: true
-        if: always()
+        if: always() && steps.build_inputs.outcome == 'success' && steps.locked_inputs.outcome == 'success'
         run: |
           mkdir -p out
           tar --exclude=.git --exclude=target --exclude=out -czf out/source.tar.gz .
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && steps.build_inputs.outcome == 'success' && steps.locked_inputs.outcome == 'success'
         with:
           name: verification-${{ github.sha }}
           path: out/
@@ -109,6 +128,8 @@ jobs:
       - name: Quality gate
         if: always()
         env:
+          BUILD_INPUTS: ${{ steps.build_inputs.outcome }}
+          LOCKED_INPUTS: ${{ steps.locked_inputs.outcome }}
           FORMAT: ${{ steps.format.outcome }}
           CHECK: ${{ steps.check.outcome }}
           TESTS: ${{ steps.tests.outcome }}
@@ -123,6 +144,8 @@ jobs:
           ARCHIVE: ${{ steps.archive.outcome }}
         run: |
           set -e
+          test "$BUILD_INPUTS" = success
+          test "$LOCKED_INPUTS" = success
           test "$FORMAT" = success
           test "$CHECK" = success
           test "$TESTS" = success

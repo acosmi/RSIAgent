@@ -10,6 +10,7 @@ import re
 import sys
 from pathlib import Path
 from check_production_store_open import check_tree
+from check_build_inputs import build_input_errors
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_MEMBERS = [
@@ -84,12 +85,9 @@ def main() -> int:
                 f"expected={expected_sha256} actual={actual_sha256}"
             )
 
-    toolchain = ROOT / "rust-toolchain.toml"
-    text = toolchain.read_text(encoding="utf-8")
-    if 'channel = "stable"' not in text:
-        return fail("rust-toolchain.toml does not pin stable")
-    if "rustfmt" not in text or "clippy" not in text:
-        return fail("rust-toolchain.toml missing rustfmt/clippy")
+    build_errors = build_input_errors(ROOT)
+    if build_errors:
+        return fail("build inputs: " + "; ".join(build_errors))
 
     # Increment reconstruction artifacts must not re-enter source.
     delivery = ROOT / ".delivery"
