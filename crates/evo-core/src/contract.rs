@@ -778,7 +778,7 @@ pub enum SurfaceCoverage {
     Unsupported,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurfaceItem {
     pub name: String,
@@ -841,6 +841,19 @@ impl HostSurfaceManifest {
                         ));
                     }
                 }
+            }
+        }
+        // v1 keeps exact clones and byte identity, but one name cannot carry
+        // different complete item contents into registration or live use.
+        let mut items_by_name: BTreeMap<&str, &SurfaceItem> = BTreeMap::new();
+        for item in &self.items {
+            if let Some(previous) = items_by_name.insert(item.name.as_str(), item)
+                && previous != item
+            {
+                return Err(Error::Invalid(format!(
+                    "conflicting host surface items for name {}",
+                    item.name
+                )));
             }
         }
         // Check old names only after the existing schema, coverage, and item guards.

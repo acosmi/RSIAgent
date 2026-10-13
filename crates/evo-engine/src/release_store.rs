@@ -106,10 +106,29 @@ pub struct PersistentProfilePointer {
 #[serde(deny_unknown_fields)]
 pub struct HostSurfaceRecord {
     pub id: String,
+    #[serde(deserialize_with = "deserialize_host_surface_record_schema")]
     pub schema_version: String,
     pub manifest: HostSurfaceManifest,
     pub manifest_digest: String,
     pub extracted: Vec<String>,
+}
+
+// Validate every typed read while leaving v1 serialized fields and order
+// unchanged. Historical conflicting v1 bodies remain readable; their manifest
+// validation at prepare/live use refuses them without rewriting the record.
+fn deserialize_host_surface_record_schema<'de, D>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let schema = String::deserialize(deserializer)?;
+    if schema != HOST_SURFACE_RECORD_SCHEMA {
+        return Err(serde::de::Error::custom(
+            "unsupported host surface record schema",
+        ));
+    }
+    Ok(schema)
 }
 
 #[derive(Debug, Clone)]
