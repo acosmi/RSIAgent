@@ -8842,3 +8842,27 @@ AG128-R1 候选5402c317中的单目标补充实际命令仍携带绝对本机 PA
 本R2另按底本公开卫生要求只节录23处既有真实本机路径，公开注明路径前缀略并给相对私有原文链接；保留所有任务/PR/SHA、计数、退出与失败事实。M4原8764行前缀不再宣称字节原样：唯一例外由 out/audit-20260930/qa/codex-r7-ag128/legacy-public-hygiene-r2/finite-line-sanitization.json 逐处列明，原完整M4 SHA05e45541264eaf964697c74a800fa5529ae8c69ef692f4b659793445b9505709、R1完整文 SHAdb4c98d7eb5a235657c279f9bf9fef040cafa2c6630b55f96b39f32cfb038dd6 先私有封存。原34行快照仍逐字保持，未关闭AG111。
 
 R1候选5402c317全门因已证实公开路径阻塞被精确中止，实际guard143、source unchanged，结束2026-10-13T04:29:01.817159Z；原wrapper、partial与终止日志原样保留，固定头探针未执行。该候选未获全门首次验收，不继承partial8信用；R2新head全部门另跑。证据 out/audit-20260930/qa/codex-r7-ag128/final-main-wrapper-r1-5402c317.json 与 r1-known-blocking-hygiene-termination.json。
+
+
+## 第七阶段实际合并与首次技术验收更新（AG-142）
+
+本节追加 AG129/130 的实际合并事实，保留此前候选、失败、撤出、校正与计数原文。94 个既有证据对象逐条原样保留；只为 AG129 两个实际提交的 Rust 目标增加 E16.5 局部记录，当前共96条。最高状态 implemented_not_verified，首次技术验收 passed；Claude 二次验收 not_executed。AG111 台账无损重构与 AG114 检查器增补仍另卡未完成。
+
+### AG-129 / PR #170 — 可信时钟输入与命名拒绝传播（E16.5；V110.c 局部）
+
+- 验收 head `f2544a95cd8bbbea8ea9840af2b1afb4a4475117`；父 `58c013572c806dc464a248331aeca41bcc4226c3`；merged `89b3c20427e8b82f07ec470d9cd4f1435f0df7ac`，2026-10-13T12:11:17Z；实际两个父与树均已核对。
+- 新鲜独立八门全部退出0；原日志计数153个结果摘要，准确分解148个 Running 测试可执行入口与5个 Doc-test 摘要，1887过/0败；Python checker69过与生产开库16过。相对父151摘要/1864过为净增2摘要/23用例，24新增具名、1旧用例移除；原计数不改写。独立同APP控制Head9过/父9编译后语义败，内退出101/guard0；源与支付事实保持。
+- 新记录只覆盖 `clock_unix_v43` 的3过/0败（纪元零、负纪元命名拒绝、单位保持）与 `clock_fail_closed_v43` 的2过/0败（负时钟在首次保留和夹具派发前拒绝）。两个独占日志摘录逐字来自原独立完整 raw；没有追加执行或把其他旧目标计为新产品。执行对象沿用真实完整八门命令，记录级八词 offline 命令仅为声明目标。
+- 输入 `out/audit-20260930/qa/inputs/codex-input-ag-129-f2544a95.json`，SHA256 `40e1ae8bdd3819503ddff9480ef18207439fdb42ec785d4fbf5b5fa55d16f718`；合并证据 `out/audit-20260930/qa/codex-r7-ag129/merged-f2544a95.json`；唯一摘录 `out/audit-20260930/qa/codex-r7-ag142/excerpt-ag129-clock-unix-f2544a95.log`（SHA256 `bacc87d088cb923be11a4c7ba59b83fe52dca9357dedb442a58ab9b47553cb98`）与 `excerpt-ag129-broker-first-clock-f2544a95.log`（SHA256 `2afca862b25f1ef69fb964645307e82e636ca96fc93fb017a9dd3fd7ed46e188`）。完整原始执行、9/9控制和历次未通过记录见同input及 `codex-r7-acceptance.md` AG129节。
+- 不可声明完整数据库最大发生时间floor/whole V110.c、真实坏系统钟、物理零SQL、真实宿主/沙箱/提供商、全部E/V、效果收益发行或二次验收。formal typedwire/历史版本/逻辑快照解释保留“待二次验收裁决”。未确定和已付费用不因错误时钟自动释放。
+
+### AG-130 / PR #171 — 构建输入静态检查（E16.5；V113.a/c 局部）
+
+- 验收 head `89105e349271d3c867e19331325ec3c322647361`；父 `89b3c20427e8b82f07ec470d9cd4f1435f0df7ac`；merged `fbc8c5545760a17242c6ee588d6c9340d1d97300`，2026-10-13T19:19:12Z；两个父、树与Root main快进均实际核对。
+- 七文件实现锁定工具链/CI action不可变引用与静态构建输入检查；独立新鲜八门全0，148 Running+5 Doc-test摘要/1887过/0败；checker69、构建输入额外50、生产开库16过。新增Rust产品测试0，所以未追加 AG130 verified_subscopes，也未借既有seeds或未提交APP制造Rust产品信用；只在 E16.5 实现/状态原因/未完事项中登记 implemented_not_verified 与首次技术验收。
+- 固定APP Head实际编译2过/0败，原wrapper读取nocapture布局时退出1保留；严格对同原raw只读补读确认2过，不重跑Cargo、不改旧失败。实际父两编译语义败/0过，inner101/guard0、4PARSED/2CONTRACT/0INVALID，源不变。原 rust-objcopy/dyld 非fatal警告保留，无真实宿主信用。
+- 输入 `out/audit-20260930/qa/inputs/codex-input-ag-130-89105e34.json`，SHA256 `0050a2e2ab79bbb006898cb2c1da0ccb310c068693f82d6af61ea7af29e7fb57`；合并补证 `out/audit-20260930/qa/codex-r7-ag130/actual-merge-and-local-FF-proof-fbc8c554.json`，SHA256 `82a678d86b5ba4049cca1a90f5eb24541d385b41bbe08a1623a77c3f0a5b361e`。原first receipt merged:null 为签发时快照，原字节保留；实际merge由补证承载。
+- 合并后普通Git TLS传输多次退出128均保留；官方Git API的既有真实signed commit原始 payload/signature 经SHA1对象框架与独立无写Git核验精确得实际M7，才导入原对象、CAS origin与本地FF0。未合成合并提交、未关闭TLS验证或改代理配置；旧FETCH_HEAD未冒称新fetch成功。初次本地FF受沙箱锁写拒绝128，获权限后实际0；没有把拒绝记0。
+- 不可声明hosted Actions执行、ZIP/archive/发行许可与完整依赖登记、whole V113/V116、真实宿主/沙箱、效果收益发行或二次验收。构建输入CLI/类型合同与同raw补读方式为“待二次验收裁决”。原已批准 notify-merge 的接收方/密钥/载荷范围未改，实际送达未独立证实。
+
+V110/V113/V116与其余新增场景族仍 planned；related_evidence_refs 仅导航E16.5两个真实局部Clock记录，不形成整族信用。真实模型、付费E01/E11/E15、真实宿主E16.4/沙箱E16.5、历史包及T断言、E14冻结合同只登记外部阻塞；货币预算0，无真实提供商调用。AG131许可/AG133依赖登记及P1→P2→P3、既有119/120/121/122队列继续，不能将本台账交付当第七阶段完成。

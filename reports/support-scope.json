@@ -2751,11 +2751,20 @@
     "E16.5": {
       "title": "Persistent Recovery Immutability, Capacity Limits & Deployment Security",
       "status": "in_progress",
-      "status_reason": "capacity gates are wired into six real entry points (AG-014), the startup recovery quarantine and deployment gates into rsia serve/mcp (AG-018), and restore protection covers this round's action and invalidation facts (AG-029); no real sandbox and Linux not exercised; AG-051 adds exact-schema economic replay envelope restore protection; AG-053 preserves snapshot semantics with bounded recursive collection (registered under E08)",
+      "status_reason": "capacity gates are wired into six real entry points (AG-014), the startup recovery quarantine and deployment gates into rsia serve/mcp (AG-018), and restore protection covers this round's action and invalidation facts (AG-029); no real sandbox and Linux not exercised; AG-051 adds exact-schema economic replay envelope restore protection; AG-053 preserves snapshot semantics with bounded recursive collection (registered under E08); AG129/PR170 implements Result-based system clock input and named refusal propagation (two local V110.c subsets only); AG130/PR171 implements build-input static checks with first technical acceptance, state implemented_not_verified, Python50 and no new Rust product target; deployment scope remains unfinished",
       "implementation_files": [
         "crates/evo-engine/src/capacity.rs",
         "crates/evo-storage/src/lifecycle.rs",
-        "crates/evo-engine/src/startup_gate.rs"
+        "crates/evo-engine/src/startup_gate.rs",
+        "crates/evo-core/src/clock.rs",
+        "crates/evo-core/tests/clock_unix_v43.rs",
+        "crates/evo-engine/tests/clock_fail_closed_v43.rs",
+        "rust-toolchain.toml",
+        "scripts/check_build_inputs.py",
+        "scripts/test_check_build_inputs.py",
+        ".github/workflows/ci.yml",
+        ".github/workflows/dependency-audit.yml",
+        ".github/workflows/offline-build-kit.yml"
       ],
       "scenarios": [
         "V007",
@@ -2928,13 +2937,72 @@
             "exit_code": 0,
             "evidence": "out/audit-20260930/qa/codex-r7-ag125/accept-final-ef2076d8.log"
           }
+        },
+        {
+          "id": "E16.5.ag129_v43_system_clock_conversion",
+          "description": "System wall-clock conversion preserves units and refuses pre-epoch samples",
+          "plan_version": "v4.3",
+          "plan_sha256": "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7",
+          "source_sha": "f2544a95cd8bbbea8ea9840af2b1afb4a4475117",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/170",
+          "merged_sha": "89b3c20427e8b82f07ec470d9cd4f1435f0df7ac",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-core/tests/clock_unix_v43.rs",
+          "command": "cargo test --locked --offline -p evo-core --test clock_unix_v43",
+          "input_digest": "40e1ae8bdd3819503ddff9480ef18207439fdb42ec785d4fbf5b5fa55d16f718",
+          "input_ref": "out/audit-20260930/qa/inputs/codex-input-ag-129-f2544a95.json",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/codex-r7-ag142/excerpt-ag129-clock-unix-f2544a95.log",
+          "actual_result": "clock_unix_v43: 3 passed / 0 failed in the original independent fresh workspace run at f2544a95cd8bbbea8ea9840af2b1afb4a4475117; unique exact raw excerpt, not a new execution. Full run: 148 Running executables plus 5 Doc-test summaries (153 historical summary count), 1887 passed / 0 failed, eight exits 0, checker Python69 and production Python16. Implemented_not_verified with first technical acceptance passed; second acceptance not executed.",
+          "scope": "E16.5; v4.3 §7.3.1 L1038–1046 and V110.c L2301, system input conversion subset only",
+          "risk": "No full database maximum-occurrence floor, real bad system clock, all-platform, real host/sandbox/provider, whole E/V, second acceptance, effects, benefits or release; logical fixture facts do not prove physical zero SQL.",
+          "rollback": "Independent reviewed revert of PR #170; accepted parent 58c013572c806dc464a248331aeca41bcc4226c3; preserve historical costs, dispatch, audit, revocation and source facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_TARGET_DIR=\"$PWD/out/work-20260930/target-codex-ag129-controller-f2544a95-d7d22984\" bash \"$PWD/out/audit-20260930/qa/codex-r7-guarded.sh\" \"$PWD/out/work-20260930/target-codex-ag129-controller-f2544a95-d7d22984\" 8192 --full -- python3 \"$PWD/out/audit-20260930/qa/codex-r7-ag129/controller-fresh8-worker.py\" _inner \"$PWD/out/audit-20260930/qa/codex-r7-ag129/controller-fresh8-f2544a95-d7d22984-manifest.json\" \"d8ebc4ace7bcdd63d83f704ae39a35caaaad55404f962a15b7fcf8082f905295\" > \"$PWD/out/audit-20260930/qa/codex-r7-ag129/controller-fresh8-f2544a95-d7d22984-guard.log\" 2>&1",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/codex-r7-ag129/controller-fresh8-f2544a95-d7d22984.log"
+          },
+          "production_consumer": "wired"
+        },
+        {
+          "id": "E16.5.ag129_v43_broker_first_clock_refusal",
+          "description": "Broker first-clock refusal precedes reservation and fixture transport",
+          "plan_version": "v4.3",
+          "plan_sha256": "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7",
+          "source_sha": "f2544a95cd8bbbea8ea9840af2b1afb4a4475117",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/170",
+          "merged_sha": "89b3c20427e8b82f07ec470d9cd4f1435f0df7ac",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/clock_fail_closed_v43.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test clock_fail_closed_v43",
+          "input_digest": "40e1ae8bdd3819503ddff9480ef18207439fdb42ec785d4fbf5b5fa55d16f718",
+          "input_ref": "out/audit-20260930/qa/inputs/codex-input-ag-129-f2544a95.json",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/codex-r7-ag142/excerpt-ag129-broker-first-clock-f2544a95.log",
+          "actual_result": "clock_fail_closed_v43: 2 passed / 0 failed in the original independent fresh workspace run at f2544a95cd8bbbea8ea9840af2b1afb4a4475117; unique exact raw excerpt, not a new execution. Full run: 148 Running executables plus 5 Doc-test summaries (153 historical summary count), 1887 passed / 0 failed, eight exits 0, checker Python69 and production Python16. Implemented_not_verified with first technical acceptance passed; second acceptance not executed.",
+          "scope": "E16.5; v4.3 §7.3.1 L1038–1046 and V110.c L2301, initial broker clock refusal subset only",
+          "risk": "No full database maximum-occurrence floor, real bad system clock, all-platform, real host/sandbox/provider, whole E/V, second acceptance, effects, benefits or release; logical fixture facts do not prove physical zero SQL.",
+          "rollback": "Independent reviewed revert of PR #170; accepted parent 58c013572c806dc464a248331aeca41bcc4226c3; preserve historical costs, dispatch, audit, revocation and source facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_TARGET_DIR=\"$PWD/out/work-20260930/target-codex-ag129-controller-f2544a95-d7d22984\" bash \"$PWD/out/audit-20260930/qa/codex-r7-guarded.sh\" \"$PWD/out/work-20260930/target-codex-ag129-controller-f2544a95-d7d22984\" 8192 --full -- python3 \"$PWD/out/audit-20260930/qa/codex-r7-ag129/controller-fresh8-worker.py\" _inner \"$PWD/out/audit-20260930/qa/codex-r7-ag129/controller-fresh8-f2544a95-d7d22984-manifest.json\" \"d8ebc4ace7bcdd63d83f704ae39a35caaaad55404f962a15b7fcf8082f905295\" > \"$PWD/out/audit-20260930/qa/codex-r7-ag129/controller-fresh8-f2544a95-d7d22984-guard.log\" 2>&1",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/codex-r7-ag129/controller-fresh8-f2544a95-d7d22984.log"
+          },
+          "production_consumer": "wired"
         }
       ],
       "remaining": [
         "no real sandbox; deployment-safety evidence is local only; Linux not exercised",
         "pending revoke cleanup jobs are not driven at startup; residual dispatched calls are not turned uncertain at startup; outbound-network consistency is unchecked",
         "capacity limits for internal objects added in round 2 (consolidation claims/proposals, practice sets, skill-group jobs, meta trials) are not registered in plan section 3.3.1; a plan revision must come first",
-        "AG077 budget source/restore and AG078 read-only unresolved-bill report are merged software subsets; they do not establish a real sandbox, provider transport, paid reconciliation or production deployment."
+        "AG077 budget source/restore and AG078 read-only unresolved-bill report are merged software subsets; they do not establish a real sandbox, provider transport, paid reconciliation or production deployment.",
+        "AG129 partial clock implementation does not establish the full database occurrence floor or whole V110.c. AG130/PR171 first technical acceptance is local static tooling/Python50 only (no new Rust product target): input out/audit-20260930/qa/inputs/codex-input-ag-130-89105e34.json SHA256 0050a2e2ab79bbb006898cb2c1da0ccb310c068693f82d6af61ea7af29e7fb57; merge proof out/audit-20260930/qa/codex-r7-ag130/actual-merge-and-local-FF-proof-fbc8c554.json SHA256 82a678d86b5ba4049cca1a90f5eb24541d385b41bbe08a1623a77c3f0a5b361e. Hosted Actions, complete V113/V116, real sandbox/host, second acceptance and release remain unverified."
       ]
     },
     "E16.6": {
@@ -6738,7 +6806,9 @@
         "verification_status": "planned",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E16.5.ag125_v43_single_writer"
+          "E16.5.ag125_v43_single_writer",
+          "E16.5.ag129_v43_system_clock_conversion",
+          "E16.5.ag129_v43_broker_first_clock_refusal"
         ],
         "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
       },
