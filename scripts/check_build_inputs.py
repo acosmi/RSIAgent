@@ -226,7 +226,8 @@ REVIEWED_STEPS = {
         '069d5d29a124985e9667c65720f7bbe772ee732395de084430928f0da6b7f21d',
         '0afa372251664252e9f6e06ecc7f9428317caf769e5b21dbcac6a64ec3b6d124',
         '0c5ce7d02ebbc4fc5bd88fc5c49a612dbd158508a4c75dd04a2305bf4b878e73',
-        '22f39a9ffa1461a359edf3dd872d8333133939bbb8624a7764d6b60dc509decc',
+        '1b86e0ef8f61be6ebe37844d1836a2e85b6184aac7429c41b87ceec7319cd397',
+        '250ffb8c8b68e74748d829e24545eebb8faeca1cdc28f55e96a27742704b8074',
         '483f544e1f470761204097a0457ca004c309516d2cb87fa72dd50616c19cd8bd',
         '50c3901dd8979bd533772017d91c14501e39dd61d885163aead5c533748e667f',
         '52e84492baaad095b9d64104a36498c519623b784b500aaba1e012d037380fd6',
@@ -239,6 +240,7 @@ REVIEWED_STEPS = {
         'be7fca0a63238911dc4902147243d5e805472f14dbc0d011a11bcab0eaa21ea8',
         'c8a4ec17087dcb4588d39a0b583af55b84978a346c2ebe2ceedf60e91ef927af',
         'ddf38305ea4a215feddb6646e136aec5f74e93ec761f71f90f6d5070508a430f',
+        'df7d3533f01c028fe0d3b4510ade0961edacc87254b6b391fef47eb0b1215f75',
         'dfd36b50b3f0532b2c653b8dc31c7c1fee7dcbb0883ec347a91aad9c8f4a1fb7',
         'ec4df22d439ddaa8b5ec35ee753434bd5baa5a8a10df33865f8d507c93c63026',
         'f5a004bcd710de40a1805e0cff5e7a0b29037f5cb27c4fc8fef44bf95d912e5c',
@@ -247,6 +249,8 @@ REVIEWED_STEPS = {
     'dependency-audit.yml': frozenset((
         '05b5016d0dbda5cd85c06c4fd8d37d25d42c61e127abcd6c2c6900c1b317b8e2',
         '069d5d29a124985e9667c65720f7bbe772ee732395de084430928f0da6b7f21d',
+        '1b86e0ef8f61be6ebe37844d1836a2e85b6184aac7429c41b87ceec7319cd397',
+        '250ffb8c8b68e74748d829e24545eebb8faeca1cdc28f55e96a27742704b8074',
         '2583feef0d32af80f8acb9bf662555fb659665a7edb0823f39a8f462b23d4779',
         '483f544e1f470761204097a0457ca004c309516d2cb87fa72dd50616c19cd8bd',
         '7b3ca07bc6ae0987e6820f0fe074f40a2931c9e6a5500c2da4a9bd21e52d241a',
@@ -264,20 +268,46 @@ REVIEWED_STEPS = {
     'offline-build-kit.yml': frozenset((
         '05b5016d0dbda5cd85c06c4fd8d37d25d42c61e127abcd6c2c6900c1b317b8e2',
         '0a547bcb4c97842f36c146eae71afc8e439dd2fd4e7cb2889bde0c54234027d9',
+        '15180e2ce28d74bd3437c3e0ae528392d7f517ea97123640554618be5a5685ab',
+        '1b86e0ef8f61be6ebe37844d1836a2e85b6184aac7429c41b87ceec7319cd397',
+        '250ffb8c8b68e74748d829e24545eebb8faeca1cdc28f55e96a27742704b8074',
         '47988a559fadd60810d186b646f1e4978314f492cc833b35c94b0a788ae2c5d7',
         '483f544e1f470761204097a0457ca004c309516d2cb87fa72dd50616c19cd8bd',
         'c8a4ec17087dcb4588d39a0b583af55b84978a346c2ebe2ceedf60e91ef927af',
-        'e2343eb2a823313c9728de08c51bef5e8867cfcf8733e9dcb8b2a2184bd57287',
         'ec4df22d439ddaa8b5ec35ee753434bd5baa5a8a10df33865f8d507c93c63026',
         'f5a004bcd710de40a1805e0cff5e7a0b29037f5cb27c4fc8fef44bf95d912e5c',
     )),
 }
 
 
-# These original CI gates must exist once and keep their relative order.
+# These CI gates must exist once and keep their relative order.
 # Their digests bind the complete execution attributes, environment and script.
-REQUIRED_CI_GATES = (('Workspace smoke', '693467b8ec5ee7b087bfbe85468ad611be5dbad1863912861438b6accf0e9e09'), ('Quality gate', '22f39a9ffa1461a359edf3dd872d8333133939bbb8624a7764d6b60dc509decc'))
+REQUIRED_CI_GATES = (
+    ('Dependency register inputs', '250ffb8c8b68e74748d829e24545eebb8faeca1cdc28f55e96a27742704b8074'),
+    ('Dependency primary evidence', '1b86e0ef8f61be6ebe37844d1836a2e85b6184aac7429c41b87ceec7319cd397'),
+    ('Workspace smoke', '693467b8ec5ee7b087bfbe85468ad611be5dbad1863912861438b6accf0e9e09'),
+    ('Quality gate', 'df7d3533f01c028fe0d3b4510ade0961edacc87254b6b391fef47eb0b1215f75'),
+)
 
+# All build workflows keep the dependency input gate after the original five,
+# then the reviewed locked fetch, then complete primary evidence.
+REQUIRED_DEPENDENCY_STAGES = {
+    'ci.yml': (
+        ('Dependency register inputs', '250ffb8c8b68e74748d829e24545eebb8faeca1cdc28f55e96a27742704b8074', 5),
+        ('Resolve dependencies', '6f929a372c6f48e98aa3a7ec031ec1b3d0c59118bbc72f112197ce12dec9ce2d', 6),
+        ('Dependency primary evidence', '1b86e0ef8f61be6ebe37844d1836a2e85b6184aac7429c41b87ceec7319cd397', 7),
+    ),
+    'dependency-audit.yml': (
+        ('Dependency register inputs', '250ffb8c8b68e74748d829e24545eebb8faeca1cdc28f55e96a27742704b8074', 5),
+        ('Prepare report', '7b3ca07bc6ae0987e6820f0fe074f40a2931c9e6a5500c2da4a9bd21e52d241a', 6),
+        ('Dependency primary evidence', '1b86e0ef8f61be6ebe37844d1836a2e85b6184aac7429c41b87ceec7319cd397', 7),
+    ),
+    'offline-build-kit.yml': (
+        ('Dependency register inputs', '250ffb8c8b68e74748d829e24545eebb8faeca1cdc28f55e96a27742704b8074', 5),
+        ('Fetch locked build inputs', '47988a559fadd60810d186b646f1e4978314f492cc833b35c94b0a788ae2c5d7', 6),
+        ('Dependency primary evidence', '1b86e0ef8f61be6ebe37844d1836a2e85b6184aac7429c41b87ceec7319cd397', 7),
+    ),
+}
 
 def _workflow_errors(name: str, text: str) -> list[str]:
     errors = []
@@ -304,6 +334,10 @@ def _workflow_errors(name: str, text: str) -> list[str]:
             if i >= len(steps) or steps[i] != expected:
                 reason = "committed lock gate must be the first run step" if i == 1 else "critical step/condition/shell/Python precondition differs"
                 errors.append(f"{name}: {reason}")
+        digests = [_step_digest(step) for step in steps]
+        for gate_name, digest, position in REQUIRED_DEPENDENCY_STAGES[name]:
+            if digests.count(digest) != 1 or digests.index(digest) != position:
+                errors.append(f"{name}: unsupported required {gate_name} differs or is missing/duplicated/moved")
     if name == "ci.yml":
         digests = [_step_digest(step) for step in steps]
         positions = []

@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from check_production_store_open import check_tree
 from check_build_inputs import build_input_errors
+from check_dependency_register import dependency_register_errors
 from check_support_scope import CheckerError, inspect_relative, load_json_strict, validate_project_license
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,6 +96,10 @@ def main() -> int:
     build_errors = build_input_errors(ROOT)
     if build_errors:
         return fail("build inputs: " + "; ".join(build_errors))
+
+    dependency_errors = dependency_register_errors(ROOT, complete=True)
+    if dependency_errors:
+        return fail("dependency register: " + "; ".join(dependency_errors))
 
     # Increment reconstruction artifacts must not re-enter source.
     delivery = ROOT / ".delivery"
