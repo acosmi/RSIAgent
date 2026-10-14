@@ -411,5 +411,56 @@ class DependencyRegisterTest(unittest.TestCase):
         self.refused('SCHEMA', complete=False)
 
 
+class ExactLegacyLicenseRegistrationTest(unittest.TestCase):
+    # Permission units only; real primary provenance is checked separately.
+    @staticmethod
+    def registered_rows():
+        return (
+            {
+                'name': 'fallible-iterator',
+                'version': '0.3.0',
+                'checksum': '2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649',
+                'license': 'MIT/Apache-2.0',
+            },
+            {
+                'name': 'fallible-streaming-iterator',
+                'version': '0.1.9',
+                'checksum': '7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a',
+                'license': 'MIT/Apache-2.0',
+            },
+        )
+
+    def test_fallible_iterator_exact_raw_license_permission(self):
+        self.assertIsNone(checker.permitted_license(self.registered_rows()[0]))
+
+    def test_fallible_streaming_iterator_exact_raw_license_permission(self):
+        self.assertIsNone(checker.permitted_license(self.registered_rows()[1]))
+
+    def assert_modified_rows_refused(self, field, replacement):
+        for row in self.registered_rows():
+            changed = dict(row)
+            changed[field] = replacement(row)
+            with self.subTest(package=row['name'], field=field):
+                with self.assertRaisesRegex(checker.DependencyError, '^LICENSE_MISMATCH:'):
+                    checker.permitted_license(changed)
+
+    def test_new_legacy_license_permission_rejects_other_name(self):
+        self.assert_modified_rows_refused('name', lambda row: row['name'] + '-unregistered')
+
+    def test_new_legacy_license_permission_rejects_other_version(self):
+        self.assert_modified_rows_refused('version', lambda row: '9.9.9')
+
+    def test_new_legacy_license_permission_rejects_one_changed_checksum_hex(self):
+        self.assert_modified_rows_refused(
+            'checksum', lambda row: ('0' if row['checksum'][0] != '0' else '1') + row['checksum'][1:]
+        )
+
+    def test_new_legacy_license_permission_rejects_unapproved_whole_expression(self):
+        self.assert_modified_rows_refused('license', lambda row: 'MIT OR GPL-3.0-only')
+
+    def test_new_legacy_license_permission_rejects_unregistered_slash_expression(self):
+        self.assert_modified_rows_refused('license', lambda row: 'MIT/BSD-3-Clause')
+
+
 if __name__ == '__main__':
     unittest.main()
