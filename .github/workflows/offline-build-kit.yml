@@ -31,22 +31,29 @@ jobs:
           rustc --version --verbose
           cargo --version
           python3 scripts/check_build_inputs.py --check-runtime
+      - name: Dependency register inputs
+        id: dependency_inputs
+        run: python3 scripts/check_dependency_register.py --input-only
       - name: Fetch locked build inputs
         run: |
           cargo fetch --locked
           rustc --version --verbose
+      - name: Dependency primary evidence
+        id: dependency_primary
+        run: python3 scripts/check_dependency_register.py
       - name: Pack compiler and dependency cache (no credentials)
         shell: bash
         run: |
-          mkdir -p kit
+          mkdir -p kit/docs
           TOOLCHAIN="$(dirname "$(dirname "$(rustup which rustc)")")"
           tar --exclude='./share/doc' --exclude='./share/man' -C "$TOOLCHAIN" -czf kit/toolchain.tar.gz .
-          tar -C "$HOME/.cargo" -czf kit/registry.tar.gz registry
+          tar -C "${CARGO_HOME:-$HOME/.cargo}" -czf kit/registry.tar.gz registry
           cp Cargo.lock kit/Cargo.lock
+          cp docs/dependency-register.json docs/dependency-license-inventory.json kit/docs/
           python3 scripts/check_build_inputs.py --check-runtime --json > kit/build-inputs.json
           python3 scripts/check_build_inputs.py --check-runtime --check-kit kit
           rustc -Vv > kit/toolchain.txt
-          sha256sum kit/*.tar.gz kit/Cargo.lock kit/build-inputs.json > kit/SHA256SUMS
+          sha256sum kit/*.tar.gz kit/Cargo.lock kit/build-inputs.json kit/docs/*.json > kit/SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: offline-rust-build-kit

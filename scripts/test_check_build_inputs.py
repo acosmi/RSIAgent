@@ -1,16 +1,20 @@
 """Build-input counterexamples use isolated Git/FS fixtures, never Cargo/rustup."""
 from __future__ import annotations
 
+import ast
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from check_build_inputs import ACTIONS, LOCK_GATE, TOOLCHAIN, inspect_tree, workflow_inputs
+from check_build_inputs import ACTIONS, LOCK_GATE, TOOLCHAIN, _parse_workflow, inspect_tree, workflow_inputs
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -286,6 +290,121 @@ class BuildInputsTest(unittest.TestCase):
         self.assertTrue(any("differs from the pinned source HEAD" in x for x in self.errors()))
 
 
+    def test_dependency_stages_keep_input_fetch_primary_order(self) -> None:
+        self.assertEqual(self.errors(), [])
+        for name in ["ci.yml", "dependency-audit.yml", "offline-build-kit.yml"]:
+            with self.subTest(workflow=name):
+                steps = _parse_workflow((self.root / ".github/workflows" / name).read_text())[1]
+                self.assertEqual(steps[5], {"name": "Dependency register inputs", "id": "dependency_inputs", "run": "python3 scripts/check_dependency_register.py --input-only"})
+                self.assertIn("cargo fetch --locked", steps[6]["run"].splitlines())
+                self.assertEqual(steps[7], {"name": "Dependency primary evidence", "id": "dependency_primary", "run": "python3 scripts/check_dependency_register.py"})
+
+    def test_dependency_stages_cannot_be_omitted_or_duplicated(self) -> None:
+        self.assertEqual(self.errors(), [])
+        for name in ["ci.yml", "dependency-audit.yml", "offline-build-kit.yml"]:
+            path = self.root / ".github/workflows" / name
+            source = path.read_text()
+            for title, step_id, command in [("Dependency register inputs", "dependency_inputs", "python3 scripts/check_dependency_register.py --input-only"), ("Dependency primary evidence", "dependency_primary", "python3 scripts/check_dependency_register.py")]:
+                block = f"      - name: {title}\n        id: {step_id}\n        run: {command}\n"
+                self.assertEqual(source.count(block), 1)
+                for replacement in ["", block + block]:
+                    with self.subTest(workflow=name, title=title, duplicate=bool(replacement)):
+                        path.write_text(source.replace(block, replacement, 1))
+                        self.assertTrue(any("unsupported required " + title in error for error in self.errors()))
+                path.write_text(source)
+
+    def test_dependency_stages_cannot_be_skipped_or_nonblocking(self) -> None:
+        self.assertEqual(self.errors(), [])
+        for name in ["ci.yml", "dependency-audit.yml", "offline-build-kit.yml"]:
+            path = self.root / ".github/workflows" / name
+            source = path.read_text()
+            for title, step_id in [("Dependency register inputs", "dependency_inputs"), ("Dependency primary evidence", "dependency_primary")]:
+                for attribute in ["if: false", "continue-on-error: true"]:
+                    with self.subTest(workflow=name, title=title, attribute=attribute):
+                        marker = f"        id: {step_id}\n"
+                        path.write_text(source.replace(marker, marker + "        " + attribute + "\n", 1))
+                        self.assertTrue(any("unsupported required " + title in error for error in self.errors()))
+                path.write_text(source)
+
+    def test_dependency_primary_cannot_move_after_compilation(self) -> None:
+        self.assertEqual(self.errors(), [])
+        path = self.root / ".github/workflows/ci.yml"
+        source = path.read_text()
+        primary = "      - name: Dependency primary evidence\n        id: dependency_primary\n        run: python3 scripts/check_dependency_register.py\n"
+        marker = "      - name: Tests\n"
+        path.write_text(source.replace(primary, "", 1).replace(marker, primary + marker, 1))
+        self.assertTrue(any("unsupported required Dependency primary evidence" in error for error in self.errors()))
+
+    def test_quality_gate_requires_both_actual_dependency_outcomes(self) -> None:
+        self.assertEqual(self.errors(), [])
+        path = self.root / ".github/workflows/ci.yml"
+        source = path.read_text()
+        for step_id in ["dependency_inputs", "dependency_primary"]:
+            with self.subTest(step_id=step_id):
+                old = "${{ steps." + step_id + ".outcome }}"
+                self.assertEqual(source.count(old), 1)
+                path.write_text(source.replace(old, "${{ steps.build_inputs.outcome }}", 1))
+                self.assertTrue(any("unsupported required Quality gate" in error for error in self.errors()))
+        path.write_text(source)
+
+    def test_unreviewed_python_commands_are_still_refused(self) -> None:
+        self.assertEqual(self.errors(), [])
+        path = self.root / ".github/workflows/ci.yml"
+        source = path.read_text()
+        for command in ["python3 scripts/unreviewed.py", "python3 scripts/check_dependency_register.py", "python3 scripts/check_dependency_register.py --input-only"]:
+            with self.subTest(command=command):
+                path.write_text(source + "      - run: " + command + "\n")
+                self.assertTrue(any("unsupported shell executable" in error for error in self.errors()))
+        path.write_text(source)
+
+    def test_dependency_audit_paths_cover_the_full_contract(self) -> None:
+        required = {"docs/dependency-register.json", "docs/dependency-license-inventory.json", "scripts/check_dependency_register.py", "scripts/test_check_dependency_register.py", "scripts/smoke_workspace.py", ".github/workflows/ci.yml", ".github/workflows/dependency-audit.yml", ".github/workflows/offline-build-kit.yml", "scripts/check_build_inputs.py", "scripts/test_check_build_inputs.py"}
+        text = (self.root / ".github/workflows/dependency-audit.yml").read_text()
+        path_sets = [set(ast.literal_eval(line.split(":", 1)[1].strip())) for line in text.splitlines() if line.strip().startswith("paths:")]
+        self.assertEqual(len(path_sets), 2)
+        for paths in path_sets:
+            self.assertTrue(required.issubset(paths))
+            self.assertTrue({"Cargo.lock", "Cargo.toml", "**/Cargo.toml"}.issubset(paths))
+
+    def test_offline_pack_uses_selected_cache_and_copies_both_inventories(self) -> None:
+        self.assertEqual(self.errors(), [])
+        _, runs = workflow_inputs((self.root / ".github/workflows/offline-build-kit.yml").read_text())
+        pack = next(run for run in runs if "kit/registry.tar.gz" in run)
+        tools = self.root / "fake-tools"
+        tools.mkdir()
+        compiler = self.root / "fixture compiler"
+        (compiler / "bin").mkdir(parents=True)
+        (compiler / "bin/rustc").write_text("fixture compiler bytes\n")
+        cache = self.root / "selected cargo home"
+        (cache / "registry/cache/mirror").mkdir(parents=True)
+        (cache / "registry/cache/mirror/selected.crate").write_bytes(b"selected cache bytes")
+        docs = self.root / "docs"
+        docs.mkdir()
+        records = {"dependency-register.json": b'{"fixture":"register"}\n', "dependency-license-inventory.json": b'{"fixture":"inventory"}\n'}
+        for name, data in records.items():
+            (docs / name).write_bytes(data)
+        scripts = {
+            "rustup": '#!/bin/sh\nprintf "%s\\n" "$FIXTURE_RUSTC"\n',
+            "rustc": '#!/bin/sh\nprintf "fixture compiler\\n"\n',
+            "python3": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$FIXTURE_PYTHON_LOG"\nprintf "{}\\n"\n',
+            "sha256sum": "#!" + sys.executable + '\nimport hashlib,sys\nfrom pathlib import Path\nfor name in sys.argv[1:]:\n    print(hashlib.sha256(Path(name).read_bytes()).hexdigest() + "  " + name)\n',
+        }
+        for name, body in scripts.items():
+            path = tools / name
+            path.write_text(body)
+            path.chmod(0o700)
+        env = self.env.copy()
+        env.update(PATH=str(tools) + ":" + env.get("PATH", ""), CARGO_HOME=str(cache), FIXTURE_RUSTC=str(compiler / "bin/rustc"), FIXTURE_PYTHON_LOG=str(self.root / "python-calls"))
+        result = subprocess.run(["/bin/bash", "-e", "-c", pack], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name, data in records.items():
+            self.assertEqual((self.root / "kit/docs" / name).read_bytes(), data)
+            self.assertIn(hashlib.sha256(data).hexdigest() + "  kit/docs/" + name, (self.root / "kit/SHA256SUMS").read_text())
+        with tarfile.open(self.root / "kit/registry.tar.gz", "r:gz") as archive:
+            self.assertEqual(archive.extractfile("registry/cache/mirror/selected.crate").read(), b"selected cache bytes")
+        self.assertEqual((self.root / "python-calls").read_text().splitlines(), ["scripts/check_build_inputs.py --check-runtime --json", "scripts/check_build_inputs.py --check-runtime --check-kit kit"])
+
+
 # Exact edits derived from independently frozen full R2 YAML inputs.
 R3_FIXED_INPUTS = {'conditional_first_gate': {'sha256': '89da62fbc429911a151905054f94e0b7a46964abc7c4a95693aaa100e7ef317c', 'kind': 'new_supported_shape', 'edits': [('after', '      - name: Require committed lock\n', '        if: false\n')]}, 'dynamic_constant_executable': {'sha256': 'b555049533441060f73c02028cda26cb67cd32d04cd5aa09c4da270f3d84996f', 'kind': 'new_supported_shape', 'edits': [('append', "      - run: ${{ 'cargo' }} +stable check --locked\n", '')]}, 'dynamic_event_run': {'sha256': '68d49d8c31540fea969e0ee20acbb393cdd41c63bc6f0a70877e447f69258ced', 'kind': 'unsupported_dynamic_unexecuted', 'edits': [('append', '      - run: ${{ github.event.inputs.command }}\n', '')]}, 'explicit_run_key': {'sha256': 'bb6bd4ad1c2f8f7aa0cc2b22b213bd6e984cda054995c99edf5c55f191a374b9', 'kind': 'unsupported_structural_unexecuted', 'edits': [('append', '      - ? run\n        : cargo check\n', '')]}, 'explicit_uses_key': {'sha256': 'caa09808bcbeeb4019746ca1bbc446d31319a967979f63d475d705e54d186bbb', 'kind': 'unsupported_structural_unexecuted', 'edits': [('append', '      - ? uses\n        : actions/checkout@v4\n', '')]}, 'fake_locked_substitution': {'sha256': 'dc48782cc3ca857751f3bc2ba6009c9a667094d889555afb0e96df29227edefc', 'kind': 'new_supported_shape', 'edits': [('append', '      - run: cargo check $(echo --locked >/dev/null)\n', '')]}, 'input_shell_python': {'sha256': '743b853c1e1bf5ea3efb32002b321ccb58b13b903ff793dca629d32801b86eee', 'kind': 'new_supported_shape', 'edits': [('after', '        id: build_inputs\n', '        shell: python\n')]}, 'line_continued_unlocked': {'sha256': '2b774e4ef6469aa5ada2b83319518b077be6e73f10c374ac758f8f26c0109fd0', 'kind': 'new_supported_shape', 'edits': [('append', '      - run: |\n          cargo \\\n            check\n', '')]}, 'multi_job_alternative_indent': {'sha256': '7119f191e5ece99fc83e5e1d9fb583190fc367a89fb49570abb4123ff4d4d887', 'kind': 'new_supported_shape', 'edits': [('append', '\n  hidden:\n      runs-on: ubuntu-latest\n      steps:\n          - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n          - run: cargo check --locked\n', '')]}, 'nonblocking_lock_and_input': {'sha256': '2241c784255abe2f70707093446966a286a517f641b27b0a23d3f30c3e5a7ed7', 'kind': 'new_supported_shape', 'edits': [('after', '      - name: Require committed lock\n', '        continue-on-error: true\n'), ('after', '        id: build_inputs\n', '        continue-on-error: true\n')]}, 'python_precondition_wrong': {'sha256': '6d2088391f6f0cc082bc38c69d186a38d556d5c8889d1b7c4d012fe361d33259', 'kind': 'new_supported_shape', 'edits': [('replace', "          python-version: '3.12'\n", "          python-version: '3.9'\n")]}, 'quoted_cargo_stable_block': {'sha256': 'bb581c4d7b5203fce0a968612fcd67f1a6929ef0556aa26480239a5ce1fe5c89', 'kind': 'new_supported_shape', 'edits': [('append', '      - run: |\n          "cargo" +stable check --locked\n', '')]}, 'quoted_cargo_unlocked_block': {'sha256': '9b3a786e72c1874957acbdae632fbd7798cd6f7d08eca197de378ca2150aab97', 'kind': 'new_supported_shape', 'edits': [('append', '      - run: |\n          "cargo" check\n', '')]}, 'quoted_rustup_stable_block': {'sha256': '8451a3a2ae66f70bfbd4d655fc73ac556a1c301dc3bbfd81f3a557f0b2aa9316', 'kind': 'new_supported_shape', 'edits': [('append', '      - run: |\n          "rustup" run stable cargo check --locked\n', '')]}, 'run_key_space_before_colon': {'sha256': 'c3ec00c0fc07a8f579c713dca3b4e7c4a9acf58e1bb8f433ed3894623d9a1e27', 'kind': 'new_supported_shape', 'edits': [('append', '      - run : cargo check\n', '')]}, 'skipped_toolchain_install': {'sha256': '22a25406c3a6cdc2d88e965cc0e27d4c42ddce6fcd6e8e3e9343116bf41db437', 'kind': 'new_supported_shape', 'edits': [('after', '      - name: Exact Rust toolchain\n', '        if: false\n')]}, 'valid_outer_yaml_quote_cargo': {'sha256': '7e253302342f9ba4635fb6508c40f5a31f02b86ba0e1ad0052f07c25f131bb25', 'kind': 'new_supported_shape', 'edits': [('append', '      - run: \'"cargo" +stable check --locked\'\n', '')]}, 'valid_outer_yaml_quote_rustup': {'sha256': '4a15ae9c309e255abac9228d295a04042c6cb03c422947475e96570c29750d44', 'kind': 'new_supported_shape', 'edits': [('append', '      - run: \'"rustup" run stable cargo check --locked\'\n', '')]}}
 
@@ -313,7 +432,7 @@ for _name, _case in R3_FIXED_INPUTS.items():
 
 
 # R4 single mutations reconstruct the four independently frozen healthy R3 inputs.
-R4_STRUCTURE_CASES = {'global_defaults_shell': ('jobs:\n', 'defaults:\n  run:\n    shell: bash --noprofile --norc {0}\njobs:\n', 'unsupported workflow/job execution default'), 'quoted_job_defaults_shell': ('    timeout-minutes: 25\n', '    timeout-minutes: 25\n    "defaults":\n      run:\n        shell: bash --noprofile --norc {0}\n', 'unsupported workflow/job execution default'), 'drop_quality_gate': ('      - name: Quality gate\n        if: always()\n        env:\n          BUILD_INPUTS: ${{ steps.build_inputs.outcome }}\n          LOCKED_INPUTS: ${{ steps.locked_inputs.outcome }}\n          FORMAT: ${{ steps.format.outcome }}\n          CHECK: ${{ steps.check.outcome }}\n          TESTS: ${{ steps.tests.outcome }}\n          CLIPPY: ${{ steps.clippy.outcome }}\n          SMOKE_WORKSPACE: ${{ steps.smoke_workspace.outcome }}\n          SMOKE: ${{ steps.smoke.outcome }}\n          MCP_STDIO: ${{ steps.mcp_stdio.outcome }}\n          PYTHON_TESTS: ${{ steps.python_tests.outcome }}\n          STATISTICS_REFERENCE: ${{ steps.statistics_reference.outcome }}\n          MIGRATION_CHECKSUMS: ${{ steps.migration_checksums.outcome }}\n          INVENTORY: ${{ steps.inventory.outcome }}\n          ARCHIVE: ${{ steps.archive.outcome }}\n        run: |\n          set -e\n          test "$BUILD_INPUTS" = success\n          test "$LOCKED_INPUTS" = success\n          test "$FORMAT" = success\n          test "$CHECK" = success\n          test "$TESTS" = success\n          test "$CLIPPY" = success\n          test "$SMOKE_WORKSPACE" = success\n          test "$SMOKE" = success\n          test "$MCP_STDIO" = success\n          test "$PYTHON_TESTS" = success\n          test "$STATISTICS_REFERENCE" = success\n          test "$MIGRATION_CHECKSUMS" = success\n          test "$INVENTORY" = success\n          test "$ARCHIVE" = success\n', '', 'unsupported required Quality gate'), 'drop_workspace_smoke': ('      - name: Workspace smoke\n        id: smoke_workspace\n        continue-on-error: true\n        run: python3 scripts/smoke_workspace.py > out/smoke-workspace.txt 2>&1\n', '', 'unsupported required Workspace smoke')}
+R4_STRUCTURE_CASES = {'global_defaults_shell': ('jobs:\n', 'defaults:\n  run:\n    shell: bash --noprofile --norc {0}\njobs:\n', 'unsupported workflow/job execution default'), 'quoted_job_defaults_shell': ('    timeout-minutes: 25\n', '    timeout-minutes: 25\n    "defaults":\n      run:\n        shell: bash --noprofile --norc {0}\n', 'unsupported workflow/job execution default'), 'drop_quality_gate': ('      - name: Quality gate\n        if: always()\n        env:\n          BUILD_INPUTS: ${{ steps.build_inputs.outcome }}\n          DEPENDENCY_INPUTS: ${{ steps.dependency_inputs.outcome }}\n          DEPENDENCY_PRIMARY: ${{ steps.dependency_primary.outcome }}\n          LOCKED_INPUTS: ${{ steps.locked_inputs.outcome }}\n          FORMAT: ${{ steps.format.outcome }}\n          CHECK: ${{ steps.check.outcome }}\n          TESTS: ${{ steps.tests.outcome }}\n          CLIPPY: ${{ steps.clippy.outcome }}\n          SMOKE_WORKSPACE: ${{ steps.smoke_workspace.outcome }}\n          SMOKE: ${{ steps.smoke.outcome }}\n          MCP_STDIO: ${{ steps.mcp_stdio.outcome }}\n          PYTHON_TESTS: ${{ steps.python_tests.outcome }}\n          STATISTICS_REFERENCE: ${{ steps.statistics_reference.outcome }}\n          MIGRATION_CHECKSUMS: ${{ steps.migration_checksums.outcome }}\n          INVENTORY: ${{ steps.inventory.outcome }}\n          ARCHIVE: ${{ steps.archive.outcome }}\n        run: |\n          set -e\n          test "$BUILD_INPUTS" = success\n          test "$DEPENDENCY_INPUTS" = success\n          test "$DEPENDENCY_PRIMARY" = success\n          test "$LOCKED_INPUTS" = success\n          test "$FORMAT" = success\n          test "$CHECK" = success\n          test "$TESTS" = success\n          test "$CLIPPY" = success\n          test "$SMOKE_WORKSPACE" = success\n          test "$SMOKE" = success\n          test "$MCP_STDIO" = success\n          test "$PYTHON_TESTS" = success\n          test "$STATISTICS_REFERENCE" = success\n          test "$MIGRATION_CHECKSUMS" = success\n          test "$INVENTORY" = success\n          test "$ARCHIVE" = success\n', '', 'unsupported required Quality gate'), 'drop_workspace_smoke': ('      - name: Workspace smoke\n        id: smoke_workspace\n        continue-on-error: true\n        run: python3 scripts/smoke_workspace.py > out/smoke-workspace.txt 2>&1\n', '', 'unsupported required Workspace smoke')}
 
 
 def _fixed_r4_case(case):

@@ -2,9 +2,9 @@ name: Dependency audit
 on:
   push:
     branches: [main]
-    paths: ['Cargo.lock', 'Cargo.toml', '**/Cargo.toml', '.github/workflows/dependency-audit.yml']
+    paths: ['Cargo.lock', 'Cargo.toml', '**/Cargo.toml', 'rust-toolchain.toml', 'LICENSE', 'docs/dependency-register.json', 'docs/dependency-license-inventory.json', 'scripts/check_dependency_register.py', 'scripts/test_check_dependency_register.py', 'scripts/smoke_workspace.py', '.github/workflows/ci.yml', '.github/workflows/dependency-audit.yml', '.github/workflows/offline-build-kit.yml', 'scripts/check_build_inputs.py', 'scripts/test_check_build_inputs.py']
   pull_request:
-    paths: ['Cargo.lock', 'Cargo.toml', '**/Cargo.toml', '.github/workflows/dependency-audit.yml']
+    paths: ['Cargo.lock', 'Cargo.toml', '**/Cargo.toml', 'rust-toolchain.toml', 'LICENSE', 'docs/dependency-register.json', 'docs/dependency-license-inventory.json', 'scripts/check_dependency_register.py', 'scripts/test_check_dependency_register.py', 'scripts/smoke_workspace.py', '.github/workflows/ci.yml', '.github/workflows/dependency-audit.yml', '.github/workflows/offline-build-kit.yml', 'scripts/check_build_inputs.py', 'scripts/test_check_build_inputs.py']
   workflow_dispatch:
 permissions:
   contents: read
@@ -34,6 +34,9 @@ jobs:
           rustc --version --verbose
           cargo --version
           python3 scripts/check_build_inputs.py --check-runtime
+      - name: Dependency register inputs
+        id: dependency_inputs
+        run: python3 scripts/check_dependency_register.py --input-only
       - name: Prepare report
         run: |
           mkdir -p audit-report
@@ -41,6 +44,9 @@ jobs:
           rustc --version --verbose > audit-report/toolchain.txt
           cargo fetch --locked
           cp Cargo.lock audit-report/Cargo.lock
+      - name: Dependency primary evidence
+        id: dependency_primary
+        run: python3 scripts/check_dependency_register.py
       - name: Install pinned audit tool
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit exact lock file

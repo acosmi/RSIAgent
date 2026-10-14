@@ -1,0 +1,1502 @@
+{
+  "dependencies": [
+    {
+      "alternative": "Use explicit typed Result error enums and contextual Display implementations.",
+      "checksum": "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470",
+      "consumers": [
+        {
+          "alias": "anyhow",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "1"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "anyhow",
+      "purpose": "Contextual error propagation in application and engine paths.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.0.104"
+    },
+    {
+      "alternative": "Use native async trait methods with explicit boxing at dynamic boundaries.",
+      "checksum": "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667",
+      "consumers": [
+        {
+          "alias": "async-trait",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-engine/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "0.1"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "async-trait",
+      "purpose": "Asynchronous trait adapters shared by runtime interfaces.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.92"
+    },
+    {
+      "alternative": "Build explicit routing and request adapters over a reviewed HTTP implementation.",
+      "checksum": "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90",
+      "consumers": [
+        {
+          "alias": "axum",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "0.8"
+        },
+        {
+          "alias": "axum",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "dev",
+          "manifest": "crates/evo-engine/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "0.8"
+        },
+        {
+          "alias": "axum",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "0.8"
+        }
+      ],
+      "license": "MIT",
+      "name": "axum",
+      "purpose": "HTTP routing and request handling for the HTTP service.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.8.9"
+    },
+    {
+      "alternative": "Use explicit argument parsing with the same validated command contract.",
+      "checksum": "aa8876b300ab35ba921adea3dfd70157a46249b33f95c9084ae5709785478946",
+      "consumers": [
+        {
+          "alias": "clap",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "derive",
+            "env"
+          ],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "derive",
+              "env"
+            ],
+            "version": "4"
+          }
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "clap",
+      "purpose": "CLI argument parsing and derive/env option definitions.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "4.6.7"
+    },
+    {
+      "alternative": "Use reviewed platform lock adapters preserving lock ownership and contention behavior.",
+      "checksum": "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213",
+      "consumers": [
+        {
+          "alias": "fs2",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "0.4"
+        }
+      ],
+      "license": "MIT/Apache-2.0",
+      "name": "fs2",
+      "purpose": "Portable file locking for owned runtime resources.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.4.3"
+    },
+    {
+      "alternative": "Use a reviewed lower-level HTTP/TLS client adapter with equivalent stream and timeout rules.",
+      "checksum": "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147",
+      "consumers": [
+        {
+          "alias": "reqwest",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": false,
+          "features": [
+            "json",
+            "rustls-tls",
+            "stream"
+          ],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "default-features": false,
+            "features": [
+              "json",
+              "rustls-tls",
+              "stream"
+            ],
+            "version": "0.12"
+          }
+        },
+        {
+          "alias": "reqwest",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": false,
+          "features": [
+            "json",
+            "rustls-tls",
+            "stream"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-engine/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "default-features": false,
+            "features": [
+              "json",
+              "rustls-tls",
+              "stream"
+            ],
+            "version": "0.12"
+          }
+        },
+        {
+          "alias": "reqwest",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": false,
+          "features": [
+            "json",
+            "rustls-tls",
+            "stream"
+          ],
+          "kind": "dev",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "default-features": false,
+            "features": [
+              "json",
+              "rustls-tls",
+              "stream"
+            ],
+            "version": "0.12"
+          }
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "reqwest",
+      "purpose": "HTTP client calls with JSON, TLS and streaming support.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.12.28"
+    },
+    {
+      "alternative": "Implement the bounded MCP wire and transport adapters with the same contract tests.",
+      "checksum": "b88db56b8ae316560e9e868b6b978ea940f27cb883323fc90e07435e44158f5c",
+      "consumers": [
+        {
+          "alias": "rmcp",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": false,
+          "features": [
+            "macros",
+            "server",
+            "transport-io",
+            "transport-streamable-http-server"
+          ],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "default-features": false,
+            "features": [
+              "server",
+              "macros",
+              "transport-io",
+              "transport-streamable-http-server"
+            ],
+            "version": "=3.3.0"
+          }
+        },
+        {
+          "alias": "rmcp",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": false,
+          "features": [
+            "macros",
+            "server",
+            "transport-io",
+            "transport-streamable-http-server"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "default-features": false,
+            "features": [
+              "server",
+              "macros",
+              "transport-io",
+              "transport-streamable-http-server"
+            ],
+            "version": "=3.3.0"
+          }
+        },
+        {
+          "alias": "rmcp",
+          "declaration": {
+            "features": [
+              "client"
+            ],
+            "workspace": true
+          },
+          "default_features": false,
+          "features": [
+            "client",
+            "macros",
+            "server",
+            "transport-io",
+            "transport-streamable-http-server"
+          ],
+          "kind": "dev",
+          "manifest": "crates/evo-mcp/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "default-features": false,
+            "features": [
+              "server",
+              "macros",
+              "transport-io",
+              "transport-streamable-http-server"
+            ],
+            "version": "=3.3.0"
+          }
+        },
+        {
+          "alias": "rmcp",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": false,
+          "features": [
+            "macros",
+            "server",
+            "transport-io",
+            "transport-streamable-http-server"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-mcp/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "default-features": false,
+            "features": [
+              "server",
+              "macros",
+              "transport-io",
+              "transport-streamable-http-server"
+            ],
+            "version": "=3.3.0"
+          }
+        }
+      ],
+      "license": "Apache-2.0",
+      "name": "rmcp",
+      "purpose": "MCP server transports and the dev client protocol controls.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "3.3.0"
+    },
+    {
+      "alternative": "Use a separately reviewed safe platform filesystem adapter.",
+      "checksum": "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d",
+      "consumers": [
+        {
+          "alias": "rustix",
+          "declaration": {
+            "features": [
+              "fs"
+            ],
+            "version": "=1.1.5"
+          },
+          "default_features": true,
+          "features": [
+            "fs"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-storage/Cargo.toml",
+          "target": "cfg(unix)",
+          "workspace_declaration": null
+        }
+      ],
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "name": "rustix",
+      "purpose": "Safe Unix filesystem operations for storage.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.1.5"
+    },
+    {
+      "alternative": "Maintain explicit versioned JSON schemas and consistency checks.",
+      "checksum": "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a",
+      "consumers": [
+        {
+          "alias": "schemars",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-core/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "1"
+        }
+      ],
+      "license": "MIT",
+      "name": "schemars",
+      "purpose": "JSON schema derivation for typed contracts.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.2.2"
+    },
+    {
+      "alternative": "Maintain explicit protocol codecs with equivalent validation.",
+      "checksum": "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba",
+      "consumers": [
+        {
+          "alias": "serde",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "derive"
+          ],
+          "kind": "dev",
+          "manifest": "crates/evo-core/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "derive"
+            ],
+            "version": "1"
+          }
+        },
+        {
+          "alias": "serde",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "derive"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-core/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "derive"
+            ],
+            "version": "1"
+          }
+        },
+        {
+          "alias": "serde",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "derive"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-engine/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "derive"
+            ],
+            "version": "1"
+          }
+        },
+        {
+          "alias": "serde",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "derive"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "derive"
+            ],
+            "version": "1"
+          }
+        },
+        {
+          "alias": "serde",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "derive"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-mcp/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "derive"
+            ],
+            "version": "1"
+          }
+        },
+        {
+          "alias": "serde",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "derive"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-storage/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "derive"
+            ],
+            "version": "1"
+          }
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "serde",
+      "purpose": "Typed serialization and deserialization with derives.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.0.229"
+    },
+    {
+      "alternative": "Use an independently reviewed JSON codec behind the same typed interfaces.",
+      "checksum": "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14",
+      "consumers": [
+        {
+          "alias": "serde_json",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "1"
+        },
+        {
+          "alias": "serde_json",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "dev",
+          "manifest": "crates/evo-core/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "1"
+        },
+        {
+          "alias": "serde_json",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-core/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "1"
+        },
+        {
+          "alias": "serde_json",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-engine/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "1"
+        },
+        {
+          "alias": "serde_json",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "1"
+        },
+        {
+          "alias": "serde_json",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-mcp/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "1"
+        },
+        {
+          "alias": "serde_json",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-storage/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "1"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "serde_json",
+      "purpose": "JSON values and wire serialization.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.0.151"
+    },
+    {
+      "alternative": "Use a separately reviewed SHA-256 provider without changing digest semantics.",
+      "checksum": "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283",
+      "consumers": [
+        {
+          "alias": "sha2",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-core/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "0.10"
+        },
+        {
+          "alias": "sha2",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "0.10"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "sha2",
+      "purpose": "SHA-256 content and evidence identities.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.10.9"
+    },
+    {
+      "alternative": "Use rusqlite plus explicit asynchronous scheduling and migration validation.",
+      "checksum": "1fefb893899429669dcdd979aff487bd78f4064e5e7907e4269081e0ef7d97dc",
+      "consumers": [
+        {
+          "alias": "sqlx",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": false,
+          "features": [
+            "macros",
+            "migrate",
+            "runtime-tokio",
+            "sqlite"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-storage/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "default-features": false,
+            "features": [
+              "runtime-tokio",
+              "sqlite",
+              "migrate",
+              "macros"
+            ],
+            "version": "=0.8.6"
+          }
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "sqlx",
+      "purpose": "Asynchronous SQLite access and fixed migrations.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.8.6"
+    },
+    {
+      "alternative": "Use explicit temporary-directory ownership and cleanup guards.",
+      "checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd",
+      "consumers": [
+        {
+          "alias": "tempfile",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "dev",
+          "manifest": "crates/evo-engine/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "3"
+        },
+        {
+          "alias": "tempfile",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "dev",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "3"
+        },
+        {
+          "alias": "tempfile",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "dev",
+          "manifest": "crates/evo-mcp/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "3"
+        },
+        {
+          "alias": "tempfile",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "dev",
+          "manifest": "crates/evo-storage/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "3"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "tempfile",
+      "purpose": "Owned temporary files and directories in test controls.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "3.27.0"
+    },
+    {
+      "alternative": "Implement Display and std::error::Error manually.",
+      "checksum": "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f",
+      "consumers": [
+        {
+          "alias": "thiserror",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-core/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "2"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "thiserror",
+      "purpose": "Typed error derives.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.0.20"
+    },
+    {
+      "alternative": "Use bounded std threads/channels plus reviewed I/O adapters after a separate behavior audit.",
+      "checksum": "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed",
+      "consumers": [
+        {
+          "alias": "tokio",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "full"
+          ],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "full"
+            ],
+            "version": "1"
+          }
+        },
+        {
+          "alias": "tokio",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "full"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-engine/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "full"
+            ],
+            "version": "1"
+          }
+        },
+        {
+          "alias": "tokio",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "full"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "full"
+            ],
+            "version": "1"
+          }
+        },
+        {
+          "alias": "tokio",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "full"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-mcp/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "full"
+            ],
+            "version": "1"
+          }
+        },
+        {
+          "alias": "tokio",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "full"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-storage/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "full"
+            ],
+            "version": "1"
+          }
+        }
+      ],
+      "license": "MIT",
+      "name": "tokio",
+      "purpose": "Asynchronous I/O, scheduling, channels and timers.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.53.1"
+    },
+    {
+      "alternative": "Implement explicit cancellation/runtime utilities with equivalent lifecycle tests.",
+      "checksum": "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52",
+      "consumers": [
+        {
+          "alias": "tokio-util",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "rt"
+          ],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "rt"
+            ],
+            "version": "0.7"
+          }
+        },
+        {
+          "alias": "tokio-util",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "rt"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-engine/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "rt"
+            ],
+            "version": "0.7"
+          }
+        },
+        {
+          "alias": "tokio-util",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "rt"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "rt"
+            ],
+            "version": "0.7"
+          }
+        },
+        {
+          "alias": "tokio-util",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "rt"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-mcp/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "rt"
+            ],
+            "version": "0.7"
+          }
+        }
+      ],
+      "license": "MIT",
+      "name": "tokio-util",
+      "purpose": "Cancellation and runtime support utilities.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.7.19"
+    },
+    {
+      "alternative": "Use explicit service wrappers preserving admission and limit behavior.",
+      "checksum": "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4",
+      "consumers": [
+        {
+          "alias": "tower",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "limit",
+            "util"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "util",
+              "limit"
+            ],
+            "version": "0.5"
+          }
+        }
+      ],
+      "license": "MIT",
+      "name": "tower",
+      "purpose": "Service middleware and request concurrency limits.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.5.3"
+    },
+    {
+      "alternative": "Implement the bounded HTTP middleware in explicit service adapters.",
+      "checksum": "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840",
+      "consumers": [
+        {
+          "alias": "tower-http",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "limit",
+            "trace"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "limit",
+              "trace"
+            ],
+            "version": "0.6"
+          }
+        }
+      ],
+      "license": "MIT",
+      "name": "tower-http",
+      "purpose": "HTTP limit and tracing middleware.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.6.11"
+    },
+    {
+      "alternative": "Use explicit log records and context fields through a reviewed logging adapter.",
+      "checksum": "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100",
+      "consumers": [
+        {
+          "alias": "tracing",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-engine/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "0.1"
+        },
+        {
+          "alias": "tracing",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "0.1"
+        },
+        {
+          "alias": "tracing",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-mcp/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "0.1"
+        },
+        {
+          "alias": "tracing",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-storage/Cargo.toml",
+          "target": null,
+          "workspace_declaration": "0.1"
+        }
+      ],
+      "license": "MIT",
+      "name": "tracing",
+      "purpose": "Structured runtime diagnostics.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.44"
+    },
+    {
+      "alternative": "Maintain explicit filtering and formatting over the same diagnostic records.",
+      "checksum": "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319",
+      "consumers": [
+        {
+          "alias": "tracing-subscriber",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "env-filter"
+          ],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "env-filter"
+            ],
+            "version": "0.3"
+          }
+        }
+      ],
+      "license": "MIT",
+      "name": "tracing-subscriber",
+      "purpose": "Environment-configured trace formatting and filtering.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.3.23"
+    },
+    {
+      "alternative": "Use a reviewed version-4 identifier adapter with the same parsing and uniqueness requirements.",
+      "checksum": "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce",
+      "consumers": [
+        {
+          "alias": "uuid",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "v4"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-core/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "v4"
+            ],
+            "version": "1"
+          }
+        },
+        {
+          "alias": "uuid",
+          "declaration": {
+            "workspace": true
+          },
+          "default_features": true,
+          "features": [
+            "v4"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-storage/Cargo.toml",
+          "target": null,
+          "workspace_declaration": {
+            "features": [
+              "v4"
+            ],
+            "version": "1"
+          }
+        }
+      ],
+      "license": "Apache-2.0 OR MIT",
+      "name": "uuid",
+      "purpose": "Version-4 identifiers for runtime records.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.26.1"
+    }
+  ],
+  "inputs": {
+    "cargo_lock_sha256": "773b26f7bc574a899f87790298558678872403a2de4cc8e17e1e3705c83ab57c",
+    "manifests": {
+      "Cargo.toml": "b509c760a653938dcb00fed78a4ead63c43aa7b6bd1537f4e6dd0fb3e5c45f61",
+      "apps/rsia/Cargo.toml": "f7a01045b14b22b99d6f1b0d442013ff836392a159226613f8fa21674935bc46",
+      "crates/evo-core/Cargo.toml": "1e53067bdd36e742e729d53b757c090df1ee30b599da58627dcfd1f471fad371",
+      "crates/evo-engine/Cargo.toml": "bac362631f8bd675c3b323b0a847f152a6d090a5039f148e3e4ae0e77eea225f",
+      "crates/evo-http/Cargo.toml": "d75104c7dc6eb959f820df2c40e5d470166fe003fc2d4cdd3086bf90f463dc68",
+      "crates/evo-mcp/Cargo.toml": "733aa65f247ea23431aa5da8accf0f7cd02144d4dd3be7d5282b0caf9614d0bf",
+      "crates/evo-storage/Cargo.toml": "826c8edca975c9293319c527d6cb634ad58217a21ea32aeade8d87f541c782d3"
+    }
+  },
+  "internal_packages": [
+    {
+      "consumers": [
+        {
+          "alias": "evo-core",
+          "declaration": {
+            "path": "../../crates/evo-core"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        },
+        {
+          "alias": "evo-core",
+          "declaration": {
+            "path": "../evo-core"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-engine/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        },
+        {
+          "alias": "evo-core",
+          "declaration": {
+            "path": "../evo-core"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        },
+        {
+          "alias": "evo-core",
+          "declaration": {
+            "path": "../evo-core"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-mcp/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        },
+        {
+          "alias": "evo-core",
+          "declaration": {
+            "path": "../evo-core"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-storage/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        }
+      ],
+      "name": "evo-core",
+      "path": "crates/evo-core",
+      "version": "0.2.0"
+    },
+    {
+      "consumers": [
+        {
+          "alias": "evo-engine",
+          "declaration": {
+            "path": "../../crates/evo-engine"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        },
+        {
+          "alias": "evo-engine",
+          "declaration": {
+            "path": "../evo-engine"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        },
+        {
+          "alias": "evo-engine",
+          "declaration": {
+            "path": "../evo-engine"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-mcp/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        }
+      ],
+      "name": "evo-engine",
+      "path": "crates/evo-engine",
+      "version": "0.2.0"
+    },
+    {
+      "consumers": [
+        {
+          "alias": "evo-http",
+          "declaration": {
+            "path": "../../crates/evo-http"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        }
+      ],
+      "name": "evo-http",
+      "path": "crates/evo-http",
+      "version": "0.2.0"
+    },
+    {
+      "consumers": [
+        {
+          "alias": "evo-mcp",
+          "declaration": {
+            "path": "../../crates/evo-mcp"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        },
+        {
+          "alias": "evo-mcp",
+          "declaration": {
+            "path": "../evo-mcp"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        }
+      ],
+      "name": "evo-mcp",
+      "path": "crates/evo-mcp",
+      "version": "0.2.0"
+    },
+    {
+      "consumers": [
+        {
+          "alias": "evo-storage",
+          "declaration": {
+            "path": "../../crates/evo-storage"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "apps/rsia/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        },
+        {
+          "alias": "evo-storage",
+          "declaration": {
+            "path": "../evo-storage"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-engine/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        },
+        {
+          "alias": "evo-storage",
+          "declaration": {
+            "path": "../evo-storage"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-http/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        },
+        {
+          "alias": "evo-storage",
+          "declaration": {
+            "path": "../evo-storage"
+          },
+          "default_features": true,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-mcp/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        }
+      ],
+      "name": "evo-storage",
+      "path": "crates/evo-storage",
+      "version": "0.2.0"
+    }
+  ],
+  "inventory_sha256": "ff61670b115348af05c79b37a48aa184a6a9858b461a4fee18426cb16999f961",
+  "legacy_license_exceptions": {
+    "Apache-2.0/MIT": [
+      {
+        "checksum": "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095",
+        "name": "flume",
+        "version": "0.11.1"
+      }
+    ],
+    "MIT/Apache-2.0": [
+      {
+        "checksum": "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213",
+        "name": "fs2",
+        "version": "0.4.3"
+      },
+      {
+        "checksum": "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39",
+        "name": "ident_case",
+        "version": "1.0.1"
+      },
+      {
+        "checksum": "e661dda6640fad38e827a6d4a310ff4763082116fe217f279885c97f511bb0b7",
+        "name": "num-bigint-dig",
+        "version": "0.8.6"
+      },
+      {
+        "checksum": "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6",
+        "name": "plain",
+        "version": "0.2.3"
+      },
+      {
+        "checksum": "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd",
+        "name": "serde_urlencoded",
+        "version": "0.7.1"
+      },
+      {
+        "checksum": "7b4df3d392d81bd458a8a621b8bffbd2302a12ffe288a9d931670948749463b1",
+        "name": "stringprep",
+        "version": "0.1.5"
+      },
+      {
+        "checksum": "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d",
+        "name": "unicode-properties",
+        "version": "0.1.4"
+      },
+      {
+        "checksum": "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426",
+        "name": "vcpkg",
+        "version": "0.2.15"
+      },
+      {
+        "checksum": "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a",
+        "name": "version_check",
+        "version": "0.9.5"
+      },
+      {
+        "checksum": "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419",
+        "name": "winapi",
+        "version": "0.3.9"
+      },
+      {
+        "checksum": "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6",
+        "name": "winapi-i686-pc-windows-gnu",
+        "version": "0.4.0"
+      },
+      {
+        "checksum": "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f",
+        "name": "winapi-x86_64-pc-windows-gnu",
+        "version": "0.4.0"
+      }
+    ]
+  },
+  "license_allowlist": [
+    "(MIT OR Apache-2.0) AND Unicode-3.0",
+    "Apache-2.0",
+    "Apache-2.0 AND ISC",
+    "Apache-2.0 OR BSL-1.0",
+    "Apache-2.0 OR BSL-1.0 OR MIT",
+    "Apache-2.0 OR ISC OR MIT",
+    "Apache-2.0 OR MIT",
+    "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+    "BSD-2-Clause OR Apache-2.0 OR MIT",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT AND BSD-3-Clause",
+    "MIT OR Apache-2.0",
+    "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
+    "MIT OR Apache-2.0 OR Zlib",
+    "Unicode-3.0",
+    "Unlicense OR MIT",
+    "Zlib",
+    "Zlib OR Apache-2.0 OR MIT"
+  ],
+  "schema_version": "rsia.dependency_register.v1",
+  "source_allowlist": [
+    "registry+https://github.com/rust-lang/crates.io-index"
+  ]
+}

@@ -36,6 +36,9 @@ jobs:
           rustc --version --verbose
           cargo --version
           python3 scripts/check_build_inputs.py --check-runtime
+      - name: Dependency register inputs
+        id: dependency_inputs
+        run: python3 scripts/check_dependency_register.py --input-only
       - name: Resolve dependencies
         run: |
           mkdir -p out
@@ -43,6 +46,9 @@ jobs:
           rustc --version --verbose > out/toolchain.txt
           python3 scripts/check_build_inputs.py --json > out/build-inputs.json
           git rev-parse HEAD > out/source-commit.txt
+      - name: Dependency primary evidence
+        id: dependency_primary
+        run: python3 scripts/check_dependency_register.py
       - name: Format check
         id: format
         continue-on-error: true
@@ -129,6 +135,8 @@ jobs:
         if: always()
         env:
           BUILD_INPUTS: ${{ steps.build_inputs.outcome }}
+          DEPENDENCY_INPUTS: ${{ steps.dependency_inputs.outcome }}
+          DEPENDENCY_PRIMARY: ${{ steps.dependency_primary.outcome }}
           LOCKED_INPUTS: ${{ steps.locked_inputs.outcome }}
           FORMAT: ${{ steps.format.outcome }}
           CHECK: ${{ steps.check.outcome }}
@@ -145,6 +153,8 @@ jobs:
         run: |
           set -e
           test "$BUILD_INPUTS" = success
+          test "$DEPENDENCY_INPUTS" = success
+          test "$DEPENDENCY_PRIMARY" = success
           test "$LOCKED_INPUTS" = success
           test "$FORMAT" = success
           test "$CHECK" = success
