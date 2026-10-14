@@ -6,6 +6,7 @@ resolver = "2"
 version = "0.2.0"
 edition = "2024"
 publish = false
+license-file = "LICENSE"
 
 [workspace.dependencies]
 anyhow = "1"

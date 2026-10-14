@@ -1,5 +1,10 @@
 {
   "schema_version": "rsia.support_scope.v2",
+  "project_license": {
+    "status": "proprietary_unreleased",
+    "path": "LICENSE",
+    "sha256": "683f49c7897397fbb819924185fc8cb4c2212cf5987faa7a39ab16f0aae1c86b"
+  },
   "plan_version": "v4.3",
   "plan_sha256": "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7",
   "plan_lineage": [

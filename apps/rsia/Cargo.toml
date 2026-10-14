@@ -3,6 +3,7 @@ name = "rsia"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license-file.workspace = true
 [dependencies]
 evo-core = { path = "../../crates/evo-core" }
 evo-storage = { path = "../../crates/evo-storage" }

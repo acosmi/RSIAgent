@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from check_production_store_open import check_tree
 from check_build_inputs import build_input_errors
+from check_support_scope import CheckerError, inspect_relative, load_json_strict, validate_project_license
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_MEMBERS = [
@@ -43,6 +44,12 @@ def sha256_file(path: Path) -> str:
 
 
 def main() -> int:
+    try:
+        manifest_path = inspect_relative(ROOT, "reports/support-scope.json", "support manifest", True)
+        manifest = load_json_strict(manifest_path.read_text(encoding="utf-8"))
+        validate_project_license(manifest, ROOT)
+    except (CheckerError, OSError, UnicodeError) as exc:
+        return fail(f"project license: {exc}")
     lock = ROOT / "Cargo.lock"
     if not lock.is_file():
         return fail("Cargo.lock missing")

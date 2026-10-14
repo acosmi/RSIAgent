@@ -17,6 +17,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+PROJECT_LICENSE_SHA256 = "683f49c7897397fbb819924185fc8cb4c2212cf5987faa7a39ab16f0aae1c86b"
+PROJECT_LICENSE_README = 'RSIAgent is proprietary and unreleased (`proprietary_unreleased`). The root\n`LICENSE` retains all rights; public source visibility does not grant a project\nredistribution or release license. Third-party licenses and notices remain\napplicable to their corresponding material. Workspace crates remain unpublished.'
+PROJECT_LICENSE_MEMBERS = ['apps/rsia', 'crates/evo-core', 'crates/evo-engine', 'crates/evo-http', 'crates/evo-mcp', 'crates/evo-storage']
+
 PLAN_VERSION = "v4.3"
 PLAN_SHA256 = "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7"
 # Registered plan lineage (plan §18.9), oldest first; the last entry is the current binding. The manifest
@@ -82,7 +86,7 @@ PRODUCTION_CONSUMER_VALUES = {"wired", "none_library_only"}
 ROOT_KEYS = {
     "schema_version", "plan_version", "plan_sha256", "plan_lineage", "derived_index_notice", "field_semantics", "declaration",
     "not_full_route_complete", "legacy_equivalence_unverified", "dimensions", "blocked", "explicitly_out_of_scope_until_revised",
-    "optional_disabled", "overall_remaining", "e_scopes", "traceability", "trace_index_coverage",
+    "optional_disabled", "overall_remaining", "e_scopes", "traceability", "trace_index_coverage", "project_license",
 }
 LINEAGE_KEYS = {"version", "file", "sha256"}
 DIMENSION_KEYS = {"engineering", "host", "model", "effect", "deploy"}
@@ -224,6 +228,66 @@ def inspect_relative(repo_root: Path, value: Any, what: str, required: bool) -> 
     except (OSError, ValueError) as exc:
         raise CheckerError(f"{what}: path escapes repository: {rel!r}") from exc
     return current
+
+
+def validate_project_license_metadata(repo_root: Path) -> dict[str, Any]:
+    """Read the closed project-license contract; this never grants release rights."""
+    def read_text(relative: str) -> str:
+        path = inspect_relative(repo_root, relative, "project license " + relative, True)
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise CheckerError(f"project license cannot read {relative}: {exc}") from exc
+
+    try:
+        cargo = tomllib.loads(read_text("Cargo.toml"))
+        workspace = cargo.get("workspace")
+        if not isinstance(workspace, dict):
+            raise CheckerError("project license workspace must be a table")
+        members = workspace.get("members")
+        if not isinstance(members, list) or any(not isinstance(x, str) for x in members) or sorted(members) != PROJECT_LICENSE_MEMBERS:
+            raise CheckerError("project license requires the exact six workspace members")
+        package = workspace.get("package")
+        if not isinstance(package, dict) or package.get("publish") is not False or package.get("license-file") != "LICENSE" or "license" in package:
+            raise CheckerError("project license root must use LICENSE and publish=false")
+        for member in members:
+            package = tomllib.loads(read_text(f"{member}/Cargo.toml")).get("package")
+            if not isinstance(package, dict) or "license" in package:
+                raise CheckerError(f"project license invalid package {member}")
+            for field in ("license-file", "publish"):
+                inherited = package.get(field)
+                if not isinstance(inherited, dict) or set(inherited) != {"workspace"} or inherited["workspace"] is not True:
+                    raise CheckerError(f"project license {member}.{field} must inherit workspace=true")
+    except tomllib.TOMLDecodeError as exc:
+        raise CheckerError(f"project license invalid Cargo TOML: {exc}") from exc
+    path = inspect_relative(repo_root, "LICENSE", "project LICENSE", True)
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise CheckerError(f"project LICENSE unreadable: {exc}") from exc
+    if digest != PROJECT_LICENSE_SHA256:
+        raise CheckerError("project LICENSE is not the reviewed proprietary_unreleased text")
+    readme = read_text("README.md").replace("\r\n", "\n")
+    sections = list(re.finditer(r"^## License[ \t]*$", readme, flags=re.MULTILINE))
+    if len(sections) != 1:
+        raise CheckerError("project license requires one README License section")
+    tail = readme[sections[0].end():]
+    # The reviewed License section is final; later headings cannot hide grants.
+    if tail.strip() != PROJECT_LICENSE_README:
+        raise CheckerError("project license README section differs from the reviewed text")
+    return {"schema_version": "rsia.project_license_metadata.v1", "status": "proprietary_unreleased", "path": "LICENSE", "sha256": digest, "members": sorted(members)}
+
+def validate_project_license(manifest: Any, repo_root: Path) -> None:
+    if not isinstance(manifest, dict):
+        raise CheckerError("project license manifest must be an object")
+    license = manifest.get("project_license")
+    if not isinstance(license, dict) or set(license) != {"status", "path", "sha256"}:
+        raise CheckerError("project_license must contain only status/path/sha256")
+    if license["status"] != "proprietary_unreleased" or license["path"] != "LICENSE" or not isinstance(license["sha256"], str) or not HEX64.fullmatch(license["sha256"]):
+        raise CheckerError("project_license fields are invalid")
+    actual = validate_project_license_metadata(repo_root)
+    if any(license[field] != actual[field] for field in license):
+        raise CheckerError("project_license does not match actual repository metadata")
 
 def string_set(value: Any, what: str) -> set[str]:
     if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
@@ -465,6 +529,7 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
     if manifest.get("plan_version") != PLAN_VERSION or manifest.get("plan_sha256") != PLAN_SHA256:
         raise CheckerError(f"manifest top level is not bound to the current plan {PLAN_VERSION} ({PLAN_SHA256}); historical lineage digests are accepted only inside evidence records")
     known_keys(manifest, ROOT_KEYS, "manifest root")
+    validate_project_license(manifest, repo_root)
     validate_plan_lineage(manifest.get("plan_lineage"))
     validate_field_semantics(manifest.get("field_semantics"))
     known_keys(manifest.get("dimensions"), DIMENSION_KEYS, "dimensions")
@@ -780,12 +845,26 @@ def run_check(repo_root: Path, manifest_rel: str, source_of_truth: Path | None) 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Read-only rsia.support_scope.v2 structural checker")
     parser.add_argument("--repo-root", required=True, type=Path)
-    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--manifest")
+    parser.add_argument("--project-license-metadata-only", action="store_true")
     parser.add_argument("--source-of-truth", type=Path)
     return parser
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.project_license_metadata_only:
+        if args.manifest is not None or args.source_of_truth is not None:
+            parser.error("metadata-only accepts only --repo-root")
+        try:
+            metadata = validate_project_license_metadata(args.repo_root.absolute())
+        except CheckerError as exc:
+            print(json.dumps({"errors": [str(exc)]}))
+            return 1
+        print(json.dumps(metadata, sort_keys=True))
+        return 0
+    if args.manifest is None:
+        parser.error("--manifest is required unless metadata-only is selected")
     report = run_check(args.repo_root.absolute(), args.manifest, args.source_of_truth)
     print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
     return 0 if report.structure_valid else 1

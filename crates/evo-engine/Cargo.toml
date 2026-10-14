@@ -3,6 +3,7 @@ name = "evo-engine"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license-file.workspace = true
 [dependencies]
 evo-core = { path = "../evo-core" }
 evo-storage = { path = "../evo-storage" }

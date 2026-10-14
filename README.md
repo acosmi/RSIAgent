@@ -187,4 +187,7 @@ Track work against [`docs/implementation-ledger.md`](docs/implementation-ledger.
 
 ## License
 
-See the repository license file if present; otherwise treat licensing as unset until one is added.
+RSIAgent is proprietary and unreleased (`proprietary_unreleased`). The root
+`LICENSE` retains all rights; public source visibility does not grant a project
+redistribution or release license. Third-party licenses and notices remain
+applicable to their corresponding material. Workspace crates remain unpublished.
