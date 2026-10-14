@@ -8866,3 +8866,55 @@ R1候选5402c317全门因已证实公开路径阻塞被精确中止，实际guar
 - 不可声明hosted Actions执行、ZIP/archive/发行许可与完整依赖登记、whole V113/V116、真实宿主/沙箱、效果收益发行或二次验收。构建输入CLI/类型合同与同raw补读方式为“待二次验收裁决”。原已批准 notify-merge 的接收方/密钥/载荷范围未改，实际送达未独立证实。
 
 V110/V113/V116与其余新增场景族仍 planned；related_evidence_refs 仅导航E16.5两个真实局部Clock记录，不形成整族信用。真实模型、付费E01/E11/E15、真实宿主E16.4/沙箱E16.5、历史包及T断言、E14冻结合同只登记外部阻塞；货币预算0，无真实提供商调用。AG131许可/AG133依赖登记及P1→P2→P3、既有119/120/121/122队列继续，不能将本台账交付当第七阶段完成。
+
+
+## 2026-10-14 第七阶段周期台账：AG131/121/133（截至 PR #175）
+
+底本§5的周期折入：前一台账 PR #172 于2026-10-13T21:13:01Z合并，此后#173/#174/#175均已有真实固定head首次技术验收与双父同树证明；本节只折入事实，不改变真源、旧记录或AG111历史重构范围。状态最高implemented_not_verified；Claude独立二次验收not_executed，货币预算0，无真实提供商调用。索引由96增至98条，96原对象和顶层field_semantics/plan/谱系/项目许可原字节保留；V111/V116及其余新场景族仍planned，related_evidence_refs仅导航有限子范围。
+
+### AG-131 / PR #173 — 项目许可元数据与Rust登记守卫
+
+- 固定验收head `4232a2265c70f8732fa13496603d18a3d2be88c6`，实际唯一父 `557fd81882123e2dc1f48e82c23f75e40c1c54a9`；merged `59c0af57ee0fec291b12d5a7dab3ba62ca726579`，时刻 `2026-10-14T00:50:19Z`；实际Git两父全等上述父与head，完整tree `1c371c9e9d82b9e9d1de24d1263121eb99e74dae` 等于验收head，Root已快进。
+- 首次独立Controller八门全0；Rust 1889过/0败，153 summaries=148 Running+5 Doc-tests；support Python 81，build-input Python 50，production-store Python 16及checker0。全部来自实际新head完整日志，不继承旧head或self成绩；不是Claude二次验收。
+- 原first input `out/audit-20260930/qa/inputs/codex-input-ag-131-4232a226.json`，SHA256 `2d0cfa8ad9e29ee4ccde8f0a3e472885dccf94fe10446e2b6de451849d2eaf31`；其merged:null/merged_at:null是签发时快照，原字节不补写。实际合并补证 `out/audit-20260930/qa/codex-r7-ag131/actual-merge-and-root-FF-proof-59c0af57-r4.json`，SHA256 `64fdceea5f45290fad8e2bbe27ae372a7c3932e011218e98111cdc3bbf3935d7`。
+- 只新增 E16.6.ag131_v43_project_license_metadata：实际已提交support_scope目标25过/0败，其中新增两项许可元数据Rust守卫；从原独立全量raw逐字唯一摘录，不新跑、不把23旧例全部授V116.a。LICENSE/workspace/README机器元数据一致性为有限范围，不声称法律充分、完整上游通知或整V116/E16.6。
+- Head两实际Rust反例绿，正常编译Parent两目标语义红101；文件机制十二项篡改只Head范围，不冒父编译证明。原a015失败clippy/test101与smokeCLI1、Python/探针解析错误、Git TLS/GraphQL/REST EOF及合并GET EOF原像保；见原input的deviations和 `out/audit-20260930/qa/codex-r7-ag131/actual-merge-and-root-FF-proof-59c0af57-r4.json` 的preserved_failures。没有关闭TLS或force。
+- 不可声明：整E/V、效果收益发行、真实提供商/宿主/沙箱、付费E01/E11/E15、历史T等价、E14冻结合同或Claude二次验收；各卡的最小失败关闭细节仍待二次验收裁决。
+
+### AG-121 / PR #174 — 脱敏bound调用的严格读取与身份保持
+
+- 固定验收head `78ed65ece5aa52fcce7328333432ea1da20378c4`，实际唯一父 `59c0af57ee0fec291b12d5a7dab3ba62ca726579`；merged `a5039eb21558cb466a0ee00a1b2ba022b11c12d1`，时刻 `2026-10-14T08:18:42Z`；实际Git两父全等上述父与head，完整tree `84467ac529e67b6b94aaa9b2692d33175d94e175` 等于验收head，Root已快进。
+- 首次独立Controller八门全0；Rust 1900过/0败，154 summaries=149 Running+5 Doc-tests；support Python 81，build-input Python 50，production-store Python 16及checker0。全部来自实际新head完整日志，不继承旧head或self成绩；不是Claude二次验收。
+- 原first input `out/audit-20260930/qa/inputs/codex-input-ag-121-78ed65ec-pr174.json`，SHA256 `4d982ae988422295e7cc08b59cfdd2313cfaad6fe851b779e8c0c7bf73718236`；其merged:null/merged_at:null是签发时快照，原字节不补写。实际合并补证 `out/audit-20260930/qa/codex-r7-ag121/actual-pr174-merge-and-root-FF-proof-r2.json`，SHA256 `64860193972f2b94bae88629cb6dff084d86ac083bce494dfb2cb303cbcaf679`。
+- 只新增一条E04.ag121_v43_redacted_bound_request_identity记录：已提交broker_redacted_bound_guards_v42目标11过/0败由原raw独占摘录登记，不制造第二次执行。AG121原first在E04/E08的11项实际测试与严格reader/原请求身份及逻辑关闭保持事实完整保留；E08只在implemented_not_verified、首验范围和remaining说明槽记录，不新增verified_subscope，V111仅导航E04记录。TransportNone、畸形body是kernel fixture；真实producer original_digest审计和whole V111.c仍由AG119等后续验收。
+- Head正常编译六控绿；Parent正常编译两健康绿、四目标语义红101（legacy脱敏bound非Forbidden、畸形有效JSON/digest错误接受、不同binding或畸形体写恢复关闭）；原H841 self1898过/2败与test-only收据观察修正保。证据 `out/audit-20260930/qa/codex-r7-ag121/actual-self-8435-terminal-failure-r2.json`；Draft远端API EOF/ Git TLS错误保留actual-174-* R1/R2原文件，成功R3不覆盖失败，未放宽读取或回执门。
+- AG149旧候选a700dfb1的暖结构检查先因真源符号链接引用退出1；改用唯一regular真源后再次退出1，准确拒绝同test_entry/source_sha跨E04/E08重复登记。原拒绝报告 `out/audit-20260930/qa/codex-r7-ag149/actual-pre-self-checker-a700dfb1-r1.json`，SHA256 `eb974fab878d20bbe01b86d485b50e306c454b9e258739961fc39a3e7b79f269`；原99条候选、R2/R3静态准备和旧H保留，均没有self/独立八门或首次验收。AG149-R1按既有去重守卫改为98条，跨任务与不同摘录的口径待二次验收裁决；不更改旧first、11项实际测试或验收判据。
+- 不可声明：整E/V、效果收益发行、真实提供商/宿主/沙箱、付费E01/E11/E15、历史T等价、E14冻结合同或Claude二次验收；各卡的最小失败关闭细节仍待二次验收裁决。
+
+### AG-133 / PR #175 — 完整依赖登记与主档许可元数据检查
+
+- 固定验收head `cb909860c293b0bf5ccd98a3c3fae3aac7d3f80b`，实际唯一父 `a5039eb21558cb466a0ee00a1b2ba022b11c12d1`；merged `14f832e7bb9e321eafc38097538e9267183d5069`，时刻 `2026-10-14T10:16:04Z`；实际Git两父全等上述父与head，完整tree `b2f9a02d02929e4182d961ad93ff7cedb4306e8b` 等于验收head，Root已快进。
+- 首次独立Controller八门全0；Rust 1900过/0败，154 summaries=149 Running+5 Doc-tests；support Python 81，build-input Python 58，production-store Python 16及checker0; dependency-register Python30。全部来自实际新head完整日志，不继承旧head或self成绩；不是Claude二次验收。
+- 原first input `out/audit-20260930/qa/inputs/codex-input-ag-133-cb909860-pr175.json`，SHA256 `6c9c7ad68986cd9a9e295e198fa683285ee56b63931c8eda54f7f05742db756b`；其merged:null/merged_at:null是签发时快照，原字节不补写。实际合并补证 `out/audit-20260930/qa/codex-r7-ag133/actual-pr175-merge-and-root-FF-proof-r2.json`，SHA256 `b2b3eb98656512deee015ef61e012216cbaf9f4e7312d267af187a694bc38a70`。
+- 已提交Rust产品测试新增0；不新增verified_subscope，不借私有未提交CPP或Python/CI成果授cargo目标信用。E16.6只用status_reason/implementation_files/remaining说明槽记录implemented_not_verified+首次技术验收，非Rust说明槽沿AG130模式，待二次验收裁决。真实登记22外部直接依赖/70使用边（61常规+9dev）及锁304包（298registry+6local），主档archive checksums和许可元数据为有限程序检查；不等于完整offlinekit、法律充分、完整notices或整V116。
+- Head正常编译三控绿；Parent正常编译F00健康绿，D1删除rustix unix使用边与D2自洽伪MIT对rmcp主档Apache两首目标语义红101；每边3selected、ignored/measured0、filtered25、outer0，CPP不加入产品索引。原R2/R3/R4 archive/名字/解析失败、低8门拒绝、onecommit前资源停止和M9→M10逐字重叠证明均保。实际初push TLS128、Ready后API EOF1、readonly TLS1、首次admin EOF1不记0；先核确实未merged再同H重试，最终双父同树实证。
+  - 过程原证 `out/audit-20260930/qa/codex-r7-ag133/actual-push-cb909860-first-TLS-failure-r1.json`，SHA256 `b4ce68baf254c361a75e6c918ee82af11c10c2878fd2ba729c467582a6d54cc7`。
+  - 过程原证 `out/audit-20260930/qa/codex-r7-ag133/actual-175-ready-r1-EOF-failure.json`，SHA256 `ee2b5b4f678ca2742925854917ef816876372c4a1ace66d4caa4c38410eefdd6`。
+  - 过程原证 `out/audit-20260930/qa/codex-r7-ag133/actual-175-readonly-r2-TLS-failure.json`，SHA256 `9e461120b0f6a451cda6e5ec5c6093e28257c51122d1a54bfc02883a06cb9463`。
+  - 过程原证 `out/audit-20260930/qa/codex-r7-ag133/actual-175-admin-attempt1-EOF-r1.json`，SHA256 `c5b9da0c52509456df95be8e9ecd12926831ca7424794161612ccbcf0b6f3876`。
+  - 过程原证 `out/audit-20260930/qa/codex-r7-ag133/actual-175-admin-attempt2-terminal-r1.json`，SHA256 `e23fd50e750a3992182d54ef629b902c5ebb1fa1d88a2bcbb8bf289a6dd6d9d3`。
+- 不可声明：整E/V、效果收益发行、真实提供商/宿主/沙箱、付费E01/E11/E15、历史T等价、E14冻结合同或Claude二次验收；各卡的最小失败关闭细节仍待二次验收裁决。
+
+非Rust实际本地验收（非hosted CI运行，且不新增E/V验收信用）：
+
+|任务|实际命令|真实退出/计数|原日志|
+|---|---|---|---|
+|AG131|`python3 scripts/test_check_build_inputs.py`|0 / 50 tests OK|`out/audit-20260930/qa/codex-r7-ag131/accept-4232a226-build_inputs50.log`|
+|AG131|`python3 -m unittest scripts/test_check_production_store_open.py`|0 / 16 tests OK|`out/audit-20260930/qa/codex-r7-ag131/accept-4232a226-production16.log`|
+|AG121|`python3 scripts/test_check_build_inputs.py`|0 / 50 tests OK|`out/audit-20260930/qa/codex-r7-ag121/accept-78ed65ec-pr174-r1-build_inputs50.log`|
+|AG121|`python3 -m unittest scripts/test_check_production_store_open.py`|0 / 16 tests OK|`out/audit-20260930/qa/codex-r7-ag121/accept-78ed65ec-pr174-r1-production16.log`|
+|AG133|`python3 scripts/test_check_build_inputs.py`|0 / 58 tests OK|`out/audit-20260930/qa/codex-r7-ag133/accept-cb909860-pr175-r1-build_inputs58.log`|
+|AG133|`python3 -m unittest scripts/test_check_production_store_open.py`|0 / 16 tests OK|`out/audit-20260930/qa/codex-r7-ag133/accept-cb909860-pr175-r1-production16.log`|
+|AG133|`python3 scripts/test_check_dependency_register.py`|0 / 30 tests OK|`out/audit-20260930/qa/codex-r7-ag133/accept-cb909860-pr175-r1-dependency30.log`|
+
+原notify-merge登记接收方/密钥/载荷范围不改变，不额外手动外发；送达未独立证实。真实模型、付费实验、真实宿主/沙箱、历史包/T、E14合同仍仅登记外部阻塞。P1→P2→P3及既有队列仍未全闭，本周期台账不是阶段完成。

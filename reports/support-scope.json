@@ -516,13 +516,14 @@
     "E04": {
       "title": "Persistent Root Budget, Broker, Cancellation & Reconciliation",
       "status": "in_progress",
-      "status_reason": "engineering: formal_local_host has an external provider transport wired; no qualified isolated runner is wired to the accepted budget/broker subset",
+      "status_reason": "engineering: formal_local_host has an external provider transport wired; no qualified isolated runner is wired to the accepted budget/broker subset; AG121/PR174 implemented_not_verified with first technical acceptance of strict redacted reader/request identity only; production redaction audit remains AG119 and full V111.c unverified",
       "implementation_files": [
         "crates/evo-storage/src/budget.rs",
         "crates/evo-engine/src/broker.rs",
         "crates/evo-engine/src/executor.rs",
         "crates/evo-storage/tests/budget_sql_fault_rollback_v42.rs",
-        "crates/evo-storage/tests/e16_budget_binding_v42.rs"
+        "crates/evo-storage/tests/e16_budget_binding_v42.rs",
+        "crates/evo-engine/tests/broker_redacted_bound_guards_v42.rs"
       ],
       "scenarios": [
         "V007",
@@ -610,12 +611,42 @@
           "scope": "E04; Typed E16 budget source snapshots, cleanup and recovery software/component boundary only. Library-only as of e727d1c: no production caller in engine/http/mcp/apps.",
           "source_sha": "26d3fe400ee1aad36082081eda6c60f3ee1a17f7",
           "test_entry": "crates/evo-storage/tests/e16_budget_binding_v42.rs"
+        },
+        {
+          "id": "E04.ag121_v43_redacted_bound_request_identity",
+          "description": "Bound broker legacy pre-write refusal and redacted request identity preservation",
+          "plan_version": "v4.3",
+          "plan_sha256": "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7",
+          "source_sha": "78ed65ece5aa52fcce7328333432ea1da20378c4",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/174",
+          "merged_sha": "a5039eb21558cb466a0ee00a1b2ba022b11c12d1",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-engine/tests/broker_redacted_bound_guards_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test broker_redacted_bound_guards_v42",
+          "input_digest": "4d982ae988422295e7cc08b59cfdd2313cfaad6fe851b779e8c0c7bf73718236",
+          "input_ref": "out/audit-20260930/qa/inputs/codex-input-ag-121-78ed65ec-pr174.json",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/codex-r7-ag149/excerpt-ag121-e04-bound-identity-78ed65ec.log",
+          "actual_result": "broker_redacted_bound_guards_v42: 11 passed / 0 failed in the original independent fresh workspace run at 78ed65ece5aa52fcce7328333432ea1da20378c4; unique exact raw excerpt, not a new execution. Full run: 149 Running executables + 5 Doc-test summaries = 154 summaries, 1900 passed / 0 failed, eight exits 0, support Python 81. Implemented_not_verified with first technical acceptance passed; second acceptance not executed. One E04 record registers this actual test run; E08 implementation and first-acceptance scope remain documented without another verified record. No producer/whole-V111.c credit.",
+          "scope": "E04; v4.3 §11.6 L1439–1453 and V111.a/b L2305–2307 strict reader/request-identity subset only",
+          "risk": "TransportNone and malformed redacted bodies are kernel fixtures; no production redaction producer audit, complete V111.c, physical zero SQL, real provider/host/sandbox, paid experiment, historical T/E14, second acceptance, effects, benefits or release.",
+          "rollback": "Independent reviewed revert of PR #174; accepted parent 59c0af57ee0fec291b12d5a7dab3ba62ca726579; preserve sources, original QA, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=\"$CARGO_TARGET_DIR\" bash \"$PWD/../../audit-20260930/qa/codex-r7-guarded.sh\" \"$CARGO_TARGET_DIR\" 8192 --full -- python3 \"$PWD/../../audit-20260930/qa/codex-r7-ag121/controller-fresh-full-78ed65ec-r2-prepared.py\" --under-guard --manifest \"out/audit-20260930/qa/codex-r7-ag121/frozen-controller-78ed65ec-pr174-r1.json\" --manifest-sha 8a4b7c3a346af4cbe3451a24875907eddfa44edcb61379e245391f00546eb8e1",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/codex-r7-ag121/accept-78ed65ec-pr174-r1.log"
+          },
+          "production_consumer": "wired"
         }
       ],
       "remaining": [
         "engineering: no actual provider transport or qualified isolated runner is wired to the accepted budget/broker subset",
         "external: paid provider reconciliation and production load/capacity evidence are unavailable",
-        "engineering: GA14 stage limits are only statically validated; root-plan version binding, stage mapping and payer correspondence need a defined contract before runtime enforcement"
+        "engineering: GA14 stage limits are only statically validated; root-plan version binding, stage mapping and payer correspondence need a defined contract before runtime enforcement",
+        "AG121/PR174 does not verify production redaction producers/original_digest audit or whole V111.c; fixture shape guards do not establish real-provider/host/sandbox closure."
       ]
     },
     "E05": {
@@ -1273,14 +1304,15 @@
     "E08": {
       "title": "Persistent Revocation, Cleanup, Backup & Trusted Anchor Recovery",
       "status": "in_progress",
-      "status_reason": "accepted program sub-scopes include revocation closure, late writes, economic restore protection (AG-051) and grant/package/seed source gates (AG-046); full production recovery and remaining write paths are unverified; AG-053 bounds dependency snapshot recursion and AG-059 checks resolved manifest sources before first package write; AG068/#113 also cleans registered valid native-authority successors in new Pending/Running jobs",
+      "status_reason": "accepted program sub-scopes include revocation closure, late writes, economic restore protection (AG-051) and grant/package/seed source gates (AG-046); full production recovery and remaining write paths are unverified; AG-053 bounds dependency snapshot recursion and AG-059 checks resolved manifest sources before first package write; AG068/#113 also cleans registered valid native-authority successors in new Pending/Running jobs; AG121/PR174 implemented_not_verified with first technical acceptance of strict redacted reader/request identity only; production redaction audit remains AG119 and full V111.c unverified",
       "implementation_files": [
         "crates/evo-storage/src/lifecycle.rs",
         "crates/evo-engine/src/lifecycle.rs",
         "scripts/restore_backup.py",
         "crates/evo-storage/tests/failed_cleanup_resume_v42.rs",
         "crates/evo-engine/tests/broker_cache_revoke_v42.rs",
-        "crates/evo-storage/tests/dependency_read_v42.rs"
+        "crates/evo-storage/tests/dependency_read_v42.rs",
+        "crates/evo-engine/tests/broker_redacted_bound_guards_v42.rs"
       ],
       "scenarios": [
         "V017",
@@ -1700,7 +1732,8 @@
         "awaiting plan clarification: physical SQLite free-page/WAL erasure is not a declared guarantee",
         "engineering: other late writes, stage_bundle and typed dependency-edge completeness remain; AG-059 closes resolved manifest prewrite checking only",
         "production disaster recovery, Linux deployment and future object scopes remain unverified",
-        "AG069/073/075 and AG077 are merged scoped software evidence. Their historical accepted results do not establish a transitive complete current E08 route, future-object scope, production disaster recovery or physical free-page/WAL erasure."
+        "AG069/073/075 and AG077 are merged scoped software evidence. Their historical accepted results do not establish a transitive complete current E08 route, future-object scope, production disaster recovery or physical free-page/WAL erasure.",
+        "AG121/PR174 does not verify production redaction producers/original_digest audit or whole V111.c; fixture shape guards do not establish real-provider/host/sandbox closure."
       ]
     },
     "E09": {
@@ -3013,10 +3046,20 @@
     "E16.6": {
       "title": "Release, Support Scope Manifest & Truth Ledger",
       "status": "in_progress",
-      "status_reason": "The v4.3 derived index keeps 90 historical evidence records: 88 unchanged in-scope records rechecked against v4.3 and 2 out-of-scope optional rejection records; 19 records whose accepted behavior changed are withdrawn from verified_subscopes, with their original facts retained in the local recheck ledger; this does not close E16 or the full route; AG128-R1 corrects AG054 old-clock compensation credit without crediting an unverified new clock fix",
+      "status_reason": "The v4.3 derived index keeps 90 historical evidence records: 88 unchanged in-scope records rechecked against v4.3 and 2 out-of-scope optional rejection records; 19 records whose accepted behavior changed are withdrawn from verified_subscopes, with their original facts retained in the local recheck ledger; this does not close E16 or the full route; AG128-R1 corrects AG054 old-clock compensation credit without crediting an unverified new clock fix; AG131/PR173 committed Rust project-license metadata guards have scoped first acceptance; AG133/PR175 non-Rust dependency/primary-metadata delivery is implemented_not_verified with first technical acceptance only, no new verified_subscope credit",
       "implementation_files": [
         "reports/support-scope.json",
-        "crates/evo-core/tests/support_scope.rs"
+        "crates/evo-core/tests/support_scope.rs",
+        "docs/dependency-register.json",
+        "docs/dependency-license-inventory.json",
+        "scripts/check_dependency_register.py",
+        "scripts/test_check_dependency_register.py",
+        "scripts/check_build_inputs.py",
+        "scripts/test_check_build_inputs.py",
+        "scripts/smoke_workspace.py",
+        ".github/workflows/ci.yml",
+        ".github/workflows/dependency-audit.yml",
+        ".github/workflows/offline-build-kit.yml"
       ],
       "scenarios": [
         "V001",
@@ -3052,12 +3095,41 @@
           "scope": "E16.6; Partial evidence registry and unchanged historical evidence records software/component boundary only.",
           "source_sha": "908eb85b33d590889a75885c9d9b20c3dad927b8",
           "test_entry": "crates/evo-core/tests/support_scope.rs"
+        },
+        {
+          "id": "E16.6.ag131_v43_project_license_metadata",
+          "description": "Project-license manifest registration and committed Rust metadata guards",
+          "plan_version": "v4.3",
+          "plan_sha256": "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7",
+          "source_sha": "4232a2265c70f8732fa13496603d18a3d2be88c6",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/173",
+          "merged_sha": "59c0af57ee0fec291b12d5a7dab3ba62ca726579",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-core/tests/support_scope.rs",
+          "command": "cargo test --locked --offline -p evo-core --test support_scope",
+          "input_digest": "2d0cfa8ad9e29ee4ccde8f0a3e472885dccf94fe10446e2b6de451849d2eaf31",
+          "input_ref": "out/audit-20260930/qa/inputs/codex-input-ag-131-4232a226.json",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/codex-r7-ag149/excerpt-ag131-support-scope-4232a226.log",
+          "actual_result": "support_scope: 25 passed / 0 failed in the original independent fresh workspace run at 4232a2265c70f8732fa13496603d18a3d2be88c6; unique exact raw excerpt, not a new execution. Full run: 148 Running executables + 5 Doc-test summaries = 153 summaries, 1889 passed / 0 failed, eight exits 0, support Python 81. Implemented_not_verified with first technical acceptance passed; second acceptance not executed. Scope is the two committed project-license metadata tests within the 25-test target; the 23 inherited tests do not expand V116 credit.",
+          "scope": "E16.6; v4.3 §2.8.1 L237–245, E16.6 L1839–1847, V116.a L2345 machine-readable project-license registration subset only",
+          "risk": "No legal sufficiency, complete upstream notices, crate publication, complete dependency/CI/front-end scope, whole V116/E16.6, real provider/host/sandbox, historical T/E14, second acceptance, effects, benefits or release.",
+          "rollback": "Independent reviewed revert of PR #173; accepted parent 557fd81882123e2dc1f48e82c23f75e40c1c54a9; preserve sources, original QA, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=\"$CARGO_TARGET_DIR\" bash \"$PWD/../../audit-20260930/qa/codex-r7-guarded.sh\" \"$CARGO_TARGET_DIR\" 8192 --full -- python3 \"$PWD/../../audit-20260930/qa/codex-r7-ag131/controller-fresh-full-4232-r1.py\" --under-guard --manifest \"out/audit-20260930/qa/codex-r7-ag131/frozen-4232a226-controller-manifest.json\" --manifest-sha 5b342d10cbb76fa2ff3b9d68eb3b4b3f2884b532920326ed50d362a43e364ac0",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/codex-r7-ag131/accept-4232a226.log"
+          }
         }
       ],
       "remaining": [
         "the index does not close E16; full-route completion, real-host, sandbox and effect evidence remain unavailable",
         "AG-013 (#59), AG-023 (#68) and the ledger PR #65 are recorded in the ledger only: their evidence (scripts and binary-crate unit tests) is outside the checker's single-target cargo test grammar",
-        "AG056 CI and AG078 Python budget reporting plus the transparent status-character frontend are ledger-only deliveries outside the single-target Rust evidence grammar. The index remains a non-normative subset declaration."
+        "AG056 CI and AG078 Python budget reporting plus the transparent status-character frontend are ledger-only deliveries outside the single-target Rust evidence grammar. The index remains a non-normative subset declaration.",
+        "AG131 metadata guards do not establish legal sufficiency or complete upstream notices. AG133/PR175 adds zero committed Rust tests: Python81/build58/dependency30/store16 and CI declarations remain ledger/status-only, without E/V or whole-V116/offline-kit/hosted-Actions credit; this reporting slot is pending second acceptance."
       ]
     },
     "E16": {
@@ -6828,8 +6900,9 @@
         "status": "planned",
         "verification_status": "planned",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
-        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+        "related_evidence_refs": [
+          "E04.ag121_v43_redacted_bound_request_identity"],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed; AG121 links only committed strict-reader/request-identity subscopes; production redaction audit and whole V111.c remain unverified"
       },
       {
         "id": "V112",
@@ -6901,8 +6974,9 @@
         "status": "planned",
         "verification_status": "planned",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
-        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed"
+        "related_evidence_refs": [
+          "E16.6.ag131_v43_project_license_metadata"],
+        "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed; AG131 links only committed project-license metadata guards; legal/notice, non-Rust/frontend/CI-egress and full offline-kit obligations remain, while AG133 has no new verified record"
       },
       {
         "id": "V117",
