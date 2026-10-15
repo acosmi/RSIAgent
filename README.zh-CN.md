@@ -29,8 +29,7 @@ RSIAgent 基于 **Rust** 构建独立核心服务，通过 **MCP、HTTP 与 CLI*
 
 候选是可演进的文本 / 策略 JSON，不是任意可执行脚本；证据一律视为不可信数据，不当指令。
 
-<details>
-<summary><b>自主程度阶梯（B0–L5）：评价的是谁控制改进决策，不是模型能力</b></summary>
+**自主程度阶梯（B0–L5）：评价的是谁控制改进决策，不是模型能力**
 
 | 层级 | 名称 | 在 RSIAgent 中的落点 |
 | --- | --- | --- |
@@ -41,17 +40,17 @@ RSIAgent 基于 **Rust** 构建独立核心服务，通过 **MCP、HTTP 与 CLI*
 | **L4** | 环境适应自主 | 依据 Application 回执持续调整（Attached → Observed → VerifiedBenefit） |
 | **L5** | 递归元改进 | 演进 Improver 本身——如何提炼、过滤、验收经验——并继承该程序 |
 
-</details>
-
 ## 研究基础与工程借鉴
 
 项目依据《**RSIAgent v4.3 定稿：受控递归自我改进系统工程实施方案**》这一唯一规范真源，参考以下研究并结合自有基础设施推进独立工程实现：
 
 - **[Dream-RSI: Recursive Self-Improvement through Evolving Worlds](https://arxiv.org/pdf/2609.14858v1)**（论文）  
-  [arXiv:2609.14858 · v1](https://arxiv.org/pdf/2609.14858v1)：借鉴生成与探索解耦、历史探索回放、离线「做梦」与策略筛选机制。
+  [arXiv:2609.14858 · v1](https://arxiv.org/pdf/2609.14858v1)：借鉴生成与探索解耦、历史探索回放、离线「做梦」与策略筛选机制。  
+  参与机构：Google、Google DeepMind、马里兰大学（UMD）、弗吉尼亚大学（UVA）；作者包括 Tong Zheng、Zheng Zhang 等。
 
 - **[The Last AI Built by Humans: Toward Genuine Recursive Self-Improvement](https://arxiv.org/pdf/2609.11873v2)**（论文）  
-  [arXiv:2609.11873 · v2](https://arxiv.org/pdf/2609.11873v2)：参考 RSI 自主性框架，重点吸收学习者状态条件化的经验获取（L3），以及改进机制的跨代继承与元改良（L5）。
+  [arXiv:2609.11873 · v2](https://arxiv.org/pdf/2609.11873v2)：参考 RSI 自主性框架，重点吸收学习者状态条件化的经验获取（L3），以及改进机制的跨代继承与元改良（L5）。  
+  参与机构：上海交通大学、Theseus Labs、清华大学、字节跳动、面壁智能、小红书、上海人工智能实验室、Humanlaya、Agent-Native Research Lab、Frontis.AI；作者包括 Zhiyuan Liu（刘知远）、Bowen Zhou（周伯文）、Guoliang Li（李国良）、Fan Wu（吴帆）等。
 
 工程机制另参考方案锁定提交的 **[RSI-Harness](https://github.com/CosmosMind-ai/RSI-Harness/tree/33c4f8dfac4359987f2e814e187de67c332498de)**（固定提交 `33c4f8df`）与 **[Microsoft SkillOpt](https://github.com/microsoft/SkillOpt/tree/79124b37e9a6371e13b753f8bcd7adb1e493ade1)**（固定提交 `79124b37`），吸收版本化资产、历史经验提炼、轨迹分析与技能内容优化思路；不整体移植上游运行时，也不将上游实验结果视为本项目的效果证明。
 
