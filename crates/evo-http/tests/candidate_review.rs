@@ -5,6 +5,7 @@ use evo_core::contract::{
     SystemSnapshot, compile_bundle,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
+use evo_core::management_registry::REVIEW_ROUTE;
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
 use evo_core::{Context, Role, Strategy, fingerprint, hash};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
@@ -346,7 +347,7 @@ async fn parent_raw_http_stored_candidate_review_requires_new_route_semantic_red
     let (_guard, state) = fixture().await;
     let (base, task) = spawn(state).await;
     let response = reqwest::Client::new()
-        .post(format!("{base}/v1/review"))
+        .post(format!("{base}{REVIEW_ROUTE}"))
         .bearer_auth(ADMIN_TOKEN)
         .header("content-type", "application/json")
         .body(r#"{"kind":"typed_candidate","id":"candidate-review","detail":"metadata"}"#)
@@ -367,7 +368,7 @@ const REVIEW_BODY: &str =
 
 async fn send(base: &str, token: Option<&str>, body: &str) -> (StatusCode, Value) {
     let mut request = reqwest::Client::new()
-        .post(format!("{base}/v1/review"))
+        .post(format!("{base}{REVIEW_ROUTE}"))
         .header("content-type", "application/json")
         .body(body.to_owned());
     if let Some(token) = token {
@@ -443,7 +444,7 @@ async fn existing_authentication_codes_and_identity_guards_are_preserved() {
     );
     for header in ["x-role", "x-namespace", "x-actor"] {
         let response = reqwest::Client::new()
-            .post(format!("{base}/v1/review"))
+            .post(format!("{base}{REVIEW_ROUTE}"))
             .bearer_auth(ADMIN_TOKEN)
             .header(header, "forged")
             .body(REVIEW_BODY)
@@ -748,4 +749,68 @@ print(json.dumps(out,sort_keys=True,separators=(',',':')))
         .unwrap();
     assert!(output.status.success(), "read-only catalog reader failed");
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// AG-136 route closure: the old `/v1/review` URL is gone on this head. It
+/// 404s for the trusted Admin with a valid review body, and the refusal writes
+/// nothing — the complete database catalog is byte-identical before and after.
+#[tokio::test]
+async fn old_review_route_is_closed_and_writes_nothing() {
+    let (guard, state) = fixture().await;
+    let db = guard.path().join("review-fixture.sqlite3");
+    let (base, task) = spawn(state).await;
+    let before = catalog(&db);
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/review"))
+        .bearer_auth(ADMIN_TOKEN)
+        .header("content-type", "application/json")
+        .body(REVIEW_BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(catalog(&db), before, "the closed route must write nothing");
+    task.abort();
+}
+
+/// AG-136 dual-CLI control: `rsia review` serializes the typed ReviewRequest
+/// with `.json(..)`, while `rsia manage control.review` posts the raw
+/// `--request-file` bytes with an explicit content-type header. Both CLI
+/// shapes hit the same registered route and must produce the identical
+/// business response, proving the two entries are one handler.
+#[tokio::test]
+async fn review_cli_and_generic_manage_cli_shapes_agree_on_the_registered_route() {
+    let (_guard, state) = fixture().await;
+    let (base, task) = spawn(state).await;
+    let request = evo_engine::review::ReviewRequest {
+        kind: evo_engine::review::ReviewKind::TypedCandidate,
+        id: CANDIDATE_ID.into(),
+        detail: evo_engine::review::ReviewDetail::Metadata,
+    };
+    // Shape 1: `rsia review` — typed request serialized as JSON.
+    let typed = reqwest::Client::new()
+        .post(format!("{base}{REVIEW_ROUTE}"))
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    let typed_status = typed.status();
+    let typed_body: Value = typed.json().await.unwrap();
+    // Shape 2: `rsia manage control.review` — raw file bytes, explicit header.
+    let raw = reqwest::Client::new()
+        .post(format!("{base}{REVIEW_ROUTE}"))
+        .bearer_auth(ADMIN_TOKEN)
+        .header("content-type", "application/json")
+        .body(REVIEW_BODY)
+        .send()
+        .await
+        .unwrap();
+    let raw_status = raw.status();
+    let raw_body: Value = raw.json().await.unwrap();
+    assert_eq!(typed_status, StatusCode::OK);
+    assert_eq!(raw_status, StatusCode::OK);
+    assert_eq!(typed_body, raw_body, "both CLI entries are one handler");
+    assert_eq!(typed_body["schema_version"], "rsia.review.v1");
+    task.abort();
 }
