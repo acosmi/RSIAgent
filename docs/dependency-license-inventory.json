@@ -8,7 +8,7 @@
       "crates/evo-engine/Cargo.toml": "bac362631f8bd675c3b323b0a847f152a6d090a5039f148e3e4ae0e77eea225f",
       "crates/evo-http/Cargo.toml": "d75104c7dc6eb959f820df2c40e5d470166fe003fc2d4cdd3086bf90f463dc68",
       "crates/evo-mcp/Cargo.toml": "733aa65f247ea23431aa5da8accf0f7cd02144d4dd3be7d5282b0caf9614d0bf",
-      "crates/evo-storage/Cargo.toml": "8be8271bd38800ada6d38adf660df80f3a6896ca42726301d6da93ab8bd844b6"
+      "crates/evo-storage/Cargo.toml": "ae3380bbfef2ff9b6f215d1d182e39c6c931f45b838b2126e3f5de3f7a89e7b7"
     }
   },
   "registry_packages": [

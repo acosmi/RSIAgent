@@ -375,20 +375,22 @@
       "version": "0.32.1"
     },
     {
-      "alternative": "Use a separately reviewed safe platform filesystem adapter.",
+      "alternative": "Use a separately reviewed safe platform filesystem and process-identity adapter.",
       "checksum": "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d",
       "consumers": [
         {
           "alias": "rustix",
           "declaration": {
             "features": [
-              "fs"
+              "fs",
+              "process"
             ],
             "version": "=1.1.5"
           },
           "default_features": true,
           "features": [
-            "fs"
+            "fs",
+            "process"
           ],
           "kind": "regular",
           "manifest": "crates/evo-storage/Cargo.toml",
@@ -398,7 +400,7 @@
       ],
       "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
       "name": "rustix",
-      "purpose": "Safe Unix filesystem operations for storage.",
+      "purpose": "Safe Unix filesystem operations and process identity/umask APIs for future storage owned-root security; no production initialization or wiring in this PR.",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "1.1.5"
     },
@@ -1204,7 +1206,7 @@
       "crates/evo-engine/Cargo.toml": "bac362631f8bd675c3b323b0a847f152a6d090a5039f148e3e4ae0e77eea225f",
       "crates/evo-http/Cargo.toml": "d75104c7dc6eb959f820df2c40e5d470166fe003fc2d4cdd3086bf90f463dc68",
       "crates/evo-mcp/Cargo.toml": "733aa65f247ea23431aa5da8accf0f7cd02144d4dd3be7d5282b0caf9614d0bf",
-      "crates/evo-storage/Cargo.toml": "8be8271bd38800ada6d38adf660df80f3a6896ca42726301d6da93ab8bd844b6"
+      "crates/evo-storage/Cargo.toml": "ae3380bbfef2ff9b6f215d1d182e39c6c931f45b838b2126e3f5de3f7a89e7b7"
     }
   },
   "internal_packages": [
@@ -1424,7 +1426,7 @@
       "version": "0.2.0"
     }
   ],
-  "inventory_sha256": "4aec112c8c2ca8787cce3eb940155d49fc4c2e0dad52b45771b7c7dfb43c4c07",
+  "inventory_sha256": "ff03b41adf1476c02d9ea847ddc82241574f31fe094513c70e4244a49223163f",
   "legacy_license_exceptions": {
     "Apache-2.0/MIT": [
       {
