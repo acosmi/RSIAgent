@@ -1271,7 +1271,7 @@ class ProjectLicenseTests(unittest.TestCase):
 
     def test_raw_duplicate_license_keys_are_not_collapsed(self):
         for raw in ['{"project_license":{},"project_license":{}}',
-                    '{"project_license":{"status":"MIT","status":"proprietary_unreleased"}}']:
+                    '{"project_license":{"status":"MIT","status":"source_available_personal_noncommercial_free"}}']:
             with self.assertRaises(css.CheckerError):
                 css.load_json_strict(raw)
 

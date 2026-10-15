@@ -1,195 +1,90 @@
+![RSIAgent](docs/assets/rsia-logo-banner.png)
+
 # RSIAgent
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-不只是变强——还要改进**「如何变强」**。
+> **万物皆可 RSI——面向跨域应用的通用递归自我改进框架。**
+>
+> 面向外部智能体的经验复用与受控递归自我改进服务  
+> Controlled Recursive Self-Improvement Service
 
-RSIAgent 是**独立的 Rust 递归改进运行时**。任务智能体通过 **MCP / HTTP / CLI** 接入：经验沉淀为可继承的技能、工具、运行时策略，以及改进策略本身——在角色、预算与独立验收之下。候选是可演进的文本 / 策略 JSON，不是任意可执行脚本。证据一律视为不可信数据，不当指令。
+让 AI 在授权边界内自主提出候选 → 预测后果 → 选择执行 → 从真实反馈中学习 → 保留改进，形成循环进化的闭环。
 
-> **现状：** 分范围实施进行中（workspace `0.2.0`），不是已完成路线。规范性工程方案为 **v4.3**（2026-10-12，SHA-256 `73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7`）。方案正文不进入本远程。公开证据是[实施台账](docs/implementation-ledger.md)与派生支持索引。v4.3 补齐 v4.2 的已知空白；它不声明源码实施、软件验收、实测收益或生产发行已经完成。截至已合并的 PR #178，已登记增量都是有限子范围，状态最高为 `implemented_not_verified`。独立二次验收尚未执行。**不要宣称实测递归收益、生产宿主，或 E00–E18 整线完成。**
+**你只需专注业务本身，无需为每个场景反复设计和打磨自我增强逻辑。**
+
+**工程基线：** v4.3 第一真源工程实施方案（2026-10-12，SHA-256 `73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7`）。  
+**当前状态：** 截至 2026-10-15，核心工程约完成 **80%**（维护者估算），即将进入全链路验证测试阶段；工程进度不等于验收通过或收益成立。公开证据见[实施台账](docs/implementation-ledger.md)与派生支持索引。
 
 仓库：https://github.com/acosmi/RSIAgent
 
-## 为什么这样设计
+## 核心设计
 
-常见「改进」停在更好的一次回复、更多粘贴 prompt、以及只会变大的技能库——最多是 **B0**：修好这次任务，不改方法。
+RSIAgent 基于 **Rust** 构建独立核心服务，通过 **MCP、HTTP 与 CLI** 对接外部智能体、可信宿主与管理工具，将业务执行与自我改进逻辑分离。首版聚焦技能与策略层改进，不训练模型权重。
 
-真正的 RSI 需要同时满足：
+系统围绕两类可发布、可继承的持久资产构建：
 
-1. **持久改变** — 经验写入后续运行会继承的东西  
-2. **继承** — 后继系统真的加载这些改变  
-3. **元改进** — 下一轮还要升级候选的生成、评价或筛选方式  
+- **Skill**：沉淀可复用经验，改变后续任务的执行方法。
+- **Improver**：在已开放范围内改进候选生成、探索、选择或经验获取机制，并由后续改进作业实际继承——不仅改进任务方法，也改进「如何改进」。
 
-改变对象不必是模型权重。RSIAgent 瞄准可版本、可交付之物：**技能、工具、harness 策略、以及 Improver 策略 JSON**。
+候选是可演进的文本 / 策略 JSON，不是任意可执行脚本；证据一律视为不可信数据，不当指令。
 
-```
-任务智能体（任意宿主）
-        │  Prepare / Feedback / Application 回执
-        ▼
-RSIAgent 运行时           ← 本仓库（Rust）
-  evo-core 契约           ← 角色、预算、候选、验收
-  evo-engine / storage    ← 作业、评估、持久化
-  evo-mcp / evo-http      ← 接入面
-```
-
-两条不变量（随台账测试落地）：
-
-1. **候选数据永远不能自我授权。** 角色（`Agent` / `Host` / `Evaluator` / `Admin` / `Worker`）决定谁可提议、验收、发布。  
-2. **结构递归 ≠ 有效递归。** 改机制与「等预算 + 独立评价下后继更好」分开报告。
-
-## 自主程度阶梯（谁说了算）
-
-层级评价的是**谁控制改进决策**，不是模型能力排行：
+<details>
+<summary><b>自主程度阶梯（B0–L5）：评价的是谁控制改进决策，不是模型能力</b></summary>
 
 | 层级 | 名称 | 在 RSIAgent 中的落点 |
 | --- | --- | --- |
 | **B0** | 任务内纠错 | 只改当前输出，不产生持久候选 |
 | **L1** | 执行自主 | 执行人类指定的持久更新（技能 / 策略补丁） |
-| **L2** | 策略自主 | 在允许方法中选择改进手段（`evo.strategy.v1` Improver） |
+| **L2** | 策略自主 | 在允许的方法中选择改进手段（`evo.strategy.v1` Improver） |
 | **L3** | 经验获取自主 | 根据 Feedback 分类决定下一步学什么 / 练什么 |
 | **L4** | 环境适应自主 | 依据 Application 回执持续调整（Attached → Observed → VerifiedBenefit） |
 | **L5** | 递归元改进 | 演进 Improver 本身——如何提炼、过滤、验收经验——并继承该程序 |
 
-宿主可沿此阶梯上升，**同时**禁止候选删除失败日志、改写生产门禁或自动发布。
+</details>
 
-## 我们优化什么（工程支柱）
+## 研究基础与工程借鉴
 
-### 技能生命周期——不是只有「添加」
+项目依据 **《RSIAgent v4.3 定稿：受控递归自我改进系统工程实施方案》**这一唯一规范真源，参考以下研究并结合自有基础设施推进独立工程实现：
 
-技能库只增不治会导致检索变差、注入错误技能（library drift）。RSIAgent 把技能当作带完整生命周期的版本化候选：
+- **[Dream-RSI: Recursive Self-Improvement through Evolving Worlds](https://arxiv.org/pdf/2609.14858v1)**  
+  `arXiv:2609.14858 · v1`：借鉴生成与探索解耦、历史探索回放、离线「做梦」与策略筛选机制。
 
-- 记录对结果的**贡献**（Application 回执）  
-- 按**实测有用性**淘汰 / 退役，而不是按年龄  
-- 限制 Prepare 快照中的**活跃**技能数量  
-- 用 **meta-skill / Improver 策略**约束新技能写法（适用面 + 反例）  
+- **[The Last AI Built by Humans: Toward Genuine Recursive Self-Improvement](https://arxiv.org/pdf/2609.11873v2)**  
+  `arXiv:2609.11873 · v2`：参考 RSI 自主性框架，重点吸收学习者状态条件化的经验获取（L3），以及改进机制的跨代继承与元改良（L5）。
 
-记忆需要维护机制，不能只有 Add。
+工程机制另参考方案锁定提交的 **[RSI-Harness](https://github.com/CosmosMind-ai/RSI-Harness/tree/33c4f8dfac4359987f2e814e187de67c332498de)** 与 **[Microsoft SkillOpt](https://github.com/microsoft/SkillOpt/tree/79124b37e9a6371e13b753f8bcd7adb1e493ade1)**，吸收版本化资产、历史经验提炼、轨迹分析与技能内容优化思路；不整体移植上游运行时，也不将上游实验结果视为本项目的效果证明。
 
-### 优化正确的指标
+## 受控进化的工程原则
 
-反思不只问「答案错在哪」，还要问「我们判断对错的方式是否错了」。内部代理指标上升、外部目标停滞时，运行时区分：
+**结构确实闭环、收益有独立证据、产品可安全部署——三项门禁相互独立，不能互相替代。**
 
-- **探索用内部反馈**（发现失败类、形成假说）  
-- **生产验收**（独立 Evaluator：最小样本、收益门槛、回归上限、成本比）  
+**经验必须真正生效。** 区分「已提供、已挂载、已使用、已验证收益」；结合成功与失败证据、反例保留和有界原子编辑，避免把总结文本或模型自述当成学习成果。
 
-反思报告写得漂亮不算成功。成功标准是：采用新的经验提炼程序后，后续技能是否比旧程序产出的**更有用**——等预算、留出任务、回归检查。
+**预测必须接受现实检验。** 历史回放与离线仿真用于有限支持范围内的候选评估，不等于对任意行为的准确预测。正式收益通过独立真实任务对照验证，采用固定保护锚点与轮换独立留出；允许提前拒绝，不允许提前批准。
 
-### 评价器可进化——基线要分阶段稳定
+**改进不能绕过治理。** 以单写者事实存储、隔离执行、根预算、人工审批和原子发布约束改进过程；来源与派生资产全链可追溯、可撤销，并纳入备份恢复治理。候选不能修改最终验收器、提高权限或预算上限，也不能自行批准发布。
 
-评价标准可以动，但必须**分阶段**：阶段内尺子固定，只在阶段边界受控更新。允许提议改标准 ≠ 有权删失败记录或越过发布边界。
+## 验证路线
 
-## 结构递归 vs 有效递归
+**G0–G5 分阶段门禁**与 **V001–V120 验收场景族**逐作用域推进：从配置优先级定位任务开始验证真实端到端闭环，再开展回放、课程与元改良对照实验，以及兼容性、故障恢复和部署安全验证。
 
-| 类型 | 要问的问题 |
-| --- | --- |
-| **结构递归** | 是否修改、保留，并在下一轮复用改进机制本身？ |
-| **有效递归** | 在可比预算与独立评价下，新机制是否产出更好的后继系统？ |
+## 边界与声明
 
-例：学会「改配置前先查加载路径」是一条技能；提出「以后每条规则都必须写适用条件并用反例防过宽」则是在改**经验提炼程序**（L5）。真正的检验是：新程序写出的技能是否优于旧程序——而不是提案文案是否好听。
+本项目并非上述论文或参考仓库的官方实现或完整复现。跨域通用性与循环进化是设计目标，实际支持范围和改进收益以独立验证结果为准；开发评分器演化与自动代码修改仍为默认关闭的扩展。感谢相关研究者与开源贡献者。
 
-验收设计朝向：
+**截至 2026-10-15，以下均不声称：**
 
-- 旧 / 新 Improver 同一基线起步  
-- 相同资源预算  
-- 改进过程外的泛化任务  
-- 相对旧版已解决问题的回归检查  
-- 计入生成 + 测试 + 人工审阅的总成本，而不只看最终成功率  
-
-## 基本用法（今天 vs 目标）
-
-### 今天
-
-```bash
-git clone https://github.com/acosmi/RSIAgent.git && cd RSIAgent
-cat docs/implementation-ledger.md
-```
-
-CLI 入口（`apps/rsia`）将 `serve` 接到 HTTP 服务，将 `mcp` 接到启动时固定 Agent 身份的四个 stdio MCP 工具，将 `manage` 接到经鉴权的 HTTP 管理作业，将 `review` 接到经鉴权的 HTTP 已存材料审阅。默认引导使用禁用的模型传输与 `ToolOnly` 能力；未配置 HTTP 鉴权时，敏感请求以 503 拒绝。这些入口不代表已达到生产就绪；当前支持范围请以台账为准。
-
-`apps/rsia/src/main.rs` 中定义的子命令：
-
-- `rsia serve` — 提供经鉴权的 HTTP API（`--bind` 默认 `127.0.0.1:7788`，`--data` 默认 `rsia.sqlite3`，`--namespace` 默认 `default`）。
-- `rsia mcp` — 通过 stdio 运行四个 MCP 工具，Agent 身份在启动时固定（`--data` 默认 `rsia.sqlite3`，`--namespace` 默认 `default`，`--actor` 默认 `stdio-agent`）。
-- `rsia manage <operation>` — 通过 HTTP 服务提交或查看经鉴权的管理作业（`--url` 默认 `http://127.0.0.1:7788`；必须提供 `--auth-token` 或环境变量 `RSIA_MANAGEMENT_TOKEN`；另接受 `--request-file` 与 `--job-id`）。
-- `rsia review --kind <typed_candidate|stage_fact|formal_report> --id <id> [--detail metadata|exact] [--url <url>] [--auth-token <token>]` — 通过经鉴权的 HTTP 服务审阅已存材料（`--detail` 默认 `metadata`，`--url` 默认 `http://127.0.0.1:7788`；必须提供 `--auth-token` 或环境变量 `RSIA_MANAGEMENT_TOKEN`）。
-
-### 目标宿主流程（设计）
-
-1. 启动 RSIAgent（HTTP / MCP）  
-2. **Prepare** — 目标 + 能力 → 活跃技能快照  
-3. 在你的智能体里跑任务  
-4. **Feedback** — 成功 / 失败分类  
-5. 可学习失败 → 改进作业 → **Proposal**（证据 + 反例）  
-6. Evaluator 验收 → 批准 → 灰度 → Active  
-7. **Application** 回执：Returned → Attached → Observed → VerifiedBenefit  
-
-HTTP 默认绑定（启用后）：`127.0.0.1:7788`。
-
-## 候选允许是什么
-
-| 类型 | 含义 |
-| --- | --- |
-| Skill | 窄范围文本技能：证据 + 适用面 + 反例 |
-| Improver | 可演进策略 JSON（`evo.strategy.v1`）——元改进程序，不是可执行脚本 |
-
-**默认禁止：** 未监督自动发布、任意代码执行、无预算的付费模型调用。
-
-## 能力地图（契约）
-
-以 `evo-core` 为准，随代码演进请再核对源码：
-
-| 领域 | 覆盖 |
-| --- | --- |
-| 角色与上下文 | 命名空间 / 执行者 / 角色；所有权；候选不可自我授权 |
-| 运行闭环 | Prepare → Feedback → Proposal → 状态机 → Release / 灰度 / Active |
-| 作业与预算 | 租约、取消、恢复；未配置预算则拒绝付费改进 |
-| 验收策略 | 最小样本、收益门槛、回归上限、成本比、置信度 |
-| 接入 | MCP（模型工具与管理能力分离）、HTTP、CLI |
-
-候选状态含：Proposed → Validated → AcceptancePassed → Approved → Canary → Active（以及 Retired / Rejected / Revoked）。
-
-## 仓库结构
-
-```
-apps/rsia           CLI / 进程入口（serve / mcp / manage / review）
-crates/evo-core     纯契约与验收规则
-crates/evo-storage  持久化
-crates/evo-engine   受控改进与评估
-crates/evo-mcp      MCP 适配
-crates/evo-http     鉴权 HTTP + 远程 MCP 传输
-docs/               实施台账与运维说明
-```
-
-## 当前状态
-
-以本树的 v4.3 方案绑定和支持索引为准（`plan_version` 为 `v4.3`，整线未完成，历史等价未核验）。三个门禁彼此独立：结构闭环、独立收益证据、可安全部署的产品。三者不能互相代替。
-
-**树内已有，且只算有限范围**
-
-- Workspace：`evo-core`、`evo-storage`、`evo-engine`、`evo-mcp`、`evo-http`，以及 `rsia` CLI（`serve` / `mcp` / `manage` / `review`）
-- 角色、预算、候选、验收与回执的领域契约
-- 台账与派生支持索引。v4.3 方案正文不在本远程
-- 截至 PR #178 已合并的有限交付，包括共享数据目录单写者、拒绝冲突的 v1 宿主面项、种子分类失败关闭、坏时钟下停止持久工作、锁定工具链与锁定构建输入、`proprietary_unreleased` 项目许可元数据、脱敏 bound 请求身份、锁定依赖与主档许可登记、两条精确旧许可表达式，以及安全只读 SQLite 读取依赖
-- E17 与 E18 仍为可选且默认关闭。货币预算缺省为 0
-
-**不声称**
-
-- E00–E18 整线完成，或 V099–V120 整族验收（这些场景族仍为 planned）
-- 独立二次验收
+- E00–E18 整线完成，或 V099–V120 整族验收（相关场景族仍为 planned）
+- 独立二次验收（尚未执行）
 - 真实模型提供商、付费实验、真实外部宿主或真实沙箱
 - 由非生产评价支撑的生产批准、灰度或 Active
-- 实测有效递归，或发行  
+- 实测有效递归收益，或发行
 
-## 开发
-
-在本地工具链与宿主 smoke 变绿前，优先看 CI 与 [实施台账](docs/implementation-ledger.md)。
-
-本仓库是**运行时与契约面**，不是训练 / 评测 / 权重更新代码库。
-
-## 贡献
-
-请对照 [`docs/implementation-ledger.md`](docs/implementation-ledger.md)。优先证据，而不是只有接口草图。
+已登记增量状态最高为 `implemented_not_verified`；货币预算缺省为 0；E17 与 E18 仍为可选且默认关闭。
 
 ## 许可
 
-RSIAgent 为专有且未发行（`proprietary_unreleased`）。根目录 `LICENSE` 保留全部权利；源码公开可见并不授予项目再分发或发行许可。第三方许可与声明仍适用于其对应材料。Workspace crate 保持不发布。
+RSIAgent 采用源码可用许可（`source_available_personal_noncommercial_free`）：**个人非商业用途免费**；**商业用途需事先获得书面授权**——包括公司或其他组织的使用，以及在商业或创收活动中的个人使用。联系方式：[fushihua@acosmi.com](mailto:fushihua@acosmi.com)，官网：[acosmi.com](https://acosmi.com)。
+
+根目录 [`LICENSE`](LICENSE) 载明完整条款（中英双语）；源码公开可见本身不授予再分发、转售或发行许可。第三方许可与声明仍适用于其对应材料。Workspace crate 保持不发布。
