@@ -45,15 +45,15 @@ RSIAgent 基于 **Rust** 构建独立核心服务，通过 **MCP、HTTP 与 CLI*
 
 ## 研究基础与工程借鉴
 
-项目依据 **《RSIAgent v4.3 定稿：受控递归自我改进系统工程实施方案》**这一唯一规范真源，参考以下研究并结合自有基础设施推进独立工程实现：
+项目依据《**RSIAgent v4.3 定稿：受控递归自我改进系统工程实施方案**》这一唯一规范真源，参考以下研究并结合自有基础设施推进独立工程实现：
 
-- **[Dream-RSI: Recursive Self-Improvement through Evolving Worlds](https://arxiv.org/pdf/2609.14858v1)**  
-  `arXiv:2609.14858 · v1`：借鉴生成与探索解耦、历史探索回放、离线「做梦」与策略筛选机制。
+- **[Dream-RSI: Recursive Self-Improvement through Evolving Worlds](https://arxiv.org/pdf/2609.14858v1)**（论文）  
+  [arXiv:2609.14858 · v1](https://arxiv.org/pdf/2609.14858v1)：借鉴生成与探索解耦、历史探索回放、离线「做梦」与策略筛选机制。
 
-- **[The Last AI Built by Humans: Toward Genuine Recursive Self-Improvement](https://arxiv.org/pdf/2609.11873v2)**  
-  `arXiv:2609.11873 · v2`：参考 RSI 自主性框架，重点吸收学习者状态条件化的经验获取（L3），以及改进机制的跨代继承与元改良（L5）。
+- **[The Last AI Built by Humans: Toward Genuine Recursive Self-Improvement](https://arxiv.org/pdf/2609.11873v2)**（论文）  
+  [arXiv:2609.11873 · v2](https://arxiv.org/pdf/2609.11873v2)：参考 RSI 自主性框架，重点吸收学习者状态条件化的经验获取（L3），以及改进机制的跨代继承与元改良（L5）。
 
-工程机制另参考方案锁定提交的 **[RSI-Harness](https://github.com/CosmosMind-ai/RSI-Harness/tree/33c4f8dfac4359987f2e814e187de67c332498de)** 与 **[Microsoft SkillOpt](https://github.com/microsoft/SkillOpt/tree/79124b37e9a6371e13b753f8bcd7adb1e493ade1)**，吸收版本化资产、历史经验提炼、轨迹分析与技能内容优化思路；不整体移植上游运行时，也不将上游实验结果视为本项目的效果证明。
+工程机制另参考方案锁定提交的 **[RSI-Harness](https://github.com/CosmosMind-ai/RSI-Harness/tree/33c4f8dfac4359987f2e814e187de67c332498de)**（固定提交 `33c4f8df`）与 **[Microsoft SkillOpt](https://github.com/microsoft/SkillOpt/tree/79124b37e9a6371e13b753f8bcd7adb1e493ade1)**（固定提交 `79124b37`），吸收版本化资产、历史经验提炼、轨迹分析与技能内容优化思路；不整体移植上游运行时，也不将上游实验结果视为本项目的效果证明。
 
 ## 受控进化的工程原则
 
