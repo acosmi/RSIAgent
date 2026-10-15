@@ -1,3 +1,5 @@
+![RSIAgent](docs/assets/rsia-logo-banner.png)
+
 # RSIAgent
 
 [English](README.md) | [中文](README.zh-CN.md)
@@ -169,7 +171,7 @@ Bound to plan v4.3 and the support index on this tree (`plan_version` `v4.3`, ro
 - Workspace crates `evo-core`, `evo-storage`, `evo-engine`, `evo-mcp`, `evo-http`, and the `rsia` CLI (`serve` / `mcp` / `manage` / `review`)
 - Domain contracts for roles, budget, candidates, acceptance, and receipts
 - Ledger plus derived support index. The v4.3 plan file is not published here
-- Merged scoped work through PR #178, including a shared data-directory single writer, rejection of conflicting v1 host-surface items, fail-closed seed classification, refusal to continue persistent work on a bad clock, pinned toolchain and locked build inputs, `proprietary_unreleased` project license metadata, redacted bound-request identity, locked dependency and primary license registration, two exact legacy license expressions, and a safe read-only SQLite reader dependency
+- Merged scoped work through PR #178, including a shared data-directory single writer, rejection of conflicting v1 host-surface items, fail-closed seed classification, refusal to continue persistent work on a bad clock, pinned toolchain and locked build inputs, project license metadata and guards, redacted bound-request identity, locked dependency and primary license registration, two exact legacy license expressions, and a safe read-only SQLite reader dependency
 - E17 and E18 remain optional and disabled. Default monetary budget is 0
 
 **Not claimed**
@@ -192,7 +194,12 @@ Track work against [`docs/implementation-ledger.md`](docs/implementation-ledger.
 
 ## License
 
-RSIAgent is proprietary and unreleased (`proprietary_unreleased`). The root
-`LICENSE` retains all rights; public source visibility does not grant a project
-redistribution or release license. Third-party licenses and notices remain
+RSIAgent is source-available under a personal, non-commercial free license
+(`source_available_personal_noncommercial_free`). The root `LICENSE` governs
+all grants: personal, non-commercial use is free of charge; any commercial
+use — including use by a company or other organization, and individual use in
+a commercial or revenue-generating activity — requires prior written
+authorization from Acosmi (fushihua@acosmi.com, https://acosmi.com); public
+source visibility does not by itself grant a redistribution, resale,
+sublicensing or release license. Third-party licenses and notices remain
 applicable to their corresponding material. Workspace crates remain unpublished.

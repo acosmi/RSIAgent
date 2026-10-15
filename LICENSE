@@ -1,10 +1,41 @@
-RSIAgent — proprietary_unreleased
+RSIAgent — Source-Available License (personal, non-commercial use free; commercial use requires authorization)
+RSIAgent — 源码可用许可（个人非商业免费；商业使用需授权）
 
-All rights reserved.
+Copyright (c) 2026 Acosmi. All rights reserved.
+版权所有 (c) 2026 Acosmi，保留所有权利。
 
-The project is proprietary and unreleased. Public visibility of this repository
-does not grant a project redistribution or release license.
+===== English =====
 
-Licenses and notices for third-party material apply to the corresponding
-material and remain in effect. This notice does not replace those notices or
-change the rights granted by those third-party licenses.
+1. Personal, non-commercial use is free.
+   You may use, copy, modify and run RSIAgent free of charge for personal,
+   non-commercial purposes.
+
+2. Commercial use requires prior written authorization.
+   Any commercial use — including use by a company or other organization, and
+   individual use in a commercial or revenue-generating activity — requires
+   prior written authorization from Acosmi.
+   Contact: fushihua@acosmi.com — https://acosmi.com
+
+3. No redistribution or sublicensing without authorization.
+   Public source visibility of this repository does not by itself grant a
+   redistribution, resale, sublicensing or release license.
+
+4. Third-party material.
+   Licenses and notices for third-party material apply to the corresponding
+   material and remain in effect. This notice does not replace those notices or
+   change the rights granted by those third-party licenses.
+
+===== 中文 =====
+
+1. 个人非商业使用免费。
+   您可以出于个人、非商业目的免费使用、复制、修改和运行 RSIAgent。
+
+2. 商业使用需事先获得书面授权。
+   任何商业用途——包括公司或其他组织的使用，以及在商业或创收活动中的个人使用——需事先获得 Acosmi 的书面授权。
+   联系方式：fushihua@acosmi.com — https://acosmi.com
+
+3. 未经授权不得再分发或再许可。
+   本仓库源码公开可见，本身不授予再分发、转售、再许可或发行许可。
+
+4. 第三方材料。
+   第三方材料的许可与声明仍适用于其对应材料；本声明不替代这些声明，也不改变相应第三方许可授予的权利。

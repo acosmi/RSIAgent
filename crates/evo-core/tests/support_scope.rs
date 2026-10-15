@@ -152,16 +152,16 @@ struct ProjectLicenseMetadata {
 }
 
 fn validate_project_license(value: &Value, root: &Path) -> Result<(), String> {
-    const REVIEWED_SHA: &str = "683f49c7897397fbb819924185fc8cb4c2212cf5987faa7a39ab16f0aae1c86b";
+    const REVIEWED_SHA: &str = "280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc";
     let license = value["project_license"]
         .as_object()
         .ok_or("project_license must be an object")?;
     if license.keys().cloned().collect::<BTreeSet<_>>() != split_set("path sha256 status")
-        || license["status"] != "proprietary_unreleased"
+        || license["status"] != "source_available_personal_noncommercial_free"
         || license["path"] != "LICENSE"
         || license["sha256"].as_str() != Some(REVIEWED_SHA)
     {
-        return Err("project_license must bind the reviewed proprietary_unreleased LICENSE".into());
+        return Err("project_license must bind the reviewed license text".into());
     }
     validate_repo_file(root, "LICENSE", "project LICENSE")?;
     validate_repo_file(
@@ -202,7 +202,7 @@ fn validate_project_license(value: &Value, root: &Path) -> Result<(), String> {
     .map(str::to_owned)
     .collect();
     if metadata.schema_version != "rsia.project_license_metadata.v1"
-        || metadata.status != "proprietary_unreleased"
+        || metadata.status != "source_available_personal_noncommercial_free"
         || metadata.path != "LICENSE"
         || metadata.sha256 != REVIEWED_SHA
         || metadata.members != expected
@@ -2147,10 +2147,10 @@ fn project_license_rejects_unreviewed_or_malformed_manifest_binding() {
     validate_project_license(&value, &root).unwrap();
     for replacement in [
         Value::Null,
-        serde_json::json!({"status":"MIT","path":"LICENSE","sha256":"683f49c7897397fbb819924185fc8cb4c2212cf5987faa7a39ab16f0aae1c86b"}),
-        serde_json::json!({"status":"proprietary_unreleased","path":"../LICENSE","sha256":"683f49c7897397fbb819924185fc8cb4c2212cf5987faa7a39ab16f0aae1c86b"}),
-        serde_json::json!({"status":"proprietary_unreleased","path":"LICENSE","sha256":true}),
-        serde_json::json!({"status":"proprietary_unreleased","path":"LICENSE","sha256":"683f49c7897397fbb819924185fc8cb4c2212cf5987faa7a39ab16f0aae1c86b","extra":false}),
+        serde_json::json!({"status":"MIT","path":"LICENSE","sha256":"280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc"}),
+        serde_json::json!({"status":"source_available_personal_noncommercial_free","path":"../LICENSE","sha256":"280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc"}),
+        serde_json::json!({"status":"source_available_personal_noncommercial_free","path":"LICENSE","sha256":true}),
+        serde_json::json!({"status":"source_available_personal_noncommercial_free","path":"LICENSE","sha256":"280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc","extra":false}),
     ] {
         let mut changed = value.clone();
         changed["project_license"] = replacement;
@@ -2162,7 +2162,7 @@ fn project_license_rejects_unreviewed_or_malformed_manifest_binding() {
 fn project_license_raw_json_rejects_duplicates_at_every_depth() {
     for raw in [
         r#"{"project_license":{},"project_license":{}}"#,
-        r#"{"project_license":{"status":"MIT","status":"proprietary_unreleased"}}"#,
+        r#"{"project_license":{"status":"MIT","status":"source_available_personal_noncommercial_free"}}"#,
         r#"[{"sha256":"a","sha256":"b"}]"#,
         r#"{"valid":true} {"trailing":true}"#,
     ] {

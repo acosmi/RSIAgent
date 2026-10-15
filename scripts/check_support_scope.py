@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-PROJECT_LICENSE_SHA256 = "683f49c7897397fbb819924185fc8cb4c2212cf5987faa7a39ab16f0aae1c86b"
-PROJECT_LICENSE_README = 'RSIAgent is proprietary and unreleased (`proprietary_unreleased`). The root\n`LICENSE` retains all rights; public source visibility does not grant a project\nredistribution or release license. Third-party licenses and notices remain\napplicable to their corresponding material. Workspace crates remain unpublished.'
+PROJECT_LICENSE_SHA256 = "280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc"
+PROJECT_LICENSE_README = 'RSIAgent is source-available under a personal, non-commercial free license\n(`source_available_personal_noncommercial_free`). The root `LICENSE` governs\nall grants: personal, non-commercial use is free of charge; any commercial\nuse — including use by a company or other organization, and individual use in\na commercial or revenue-generating activity — requires prior written\nauthorization from Acosmi (fushihua@acosmi.com, https://acosmi.com); public\nsource visibility does not by itself grant a redistribution, resale,\nsublicensing or release license. Third-party licenses and notices remain\napplicable to their corresponding material. Workspace crates remain unpublished.'
 PROJECT_LICENSE_MEMBERS = ['apps/rsia', 'crates/evo-core', 'crates/evo-engine', 'crates/evo-http', 'crates/evo-mcp', 'crates/evo-storage']
 
 PLAN_VERSION = "v4.3"
@@ -266,7 +266,7 @@ def validate_project_license_metadata(repo_root: Path) -> dict[str, Any]:
     except OSError as exc:
         raise CheckerError(f"project LICENSE unreadable: {exc}") from exc
     if digest != PROJECT_LICENSE_SHA256:
-        raise CheckerError("project LICENSE is not the reviewed proprietary_unreleased text")
+        raise CheckerError("project LICENSE is not the reviewed license text")
     readme = read_text("README.md").replace("\r\n", "\n")
     sections = list(re.finditer(r"^## License[ \t]*$", readme, flags=re.MULTILINE))
     if len(sections) != 1:
@@ -275,7 +275,7 @@ def validate_project_license_metadata(repo_root: Path) -> dict[str, Any]:
     # The reviewed License section is final; later headings cannot hide grants.
     if tail.strip() != PROJECT_LICENSE_README:
         raise CheckerError("project license README section differs from the reviewed text")
-    return {"schema_version": "rsia.project_license_metadata.v1", "status": "proprietary_unreleased", "path": "LICENSE", "sha256": digest, "members": sorted(members)}
+    return {"schema_version": "rsia.project_license_metadata.v1", "status": "source_available_personal_noncommercial_free", "path": "LICENSE", "sha256": digest, "members": sorted(members)}
 
 def validate_project_license(manifest: Any, repo_root: Path) -> None:
     if not isinstance(manifest, dict):
@@ -283,7 +283,7 @@ def validate_project_license(manifest: Any, repo_root: Path) -> None:
     license = manifest.get("project_license")
     if not isinstance(license, dict) or set(license) != {"status", "path", "sha256"}:
         raise CheckerError("project_license must contain only status/path/sha256")
-    if license["status"] != "proprietary_unreleased" or license["path"] != "LICENSE" or not isinstance(license["sha256"], str) or not HEX64.fullmatch(license["sha256"]):
+    if license["status"] != "source_available_personal_noncommercial_free" or license["path"] != "LICENSE" or not isinstance(license["sha256"], str) or not HEX64.fullmatch(license["sha256"]):
         raise CheckerError("project_license fields are invalid")
     actual = validate_project_license_metadata(repo_root)
     if any(license[field] != actual[field] for field in license):
