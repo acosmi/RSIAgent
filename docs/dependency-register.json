@@ -351,6 +351,30 @@
       "version": "3.3.0"
     },
     {
+      "alternative": "SQLx has no public safe setter on its handle; direct FFI is forbidden; existing read-only-WAL permissions cover only a limited source subset.",
+      "checksum": "7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e",
+      "consumers": [
+        {
+          "alias": "rusqlite",
+          "declaration": {
+            "default-features": false,
+            "version": "=0.32.1"
+          },
+          "default_features": false,
+          "features": [],
+          "kind": "regular",
+          "manifest": "crates/evo-storage/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        }
+      ],
+      "license": "MIT",
+      "name": "rusqlite",
+      "purpose": "Safe SQLite NO_CKPT_ON_CLOSE configuration for a future AG132 independent read-only source connection; no production floor or reader wiring.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.32.1"
+    },
+    {
       "alternative": "Use a separately reviewed safe platform filesystem adapter.",
       "checksum": "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d",
       "consumers": [
@@ -1172,7 +1196,7 @@
     }
   ],
   "inputs": {
-    "cargo_lock_sha256": "773b26f7bc574a899f87790298558678872403a2de4cc8e17e1e3705c83ab57c",
+    "cargo_lock_sha256": "87daf3d622f60c12135dc8856d95c4690ee06ae8854a561988d846878657d7b0",
     "manifests": {
       "Cargo.toml": "b509c760a653938dcb00fed78a4ead63c43aa7b6bd1537f4e6dd0fb3e5c45f61",
       "apps/rsia/Cargo.toml": "f7a01045b14b22b99d6f1b0d442013ff836392a159226613f8fa21674935bc46",
@@ -1180,7 +1204,7 @@
       "crates/evo-engine/Cargo.toml": "bac362631f8bd675c3b323b0a847f152a6d090a5039f148e3e4ae0e77eea225f",
       "crates/evo-http/Cargo.toml": "d75104c7dc6eb959f820df2c40e5d470166fe003fc2d4cdd3086bf90f463dc68",
       "crates/evo-mcp/Cargo.toml": "733aa65f247ea23431aa5da8accf0f7cd02144d4dd3be7d5282b0caf9614d0bf",
-      "crates/evo-storage/Cargo.toml": "826c8edca975c9293319c527d6cb634ad58217a21ea32aeade8d87f541c782d3"
+      "crates/evo-storage/Cargo.toml": "8be8271bd38800ada6d38adf660df80f3a6896ca42726301d6da93ab8bd844b6"
     }
   },
   "internal_packages": [
@@ -1400,7 +1424,7 @@
       "version": "0.2.0"
     }
   ],
-  "inventory_sha256": "ff61670b115348af05c79b37a48aa184a6a9858b461a4fee18426cb16999f961",
+  "inventory_sha256": "678e214c9093241aa6a67bd6c3d6481b886773e1e6419fadc47b8729d800d7bc",
   "legacy_license_exceptions": {
     "Apache-2.0/MIT": [
       {
