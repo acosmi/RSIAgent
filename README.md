@@ -6,7 +6,7 @@ Not only get stronger — improve **how** you get stronger.
 
 RSIAgent is an **independent Rust recursive-improvement runtime**. Task agents plug in over **MCP**, **HTTP**, or **CLI**. Experience becomes lasting, inheritable change to skills, tools, runtime policy, and the improvement strategy itself — under roles, budgets, and independent acceptance. Candidates are evolvable text / strategy JSON, not arbitrary executable scripts. Evidence is untrusted data, never instructions.
 
-> **Status:** early implementation (workspace `0.2.0`). The richest surface today is the domain contracts in `evo-core`. Host services and a full CLI are still landing. The [implementation ledger](docs/implementation-ledger.md) is the source of truth for compile / smoke / evolution evidence. **Do not claim measured recursive gains until that ledger records them.**
+> **Status:** scoped implementation in progress (workspace `0.2.0`), not a finished route. The normative engineering plan is **v4.3** (2026-10-12, SHA-256 `73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7`). That plan body stays off this remote. Public evidence is the [implementation ledger](docs/implementation-ledger.md) and the derived support index. v4.3 fills known gaps in v4.2; it does not declare source implementation, software acceptance, measured benefit, or a production release complete. As of merged PR #178, recorded increments are limited scopes at `implemented_not_verified` or earlier. Independent second acceptance has not been executed. **Do not claim measured recursive gains, a production host, or a complete E00–E18 route.**
 
 Repository: https://github.com/acosmi/RSIAgent
 
@@ -162,18 +162,23 @@ docs/               Implementation ledger & ops notes
 
 ## Current status
 
-**In progress / present in tree**
+Bound to plan v4.3 and the support index on this tree (`plan_version` `v4.3`, route not complete, legacy equivalence unverified). Three gates stay independent: a closed structure, independent benefit evidence, and a deployable product. None of them stands in for the others.
 
-- Workspace layout and CI hooks  
-- Rich `evo-core` domain contracts (roles, budget, candidates, acceptance, receipts)  
-- Explicit ledger separating written / compiled / tested / host-verified / measured benefit  
-- Design coverage for L1–L5 autonomy, skill lifecycle, staged acceptance, structural vs effective recursion  
+**Present, scoped**
 
-**Not yet**
+- Workspace crates `evo-core`, `evo-storage`, `evo-engine`, `evo-mcp`, `evo-http`, and the `rsia` CLI (`serve` / `mcp` / `manage` / `review`)
+- Domain contracts for roles, budget, candidates, acceptance, and receipts
+- Ledger plus derived support index. The v4.3 plan file is not published here
+- Merged scoped work through PR #178, including a shared data-directory single writer, rejection of conflicting v1 host-surface items, fail-closed seed classification, refusal to continue persistent work on a bad clock, pinned toolchain and locked build inputs, `proprietary_unreleased` project license metadata, redacted bound-request identity, locked dependency and primary license registration, two exact legacy license expressions, and a safe read-only SQLite reader dependency
+- E17 and E18 remain optional and disabled. Default monetary budget is 0
 
-- Full CLI / HTTP / MCP host you can treat as production-ready  
-- One-command demo with published **effective**-recursion evidence  
-- Ledger-backed measured recursive gains  
+**Not claimed**
+
+- A complete E00–E18 route, or whole scenario families V099–V120 (those families stay planned)
+- Independent second acceptance
+- A real model provider, paid experiments, a real extra host, or a real sandbox
+- Production approval, canary, or Active backed by non-production evaluation
+- Measured effective recursion, or a release  
 
 ## Development
 
