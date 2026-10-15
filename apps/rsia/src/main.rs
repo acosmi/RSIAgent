@@ -67,7 +67,9 @@ async fn review_client(
             ReviewDetailArgument::Exact => evo_engine::review::ReviewDetail::Exact,
         },
     };
-    base.set_path("/v1/review");
+    // The canonical dispatch-plane route of the registered review action,
+    // concat-derived from the single registry name (plan §6.1.2 L734).
+    base.set_path(evo_core::management_registry::REVIEW_ROUTE);
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())

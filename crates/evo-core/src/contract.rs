@@ -875,19 +875,17 @@ pub fn model_tool_names() -> &'static [&'static str] {
 }
 
 pub fn admin_ops() -> &'static [&'static str] {
-    &[
-        "experiment.register",
-        "evaluation.start",
-        "evaluation.status",
-        "exploration.start",
-        "replay.run",
-        "curriculum.step",
-        "meta.start",
-    ]
+    // Single source: the dispatch-plane projection of the §6.1.2 registry
+    // (58 original dispatch names + control.review). The formal-authority and
+    // offline planes are deliberately not admin_ops, so neither classify nor
+    // the CLI manage gate admits them.
+    crate::management_registry::dispatch_names()
 }
 
 pub fn reject_admin_as_model_tool(name: &str) -> Result<()> {
-    if admin_ops().contains(&name) {
+    // Every registered management name on any plane (73) is rejected as a
+    // model tool; only the four model tools are accepted.
+    if crate::management_registry::lookup(name).is_some() {
         return Err(Error::Forbidden);
     }
     if MODEL_TOOLS.contains(&name) {

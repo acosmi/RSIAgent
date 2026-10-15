@@ -134,10 +134,16 @@ pub fn router(state: HttpState) -> Router {
         .route("/v1/tools/feedback", post(feedback))
         .route("/v1/tools/propose", post(propose))
         .route("/v1/tools/inspect", post(inspect))
-        .route("/v1/review", post(review))
         .route("/v1/host/trace", post(record_trace))
         .route("/v1/host/snapshot", post(read_snapshot))
         .route("/v1/host/application", post(record_application))
+        // The registered synchronous read-only review view lives on the
+        // dispatch plane at its concat-derived route (plan §6.1.2 L734,
+        // §6.5 L863). This explicit static segment takes precedence over the
+        // `/v1/manage/{operation}` wildcard below (axum/matchit static-over-
+        // param priority), so control.review never reaches the async job
+        // dispatcher and never creates a job, private input, audit or call.
+        .route(evo_core::management_registry::REVIEW_ROUTE, post(review))
         .route("/v1/manage/{operation}", post(management))
         .route("/v1/manage/jobs/{job_id}", get(management_status))
         .route("/v1/manage/jobs/{job_id}/cancel", post(management_cancel))
