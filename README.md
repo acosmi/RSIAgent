@@ -1,205 +1,204 @@
-![RSIAgent](docs/assets/rsia-logo-banner.png)
+<p align="center">
+  <img src="docs/assets/rsia-logo-banner.png" alt="RSIAgent" width="100%">
+</p>
 
-# RSIAgent
+<h1 align="center">RSIAgent</h1>
 
-[English](README.md) | [中文](README.zh-CN.md)
+<p align="center">
+  <b>Controlled Recursive Self-Improvement Runtime for Cross-Domain LLM Agents</b><br>
+  Not only get stronger — improve <b>how</b> you get stronger.
+</p>
 
-Not only get stronger — improve **how** you get stronger.
+<p align="center">
+  <a href="#core-architecture-dual-loop-cognition--controlled-evolution"><img src="https://img.shields.io/badge/architecture-dual--loop%20RSI-007ec6?style=flat-square" alt="Architecture"></a>
+  <a href="#two-layer-fact--asset-pipeline--version-evolution-chain"><img src="https://img.shields.io/badge/data_plane-fact%20%E2%86%94%20asset%20pipeline-00897b?style=flat-square" alt="Two-Layer Pipeline"></a>
+  <a href="#autonomy-ladder-b0l5"><img src="https://img.shields.io/badge/autonomy-B0--L5%20ladder-149954?style=flat-square" alt="Autonomy Ladder"></a>
+  <a href="#research-basis--engineering-references"><img src="https://img.shields.io/badge/research-papers%20%26%20systems-68448b?style=flat-square" alt="Research & References"></a>
+  <a href="#quick-start--integration-flow"><img src="https://img.shields.io/badge/integration-MCP%20%7C%20HTTP%20%7C%20CLI-f28c45?style=flat-square" alt="Integration"></a>
+  <a href="docs/implementation-ledger.md"><img src="https://img.shields.io/badge/evidence-implementation%20ledger-e65100?style=flat-square" alt="Implementation Ledger"></a>
+  <a href="https://acosmi.com"><img src="https://img.shields.io/badge/website-Acosmi-0052d9?style=flat-square" alt="Website"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Non--Commercial%20Open-4c6ef5?style=flat-square" alt="License"></a>
+</p>
 
-RSIAgent is an **independent Rust recursive-improvement runtime**. Task agents plug in over **MCP**, **HTTP**, or **CLI**. Experience becomes lasting, inheritable change to skills, tools, runtime policy, and the improvement strategy itself — under roles, budgets, and independent acceptance. Candidates are evolvable text / strategy JSON, not arbitrary executable scripts. Evidence is untrusted data, never instructions.
+<p align="center">
+  <b>English</b> | <a href="README.zh-CN.md">中文</a>
+</p>
 
-> **Status:** scoped implementation in progress (workspace `0.2.0`), not a finished route. The normative engineering plan is **v4.3** (2026-10-12, SHA-256 `73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7`). That plan body stays off this remote. Public evidence is the [implementation ledger](docs/implementation-ledger.md) and the derived support index. v4.3 fills known gaps in v4.2; it does not declare source implementation, software acceptance, measured benefit, or a production release complete. As of merged PR #178, recorded increments are limited scopes at `implemented_not_verified` or earlier. Independent second acceptance has not been executed. **Do not claim measured recursive gains, a production host, or a complete E00–E18 route.**
+**RSIAgent** is an independent **Rust** controlled recursive self-improvement runtime. It decouples **online task execution** from **offline self-evolution governance**: coding assistants, general-purpose agents, and trusted hosts (such as Claude Code, Cursor, Codex, OpenCode, and custom business agents) connect over **MCP, HTTP, and CLI** into a unified, local-first single-writer runtime (`Prepare → Feedback → Proposal → Evaluation → Release → Application`). Under strict role boundaries, root budgets, and independent acceptance gates, experience turns into lasting, inheritable improvements to both **task skills (`Skill`)** and **the meta-improvement strategy itself (`Improver`)**. **Focus on your business logic — without rebuilding self-improvement infrastructure for every scenario.**
 
-Repository: https://github.com/acosmi/RSIAgent
+> **Engineering Baseline:** Normative plan **v4.3** (2026-10-12, SHA-256 `73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7`). That plan body stays off this remote.  
+> **Current Status:** As of 2026-10-16, core engineering is roughly **80%** complete (maintainer estimate) and approaching end-to-end verification; engineering progress does not imply acceptance pass or measured benefit. Public evidence is tracked in the [implementation ledger](docs/implementation-ledger.md) and the derived support index. **Do not claim measured recursive gains, a production host, or a complete E00–E18 route.**
 
-## Why this design
+---
 
-Today, “agent improvement” usually means better one-shot replies, more prompts pasted around, and a skill library that only grows. That is **B0** at best: fix this task, forget the method.
+## Core Architecture: Dual-Loop Cognition & Controlled Evolution
 
-Real RSI needs three things at once:
+Today, “agent improvement” usually means ad-hoc reflection prompts or a skill library that only grows (`Add only`) — inflating latency while injecting noisy or conflicting instructions (library drift). Inspired by dual-process cognitive architectures (**System 1 fast execution + System 2 slow evolution**), RSIAgent splits runtime execution and recursive evolution into two loops with distinct latency and authority boundaries:
 
-1. **Lasting change** — experience writes something future runs inherit  
-2. **Inheritance** — successors actually load those changes  
-3. **Meta-improvement** — the next round also upgrades how candidates are generated, evaluated, or filtered  
-
-The object of change need not be model weights. RSIAgent targets what you can version and ship: **skills, tools, harness policy, and Improver strategy JSON**.
-
-```
-task agent (any host)
-        │  Prepare / Feedback / Application receipts
+```text
+External Task Agents / Multi-Host Clients (Claude Code / Cursor / Codex / Custom Agents)
+        │  MCP (stdio/remote) · HTTP · CLI
         ▼
-RSIAgent runtime          ← this project (Rust)
-  evo-core contracts      ← roles, budget, candidates, acceptance
-  evo-engine / storage    ← jobs, evaluation, persistence
-  evo-mcp / evo-http      ← integration surfaces
+┌──────────────────────────────────────────────────────────────────────┐
+│ RSIAgent Runtime (Rust) — One Runtime · Single-Writer Data Plane     │
+│                                                                      │
+│  [System 1 · Online Fast Loop]  Prepare Snapshot ──► Task Execution  │
+│                                 ──► Feedback & 4-Stage Application   │
+│                                     Receipts (zero evolution block)  │
+│                                           │                          │
+│                                           ▼ Untrusted evidence store │
+│  [System 2 · Offline Slow Loop] Learnable Failure Attribution        │
+│                                 ──► Replay / Offline Simulation      │
+│                                 ──► Proposal & Counterexamples       │
+│                                 ──► Independent Evaluator Acceptance │
+│                                 ──► Approval / Canary / Active       │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-Two invariants (enforced as tests land in the ledger):
-
-1. **Candidate data never grants authority.** Roles (`Agent` / `Host` / `Evaluator` / `Admin` / `Worker`) decide who may propose, accept, or release.  
-2. **Structural recursion ≠ effective recursion.** Changing the mechanism is reported separately from proving a better successor under comparable budget and independent evaluation.
-
-## Autonomy ladder (who decides)
-
-These levels score **who controls improvement decisions**, not raw model IQ:
-
-| Level | Name | In RSIAgent terms |
+| Dimension | System 1: Online Task Execution Loop (Fast Path) | System 2: Controlled Recursive Evolution Loop (Slow Path) |
 | --- | --- | --- |
-| **B0** | Intra-task correction | Fix the current output only — no lasting candidate |
-| **L1** | Execution autonomy | Apply human-prescribed lasting updates (skills / policy patches) |
+| **Responsibility** | Assemble a bounded active skill snapshot for the task goal + host capabilities, and record verbatim execution traces | Identify learnable failures from accumulated traces; generate, replay, filter, and evaluate new candidates offline |
+| **Model Overhead** | Zero extra LLM calls by default (`ToolOnly` snapshot assembly); never blocks the host's critical path | Asynchronous job scheduling strictly bounded by root budgets (`Budget`) and recoverable leases |
+| **Target Objects** | Frozen read-only active snapshot + append-only stage facts and receipts | Versioned **Skill** (task method) and **Improver** (`evo.strategy.v1` meta-improvement strategy JSON) |
+| **Safety Boundary** | External inputs and traces are treated strictly as **untrusted data**, never executable instructions or self-authorization | Independent `Evaluator` acceptance + human approval / canary / atomic release; candidates never self-approve |
+
+---
+
+## Two-Layer Fact ↔ Asset Pipeline & Version-Evolution Chain
+
+Drawing on long-horizon productivity and software-engineering memory design, RSIAgent avoids storing vague summaries or unpruned skill dumps. Every task trace feeds a **two-layer pipeline with bidirectional provenance** and a **version-evolution chain**:
+
+### 1. Verbatim Stage Facts ↔ Thresholded Evolvable Assets
+
+| Layer | What It Records | Admission Policy | Structure & Governance Contract |
+| --- | --- | --- | --- |
+| **Fact Layer (`StageFact` & Receipts)** | What the run actually did: goal, tool trace, success/failure class, and four-stage application receipts | **Zero-threshold verbatim retention** (append-only immutable records) | Tracks `Returned → Attached → Observed → VerifiedBenefit`; preserves both positive and negative outcomes |
+| **Asset Layer (`Skill` & `Improver`)** | Reusable approaches for future tasks (**Skill**) and meta-strategies for future refinement (**Improver**) | **High-threshold gated admission** (must pass counterexample checks & independent evaluation) | **Skill**: narrow text skill (evidence + applicability boundary + counterexample)<br>**Improver**: evolvable strategy JSON (`evo.strategy.v1`) governing how experience is refined, filtered, and accepted |
+
+- **Bidirectional Provenance & Cascading Revocation**: Every derived candidate (`Skill` or `Improver`) is cryptographically and relationally bound to its upstream stage facts and evidence IDs. If upstream evidence is tainted or revoked, the runtime cascades revocation and cleanup across derived assets so active state remains auditable and recoverable.
+- **Full-Lifecycle Skill Maintenance (Not “Add Only”)**: Skills are versioned candidates with a full lifecycle. RSIAgent tracks downstream contribution via `Application` receipts, caps active skills per `Prepare` snapshot, and prunes or retires low-utility assets based on measured usefulness rather than age.
+
+### 2. Why a Version-Evolution Chain & Counterexamples Matter (Summaries ≠ Learning)
+
+In long-horizon coding and complex tool use, plain text summaries inevitably drop **reverted attempts**, **negative trajectories**, and **intermediate revisions no longer present at `HEAD`**. RSIAgent enforces exact evolutionary lineage:
+
+- **Bounded Atomic Edits & State Evolution Chain**: Candidates progress through `Proposed → Validated → AcceptancePassed → Approved → Canary → Active` (plus `Retired / Rejected / Revoked`), preserving the exact diff and rationale of each revision rather than overwriting history in place.
+- **First-Class Counterexamples**: Every skill proposal must state explicit applicability boundaries and counterexamples so future runs know both *when to apply* and *when not to apply* a method.
+- **Structural vs. Effective Recursion**: Modifying the improvement mechanism (**Structural Recursion**) is tracked separately from proving that the new `Improver` produces higher-utility successor skills under equal budget, held-out generalization tasks, and non-regression checks on previously solved work (**Effective Recursion**).
+
+---
+
+## Autonomy Ladder (`B0–L5`)
+
+These levels score **who controls improvement decisions and evolutionary depth**, not raw base-model IQ:
+
+| Level | Name | In RSIAgent Terms |
+| --- | --- | --- |
+| **B0** | Intra-task correction | Fix the current output only — no lasting cross-session candidate |
+| **L1** | Execution autonomy | Apply human-prescribed lasting updates (skills or policy patches) within governed bounds |
 | **L2** | Strategy autonomy | Choose among allowed improvement methods (`evo.strategy.v1` Improver) |
-| **L3** | Experience acquisition | Decide what to learn / practice next from Feedback classes |
-| **L4** | Environment adaptation | Continuous adjust from Application receipts (Attached → Observed → VerifiedBenefit) |
-| **L5** | Recursive meta-improvement | Evolve the Improver itself — how experience is refined, filtered, and accepted — then inherit that procedure |
+| **L3** | Experience acquisition | Decide what to learn or practice next from `Feedback` failure classes and learner state |
+| **L4** | Environment adaptation | Continuously adjust from four-stage `Application` receipts (`Attached → Observed → VerifiedBenefit`) |
+| **L5** | Recursive meta-improvement | Evolve the **Improver itself** — how experience is refined, filtered, and accepted — and inherit that procedure in subsequent generations |
 
-RSIAgent is built so hosts can climb this ladder **without** giving candidates the power to erase failure logs, rewrite production gates, or auto-publish.
+---
 
-## What we optimize for (engineering pillars)
+## Research Basis & Engineering References
 
-### Skill lifecycle — not “Add only”
+Grounded in the normative **RSIAgent v4.3 Engineering Implementation Plan**, this project advances an independent Rust implementation informed by the following research papers and open-source engineering systems:
 
-A growing skill library can **hurt** retrieval and inject wrong skills (library drift). RSIAgent treats skills as versioned candidates with a full lifecycle:
+- **[Dream-RSI: Recursive Self-Improvement through Evolving Worlds](https://arxiv.org/pdf/2609.14858v1)** *(Paper)*  
+  [arXiv:2609.14858 · v1](https://arxiv.org/pdf/2609.14858v1): Informs generation–exploration decoupling, historical exploration replay, offline “dreaming” simulation, and strategy filtering.  
+  Institutions: Google, Google DeepMind, University of Maryland (UMD), University of Virginia (UVA); authors include Tong Zheng, Zheng Zhang et al.
 
-- Record **contribution** toward outcomes (Application receipts)  
-- **Prune / retire** by measured usefulness, not age  
-- Cap what is **active** in a Prepare snapshot  
-- Use **meta-skills / Improver strategy** to guide how new skills are written (applicability + counterexamples)  
+- **[The Last AI Built by Humans: Toward Genuine Recursive Self-Improvement](https://arxiv.org/pdf/2609.11873v2)** *(Paper)*  
+  [arXiv:2609.11873 · v2](https://arxiv.org/pdf/2609.11873v2): Informs the B0–L5 RSI autonomy taxonomy, learner-state-conditioned experience acquisition (L3), and cross-generation inheritance & meta-refinement of the improvement procedure (L5).  
+  Institutions: Shanghai Jiao Tong University, Theseus Labs, Tsinghua University, ByteDance, ModelBest, Xiaohongshu, Shanghai AI Lab, Humanlaya, Agent-Native Research Lab, Frontis.AI; authors include Zhiyuan Liu, Bowen Zhou, Guoliang Li, Fan Wu et al.
 
-Memory needs a maintenance loop, not a dump button.
+- **[Memory Beyond Recall](https://arxiv.org/abs/2606.09483) & [Tencent-Hunyuan/Hy-Memory](https://github.com/Tencent-Hunyuan/Hy-Memory)** *(Paper & Open-Source System)*  
+  [arXiv:2606.09483](https://arxiv.org/abs/2606.09483) (EMNLP 2026) and Tencent Hunyuan's open-source [Hy-Memory / MemHub](https://github.com/Tencent-Hunyuan/Hy-Memory): Informs the System 1 / System 2 cognitive division, the two-layer `Session Fact ↔ Reusable Experience` pipeline with bidirectional provenance, the version-evolution diff-chain philosophy for coding trajectories, and the local-first single-writer cross-host runtime model.
 
-### Optimize the right metric
+- **[RSI-Harness](https://github.com/CosmosMind-ai/RSI-Harness/tree/33c4f8dfac4359987f2e814e187de67c332498de)** (pinned commit `33c4f8df`) & **[Microsoft SkillOpt](https://github.com/microsoft/SkillOpt/tree/79124b37e9a6371e13b753f8bcd7adb1e493ade1)** (pinned commit `79124b37`)  
+  Inform versioned asset management, historical experience distillation, trajectory attribution, and bounded skill refinement; upstream runtimes are not transplanted wholesale, nor are upstream benchmark numbers claimed as proof of effect for this repository.
 
-Reflection is not only “why was this answer wrong?” — it is also “is our judge of right/wrong wrong?” Internal proxy scores can rise while external goals stall. The runtime separates:
+---
 
-- **Exploration feedback** (find failure classes, form hypotheses)  
-- **Production acceptance** (independent Evaluator, min samples, gain floor, regression cap, cost ratio)  
+## Engineering Principles of Controlled Evolution
 
-A prettier reflection report is not success. Success is: after adopting the new refinement procedure, later skills are **more useful** than those from the old procedure, under equal budget, held-out tasks, and regression checks.
+**A closed structural loop, independent benefit evidence, and a safely deployable product are three independent gates — none substitutes for the others.**
 
-### Evaluators may evolve — baselines stay staged
+1. **One Runtime, Single-Writer Data Plane, Multi-Host Isolation**  
+   A shared data-directory single writer serializes persistent mutations, paired with a safe read-only SQLite reader for inspection. Access is isolated by `namespace`, `actor`, and five explicit roles (`Agent` / `Host` / `Evaluator` / `Admin` / `Worker`).
+2. **Experience Must Prove Real Downstream Utility**  
+   The runtime separates `Returned → Attached → Observed → VerifiedBenefit` receipts, combines positive and negative evidence with preserved counterexamples, and rejects model self-reports as proof of learning.
+3. **Predictions Must Face Held-Out Reality (Early Reject Allowed, Early Approve Forbidden)**  
+   Historical replay and offline simulation serve bounded candidate screening only. Formal benefit requires independent evaluation across fixed protection anchors and rotated held-out tasks under min-sample, gain-floor, regression-cap, and full cost-ratio constraints.
+4. **Evolution Never Bypasses Governance**  
+   Root budgets, lease recovery, human approval, and atomic release govern every state transition. Candidates are restricted to evolvable text and `evo.strategy.v1` JSON — never arbitrary executable code, unsupervised auto-publishing, or unbudgeted paid model calls.
 
-Evaluation criteria can move, but only in **controlled stages**: keep the yardstick fixed inside a stage; update it at stage boundaries. Suggesting a criterion change ≠ authority to delete failures or skip release boundaries.
+---
 
-## Structural vs effective recursion
+## Quick Start & Integration Flow
 
-| Kind | Question |
-| --- | --- |
-| **Structural** | Did we modify, retain, and reuse the improvement mechanism itself? |
-| **Effective** | Under comparable budget + independent eval, does the new mechanism produce a better successor? |
-
-Example: learning “check load paths before editing config” is a skill. Proposing that **every** future skill must state applicability and counterexamples is changing the **experience-refinement procedure** (L5). The true test is whether skills written under the new procedure outperform the old one — not whether the proposal text sounds sophisticated.
-
-Acceptance design RSIAgent encodes toward:
-
-- Same baseline start for old vs new Improver  
-- Equal resource budget  
-- Held-out / generalization tasks  
-- Regression vs previously solved work  
-- Full cost of generate + test + review, not final pass rate alone  
-
-## Basic usage (today vs target)
-
-### Today
+### 1. CLI & Service Entry Points (Current Tree)
 
 ```bash
 git clone https://github.com/acosmi/RSIAgent.git && cd RSIAgent
 cat docs/implementation-ledger.md
 ```
 
-The CLI entry (`apps/rsia`) wires `serve` to the HTTP service, `mcp` to the four stdio MCP tools with a startup-fixed Agent identity, `manage` to authenticated HTTP management jobs, and `review` to authenticated HTTP review of stored material. The default bootstrap uses a disabled model transport and `ToolOnly` capabilities; without configured HTTP authentication, sensitive requests are refused with 503. These entry points do not establish production readiness; consult the ledger for the current support scope.
+The CLI entry (`apps/rsia`) strictly separates agent tool surfaces from authenticated management and review operations (default bootstrap disables external model transport and uses `ToolOnly` capabilities; without configured HTTP authentication, sensitive requests fail closed with `503`):
 
-Subcommands defined in `apps/rsia/src/main.rs`:
+- `rsia serve` — serves the authenticated HTTP API and remote MCP transport (`--bind` defaults to `127.0.0.1:7788`, `--data` to `rsia.sqlite3`, `--namespace` to `default`).
+- `rsia mcp` — runs the four agent MCP tools over stdio with a startup-fixed Agent identity (`--data` defaults to `rsia.sqlite3`, `--namespace` to `default`, `--actor` to `stdio-agent`).
+- `rsia manage <operation>` — submits or inspects authenticated management and evolution jobs (`--url` defaults to `http://127.0.0.1:7788`; requires `--auth-token` or `RSIA_MANAGEMENT_TOKEN`; supports `--request-file` and `--job-id`).
+- `rsia review --kind <typed_candidate|stage_fact|formal_report> --id <id> [--detail metadata|exact]` — inspects stored candidates, stage facts, and formal reports over the authenticated read-only review path.
 
-- `rsia serve` — serves the authenticated HTTP API (`--bind` defaults to `127.0.0.1:7788`, `--data` to `rsia.sqlite3`, `--namespace` to `default`).
-- `rsia mcp` — runs the four MCP tools over stdio with a startup-fixed Agent identity (`--data` defaults to `rsia.sqlite3`, `--namespace` to `default`, `--actor` to `stdio-agent`).
-- `rsia manage <operation>` — submits or inspects authenticated management jobs through the HTTP service (`--url` defaults to `http://127.0.0.1:7788`; `--auth-token`, or the `RSIA_MANAGEMENT_TOKEN` environment variable, is required; `--request-file` and `--job-id` are also accepted).
-- `rsia review --kind <typed_candidate|stage_fact|formal_report> --id <id> [--detail metadata|exact] [--url <url>] [--auth-token <token>]` — reviews stored material through the authenticated HTTP service (`--detail` defaults to `metadata`, `--url` to `http://127.0.0.1:7788`, and `--auth-token`, or the `RSIA_MANAGEMENT_TOKEN` environment variable, is required).
+### 2. Target 7-Step Host Loop
 
-### Target host flow (designed)
+1. **Start Runtime** — run RSIAgent over HTTP or stdio MCP.  
+2. **Prepare** — submit task goal + host capabilities → receive a version-locked active skill snapshot.  
+3. **Execute Task** — run the task inside your host agent without evolution-path blocking.  
+4. **Feedback** — report outcome and failure class (reasoning, domain knowledge, tool-use, etc.).  
+5. **Proposal** — learnable failures trigger asynchronous improvement jobs producing candidates with evidence, applicability bounds, and counterexamples.  
+6. **Evaluate & Release** — independent `Evaluator` acceptance → `Approved` → `Canary` → `Active`.  
+7. **Application Receipts** — subsequent runs record `Returned → Attached → Observed → VerifiedBenefit`.
 
-1. Start RSIAgent (HTTP / MCP)  
-2. **Prepare** — goal + capabilities → active skill snapshot  
-3. Run the task in your agent  
-4. **Feedback** — success / failure class (reasoning, knowledge, tool-use, …)  
-5. Learnable failures → improvement jobs → **Proposal** (evidence + counterexample)  
-6. Evaluator acceptance → approve → canary → active  
-7. **Application** receipts: Returned → Attached → Observed → VerifiedBenefit  
+### 3. Repository Layout
 
-Default HTTP bind (when enabled): `127.0.0.1:7788`.
-
-## What a candidate is allowed to be
-
-| Kind | Meaning |
-| --- | --- |
-| Skill | Narrow text skill: evidence + applicability + counterexample |
-| Improver | Evolvable strategy JSON (`evo.strategy.v1`) — the meta-improvement procedure, not an executable script |
-
-**Default denials:** unsupervised auto-publish, arbitrary code execution, paid model calls without a configured budget.
-
-## Capability map (contracts)
-
-Grounded in `evo-core` — verify against source as the project moves:
-
-| Area | Covers |
-| --- | --- |
-| Roles & context | Namespace/actor/role; ownership; candidates cannot self-authorize |
-| Run loop | Prepare → Feedback → Proposal → state machine → Release / canary / active |
-| Jobs & budget | Leases, cancel, recovery; refuse paid improvement when budget unset |
-| Acceptance policy | Min samples, gain floor, regression cap, cost ratio, confidence |
-| Integration | MCP (model tools vs management separated), HTTP, CLI |
-
-Candidate states include: Proposed → Validated → AcceptancePassed → Approved → Canary → Active (plus Retired / Rejected / Revoked).
-
-## Repository layout
-
-```
-apps/rsia           CLI / process entry (serve / mcp / manage / review)
-crates/evo-core     Pure contracts & acceptance rules
-crates/evo-storage  Persistence
-crates/evo-engine   Controlled improvement & evaluation
-crates/evo-mcp      MCP adapter
-crates/evo-http     Authenticated HTTP + remote MCP transport
-docs/               Implementation ledger & ops notes
+```text
+apps/rsia           CLI & daemon entry (serve / mcp / manage / review)
+crates/evo-core     Pure domain contracts, role permissions, state machines & acceptance rules
+crates/evo-storage  Single-writer persistence, read-only inspection, lineage & budget ledger
+crates/evo-engine   Controlled improvement jobs, replay evaluation & candidate evolution
+crates/evo-mcp      MCP adapter (agent tools isolated from management surfaces)
+crates/evo-http     Authenticated HTTP service & remote MCP transport
+docs/               Implementation ledger, dependency register & operations notes
 ```
 
-## Current status
+---
 
-Bound to plan v4.3 and the support index on this tree (`plan_version` `v4.3`, route not complete, legacy equivalence unverified). Three gates stay independent: a closed structure, independent benefit evidence, and a deployable product. None of them stands in for the others.
+## Verification Route & Scope Boundaries
 
-**Present, scoped**
+**G0–G5 staged gates** and **V001–V120 verification scenario families** advance scope by scope: starting from end-to-end configuration-priority localization tasks, then expanding to historical replay, curriculum learning, L5 meta-improvement controlled experiments, cross-host compatibility, fault recovery, and deployment safety.
 
+This repository is a **runtime and contract surface**, not a model-weight training codebase or an official reproduction of the cited papers or reference repositories. We thank the respective researchers and open-source contributors.
+
+**Present in this tree (scoped, through PR #184):**
 - Workspace crates `evo-core`, `evo-storage`, `evo-engine`, `evo-mcp`, `evo-http`, and the `rsia` CLI (`serve` / `mcp` / `manage` / `review`)
-- Domain contracts for roles, budget, candidates, acceptance, and receipts
-- Ledger plus derived support index. The v4.3 plan file is not published here
-- Merged scoped work through PR #178, including a shared data-directory single writer, rejection of conflicting v1 host-surface items, fail-closed seed classification, refusal to continue persistent work on a bad clock, pinned toolchain and locked build inputs, project license metadata and guards, redacted bound-request identity, locked dependency and primary license registration, two exact legacy license expressions, and a safe read-only SQLite reader dependency
-- E17 and E18 remain optional and disabled. Default monetary budget is 0
+- Domain contracts for roles, budgets, candidates, acceptance, and four-stage receipts
+- Implementation ledger plus derived support index (`plan_version` `v4.3`, route not complete, legacy equivalence unverified)
+- Shared data-directory single writer, safe read-only SQLite reader, single-source management registry, real `control.review` route, fail-closed seed classification, bad-clock persistence guard, pinned toolchain and locked build inputs, project license metadata and guards, redacted bound-request identity, and locked dependency license provenance
 
-**Not claimed**
-
-- A complete E00–E18 route, or whole scenario families V099–V120 (those families stay planned)
+**Not claimed (as of 2026-10-16):**
+- A complete E00–E18 route, or whole scenario families V099–V120 (those families remain `planned`)
 - Independent second acceptance
-- A real model provider, paid experiments, a real extra host, or a real sandbox
-- Production approval, canary, or Active backed by non-production evaluation
-- Measured effective recursion, or a release  
+- A live external model provider, paid experiments, a live external host, or a production sandbox
+- Production approval, canary, or `Active` backed by non-production evaluation
+- Measured effective recursion gains, or a formal production release (recorded increments are at `implemented_not_verified` or earlier; default monetary budget is `0`; E17 and E18 remain optional and disabled)
 
-## Development
-
-Prefer CI and the [implementation ledger](docs/implementation-ledger.md) until local toolchain + host smoke are green in your environment.
-
-This repository is a **runtime and contract surface**, not a training / benchmark / weight-update codebase.
-
-## Contributing
-
-Track work against [`docs/implementation-ledger.md`](docs/implementation-ledger.md). Prefer evidence (compile, tests, host smoke, measured benefit) over interface sketches.
+---
 
 ## License
 
-RSIAgent is source-available under a personal, non-commercial free license
-(`source_available_personal_noncommercial_free`). The root `LICENSE` governs
-all grants: personal, non-commercial use is free of charge; any commercial
-use — including use by a company or other organization, and individual use in
-a commercial or revenue-generating activity — requires prior written
-authorization from Acosmi (fushihua@acosmi.com, https://acosmi.com); public
-source visibility does not by itself grant a redistribution, resale,
-sublicensing or release license. Third-party licenses and notices remain
-applicable to their corresponding material. Workspace crates remain unpublished.
+RSIAgent is source-available under a research- and community-friendly non-commercial license (`source_available_personal_noncommercial_free`). The root `LICENSE` governs all grants: personal learning, academic and scientific research, educational use, benchmarking, and internal non-commercial technical evaluation (by individuals, universities, research institutions, non-profits, or engineering teams) are free of charge; open-source forking, academic reproduction artifacts, and non-commercial community sharing of modifications are permitted provided the original copyright notice and `LICENSE` are retained; deploying RSIAgent in commercial production operations, offering it as a paid or managed cloud/SaaS service, or embedding/distributing it in commercial products or revenue-generating services requires prior written authorization from Acosmi (fushihua@acosmi.com, https://acosmi.com). Third-party licenses and notices remain applicable to their corresponding material. Workspace crates remain unpublished.

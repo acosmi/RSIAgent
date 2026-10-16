@@ -5822,7 +5822,7 @@
     {
       "license_file": {
         "path": "LICENSE",
-        "sha256": "280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc"
+        "sha256": "164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb"
       },
       "manifest": "crates/evo-core/Cargo.toml",
       "name": "evo-core",
@@ -5831,7 +5831,7 @@
     {
       "license_file": {
         "path": "LICENSE",
-        "sha256": "280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc"
+        "sha256": "164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb"
       },
       "manifest": "crates/evo-engine/Cargo.toml",
       "name": "evo-engine",
@@ -5840,7 +5840,7 @@
     {
       "license_file": {
         "path": "LICENSE",
-        "sha256": "280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc"
+        "sha256": "164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb"
       },
       "manifest": "crates/evo-http/Cargo.toml",
       "name": "evo-http",
@@ -5849,7 +5849,7 @@
     {
       "license_file": {
         "path": "LICENSE",
-        "sha256": "280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc"
+        "sha256": "164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb"
       },
       "manifest": "crates/evo-mcp/Cargo.toml",
       "name": "evo-mcp",
@@ -5858,7 +5858,7 @@
     {
       "license_file": {
         "path": "LICENSE",
-        "sha256": "280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc"
+        "sha256": "164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb"
       },
       "manifest": "crates/evo-storage/Cargo.toml",
       "name": "evo-storage",
@@ -5867,7 +5867,7 @@
     {
       "license_file": {
         "path": "LICENSE",
-        "sha256": "280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc"
+        "sha256": "164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb"
       },
       "manifest": "apps/rsia/Cargo.toml",
       "name": "rsia",

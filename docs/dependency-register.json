@@ -1426,7 +1426,7 @@
       "version": "0.2.0"
     }
   ],
-  "inventory_sha256": "ff03b41adf1476c02d9ea847ddc82241574f31fe094513c70e4244a49223163f",
+  "inventory_sha256": "124767c45a982453be8c66d09567a10ac662000e3820d0d78d342dd3433b3805",
   "legacy_license_exceptions": {
     "Apache-2.0/MIT": [
       {

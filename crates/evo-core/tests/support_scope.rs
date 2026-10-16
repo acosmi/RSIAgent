@@ -152,7 +152,7 @@ struct ProjectLicenseMetadata {
 }
 
 fn validate_project_license(value: &Value, root: &Path) -> Result<(), String> {
-    const REVIEWED_SHA: &str = "280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc";
+    const REVIEWED_SHA: &str = "164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb";
     let license = value["project_license"]
         .as_object()
         .ok_or("project_license must be an object")?;
@@ -2147,10 +2147,10 @@ fn project_license_rejects_unreviewed_or_malformed_manifest_binding() {
     validate_project_license(&value, &root).unwrap();
     for replacement in [
         Value::Null,
-        serde_json::json!({"status":"MIT","path":"LICENSE","sha256":"280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc"}),
-        serde_json::json!({"status":"source_available_personal_noncommercial_free","path":"../LICENSE","sha256":"280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc"}),
+        serde_json::json!({"status":"MIT","path":"LICENSE","sha256":"164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb"}),
+        serde_json::json!({"status":"source_available_personal_noncommercial_free","path":"../LICENSE","sha256":"164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb"}),
         serde_json::json!({"status":"source_available_personal_noncommercial_free","path":"LICENSE","sha256":true}),
-        serde_json::json!({"status":"source_available_personal_noncommercial_free","path":"LICENSE","sha256":"280279c14b935c26ad8b8803db62f9ed19d36f38c33268cc3d7ab0b4e5f650dc","extra":false}),
+        serde_json::json!({"status":"source_available_personal_noncommercial_free","path":"LICENSE","sha256":"164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb","extra":false}),
     ] {
         let mut changed = value.clone();
         changed["project_license"] = replacement;
