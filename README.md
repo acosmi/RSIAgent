@@ -24,7 +24,7 @@
   <b>English</b> | <a href="README.zh-CN.md">中文</a>
 </p>
 
-**RSIAgent** is an independent **Rust** controlled recursive self-improvement runtime. It decouples **online task execution** from **offline self-evolution governance**: coding assistants, general-purpose agents, and trusted hosts (such as Claude Code, Cursor, Codex, OpenCode, and custom business agents) connect over **MCP, HTTP, and CLI** into a unified, local-first single-writer runtime (`Prepare → Feedback → Proposal → Evaluation → Release → Application`). Under strict role boundaries, root budgets, and independent acceptance gates, experience turns into lasting, inheritable improvements to both **task skills (`Skill`)** and **the meta-improvement strategy itself (`Improver`)**. **Focus on your business logic — without rebuilding self-improvement infrastructure for every scenario.**
+**RSIAgent** is an independent **Rust** controlled recursive self-improvement runtime. It decouples **online task execution** from **offline self-evolution governance**: coding assistants, general-purpose agents, and trusted hosts (such as Claude Code, Cursor, Codex, Antigravity, OpenCode, and custom business agents) connect over **MCP, HTTP, and CLI** into a unified, local-first single-writer runtime (`Prepare → Feedback → Proposal → Evaluation → Release → Application`). Under strict role boundaries, root budgets, and independent acceptance gates, experience turns into lasting, inheritable improvements to both **task skills (`Skill`)** and **the meta-improvement strategy itself (`Improver`)**. **Focus on your business logic — without rebuilding self-improvement infrastructure for every scenario.**
 
 > **Engineering Baseline:** Normative plan **v4.3** (2026-10-12, SHA-256 `73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7`). That plan body stays off this remote.  
 > **Current Status:** As of 2026-10-16, core engineering is roughly **80%** complete (maintainer estimate) and approaching end-to-end verification; engineering progress does not imply acceptance pass or measured benefit. Public evidence is tracked in the [implementation ledger](docs/implementation-ledger.md) and the derived support index. **Do not claim measured recursive gains, a production host, or a complete E00–E18 route.**
@@ -36,7 +36,7 @@
 Today, “agent improvement” usually means ad-hoc reflection prompts or a skill library that only grows (`Add only`) — inflating latency while injecting noisy or conflicting instructions (library drift). Inspired by dual-process cognitive architectures (**System 1 fast execution + System 2 slow evolution**), RSIAgent splits runtime execution and recursive evolution into two loops with distinct latency and authority boundaries:
 
 ```text
-External Task Agents / Multi-Host Clients (Claude Code / Cursor / Codex / Custom Agents)
+External Task Agents / Multi-Host Clients (Claude Code / Cursor / Codex / Antigravity / Custom Agents)
         │  MCP (stdio/remote) · HTTP · CLI
         ▼
 ┌──────────────────────────────────────────────────────────────────────┐

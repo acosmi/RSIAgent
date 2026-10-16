@@ -24,7 +24,7 @@
   <a href="README.md">English</a> | <b>中文</b>
 </p>
 
-**RSIAgent** 是基于 **Rust** 构建的独立受控递归自我改进运行时（Controlled Recursive Self-Improvement Runtime）。它将外部智能体的「在线业务执行」与「离线自我进化治理」彻底解耦：各类编码助手、通用智能体与可信宿主（如 Claude Code、Cursor、Codex、OpenCode 及自研业务 Agent）通过 **MCP、HTTP 与 CLI** 接入同一本地优先运行时与受控数据目录，在角色授权、预算边界与独立验收门禁下，实现**自主提出候选 → 预测后果 → 选择执行 → 从真实反馈中学习 → 跨代保留改进**的进化闭环。**你只需专注业务本身，无需为每个场景反复设计和打磨自我增强逻辑。**
+**RSIAgent** 是基于 **Rust** 构建的独立受控递归自我改进运行时（Controlled Recursive Self-Improvement Runtime）。它将外部智能体的「在线业务执行」与「离线自我进化治理」彻底解耦：各类编码助手、通用智能体与可信宿主（如 Claude Code、Cursor、Codex、Antigravity、OpenCode 及自研业务 Agent）通过 **MCP、HTTP 与 CLI** 接入同一本地优先运行时与受控数据目录，在角色授权、预算边界与独立验收门禁下，实现**自主提出候选 → 预测后果 → 选择执行 → 从真实反馈中学习 → 跨代保留改进**的进化闭环。**你只需专注业务本身，无需为每个场景反复设计和打磨自我增强逻辑。**
 
 > **工程基线：** v4.3 第一真源工程实施方案（2026-10-12，SHA-256 `73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7`）。  
 > **当前状态：** 截至 2026-10-16，核心工程约完成 **80%**（维护者估算），即将进入全链路验证测试阶段；工程进度不等于验收通过或收益成立。公开证据见[实施台账](docs/implementation-ledger.md)与派生支持索引。
@@ -36,7 +36,7 @@
 传统 Agent 的「自我改进」往往停留在单次反射提示词拼接或只增不减的技能堆砌——不仅拉高在线时延，还会因错误经验混入导致检索漂移（Library Drift）。RSIAgent 借鉴认知科学的**双系统（System 1 快执行 + System 2 慢演进）**分工，将运行时划分为两条速率与权限截然不同的闭环：
 
 ```text
-外部智能体 / 多宿主客户端 (Claude Code / Cursor / Codex / Custom Agents)
+外部智能体 / 多宿主客户端 (Claude Code / Cursor / Codex / Antigravity / Custom Agents)
         │  MCP (stdio/remote) · HTTP · CLI
         ▼
 ┌──────────────────────────────────────────────────────────────────────┐
