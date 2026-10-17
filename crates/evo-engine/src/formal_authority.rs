@@ -292,6 +292,7 @@ pub(crate) fn compiler_dependency_schema(kind: &str, schema: &str) -> bool {
                 | FORMAL_SCHEMA
                 | HOST_SCHEMA
                 | PROVIDER_SCHEMA
+                | PROVIDER_CURRENT_SCHEMA
                 | METER_SCHEMA
                 | PRINCIPAL_ACTION_SCHEMA
                 | CONTROL_PRINCIPAL_ACTION_SCHEMA
@@ -353,6 +354,7 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
                 | FORMAL_SCHEMA
                 | HOST_SCHEMA
                 | PROVIDER_SCHEMA
+                | PROVIDER_CURRENT_SCHEMA
                 | METER_SCHEMA
                 | PRINCIPAL_ACTION_SCHEMA
                 | CONTROL_PRINCIPAL_ACTION_SCHEMA
@@ -428,6 +430,10 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
         }
         PROVIDER_SCHEMA => {
             let _: RegisteredExternalProvider = decode(body.clone())?;
+        }
+        PROVIDER_CURRENT_SCHEMA => {
+            let provider: RegisteredExternalProviderV2 = decode(body.clone())?;
+            provider.validate_public_fields()?;
         }
         METER_SCHEMA => {
             let _: RegisteredResourceInstrumentation = decode(body.clone())?;
@@ -606,6 +612,7 @@ pub async fn read_typed_closure(
             | ROOT_SCHEMA
             | HOST_SCHEMA
             | PROVIDER_SCHEMA
+            | PROVIDER_CURRENT_SCHEMA
             | METER_SCHEMA
             | "rsia.formal_profile_selection.v1"
             | "rsia.formal_parent_selection.v1"
@@ -973,10 +980,11 @@ async fn registered_subject_host(
         .unwrap_or("");
     let host_id = match schema {
         HOST_SCHEMA => body.get("id").and_then(Value::as_str).map(str::to_owned),
-        PROFILE_SCHEMA | ROOT_SCHEMA | PROVIDER_SCHEMA | METER_SCHEMA => body
-            .get("host_registration_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        PROFILE_SCHEMA | ROOT_SCHEMA | PROVIDER_SCHEMA | PROVIDER_CURRENT_SCHEMA | METER_SCHEMA => {
+            body.get("host_registration_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }
         "rsia.formal_profile_selection.v1" => {
             let id = body["registration_id"].as_str().ok_or(Error::Forbidden)?;
             let profile: Value = s.need(ctx, "artifact", id).await?;
@@ -1114,7 +1122,7 @@ async fn observe_host_principal(
     profile: &FrozenCompilerProfile,
 ) -> Result<crate::executor::ObservedProcessIdentity> {
     let set = principal_set(s, ctx, host).await?;
-    let provider: RegisteredExternalProvider = attested_read(
+    let provider: FrozenProviderRegistration = attested_read(
         s,
         ctx,
         "artifact",
@@ -1722,6 +1730,10 @@ pub enum FormalOperatorCommand {
     RegisterProvider {
         provider: Box<RegisteredExternalProvider>,
     },
+    #[serde(rename = "register_provider")]
+    RegisterProviderCurrent {
+        provider: Box<RegisteredExternalProviderV2>,
+    },
     RegisterMeter {
         meter: Box<RegisteredResourceInstrumentation>,
     },
@@ -1768,7 +1780,7 @@ impl<'de> Deserialize<'de> for FormalOperatorCommand {
         enum Wire {
             Bootstrap {},
             RegisterProvider {
-                provider: Box<RegisteredExternalProvider>,
+                provider: Box<ProviderRegistrationWire>,
             },
             RegisterMeter {
                 meter: Box<RegisteredResourceInstrumentation>,
@@ -1822,7 +1834,14 @@ impl<'de> Deserialize<'de> for FormalOperatorCommand {
         }
         Ok(match deserializer.deserialize_map(CommandObjectVisitor)? {
             Wire::Bootstrap {} => Self::Bootstrap,
-            Wire::RegisterProvider { provider } => Self::RegisterProvider { provider },
+            Wire::RegisterProvider { provider } => match *provider {
+                ProviderRegistrationWire::Legacy(provider) => Self::RegisterProvider {
+                    provider: Box::new(provider),
+                },
+                ProviderRegistrationWire::Current(provider) => Self::RegisterProviderCurrent {
+                    provider: Box::new(provider),
+                },
+            },
             Wire::RegisterMeter { meter } => Self::RegisterMeter { meter },
             Wire::FreezeProfile { profile } => Self::FreezeProfile { profile },
             Wire::EmptyRoot { root } => Self::EmptyRoot { root },
@@ -1869,7 +1888,9 @@ impl FormalOperatorCommand {
     fn operation(&self) -> &'static str {
         match self {
             Self::Bootstrap => "bootstrap",
-            Self::RegisterProvider { .. } => "register_provider",
+            Self::RegisterProvider { .. } | Self::RegisterProviderCurrent { .. } => {
+                "register_provider"
+            }
             Self::RegisterMeter { .. } => "register_meter",
             Self::FreezeProfile { .. } => "freeze_profile",
             Self::EmptyRoot { .. } => "empty_root",
@@ -2052,6 +2073,10 @@ impl PrincipalAuthorityService {
                 FormalRegistry::register_provider(ctx, store, *provider).await?;
                 Ok(Value::Null)
             }
+            FormalOperatorCommand::RegisterProviderCurrent { provider } => {
+                FormalRegistry::register_provider_current(ctx, store, *provider).await?;
+                Ok(Value::Null)
+            }
             FormalOperatorCommand::RegisterMeter { meter } => {
                 FormalRegistry::register_resource_instrumentation(ctx, store, *meter).await?;
                 Ok(Value::Null)
@@ -2159,6 +2184,309 @@ impl RegisteredExternalProvider {
         Ok(())
     }
 }
+pub const PROVIDER_CURRENT_SCHEMA: &str = "rsia.registered_external_provider.v2";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum ExternalServiceCategory {
+    #[serde(rename = "model")]
+    Model,
+}
+
+/// New registrations explicitly freeze the protocol, sampling and timeout.
+/// The v1 record remains strict and byte-compatible, including its 120s timeout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisteredExternalProviderV2 {
+    pub id: String,
+    pub schema_version: String,
+    pub namespace: String,
+    pub host_registration_id: String,
+    pub endpoint: String,
+    pub provider_model: String,
+    pub model_digest: String,
+    pub transport_code_digest: String,
+    pub credential_environment_key: String,
+    pub credential_principal: String,
+    pub currency: String,
+    pub pricing_version: String,
+    pub input_micros_per_million_tokens: u64,
+    pub output_micros_per_million_tokens: u64,
+    pub max_output_tokens: u32,
+    pub authorized_by: String,
+    pub service_category: ExternalServiceCategory,
+    pub protocol_id: evo_core::model_protocol::ModelProtocolId,
+    pub sampling_profile: evo_core::model_protocol::SamplingProfileId,
+    pub sampling_digest: String,
+    pub request_timeout_seconds: u32,
+}
+
+impl RegisteredExternalProviderV2 {
+    fn validate_public_fields(&self) -> Result<()> {
+        if self.schema_version != PROVIDER_CURRENT_SCHEMA
+            || self.sampling_digest
+                != evo_core::model_protocol::sampling_digest_v1(
+                    self.protocol_id,
+                    self.sampling_profile,
+                )?
+        {
+            return Err(Error::Forbidden);
+        }
+        match self.service_category {
+            ExternalServiceCategory::Model => {}
+        }
+        if !(1..=120).contains(&self.request_timeout_seconds) {
+            return Err(Error::Invalid(
+                "external request timeout must be 1..120 seconds".into(),
+            ));
+        }
+        let endpoint = reqwest::Url::parse(&self.endpoint).map_err(|_| Error::Forbidden)?;
+        // Current's first endpoint profile is query-free. Legacy records keep
+        // their original reader; credentials cannot enter new public material.
+        if endpoint.scheme() != "https"
+            || endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || self.endpoint.chars().any(char::is_whitespace)
+        {
+            return Err(Error::Forbidden);
+        }
+        Ok(())
+    }
+    /// Pure data conversion, never a source attestation or registration.
+    pub fn from_configuration(
+        base: RegisteredExternalProvider,
+        protocol_id: evo_core::model_protocol::ModelProtocolId,
+        sampling_profile: evo_core::model_protocol::SamplingProfileId,
+        request_timeout_seconds: u32,
+    ) -> Result<Self> {
+        if !(1..=120).contains(&request_timeout_seconds) {
+            return Err(Error::Invalid(
+                "external request timeout must be 1..120 seconds".into(),
+            ));
+        }
+        let current = Self {
+            id: base.id,
+            schema_version: PROVIDER_CURRENT_SCHEMA.into(),
+            namespace: base.namespace,
+            host_registration_id: base.host_registration_id,
+            endpoint: base.endpoint,
+            provider_model: base.provider_model,
+            model_digest: base.model_digest,
+            transport_code_digest: base.transport_code_digest,
+            credential_environment_key: base.credential_environment_key,
+            credential_principal: base.credential_principal,
+            currency: base.currency,
+            pricing_version: base.pricing_version,
+            input_micros_per_million_tokens: base.input_micros_per_million_tokens,
+            output_micros_per_million_tokens: base.output_micros_per_million_tokens,
+            max_output_tokens: base.max_output_tokens,
+            authorized_by: base.authorized_by,
+            service_category: ExternalServiceCategory::Model,
+            protocol_id,
+            sampling_profile,
+            sampling_digest: evo_core::model_protocol::sampling_digest_v1(
+                protocol_id,
+                sampling_profile,
+            )?,
+            request_timeout_seconds,
+        };
+        current.validate_public_fields()?;
+        Ok(current)
+    }
+    fn common_view(&self) -> RegisteredExternalProvider {
+        RegisteredExternalProvider {
+            id: self.id.clone(),
+            schema_version: PROVIDER_SCHEMA.into(),
+            namespace: self.namespace.clone(),
+            host_registration_id: self.host_registration_id.clone(),
+            endpoint: self.endpoint.clone(),
+            provider_model: self.provider_model.clone(),
+            model_digest: self.model_digest.clone(),
+            transport_code_digest: self.transport_code_digest.clone(),
+            credential_environment_key: self.credential_environment_key.clone(),
+            credential_principal: self.credential_principal.clone(),
+            currency: self.currency.clone(),
+            pricing_version: self.pricing_version.clone(),
+            input_micros_per_million_tokens: self.input_micros_per_million_tokens,
+            output_micros_per_million_tokens: self.output_micros_per_million_tokens,
+            max_output_tokens: self.max_output_tokens,
+            authorized_by: self.authorized_by.clone(),
+        }
+    }
+
+    fn projection_input(&self) -> evo_core::model_protocol::ChatProviderProjectionInput {
+        evo_core::model_protocol::ChatProviderProjectionInput {
+            model_digest: self.model_digest.clone(),
+            provider_model: self.provider_model.clone(),
+            max_output_tokens: self.max_output_tokens,
+            protocol_id: self.protocol_id,
+            sampling_profile: self.sampling_profile,
+        }
+    }
+
+    /// Nonsecret public registration inputs for the separate environment
+    /// material producer. This does not attest model or adapter source bytes.
+    pub fn public_configuration(&self) -> Result<Value> {
+        self.validate_public_fields()?;
+        let mut value = serde_json::to_value(self).map_err(|_| Error::Internal)?;
+        let fields = value.as_object_mut().ok_or(Error::Internal)?;
+        fields.remove("credential_environment_key");
+        fields.remove("credential_principal");
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ProviderRegistrationWire {
+    Legacy(RegisteredExternalProvider),
+    Current(RegisteredExternalProviderV2),
+}
+
+/// Immutable common field projection for consumers; serialization always uses
+/// the original full versioned record, so config changes enter every binding.
+#[derive(Debug, Clone)]
+struct FrozenProviderRegistration {
+    record: Box<ProviderRegistrationWire>,
+    common: Box<RegisteredExternalProvider>,
+}
+
+impl FrozenProviderRegistration {
+    fn from_record(record: ProviderRegistrationWire) -> Self {
+        let common = match &record {
+            ProviderRegistrationWire::Legacy(p) => p.clone(),
+            ProviderRegistrationWire::Current(p) => p.common_view(),
+        };
+        Self {
+            record: Box::new(record),
+            common: Box::new(common),
+        }
+    }
+
+    fn validate(&self, ctx: &Context) -> Result<()> {
+        self.common.validate(ctx)?;
+        if let ProviderRegistrationWire::Current(p) = self.record.as_ref() {
+            p.validate_public_fields()?;
+        }
+        Ok(())
+    }
+
+    fn projection_input(&self) -> evo_core::model_protocol::ChatProviderProjectionInput {
+        match self.record.as_ref() {
+            ProviderRegistrationWire::Legacy(p) => {
+                evo_core::model_protocol::ChatProviderProjectionInput {
+                    model_digest: p.model_digest.clone(),
+                    provider_model: p.provider_model.clone(),
+                    max_output_tokens: p.max_output_tokens,
+                    protocol_id:
+                        evo_core::model_protocol::ModelProtocolId::ChatCompletionsNonstreamV1,
+                    sampling_profile:
+                        evo_core::model_protocol::SamplingProfileId::TemperatureZeroV1,
+                }
+            }
+            ProviderRegistrationWire::Current(p) => p.projection_input(),
+        }
+    }
+    fn request_timeout_seconds(&self) -> u32 {
+        match self.record.as_ref() {
+            ProviderRegistrationWire::Legacy(_) => 120,
+            ProviderRegistrationWire::Current(p) => p.request_timeout_seconds,
+        }
+    }
+    fn sampling_authority(&self) -> ProviderSamplingAuthority {
+        match self.record.as_ref() {
+            ProviderRegistrationWire::Legacy(_) => ProviderSamplingAuthority::LegacyUnboundSampling,
+            ProviderRegistrationWire::Current(_) => {
+                ProviderSamplingAuthority::CurrentSourceUnavailable
+            }
+        }
+    }
+    fn require_legacy_profile(&self) -> Result<()> {
+        match self.record.as_ref() {
+            ProviderRegistrationWire::Legacy(_) => Ok(()),
+            ProviderRegistrationWire::Current(_) => Err(Error::Conflict(
+                "current_provider_source_unavailable".into(),
+            )),
+        }
+    }
+}
+
+impl std::ops::Deref for FrozenProviderRegistration {
+    type Target = RegisteredExternalProvider;
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
+}
+
+impl Serialize for FrozenProviderRegistration {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.record.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FrozenProviderRegistration {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(Self::from_record(ProviderRegistrationWire::deserialize(
+            deserializer,
+        )?))
+    }
+}
+
+/// The current code has no authenticated same-owner, same-TX producer. No
+/// public digest or DTO can manufacture a successful state of this authority.
+#[derive(Clone, Copy)]
+enum ProviderSamplingAuthority {
+    LegacyUnboundSampling,
+    CurrentSourceUnavailable,
+}
+impl ProviderSamplingAuthority {
+    fn require_new_dispatch(&self) -> Result<()> {
+        Err(Error::Conflict(
+            match self {
+                Self::LegacyUnboundSampling => "LegacyUnboundSampling",
+                Self::CurrentSourceUnavailable => "current_provider_source_unavailable",
+            }
+            .into(),
+        ))
+    }
+}
+
+fn build_registered_chat_http_request(
+    provider: &FrozenProviderRegistration,
+    credential: &str,
+    projection: &evo_core::model_protocol::ProjectedChatRequest,
+) -> Result<reqwest::Request> {
+    if !(1..=120).contains(&provider.request_timeout_seconds()) {
+        return Err(Error::Forbidden);
+    }
+    let mut request = reqwest::Request::new(
+        reqwest::Method::POST,
+        reqwest::Url::parse(&provider.endpoint).map_err(|_| Error::Forbidden)?,
+    );
+    request.headers_mut().insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {credential}"))
+        .map_err(|_| Error::Forbidden)?;
+    authorization.set_sensitive(true);
+    request
+        .headers_mut()
+        .insert(reqwest::header::AUTHORIZATION, authorization);
+    *request.body_mut() = Some(projection.wire_utf8().to_vec().into());
+    *request.timeout_mut() = Some(std::time::Duration::from_secs(u64::from(
+        provider.request_timeout_seconds(),
+    )));
+    Ok(request)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenCompilerProfile {
@@ -2386,6 +2714,23 @@ impl FormalRegistry {
             .await?;
         s.commit().await
     }
+    pub async fn register_provider_current(
+        ctx: &Context,
+        _store: &Store,
+        provider: RegisteredExternalProviderV2,
+    ) -> Result<()> {
+        ctx.require(&[Role::Admin])?;
+        provider.validate_public_fields()?;
+        provider.common_view().validate(ctx)?;
+        if provider.authorized_by != ctx.actor() {
+            return Err(Error::Forbidden);
+        }
+        // There is no same-owner, same-TX configuration/compiled-adapter
+        // producer yet. Deserializing all 21 fields cannot attest that source.
+        Err(Error::Conflict(
+            "current_provider_source_unavailable".into(),
+        ))
+    }
     pub async fn freeze_profile(
         ctx: &Context,
         store: &Store,
@@ -2405,7 +2750,7 @@ impl FormalRegistry {
             Role::Admin,
         )
         .await?;
-        let provider: RegisteredExternalProvider = attested_read(
+        let provider: FrozenProviderRegistration = attested_read(
             &mut s,
             ctx,
             "artifact",
@@ -2416,6 +2761,7 @@ impl FormalRegistry {
         host.validate(ctx)?;
         require_registered_admin(&mut s, ctx, &host).await?;
         provider.validate(ctx)?;
+        provider.require_legacy_profile()?;
         if fingerprint(&host.snapshot)? != fingerprint(&profile.system_snapshot)?
             || fingerprint(&host.capabilities)? != fingerprint(&profile.capabilities)?
             || provider.host_registration_id != host.id
@@ -3020,7 +3366,7 @@ async fn verify_provider_registration(
     c: &FormalProviderCaptureRecord,
     host: &RegisteredFormalHost,
 ) -> Result<()> {
-    let p: RegisteredExternalProvider =
+    let p: FrozenProviderRegistration =
         attested_read(s, ctx, "artifact", &c.provider_registration_id, Role::Admin).await?;
     p.validate(ctx)?;
     let v = validate_provider_response(c)?;
@@ -3069,14 +3415,14 @@ impl CapturedFormalCompletion {
     }
 }
 pub struct RegisteredExternalTransport {
-    provider: RegisteredExternalProvider,
+    provider: FrozenProviderRegistration,
     host: RegisteredFormalHost,
     credential: String,
     process: crate::executor::ObservedProcessIdentity,
-    client: reqwest::Client,
 }
 /// No public constructor or Deserialize; a provenance label cannot make one.
 pub struct FormalTransportCapability {
+    sampling_authority: ProviderSamplingAuthority,
     provider_id: String,
     provider_digest: String,
     host_id: String,
@@ -3085,13 +3431,16 @@ pub struct FormalTransportCapability {
     uid: u32,
 }
 impl FormalTransportCapability {
+    pub(crate) fn require_new_dispatch_sampling(&self) -> Result<()> {
+        self.sampling_authority.require_new_dispatch()
+    }
     pub(crate) async fn validate_optimizer_in_session(
         &self,
         s: &mut Session,
         ctx: &Context,
         bound: &crate::model::BoundModelRequest,
     ) -> Result<()> {
-        let provider: RegisteredExternalProvider =
+        let provider: FrozenProviderRegistration =
             attested_read(s, ctx, "artifact", &self.provider_id, Role::Admin).await?;
         let host: RegisteredFormalHost =
             attested_read(s, ctx, "artifact", &self.host_id, Role::Admin).await?;
@@ -3128,7 +3477,7 @@ impl FormalTransportCapability {
         ctx: &Context,
         request: &crate::model::FormalTaskRequest,
     ) -> Result<()> {
-        let provider: RegisteredExternalProvider =
+        let provider: FrozenProviderRegistration =
             attested_read(s, ctx, "artifact", &self.provider_id, Role::Admin).await?;
         let host: RegisteredFormalHost =
             attested_read(s, ctx, "artifact", &self.host_id, Role::Admin).await?;
@@ -3166,7 +3515,7 @@ impl RegisteredExternalTransport {
     pub async fn connect(ctx: &Context, store: &Store, registration_id: &str) -> Result<Self> {
         ctx.require(&[Role::Host])?;
         let mut s = store.session().await?;
-        let provider: RegisteredExternalProvider =
+        let provider: FrozenProviderRegistration =
             attested_read(&mut s, ctx, "artifact", registration_id, Role::Admin).await?;
         let host: RegisteredFormalHost = attested_read(
             &mut s,
@@ -3177,6 +3526,7 @@ impl RegisteredExternalTransport {
         )
         .await?;
         provider.validate(ctx)?;
+        provider.require_legacy_profile()?;
         host.validate(ctx)?;
         let set = principal_set(&mut s, ctx, &host).await?;
         if ctx.actor() != set.host.actor || ctx.role() != Role::Host {
@@ -3198,40 +3548,31 @@ impl RegisteredExternalTransport {
             &host.code_digest,
             &host.host_workspace,
         )?;
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .map_err(|_| Error::Internal)?;
         Ok(Self {
             provider,
             host,
             credential,
             process,
-            client,
         })
     }
     async fn complete(
         &self,
-        messages: Vec<Value>,
+        projection: evo_core::model_protocol::ProjectedChatRequest,
         model_digest: &str,
     ) -> Result<(crate::broker::TransportCompletion, String, u64, u64)> {
+        self.provider.sampling_authority().require_new_dispatch()?;
         if model_digest != self.provider.model_digest {
             return Err(Error::Forbidden);
         }
-        // A single Admin-frozen chat-completions protocol. The candidate cannot
-        // choose a destination, credentials, tools, filesystem or request fields.
-        let mut response = self
-            .client
-            .post(&self.provider.endpoint)
-            .bearer_auth(&self.credential)
-            .json(
-                &serde_json::json!({"model":self.provider.provider_model,"messages":messages,
-                "max_tokens":self.provider.max_output_tokens,"temperature":0}),
-            )
-            .send()
-            .await
+        let request =
+            build_registered_chat_http_request(&self.provider, &self.credential, &projection)?;
+        // The source gate precedes Client and Request construction. A future
+        // Current producer must also retain the broker's opaque paid Arm gate.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
             .map_err(|_| Error::Internal)?;
+        let mut response = client.execute(request).await.map_err(|_| Error::Internal)?;
         if !response.status().is_success() {
             return Err(Error::Conflict(
                 "registered provider rejected request; usage unresolved".into(),
@@ -3311,6 +3652,7 @@ impl RegisteredExternalTransport {
 impl crate::broker::ModelTransport for RegisteredExternalTransport {
     fn formal_capability(&self) -> Option<FormalTransportCapability> {
         Some(FormalTransportCapability {
+            sampling_authority: self.provider.sampling_authority(),
             provider_id: self.provider.id.clone(),
             provider_digest: fingerprint(&self.provider).ok()?,
             host_id: self.host.id.clone(),
@@ -3328,11 +3670,12 @@ impl crate::broker::ModelTransport for RegisteredExternalTransport {
         _dispatch_id: &str,
     ) -> Result<crate::broker::TransportCompletion> {
         request.validate()?;
-        let messages = request.input.iter().map(|part| serde_json::json!({
-            "role": if part.role == evo_core::optimization::ModelInputRole::System { "system" } else { "user" },
-            "content":part.content
-        })).collect();
-        self.complete(messages, &request.model_digest)
+        self.provider.sampling_authority().require_new_dispatch()?;
+        let projection = evo_core::model_protocol::project_bound_chat_v1(
+            request,
+            &self.provider.projection_input(),
+        )?;
+        self.complete(projection, &request.model_digest)
             .await
             .map(|v| v.0)
     }
@@ -3342,6 +3685,7 @@ impl crate::broker::ModelTransport for RegisteredExternalTransport {
         dispatch_id: &str,
     ) -> Result<CapturedFormalCompletion> {
         request.validate()?;
+        self.provider.sampling_authority().require_new_dispatch()?;
         let process = crate::executor::observe_registered_process(
             self.host.host_uid,
             &self.host.code_digest,
@@ -3363,8 +3707,14 @@ impl crate::broker::ModelTransport for RegisteredExternalTransport {
         }
         messages.push(serde_json::json!({"role":"user","content":request.task_input_utf8}));
         let application_digest = fingerprint(&messages)?;
+        let projection = evo_core::model_protocol::project_formal_chat_v1(
+            &request.mandatory_context,
+            &request.projection,
+            &request.task_input_utf8,
+            &self.provider.projection_input(),
+        )?;
         let (completion, response_utf8, input_tokens, output_tokens) =
-            self.complete(messages, &request.model_digest).await?;
+            self.complete(projection, &request.model_digest).await?;
         let capture = FormalProviderCaptureRecord {
             id: format!("formal-capture-{}", &hash(dispatch_id.as_bytes())[..32]),
             schema_version: "rsia.actual_formal_provider_capture.v1".into(),
@@ -3459,7 +3809,7 @@ pub async fn prepare_formal_task(
             "frozen pair/mandatory host application mismatch".into(),
         ));
     }
-    let provider: RegisteredExternalProvider = attested_read(
+    let provider: FrozenProviderRegistration = attested_read(
         &mut s,
         ctx,
         "artifact",
@@ -3474,7 +3824,7 @@ pub async fn prepare_formal_task(
         candidate_id: candidate.id,
         profile_registration_id: verified.profile.id,
         compiler_binding_digest: verified.binding.binding_digest,
-        model_digest: provider.model_digest,
+        model_digest: provider.model_digest.clone(),
         mandatory_context,
         projection,
         task_input_utf8,
@@ -5576,5 +5926,177 @@ mod audit_f01_strategy_authority_tests {
             // The actual parent is checked separately before it can supply any
             // new request, even when the requested new output is the default.
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_f06_contract_tests {
+    use super::*;
+    use evo_core::model_protocol::{ModelProtocolId, SamplingProfileId, project_formal_chat_v1};
+    use serde_json::json;
+    const LEGACY: &str = r#"{"id":"legacy-provider","schema_version":"rsia.registered_external_provider.v1","namespace":"n","host_registration_id":"host","endpoint":"https://provider.invalid/v1/chat/completions","provider_model":"registered-model","model_digest":"9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4","transport_code_digest":"ae1eae1d76e5b7c865c4122ce366a08025842566d2d96c75cc13e6353a73db0d","credential_environment_key":"RSIA_TEST_KEY","credential_principal":"97173de4d100b1aec0c74c1c4367961238aa508352383c4cfd5ea1a83a25eae7","currency":"USD","pricing_version":"pricing-v1","input_micros_per_million_tokens":1,"output_micros_per_million_tokens":2,"max_output_tokens":128,"authorized_by":"admin"}"#;
+    fn legacy() -> RegisteredExternalProvider {
+        serde_json::from_str(LEGACY).unwrap()
+    }
+    fn current(timeout: u32) -> RegisteredExternalProviderV2 {
+        RegisteredExternalProviderV2::from_configuration(
+            legacy(),
+            ModelProtocolId::ChatCompletionsNonstreamV1,
+            SamplingProfileId::TemperatureZeroV1,
+            timeout,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn legacy_sixteen_fields_keep_exact_wire_fingerprint_and_unbound_authority() {
+        let p = legacy();
+        let wrapped =
+            FrozenProviderRegistration::from_record(ProviderRegistrationWire::Legacy(p.clone()));
+        assert_eq!(serde_json::to_string(&p).unwrap(), LEGACY);
+        assert_eq!(
+            fingerprint(&p).unwrap(),
+            "0eabf8c9f69f6375ad68816c3a09b68b579f0fe7007ded8acaba701853e2f42c"
+        );
+        assert_eq!(fingerprint(&wrapped).unwrap(), fingerprint(&p).unwrap());
+        assert_eq!(
+            serde_json::to_value(&wrapped)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            16
+        );
+        let read: FrozenProviderRegistration = serde_json::from_str(LEGACY).unwrap();
+        assert_eq!(serde_json::to_string(&read).unwrap(), LEGACY);
+        assert_eq!(read.request_timeout_seconds(), 120);
+        assert!(
+            matches!(read.sampling_authority().require_new_dispatch(),Err(Error::Conflict(s)) if s=="LegacyUnboundSampling")
+        );
+    }
+    #[test]
+    fn current_requires_all_twenty_one_fields_and_exports_only_nineteen_noncredential_fields() {
+        let p = current(17);
+        let ctx = Context::new("n", "admin", Role::Admin).unwrap();
+        p.common_view().validate(&ctx).unwrap();
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 21);
+        for field in [
+            "request_timeout_seconds",
+            "protocol_id",
+            "sampling_profile",
+            "sampling_digest",
+            "service_category",
+        ] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<RegisteredExternalProviderV2>(missing).is_err());
+        }
+        for (field, bad) in [
+            ("protocol_id", json!("streaming")),
+            ("sampling_profile", json!("temperature_one_v1")),
+            ("request_timeout_seconds", json!("17")),
+        ] {
+            let mut changed = value.clone();
+            changed[field] = bad;
+            assert!(serde_json::from_value::<RegisteredExternalProviderV2>(changed).is_err());
+        }
+        let public = p.public_configuration().unwrap();
+        assert_eq!(public.as_object().unwrap().len(), 19);
+        assert!(public.get("credential_environment_key").is_none());
+        assert!(public.get("credential_principal").is_none());
+        let mut altered = p.clone();
+        altered.sampling_digest = hash(br#"{"temperature":0}"#);
+        assert!(altered.validate_public_fields().is_err());
+        for n in [0, 121] {
+            let mut bad = p.clone();
+            bad.request_timeout_seconds = n;
+            assert!(bad.validate_public_fields().is_err());
+        }
+        let mut changed = p.clone();
+        changed.request_timeout_seconds = 18;
+        assert_ne!(
+            fingerprint(&FrozenProviderRegistration::from_record(
+                ProviderRegistrationWire::Current(p.clone())
+            ))
+            .unwrap(),
+            fingerprint(&FrozenProviderRegistration::from_record(
+                ProviderRegistrationWire::Current(changed)
+            ))
+            .unwrap()
+        );
+        let wrapped = FrozenProviderRegistration::from_record(ProviderRegistrationWire::Current(p));
+        assert!(
+            matches!(wrapped.require_legacy_profile(),Err(Error::Conflict(s)) if s=="current_provider_source_unavailable")
+        );
+    }
+    #[test]
+    fn offline_http_request_consumes_the_exact_shared_bytes_and_required_timeout_without_a_client()
+    {
+        for timeout in [1, 17, 120] {
+            let p = current(timeout);
+            let projected = project_formal_chat_v1(
+                "M",
+                &evo_core::contract::RunProjection {
+                    bundle_digest: hash(b"bundle"),
+                    instructions: vec!["I".into()],
+                    tools: vec![],
+                },
+                "T",
+                &p.projection_input(),
+            )
+            .unwrap();
+            let wrapped =
+                FrozenProviderRegistration::from_record(ProviderRegistrationWire::Current(p));
+            let request = build_registered_chat_http_request(
+                &wrapped,
+                "dummy-local-only-credential",
+                &projected,
+            )
+            .unwrap();
+            assert_eq!(
+                request.body().unwrap().as_bytes().unwrap(),
+                projected.wire_utf8()
+            );
+            assert_eq!(
+                request.timeout(),
+                Some(&std::time::Duration::from_secs(u64::from(timeout)))
+            );
+            assert_eq!(request.method(), reqwest::Method::POST);
+            assert!(request.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
+            assert_eq!(
+                request.headers()[reqwest::header::CONTENT_TYPE],
+                "application/json"
+            );
+            let body: Value =
+                serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+            assert_eq!(body.as_object().unwrap().len(), 4);
+            assert!(body.get("request_timeout_seconds").is_none());
+        }
+    }
+    #[tokio::test]
+    async fn current_registration_refuses_source_before_even_opening_a_session_or_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).await.unwrap();
+        store.close().await;
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        assert!(
+            matches!(FormalRegistry::register_provider_current(&admin,&store,current(17)).await,Err(Error::Conflict(s)) if s=="current_provider_source_unavailable")
+        );
+        let worker = Context::new("n", "worker", Role::Worker).unwrap();
+        assert!(matches!(
+            FormalRegistry::register_provider_current(&worker, &store, current(17)).await,
+            Err(Error::Forbidden)
+        ));
+        let mut wrong_actor = current(17);
+        wrong_actor.authorized_by = "someone-else".into();
+        assert!(matches!(
+            FormalRegistry::register_provider_current(&admin, &store, wrong_actor).await,
+            Err(Error::Forbidden)
+        ));
+        let wrong = Context::new("other", "admin", Role::Admin).unwrap();
+        assert!(matches!(
+            FormalRegistry::register_provider_current(&wrong, &store, current(17)).await,
+            Err(Error::Forbidden)
+        ));
     }
 }

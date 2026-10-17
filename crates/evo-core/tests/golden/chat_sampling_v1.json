@@ -1,0 +1,1 @@
+{"algorithm_version":"rsia.chat_sampling.sha256.cjson.v1","protocol_id":"chat_completions_nonstream_v1","sampling":{"temperature":0},"schema_version":"rsia.chat_sampling_projection.v1"}

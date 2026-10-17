@@ -279,6 +279,14 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         if billing != self.config.billing_scope {
             return Err(Error::Forbidden);
         }
+        // Already-dispatched calls retain their original accounting/no-resend
+        // path. Only a new or still-undispatched reservation needs this gate.
+        if s.budget_call(&ctx, &billing, &call_id)
+            .await?
+            .is_none_or(|call| call.state == BudgetCallState::Reserved)
+        {
+            capability.require_new_dispatch_sampling()?;
+        }
         let token = hash(format!("{namespace}:{call_id}:{now}").as_bytes());
         let reservation = BudgetCallReservation {
             billing_scope: billing.clone(),
@@ -1062,6 +1070,9 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
                 }
                 return Ok(response);
             }
+        }
+        if let Some(capability) = self.transport.formal_capability() {
+            capability.require_new_dispatch_sampling()?;
         }
         let Some(provenance) = self.transport.provenance() else {
             return Ok(ModelResponse::Rejected {

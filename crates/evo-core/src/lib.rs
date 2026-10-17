@@ -15,6 +15,7 @@ pub mod holdout;
 pub mod import_fixture;
 pub mod improver;
 pub mod management_registry;
+pub mod model_protocol;
 pub mod optimization;
 pub mod replay;
 pub mod replay_economics;

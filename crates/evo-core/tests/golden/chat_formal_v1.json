@@ -1,0 +1,1 @@
+{"max_tokens":128,"messages":[{"content":"M","role":"system"},{"content":"I1","role":"system"},{"content":"I2","role":"system"},{"content":"T","role":"user"}],"model":"registered-model","temperature":0}
