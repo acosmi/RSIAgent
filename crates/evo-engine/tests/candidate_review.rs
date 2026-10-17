@@ -1390,50 +1390,33 @@ async fn support_limit_refuses_the_whole_recipe_without_truncation() {
     assert!(response.payload.is_none() && response.gaps.contains(&ReviewGap::SupportLimit));
     assert_eq!(catalog(&fixture.db_path), before);
 
-    // All fields are legal and <= 16KiB. JSON escaping makes the complete
-    // parent + baseline + output projection exceed the independent 256KiB cap.
-    let mut large_projection = parent();
-    large_projection.content = "\"".repeat(16 * 1024);
-    large_projection.applicability = "\"".repeat(4096);
-    large_projection.counterexample = large_projection.applicability.clone();
-    large_projection.required_capabilities = (0..32)
-        .map(|i| format!("capability-{i:02}-{}", "x".repeat(100)))
-        .collect();
-    large_projection.dependencies = (0..32)
-        .map(|i| format!("dependency-{i:02}-{}", "x".repeat(100)))
-        .collect();
-    let strategy = Strategy {
-        instruction: "\"".repeat(8192),
-        ..Strategy::default()
-    };
-    let fixture = material_fixture_with_inputs(
-        large_projection.clone(),
-        large_projection,
-        strategy.clone(),
-        strategy,
+    // The former aggregate-size fixture enlarged an unapproved generation
+    // strategy. That profile is inadmissible under the production authority
+    // contract; it must be rejected before any current review can use it.
+    // The independent aggregate byte cap itself is unchanged.
+    let mut unapproved = trusted_compiler_inputs::inputs(
+        NS,
+        "review-unapproved-generation",
+        SkillSnapshot::empty(),
+        Strategy::default(),
+        HostCapabilities {
+            available: Default::default(),
+            granted: Default::default(),
+        },
+        &d("environment"),
     )
-    .await;
-    let stored = seed_edit(
-        &fixture,
-        vec![edit(
-            &fixture.parent,
-            SkillTextField::Content,
-            0,
-            1,
-            TextEditOperation::Replace { text: "a".into() },
-        )],
-    )
-    .await;
-    let before = catalog(&fixture.db_path);
-    let response = review(
-        &fixture,
-        ReviewKind::StageFact,
-        &stored.compiled.artifact_id,
-        ReviewDetail::Exact,
-    )
-    .await;
-    assert!(response.payload.is_none() && response.gaps.contains(&ReviewGap::SupportLimit));
-    assert_eq!(catalog(&fixture.db_path), before);
+    .frozen;
+    unapproved.authorized_by = fixture.admin.actor().into();
+    unapproved.baseline_strategy.instruction = "\"".repeat(8192);
+    assert!(matches!(
+        evo_engine::formal_authority::FormalRegistry::freeze_profile(
+            &fixture.admin,
+            &fixture.store,
+            unapproved
+        )
+        .await,
+        Err(evo_core::Error::Forbidden),
+    ));
 
     let fixture = material_fixture(parent()).await;
     let mut predecessor = None;

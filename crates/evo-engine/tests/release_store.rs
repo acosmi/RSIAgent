@@ -733,3 +733,116 @@ async fn typed_host_surface_requires_actual_admin_witness_and_correct_kind() {
     session.commit().await.unwrap();
     store.close().await;
 }
+
+async fn audit_f01_stage_refuses_strategy_change(change_instruction: bool) {
+    let (_dir, store) = database().await;
+    let (_, proposer, sources) = setup_sources(&store, "n").await;
+    let environment = system("p1").digest().unwrap();
+    ReleaseStore::stage_bundle(
+        &proposer,
+        &store,
+        StageBundleRequest {
+            candidate_id: d("audit-f01-healthy"),
+            bundle: bundle("p1", "healthy skill"),
+            environment_digest: environment.clone(),
+            proposer_actor: proposer.actor().into(),
+            sources: sources.clone(),
+            revoke_watermark: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let mut strategy = Strategy::default();
+    if change_instruction {
+        strategy
+            .instruction
+            .push_str(" unauthorized persistent instruction");
+    } else {
+        strategy.max_candidates = 3;
+    }
+    let profile = Profile {
+        id: "p1".into(),
+        evolution_enabled: true,
+        parent_digest: d("parent"),
+        baseline_digest: d("baseline"),
+    };
+    let invalid = trusted_compiler_inputs::bundle(
+        CompileParts {
+            profile: &profile,
+            parent: &SkillSnapshot::empty(),
+            baseline: &SkillSnapshot::empty(),
+            parent_strategy: &strategy,
+            baseline_strategy: &Strategy::default(),
+            skill_patch: &SkillPatch::default(),
+            improver_patch: &ImproverPatch::default(),
+            caps: &HostCapabilities {
+                available: Default::default(),
+                granted: Default::default(),
+            },
+            revoked: &Default::default(),
+        },
+        "n",
+        &environment,
+    )
+    .unwrap();
+    let before = {
+        let mut s = store.session().await.unwrap();
+        s.namespace_object_count(&proposer, "artifact")
+            .await
+            .unwrap()
+    };
+    let id = d("audit-f01-refused");
+    let result = ReleaseStore::stage_bundle(
+        &proposer,
+        &store,
+        StageBundleRequest {
+            candidate_id: id.clone(),
+            bundle: invalid,
+            environment_digest: environment,
+            proposer_actor: proposer.actor().into(),
+            sources,
+            revoke_watermark: 1,
+        },
+    )
+    .await;
+    eprintln!(
+        "AUDIT_F01 healthy Stage passed; changed_instruction={change_instruction}, target={result:?}"
+    );
+    assert!(matches!(result, Err(Error::Forbidden)));
+    let mut s = store.session().await.unwrap();
+    assert_eq!(
+        s.namespace_object_count(&proposer, "artifact")
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(
+        s.get::<serde_json::Value>(&proposer, "artifact", &id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        s.dependency_edges(&proposer, "artifact", &id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !s.has_role_audit_witness(&proposer, proposer.role(), "release.candidate.stage", &id)
+            .await
+            .unwrap()
+    );
+    drop(s);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn audit_f01_direct_stage_rejects_unauthorized_instruction() {
+    audit_f01_stage_refuses_strategy_change(true).await;
+}
+
+#[tokio::test]
+async fn audit_f01_direct_stage_rejects_unauthorized_candidate_limit() {
+    audit_f01_stage_refuses_strategy_change(false).await;
+}
