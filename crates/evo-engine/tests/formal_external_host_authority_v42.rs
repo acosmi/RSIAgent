@@ -42,12 +42,12 @@ use evo_core::sequential::{AlphaAllocation, FormalClaimKind, ResearchFamilyAlpha
 use evo_core::{Context, Error, Role, Strategy, fingerprint, hash};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::formal_authority::{
-    EpisodeCostRecord, FormalAuthorityIssuer, FormalProviderCaptureRecord, FormalRegistry,
-    FrozenCompilerProfile, IndependentGradeCapture, IssuedFormalAuthority, METER_SCHEMA,
-    PRINCIPAL_ACTION_SCHEMA, PRINCIPALS_SCHEMA, RegisteredExternalProvider, RegisteredFormalHost,
-    RegisteredPrincipal, RegisteredPrincipalSet, RegisteredResourceInstrumentation,
-    TypedContentClosure, TypedContentEdge, TypedContentRef, content_digest, prepare_formal_task,
-    read_typed_closure,
+    CONTROL_PRINCIPAL_ACTION_SCHEMA, EpisodeCostRecord, FormalAuthorityIssuer,
+    FormalOperatorCommand, FormalProviderCaptureRecord, FormalRegistry, FrozenCompilerProfile,
+    IndependentGradeCapture, IssuedFormalAuthority, METER_SCHEMA, PRINCIPAL_ACTION_SCHEMA,
+    PRINCIPALS_SCHEMA, RegisteredExternalProvider, RegisteredFormalHost, RegisteredPrincipal,
+    RegisteredPrincipalSet, RegisteredResourceInstrumentation, TypedContentClosure,
+    TypedContentEdge, TypedContentRef, content_digest, prepare_formal_task, read_typed_closure,
 };
 use evo_engine::release_store::{
     ReleaseCandidateRecord, ReleaseStore, StageBundleRequest, TypedSourceRef,
@@ -237,13 +237,30 @@ async fn principal_action(
         Role::Worker => &set.worker,
         _ => unreachable!(),
     };
+    let control_action = role == Role::Evaluator && operation == "register_control";
     let action_id = format!(
         "principal-action-{}",
-        fingerprint(&(kind, id, role)).unwrap()
+        if control_action {
+            fingerprint(&(kind, id, role, CONTROL_PRINCIPAL_ACTION_SCHEMA)).unwrap()
+        } else {
+            fingerprint(&(kind, id, role)).unwrap()
+        }
     );
+    let authenticated_request_digest = if control_action {
+        // Software fixture of the new wire witness, not an observed peer.
+        let stored: Value = s.need(&ctx(role, &p.actor), kind, id).await.unwrap();
+        let control: RegisteredEvaluationControl =
+            serde_json::from_value(stored["payload"].clone()).unwrap();
+        fingerprint(&FormalOperatorCommand::RegisterControl {
+            control: Box::new(control),
+        })
+        .unwrap()
+    } else {
+        subject_content_digest.clone()
+    };
     let action = json!({
         "id": action_id,
-        "schema_version": PRINCIPAL_ACTION_SCHEMA,
+        "schema_version": if control_action { CONTROL_PRINCIPAL_ACTION_SCHEMA } else { PRINCIPAL_ACTION_SCHEMA },
         "namespace": NS,
         "host_registration_id": host.id,
         "host_digest": fingerprint(host).unwrap(),
@@ -257,9 +274,9 @@ async fn principal_action(
         "subject_id": id,
         "subject_content_digest": subject_content_digest,
         "operation": operation,
-        "authenticated_request_digest": subject_content_digest,
+        "authenticated_request_digest": authenticated_request_digest,
         "peer_uid": p.uid,
-        "peer_gid": Value::Null,
+        "peer_gid": if control_action { json!(42) } else { Value::Null },
         "peer_pid": Value::Null,
         "authority_pid": std::process::id(),
         "authority_uid": set.grader.uid,
@@ -331,7 +348,7 @@ fn compile(
 
 /// Runs the registered grader: the fixed binary in its private workspace with
 /// only its private credential in the environment.
-fn grader_process(fx: &Fx, command: Value) -> Result<Value, String> {
+fn spawn_grader_command(fx: &Fx, command: Value) -> std::process::Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_formal_local_host"))
         .current_dir(&fx.workspace)
         .env_clear()
@@ -348,6 +365,11 @@ fn grader_process(fx: &Fx, command: Value) -> Result<Value, String> {
         .unwrap()
         .write_all(&serde_json::to_vec(&command).unwrap())
         .unwrap();
+    child
+}
+
+fn grader_process(fx: &Fx, command: Value) -> Result<Value, String> {
+    let child = spawn_grader_command(fx, command);
     let output = child.wait_with_output().unwrap();
     if output.status.success() {
         return Ok(serde_json::from_slice(&output.stdout).unwrap());
@@ -716,6 +738,11 @@ async fn prepare_in(order: TicketOrder) -> Fx {
 /// The batch of `prepare_in`; for `RequestedBeforeStage` it stops after the
 /// refused request (`None`), before the Worker stages the candidate.
 async fn prepare_or_refuse(order: TicketOrder) -> Option<Fx> {
+    prepare_with_scope(order, true).await
+}
+
+/// The control-only scope stops before ticket issue or any batch execution.
+async fn prepare_with_scope(order: TicketOrder, execute_batch: bool) -> Option<Fx> {
     let db_dir = tempfile::tempdir().unwrap();
     let db = db_dir.path().join("ag095.sqlite3");
     // The registered grader workspace is private to this test user (0700).
@@ -1182,6 +1209,19 @@ async fn prepare_or_refuse(order: TicketOrder) -> Option<Fx> {
     s.commit().await.unwrap();
     // L288: every principal action over the candidate closure precedes the
     // ticket, whose GA-18 binding pins that closure.
+    if !execute_batch {
+        store.close().await;
+        return Some(Fx {
+            _db_dir: db_dir,
+            db,
+            _workspace: workspace_dir,
+            workspace,
+            host,
+            set,
+            candidate,
+            graded: BTreeMap::new(),
+        });
+    }
     let ticket = register_and_issue(&store, holdout).await;
     assert!(ticket.candidate_dependency_binding.is_some());
 
@@ -1445,6 +1485,128 @@ async fn ticket_requested_before_the_candidate_is_staged_is_refused_without_writ
                 .is_none()
         );
     }
+}
+
+/// A real Evaluator peer and registered authority persist the incoming
+/// command's witness. The fixture's other three principals remain synthetic.
+#[tokio::test]
+async fn audit_f02_real_evaluator_ingress_records_request_peer_and_service_separately() {
+    let fx = prepare_with_scope(TicketOrder::StagedBeforeIssue, false)
+        .await
+        .unwrap();
+    let store = Store::open(&fx.db).await.unwrap();
+    let grader = ctx(Role::Evaluator, GRADER);
+    let mut s = store.session().await.unwrap();
+    let stored: Value = s
+        .need(&grader, "artifact", &storage_id(CONTROL_KIND, CONTROL_ID))
+        .await
+        .unwrap();
+    let mut control: RegisteredEvaluationControl =
+        serde_json::from_value(stored["payload"].clone()).unwrap();
+    control.id = "audit-f02-real-ingress".into();
+    control.validate().unwrap();
+    drop(s);
+    store.close().await;
+    std::fs::set_permissions(&fx.db, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // A short private socket path also fits macOS's Unix socket limit.
+    let socket_dir = tempfile::Builder::new()
+        .prefix("f02-socket-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = std::fs::canonicalize(socket_dir.path())
+        .unwrap()
+        .join("authority.sock");
+    let mut authority = spawn_grader_command(
+        &fx,
+        json!({
+            "operation":"authority", "database":fx.db, "host":fx.host,
+            "principals":fx.set, "socket":socket, "connections":1,
+        }),
+    );
+    let authority_pid = authority.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !socket.exists() {
+        if let Some(status) = authority.try_wait().unwrap() {
+            let output = authority.wait_with_output().unwrap();
+            panic!(
+                "authority setup failed {status}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            authority.kill().unwrap();
+            let output = authority.wait_with_output().unwrap();
+            panic!(
+                "authority socket setup timeout: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let command = FormalOperatorCommand::RegisterControl {
+        control: Box::new(control.clone()),
+    };
+    let operator = spawn_grader_command(
+        &fx,
+        json!({
+            "operation":"operator", "socket":socket, "expected_authority_uid":fx.host.grader_uid,
+            "credential_environment_key":GRADER_KEY, "command":command,
+        }),
+    );
+    let operator_pid = operator.id();
+    let response = operator.wait_with_output().unwrap();
+    let authority_output = authority.wait_with_output().unwrap();
+    assert!(
+        response.status.success(),
+        "{}",
+        String::from_utf8_lossy(&response.stderr)
+    );
+    assert!(
+        authority_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&authority_output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&response.stdout).unwrap();
+    assert_eq!(response["status"], "complete");
+    let serving: Value = serde_json::from_slice(&authority_output.stdout).unwrap();
+    assert_eq!(serving["completed"], 1);
+    assert_eq!(serving["refused"], 0);
+
+    let store = Store::open(&fx.db).await.unwrap();
+    let mut s = store.session().await.unwrap();
+    let subject = storage_id(CONTROL_KIND, &control.id);
+    let action_id = format!(
+        "principal-action-{}",
+        fingerprint(&(
+            "artifact",
+            &subject,
+            Role::Evaluator,
+            CONTROL_PRINCIPAL_ACTION_SCHEMA
+        ))
+        .unwrap()
+    );
+    let action: Value = s.need(&grader, "artifact", &action_id).await.unwrap();
+    assert_eq!(action["schema_version"], CONTROL_PRINCIPAL_ACTION_SCHEMA);
+    assert_eq!(action["actor"], GRADER);
+    assert_eq!(action["role"], "evaluator");
+    assert_eq!(action["peer_uid"], fx.set.grader.uid);
+    assert!(action["peer_gid"].as_u64().is_some());
+    if let Some(pid) = action["peer_pid"].as_u64() {
+        assert_eq!(pid, u64::from(operator_pid));
+    }
+    assert_eq!(action["authority_pid"], authority_pid);
+    assert_eq!(action["authority_uid"], fx.host.grader_uid);
+    assert_eq!(action["operation"], "register_control");
+    assert_eq!(
+        action["authenticated_request_digest"],
+        fingerprint(&command).unwrap()
+    );
+    assert_eq!(
+        action["subject_content_digest"],
+        content_digest(&control).unwrap()
+    );
+    drop(s);
+    store.close().await;
 }
 
 #[tokio::test]

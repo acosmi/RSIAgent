@@ -1109,6 +1109,7 @@ impl IndependentEvaluationControl {
     ) -> Result<String> {
         ctx.require(&[Role::Evaluator])?;
         control.validate()?;
+        crate::formal_authority::authenticate_control_registration(ctx, &control)?;
         if control.evaluator_actor != ctx.actor() {
             return Err(Error::Forbidden);
         }

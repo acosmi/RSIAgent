@@ -294,6 +294,7 @@ pub(crate) fn compiler_dependency_schema(kind: &str, schema: &str) -> bool {
                 | PROVIDER_SCHEMA
                 | METER_SCHEMA
                 | PRINCIPAL_ACTION_SCHEMA
+                | CONTROL_PRINCIPAL_ACTION_SCHEMA
                 | "rsia.formal_principal_set_observation.v1"
                 | "rsia.formal_profile_selection.v1"
                 | "rsia.persisted_compiler_binding.v1"
@@ -354,6 +355,7 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
                 | PROVIDER_SCHEMA
                 | METER_SCHEMA
                 | PRINCIPAL_ACTION_SCHEMA
+                | CONTROL_PRINCIPAL_ACTION_SCHEMA
                 | "rsia.formal_principal_set_observation.v1"
                 | "rsia.formal_profile_selection.v1"
                 | "rsia.persisted_compiler_binding.v1"
@@ -418,7 +420,7 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
         HOST_SCHEMA => {
             let _: RegisteredFormalHost = decode(body.clone())?;
         }
-        PRINCIPAL_ACTION_SCHEMA => {
+        PRINCIPAL_ACTION_SCHEMA | CONTROL_PRINCIPAL_ACTION_SCHEMA => {
             let _: PrincipalAction = decode(body.clone())?;
         }
         "rsia.formal_principal_set_observation.v1" => {
@@ -625,7 +627,10 @@ pub async fn read_typed_closure(
         if authority_role == Some(Role::Admin) {
             require_registered_body_authority(s, ctx, &kind, &id, &body).await?;
         }
-        if schema == PRINCIPAL_ACTION_SCHEMA {
+        if matches!(
+            schema.as_str(),
+            PRINCIPAL_ACTION_SCHEMA | CONTROL_PRINCIPAL_ACTION_SCHEMA
+        ) {
             require_content_witness(s, ctx, &kind, &id, &body, Role::Evaluator).await?;
         }
         if schema == "rsia.formal_principal_set_observation.v1" {
@@ -819,6 +824,9 @@ impl RegisteredFormalHost {
 }
 pub const PRINCIPALS_SCHEMA: &str = "rsia.registered_formal_principals.v1";
 pub const PRINCIPAL_ACTION_SCHEMA: &str = "rsia.observed_principal_action.v1";
+/// Actual incoming Evaluator authorization, distinct from the legacy service
+/// self-observation used for control registration. Other v1 actions stay v1.
+pub const CONTROL_PRINCIPAL_ACTION_SCHEMA: &str = "rsia.observed_control_principal_action.v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1164,9 +1172,19 @@ async fn record_operator_action<T: Serialize>(
     if peer.uid() != principal.uid || authority.uid != set.grader.uid {
         return Err(Error::Forbidden);
     }
+    let control_action = expected == Role::Evaluator && operation == "register_control";
     let action = PrincipalAction {
-        id: principal_action_id(kind, id, expected)?,
-        schema_version: PRINCIPAL_ACTION_SCHEMA.into(),
+        id: if control_action {
+            control_principal_action_id(kind, id)?
+        } else {
+            principal_action_id(kind, id, expected)?
+        },
+        schema_version: if control_action {
+            CONTROL_PRINCIPAL_ACTION_SCHEMA
+        } else {
+            PRINCIPAL_ACTION_SCHEMA
+        }
+        .into(),
         namespace: ctx.namespace().into(),
         host_registration_id: host.id.clone(),
         host_digest: fingerprint(host)?,
@@ -1195,6 +1213,51 @@ fn principal_action_id(kind: &str, id: &str, role: Role) -> Result<String> {
         "principal-action-{}",
         fingerprint(&(kind, id, role))?
     ))
+}
+fn control_principal_action_id(kind: &str, id: &str) -> Result<String> {
+    Ok(format!(
+        "principal-action-{}",
+        fingerprint(&(kind, id, Role::Evaluator, CONTROL_PRINCIPAL_ACTION_SCHEMA))?
+    ))
+}
+
+fn control_request_digest(
+    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
+) -> Result<String> {
+    FormalOperatorCommand::RegisterControl {
+        control: Box::new(control.clone()),
+    }
+    .authentication_digest()
+}
+
+/// This pure preflight runs before root-budget reads or registration writes.
+/// A supplied Context alone cannot turn the grader service into a delegate.
+pub(crate) fn authenticate_control_registration(
+    ctx: &Context,
+    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
+) -> Result<()> {
+    if control.evidence_scope == crate::streaming_evaluator::EvaluationEvidenceScope::ProgramFixture
+    {
+        return Ok(());
+    }
+    let expected_digest = control_request_digest(control)?;
+    OPERATOR_CREDENTIAL
+        .try_with(|cap| {
+            if cap.role != Role::Evaluator
+                || ctx.role() != Role::Evaluator
+                || cap.actor != ctx.actor()
+                || cap.namespace != ctx.namespace()
+                || cap.principals.namespace != ctx.namespace()
+                || cap.actor != cap.principals.grader.actor
+                || cap.peer.uid() != cap.principals.grader.uid
+                || cap.operation != "register_control"
+                || cap.request_digest != expected_digest
+            {
+                return Err(Error::Forbidden);
+            }
+            Ok(())
+        })
+        .map_err(|_| Error::Forbidden)?
 }
 async fn persist_principal_action(
     s: &mut Session,
@@ -1268,68 +1331,116 @@ async fn require_principal_action<T: Serialize>(
     body: &T,
     role: Role,
 ) -> Result<RegisteredPrincipal> {
-    let set = principal_set(s, ctx, host).await?;
-    let action_id = principal_action_id(kind, id, role)?;
-    let action_body: Value = s.need(ctx, "artifact", &action_id).await?;
-    require_content_witness(
-        s,
-        ctx,
-        "artifact",
-        &action_id,
-        &action_body,
-        Role::Evaluator,
-    )
-    .await?;
-    let action: PrincipalAction = decode(action_body)?;
-    let p = set.principal(role)?;
-    if action.id != action_id
-        || action.schema_version != PRINCIPAL_ACTION_SCHEMA
-        || action.namespace != ctx.namespace()
-        || action.role != role
-        || action.actor != p.actor
-        || action.uid != p.uid
-        || action.peer_uid != p.uid
-        || action.principal != p.principal
-        || action.credential_digest != p.credential_digest
-        || action.host_registration_id != host.id
-        || action.host_digest != fingerprint(host)?
-        || action.principal_set_digest != set.binding_digest()?
-        || action.subject_kind != kind
-        || action.subject_id != id
-        || action.subject_content_digest != content_digest(body)?
-        || action.authority_uid != set.grader.uid
-        || action.authority_executable_digest != host.grader_code_digest
-        || action.authority_pid == 0
-    {
-        return Err(Error::Conflict(
-            "actual proposer/approver credential binding is missing or stale".into(),
-        ));
-    }
-    digest(&action.authenticated_request_digest)?;
-    let valid_operation = match role {
-        Role::Worker => action.operation == "stage",
-        Role::Admin => matches!(
-            action.operation.as_str(),
-            "bootstrap"
-                | "register_provider"
-                | "register_meter"
-                | "freeze_profile"
-                | "empty_root"
-                | "approve"
-                | "canary"
-                | "activate"
-                | "rollback"
-        ),
-        Role::Evaluator => matches!(
-            action.operation.as_str(),
-            "register_control" | "issue_report"
-        ),
-        _ => false,
-    };
-    if !valid_operation {
-        return Err(Error::Forbidden);
-    }
-    Ok(p.clone())
+    // Closure validation is nested in ticket, report, and release readers. Keep
+    // this authorization state machine off their default-size thread stacks.
+    Box::pin(async {
+        let set = principal_set(s, ctx, host).await?;
+        let body_value = serde_json::to_value(body).map_err(|_| Error::Internal)?;
+        let control = if role == Role::Evaluator
+            && matches!(
+                body_value["schema_version"].as_str(),
+                Some(
+                    crate::streaming_evaluator::RegisteredEvaluationControl::SCHEMA
+                        | crate::streaming_evaluator::RegisteredEvaluationControl::SCHEMA_V1
+                )
+            ) {
+            Some(decode::<
+                crate::streaming_evaluator::RegisteredEvaluationControl,
+            >(body_value)?)
+        } else {
+            None
+        };
+        let action_id = if control.is_some() {
+            control_principal_action_id(kind, id)?
+        } else {
+            principal_action_id(kind, id, role)?
+        };
+        if control.is_some()
+            && s.get::<Value>(ctx, "artifact", &action_id).await?.is_none()
+            && s.get::<Value>(ctx, "artifact", &principal_action_id(kind, id, role)?)
+                .await?
+                .is_some()
+        {
+            return Err(Error::Conflict(
+                "legacy control authorization cannot authorize new formal consumption".into(),
+            ));
+        }
+        let action_body: Value = s.need(ctx, "artifact", &action_id).await?;
+        require_content_witness(
+            s,
+            ctx,
+            "artifact",
+            &action_id,
+            &action_body,
+            Role::Evaluator,
+        )
+        .await?;
+        let action: PrincipalAction = decode(action_body)?;
+        let p = set.principal(role)?;
+        if action.id != action_id
+            || action.schema_version
+                != if control.is_some() {
+                    CONTROL_PRINCIPAL_ACTION_SCHEMA
+                } else {
+                    PRINCIPAL_ACTION_SCHEMA
+                }
+            || action.namespace != ctx.namespace()
+            || action.role != role
+            || action.actor != p.actor
+            || action.uid != p.uid
+            || action.peer_uid != p.uid
+            || action.principal != p.principal
+            || action.credential_digest != p.credential_digest
+            || action.host_registration_id != host.id
+            || action.host_digest != fingerprint(host)?
+            || action.principal_set_digest != set.binding_digest()?
+            || action.subject_kind != kind
+            || action.subject_id != id
+            || action.subject_content_digest != content_digest(body)?
+            || action.authority_uid != set.grader.uid
+            || action.authority_executable_digest != host.grader_code_digest
+            || action.authority_pid == 0
+        {
+            return Err(Error::Conflict(
+                "actual proposer/approver credential binding is missing or stale".into(),
+            ));
+        }
+        digest(&action.authenticated_request_digest)?;
+        if let Some(control) = &control
+            && (action.operation != "register_control"
+                || action.authenticated_request_digest != control_request_digest(control)?
+                || action.peer_gid.is_none())
+        {
+            return Err(Error::Conflict(
+                "control authorization differs from the authenticated request".into(),
+            ));
+        }
+        let valid_operation = match role {
+            Role::Worker => action.operation == "stage",
+            Role::Admin => matches!(
+                action.operation.as_str(),
+                "bootstrap"
+                    | "register_provider"
+                    | "register_meter"
+                    | "freeze_profile"
+                    | "empty_root"
+                    | "approve"
+                    | "canary"
+                    | "activate"
+                    | "rollback"
+            ),
+            Role::Evaluator => matches!(
+                action.operation.as_str(),
+                "register_control" | "issue_report"
+            ),
+            _ => false,
+        };
+        if !valid_operation {
+            return Err(Error::Forbidden);
+        }
+        Ok(p.clone())
+    })
+    .await
 }
 async fn require_registered_admin(
     s: &mut Session,
@@ -1531,6 +1642,7 @@ pub(crate) async fn bind_control_principals(
     {
         return Ok(());
     }
+    authenticate_control_registration(ctx, control)?;
     // The registered control names a staged candidate indirectly only later;
     // the service's authenticated, observed host is the unique authority here.
     let host_id = OPERATOR_CREDENTIAL
@@ -1546,14 +1658,14 @@ pub(crate) async fn bind_control_principals(
     {
         return Err(Error::Forbidden);
     }
-    record_grader_action(
+    record_operator_action(
         s,
         ctx,
         &host,
         "artifact",
         &crate::streaming_evaluator::storage_id("registered_evaluation_control_v41", &control.id)?,
         control,
-        "register_control",
+        Role::Evaluator,
     )
     .await
 }
@@ -1748,10 +1860,10 @@ impl<'de> Deserialize<'de> for FormalOperatorCommand {
 
 impl FormalOperatorCommand {
     fn role(&self) -> Role {
-        if matches!(self, Self::Stage { .. }) {
-            Role::Worker
-        } else {
-            Role::Admin
+        match self {
+            Self::Stage { .. } => Role::Worker,
+            Self::RegisterControl { .. } => Role::Evaluator,
+            _ => Role::Admin,
         }
     }
     fn operation(&self) -> &'static str {
@@ -1957,9 +2069,7 @@ impl PrincipalAuthorityService {
             }
             FormalOperatorCommand::RegisterControl { control } => Ok(Value::String(
                 crate::streaming_evaluator::IndependentEvaluationControl::register_control(
-                    &self.grader,
-                    store,
-                    *control,
+                    ctx, store, *control,
                 )
                 .await?,
             )),
@@ -4573,6 +4683,351 @@ pub async fn verify_issued_authority(
 #[cfg(test)]
 mod response_bound_tests {
     use super::*;
+
+    fn audit_f02_control() -> crate::streaming_evaluator::RegisteredEvaluationControl {
+        use crate::streaming_evaluator::{
+            EvaluationEvidenceScope, FixedGraderMethod, FixedGraderSpec,
+            RegisteredEvaluationControl,
+        };
+        use evo_core::evaluation::{
+            ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec, FormalExperimentPlanV41,
+            FormalStatisticalUnit, Money, OptimizationBudgetPlan, OptimizerComparisonContract,
+            ProfileKind,
+        };
+        use evo_core::holdout::{AnchorCoverageMatrix, CriticalCapabilityCoverage};
+        use evo_core::sequential::{AlphaAllocation, FormalClaimKind, ResearchFamilyAlphaPlan};
+        let money = || Money {
+            currency: "USD".into(),
+            pricing_version: "pricing-v1".into(),
+            amount: "0.001".into(),
+        };
+        let mut plan = ExperimentPlan::first_low_risk("audit-f02", 60).unwrap();
+        plan.n_planned = 20;
+        plan.profile = ProfileKind::QualityGain;
+        plan.monetary_budget = money();
+        plan.frozen = true;
+        plan.frozen_at = Some(1);
+        let alpha = ResearchFamilyAlphaPlan::new(
+            "audit-family",
+            "0.05",
+            vec![AlphaAllocation {
+                claim_id: "gain".into(),
+                attempt_id: "attempt".into(),
+                kind: FormalClaimKind::FixedSampleGain,
+                alpha: "0.05".into(),
+            }],
+        )
+        .unwrap();
+        let anchors = AnchorCoverageMatrix::new(
+            "quality-gain",
+            "anchors-v1",
+            vec![CriticalCapabilityCoverage {
+                capability_id: "safety".into(),
+                anchor_ids: vec!["anchor".into()],
+            }],
+        )
+        .unwrap();
+        let mut budget = OptimizationBudgetPlan::unfunded("billing", "payer", "USD").unwrap();
+        budget.root_total = money();
+        budget.admin_authorization_receipt_digest = Some(hash(b"authorization"));
+        for stage in &mut budget.stages {
+            stage.per_call_limit.pricing_version = "pricing-v1".into();
+            stage.experiment_total.pricing_version = "pricing-v1".into();
+        }
+        let optimizer = |arm, name: &[u8]| FixedOptimizerSpec {
+            arm,
+            implementation_digest: hash(name),
+            initial_s0_digest: hash(b"s0"),
+            base_model_digest: hash(b"model"),
+            tools_digest: hash(b"tools"),
+            authorized_materials_digest: hash(b"materials"),
+            task_partition_digest: hash(b"partition"),
+            context_limit_tokens: 4096,
+            root_budget_scope_id: "billing".into(),
+            budget_limit: money(),
+        };
+        let comparison = OptimizerComparisonContract::new(
+            optimizer(FixedOptimizerArm::CSimple, b"simple"),
+            optimizer(FixedOptimizerArm::CSkillopt, b"skillopt"),
+            FixedOptimizerArm::CSkillopt,
+        )
+        .unwrap();
+        let formal = FormalExperimentPlanV41::new(
+            &plan,
+            hash(b"preregistration"),
+            &alpha,
+            &comparison,
+            &budget,
+            anchors.digest().unwrap(),
+            hash(b"sampling"),
+            hash(b"mean"),
+            FormalStatisticalUnit::IndependentTaskCluster,
+            20,
+        )
+        .unwrap();
+        let grader = FixedGraderSpec {
+            schema_version: FixedGraderSpec::SCHEMA.into(),
+            version: "exact-v1".into(),
+            method: FixedGraderMethod::ExactJsonAnswerV1,
+        };
+        let control = RegisteredEvaluationControl {
+            schema_version: RegisteredEvaluationControl::SCHEMA.into(),
+            id: "audit-control".into(),
+            v1_plan_snapshot: plan,
+            formal_plan: formal,
+            alpha_plan: alpha,
+            optimizer_comparison: comparison,
+            optimization_budget: budget,
+            early_stop_plan: None,
+            anchor_matrix: anchors,
+            attempt_id: "attempt".into(),
+            fixed_sample_claim_id: "gain".into(),
+            billing_scope: "billing".into(),
+            executor_actor: "host".into(),
+            evaluator_actor: "grader".into(),
+            proposer_actor: "worker".into(),
+            approver_actor: "admin".into(),
+            oracle_digest: hash(b"oracle"),
+            grader_digest: fingerprint(&grader).unwrap(),
+            fixed_grader: grader,
+            evidence_scope: EvaluationEvidenceScope::RegisteredExternalHost,
+            created_at_unix_seconds: 2,
+        };
+        control.validate().unwrap();
+        control
+    }
+
+    fn audit_f02_principals(uid: u32, actual_role: Role) -> RegisteredPrincipalSet {
+        let principal = |uid, actor: &str, credential: &str| RegisteredPrincipal {
+            uid,
+            actor: actor.into(),
+            principal: hash(credential.as_bytes()),
+            credential_digest: hash(credential.as_bytes()),
+        };
+        let mut set = RegisteredPrincipalSet {
+            id: "formal-principals-host".into(),
+            schema_version: PRINCIPALS_SCHEMA.into(),
+            namespace: "n".into(),
+            host_registration_id: "host".into(),
+            version: 1,
+            host: principal(uid + 1, "host", "host-private-fixture-credential-32-bytes"),
+            grader: principal(
+                uid + 2,
+                "grader",
+                "grader-private-fixture-credential-32-bytes",
+            ),
+            administrator: principal(
+                uid + 3,
+                "admin",
+                "administrator-private-fixture-credential-32-bytes",
+            ),
+            worker: principal(
+                uid + 4,
+                "worker",
+                "worker-private-fixture-credential-32-bytes",
+            ),
+        };
+        match actual_role {
+            Role::Host => set.host.uid = uid,
+            Role::Evaluator => set.grader.uid = uid,
+            Role::Admin => set.administrator.uid = uid,
+            Role::Worker => set.worker.uid = uid,
+            _ => unreachable!(),
+        }
+        set
+    }
+
+    #[tokio::test]
+    async fn audit_f02_external_control_rejects_context_without_authenticated_peer_before_budget() {
+        use crate::streaming_evaluator::IndependentEvaluationControl;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        let store = Store::open(&db).await.unwrap();
+        let control = audit_f02_control();
+        for (role, actor) in [
+            (Role::Admin, "admin"),
+            (Role::Worker, "worker"),
+            (Role::Host, "host"),
+            (Role::Evaluator, "grader"),
+        ] {
+            let ctx = Context::new("n", actor, role).unwrap();
+            assert!(matches!(
+                IndependentEvaluationControl::register_control(&ctx, &store, control.clone()).await,
+                Err(Error::Forbidden)
+            ));
+            let mut s = store.session().await.unwrap();
+            assert_eq!(s.namespace_object_count(&ctx, "artifact").await.unwrap(), 0);
+            drop(s);
+            // Reuse the existing Python/SQLite test tooling; the engine does
+            // not add a database-driver dependency or bypass Store in product.
+            let read = std::process::Command::new("python3")
+                .args([
+                    "-B", "-c",
+                    "import json,sqlite3,sys,urllib.parse; c=sqlite3.connect('file:'+urllib.parse.quote(sys.argv[1],safe='/')+'?mode=ro',uri=True); print(json.dumps(c.execute('SELECT (SELECT COUNT(*) FROM objects),(SELECT COUNT(*) FROM audit),(SELECT COUNT(*) FROM dependencies),(SELECT COUNT(*) FROM root_budget_calls)').fetchone())); c.close()",
+                ])
+                .arg(&db)
+                .output()
+                .unwrap();
+            assert!(
+                read.status.success(),
+                "{}",
+                String::from_utf8_lossy(&read.stderr)
+            );
+            let counts: Vec<u64> = serde_json::from_slice(&read.stdout).unwrap();
+            assert_eq!(counts, [0, 0, 0, 0]);
+        }
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn audit_f02_capability_binds_role_actor_namespace_peer_and_exact_command() {
+        let (left, _right) = tokio::net::UnixStream::pair().unwrap();
+        let peer = crate::executor::observe_kernel_peer(&left).unwrap();
+        let set = audit_f02_principals(peer.uid(), Role::Evaluator);
+        let control = audit_f02_control();
+        let ctx = Context::new("n", "grader", Role::Evaluator).unwrap();
+        let cap = OperatorCredential {
+            namespace: "n".into(),
+            actor: "grader".into(),
+            role: Role::Evaluator,
+            host_digest: hash(b"test-only-host-binding"),
+            principals: set,
+            peer: peer.clone(),
+            // The pure capability preflight is tested here; no process
+            // registration, persistence or formal issuance is claimed.
+            authority: crate::executor::ObservedProcessIdentity {
+                pid: std::process::id(),
+                uid: peer.uid(),
+                executable_digest: hash(b"test-authority"),
+                workspace: "test-only".into(),
+            },
+            operation: "register_control".into(),
+            request_digest: control_request_digest(&control).unwrap(),
+        };
+        OPERATOR_CREDENTIAL
+            .scope(cap, async {
+                authenticate_control_registration(&ctx, &control).unwrap();
+                for bad_ctx in [
+                    Context::new("n", "admin", Role::Admin).unwrap(),
+                    Context::new("n", "other", Role::Evaluator).unwrap(),
+                    Context::new("other", "grader", Role::Evaluator).unwrap(),
+                ] {
+                    assert!(matches!(
+                        authenticate_control_registration(&bad_ctx, &control),
+                        Err(Error::Forbidden)
+                    ));
+                }
+                let mut changed = control.clone();
+                changed.id.push_str("-changed");
+                changed.validate().unwrap();
+                assert!(matches!(
+                    authenticate_control_registration(&ctx, &changed),
+                    Err(Error::Forbidden)
+                ));
+            })
+            .await;
+    }
+
+    #[test]
+    fn audit_f02_control_witness_has_new_identity_and_preserves_legacy_wire_support() {
+        let control = audit_f02_control();
+        let id = crate::streaming_evaluator::storage_id(
+            "registered_evaluation_control_v41",
+            &control.id,
+        )
+        .unwrap();
+        assert_ne!(
+            control_principal_action_id("artifact", &id).unwrap(),
+            principal_action_id("artifact", &id, Role::Evaluator).unwrap()
+        );
+        assert!(compiler_dependency_schema(
+            "artifact",
+            PRINCIPAL_ACTION_SCHEMA
+        ));
+        assert!(compiler_dependency_schema(
+            "artifact",
+            CONTROL_PRINCIPAL_ACTION_SCHEMA
+        ));
+        assert_ne!(
+            control_request_digest(&control).unwrap(),
+            content_digest(&control).unwrap()
+        );
+        let command = FormalOperatorCommand::RegisterControl {
+            control: Box::new(control),
+        };
+        let wire = serde_json::to_value(&command).unwrap();
+        let decoded: FormalOperatorCommand = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            command.authentication_digest().unwrap(),
+            decoded.authentication_digest().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_f02_admin_worker_and_host_cannot_authenticate_control_registration() {
+        let (left, _right) = tokio::net::UnixStream::pair().unwrap();
+        let peer = crate::executor::observe_kernel_peer(&left).unwrap();
+        let command = FormalOperatorCommand::RegisterControl {
+            control: Box::new(audit_f02_control()),
+        };
+        for (role, credential) in [
+            (
+                Role::Admin,
+                "administrator-private-fixture-credential-32-bytes",
+            ),
+            (Role::Worker, "worker-private-fixture-credential-32-bytes"),
+            (Role::Host, "host-private-fixture-credential-32-bytes"),
+        ] {
+            let set = audit_f02_principals(peer.uid(), role);
+            assert!(
+                matches!(
+                    authenticate_operator_peer(&set, &peer, credential, &command),
+                    Err(Error::Forbidden)
+                ),
+                "unauthorized role {role:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_f02_registered_evaluator_authenticates_control_with_own_peer_and_credential() {
+        let (left, _right) = tokio::net::UnixStream::pair().unwrap();
+        let peer = crate::executor::observe_kernel_peer(&left).unwrap();
+        let set = audit_f02_principals(peer.uid(), Role::Evaluator);
+        let command = FormalOperatorCommand::RegisterControl {
+            control: Box::new(audit_f02_control()),
+        };
+        let principal = authenticate_operator_peer(
+            &set,
+            &peer,
+            "grader-private-fixture-credential-32-bytes",
+            &command,
+        )
+        .unwrap();
+        assert_eq!(command.role(), Role::Evaluator);
+        assert_eq!(principal.actor, "grader");
+        assert_eq!(principal.uid, peer.uid());
+        assert!(matches!(
+            authenticate_operator_peer(
+                &set,
+                &peer,
+                "administrator-private-fixture-credential-32-bytes",
+                &command
+            ),
+            Err(Error::Forbidden)
+        ));
+        let mut wrong_uid = set.clone();
+        wrong_uid.grader.uid += 10;
+        assert!(matches!(
+            authenticate_operator_peer(
+                &wrong_uid,
+                &peer,
+                "grader-private-fixture-credential-32-bytes",
+                &command
+            ),
+            Err(Error::Forbidden)
+        ));
+    }
 
     #[test]
     fn cumulative_provider_body_bound_precedes_extension_and_keeps_partial_capture() {
