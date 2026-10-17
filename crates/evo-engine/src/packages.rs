@@ -1289,9 +1289,7 @@ fn validate_candidate_material(
     strategy.validate()?;
     match binding.strategy_authority {
         CandidateStrategyAuthority::BuiltinDefaultV1 => {
-            if fingerprint(&strategy)? != fingerprint(&Strategy::default())? {
-                return Err(Error::Forbidden);
-            }
+            crate::formal_authority::require_builtin_default_strategy(&strategy)?;
         }
     }
     Ok((skill, strategy))

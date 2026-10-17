@@ -2200,6 +2200,7 @@ impl FrozenCompilerProfile {
         digest(&self.environment_digest)?;
         self.baseline_skill.validate()?;
         self.baseline_strategy.validate()?;
+        require_builtin_default_strategy(&self.baseline_strategy)?;
         if !self
             .capabilities
             .allows(&self.baseline_skill.required_capabilities)
@@ -2232,6 +2233,33 @@ pub fn empty_root_strategy() -> Strategy {
         require_counterexample: true,
     }
 }
+/// Packages and B profiles can only select the built-in generation strategy.
+pub(crate) fn require_builtin_default_strategy(strategy: &Strategy) -> Result<()> {
+    strategy.validate()?;
+    if fingerprint(strategy)? != fingerprint(&Strategy::default())? {
+        return Err(Error::Forbidden);
+    }
+    Ok(())
+}
+
+/// The fixed empty-root value may only be inherited from authenticated P.
+fn require_resolved_strategy(strategy: &Strategy, parent: &Strategy) -> Result<()> {
+    strategy.validate()?;
+    if require_builtin_default_strategy(strategy).is_ok() {
+        return Ok(());
+    }
+    if fingerprint(parent)? == fingerprint(&empty_root_strategy())?
+        && fingerprint(strategy)? == fingerprint(parent)?
+    {
+        return Ok(());
+    }
+    Err(Error::Forbidden)
+}
+
+pub(crate) fn require_builtin_parent_strategy(strategy: &Strategy) -> Result<()> {
+    require_resolved_strategy(strategy, &empty_root_strategy())
+}
+
 impl EmptyRootAuthorization {
     pub fn digest(&self) -> Result<String> {
         fingerprint(self)
@@ -2591,7 +2619,7 @@ impl VerifiedCompilerInputs {
         skill_patch: &SkillPatch,
         improver_patch: &ImproverPatch,
     ) -> Result<ResolvedBundle> {
-        compile_bundle(CompileParts {
+        let bundle = compile_bundle(CompileParts {
             profile: &Profile {
                 id: self.profile.profile_id.clone(),
                 evolution_enabled: true,
@@ -2606,7 +2634,9 @@ impl VerifiedCompilerInputs {
             improver_patch,
             caps: &self.profile.capabilities,
             revoked: &BTreeSet::new(),
-        })
+        })?;
+        require_resolved_strategy(&bundle.improver, &self.parent_strategy)?;
+        Ok(bundle)
     }
     pub fn compile_search_edit(
         &self,
@@ -2641,6 +2671,7 @@ impl VerifiedCompilerInputs {
         )
     }
     pub fn replay(&self, bundle: &ResolvedBundle) -> Result<()> {
+        require_resolved_strategy(&bundle.improver, &self.parent_strategy)?;
         if bundle.profile_id != self.profile.profile_id
             || bundle.parent_digest != self.binding.parent_digest
             || bundle.baseline_digest != self.binding.baseline_digest
@@ -2755,6 +2786,8 @@ pub async fn resolve_compiler_inputs(
             )
         }
     };
+    require_builtin_parent_strategy(&parent_strategy)?;
+    require_resolved_strategy(&request.search_parent_strategy, &parent_strategy)?;
     let parent_strategy_digest = fingerprint(&parent_strategy)?;
     if request
         .expected_parent_strategy_digest
@@ -5502,6 +5535,46 @@ mod principal_and_meter_repair_tests {
                     Err(Error::Internal)
                 ));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_f01_strategy_authority_tests {
+    use super::*;
+    #[test]
+    fn only_exact_builtin_or_actual_empty_root_inheritance_has_generation_authority() {
+        let default = Strategy::default();
+        let empty = empty_root_strategy();
+        require_builtin_default_strategy(&default).unwrap();
+        require_resolved_strategy(&default, &empty).unwrap();
+        require_resolved_strategy(&empty, &empty).unwrap();
+        assert!(matches!(
+            require_resolved_strategy(&empty, &default),
+            Err(Error::Forbidden)
+        ));
+        assert!(matches!(
+            require_builtin_default_strategy(&empty),
+            Err(Error::Forbidden)
+        ));
+        for change in 0..4 {
+            let mut custom = default.clone();
+            match change {
+                0 => custom.instruction.push_str(" unapproved generation"),
+                1 => custom.max_candidates = 3,
+                2 => custom.max_rounds = 3,
+                _ => custom.require_counterexample = false,
+            }
+            assert!(matches!(
+                require_builtin_parent_strategy(&custom),
+                Err(Error::Forbidden)
+            ));
+            assert!(matches!(
+                require_resolved_strategy(&custom, &default),
+                Err(Error::Forbidden)
+            ));
+            // The actual parent is checked separately before it can supply any
+            // new request, even when the requested new output is the default.
         }
     }
 }

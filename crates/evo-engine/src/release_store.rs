@@ -252,6 +252,7 @@ impl ReleaseStore {
         validate_digest(&candidate.parent_digest, "parent digest")?;
         validate_digest(&candidate.bundle.baseline_digest, "baseline digest")?;
         validate_resolved_bundle_identity(&candidate.bundle)?;
+        crate::formal_authority::require_builtin_parent_strategy(&candidate.bundle.improver)?;
         candidate.bundle.skill.validate()?;
         if canonical_sources(candidate.sources.clone())? != candidate.sources {
             return Err(Error::Invalid("noncanonical review sources".into()));
@@ -1047,6 +1048,7 @@ fn validate_stage_request(ctx: &Context, request: &StageBundleRequest) -> Result
     }
     validate_digest(&request.environment_digest, "environment_digest")?;
     validate_resolved_bundle_identity(&request.bundle)?;
+    crate::formal_authority::require_builtin_parent_strategy(&request.bundle.improver)?;
     if request.sources.is_empty() {
         return Err(Error::Invalid(
             "release candidate requires source closure".into(),
@@ -1115,6 +1117,7 @@ pub(crate) async fn validate_candidate_read_in_session(
     validate_digest(&candidate.bundle_digest, "bundle_digest")?;
     validate_digest(&candidate.parent_digest, "parent_digest")?;
     validate_resolved_bundle_identity(&candidate.bundle)?;
+    crate::formal_authority::require_builtin_parent_strategy(&candidate.bundle.improver)?;
     if candidate.bundle_digest != candidate.bundle.digest
         || candidate.profile_id != candidate.bundle.profile_id
         || candidate.parent_digest != candidate.bundle.parent_digest
