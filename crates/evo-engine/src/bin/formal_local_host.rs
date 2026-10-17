@@ -21,7 +21,7 @@ enum Command {
         input: String,
     },
     /// Run as the registered grader OS user in its private registered workspace.
-    /// The finite socket ingress authenticates independent Admin/Worker peers.
+    /// The finite socket ingress authenticates Admin/Evaluator/Worker peers.
     Authority {
         database: String,
         host: Box<evo_engine::formal_authority::RegisteredFormalHost>,
