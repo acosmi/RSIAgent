@@ -17,6 +17,7 @@ pub mod improver;
 pub mod management_registry;
 pub mod model_protocol;
 pub mod optimization;
+pub mod prepare_contract;
 pub mod replay;
 pub mod replay_economics;
 pub mod sequential;
