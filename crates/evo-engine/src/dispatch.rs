@@ -855,6 +855,23 @@ struct JobOutcome {
     error_code: Option<String>,
 }
 
+impl JobOutcome {
+    fn has_committed_side_effect(&self) -> bool {
+        // These private returned variants follow the consumer's actual commit.
+        // A read-only result or an absent result does not establish a commit.
+        match self.result.as_ref() {
+            Some(
+                ManagementResult::ExperimentRegistered { .. }
+                | ManagementResult::EvaluationTicketBlocked { .. }
+                | ManagementResult::ReplayStored { .. }
+                | ManagementResult::ProbeScheduled { .. }
+                | ManagementResult::ExplorationStarted { .. },
+            ) => true,
+            Some(ManagementResult::EvaluationStatus { .. }) | None => false,
+        }
+    }
+}
+
 async fn execute_request(
     ctx: &Context,
     store: &Store,
@@ -1334,7 +1351,9 @@ async fn finish_claim(
         return Ok(());
     }
     ensure_fence(&current, claimed)?;
-    if current.cancel_requested {
+    let cancelled_after_side_effect =
+        current.cancel_requested && outcome.has_committed_side_effect();
+    if current.cancel_requested && !cancelled_after_side_effect {
         current.state = ManagementJobState::Cancelled;
         current.step = "cancelled".into();
         current.result = None;
@@ -1342,6 +1361,9 @@ async fn finish_claim(
     } else {
         current.state = outcome.state;
         current.step = outcome.step;
+        if cancelled_after_side_effect {
+            current.step.push_str(":cancel_after_side_effect");
+        }
         current.result = outcome.result;
         current.error_code = outcome.error_code;
     }
@@ -1932,3 +1954,7 @@ print(json.dumps(result,sort_keys=True))
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dispatch_late_cancel_tests.rs"]
+mod late_cancel_tests;
