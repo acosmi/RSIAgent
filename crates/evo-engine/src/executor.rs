@@ -202,17 +202,21 @@ impl RootBudget {
         ))
     }
 
+    /// Cancel without refunding paid usage or releasing dispatched reservations.
     pub fn cancel(&mut self, token: &str, now: i64) -> Result<()> {
         self.fence(token, now)?;
         match self.phase {
-            BudgetPhase::Reserved | BudgetPhase::Dispatched => {
+            BudgetPhase::Reserved => {
+                self.reserved = 0;
                 self.phase = BudgetPhase::Cancelled;
                 Ok(())
             }
-            BudgetPhase::Uncertain => Err(Error::Conflict(
-                "uncertain bills stay for manual reconcile".into(),
-            )),
-            _ => Err(Error::Conflict("budget not cancellable".into())),
+            BudgetPhase::Dispatched => {
+                self.phase = BudgetPhase::Uncertain;
+                Ok(())
+            }
+            BudgetPhase::Cancelled | BudgetPhase::Uncertain => Ok(()),
+            BudgetPhase::Finalized => Err(Error::Conflict("budget not cancellable".into())),
         }
     }
 
