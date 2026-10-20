@@ -174,7 +174,7 @@ fn validate_project_license(value: &Value, root: &Path) -> Result<(), String> {
     if evo_core::hash(&body) != REVIEWED_SHA {
         return Err("project LICENSE differs from the reviewed text".into());
     }
-    let output = std::process::Command::new("python3.12")
+    let output = std::process::Command::new("python3")
         .arg(root.join("scripts/check_support_scope.py"))
         .arg("--repo-root")
         .arg(root)
@@ -349,24 +349,74 @@ fn valid_ident(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-fn package_is_declared(root: &Path, package: &str) -> Result<(), String> {
-    if !valid_ident(package) {
-        return Err("cargo package name is invalid".into());
+/// Reuse the reviewed stdlib TOML reader in isolated metadata-only mode. The code
+/// path is this checkout's checker, never a helper supplied by the inspected root.
+/// Python >=3.11 and this shared-parser contract remain subject to second acceptance.
+fn workspace_packages(root: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
+    let checker_root = repo_root()
+        .canonicalize()
+        .map_err(|error| format!("cannot locate workspace checker: {error}"))?;
+    validate_repo_file(
+        &checker_root,
+        "scripts/check_support_scope.py",
+        "workspace metadata checker",
+    )?;
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-B"])
+        .arg(checker_root.join("scripts/check_support_scope.py"))
+        .arg("--repo-root")
+        .arg(root)
+        .arg("--workspace-packages-only")
+        .current_dir(&checker_root)
+        .output()
+        .map_err(|error| format!("cannot read workspace packages: {error}"))?;
+    if !output.status.success() {
+        return Err("read-only workspace package check failed".into());
     }
-    let manifest_path = root.join("crates").join(package).join("Cargo.toml");
-    let body = std::fs::read_to_string(&manifest_path)
-        .map_err(|_| format!("cargo package {package} is not a declared crate"))?;
-    let compact: String = body
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect();
-    if !compact.contains(&format!("name=\"{package}\"")) {
-        return Err(format!("Cargo.toml does not declare package {package}"));
-    }
-    Ok(())
+    let raw = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "workspace package metadata is not UTF-8")?;
+    decode_workspace_packages(raw, root)
 }
 
-fn resolve_test_command(root: &Path, command: &str) -> Result<PathBuf, String> {
+fn decode_workspace_packages(raw: &str, root: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
+    let value = load_json_strict(raw)?;
+    let object = value
+        .as_object()
+        .filter(|value| !value.is_empty())
+        .ok_or("workspace package metadata must be a nonempty object")?;
+    let mut packages = BTreeMap::new();
+    let mut members = BTreeSet::new();
+    for (name, member) in object {
+        if !valid_ident(name) {
+            return Err("workspace package metadata has an invalid package name".into());
+        }
+        let relative = nonempty_string(member, "workspace member")?;
+        if relative.contains('\\')
+            || relative
+                .split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        {
+            return Err("workspace package metadata has a non-normal member".into());
+        }
+        let member = safe_relative(relative, "workspace member")?;
+        validate_repo_file(root, &format!("{relative}/Cargo.toml"), "member Cargo.toml")?;
+        if !members.insert(member.clone()) || packages.insert(name.clone(), member).is_some() {
+            return Err("workspace package metadata has a duplicate member/package".into());
+        }
+    }
+    Ok(packages)
+}
+
+struct ResolvedTestCommand {
+    target: PathBuf,
+    member: PathBuf,
+}
+
+fn resolve_test_command(
+    root: &Path,
+    command: &str,
+    packages: &BTreeMap<String, PathBuf>,
+) -> Result<ResolvedTestCommand, String> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     if tokens.len() != 8
         || tokens[0] != "cargo"
@@ -378,16 +428,22 @@ fn resolve_test_command(root: &Path, command: &str) -> Result<PathBuf, String> {
         return Err("command must use the finite cargo test grammar".into());
     }
     let package = tokens[5];
-    package_is_declared(root, package)?;
+    let member = packages
+        .get(package)
+        .ok_or_else(|| format!("cargo package {package} is not a declared workspace member"))?
+        .clone();
     match tokens[6] {
         "--test" => {
             let target = tokens[7];
             if !valid_ident(target) {
                 return Err("integration test target is invalid".into());
             }
-            let path = PathBuf::from(format!("crates/{package}/tests/{target}.rs"));
+            let path = member.join("tests").join(format!("{target}.rs"));
             validate_repo_file(root, path.to_str().unwrap(), "test command target")?;
-            Ok(path)
+            Ok(ResolvedTestCommand {
+                target: path,
+                member,
+            })
         }
         "--lib" => {
             let filter = tokens[7];
@@ -398,18 +454,20 @@ fn resolve_test_command(root: &Path, command: &str) -> Result<PathBuf, String> {
                 return Err("--lib module filter is invalid".into());
             }
             let first = module.split("::").next().unwrap();
-            let lib = root.join("crates").join(package).join("src/lib.rs");
+            let lib = root.join(&member).join("src/lib.rs");
             let lib_body = std::fs::read_to_string(&lib)
                 .map_err(|_| format!("package {package} has no readable src/lib.rs"))?;
             if !lib_body.contains(&format!("mod {first};")) {
                 return Err(format!("module {first} is not declared by {package}"));
             }
-            let path = PathBuf::from(format!(
-                "crates/{package}/src/{}.rs",
-                module.replace("::", "/")
-            ));
+            let path = member
+                .join("src")
+                .join(format!("{}.rs", module.replace("::", "/")));
             validate_repo_file(root, path.to_str().unwrap(), "test command target")?;
-            Ok(path)
+            Ok(ResolvedTestCommand {
+                target: path,
+                member,
+            })
         }
         _ => Err("command must contain exactly one --test or --lib target".into()),
     }
@@ -605,8 +663,64 @@ fn validate_production_consumer(id: &str, record: &Value) -> Result<(), String> 
     }
 }
 
-fn validate_evidence_record(record: &Value, task: &str, root: &Path) -> Result<String, String> {
+fn validate_evidence_namespace(id: &str, task: &str) -> Result<(), String> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(format!("{task} evidence id is invalid"));
+    }
+    let owner = expected_e_ids()
+        .into_iter()
+        .filter(|candidate| {
+            id.strip_prefix(candidate.as_str())
+                .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+        .max_by_key(String::len);
+    if owner.as_deref() != Some(task) {
+        return Err(format!(
+            "{task} evidence id {id} is not namespaced under its own task"
+        ));
+    }
+    Ok(())
+}
+
+fn test_entry_belongs_to_task(entry: &str, member: &Path, files: &[Value]) -> bool {
+    files.iter().any(|file| {
+        file.as_str()
+            .is_some_and(|file| file == entry || Path::new(file).starts_with(member))
+    })
+}
+
+fn validate_evidence_refs(
+    value: &Value,
+    field: &str,
+    tasks: &BTreeSet<String>,
+    owners: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    for reference in string_set(value, field)? {
+        let owner = owners
+            .get(&reference)
+            .ok_or_else(|| format!("{field} references unknown evidence {reference}"))?;
+        if !tasks.contains(owner) {
+            return Err(format!(
+                "{field} references evidence {reference} owned by unrelated task {owner}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_evidence_record(
+    record: &Value,
+    task: &str,
+    root: &Path,
+    implementation_files: &[Value],
+    packages: &BTreeMap<String, PathBuf>,
+) -> Result<String, String> {
     let id = nonempty_string(&record["id"], &format!("{task} evidence id"))?;
+    validate_evidence_namespace(id, task)?;
     nonempty_string(&record["description"], &format!("{id} description"))?;
     let version = nonempty_string(&record["plan_version"], &format!("{id} plan_version"))?;
     let digest = nonempty_string(&record["plan_sha256"], &format!("{id} plan_sha256"))?;
@@ -649,6 +763,11 @@ fn validate_evidence_record(record: &Value, task: &str, root: &Path) -> Result<S
         .ok_or_else(|| format!("{id} has an invalid pull request URL"))?
         .parse::<u64>()
         .map_err(|_| format!("{id} has an invalid pull request number"))?;
+    if !record["merged_sha"].is_null() && record["merged_sha"] == record["source_sha"] {
+        return Err(format!(
+            "{id} merged_sha must differ from its own source_sha"
+        ));
+    }
     let expected_merge = expected_merge_for_pr(pr_number)?;
     match expected_merge {
         Some(expected) => {
@@ -680,11 +799,16 @@ fn validate_evidence_record(record: &Value, task: &str, root: &Path) -> Result<S
     let entry = nonempty_string(&record["test_entry"], &format!("{id} test_entry"))?;
     validate_repo_file(root, entry, &format!("{id} test_entry"))?;
     let command = nonempty_string(&record["command"], &format!("{id} command"))?;
-    let target = resolve_test_command(root, command)?;
-    if target.as_path() != Path::new(entry) {
+    let resolved = resolve_test_command(root, command, packages)?;
+    if resolved.target.as_path() != Path::new(entry) {
         return Err(format!(
             "{id} command target {} differs from test_entry {entry}",
-            target.display()
+            resolved.target.display()
+        ));
+    }
+    if !test_entry_belongs_to_task(entry, &resolved.member, implementation_files) {
+        return Err(format!(
+            "{id} test_entry is not part of the task's implementation crate/files"
         ));
     }
     validate_execution(id, record, pr_number)?;
@@ -692,7 +816,7 @@ fn validate_evidence_record(record: &Value, task: &str, root: &Path) -> Result<S
     Ok(id.to_string())
 }
 
-fn validate_e_scopes(value: &Value, root: &Path) -> Result<BTreeSet<String>, String> {
+fn validate_e_scopes(value: &Value, root: &Path) -> Result<BTreeMap<String, String>, String> {
     let object = value.as_object().ok_or("e_scopes must be an object")?;
     let actual: BTreeSet<String> = object.keys().cloned().collect();
     let expected = expected_e_ids();
@@ -704,7 +828,8 @@ fn validate_e_scopes(value: &Value, root: &Path) -> Result<BTreeSet<String>, Str
         ));
     }
     let expected_scenarios = expected_e_scenarios();
-    let mut evidence_ids = BTreeSet::new();
+    let mut evidence_ids = BTreeMap::new();
+    let packages = workspace_packages(root)?;
     for (task, entry) in object {
         nonempty_string(&entry["title"], &format!("{task} title"))?;
         let status = nonempty_string(&entry["status"], &format!("{task} status"))?;
@@ -757,8 +882,8 @@ fn validate_e_scopes(value: &Value, root: &Path) -> Result<BTreeSet<String>, Str
             return Err(format!("{task} verified status lacks execution evidence"));
         }
         for record in evidence {
-            let id = validate_evidence_record(record, task, root)?;
-            if !evidence_ids.insert(id.clone()) {
+            let id = validate_evidence_record(record, task, root, files, &packages)?;
+            if evidence_ids.insert(id.clone(), task.clone()).is_some() {
                 return Err(format!("duplicate evidence id {id}"));
             }
         }
@@ -909,7 +1034,7 @@ fn validate_commitments(
     e_ids: &BTreeSet<String>,
     v_ids: &BTreeSet<String>,
     so_ids: &BTreeSet<String>,
-    evidence_ids: &BTreeSet<String>,
+    evidence_ids: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     let array = value
         .as_array()
@@ -991,13 +1116,12 @@ fn validate_commitments(
             let artifact = nonempty_string(artifact, "local artifact")?;
             validate_repo_file(root, artifact, &format!("{} local artifact", expected.id))?;
         }
-        let refs = string_set(
+        validate_evidence_refs(
             &entry["related_evidence_refs"],
             &format!("{} related_evidence_refs", expected.id),
+            &tasks,
+            evidence_ids,
         )?;
-        if !refs.is_subset(evidence_ids) {
-            return Err(format!("{} references unknown evidence", expected.id));
-        }
         nonempty_string(&entry["remaining"], &format!("{} remaining", expected.id))?;
     }
     Ok(())
@@ -1155,6 +1279,7 @@ fn validate_so_sources(
     value: &Value,
     root: &Path,
     e_ids: &BTreeSet<String>,
+    evidence_ids: &BTreeMap<String, String>,
 ) -> Result<BTreeSet<String>, String> {
     let array = value.as_array().ok_or("so_sources must be an array")?;
     let mut by_id = BTreeMap::new();
@@ -1192,6 +1317,14 @@ fn validate_so_sources(
                 "{} task mapping differs from plan {PLAN_VERSION}",
                 expected.id
             ));
+        }
+        if let Some(refs) = entry.get("verification_evidence_refs") {
+            validate_evidence_refs(
+                refs,
+                &format!("{} verification_evidence_refs", expected.id),
+                &tasks,
+                evidence_ids,
+            )?;
         }
         if entry["local_use"]["mode"] != "reference_only_no_upstream_runtime_import" {
             return Err(format!(
@@ -1233,7 +1366,7 @@ fn expected_v_to_e() -> BTreeMap<String, BTreeSet<String>> {
 
 fn validate_v_scenarios(
     value: &Value,
-    evidence_ids: &BTreeSet<String>,
+    evidence_ids: &BTreeMap<String, String>,
 ) -> Result<BTreeSet<String>, String> {
     let array = value.as_array().ok_or("v_scenarios must be an array")?;
     let mut by_id = BTreeMap::new();
@@ -1266,13 +1399,12 @@ fn validate_v_scenarios(
                 "{id} E responsibility mapping differs from plan {PLAN_VERSION}"
             ));
         }
-        let refs = string_set(
+        validate_evidence_refs(
             &entry["related_evidence_refs"],
             &format!("{id} evidence refs"),
+            &tasks,
+            evidence_ids,
         )?;
-        if !refs.is_subset(evidence_ids) {
-            return Err(format!("{id} references unknown evidence"));
-        }
         nonempty_string(&entry["remaining"], &format!("{id} remaining"))?;
     }
     Ok(actual_ids)
@@ -1419,7 +1551,12 @@ fn validate_manifest(value: &Value, root: &Path) -> Result<(), String> {
     validate_trace_index_coverage(&value["trace_index_coverage"])?;
     let evidence_ids = validate_e_scopes(&value["e_scopes"], root)?;
     let e_ids = expected_e_ids();
-    let so_ids = validate_so_sources(&value["traceability"]["so_sources"], root, &e_ids)?;
+    let so_ids = validate_so_sources(
+        &value["traceability"]["so_sources"],
+        root,
+        &e_ids,
+        &evidence_ids,
+    )?;
     let v_ids = validate_v_scenarios(&value["traceability"]["v_scenarios"], &evidence_ids)?;
     validate_commitments(
         "B",
@@ -2172,4 +2309,302 @@ fn project_license_raw_json_rejects_duplicates_at_every_depth() {
         load_json_strict(r#"{"scalars":[true,null,-1,2,0.5,"text"]}"#).unwrap(),
         serde_json::json!({"scalars":[true,null,-1,2,0.5,"text"]})
     );
+}
+
+#[test]
+fn support_evidence_rejects_own_merge_even_with_reviewed_pr_metadata() {
+    let root = repo_root();
+    let mut value = load_manifest(&root);
+    validate_manifest(&value, &root).unwrap();
+    let record = &mut value["e_scopes"]["E01"]["verified_subscopes"][0];
+    record["source_sha"] = record["merged_sha"].clone();
+    let error = validate_manifest(&value, &root).unwrap_err();
+    assert!(
+        error.contains("must differ from its own source_sha"),
+        "{error}"
+    );
+}
+
+#[test]
+fn support_evidence_namespace_uses_the_longest_registered_task() {
+    for (id, task) in [
+        ("E01.real_record", "E01"),
+        ("E16.real_record", "E16"),
+        ("E16.5.real_record", "E16.5"),
+    ] {
+        validate_evidence_namespace(id, task).unwrap();
+    }
+    for (id, task) in [
+        ("E16.5.borrowed", "E16"),
+        ("E01.borrowed", "E02"),
+        ("E160.borrowed", "E16"),
+        ("E01.bad/name", "E01"),
+        ("E01.é", "E01"),
+    ] {
+        assert!(
+            validate_evidence_namespace(id, task).is_err(),
+            "accepted {id} for {task}"
+        );
+    }
+}
+
+#[test]
+fn support_trace_groups_reject_known_evidence_from_an_unmapped_task() {
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    validate_manifest(&baseline, &root).unwrap();
+    for group in [
+        "v_scenarios",
+        "b_commitments",
+        "u_commitments",
+        "k_commitments",
+        "so_sources",
+    ] {
+        let mut value = baseline.clone();
+        let entry = value["traceability"][group]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| {
+                !entry["e_tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|task| task == "E01")
+            })
+            .expect("a real mapping outside E01");
+        let field = if group == "so_sources" {
+            "verification_evidence_refs"
+        } else {
+            "related_evidence_refs"
+        };
+        if entry.get(field).is_none() {
+            entry[field] = serde_json::json!([]);
+        }
+        entry[field]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("E01.controller_acceptance"));
+        let error = validate_manifest(&value, &root).unwrap_err();
+        assert!(
+            error.contains("owned by unrelated task E01"),
+            "{group}: {error}"
+        );
+    }
+}
+
+#[test]
+fn support_evidence_refs_require_unique_known_owners_and_allow_empty_so() {
+    let root = repo_root();
+    let mut value = load_manifest(&root);
+    for entry in value["traceability"]["so_sources"].as_array_mut().unwrap() {
+        entry["verification_evidence_refs"] = serde_json::json!([]);
+    }
+    validate_manifest(&value, &root).unwrap();
+    let owners = validate_e_scopes(&value["e_scopes"], &root).unwrap();
+    let tasks = split_set("E01");
+    validate_evidence_refs(
+        &serde_json::json!(["E01.controller_acceptance"]),
+        "refs",
+        &tasks,
+        &owners,
+    )
+    .unwrap();
+    for bad in [
+        serde_json::json!(["E01.missing"]),
+        serde_json::json!(["E01.controller_acceptance", "E01.controller_acceptance"]),
+    ] {
+        assert!(validate_evidence_refs(&bad, "refs", &tasks, &owners).is_err());
+    }
+}
+
+#[test]
+fn support_test_entry_ownership_is_independent_of_evidence_namespace() {
+    let root = repo_root();
+    let mut value = load_manifest(&root);
+    validate_manifest(&value, &root).unwrap();
+    let other = value["e_scopes"]["E03"]["verified_subscopes"][0].clone();
+    let record = &mut value["e_scopes"]["E01"]["verified_subscopes"][0];
+    record["test_entry"] = other["test_entry"].clone();
+    record["command"] = other["command"].clone();
+    let error = validate_manifest(&value, &root).unwrap_err();
+    assert!(
+        error.contains("not part of the task's implementation crate/files"),
+        "{error}"
+    );
+    let entry = "crates/evo-core/tests/evaluation_v41.rs";
+    assert!(test_entry_belongs_to_task(
+        entry,
+        Path::new("crates/evo-core"),
+        &[serde_json::json!(entry)]
+    ));
+    assert!(test_entry_belongs_to_task(
+        entry,
+        Path::new("crates/evo-core"),
+        &[serde_json::json!("crates/evo-core/src/holdout.rs")]
+    ));
+    assert!(!test_entry_belongs_to_task(
+        entry,
+        Path::new("crates/evo-core"),
+        &[serde_json::json!("crates/evo-core-extra/src/holdout.rs")]
+    ));
+}
+
+struct WorkspaceMapFixture {
+    root: PathBuf,
+}
+
+impl WorkspaceMapFixture {
+    fn new() -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rsia-support-workspace-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        Self { root }
+    }
+
+    fn write(&self, relative: &str, body: &str) {
+        let path = self.root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn member(&self, path: &str, name: &str) {
+        self.write(
+            &format!("{path}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\n"),
+        );
+        self.write(&format!("{path}/tests/target.rs"), "// fixture target\n");
+    }
+}
+
+impl Drop for WorkspaceMapFixture {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.root).unwrap();
+    }
+}
+
+#[test]
+fn workspace_mapping_uses_declared_member_not_package_directory_guess() {
+    let fixture = WorkspaceMapFixture::new();
+    fixture.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"components/core-implementation\"]\n",
+    );
+    fixture.member("components/core-implementation", "evo-core");
+    fixture.write(
+        "components/core-implementation/src/lib.rs",
+        "pub mod evaluator;\n",
+    );
+    fixture.write(
+        "components/core-implementation/src/evaluator.rs",
+        "// module fixture\n",
+    );
+    // Inspected data must never supply the executable metadata helper.
+    fixture.write(
+        "scripts/check_support_scope.py",
+        "raise AssertionError('untrusted fixture helper')\n",
+    );
+    let packages = workspace_packages(&fixture.root).unwrap();
+    assert_eq!(
+        packages["evo-core"],
+        Path::new("components/core-implementation")
+    );
+    for (command, expected) in [
+        (
+            "cargo test --locked --offline -p evo-core --test target",
+            "components/core-implementation/tests/target.rs",
+        ),
+        (
+            "cargo test --locked --offline -p evo-core --lib evaluator::tests",
+            "components/core-implementation/src/evaluator.rs",
+        ),
+    ] {
+        let resolved = resolve_test_command(&fixture.root, command, &packages).unwrap();
+        assert_eq!(resolved.target, Path::new(expected));
+        assert!(test_entry_belongs_to_task(
+            expected,
+            &resolved.member,
+            &[serde_json::json!(
+                "components/core-implementation/src/lib.rs"
+            )]
+        ));
+        assert!(!test_entry_belongs_to_task(
+            expected,
+            &resolved.member,
+            &[serde_json::json!(
+                "components/core-implementation-extra/src/lib.rs"
+            )]
+        ));
+    }
+}
+
+#[test]
+fn workspace_mapping_rejects_undeclared_package_with_real_old_directory() {
+    let fixture = WorkspaceMapFixture::new();
+    fixture.member("crates/evo-core", "evo-core");
+    fixture.member("components/other", "other");
+    fixture.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/evo-core\"]\n",
+    );
+    let command = "cargo test --locked --offline -p evo-core --test target";
+    resolve_test_command(
+        &fixture.root,
+        command,
+        &workspace_packages(&fixture.root).unwrap(),
+    )
+    .unwrap();
+    fixture.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"components/other\"]\n",
+    );
+    let error = resolve_test_command(
+        &fixture.root,
+        command,
+        &workspace_packages(&fixture.root).unwrap(),
+    )
+    .err()
+    .expect("an undeclared real directory was borrowed");
+    assert!(error.contains("not a declared workspace member"), "{error}");
+}
+
+#[test]
+fn workspace_mapping_rejects_duplicate_ambiguous_or_escaping_metadata() {
+    let fixture = WorkspaceMapFixture::new();
+    fixture.member("components/one", "evo-core");
+    fixture.member("components/two", "evo-core");
+    for members in [
+        "[\"components/one\", \"components/one\"]",
+        "[\"components/one\", \"components/two\"]",
+        "[\"../outside\"]",
+        "[\"components/*\"]",
+    ] {
+        fixture.write("Cargo.toml", &format!("[workspace]\nmembers = {members}\n"));
+        assert!(
+            workspace_packages(&fixture.root).is_err(),
+            "accepted {members}"
+        );
+    }
+    for raw in [
+        r#"{}"#,
+        r#"[]"#,
+        r#"{"evo-core":1}"#,
+        r#"{"evo-core":"components/one","evo-core":"components/one"}"#,
+        r#"{"evo-core":"components/one","other":"components/one"}"#,
+        r#"{"evo-core":"../outside"}"#,
+        r#"{"evo-core":"/outside"}"#,
+        r#"{"evo-core":"components//one"}"#,
+        r#"{"unknown":null}"#,
+    ] {
+        assert!(
+            decode_workspace_packages(raw, &fixture.root).is_err(),
+            "accepted {raw}"
+        );
+    }
 }
