@@ -38,9 +38,9 @@ def _valid_execution(**overrides) -> dict:
     return execution
 
 def _fresh_record(base: dict, task: str, name: str, stem: str) -> dict:
-    """Copy an existing record but give it its own id, PR, source, log, input and record_source."""
+    """Give a known-PR record its own evidence identity, source and local artifacts."""
     record = copy.deepcopy(base)
-    record.pop("pr_state", None)  # a fresh unmerged record starts without a recorded PR state
+    record.pop("pr_state", None)  # retain the reviewed PR/merge, without adding a state claim
     record.pop("plan_recheck", None)  # a record registered after the switch is verified against the current plan
     record.update(
         {
@@ -48,13 +48,11 @@ def _fresh_record(base: dict, task: str, name: str, stem: str) -> dict:
             "plan_version": css.PLAN_VERSION,
             "plan_sha256": css.PLAN_SHA256,
             "source_sha": hashlib.sha1(f"{task}.{name}".encode()).hexdigest(),
-            "pr": "https://github.com/acosmi/RSIAgent/pull/999",
-            "merged_sha": None,
             "log_path": f"out/fixture/{stem}.log",
             "input_ref": f"out/fixture/{stem}-input.json",
             "input_digest": hashlib.sha256(stem.encode()).hexdigest(),
             "record_source": f"out/fixture/{stem}-acceptance.json",
-            "execution": _valid_execution(),  # PR 999 is above #141, so the record must say what was literally run
+            "execution": _valid_execution(),  # retain an explicit literal execution record
         }
     )
     return record
@@ -87,6 +85,8 @@ class FixtureRepo:
             name = member.rsplit("/", 1)[1]
             _write(root / member / "Cargo.toml", f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2024"\nlicense-file.workspace = true\npublish.workspace = true\n')
             _write(root / member / "src/lib.rs", "pub mod evaluator;\npub mod hosts;\n")
+        # Runtime validation uses the same actual Rust fact table, never a Python copy.
+        _write(root / "crates/evo-core/tests/support_scope.rs", (REAL_ROOT / "crates/evo-core/tests/support_scope.rs").read_text(encoding="utf-8"))
         self.write_manifest(self.manifest)
     def write_manifest(self, manifest: dict, rel: str = "reports/support-scope.json") -> None:
         _write(self.root / rel, json.dumps(manifest, ensure_ascii=False, indent=2))
@@ -180,16 +180,14 @@ class ValidManifestTests(unittest.TestCase):
                 {
                     "id": "E03.future_controller_subscope",
                     "source_sha": "a" * 40,
-                    "pr": "https://github.com/acosmi/RSIAgent/pull/999",
-                    "merged_sha": None,
-                    "pr_state": "draft",
+                    "pr_state": "merged",
                     "input_ref": "out/future/input.json",
                     "input_digest": hashlib.sha256(input_bytes).hexdigest(),
                     "log_path": "out/future/test.log",
                     "record_source": "out/future/acceptance.json",
                     "actual_result": "fixture record exercises schema extensibility",
                     "scope": "synthetic structural fixture only",
-                    "execution": _valid_execution(evidence="out/future/test.log"),  # PR 999 is above #141
+                    "execution": _valid_execution(evidence="out/future/test.log"),
                 }
             )
             manifest["e_scopes"]["E03"]["verified_subscopes"].append(new_record)
@@ -585,13 +583,14 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
             errors = self._errors(manifest)
             self.assertIn("merged_sha must be null or lowercase 40-hex", errors[0])
 
-    def test_unverifiable_merged_sha_claim_is_named_in_needs_verification(self):
-        """A fabricated merged_sha that collides with nothing in the manifest cannot be refuted without git
-        ancestry (no subprocess allowed); the checker must at least name the claim as unverified."""
+    def test_unreviewed_merged_sha_is_rejected_but_reviewed_claim_stays_unverified(self):
+        """Static fact agreement is required; it still does not prove git ancestry."""
         manifest = _valid_manifest_dict()
         record = manifest["e_scopes"]["E16.4"]["verified_subscopes"][0]
         record.pop("pr_state")
         record["merged_sha"] = hashlib.sha1(b"fabricated merge of pr47").hexdigest()
+        self.assertIn("differs from the reviewed PR merge", self._errors(manifest)[0])
+        record["merged_sha"] = css.reviewed_merge_facts(REAL_ROOT)[int(record["pr"].rsplit("/", 1)[1])]
         report = self._assert_valid(manifest)
         self.assertTrue(
             any(
@@ -612,7 +611,7 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
             {
                 "test_entry": "crates/evo-engine/tests/meta.rs",
                 "command": "cargo test --locked --offline -p evo-engine --test meta",
-                "pr_state": "open",
+                "pr_state": "merged",
             }
         )
         e15["verified_subscopes"].append(record)
@@ -844,12 +843,13 @@ class HonestMachineFieldTests(unittest.TestCase):
         self.assertTrue(report.structure_valid, report.errors)
         return report
 
-    def _with_fresh_record(self, pr: int = 142, **overrides) -> tuple[dict, dict]:
-        """The real manifest plus one fresh unmerged E13 record of the given PR number (the record object is shared with the manifest)."""
+    def _with_fresh_record(self, pr: int = 144, **overrides) -> tuple[dict, dict]:
+        """A fresh E13 evidence identity for a reviewed PR (unknown PRs stay rejection fixtures)."""
         manifest = _valid_manifest_dict()
         e13 = manifest["e_scopes"]["E13"]
         record = _fresh_record(e13["verified_subscopes"][0], "E13", "ag102_fixture", "e13-ag102")
         record["pr"] = f"https://github.com/acosmi/RSIAgent/pull/{pr}"
+        record["merged_sha"] = css.reviewed_merge_facts(REAL_ROOT).get(pr)
         record.update(overrides)
         e13["verified_subscopes"].append(record)
         return manifest, record
@@ -921,23 +921,24 @@ class HonestMachineFieldTests(unittest.TestCase):
 
     def test_execution_stays_optional_up_to_pr_141(self):
         self.assertEqual(css.EXECUTION_REQUIRED_ABOVE_PR, 141)
-        manifest, record = self._with_fresh_record(141)
+        css.validate_execution({}, "E13.boundary_only", 141)  # unit boundary, no manifest/PR acceptance claim
+        manifest, record = self._with_fresh_record(140)
         del record["execution"]
         self._assert_valid(manifest)
 
     def test_older_record_with_a_malformed_execution_is_still_rejected(self):
-        manifest, record = self._with_fresh_record(141, execution=_valid_execution(exit_code="0"))
+        manifest, record = self._with_fresh_record(140, execution=_valid_execution(exit_code="0"))
         self.assertIn(f"{record['id']} execution: exit_code must be the integer exit code of the executed command", self._errors(manifest)[0])
 
     def test_valid_record_above_pr_141_with_execution_passes(self):
-        manifest, record = self._with_fresh_record(142)
+        manifest, record = self._with_fresh_record(144)
         self.assertEqual(record["execution"], _valid_execution())
         self.assertGreater(int(record["pr"].rsplit("/", 1)[1]), css.EXECUTION_REQUIRED_ABOVE_PR)
         self._assert_valid(manifest)
         for runner in sorted(css.EXECUTION_RUNNERS):
             for scope in sorted(css.EXECUTION_SCOPES):
                 with self.subTest(runner=runner, scope=scope):
-                    manifest, _ = self._with_fresh_record(142, execution=_valid_execution(runner=runner, scope=scope))
+                    manifest, _ = self._with_fresh_record(144, execution=_valid_execution(runner=runner, scope=scope))
                     self._assert_valid(manifest)
 
     def test_rejects_execution_command_that_copies_the_declared_target(self):
@@ -949,24 +950,24 @@ class HonestMachineFieldTests(unittest.TestCase):
         ]
         for command in copies:
             with self.subTest(command=command):
-                manifest, record = self._with_fresh_record(142, execution=_valid_execution(command=command))
+                manifest, record = self._with_fresh_record(144, execution=_valid_execution(command=command))
                 self.assertIn(f"{record['id']} execution: command must be the literally executed command", self._errors(manifest)[0])
         for command in ("cargom test --workspace --locked --no-fail-fast", "cargo test --locked -p evo-core --test evaluation_v41", "cargo test --workspace --locked"):
             with self.subTest(command=command):
-                manifest, _ = self._with_fresh_record(142, execution=_valid_execution(command=command))
+                manifest, _ = self._with_fresh_record(144, execution=_valid_execution(command=command))
                 self._assert_valid(manifest)
 
     def test_rejects_non_integer_execution_exit_code(self):
         for value in ("0", 0.0, 1.5, True, False, None, [], {}):
             with self.subTest(value=value):
-                manifest, record = self._with_fresh_record(142, execution=_valid_execution(exit_code=value))
+                manifest, record = self._with_fresh_record(144, execution=_valid_execution(exit_code=value))
                 self.assertIn(f"{record['id']} execution: exit_code must be the integer exit code of the executed command", self._errors(manifest)[0])
 
     def test_execution_exit_code_records_the_real_value_even_when_nonzero(self):
         """E00: real exit codes. A workspace run that also hits unrelated failing binaries exits nonzero; recording that must stay possible."""
         for code in (0, 1, 101, 134, -1):
             with self.subTest(exit_code=code):
-                manifest, _ = self._with_fresh_record(142, execution=_valid_execution(exit_code=code))
+                manifest, _ = self._with_fresh_record(144, execution=_valid_execution(exit_code=code))
                 self._assert_valid(manifest)
 
     def test_rejects_malformed_execution_objects(self):
@@ -992,7 +993,7 @@ class HonestMachineFieldTests(unittest.TestCase):
             cases.append((f"missing {key}", {k: v for k, v in base.items() if k != key}, f": missing key(s) ['{key}']"))
         for name, execution, expected in cases:
             with self.subTest(case=name):
-                manifest, record = self._with_fresh_record(142, execution=execution)
+                manifest, record = self._with_fresh_record(144, execution=execution)
                 self.assertIn(f"{record['id']} execution{expected}", self._errors(manifest)[0])
 
     # production_consumer
@@ -1000,7 +1001,7 @@ class HonestMachineFieldTests(unittest.TestCase):
     def test_rejects_invalid_production_consumer(self):
         for value in ("yes", "library_only", "", "WIRED", None, True, 1, ["wired"], {}):
             with self.subTest(value=value):
-                manifest, record = self._with_fresh_record(142, production_consumer=value)
+                manifest, record = self._with_fresh_record(144, production_consumer=value)
                 self.assertIn(
                     f"{record['id']}: production_consumer must be one of ['none_library_only', 'wired'] when present",
                     self._errors(manifest)[0],
@@ -1010,9 +1011,9 @@ class HonestMachineFieldTests(unittest.TestCase):
         self.assertEqual(css.PRODUCTION_CONSUMER_VALUES, {"wired", "none_library_only"})
         for value in sorted(css.PRODUCTION_CONSUMER_VALUES):
             with self.subTest(value=value):
-                manifest, _ = self._with_fresh_record(142, production_consumer=value)
+                manifest, _ = self._with_fresh_record(144, production_consumer=value)
                 self._assert_valid(manifest)
-        manifest, record = self._with_fresh_record(142)
+        manifest, record = self._with_fresh_record(144)
         self.assertNotIn("production_consumer", record)
         self._assert_valid(manifest)
 
@@ -1292,6 +1293,257 @@ class RealRepositoryTests(unittest.TestCase):
         self.assertFalse(payload["plan_binding_available"])
         self.assertFalse(payload["input_binding_available"])
         self.assertEqual((payload["plan_version"], payload["plan_sha256"]), (css.PLAN_VERSION, css.PLAN_SHA256))
+
+
+class IndexOwnershipAndMergeFactsTests(unittest.TestCase):
+    def _report(self, manifest: dict) -> css.CheckReport:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            return css.run_check(repo.root, "reports/support-scope.json", None)
+
+    def test_runtime_reads_the_single_reviewed_rust_table(self):
+        facts = css.reviewed_merge_facts(REAL_ROOT)
+        self.assertEqual(len(facts), 118)
+        records = [record for scope in _valid_manifest_dict()["e_scopes"].values() for record in scope["verified_subscopes"]]
+        self.assertEqual(len(records), 98)
+        for record in records:
+            self.assertEqual(record["merged_sha"], facts[int(record["pr"].rsplit("/", 1)[1])])
+            self.assertNotEqual(record["source_sha"], record["merged_sha"])
+
+    def test_cli_rejects_missing_duplicate_or_unsupported_rust_fact_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp))
+            path = repo.root / "crates/evo-core/tests/support_scope.rs"
+            original = path.read_text(encoding="utf-8")
+            arm = next(line for line in original.splitlines() if "=> Some(" in line)
+            cases = {
+                "missing function": "fn other() {}\n",
+                "comment-only function": "/*\n" + original + "\n*/",
+                "raw-string-only function": 'const TABLE: &str = r####"\n' + original + '\n"####;\n',
+                "duplicate function": original + "\nfn expected_merge_for_pr() {}\n",
+                "duplicate arm": original.replace(arm, arm + "\n" + arm, 1),
+                "unknown arm": original.replace(arm, '        29 => derive_merge(),', 1),
+                "unknown fallback": original.replace('no reviewed merge status for PR {pr}', 'unknown PR {pr}', 1),
+                "empty table": original[:original.index("fn expected_merge_for_pr")] + "fn expected_merge_for_pr(pr: u64) -> Result<Option<&'static str>, String> {\n    Ok(match pr {\n        _ => return Err(format!(\"no reviewed merge status for PR {pr}\")),\n    })\n}\n",
+            }
+            for label, source in cases.items():
+                with self.subTest(case=label):
+                    path.write_text(source, encoding="utf-8")
+                    code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+                    self.assertEqual(code, 1)
+                    self.assertFalse(report["structure_valid"])
+                    self.assertTrue(any("reviewed merge facts" in error for error in report["errors"]), report)
+            path.unlink()
+            code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+            self.assertEqual(code, 1)
+            self.assertFalse(report["structure_valid"])
+
+    def test_self_merge_and_same_pr_shared_forgery_are_rejected(self):
+        manifest = _valid_manifest_dict()
+        record = manifest["e_scopes"]["E01"]["verified_subscopes"][0]
+        record["source_sha"] = record["merged_sha"]
+        report = self._report(manifest)
+        self.assertFalse(report.structure_valid)
+        self.assertIn("must differ from its own source_sha", report.errors[0])
+        manifest = _valid_manifest_dict()
+        record = manifest["e_scopes"]["E01"]["verified_subscopes"][0]
+        sibling = _fresh_record(record, "E01", "second_reviewed_target", "same-pr")
+        record["merged_sha"] = sibling["merged_sha"] = "a" * 40
+        manifest["e_scopes"]["E01"]["verified_subscopes"].append(sibling)
+        report = self._report(manifest)
+        self.assertFalse(report.structure_valid)
+        self.assertIn("differs from the reviewed PR merge", report.errors[0])
+
+    def test_unknown_pr_is_not_an_implicit_unmerged_fact(self):
+        manifest = _valid_manifest_dict()
+        record = _fresh_record(manifest["e_scopes"]["E03"]["verified_subscopes"][0], "E03", "unreviewed_pr", "unknown-pr")
+        record.update(pr="https://github.com/acosmi/RSIAgent/pull/999", merged_sha=None, pr_state="draft")
+        manifest["e_scopes"]["E03"]["verified_subscopes"].append(record)
+        report = self._report(manifest)
+        self.assertFalse(report.structure_valid)
+        self.assertIn("no reviewed merge status for PR 999", report.errors[0])
+        # Synthetic parser control only: None is legal solely when it has an explicit Rust arm.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            path = repo.root / "crates/evo-core/tests/support_scope.rs"
+            original = path.read_text(encoding="utf-8")
+            path.write_text(original.replace('        _ => return Err(format!("no reviewed merge status for PR {pr}")),', '        999 => None,\n        _ => return Err(format!("no reviewed merge status for PR {pr}")),', 1), encoding="utf-8")
+            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            self.assertTrue(report.structure_valid, report.errors)
+            record["merged_sha"] = "b" * 40
+            record["pr_state"] = "merged"
+            repo.write_manifest(manifest)
+            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            self.assertFalse(report.structure_valid)
+            self.assertIn("differs from the reviewed PR merge", report.errors[0])
+
+    def test_namespace_characters_and_e16_subtask_ownership_are_precise(self):
+        for task, identifier in [("E01", "E02.borrowed"), ("E01", "E01.bad/name"), ("E16.5", "E16.50.borrowed")]:
+            with self.subTest(task=task, identifier=identifier):
+                manifest = _valid_manifest_dict()
+                manifest["e_scopes"][task]["verified_subscopes"][0]["id"] = identifier
+                report = self._report(manifest)
+                self.assertFalse(report.structure_valid)
+                self.assertTrue("evidence id is invalid" in report.errors[0] or "not namespaced under its own task" in report.errors[0])
+        manifest = _valid_manifest_dict()
+        parent = manifest["e_scopes"]["E16"]
+        parent["status"] = "in_progress"
+        record = _fresh_record(manifest["e_scopes"]["E16.5"]["verified_subscopes"][0], "E16.5", "parent_borrow", "parent-borrow")
+        parent["verified_subscopes"].append(record)
+        report = self._report(manifest)
+        self.assertFalse(report.structure_valid)
+        self.assertIn("not namespaced under its own task", report.errors[0])
+
+    def test_all_trace_groups_enforce_evidence_owner_and_empty_so_is_healthy(self):
+        for group in ("v_scenarios", "b_commitments", "u_commitments", "k_commitments", "so_sources"):
+            with self.subTest(group=group):
+                manifest = _valid_manifest_dict()
+                entry = next(entry for entry in manifest["traceability"][group] if "E01" not in entry["e_tasks"])
+                field = "verification_evidence_refs" if group == "so_sources" else "related_evidence_refs"
+                entry.setdefault(field, []).append("E01.controller_acceptance")
+                report = self._report(manifest)
+                self.assertFalse(report.structure_valid)
+                self.assertIn("outside the mapped E scope", report.errors[0])
+        manifest = _valid_manifest_dict()
+        for entry in manifest["traceability"]["so_sources"]:
+            entry["verification_evidence_refs"] = []
+        report = self._report(manifest)
+        self.assertTrue(report.structure_valid, report.errors)
+
+    def test_test_entry_requires_its_own_task_crate_or_exact_file(self):
+        manifest = _valid_manifest_dict()
+        record = manifest["e_scopes"]["E01"]["verified_subscopes"][0]
+        other = manifest["e_scopes"]["E03"]["verified_subscopes"][0]
+        record.update(test_entry=other["test_entry"], command=other["command"])
+        report = self._report(manifest)
+        self.assertFalse(report.structure_valid)
+        self.assertIn("not among E01's declared implementation_files nor inside a crate they declare", report.errors[0])
+        for files in (["crates/evo-core/src/holdout.rs"], ["crates/evo-core/tests/another_target.rs"], ["crates/evo-core-extra/src/holdout.rs"]):
+            with self.subTest(files=files):
+                manifest = _valid_manifest_dict()
+                scope = manifest["e_scopes"]["E01"]
+                scope["implementation_files"] = files
+                record = scope["verified_subscopes"][0]
+                record.update(test_entry="crates/evo-core/tests/another_target.rs", command="cargo test --locked --offline -p evo-core --test another_target")
+                report = self._report(manifest)
+                self.assertEqual(report.structure_valid, not files[0].startswith("crates/evo-core-extra/"), report.errors)
+
+
+class SharedWorkspaceAndRawFunctionTests(unittest.TestCase):
+    def test_raw_fact_function_declarations_are_ambiguous_or_unsupported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp))
+            path = repo.root / "crates/evo-core/tests/support_scope.rs"
+            original = path.read_text(encoding="utf-8")
+            for label, source in (
+                ("ordinary plus raw", original + "\nfn r#expected_merge_for_pr() {}\n"),
+                ("raw only", original.replace("fn expected_merge_for_pr(", "fn r#expected_merge_for_pr(", 1)),
+            ):
+                with self.subTest(case=label):
+                    path.write_text(source, encoding="utf-8")
+                    code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+                    self.assertEqual(code, 1)
+                    self.assertFalse(report["structure_valid"])
+                    self.assertTrue(any("reviewed merge facts" in error for error in report["errors"]), report)
+            path.write_text(original + '\n// fn r#expected_merge_for_pr() {}\nconst DOC: &str = "fn r#expected_merge_for_pr() {}";\n', encoding="utf-8")
+            self.assertEqual(css.reviewed_merge_facts(repo.root), css.reviewed_merge_facts(REAL_ROOT))
+
+    def test_workspace_metadata_uses_actual_member_and_never_recurses_into_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            member = "components/core-implementation"
+            _write(root / "Cargo.toml", f'[workspace]\nmembers = ["{member}"]\n')
+            _write(root / member / "Cargo.toml", '[package]\nname = "evo-core"\n')
+            _write(root / member / "src/lib.rs", "pub mod evaluator;\n")
+            _write(root / member / "src/evaluator.rs")
+            _write(root / member / "tests/target.rs")
+            _write(root / "scripts/check_support_scope.py", "raise AssertionError('untrusted fixture helper')\n")
+            with mock.patch.object(css, "validate_manifest", side_effect=AssertionError("manifest recursion")), mock.patch.object(css, "reviewed_merge_facts", side_effect=AssertionError("fact recursion")):
+                code, mapping = _run_cli(["--repo-root", str(root), "--workspace-packages-only"])
+            self.assertEqual(code, 0)
+            self.assertEqual(mapping, {"evo-core": member})
+            packages = css.workspace_packages(root)
+            self.assertEqual(css.resolve_cargo_target(root, "cargo test --locked --offline -p evo-core --test target", packages), member + "/tests/target.rs")
+            self.assertEqual(css.resolve_cargo_target(root, "cargo test --locked --offline -p evo-core --lib evaluator::tests", packages), member + "/src/evaluator.rs")
+            # A conventional package directory remaining on disk is not a workspace declaration.
+            _write(root / "crates/evo-core/Cargo.toml", '[package]\nname = "evo-core"\n')
+            _write(root / "crates/evo-core/tests/target.rs")
+            _write(root / "other/Cargo.toml", '[package]\nname = "other"\n')
+            _write(root / "Cargo.toml", '[workspace]\nmembers = ["other"]\n')
+            with self.assertRaisesRegex(css.CheckerError, "undeclared workspace package"):
+                css.resolve_cargo_target(root, "cargo test --locked --offline -p evo-core --test target", css.workspace_packages(root))
+            for label, cargo in (
+                ("duplicate member", f'[workspace]\nmembers = ["{member}", "{member}"]\n'),
+                ("duplicate package", f'[workspace]\nmembers = ["{member}", "crates/evo-core"]\n'),
+                ("escape", '[workspace]\nmembers = ["../outside"]\n'),
+                ("glob", '[workspace]\nmembers = ["components/*"]\n'),
+                ("unknown workspace shape", 'workspace = []\n'),
+                ("unsupported members shape", '[workspace]\nmembers = "other"\n'),
+                ("duplicate TOML key", f'[workspace]\nmembers = ["{member}"]\nmembers = ["other"]\n'),
+            ):
+                with self.subTest(case=label):
+                    _write(root / "Cargo.toml", cargo)
+                    code, report = _run_cli(["--repo-root", str(root), "--workspace-packages-only"])
+                    self.assertEqual(code, 1)
+                    self.assertTrue(report["errors"])
+
+
+class CompleteFactFunctionDeclarationTests(unittest.TestCase):
+    def test_function_qualifiers_are_rejected_across_complete_item_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp))
+            path = repo.root / "crates/evo-core/tests/support_scope.rs"
+            original = path.read_text(encoding="utf-8")
+            declaration = "fn expected_merge_for_pr("
+            for prefix in (
+                "async ", "async\n", "pub ", "pub\n", "pub(crate)\n",
+                'unsafe extern "C" ', 'unsafe\nextern "C"\n', "const\n",
+                '#[cfg(any())]\n', 'async /* comment with fn and braces {} */\n',
+            ):
+                with self.subTest(prefix=prefix):
+                    path.write_text(original.replace(declaration, prefix + declaration, 1), encoding="utf-8")
+                    code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+                    self.assertEqual(code, 1)
+                    self.assertFalse(report["structure_valid"])
+                    self.assertTrue(any("ordinary private synchronous function" in error for error in report["errors"]), report)
+            # Trivia and a separate completed string-valued item are healthy.
+            trivia = '// async pub fn r#expected_merge_for_pr() {}\n/* unsafe extern "C"\nfn expected_merge_for_pr() {} */\n'
+            doc_item = 'const FACT_DOC: &str = r##"pub async fn expected_merge_for_pr() {}"##;\n'
+            for prefix in ("", trivia, doc_item + trivia):
+                with self.subTest(healthy_prefix=prefix):
+                    path.write_text(original.replace(declaration, prefix + declaration, 1), encoding="utf-8")
+                    self.assertEqual(css.reviewed_merge_facts(repo.root), css.reviewed_merge_facts(REAL_ROOT))
+
+
+class FactFunctionTokenTreeTests(unittest.TestCase):
+    def test_macro_token_trees_and_bad_delimiters_cannot_supply_fact_function(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp))
+            path = repo.root / "crates/evo-core/tests/support_scope.rs"
+            original = path.read_text(encoding="utf-8")
+            start = original.index("fn expected_merge_for_pr(")
+            end = original.index("\n}\n", start) + 2
+            function = original[start:end]
+            # This macro can discard all table tokens and generate a different function.
+            macro = "macro_rules! discard_table { ($name:ident; $($body:tt)*) => { fn $name(_: u64) -> Result<Option<&'static str>, String> { Ok(None) } }; }\n"
+            cases = [
+                macro + original.replace(function, "discard_table!(expected_merge_for_pr;\n" + function + "\n);", 1),
+                macro + original.replace(function, "discard_table![expected_merge_for_pr;\n" + function + "\n];", 1),
+                macro + original.replace(function, "discard_table!(expected_merge_for_pr; [({\n" + function + "\n})]);", 1),
+                "[)\n" + original,
+                original + "\n(",
+                original + "\n]",
+            ]
+            for index, source in enumerate(cases):
+                with self.subTest(case=index):
+                    path.write_text(source, encoding="utf-8")
+                    code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+                    self.assertEqual(code, 1)
+                    self.assertFalse(report["structure_valid"])
+                    self.assertTrue(any("top-level Rust function" in error or "delimiters" in error for error in report["errors"]), report)
+            prefix = 'const PREVIOUS_ITEM: [(); 1] = [()];\n// ([)]\nconst DELIMITER_DOC: &str = "([)]";\n'
+            path.write_text(original.replace(function, prefix + function, 1), encoding="utf-8")
+            self.assertEqual(css.reviewed_merge_facts(repo.root), css.reviewed_merge_facts(REAL_ROOT))
 
 if __name__ == "__main__":
     unittest.main()

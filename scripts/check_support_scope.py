@@ -315,12 +315,19 @@ def workspace_packages(repo_root: Path) -> dict[str, tuple[Path, dict[str, Any]]
         workspace = tomllib.loads(root_manifest.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise CheckerError(f"workspace Cargo.toml is invalid: {exc}") from exc
-    members = workspace.get("workspace", {}).get("members")
+    table = workspace.get("workspace")
+    if not isinstance(table, dict):
+        raise CheckerError("workspace Cargo.toml has no workspace table")
+    members = table.get("members")
     if not isinstance(members, list) or not members:
         raise CheckerError("workspace Cargo.toml has no explicit members")
     result = {}
+    seen_members = set()
     for member in members:
         rel = safe_relative(member, "workspace member")
+        if rel in seen_members:
+            raise CheckerError("workspace Cargo.toml has a duplicate member")
+        seen_members.add(rel)
         if any(char in rel for char in "*?["):
             raise CheckerError("workspace glob members are unsupported by this finite checker")
         cargo = inspect_relative(repo_root, f"{rel}/Cargo.toml", "member Cargo.toml", True)
@@ -328,7 +335,10 @@ def workspace_packages(repo_root: Path) -> dict[str, tuple[Path, dict[str, Any]]
             data = tomllib.loads(cargo.read_text(encoding="utf-8"))
         except (OSError, tomllib.TOMLDecodeError) as exc:
             raise CheckerError(f"invalid member Cargo.toml {rel}: {exc}") from exc
-        name = data.get("package", {}).get("name")
+        package = data.get("package")
+        if not isinstance(package, dict):
+            raise CheckerError(f"member Cargo.toml {rel} has no package table")
+        name = package.get("name")
         if not isinstance(name, str) or not IDENT_RE.fullmatch(name) or name in result:
             raise CheckerError(f"invalid or duplicate package name in {rel}")
         result[name] = (Path(rel), data)
@@ -430,6 +440,117 @@ def expected_v_to_e() -> dict[str, set[str]]:
 def evidence_expected_refs(e_tasks: set[str], evidence_by_task: dict[str, set[str]]) -> set[str]:
     return {item for task in e_tasks for item in evidence_by_task[task]}
 
+def _rust_code_mask(source: str) -> str:
+    """Keep code positions; comments/literals cannot impersonate the fact function."""
+    masked = list(source)
+    raw_literal = re.compile(r'(?:br|r)(#*)"')
+    char_literal = re.compile(r"'(?:[^\\'\n]|\\(?:[nrt0\\'\"]|x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}))'")
+    index = 0
+    while index < len(source):
+        end = index
+        if source.startswith("//", index):
+            end = source.find("\n", index)
+            end = len(source) if end < 0 else end
+        elif source.startswith("/*", index):
+            end, depth = index + 2, 1
+            while depth and end < len(source):
+                if source.startswith("/*", end):
+                    depth, end = depth + 1, end + 2
+                elif source.startswith("*/", end):
+                    depth, end = depth - 1, end + 2
+                else:
+                    end += 1
+            if depth:
+                raise CheckerError("reviewed merge facts contain an unterminated Rust comment")
+        else:
+            raw = raw_literal.match(source, index) if index == 0 or not (source[index - 1].isalnum() or source[index - 1] == "_") else None
+            if raw:
+                close = '"' + raw.group(1)
+                close_at = source.find(close, raw.end())
+                if close_at < 0:
+                    raise CheckerError("reviewed merge facts contain an unterminated Rust raw string")
+                end = close_at + len(close)
+            elif source[index] == '"':
+                end = index + 1
+                while end < len(source) and source[end] != '"':
+                    end += 2 if source[end] == "\\" else 1
+                if end >= len(source):
+                    raise CheckerError("reviewed merge facts contain an unterminated Rust string")
+                end += 1
+            elif source[index] == "'":
+                char = char_literal.match(source, index)
+                if char:
+                    end = char.end()
+        if end > index:
+            for position in range(index, end):
+                if masked[position] != "\n":
+                    masked[position] = " "
+            index = end
+        else:
+            index += 1
+    return "".join(masked)
+
+def reviewed_merge_facts(repo_root: Path) -> dict[int, str | None]:
+    """Read the Rust checker's single finite fact table, without executing Rust."""
+    path = inspect_relative(repo_root, "crates/evo-core/tests/support_scope.rs", "reviewed merge facts", True)
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise CheckerError(f"reviewed merge facts are unreadable: {exc}") from exc
+    # Any second declaration is ambiguous, even if it would be cfg-disabled.
+    code = _rust_code_mask(source)
+    declarations = list(re.finditer(r"\bfn\s+(?:r#)?expected_merge_for_pr\b", code))
+    if len(declarations) != 1:
+        raise CheckerError("reviewed merge facts require exactly one expected_merge_for_pr function")
+    start = declarations[0].start()
+    # A semicolon inside any token tree is not a top-level item boundary.
+    stack, item_start = [], 0
+    closers = {"}": "{", ")": "(", "]": "["}
+    for position, token in enumerate(code):
+        if position == start:
+            if stack:
+                raise CheckerError("reviewed merge facts require the top-level Rust function")
+            if code[item_start:start].strip():
+                raise CheckerError("reviewed merge facts require an ordinary private synchronous function without modifiers")
+        if token in "{([":
+            stack.append(token)
+        elif token in "})]":
+            if not stack or stack.pop() != closers[token]:
+                raise CheckerError("reviewed merge facts have mismatched delimiters")
+            if not stack and token == "}":
+                item_start = position + 1
+        elif token == ";" and not stack:
+            item_start = position + 1
+    if stack:
+        raise CheckerError("reviewed merge facts have unclosed delimiters")
+    function = re.match(
+        r"(?ms)^fn\s+expected_merge_for_pr\s*\(\s*pr\s*:\s*u64\s*\)\s*"
+        r"->\s*Result\s*<\s*Option\s*<\s*&'static\s+str\s*>\s*,\s*String\s*>\s*\{(.*?)^\}",
+        source[start:],
+    )
+    body = re.fullmatch(
+        r'\s*Ok\s*\(\s*match\s+pr\s*\{(.*?)'
+        r'\s*_\s*=>\s*return\s+Err\s*\(\s*format!\s*\(\s*"no reviewed merge status for PR \{pr\}"\s*\)\s*\)\s*,\s*\}\s*\)\s*',
+        function.group(1) if function else "",
+        re.S,
+    )
+    if body is None:
+        raise CheckerError("reviewed merge facts contain an unsupported function or fallback")
+    facts: dict[int, str | None] = {}
+    for line in body.group(1).splitlines():
+        if not line.strip():
+            continue
+        arm = re.fullmatch(r'\s*(0|[1-9][0-9]*)\s*=>\s*(?:Some\("([0-9a-f]{40})"\)|(None))\s*,\s*', line)
+        if arm is None:
+            raise CheckerError("reviewed merge facts contain an unsupported literal arm")
+        number = int(arm.group(1))
+        if number > 2**64 - 1 or number in facts:
+            raise CheckerError("reviewed merge facts contain an out-of-range or duplicate PR")
+        facts[number] = arm.group(2)
+    if not facts:
+        raise CheckerError("reviewed merge facts are empty")
+    return facts
+
 def validate_evidence(record: Any, task: str, repo_root: Path, packages: dict[str, tuple[Path, dict[str, Any]]], implementation_files: list[str]) -> str:
     if not isinstance(record, dict):
         raise CheckerError(f"{task}: evidence record is not an object")
@@ -462,6 +583,8 @@ def validate_evidence(record: Any, task: str, repo_root: Path, packages: dict[st
     merged = record.get("merged_sha")
     if merged is not None and (not isinstance(merged, str) or not HEX40.fullmatch(merged)):
         raise CheckerError(f"{identifier}: merged_sha must be null or lowercase 40-hex")
+    if merged is not None and merged == source_sha:
+        raise CheckerError(f"{identifier}: merged_sha must differ from its own source_sha")
     pr_state = record.get("pr_state")
     if pr_state is not None and pr_state not in PR_STATES:
         raise CheckerError(f"{identifier}: pr_state must be one of {sorted(PR_STATES)}")
@@ -639,6 +762,14 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[dict[str, Any]]:
                 raise CheckerError(
                     f"{task}: verified status lacks explicit task completion evidence"
                 )
+
+    reviewed = reviewed_merge_facts(repo_root)
+    for record in evidence_records:
+        number = int(PR_RE.fullmatch(record["pr"]).group(1))
+        if number not in reviewed:
+            raise CheckerError(f"{record['id']}: no reviewed merge status for PR {number}")
+        if record["merged_sha"] != reviewed[number]:
+            raise CheckerError(f"{record['id']}: merged_sha differs from the reviewed PR merge")
 
     trace = known_keys(manifest.get("traceability"), TRACEABILITY_KEYS, "traceability")
     so_entries = trace.get("so_sources")
@@ -847,12 +978,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", required=True, type=Path)
     parser.add_argument("--manifest")
     parser.add_argument("--project-license-metadata-only", action="store_true")
+    parser.add_argument("--workspace-packages-only", action="store_true")
     parser.add_argument("--source-of-truth", type=Path)
     return parser
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.workspace_packages_only:
+        if args.project_license_metadata_only or args.manifest is not None or args.source_of_truth is not None:
+            parser.error("workspace-packages-only accepts only --repo-root")
+        try:
+            packages = workspace_packages(args.repo_root.absolute())
+        except (CheckerError, OSError, UnicodeError, ValueError) as exc:
+            print(json.dumps({"errors": [str(exc)]}))
+            return 1
+        print(json.dumps({name: member.as_posix() for name, (member, _) in packages.items()}, sort_keys=True))
+        return 0
     if args.project_license_metadata_only:
         if args.manifest is not None or args.source_of_truth is not None:
             parser.error("metadata-only accepts only --repo-root")
