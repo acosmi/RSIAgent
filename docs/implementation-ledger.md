@@ -4107,3 +4107,17 @@ V110/V113/V116与其余新增场景族仍 planned；related_evidence_refs 仅导
 |AG133|`python3 scripts/test_check_dependency_register.py`|0 / 30 tests OK|`out/audit-20260930/qa/codex-r7-ag133/accept-cb909860-pr175-r1-dependency30.log`|
 
 原notify-merge登记接收方/密钥/载荷范围不改变，不额外手动外发；送达未独立证实。真实模型、付费实验、真实宿主/沙箱、历史包/T、E14合同仍仅登记外部阻塞。P1→P2→P3及既有队列仍未全闭，本周期台账不是阶段完成。
+
+
+## AG-156：Q24 非 Rust CI 与外发资格
+
+状态上限为 implemented_not_verified。本节登记前端、Python、CI 的完整交付合同；非 Rust 命令不进入 cargo 单目标证据语法，new_verified_subscopes 为空。
+
+- 独立前端作业、路径集合、固定 CI 入口及日志声明见 `.github/workflows/non-rust-delivery.yml` 与 `docs/non-rust-delivery-register.json`。入口 `python3 -B scripts/non_rust_delivery.py` 实际执行 `node --check`、`node --test`、既有 Python discover 和 build-input 检查；不安装 npm、不做浏览器或真实后端测试。
+- 入库登记为静态合同；实际命令、数字退出码、完整 stdout/stderr 及可恢复原字节由每次运行回执承载。未启动记录为 null，必需命令失败或未跑即整体非零。`out/non-rust-delivery/` 是作业期间副本，持久日志以实际 CI run/attempt、job 名与 console 标记定位；没有 numeric job ID 时不虚构 job URL。Python discover 合法 MCP skip 保留，不冒称 MCP 已验。
+- 检查器读取 `docs/ci-egress-register.json`，与全部工作流的实际外发步骤及已批准 notify 的触发、合并条件、接收方、事件范围、密钥名和完整来源像对应。缺登记、未批准改动、自报新 SHA 或新 entry 自确认均拒绝。既有三套 Rust 输入门、默认工具链与已批准通知范围保持；不新增第三方发送或 artifact 上传。
+- 有限 workflow 外壳与步骤准入，以及既有 GitHub 仓库平台工件和第三方整合的分类，标记“待二次验收裁决”。本实现不宣称能静态判定任意 shell、提供网络沙箱或证明通知送达。
+- 本地旧 M31 基线已复现：健康 0；移除 notify 登记和取消 merged 条件后自报新 SHA，两坏输入仍为 0。原证 `out/audit-20260930/qa/codex-r7-ag156/AG156-M31-Q24-baseline-actual-warm-r1.json`（SHA256 `59c2a9d91364a245d8cba8d55ba95016ad27a3230fb4ab896fcbf81ef57288ca`）。这只证明旧缺口，不是正常父编译 CPP 或新实现首次。
+- 此登记写入时固定新 head 全八、真实两侧父编译语义反例、独立控制器和 hosted CI 尚未运行，退出码不预填。后续结果须以本任务私有实际首验/合并证明复算；最高状态不因此上调。
+
+不声明整 E/V、完整许可或离线包、真实模型/付费实验/宿主/沙箱、历史 T 等价、效果收益、发行或 Claude 二次验收。货币预算0。

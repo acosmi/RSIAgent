@@ -25,7 +25,9 @@ class BuildInputsTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         (self.root / ".github/workflows").mkdir(parents=True)
-        for path in ["Cargo.lock", "rust-toolchain.toml", ".github/workflows/ci.yml", ".github/workflows/dependency-audit.yml", ".github/workflows/offline-build-kit.yml"]:
+        from non_rust_delivery import FRONTEND_PATHS, PYTHON_PATHS, CI_PATHS
+        for path in ["Cargo.lock", "rust-toolchain.toml", *FRONTEND_PATHS, *PYTHON_PATHS, *CI_PATHS]:
+            (self.root / path).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / path, self.root / path)
         self.env = os.environ.copy()
         self.env.update(GIT_AUTHOR_NAME="Build fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid", GIT_COMMITTER_NAME="Build fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
@@ -379,7 +381,7 @@ class BuildInputsTest(unittest.TestCase):
         (cache / "registry/cache/mirror").mkdir(parents=True)
         (cache / "registry/cache/mirror/selected.crate").write_bytes(b"selected cache bytes")
         docs = self.root / "docs"
-        docs.mkdir()
+        docs.mkdir(exist_ok=True)
         records = {"dependency-register.json": b'{"fixture":"register"}\n', "dependency-license-inventory.json": b'{"fixture":"inventory"}\n'}
         for name, data in records.items():
             (docs / name).write_bytes(data)
@@ -403,6 +405,62 @@ class BuildInputsTest(unittest.TestCase):
         with tarfile.open(self.root / "kit/registry.tar.gz", "r:gz") as archive:
             self.assertEqual(archive.extractfile("registry/cache/mirror/selected.crate").read(), b"selected cache bytes")
         self.assertEqual((self.root / "python-calls").read_text().splitlines(), ["scripts/check_build_inputs.py --check-runtime --json", "scripts/check_build_inputs.py --check-runtime --check-kit kit"])
+
+
+    def test_non_rust_workflow_and_approved_register_are_required(self) -> None:
+        self.assertEqual(self.errors(), [])
+        workflow = self.root / ".github/workflows/non-rust-delivery.yml"
+        original = workflow.read_bytes()
+        workflow.unlink()
+        self.assertTrue(self.errors())
+        workflow.write_bytes(original)
+        self.assertEqual(self.errors(), [])
+        register = self.root / "docs/ci-egress-register.json"
+        data = json.loads(register.read_bytes())
+        data["entries"] = []
+        register.write_text(json.dumps(data))
+        self.assertTrue(any("egress register" in error for error in self.errors()))
+
+    def test_notify_cannot_remove_merged_guard_and_self_approve_new_hash(self) -> None:
+        self.assertEqual(self.errors(), [])
+        workflow = self.root / ".github/workflows/notify-merge.yml"
+        source = workflow.read_text()
+        workflow.write_text(source.replace("if: github.event.pull_request.merged == true", "if: true", 1))
+        register = self.root / "docs/ci-egress-register.json"
+        data = json.loads(register.read_bytes())
+        data["entries"][0]["workflow_sha256"] = hashlib.sha256(workflow.read_bytes()).hexdigest()
+        register.write_text(json.dumps(data))
+        self.assertTrue(any("approved" in error for error in self.errors()))
+
+    def test_unparsed_headers_and_unknown_workflow_cannot_hide_execution(self) -> None:
+        self.assertEqual(self.errors(), [])
+        path = self.root / ".github/workflows/ci.yml"
+        original = path.read_text()
+        for old, new in [
+            ("  contents: read", "  contents: write"),
+            ("    branches: [main]", "    branches: [other]"),
+            ("    runs-on: ubuntu-latest", "    runs-on: self-hosted"),
+            ("    timeout-minutes: 25", "    timeout-minutes: 25\n    container: unknown"),
+        ]:
+            with self.subTest(old=old):
+                path.write_text(original.replace(old, new, 1))
+                self.assertTrue(any("header" in error for error in self.errors()))
+        path.write_text(original)
+        hidden = self.root / ".github/workflows/unknown.yml"
+        hidden.write_text(original)
+        self.assertTrue(any("unknown" in error for error in self.errors()))
+
+    def test_extra_egress_and_unknown_action_do_not_borrow_notify_confirmation(self) -> None:
+        self.assertEqual(self.errors(), [])
+        path = self.root / ".github/workflows/ci.yml"
+        original = path.read_text()
+        for extra in [
+            "      - run: curl https://unapproved.invalid\n",
+            "      - uses: other/send@" + "a" * 40 + "\n",
+            "      - uses: actions/upload-artifact@" + ACTIONS["actions/upload-artifact"] + "\n        with:\n          name: extra\n          path: .git/\n",
+        ]:
+            path.write_text(original + extra)
+            self.assertTrue(self.errors())
 
 
 # Exact edits derived from independently frozen full R2 YAML inputs.

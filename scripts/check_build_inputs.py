@@ -309,8 +309,21 @@ REQUIRED_DEPENDENCY_STAGES = {
     ),
 }
 
+# Only the previously unparsed workflow/job prefix is fixed. Existing step
+# parsing and pinned/quoted Cargo admission remain unchanged.
+WORKFLOW_HEADERS = {'ci.yml': '880cb3b5e67315205b8490b29df5d44b05c18453d2234380a6d01384e5badaa3', 'dependency-audit.yml': '0b3c8b06b7164ed6f19faabab12a229fa1eff10132a111f3fe02d722a36703aa', 'offline-build-kit.yml': '8075cbbf94ad69d3af378c0630bec4e83c0bece8b3564043ec4e6445530e2b5a'}
+
 def _workflow_errors(name: str, text: str) -> list[str]:
+    if name == "non-rust-delivery.yml":
+        from non_rust_delivery import workflow_errors
+        return workflow_errors(text)
     errors = []
+    if name not in (*BUILD_WORKFLOWS, "notify-merge.yml"):
+        errors.append(f"{name}: unknown workflow requires a reviewed contract")
+    if name in BUILD_WORKFLOWS:
+        prefix, marker, _ = text.partition("    steps:\n")
+        if not marker or hashlib.sha256((prefix + marker).encode()).hexdigest() != WORKFLOW_HEADERS[name]:
+            errors.append(f"{name}: unsupported workflow/job header differs from the finite prefix")
     overrides = [l for l in text.splitlines() if re.match(r"\s*['\"]?RUSTUP_TOOLCHAIN['\"]?\s*:", l)]
     if name in BUILD_WORKFLOWS and overrides != [f"      RUSTUP_TOOLCHAIN: '{TOOLCHAIN}'"]:
         errors.append(f"{name}: unsupported duplicate/step toolchain override")
@@ -416,6 +429,14 @@ def inspect_tree(root: Path, *, runtime: bool = False, kit: Path | None = None) 
             errors.extend(_workflow_errors(path.name, _read_regular(path).decode()))
     except (OSError, UnicodeError, ValueError) as error:
         errors.append(str(error))
+    # Keep the old Rust info/kit schema, including its three-Action map.
+    # Non-Rust declarations and the independent notify approval are additional
+    # finite inputs, not replacements for any original Rust step gate.
+    try:
+        from non_rust_delivery import inspect_contract
+        errors.extend(inspect_contract(root))
+    except (OSError, ValueError, TypeError, UnicodeError) as error:
+        errors.append("non-Rust input contract: " + str(error))
     if runtime and not errors:
         # rustup run without --install refuses a missing toolchain; never installs.
         try:

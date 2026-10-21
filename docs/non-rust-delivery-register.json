@@ -1,0 +1,97 @@
+{
+  "schema_version": "rsia.non_rust_delivery.v1",
+  "workflow": ".github/workflows/non-rust-delivery.yml",
+  "job": "frontend",
+  "entrypoint": [
+    "python3",
+    "-B",
+    "scripts/non_rust_delivery.py"
+  ],
+  "node_version": "26.10.0",
+  "python_version": "3.12",
+  "groups": {
+    "frontend": {
+      "paths": [
+        "frontend/status-character/README.md",
+        "frontend/status-character/bridge.mjs",
+        "frontend/status-character/character.css",
+        "frontend/status-character/character.mjs",
+        "frontend/status-character/entry.mjs",
+        "frontend/status-character/index.html",
+        "frontend/status-character/page.css",
+        "frontend/status-character/qa/fixture.css",
+        "frontend/status-character/qa/fixture.mjs",
+        "frontend/status-character/qa/index.html",
+        "frontend/status-character/status-source.mjs",
+        "frontend/status-character/tests/contracts.test.mjs",
+        "frontend/status-character/v3-scene.mjs",
+        "frontend/status-character/view-model.mjs"
+      ],
+      "command_ids": [
+        "node-version",
+        "node-check-1",
+        "node-check-2",
+        "node-check-3",
+        "node-check-4",
+        "node-check-5",
+        "node-check-6",
+        "node-check-7",
+        "node-check-8",
+        "node-test"
+      ]
+    },
+    "python": {
+      "paths": [
+        "scripts/budget_report.py",
+        "scripts/check_build_inputs.py",
+        "scripts/check_dependency_register.py",
+        "scripts/check_production_store_open.py",
+        "scripts/check_support_scope.py",
+        "scripts/estimate_sample_size.py",
+        "scripts/inventory_baseline_tests.py",
+        "scripts/non_rust_delivery.py",
+        "scripts/restore_backup.py",
+        "scripts/smoke.py",
+        "scripts/smoke_cli.py",
+        "scripts/smoke_workspace.py",
+        "scripts/statistics_reference.py",
+        "scripts/test_budget_report.py",
+        "scripts/test_check_build_inputs.py",
+        "scripts/test_check_dependency_register.py",
+        "scripts/test_check_production_store_open.py",
+        "scripts/test_check_support_scope.py",
+        "scripts/test_mcp_stdio.py",
+        "scripts/test_non_rust_delivery.py",
+        "scripts/test_restore_backup.py"
+      ],
+      "command_ids": [
+        "python-discover",
+        "build-inputs"
+      ]
+    },
+    "ci": {
+      "paths": [
+        ".github/workflows/ci.yml",
+        ".github/workflows/dependency-audit.yml",
+        ".github/workflows/non-rust-delivery.yml",
+        ".github/workflows/notify-merge.yml",
+        ".github/workflows/offline-build-kit.yml",
+        "docs/ci-egress-register.json",
+        "docs/non-rust-delivery-register.json"
+      ],
+      "command_ids": [
+        "build-inputs"
+      ]
+    }
+  },
+  "evidence": {
+    "declaration_only": true,
+    "actual_results": "separate runtime receipt, never prefilled",
+    "console": "complete raw streams as base64 with run/attempt URL, job name and fixed command markers",
+    "local_logs": "temporary job copies; no artifact upload or cloud-retention claim",
+    "python_discover": "MCP may be skipped without RSIA_BINARY; actual skip diagnostics and counts remain in raw stderr",
+    "new_verified_subscopes": [],
+    "cargo_target_credit": false,
+    "platform_artifact_classification": "existing three Rust workflow steps only; pending secondary acceptance; no notify authority borrowed"
+  }
+}
