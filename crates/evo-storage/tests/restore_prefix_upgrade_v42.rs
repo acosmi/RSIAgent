@@ -1,36 +1,17 @@
-//! E08 / plan §11 (AG-104): a consistent backup taken on a strict prefix of the
-//! migration set (0001-0005 or 0001-0006) is restored into a new directory, and
-//! `scripts/restore_backup.py` applies the missing migrations to its private copy
-//! before the anchor comparison, the delta replay and publication.
-//!
-//! The historical databases are written by the real sqlx migrator (the compiled
-//! `sqlx::migrate!` set with its later versions removed, as in
-//! `formal_parent_kind_migration_v42.rs`), and the backups are built the way
-//! `Store::backup` builds them: `VACUUM INTO` plus an `rsia.backup.v2` manifest
-//! read from that database. The restored database must equal the same backup
-//! database migrated by `Store::open` in its schema SQL, its `_sqlx_migrations`
-//! version, description, success and checksum, and every row of every table
-//! (`installed_on` and `execution_time` aside), and it must pass
-//! `read_control_plane_facts` with the same facts as the trusted anchor, which is
-//! what the startup gate compares. The anchor and the gate stay on the exact
-//! compiled set; every other migration ledger is still isolated.
+//! §18.4: mechanical preservation of the original unqualified fourteen-kind seed.
+//! Raw compiled migrations verify SQL/ledger/row preservation only; they do not
+//! establish a trusted producer, qualified writer, restore admission or gate result.
+//! The replaced healthy restore/delta/gate obligations are mapped to the existing
+//! engine restore_economic_v42.rs real-producer prefix controls.
 
-use evo_core::{Context, Error, Role, hash};
-use evo_storage::Store;
+use evo_core::hash;
 use evo_storage::lifecycle::{
     BACKUP_SCHEMA, BackupFileEntry, BackupManifest, BackupMigrationEntry, BackupWatermarkEntry,
-    CleanupState, ControlPlaneFacts, LifecycleStore, RevokeTombstone, TypedObjectRef,
-    parse_strict_json, read_control_plane_facts,
 };
 use serde_json::{Value, json};
 use sqlx::{Connection, Row, SqliteConnection, migrate::Migrator, sqlite::SqliteConnectOptions};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 
-const RESTORE_SCRIPT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../scripts/restore_backup.py"
-);
 const CURRENT_VERSIONS: [i64; 6] = [1, 2, 4, 5, 6, 7];
 const LEGACY_KINDS: [&str; 14] = [
     "run",
@@ -48,25 +29,6 @@ const LEGACY_KINDS: [&str; 14] = [
     "improvement",
     "artifact",
 ];
-const NOT_A_PREFIX: &str =
-    "unsupported manifest migrations: not a prefix of the current migration set";
-const PREDATES: &str =
-    "backup predates the root budget ledger (0005); protected facts cannot be verified";
-const RECEIPT_KEYS: [&str; 6] = [
-    "backup_manifest_sha256",
-    "isolated",
-    "receipt_scope",
-    "replayed_revoke_events",
-    "schema_version",
-    "trusted_anchor",
-];
-const ANCHOR_KEYS: [&str; 5] = [
-    "control_plane_digest",
-    "path_local_only",
-    "scope",
-    "verified_at",
-    "watermarks",
-];
 const BLOB: &[u8] = b"legacy blob bytes";
 
 type SchemaRow = (String, String, String, Option<String>);
@@ -80,10 +42,6 @@ struct Image {
     schema: Vec<SchemaRow>,
     ledger: Vec<QuotedLedgerRow>,
     tables: Vec<TableRows>,
-}
-
-fn admin(namespace: &str) -> Context {
-    Context::new(namespace, "admin", Role::Admin).unwrap()
 }
 
 fn digest_of(text: &str) -> String {
@@ -400,15 +358,20 @@ impl Scenario {
         }
     }
 
-    /// A copy of `source` in its own directory, migrated by `Store::open` when
-    /// `upgrade` (the binary upgrade of a live control plane).
+    /// A copy of `source` in its own directory, migrated by the raw compiled set when
+    /// `upgrade` (raw compiled SQL only; no qualified writer/admission).
     async fn copy(&self, source: &Path, name: &str, upgrade: bool) -> PathBuf {
         let directory = self.root.join(name);
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("rsia.sqlite3");
         std::fs::copy(source, &path).unwrap();
         if upgrade {
-            Store::open(&path).await.unwrap().close().await;
+            let mut connection = connect(&path, false).await;
+            migrator(&CURRENT_VERSIONS)
+                .run(&mut connection)
+                .await
+                .unwrap();
+            connection.close().await.unwrap();
         }
         path
     }
@@ -551,571 +514,232 @@ impl Scenario {
         .unwrap();
         path
     }
-
-    fn restore(&self, backup: &Path, anchor: &Path, delta: &Path, name: &str) -> (PathBuf, Output) {
-        let dest = self.root.join(name);
-        let output = Command::new("python3")
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .arg(RESTORE_SCRIPT)
-            .arg("--backup")
-            .arg(backup)
-            .arg("--dest")
-            .arg(&dest)
-            .arg("--revoke-delta")
-            .arg(delta)
-            .arg("--trusted-revocations-db")
-            .arg(anchor)
-            .output()
-            .unwrap();
-        (dest, output)
-    }
-
-    fn assert_isolated(&self, dest: &Path, output: &Output, reason: &str) {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(1), "{reason}: {stdout} {stderr}");
-        assert_eq!(stderr, format!("ISOLATE {reason}; not mounting\n"));
-        assert!(stdout.is_empty(), "{stdout}");
-        assert!(
-            !dest.exists(),
-            "{reason}: an isolated restore was published"
-        );
-        let staging = format!(".{}.restore-", dest.file_name().unwrap().to_string_lossy());
-        for entry in std::fs::read_dir(&self.root).unwrap() {
-            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-            assert!(!name.starts_with(&staging), "staging left behind: {name}");
-        }
-    }
 }
 
-fn assert_restored(output: &Output, events: usize, applied: &str) {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(0), "{stdout} {stderr}");
-    assert_eq!(
-        stdout,
-        format!("RESTORE_OK events={events} migrations_applied={applied}\n"),
-        "{stderr}"
-    );
-    assert!(stderr.is_empty(), "{stderr}");
-}
-
-/// What the startup gate verifies before it admits a restored directory: the
-/// receipt has exactly the v2 fields, and the data directory's control-plane
-/// facts, read without `Store::open` and on the exact compiled migration set,
-/// equal the anchor's and the receipt's watermarks.
-async fn assert_gate_facts_admit(restored: &Path, anchor: &Path) -> ControlPlaneFacts {
-    let receipt_bytes = std::fs::read(restored.join("restore.json")).unwrap();
-    let receipt = parse_strict_json(std::str::from_utf8(&receipt_bytes).unwrap()).unwrap();
-    let mut keys: Vec<&str> = receipt
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    assert_eq!(keys, RECEIPT_KEYS);
-    let mut anchor_keys: Vec<&str> = receipt["trusted_anchor"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    anchor_keys.sort_unstable();
-    assert_eq!(anchor_keys, ANCHOR_KEYS);
-    assert_eq!(receipt["schema_version"], "rsia.restore_receipt.v2");
-    assert_eq!(receipt["isolated"], json!(false));
-    assert_eq!(receipt["receipt_scope"], "local_only_not_for_export");
-
-    let data = read_control_plane_facts(&restored.join("rsia.sqlite3"))
-        .await
-        .unwrap();
-    let trusted = read_control_plane_facts(anchor).await.unwrap();
-    assert_eq!(data, trusted);
-    assert!(!data.watermarks.is_empty());
-    for (namespace, mark) in &data.watermarks {
-        let recorded = &receipt["trusted_anchor"]["watermarks"][namespace];
-        assert_eq!(recorded["seq"], json!(mark.seq), "{namespace}");
-        assert_eq!(recorded["digest"], json!(mark.digest), "{namespace}");
-    }
-    assert_eq!(
-        receipt["trusted_anchor"]["watermarks"]
-            .as_object()
-            .unwrap()
-            .len(),
-        data.watermarks.len()
-    );
-    data
-}
-
-/// The seeded scenarios hold protected objects, root budget rows and tombstones
-/// in both namespaces, so the facts the gate compares are not vacuous.
-fn assert_seeded_facts(facts: &ControlPlaneFacts) {
-    assert_eq!(
-        facts
-            .watermarks
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["legacy-a", "legacy-b"]
-    );
-    assert!(
-        facts
-            .protected_objects
-            .keys()
-            .any(|(namespace, kind, _)| namespace == "legacy-a" && kind == "budget")
-    );
-    assert!(
-        facts
-            .protected_objects
-            .keys()
-            .any(|(namespace, _, id)| namespace == "legacy-a" && id == "ledger-1")
-    );
-    assert!(
-        facts
-            .protected_objects
-            .keys()
-            .any(|(namespace, kind, _)| namespace == "legacy-b" && kind == "evaluation")
-    );
-    assert!(
-        facts
-            .root_budget_tables
-            .get("root_budgets")
-            .is_some_and(|rows| rows.len() == 1)
-    );
-    assert!(
-        facts
-            .tombstones
-            .contains_key(&("legacy-a".to_owned(), "run-0".to_owned()))
-    );
-}
-
-fn migrations_record(restored: &Path) -> Value {
-    let text = std::fs::read_to_string(restored.join("restore.migrations.json")).unwrap();
-    assert!(text.ends_with('\n'));
-    let value = parse_strict_json(&text).unwrap();
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    assert_eq!(
-        keys,
-        ["applied", "current_versions", "schema", "source_versions"]
-    );
-    // on disk the fields follow the documented order
-    let positions: Vec<usize> = ["schema", "source_versions", "applied", "current_versions"]
-        .iter()
-        .map(|key| text.find(&format!("\"{key}\":")).unwrap())
-        .collect();
-    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
-    value
-}
-
-fn checksum_hex(version: i64) -> String {
-    let compiled = sqlx::migrate!("./migrations");
-    let migration = compiled.iter().find(|m| m.version == version).unwrap();
-    migration
-        .checksum
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-/// A prefix backup restored without later revocations: the script's upgrade and
-/// `Store::open` on the same backup database agree on everything compared.
-async fn upgrade_matches_store_open(versions: &[i64], applied: &[i64]) {
+// §18.4 replacement mapping: the old fourteen-kind seed is raw migration data,
+// not a producer witness or a qualified writer/restore fixture. Its bytes stay
+// unchanged above. Healthy restore/admission and fault controls live in the
+// existing engine restore_economic_v42.rs tests, which can call HostService.
+async fn raw_compiled_upgrade_preserves_image(versions: &[i64], applied: &[i64]) {
     let scenario = Scenario::new(versions).await;
+    let history = image(&scenario.history).await;
     let backup = scenario.backup("backup", None, |_| {}).await;
-    let backup_timings = timings(&backup.join("rsia.sqlite3")).await;
+    let database = backup.join("rsia.sqlite3");
+    let raw_database = std::fs::read(&database).unwrap();
+    let raw_manifest = std::fs::read(backup.join("backup-manifest.json")).unwrap();
+    let manifest: BackupManifest = serde_json::from_slice(&raw_manifest).unwrap();
+    assert_eq!(manifest.database.sha256, hash(&raw_database));
+    assert_eq!(manifest.database.bytes, raw_database.len() as u64);
+    assert_eq!(manifest.blobs.len(), 1);
+    let blob_path = backup.join(&manifest.blobs[0].path);
+    assert_eq!(std::fs::read(&blob_path).unwrap(), BLOB);
+    assert_eq!(manifest.blobs[0].sha256, hash(BLOB));
+    assert_eq!(manifest.blobs[0].bytes, BLOB.len() as u64);
+    let before_timings = timings(&database).await;
     assert_eq!(
-        backup_timings.iter().map(|row| row.0).collect::<Vec<_>>(),
+        before_timings.iter().map(|row| row.0).collect::<Vec<_>>(),
         versions
     );
-    // The live control plane after the binary upgrade, and the same backup
-    // database migrated by Store::open.
-    let anchor = scenario.copy(&scenario.history, "live", true).await;
-    let reference = scenario
-        .copy(&backup.join("rsia.sqlite3"), "store-open", true)
-        .await;
-    let delta = scenario.delta(&backup, "delta", None);
-    let (restored, output) = scenario.restore(&backup, &anchor, &delta, "restored");
-    let applied_text = applied
-        .iter()
-        .map(i64::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    assert_restored(&output, 0, &applied_text);
 
-    let mut names: Vec<String> = std::fs::read_dir(&restored)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    assert_eq!(
-        names,
-        [
-            "blobs",
-            "restore.json",
-            "restore.migrations.json",
-            "rsia.sqlite3"
-        ]
-    );
-    assert_eq!(
-        std::fs::read(restored.join(format!("blobs/legacy-a/{}", hash(BLOB)))).unwrap(),
-        BLOB
-    );
-    let record = migrations_record(&restored);
-    assert_eq!(
-        record,
-        json!({
-            "schema": "rsia.restore_migrations.v1",
-            "source_versions": versions,
-            "applied": applied
-                .iter()
-                .map(|version| json!({"version": version, "checksum_sha384": checksum_hex(*version)}))
-                .collect::<Vec<_>>(),
-            "current_versions": CURRENT_VERSIONS,
-        })
-    );
-
-    // Equivalence with Store::open: schema SQL, ledger, every row.
-    let restored_db = restored.join("rsia.sqlite3");
-    let upgraded = image(&restored_db).await;
-    let migrated = image(&reference).await;
+    let together = scenario.copy(&database, "raw-together", true).await;
+    let stepwise = scenario.copy(&database, "raw-stepwise", false).await;
+    let mut prefix = versions.to_vec();
+    for version in applied {
+        prefix.push(*version);
+        let mut connection = connect(&stepwise, false).await;
+        migrator(&prefix).run(&mut connection).await.unwrap();
+        connection.close().await.unwrap();
+    }
+    let upgraded = image(&together).await;
+    let migrated = image(&stepwise).await;
     assert_eq!(upgraded.schema, migrated.schema);
     assert_eq!(upgraded.ledger, migrated.ledger);
     assert_eq!(
-        upgraded.tables.iter().map(|t| &t.0).collect::<Vec<_>>(),
-        migrated.tables.iter().map(|t| &t.0).collect::<Vec<_>>()
+        upgraded.tables.iter().map(|row| &row.0).collect::<Vec<_>>(),
+        migrated.tables.iter().map(|row| &row.0).collect::<Vec<_>>()
     );
     for (left, right) in upgraded.tables.iter().zip(&migrated.tables) {
         assert_eq!(left, right, "table {}", left.0);
     }
     assert_eq!(upgraded, migrated);
-    assert_eq!(upgraded, image(&anchor).await);
+    // Every original table, including rowids, raw TEXT/BLOB and FTS shadows,
+    // retains every row. Only the migration ledger gains the missing versions.
+    for (name, rows) in &history.tables {
+        let after = upgraded.tables.iter().find(|row| &row.0 == name).unwrap();
+        assert_eq!(&after.1, rows, "raw legacy table {name}");
+    }
     assert!(
         upgraded
             .tables
             .iter()
-            .any(|(name, rows)| name == "objects" && rows.len() == LEGACY_KINDS.len() + 5)
+            .any(|(name, rows)| { name == "objects" && rows.len() == LEGACY_KINDS.len() + 5 })
     );
-    assert_ledger_is_the_compiled_set(&restored_db).await;
-    assert_ledger_is_the_compiled_set(&reference).await;
-
-    // The backup's ledger rows are kept as they were; the new rows carry the
-    // column types sqlx writes and a measured execution time.
-    let restored_timings = timings(&restored_db).await;
-    assert_eq!(
-        &restored_timings[..versions.len()],
-        backup_timings.as_slice()
-    );
-    for row in &restored_timings[versions.len()..] {
+    let mut connection = connect(&together, false).await;
+    for (index, kind) in LEGACY_KINDS.iter().enumerate() {
+        let id = if *kind == "run" { "run-1" } else { "shared" };
+        let row = sqlx::query(
+            "SELECT rowid,owner,body,revision FROM objects WHERE namespace='legacy-a' AND kind=? AND id=?",
+        )
+        .bind(*kind).bind(id).fetch_one(&mut connection).await.unwrap();
+        assert_eq!(row.get::<i64, _>("rowid"), 100 + index as i64 * 17);
+        assert_eq!(row.get::<String, _>("owner"), format!("owner-{index}"));
+        assert_eq!(
+            row.get::<String, _>("body"),
+            format!(" {{ \"id\" : \"{id}\", \"kind\" : \"{kind}\", \"state\" : \"queued\" }} ")
+        );
+        assert_eq!(row.get::<i64, _>("revision"), index as i64 + 2);
+    }
+    let namespaces: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT namespace FROM objects ORDER BY namespace")
+            .fetch_all(&mut connection)
+            .await
+            .unwrap();
+    assert_eq!(namespaces, ["legacy-a", "legacy-b"]);
+    connection.close().await.unwrap();
+    assert_ledger_is_the_compiled_set(&together).await;
+    assert_ledger_is_the_compiled_set(&stepwise).await;
+    let after_timings = timings(&together).await;
+    assert_eq!(&after_timings[..versions.len()], before_timings.as_slice());
+    for row in &after_timings[versions.len()..] {
         assert!(applied.contains(&row.0));
         assert_eq!((row.2.as_str(), row.4.as_str()), ("text", "integer"));
         assert!(row.3 >= 0, "{row:?}");
     }
-
-    // The restored directory passes what the startup gate reads.
-    let facts = assert_gate_facts_admit(&restored, &anchor).await;
-    assert_seeded_facts(&facts);
+    assert_eq!(std::fs::read(&database).unwrap(), raw_database);
     assert_eq!(
-        read_control_plane_facts(&restored_db).await.unwrap(),
-        read_control_plane_facts(&reference).await.unwrap()
+        std::fs::read(backup.join("backup-manifest.json")).unwrap(),
+        raw_manifest
     );
-    // And the product opens it without migrating anything further.
-    let before = image(&restored_db).await;
-    Store::open(&restored_db).await.unwrap().close().await;
-    assert_eq!(image(&restored_db).await, before);
+    assert_eq!(std::fs::read(blob_path).unwrap(), BLOB);
 }
 
 #[tokio::test]
-async fn a_backup_on_0001_to_0006_is_upgraded_exactly_like_store_open() {
-    upgrade_matches_store_open(&[1, 2, 4, 5, 6], &[7]).await;
+async fn raw_compiled_0006_upgrade_preserves_the_full_legacy_image() {
+    raw_compiled_upgrade_preserves_image(&[1, 2, 4, 5, 6], &[7]).await;
 }
 
 #[tokio::test]
-async fn a_backup_on_0001_to_0005_is_upgraded_exactly_like_store_open() {
-    upgrade_matches_store_open(&[1, 2, 4, 5], &[6, 7]).await;
+async fn raw_compiled_0005_upgrade_preserves_the_full_legacy_image() {
+    raw_compiled_upgrade_preserves_image(&[1, 2, 4, 5], &[6, 7]).await;
 }
 
 #[tokio::test]
-async fn a_0005_backup_replays_a_revocation_made_after_the_binary_upgrade() {
-    let versions = [1, 2, 4, 5];
-    let scenario = Scenario::new(&versions).await;
-    let backup = scenario.backup("backup", None, |_| {}).await;
-    let manifest: BackupManifest =
-        serde_json::from_slice(&std::fs::read(backup.join("backup-manifest.json")).unwrap())
+async fn raw_current_schema_requires_no_further_compiled_migration() {
+    let scenario = Scenario::new(&CURRENT_VERSIONS).await;
+    let before = image(&scenario.history).await;
+    let before_timings = timings(&scenario.history).await;
+    let mut connection = connect(&scenario.history, false).await;
+    migrator(&CURRENT_VERSIONS)
+        .run(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+    assert_eq!(image(&scenario.history).await, before);
+    assert_eq!(timings(&scenario.history).await, before_timings);
+}
+
+#[tokio::test]
+async fn raw_0006_commit_survives_a_0007_sql_conflict_without_writer_admission() {
+    let scenario = Scenario::new(&[1, 2, 4, 5]).await;
+    let mut connection = connect(&scenario.history, false).await;
+    sqlx::raw_sql("CREATE TABLE objects_formal_parent(x)")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+    let before = image(&scenario.history).await;
+    let mut connection = connect(&scenario.history, false).await;
+    let error = migrator(&CURRENT_VERSIONS)
+        .run(&mut connection)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("table objects_formal_parent already exists")
+    );
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&mut connection)
+            .await
             .unwrap();
+    assert_eq!(versions, [1, 2, 4, 5, 6]);
+    connection.close().await.unwrap();
+    let after = image(&scenario.history).await;
+    for (name, rows) in &before.tables {
+        assert_eq!(
+            &after.tables.iter().find(|row| &row.0 == name).unwrap().1,
+            rows,
+            "{name}"
+        );
+    }
+    for name in [
+        "revoke_cleanup_jobs",
+        "revoke_cleanup_frontier",
+        "revoke_cleanup_events",
+    ] {
+        assert!(
+            after
+                .tables
+                .iter()
+                .any(|(table, rows)| table == name && rows.is_empty())
+        );
+    }
+    // Qualified adapter refusal/rollback is independently retained by
+    // migration_clock::{committed_six_survives_seven_post_ddl_admission_failure,
+    // rogue_sql_and_conflicting_prefix_have_no_effects}; raw SQL is no admission.
+}
+
+#[tokio::test]
+async fn legacy_delta_document_preserves_its_original_raw_binding_without_admission() {
+    let scenario = Scenario::new(&[1, 2, 4, 5]).await;
+    let backup = scenario.backup("backup", None, |_| {}).await;
+    let bytes = std::fs::read(backup.join("backup-manifest.json")).unwrap();
+    let manifest: BackupManifest = serde_json::from_slice(&bytes).unwrap();
     let base = manifest
         .watermarks
         .iter()
-        .find(|mark| mark.namespace == "legacy-a")
-        .unwrap()
-        .clone();
-
-    // The upgraded live control plane revokes a run after the backup; the
-    // revocation tables it writes did not exist when the backup was taken.
-    let anchor = scenario.copy(&scenario.history, "live", false).await;
-    let store = Store::open(&anchor).await.unwrap();
-    let context = admin("legacy-a");
-    let revoked = LifecycleStore::begin_revoke(
-        &context,
-        &store,
-        TypedObjectRef {
-            kind: "run".into(),
-            id: "run-1".into(),
-        },
+        .find(|row| row.namespace == "legacy-a")
+        .unwrap();
+    let watermark_digest = digest_of("legacy-a-4");
+    let body = tombstone_body(
+        "run-1",
+        base.seq + 1,
+        &watermark_digest,
         "revoked after the upgrade",
         9,
-    )
-    .await
-    .unwrap();
-    let mut session = store.session().await.unwrap();
-    let tombstone: RevokeTombstone = session.need(&context, "tombstone", "run-1").await.unwrap();
-    session.commit().await.unwrap();
-    store.close().await;
+    );
+    let tombstone_digest = hash(body.as_bytes());
     let event = json!({
-        "seq": base.seq + 1,
-        "previous_digest": base.digest,
-        "digest": revoked.watermark_digest,
-        "source_kind": "run",
-        "source_id": "run-1",
-        "tombstone_digest": hash(&serde_json::to_vec(&tombstone).unwrap()),
-        "reason": "revoked after the upgrade",
-        "created_at": 9,
+        "seq":base.seq + 1,"previous_digest":base.digest,"digest":watermark_digest,
+        "source_kind":"run","source_id":"run-1","tombstone_digest":tombstone_digest,
+        "reason":"revoked after the upgrade","created_at":9,
     });
-    let delta = scenario.delta(
+    let path = scenario.delta(
         &backup,
         "delta",
-        Some((vec![event], base.seq + 1, revoked.watermark_digest.clone())),
+        Some((vec![event.clone()], base.seq + 1, watermark_digest.clone())),
     );
-    let (restored, output) = scenario.restore(&backup, &anchor, &delta, "restored");
-    assert_restored(&output, 1, "6,7");
-    let record = migrations_record(&restored);
-    assert_eq!(record["source_versions"], json!(versions));
-    assert_eq!(record["current_versions"], json!(CURRENT_VERSIONS));
-    let restored_db = restored.join("rsia.sqlite3");
-    assert_ledger_is_the_compiled_set(&restored_db).await;
-    let facts = assert_gate_facts_admit(&restored, &anchor).await;
-    assert_seeded_facts(&facts);
+    let delta: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(delta["base_manifest_sha256"], hash(&bytes));
+    let rows = delta["namespaces"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let selected = rows
+        .iter()
+        .find(|row| row["namespace"] == "legacy-a")
+        .unwrap();
+    assert_eq!(selected["base_seq"], base.seq);
+    assert_eq!(selected["base_digest"], base.digest);
+    assert_eq!(selected["events"], json!([event]));
+    assert_eq!(selected["latest_seq"], base.seq + 1);
+    assert_eq!(selected["latest_digest"], watermark_digest);
     assert_eq!(
-        facts.tombstones[&("legacy-a".to_owned(), "run-1".to_owned())]["watermark_seq"],
-        json!(base.seq + 1)
+        selected["events"][0]["tombstone_digest"],
+        hash(body.as_bytes())
     );
-
-    let restored_store = Store::open(&restored_db).await.unwrap();
-    let mut session = restored_store.session().await.unwrap();
-    let replayed: RevokeTombstone = session.need(&context, "tombstone", "run-1").await.unwrap();
-    assert_eq!(replayed.watermark_digest, revoked.watermark_digest);
-    assert_eq!(
-        session.watermark(&context).await.unwrap(),
-        Some((base.seq + 1, revoked.watermark_digest.clone()))
-    );
-    session.commit().await.unwrap();
-    let status = LifecycleStore::cleanup_status(&context, &restored_store, &revoked.job_id)
-        .await
+    let other = rows
+        .iter()
+        .find(|row| row["namespace"] == "legacy-b")
         .unwrap();
-    assert_eq!(status.state, CleanupState::Pending);
-    restored_store.close().await;
-}
-
-#[tokio::test]
-async fn a_current_backup_applies_nothing_and_writes_no_migration_record() {
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().canonicalize().unwrap();
-    let live = root.join("rsia.sqlite3");
-    let store = Store::open(&live).await.unwrap();
-    let context = admin("n");
-    let mut session = store.session().await.unwrap();
-    session
-        .put(
-            &context,
-            "artifact",
-            "a",
-            context.actor(),
-            &json!({"id":"a"}),
-        )
-        .await
-        .unwrap();
-    session
-        .bump_watermark(&context, &hash(b"initial-watermark"))
-        .await
-        .unwrap();
-    session.commit().await.unwrap();
-    let backup = root.join("backup");
-    store.backup(&backup).await.unwrap();
-    store.close().await;
-    let scenario = Scenario {
-        _guard: directory,
-        root,
-        history: live.clone(),
-    };
-    let delta = scenario.delta(&backup, "delta", None);
-    let (restored, output) = scenario.restore(&backup, &live, &delta, "restored");
-    assert_restored(&output, 0, "none");
-    let mut names: Vec<String> = std::fs::read_dir(&restored)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    assert_eq!(names, ["restore.json", "rsia.sqlite3"]);
-    assert_gate_facts_admit(&restored, &live).await;
-}
-
-#[tokio::test]
-async fn every_other_migration_ledger_is_still_isolated() {
-    // A gap: 0007 without 0006, written by the real migrator.
-    let gap = Scenario::new(&[1, 2, 4, 5, 7]).await;
-    let backup = gap.backup("backup", None, |_| {}).await;
-    let anchor = gap.copy(&gap.history, "live", true).await;
-    let delta = gap.delta(&backup, "delta", None);
-    let (dest, output) = gap.restore(&backup, &anchor, &delta, "restored");
-    gap.assert_isolated(&dest, &output, NOT_A_PREFIX);
-
-    // A prefix that predates the root budget ledger.
-    let old = Scenario::new(&[1, 2, 4]).await;
-    let backup = old.backup("backup", None, |_| {}).await;
-    let anchor = old.copy(&old.history, "live", true).await;
-    let delta = old.delta(&backup, "delta", None);
-    let (dest, output) = old.restore(&backup, &anchor, &delta, "restored");
-    old.assert_isolated(&dest, &output, PREDATES);
-
-    // An unknown future version in the database and the manifest.
-    let current = Scenario::new(&CURRENT_VERSIONS).await;
-    let anchor = current.copy(&current.history, "live", true).await;
-    let backup = current
-        .backup(
-            "future",
-            Some("INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time) VALUES(999,'future',TRUE,zeroblob(48),0)"),
-            |manifest| {
-                manifest["migrations"].as_array_mut().unwrap().push(json!({
-                    "version": 999,
-                    "description": "future",
-                    "checksum_hex": "00".repeat(48),
-                    "success": true,
-                }));
-            },
-        )
-        .await;
-    let delta = current.delta(&backup, "future-delta", None);
-    let (dest, output) = current.restore(&backup, &anchor, &delta, "restored-future");
-    current.assert_isolated(&dest, &output, NOT_A_PREFIX);
-
-    // A manifest that does not describe its database's ledger.
-    let backup = current
-        .backup("short-manifest", None, |manifest| {
-            manifest["migrations"].as_array_mut().unwrap().pop();
-        })
-        .await;
-    let delta = current.delta(&backup, "short-manifest-delta", None);
-    let (dest, output) = current.restore(&backup, &anchor, &delta, "restored-short-manifest");
-    current.assert_isolated(
-        &dest,
-        &output,
-        "backup database migrations differ from its manifest",
-    );
-
-    let prefix = Scenario::new(&[1, 2, 4, 5, 6]).await;
-    let anchor = prefix.copy(&prefix.history, "live", true).await;
-    let backup = prefix
-        .backup("long-manifest", None, |manifest| {
-            manifest["migrations"].as_array_mut().unwrap().push(json!({
-                "version": 7,
-                "description": "formal parent kind",
-                "checksum_hex": checksum_hex(7),
-                "success": true,
-            }));
-        })
-        .await;
-    let delta = prefix.delta(&backup, "long-manifest-delta", None);
-    let (dest, output) = prefix.restore(&backup, &anchor, &delta, "restored-long-manifest");
-    prefix.assert_isolated(
-        &dest,
-        &output,
-        "backup database migrations differ from its manifest",
-    );
-
-    // A changed checksum inside the prefix, recorded in both places or only in the database.
-    let tamper = "UPDATE _sqlx_migrations SET checksum=zeroblob(48) WHERE version=1";
-    let backup = prefix
-        .backup("checksum", Some(tamper), |manifest| {
-            manifest["migrations"][0]["checksum_hex"] = json!("00".repeat(48));
-        })
-        .await;
-    let delta = prefix.delta(&backup, "checksum-delta", None);
-    let (dest, output) = prefix.restore(&backup, &anchor, &delta, "restored-checksum");
-    prefix.assert_isolated(
-        &dest,
-        &output,
-        "manifest migration checksums differ from current code",
-    );
-    let backup = prefix.backup("checksum-db", Some(tamper), |_| {}).await;
-    let delta = prefix.delta(&backup, "checksum-db-delta", None);
-    let (dest, output) = prefix.restore(&backup, &anchor, &delta, "restored-checksum-db");
-    prefix.assert_isolated(
-        &dest,
-        &output,
-        "database migration checksums differ from current code",
-    );
-
-    // An unsuccessful migration, recorded in both places or only in the database.
-    let failed = "UPDATE _sqlx_migrations SET success=0 WHERE version=5";
-    let backup = prefix
-        .backup("unsuccessful", Some(failed), |manifest| {
-            manifest["migrations"][3]["success"] = json!(false);
-        })
-        .await;
-    let delta = prefix.delta(&backup, "unsuccessful-delta", None);
-    let (dest, output) = prefix.restore(&backup, &anchor, &delta, "restored-unsuccessful");
-    prefix.assert_isolated(&dest, &output, "migration is not successful");
-    let backup = prefix.backup("unsuccessful-db", Some(failed), |_| {}).await;
-    let delta = prefix.delta(&backup, "unsuccessful-db-delta", None);
-    let (dest, output) = prefix.restore(&backup, &anchor, &delta, "restored-unsuccessful-db");
-    prefix.assert_isolated(
-        &dest,
-        &output,
-        "backup database has an unsuccessful migration",
-    );
-
-    // The anchor stays on the exact compiled set: a prefix anchor is refused,
-    // while the same backup against the upgraded anchor is restorable.
-    let backup = prefix.backup("valid", None, |_| {}).await;
-    let stale_anchor = prefix.copy(&prefix.history, "stale-live", false).await;
-    let delta = prefix.delta(&backup, "valid-delta", None);
-    let (dest, output) = prefix.restore(&backup, &stale_anchor, &delta, "restored-stale-anchor");
-    prefix.assert_isolated(
-        &dest,
-        &output,
-        "database migration checksums differ from current code",
-    );
-    let (restored, output) = prefix.restore(&backup, &anchor, &delta, "restored-valid");
-    assert_restored(&output, 0, "7");
-    assert_gate_facts_admit(&restored, &anchor).await;
-
-    // A migration that cannot apply to the copy isolates the restore, and the
-    // Rust migrator refuses the same database.
-    let backup = prefix
-        .backup(
-            "conflict",
-            Some("CREATE TABLE objects_formal_parent(x)"),
-            |_| {},
-        )
-        .await;
-    let delta = prefix.delta(&backup, "conflict-delta", None);
-    let (dest, output) = prefix.restore(&backup, &anchor, &delta, "restored-conflict");
-    prefix.assert_isolated(&dest, &output, "table objects_formal_parent already exists");
-    let refused = prefix
-        .copy(&backup.join("rsia.sqlite3"), "conflict-store-open", false)
-        .await;
-    match Store::open(&refused).await {
-        Err(Error::Internal) => {}
-        Err(error) => panic!("unexpected refusal: {error:?}"),
-        Ok(store) => {
-            store.close().await;
-            panic!("Store::open applied 0007 over a conflicting table");
-        }
-    }
+    assert!(other["events"].as_array().unwrap().is_empty());
 }

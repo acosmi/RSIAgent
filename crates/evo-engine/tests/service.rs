@@ -50,9 +50,11 @@ fn prepare_config() -> HostPrepareConfig {
 
 async fn setup() -> (tempfile::TempDir, HostService, Context, HostPrepareConfig) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("service.sqlite3"))
-        .await
-        .unwrap();
+    let config = prepare_config();
+    let store =
+        Store::open_with_prepare_configs(&dir.path().join("service.sqlite3"), vec![config.clone()])
+            .await
+            .unwrap();
     let host = context("gateway-host", Role::Host);
     let admin = context("admin", Role::Admin);
     let manifest = HostSurfaceManifest {
@@ -79,7 +81,7 @@ async fn setup() -> (tempfile::TempDir, HostService, Context, HostPrepareConfig)
     .await
     .unwrap();
     let service = HostService::new(store, host.clone()).unwrap();
-    (dir, service, host, prepare_config())
+    (dir, service, host, config)
 }
 
 #[tokio::test]

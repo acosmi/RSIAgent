@@ -1860,7 +1860,7 @@ pub struct RegisteredDevelopmentRunner {
     grader: Context,
     control_id: String,
     lease_seconds: i64,
-    clock: Arc<dyn Fn() -> Result<i64> + Send + Sync>,
+    clock: evo_core::clock::WallClock,
 }
 
 impl RegisteredDevelopmentRunner {
@@ -1871,14 +1871,8 @@ impl RegisteredDevelopmentRunner {
         control_id: impl Into<String>,
         lease_seconds: i64,
     ) -> Result<Self> {
-        Self::with_result_clock(
-            store,
-            executor,
-            grader,
-            control_id,
-            lease_seconds,
-            Arc::new(evo_core::now),
-        )
+        let clock = store.wall_clock();
+        Self::with_result_clock(store, executor, grader, control_id, lease_seconds, clock)
     }
 
     pub fn with_clock(
@@ -1895,7 +1889,7 @@ impl RegisteredDevelopmentRunner {
             grader,
             control_id,
             lease_seconds,
-            Arc::new(move || Ok(clock())),
+            evo_core::clock::WallClock::fixture_seconds(clock),
         )
     }
 
@@ -1905,8 +1899,9 @@ impl RegisteredDevelopmentRunner {
         grader: Context,
         control_id: impl Into<String>,
         lease_seconds: i64,
-        clock: Arc<dyn Fn() -> Result<i64> + Send + Sync>,
+        clock: evo_core::clock::WallClock,
     ) -> Result<Self> {
+        store.require_clock_source(&clock)?;
         executor.require(&[Role::Worker, Role::Host])?;
         grader.require(&[Role::Evaluator])?;
         if executor.actor() == grader.actor() || executor.namespace() != grader.namespace() {
@@ -1928,7 +1923,7 @@ impl RegisteredDevelopmentRunner {
     }
 
     fn now(&self) -> Result<i64> {
-        let now = (self.clock)()?;
+        let now = self.clock.seconds()?;
         if now < 0 {
             return Err(Error::ClockRegressed);
         }

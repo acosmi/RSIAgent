@@ -6,12 +6,35 @@ pub mod lifecycle;
 pub mod replay;
 pub mod typed_budget;
 
-use evo_core::{Context, Error, Result, fingerprint, hash, identifier, now, search_tokens};
+mod migration_clock;
+mod owned_occurrence;
+mod readonly_worker;
+
+/// Fixed data-only child entry, called by rsia before normal bootstrap.
+#[doc(hidden)]
+pub fn readonly_original_worker_entry() -> Option<i32> {
+    readonly_worker::entry_if_requested()
+}
+mod write_clock;
+
+pub use owned_occurrence::e05_issue::{
+    ClosedFormalReadR39, ClosedFormalSourceR38, E05IssueOperation, E05IssueOutcome, E05NativeFacts,
+    FormalReadDataR49, FormalReadSelectorR38, FormalSourceClassR38, NativeCompilerClosureDataR49,
+    NativeCompilerInputsDataR49, NativeCurrentCompleteR39, NativeCurrentFormalR39,
+    NativeHostEvidenceR49, NativeOperatorCredentialR49, NativeReadRecordR39,
+    NativeReleaseCredentialR49, NativeTypedReadSetR39, validate_native_compiler_value_r49,
+};
+
+use owned_occurrence::PreparePreimages;
+use write_clock::OperationClock;
+pub use write_clock::TransactionFailure as SessionCommitFailure;
+
+use evo_core::{Context, Error, Result, fingerprint, hash, identifier, search_tokens};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sqlx::{
-    ConnectOptions, Row, Sqlite, SqlitePool, Transaction,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    ConnectOptions, Connection, Row, Sqlite, TransactionManager,
+    sqlite::{SqliteConnectOptions, SqliteSynchronous},
 };
 use std::{
     fs::File,
@@ -104,12 +127,471 @@ struct BlobFileIdentity {
 
 #[derive(Clone)]
 pub struct Store {
-    pool: SqlitePool,
+    pool: NativePool,
     root: PathBuf,
+    // Exact mounted database, not a guessed basename under the blob directory.
+    data_path: PathBuf,
     blob_lock: Arc<RwLock<()>>,
+    prepare_inputs: Arc<PreparePreimages>,
+    wall_clock: evo_core::clock::WallClock,
+    runtime: Arc<StoreRuntime>,
 }
 pub struct Session {
-    tx: Transaction<'static, Sqlite>,
+    tx: Option<NativeTransaction>,
+    clock: OperationClock,
+    prepare_inputs: Arc<PreparePreimages>,
+    write_started: bool,
+    _runtime: Arc<StoreRuntime>,
+    _activity: lifecycle::WriterActivity,
+}
+
+/// Native connection ownership is separate from an async caller's lifetime.
+/// Cancelling a lease never drops SQLite's independent worker connection.
+#[derive(Clone)]
+struct NativePool {
+    owner: Arc<NativeOwner>,
+}
+
+struct NativeOwner {
+    connection: Arc<tokio::sync::Mutex<Option<sqlx::SqliteConnection>>>,
+    writer: std::sync::Mutex<Option<Arc<lifecycle::DirectoryWriterGuard>>>,
+    closing: std::sync::atomic::AtomicBool,
+    native_started: std::sync::atomic::AtomicBool,
+    completion: tokio::sync::watch::Sender<Option<bool>>,
+    fs_jobs: tokio::sync::watch::Sender<usize>,
+}
+
+struct NativeConnection {
+    // Drop this guard before the owner: its final Drop may close the connection.
+    lease: Option<tokio::sync::OwnedMutexGuard<Option<sqlx::SqliteConnection>>>,
+    owner: Arc<NativeOwner>,
+}
+
+pub(crate) struct NativeTransaction {
+    connection: NativeConnection,
+    open: bool,
+}
+
+struct NativeFsJob {
+    owner: Arc<NativeOwner>,
+}
+
+// Until a positive native acknowledgement, unwind must retain this OS guard too.
+struct NativeGuardUntilAck(Option<Arc<lifecycle::DirectoryWriterGuard>>);
+
+impl NativeGuardUntilAck {
+    fn acknowledged(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for NativeGuardUntilAck {
+    fn drop(&mut self) {
+        if let Some(writer) = self.0.take() {
+            std::mem::forget(writer);
+        }
+    }
+}
+
+impl Drop for NativeFsJob {
+    fn drop(&mut self) {
+        self.owner.fs_jobs.send_modify(|active| *active -= 1);
+    }
+}
+
+impl NativeOwner {
+    fn retain_unconfirmed_guard(&self) {
+        if let Some(writer) = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            // The public API supplied no native acknowledgement. This exceptional
+            // resource retention is never counted as a successful close.
+            std::mem::forget(writer);
+        }
+    }
+
+    async fn close_native(&self) -> bool {
+        let connection = self.connection.lock().await.take();
+        let mut jobs = self.fs_jobs.subscribe();
+        while *jobs.borrow_and_update() != 0 {
+            if jobs.changed().await.is_err() {
+                self.retain_unconfirmed_guard();
+                return false;
+            }
+        }
+        let result = match connection {
+            Some(connection) => connection.close().await,
+            None if !self
+                .native_started
+                .load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                Ok(())
+            }
+            None => Err(sqlx::Error::WorkerCrashed),
+        };
+        match result {
+            Ok(()) => {
+                // Connection::close acknowledged SQLite worker shutdown. The
+                // blocking FS tokens above also reached their actual terminal.
+                self.writer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                true
+            }
+            Err(error) => {
+                tracing::error!(error=?error, "native close unconfirmed; retaining directory guard");
+                self.retain_unconfirmed_guard();
+                false
+            }
+        }
+    }
+}
+
+impl Drop for NativeOwner {
+    fn drop(&mut self) {
+        let writer = self
+            .writer
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(writer) = writer else {
+            return;
+        };
+        let mut guard = NativeGuardUntilAck(Some(writer));
+        // Every pending acquisition, lease and actual FS job retains this owner.
+        // The last owner therefore has no legitimate mutex user left.
+        let connection = match self.connection.try_lock() {
+            Ok(mut slot) => slot.take(),
+            Err(error) => {
+                tracing::error!(error=%error, "last native owner still leased; retaining guard");
+                return;
+            }
+        };
+        let Some(connection) = connection else {
+            if !self
+                .native_started
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                guard.acknowledged();
+            }
+            return;
+        };
+        let closing = std::thread::Builder::new()
+            .name("rsia-native-last-close".into())
+            .spawn(move || {
+                let result = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(connection.close()),
+                    Err(error) => {
+                        tracing::error!(error=%error, "native close runtime unavailable");
+                        Err(sqlx::Error::WorkerCrashed)
+                    }
+                };
+                match result {
+                    Ok(()) => guard.acknowledged(),
+                    Err(error) => {
+                        tracing::error!(error=?error, "last native close unconfirmed; retaining guard");
+                    }
+                }
+                // Failed spawn, runtime, close or unwind all retain this guard.
+            });
+        if let Err(error) = closing {
+            tracing::error!(error=%error, "native close thread unavailable; retaining guard");
+        }
+    }
+}
+
+impl NativePool {
+    fn new(writer: Arc<lifecycle::DirectoryWriterGuard>) -> Self {
+        Self {
+            owner: Arc::new(NativeOwner {
+                connection: Arc::new(tokio::sync::Mutex::new(None)),
+                writer: std::sync::Mutex::new(Some(writer)),
+                closing: std::sync::atomic::AtomicBool::new(false),
+                native_started: std::sync::atomic::AtomicBool::new(false),
+                completion: tokio::sync::watch::channel(None).0,
+                fs_jobs: tokio::sync::watch::channel(0).0,
+            }),
+        }
+    }
+
+    fn writer(&self) -> Result<Arc<lifecycle::DirectoryWriterGuard>> {
+        if self
+            .owner
+            .closing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Conflict("store is closing".into()));
+        }
+        self.owner
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| Error::Conflict("store is closed".into()))
+    }
+
+    async fn initialize(
+        &self,
+        options: SqliteConnectOptions,
+        mut clock: OperationClock,
+    ) -> Result<OperationClock> {
+        let owner = Arc::clone(&self.owner);
+        let (sent, received) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("rsia-native-connect".into())
+            .spawn(move || {
+                let result = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(async {
+                        // The first connect can create a DB and runs SQLx's own
+                        // initialization. The very same operation samples before it.
+                        let stamp = clock.seconds(&Default::default())?;
+                        clock.take_seconds(stamp)?;
+                        owner
+                            .native_started
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        let connection = match options.connect().await {
+                            Ok(connection) => connection,
+                            Err(error) => {
+                                // SQLx may already have dropped an internal worker
+                                // before returning Err. No public shutdown ack exists.
+                                owner.retain_unconfirmed_guard();
+                                return Err(internal(error));
+                            }
+                        };
+                        *owner.connection.lock().await = Some(connection);
+                        Ok(clock)
+                    }),
+                    Err(error) => Err(internal(error)),
+                };
+                // Only operation data/status cross this channel. If the receiver
+                // disappeared, this thread still owns the complete native lifetime.
+                let _ = sent.send(result);
+            })
+            .map_err(internal)?;
+        received.await.map_err(internal)?
+    }
+
+    async fn acquire(&self) -> std::result::Result<NativeConnection, sqlx::Error> {
+        let owner = Arc::clone(&self.owner);
+        if owner.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(sqlx::Error::PoolClosed);
+        }
+        let lease = Arc::clone(&owner.connection).lock_owned().await;
+        if owner.closing.load(std::sync::atomic::Ordering::Acquire) || lease.is_none() {
+            return Err(sqlx::Error::PoolClosed);
+        }
+        let mut connection = NativeConnection {
+            lease: Some(lease),
+            owner,
+        };
+        // A previous future may have queued rollback during cancellation. The
+        // FIFO ping must acknowledge it before this becomes a new top-level
+        // operation. Failed rollback must never turn a new BEGIN into SAVEPOINT.
+        let ready = connection.ping().await.and_then(|()| {
+            if sqlx::sqlite::SqliteTransactionManager::get_transaction_depth(&connection) == 0 {
+                Ok(())
+            } else {
+                Err(sqlx::Error::BeginFailed)
+            }
+        });
+        if let Err(error) = ready {
+            self.request_close();
+            return Err(error);
+        }
+        Ok(connection)
+    }
+
+    async fn begin(&self) -> std::result::Result<NativeTransaction, sqlx::Error> {
+        self.begin_statement(None).await
+    }
+
+    async fn begin_with(
+        &self,
+        statement: &'static str,
+    ) -> std::result::Result<NativeTransaction, sqlx::Error> {
+        self.begin_statement(Some(std::borrow::Cow::Borrowed(statement)))
+            .await
+    }
+
+    async fn begin_statement(
+        &self,
+        statement: Option<std::borrow::Cow<'static, str>>,
+    ) -> std::result::Result<NativeTransaction, sqlx::Error> {
+        let mut transaction = NativeTransaction {
+            connection: self.acquire().await?,
+            open: true,
+        };
+        sqlx::sqlite::SqliteTransactionManager::begin(&mut transaction, statement).await?;
+        Ok(transaction)
+    }
+
+    fn fs_job(&self) -> NativeFsJob {
+        let owner = Arc::clone(&self.owner);
+        owner.fs_jobs.send_modify(|active| {
+            *active = active.checked_add(1).expect("native job count overflow")
+        });
+        NativeFsJob { owner }
+    }
+
+    fn request_close(&self) {
+        if self
+            .owner
+            .closing
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let owner = Arc::clone(&self.owner);
+        let fallback = Arc::clone(&owner);
+        let closing = std::thread::Builder::new()
+            .name("rsia-native-close".into())
+            .spawn(move || {
+                let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        Ok(runtime) => runtime.block_on(owner.close_native()),
+                        Err(error) => {
+                            owner.retain_unconfirmed_guard();
+                            tracing::error!(error=%error, "native close runtime unavailable; retaining guard");
+                            false
+                        }
+                    }
+                }));
+                let closed = match closed {
+                    Ok(closed) => closed,
+                    Err(_) => {
+                        owner.retain_unconfirmed_guard();
+                        false
+                    }
+                };
+                // An unwind publishes an honest failed terminal to all waiters.
+                owner.completion.send_replace(Some(closed));
+            });
+        if let Err(error) = closing {
+            fallback.retain_unconfirmed_guard();
+            fallback.completion.send_replace(Some(false));
+            tracing::error!(error=%error, "native close owner unavailable");
+        }
+    }
+
+    async fn close(&self) -> std::result::Result<(), sqlx::Error> {
+        let mut completion = self.owner.completion.subscribe();
+        self.request_close();
+        loop {
+            match *completion.borrow_and_update() {
+                Some(true) => return Ok(()),
+                Some(false) => return Err(sqlx::Error::WorkerCrashed),
+                None => {}
+            }
+            completion
+                .changed()
+                .await
+                .map_err(|_| sqlx::Error::WorkerCrashed)?;
+        }
+    }
+}
+
+impl std::ops::Deref for NativeConnection {
+    type Target = sqlx::SqliteConnection;
+    fn deref(&self) -> &Self::Target {
+        self.lease
+            .as_ref()
+            .and_then(|slot| slot.as_ref())
+            .expect("private live native lease")
+    }
+}
+impl std::ops::DerefMut for NativeConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.lease
+            .as_mut()
+            .and_then(|slot| slot.as_mut())
+            .expect("private live native lease")
+    }
+}
+impl Drop for NativeConnection {
+    fn drop(&mut self) {
+        // Queued rollback stays on the owner-held connection. The next command
+        // or native shutdown is FIFO after it; no native connection is dropped.
+        if sqlx::sqlite::SqliteTransactionManager::get_transaction_depth(self) > 0 {
+            sqlx::sqlite::SqliteTransactionManager::start_rollback(self);
+        }
+        drop(self.lease.take());
+    }
+}
+impl NativeConnection {
+    async fn release(mut self) -> std::result::Result<(), sqlx::Error> {
+        let result = async {
+            while sqlx::sqlite::SqliteTransactionManager::get_transaction_depth(&self) > 0 {
+                sqlx::sqlite::SqliteTransactionManager::rollback(&mut self).await?;
+            }
+            self.ping().await
+        }
+        .await;
+        if result.is_err() {
+            NativePool {
+                owner: Arc::clone(&self.owner),
+            }
+            .request_close();
+        }
+        result
+    }
+}
+impl std::ops::Deref for NativeTransaction {
+    type Target = sqlx::SqliteConnection;
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+impl std::ops::DerefMut for NativeTransaction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+impl Drop for NativeTransaction {
+    fn drop(&mut self) {
+        if self.open {
+            sqlx::sqlite::SqliteTransactionManager::start_rollback(&mut self.connection);
+        }
+    }
+}
+impl NativeTransaction {
+    async fn commit(mut self) -> std::result::Result<(), sqlx::Error> {
+        sqlx::sqlite::SqliteTransactionManager::commit(&mut self.connection).await?;
+        self.open = false;
+        Ok(())
+    }
+    async fn rollback(mut self) -> std::result::Result<(), sqlx::Error> {
+        sqlx::sqlite::SqliteTransactionManager::rollback(&mut self.connection).await?;
+        self.open = false;
+        Ok(())
+    }
+    async fn begin(&mut self) -> std::result::Result<sqlx::Transaction<'_, Sqlite>, sqlx::Error> {
+        self.connection.begin().await
+    }
+}
+
+struct StoreRuntime {
+    pool: NativePool,
+}
+impl StoreRuntime {
+    fn writer(&self) -> Result<Arc<lifecycle::DirectoryWriterGuard>> {
+        self.pool.writer()
+    }
+    async fn close(&self) {
+        if let Err(error) = self.pool.close().await {
+            tracing::error!(error=?error, "store close did not obtain native acknowledgement");
+        }
+    }
 }
 
 /// Schema of the tombstone the revocation cleanup leaves in place of an artifact
@@ -592,7 +1074,43 @@ fn publish_blob_no_replace(source: &Path, destination: &Path) -> Result<bool> {
     }
 }
 
-async fn cleanup_private_blob_staging(root: &Path) -> Result<()> {
+/// The actual blocking syscall owns the lifetime capability. Cancelling the
+/// JoinHandle receiver cannot release the directory while that job still runs.
+#[derive(Clone, Copy)]
+enum StagingRemoval {
+    File,
+    EmptyDirectory,
+    Tree,
+}
+
+async fn remove_private_staging(
+    path: PathBuf,
+    activity: lifecycle::WriterActivity,
+    native: NativeFsJob,
+    removal: StagingRemoval,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let _activity = activity;
+        let _native = native;
+        match removal {
+            StagingRemoval::File => std::fs::remove_file(path),
+            StagingRemoval::EmptyDirectory => std::fs::remove_dir(path),
+            StagingRemoval::Tree => std::fs::remove_dir_all(path),
+        }
+        .map_err(internal)
+    })
+    .await
+    .map_err(internal)?
+}
+
+async fn cleanup_private_blob_staging(
+    root: &Path,
+    connection: &mut sqlx::SqliteConnection,
+    inputs: &PreparePreimages,
+    clock: &mut OperationClock,
+    activity: &lifecycle::WriterActivity,
+    pool: &NativePool,
+) -> Result<()> {
     let staging = root.join(".blob-staging");
     let metadata = match tokio::fs::symlink_metadata(&staging).await {
         Ok(metadata) => metadata,
@@ -604,20 +1122,20 @@ async fn cleanup_private_blob_staging(root: &Path) -> Result<()> {
             "private blob staging root is linked or non-directory".into(),
         ));
     }
-    let mut namespaces = tokio::fs::read_dir(&staging).await.map_err(internal)?;
-    while let Some(namespace) = namespaces.next_entry().await.map_err(internal)? {
-        let metadata = namespace.metadata().await.map_err(internal)?;
-        if !metadata.is_dir() || namespace.file_type().await.map_err(internal)?.is_symlink() {
+    // Synchronous enumeration has no detached blocking job after cancellation.
+    // The operation's native lease and directory activity remain in this frame.
+    for namespace in std::fs::read_dir(&staging).map_err(internal)? {
+        let namespace = namespace.map_err(internal)?;
+        let metadata = namespace.metadata().map_err(internal)?;
+        if !metadata.is_dir() || namespace.file_type().map_err(internal)?.is_symlink() {
             return Err(Error::Conflict(
                 "private blob staging namespace is linked or non-directory".into(),
             ));
         }
-        let mut files = tokio::fs::read_dir(namespace.path())
-            .await
-            .map_err(internal)?;
-        while let Some(file) = files.next_entry().await.map_err(internal)? {
-            let metadata = file.metadata().await.map_err(internal)?;
-            if !metadata.is_file() || file.file_type().await.map_err(internal)?.is_symlink() {
+        for file in std::fs::read_dir(namespace.path()).map_err(internal)? {
+            let file = file.map_err(internal)?;
+            let metadata = file.metadata().map_err(internal)?;
+            if !metadata.is_file() || file.file_type().map_err(internal)?.is_symlink() {
                 return Err(Error::Conflict(
                     "private blob staging member is linked or non-regular".into(),
                 ));
@@ -631,18 +1149,42 @@ async fn cleanup_private_blob_staging(root: &Path) -> Result<()> {
                     ));
                 }
             }
-            tokio::fs::remove_file(file.path())
-                .await
-                .map_err(internal)?;
+            write_clock::seconds_on_connection(connection, inputs, clock).await?;
+            remove_private_staging(
+                file.path(),
+                activity.clone(),
+                pool.fs_job(),
+                StagingRemoval::File,
+            )
+            .await?;
         }
-        tokio::fs::remove_dir(namespace.path())
-            .await
-            .map_err(internal)?;
+        write_clock::seconds_on_connection(connection, inputs, clock).await?;
+        remove_private_staging(
+            namespace.path(),
+            activity.clone(),
+            pool.fs_job(),
+            StagingRemoval::EmptyDirectory,
+        )
+        .await?;
     }
-    tokio::fs::remove_dir(staging).await.map_err(internal)
+    write_clock::seconds_on_connection(connection, inputs, clock).await?;
+    remove_private_staging(
+        staging,
+        activity.clone(),
+        pool.fs_job(),
+        StagingRemoval::EmptyDirectory,
+    )
+    .await
 }
 
-async fn cleanup_private_export_staging(root: &Path) -> Result<()> {
+async fn cleanup_private_export_staging(
+    root: &Path,
+    connection: &mut sqlx::SqliteConnection,
+    inputs: &PreparePreimages,
+    clock: &mut OperationClock,
+    activity: &lifecycle::WriterActivity,
+    pool: &NativePool,
+) -> Result<()> {
     let staging = root.join(".export-staging");
     let metadata = match tokio::fs::symlink_metadata(&staging).await {
         Ok(metadata) => metadata,
@@ -654,8 +1196,10 @@ async fn cleanup_private_export_staging(root: &Path) -> Result<()> {
             "private export staging root is linked or non-directory".into(),
         ));
     }
-    let mut namespaces = tokio::fs::read_dir(&staging).await.map_err(internal)?;
-    while let Some(namespace) = namespaces.next_entry().await.map_err(internal)? {
+    // Synchronous enumeration has no detached blocking job after cancellation.
+    // The operation's native lease and directory activity remain in this frame.
+    for namespace in std::fs::read_dir(&staging).map_err(internal)? {
+        let namespace = namespace.map_err(internal)?;
         let metadata = tokio::fs::symlink_metadata(namespace.path())
             .await
             .map_err(internal)?;
@@ -664,11 +1208,23 @@ async fn cleanup_private_export_staging(root: &Path) -> Result<()> {
                 "private export staging namespace is linked or non-directory".into(),
             ));
         }
-        tokio::fs::remove_dir_all(namespace.path())
-            .await
-            .map_err(internal)?;
+        write_clock::seconds_on_connection(connection, inputs, clock).await?;
+        remove_private_staging(
+            namespace.path(),
+            activity.clone(),
+            pool.fs_job(),
+            StagingRemoval::Tree,
+        )
+        .await?;
     }
-    tokio::fs::remove_dir(staging).await.map_err(internal)
+    write_clock::seconds_on_connection(connection, inputs, clock).await?;
+    remove_private_staging(
+        staging,
+        activity.clone(),
+        pool.fs_job(),
+        StagingRemoval::EmptyDirectory,
+    )
+    .await
 }
 
 async fn verify_registered_source_refs(
@@ -763,7 +1319,7 @@ async fn load_dependency_record_snapshots(
     .bind(ctx.namespace())
     .bind(artifact_id)
     .bind(ctx.namespace())
-    .fetch_all(&mut *session.tx)
+    .fetch_all(&mut **session.transaction()?)
     .await
     .map_err(internal)?;
     if rows.len() > 10_000 {
@@ -1200,7 +1756,7 @@ pub(crate) struct RawUpstreamNode {
 }
 
 pub(crate) async fn upstream_rows_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     namespace: &str,
     roots: &[(&str, &str)],
     limit: usize,
@@ -1267,47 +1823,410 @@ pub(crate) async fn upstream_rows_in_tx(
 
 impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
-        let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        tokio::fs::create_dir_all(&root).await.map_err(internal)?;
-        cleanup_private_blob_staging(&root).await?;
-        cleanup_private_export_staging(&root).await?;
+        Self::open_with_prepare_configs(path, Vec::new()).await
+    }
+    pub async fn reject_known_host_complete_before_open_r49(
+        ctx: &Context,
+        path: &Path,
+        ticket_id: &str,
+    ) -> Result<()> {
+        ctx.require(&[evo_core::Role::Evaluator])?;
+        evo_core::identifier(ticket_id)?;
+        let data = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().map_err(internal)?.join(path)
+        };
+        lifecycle::reject_known_host_complete_path_r49(data, ctx.clone(), ticket_id.into()).await
+    }
+
+    /// Preimages are data. Both read-only admission and the writer connection
+    /// independently qualify them against this database's immutable witnesses.
+    pub async fn open_with_prepare_configs(
+        path: &Path,
+        candidates: Vec<evo_core::prepare_contract::HostPrepareConfig>,
+    ) -> Result<Self> {
+        Self::open_clock_source(path, candidates, evo_core::clock::WallClock::system()).await
+    }
+
+    /// Explicit trusted Rust fixture dependency, chosen before preflight and
+    /// the first migration. No production wire/config selects this source.
+    #[doc(hidden)]
+    pub async fn open_with_fixture_clock(
+        path: &Path,
+        candidates: Vec<evo_core::prepare_contract::HostPrepareConfig>,
+        clock: evo_core::clock::WallClock,
+    ) -> Result<Self> {
+        Self::open_clock_source(path, candidates, clock).await
+    }
+
+    async fn open_clock_source(
+        path: &Path,
+        candidates: Vec<evo_core::prepare_contract::HostPrepareConfig>,
+        clock: evo_core::clock::WallClock,
+    ) -> Result<Self> {
+        // Capture relative request semantics before a guard or the first await.
+        // Every writer and original-RO operation below receives this same path.
+        let requested_data_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().map_err(internal)?.join(path)
+        };
+        let path = requested_data_path.as_path();
+        for candidate in &candidates {
+            candidate.validate()?;
+        }
+        let guard =
+            lifecycle::DirectoryWriterGuard::acquire_checked_with_clock(path, &candidates, &clock)?;
+        Self::open_locked_clock_source(path, guard, candidates, clock).await
+    }
+
+    /// Trusted mounted entries transfer the real OS guard, not a path/bool
+    /// claiming that another owner once checked the directory.
+    pub async fn open_locked(
+        path: &Path,
+        guard: Arc<lifecycle::DirectoryWriterGuard>,
+        candidates: Vec<evo_core::prepare_contract::HostPrepareConfig>,
+    ) -> Result<Self> {
+        Self::open_locked_clock_source(
+            path,
+            guard,
+            candidates,
+            evo_core::clock::WallClock::system(),
+        )
+        .await
+    }
+
+    async fn open_locked_clock_source(
+        path: &Path,
+        guard: Arc<lifecycle::DirectoryWriterGuard>,
+        candidates: Vec<evo_core::prepare_contract::HostPrepareConfig>,
+        clock: evo_core::clock::WallClock,
+    ) -> Result<Self> {
+        // Capture relative request semantics before a guard or the first await.
+        // Every writer and original-RO operation below receives this same path.
+        let requested_data_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().map_err(internal)?.join(path)
+        };
+        let path = requested_data_path.as_path();
+        if !guard.matches_data(path) {
+            return Err(Error::Forbidden);
+        }
+        for candidate in &candidates {
+            candidate.validate()?;
+        }
+        lifecycle::preflight_occurrence_clock_with_clock(path, &candidates, clock.clone()).await?;
+        let root = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let prepare_inputs = Arc::new(PreparePreimages {
+            candidates,
+            ..Default::default()
+        });
+        // Only source-proven neutral connection-local initialization occurs
+        // here. Persistent WAL selection follows original-connection admission.
         let opts = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             .foreign_keys(true)
-            .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full)
             .busy_timeout(Duration::from_secs(5))
             .disable_statement_logging();
-        // One connection serializes state transitions, including read/modify/write budget transactions.
-        // Production entry points hold a shared data-directory OS lock until close.
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_lazy_with(opts);
-        // Retain the pool even when connecting/migrating fails. Dropping its
-        // last handle does not await background connection shutdown, so it
-        // must be explicitly closed before the caller releases its OS guard.
-        if let Err(error) = sqlx::migrate!("./migrations").run(&pool).await {
-            pool.close().await;
-            return Err(internal(error));
+        let pool = NativePool::new(Arc::clone(&guard));
+        let runtime = Arc::new(StoreRuntime { pool: pool.clone() });
+        let _activity = guard.write_scope().await;
+        let initialized: Result<()> = async {
+            let mut operation_clock = pool
+                .initialize(opts, OperationClock::with_source(clock.clone()))
+                .await?;
+            let mut connection = pool.acquire().await.map_err(internal)?;
+            write_clock::seconds_on_connection(
+                &mut connection,
+                &prepare_inputs,
+                &mut operation_clock,
+            )
+            .await?;
+            let (version, source_id): (String, String) =
+                sqlx::query_as("SELECT sqlite_version(),sqlite_source_id()")
+                    .fetch_one(&mut *connection)
+                    .await
+                    .map_err(internal)?;
+            if version.is_empty() || source_id.is_empty() {
+                return Err(Error::Internal);
+            }
+            tracing::debug!(%version, %source_id, "original SQLite connection identity");
+            write_clock::seconds_on_connection(
+                &mut connection,
+                &prepare_inputs,
+                &mut operation_clock,
+            )
+            .await?;
+            sqlx::query("PRAGMA journal_mode=WAL")
+                .execute(&mut *connection)
+                .await
+                .map_err(internal)?;
+            if let Err(failure) = migration_clock::run_migrations(
+                &mut connection,
+                &prepare_inputs,
+                &mut operation_clock,
+            )
+            .await
+            {
+                tracing::error!(migration_error=?failure.migration_error,
+                    rollback_error=?failure.rollback_error,
+                    committed_versions=?failure.committed_versions,
+                    commit_outcome_unknown=failure.commit_outcome_unknown,
+                    migrations_table_phase_committed=failure.migrations_table_phase_committed,
+                    "migration stopped with original completion facts");
+                return Err(failure.error);
+            }
+            // Cleanup is downstream of both read-only preflight and actual
+            // writer-connection/migration admission, never an open side effect.
+            cleanup_private_blob_staging(
+                &root,
+                &mut connection,
+                &prepare_inputs,
+                &mut operation_clock,
+                &_activity,
+                &pool,
+            )
+            .await?;
+            cleanup_private_export_staging(
+                &root,
+                &mut connection,
+                &prepare_inputs,
+                &mut operation_clock,
+                &_activity,
+                &pool,
+            )
+            .await?;
+            Ok(())
         }
+        .await;
+        if let Err(error) = initialized {
+            runtime.close().await;
+            return Err(error);
+        }
+        let data_path = match path.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                runtime.close().await;
+                return Err(internal(error));
+            }
+        };
         Ok(Self {
             pool,
             root,
+            data_path,
             blob_lock: Arc::new(RwLock::new(())),
+            prepare_inputs,
+            wall_clock: clock,
+            runtime,
         })
     }
+    /// Capture a fixed formal source on its original readonly native snapshot.
+    /// The returned private-field source has completed native close; it is not
+    /// a Current report and cannot authorize approval or replace read verification.
+    pub async fn capture_formal_source(
+        &self,
+        ctx: &Context,
+        selector: FormalReadSelectorR38,
+    ) -> Result<Option<ClosedFormalSourceR38>> {
+        selector.validate_request(ctx)?;
+        let mount = self.runtime.writer()?;
+        lifecycle::read_formal_source_r38(self.data_path.clone(), mount, ctx.clone(), selector)
+            .await
+    }
+
+    /// One original readonly transaction/close owner for status and formal
+    /// source content. Running tickets do not require a report to exist.
+    pub async fn read_formal_snapshot(
+        &self,
+        ctx: &Context,
+        selector: FormalReadSelectorR38,
+    ) -> Result<ClosedFormalReadR39> {
+        selector.validate_request(ctx)?;
+        let mount = self.runtime.writer()?;
+        lifecycle::read_formal_snapshot_r39(self.data_path.clone(), mount, ctx.clone(), selector)
+            .await
+    }
+
+    pub fn wall_clock(&self) -> evo_core::clock::WallClock {
+        self.wall_clock.clone()
+    }
+
+    /// A trusted fixture runner/broker must share the actual original reader.
+    /// Equal numeric values are insufficient and never replace source identity.
+    pub fn require_clock_source(&self, clock: &evo_core::clock::WallClock) -> Result<()> {
+        if self.wall_clock.same_source(clock) {
+            Ok(())
+        } else {
+            Err(Error::Conflict(
+                "clock source differs from the mounted store".into(),
+            ))
+        }
+    }
+
+    fn operation_clock(&self) -> OperationClock {
+        OperationClock::with_source(self.wall_clock.clone())
+    }
+
+    /// Candidate request preimages for historical owned prepare caches. These
+    /// values grant no role or provenance: the snapshot collector revalidates
+    /// each candidate against independently persisted Host/Profile witnesses.
+    pub fn with_prepare_configs(
+        mut self,
+        candidates: Vec<evo_core::prepare_contract::HostPrepareConfig>,
+    ) -> Result<Self> {
+        for candidate in &candidates {
+            candidate.validate()?;
+        }
+        self.prepare_inputs = Arc::new(PreparePreimages {
+            candidates,
+            ..Default::default()
+        });
+        Ok(self)
+    }
+
+    /// Matches actual operation data to the finite pre-open candidate set.
+    /// This is not provenance: collect_floor separately verifies the stored
+    /// immutable Host/Profile and complete snapshot/request content.
+    pub fn require_prepare_config(
+        &self,
+        config: &evo_core::prepare_contract::HostPrepareConfig,
+    ) -> Result<()> {
+        config.validate()?;
+        let expected = fingerprint(config)?;
+        for candidate in &self.prepare_inputs.candidates {
+            if fingerprint(candidate)? == expected {
+                return Ok(());
+            }
+        }
+        Err(Error::ClockRegressed)
+    }
+
+    /// Only the actual trusted registration path supplies this private session
+    /// candidate. Its complete request is requalified against every stored row;
+    /// it conveys no role, persistent claim, or exemption for an existing graph.
+    pub async fn session_with_import_request(
+        &self,
+        ctx: &Context,
+        request: &Value,
+    ) -> Result<Session> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        owned_occurrence::validate_import_preimage(ctx.namespace(), ctx.actor(), request)?;
+        let mut session = self.session().await?;
+        Arc::make_mut(&mut session.prepare_inputs)
+            .import_requests
+            .push(json!({
+                "namespace": ctx.namespace(), "owner_actor": ctx.actor(), "request": request
+            }));
+        Ok(session)
+    }
+
+    /// The actual request is only an operation-local preimage for the interval
+    /// after its Run insert and before its cache insert. An existing cache
+    /// cannot be bypassed using this transient candidate.
+    pub async fn session_with_prepare(
+        &self,
+        request: &evo_core::Prepare,
+        config: &evo_core::prepare_contract::HostPrepareConfig,
+    ) -> Result<Session> {
+        self.require_prepare_config(config)?;
+        evo_core::Validate::validate(request)?;
+        let mut session = self.session().await?;
+        Arc::make_mut(&mut session.prepare_inputs)
+            .requests
+            .push(request.clone());
+        Ok(session)
+    }
+
     pub async fn session(&self) -> Result<Session> {
+        let activity = self.runtime.writer()?.write_scope().await;
+        self.session_in_activity(activity).await
+    }
+
+    async fn session_in_activity(&self, activity: lifecycle::WriterActivity) -> Result<Session> {
+        if !activity.belongs_to(&self.runtime.writer()?) {
+            return Err(Error::Forbidden);
+        }
         Ok(Session {
-            tx: self.pool.begin().await.map_err(internal)?,
+            tx: Some(self.pool.begin().await.map_err(internal)?),
+            clock: self.operation_clock(),
+            prepare_inputs: Arc::clone(&self.prepare_inputs),
+            write_started: false,
+            _runtime: Arc::clone(&self.runtime),
+            _activity: activity,
         })
     }
+    /// Direct budget/lifecycle writers use the same connection and operation
+    /// latch as their final commit; diagnostic transactions keep their read path.
+    pub(crate) async fn begin_write_transaction(
+        &self,
+    ) -> Result<(NativeTransaction, OperationClock, lifecycle::WriterActivity)> {
+        let activity = self.runtime.writer()?.write_scope().await;
+        self.begin_write_transaction_in_activity(activity).await
+    }
+
+    pub(crate) async fn begin_write_transaction_in_activity(
+        &self,
+        activity: lifecycle::WriterActivity,
+    ) -> Result<(NativeTransaction, OperationClock, lifecycle::WriterActivity)> {
+        if !activity.belongs_to(&self.runtime.writer()?) {
+            return Err(Error::Forbidden);
+        }
+        let mut clock = self.operation_clock();
+        // Refuse a pre-epoch system sample before obtaining a write transaction.
+        // The real database floor is still requalified after the awaited begin.
+        let stamp = clock.seconds(&owned_occurrence::OccurrenceFloor::default())?;
+        clock.take_seconds(stamp)?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal)?;
+        if let Err(error) =
+            write_clock::seconds_in_transaction(&mut tx, &self.prepare_inputs, &mut clock).await
+        {
+            if let Err(rollback) = tx.rollback().await {
+                clock.record_rollback_error(rollback);
+            }
+            return Err(clock.failure(error).into_error());
+        }
+        Ok((tx, clock, activity))
+    }
+
+    pub(crate) async fn guard_transaction(
+        &self,
+        tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
+        clock: &mut OperationClock,
+    ) -> Result<()> {
+        write_clock::seconds_in_transaction(tx, &self.prepare_inputs, clock)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn commit_write_transaction(
+        &self,
+        tx: NativeTransaction,
+        clock: &mut OperationClock,
+    ) -> Result<()> {
+        write_clock::finish_transaction(tx, &self.prepare_inputs, clock, true)
+            .await
+            .map_err(SessionCommitFailure::into_error)
+    }
+
     pub async fn close(&self) {
-        self.pool.close().await;
+        self.runtime.close().await;
     }
     pub async fn integrity(&self) -> Result<String> {
+        let mut connection = self.pool.acquire().await.map_err(internal)?;
         sqlx::query_scalar("PRAGMA integrity_check")
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *connection)
             .await
             .map_err(internal)
     }
@@ -1328,6 +2247,7 @@ impl Store {
     ) -> Result<String> {
         ctx.require(&[evo_core::Role::Host, evo_core::Role::Admin])?;
         validate_blob_bound(bytes, max_bytes)?;
+        let _activity = self.runtime.writer()?.write_scope().await;
         let _guard = self.blob_lock.write().await;
         let digest = hash(bytes);
         let dir = self
@@ -1485,17 +2405,18 @@ impl Store {
             .map_err(internal)?;
         let final_path = final_dir.join(&digest);
 
+        let activity = self.runtime.writer()?.write_scope().await;
         let _guard = self.blob_lock.write().await;
         self.verify_prevalidated_dependency_identities(ctx, &dependencies)
             .await?;
-        let mut session = self.session().await?;
+        let mut session = self.session_in_activity(activity.clone()).await?;
         let fenced = sqlx::query(
             "UPDATE objects SET revision=revision
              WHERE namespace=? AND kind='artifact' AND id=?",
         )
         .bind(ctx.namespace())
         .bind(&artifact_id)
-        .execute(&mut *session.tx)
+        .execute(&mut **session.write_transaction().await?)
         .await
         .map_err(internal)?;
         if fenced.rows_affected() != 1 {
@@ -1714,6 +2635,7 @@ impl Store {
             None
         };
 
+        let activity = self.runtime.writer()?.write_scope().await;
         let _guard = self.blob_lock.write().await;
         if local_export_identity(staging.path()).await? != staging_identity {
             return Err(Error::Conflict(
@@ -1738,13 +2660,13 @@ impl Store {
         }
         self.verify_prevalidated_dependency_identities(ctx, dependencies)
             .await?;
-        let mut session = self.session().await?;
+        let mut session = self.session_in_activity(activity.clone()).await?;
         let fenced = sqlx::query(
             "UPDATE objects SET revision=revision WHERE namespace=? AND kind='artifact' AND id=?",
         )
         .bind(ctx.namespace())
         .bind(export_id)
-        .execute(&mut *session.tx)
+        .execute(&mut **session.write_transaction().await?)
         .await
         .map_err(internal)?;
         if fenced.rows_affected() != 1 {
@@ -1869,6 +2791,7 @@ impl Store {
             ));
         }
         let identity = local_export_identity(&path).await?;
+        let activity = self.runtime.writer()?.write_scope().await;
         let _guard = self.blob_lock.read().await;
         if local_export_identity(&path).await? != identity {
             return Err(Error::Conflict(
@@ -1877,13 +2800,13 @@ impl Store {
         }
         self.verify_prevalidated_dependency_identities(ctx, &dependencies)
             .await?;
-        let mut session = self.session().await?;
+        let mut session = self.session_in_activity(activity.clone()).await?;
         let fenced = sqlx::query(
             "UPDATE objects SET revision=revision WHERE namespace=? AND kind='artifact' AND id=?",
         )
         .bind(ctx.namespace())
         .bind(export_id)
-        .execute(&mut *session.tx)
+        .execute(&mut **session.write_transaction().await?)
         .await
         .map_err(internal)?;
         if fenced.rows_affected() != 1 {
@@ -1928,14 +2851,15 @@ impl Store {
     ) -> Result<()> {
         ctx.require(&[evo_core::Role::Admin])?;
         validate_export_id(export_id)?;
+        let activity = self.runtime.writer()?.write_scope().await;
         let _guard = self.blob_lock.write().await;
-        let mut session = self.session().await?;
+        let mut session = self.session_in_activity(activity.clone()).await?;
         let fenced = sqlx::query(
             "UPDATE objects SET revision=revision WHERE namespace=? AND kind='artifact' AND id=?",
         )
         .bind(ctx.namespace())
         .bind(export_id)
-        .execute(&mut *session.tx)
+        .execute(&mut **session.write_transaction().await?)
         .await
         .map_err(internal)?;
         if fenced.rows_affected() != 1 {
@@ -1995,6 +2919,7 @@ impl Store {
                 "blob read bound must be 1..=67108864 bytes".into(),
             ));
         }
+        let _activity = self.runtime.writer()?.write_scope().await;
         let _guard = self.blob_lock.read().await;
         let path = self
             .root
@@ -2060,6 +2985,7 @@ impl Store {
         if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(Error::Invalid("invalid content digest".into()));
         }
+        let _activity = self.runtime.writer()?.write_scope().await;
         let _guard = self.blob_lock.write().await;
         let path = self
             .root
@@ -2073,12 +2999,13 @@ impl Store {
         }
     }
     pub async fn verify_audit(&self, ctx: &Context) -> Result<usize> {
+        let mut connection = self.pool.acquire().await.map_err(internal)?;
         ctx.require(&[evo_core::Role::Admin, evo_core::Role::Evaluator])?;
         let rows = sqlx::query(
             "SELECT payload,previous_hash,digest FROM audit WHERE namespace=? ORDER BY seq",
         )
         .bind(ctx.namespace())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(internal)?;
         let mut previous = String::new();
@@ -2095,6 +3022,174 @@ impl Store {
     }
 }
 impl Session {
+    /// Transfer this entire operation to a native E05 issue owner before another
+    /// await point. Caller JSON is an intent, never a source or pending proof.
+    pub fn begin_formal_grade_capture_r49(
+        self,
+        ctx: Context,
+        ticket_id: String,
+        target_id: String,
+        receipt_id: String,
+    ) -> Result<E05IssueOperation> {
+        owned_occurrence::e05_issue::begin_grade_capture_r49(
+            self, ctx, ticket_id, target_id, receipt_id,
+        )
+    }
+    pub fn begin_formal_authority_r49(
+        self,
+        ctx: Context,
+        reference: evo_core::formal_version::ReportRef,
+    ) -> Result<E05IssueOperation> {
+        owned_occurrence::e05_issue::begin_authority_r49(self, ctx, reference)
+    }
+    pub fn begin_formal_approval_r49(
+        self,
+        ctx: Context,
+        credential: NativeOperatorCredentialR49,
+    ) -> Result<E05IssueOperation> {
+        owned_occurrence::e05_issue::begin_approval_r49(self, ctx, credential)
+    }
+    pub fn begin_formal_release_transition_r49(
+        self,
+        ctx: Context,
+        credential: NativeReleaseCredentialR49,
+    ) -> Result<E05IssueOperation> {
+        owned_occurrence::e05_issue::begin_release_transition_r49(self, ctx, credential)
+    }
+    /// Data inspection in this caller's actual transaction. It returns no
+    /// after-close or mutation capability and never opens a second snapshot.
+    pub async fn inspect_formal_data_r49(
+        &mut self,
+        ctx: &Context,
+        selector: FormalReadSelectorR38,
+    ) -> Result<FormalReadDataR49> {
+        owned_occurrence::e05_issue::inspect_formal_data_r49(self, ctx, selector).await
+    }
+    /// Fixed compiler reads in this already-owned native transaction. Returned
+    /// data grants no mutation capability and opens no other connection.
+    pub async fn inspect_native_compiler_inputs_r49(
+        &mut self,
+        ctx: &Context,
+        request: Value,
+    ) -> Result<Option<NativeCompilerInputsDataR49>> {
+        owned_occurrence::e05_issue::inspect_native_compiler_inputs_r49(self, ctx, request).await
+    }
+    pub async fn inspect_native_compiler_bundle_r49(
+        &mut self,
+        ctx: &Context,
+        bundle: Value,
+        environment: &str,
+        watermark: u64,
+        purpose: evo_core::evidence::Purpose,
+    ) -> Result<Option<NativeCompilerInputsDataR49>> {
+        owned_occurrence::e05_issue::inspect_native_compiler_bundle_r49(
+            self,
+            ctx,
+            bundle,
+            environment,
+            watermark,
+            purpose,
+        )
+        .await
+    }
+    /// The original bounded typed-closure business read in this same held
+    /// transaction. Returned data grants neither Current nor mutation rights.
+    pub async fn inspect_native_typed_closure_r49(
+        &mut self,
+        ctx: &Context,
+        roots: Vec<(String, String)>,
+    ) -> Result<Option<NativeCompilerClosureDataR49>> {
+        owned_occurrence::e05_issue::inspect_native_typed_closure_r49(self, ctx, roots).await
+    }
+    pub fn begin_e05_issue(self, ctx: Context, intent: Value) -> Result<E05IssueOperation> {
+        owned_occurrence::e05_issue::begin(self, ctx, intent)
+    }
+
+    pub fn begin_e05_execution(self, ctx: Context, intent: Value) -> Result<E05IssueOperation> {
+        owned_occurrence::e05_issue::begin_execution(self, ctx, intent)
+    }
+
+    pub fn begin_e05_grade(self, ctx: Context, intent: Value) -> Result<E05IssueOperation> {
+        owned_occurrence::e05_issue::begin_grade(self, ctx, intent)
+    }
+
+    pub fn begin_e05_complete(self, ctx: Context, intent: Value) -> Result<E05IssueOperation> {
+        owned_occurrence::e05_issue::begin_complete(self, ctx, intent)
+    }
+
+    pub fn begin_e05_reconcile(self, ctx: Context, intent: Value) -> Result<E05IssueOperation> {
+        owned_occurrence::e05_issue::begin_reconcile(self, ctx, intent)
+    }
+
+    pub fn begin_e05_invalidate(self, ctx: Context, intent: Value) -> Result<E05IssueOperation> {
+        owned_occurrence::e05_issue::begin_invalidate(self, ctx, intent)
+    }
+
+    /// No business SQL can use a transaction after temporal termination.
+    /// Fixed role/namespace-scoped readonly query. No raw transaction escapes.
+    pub async fn read_legacy_formal_material(
+        &mut self,
+        ctx: &Context,
+        ticket_id: &str,
+        expected: Option<&evo_core::formal_version::AnyReportRef>,
+    ) -> Result<Option<evo_core::formal_version::LegacyFormalMaterial>> {
+        owned_occurrence::e05_issue::read_legacy_formal_material_r24(self, ctx, ticket_id, expected)
+            .await
+    }
+
+    pub(crate) fn transaction(&mut self) -> Result<&mut NativeTransaction> {
+        self.clock.check()?;
+        self.tx.as_mut().ok_or(Error::ClockRegressed)
+    }
+
+    async fn terminate_clock_refusal(&mut self) {
+        if self.clock.check().is_err()
+            && let Some(tx) = self.tx.take()
+            && let Err(error) = tx.rollback().await
+        {
+            self.clock.record_rollback_error(error);
+        }
+    }
+
+    /// A fresh trusted sample on this Session's original transaction snapshot.
+    /// No caller, DTO or environment value can supply the sample.
+    pub async fn wall_seconds(&mut self) -> Result<i64> {
+        self.write_started = true;
+        let result = write_clock::seconds_in_transaction(
+            self.tx.as_mut().ok_or(Error::ClockRegressed)?,
+            &self.prepare_inputs,
+            &mut self.clock,
+        )
+        .await;
+        if result.is_err() {
+            self.terminate_clock_refusal().await;
+        }
+        result
+    }
+
+    pub async fn wall_millis(&mut self) -> Result<i64> {
+        self.write_started = true;
+        let result = write_clock::millis_in_transaction(
+            self.tx.as_mut().ok_or(Error::ClockRegressed)?,
+            &self.prepare_inputs,
+            &mut self.clock,
+        )
+        .await;
+        if result.is_err() {
+            self.terminate_clock_refusal().await;
+        }
+        result
+    }
+
+    pub(crate) async fn guard_write(&mut self) -> Result<()> {
+        self.wall_seconds().await.map(|_| ())
+    }
+
+    pub(crate) async fn write_transaction(&mut self) -> Result<&mut NativeTransaction> {
+        self.guard_write().await?;
+        self.transaction()
+    }
+
     /// Measure the whole instance against the E16.5 MVP capacity bounds inside
     /// this transaction. Every counter spans all namespaces (F24): the MVP load
     /// contract is per deployment, so a cap cannot be split by deriving from
@@ -2104,18 +3199,18 @@ impl Session {
     pub async fn capacity_usage_v41(&mut self, now_secs: u64) -> Result<CapacityUsageV41> {
         let now = i64::try_from(now_secs)
             .map_err(|_| Error::Invalid("capacity clock is out of range".into()))?;
-        let runs = count_runs_all_namespaces(&mut self.tx).await?;
+        let runs = count_runs_all_namespaces(self.transaction()?).await?;
         let imported_events: i64 = sqlx::query_scalar(
             "SELECT CAST(COALESCE(SUM(json_extract(body,'$.payload.aggregate_summary.total_events')),0) AS INTEGER)
              FROM objects WHERE kind='artifact'
                AND json_extract(body,'$.schema_version')=?",
         )
         .bind(CAPACITY_IMPORT_RESULT_SCHEMA)
-        .fetch_one(&mut *self.tx)
+        .fetch_one(&mut **self.transaction()?)
         .await
         .map_err(internal)?;
-        let event_objects = count_objects_all_namespaces(&mut self.tx, "event").await?;
-        let skills = count_objects_all_namespaces(&mut self.tx, "candidate").await?;
+        let event_objects = count_objects_all_namespaces(self.transaction()?, "event").await?;
+        let skills = count_objects_all_namespaces(self.transaction()?, "candidate").await?;
         let exploration_nodes: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM objects WHERE kind='artifact'
                AND json_extract(body,'$.schema_version')=?
@@ -2123,21 +3218,21 @@ impl Session {
         )
         .bind(CAPACITY_EXPLORATION_ENVELOPE_SCHEMA)
         .bind(CAPACITY_EXPLORATION_NODE_RECORD_KIND)
-        .fetch_one(&mut *self.tx)
+        .fetch_one(&mut **self.transaction()?)
         .await
         .map_err(internal)?;
         let replay_worlds = self.replay_world_count().await?;
-        let active_leases = count_active_leases(&mut self.tx, now).await?;
+        let active_leases = count_active_leases(self.transaction()?, now).await?;
         let staged_packages: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM objects WHERE kind='artifact'
                AND json_extract(body,'$.schema_version')=?
                AND json_extract(body,'$.payload.state') IN ('prepared','staged','quarantined')",
         )
         .bind(CAPACITY_STAGED_ASSET_SCHEMA)
-        .fetch_one(&mut *self.tx)
+        .fetch_one(&mut **self.transaction()?)
         .await
         .map_err(internal)?;
-        let concurrent_dispatches = count_running_management_jobs(&mut self.tx, now).await?;
+        let concurrent_dispatches = count_running_management_jobs(self.transaction()?, now).await?;
         Ok(CapacityUsageV41 {
             runs,
             events: count_to_u64(imported_events)?
@@ -2155,7 +3250,7 @@ impl Session {
     /// Count replay worlds (drafts and sealed) across every namespace.
     pub async fn replay_world_count(&mut self) -> Result<u64> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM replay_worlds")
-            .fetch_one(&mut *self.tx)
+            .fetch_one(&mut **self.transaction()?)
             .await
             .map_err(internal)?;
         count_to_u64(count)
@@ -2168,7 +3263,7 @@ impl Session {
             sqlx::query_scalar("SELECT COUNT(*) FROM objects WHERE namespace=? AND kind=?")
                 .bind(ctx.namespace())
                 .bind(kind)
-                .fetch_one(&mut *self.tx)
+                .fetch_one(&mut **self.transaction()?)
                 .await
                 .map_err(internal)?;
         u64::try_from(count).map_err(|_| Error::Internal)
@@ -2247,7 +3342,7 @@ impl Session {
         .bind(numeric_path)
         .bind(numeric_path)
         .bind(numeric_path)
-        .fetch_one(&mut *self.tx)
+        .fetch_one(&mut **self.transaction()?)
         .await
         .map_err(internal)?;
         if invalid != 0 {
@@ -2263,7 +3358,7 @@ impl Session {
         .bind(ctx.namespace())
         .bind(kind)
         .bind(schema_version)
-        .fetch_one(&mut *self.tx)
+        .fetch_one(&mut **self.transaction()?)
         .await
         .map_err(internal)?;
         let used = u64::try_from(used).map_err(|_| Error::Internal)?;
@@ -2287,7 +3382,7 @@ impl Session {
                 .bind(ctx.namespace())
                 .bind(kind)
                 .bind(id)
-                .fetch_optional(&mut *self.tx)
+                .fetch_optional(&mut **self.transaction()?)
                 .await
                 .map_err(internal)?;
         body.map(|b| serde_json::from_str(&b).map_err(internal))
@@ -2307,7 +3402,7 @@ impl Session {
         )
         .bind(ctx.namespace())
         .bind(kind)
-        .fetch_all(&mut *self.tx)
+        .fetch_all(&mut **self.transaction()?)
         .await
         .map_err(internal)?;
         if rows.len() > 10000 {
@@ -2333,13 +3428,13 @@ impl Session {
             )
             .bind(ctx.namespace())
             .bind(id)
-            .fetch_one(&mut *self.tx)
+            .fetch_one(&mut **self.transaction()?)
             .await
             .map_err(internal)?;
             if exists == 0 {
                 // E16.5 / F24: the run bound is instance-wide, like every other
                 // MVP counter; a new run id anywhere counts against it.
-                let used = count_runs_all_namespaces(&mut self.tx).await?;
+                let used = count_runs_all_namespaces(self.transaction()?).await?;
                 if used >= MVP_MAX_RUNS {
                     return Err(mvp_capacity_exceeded("runs", used, MVP_MAX_RUNS));
                 }
@@ -2349,16 +3444,18 @@ impl Session {
         if body.len() > 4 * 1024 * 1024 {
             return Err(Error::Invalid("object exceeds 4 MiB".into()));
         }
+        self.guard_write().await?;
         sqlx::query("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,?,?,?,?) ON CONFLICT(namespace,kind,id) DO UPDATE SET owner=excluded.owner,body=excluded.body,revision=objects.revision+1")
-   .bind(ctx.namespace()).bind(kind).bind(id).bind(owner).bind(body).execute(&mut *self.tx).await.map_err(internal)?;
+   .bind(ctx.namespace()).bind(kind).bind(id).bind(owner).bind(body).execute(&mut **self.transaction()?).await.map_err(internal)?;
         Ok(())
     }
     pub async fn delete(&mut self, ctx: &Context, kind: &str, id: &str) -> Result<()> {
+        self.guard_write().await?;
         sqlx::query("DELETE FROM objects WHERE namespace=? AND kind=? AND id=?")
             .bind(ctx.namespace())
             .bind(kind)
             .bind(id)
-            .execute(&mut *self.tx)
+            .execute(&mut **self.transaction()?)
             .await
             .map_err(internal)?;
         Ok(())
@@ -2372,7 +3469,7 @@ impl Session {
     ) -> Result<Option<T>> {
         identifier(key)?;
         let row=sqlx::query("SELECT payload_hash,response,redacted FROM idempotency WHERE namespace=? AND actor=? AND operation=? AND request_key=?")
-   .bind(ctx.namespace()).bind(ctx.actor()).bind(op).bind(key).fetch_optional(&mut *self.tx).await.map_err(internal)?;
+   .bind(ctx.namespace()).bind(ctx.actor()).bind(op).bind(key).fetch_optional(&mut **self.transaction()?).await.map_err(internal)?;
         let Some(row) = row else { return Ok(None) };
         let expected: String = row.try_get("payload_hash").map_err(internal)?;
         if expected != fingerprint(args)? {
@@ -2397,18 +3494,20 @@ impl Session {
         subject: &str,
         result: &T,
     ) -> Result<()> {
+        self.guard_write().await?;
         sqlx::query("INSERT INTO idempotency(namespace,actor,operation,request_key,payload_hash,subject_id,response) VALUES(?,?,?,?,?,?,?)")
    .bind(ctx.namespace()).bind(ctx.actor()).bind(op).bind(key).bind(fingerprint(args)?).bind(subject).bind(serde_json::to_string(result).map_err(internal)?)
-   .execute(&mut *self.tx).await.map_err(internal)?;
+   .execute(&mut **self.transaction()?).await.map_err(internal)?;
         Ok(())
     }
     pub async fn redact_cache(&mut self, ctx: &Context, subject: &str) -> Result<()> {
+        self.guard_write().await?;
         sqlx::query(
             "UPDATE idempotency SET response='null',redacted=1 WHERE namespace=? AND subject_id=?",
         )
         .bind(ctx.namespace())
         .bind(subject)
-        .execute(&mut *self.tx)
+        .execute(&mut **self.transaction()?)
         .await
         .map_err(internal)?;
         Ok(())
@@ -2462,7 +3561,7 @@ impl Session {
             "SELECT COUNT(*) AS row_count,COALESCE(MAX(seq),0) AS watermark FROM audit WHERE namespace=?",
         )
         .bind(ctx.namespace())
-        .fetch_one(&mut *self.tx)
+        .fetch_one(&mut **self.transaction()?)
         .await
         .map_err(internal)?;
         let count: i64 = snapshot.try_get("row_count").map_err(internal)?;
@@ -2484,7 +3583,7 @@ impl Session {
             .bind(ctx.namespace())
             .bind(after)
             .bind(watermark)
-            .fetch_all(&mut *self.tx)
+            .fetch_all(&mut **self.transaction()?)
             .await
             .map_err(internal)?;
             if rows.is_empty() {
@@ -2536,7 +3635,7 @@ impl Session {
                     .bind(i64::try_from(length).map_err(internal)?)
                     .bind(ctx.namespace())
                     .bind(sequence)
-                    .fetch_optional(&mut *self.tx)
+                    .fetch_optional(&mut **self.transaction()?)
                     .await
                     .map_err(internal)?
                     .ok_or_else(invalid_chain)?;
@@ -2578,15 +3677,21 @@ impl Session {
     }
 
     pub async fn audit(&mut self, ctx: &Context, operation: &str, entity: &str) -> Result<()> {
-        let timestamp = now()?;
+        {
+            let _ = self.transaction()?;
+        }
+        if owned_occurrence::e05_issue::reserved_native_audit_operation(operation) {
+            return Err(Error::Forbidden);
+        }
         let prev: Option<String> = sqlx::query_scalar(
             "SELECT digest FROM audit WHERE namespace=? ORDER BY seq DESC LIMIT 1",
         )
         .bind(ctx.namespace())
-        .fetch_optional(&mut *self.tx)
+        .fetch_optional(&mut **self.transaction()?)
         .await
         .map_err(internal)?;
         let prev = prev.unwrap_or_default();
+        let timestamp = self.wall_seconds().await?;
         let payload=json!({"actor":ctx.actor(),"role":ctx.role(),"operation":operation,"entity":entity,"timestamp":timestamp}).to_string();
         let digest = hash(format!("{prev}\n{payload}").as_bytes());
         sqlx::query("INSERT INTO audit(namespace,payload,previous_hash,digest) VALUES(?,?,?,?)")
@@ -2594,7 +3699,7 @@ impl Session {
             .bind(payload)
             .bind(prev)
             .bind(digest)
-            .execute(&mut *self.tx)
+            .execute(&mut **self.transaction()?)
             .await
             .map_err(internal)?;
         Ok(())
@@ -2604,18 +3709,20 @@ impl Session {
         ctx: &Context,
         entries: &[(String, String)],
     ) -> Result<()> {
+        self.guard_write().await?;
         sqlx::query("DELETE FROM skill_fts WHERE namespace=?")
             .bind(ctx.namespace())
-            .execute(&mut *self.tx)
+            .execute(&mut **self.transaction()?)
             .await
             .map_err(internal)?;
         for (id, content) in entries {
             let tokens = search_tokens(content).join(" ");
+            self.guard_write().await?;
             sqlx::query("INSERT INTO skill_fts(namespace,candidate_id,tokens) VALUES(?,?,?)")
                 .bind(ctx.namespace())
                 .bind(id)
                 .bind(tokens)
-                .execute(&mut *self.tx)
+                .execute(&mut **self.transaction()?)
                 .await
                 .map_err(internal)?;
         }
@@ -2632,7 +3739,7 @@ impl Session {
             .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR ");
-        sqlx::query_scalar("SELECT candidate_id FROM skill_fts WHERE skill_fts MATCH ? AND namespace=? ORDER BY bm25(skill_fts),candidate_id LIMIT 64").bind(expression).bind(ctx.namespace()).fetch_all(&mut *self.tx).await.map_err(internal)
+        sqlx::query_scalar("SELECT candidate_id FROM skill_fts WHERE skill_fts MATCH ? AND namespace=? ORDER BY bm25(skill_fts),candidate_id LIMIT 64").bind(expression).bind(ctx.namespace()).fetch_all(&mut **self.transaction()?).await.map_err(internal)
     }
     pub async fn put_edge(
         &mut self,
@@ -2644,13 +3751,14 @@ impl Session {
     ) -> Result<()> {
         identifier(src_id)?;
         identifier(dst_id)?;
+        self.guard_write().await?;
         sqlx::query("INSERT OR IGNORE INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id) VALUES(?,?,?,?,?)")
             .bind(ctx.namespace())
             .bind(src_kind)
             .bind(src_id)
             .bind(dst_kind)
             .bind(dst_id)
-            .execute(&mut *self.tx)
+            .execute(&mut **self.transaction()?)
             .await
             .map_err(internal)?;
         Ok(())
@@ -2682,7 +3790,7 @@ impl Session {
         .bind(src_kind)
         .bind(src_id)
         .bind(i64::try_from(limit + 1).map_err(|_| Error::Internal)?)
-        .fetch_all(&mut *self.tx)
+        .fetch_all(&mut **self.transaction()?)
         .await
         .map_err(internal)?;
         if rows.len() > limit {
@@ -2717,7 +3825,7 @@ impl Session {
         .bind(ctx.namespace())
         .bind(src_kind)
         .bind(src_id)
-        .fetch_all(&mut *self.tx)
+        .fetch_all(&mut **self.transaction()?)
         .await
         .map_err(internal)?;
         if rows.len() > 10_000 {
@@ -2744,7 +3852,7 @@ impl Session {
             .bind(ctx.namespace())
             .bind(dst_kind)
             .bind(dst_id)
-            .fetch_all(&mut *self.tx)
+            .fetch_all(&mut **self.transaction()?)
             .await
             .map_err(internal)?;
         let mut out = Vec::new();
@@ -2795,7 +3903,7 @@ impl Session {
             return Ok(Vec::new());
         }
         let roots: Vec<(&str, &str)> = seeds.iter().map(|pair| (pair[0], pair[1])).collect();
-        let rows = upstream_rows_in_tx(&mut self.tx, ctx.namespace(), &roots, limit, false).await?
+        let rows = upstream_rows_in_tx(self.transaction()?, ctx.namespace(), &roots, limit, false).await?
             .ok_or_else(|| Error::Conflict(format!(
                 "upstream dependency closure exceeds {limit} nodes; it is refused, not truncated"
             )))?;
@@ -2822,16 +3930,17 @@ impl Session {
         identifier(digest)?;
         let prev: i64 = sqlx::query_scalar("SELECT seq FROM revoke_watermark WHERE namespace=?")
             .bind(ctx.namespace())
-            .fetch_optional(&mut *self.tx)
+            .fetch_optional(&mut **self.transaction()?)
             .await
             .map_err(internal)?
             .unwrap_or(0);
         let seq = prev + 1;
+        self.guard_write().await?;
         sqlx::query("INSERT INTO revoke_watermark(namespace,seq,digest) VALUES(?,?,?) ON CONFLICT(namespace) DO UPDATE SET seq=excluded.seq,digest=excluded.digest")
             .bind(ctx.namespace())
             .bind(seq)
             .bind(digest)
-            .execute(&mut *self.tx)
+            .execute(&mut **self.transaction()?)
             .await
             .map_err(internal)?;
         Ok(seq)
@@ -2840,7 +3949,7 @@ impl Session {
     pub async fn watermark(&mut self, ctx: &Context) -> Result<Option<(i64, String)>> {
         let row = sqlx::query("SELECT seq,digest FROM revoke_watermark WHERE namespace=?")
             .bind(ctx.namespace())
-            .fetch_optional(&mut *self.tx)
+            .fetch_optional(&mut **self.transaction()?)
             .await
             .map_err(internal)?;
         match row {
@@ -2884,12 +3993,13 @@ impl Session {
                 ));
             }
         }
+        self.guard_write().await?;
         sqlx::query("INSERT INTO replay_worlds(namespace,id,sealed,manifest) VALUES(?,?,?,?) ON CONFLICT(namespace,id) DO UPDATE SET sealed=excluded.sealed,manifest=excluded.manifest")
             .bind(ctx.namespace())
             .bind(id)
             .bind(i64::from(sealed))
             .bind(manifest.to_string())
-            .execute(&mut *self.tx)
+            .execute(&mut **self.transaction()?)
             .await
             .map_err(internal)?;
         Ok(())
@@ -2901,7 +4011,7 @@ impl Session {
             sqlx::query("SELECT sealed,manifest FROM replay_worlds WHERE namespace=? AND id=?")
                 .bind(ctx.namespace())
                 .bind(id)
-                .fetch_optional(&mut *self.tx)
+                .fetch_optional(&mut **self.transaction()?)
                 .await
                 .map_err(internal)?;
         match row {
@@ -2917,8 +4027,24 @@ impl Session {
         }
     }
 
+    /// Complete facts are available to the trusted operation/close owner.
+    pub async fn commit_detailed(mut self) -> std::result::Result<(), SessionCommitFailure> {
+        let Some(tx) = self.tx.take() else {
+            return Err(self.clock.failure(Error::ClockRegressed));
+        };
+        write_clock::finish_transaction(
+            tx,
+            &self.prepare_inputs,
+            &mut self.clock,
+            self.write_started,
+        )
+        .await
+    }
+
     pub async fn commit(self) -> Result<()> {
-        self.tx.commit().await.map_err(internal)
+        self.commit_detailed()
+            .await
+            .map_err(SessionCommitFailure::into_error)
     }
     pub async fn raw_object(&mut self, ctx: &Context, kind: &str, id: &str) -> Result<Value> {
         self.need(ctx, kind, id).await
@@ -2955,9 +4081,383 @@ fn json_value_at_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
 }
 
 #[cfg(test)]
+mod r38_fixed_source_tests {
+    use super::*;
+    use evo_core::Role;
+
+    #[tokio::test]
+    async fn relative_request_remains_the_original_database_across_initialization_await() {
+        use std::future::Future;
+        use std::task::Poll;
+        const CHILD: &str = "RSIA_AG132_R38_PATH_CONTROL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Only the isolated child changes process cwd. Other tests and
+            // their databases retain their actual directory and environment.
+            let executable = std::env::current_exe().unwrap();
+            let output = tokio::task::spawn_blocking(move || {
+                std::process::Command::new(executable)
+                    .args(["--exact",
+                        "r38_fixed_source_tests::relative_request_remains_the_original_database_across_initialization_await",
+                        "--nocapture"])
+                    .env(CHILD, "isolated-native-path-control")
+                    .output().unwrap()
+            }).await.unwrap();
+            eprintln!(
+                "r38 isolated native CWD child status={} stdout_bytes={:?} stderr_bytes={:?}",
+                output.status, output.stdout, output.stderr
+            );
+            assert!(
+                output.status.success(),
+                "isolated native CWD control failed"
+            );
+            return;
+        }
+        assert_eq!(
+            std::env::var(CHILD).unwrap(),
+            "isolated-native-path-control"
+        );
+        let initial_cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("original");
+        let second = directory.path().join("later");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let relative = Path::new("same name 真源.sqlite");
+        let unselected = second.join(relative);
+        std::fs::write(&unselected, b"not the requested database").unwrap();
+        std::env::set_current_dir(&first).unwrap();
+        let mut opening = Box::pin(Store::open(relative));
+        let first_poll = std::future::poll_fn(|cx| Poll::Ready(opening.as_mut().poll(cx))).await;
+        assert!(
+            matches!(first_poll, Poll::Pending),
+            "fixture did not establish an actual initialization await"
+        );
+        std::env::set_current_dir(&second).unwrap();
+        let result = opening.await;
+        // Restore even when open failed, before reporting that real failure.
+        std::env::set_current_dir(&initial_cwd).unwrap();
+        let store = result.unwrap();
+        assert_eq!(
+            store.data_path,
+            first.join(relative).canonicalize().unwrap()
+        );
+        assert_eq!(
+            store.root.canonicalize().unwrap(),
+            first.canonicalize().unwrap()
+        );
+        let ctx = Context::new("r38", "evaluator", Role::Evaluator).unwrap();
+        let read = store
+            .capture_formal_source(&ctx, FormalReadSelectorR38::Ticket("no-report".into()))
+            .await;
+        store.close().await;
+        assert!(matches!(read, Ok(None)));
+        assert_eq!(
+            std::fs::read(unselected).unwrap(),
+            b"not the requested database"
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_formal_reader_uses_the_actual_database_basename() {
+        let directory = tempfile::tempdir().unwrap();
+        let actual = directory.path().join("formal records 真源.sqlite");
+        let store = Store::open(&actual).await.unwrap();
+        // This is a different, test-owned path. Guessing the old conventional
+        // basename must not silently read it or create a replacement database.
+        let wrong = directory.path().join("db.sqlite3");
+        std::fs::write(&wrong, b"not the mounted SQLite database").unwrap();
+        let ctx = Context::new("r38", "evaluator", Role::Evaluator).unwrap();
+        let result = store
+            .capture_formal_source(&ctx, FormalReadSelectorR38::Ticket("no-report".into()))
+            .await;
+        store.close().await;
+        assert!(matches!(result, Ok(None)));
+        assert_eq!(
+            std::fs::read(&wrong).unwrap(),
+            b"not the mounted SQLite database"
+        );
+        assert!(actual.exists());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use evo_core::Role;
+
+    // These complete wire fixtures use the same core contracts as the stored
+    // native-run producer. They are local program fixtures, not Host/Current evidence.
+    #[derive(serde::Serialize)]
+    struct NativeRunFixtureRecord {
+        id: String,
+        body: Vec<u8>,
+        parent_family: String,
+        task_origin: evo_core::evidence::TaskOrigin,
+        execution_attestation: evo_core::evidence::ExecutionAttestation,
+        purpose: evo_core::evidence::Purpose,
+    }
+
+    #[derive(serde::Serialize)]
+    struct NativeRunFixture {
+        schema_version: String,
+        record: NativeRunFixtureRecord,
+        trace: evo_core::optimization::OptimizationTrace,
+        excerpt_start: usize,
+        excerpt_end: usize,
+    }
+
+    pub(super) fn native_run_fixture(id: &str, body: &[u8]) -> Value {
+        use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
+        use evo_core::optimization::{OptimizationTrace, TraceOutcome};
+        let parent_family = format!("fixture-family-{id}");
+        serde_json::to_value(NativeRunFixture {
+            schema_version: "rsia.optimization.source.v1".into(),
+            record: NativeRunFixtureRecord {
+                id: id.into(),
+                body: body.to_vec(),
+                parent_family: parent_family.clone(),
+                task_origin: TaskOrigin::TrustedRun,
+                execution_attestation: ExecutionAttestation::TrustedHost,
+                purpose: Purpose::Development,
+            },
+            trace: OptimizationTrace {
+                run_id: id.into(),
+                parent_family,
+                source_digest: hash(body),
+                purpose: Purpose::Development,
+                outcome: TraceOutcome::Success,
+                diagnosis: None,
+                excerpt: String::from_utf8(body.to_vec()).unwrap(),
+                seed: 1,
+            },
+            excerpt_start: 0,
+            excerpt_end: body.len(),
+        })
+        .unwrap()
+    }
+
+    #[derive(serde::Serialize)]
+    struct StagedSourceFixture {
+        kind: String,
+        id: String,
+        digest: String,
+    }
+
+    // Storage's crate boundary cannot depend on evo-engine. Keep its complete
+    // E16Envelope<StagedAssetPayload> wire here, including every optional field.
+    #[derive(serde::Serialize)]
+    struct StagedPayloadFixture {
+        publisher: String,
+        asset_id: String,
+        package_kind: String,
+        manifest_digest: String,
+        content_blob_digest: String,
+        content_bytes: u64,
+        baseline_digest: String,
+        local_digest: String,
+        upstream_digest: Option<String>,
+        environment_digest: String,
+        package_schema_version: String,
+        compiler_version: String,
+        state: String,
+        quarantine_reason: Option<String>,
+        candidate_material: Option<Value>,
+        candidate_ref: Option<String>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct StagedEnvelopeFixture {
+        schema_version: String,
+        id: String,
+        namespace: String,
+        owner_actor: String,
+        request_key: String,
+        input_digest: String,
+        created_at: i64,
+        updated_at: i64,
+        source_refs: Vec<StagedSourceFixture>,
+        revoke_watermark: u64,
+        payload: StagedPayloadFixture,
+    }
+
+    fn staged_asset_fixture(
+        ctx: &Context,
+        request_key: &str,
+        bytes: &[u8],
+        event_seconds: i64,
+        source_refs: Vec<StagedSourceFixture>,
+    ) -> (String, Value) {
+        let id = format!(
+            "e16-staged-asset-{}",
+            fingerprint(&(ctx.namespace(), ctx.actor(), request_key)).unwrap()
+        );
+        let content_blob_digest = hash(bytes);
+        let input_digest = fingerprint(&(
+            ctx.namespace(),
+            ctx.actor(),
+            request_key,
+            &content_blob_digest,
+            &source_refs,
+        ))
+        .unwrap();
+        let value = serde_json::to_value(StagedEnvelopeFixture {
+            schema_version: "rsia.e16.staged_asset.v1".into(),
+            id: id.clone(),
+            namespace: ctx.namespace().into(),
+            owner_actor: ctx.actor().into(),
+            request_key: request_key.into(),
+            input_digest,
+            created_at: event_seconds,
+            updated_at: event_seconds,
+            source_refs,
+            revoke_watermark: 1,
+            payload: StagedPayloadFixture {
+                publisher: "fixture-publisher".into(),
+                asset_id: "fixture-asset".into(),
+                package_kind: "skill".into(),
+                manifest_digest: hash(b"fixture-manifest"),
+                content_blob_digest,
+                content_bytes: u64::try_from(bytes.len()).unwrap(),
+                baseline_digest: hash(b"fixture-baseline"),
+                local_digest: hash(b"fixture-local"),
+                upstream_digest: None,
+                environment_digest: hash(b"fixture-environment"),
+                package_schema_version: "rsia.package.v1".into(),
+                compiler_version: "rsia.asset_package.compiler.v1".into(),
+                state: "prepared".into(),
+                quarantine_reason: None,
+                candidate_material: None,
+                candidate_ref: None,
+            },
+        })
+        .unwrap();
+        (id, value)
+    }
+
+    pub(super) fn replay_fixture_world(
+        id: &str,
+        partition: evo_core::replay::WorldPartition,
+    ) -> evo_core::replay::ReplayWorldV2 {
+        use evo_core::evidence::Purpose;
+        use evo_core::replay::{
+            PrefixCoverageV1, REPLAY_MANIFEST_SCHEMA, REPLAY_WORLD_SCHEMA, ReplaySourceRef,
+            ReplayWorldManifestV2, ReplayWorldV2, replay_baseline_observation_digest,
+        };
+        let baseline_context_signature = hash(b"fixture-baseline-context");
+        let mut manifest = ReplayWorldManifestV2 {
+            schema_version: REPLAY_MANIFEST_SCHEMA.into(),
+            world_id: id.into(),
+            cluster_id: format!("cluster-{id}"),
+            partition,
+            purpose: Purpose::Development,
+            generation_signature: hash(b"fixture-generation"),
+            world_context_signature: hash(format!("fixture-world-{id}").as_bytes()),
+            baseline_context_signature: baseline_context_signature.clone(),
+            approved_parent_digest: hash(b"fixture-approved-parent"),
+            model_digest: hash(b"fixture-model"),
+            tools_digest: hash(b"fixture-tools"),
+            scorer_digest: hash(b"fixture-scorer"),
+            guidance_digest: hash(b"fixture-guidance"),
+            repair_template_digest: hash(b"fixture-repair-template"),
+            input_order_digest: hash(format!("fixture-input-order-{id}").as_bytes()),
+            initial_baseline_quality_micros: 100_000,
+            baseline_observation_source_id: format!("baseline-{id}"),
+            source_closure: vec![ReplaySourceRef {
+                source_id: format!("baseline-{id}"),
+                content_digest: hash(b"replaced-by-real-baseline-material"),
+            }],
+            revoke_watermark: 1,
+            prefix_coverage: vec![PrefixCoverageV1 {
+                context_signature: baseline_context_signature,
+                exhausted: true,
+            }],
+            action_catalog: vec![],
+        };
+        manifest.source_closure[0].content_digest =
+            replay_baseline_observation_digest(&manifest).unwrap();
+        ReplayWorldV2 {
+            schema_version: REPLAY_WORLD_SCHEMA.into(),
+            manifest,
+            transitions: vec![],
+            sealed_digest: None,
+        }
+    }
+
+    // Deliberately invalid legacy data for the generic readonly graph loader.
+    // Never commit it or call guarded producer APIs after arranging it.
+    async fn arrange_invalid_graph_object(
+        session: &mut Session,
+        ctx: &Context,
+        kind: &str,
+        id: &str,
+        body: &Value,
+    ) {
+        sqlx::query(
+            "INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,?,?,?,?)
+             ON CONFLICT(namespace,kind,id) DO UPDATE SET
+             body=excluded.body,revision=objects.revision+1",
+        )
+        .bind(ctx.namespace())
+        .bind(kind)
+        .bind(id)
+        .bind(ctx.actor())
+        .bind(body.to_string())
+        .execute(&mut **session.transaction().unwrap())
+        .await
+        .unwrap();
+    }
+
+    async fn arrange_invalid_graph_edge(
+        session: &mut Session,
+        ctx: &Context,
+        src_kind: &str,
+        src_id: &str,
+        dst_kind: &str,
+        dst_id: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id)
+             VALUES(?,?,?,?,?)",
+        )
+        .bind(ctx.namespace())
+        .bind(src_kind)
+        .bind(src_id)
+        .bind(dst_kind)
+        .bind(dst_id)
+        .execute(&mut **session.transaction().unwrap())
+        .await
+        .unwrap();
+    }
+
+    async fn fixture_business_counts(store: &Store) -> Vec<(String, i64)> {
+        let mut session = store.session().await.unwrap();
+        let mut counts = vec![];
+        for table in [
+            "objects",
+            "audit",
+            "idempotency",
+            "dependencies",
+            "revoke_watermark",
+            "replay_worlds",
+            "root_budgets",
+            "root_budget_namespaces",
+            "root_budget_dispatch_groups",
+            "root_budget_calls",
+            "root_budget_events",
+            "revoke_cleanup_jobs",
+            "revoke_cleanup_frontier",
+            "revoke_cleanup_events",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&mut **session.transaction().unwrap())
+                .await
+                .unwrap();
+            counts.push((table.into(), count));
+        }
+        session.commit().await.unwrap();
+        counts
+    }
+
     async fn db() -> (tempfile::TempDir, Store) {
         let d = tempfile::tempdir().unwrap();
         let s = Store::open(&d.path().join("db.sqlite3")).await.unwrap();
@@ -2978,7 +4478,7 @@ mod tests {
         .bind(nodes)
         .bind(ctx.namespace())
         .bind(root)
-        .execute(&mut *session.tx)
+        .execute(&mut **session.transaction().unwrap())
         .await
         .unwrap();
     }
@@ -2992,7 +4492,8 @@ mod tests {
         let steps = std::sync::Arc::new(AtomicU64::new(0));
         let counter = steps.clone();
         session
-            .tx
+            .transaction()
+            .unwrap()
             .lock_handle()
             .await
             .unwrap()
@@ -3002,7 +4503,8 @@ mod tests {
             });
         let result = load_dependency_record_snapshots(session, ctx, root).await;
         session
-            .tx
+            .transaction()
+            .unwrap()
             .lock_handle()
             .await
             .unwrap()
@@ -3046,6 +4548,8 @@ mod tests {
     async fn dependency_snapshots_preserve_typed_cycles_diamonds_sort_and_fingerprints() {
         let (_dir, store) = db().await;
         let ctx = Context::new("n", "admin", Role::Admin).unwrap();
+        // This deliberately invalid historical graph exercises readonly storage
+        // primitives; blob/b remains an opaque edge node, not fabricated content.
         let mut session = store.session().await.unwrap();
         assert!(
             load_dependency_record_snapshots(&mut session, &ctx, "root")
@@ -3060,10 +4564,7 @@ mod tests {
             ("run", "z", json!({"run":3})),
         ];
         for (kind, id, body) in &objects {
-            session
-                .put(&ctx, kind, id, ctx.actor(), body)
-                .await
-                .unwrap();
+            arrange_invalid_graph_object(&mut session, &ctx, kind, id, body).await;
         }
         for (src_kind, src_id, dst_kind, dst_id) in [
             ("artifact", "root", "run", "z"),
@@ -3075,10 +4576,8 @@ mod tests {
             ("blob", "b", "artifact", "root"),
             ("artifact", "root", "artifact", "root"),
         ] {
-            session
-                .put_edge(&ctx, src_kind, src_id, dst_kind, dst_id)
-                .await
-                .unwrap();
+            arrange_invalid_graph_edge(&mut session, &ctx, src_kind, src_id, dst_kind, dst_id)
+                .await;
         }
         let mut expected: Vec<_> = objects
             .iter()
@@ -3101,16 +4600,21 @@ mod tests {
             expected
         );
         let changed = json!({"candidate":4});
-        session
-            .put(&ctx, "candidate", "shared", ctx.actor(), &changed)
-            .await
-            .unwrap();
+        arrange_invalid_graph_object(&mut session, &ctx, "candidate", "shared", &changed).await;
         expected[2].fingerprint = Some(fingerprint(&changed).unwrap());
         assert_eq!(
             load_dependency_record_snapshots(&mut session, &ctx, "root")
                 .await
                 .unwrap(),
             expected
+        );
+        session.tx.take().unwrap().rollback().await.unwrap();
+        drop(session);
+        assert!(
+            fixture_business_counts(&store)
+                .await
+                .iter()
+                .all(|(_, n)| *n == 0)
         );
     }
 
@@ -3119,32 +4623,32 @@ mod tests {
         let (_dir, store) = db().await;
         let ctx = Context::new("n", "admin", Role::Admin).unwrap();
         let other = Context::new("other", "admin", Role::Admin).unwrap();
+        // Isolated invalid legacy rows are arranged only for readonly namespace
+        // traversal. They never pass a producer or guarded commit.
         let mut session = store.session().await.unwrap();
         let body = json!({"namespace":"n"});
         for scope in [&ctx, &other] {
-            session
-                .put_edge(scope, "artifact", "root", "run", "shared")
-                .await
-                .unwrap();
-            session
-                .put(
-                    scope,
-                    "run",
-                    "shared",
-                    scope.actor(),
-                    &json!({"namespace":scope.namespace()}),
-                )
-                .await
-                .unwrap();
+            arrange_invalid_graph_edge(&mut session, scope, "artifact", "root", "run", "shared")
+                .await;
+            arrange_invalid_graph_object(
+                &mut session,
+                scope,
+                "run",
+                "shared",
+                &json!({"namespace":scope.namespace()}),
+            )
+            .await;
         }
-        session
-            .put_edge(&other, "run", "shared", "candidate", "missing")
-            .await
-            .unwrap();
-        session
-            .put(&other, "tombstone", "shared", other.actor(), &json!({}))
-            .await
-            .unwrap();
+        arrange_invalid_graph_edge(
+            &mut session,
+            &other,
+            "run",
+            "shared",
+            "candidate",
+            "missing",
+        )
+        .await;
+        arrange_invalid_graph_object(&mut session, &other, "tombstone", "shared", &json!({})).await;
         assert_eq!(
             load_dependency_record_snapshots(&mut session, &ctx, "root")
                 .await
@@ -3155,10 +4659,20 @@ mod tests {
                 fingerprint: Some(fingerprint(&body).unwrap()),
             }]
         );
+        // The sorted missing candidate is reached first: this original result
+        // establishes NotFound, not a separate tombstone Forbidden proof.
         assert!(matches!(
             load_dependency_record_snapshots(&mut session, &other, "root").await,
             Err(Error::NotFound)
         ));
+        session.tx.take().unwrap().rollback().await.unwrap();
+        drop(session);
+        assert!(
+            fixture_business_counts(&store)
+                .await
+                .iter()
+                .all(|(_, n)| *n == 0)
+        );
     }
 
     #[tokio::test]
@@ -3201,11 +4715,11 @@ mod tests {
         // sizes use the same initialized statistics; the unrelated-edge test
         // below separately checks lookup behavior without ANALYZE.
         sqlx::query("ANALYZE dependencies")
-            .execute(&mut *session.tx)
+            .execute(&mut **session.transaction().unwrap())
             .await
             .unwrap();
         let version: String = sqlx::query_scalar("SELECT sqlite_version()")
-            .fetch_one(&mut *session.tx)
+            .fetch_one(&mut **session.transaction().unwrap())
             .await
             .unwrap();
         let (short_result, short_steps) = snapshot_vm_steps(&mut session, &short_ctx, "root").await;
@@ -3318,8 +4832,8 @@ mod tests {
     async fn registered_blob_publish_is_fenced_by_prepared_owner_sources_and_watermark() {
         let (_dir, store) = db().await;
         let admin = Context::new("n", "admin", Role::Admin).unwrap();
-        let source = json!({"id":"source","value":"authority"});
-        let nested = json!({"id":"nested","value":"dependency"});
+        let source = native_run_fixture("source", b"authority");
+        let nested = native_run_fixture("nested", b"dependency");
         let source_digest = fingerprint(&source).unwrap();
         let mut session = store.session().await.unwrap();
         session
@@ -3340,31 +4854,26 @@ mod tests {
             .unwrap();
         let bytes = b"registered package projection";
         let digest = hash(bytes);
-        let artifact = json!({
-            "schema_version":"rsia.e16.staged_asset.v1",
-            "id":"prepared-package",
-            "namespace":"n",
-            "owner_actor":"admin",
-            "request_key":"request",
-            "input_digest":hash(b"input"),
-            "created_at":1,
-            "updated_at":1,
-            "source_refs":[{"kind":"run","id":"source","digest":source_digest}],
-            "revoke_watermark":1,
-            "payload":{"state":"prepared","content_blob_digest":digest}
-        });
+        let event_seconds = session.wall_seconds().await.unwrap();
+        // Complete typed storage input for the publish fence, not an assertion
+        // that a package/Host validator has approved the projection bytes.
+        let (artifact_id, artifact) = staged_asset_fixture(
+            &admin,
+            "request",
+            bytes,
+            event_seconds,
+            vec![StagedSourceFixture {
+                kind: "run".into(),
+                id: "source".into(),
+                digest: source_digest,
+            }],
+        );
         session
-            .put(
-                &admin,
-                "artifact",
-                "prepared-package",
-                admin.actor(),
-                &artifact,
-            )
+            .put(&admin, "artifact", &artifact_id, admin.actor(), &artifact)
             .await
             .unwrap();
         session
-            .put_edge(&admin, "artifact", "prepared-package", "run", "source")
+            .put_edge(&admin, "artifact", &artifact_id, "run", "source")
             .await
             .unwrap();
         session.commit().await.unwrap();
@@ -3374,7 +4883,7 @@ mod tests {
             store
                 .publish_registered_blob(
                     &other,
-                    "prepared-package",
+                    &artifact_id,
                     "rsia.e16.staged_asset.v1",
                     "content_blob_digest",
                     bytes,
@@ -3387,7 +4896,7 @@ mod tests {
         let first = store
             .publish_registered_blob(
                 &admin,
-                "prepared-package",
+                &artifact_id,
                 "rsia.e16.staged_asset.v1",
                 "content_blob_digest",
                 bytes,
@@ -3398,7 +4907,7 @@ mod tests {
         let retry = store
             .publish_registered_blob(
                 &admin,
-                "prepared-package",
+                &artifact_id,
                 "rsia.e16.staged_asset.v1",
                 "content_blob_digest",
                 bytes,
@@ -3406,6 +4915,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(first, digest);
         assert_eq!(first, retry);
 
         let mut session = store.session().await.unwrap();
@@ -3424,7 +4934,7 @@ mod tests {
             store
                 .publish_registered_blob(
                     &admin,
-                    "prepared-package",
+                    &artifact_id,
                     "rsia.e16.staged_asset.v1",
                     "content_blob_digest",
                     bytes,
@@ -3445,7 +4955,7 @@ mod tests {
             store
                 .publish_registered_blob(
                     &admin,
-                    "prepared-package",
+                    &artifact_id,
                     "rsia.e16.staged_asset.v1",
                     "content_blob_digest",
                     bytes,
@@ -3479,26 +4989,11 @@ mod tests {
             .bump_watermark(&admin, &hash(b"cancel-watermark"))
             .await
             .unwrap();
+        let event_seconds = session.wall_seconds().await.unwrap();
+        let (artifact_id, artifact) =
+            staged_asset_fixture(&admin, "cancel-request", &bytes, event_seconds, vec![]);
         session
-            .put(
-                &admin,
-                "artifact",
-                "cancelled-producer",
-                admin.actor(),
-                &json!({
-                    "schema_version":"rsia.e16.staged_asset.v1",
-                    "id":"cancelled-producer",
-                    "namespace":"n",
-                    "owner_actor":"admin",
-                    "request_key":"cancel-request",
-                    "input_digest":hash(b"cancel-input"),
-                    "created_at":1,
-                    "updated_at":1,
-                    "source_refs":[],
-                    "revoke_watermark":1,
-                    "payload":{"state":"prepared","content_blob_digest":digest}
-                }),
-            )
+            .put(&admin, "artifact", &artifact_id, admin.actor(), &artifact)
             .await
             .unwrap();
         session.commit().await.unwrap();
@@ -3506,11 +5001,12 @@ mod tests {
         let guard = store.blob_lock.write().await;
         let task_store = store.clone();
         let task_admin = admin.clone();
+        let task_artifact_id = artifact_id.clone();
         let task = tokio::spawn(async move {
             task_store
                 .publish_registered_blob(
                     &task_admin,
-                    "cancelled-producer",
+                    &task_artifact_id,
                     "rsia.e16.staged_asset.v1",
                     "content_blob_digest",
                     &bytes,
@@ -3562,9 +5058,15 @@ mod tests {
         let a = Context::new("a", "u", Role::Admin).unwrap();
         let b = Context::new("b", "u", Role::Admin).unwrap();
         let mut t = s.session().await.unwrap();
-        t.put(&a, "run", "r", "u", &json!({"id":"r"}))
-            .await
-            .unwrap();
+        t.put(
+            &a,
+            "run",
+            "r",
+            "u",
+            &native_run_fixture("r", b"namespace-scoped run"),
+        )
+        .await
+        .unwrap();
         t.commit().await.unwrap();
         let mut t = s.session().await.unwrap();
         assert!(t.get::<Value>(&b, "run", "r").await.unwrap().is_none());
@@ -3621,7 +5123,7 @@ mod tests {
         let mut t = s.session().await.unwrap();
         let deps = t.dependents(&c, "run", "run2").await.unwrap();
         assert_eq!(deps, vec![("job".into(), "j1".into())]);
-        let seq = t.bump_watermark(&c, "wm1").await.unwrap();
+        let seq = t.bump_watermark(&c, &hash(b"wm1")).await.unwrap();
         assert_eq!(seq, 1);
         t.commit().await.unwrap();
         let mut t = s.session().await.unwrap();
@@ -3633,16 +5135,203 @@ mod tests {
     }
     #[tokio::test]
     async fn sealed_world_roundtrip() {
-        let (_d, s) = db().await;
+        use evo_core::replay::{WorldPartition, replay_baseline_observation_bytes};
+        let (dir, s) = db().await;
         let c = Context::new("n", "a", Role::Admin).unwrap();
+        let mut world = replay_fixture_world("w1", WorldPartition::Train);
+        let source_id = world.manifest.baseline_observation_source_id.clone();
+        let source_bytes = replay_baseline_observation_bytes(&world.manifest).unwrap();
+        let source = native_run_fixture(&source_id, &source_bytes);
         let mut t = s.session().await.unwrap();
-        t.put_world(&c, "w1", true, &json!({"k":"v"}))
+        t.put(&c, "run", &source_id, c.actor(), &source)
             .await
             .unwrap();
+        assert_eq!(
+            t.bump_watermark(&c, &hash(b"world-watermark"))
+                .await
+                .unwrap(),
+            1
+        );
         t.commit().await.unwrap();
+
+        replay::put_replay_world_draft(&c, &s, &world)
+            .await
+            .unwrap();
+        world.seal().unwrap();
+        replay::seal_replay_world(&c, &s, &world).await.unwrap();
+        // An identical seal is idempotent, while a sealed ID cannot be changed.
+        replay::seal_replay_world(&c, &s, &world).await.unwrap();
+        let expected = serde_json::to_value(&world).unwrap();
         let mut t = s.session().await.unwrap();
         let got = t.get_world(&c, "w1").await.unwrap().unwrap();
         assert!(got.0);
-        assert_eq!(got.1["k"], "v");
+        assert_eq!(got.1, expected);
+        let mut changed = world.clone();
+        changed.manifest.cluster_id = "different-cluster".into();
+        changed.sealed_digest = None;
+        changed.manifest.source_closure[0].content_digest =
+            evo_core::replay::replay_baseline_observation_digest(&changed.manifest).unwrap();
+        changed.seal().unwrap();
+        assert!(matches!(
+            t.put_world(&c, "w1", true, &serde_json::to_value(&changed).unwrap())
+                .await,
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(
+            t.get_world(&c, "w1").await.unwrap().unwrap(),
+            (true, expected.clone())
+        );
+        t.commit().await.unwrap();
+
+        s.close().await;
+        let reopened = Store::open(&dir.path().join("db.sqlite3")).await.unwrap();
+        let mut t = reopened.session().await.unwrap();
+        let got = t.get_world(&c, "w1").await.unwrap().unwrap();
+        assert!(got.0);
+        assert_eq!(got.1, expected);
+        t.commit().await.unwrap();
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_typed_graph_inputs_still_refuse_guarded_commit_without_persistent_changes() {
+        let (_dir, store) = db().await;
+        let ctx = Context::new("n", "admin", Role::Admin).unwrap();
+        let before = fixture_business_counts(&store).await;
+        assert!(before.iter().all(|(_, n)| *n == 0));
+        // These are the same malformed business rows arranged by the readonly
+        // regressions, plus the former incomplete staged producer.
+        for (kind, id, body) in [
+            ("candidate", "shared", json!({"candidate":1})),
+            ("release", "shared", json!({"release":2})),
+            ("run", "z", json!({"run":3})),
+            ("run", "shared", json!({"namespace":"n"})),
+            (
+                "artifact",
+                "prepared-package",
+                json!({
+                    "schema_version":"rsia.e16.staged_asset.v1",
+                    "id":"prepared-package",
+                    "namespace":"n",
+                    "owner_actor":"admin",
+                    "request_key":"request",
+                    "input_digest":hash(b"input"),
+                    "created_at":1,
+                    "updated_at":1,
+                    "source_refs":[],
+                    "revoke_watermark":1,
+                    "payload":{"state":"prepared","content_blob_digest":hash(b"bytes")}
+                }),
+            ),
+        ] {
+            let mut session = store.session().await.unwrap();
+            let result = match session.put(&ctx, kind, id, ctx.actor(), &body).await {
+                Ok(()) => session.commit().await,
+                Err(error) => {
+                    drop(session);
+                    Err(error)
+                }
+            };
+            assert!(matches!(result, Err(Error::ClockRegressed)), "{kind}/{id}");
+            assert_eq!(fixture_business_counts(&store).await, before);
+        }
+        // The replacement fixtures still enter through ordinary APIs and commit.
+        let mut session = store.session().await.unwrap();
+        let body = native_run_fixture("lawful-run", b"actual typed fixture input");
+        session
+            .put(&ctx, "run", "lawful-run", ctx.actor(), &body)
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let mut session = store.session().await.unwrap();
+        assert_eq!(
+            session
+                .get::<Value>(&ctx, "run", "lawful-run")
+                .await
+                .unwrap(),
+            Some(body)
+        );
+        session.commit().await.unwrap();
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_watermark_digest_refuses_without_persistent_changes() {
+        let (_dir, store) = db().await;
+        let ctx = Context::new("n", "admin", Role::Admin).unwrap();
+        let before = fixture_business_counts(&store).await;
+        assert!(before.iter().all(|(_, n)| *n == 0));
+        let mut session = store.session().await.unwrap();
+        let result = match session.bump_watermark(&ctx, "wm1").await {
+            Ok(_) => session.commit().await,
+            Err(error) => {
+                drop(session);
+                Err(error)
+            }
+        };
+        assert!(matches!(result, Err(Error::ClockRegressed)));
+        assert_eq!(fixture_business_counts(&store).await, before);
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn native_reserved_audit_keeps_first_clock_and_transaction_failure() {
+        let (_dir, store) = db().await;
+        let ctx = Context::new("n", "admin", Role::Admin).unwrap();
+        let operations = [
+            "formal.native.asof.issue.v1",
+            "formal.native.asof.execution.v1",
+            "formal.native.asof.grade.v1",
+            "formal.native.asof.complete.v1",
+            "formal.native.asof.reconcile.v1",
+            "formal.native.asof.invalidate.v1",
+            "formal.native.report_binding.v1",
+        ];
+        let mut session = store.session().await.unwrap();
+        for operation in operations {
+            // Healthy transaction check is memory-only. Reserved refusal occurs
+            // before the first query and before any clock sample/stamp exists.
+            assert!(matches!(
+                session.audit(&ctx, operation, "forged").await,
+                Err(Error::Forbidden)
+            ));
+            assert!(!session.write_started);
+            assert!(session.tx.is_some());
+            assert!(session.clock.check().is_ok());
+        }
+        session.clock.fail();
+        for operation in operations {
+            assert!(matches!(
+                session.audit(&ctx, operation, "forged").await,
+                Err(Error::ClockRegressed)
+            ));
+        }
+        session.tx.take().unwrap().rollback().await.unwrap();
+        drop(session);
+        let mut absent = store.session().await.unwrap();
+        absent.tx.take().unwrap().rollback().await.unwrap();
+        assert!(absent.clock.check().is_ok());
+        for operation in operations {
+            assert!(matches!(
+                absent.audit(&ctx, operation, "forged").await,
+                Err(Error::ClockRegressed)
+            ));
+            assert!(!absent.write_started);
+            assert!(absent.tx.is_none());
+        }
+        for operation in [
+            "test",
+            "issue_evaluation_ticket",
+            "complete_formal_evaluation",
+            "late_execution_receipt_after_formal",
+            "late_grader_receipt_after_final_report",
+            "late_grader_error_after_final_report",
+            "formal.native.asof.issue.v1.suffix",
+            "formal.evaluator.content.v1.literal",
+        ] {
+            assert!(!owned_occurrence::e05_issue::reserved_native_audit_operation(operation));
+        }
+        drop(absent);
+        store.close().await;
     }
 }

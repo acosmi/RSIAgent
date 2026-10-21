@@ -1139,7 +1139,7 @@ async fn readonly_status_some_is_not_a_committed_write() {
     assert_eq!(outcome.state, ManagementJobState::Succeeded);
     assert!(matches!(
         outcome.result,
-        Some(ManagementResult::EvaluationStatus { .. })
+        Some(ManagementResult::EvaluationStatusV3 { .. })
     ));
     let mut expected = dispatcher.cancel(&evaluator, &queued.id).await.unwrap();
     let committed = artifacts(&evaluator, &store).await;

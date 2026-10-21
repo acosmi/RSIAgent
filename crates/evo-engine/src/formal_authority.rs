@@ -282,7 +282,10 @@ pub struct TypedContentClosure {
 pub(crate) fn compiler_dependency_schema(kind: &str, schema: &str) -> bool {
     match kind {
         "formal_parent" => schema == "rsia.formal_parent_selection.v1",
-        "release" => schema == "rsia.persistent_release.v1",
+        "release" => matches!(
+            schema,
+            "rsia.persistent_release.v1" | evo_core::formal_version::PERSISTENT_RELEASE_V2
+        ),
         "pointer" => schema == "rsia.profile_pointer.v1",
         "receipt" => schema == "rsia.host_application.v1",
         "artifact" => matches!(
@@ -296,6 +299,9 @@ pub(crate) fn compiler_dependency_schema(kind: &str, schema: &str) -> bool {
                 | METER_SCHEMA
                 | PRINCIPAL_ACTION_SCHEMA
                 | CONTROL_PRINCIPAL_ACTION_SCHEMA
+                | "rsia.issued_formal_authority.v3"
+                | "rsia.independent_grade_capture.v2"
+                | "rsia.release_action.v2"
                 | "rsia.formal_principal_set_observation.v1"
                 | "rsia.formal_profile_selection.v1"
                 | "rsia.persisted_compiler_binding.v1"
@@ -341,9 +347,31 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
         .get("schema_version")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Conflict("dependency missing typed schema".into()))?;
+    if let Some(native_schema) = evo_storage::validate_native_compiler_value_r49(kind, id, body)? {
+        return Ok(native_schema);
+    }
+    if kind == "artifact" && schema == evo_core::formal_version::NATIVE_TICKET_ENVELOPE {
+        let ticket: crate::streaming_evaluator::EvaluationTicketV2 =
+            decode(body["payload"].clone())?;
+        ticket.validate()?;
+        if body["id"] != id
+            || body["record_kind"] != "evaluation_ticket_v2"
+            || id
+                != format!(
+                    "e05-{}",
+                    fingerprint(&("evaluation_ticket_v2", ticket.id.as_str()))?
+                )
+        {
+            return Err(Error::Conflict("typed object id alias".into()));
+        }
+        return Ok(schema.into());
+    }
     let supported = match kind {
         "run" => schema == "rsia.optimization.source.v1",
-        "release" => schema == "rsia.persistent_release.v1",
+        "release" => matches!(
+            schema,
+            "rsia.persistent_release.v1" | evo_core::formal_version::PERSISTENT_RELEASE_V2
+        ),
         "formal_parent" => schema == "rsia.formal_parent_selection.v1",
         "pointer" => schema == "rsia.profile_pointer.v1",
         "receipt" => schema == "rsia.host_application.v1",
@@ -358,6 +386,9 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
                 | METER_SCHEMA
                 | PRINCIPAL_ACTION_SCHEMA
                 | CONTROL_PRINCIPAL_ACTION_SCHEMA
+                | "rsia.issued_formal_authority.v3"
+                | "rsia.independent_grade_capture.v2"
+                | "rsia.release_action.v2"
                 | "rsia.formal_principal_set_observation.v1"
                 | "rsia.formal_profile_selection.v1"
                 | "rsia.persisted_compiler_binding.v1"
@@ -474,6 +505,17 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
         "rsia.persistent_release.v1" => {
             let _: crate::release_store::PersistentRelease = decode(body.clone())?;
         }
+        evo_core::formal_version::PERSISTENT_RELEASE_V2 => {
+            let wrapper: evo_core::formal_version::PersistentReleaseV2<
+                crate::release_store::PersistentRelease,
+            > = decode(body.clone())?;
+            wrapper
+                .validate_known()
+                .map_err(|_| Error::Conflict("typed current release wrapper differs".into()))?;
+            if wrapper.id != id {
+                return Err(Error::Conflict("typed object id alias".into()));
+            }
+        }
         "rsia.profile_pointer.v1" => {
             let _: crate::release_store::PersistentProfilePointer = decode(body.clone())?;
         }
@@ -564,6 +606,14 @@ pub async fn read_typed_closure(
             "typed content root count exceeds bound".into(),
         ));
     }
+    if let Some(actual) = s
+        .inspect_native_typed_closure_r49(ctx, roots.to_vec())
+        .await?
+    {
+        // Non-Serde private-constructor data from this same held transaction.
+        // The old decoder below cannot validate native Current/origin records.
+        return decode(actual.closure().clone());
+    }
     crate::revocation_gate::ensure_dependencies_live(ctx, s, roots, "formal content").await?;
     let mut pending = roots.to_vec();
     let mut nodes = BTreeMap::new();
@@ -596,7 +646,13 @@ pub async fn read_typed_closure(
             ));
         }
         let schema = supported_node_schema(&kind, &id, &body)?;
-        if schema == "rsia.typed_artifact_envelope.v1" {
+        if schema == evo_core::formal_version::NATIVE_TICKET_ENVELOPE {
+            evo_core::formal_version::native_ticket_payload(&body, ctx.namespace(), &id)
+                .map_err(|_| Error::Conflict("typed native ticket differs".into()))?;
+        }
+        if schema == "rsia.typed_artifact_envelope.v1"
+            || schema == evo_core::formal_version::NATIVE_TICKET_ENVELOPE
+        {
             match body["record_kind"].as_str() {
                 Some("evaluation_ticket_v2") => {
                     tickets.insert((kind.clone(), id.clone()));
@@ -617,9 +673,13 @@ pub async fn read_typed_closure(
             | "rsia.formal_profile_selection.v1"
             | "rsia.formal_parent_selection.v1"
             | "rsia.persistent_release.v1"
+            | "rsia.persistent_release.v2"
             | "rsia.profile_pointer.v1"
             | "rsia.host_surface_record.v1" => Some(Role::Admin),
-            FORMAL_SCHEMA | "rsia.independent_grade_capture.v1" => Some(Role::Evaluator),
+            FORMAL_SCHEMA
+            | "rsia.issued_formal_authority.v3"
+            | "rsia.independent_grade_capture.v1"
+            | "rsia.independent_grade_capture.v2" => Some(Role::Evaluator),
             "rsia.actual_formal_provider_capture.v1"
             | "rsia.complete_episode_cost.v1"
             | "rsia.trusted_resource_meter.v1"
@@ -636,7 +696,7 @@ pub async fn read_typed_closure(
         }
         if matches!(
             schema.as_str(),
-            PRINCIPAL_ACTION_SCHEMA | CONTROL_PRINCIPAL_ACTION_SCHEMA
+            PRINCIPAL_ACTION_SCHEMA | CONTROL_PRINCIPAL_ACTION_SCHEMA | "rsia.release_action.v2"
         ) {
             require_content_witness(s, ctx, &kind, &id, &body, Role::Evaluator).await?;
         }
@@ -1292,44 +1352,6 @@ async fn persist_principal_action(
     )
     .await
 }
-async fn record_grader_action<T: Serialize>(
-    s: &mut Session,
-    ctx: &Context,
-    host: &RegisteredFormalHost,
-    kind: &str,
-    id: &str,
-    body: &T,
-    operation: &str,
-) -> Result<()> {
-    let set = principal_set(s, ctx, host).await?;
-    let observed = process_principal(ctx, host, &set, Role::Evaluator)?;
-    let p = &set.grader;
-    let action = PrincipalAction {
-        id: principal_action_id(kind, id, Role::Evaluator)?,
-        schema_version: PRINCIPAL_ACTION_SCHEMA.into(),
-        namespace: ctx.namespace().into(),
-        host_registration_id: host.id.clone(),
-        host_digest: fingerprint(host)?,
-        principal_set_digest: set.binding_digest()?,
-        role: Role::Evaluator,
-        actor: p.actor.clone(),
-        uid: p.uid,
-        principal: p.principal.clone(),
-        credential_digest: p.credential_digest.clone(),
-        subject_kind: kind.into(),
-        subject_id: id.into(),
-        subject_content_digest: content_digest(body)?,
-        operation: operation.into(),
-        authenticated_request_digest: content_digest(body)?,
-        peer_uid: p.uid,
-        peer_gid: None,
-        peer_pid: Some(observed.pid),
-        authority_pid: observed.pid,
-        authority_uid: observed.uid,
-        authority_executable_digest: observed.executable_digest,
-    };
-    persist_principal_action(s, ctx, host, &set, action).await
-}
 async fn require_principal_action<T: Serialize>(
     s: &mut Session,
     ctx: &Context,
@@ -1753,6 +1775,24 @@ pub enum FormalOperatorCommand {
         candidate_id: String,
         report_id: String,
     },
+    ApproveCurrentV2 {
+        candidate_id: String,
+        report_ref: evo_core::formal_version::ReportRef,
+    },
+    CanaryCurrentV2 {
+        release_id: String,
+    },
+    ActivateCurrentV2 {
+        release_id: String,
+        expected_pointer_epoch: u64,
+    },
+    RollbackCurrentV2 {
+        profile_id: String,
+        target_release_id: String,
+        expected_pointer_epoch: u64,
+        environment_digest: String,
+    },
+
     Canary {
         release_id: String,
     },
@@ -1801,6 +1841,24 @@ impl<'de> Deserialize<'de> for FormalOperatorCommand {
                 candidate_id: String,
                 report_id: String,
             },
+            ApproveCurrentV2 {
+                candidate_id: String,
+                report_ref: evo_core::formal_version::ReportRef,
+            },
+            CanaryCurrentV2 {
+                release_id: String,
+            },
+            ActivateCurrentV2 {
+                release_id: String,
+                expected_pointer_epoch: u64,
+            },
+            RollbackCurrentV2 {
+                profile_id: String,
+                target_release_id: String,
+                expected_pointer_epoch: u64,
+                environment_digest: String,
+            },
+
             Canary {
                 release_id: String,
             },
@@ -1854,6 +1912,32 @@ impl<'de> Deserialize<'de> for FormalOperatorCommand {
                 candidate_id,
                 report_id,
             },
+            Wire::ApproveCurrentV2 {
+                candidate_id,
+                report_ref,
+            } => Self::ApproveCurrentV2 {
+                candidate_id,
+                report_ref,
+            },
+            Wire::CanaryCurrentV2 { release_id } => Self::CanaryCurrentV2 { release_id },
+            Wire::ActivateCurrentV2 {
+                release_id,
+                expected_pointer_epoch,
+            } => Self::ActivateCurrentV2 {
+                release_id,
+                expected_pointer_epoch,
+            },
+            Wire::RollbackCurrentV2 {
+                profile_id,
+                target_release_id,
+                expected_pointer_epoch,
+                environment_digest,
+            } => Self::RollbackCurrentV2 {
+                profile_id,
+                target_release_id,
+                expected_pointer_epoch,
+                environment_digest,
+            },
             Wire::Canary { release_id } => Self::Canary { release_id },
             Wire::Activate {
                 release_id,
@@ -1897,6 +1981,10 @@ impl FormalOperatorCommand {
             Self::Stage { .. } => "stage",
             Self::RegisterControl { .. } => "register_control",
             Self::Approve { .. } => "approve",
+            Self::ApproveCurrentV2 { .. } => "approve_current_v2",
+            Self::CanaryCurrentV2 { .. } => "canary_current_v2",
+            Self::ActivateCurrentV2 { .. } => "activate_current_v2",
+            Self::RollbackCurrentV2 { .. } => "rollback_current_v2",
             Self::Canary { .. } => "canary",
             Self::Activate { .. } => "activate",
             Self::Rollback { .. } => "rollback",
@@ -1998,6 +2086,48 @@ impl PrincipalAuthorityService {
             &envelope.credential,
             &envelope.command,
         )?;
+        if matches!(
+            &envelope.command,
+            FormalOperatorCommand::ApproveCurrentV2 { .. }
+        ) {
+            // Kernel peer is observed from this actual stream. Raw credential
+            // and command are reauthenticated against actual native DB facts.
+            let credential = evo_storage::NativeOperatorCredentialR49::from_socket(
+                &stream,
+                &envelope.credential,
+                serde_json::to_value(&envelope.command).map_err(|_| Error::Internal)?,
+            )?;
+            envelope.credential.clear();
+            bytes.fill(0);
+            let ctx = Context::new(&self.host.namespace, &p.actor, role)?;
+            let result =
+                crate::release_store::ReleaseStore::approve_current(&ctx, store, credential)
+                    .await
+                    .and_then(|value| serde_json::to_value(value).map_err(|_| Error::Internal));
+            let response = write_operator_response(&mut stream, &result).await;
+            return operator_result_after_response(result, response);
+        }
+        if matches!(
+            &envelope.command,
+            FormalOperatorCommand::CanaryCurrentV2 { .. }
+                | FormalOperatorCommand::ActivateCurrentV2 { .. }
+                | FormalOperatorCommand::RollbackCurrentV2 { .. }
+        ) {
+            let credential = evo_storage::NativeReleaseCredentialR49::from_socket(
+                &stream,
+                &envelope.credential,
+                serde_json::to_value(&envelope.command).map_err(|_| Error::Internal)?,
+            )?;
+            envelope.credential.clear();
+            bytes.fill(0);
+            let ctx = Context::new(&self.host.namespace, &p.actor, role)?;
+            let result =
+                crate::release_store::ReleaseStore::transition_current(&ctx, store, credential)
+                    .await
+                    .and_then(|value| serde_json::to_value(value).map_err(|_| Error::Internal));
+            let response = write_operator_response(&mut stream, &result).await;
+            return operator_result_after_response(result, response);
+        }
         // The secret has no representable field in the persisted observation.
         envelope.credential.clear();
         bytes.fill(0);
@@ -2105,6 +2235,10 @@ impl PrincipalAuthorityService {
                 ReleaseStore::approve_verified(ctx, store, &candidate_id, &report_id).await?,
             )
             .map_err(|_| Error::Internal),
+            FormalOperatorCommand::ApproveCurrentV2 { .. }
+            | FormalOperatorCommand::CanaryCurrentV2 { .. }
+            | FormalOperatorCommand::ActivateCurrentV2 { .. }
+            | FormalOperatorCommand::RollbackCurrentV2 { .. } => Err(Error::Forbidden),
             FormalOperatorCommand::Canary { release_id } => {
                 serde_json::to_value(ReleaseStore::advance_canary(ctx, store, &release_id).await?)
                     .map_err(|_| Error::Internal)
@@ -3035,6 +3169,19 @@ impl VerifiedCompilerInputs {
         )
     }
 }
+fn compiler_data_from_native_r49(
+    data: evo_storage::NativeCompilerInputsDataR49,
+) -> Result<VerifiedCompilerInputs> {
+    // The source type has private fields and no Deserialize. These are data
+    // projections of one real owned transaction, not a wire authorization.
+    Ok(VerifiedCompilerInputs {
+        profile: decode(data.profile().clone())?,
+        parent_skill: decode(data.parent_skill().clone())?,
+        parent_strategy: decode(data.parent_strategy().clone())?,
+        search_parent_strategy: decode(data.search_parent_strategy().clone())?,
+        binding: decode(data.binding().clone())?,
+    })
+}
 pub async fn resolve_compiler_inputs(
     s: &mut Session,
     ctx: &Context,
@@ -3045,6 +3192,15 @@ pub async fn resolve_compiler_inputs(
     request.baseline.validate()?;
     request.search_parent_strategy.validate()?;
     request.baseline_strategy.validate()?;
+    if let Some(actual) = s
+        .inspect_native_compiler_inputs_r49(
+            ctx,
+            serde_json::to_value(request).map_err(|_| Error::Internal)?,
+        )
+        .await?
+    {
+        return compiler_data_from_native_r49(actual);
+    }
     let selection: ProfileSelection = attested_read(
         s,
         ctx,
@@ -3208,6 +3364,18 @@ pub async fn resolve_bundle_in_session(
     watermark: u64,
     purpose: Purpose,
 ) -> Result<VerifiedCompilerInputs> {
+    if let Some(actual) = s
+        .inspect_native_compiler_bundle_r49(
+            ctx,
+            serde_json::to_value(bundle).map_err(|_| Error::Internal)?,
+            environment_digest,
+            watermark,
+            purpose,
+        )
+        .await?
+    {
+        return compiler_data_from_native_r49(actual);
+    }
     let selection: ProfileSelection = attested_read(
         s,
         ctx,
@@ -4209,6 +4377,32 @@ async fn record_meter_sources_and_cost_in_session(
     .await
 }
 impl FormalAuthorityIssuer {
+    pub async fn revalidate_current(
+        ctx: &Context,
+        store: &Store,
+        reference: evo_core::formal_version::ReportRef,
+    ) -> Result<evo_core::formal_version::FormalAuthorityV3<IssuedFormalAuthority>> {
+        ctx.require(&[Role::Evaluator, Role::Admin, Role::Host])?;
+        let closed = store
+            .read_formal_snapshot(
+                ctx,
+                evo_storage::FormalReadSelectorR38::Reference(
+                    evo_core::formal_version::AnyReportRef::VersionedV3(reference.clone()),
+                ),
+            )
+            .await?;
+        let host = closed.host_evidence()?.ok_or(Error::Forbidden)?;
+        if host.reference() != &reference {
+            return Err(Error::Forbidden);
+        }
+        let value: evo_core::formal_version::FormalAuthorityV3<IssuedFormalAuthority> =
+            serde_json::from_value(host.authority().clone()).map_err(|_| Error::Internal)?;
+        value.validate_known().map_err(|_| {
+            Error::Conflict("current formal authority returned invalid identity".into())
+        })?;
+        Ok(value)
+    }
+
     /// One frozen instrumentation protocol, independent of candidate/model
     /// text. Its authenticated service must measure the entire episode/root.
     /// Missing CPU/storage/history/human/gray measurements refuse, including
@@ -4500,421 +4694,6 @@ impl FormalAuthorityIssuer {
         s.commit().await?;
         Ok(result)
     }
-}
-pub(crate) async fn capture_independent_grade(
-    s: &mut Session,
-    ctx: &Context,
-    ticket: &crate::streaming_evaluator::EvaluationTicketV2,
-    target_id: &str,
-    receipt_id: &str,
-    receipt_digest: &str,
-) -> Result<()> {
-    ctx.require(&[Role::Evaluator])?;
-    let candidate: crate::release_store::ReleaseCandidateRecord =
-        s.need(ctx, "artifact", &ticket.candidate_digest).await?;
-    let inputs = resolve_bundle_in_session(
-        s,
-        ctx,
-        &candidate.bundle,
-        &candidate.environment_digest,
-        candidate.revoke_watermark,
-        Purpose::Development,
-    )
-    .await?;
-    let host: RegisteredFormalHost = attested_read(
-        s,
-        ctx,
-        "artifact",
-        &inputs.profile.host_registration_id,
-        Role::Admin,
-    )
-    .await?;
-    host.validate(ctx)?;
-    let control: crate::streaming_evaluator::RegisteredEvaluationControl =
-        crate::streaming_evaluator::need_record(
-            s,
-            ctx,
-            "registered_evaluation_control_v41",
-            &ticket.registration_id,
-        )
-        .await?;
-    let set = verify_candidate_principals(s, ctx, &host.id, &candidate, &control).await?;
-    process_principal(ctx, &host, &set, Role::Evaluator)?;
-    let credential =
-        std::env::var(&host.grader_credential_environment_key).map_err(|_| Error::Forbidden)?;
-    if hash(credential.as_bytes()) != host.grader_principal
-        || host.grader_principal == host.host_principal
-    {
-        return Err(Error::Forbidden);
-    }
-    let observed = crate::executor::observe_registered_process(
-        host.grader_uid,
-        &host.grader_code_digest,
-        &host.grader_workspace,
-    )?;
-    let record = IndependentGradeCapture {
-        id: format!(
-            "formal-grade-{}",
-            &fingerprint(&(ticket.id.as_str(), target_id))?[..32]
-        ),
-        schema_version: "rsia.independent_grade_capture.v1".into(),
-        ticket_id: ticket.id.clone(),
-        target_id: target_id.into(),
-        grader_receipt_digest: receipt_digest.into(),
-        host_registration_id: host.id.clone(),
-        grader_principal: host.grader_principal,
-        grader_pid: observed.pid,
-        grader_uid: observed.uid,
-        grader_code_digest: observed.executable_digest,
-        grader_workspace: observed.workspace,
-    };
-    immutable(s, ctx, "artifact", &record.id, &record).await?;
-    attest_content(s, ctx, "artifact", &record.id, &record).await?;
-    s.put_edge(ctx, "artifact", &record.id, "artifact", &host.id)
-        .await?;
-    s.put_edge(
-        ctx,
-        "artifact",
-        &record.id,
-        "artifact",
-        &crate::streaming_evaluator::storage_id("independent_grader_receipt_v2", receipt_id)?,
-    )
-    .await?;
-    Ok(())
-}
-pub(crate) async fn issue_complete_authority_in_session(
-    s: &mut Session,
-    ctx: &Context,
-    ticket: &crate::streaming_evaluator::EvaluationTicketV2,
-    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
-    formal: &crate::streaming_evaluator::FormalEvaluationV2,
-) -> Result<()> {
-    ctx.require(&[Role::Evaluator])?;
-    if control.evidence_scope
-        != crate::streaming_evaluator::EvaluationEvidenceScope::RegisteredExternalHost
-    {
-        return Err(Error::Forbidden);
-    }
-    let candidate: crate::release_store::ReleaseCandidateRecord =
-        s.need(ctx, "artifact", &ticket.candidate_digest).await?;
-    let inputs = resolve_bundle_in_session(
-        s,
-        ctx,
-        &candidate.bundle,
-        &candidate.environment_digest,
-        candidate.revoke_watermark,
-        Purpose::Development,
-    )
-    .await?;
-    let host: RegisteredFormalHost = attested_read(
-        s,
-        ctx,
-        "artifact",
-        &inputs.profile.host_registration_id,
-        Role::Admin,
-    )
-    .await?;
-    host.validate(ctx)?;
-    let set = verify_candidate_principals(s, ctx, &host.id, &candidate, control).await?;
-    process_principal(ctx, &host, &set, Role::Evaluator)?;
-    let report_storage_id =
-        crate::streaming_evaluator::storage_id("formal_evaluation_v2", &ticket.id)?;
-    record_grader_action(
-        s,
-        ctx,
-        &host,
-        "artifact",
-        &report_storage_id,
-        formal,
-        "issue_report",
-    )
-    .await?;
-    let report_principal_action_id =
-        principal_action_id("artifact", &report_storage_id, Role::Evaluator)?;
-    let observed = crate::executor::observe_registered_process(
-        host.grader_uid,
-        &host.grader_code_digest,
-        &host.grader_workspace,
-    )?;
-    let seal = s
-        .sealed_root_budget_evidence(ctx, &control.billing_scope)
-        .await?
-        .ok_or(Error::NotFound)?;
-    if !seal.monetary_complete || !seal.unresolved.is_empty() {
-        return Err(Error::Conflict("complete root cost unresolved".into()));
-    }
-    let cost: EpisodeCostRecord = attested_read(
-        s,
-        ctx,
-        "artifact",
-        &format!("formal-cost-{}", ticket.id),
-        Role::Host,
-    )
-    .await?;
-    cost.measurements.validate_complete()?;
-    verify_refs(s, ctx, &cost.measurement_sources).await?;
-    if cost.ticket_id != ticket.id
-        || cost.profile_registration_id != inputs.profile.id
-        || cost.observed_uid != host.host_uid
-    {
-        return Err(Error::Conflict("episode meter scope mismatch".into()));
-    }
-    let mut provider_captures = Vec::new();
-    let mut grader_captures = Vec::new();
-    if cost.measurements.episode_id != control.attempt_id
-        || seal.root.billing_scope != control.billing_scope
-    {
-        return Err(Error::Conflict("episode/root identity differs".into()));
-    }
-    validate_episode_meter_sources(
-        s,
-        ctx,
-        &inputs.profile,
-        &host,
-        ticket,
-        control,
-        &seal,
-        &cost.measurements,
-        &cost.measurement_sources,
-    )
-    .await?;
-    let mut roots = vec![
-        ("artifact".into(), candidate.id.clone()),
-        ("artifact".into(), cost.id.clone()),
-        (
-            "artifact".into(),
-            crate::streaming_evaluator::storage_id("formal_evaluation_v2", &ticket.id)?,
-        ),
-        (
-            "artifact".into(),
-            crate::streaming_evaluator::storage_id("evaluation_ticket_v2", &ticket.id)?,
-        ),
-        (
-            "artifact".into(),
-            crate::streaming_evaluator::storage_id(
-                "registered_evaluation_control_v41",
-                &ticket.registration_id,
-            )?,
-        ),
-        (
-            "artifact".into(),
-            crate::streaming_evaluator::storage_id("protected_holdout_v41", &ticket.holdout_id)?,
-        ),
-        ("artifact".into(), set.id.clone()),
-        ("artifact".into(), report_principal_action_id.clone()),
-    ];
-    for target in &ticket.targets {
-        let crate::streaming_evaluator::TargetState::Completed {
-            candidate_receipt_id,
-            baseline_receipt_id,
-            grader_receipt_id,
-            ..
-        } = &target.state
-        else {
-            return Err(Error::Conflict("formal target incomplete".into()));
-        };
-        for receipt_id in [candidate_receipt_id, baseline_receipt_id] {
-            let receipt: crate::streaming_evaluator::ExecutionReceiptV2 =
-                crate::streaming_evaluator::need_record(s, ctx, "execution_receipt_v2", receipt_id)
-                    .await?;
-            let call = s
-                .budget_call(ctx, &control.billing_scope, &receipt.budget_call_id)
-                .await?
-                .ok_or(Error::NotFound)?;
-            if call.execution_provenance
-                != Some(evo_storage::budget::BudgetExecutionProvenance::ExternalProvider)
-                || !call.execution_closed
-                || call.state != evo_storage::budget::BudgetCallState::Finalized
-                || call.dispatch_group_id != ticket.id
-                || call.response_usable != Some(true)
-            {
-                return Err(Error::Forbidden);
-            }
-            let id = format!(
-                "formal-capture-{}",
-                &hash(call.dispatch_id.as_ref().ok_or(Error::NotFound)?.as_bytes())[..32]
-            );
-            let capture: FormalProviderCaptureRecord =
-                attested_read(s, ctx, "artifact", &id, Role::Host).await?;
-            verify_provider_registration(s, ctx, &capture, &host).await?;
-            let request_artifact = call.request_artifact.as_ref().ok_or(Error::NotFound)?;
-            if request_artifact.schema_version != "rsia.formal_task_request.v1" {
-                return Err(Error::Forbidden);
-            }
-            let actual_request: crate::model::FormalTaskRequest =
-                serde_json::from_str(&request_artifact.body).map_err(|_| Error::Forbidden)?;
-            actual_request.validate()?;
-            let applied_bundle =
-                if receipt.side == crate::streaming_evaluator::ExecutionSide::Candidate {
-                    candidate.bundle.clone()
-                } else {
-                    inputs.compile(
-                        &SkillPatch {
-                            content: evo_core::contract::PatchOp::ResetToBaseline,
-                            applicability: evo_core::contract::PatchOp::ResetToBaseline,
-                            counterexample: evo_core::contract::PatchOp::ResetToBaseline,
-                            required_capabilities: evo_core::contract::PatchOp::ResetToBaseline,
-                            dependencies: evo_core::contract::PatchOp::ResetToBaseline,
-                        },
-                        &ImproverPatch {
-                            instruction: evo_core::contract::PatchOp::ResetToBaseline,
-                            max_candidates: evo_core::contract::PatchOp::ResetToBaseline,
-                            max_rounds: evo_core::contract::PatchOp::ResetToBaseline,
-                        },
-                    )?
-                };
-            let projection = evo_core::contract::project_run(
-                &applied_bundle,
-                &inputs.profile.system_snapshot,
-                true,
-            )?;
-            let mut application = vec![
-                serde_json::json!({"role":"system","content":actual_request.mandatory_context}),
-            ];
-            for instruction in &projection.instructions {
-                application.push(serde_json::json!({"role":"system","content":instruction}));
-            }
-            application
-                .push(serde_json::json!({"role":"user","content":actual_request.task_input_utf8}));
-            if actual_request.candidate_id != candidate.id
-                || actual_request.profile_registration_id != inputs.profile.id
-                || actual_request.compiler_binding_digest != inputs.binding.binding_digest
-                || actual_request.task.ticket_id != ticket.id
-                || actual_request.task.target_id != target.target_id
-                || actual_request.task.side != receipt.side
-                || actual_request.task.request_digest != receipt.request_digest
-                || actual_request.task.input_digest != target.input_digest
-                || applied_bundle.digest != receipt.bundle_digest
-                || hash(actual_request.mandatory_context.as_bytes())
-                    != inputs.profile.system_snapshot.mandatory_context_digest
-                || fingerprint(&actual_request.projection)? != fingerprint(&projection)?
-                || fingerprint(&application)? != capture.application_digest
-            {
-                return Err(Error::Conflict(
-                    "actual request application differs from frozen P/B".into(),
-                ));
-            }
-            let transport = call.transport_artifact.as_ref().ok_or(Error::NotFound)?;
-            if decode::<FormalProviderCaptureRecord>(
-                serde_json::from_str(&transport.body).map_err(|_| Error::Internal)?,
-            )?
-            .id != capture.id
-                || fingerprint(&capture)?
-                    != fingerprint(&decode::<FormalProviderCaptureRecord>(
-                        serde_json::from_str(&transport.body).map_err(|_| Error::Internal)?,
-                    )?)?
-                || capture.host_registration_id != host.id
-                || capture.host_uid != host.host_uid
-                || capture.host_pid == observed.pid
-                || capture.host_principal != host.host_principal
-                || capture.host_code_digest != host.code_digest
-                || capture.host_workspace != host.host_workspace
-                || capture.request_digest != receipt.request_digest
-                || capture.bundle_digest != receipt.bundle_digest
-                || capture.output_digest != receipt.output_digest
-                || capture.input_digest != target.input_digest
-                || call.actual_cost_micros != Some(capture.actual_cost_micros)
-                || call.actual_currency.as_deref() != Some(capture.currency.as_str())
-                || call.actual_pricing_version.as_deref() != Some(capture.pricing_version.as_str())
-                || seal.root.currency != capture.currency
-                || seal.root.pricing_version != capture.pricing_version
-                || call.output_digest.as_deref() != Some(capture.output_digest.as_str())
-                || call.provider_request_id.as_deref() != Some(capture.provider_request_id.as_str())
-                || call.usage_record_id.as_deref() != Some(capture.usage_record_id.as_str())
-            {
-                return Err(Error::Conflict(
-                    "actual provider/host/output/usage mismatch".into(),
-                ));
-            }
-            let r = TypedContentRef {
-                kind: "artifact".into(),
-                id: id.clone(),
-                schema_version: capture.schema_version.clone(),
-                content_digest: content_digest(&capture)?,
-            };
-            provider_captures.push(r);
-            roots.push(("artifact".into(), id));
-            for kind_id in [
-                ("execution_receipt_v2", receipt_id.as_str()),
-                (
-                    "evaluation_execution_output_v1",
-                    receipt.output_artifact_id.as_str(),
-                ),
-            ] {
-                roots.push((
-                    "artifact".into(),
-                    crate::streaming_evaluator::storage_id(kind_id.0, kind_id.1)?,
-                ));
-            }
-        }
-        let grade_id = format!(
-            "formal-grade-{}",
-            &fingerprint(&(ticket.id.as_str(), target.target_id.as_str()))?[..32]
-        );
-        let grade: IndependentGradeCapture =
-            attested_read(s, ctx, "artifact", &grade_id, Role::Evaluator).await?;
-        // The capture names the canonical digest of the stored receipt itself:
-        // any changed field, or a capture of another digest, fails closed.
-        let original: Value = crate::streaming_evaluator::need_record(
-            s,
-            ctx,
-            "independent_grader_receipt_v2",
-            grader_receipt_id,
-        )
-        .await?;
-        if grade.grader_receipt_digest != evo_core::canonical_fingerprint(&original)?
-            || grade.grader_uid != host.grader_uid
-            || grade.grader_principal != host.grader_principal
-            || grade.grader_code_digest != host.grader_code_digest
-            || grade.grader_workspace != host.grader_workspace
-            || grade.ticket_id != ticket.id
-            || grade.target_id != target.target_id
-        {
-            return Err(Error::Forbidden);
-        }
-        grader_captures.push(TypedContentRef {
-            kind: "artifact".into(),
-            id: grade_id.clone(),
-            schema_version: grade.schema_version.clone(),
-            content_digest: content_digest(&grade)?,
-        });
-        roots.push(("artifact".into(), grade_id));
-        roots.push((
-            "artifact".into(),
-            crate::streaming_evaluator::storage_id(
-                "independent_grader_receipt_v2",
-                grader_receipt_id,
-            )?,
-        ));
-    }
-    let closure = read_typed_closure(s, ctx, &roots).await?;
-    let record = IssuedFormalAuthority {
-        id: format!("formal-authority-{}", ticket.id),
-        schema_version: FORMAL_SCHEMA.into(),
-        report_id: ticket.id.clone(),
-        raw_report_digest: fingerprint(formal)?,
-        ticket_digest: fingerprint(ticket)?,
-        candidate_id: candidate.id,
-        candidate_bundle_digest: candidate.bundle_digest,
-        environment_digest: candidate.environment_digest,
-        compiler_binding: inputs.binding,
-        billing_scope: control.billing_scope.clone(),
-        root_seal_digest: fingerprint(&seal)?,
-        episode_cost_digest: fingerprint(&cost)?,
-        host_registration_id: host.id,
-        principal_set_digest: set.binding_digest()?,
-        report_principal_action_id,
-        provider_captures,
-        grader_captures,
-        closure_roots: roots,
-        closure,
-        watermark: s.watermark(ctx).await?,
-        issued_by: ctx.actor().into(),
-    };
-    immutable(s, ctx, "artifact", &record.id, &record).await?;
-    attest_content(s, ctx, "artifact", &record.id, &record).await?;
-    edges(s, ctx, "artifact", &record.id, &record.closure.nodes).await?;
-    s.audit(ctx, "formal.authority.issue", &record.id).await
 }
 pub async fn verify_issued_authority(
     s: &mut Session,

@@ -1305,7 +1305,14 @@ class IndexOwnershipAndMergeFactsTests(unittest.TestCase):
         facts = css.reviewed_merge_facts(REAL_ROOT)
         self.assertEqual(len(facts), 118)
         records = [record for scope in _valid_manifest_dict()["e_scopes"].values() for record in scope["verified_subscopes"]]
-        self.assertEqual(len(records), 98)
+        self.assertEqual(len(records), 97)
+        removed_id = "E08.ag104_restore_prefix_migration_upgrade_v42"
+        self.assertNotIn(removed_id, {record["id"] for record in records})
+        self.assertEqual(
+            hashlib.sha256(json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "ce92cdb9917af993fce55f0eb5738598be8344166957729f5cd2667c0fd80b0d",
+        )
+        self.assertTrue(all(removed_id not in item["related_evidence_refs"] for item in _valid_manifest_dict()["traceability"]["v_scenarios"]))
         for record in records:
             self.assertEqual(record["merged_sha"], facts[int(record["pr"].rsplit("/", 1)[1])])
             self.assertNotEqual(record["source_sha"], record["merged_sha"])

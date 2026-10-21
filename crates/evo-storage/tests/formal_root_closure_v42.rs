@@ -1651,3 +1651,252 @@ async fn role_witness_rejects_hash_valid_malformed_private_audit_payloads() {
         store.close().await;
     }
 }
+
+// A single explicitly installed fixture source advances with the real operation
+// chronology. None of these event times is copied from a floor or rounded ahead.
+async fn r42_clocked_store() -> (
+    tempfile::TempDir,
+    Store,
+    Arc<std::sync::atomic::AtomicI64>,
+    Context,
+    Context,
+    Context,
+) {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let seconds = Arc::new(AtomicI64::new(0));
+    let reader = Arc::clone(&seconds);
+    let clock = evo_core::clock::WallClock::fixture_seconds(Arc::new(move || {
+        reader.load(Ordering::SeqCst)
+    }));
+    let store = Store::open_with_fixture_clock(
+        &dir.path().join("r42-arbitrary-ledger-name.sqlite3"),
+        Vec::new(),
+        clock,
+    )
+    .await
+    .unwrap();
+    let admin = ctx("ns-a", "admin", Role::Admin);
+    let a = ctx("ns-a", "worker-a", Role::Worker);
+    let b = ctx("ns-b", "worker-b", Role::Worker);
+    seconds.store(1, Ordering::SeqCst);
+    store
+        .authorize_root_budget(&admin, &authorization())
+        .await
+        .unwrap();
+    (dir, store, seconds, admin, a, b)
+}
+
+#[tokio::test]
+async fn r42_real_late_finance_keeps_history_but_requires_strict_latest_reseal() {
+    use std::sync::atomic::Ordering;
+    let (dir, store, seconds, admin, a, b) = r42_clocked_store().await;
+    seconds.store(10, Ordering::SeqCst);
+    let pending = store
+        .reserve_budget_call(
+            &b,
+            &reservation("r42-uncertain", BudgetStage::TaskExecution, 10),
+        )
+        .await
+        .unwrap();
+    seconds.store(11, Ordering::SeqCst);
+    let dispatched = store
+        .begin_budget_dispatch(&b, &fence(&pending, 11))
+        .await
+        .unwrap();
+    seconds.store(12, Ordering::SeqCst);
+    store
+        .mark_budget_call_uncertain(&b, &fence(&dispatched.call, 12), "unknown usage")
+        .await
+        .unwrap();
+    seconds.store(13, Ordering::SeqCst);
+    let reserved = store
+        .reserve_budget_call(
+            &a,
+            &reservation("r42-reserved", BudgetStage::HumanReview, 13),
+        )
+        .await
+        .unwrap();
+    seconds.store(20, Ordering::SeqCst);
+    let mut session = store.session().await.unwrap();
+    let first = session
+        .seal_root_budget(&admin, "scope", "first immutable stop", 20)
+        .await
+        .unwrap();
+    let first_bytes = serde_json::to_value(&first).unwrap().to_string();
+    assert!(!first.monetary_complete);
+    assert_eq!(first.held_reservation_micros, "20");
+    assert_eq!(
+        session
+            .sealed_root_budget_evidence(&b, "scope")
+            .await
+            .unwrap(),
+        Some(first.clone())
+    );
+    session.commit().await.unwrap();
+
+    seconds.store(22, Ordering::SeqCst);
+    store
+        .reconcile_budget_call_cost(
+            &admin,
+            "scope",
+            "r42-uncertain",
+            &charge("r42-uncertain", 6),
+            22,
+        )
+        .await
+        .unwrap();
+    seconds.store(23, Ordering::SeqCst);
+    store
+        .close_budget_call_execution(
+            &b,
+            "scope",
+            "r42-uncertain",
+            dispatched.call.dispatch_id.as_deref().unwrap(),
+            "late execution closed",
+            23,
+        )
+        .await
+        .unwrap();
+    seconds.store(24, Ordering::SeqCst);
+    store
+        .release_undispatched_budget_call(&a, &fence(&reserved, 24), "not dispatched")
+        .await
+        .unwrap();
+    let mut session = store.session().await.unwrap();
+    assert!(
+        matches!(session.sealed_root_budget_evidence(&b,"scope").await,
+        Err(Error::Conflict(message)) if message=="root monetary seal is stale or invalid")
+    );
+    let actual = session
+        .root_budget_monetary_snapshot(&admin, "scope")
+        .await
+        .unwrap();
+    assert_eq!(actual.root.spent_micros, 6);
+    assert_eq!(actual.root.reserved_micros, 0);
+    assert_eq!(actual.stage_totals.len(), BudgetStage::ALL.len());
+    assert_eq!(actual.calls.len(), 2);
+    assert!(
+        actual
+            .ledger_events
+            .iter()
+            .any(|event| event.event_kind == "cost_reconciled")
+    );
+
+    seconds.store(25, Ordering::SeqCst);
+    let second = session
+        .seal_root_budget(&admin, "scope", "reseal after late reconciliation", 25)
+        .await
+        .unwrap();
+    assert!(second.monetary_complete);
+    assert_ne!(second.snapshot_digest, first.snapshot_digest);
+    assert_eq!(second.root.stop_reason, first.root.stop_reason);
+    assert_eq!(second.root.stop_committed_at, first.root.stop_committed_at);
+    assert_eq!(
+        session
+            .sealed_root_budget_evidence(&a, "scope")
+            .await
+            .unwrap(),
+        Some(second.clone())
+    );
+    let foreign = ctx("foreign", "admin", Role::Admin);
+    assert!(matches!(
+        session.sealed_root_budget_evidence(&foreign, "scope").await,
+        Err(Error::NotFound)
+    ));
+    let agent = ctx("ns-a", "agent", Role::Agent);
+    assert!(matches!(
+        session.sealed_root_budget_evidence(&agent, "scope").await,
+        Err(Error::Forbidden)
+    ));
+    session.commit().await.unwrap();
+    assert!(!second.complete_episode_cost);
+    assert!(!second.ordinary_p_eligible);
+    store.close().await;
+
+    // Inspect the original bytes only after the real mounted Store has closed.
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(dir.path().join("r42-arbitrary-ledger-name.sqlite3"))
+        .read_only(true)
+        .create_if_missing(false);
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    let seals:Vec<String>=sqlx::query_scalar(
+        "SELECT details FROM root_budget_events WHERE billing_scope=? AND event_kind=? ORDER BY seq",
+    ).bind("scope").bind("root_monetary_sealed_v1").fetch_all(&mut connection).await.unwrap();
+    assert_eq!(seals.len(), 2);
+    assert_eq!(seals[0], first_bytes);
+    assert_eq!(seals[1], serde_json::to_value(&second).unwrap().to_string());
+    connection.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn r42_historical_negative_money_and_static_authorization_corruption_are_still_rejected() {
+    use std::sync::atomic::Ordering;
+    for fault in [
+        "negative_spent",
+        "negative_reserved",
+        "authorization",
+        "first_stop",
+        "actor",
+    ] {
+        let (dir, store, seconds, admin, _, _) = r42_clocked_store().await;
+        seconds.store(20, Ordering::SeqCst);
+        let mut session = store.session().await.unwrap();
+        let first = session
+            .seal_root_budget(&admin, "scope", "original stop", 20)
+            .await
+            .unwrap();
+        let second = session
+            .seal_root_budget(&admin, "scope", "do not replace stop", 20)
+            .await
+            .unwrap();
+        assert_eq!(second.root.stop_reason, first.root.stop_reason);
+        session.commit().await.unwrap();
+        store.close().await;
+        let path = dir.path().join("r42-arbitrary-ledger-name.sqlite3");
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        let mut bad = serde_json::to_value(&first).unwrap();
+        match fault {
+            "negative_spent" => bad["root"]["spent_micros"] = json!(-1),
+            "negative_reserved" => bad["root"]["reserved_micros"] = json!(-1),
+            "authorization" => {
+                bad["root"]["authorization_receipt_digest"] = json!(hash(b"wrong authorization"))
+            }
+            "first_stop" => bad["root"]["stop_reason"] = json!("replaced first reason"),
+            "actor" => bad["sealed_by_actor"] = json!("bad actor"),
+            _ => unreachable!(),
+        }
+        let bad_bytes = serde_json::to_string(&bad).unwrap();
+        // Deliberate isolated storage corruption; never a healthy second writer.
+        let changed=sqlx::query(
+            "UPDATE root_budget_events SET details=? WHERE seq=(SELECT MIN(seq) FROM root_budget_events WHERE billing_scope=? AND event_kind=?)",
+        ).bind(&bad_bytes).bind("scope").bind("root_monetary_sealed_v1")
+            .execute(&mut connection).await.unwrap();
+        assert_eq!(changed.rows_affected(), 1);
+        connection.close().await.unwrap();
+        let reader = Arc::clone(&seconds);
+        let reopened = Store::open_with_fixture_clock(
+            &path,
+            Vec::new(),
+            evo_core::clock::WallClock::fixture_seconds(Arc::new(move || {
+                reader.load(Ordering::SeqCst)
+            })),
+        )
+        .await;
+        assert!(matches!(reopened, Err(Error::ClockRegressed)), "{fault}");
+        // An open refusal must not rewrite the retained malformed evidence.
+        let mut connection = SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .read_only(true),
+        )
+        .await
+        .unwrap();
+        let retained:String=sqlx::query_scalar(
+            "SELECT details FROM root_budget_events WHERE billing_scope=? AND event_kind=? ORDER BY seq LIMIT 1",
+        ).bind("scope").bind("root_monetary_sealed_v1").fetch_one(&mut connection).await.unwrap();
+        assert_eq!(retained, bad_bytes);
+        connection.close().await.unwrap();
+    }
+}

@@ -20,38 +20,12 @@ pub(crate) fn observe_registered_process(
     code: &str,
     workspace: &str,
 ) -> Result<ObservedProcessIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    let path = std::fs::canonicalize(workspace).map_err(|_| Error::Forbidden)?;
-    let cwd = std::env::current_dir().map_err(|_| Error::Internal)?;
-    let metadata = std::fs::metadata(&path).map_err(|_| Error::Forbidden)?;
-    if cwd != path || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-        return Err(Error::Forbidden);
-    }
-    // Fixed platform utility; no shell or candidate-controlled executable.
-    let observed = std::process::Command::new("/usr/bin/id")
-        .arg("-u")
-        .env_clear()
-        .output()
-        .map_err(|_| Error::Internal)?;
-    if !observed.status.success() {
-        return Err(Error::Forbidden);
-    }
-    let observed_uid: u32 = std::str::from_utf8(&observed.stdout)
-        .map_err(|_| Error::Internal)?
-        .trim()
-        .parse()
-        .map_err(|_| Error::Internal)?;
-    let executable = std::env::current_exe().map_err(|_| Error::Internal)?;
-    let bytes = std::fs::read(executable).map_err(|_| Error::Internal)?;
-    let actual_digest = evo_core::hash(&bytes);
-    if observed_uid != uid || actual_digest != code {
-        return Err(Error::Forbidden);
-    }
+    let actual = evo_core::formal_version::observe_registered_process_r49(uid, code, workspace)?;
     Ok(ObservedProcessIdentity {
-        pid: std::process::id(),
-        uid,
-        executable_digest: actual_digest,
-        workspace: path.to_string_lossy().into_owned(),
+        pid: actual.pid(),
+        uid: actual.uid(),
+        executable_digest: actual.executable_digest().to_owned(),
+        workspace: actual.workspace().to_owned(),
     })
 }
 

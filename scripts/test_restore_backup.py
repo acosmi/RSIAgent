@@ -1,14 +1,11 @@
-"""Migration-prefix upgrade in scripts/restore_backup.py (AG-104, E08 / plan §11).
+"""Restore migration-prefix regressions (AG-104 / AG132).
 
-Pure Python. The fixtures execute the repository's migration files with sqlite3
-and write the `_sqlx_migrations` rows the way sqlx 0.8.6 writes them, then build
-an rsia.backup.v2 package the way `Store::backup` does (VACUUM INTO plus a
-manifest read from the database). The real script runs as a subprocess.
-
-These tests pin the prefix rule, the sqlx description and checksum derivation,
-the one-transaction-per-migration upgrade and every rejection. The Rust test
-crates/evo-storage/tests/restore_prefix_upgrade_v42.rs proves the upgraded
-database equal to `Store::open` on ledgers the real sqlx migrator wrote.
+LegacyMechanicalTests retains the original SQL fixtures and physical row,
+ledger and image comparisons; it grants no qualified business-history credit.
+RestoreTests requires closed real-producer facts materialized in the compiled
+prefix schemas by evo-engine, then executes all fifteen real CLI calls.
+The two direct-helper tests cover the native-only boundary; actual migration
+commit/rollback and rogue-SQL admission live in migration_clock's file controls.
 """
 
 import hashlib
@@ -178,7 +175,7 @@ def quoted(name):
 
 def database_image(path):
     """Schema SQL, the ledger without its timing columns, and every table's rows (with rowids)."""
-    con = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+    con = readonly_fixture(path)
     try:
         schema = con.execute("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").fetchall()
         ledger = con.execute(
@@ -203,6 +200,46 @@ def database_image(path):
         con.close()
 
 
+def readonly_fixture(path):
+    # Only closed private test fixtures; this is not a production source reader.
+    path = Path(path).resolve()
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = Path(str(path) + suffix)
+        assert not sidecar.exists() or suffix == "-wal" and sidecar.stat().st_size == 0
+    return sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)
+
+
+def fixture_copy(source, directory):
+    source, directory = Path(source), Path(directory)
+    directory.mkdir(mode=0o700)
+    shutil.copyfile(source, directory / "rsia.sqlite3")
+    if (source.parent / "blobs").exists():
+        shutil.copytree(source.parent / "blobs", directory / "blobs")
+    return directory / "rsia.sqlite3"
+
+
+def fixture_fault(database, sql):
+    import fcntl
+    # No producer remains live; only this test-owned closed copy is writable.
+    directory = os.open(database.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    lock = os.open(database.parent / ".rsia.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    con = sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True, isolation_level=None)
+    try:
+        con.executescript(sql)
+    finally:
+        con.close()
+        os.unlink(database.parent / ".rsia.lock")
+        os.close(lock)
+        os.close(directory)
+
+
+def fixture_snapshot(directory):
+    return {p.relative_to(directory).as_posix(): None if p.is_dir() else p.read_bytes()
+            for p in directory.rglob("*")}
+
+
 class Scenario:
     """A historical live database on `versions`, its backups, and anchors made from it."""
 
@@ -211,6 +248,23 @@ class Scenario:
         test.addCleanup(shutil.rmtree, self.base, True)
         self.versions = list(versions)
         self.history = self.base / "history.sqlite3"
+        self.qualified = isinstance(test, RestoreTests)
+        if self.qualified:
+            test._qualified_scenario = self
+            root = Path(os.environ["RSIA_TEST_RESTORE_FIXTURE_ROOT"]).resolve()
+            fixtures = json.loads((root / "python-fixtures.json").read_text())
+            assert set(fixtures) == {"5", "6", "current", "late"}
+            if versions == [1, 2, 4, 5]:
+                label = "late" if test._testMethodName == "test_a_0005_backup_replays_a_later_revocation_after_the_upgrade" else "5"
+            elif versions == [1, 2, 4, 5, 6]:
+                label = "6"
+            else:
+                assert versions in (CURRENT, [1, 2, 4, 5, 7], [1, 2, 4])
+                label = "current"
+            self.fixture = fixtures[label]
+            self.actual_versions = CURRENT if label == "current" else [1, 2, 4, 5] + ([6] if label == "6" else [])
+            shutil.copyfile(self.fixture["prefix"], self.history)
+            return
         con = connect(self.history)
         sqlx_migrate(con, self.versions)
         seed(con, self.versions)
@@ -219,6 +273,9 @@ class Scenario:
     def anchor(self, name="live", upgrade=True):
         """The current control plane: the live database after the binary upgrade."""
         directory = self.base / name
+        if self.qualified:
+            source = self.fixture["anchor"] if upgrade else self.fixture["prefix"]
+            return fixture_copy(source, directory)
         directory.mkdir()
         path = directory / "rsia.sqlite3"
         shutil.copyfile(self.history, path)
@@ -234,6 +291,25 @@ class Scenario:
         `db_sql` changes the copied database after the manifest's migration and
         watermark lists were read; `manifest` mutates the document."""
         directory = self.base / name
+        if self.qualified:
+            source = Path(self.fixture["backup"])
+            database = fixture_copy(source / "rsia.sqlite3", directory)
+            document = json.loads((source / "backup-manifest.json").read_bytes())
+            if self.versions != self.actual_versions:
+                keep = ",".join(map(str, self.versions))
+                fixture_fault(database, "DELETE FROM _sqlx_migrations WHERE version NOT IN (" + keep + ")")
+                document["migrations"] = [m for m in document["migrations"] if m["version"] in self.versions]
+            if db_sql:
+                fixture_fault(database, db_sql)
+            data = database.read_bytes()
+            document["database"].update(sha256=hashlib.sha256(data).hexdigest(), bytes=len(data))
+            if manifest:
+                manifest(document)
+            raw = (source / "backup-manifest.json").read_bytes()
+            if document != json.loads(raw):
+                raw = json.dumps(document).encode()
+            (directory / "backup-manifest.json").write_bytes(raw)
+            return directory
         directory.mkdir()
         database = directory / "rsia.sqlite3"
         con = connect(self.history)
@@ -271,6 +347,12 @@ class Scenario:
     def delta(self, backup, events=None, latest=None):
         """The exact revoke delta; `events`/`latest` replace legacy-a's tail."""
         manifest = (backup / "backup-manifest.json").read_bytes()
+        if self.qualified:
+            packet = json.loads(Path(self.fixture["delta"]).read_bytes())
+            packet["base_manifest_sha256"] = hashlib.sha256(manifest).hexdigest()
+            path = self.base / (backup.name + "-delta.json")
+            path.write_text(json.dumps(packet))
+            return path
         namespaces = []
         for mark in json.loads(manifest)["watermarks"]:
             entry = {
@@ -299,10 +381,15 @@ class Scenario:
 
     def restore(self, backup, anchor, name="restored", delta=None):
         dest = self.base / name
+        before = (fixture_snapshot(backup), fixture_snapshot(anchor.parent)) if self.qualified else None
+        if self.qualified:
+            self.last_backup = backup
         result = subprocess.run(
             [
                 sys.executable,
                 str(SCRIPT),
+                "--native-reader", os.environ["RSIA_TEST_NATIVE_READER"],
+                "--prepare-configs-file", os.environ["RSIA_TEST_PREPARE_CONFIGS_FILE"],
                 "--backup", str(backup),
                 "--dest", str(dest),
                 "--revoke-delta", str(delta or self.delta(backup)),
@@ -313,6 +400,8 @@ class Scenario:
             timeout=120,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         )
+        if self.qualified:
+            assert (fixture_snapshot(backup), fixture_snapshot(anchor.parent)) == before
         return dest, result
 
 
@@ -361,36 +450,55 @@ class PrefixRuleTests(unittest.TestCase):
 
 class UpgradeStepTests(unittest.TestCase):
     def test_every_missing_migration_commits_in_its_own_transaction(self):
-        scenario = Scenario(self, [1, 2, 4, 5])
-        database = scenario.base / "copy.sqlite3"
-        shutil.copyfile(scenario.history, database)
-        con = connect(database)
-        con.execute("CREATE TABLE objects_formal_parent(x)")  # makes 0007 fail
-        objects_sql = con.execute("SELECT sql FROM sqlite_master WHERE name='objects'").fetchone()
-        con.close()
-        with self.assertRaisesRegex(sqlite3.OperationalError, "objects_formal_parent already exists"):
-            restore.apply_missing_migrations(database, [1, 2, 4, 5])
-        con = connect(database)
-        # 0006 and its ledger row committed; 0007 rolled back as a whole.
-        self.assertEqual([row[0] for row in con.execute("SELECT version FROM _sqlx_migrations ORDER BY version")], [1, 2, 4, 5, 6])
-        self.assertIsNotNone(con.execute("SELECT 1 FROM sqlite_master WHERE name='revoke_cleanup_jobs'").fetchone())
-        self.assertEqual(con.execute("SELECT sql FROM sqlite_master WHERE name='objects'").fetchone(), objects_sql)
-        self.assertEqual(con.execute("SELECT count(*) FROM objects_formal_parent").fetchone(), (0,))
-        self.assertFalse(Path(str(database) + "-journal").exists())
-        con.close()
+        # Legacy commit/rollback obligation: Rust's committed_six_survives_seven_post_ddl_admission_failure.
+        # This old Python entry now refuses both prefixes before opening the copy.
+        for versions in ([1, 2, 4, 5], [1, 2, 4, 5, 6]):
+            with self.subTest(versions=versions):
+                scenario = Scenario(self, versions)
+                database = scenario.base / "copy.sqlite3"
+                shutil.copyfile(scenario.history, database)
+                con = connect(database)
+                con.execute("CREATE TABLE objects_formal_parent(x)")
+                objects_sql = con.execute("SELECT sql FROM sqlite_master WHERE name='objects'").fetchone()
+                con.close()
+                before_bytes, before_image = database.read_bytes(), database_image(database)
+                members = sorted(p.name for p in scenario.base.iterdir())
+                with self.assertRaisesRegex(restore.IsolationError, "^SQLite migration requires the fixed native restore-copy operation$"):
+                    restore.apply_missing_migrations(database, versions)
+                self.assertEqual(database.read_bytes(), before_bytes)
+                self.assertEqual(database_image(database), before_image)
+                self.assertEqual(sorted(p.name for p in scenario.base.iterdir()), members)
+                con = connect(database)
+                if versions[-1] == 6:
+                    self.assertEqual([row[0] for row in con.execute("SELECT version FROM _sqlx_migrations ORDER BY version")], [1, 2, 4, 5, 6])
+                    self.assertIsNotNone(con.execute("SELECT 1 FROM sqlite_master WHERE name='revoke_cleanup_jobs'").fetchone())
+                else:
+                    self.assertEqual([row[0] for row in con.execute("SELECT version FROM _sqlx_migrations ORDER BY version")], versions)
+                    self.assertIsNone(con.execute("SELECT 1 FROM sqlite_master WHERE name='revoke_cleanup_jobs'").fetchone())
+                self.assertEqual(con.execute("SELECT sql FROM sqlite_master WHERE name='objects'").fetchone(), objects_sql)
+                self.assertEqual(con.execute("SELECT count(*) FROM objects_formal_parent").fetchone(), (0,))
+                self.assertFalse(Path(str(database) + "-journal").exists())
+                con.close()
 
     def test_a_migration_that_ends_its_own_transaction_is_refused(self):
+        # The same rogue SQL is rejected by Rust's compiled identity, before execution.
         scenario = Scenario(self, [1, 2, 4, 5, 6])
         database = scenario.base / "copy.sqlite3"
         shutil.copyfile(scenario.history, database)
         code = restore.code_migrations()
         rogue = b"CREATE TABLE rogue(x);\nCOMMIT;\n"
         code[7] = (code[7][0], rogue, hashlib.sha384(rogue).hexdigest())
+        before_bytes, before_image = database.read_bytes(), database_image(database)
+        members = sorted(p.name for p in scenario.base.iterdir())
         with mock.patch.object(restore, "code_migrations", return_value=code):
-            with self.assertRaisesRegex(restore.IsolationError, "^migration 7 ended its own transaction$"):
+            with self.assertRaisesRegex(restore.IsolationError, "^SQLite migration requires the fixed native restore-copy operation$"):
                 restore.apply_missing_migrations(database, [1, 2, 4, 5, 6])
+        self.assertEqual(database.read_bytes(), before_bytes)
+        self.assertEqual(database_image(database), before_image)
+        self.assertEqual(sorted(p.name for p in scenario.base.iterdir()), members)
         con = connect(database)
         self.assertEqual([row[0] for row in con.execute("SELECT version FROM _sqlx_migrations ORDER BY version")], [1, 2, 4, 5, 6])
+        self.assertFalse(Path(str(database) + "-journal").exists())
         con.close()
 
     def test_the_current_set_is_not_touched(self):
@@ -398,6 +506,41 @@ class UpgradeStepTests(unittest.TestCase):
         before = scenario.history.read_bytes()
         self.assertEqual(restore.apply_missing_migrations(scenario.history, CURRENT), [])
         self.assertEqual(scenario.history.read_bytes(), before)
+
+
+class LegacyMechanicalTests(unittest.TestCase):
+    def test_original_fixture_rows_survive_fixture_migrations(self):
+        # Raw historical fixture mechanics only; no qualified business-origin equivalence.
+        for versions in ([1, 2, 4, 5], [1, 2, 4, 5, 6], CURRENT):
+            scenario = Scenario(self, versions)
+            con = connect(scenario.history)
+            utf8 = ' { "id" : "shared", "text" : "汉字" } '
+            con.execute("INSERT INTO objects(rowid,namespace,kind,id,owner,body,revision) VALUES(901,'legacy-a','artifact','shared','unicode-owner',?,37)", (utf8,))
+            con.close()
+            anchor = scenario.anchor()
+            database = scenario.base / "mechanical.sqlite3"
+            shutil.copyfile(scenario.history, database)
+            con = connect(database)
+            sqlx_migrate(con, [v for v in CURRENT if v not in versions])
+            con.close()
+            self.assertEqual(database_image(database), database_image(anchor))
+            old, upgraded = readonly_fixture(scenario.history), readonly_fixture(database)
+            columns = "rowid,namespace,kind,id,owner,body,revision"
+            rows = old.execute("SELECT " + columns + " FROM objects ORDER BY rowid").fetchall()
+            self.assertEqual(upgraded.execute("SELECT " + columns + " FROM objects ORDER BY rowid").fetchall(), rows)
+            self.assertEqual([r[0] for r in rows if r[0] != 901], [3, 8, 100, 117, 134, 151, 900])
+            self.assertEqual(rows[-1][1:], ("legacy-a", "artifact", "shared", "unicode-owner", utf8, 37))
+            self.assertEqual(rows[-1][5].encode(), utf8.encode())
+            self.assertEqual(rows[0][1:4], ("legacy-b", "artifact", "shared"))
+            self.assertEqual(rows[0][-1], 31)
+            self.assertEqual(rows[1][5], ' { "id" : "first", "v" : 1 } ')
+            ledger = "version,description,installed_on,success,checksum,execution_time"
+            self.assertEqual(upgraded.execute("SELECT " + ledger + " FROM _sqlx_migrations WHERE version<=? ORDER BY version", (versions[-1],)).fetchall(),
+                             old.execute("SELECT " + ledger + " FROM _sqlx_migrations ORDER BY version").fetchall())
+            self.assertEqual(database_image(database)["integrity"], [("ok",)])
+            self.assertEqual(database_image(database)["foreign_keys"], [])
+            old.close()
+            upgraded.close()
 
 
 class RestoreTests(unittest.TestCase):
@@ -411,6 +554,15 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(receipt["schema_version"], "rsia.restore_receipt.v2")
         self.assertEqual(receipt["replayed_revoke_events"], events)
         self.assertIs(receipt["isolated"], False)
+        backup = self._qualified_scenario.last_backup
+        raw = (backup / "backup-manifest.json").read_bytes()
+        self.assertEqual(receipt["backup_manifest_sha256"], hashlib.sha256(raw).hexdigest())
+        for item in json.loads(raw)["blobs"]:
+            expected = (backup / item["path"]).read_bytes()
+            actual = (dest / item["path"]).read_bytes()
+            self.assertEqual(actual, expected)
+            self.assertEqual(len(actual), item["bytes"])
+            self.assertEqual(hashlib.sha256(actual).hexdigest(), item["sha256"])
 
     def assert_isolated(self, scenario, dest, result, reason):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -426,7 +578,7 @@ class RestoreTests(unittest.TestCase):
         anchor = scenario.anchor()
         dest, result = scenario.restore(backup, anchor)
         self.assert_restored(dest, result, 0, "7")
-        self.assertEqual(sorted(path.name for path in dest.iterdir()), ["restore.json", "restore.migrations.json", "rsia.sqlite3"])
+        self.assertEqual(sorted(path.name for path in dest.iterdir()), ["blobs", "restore.json", "restore.migrations.json", "rsia.sqlite3"])
         record = (dest / "restore.migrations.json").read_text()
         self.assertTrue(record.endswith("\n"))
         self.assertEqual(
@@ -444,8 +596,8 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(restored["integrity"], [("ok",)])
         self.assertEqual(restored["foreign_keys"], [])
         # The backup's ledger rows are kept byte for byte; the new row is written like sqlx's.
-        con = sqlite3.connect(dest / "rsia.sqlite3")
-        old = sqlite3.connect(backup / "rsia.sqlite3")
+        con = readonly_fixture(dest / "rsia.sqlite3")
+        old = readonly_fixture(backup / "rsia.sqlite3")
         everything = "SELECT version,description,installed_on,success,checksum,execution_time FROM _sqlx_migrations"
         self.assertEqual(con.execute(everything + " WHERE version<7 ORDER BY version").fetchall(), old.execute(everything + " ORDER BY version").fetchall())
         row = con.execute(
@@ -459,29 +611,23 @@ class RestoreTests(unittest.TestCase):
         con.close()
         old.close()
         # The backup itself was only read.
-        self.assertEqual(sorted(path.name for path in backup.iterdir()), ["backup-manifest.json", "rsia.sqlite3"])
+        self.assertEqual(sorted(path.name for path in backup.iterdir()), ["backup-manifest.json", "blobs", "rsia.sqlite3"])
 
     def test_a_0005_backup_replays_a_later_revocation_after_the_upgrade(self):
         scenario = Scenario(self, [1, 2, 4, 5])
         backup = scenario.backup()
         anchor = scenario.anchor()
-        base_seq, base_digest = WATERMARKS["legacy-a"]
-        latest_digest = sha256_text("legacy-a-4")
-        body = json.dumps(tombstone("run-1", base_seq + 1, latest_digest, "revoked after the backup", 9))
-        con = connect(anchor)
-        con.execute("INSERT INTO objects(namespace,kind,id,owner,body) VALUES('legacy-a','tombstone','run-1','admin',?)", (body,))
-        con.execute("UPDATE revoke_watermark SET seq=?,digest=? WHERE namespace='legacy-a'", (base_seq + 1, latest_digest))
-        con.close()
-        event = {
-            "seq": base_seq + 1,
-            "previous_digest": base_digest,
-            "digest": latest_digest,
-            "source_kind": "run",
-            "source_id": "run-1",
-            "tombstone_digest": sha256_text(body),
-            "reason": "revoked after the backup",
-            "created_at": 9,
-        }
+        packet = json.loads(Path(scenario.fixture["delta"]).read_bytes())
+        self.assertEqual(len(packet["namespaces"]), 1)
+        entry = packet["namespaces"][0]
+        self.assertEqual(len(entry["events"]), 1)
+        event = entry["events"][0]
+        namespace, source = entry["namespace"], event["source_id"]
+        base_seq, base_digest = entry["base_seq"], entry["base_digest"]
+        self.assertEqual(event["seq"], base_seq + 1)
+        self.assertEqual(event["previous_digest"], base_digest)
+        latest_digest = event["digest"]
+        body = json.dumps(tombstone(source, event["seq"], latest_digest, event["reason"], event["created_at"]))
         delta = scenario.delta(backup, [event], (base_seq + 1, latest_digest))
         dest, result = scenario.restore(backup, anchor, delta=delta)
         self.assert_restored(dest, result, 1, "6,7")
@@ -489,14 +635,14 @@ class RestoreTests(unittest.TestCase):
             {"version": 6, "checksum_sha384": hashlib.sha384(migration_file(6).read_bytes()).hexdigest()},
             {"version": 7, "checksum_sha384": hashlib.sha384(migration_file(7).read_bytes()).hexdigest()},
         ])
-        con = sqlite3.connect(dest / "rsia.sqlite3")
+        con = readonly_fixture(dest / "rsia.sqlite3")
         self.assertEqual(con.execute("SELECT version FROM _sqlx_migrations ORDER BY version").fetchall(), [(v,) for v in CURRENT])
-        self.assertEqual(con.execute("SELECT seq,digest FROM revoke_watermark WHERE namespace='legacy-a'").fetchone(), (base_seq + 1, latest_digest))
+        self.assertEqual(con.execute("SELECT seq,digest FROM revoke_watermark WHERE namespace=?", (namespace,)).fetchone(), (base_seq + 1, latest_digest))
         self.assertEqual(
-            json.loads(con.execute("SELECT body FROM objects WHERE namespace='legacy-a' AND kind='tombstone' AND id='run-1'").fetchone()[0]),
+            json.loads(con.execute("SELECT body FROM objects WHERE namespace=? AND kind='tombstone' AND id=?", (namespace, source)).fetchone()[0]),
             json.loads(body),
         )
-        self.assertEqual(con.execute("SELECT source_id,state FROM revoke_cleanup_jobs").fetchall(), [("run-1", "pending")])
+        self.assertEqual(con.execute("SELECT source_id,state FROM revoke_cleanup_jobs").fetchall(), [(source, "pending")])
         self.assertEqual(con.execute("SELECT count(*) FROM revoke_cleanup_frontier").fetchone(), (3,))
         self.assertEqual(con.execute("SELECT event_kind FROM revoke_cleanup_events").fetchall(), [("logical_block_restored",)])
         con.close()
@@ -507,7 +653,7 @@ class RestoreTests(unittest.TestCase):
         anchor = scenario.anchor()
         dest, result = scenario.restore(backup, anchor)
         self.assert_restored(dest, result, 0, "none")
-        self.assertEqual(sorted(path.name for path in dest.iterdir()), ["restore.json", "rsia.sqlite3"])
+        self.assertEqual(sorted(path.name for path in dest.iterdir()), ["blobs", "restore.json", "rsia.sqlite3"])
         self.assertEqual((dest / "rsia.sqlite3").read_bytes(), (backup / "rsia.sqlite3").read_bytes())
 
     def test_a_gap_is_isolated(self):
@@ -540,7 +686,7 @@ class RestoreTests(unittest.TestCase):
         # only in the database
         database_only = scenario.backup("database-only", db_sql=tamper)
         dest, result = scenario.restore(database_only, anchor, "restored-database-only")
-        self.assert_isolated(scenario, dest, result, "database migration checksums differ from current code")
+        self.assert_isolated(scenario, dest, result, "native restore refused: clock_regressed")
 
     def test_an_unsuccessful_migration_is_isolated(self):
         scenario = Scenario(self, [1, 2, 4, 5, 6])
@@ -551,7 +697,7 @@ class RestoreTests(unittest.TestCase):
         self.assert_isolated(scenario, dest, result, "migration is not successful")
         database_only = scenario.backup("database-only", db_sql=failed)
         dest, result = scenario.restore(database_only, anchor, "restored-database-only")
-        self.assert_isolated(scenario, dest, result, "backup database has an unsuccessful migration")
+        self.assert_isolated(scenario, dest, result, "native restore refused: clock_regressed")
 
     def test_a_manifest_that_disagrees_with_its_database_is_isolated(self):
         current = Scenario(self, CURRENT)
@@ -585,7 +731,7 @@ class RestoreTests(unittest.TestCase):
         scenario = Scenario(self, [1, 2, 4, 5, 6])
         backup = scenario.backup(db_sql="CREATE TABLE objects_formal_parent(x)")
         dest, result = scenario.restore(backup, scenario.anchor())
-        self.assert_isolated(scenario, dest, result, "table objects_formal_parent already exists")
+        self.assert_isolated(scenario, dest, result, "native restore refused: clock_regressed")
 
 
 if __name__ == "__main__":

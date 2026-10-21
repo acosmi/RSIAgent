@@ -219,7 +219,7 @@ pub struct PersistentModelBroker<T> {
     store: Store,
     transport: T,
     config: BrokerConfig,
-    clock: Arc<dyn Fn() -> Result<i64> + Send + Sync>,
+    clock: evo_core::clock::WallClock,
 }
 
 impl PersistentModelBroker<DisabledModelTransport> {
@@ -231,11 +231,12 @@ impl PersistentModelBroker<DisabledModelTransport> {
 impl<T: ModelTransport> PersistentModelBroker<T> {
     pub fn new(store: Store, transport: T, config: BrokerConfig) -> Result<Self> {
         config.validate()?;
+        let clock = store.wall_clock();
         Ok(Self {
             store,
             transport,
             config,
-            clock: Arc::new(evo_core::now),
+            clock,
         })
     }
 
@@ -246,11 +247,13 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     ) -> Result<Self> {
         config.validate()?;
+        let clock = evo_core::clock::WallClock::fixture_seconds(clock);
+        store.require_clock_source(&clock)?;
         Ok(Self {
             store,
             transport,
             config,
-            clock: Arc::new(move || Ok(clock())),
+            clock,
         })
     }
 
@@ -452,10 +455,10 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         crate::formal_authority::persist_formal_capture(&mut s, &ctx, &candidate.id, &capture)
             .await?;
         s.commit().await?;
-        crate::streaming_evaluator::IndependentEvaluationControl::record_execution_receipt(
+        crate::streaming_evaluator::IndependentEvaluationControl::record_execution_receipt_now(
             &ctx,
             &self.store,
-            crate::streaming_evaluator::ExecutionReceiptRequest {
+            crate::streaming_evaluator::ExecutionReceiptIntent {
                 receipt_id: format!("formal-execution-{}", &hash(dispatch_id.as_bytes())[..32]),
                 ticket_id: request.task.ticket_id,
                 target_id: request.task.target_id,
@@ -469,7 +472,6 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                 budget_call_id: call_id,
                 latency_micros: u64::try_from(started.elapsed().as_micros())
                     .map_err(|_| Error::Internal)?,
-                issued_at_unix_seconds: self.now()?,
             },
         )
         .await
@@ -606,7 +608,7 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
     }
 
     fn now(&self) -> Result<i64> {
-        let now = (self.clock)()?;
+        let now = self.clock.seconds()?;
         if now < 0 {
             return Err(Error::ClockRegressed);
         }

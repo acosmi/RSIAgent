@@ -54,9 +54,9 @@ use evo_engine::release_store::{
 };
 use evo_engine::streaming_evaluator::{
     AnchorEvidenceStatus, BrokerTaskView, CostEvidenceScope, DependencyEvidenceStatus,
-    EvaluationEvidenceScope, EvaluationTicketV2, ExecutionReceiptRequest, ExecutionSide,
+    EvaluationEvidenceScope, EvaluationTicketV2, ExecutionReceiptIntent, ExecutionSide,
     FixedGraderMethod, FixedGraderSpec, FrozenOracleEntry, IndependentEvaluationControl,
-    IndependentGraderReceiptV2, IssueTicketRequest, ProtectedHoldoutRecord, ProtectedInputRef,
+    IndependentGraderReceiptV2, IssueTicketIntent, ProtectedHoldoutRecord, ProtectedInputRef,
     RegisteredEvaluationControl, StartExecutionRequest, TargetState, TicketLifecycle,
     VerifiedReportVariant, verified_report_view_in_session,
 };
@@ -115,9 +115,39 @@ fn storage_id(record_kind: &str, logical_id: &str) -> String {
     format!("e05-{}", fingerprint(&(record_kind, logical_id)).unwrap())
 }
 
+fn real_event_seconds_r49() -> i64 {
+    evo_core::now().unwrap()
+}
+async fn current_authority_r49(
+    store: &Store,
+    candidate_id: &str,
+) -> (evo_core::formal_version::ReportRef, IssuedFormalAuthority) {
+    let reader = ctx(Role::Admin, ADMIN);
+    let closed = store
+        .read_formal_snapshot(
+            &reader,
+            evo_storage::FormalReadSelectorR38::Ticket(TICKET.into()),
+        )
+        .await
+        .unwrap();
+    let reference = closed
+        .formal()
+        .unwrap()
+        .current_complete()
+        .unwrap()
+        .reference()
+        .clone();
+    let wrapper = FormalAuthorityIssuer::revalidate_current(&reader, store, reference.clone())
+        .await
+        .unwrap();
+    assert_eq!(wrapper.report_ref, reference);
+    assert_eq!(wrapper.authority.candidate_id, candidate_id);
+    (reference, wrapper.authority)
+}
+
 fn grade_capture_id(target: &str) -> String {
     format!(
-        "formal-grade-{}",
+        "formal-grade-v2-{}",
         &fingerprint(&(TICKET, target)).unwrap()[..32]
     )
 }
@@ -452,7 +482,7 @@ async fn execute(
     )
     .await
     .unwrap();
-    let now = 10 + i64::from(ordinal) * 5;
+    let now = real_event_seconds_r49();
     let call_id = format!(
         "formal-call-{}",
         &hash(view.request_digest.as_bytes())[..32]
@@ -556,7 +586,7 @@ async fn execute(
         .settle_model_budget_call(
             &host,
             &BudgetCallFence {
-                now: now + 1,
+                now: real_event_seconds_r49(),
                 ..fence.clone()
             },
             &UsageCharge {
@@ -605,14 +635,14 @@ async fn execute(
             &call_id,
             &dispatch_id,
             "formal_provider_capture_persisted",
-            now + 2,
+            real_event_seconds_r49(),
         )
         .await
         .unwrap();
-    let receipt = IndependentEvaluationControl::record_execution_receipt(
+    let receipt = IndependentEvaluationControl::record_execution_receipt_now(
         &host,
         store,
-        ExecutionReceiptRequest {
+        ExecutionReceiptIntent {
             receipt_id: format!("formal-execution-{}", &hash(dispatch_id.as_bytes())[..32]),
             ticket_id: TICKET.into(),
             target_id: target.into(),
@@ -622,7 +652,7 @@ async fn execute(
             output_utf8: output.into(),
             budget_call_id: call_id,
             latency_micros: 100,
-            issued_at_unix_seconds: now + 3,
+            // Native receipt owner records the actual event sample.
         },
     )
     .await
@@ -672,14 +702,14 @@ const CANDIDATE_RECORD_MISSING: &str = "formal_candidate_record_missing_at_issue
 
 /// The registered grader's ticket request.
 async fn request_ticket(store: &Store) -> Result<EvaluationTicketV2, Error> {
-    IndependentEvaluationControl::issue_ticket(
+    IndependentEvaluationControl::issue_ticket_now(
         &ctx(Role::Evaluator, GRADER),
         store,
-        IssueTicketRequest {
+        IssueTicketIntent {
             ticket_id: TICKET.into(),
             registration_id: CONTROL_ID.into(),
             holdout_id: HOLDOUT_ID.into(),
-            issued_at_unix_seconds: 5,
+            // Actual issue event time is captured by the native owner.
         },
     )
     .await
@@ -892,7 +922,7 @@ async fn prepare_with_scope(order: TicketOrder, execute_batch: bool) -> Option<F
                 authorization_receipt_digest: d("admin-budget-receipt"),
                 per_call_cap_micros: 100,
                 total_limit_micros: 1_000,
-                created_at: 1,
+                created_at: real_event_seconds_r49(),
             },
         )
         .await
@@ -928,7 +958,7 @@ async fn prepare_with_scope(order: TicketOrder, execute_batch: bool) -> Option<F
     v1.profile = ProfileKind::QualityGain;
     v1.monetary_budget = money("0.001");
     v1.frozen = true;
-    v1.frozen_at = Some(1);
+    v1.frozen_at = Some(real_event_seconds_r49());
     v1.validate().unwrap();
     let alpha = ResearchFamilyAlphaPlan::new(
         "family-e05",
@@ -1015,7 +1045,7 @@ async fn prepare_with_scope(order: TicketOrder, execute_batch: bool) -> Option<F
         grader_digest: fingerprint(&grader_spec).unwrap(),
         fixed_grader: grader_spec,
         evidence_scope: EvaluationEvidenceScope::RegisteredExternalHost,
-        created_at_unix_seconds: 2,
+        created_at_unix_seconds: real_event_seconds_r49(),
     };
     control.validate().unwrap();
     let control_storage_id = storage_id(CONTROL_KIND, CONTROL_ID);
@@ -1275,15 +1305,14 @@ async fn prepare_with_scope(order: TicketOrder, execute_batch: bool) -> Option<F
         graded: BTreeMap::new(),
     };
     // Independent grading by the registered grader process, one per member.
-    for (index, (target, candidate_receipt, baseline_receipt)) in executed.iter().enumerate() {
+    for (_index, (target, candidate_receipt, baseline_receipt)) in executed.iter().enumerate() {
         let receipt_id = format!("grade-{target}");
         let receipt = grader_process(
             &fx,
-            json!({"operation":"grade","database":fx.db.to_str().unwrap(),"namespace":NS,
+            json!({"operation":"grade_now","database":fx.db.to_str().unwrap(),"namespace":NS,
                 "actor":GRADER,"receipt_id":receipt_id,"ticket_id":TICKET,"target_id":target,
                 "candidate_execution_receipt_id":candidate_receipt,
-                "baseline_execution_receipt_id":baseline_receipt,
-                "issued_at_unix_seconds":500 + i64::try_from(index).unwrap()}),
+                "baseline_execution_receipt_id":baseline_receipt}),
         )
         .unwrap_or_else(|reason| panic!("registered grader refused {target}: {reason}"));
         assert_eq!(receipt["receipt_id"], receipt_id.as_str());
@@ -1296,12 +1325,23 @@ async fn prepare_with_scope(order: TicketOrder, execute_batch: bool) -> Option<F
     let store = Store::open(&fx.db).await.unwrap();
     persist_captures(&store, &fx.candidate, &captures).await;
     store
-        .stop_dispatch_group(&admin, BILLING, TICKET, "ag095_batch_closeout", 1_900)
+        .stop_dispatch_group(
+            &admin,
+            BILLING,
+            TICKET,
+            "ag095_batch_closeout",
+            real_event_seconds_r49(),
+        )
         .await
         .unwrap();
     let mut s = store.session().await.unwrap();
     let seal = s
-        .seal_root_budget(&admin, BILLING, "ag095_episode_seal", 2_000)
+        .seal_root_budget(
+            &admin,
+            BILLING,
+            "ag095_episode_seal",
+            real_event_seconds_r49(),
+        )
         .await
         .unwrap();
     s.commit().await.unwrap();
@@ -1413,61 +1453,133 @@ async fn edit_stored_receipt(
     receipt_id: &str,
     edit: impl FnOnce(&mut Map<String, Value>),
 ) {
-    let store = Store::open(db).await.unwrap();
-    let grader = ctx(Role::Evaluator, GRADER);
     let id = storage_id(GRADER_RECEIPT_KIND, receipt_id);
-    let mut s = store.session().await.unwrap();
-    let mut envelope: Value = s.need(&grader, "artifact", &id).await.unwrap();
-    edit(envelope["payload"].as_object_mut().unwrap());
-    s.put(&grader, "artifact", &id, GRADER, &envelope)
-        .await
-        .unwrap();
-    s.commit().await.unwrap();
-    store.close().await;
+    let before = fixture_object_r49(db, &id);
+    let mut after = before.clone();
+    edit(after["payload"].as_object_mut().unwrap());
+    // No healthy API is asked to admit a deliberately inconsistent old row.
+    fixture_fault_cas_r49(db, &id, &before, &after, false);
+}
+
+fn fixture_object_r49(db: &Path, id: &str) -> Value {
+    let raw = own_sqlite(
+        db,
+        r#"
+import sqlite3,sys
+con=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+row=con.execute("SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+                (sys.argv[2],sys.argv[3])).fetchone()
+assert row is not None
+print(row[0])
+"#,
+        &[NS, id],
+    );
+    serde_json::from_str(&raw).unwrap()
+}
+fn fixture_fault_cas_r49(db: &Path, id: &str, before: &Value, after: &Value, witness: bool) {
+    let before = serde_json::to_string(before).unwrap();
+    let after = serde_json::to_string(after).unwrap();
+    let operation = format!(
+        "formal.evaluator.content.v1.{}",
+        fingerprint(&(NS, "artifact", id)).unwrap()
+    );
+    let entity = fingerprint(&(
+        NS,
+        "artifact",
+        id,
+        content_digest(&serde_json::from_str::<Value>(&after).unwrap()).unwrap(),
+    ))
+    .unwrap();
+    let timestamp = real_event_seconds_r49();
+    own_sqlite(
+        db,
+        r#"
+import sqlite3,sys,json,hashlib
+con=sqlite3.connect(sys.argv[1]);con.execute('BEGIN IMMEDIATE')
+ns,ident,before,after,add_witness,operation,entity,actor,stamp=sys.argv[2:]
+row=con.execute("SELECT owner,body,revision FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+                (ns,ident)).fetchone()
+assert row is not None and json.loads(row[1])==json.loads(before)
+assert con.execute("UPDATE objects SET body=?,revision=revision+1 WHERE namespace=? AND kind='artifact' AND id=? AND owner=? AND body=? AND revision=?",
+                   (after,ns,ident,row[0],row[1],row[2])).rowcount==1
+if add_witness=='true':
+    prior=con.execute('SELECT digest FROM audit WHERE namespace=? ORDER BY seq DESC LIMIT 1',(ns,)).fetchone()
+    previous=prior[0] if prior else ''
+    payload=json.dumps({'actor':actor,'role':'evaluator','operation':operation,'entity':entity,'timestamp':int(stamp)},
+                       separators=(',',':'))
+    digest=hashlib.sha256((previous+'\n'+payload).encode()).hexdigest()
+    con.execute('INSERT INTO audit(namespace,payload,previous_hash,digest) VALUES(?,?,?,?)',(ns,payload,previous,digest))
+actual=con.execute("SELECT owner,body,revision FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+                   (ns,ident)).fetchone()
+assert actual==(row[0],after,row[2]+1)
+con.commit()
+"#,
+        &[
+            NS,
+            id,
+            &before,
+            &after,
+            if witness { "true" } else { "false" },
+            &operation,
+            &entity,
+            GRADER,
+            &timestamp.to_string(),
+        ],
+    );
 }
 
 type ReceiptEdit = Box<dyn FnOnce(&mut Map<String, Value>)>;
 
 /// A capture that is a correctly witnessed grader record but names `digest`.
 async fn rebind_capture(db: &Path, target: &str, digest: String) {
-    let store = Store::open(db).await.unwrap();
-    let grader = ctx(Role::Evaluator, GRADER);
     let id = grade_capture_id(target);
-    let mut s = store.session().await.unwrap();
-    let mut capture: IndependentGradeCapture = s.need(&grader, "artifact", &id).await.unwrap();
+    let before = fixture_object_r49(db, &id);
+    let mut capture: IndependentGradeCapture = serde_json::from_value(before.clone()).unwrap();
     assert_ne!(capture.grader_receipt_digest, digest);
     capture.grader_receipt_digest = digest;
-    put_witnessed(&mut s, Role::Evaluator, GRADER, "artifact", &id, &capture).await;
-    s.commit().await.unwrap();
-    store.close().await;
+    let after = serde_json::to_value(capture).unwrap();
+    // Preserve the original attack's correct ordinary Evaluator witness. The
+    // actual immutable native-origin proof is deliberately NOT forged.
+    fixture_fault_cas_r49(db, &id, &before, &after, true);
 }
 
 /// A refused finalization leaves no report, no issued authority and the
 /// ticket still ReadyForFinal.
 async fn assert_nothing_issued(db: &Path) {
-    let store = Store::open(db).await.unwrap();
-    let grader = ctx(Role::Evaluator, GRADER);
-    let mut s = store.session().await.unwrap();
+    // Read only this deliberately corrupted private fixture. No production
+    // open/Session admission is asserted healthy by these storage assertions.
+    let raw = own_sqlite(
+        db,
+        r#"
+import sqlite3,sys,json
+con=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+rows=con.execute("SELECT id,body FROM objects WHERE namespace=? AND kind='artifact' ORDER BY id",
+                 (sys.argv[2],)).fetchall()
+print(json.dumps([[ident,json.loads(body)] for ident,body in rows],separators=(',',':')))
+"#,
+        &[NS],
+    );
+    let rows: Vec<(String, Value)> = serde_json::from_str(&raw).unwrap();
     assert!(
-        s.get::<Value>(&grader, "artifact", &format!("formal-authority-{TICKET}"))
-            .await
-            .unwrap()
+        rows.iter()
+            .find(|(id, _)| id == &format!("formal-authority-{TICKET}"))
             .is_none()
     );
     assert!(
-        s.get::<Value>(&grader, "artifact", &storage_id(FORMAL_KIND, TICKET))
-            .await
-            .unwrap()
+        rows.iter()
+            .find(|(id, _)| id == &storage_id(FORMAL_KIND, TICKET))
             .is_none()
     );
-    let envelope: Value = s
-        .need(&grader, "artifact", &storage_id(TICKET_KIND, TICKET))
-        .await
-        .unwrap();
+    assert!(!rows.iter().any(|(_, body)| body["schema_version"]
+        == "rsia.issued_formal_authority.v3"
+        || body["schema_version"] == evo_core::formal_version::SCHEMA));
+    let envelope = &rows
+        .iter()
+        .find(|(id, _)| id == &storage_id(TICKET_KIND, TICKET))
+        .unwrap()
+        .1;
     let ticket: EvaluationTicketV2 = serde_json::from_value(envelope["payload"].clone()).unwrap();
     assert_eq!(ticket.lifecycle, TicketLifecycle::ReadyForFinal);
-    s.commit().await.unwrap();
-    store.close().await;
 }
 
 /// AG-100 (L288, L564): the registered external host's ticket requested
@@ -1648,10 +1760,10 @@ async fn registered_external_host_complete_batch_issues_authority_and_release_vi
     }
 
     let admin = ctx(Role::Admin, ADMIN);
-    let authority = FormalAuthorityIssuer::revalidate(&admin, &store, TICKET, &fx.candidate.id)
-        .await
-        .unwrap();
+    let (reference, authority) = current_authority_r49(&store, &fx.candidate.id).await;
     assert_eq!(authority.report_id, TICKET);
+    assert_eq!(reference.ticket_id, TICKET);
+    assert_ne!(reference.physical_id, TICKET);
     assert_eq!(authority.candidate_id, fx.candidate.id);
     assert_eq!(authority.grader_captures.len(), fx.graded.len());
     assert_eq!(authority.provider_captures.len(), 2 * fx.graded.len());
@@ -1830,6 +1942,17 @@ async fn ticket_closure(db: &Path) -> Result<TypedContentClosure, Error> {
     store.close().await;
     closure
 }
+async fn ticket_closure_in_store_r49(store: &Store) -> Result<TypedContentClosure, Error> {
+    let mut s = store.session().await.unwrap();
+    let closure = read_typed_closure(
+        &mut s,
+        &ctx(Role::Evaluator, GRADER),
+        &[("artifact".into(), storage_id(TICKET_KIND, TICKET))],
+    )
+    .await;
+    drop(s);
+    closure
+}
 
 /// Every (kind, id) reachable from `roots` over the stored dependency edges,
 /// walked here independently of the typed closure reader.
@@ -1846,19 +1969,21 @@ async fn reachable(s: &mut Session, roots: &[(String, String)]) -> BTreeSet<(Str
 }
 
 async fn add_artifact_edge(db: &Path, from: &str, to: &str) {
-    let store = Store::open(db).await.unwrap();
-    let mut s = store.session().await.unwrap();
-    s.put_edge(
-        &ctx(Role::Evaluator, GRADER),
-        "artifact",
-        from,
-        "artifact",
-        to,
-    )
-    .await
-    .unwrap();
-    s.commit().await.unwrap();
-    store.close().await;
+    own_sqlite(
+        db,
+        r#"
+import sqlite3,sys
+con=sqlite3.connect(sys.argv[1]);con.execute('BEGIN IMMEDIATE')
+assert con.execute("SELECT 1 FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+                   (sys.argv[2],sys.argv[3])).fetchone()
+assert con.execute("SELECT 1 FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+                   (sys.argv[2],sys.argv[4])).fetchone()
+assert con.execute("INSERT INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id) VALUES(?,'artifact',?,'artifact',?)",
+                   (sys.argv[2],sys.argv[3],sys.argv[4])).rowcount==1
+con.commit()
+"#,
+        &[NS, from, to],
+    );
 }
 
 /// Runs a script on this test's own temporary SQLite file through the
@@ -1966,17 +2091,15 @@ async fn bound_report_reads(
 }
 
 /// Every reader refuses the copy with exactly `message` and writes nothing.
-async fn assert_reads_refused(db: &Path, candidate_id: &str, message: &str) {
-    let store = Store::open(db).await.unwrap();
+async fn assert_reads_refused(store: &Store, db: &Path, candidate_id: &str, message: &str) {
     let before = catalog(db);
-    for (reader, result) in bound_report_reads(&store, candidate_id).await {
+    for (reader, result) in bound_report_reads(store, candidate_id).await {
         assert!(
             matches!(&result, Err(Error::Conflict(text)) if text == message),
             "{reader}: {result:?}"
         );
     }
     assert_eq!(catalog(db), before, "refused reads wrote state");
-    store.close().await;
 }
 
 /// AG-109 T1 + T5 (E05 L1257; L288; L564). In the true-source order the
@@ -2011,11 +2134,11 @@ async fn bound_ticket_complete_batch_issues_authority_through_attachment_cycles(
     let ticket = stored_ticket(&store).await;
     assert!(ticket.candidate_dependency_binding.is_some());
     assert_eq!(ticket.lifecycle, TicketLifecycle::CompleteBatch);
-    let admin = ctx(Role::Admin, ADMIN);
-    let authority = FormalAuthorityIssuer::revalidate(&admin, &store, TICKET, &fx.candidate.id)
-        .await
-        .unwrap();
+    let _admin = ctx(Role::Admin, ADMIN);
+    let (reference, authority) = current_authority_r49(&store, &fx.candidate.id).await;
     assert_eq!(authority.report_id, TICKET);
+    assert_eq!(reference.ticket_id, TICKET);
+    assert_ne!(reference.physical_id, TICKET);
     assert_eq!(authority.candidate_id, fx.candidate.id);
     assert_eq!(authority.grader_captures.len(), fx.graded.len());
     assert_eq!(authority.provider_captures.len(), 2 * fx.graded.len());
@@ -2098,12 +2221,10 @@ async fn bound_ticket_issued_report_is_read_by_status_views_and_approval() {
     });
     let store = Store::open(&fx.db).await.unwrap();
     let grader = ctx(Role::Evaluator, GRADER);
-    let report = storage_id(FORMAL_KIND, TICKET);
+    let (reference, authority) = current_authority_r49(&store, &fx.candidate.id).await;
+    let report = reference.physical_id.clone();
+    assert_eq!(reference.ticket_id, TICKET);
     let mut s = store.session().await.unwrap();
-    let authority: IssuedFormalAuthority = s
-        .need(&grader, "artifact", &format!("formal-authority-{TICKET}"))
-        .await
-        .unwrap();
     // The issuer's canonical action over the report, Evaluator role.
     assert_eq!(
         authority.report_principal_action_id,
@@ -2186,7 +2307,10 @@ async fn bound_ticket_report_edge_set_stays_exact_with_the_issued_principal_acti
     finalize(&fx, &fx.db).unwrap_or_else(|reason| {
         panic!("bound complete-batch authority issuance refused: {reason}")
     });
-    let report = storage_id(FORMAL_KIND, TICKET);
+    let original_store = Store::open(&fx.db).await.unwrap();
+    let (reference, authority) = current_authority_r49(&original_store, &fx.candidate.id).await;
+    original_store.close().await;
+    let report = reference.physical_id.clone();
     let action = format!(
         "principal-action-{}",
         fingerprint(&("artifact", &report, Role::Evaluator)).unwrap()
@@ -2194,11 +2318,14 @@ async fn bound_ticket_report_edge_set_stays_exact_with_the_issued_principal_acti
     {
         // One more report edge, to the logical ticket id.
         let (_dir, db) = copy_database(&fx);
+        let mounted = Store::open(&db).await.unwrap();
         add_artifact_edge(&db, &report, TICKET).await;
-        assert_reads_refused(&db, &fx.candidate.id, EDGES_DIFFER).await;
+        assert_reads_refused(&mounted, &db, &fx.candidate.id, EDGES_DIFFER).await;
+        mounted.close().await;
     }
     {
         let (_dir, db) = copy_database(&fx);
+        let mounted = Store::open(&db).await.unwrap();
         assert_eq!(
             delete_rows(
                 &db,
@@ -2207,19 +2334,22 @@ async fn bound_ticket_report_edge_set_stays_exact_with_the_issued_principal_acti
             ),
             "1"
         );
-        assert_reads_refused(&db, &fx.candidate.id, EDGES_DIFFER).await;
+        assert_reads_refused(&mounted, &db, &fx.candidate.id, EDGES_DIFFER).await;
+        mounted.close().await;
     }
     {
         let (_dir, db) = copy_database(&fx);
+        let mounted = Store::open(&db).await.unwrap();
         assert_eq!(
             delete_rows(
                 &db,
                 "DELETE FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
-                &[NS, &format!("formal-authority-{TICKET}")],
+                &[NS, &authority.id],
             ),
             "1"
         );
-        assert_reads_refused(&db, &fx.candidate.id, AUTHORITY_MISSING).await;
+        assert_reads_refused(&mounted, &db, &fx.candidate.id, AUTHORITY_MISSING).await;
+        mounted.close().await;
     }
 }
 
@@ -2260,8 +2390,9 @@ async fn bound_ticket_cycles_of_other_edges_are_still_refused() {
         ),
     ] {
         let (_dir, db) = copy_database(&fx);
+        let mounted = Store::open(&db).await.unwrap();
         add_artifact_edge(&db, &from, &to).await;
-        let refused = ticket_closure(&db).await;
+        let refused = ticket_closure_in_store_r49(&mounted).await;
         assert!(
             matches!(&refused, Err(Error::Conflict(text)) if text == CYCLE),
             "{from} -> {to}: {:?}",
@@ -2273,6 +2404,7 @@ async fn bound_ticket_cycles_of_other_edges_are_still_refused() {
             "{from} -> {to}"
         );
         assert_nothing_issued(&db).await;
+        mounted.close().await;
     }
 }
 

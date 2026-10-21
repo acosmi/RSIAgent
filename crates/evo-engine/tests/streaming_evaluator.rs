@@ -1643,7 +1643,7 @@ async fn management_dispatch_recovers_registered_inputs_and_existing_ticket_with
     assert_eq!(status.state, ManagementJobState::Succeeded);
     assert!(matches!(
         status.result,
-        Some(ManagementResult::EvaluationStatus { .. })
+        Some(ManagementResult::EvaluationStatusV3 { .. })
     ));
     let public = serde_json::to_string(&status).unwrap();
     assert!(!public.contains("expected_answer_json"));

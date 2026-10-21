@@ -173,6 +173,7 @@ impl HostService {
         if !config.host_capabilities.allows(&request.capabilities) {
             return Err(Error::Forbidden);
         }
+        self.store.require_prepare_config(config)?;
         let operation = PrepareOperation {
             request: &request,
             config,
@@ -180,7 +181,7 @@ impl HostService {
         // Held until this function returns on any path.
         let _inflight = self.begin_inflight_prepare()?;
         {
-            let mut session = self.store.session().await?;
+            let mut session = self.store.session_with_prepare(&request, config).await?;
             if let Some(existing) = session
                 .cached::<Prepared, _>(caller, "service.prepare", &request.request_key, &operation)
                 .await?
@@ -257,7 +258,7 @@ impl HostService {
             limitations,
         };
 
-        let mut session = self.store.session().await?;
+        let mut session = self.store.session_with_prepare(&request, config).await?;
         if let Some(existing) = session
             .cached::<Prepared, _>(caller, "service.prepare", &request.request_key, &operation)
             .await?

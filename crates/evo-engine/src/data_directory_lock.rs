@@ -1,40 +1,39 @@
 //! Shared writer admission for the data directory (plan §7.3.1).
-//! Both gate evaluations are read-only; acquiring the lock happens between them.
-//! The returned guard must outlive every database operation and connection close.
-use crate::startup_gate::{
-    DATA_LOCK_FILE, GateDecision, StartupGate, StartupGateError, data_directory,
-};
-use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{Error, ErrorKind};
-use std::path::Path;
+//! The storage-owned capability retains the actual OS locks through native close.
+use crate::startup_gate::{GateDecision, StartupGate, StartupGateError};
+use evo_core::prepare_contract::HostPrepareConfig;
+use evo_storage::lifecycle::DirectoryWriterGuard;
+use std::{path::Path, sync::Arc};
 
 #[derive(Debug)]
 pub struct DataDirectoryLock {
-    _file: File,
+    guard: Arc<DirectoryWriterGuard>,
 }
 
 impl DataDirectoryLock {
     pub fn acquire(data: &Path) -> std::io::Result<Self> {
-        let directory = data_directory(data);
-        std::fs::create_dir_all(&directory)?;
-        let directory = directory.canonicalize()?;
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(directory.join(DATA_LOCK_FILE))?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(TryLockError::WouldBlock) => Err(Error::new(
-                ErrorKind::WouldBlock,
-                format!(
-                    "data directory is already locked by another RSIA process: {}",
-                    directory.display()
-                ),
-            )),
-            Err(TryLockError::Error(error)) => Err(error),
-        }
+        Self::acquire_checked(data, &[]).map_err(|error| {
+            let kind = match &error {
+                evo_core::Error::Conflict(_) => std::io::ErrorKind::WouldBlock,
+                evo_core::Error::Invalid(_) => std::io::ErrorKind::InvalidInput,
+                _ => std::io::ErrorKind::Other,
+            };
+            std::io::Error::new(kind, error)
+        })
+    }
+
+    pub fn acquire_checked(
+        data: &Path,
+        candidates: &[HostPrepareConfig],
+    ) -> evo_core::Result<Self> {
+        DirectoryWriterGuard::acquire_new_mount_checked(data, candidates)
+            .map(|guard| Self { guard })
+    }
+
+    /// Transfer real lock ownership to Store/operation/close owners, not a
+    /// caller-supplied stability or authorization flag.
+    pub fn guard(&self) -> Arc<DirectoryWriterGuard> {
+        Arc::clone(&self.guard)
     }
 }
 
@@ -42,10 +41,20 @@ pub async fn mount_gate(
     data: &Path,
     trusted_revocations_db: Option<&Path>,
 ) -> std::result::Result<(DataDirectoryLock, GateDecision), StartupGateError> {
-    let gate = StartupGate::new(data, trusted_revocations_db);
+    mount_gate_with_prepare_configs(data, trusted_revocations_db, &[]).await
+}
+
+pub async fn mount_gate_with_prepare_configs(
+    data: &Path,
+    trusted_revocations_db: Option<&Path>,
+    candidates: &[HostPrepareConfig],
+) -> std::result::Result<(DataDirectoryLock, GateDecision), StartupGateError> {
+    let gate = StartupGate::new(data, trusted_revocations_db).with_prepare_configs(candidates)?;
+    // Before mkdir/compatibility-lock creation or any database initialization.
     gate.evaluate().await?;
-    let lock = DataDirectoryLock::acquire(data)
+    let lock = DataDirectoryLock::acquire_checked(data, candidates)
         .map_err(|error| StartupGateError::Rejected(error.to_string()))?;
+    // Requalify the actual original source under the real acquired OS locks.
     let decision = gate.evaluate().await?;
     Ok((lock, decision))
 }

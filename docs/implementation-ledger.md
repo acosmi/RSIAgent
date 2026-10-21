@@ -4107,3 +4107,48 @@ V110/V113/V116与其余新增场景族仍 planned；related_evidence_refs 仅导
 |AG133|`python3 scripts/test_check_dependency_register.py`|0 / 30 tests OK|`out/audit-20260930/qa/codex-r7-ag133/accept-cb909860-pr175-r1-dependency30.log`|
 
 原notify-merge登记接收方/密钥/载荷范围不改变，不额外手动外发；送达未独立证实。真实模型、付费实验、真实宿主/沙箱、历史包/T、E14合同仍仅登记外部阻塞。P1→P2→P3及既有队列仍未全闭，本周期台账不是阶段完成。
+
+
+## AG132：AG104 当前复核撤出
+
+`recheck_required` / `legacy_equivalence_unverified`。AG132 覆盖 AG124 中本项“行为未变”的当前判定，原行与历史数字不改。保留 raw/Image/hash/rowid、逐坏输入零写拒绝及真实 producer 健康 prefix/anchor/delta/发布替代义务；替代覆盖未闭。仅撤该 ID 与五 V 引用，其余97完整记录不变，不授新 verified/first。E16.6 当前89=87+2、withdrawn20。
+
+旧 E16.6.status_reason 原值：
+
+```text
+The v4.3 derived index keeps 90 historical evidence records: 88 unchanged in-scope records rechecked against v4.3 and 2 out-of-scope optional rejection records; 19 records whose accepted behavior changed are withdrawn from verified_subscopes, with their original facts retained in the local recheck ledger; this does not close E16 or the full route; AG128-R1 corrects AG054 old-clock compensation credit without crediting an unverified new clock fix; AG131/PR173 committed Rust project-license metadata guards have scoped first acceptance; AG133/PR175 non-Rust dependency/primary-metadata delivery is implemented_not_verified with first technical acceptance only, no new verified_subscope credit
+```
+
+旧完整索引记录原字节切片（含分隔符，仅历史证据）：
+
+```text
+        {
+          "id": "E08.ag104_restore_prefix_migration_upgrade_v42",
+          "description": "restore accepts a backup whose manifest and database ledger are a strict prefix of the current migration set, applies the missing migrations inside the private restore copy before anchor comparison, delta replay and publication; the anchor and the startup gate keep the exact current set",
+          "plan_version": "v4.2",
+          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
+          "plan_recheck": "rechecked_v4.3",
+          "source_sha": "a2705252894c61aaa1972f0596a279e2f36c2ab5",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/159",
+          "merged_sha": "a78a1e60a4298cd3ca57598a7aba7c5c84a8a721",
+          "pr_state": "merged",
+          "test_entry": "crates/evo-storage/tests/restore_prefix_upgrade_v42.rs",
+          "command": "cargo test --locked --offline -p evo-storage --test restore_prefix_upgrade_v42",
+          "input_digest": "6b925b49efe5e8fd1d2f4ef2ee7425bbfe68d1b784fec4e73b8660c511d2909e",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.restore_prefix_upgrade_v42.log",
+          "actual_result": "this-window controller acceptance at a2705252 (restacked 647c7ce8 onto 4036c0d2, before/after patches byte-identical 85061 B; fresh target under a 1.5 GiB disk watchdog): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 144 binaries 1810 passed / 0 failed / 0 overflow (parent 4036c0d2: 143 binaries 1805 passed; new 5 in restore_prefix_upgrade_v42), build rsia 0, both smokes 0, checker 0, unittest 0; pure-Python suites re-run by the controller on the head: scripts.test_restore_backup 17 OK, discover 177 run OK (47 skipped MCP stdio cases without a binary); protected_facts and verify_delta of scripts/restore_backup.py byte-identical to main; 2 controller probes (qa/probe-ag104/append.rs: a 0001-0005 prefix backup is published with sqlx-shaped ledger rows for 0006/0007; a 0001-0006 prefix backup writes the exact restore.migrations.json and keeps the v2 restore.json keys) pass on head and fail on parent 4036c0d2 (the old script isolates both). Declared target covered with exit 0 by this window's AG-115 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.restore_prefix_upgrade_v42.log).",
+          "scope": "E08; plan §11 L1079 (restore to a new directory, register the new migrations, backfill and index verification before publication), §11.3 L1112 and E08 L1299; V017/V018/V038/V081/V082 subset: strict-prefix backups (0001-0005 or 0001-0006, every row successful with the current file SHA-384) are upgraded in the private copy the way sqlx 0.8.6 migrates; gaps, unknown or future versions, changed checksums, unsuccessful rows, prefixes before 0005 and manifest/database mismatches stay isolated",
+          "risk": "No claim on backups before 0005, disk-exhaustion scenarios, automation of the operational upgrade flow (stop writes, shadow comparison, per-profile enablement), full E08 route or any gain",
+          "rollback": "revert PR #159 through an independent revert PR; accepted-head parent 4036c0d2d11a01ddcdcb2940d0b00f0f00975656; retain immutable evidence, frozen plans, costs and revocation state",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-104-a270525.json",
+          "execution": {
+            "runner": "ctrl_verify.sh",
+            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-104 cargom test --workspace --locked --no-fail-fast",
+            "scope": "workspace",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/accept-ag104/ctrl-ag104-final.log.test"
+          }
+        },
+```

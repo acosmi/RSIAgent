@@ -200,9 +200,33 @@ async fn registered_review_bundle(
 
 async fn fixture() -> (tempfile::TempDir, HttpState) {
     let guard = tempfile::tempdir().unwrap();
-    let store = Store::open(&guard.path().join("review-fixture.sqlite3"))
-        .await
-        .unwrap();
+    let caps = HostCapabilities {
+        available: BTreeSet::new(),
+        granted: BTreeSet::new(),
+    };
+    let system_snapshot = SystemSnapshot {
+        schema_version: "rsia.system_snapshot.v2".into(),
+        profile_id: PROFILE_ID.into(),
+        host_id: "reference-host".into(),
+        host_version: "1.0.0".into(),
+        model_id: "disabled".into(),
+        tools: vec![],
+        mandatory_context_digest: d("mandatory"),
+    };
+    let prepare_config = HostPrepareConfig {
+        profile_id: PROFILE_ID.into(),
+        system_snapshot: system_snapshot.clone(),
+        host_surface_id: "unused-by-read-only-review".into(),
+        host_capabilities: caps.clone(),
+        evolution_enabled: true,
+        capability_level: CapabilityLevel::ToolOnly,
+    };
+    let store = Store::open_with_prepare_configs(
+        &guard.path().join("review-fixture.sqlite3"),
+        vec![prepare_config.clone()],
+    )
+    .await
+    .unwrap();
     let host = context("gateway-host", Role::Host);
     let proposer = context("proposer", Role::Worker);
     let admin = context("admin", Role::Admin);
@@ -230,21 +254,8 @@ async fn fixture() -> (tempfile::TempDir, HttpState) {
         required_capabilities: vec![],
         dependencies: vec![],
     };
-    let caps = HostCapabilities {
-        available: BTreeSet::new(),
-        granted: BTreeSet::new(),
-    };
     // Fixture setup only. The review operation itself must never compile.
 
-    let system_snapshot = SystemSnapshot {
-        schema_version: "rsia.system_snapshot.v2".into(),
-        profile_id: PROFILE_ID.into(),
-        host_id: "reference-host".into(),
-        host_version: "1.0.0".into(),
-        model_id: "disabled".into(),
-        tools: vec![],
-        mandatory_context_digest: d("mandatory"),
-    };
     let bundle =
         registered_review_bundle(&store, NAMESPACE, &system_snapshot, &parent, &caps).await;
     let staged = ReleaseStore::stage_bundle(
@@ -293,14 +304,7 @@ async fn fixture() -> (tempfile::TempDir, HttpState) {
         guard,
         HttpState {
             service,
-            prepare_config: HostPrepareConfig {
-                profile_id: PROFILE_ID.into(),
-                system_snapshot,
-                host_surface_id: "unused-by-read-only-review".into(),
-                host_capabilities: caps,
-                evolution_enabled: true,
-                capability_level: CapabilityLevel::ToolOnly,
-            },
+            prepare_config,
             auth,
             management,
         },

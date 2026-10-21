@@ -19,7 +19,29 @@ fn d(label: &str) -> String {
 
 async fn server() -> (tempfile::TempDir, McpHost) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("mcp.sqlite3")).await.unwrap();
+    let config = HostPrepareConfig {
+        profile_id: "profile-a".into(),
+        system_snapshot: SystemSnapshot {
+            schema_version: "rsia.system_snapshot.v2".into(),
+            profile_id: "profile-a".into(),
+            host_id: "reference-host".into(),
+            host_version: "1.0.0".into(),
+            model_id: "disabled".into(),
+            tools: vec!["read_config".into()],
+            mandatory_context_digest: d("mandatory"),
+        },
+        host_surface_id: "reference-surface".into(),
+        host_capabilities: HostCapabilities {
+            available: BTreeSet::new(),
+            granted: BTreeSet::new(),
+        },
+        evolution_enabled: true,
+        capability_level: CapabilityLevel::ToolOnly,
+    };
+    let store =
+        Store::open_with_prepare_configs(&dir.path().join("mcp.sqlite3"), vec![config.clone()])
+            .await
+            .unwrap();
     let host = Context::new("tenant-a", "gateway-host", Role::Host).unwrap();
     let admin = Context::new("tenant-a", "admin", Role::Admin).unwrap();
     ReleaseStore::register_host_surface(
@@ -46,25 +68,6 @@ async fn server() -> (tempfile::TempDir, McpHost) {
     .unwrap();
     let service = HostService::new(store, host).unwrap();
     let caller = Context::new("tenant-a", "stdio-agent", Role::Agent).unwrap();
-    let config = HostPrepareConfig {
-        profile_id: "profile-a".into(),
-        system_snapshot: SystemSnapshot {
-            schema_version: "rsia.system_snapshot.v2".into(),
-            profile_id: "profile-a".into(),
-            host_id: "reference-host".into(),
-            host_version: "1.0.0".into(),
-            model_id: "disabled".into(),
-            tools: vec!["read_config".into()],
-            mandatory_context_digest: d("mandatory"),
-        },
-        host_surface_id: "reference-surface".into(),
-        host_capabilities: HostCapabilities {
-            available: BTreeSet::new(),
-            granted: BTreeSet::new(),
-        },
-        evolution_enabled: true,
-        capability_level: CapabilityLevel::ToolOnly,
-    };
     (dir, McpHost::new(service, caller, config).unwrap())
 }
 

@@ -1669,35 +1669,6 @@
           }
         },
         {
-          "id": "E08.ag104_restore_prefix_migration_upgrade_v42",
-          "description": "restore accepts a backup whose manifest and database ledger are a strict prefix of the current migration set, applies the missing migrations inside the private restore copy before anchor comparison, delta replay and publication; the anchor and the startup gate keep the exact current set",
-          "plan_version": "v4.2",
-          "plan_sha256": "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455",
-          "plan_recheck": "rechecked_v4.3",
-          "source_sha": "a2705252894c61aaa1972f0596a279e2f36c2ab5",
-          "pr": "https://github.com/acosmi/RSIAgent/pull/159",
-          "merged_sha": "a78a1e60a4298cd3ca57598a7aba7c5c84a8a721",
-          "pr_state": "merged",
-          "test_entry": "crates/evo-storage/tests/restore_prefix_upgrade_v42.rs",
-          "command": "cargo test --locked --offline -p evo-storage --test restore_prefix_upgrade_v42",
-          "input_digest": "6b925b49efe5e8fd1d2f4ef2ee7425bbfe68d1b784fec4e73b8660c511d2909e",
-          "exit_code": 0,
-          "log_path": "out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.restore_prefix_upgrade_v42.log",
-          "actual_result": "this-window controller acceptance at a2705252 (restacked 647c7ce8 onto 4036c0d2, before/after patches byte-identical 85061 B; fresh target under a 1.5 GiB disk watchdog): fmt 0, clippy -D warnings 0, cargom test --workspace --locked --no-fail-fast exit 0 with 144 binaries 1810 passed / 0 failed / 0 overflow (parent 4036c0d2: 143 binaries 1805 passed; new 5 in restore_prefix_upgrade_v42), build rsia 0, both smokes 0, checker 0, unittest 0; pure-Python suites re-run by the controller on the head: scripts.test_restore_backup 17 OK, discover 177 run OK (47 skipped MCP stdio cases without a binary); protected_facts and verify_delta of scripts/restore_backup.py byte-identical to main; 2 controller probes (qa/probe-ag104/append.rs: a 0001-0005 prefix backup is published with sqlx-shaped ledger rows for 0006/0007; a 0001-0006 prefix backup writes the exact restore.migrations.json and keeps the v2 restore.json keys) pass on head and fail on parent 4036c0d2 (the old script isolates both). Declared target covered with exit 0 by this window's AG-115 acceptance run on the merged tree (out/audit-20260930/qa/accept-ag115/ctrl-ag115-final.restore_prefix_upgrade_v42.log).",
-          "scope": "E08; plan §11 L1079 (restore to a new directory, register the new migrations, backfill and index verification before publication), §11.3 L1112 and E08 L1299; V017/V018/V038/V081/V082 subset: strict-prefix backups (0001-0005 or 0001-0006, every row successful with the current file SHA-384) are upgraded in the private copy the way sqlx 0.8.6 migrates; gaps, unknown or future versions, changed checksums, unsuccessful rows, prefixes before 0005 and manifest/database mismatches stay isolated",
-          "risk": "No claim on backups before 0005, disk-exhaustion scenarios, automation of the operational upgrade flow (stop writes, shadow comparison, per-profile enablement), full E08 route or any gain",
-          "rollback": "revert PR #159 through an independent revert PR; accepted-head parent 4036c0d2d11a01ddcdcb2940d0b00f0f00975656; retain immutable evidence, frozen plans, costs and revocation state",
-          "record_source": "docs/implementation-ledger.md",
-          "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-104-a270525.json",
-          "execution": {
-            "runner": "ctrl_verify.sh",
-            "command": "CARGO_TARGET_DIR=out/work-20260930/target-accept-ag-104 cargom test --workspace --locked --no-fail-fast",
-            "scope": "workspace",
-            "exit_code": 0,
-            "evidence": "out/audit-20260930/qa/accept-ag104/ctrl-ag104-final.log.test"
-          }
-        },
-        {
           "id": "E08.ag117_formal_call_revoke_cleanup_v42",
           "description": "Revocation cleanup judges a legacy budget call's closure by its registered source reference, so a formal call no longer fails every cleanup and a dependent one is redacted",
           "plan_version": "v4.2",
@@ -1733,7 +1704,8 @@
         "engineering: other late writes, stage_bundle and typed dependency-edge completeness remain; AG-059 closes resolved manifest prewrite checking only",
         "production disaster recovery, Linux deployment and future object scopes remain unverified",
         "AG069/073/075 and AG077 are merged scoped software evidence. Their historical accepted results do not establish a transitive complete current E08 route, future-object scope, production disaster recovery or physical free-page/WAL erasure.",
-        "AG121/PR174 does not verify production redaction producers/original_digest audit or whole V111.c; fixture shape guards do not establish real-provider/host/sandbox closure."
+        "AG121/PR174 does not verify production redaction producers/original_digest audit or whole V111.c; fixture shape guards do not establish real-provider/host/sandbox closure.",
+        "AG132: E08.ag104_restore_prefix_migration_upgrade_v42 is recheck_required / legacy_equivalence_unverified. Qualified healthy-prefix replacement coverage is not yet verified; the complete historical record is retained in docs/implementation-ledger.md."
       ]
     },
     "E09": {
@@ -3046,7 +3018,7 @@
     "E16.6": {
       "title": "Release, Support Scope Manifest & Truth Ledger",
       "status": "in_progress",
-      "status_reason": "The v4.3 derived index keeps 90 historical evidence records: 88 unchanged in-scope records rechecked against v4.3 and 2 out-of-scope optional rejection records; 19 records whose accepted behavior changed are withdrawn from verified_subscopes, with their original facts retained in the local recheck ledger; this does not close E16 or the full route; AG128-R1 corrects AG054 old-clock compensation credit without crediting an unverified new clock fix; AG131/PR173 committed Rust project-license metadata guards have scoped first acceptance; AG133/PR175 non-Rust dependency/primary-metadata delivery is implemented_not_verified with first technical acceptance only, no new verified_subscope credit",
+      "status_reason": "The v4.3 derived index keeps 89 historical evidence records: 87 unchanged in-scope records rechecked against v4.3 and 2 out-of-scope optional rejection records; 20 records whose accepted behavior changed are withdrawn from verified_subscopes, with their original facts retained in the local recheck ledger; this does not close E16 or the full route; AG128-R1 corrects AG054 old-clock compensation credit without crediting an unverified new clock fix; AG131/PR173 committed Rust project-license metadata guards have scoped first acceptance; AG133/PR175 non-Rust dependency/primary-metadata delivery is implemented_not_verified with first technical acceptance only, no new verified_subscope credit",
       "implementation_files": [
         "reports/support-scope.json",
         "crates/evo-core/tests/support_scope.rs",
@@ -5037,10 +5009,9 @@
           "E16.1.ag070_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E08.ag096_unreadable_bound_request_isolated",
-          "E08.ag104_restore_prefix_migration_upgrade_v42",
           "E08.ag117_formal_call_revoke_cleanup_v42"
         ],
-        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive; AG132: E08.ag104_restore_prefix_migration_upgrade_v42 is recheck_required / legacy_equivalence_unverified. Qualified healthy-prefix replacement coverage is not yet verified; the complete historical record is retained in docs/implementation-ledger.md."
       },
       {
         "id": "V018",
@@ -5061,10 +5032,9 @@
           "E08.ag073_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E08.ag096_unreadable_bound_request_isolated",
-          "E08.ag104_restore_prefix_migration_upgrade_v42",
           "E08.ag117_formal_call_revoke_cleanup_v42"
         ],
-        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive; AG132: E08.ag104_restore_prefix_migration_upgrade_v42 is recheck_required / legacy_equivalence_unverified. Qualified healthy-prefix replacement coverage is not yet verified; the complete historical record is retained in docs/implementation-ledger.md."
       },
       {
         "id": "V019",
@@ -5375,10 +5345,9 @@
           "E13.ag081_local_scoped_acceptance",
           "E04.ag082_local_scoped_acceptance",
           "E04.ag077_local_scoped_acceptance",
-          "E08.ag075_local_scoped_acceptance",
-          "E08.ag104_restore_prefix_migration_upgrade_v42"
+          "E08.ag075_local_scoped_acceptance"
         ],
-        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive; AG132: E08.ag104_restore_prefix_migration_upgrade_v42 is recheck_required / legacy_equivalence_unverified. Qualified healthy-prefix replacement coverage is not yet verified; the complete historical record is retained in docs/implementation-ledger.md."
       },
       {
         "id": "V039",
@@ -6109,10 +6078,9 @@
           "E08.ag075_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance",
-          "E09.ag103_fairness_waits_legal_set_v42",
-          "E08.ag104_restore_prefix_migration_upgrade_v42"
+          "E09.ag103_fairness_waits_legal_set_v42"
         ],
-        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive; AG132: E08.ag104_restore_prefix_migration_upgrade_v42 is recheck_required / legacy_equivalence_unverified. Qualified healthy-prefix replacement coverage is not yet verified; the complete historical record is retained in docs/implementation-ledger.md."
       },
       {
         "id": "V082",
@@ -6138,10 +6106,9 @@
           "E13.ag081_local_scoped_acceptance",
           "E08.ag075_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance",
-          "E08.ag104_restore_prefix_migration_upgrade_v42"
+          "E02.ag093_local_scoped_acceptance"
         ],
-        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
+        "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive; AG132: E08.ag104_restore_prefix_migration_upgrade_v42 is recheck_required / legacy_equivalence_unverified. Qualified healthy-prefix replacement coverage is not yet verified; the complete historical record is retained in docs/implementation-ledger.md."
       },
       {
         "id": "V083",

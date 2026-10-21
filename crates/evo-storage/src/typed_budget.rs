@@ -9,7 +9,7 @@ use crate::lifecycle::{
 use crate::{Session, Store, internal, upstream_rows_in_tx};
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, text};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::Row;
 use std::collections::BTreeSet;
 
 pub const E16_BUDGET_REQUEST_SCHEMA: &str = "rsia.e16.model_budget_request.v1";
@@ -218,7 +218,7 @@ impl Session {
         let mut references = Vec::with_capacity(sources.len());
         for id in keys {
             references.push(
-                read_source_in_tx(&mut self.tx, ctx.namespace(), id)
+                read_source_in_tx(self.transaction()?, ctx.namespace(), id)
                     .await?
                     .ok_or_else(sources_unavailable)?,
             );
@@ -229,7 +229,7 @@ impl Session {
 }
 
 async fn read_source_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     namespace: &str,
     id: &str,
 ) -> Result<Option<E16BudgetSourceRef>> {
@@ -277,7 +277,7 @@ async fn read_source_in_tx(
 }
 
 pub(crate) async fn snapshots_live_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     namespace: &str,
     refs: &[E16BudgetSourceRef],
 ) -> Result<bool> {
@@ -336,7 +336,7 @@ pub(crate) enum E16CallMode {
 }
 
 pub(crate) async fn new_ref_exists_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     namespace: &str,
     scope: &str,
     call: &str,
@@ -354,7 +354,7 @@ pub(crate) async fn new_ref_exists_in_tx(
 }
 
 pub(crate) async fn call_mode_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     call: &BudgetCallRecord,
 ) -> Result<E16CallMode> {
     let present =
@@ -439,7 +439,7 @@ fn redaction_matches(artifact: &BudgetArtifact, reference: &E16BudgetCallRef) ->
 }
 
 async fn load_ref_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     call: &BudgetCallRecord,
 ) -> Result<Option<String>> {
     sqlx::query_scalar("SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?")
@@ -455,7 +455,7 @@ async fn load_ref_in_tx(
 }
 
 async fn legacy_ref_exists_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     call: &BudgetCallRecord,
 ) -> Result<bool> {
     let digest = fingerprint(&(
@@ -483,9 +483,28 @@ fn parse_ref(call: &BudgetCallRecord, body: &str) -> Option<E16BudgetCallRef> {
     valid_ref(call, &reference).then_some(reference)
 }
 
+/// Pure snapshot qualification: no source liveness or maintenance writes.
+/// Retained redaction binds the original request digest and actual call.
+pub(super) fn history_ref_from_body(
+    call: &BudgetCallRecord,
+    body: &str,
+) -> Option<E16BudgetCallRef> {
+    let reference = parse_ref(call, body)?;
+    let artifact = call.request_artifact.as_ref()?;
+    if !valid_artifact(artifact) {
+        return None;
+    }
+    let bound = if let Some(request) = parse_request(artifact) {
+        ref_from_request(call, &request).as_ref() == Some(&reference)
+    } else {
+        redaction_matches(artifact, &reference)
+    };
+    bound.then_some(reference)
+}
+
 /// No missing-ref fallback at any content gate, including repeated reserve.
 pub(crate) async fn call_sources_live_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     call: &BudgetCallRecord,
 ) -> Result<bool> {
     if legacy_ref_exists_in_tx(tx, call).await? {
@@ -507,7 +526,7 @@ pub(crate) async fn call_sources_live_in_tx(
 }
 
 pub(crate) async fn create_ref_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     call: &BudgetCallRecord,
 ) -> Result<()> {
@@ -523,7 +542,7 @@ pub(crate) async fn create_ref_in_tx(
 }
 
 async fn insert_ref_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     reference: &E16BudgetCallRef,
 ) -> Result<u64> {
@@ -540,7 +559,7 @@ async fn insert_ref_in_tx(
 }
 
 async fn repair_edges_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     reference: &E16BudgetCallRef,
 ) -> Result<u64> {
     let mut added = 0;
@@ -564,7 +583,7 @@ pub(crate) enum E16History {
 /// Cleanup-only history maintenance. Does not grant dispatch or content use and
 /// does not consult a source body that cleanup may already have destroyed.
 pub(crate) async fn maintain_history_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     call: &BudgetCallRecord,
 ) -> Result<E16History> {
@@ -612,7 +631,7 @@ pub(crate) async fn maintain_history_in_tx(
 /// A frontier ref is usable as history only when it identifies the actual call
 /// and its original request binding. Arbitrary edges cannot target another call.
 pub(crate) async fn history_call_for_ref_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     node: &TypedObjectRef,
     body: &str,

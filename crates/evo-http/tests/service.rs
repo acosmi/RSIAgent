@@ -28,7 +28,31 @@ fn d(label: &str) -> String {
 
 async fn state(auth: AuthRegistry) -> (tempfile::TempDir, HttpState) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("http.sqlite3")).await.unwrap();
+    let prepare_config = HostPrepareConfig {
+        profile_id: "profile-a".into(),
+        system_snapshot: SystemSnapshot {
+            schema_version: "rsia.system_snapshot.v2".into(),
+            profile_id: "profile-a".into(),
+            host_id: "reference-host".into(),
+            host_version: "1.0.0".into(),
+            model_id: "disabled".into(),
+            tools: vec!["read_config".into()],
+            mandatory_context_digest: d("mandatory"),
+        },
+        host_surface_id: "reference-surface".into(),
+        host_capabilities: HostCapabilities {
+            available: BTreeSet::new(),
+            granted: BTreeSet::new(),
+        },
+        evolution_enabled: true,
+        capability_level: CapabilityLevel::ToolOnly,
+    };
+    let store = Store::open_with_prepare_configs(
+        &dir.path().join("http.sqlite3"),
+        vec![prepare_config.clone()],
+    )
+    .await
+    .unwrap();
     let host = Context::new("tenant-a", "gateway-host", Role::Host).unwrap();
     let admin = Context::new("tenant-a", "admin", Role::Admin).unwrap();
     ReleaseStore::register_host_surface(
@@ -53,25 +77,6 @@ async fn state(auth: AuthRegistry) -> (tempfile::TempDir, HttpState) {
     )
     .await
     .unwrap();
-    let prepare_config = HostPrepareConfig {
-        profile_id: "profile-a".into(),
-        system_snapshot: SystemSnapshot {
-            schema_version: "rsia.system_snapshot.v2".into(),
-            profile_id: "profile-a".into(),
-            host_id: "reference-host".into(),
-            host_version: "1.0.0".into(),
-            model_id: "disabled".into(),
-            tools: vec!["read_config".into()],
-            mandatory_context_digest: d("mandatory"),
-        },
-        host_surface_id: "reference-surface".into(),
-        host_capabilities: HostCapabilities {
-            available: BTreeSet::new(),
-            granted: BTreeSet::new(),
-        },
-        evolution_enabled: true,
-        capability_level: CapabilityLevel::ToolOnly,
-    };
     let service = HostService::new(store, host).unwrap();
     let management = evo_engine::dispatch::ManagementDispatcher::new(
         service.store().clone(),

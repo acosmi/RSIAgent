@@ -5,8 +5,9 @@
 //! restored state of an independent, operator-designated current control plane:
 //! a restore must not resurrect revoked history or permissions, rewind consumed
 //! query/exposure/budget facts, or reopen early-stopped tickets (E16.5, §11.3 to
-//! §11.5, E08). The gate is a pure read-only decision; it never opens the
-//! database through `Store::open` and every failure path writes nothing.
+//! §11.5, E08). The gate uses an original read-only transaction rather than
+//! `Store::open`. Physical zero-write and strict-atime behavior are separately
+//! qualified by the native acceptance controls.
 //!
 //! State machine (data directory `D` = parent of the `--data` file):
 //!
@@ -166,6 +167,8 @@ pub struct GateDecision {
     posture: RecoveryPosture,
     isolation: IsolationPolicy,
     data_dir: PathBuf,
+    data: PathBuf,
+    candidates: Vec<evo_core::prepare_contract::HostPrepareConfig>,
     pending: Option<PendingAdmission>,
 }
 
@@ -206,7 +209,7 @@ impl GateDecision {
     /// overwrites) and the directory is fsynced.
     pub fn admit(&self) -> Result<(), StartupGateError> {
         match &self.pending {
-            Some(pending) => write_admission(&self.data_dir, pending),
+            Some(pending) => write_admission(&self.data, &self.data_dir, pending, &self.candidates),
             None => Ok(()),
         }
     }
@@ -218,6 +221,7 @@ impl GateDecision {
 pub struct StartupGate {
     data: PathBuf,
     trusted_anchor: Option<PathBuf>,
+    candidates: Vec<evo_core::prepare_contract::HostPrepareConfig>,
 }
 
 impl StartupGate {
@@ -225,10 +229,44 @@ impl StartupGate {
         Self {
             data: data.to_path_buf(),
             trusted_anchor: trusted_anchor.map(Path::to_path_buf),
+            candidates: Vec::new(),
         }
     }
 
-    /// Read-only. Never creates, modifies or removes anything.
+    /// Candidate preimages are checked again against independent persisted
+    /// witnesses; carrying them in the gate never grants data authority.
+    pub fn with_prepare_configs(
+        mut self,
+        candidates: &[evo_core::prepare_contract::HostPrepareConfig],
+    ) -> Result<Self, StartupGateError> {
+        for candidate in candidates {
+            candidate
+                .validate()
+                .map_err(|error| StartupGateError::Rejected(error.to_string()))?;
+        }
+        self.candidates = candidates.to_vec();
+        Ok(self)
+    }
+
+    async fn clock_preflight(&self) -> Result<(), StartupGateError> {
+        let data = self.data.clone();
+        let candidates = self.candidates.clone();
+        let extra_occurrences = admission_occurrences(&data_directory(&self.data))?;
+        tokio::task::spawn_blocking(move || {
+            evo_storage::lifecycle::readonly_wall_seconds(&data, &candidates, &extra_occurrences)
+                .map(|_| ())
+        })
+        .await
+        .map_err(|error| {
+            StartupGateError::Rejected(format!("read-only preflight worker: {error}"))
+        })?
+        .map_err(|error| match error {
+            Error::ClockRegressed => StartupGateError::Rejected("clock_regressed".into()),
+            other => StartupGateError::Rejected(other.to_string()),
+        })
+    }
+
+    /// Read-only. Physical zero-FS/strict-atime behavior requires the native gate.
     pub async fn evaluate(&self) -> Result<GateDecision, StartupGateError> {
         let dir = data_directory(&self.data);
         let isolation = IsolationPolicy::reference_host(dir.to_string_lossy().into_owned());
@@ -236,6 +274,8 @@ impl StartupGate {
             posture,
             isolation: isolation.clone(),
             data_dir: dir.clone(),
+            data: self.data.clone(),
+            candidates: self.candidates.clone(),
             pending,
         };
 
@@ -245,6 +285,7 @@ impl StartupGate {
                 return Err(StartupGateError::Rejected(ANCHOR_WITHOUT_RESTORE.into()));
             }
             code_execution_gate(&isolation)?;
+            self.clock_preflight().await?;
             return Ok(decision(RecoveryPosture::Normal, None));
         }
 
@@ -263,6 +304,7 @@ impl StartupGate {
                 return Err(StartupGateError::Rejected(ANCHOR_WITHOUT_RESTORE.into()));
             }
             code_execution_gate(&isolation)?;
+            self.clock_preflight().await?;
             return Ok(decision(RecoveryPosture::AdmittedPreviously, None));
         }
 
@@ -274,6 +316,7 @@ impl StartupGate {
         let pending = self
             .verify_restored(&dir, &receipt_bytes, receipt_sha256, anchor, &isolation)
             .await?;
+        self.clock_preflight().await?;
         Ok(decision(RecoveryPosture::RestoredVerified, Some(pending)))
     }
 
@@ -541,34 +584,69 @@ fn read_admission(path: &Path) -> Result<AdmissionRecord, StartupGateError> {
     Ok(record)
 }
 
-fn write_admission(dir: &Path, pending: &PendingAdmission) -> Result<(), StartupGateError> {
+/// Only a bound, strictly parsed existing admission contributes an FS time.
+/// An absent restore receipt leaves the old normal-directory behavior intact.
+fn admission_occurrences(dir: &Path) -> Result<Vec<i64>, StartupGateError> {
+    let receipt_path = dir.join(RESTORE_RECEIPT_FILE);
+    let admission_path = dir.join(RESTORE_ADMISSION_FILE);
+    if !entry_present(&receipt_path, "restore receipt")?
+        || !entry_present(&admission_path, "restore admission record")?
+    {
+        return Ok(Vec::new());
+    }
+    let receipt = read_small_regular_file(&receipt_path, "restore receipt")?;
+    let record = read_admission(&admission_path)?;
+    if record.receipt_sha256 != hash(&receipt) {
+        return Err(quarantine(
+            "admission record is bound to a different restore receipt",
+        ));
+    }
+    Ok(vec![record.admitted_at])
+}
+
+fn write_admission(
+    data: &Path,
+    dir: &Path,
+    pending: &PendingAdmission,
+    candidates: &[evo_core::prepare_contract::HostPrepareConfig],
+) -> Result<(), StartupGateError> {
     let failed = |what: &str, error: &dyn fmt::Display| {
         StartupGateError::Admission(format!("{what}: {error}"))
     };
+    let (admitted_at, unique) = evo_storage::lifecycle::readonly_wall_sample(
+        data,
+        candidates,
+        &admission_occurrences(dir)?,
+    )
+    .map_err(|error| failed("clock_regressed", &error))?
+    .into_parts();
     let record = AdmissionRecord {
         schema_version: RESTORE_ADMISSION_SCHEMA.into(),
         receipt_sha256: pending.receipt_sha256.clone(),
         anchor_path_local_only: pending.anchor_path_local_only.clone(),
         verified_facts_digest: pending.verified_facts_digest.clone(),
         namespaces: pending.namespaces.clone(),
-        admitted_at: evo_core::now().map_err(|error| failed("clock_regressed", &error))?,
+        admitted_at,
         scope: RECEIPT_SCOPE.into(),
     };
     let mut bytes = serde_json::to_vec(&record)
         .map_err(|error| failed("cannot serialize the admission record", &error))?;
     bytes.push(b'\n');
 
-    let unique = evo_core::clock::unix_nanos_at(std::time::SystemTime::now())
-        .map_err(|error| failed("clock_regressed", &error))?;
     let temp = dir.join(format!(
         ".{RESTORE_ADMISSION_FILE}.tmp-{}-{unique}",
         std::process::id()
     ));
     let target = dir.join(RESTORE_ADMISSION_FILE);
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(&temp)
         .map_err(|error| failed("cannot create the admission temp file", &error))?;
     let linked = file
@@ -660,15 +738,28 @@ fn check_anchor_file_identity(_anchor: &Path, _data_db: &Path) -> Result<(), Str
     Err("trusted anchor identity cannot be verified on this platform".into())
 }
 
-/// An anchor directory whose `.rsia.lock` is held belongs to a running RSIA
-/// process, whose state is still moving. The probe takes a shared lock on a
-/// read-only handle and releases it immediately.
+/// Early liveness diagnostic only. The later original-source reader obtains
+/// and retains its own real stability scope through native close. In particular,
+/// absence of the compatibility file does not confer stability authority.
 fn probe_anchor_lock(anchor_dir: &Path) -> Result<(), String> {
+    let directory = std::fs::File::open(anchor_dir)
+        .map_err(|error| format!("cannot open the anchor directory: {error}"))?;
+    match directory.try_lock_shared() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(
+                "anchor is held by a running RSIA process (its directory is locked)".into(),
+            );
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(format!("cannot probe the anchor directory lock: {error}"));
+        }
+    }
     let lock_path = anchor_dir.join(DATA_LOCK_FILE);
     match std::fs::symlink_metadata(&lock_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("cannot inspect the anchor lock file: {error}")),
-        Ok(meta) if !meta.is_file() => {
+        Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
             return Err("the anchor lock path is not a regular file".into());
         }
         Ok(_) => {}
@@ -676,10 +767,7 @@ fn probe_anchor_lock(anchor_dir: &Path) -> Result<(), String> {
     let file = std::fs::File::open(&lock_path)
         .map_err(|error| format!("cannot open the anchor lock file: {error}"))?;
     match file.try_lock_shared() {
-        Ok(()) => {
-            let _ = file.unlock();
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(std::fs::TryLockError::WouldBlock) => {
             Err("anchor is held by a running RSIA process (its .rsia.lock is locked)".into())
         }
@@ -1057,6 +1145,8 @@ mod tests {
             posture: RecoveryPosture::AdmittedPreviously,
             isolation,
             data_dir: PathBuf::from("/d"),
+            data: PathBuf::from("/d/db.sqlite3"),
+            candidates: Vec::new(),
             pending: None,
         };
         assert_eq!(

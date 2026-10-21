@@ -873,6 +873,138 @@ struct Revocation {
     created_at: i64,
 }
 
+/// Exact retained prepare originals, shared by this file's real producer fixtures.
+struct RestoreFixtureInputs {
+    config: evo_engine::service::HostPrepareConfig,
+    reader: PathBuf,
+    originals: PathBuf,
+}
+
+impl RestoreFixtureInputs {
+    fn new(root: &Path) -> Self {
+        #[cfg(not(unix))]
+        {
+            let _ = root;
+            panic!("unsupported restore fixture platform");
+        }
+        #[cfg(unix)]
+        {
+            use evo_core::contract::{CapabilityLevel, HostCapabilities, SystemSnapshot};
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+            let config = evo_engine::service::HostPrepareConfig {
+                profile_id: "profile-a".into(),
+                system_snapshot: SystemSnapshot {
+                    schema_version: "rsia.system_snapshot.v2".into(),
+                    profile_id: "profile-a".into(),
+                    host_id: "reference-host".into(),
+                    host_version: "1.0.0".into(),
+                    model_id: "disabled".into(),
+                    tools: vec!["read_config".into()],
+                    mandatory_context_digest: hash(b"restore-prepare-mandatory"),
+                },
+                host_surface_id: "reference-surface".into(),
+                host_capabilities: HostCapabilities {
+                    available: ["fs_read".into()].into(),
+                    granted: ["fs_read".into()].into(),
+                },
+                evolution_enabled: true,
+                capability_level: CapabilityLevel::ToolOnly,
+            };
+            config.validate().unwrap();
+            let test = std::env::current_exe().unwrap().canonicalize().unwrap();
+            let deps = test.parent().unwrap();
+            assert_eq!(deps.file_name().unwrap(), "deps");
+            let reader = deps.parent().unwrap().join("rsia").canonicalize().unwrap();
+            let metadata = std::fs::metadata(&reader).unwrap();
+            assert!(metadata.is_file() && metadata.nlink() == 1);
+            let originals = root.join("prepare-originals.json");
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&originals)
+                .unwrap();
+            serde_json::to_writer(&mut file, std::slice::from_ref(&config)).unwrap();
+            file.sync_all().unwrap();
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            Self {
+                config,
+                reader,
+                originals,
+            }
+        }
+    }
+
+    async fn open(&self, path: &Path) -> Store {
+        Store::open_with_prepare_configs(path, vec![self.config.clone()])
+            .await
+            .unwrap()
+    }
+
+    async fn close(&self, store: Store, path: &Path) {
+        store.close().await;
+        // Failed native close retains the real OS lock; require actual handback.
+        let closed = evo_storage::lifecycle::DirectoryWriterGuard::acquire_new_mount_checked(
+            path,
+            std::slice::from_ref(&self.config),
+        )
+        .unwrap();
+        drop(closed);
+    }
+
+    fn gate(&self, path: &Path, anchor: Option<&Path>) -> StartupGate {
+        StartupGate::new(path, anchor)
+            .with_prepare_configs(std::slice::from_ref(&self.config))
+            .unwrap()
+    }
+
+    async fn prepare(
+        &self,
+        store: &Store,
+    ) -> (evo_core::Prepared, Context, Context, evo_core::Prepare) {
+        use evo_core::Prepare;
+        use evo_core::contract::{HostSurfaceManifest, SurfaceCoverage, SurfaceItem};
+        use evo_engine::release_store::ReleaseStore;
+        use evo_engine::service::HostService;
+        let config = &self.config;
+        ReleaseStore::register_host_surface(
+            &admin(),
+            store,
+            "reference-surface",
+            HostSurfaceManifest {
+                schema_version: "rsia.host_surface.v1".into(),
+                host: "reference-host".into(),
+                host_version: "1.0.0".into(),
+                adapter_version: "1.0.0".into(),
+                source_digest: hash(b"restore-reference-surface"),
+                items: vec![SurfaceItem {
+                    name: "model".into(),
+                    coverage: SurfaceCoverage::Supported,
+                    mapped_field: Some("host.model".into()),
+                    consumer: Some("reference-host".into()),
+                    reason: "fixed reference fixture".into(),
+                }],
+            },
+            vec!["model".into()],
+        )
+        .await
+        .unwrap();
+        let host = Context::new(NS, "gateway-host", Role::Host).unwrap();
+        let agent = Context::new(NS, "restore-agent", Role::Agent).unwrap();
+        let service = HostService::new((*store).clone(), host.clone()).unwrap();
+        let request = Prepare {
+            request_key: "restore-prepare-1".into(),
+            goal: "preserve the real prepare cache".into(),
+            capabilities: vec!["fs_read".into()],
+        };
+        let prepared = service
+            .prepare(&agent, request.clone(), config)
+            .await
+            .unwrap();
+        (prepared, host, agent, request)
+    }
+}
+
 struct Scenario {
     _guard: tempfile::TempDir,
     root: PathBuf,
@@ -883,6 +1015,7 @@ struct Scenario {
     manifest_bytes: Vec<u8>,
     experiment: ReplayEconomicExperimentV1,
     job_id: Option<String>,
+    inputs: RestoreFixtureInputs,
 }
 
 impl Scenario {
@@ -893,11 +1026,21 @@ impl Scenario {
         let guard = tempfile::tempdir().unwrap();
         // the script refuses symlinks in any supplied path (`/var` on macOS)
         let root = guard.path().canonicalize().unwrap();
-        let live = root.join("rsia.sqlite3");
-        let store = Store::open(&live).await.unwrap();
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt;
+        let live_dir = root.join("live");
+        #[cfg(unix)]
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&live_dir)
+            .unwrap();
+        let inputs = RestoreFixtureInputs::new(&root);
+        let live = live_dir.join("rsia.sqlite3");
+        let store = inputs.open(&live).await;
         let experiment = prerequisites(&store).await;
         spend_before_the_backup(&store).await;
-        store.close().await;
+        let _ = inputs.prepare(&store).await;
+        inputs.close(store, &live).await;
         Self {
             _guard: guard,
             backup: root.join("backup"),
@@ -907,14 +1050,15 @@ impl Scenario {
             manifest_bytes: Vec::new(),
             experiment,
             job_id: None,
+            inputs,
         }
     }
 
     /// Take the real backup of the live database as it is now.
     async fn take_backup(&mut self) {
-        let store = Store::open(&self.live).await.unwrap();
+        let store = self.inputs.open(&self.live).await;
         store.backup(&self.backup).await.unwrap();
-        store.close().await;
+        self.inputs.close(store, &self.live).await;
         self.manifest_bytes = std::fs::read(self.backup.join("backup-manifest.json")).unwrap();
         let manifest: BackupManifest = serde_json::from_slice(&self.manifest_bytes).unwrap();
         assert_eq!(manifest.watermarks.len(), 1);
@@ -925,24 +1069,64 @@ impl Scenario {
         self.backup.join("rsia.sqlite3")
     }
 
-    /// The anchor stores the [`look_alikes`].
-    async fn put_look_alikes(&self) {
-        let store = Store::open(&self.live).await.unwrap();
+    /// Arrange deliberately unqualified stored bytes only for diagnostic/negative controls.
+    /// No Store or producer remains live; this is not a healthy producer fixture.
+    fn inject_look_alikes(&self, values: &[(&str, Value)]) {
+        let program = r#"
+import fcntl, json, os, pathlib, sqlite3, sys
+database = pathlib.Path(sys.argv[1]).resolve()
+directory = os.open(database.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+legacy = None
+con = None
+try:
+    fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    legacy = os.open(database.parent / ".rsia.lock", os.O_RDONLY | os.O_NOFOLLOW)
+    fcntl.flock(legacy, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    con = sqlite3.connect(database.as_uri() + "?mode=rw", uri=True, isolation_level=None)
+    con.execute("BEGIN IMMEDIATE")
+    for identity, body in json.loads(sys.argv[2]):
+        con.execute("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,'artifact',?,?,?)",
+                    ("n", identity, "admin", json.dumps(body, separators=(",", ":"))))
+    con.execute("COMMIT")
+finally:
+    if con is not None:
+        con.close()
+    if legacy is not None:
+        os.close(legacy)
+    os.close(directory)
+"#;
+        let output = Command::new("python3")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .arg("-c")
+            .arg(program)
+            .arg(&self.live)
+            .arg(serde_json::to_string(values).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    }
+
+    async fn put_unprotected_look_alike(&self) {
+        let store = self.inputs.open(&self.live).await;
         let admin = admin();
+        let (id, body) = look_alikes().into_iter().nth(2).unwrap();
         let mut session = store.session().await.unwrap();
-        for (id, body) in look_alikes() {
-            session
-                .put(&admin, "artifact", id, admin.actor(), &body)
-                .await
-                .unwrap();
-        }
+        session
+            .put(&admin, "artifact", id, admin.actor(), &body)
+            .await
+            .unwrap();
         session.commit().await.unwrap();
-        store.close().await;
+        self.inputs.close(store, &self.live).await;
     }
 
     /// Take one step on the anchor, with the engine's own coordinator.
     async fn step(&mut self, step: Step) -> Stepped {
-        let store = Store::open(&self.live).await.unwrap();
+        let store = self.inputs.open(&self.live).await;
         let evaluator = evaluator();
         let stepped = match step {
             Step::Register => {
@@ -1025,7 +1209,7 @@ impl Scenario {
                 }
             }
         };
-        store.close().await;
+        self.inputs.close(store, &self.live).await;
         stepped
     }
 
@@ -1077,7 +1261,7 @@ impl Scenario {
 
     /// Revoke `source` on the anchor and run its cleanup closure to the end.
     async fn revoke_and_clean(&self, source: &str) -> Revocation {
-        let store = Store::open(&self.live).await.unwrap();
+        let store = self.inputs.open(&self.live).await;
         let admin = admin();
         let mut status = LifecycleStore::begin_revoke(
             &admin,
@@ -1107,7 +1291,7 @@ impl Scenario {
         let mut session = store.session().await.unwrap();
         let tombstone: RevokeTombstone = session.need(&admin, "tombstone", source).await.unwrap();
         session.commit().await.unwrap();
-        store.close().await;
+        self.inputs.close(store, &self.live).await;
         Revocation {
             source: source.into(),
             seq: i64::try_from(tombstone.watermark_seq).unwrap(),
@@ -1164,18 +1348,32 @@ impl Scenario {
 
     /// Run the real script against the backup, with the live database as anchor.
     fn restore(&self, name: &str, delta: &Path) -> Restored {
+        self.restore_with_sources(name, delta, &self.backup, &self.live)
+    }
+
+    fn restore_with_sources(
+        &self,
+        name: &str,
+        delta: &Path,
+        backup: &Path,
+        anchor: &Path,
+    ) -> Restored {
         let dest = self.root.join(name);
         let output = Command::new("python3")
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .arg(RESTORE_SCRIPT)
+            .arg("--native-reader")
+            .arg(&self.inputs.reader)
+            .arg("--prepare-configs-file")
+            .arg(&self.inputs.originals)
             .arg("--backup")
-            .arg(&self.backup)
+            .arg(backup)
             .arg("--dest")
             .arg(&dest)
             .arg("--revoke-delta")
             .arg(delta)
             .arg("--trusted-revocations-db")
-            .arg(&self.live)
+            .arg(anchor)
             .output()
             .unwrap();
         Restored {
@@ -1195,9 +1393,15 @@ impl Scenario {
 }
 
 /// The gate must refuse the directory with `recovery_quarantine` and write nothing.
-async fn quarantine_reason(step: Step, data: &Path, anchor: &Path, directory: &Path) -> String {
+async fn quarantine_reason(
+    scenario: &Scenario,
+    step: Step,
+    data: &Path,
+    anchor: &Path,
+    directory: &Path,
+) -> String {
     let before = snapshot(directory);
-    let error = match StartupGate::new(data, Some(anchor)).evaluate().await {
+    let error = match scenario.inputs.gate(data, Some(anchor)).evaluate().await {
         Ok(decision) => panic!(
             "{step:?}: the gate admitted a directory the anchor has moved past (posture {:?})",
             decision.posture()
@@ -1304,7 +1508,7 @@ async fn the_script_and_the_reader_select_every_record_kind_of_the_economic_enve
     scenario.run_history().await;
 
     // not protected: see `look_alikes`
-    scenario.put_look_alikes().await;
+    scenario.inject_look_alikes(&look_alikes());
 
     let records = economic_objects(&scenario.live);
     assert_eq!(
@@ -1465,7 +1669,9 @@ async fn an_economic_record_the_anchor_took_after_the_restore_quarantines_the_di
         restored.assert_restored(&format!("{step:?}: before the step"), 0);
 
         // While the anchor still equals the restore the directory verifies ...
-        let verified = StartupGate::new(&restored.data(), Some(&scenario.live))
+        let verified = scenario
+            .inputs
+            .gate(&restored.data(), Some(&scenario.live))
             .evaluate()
             .await
             .unwrap_or_else(|error| panic!("{step:?}: {error}"));
@@ -1473,8 +1679,14 @@ async fn an_economic_record_the_anchor_took_after_the_restore_quarantines_the_di
 
         // ... and stops verifying the moment the anchor takes the step.
         let stepped = scenario.step(step).await;
-        let reason =
-            quarantine_reason(step, &restored.data(), &scenario.live, &restored.dest).await;
+        let reason = quarantine_reason(
+            &scenario,
+            step,
+            &restored.data(),
+            &scenario.live,
+            &restored.dest,
+        )
+        .await;
         assert_eq!(reason, stepped.reason(), "{step:?}");
     }
 }
@@ -1492,17 +1704,22 @@ async fn an_equal_economic_history_restores_and_the_gate_admits_the_directory() 
     restored.assert_restored("the economic history is the same on both sides", 0);
 
     // first start: verified against the anchor, then admitted and recorded
-    let decision = StartupGate::new(&restored.data(), Some(&scenario.live))
+    let decision = scenario
+        .inputs
+        .gate(&restored.data(), Some(&scenario.live))
         .evaluate()
         .await
         .unwrap();
     assert_eq!(decision.posture(), RecoveryPosture::RestoredVerified);
-    Store::open(&restored.data()).await.unwrap().close().await;
+    let reopened = scenario.inputs.open(&restored.data()).await;
+    scenario.inputs.close(reopened, &restored.data()).await;
     assert!(!restored.dest.join(RESTORE_ADMISSION_FILE).exists());
     decision.admit().unwrap();
     assert!(restored.dest.join(RESTORE_ADMISSION_FILE).is_file());
     // the next start needs no anchor
-    let again = StartupGate::new(&restored.data(), None)
+    let again = scenario
+        .inputs
+        .gate(&restored.data(), None)
         .evaluate()
         .await
         .unwrap();
@@ -1592,7 +1809,9 @@ async fn a_backup_holding_the_history_restores_through_a_later_revocation_of_its
     let delta = scenario.delta("delta.json", &[revocation]);
     let restored = scenario.restore("restored", &delta);
     restored.assert_restored("history in the backup, source revoked after it", 1);
-    let decision = StartupGate::new(&restored.data(), Some(&scenario.live))
+    let decision = scenario
+        .inputs
+        .gate(&restored.data(), Some(&scenario.live))
         .evaluate()
         .await
         .unwrap();
@@ -1625,9 +1844,1184 @@ async fn a_backup_holding_the_history_restores_through_a_later_revocation_of_its
 async fn schemas_next_to_the_envelope_do_not_isolate_a_backup() {
     let mut scenario = Scenario::begin().await;
     scenario.take_backup().await;
-    scenario.put_look_alikes().await;
-    scenario.restore_without_events("restored").assert_restored(
-        "a v2 envelope, a payload schema and an unrelated artifact",
-        0,
+    scenario.put_unprotected_look_alike().await;
+    scenario
+        .restore_without_events("restored")
+        .assert_restored("an unrelated artifact", 0);
+
+    // Selection is not qualification. Unknown rsia.* bytes remain unprotected
+    // selector diagnostics, but may not license restore or any temporal write.
+    // Pending secondary acceptance: the source supplies no healthy unknown-schema contract.
+    for value in look_alikes().into_iter().take(2) {
+        let mut invalid = Scenario::begin().await;
+        invalid.take_backup().await;
+        invalid
+            .restore_without_events("healthy-before-fault")
+            .assert_restored("the genuine fixture before unknown-schema injection", 0);
+        invalid.inject_look_alikes(std::slice::from_ref(&value));
+        assert!(!script_selection(&invalid.live).contains(&format!("{NS}/artifact/{}", value.0)));
+        let before = snapshot(invalid.live.parent().unwrap());
+        let refused = invalid.restore_without_events("unqualified");
+        assert_eq!(refused.code, Some(1), "{}", refused.output());
+        assert_eq!(
+            refused.stderr,
+            "ISOLATE native restore refused: clock_regressed; not mounting\n"
+        );
+        assert!(refused.stdout.is_empty() && !refused.dest.exists());
+        assert_eq!(snapshot(invalid.live.parent().unwrap()), before);
+        let prefix = format!(
+            ".{}.restore-",
+            refused.dest.file_name().unwrap().to_string_lossy()
+        );
+        assert!(!std::fs::read_dir(&invalid.root).unwrap().any(|row| {
+            row.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&prefix)
+        }));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restore_real_prepare() {
+    use evo_engine::service::HostService;
+    use std::os::unix::fs::DirBuilderExt;
+
+    let owner = tempfile::tempdir().unwrap();
+    let root = owner.path().canonicalize().unwrap();
+    let source_dir = root.join("live");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&source_dir)
+        .unwrap();
+    let live = source_dir.join("rsia.sqlite3");
+    let inputs = RestoreFixtureInputs::new(&root);
+    let config = inputs.config.clone();
+    let store = Store::open_with_prepare_configs(&live, vec![config.clone()])
+        .await
+        .unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin(), &hash(b"restore-prepare-watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let (prepared, host, agent, request) = inputs.prepare(&store).await;
+    let backup = root.join("backup");
+    store.backup(&backup).await.unwrap();
+    let raw = std::fs::read(backup.join("backup-manifest.json")).unwrap();
+    let manifest: BackupManifest = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(manifest.watermarks.len(), 1);
+    assert_eq!(manifest.watermarks[0].namespace, NS);
+
+    inputs.close(store, &live).await;
+    let live_before = snapshot(&source_dir);
+    let backup_before = snapshot(&backup);
+    let delta = root.join("empty-delta.json");
+    std::fs::write(
+        &delta,
+        serde_json::to_vec(&json!({
+            "schema_version":"rsia.revoke_delta.v1",
+            "base_manifest_sha256":hash(&raw),
+            "namespaces":manifest.watermarks.iter().map(|row| json!({
+                "namespace":row.namespace,"base_seq":row.seq,"base_digest":row.digest,
+                "events":[],"latest_seq":row.seq,"latest_digest":row.digest
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let dest = root.join("restored");
+    let output = Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg(RESTORE_SCRIPT)
+        .arg("--backup")
+        .arg(&backup)
+        .arg("--dest")
+        .arg(&dest)
+        .arg("--revoke-delta")
+        .arg(&delta)
+        .arg("--trusted-revocations-db")
+        .arg(&live)
+        .arg("--native-reader")
+        .arg(&inputs.reader)
+        .arg("--prepare-configs-file")
+        .arg(&inputs.originals)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        b"RESTORE_OK events=0 migrations_applied=none\n"
+    );
+    let receipt: Value =
+        serde_json::from_slice(&std::fs::read(dest.join("restore.json")).unwrap()).unwrap();
+    assert_eq!(receipt["schema_version"], "rsia.restore_receipt.v2");
+    assert_eq!(receipt["backup_manifest_sha256"], hash(&raw));
+    assert_eq!(receipt["replayed_revoke_events"], 0);
+    assert_eq!(receipt["isolated"], false);
+    assert_eq!(snapshot(&source_dir), live_before);
+    assert_eq!(snapshot(&backup), backup_before);
+
+    let restored_db = dest.join("rsia.sqlite3");
+    let restored = Store::open_with_prepare_configs(&restored_db, vec![config.clone()])
+        .await
+        .unwrap();
+    let reopened = HostService::new(restored.clone(), host).unwrap();
+    let replayed = reopened.prepare(&agent, request, &config).await.unwrap();
+    assert_eq!(
+        fingerprint(&replayed).unwrap(),
+        fingerprint(&prepared).unwrap()
+    );
+    inputs.close(restored, &restored_db).await;
+}
+
+// §18.4 replacements: raw preservation stays in the storage test; genuine
+// producer compatibility/admission is tested here. No physical legacy
+// event/evaluation business-source equivalence or paid/consumer credit is claimed.
+#[cfg(unix)]
+mod qualified_prefix_replacements {
+    use super::*;
+    const PYTHON: &str = r####"
+import fcntl, hashlib, json, os, pathlib, shutil, sqlite3, stat, sys
+database = pathlib.Path(sys.argv[1]).resolve()
+operation = sys.argv[2]
+arg = json.loads(sys.argv[3])
+def quoted(name):
+    return '"' + name.replace('"', '""') + '"'
+def readonly(path):
+    for suffix in ["-wal", "-shm", "-journal"]:
+        sidecar = pathlib.Path(str(path) + suffix)
+        assert not sidecar.exists() or suffix == "-wal" and sidecar.stat().st_size == 0, str(sidecar)
+    return sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)
+def schema(con):
+    return list(con.execute("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"))
+def names(con):
+    return [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+def columns(con, table, with_rowid=True):
+    result = [r[1] for r in con.execute("PRAGMA table_info(" + quoted(table) + ")")]
+    if with_rowid:
+        try:
+            con.execute("SELECT rowid FROM " + quoted(table) + " LIMIT 0")
+            result.insert(0, "rowid")
+        except sqlite3.OperationalError:
+            pass
+    return result
+def table_rows(con, table):
+    cols = columns(con, table)
+    return list(con.execute("SELECT " + ",".join(map(quoted, cols)) + " FROM " + quoted(table)))
+def inspect(con):
+    ledger = list(con.execute("SELECT quote(version),quote(description),quote(success),quote(checksum) FROM _sqlx_migrations ORDER BY version"))
+    tables = []
+    for table in names(con):
+        if table == "_sqlx_migrations":
+            continue
+        expressions = ",".join("quote(" + quoted(c) + ")" for c in columns(con, table))
+        rows = sorted(list(con.execute("SELECT " + expressions + " FROM " + quoted(table))))
+        tables.append([table, rows])
+    assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert not list(con.execute("PRAGMA foreign_key_check"))
+    timings = list(con.execute("SELECT version,CAST(installed_on AS TEXT),typeof(installed_on),execution_time,typeof(execution_time) FROM _sqlx_migrations ORDER BY version"))
+    return {"image":{"schema":schema(con),"ledger":ledger,"tables":tables},"timings":timings}
+def safe_copy_tree(source, dest):
+    if not source.exists():
+        return
+    for item in source.rglob("*"):
+        meta = item.lstat()
+        assert not stat.S_ISLNK(meta.st_mode)
+        assert stat.S_ISDIR(meta.st_mode) or stat.S_ISREG(meta.st_mode) and meta.st_nlink == 1
+    shutil.copytree(source, dest)
+def manifest_for(path, created_at):
+    con = readonly(path)
+    migrations = [{"version":v,"description":d,"checksum_hex":bytes(c).hex(),"success":bool(s)}
+        for v,d,c,s in con.execute("SELECT version,description,checksum,success FROM _sqlx_migrations ORDER BY version")]
+    watermarks = [{"namespace":n,"seq":s,"digest":d} for n,s,d in con.execute("SELECT namespace,seq,digest FROM revoke_watermark ORDER BY namespace")]
+    con.close()
+    data = path.read_bytes()
+    blobs = []
+    root = path.parent / "blobs"
+    if root.exists():
+        for item in sorted(root.rglob("*")):
+            if item.is_file():
+                body = item.read_bytes()
+                digest = hashlib.sha256(body).hexdigest()
+                assert item.name == digest
+                blobs.append({"path":item.relative_to(path.parent).as_posix(),"sha256":digest,"bytes":len(body)})
+    return {"schema_version":"rsia.backup.v2","complete":True,
+        "database":{"path":"rsia.sqlite3","sha256":hashlib.sha256(data).hexdigest(),"bytes":len(data)},
+        "blobs":blobs,"migrations":migrations,"watermarks":watermarks,"created_at":created_at}
+if operation == "inspect":
+    con = readonly(database)
+    result = inspect(con)
+    con.close()
+elif operation == "prefix":
+    source = readonly(database)
+    specs = arg["migrations"]
+    versions = arg["versions"]
+    assert versions in [[1,2,4,5],[1,2,4,5,6]]
+    ledger_columns = columns(source, "_sqlx_migrations")
+    ledger = list(source.execute("SELECT " + ",".join(map(quoted, ledger_columns)) + " FROM _sqlx_migrations ORDER BY version"))
+    by_name = lambda row:dict(zip(ledger_columns,row))
+    records = [by_name(r) for r in ledger]
+    assert [r["version"] for r in records] == [r["version"] for r in specs]
+    for actual, spec in zip(records, specs):
+        assert actual["description"] == spec["description"] and actual["success"] == 1
+        assert bytes(actual["checksum"]).hex() == hashlib.sha384(spec["sql"].encode()).hexdigest()
+    full = sqlite3.connect(":memory:")
+    for spec in specs:
+        full.executescript(spec["sql"])
+    destination = pathlib.Path(arg["dest"])
+    assert not destination.exists()
+    fd = os.open(destination, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
+    os.close(fd)
+    target = sqlite3.connect(destination)
+    target.execute("PRAGMA foreign_keys=OFF")
+    for spec in specs:
+        if spec["version"] in versions:
+            target.executescript(spec["sql"])
+    target.execute(source.execute("SELECT sql FROM sqlite_master WHERE name='_sqlx_migrations'").fetchone()[0])
+    expected_all = set(names(full)) | {"_sqlx_migrations"}
+    assert set(names(source)) == expected_all, "unclassified source table"
+    omitted = expected_all - set(names(target))
+    assert omitted == ({"revoke_cleanup_jobs","revoke_cleanup_frontier","revoke_cleanup_events"} if versions[-1] == 5 else set())
+    for table in omitted:
+        assert not table_rows(source, table), "nonempty later table: " + table
+    assert not source.execute("SELECT 1 FROM objects WHERE kind='formal_parent' LIMIT 1").fetchone()
+    for table in names(target):
+        assert columns(target, table) == columns(source, table), table
+        if table == "_sqlx_migrations":
+            cols = columns(target, table)
+            rows = [r for r in ledger if by_name(r)["version"] in versions]
+        elif table == "skill_fts" or table.startswith("skill_fts_"):
+            assert sorted(table_rows(source, table)) == sorted(table_rows(target, table)), "nonempty FTS needs explicit representation"
+            continue
+        else:
+            cols = columns(target, table)
+            rows = table_rows(source, table)
+        target.execute("DELETE FROM " + quoted(table))
+        if rows:
+            target.executemany("INSERT INTO " + quoted(table) + "(" + ",".join(map(quoted,cols)) + ") VALUES(" + ",".join("?" for c in cols) + ")", rows)
+    target.commit()
+    target.execute("PRAGMA foreign_keys=ON")
+    result = inspect(target)
+    assert [r[0] for r in target.execute("SELECT version FROM _sqlx_migrations ORDER BY version")] == versions
+    assert list(target.execute("SELECT " + ",".join(map(quoted, ledger_columns)) + " FROM _sqlx_migrations ORDER BY version")) == [r for r in ledger if by_name(r)["version"] in versions]
+    target.close()
+    full.close()
+    source.close()
+    safe_copy_tree(database.parent / "blobs", destination.parent / "blobs")
+elif operation == "copy":
+    destination = pathlib.Path(arg["dest"])
+    assert not destination.exists()
+    source = readonly(database)
+    fd = os.open(destination, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
+    os.close(fd)
+    target = sqlite3.connect(destination)
+    source.backup(target)
+    result = inspect(target)
+    target.close()
+    source.close()
+    safe_copy_tree(database.parent / "blobs", destination.parent / "blobs")
+elif operation == "manifest":
+    result = manifest_for(database, arg["created_at"])
+    fd = os.open(database.parent / "backup-manifest.json", os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
+    os.close(fd)
+elif operation == "fault":
+    meta = database.lstat()
+    assert stat.S_ISREG(meta.st_mode) and meta.st_nlink == 1 and meta.st_uid == os.getuid()
+    directory = os.open(database.parent, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        fcntl.flock(directory, fcntl.LOCK_EX|fcntl.LOCK_NB)
+        con = sqlite3.connect(database, isolation_level=None)
+        # This private, closed negative fixture may deliberately violate FK links.
+        # The production collector and every production guard remain unchanged.
+        con.execute("PRAGMA foreign_keys=OFF")
+        con.execute("BEGIN IMMEDIATE")
+        for sql in arg["sql"]:
+            cursor = con.execute(sql)
+            if sql.lstrip().upper().startswith("UPDATE"):
+                assert cursor.rowcount > 0, sql
+        con.execute("COMMIT")
+        con.close()
+    finally:
+        os.close(directory)
+    result = {"sha256":hashlib.sha256(database.read_bytes()).hexdigest(),"bytes":database.stat().st_size}
+else:
+    raise AssertionError(operation)
+print(json.dumps(result, ensure_ascii=False, separators=(",",":")))
+"####;
+
+    const VERSIONS: [i64; 6] = [1, 2, 4, 5, 6, 7];
+    const LEGACY_BLOB: &[u8] = b"legacy blob bytes";
+
+    fn migration_specs() -> Value {
+        json!([
+            {"version":1,"description":"runtime","sql":include_str!("../../evo-storage/migrations/0001_runtime.sql")},
+            {"version":2,"description":"revoke graph","sql":include_str!("../../evo-storage/migrations/0002_revoke_graph.sql")},
+            {"version":4,"description":"replay worlds","sql":include_str!("../../evo-storage/migrations/0004_replay_worlds.sql")},
+            {"version":5,"description":"root budget","sql":include_str!("../../evo-storage/migrations/0005_root_budget.sql")},
+            {"version":6,"description":"revoke cleanup","sql":include_str!("../../evo-storage/migrations/0006_revoke_cleanup.sql")},
+            {"version":7,"description":"formal parent kind","sql":include_str!("../../evo-storage/migrations/0007_formal_parent_kind.sql")}
+        ])
+    }
+
+    fn fixture_python(database: &Path, operation: &str, argument: Value) -> Value {
+        let output = Command::new("python3")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .arg("-c")
+            .arg(PYTHON)
+            .arg(database)
+            .arg(operation)
+            .arg(serde_json::to_string(&argument).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{operation}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty(), "{operation}: {:?}", output.stderr);
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    fn private_directory(root: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let path = root.join(name);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        path
+    }
+
+    fn inspect(database: &Path) -> Value {
+        fixture_python(database, "inspect", json!({}))
+    }
+
+    fn copy_database(source: &Path, root: &Path, name: &str) -> PathBuf {
+        let dest = private_directory(root, name).join("rsia.sqlite3");
+        fixture_python(source, "copy", json!({"dest":dest}));
+        dest
+    }
+
+    /// Current producer facts materialized into the actual older SQL schema.
+    /// This is a compatibility fixture, not a claim of old-version business origin.
+    /// Every original prefix ledger column is copied, and a nonempty later table,
+    /// unknown table, nonempty unhandled FTS state or formal_parent fails construction.
+    struct PrefixFixture {
+        base: Scenario,
+        versions: Vec<i64>,
+        prefix: PathBuf,
+        anchor: PathBuf,
+        reference: PathBuf,
+        backup: PathBuf,
+        manifest: Vec<u8>,
+        checksums: BTreeMap<i64, String>,
+        prepared: evo_core::Prepared,
+        host: Context,
+        agent: Context,
+        request: evo_core::Prepare,
+    }
+
+    impl PrefixFixture {
+        async fn new(versions: &[i64]) -> Self {
+            let mut base = Scenario::begin().await;
+            let store = base.inputs.open(&base.live).await;
+            let (prepared, host, agent, request) = base.inputs.prepare(&store).await;
+            assert_eq!(
+                store.put_blob(&admin(), LEGACY_BLOB).await.unwrap(),
+                hash(LEGACY_BLOB)
+            );
+            let capture = base.root.join("prefix-current-capture");
+            store.backup(&capture).await.unwrap();
+            base.inputs.close(store, &base.live).await;
+            base.manifest_bytes = std::fs::read(capture.join("backup-manifest.json")).unwrap();
+
+            let source_before = snapshot(base.live.parent().unwrap());
+            let prefix = private_directory(&base.root, "compat-prefix").join("rsia.sqlite3");
+            if versions == VERSIONS.as_slice() {
+                fixture_python(&base.live, "copy", json!({"dest":prefix}));
+            } else {
+                fixture_python(
+                    &base.live,
+                    "prefix",
+                    json!({
+                        "dest":prefix,"versions":versions,"migrations":migration_specs()
+                    }),
+                );
+            }
+            assert_eq!(snapshot(base.live.parent().unwrap()), source_before);
+            let prefix_before = snapshot(prefix.parent().unwrap());
+            let anchor = copy_database(&prefix, &base.root, "prefix-anchor");
+            let store = base.inputs.open(&anchor).await;
+            base.inputs.close(store, &anchor).await;
+            let reference = copy_database(&prefix, &base.root, "prefix-store-open");
+            let store = base.inputs.open(&reference).await;
+            base.inputs.close(store, &reference).await;
+            let backup_db = copy_database(&prefix, &base.root, "prefix-backup");
+            let backup = backup_db.parent().unwrap().to_path_buf();
+            let manifest_value = fixture_python(
+                &backup_db,
+                "manifest",
+                json!({"created_at":evo_core::now().unwrap()}),
+            );
+            let manifest = serde_json::to_vec_pretty(&manifest_value).unwrap();
+            std::fs::write(backup.join("backup-manifest.json"), &manifest).unwrap();
+            assert_eq!(snapshot(prefix.parent().unwrap()), prefix_before);
+            let genuine: BackupManifest = serde_json::from_slice(&base.manifest_bytes).unwrap();
+            let checksums = genuine
+                .migrations
+                .into_iter()
+                .map(|r| (r.version, r.checksum_hex))
+                .collect();
+            let compatible: BackupManifest = serde_json::from_slice(&manifest).unwrap();
+            assert_eq!(compatible.watermarks.len(), 1);
+            base.base = Some(compatible.watermarks[0].clone());
+            base.manifest_bytes = manifest.clone();
+            Self {
+                base,
+                versions: versions.to_vec(),
+                prefix,
+                anchor,
+                reference,
+                backup,
+                manifest,
+                checksums,
+                prepared,
+                host,
+                agent,
+                request,
+            }
+        }
+
+        fn checksum(&self, version: i64) -> String {
+            self.checksums[&version].clone()
+        }
+
+        fn restore(&self, name: &str, revocation: Option<&Revocation>) -> Restored {
+            let events = revocation.map_or(&[][..], std::slice::from_ref);
+            let delta = self.base.delta(&format!("{name}-delta.json"), events);
+            self.base
+                .restore_with_sources(name, &delta, &self.backup, &self.anchor)
+        }
+
+        async fn assert_success(&self, name: &str, revocation: Option<&Revocation>) {
+            let anchor_before = snapshot(self.anchor.parent().unwrap());
+            let backup_before = snapshot(&self.backup);
+            let prefix_before = snapshot(self.prefix.parent().unwrap());
+            let events = usize::from(revocation.is_some());
+            let applied = VERSIONS
+                .into_iter()
+                .filter(|version| !self.versions.contains(version))
+                .collect::<Vec<_>>();
+            let applied_text = if applied.is_empty() {
+                "none".into()
+            } else {
+                applied
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let result = self.restore(name, revocation);
+            result.assert_restored("qualified compatible prefix", events);
+            assert_eq!(
+                result.stdout,
+                format!("RESTORE_OK events={events} migrations_applied={applied_text}\n")
+            );
+            assert!(result.stderr.is_empty());
+            assert_eq!(snapshot(self.anchor.parent().unwrap()), anchor_before);
+            assert_eq!(snapshot(&self.backup), backup_before);
+            assert_eq!(snapshot(self.prefix.parent().unwrap()), prefix_before);
+
+            let mut entries = std::fs::read_dir(&result.dest)
+                .unwrap()
+                .map(|row| row.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            entries.sort();
+            let mut expected = vec!["blobs", "restore.json", "rsia.sqlite3"];
+            if !applied.is_empty() {
+                expected.push("restore.migrations.json");
+                expected.sort();
+            }
+            assert_eq!(entries, expected);
+            assert_eq!(
+                std::fs::read(
+                    result
+                        .dest
+                        .join(format!("blobs/{NS}/{}", hash(LEGACY_BLOB)))
+                )
+                .unwrap(),
+                LEGACY_BLOB
+            );
+            let receipt_text = std::fs::read_to_string(result.dest.join("restore.json")).unwrap();
+            let receipt = evo_storage::lifecycle::parse_strict_json(&receipt_text).unwrap();
+            let mut keys = receipt
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "backup_manifest_sha256",
+                    "isolated",
+                    "receipt_scope",
+                    "replayed_revoke_events",
+                    "schema_version",
+                    "trusted_anchor"
+                ]
+            );
+            let mut keys = receipt["trusted_anchor"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "control_plane_digest",
+                    "path_local_only",
+                    "scope",
+                    "verified_at",
+                    "watermarks"
+                ]
+            );
+            assert_eq!(receipt["schema_version"], "rsia.restore_receipt.v2");
+            assert_eq!(receipt["isolated"], false);
+            assert_eq!(receipt["receipt_scope"], "local_only_not_for_export");
+            assert_eq!(receipt["backup_manifest_sha256"], hash(&self.manifest));
+            assert_eq!(receipt["replayed_revoke_events"], events);
+            let data = read_control_plane_facts(&result.data()).await.unwrap();
+            let anchor = read_control_plane_facts(&self.anchor).await.unwrap();
+            assert_eq!(data, anchor);
+            assert_eq!(
+                data.watermarks
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                [NS]
+            );
+            for (namespace, mark) in &data.watermarks {
+                assert_eq!(
+                    receipt["trusted_anchor"]["watermarks"][namespace]["seq"],
+                    mark.seq
+                );
+                assert_eq!(
+                    receipt["trusted_anchor"]["watermarks"][namespace]["digest"],
+                    mark.digest
+                );
+            }
+            assert_eq!(
+                receipt["trusted_anchor"]["watermarks"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                data.watermarks.len()
+            );
+            assert!(
+                data.root_budget_tables
+                    .get("root_budgets")
+                    .is_some_and(|rows| rows.len() == 1)
+            );
+
+            let actual = inspect(&result.data());
+            let reference = inspect(&self.reference);
+            if revocation.is_none() {
+                assert_eq!(actual["image"]["schema"], reference["image"]["schema"]);
+                assert_eq!(actual["image"]["ledger"], reference["image"]["ledger"]);
+                assert_eq!(actual["image"]["tables"], reference["image"]["tables"]);
+                assert_eq!(actual["image"], reference["image"]);
+                assert_eq!(actual["image"], inspect(&self.anchor)["image"]);
+                assert_eq!(
+                    data,
+                    read_control_plane_facts(&self.reference).await.unwrap()
+                );
+            }
+            let old_timings = inspect(&self.backup.join("rsia.sqlite3"))["timings"]
+                .as_array()
+                .unwrap()
+                .clone();
+            assert_eq!(
+                &actual["timings"].as_array().unwrap()[..self.versions.len()],
+                old_timings.as_slice()
+            );
+            for row in &actual["timings"].as_array().unwrap()[self.versions.len()..] {
+                assert!(applied.contains(&row[0].as_i64().unwrap()));
+                assert_eq!(row[2], "text");
+                assert_eq!(row[4], "integer");
+                assert!(row[3].as_i64().unwrap() >= 0);
+            }
+            assert_eq!(
+                actual["image"]["ledger"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row[0].as_str().unwrap().parse::<i64>().unwrap())
+                    .collect::<Vec<_>>(),
+                VERSIONS
+            );
+            for row in actual["image"]["ledger"].as_array().unwrap() {
+                let version = row[0].as_str().unwrap().parse::<i64>().unwrap();
+                assert_eq!(row[2], "1");
+                assert_eq!(
+                    row[3].as_str().unwrap().to_ascii_lowercase(),
+                    format!("x'{}'", self.checksum(version))
+                );
+            }
+            let record_path = result.dest.join("restore.migrations.json");
+            if applied.is_empty() {
+                assert!(!record_path.exists());
+            } else {
+                let text = std::fs::read_to_string(record_path).unwrap();
+                assert!(text.ends_with('\n'));
+                let record = evo_storage::lifecycle::parse_strict_json(&text).unwrap();
+                let mut keys = record
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                keys.sort_unstable();
+                assert_eq!(
+                    keys,
+                    ["applied", "current_versions", "schema", "source_versions"]
+                );
+                let positions = ["schema", "source_versions", "applied", "current_versions"]
+                    .map(|key| text.find(&format!("\"{key}\":")).unwrap());
+                assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+                assert_eq!(
+                    record,
+                    json!({
+                        "schema":"rsia.restore_migrations.v1","source_versions":self.versions,
+                        "applied":applied.iter().map(|version| json!({
+                            "version":version,"checksum_sha384":self.checksum(*version)
+                        })).collect::<Vec<_>>(),"current_versions":VERSIONS,
+                    })
+                );
+            }
+            assert_eq!(
+                self.base
+                    .inputs
+                    .gate(&result.data(), Some(&self.anchor))
+                    .evaluate()
+                    .await
+                    .unwrap()
+                    .posture(),
+                RecoveryPosture::RestoredVerified
+            );
+            let before_open = inspect(&result.data());
+            let store = self.base.inputs.open(&result.data()).await;
+            let service =
+                evo_engine::service::HostService::new(store.clone(), self.host.clone()).unwrap();
+            let replayed = service
+                .prepare(&self.agent, self.request.clone(), &self.base.inputs.config)
+                .await
+                .unwrap();
+            assert_eq!(
+                fingerprint(&replayed).unwrap(),
+                fingerprint(&self.prepared).unwrap()
+            );
+            if let Some(event) = revocation {
+                let mut session = store.session().await.unwrap();
+                let replayed: RevokeTombstone = session
+                    .need(&admin(), "tombstone", &event.source)
+                    .await
+                    .unwrap();
+                assert_eq!(replayed.watermark_digest, event.digest);
+                assert_eq!(
+                    session.watermark(&admin()).await.unwrap(),
+                    Some((event.seq, event.digest.clone()))
+                );
+                session.commit().await.unwrap();
+                let status = LifecycleStore::cleanup_status(
+                    &admin(),
+                    &store,
+                    &format!(
+                        "revoke-{}",
+                        &fingerprint(&(
+                            NS,
+                            "run",
+                            &event.source,
+                            replayed.watermark_seq,
+                            &event.digest
+                        ))
+                        .unwrap()[..32]
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(status.state, CleanupState::Pending);
+                assert_eq!(
+                    data.tombstones[&(NS.to_owned(), event.source.clone())]["watermark_seq"],
+                    event.seq
+                );
+            }
+            self.base.inputs.close(store, &result.data()).await;
+            assert_eq!(inspect(&result.data()), before_open);
+        }
+
+        async fn begin_revoke(&self) -> Revocation {
+            let store = self.base.inputs.open(&self.anchor).await;
+            let status = LifecycleStore::begin_revoke(
+                &admin(),
+                &store,
+                TypedObjectRef {
+                    kind: "run".into(),
+                    id: REVOKED_RUN.into(),
+                },
+                "revoked after the upgrade",
+                evo_core::now().unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status.state, CleanupState::Pending);
+            let mut session = store.session().await.unwrap();
+            let tombstone: RevokeTombstone = session
+                .need(&admin(), "tombstone", REVOKED_RUN)
+                .await
+                .unwrap();
+            session.commit().await.unwrap();
+            self.base.inputs.close(store, &self.anchor).await;
+            Revocation {
+                source: REVOKED_RUN.into(),
+                seq: i64::try_from(tombstone.watermark_seq).unwrap(),
+                digest: tombstone.watermark_digest.clone(),
+                tombstone_digest: hash(&serde_json::to_vec(&tombstone).unwrap()),
+                reason: tombstone.reason.clone(),
+                created_at: tombstone.created_at,
+            }
+        }
+
+        fn select_backup_copy(&mut self, source: &Path, name: &str) {
+            let before = snapshot(source);
+            let database = copy_database(&source.join("rsia.sqlite3"), &self.base.root, name);
+            let directory = database.parent().unwrap().to_path_buf();
+            let manifest = std::fs::read(source.join("backup-manifest.json")).unwrap();
+            std::fs::copy(
+                source.join("backup-manifest.json"),
+                directory.join("backup-manifest.json"),
+            )
+            .unwrap();
+            assert_eq!(snapshot(&directory), before);
+            assert_eq!(snapshot(source), before);
+            self.backup = directory;
+            self.manifest = manifest;
+            self.base.manifest_bytes = self.manifest.clone();
+        }
+
+        async fn capture_pending_current(&mut self) {
+            assert_eq!(self.versions, VERSIONS);
+            let _event = self.begin_revoke().await;
+            let store = self.base.inputs.open(&self.anchor).await;
+            let backup = self.base.root.join("pending-current-backup");
+            store.backup(&backup).await.unwrap();
+            self.base.inputs.close(store, &self.anchor).await;
+            self.backup = backup;
+            self.manifest = std::fs::read(self.backup.join("backup-manifest.json")).unwrap();
+            let manifest: BackupManifest = serde_json::from_slice(&self.manifest).unwrap();
+            self.base.base = Some(
+                manifest
+                    .watermarks
+                    .into_iter()
+                    .find(|r| r.namespace == NS)
+                    .unwrap(),
+            );
+            self.base.manifest_bytes = self.manifest.clone();
+            self.reference = copy_database(&self.anchor, &self.base.root, "pending-reference");
+            self.prefix = copy_database(&self.anchor, &self.base.root, "pending-prefix");
+        }
+
+        fn fault(&mut self, sql: &[&str], edit: impl FnOnce(&mut Value)) {
+            let path = self.backup.join("rsia.sqlite3");
+            if !sql.is_empty() {
+                fixture_python(&path, "fault", json!({"sql":sql}));
+            }
+            let mut document: Value = serde_json::from_slice(&self.manifest).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            document["database"]["sha256"] = json!(hash(&bytes));
+            document["database"]["bytes"] = json!(bytes.len());
+            edit(&mut document);
+            self.manifest = serde_json::to_vec_pretty(&document).unwrap();
+            self.base.manifest_bytes = self.manifest.clone();
+            std::fs::write(self.backup.join("backup-manifest.json"), &self.manifest).unwrap();
+        }
+
+        fn assert_refused(&self, name: &str, reason: &str) {
+            let anchor_before = snapshot(self.anchor.parent().unwrap());
+            let backup_before = snapshot(&self.backup);
+            let prefix_before = snapshot(self.prefix.parent().unwrap());
+            let result = self.restore(name, None);
+            assert_eq!(result.code, Some(1), "{}", result.output());
+            assert_eq!(result.stderr, format!("ISOLATE {reason}; not mounting\n"));
+            assert!(result.stdout.is_empty() && !result.dest.exists());
+            let staging = format!(".{name}.restore-");
+            assert!(!std::fs::read_dir(&self.base.root).unwrap().any(|row| {
+                row.unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&staging)
+            }));
+            assert_eq!(snapshot(self.anchor.parent().unwrap()), anchor_before);
+            assert_eq!(snapshot(&self.backup), backup_before);
+            assert_eq!(snapshot(self.prefix.parent().unwrap()), prefix_before);
+        }
+    }
+
+    // Original restore_prefix_upgrade_v42.rs mapping:
+    // upgrade_matches_store_open's raw rows/timings/checksums stay in storage.
+    // Its qualified restore/receipt/anchor/gate/no-further-upgrade assertions
+    // are exercised here over genuine producers, without claiming legacy
+    // physical event/evaluation business-source equivalence.
+    #[tokio::test]
+    async fn real_producer_prefix_0005_restores_like_store_open() {
+        PrefixFixture::new(&[1, 2, 4, 5])
+            .await
+            .assert_success("restored-prefix-five", None)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn real_producer_prefix_0006_restores_like_store_open() {
+        PrefixFixture::new(&[1, 2, 4, 5, 6])
+            .await
+            .assert_success("restored-prefix-six", None)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn real_producer_prefix_0005_replays_later_revocation() {
+        let fixture = PrefixFixture::new(&[1, 2, 4, 5]).await;
+        fixture
+            .assert_success("healthy-before-revocation", None)
+            .await;
+        let event = fixture.begin_revoke().await;
+        fixture
+            .assert_success("restored-later-revocation", Some(&event))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn real_producer_current_backup_applies_no_migration() {
+        let current = PrefixFixture::new(&VERSIONS).await;
+        current.assert_success("restored-current", None).await;
+        let five = PrefixFixture::new(&[1, 2, 4, 5]).await;
+        let six = PrefixFixture::new(&[1, 2, 4, 5, 6]).await;
+        let late = PrefixFixture::new(&[1, 2, 4, 5]).await;
+        five.assert_success("python-five-control", None).await;
+        six.assert_success("python-six-control", None).await;
+        late.assert_success("python-late-before", None).await;
+        let event = late.begin_revoke().await;
+        late.assert_success("python-late-control", Some(&event))
+            .await;
+        let entry = |f: &PrefixFixture, event: Option<&Revocation>| {
+            assert_eq!(
+                std::fs::read(&f.base.inputs.originals).unwrap(),
+                std::fs::read(&current.base.inputs.originals).unwrap()
+            );
+            let delta = f.base.delta(
+                "python-empty-or-late.json",
+                event.map_or(&[][..], std::slice::from_ref),
+            );
+            json!({"prefix":f.prefix,"anchor":f.anchor,"backup":f.backup,
+                "reference":f.reference,"delta":delta})
+        };
+        let fixtures = json!({"5":entry(&five,None),"6":entry(&six,None),
+            "current":entry(&current,None),"late":entry(&late,Some(&event))});
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(current.base.root.join("python-fixtures.json"))
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&fixtures).unwrap())
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let before = [&five, &six, &current, &late].map(|f| {
+            (
+                snapshot(f.prefix.parent().unwrap()),
+                snapshot(f.anchor.parent().unwrap()),
+                snapshot(&f.backup),
+            )
+        });
+        let output = Command::new("python3")
+            .arg("-B")
+            .args(["-m", "unittest", "-v", "scripts.test_restore_backup"])
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("RSIA_TEST_NATIVE_READER", &current.base.inputs.reader)
+            .env(
+                "RSIA_TEST_PREPARE_CONFIGS_FILE",
+                &current.base.inputs.originals,
+            )
+            .env("RSIA_TEST_RESTORE_FIXTURE_ROOT", &current.base.root)
+            .output()
+            .unwrap();
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "{:?}", output);
+        assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+        let terminal = String::from_utf8(output.stderr).unwrap();
+        assert!(terminal.contains("\nRan 18 tests in "));
+        assert!(terminal.ends_with("\nOK\n"));
+        assert_eq!(
+            [&five, &six, &current, &late].map(|f| (
+                snapshot(f.prefix.parent().unwrap()),
+                snapshot(f.anchor.parent().unwrap()),
+                snapshot(&f.backup)
+            )),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn every_original_ledger_fault_has_an_independently_healthy_control() {
+        const NOT_A_PREFIX: &str =
+            "unsupported manifest migrations: not a prefix of the current migration set";
+        const PREDATES: &str =
+            "backup predates the root budget ledger (0005); protected facts cannot be verified";
+        let mut six = PrefixFixture::new(&[1, 2, 4, 5, 6]).await;
+        let six_backup = six.backup.clone();
+        let mut current = PrefixFixture::new(&VERSIONS).await;
+        let current_backup = current.backup.clone();
+        for name in [
+            "gap",
+            "predates",
+            "future",
+            "short-manifest",
+            "long-manifest",
+            "checksum",
+            "checksum-db",
+            "unsuccessful",
+            "unsuccessful-db",
+            "stale-anchor",
+            "conflict",
+        ] {
+            let fixture = if matches!(name, "gap" | "predates" | "future" | "short-manifest") {
+                current.select_backup_copy(&current_backup, &format!("ledger-{name}-backup"));
+                &mut current
+            } else {
+                six.select_backup_copy(&six_backup, &format!("ledger-{name}-backup"));
+                &mut six
+            };
+            fixture
+                .assert_success(&format!("healthy-before-{name}"), None)
+                .await;
+            let reason = match name {
+                "gap" => {
+                    fixture.fault(&["DELETE FROM _sqlx_migrations WHERE version=6"], |m| {
+                        m["migrations"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|r| r["version"] != 6)
+                    });
+                    NOT_A_PREFIX
+                }
+                "predates" => {
+                    fixture.fault(&["DELETE FROM _sqlx_migrations WHERE version>=5"], |m| {
+                        m["migrations"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|r| r["version"].as_i64().unwrap() < 5)
+                    });
+                    PREDATES
+                }
+                "future" => {
+                    fixture.fault(
+                        &["INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time) VALUES(999,'future',TRUE,zeroblob(48),0)"],
+                        |m| m["migrations"].as_array_mut().unwrap().push(json!({
+                            "version":999,"description":"future","checksum_hex":"00".repeat(48),"success":true,
+                        })),
+                    );
+                    NOT_A_PREFIX
+                }
+                "short-manifest" => {
+                    fixture.fault(&[], |m| {
+                        m["migrations"].as_array_mut().unwrap().pop();
+                    });
+                    "backup database migrations differ from its manifest"
+                }
+                "long-manifest" => {
+                    let checksum = fixture.checksum(7);
+                    fixture.fault(&[], |m| m["migrations"].as_array_mut().unwrap().push(json!({
+                        "version":7,"description":"formal parent kind","checksum_hex":checksum,"success":true,
+                    })));
+                    "backup database migrations differ from its manifest"
+                }
+                "checksum" => {
+                    let tamper =
+                        "UPDATE _sqlx_migrations SET checksum=zeroblob(48) WHERE version=1";
+                    fixture.fault(&[tamper], |m| {
+                        m["migrations"][0]["checksum_hex"] = json!("00".repeat(48))
+                    });
+                    "manifest migration checksums differ from current code"
+                }
+                "checksum-db" => {
+                    let tamper =
+                        "UPDATE _sqlx_migrations SET checksum=zeroblob(48) WHERE version=1";
+                    fixture.fault(&[tamper], |_| {});
+                    "native restore refused: clock_regressed"
+                }
+                "unsuccessful" => {
+                    let failed = "UPDATE _sqlx_migrations SET success=0 WHERE version=5";
+                    fixture.fault(&[failed], |m| m["migrations"][3]["success"] = json!(false));
+                    "migration is not successful"
+                }
+                "unsuccessful-db" => {
+                    let failed = "UPDATE _sqlx_migrations SET success=0 WHERE version=5";
+                    fixture.fault(&[failed], |_| {});
+                    "native restore refused: clock_regressed"
+                }
+                "stale-anchor" => {
+                    let original = fixture.anchor.clone();
+                    fixture.anchor =
+                        copy_database(&fixture.prefix, &fixture.base.root, "stale-live");
+                    fixture.assert_refused(
+                        "restored-stale-anchor",
+                        "database migration checksums differ from current code",
+                    );
+                    fixture.anchor = original;
+                    continue;
+                }
+                "conflict" => {
+                    fixture.fault(&["CREATE TABLE objects_formal_parent(x)"], |_| {});
+                    let refused = copy_database(
+                        &fixture.backup.join("rsia.sqlite3"),
+                        &fixture.base.root,
+                        "conflict-store-open",
+                    );
+                    let before = snapshot(refused.parent().unwrap());
+                    match Store::open_with_prepare_configs(
+                        &refused,
+                        vec![fixture.base.inputs.config.clone()],
+                    )
+                    .await
+                    {
+                        Err(evo_core::Error::ClockRegressed) => {}
+                        Err(error) => panic!("unexpected refusal: {error:?}"),
+                        Ok(store) => {
+                            fixture.base.inputs.close(store, &refused).await;
+                            panic!("Store::open applied 0007 over a conflicting table");
+                        }
+                    }
+                    assert_eq!(snapshot(refused.parent().unwrap()), before);
+                    "native restore refused: clock_regressed"
+                }
+                _ => unreachable!(),
+            };
+            fixture.assert_refused(&format!("restored-{name}"), reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn each_unqualified_legacy_family_is_refused_without_another_bad_family_masking_it() {
+        let mut fixture = PrefixFixture::new(&[1, 2, 4, 5, 6]).await;
+        let original = fixture.backup.clone();
+        for (name, sql) in [
+            (
+                "audit",
+                "UPDATE audit SET payload=' { \"event\" : \"old\" } ',previous_hash='previous',digest='digest' WHERE seq=(SELECT MIN(seq) FROM audit)",
+            ),
+            (
+                "world",
+                "UPDATE replay_worlds SET manifest=' { \"sealed\" : true } ' WHERE id='world-select'",
+            ),
+            (
+                "root",
+                "UPDATE root_budgets SET authorization_receipt_digest='authorization' WHERE billing_scope='economic-scope'",
+            ),
+            (
+                "group",
+                "UPDATE root_budget_dispatch_groups SET owner_namespace='legacy-a' WHERE dispatch_group_id='group-fixed'",
+            ),
+            (
+                "call",
+                "UPDATE root_budget_calls SET actual_input_digest='input' WHERE call_id='fixed-call'",
+            ),
+            (
+                "typed-ledger",
+                "INSERT INTO objects(namespace,kind,id,owner,body) VALUES('legacy-a','artifact','ledger-1','admin','{\"id\":\"ledger-1\",\"schema_version\":\"rsia.typed_artifact_envelope.v1\",\"record_kind\":\"exposure_ledger_v1\",\"payload\":{\"spent\":1}}')",
+            ),
+            (
+                "evaluation",
+                "INSERT INTO objects(rowid,namespace,kind,id,owner,body,revision) VALUES(970,'legacy-b','evaluation','eval-1','admin','{\"id\":\"eval-1\",\"score\":0.5}',7)",
+            ),
+        ] {
+            fixture.select_backup_copy(&original, &format!("family-{name}-backup"));
+            fixture
+                .assert_success(&format!("healthy-before-{name}"), None)
+                .await;
+            fixture.fault(&[sql], |_| {});
+            fixture.assert_refused(
+                &format!("refused-{name}"),
+                "native restore refused: clock_regressed",
+            );
+        }
+        for kind in ["run", "event", "release", "receipt", "candidate"] {
+            fixture.select_backup_copy(&original, &format!("bare-{kind}-backup"));
+            fixture
+                .assert_success(&format!("healthy-before-bare-{kind}"), None)
+                .await;
+            let id = if kind == "run" { "run-1" } else { "shared" };
+            let sql = format!(
+                "INSERT INTO objects(namespace,kind,id,owner,body,revision) VALUES('legacy-a','{kind}','{id}','owner-0',' {{ \"id\" : \"{id}\", \"kind\" : \"{kind}\", \"state\" : \"queued\" }} ',2)"
+            );
+            fixture.fault(&[&sql], |_| {});
+            fixture.assert_refused(
+                &format!("refused-bare-{kind}"),
+                "native restore refused: clock_regressed",
+            );
+        }
+        // feedback/pointer/dataset/budget/reservation/job/improvement and plain
+        // artifact do not become authorized business evidence by parsing. Their
+        // exact original seed bytes remain in the storage mechanical tests.
+    }
+
+    #[tokio::test]
+    async fn cleanup_identity_faults_are_not_hidden_by_an_invalid_placeholder_job() {
+        let mut fixture = PrefixFixture::new(&VERSIONS).await;
+        fixture.capture_pending_current().await;
+        let original = fixture.backup.clone();
+        for (name, sql) in [
+            (
+                "job",
+                "UPDATE revoke_cleanup_jobs SET watermark_digest='watermark'",
+            ),
+            (
+                "frontier",
+                "UPDATE revoke_cleanup_frontier SET job_id='cleanup' WHERE seq=(SELECT MIN(seq) FROM revoke_cleanup_frontier)",
+            ),
+            (
+                "event",
+                "UPDATE revoke_cleanup_events SET job_id='cleanup' WHERE seq=(SELECT MIN(seq) FROM revoke_cleanup_events)",
+            ),
+        ] {
+            fixture.select_backup_copy(&original, &format!("cleanup-{name}-backup"));
+            fixture
+                .assert_success(&format!("healthy-before-cleanup-{name}"), None)
+                .await;
+            fixture.fault(&[sql], |_| {});
+            fixture.assert_refused(
+                &format!("refused-cleanup-{name}"),
+                "native restore refused: clock_regressed",
+            );
+        }
+        // Ordinary valid JSON details such as { "old" : true } are not claimed
+        // invalid on their own. The originals stay mechanically preserved; no
+        // current consumer, provider, paid capability or deletion proof is added.
+    }
 }

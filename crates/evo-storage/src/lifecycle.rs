@@ -4,10 +4,1192 @@ use super::{Store, internal};
 use evo_core::{Context, Error, Result, Role, fingerprint, identifier};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{ConnectOptions, Connection, Row, sqlite::SqliteConnectOptions};
+use sqlx::sqlite::SqliteTransactionManager;
+use sqlx::{ConnectOptions, Connection, Row, TransactionManager};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+// Directory authority and original-source readers are intentionally non-Serde.
+// A filesystem path or a missing lock file is never a stability capability.
+use crate::owned_occurrence::{PreparePreimages, collect_floor_rusqlite};
+use crate::write_clock::OperationClock;
+use evo_core::clock::WallClock;
+use evo_core::prepare_contract::HostPrepareConfig;
+use rusqlite::{Connection as ReadConnection, OpenFlags, TransactionBehavior, config::DbConfig};
+use std::fs::{File, OpenOptions, TryLockError};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+
+const WRITER_LOCK_NAME: &str = ".rsia.lock";
+type DirectoryOwners = Mutex<BTreeMap<PathBuf, Weak<DirectoryWriterGuard>>>;
+static DIRECTORY_OWNERS: OnceLock<DirectoryOwners> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+enum AcquireMode {
+    SharedStore,
+    NewMount,
+}
+
+fn directory_owners() -> &'static DirectoryOwners {
+    DIRECTORY_OWNERS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn data_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// A real process-owned OS writer lock. Its weak registry never extends its
+/// lifetime: Store/operation/close owners retain their own Arc until native
+/// shutdown. A close followed by reopen must not be prevented by a dead entry.
+#[derive(Debug)]
+pub struct DirectoryWriterGuard {
+    directory: PathBuf,
+    _directory_file: Arc<File>,
+    _legacy_file: Arc<File>,
+    activity: Arc<RwLock<()>>,
+}
+
+/// One writer operation's lifetime, including rollback and native close.
+/// Nested work in that operation clones this capability instead of acquiring
+/// the lock again. This conveys lifetime only, never role or data provenance.
+#[derive(Debug, Clone)]
+pub struct WriterActivity {
+    _inner: Arc<WriterActivityInner>,
+}
+
+impl WriterActivity {
+    pub(super) fn belongs_to(&self, owner: &Arc<DirectoryWriterGuard>) -> bool {
+        Arc::ptr_eq(&self._inner._directory, owner)
+    }
+}
+
+#[derive(Debug)]
+struct WriterActivityInner {
+    _directory: Arc<DirectoryWriterGuard>,
+    _activity: OwnedRwLockReadGuard<()>,
+}
+
+#[derive(Debug)]
+pub struct StableReadScope {
+    _directory: Arc<DirectoryWriterGuard>,
+    _activity: OwnedRwLockWriteGuard<()>,
+}
+
+impl DirectoryWriterGuard {
+    /// Compatibility signature; production uses acquire_checked so Clock
+    /// remains typed instead of being converted into an I/O diagnostic.
+    pub fn acquire(data: &Path) -> std::io::Result<Arc<Self>> {
+        Self::acquire_checked(data, &[]).map_err(|error| {
+            let kind = match &error {
+                Error::Conflict(_) => std::io::ErrorKind::WouldBlock,
+                Error::Invalid(_) => std::io::ErrorKind::InvalidInput,
+                _ => std::io::ErrorKind::Other,
+            };
+            std::io::Error::new(kind, error)
+        })
+    }
+
+    pub fn acquire_checked(data: &Path, candidates: &[HostPrepareConfig]) -> Result<Arc<Self>> {
+        Self::acquire_checked_with_clock(data, candidates, &WallClock::system())
+    }
+
+    /// The trusted Store factory supplies the exact reader before opening any
+    /// native handle. Neither a wire value nor an existing Store can replace it.
+    pub(super) fn acquire_checked_with_clock(
+        data: &Path,
+        candidates: &[HostPrepareConfig],
+        clock: &WallClock,
+    ) -> Result<Arc<Self>> {
+        Self::acquire_mode(data, candidates, AcquireMode::SharedStore, clock)
+    }
+
+    /// A distinct production mount cannot reuse another mount's authority.
+    /// Stores inside that mount share the actual guard through open_locked.
+    pub fn acquire_new_mount_checked(
+        data: &Path,
+        candidates: &[HostPrepareConfig],
+    ) -> Result<Arc<Self>> {
+        Self::acquire_mode(
+            data,
+            candidates,
+            AcquireMode::NewMount,
+            &WallClock::system(),
+        )
+    }
+
+    fn acquire_mode(
+        data: &Path,
+        candidates: &[HostPrepareConfig],
+        mode: AcquireMode,
+        source: &WallClock,
+    ) -> Result<Arc<Self>> {
+        if !cfg!(any(target_os = "macos", target_os = "linux")) {
+            return Err(Error::Invalid(
+                "unsupported data-directory locking platform".into(),
+            ));
+        }
+        // No mkdir or compatibility-lock create precedes this original-source
+        // qualification and fresh system sample.
+        readonly_wall_seconds_with_clock(data, candidates, &[], source)?;
+        let parent = data_parent(data);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(internal)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(parent).map_err(internal)?;
+        let directory = parent.canonicalize().map_err(internal)?;
+        let mut owners = directory_owners().lock().map_err(internal)?;
+        if let Some(existing) = owners.get(&directory).and_then(Weak::upgrade) {
+            if matches!(mode, AcquireMode::NewMount) {
+                return Err(Error::Conflict(
+                    "data directory already has a mounted writer owner".into(),
+                ));
+            }
+            if !existing.matches_data(data) {
+                return Err(Error::ClockRegressed);
+            }
+            drop(owners);
+            // An existing owner may have active writers. Use the normal
+            // activity-aware reader, never manufacture a stable heap scope.
+            readonly_wall_seconds_with_clock(data, candidates, &[], source)?;
+            return Ok(existing);
+        }
+        let directory_file = Arc::new(File::open(&directory).map_err(internal)?);
+        try_exclusive(&directory_file).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                Error::Conflict("data directory is already locked by another RSIA process".into())
+            } else {
+                internal(error)
+            }
+        })?;
+        // Retain an existing compatibility lock before treating the original
+        // source as stable. Opening it never creates a directory member.
+        let existing_legacy = existing_legacy_lock(&directory, true)?.map(Arc::new);
+        // This private capability can only be minted after both real OS lock
+        // checks. It is neither registered nor returned to callers.
+        let source_scope = LockedOriginalSource {
+            directory: &directory,
+            file: &directory_file,
+            legacy: existing_legacy.as_ref(),
+        };
+        readonly_wall_seconds_scoped(data, candidates, &[], Some(&source_scope), source)?;
+        // Full floor + fresh system wall time were just rechecked under that
+        // same lock, before the first compatibility-lock member is created.
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+        }
+        let legacy_file = match existing_legacy {
+            Some(file) => file,
+            None => {
+                let file = options
+                    .open(directory.join(WRITER_LOCK_NAME))
+                    .map_err(internal)?;
+                try_exclusive(&file).map_err(lock_error)?;
+                Arc::new(file)
+            }
+        };
+        if !same_directory(&directory_file, &directory).map_err(internal)?
+            || !same_regular_file(&legacy_file, &directory.join(WRITER_LOCK_NAME))
+                .map_err(internal)?
+        {
+            return Err(Error::ClockRegressed);
+        }
+        let guard = Arc::new(Self {
+            directory: directory.clone(),
+            _directory_file: directory_file,
+            _legacy_file: legacy_file,
+            activity: Arc::new(RwLock::new(())),
+        });
+        owners.insert(directory, Arc::downgrade(&guard));
+        Ok(guard)
+    }
+
+    pub fn matches_data(&self, data: &Path) -> bool {
+        data_parent(data).canonicalize().is_ok_and(|directory| {
+            directory == self.directory
+                && same_directory(&self._directory_file, &directory).unwrap_or(false)
+                && same_regular_file(&self._legacy_file, &directory.join(WRITER_LOCK_NAME))
+                    .unwrap_or(false)
+        })
+    }
+
+    pub async fn write_scope(self: &Arc<Self>) -> WriterActivity {
+        let activity = Arc::clone(&self.activity).read_owned().await;
+        WriterActivity {
+            _inner: Arc::new(WriterActivityInner {
+                _directory: Arc::clone(self),
+                _activity: activity,
+            }),
+        }
+    }
+
+    pub async fn stable_read_scope(self: &Arc<Self>) -> StableReadScope {
+        let activity = Arc::clone(&self.activity).write_owned().await;
+        StableReadScope {
+            _directory: Arc::clone(self),
+            _activity: activity,
+        }
+    }
+
+    pub fn try_stable_read_scope(self: &Arc<Self>) -> Option<StableReadScope> {
+        Arc::clone(&self.activity)
+            .try_write_owned()
+            .ok()
+            .map(|activity| StableReadScope {
+                _directory: Arc::clone(self),
+                _activity: activity,
+            })
+    }
+}
+
+fn try_exclusive(file: &File) -> std::io::Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "data directory is held by a live writer",
+        )),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+fn lock_error(error: std::io::Error) -> Error {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Error::Conflict("data directory is already locked by another RSIA process".into())
+    } else {
+        internal(error)
+    }
+}
+
+fn existing_legacy_lock(directory: &Path, exclusive: bool) -> Result<Option<File>> {
+    let path = directory.join(WRITER_LOCK_NAME);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(Error::ClockRegressed),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(Error::ClockRegressed),
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+    let file = options.open(&path).map_err(|_| Error::ClockRegressed)?;
+    if exclusive {
+        try_exclusive(&file).map_err(lock_error)?;
+    } else {
+        match file.try_lock_shared() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(Error::Conflict(
+                    "data directory is held by a live writer".into(),
+                ));
+            }
+            Err(TryLockError::Error(_)) => return Err(Error::ClockRegressed),
+        }
+    }
+    if !same_regular_file(&file, &path).map_err(|_| Error::ClockRegressed)? {
+        return Err(Error::ClockRegressed);
+    }
+    Ok(Some(file))
+}
+
+#[derive(Debug)]
+enum StableSource {
+    Process {
+        scope: StableReadScope,
+    },
+    External {
+        directory: PathBuf,
+        file: Arc<File>,
+        legacy: Option<Arc<File>>,
+    },
+}
+
+impl StableSource {
+    fn recheck(&self, data: &Path) -> Result<()> {
+        match self {
+            Self::Process { scope } if scope._directory.matches_data(data) => Ok(()),
+            Self::Process { .. } => Err(Error::ClockRegressed),
+            Self::External {
+                directory,
+                file,
+                legacy,
+            } => LockedOriginalSource {
+                directory,
+                file,
+                legacy: legacy.as_ref(),
+            }
+            .recheck(data),
+        }
+    }
+}
+
+fn source_stability(data: &Path) -> Result<Option<StableSource>> {
+    let directory = data_parent(data)
+        .canonicalize()
+        .map_err(|_| Error::ClockRegressed)?;
+    let existing = directory_owners()
+        .lock()
+        .map_err(|_| Error::ClockRegressed)?
+        .get(&directory)
+        .and_then(Weak::upgrade);
+    if let Some(owner) = existing {
+        if !owner.matches_data(data) {
+            return Err(Error::ClockRegressed);
+        }
+        return Ok(owner
+            .try_stable_read_scope()
+            .map(|scope| StableSource::Process { scope }));
+    }
+    let directory_file = Arc::new(File::open(&directory).map_err(|_| Error::ClockRegressed)?);
+    match directory_file.try_lock_shared() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Error(_)) => return Err(Error::ClockRegressed),
+    }
+    // Positive directory-fd locking is required even when .rsia.lock is absent.
+    let legacy = match existing_legacy_lock(&directory, false) {
+        Ok(legacy) => legacy.map(Arc::new),
+        Err(Error::Conflict(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let stable = StableSource::External {
+        directory,
+        file: directory_file,
+        legacy,
+    };
+    stable.recheck(data)?;
+    Ok(Some(stable))
+}
+
+struct LockedOriginalSource<'a> {
+    directory: &'a Path,
+    file: &'a Arc<File>,
+    legacy: Option<&'a Arc<File>>,
+}
+
+fn same_directory(file: &File, path: &Path) -> std::io::Result<bool> {
+    same_member(file, path, true)
+}
+
+fn same_regular_file(file: &File, path: &Path) -> std::io::Result<bool> {
+    same_member(file, path, false)
+}
+
+fn same_member(file: &File, path: &Path, directory: bool) -> std::io::Result<bool> {
+    let retained = file.metadata()?;
+    let current = std::fs::symlink_metadata(path)?;
+    let kinds_match = if directory {
+        current.is_dir() && retained.is_dir()
+    } else {
+        current.is_file() && retained.is_file()
+    };
+    if current.file_type().is_symlink() || !kinds_match {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(retained.dev() == current.dev() && retained.ino() == current.ino())
+    }
+    #[cfg(not(unix))]
+    Ok(false)
+}
+
+impl LockedOriginalSource<'_> {
+    fn retain_after_failed_close(&self) {
+        // Exceptional native close failure has no terminal credit. Keep the
+        // actual locked file descriptions alive, not a path or a copied bool.
+        std::mem::forget(Arc::clone(self.file));
+        if let Some(legacy) = self.legacy {
+            std::mem::forget(Arc::clone(legacy));
+        }
+    }
+
+    fn recheck(&self, data: &Path) -> Result<()> {
+        let directory = data_parent(data)
+            .canonicalize()
+            .map_err(|_| Error::ClockRegressed)?;
+        if directory != self.directory
+            || !same_directory(self.file, &directory).map_err(|_| Error::ClockRegressed)?
+        {
+            return Err(Error::ClockRegressed);
+        }
+        if let Some(legacy) = self.legacy
+            && !same_regular_file(legacy, &directory.join(WRITER_LOCK_NAME))
+                .map_err(|_| Error::ClockRegressed)?
+        {
+            return Err(Error::ClockRegressed);
+        }
+        Ok(())
+    }
+}
+
+fn sidecar_path(data: &Path, suffix: &str) -> PathBuf {
+    let mut path = data.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn regular_source_member(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => Err(Error::ClockRegressed),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(Error::ClockRegressed),
+    }
+}
+
+#[cfg(unix)]
+fn original_read_shm_uri(path: &Path) -> Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    if !path.is_absolute() || bytes.contains(&0) {
+        return Err(Error::ClockRegressed);
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut uri = String::from("file://");
+    for &byte in bytes {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push(char::from(HEX[usize::from(byte >> 4)]));
+            uri.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    uri.push_str("?readonly_shm=1");
+    Ok(uri)
+}
+
+#[cfg(not(unix))]
+fn original_read_shm_uri(_path: &Path) -> Result<String> {
+    Err(Error::Invalid("unsupported read-only platform".into()))
+}
+
+struct OriginalReadCloseAck(());
+
+struct OriginalReadStabilityUntilAck<'a, 'b> {
+    scope: Option<&'a LockedOriginalSource<'b>>,
+    stability: Option<StableSource>,
+    // Lifetime only: this does not make the directory static, select heap SHM,
+    // take the writer activity barrier, or grant content/role authority.
+    mount_lifetime: Option<Arc<DirectoryWriterGuard>>,
+}
+
+impl OriginalReadStabilityUntilAck<'_, '_> {
+    fn acknowledged(&mut self, _ack: OriginalReadCloseAck) {
+        self.scope = None;
+        drop(self.stability.take());
+        drop(self.mount_lifetime.take());
+    }
+}
+
+impl Drop for OriginalReadStabilityUntilAck<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope.take() {
+            scope.retain_after_failed_close();
+        }
+        std::mem::forget(self.stability.take());
+        std::mem::forget(self.mount_lifetime.take());
+    }
+}
+
+struct OriginalReadOwner<'a, 'b> {
+    connection: Option<ReadConnection>,
+    source: OriginalReadStabilityUntilAck<'a, 'b>,
+    close_ack: Option<OriginalReadCloseAck>,
+    close_error: Option<rusqlite::Error>,
+}
+
+impl OriginalReadOwner<'_, '_> {
+    fn close_native(&mut self) -> Result<()> {
+        let connection = self.connection.take().ok_or(Error::ClockRegressed)?;
+        match connection.close() {
+            Ok(()) => {
+                self.close_ack = Some(OriginalReadCloseAck(()));
+                Ok(())
+            }
+            Err((connection, error)) => {
+                std::mem::forget(connection);
+                self.close_error = Some(error);
+                Err(Error::ClockRegressed)
+            }
+        }
+    }
+}
+
+impl Drop for OriginalReadOwner<'_, '_> {
+    fn drop(&mut self) {
+        if self.connection.is_some() && self.close_native().is_err() {
+            return;
+        }
+        if let Some(ack) = self.close_ack.take() {
+            self.source.acknowledged(ack);
+        }
+    }
+}
+
+// Constructor remains private to this module; it is neither a wire bool nor a
+// re-usable native/Current permit. Only the fixed after-close source route gets it.
+pub(crate) struct OriginalReadCompletedR38(());
+
+pub(super) async fn read_formal_source_r38(
+    data: PathBuf,
+    mount: Arc<DirectoryWriterGuard>,
+    ctx: Context,
+    selector: crate::FormalReadSelectorR38,
+) -> Result<Option<crate::ClosedFormalSourceR38>> {
+    selector.validate_request(&ctx)?;
+    if !mount.matches_data(&data) {
+        return Err(Error::Forbidden);
+    }
+    // A cancelled waiter does not drop the running blocking owner/native handle.
+    // The real mount lease is moved inside OriginalReadOwner before any read SQL
+    // and retained on close failure/unwind according to the R34 ACK semantics.
+    tokio::task::spawn_blocking(move || {
+        let (prepared, completed) = if live_original_source_r50(&data, None)? {
+            let (raw, completed) = read_original_rows_r50(&data, None, Some(mount))?;
+            let prepared = crate::owned_occurrence::e05_issue::prepare_formal_source_from_raw_r50(
+                raw, &ctx, &selector,
+            )?;
+            (prepared, completed)
+        } else {
+            let prepared =
+                original_read_scoped_mounted_r38(&data, None, Some(mount), |connection| {
+                    crate::owned_occurrence::e05_issue::capture_formal_source_r38(
+                        connection, &ctx, &selector,
+                    )
+                })?;
+            (prepared, OriginalReadCompletedR38(()))
+        };
+        Ok(prepared.map(|source| {
+            crate::owned_occurrence::e05_issue::finish_formal_source_r38(source, completed)
+        }))
+    })
+    .await
+    .map_err(internal)?
+}
+
+pub(super) async fn reject_known_host_complete_path_r49(
+    data: PathBuf,
+    ctx: Context,
+    ticket_id: String,
+) -> Result<()> {
+    ctx.require(&[Role::Evaluator])?;
+    // Missing/new files follow the unchanged ordinary mount/open path. This
+    // preflight never creates a DB and never returns a transferable capability.
+    match std::fs::symlink_metadata(&data) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(internal(error)),
+        Ok(metadata) if !metadata.file_type().is_file() => return Err(Error::ClockRegressed),
+        Ok(_) => {}
+    }
+    tokio::task::spawn_blocking(move || {
+        if live_original_source_r50(&data, None)? {
+            let (raw, _completed) = read_original_rows_r50(&data, None, None)?;
+            crate::owned_occurrence::e05_issue::reject_known_host_complete_raw_r50(
+                &raw, &ctx, &ticket_id,
+            )
+        } else {
+            original_read_scoped(&data, None, |connection| {
+                crate::owned_occurrence::e05_issue::reject_known_host_complete_connection_r49(
+                    connection, &ctx, &ticket_id,
+                )
+            })
+        }
+    })
+    .await
+    .map_err(internal)?
+}
+
+pub(super) async fn read_formal_snapshot_r39(
+    data: PathBuf,
+    mount: Arc<DirectoryWriterGuard>,
+    ctx: Context,
+    selector: crate::FormalReadSelectorR38,
+) -> Result<crate::ClosedFormalReadR39> {
+    selector.validate_request(&ctx)?;
+    if !mount.matches_data(&data) {
+        return Err(Error::Forbidden);
+    }
+    tokio::task::spawn_blocking(move || {
+        let (prepared, completed) = if live_original_source_r50(&data, None)? {
+            let (raw, completed) = read_original_rows_r50(&data, None, Some(mount))?;
+            let prepared =
+                crate::owned_occurrence::e05_issue::prepare_formal_snapshot_from_raw_r50(
+                    raw, &ctx, &selector,
+                )?;
+            (prepared, completed)
+        } else {
+            let prepared =
+                original_read_scoped_mounted_r38(&data, None, Some(mount), |connection| {
+                    crate::owned_occurrence::e05_issue::capture_formal_snapshot_r39(
+                        connection, &ctx, &selector,
+                    )
+                })?;
+            (prepared, OriginalReadCompletedR38(()))
+        };
+        Ok(crate::owned_occurrence::e05_issue::finish_formal_snapshot_r39(prepared, completed))
+    })
+    .await
+    .map_err(internal)?
+}
+
+/// Run a read on the original directory and original native connection.
+/// Immutable is limited to a held stable main-only source; nonempty WAL is
+/// never ignored. No database serialization/copy, checkpoint, chmod or cleanup.
+/// Native event/strict-atime qualification remains a separate acceptance gate.
+fn original_read<T>(data: &Path, read: impl FnOnce(&ReadConnection) -> Result<T>) -> Result<T> {
+    original_read_scoped(data, None, read)
+}
+
+fn original_read_scoped<T>(
+    data: &Path,
+    scope: Option<&LockedOriginalSource<'_>>,
+    read: impl FnOnce(&ReadConnection) -> Result<T>,
+) -> Result<T> {
+    original_read_scoped_mounted_r38(data, scope, None, read)
+}
+
+fn original_read_scoped_mounted_r38<T>(
+    data: &Path,
+    scope: Option<&LockedOriginalSource<'_>>,
+    mount_lifetime: Option<Arc<DirectoryWriterGuard>>,
+    read: impl FnOnce(&ReadConnection) -> Result<T>,
+) -> Result<T> {
+    original_native_read_r50(
+        data,
+        scope,
+        mount_lifetime,
+        OriginalReadRouteR50::Scoped,
+        read,
+    )
+}
+
+enum OriginalReadRouteR50 {
+    Scoped,
+    FreshExec,
+}
+
+pub(super) fn fresh_live_read_worker_r50<T>(
+    data: &Path,
+    read: impl FnOnce(&ReadConnection) -> Result<T>,
+) -> Result<T> {
+    original_native_read_r50(data, None, None, OriginalReadRouteR50::FreshExec, read)
+}
+
+// Only called after a real borrowed scope or StableSource has been acquired.
+// These descriptors stay live through rollback, native close and source recheck.
+fn original_heap_source_r50(data: &Path) -> Result<(File, Option<File>, Option<String>)> {
+    let main = restore_regular_file_r50(data).map_err(|_| Error::ClockRegressed)?;
+    let shm = regular_source_member(&sidecar_path(data, "-shm"))?;
+    if regular_source_member(&sidecar_path(data, "-journal"))? {
+        // No hot/cold journal distinction is inferred from its name or length.
+        return Err(Error::ClockRegressed);
+    }
+    let wal_path = sidecar_path(data, "-wal");
+    let wal = if regular_source_member(&wal_path)? {
+        Some(restore_regular_file_r50(&wal_path).map_err(|_| Error::ClockRegressed)?)
+    } else {
+        None
+    };
+    let main_only = match &wal {
+        None => true,
+        Some(file) => file.metadata().map_err(|_| Error::ClockRegressed)?.len() == 0,
+    };
+    let uri = if main_only {
+        if shm {
+            return Err(Error::ClockRegressed);
+        }
+        let encoded = original_read_shm_uri(data)?;
+        let base = encoded
+            .strip_suffix("?readonly_shm=1")
+            .ok_or(Error::ClockRegressed)?;
+        Some(format!("{base}?immutable=1"))
+    } else {
+        None
+    };
+    Ok((main, wal, uri))
+}
+
+fn original_native_read_r50<T>(
+    data: &Path,
+    scope: Option<&LockedOriginalSource<'_>>,
+    mount_lifetime: Option<Arc<DirectoryWriterGuard>>,
+    route: OriginalReadRouteR50,
+    read: impl FnOnce(&ReadConnection) -> Result<T>,
+) -> Result<T> {
+    if let Some(mount) = &mount_lifetime
+        && !mount.matches_data(data)
+    {
+        return Err(Error::Forbidden);
+    }
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return Err(Error::Invalid("unsupported read-only platform".into()));
+    }
+    if !regular_source_member(data)? {
+        return Err(Error::ClockRegressed);
+    }
+    let canonical = data.canonicalize().map_err(|_| Error::ClockRegressed)?;
+    let shared_memory = regular_source_member(&sidecar_path(&canonical, "-shm"))?;
+    let stability = match scope {
+        Some(scope) => {
+            scope.recheck(&canonical)?;
+            None
+        }
+        // A legitimate live SHM already supplies SQLite's readonly snapshot
+        // protocol. Do not acquire the process writer barrier for this route.
+        None if shared_memory => None,
+        None => source_stability(&canonical)?,
+    };
+    if let Some(stability) = &stability {
+        stability.recheck(&canonical)?;
+    }
+    let heap_index = scope.is_some() || stability.is_some();
+    // A live SHM reader retains SQLite's native snapshot/lock protocol. The
+    // heap-index path requires the actual stability scope retained until close.
+    if (!heap_index && (!shared_memory || !matches!(route, OriginalReadRouteR50::FreshExec)))
+        || (heap_index && matches!(route, OriginalReadRouteR50::FreshExec))
+    {
+        return Err(Error::ClockRegressed);
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let heap_source = if heap_index {
+        Some(original_heap_source_r50(&canonical)?)
+    } else {
+        None
+    };
+    let connection = if let Some((_, _, Some(uri))) = heap_source.as_ref() {
+        ReadConnection::open_with_flags_and_vfs(Path::new(uri), flags, "unix-none")
+    } else if heap_index {
+        ReadConnection::open_with_flags_and_vfs(&canonical, flags, "unix-none")
+    } else {
+        ReadConnection::open_with_flags_and_vfs(
+            Path::new(&original_read_shm_uri(&canonical)?),
+            flags,
+            "unix",
+        )
+    }
+    .map_err(|_| Error::ClockRegressed)?;
+    let mut close_owner = OriginalReadOwner {
+        connection: Some(connection),
+        source: OriginalReadStabilityUntilAck {
+            scope,
+            stability,
+            mount_lifetime,
+        },
+        close_ack: None,
+        close_error: None,
+    };
+    let result = (|| {
+        let connection = close_owner
+            .connection
+            .as_mut()
+            .ok_or(Error::ClockRegressed)?;
+        let config = DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE;
+        let _initial_value = connection
+            .db_config(config)
+            .map_err(|_| Error::ClockRegressed)?;
+        if !connection
+            .set_db_config(config, true)
+            .map_err(|_| Error::ClockRegressed)?
+            || !connection
+                .db_config(config)
+                .map_err(|_| Error::ClockRegressed)?
+        {
+            return Err(Error::ClockRegressed);
+        }
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|_| Error::ClockRegressed)?;
+        connection
+            .execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY;")
+            .map_err(|_| Error::ClockRegressed)?;
+        if heap_index {
+            connection
+                .execute_batch("PRAGMA locking_mode=EXCLUSIVE;")
+                .map_err(|_| Error::ClockRegressed)?;
+        }
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|_| Error::ClockRegressed)?;
+        // Observe the actual backend. No invented numeric minimum or Python
+        // SQLite version can qualify this handle.
+        let result = (|| {
+            let identity: (String, String) = tx
+                .query_row("SELECT sqlite_version(),sqlite_source_id()", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|_| Error::ClockRegressed)?;
+            if identity.0.is_empty() || identity.1.is_empty() {
+                return Err(Error::ClockRegressed);
+            }
+            read(&tx)
+        })();
+        let rollback = tx.rollback().map_err(|_| Error::ClockRegressed);
+        match (result, rollback) {
+            (Err(error), Err(rollback)) => {
+                tracing::error!(?rollback, "read-only rollback failed after primary refusal");
+                Err(error)
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    })();
+    let close = close_owner.close_native().map_err(|error| {
+        if let Some(native_error) = close_owner.close_error.as_ref() {
+            tracing::error!(
+                error=?native_error,
+                "original read-only native close failed; retaining native source owner"
+            );
+        }
+        error
+    });
+    let source_recheck = scope
+        .map(|scope| scope.recheck(&canonical))
+        .transpose()
+        .and_then(|_| {
+            close_owner
+                .source
+                .stability
+                .as_ref()
+                .map(|stable| stable.recheck(&canonical))
+                .transpose()
+        })
+        .and_then(|_| {
+            if let Some((main, wal, uri)) = &heap_source {
+                if !same_regular_file(main, &canonical).map_err(|_| Error::ClockRegressed)? {
+                    return Err(Error::ClockRegressed);
+                }
+                let wal_path = sidecar_path(&canonical, "-wal");
+                if let Some(file) = wal
+                    && !same_regular_file(file, &wal_path).map_err(|_| Error::ClockRegressed)?
+                {
+                    return Err(Error::ClockRegressed);
+                }
+                if uri.is_some() {
+                    if regular_source_member(&sidecar_path(&canonical, "-shm"))?
+                        || regular_source_member(&sidecar_path(&canonical, "-journal"))?
+                    {
+                        return Err(Error::ClockRegressed);
+                    }
+                    match wal {
+                        None if regular_source_member(&wal_path)? => {
+                            return Err(Error::ClockRegressed);
+                        }
+                        Some(file)
+                            if file.metadata().map_err(|_| Error::ClockRegressed)?.len() != 0 =>
+                        {
+                            return Err(Error::ClockRegressed);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(())
+        });
+    drop(close_owner);
+    if source_recheck.is_err() && result.is_ok() {
+        return Err(Error::ClockRegressed);
+    }
+    match (result, close) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+fn live_original_source_r50(data: &Path, scope: Option<&LockedOriginalSource<'_>>) -> Result<bool> {
+    if let Some(scope) = scope {
+        scope.recheck(data)?;
+        return Ok(false);
+    }
+    if !regular_source_member(data)? {
+        return Err(Error::ClockRegressed);
+    }
+    let canonical = data.canonicalize().map_err(|_| Error::ClockRegressed)?;
+    regular_source_member(&sidecar_path(&canonical, "-shm"))
+}
+
+fn read_original_rows_r50(
+    data: &Path,
+    scope: Option<&LockedOriginalSource<'_>>,
+    mount: Option<Arc<DirectoryWriterGuard>>,
+) -> Result<(
+    crate::owned_occurrence::RawDatabase,
+    OriginalReadCompletedR38,
+)> {
+    if mount
+        .as_ref()
+        .is_some_and(|guard| !guard.matches_data(data))
+    {
+        return Err(Error::Forbidden);
+    }
+    if !live_original_source_r50(data, scope)? {
+        return Err(Error::ClockRegressed);
+    }
+    let closed = crate::readonly_worker::run_live(
+        data,
+        crate::readonly_worker::Operation::RawSnapshot,
+        mount,
+    )?;
+    let raw = crate::owned_occurrence::raw_from_worker_r50(closed.into_value())?;
+    // Only the live transport's real child close, wait and both EOFs yield this.
+    Ok((raw, OriginalReadCompletedR38(())))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlFactsWireR50 {
+    watermarks: Vec<(String, i64, String)>,
+    tombstones: Vec<(String, String, String)>,
+    protected_objects: Vec<(String, String, String, String)>,
+    root_budget_tables: Vec<(String, Vec<String>)>,
+}
+
+pub(super) fn control_facts_worker_value_r50(
+    connection: &ReadConnection,
+) -> Result<serde_json::Value> {
+    let facts = read_facts_native(connection)?;
+    let wire = ControlFactsWireR50 {
+        watermarks: facts
+            .watermarks
+            .into_iter()
+            .map(|(ns, value)| (ns, value.seq, value.digest))
+            .collect(),
+        tombstones: facts
+            .tombstones
+            .into_iter()
+            .map(|((ns, id), value)| Ok((ns, id, serde_json::to_string(&value).map_err(internal)?)))
+            .collect::<Result<Vec<_>>>()?,
+        protected_objects: facts
+            .protected_objects
+            .into_iter()
+            .map(|((ns, kind, id), value)| {
+                Ok((
+                    ns,
+                    kind,
+                    id,
+                    serde_json::to_string(&value).map_err(internal)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        root_budget_tables: facts.root_budget_tables.into_iter().collect(),
+    };
+    serde_json::to_value(wire).map_err(internal)
+}
+
+fn control_facts_from_worker_r50(value: serde_json::Value) -> Result<ControlPlaneFacts> {
+    let wire: ControlFactsWireR50 =
+        serde_json::from_value(value).map_err(|_| Error::ClockRegressed)?;
+    let mut facts = ControlPlaneFacts {
+        watermarks: BTreeMap::new(),
+        tombstones: BTreeMap::new(),
+        protected_objects: BTreeMap::new(),
+        root_budget_tables: BTreeMap::new(),
+    };
+    for (ns, seq, digest) in wire.watermarks {
+        if facts
+            .watermarks
+            .insert(ns, WatermarkFact { seq, digest })
+            .is_some()
+        {
+            return Err(Error::ClockRegressed);
+        }
+    }
+    for (ns, id, value) in wire.tombstones {
+        let value = parse_strict_json(&value)?;
+        if facts.tombstones.insert((ns, id), value).is_some() {
+            return Err(Error::ClockRegressed);
+        }
+    }
+    for (ns, kind, id, value) in wire.protected_objects {
+        let value = parse_strict_json(&value)?;
+        if facts
+            .protected_objects
+            .insert((ns, kind, id), value)
+            .is_some()
+        {
+            return Err(Error::ClockRegressed);
+        }
+    }
+    for (name, rows) in wire.root_budget_tables {
+        if facts.root_budget_tables.insert(name, rows).is_some() {
+            return Err(Error::ClockRegressed);
+        }
+    }
+    Ok(facts)
+}
+
+/// Fresh same-snapshot wall time for a trusted FS caller. Extra values are data
+/// only: their owner must qualify the actual record and cannot authorize a clock.
+/// One actual, already-admitted sample. The private fields are not a clock
+/// injection API. Consuming it binds an occurrence and its temporary-name
+/// nanoseconds to the same native snapshot and same system observation.
+#[derive(Debug)]
+pub struct ReadonlyWallSample {
+    seconds: i64,
+    nanos: u128,
+}
+
+impl ReadonlyWallSample {
+    pub fn into_parts(self) -> (i64, u128) {
+        (self.seconds, self.nanos)
+    }
+}
+
+fn admitted_sample(
+    floor: &crate::owned_occurrence::OccurrenceFloor,
+    clock: &mut OperationClock,
+) -> Result<ReadonlyWallSample> {
+    let stamp = clock.nanos(floor)?;
+    let nanos = clock.take_nanos(stamp)?;
+    let seconds = i64::try_from(nanos / 1_000_000_000).map_err(|_| clock.fail())?;
+    Ok(ReadonlyWallSample { seconds, nanos })
+}
+
+pub fn readonly_wall_seconds(
+    data: &Path,
+    candidates: &[HostPrepareConfig],
+    extra_occurrences: &[i64],
+) -> Result<i64> {
+    readonly_wall_seconds_with_clock(data, candidates, extra_occurrences, &WallClock::system())
+}
+
+fn readonly_wall_seconds_with_clock(
+    data: &Path,
+    candidates: &[HostPrepareConfig],
+    extra_occurrences: &[i64],
+    source: &WallClock,
+) -> Result<i64> {
+    readonly_wall_sample_scoped(data, candidates, extra_occurrences, None, source)
+        .map(|sample| sample.seconds)
+}
+
+pub fn readonly_wall_sample(
+    data: &Path,
+    candidates: &[HostPrepareConfig],
+    extra_occurrences: &[i64],
+) -> Result<ReadonlyWallSample> {
+    readonly_wall_sample_scoped(
+        data,
+        candidates,
+        extra_occurrences,
+        None,
+        &WallClock::system(),
+    )
+}
+
+fn readonly_wall_seconds_scoped(
+    data: &Path,
+    candidates: &[HostPrepareConfig],
+    extra_occurrences: &[i64],
+    scope: Option<&LockedOriginalSource<'_>>,
+    source: &WallClock,
+) -> Result<i64> {
+    readonly_wall_sample_scoped(data, candidates, extra_occurrences, scope, source)
+        .map(|sample| sample.seconds)
+}
+
+fn readonly_wall_sample_scoped(
+    data: &Path,
+    candidates: &[HostPrepareConfig],
+    extra_occurrences: &[i64],
+    scope: Option<&LockedOriginalSource<'_>>,
+    source: &WallClock,
+) -> Result<ReadonlyWallSample> {
+    let mut clock = OperationClock::with_source(source.clone());
+    if let Some(scope) = scope {
+        scope.recheck(data)?;
+    }
+    if !regular_source_member(data)? {
+        if regular_source_member(&sidecar_path(data, "-wal"))?
+            || regular_source_member(&sidecar_path(data, "-shm"))?
+        {
+            return Err(clock.fail());
+        }
+        let mut floor = crate::owned_occurrence::OccurrenceFloor::default();
+        for value in extra_occurrences {
+            floor.observe_seconds(*value).map_err(|_| clock.fail())?;
+        }
+        return admitted_sample(&floor, &mut clock);
+    }
+    let inputs = PreparePreimages {
+        candidates: candidates.to_vec(),
+        ..Default::default()
+    };
+    let floor = if live_original_source_r50(data, scope)? {
+        let (raw, _completed) = read_original_rows_r50(data, scope, None)?;
+        let mut floor = crate::owned_occurrence::collect_floor_from_raw_r50(&raw, &inputs)
+            .map_err(|_| clock.fail())?;
+        for value in extra_occurrences {
+            floor.observe_seconds(*value).map_err(|_| clock.fail())?;
+        }
+        floor
+    } else {
+        original_read_scoped(data, scope, |connection| {
+            let mut floor =
+                collect_floor_rusqlite(connection, &inputs).map_err(|_| clock.fail())?;
+            for value in extra_occurrences {
+                floor.observe_seconds(*value).map_err(|_| clock.fail())?;
+            }
+            Ok(floor)
+        })?
+    };
+    // Rollback and native close above are terminal before the production wall
+    // sample used by the caller's next filesystem event is obtained.
+    admitted_sample(&floor, &mut clock)
+}
+
+pub async fn preflight_occurrence_clock(
+    data: &Path,
+    candidates: &[HostPrepareConfig],
+) -> Result<()> {
+    preflight_occurrence_clock_with_clock(data, candidates, WallClock::system()).await
+}
+
+pub(super) async fn preflight_occurrence_clock_with_clock(
+    data: &Path,
+    candidates: &[HostPrepareConfig],
+    clock: WallClock,
+) -> Result<()> {
+    let data = data.to_path_buf();
+    let candidates = candidates.to_vec();
+    let source = clock.clone();
+    // The worker owns the exact source and source scopes/connection through
+    // actual rollback and close, even if the awaiting entry is cancelled.
+    // The outer operation has no terminal native credit merely from cancellation.
+    tokio::task::spawn_blocking(move || {
+        readonly_wall_seconds_with_clock(&data, &candidates, &[], &source).map(|_| ())
+    })
+    .await
+    .map_err(internal)?
+}
 
 pub const REVOKE_TOMBSTONE_SCHEMA: &str = "rsia.revoke_tombstone.v1";
 pub const MAX_CLEANUP_EDGE_PAGE: usize = 1_000;
@@ -244,7 +1426,7 @@ impl LifecycleStore {
                 )));
             }
             let status = load_status_by_source(
-                &mut session.tx,
+                session.transaction()?,
                 ctx.namespace(),
                 &source,
                 tombstone.watermark_seq,
@@ -308,7 +1490,7 @@ impl LifecycleStore {
         .bind(&watermark_digest)
         .bind(now)
         .bind(now)
-        .execute(&mut *session.tx)
+        .execute(&mut **session.write_transaction().await?)
         .await
         .map_err(internal)?;
         sqlx::query(
@@ -318,11 +1500,11 @@ impl LifecycleStore {
         .bind(ctx.namespace())
         .bind(&job_id)
         .bind(&source.id)
-        .execute(&mut *session.tx)
+        .execute(&mut **session.write_transaction().await?)
         .await
         .map_err(internal)?;
         sqlx::query("INSERT INTO revoke_cleanup_frontier(namespace,job_id,node_kind,node_id) VALUES(?,?,'__world_scan',?)")
-            .bind(ctx.namespace()).bind(&job_id).bind(&source.id).execute(&mut *session.tx).await.map_err(internal)?;
+            .bind(ctx.namespace()).bind(&job_id).bind(&source.id).execute(&mut **session.write_transaction().await?).await.map_err(internal)?;
         sqlx::query(
             "INSERT INTO revoke_cleanup_frontier(namespace,job_id,node_kind,node_id)
              VALUES(?,?,?,?)",
@@ -331,11 +1513,11 @@ impl LifecycleStore {
         .bind(&job_id)
         .bind(&source.kind)
         .bind(&source.id)
-        .execute(&mut *session.tx)
+        .execute(&mut **session.write_transaction().await?)
         .await
         .map_err(internal)?;
         insert_cleanup_event(
-            &mut session.tx,
+            session.transaction()?,
             ctx.namespace(),
             &job_id,
             Some(&source),
@@ -344,7 +1526,7 @@ impl LifecycleStore {
             json!({"watermark_seq":watermark_seq,"watermark_digest":watermark_digest}),
         )
         .await?;
-        let status = load_status(&mut session.tx, ctx.namespace(), &job_id)
+        let status = load_status(session.transaction()?, ctx.namespace(), &job_id)
             .await?
             .ok_or(Error::Internal)?;
         session.commit().await?;
@@ -366,13 +1548,15 @@ impl LifecycleStore {
                 "edge page limit must be 1..={MAX_CLEANUP_EDGE_PAGE}"
             )));
         }
+        let activity = store.runtime.writer()?.write_scope().await;
         let _blob_guard = store.blob_lock.write().await;
-        let mut tx = store.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) =
+            store.begin_write_transaction_in_activity(activity).await?;
         let status = load_status(&mut tx, ctx.namespace(), job_id)
             .await?
             .ok_or(Error::NotFound)?;
         if status.state == CleanupState::Complete {
-            tx.commit().await.map_err(internal)?;
+            store.commit_write_transaction(tx, &mut clock).await?;
             return Ok(status);
         }
         ensure_logical_block(&mut tx, ctx, &status).await?;
@@ -471,7 +1655,7 @@ impl LifecycleStore {
         let status = load_status(&mut tx, ctx.namespace(), job_id)
             .await?
             .ok_or(Error::Internal)?;
-        tx.commit().await.map_err(internal)?;
+        store.commit_write_transaction(tx, &mut clock).await?;
         Ok(status)
     }
 
@@ -496,7 +1680,7 @@ impl LifecycleStore {
 /// Both scan cursors are reset: historical failures do not identify every world
 /// or a budget call's billing scope. No execution/accounting facts are changed.
 async fn prepare_failed_cleanup_retry(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     status: &CleanupStatus,
     now: i64,
@@ -549,7 +1733,7 @@ async fn prepare_failed_cleanup_retry(
 /// answer skips the budget recheck, which reads every unredacted request of the
 /// namespace.
 async fn closure_is_open(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     job_id: &str,
     source: &TypedObjectRef,
@@ -578,7 +1762,7 @@ async fn closure_is_open(
 /// reads their own dependents and cleans their content). Returns how many.
 /// A frontier is the closure of one job, so membership is per `job_id`.
 async fn queue_late_dependents(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     job_id: &str,
     limit: usize,
@@ -642,7 +1826,7 @@ async fn queue_late_dependents(
 /// fixpoint. Its index repair precedes direct-source filtering so ref -> S -> R
 /// remains reachable when R is not a declared direct material.
 async fn scan_e16_budget_call(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     job_id: &str,
     source: &TypedObjectRef,
@@ -742,7 +1926,7 @@ async fn scan_e16_budget_call(
 /// left as it is. Redacts at most `limit` calls; returns whether it
 /// redacted or isolated any.
 async fn redact_late_budget_calls(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     job_id: &str,
     source: &TypedObjectRef,
@@ -906,7 +2090,7 @@ pub(crate) enum BudgetRequestSources {
 /// leave the job running with no diagnostic, unreachable by a retry (AG-096). The
 /// two answers differ on purpose.
 async fn budget_call_source_closure(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     billing_scope: &str,
     call_id: &str,
@@ -1000,49 +2184,184 @@ fn registered_execution_source_ids(request: &serde_json::Value) -> Option<Vec<St
 }
 
 pub(crate) async fn backup_consistent(store: &Store, destination: &Path) -> Result<()> {
+    let store = store.clone();
+    let destination = destination.to_path_buf();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    // The request's cancellation cannot drop the real stability scope while a
+    // SQLite/FS worker is still executing. This owner is independent of the
+    // caller's runtime; its result is sent only after actual operation return.
+    let _worker = std::thread::Builder::new()
+        .name("rsia-backup-drain".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = send.send(Err(internal(error)));
+                    return;
+                }
+            };
+            let owner = match store.runtime.writer() {
+                Ok(owner) => owner,
+                Err(error) => {
+                    let _ = send.send(Err(error));
+                    return;
+                }
+            };
+            let stable_source = runtime.block_on(owner.stable_read_scope());
+            let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(backup_consistent_owned(&store, &destination))
+            }));
+            let result = match completed {
+                Ok(BackupCompletion::CommandsAcknowledged(result)) => result,
+                Ok(BackupCompletion::Unconfirmed(error)) => {
+                    tracing::error!("backup command drain failed; retaining source exclusion");
+                    std::mem::forget(stable_source);
+                    std::mem::forget(owner);
+                    let _ = send.send(Err(error));
+                    return;
+                }
+                Err(_) => {
+                    // Neither pool size nor pool.close() is a public native
+                    // shutdown receipt after a panic or unknown worker state.
+                    tracing::error!("backup worker panicked; retaining source exclusion");
+                    std::mem::forget(stable_source);
+                    std::mem::forget(owner);
+                    let _ = send.send(Err(Error::Internal));
+                    return;
+                }
+            };
+            drop(stable_source);
+            let _ = send.send(result);
+        })
+        .map_err(internal)?;
+    receive.await.map_err(internal)?
+}
+
+enum BackupCompletion {
+    CommandsAcknowledged(Result<()>),
+    Unconfirmed(Error),
+}
+
+async fn backup_consistent_owned(store: &Store, destination: &Path) -> BackupCompletion {
     if !cfg!(any(
         target_os = "linux",
         target_os = "android",
         target_vendor = "apple"
     )) {
-        return Err(Error::Invalid(
+        return BackupCompletion::CommandsAcknowledged(Err(Error::Invalid(
             "atomic no-overwrite backup publication unsupported platform".into(),
-        ));
+        )));
     }
     if destination.exists() {
-        return Err(Error::Conflict("backup destination already exists".into()));
+        return BackupCompletion::CommandsAcknowledged(Err(Error::Conflict(
+            "backup destination already exists".into(),
+        )));
     }
-    evo_core::now()?;
-    let parent = destination.parent().unwrap_or(Path::new("."));
-    tokio::fs::create_dir_all(parent).await.map_err(internal)?;
-    let name = destination
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| Error::Invalid("backup destination needs a UTF-8 name".into()))?;
-    let temp = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4()));
-    tokio::fs::create_dir(&temp).await.map_err(internal)?;
-    let result = backup_into_temp(store, &temp).await;
-    if let Err(error) = result {
-        let _ = tokio::fs::remove_dir_all(&temp).await;
-        return Err(error);
-    }
-    if destination.exists() {
-        let _ = tokio::fs::remove_dir_all(&temp).await;
-        return Err(Error::Conflict(
-            "backup destination appeared during backup".into(),
-        ));
-    }
-    let source = temp.clone();
-    let target = destination.to_path_buf();
-    let published = tokio::task::spawn_blocking(move || publish_backup_directory(&source, &target))
+    // The thread owner retains its real source scope through this whole
+    // original VACUUM algorithm. No nested acquire is used for clock guards.
+    let _blob_guard = store.blob_lock.write().await;
+    let mut connection = match store.pool.acquire().await {
+        Ok(connection) => connection,
+        Err(error) => return BackupCompletion::Unconfirmed(internal(error)),
+    };
+    let mut clock = store.operation_clock();
+    let result: Result<()> = async {
+        crate::write_clock::seconds_on_connection(
+            &mut connection,
+            &store.prepare_inputs,
+            &mut clock,
+        )
+        .await?;
+        let parent = destination.parent().unwrap_or(Path::new("."));
+        create_private_backup_directory(parent, true).await?;
+        let name = destination
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| Error::Invalid("backup destination needs a UTF-8 name".into()))?;
+        let temp = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4()));
+        crate::write_clock::seconds_on_connection(
+            &mut connection,
+            &store.prepare_inputs,
+            &mut clock,
+        )
+        .await?;
+        create_private_backup_directory(&temp, false).await?;
+        let result = backup_into_temp(store, &temp, &mut connection, &mut clock).await;
+        if let Err(error) = result {
+            let _ = tokio::fs::remove_dir_all(&temp).await;
+            return Err(error);
+        }
+        if destination.exists() {
+            let _ = tokio::fs::remove_dir_all(&temp).await;
+            return Err(Error::Conflict(
+                "backup destination appeared during backup".into(),
+            ));
+        }
+        if let Err(error) = crate::write_clock::seconds_on_connection(
+            &mut connection,
+            &store.prepare_inputs,
+            &mut clock,
+        )
         .await
-        .map_err(internal)?;
-    if let Err(error) = published {
-        let _ = tokio::fs::remove_dir_all(&temp).await;
-        return Err(error);
+        {
+            let _ = tokio::fs::remove_dir_all(&temp).await;
+            return Err(error);
+        }
+        let source = temp.clone();
+        let target = destination.to_path_buf();
+        let published =
+            tokio::task::spawn_blocking(move || publish_backup_directory(&source, &target))
+                .await
+                .map_err(internal)?;
+        if let Err(error) = published {
+            let _ = tokio::fs::remove_dir_all(&temp).await;
+            return Err(error);
+        }
+        sync_directory(parent.to_path_buf()).await?;
+        Ok(())
     }
-    sync_directory(parent.to_path_buf()).await?;
-    Ok(())
+    .await;
+    // Await the original worker's queued rollback and ping explicitly before
+    // its public pool return. No Drop, pool-size or flush is an acknowledgement.
+    let settled: Result<()> = async {
+        if connection.is_in_transaction() {
+            SqliteTransactionManager::rollback(&mut *connection)
+                .await
+                .map_err(internal)?;
+        }
+        connection.ping().await.map_err(internal)?;
+        if connection.is_in_transaction() {
+            return Err(Error::Internal);
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = settled {
+        tracing::error!(
+            ?error,
+            "backup original connection command state unconfirmed"
+        );
+        return BackupCompletion::Unconfirmed(result.err().unwrap_or(error));
+    }
+    // The private native owner retains the actual connection through pending
+    // rollback and its worker acknowledgement. A failed release cannot be
+    // credited as terminal completion or release the source exclusion scope.
+    if let Err(error) = connection.release().await {
+        tracing::error!(%error, "backup native owner release unconfirmed");
+        return BackupCompletion::Unconfirmed(result.err().unwrap_or_else(|| internal(error)));
+    }
+    BackupCompletion::CommandsAcknowledged(result)
+}
+
+async fn create_private_backup_directory(path: &Path, recursive: bool) -> Result<()> {
+    let mut builder = tokio::fs::DirBuilder::new();
+    builder.recursive(recursive);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(path).await.map_err(internal)
 }
 
 fn publish_backup_directory(source: &Path, destination: &Path) -> Result<()> {
@@ -1068,10 +2387,24 @@ fn publish_backup_directory(source: &Path, destination: &Path) -> Result<()> {
     }
 }
 
-async fn backup_into_temp(store: &Store, temp: &Path) -> Result<()> {
-    let _blob_guard = store.blob_lock.write().await;
-    let mut connection = store.pool.acquire().await.map_err(internal)?;
+async fn backup_into_temp(
+    store: &Store,
+    temp: &Path,
+    connection: &mut sqlx::SqliteConnection,
+    clock: &mut OperationClock,
+) -> Result<()> {
     let database_path = temp.join("rsia.sqlite3");
+    crate::write_clock::seconds_on_connection(connection, &store.prepare_inputs, clock).await?;
+    // SQLite permits an existing empty VACUUM INTO output. Creating it with
+    // the final private mode avoids a transient permissive database file.
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(&database_path).await.map_err(internal)?;
+    file.sync_all().await.map_err(internal)?;
+    drop(file);
+    crate::write_clock::seconds_on_connection(connection, &store.prepare_inputs, clock).await?;
     sqlx::query("VACUUM INTO ?")
         .bind(database_path.to_string_lossy().as_ref())
         .execute(&mut *connection)
@@ -1079,10 +2412,22 @@ async fn backup_into_temp(store: &Store, temp: &Path) -> Result<()> {
         .map_err(internal)?;
     sync_file(&database_path).await?;
     let database = file_entry(&database_path, "rsia.sqlite3").await?;
-    let migrations = load_backup_migrations(&mut connection).await?;
-    let watermarks = load_backup_watermarks(&mut connection).await?;
+    let migrations = load_backup_migrations(connection).await?;
+    let watermarks = load_backup_watermarks(connection).await?;
     let mut blobs = copy_backup_blobs(store, temp).await?;
     blobs.sort_by(|left, right| left.path.cmp(&right.path));
+
+    crate::write_clock::seconds_on_connection(connection, &store.prepare_inputs, clock).await?;
+    let manifest_path = temp.join("backup-manifest.json");
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&manifest_path).await.map_err(internal)?;
+    // The open awaited: obtain the manifest occurrence only now, using the
+    // original held connection and the same operation poison latch.
+    let created_at =
+        crate::write_clock::seconds_on_connection(connection, &store.prepare_inputs, clock).await?;
     let manifest = BackupManifest {
         schema_version: BACKUP_SCHEMA.into(),
         complete: true,
@@ -1090,14 +2435,13 @@ async fn backup_into_temp(store: &Store, temp: &Path) -> Result<()> {
         blobs,
         migrations,
         watermarks,
-        created_at: evo_core::now()?,
+        created_at,
     };
-    let manifest_path = temp.join("backup-manifest.json");
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(internal)?;
-    tokio::fs::write(&manifest_path, bytes)
-        .await
-        .map_err(internal)?;
-    sync_file(&manifest_path).await?;
+    use tokio::io::AsyncWriteExt;
+    file.write_all(&bytes).await.map_err(internal)?;
+    file.sync_all().await.map_err(internal)?;
+    drop(file);
     sync_directory(temp.to_path_buf()).await
 }
 
@@ -1278,7 +2622,7 @@ fn hex(bytes: &[u8]) -> String {
 
 #[allow(clippy::too_many_arguments)]
 async fn expand_frontier(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     store: &Store,
     ctx: &Context,
     job_id: &str,
@@ -1428,7 +2772,7 @@ async fn expand_frontier(
 
 #[allow(clippy::too_many_arguments)]
 async fn expand_world_scan(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     job_id: &str,
     source_id: &str,
@@ -1493,7 +2837,7 @@ async fn expand_world_scan(
 }
 
 async fn expand_budget_scan(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     job_id: &str,
     source: &TypedObjectRef,
@@ -1692,7 +3036,7 @@ fn validate_hex_digest(value: &str) -> Result<()> {
 }
 
 async fn redact_evaluation_resource_evidence(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     job_id: &str,
     node: &TypedObjectRef,
@@ -1821,7 +3165,7 @@ fn minimal_budget_artifact(artifact: &crate::budget::BudgetArtifact) -> serde_js
 }
 
 async fn redact_replay_store_envelope(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     job_id: &str,
     node: &TypedObjectRef,
@@ -2125,7 +3469,7 @@ fn is_lower_hex_digest(value: &serde_json::Value) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 async fn cleanup_e16_envelope(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     store: &Store,
     ctx: &Context,
     job_id: &str,
@@ -2289,7 +3633,7 @@ async fn cleanup_e16_envelope(
 /// directory failure from another job in the same namespace still belongs to
 /// that node. EXISTS avoids loading the history; its scan cost is not constant.
 async fn has_failed_local_export(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     node: &TypedObjectRef,
 ) -> Result<bool> {
@@ -2320,7 +3664,7 @@ async fn remove_controlled_local_export(
     ctx: &Context,
     node: &TypedObjectRef,
     job_id: &str,
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     now: i64,
 ) -> Result<()> {
     // The export attempt id names the directory under the namespace export
@@ -2416,7 +3760,7 @@ async fn remove_controlled_local_export(
 }
 
 async fn cleanup_e16_blob(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     store: &Store,
     ctx: &Context,
     job_id: &str,
@@ -2452,7 +3796,7 @@ async fn cleanup_e16_blob(
 }
 
 async fn remove_e16_blob_if_unreferenced(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     store: &Store,
     ctx: &Context,
     job_id: &str,
@@ -2567,7 +3911,7 @@ fn e16_record_keeps_blobs_alive(schema: &str, payload: &serde_json::Value) -> bo
 }
 
 async fn e16_payload_has_live_blob_reference(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     job_id: &str,
     digest: &str,
@@ -2750,7 +4094,7 @@ fn valid_stored_report_without_pool(report: &evo_core::replay::StoredReplayRepor
 }
 
 async fn cleanup_node_content(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     store: &Store,
     ctx: &Context,
     job_id: &str,
@@ -2984,6 +4328,7 @@ async fn cleanup_node_content(
             | "alpha_claim_reservation_v1"
             | "evaluation_ticket_v2"
             | "evaluation_ticket_issue_receipt_v1"
+            | "evaluation_ticket_issue_receipt_v2"
             | "execution_receipt_v2"
             | "independent_grader_receipt_v2"
             | "formal_evaluation_v2"
@@ -2992,6 +4337,14 @@ async fn cleanup_node_content(
             | "development_grader_receipt_v1"
             | "development_run_receipt_v1",
         ) => true,
+        ("release", "rsia.persistent_release.v2", _)
+        | ("artifact", "rsia.issued_formal_authority.v3", _)
+        | ("artifact", "rsia.independent_grade_capture.v2", _)
+        | ("artifact", "rsia.release_action.v2", _)
+        | ("artifact", evo_core::formal_version::SCHEMA, _)
+        | ("artifact", evo_core::formal_version::NATIVE_TICKET_ENVELOPE, "evaluation_ticket_v2") => {
+            true
+        }
         ("release", "rsia.persistent_release.v1", _)
         | ("pointer", "rsia.profile_pointer.v1", _)
         | ("tombstone", "rsia.revoke_tombstone.v1", _) => true,
@@ -3209,7 +4562,7 @@ async fn cleanup_node_content(
 }
 
 async fn mark_unknown_scope(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     job_id: &str,
     node: &TypedObjectRef,
@@ -3385,7 +4738,7 @@ fn minimal_metadata(value: &serde_json::Value) -> serde_json::Value {
 }
 
 async fn ensure_logical_block(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     status: &CleanupStatus,
 ) -> Result<()> {
@@ -3416,7 +4769,7 @@ async fn ensure_logical_block(
 }
 
 async fn load_status_by_source(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     namespace: &str,
     source: &TypedObjectRef,
     watermark_seq: u64,
@@ -3439,7 +4792,7 @@ async fn load_status_by_source(
 }
 
 async fn load_status(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     namespace: &str,
     job_id: &str,
 ) -> Result<Option<CleanupStatus>> {
@@ -3456,7 +4809,7 @@ async fn load_status(
 }
 
 async fn status_from_row(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     namespace: &str,
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<CleanupStatus> {
@@ -3488,7 +4841,7 @@ async fn status_from_row(
 }
 
 async fn insert_cleanup_event(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     namespace: &str,
     job_id: &str,
     node: Option<&TypedObjectRef>,
@@ -3653,76 +5006,39 @@ pub struct ControlPlaneFacts {
     pub root_budget_tables: BTreeMap<String, Vec<String>>,
 }
 
-/// Read the recovery facts of `path` without `Store::open`.
-///
-/// The database is opened `SQLITE_OPEN_READONLY` without `create_if_missing`,
-/// `PRAGMA query_only=ON` is set, and every read happens in one transaction.
-/// Before any fact is read the database must pass `PRAGMA integrity_check` and
-/// its `_sqlx_migrations` must equal the compiled-in migration set exactly
-/// (the same comparison a backup uses). Any failure is an error; nothing here
-/// repairs, migrates or creates anything.
-///
-/// One case would still leave files behind: a WAL-mode database that nobody has
-/// open has neither `-wal` nor `-shm`, and even a read-only connection creates
-/// both. That database cannot be mid-write (a live or crashed writer leaves the
-/// side files), so it is read as `immutable` and nothing is created. Every other
-/// database is read through a normal read-only connection so a WAL that a writer
-/// left behind is honoured.
+/// Read recovery diagnostics on the original native source, in one read-only
+/// transaction. This deliberately does not require a healthy wall clock: a
+/// malformed occurrence must remain inspectable. Source permission, latest-WAL,
+/// strict-atime and every-file-event controls still require native acceptance.
 pub async fn read_control_plane_facts(path: &Path) -> Result<ControlPlaneFacts> {
-    let options = SqliteConnectOptions::new()
-        .filename(path)
-        .read_only(true)
-        .immutable(is_unopened_wal_database(path))
-        .create_if_missing(false)
-        .busy_timeout(Duration::from_secs(5))
-        .disable_statement_logging();
-    let mut connection = options
-        .connect()
-        .await
-        .map_err(|error| Error::Invalid(format!("cannot open read-only: {error}")))?;
-    let facts = read_facts_from(&mut connection).await;
-    let _ = connection.close().await;
-    facts
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        if live_original_source_r50(&path, None)? {
+            let closed = crate::readonly_worker::run_live(
+                &path,
+                crate::readonly_worker::Operation::ControlFacts,
+                None,
+            )?;
+            control_facts_from_worker_r50(closed.into_value())
+        } else {
+            original_read(&path, read_facts_native)
+        }
+    })
+    .await
+    .map_err(internal)?
 }
 
-/// A database file whose header says WAL mode (file format write/read version
-/// bytes 18 and 19 are both 2) while neither `<path>-wal` nor `<path>-shm` exists.
-fn is_unopened_wal_database(path: &Path) -> bool {
-    use std::io::Read;
-    let mut header = [0u8; 20];
-    let header_says_wal = std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut header))
-        .is_ok()
-        && header.starts_with(b"SQLite format 3\0")
-        && header[18] == 2
-        && header[19] == 2;
-    let absent = |suffix: &str| {
-        let mut name = path.as_os_str().to_owned();
-        name.push(suffix);
-        matches!(
-            std::fs::symlink_metadata(PathBuf::from(name)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        )
-    };
-    header_says_wal && absent("-wal") && absent("-shm")
-}
-
-async fn read_facts_from(connection: &mut sqlx::SqliteConnection) -> Result<ControlPlaneFacts> {
-    fn unreadable(context: &'static str) -> impl Fn(sqlx::Error) -> Error {
+fn read_facts_native(connection: &ReadConnection) -> Result<ControlPlaneFacts> {
+    fn unreadable(context: &'static str) -> impl Fn(rusqlite::Error) -> Error {
         move |error| Error::Invalid(format!("{context}: {error}"))
     }
-    sqlx::query("PRAGMA query_only = ON")
-        .execute(&mut *connection)
-        .await
-        .map_err(unreadable("cannot enforce query_only"))?;
-    let mut tx = connection
-        .begin()
-        .await
-        .map_err(unreadable("cannot begin read transaction"))?;
-
-    let integrity: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
-        .fetch_all(&mut *tx)
-        .await
+    let integrity = connection
+        .prepare("PRAGMA integrity_check")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
         .map_err(unreadable("integrity check could not run"))?;
     if integrity.len() != 1 || integrity[0] != "ok" {
         let first = integrity.first().map(String::as_str).unwrap_or("no result");
@@ -3731,63 +5047,82 @@ async fn read_facts_from(connection: &mut sqlx::SqliteConnection) -> Result<Cont
             first.chars().take(200).collect::<String>()
         )));
     }
-    // One compiled-set comparison for backups and for the recovery gate.
-    if let Err(error) = load_backup_migrations(&mut tx).await {
-        return Err(Error::Conflict(format!(
-            "migration set is not the compiled-in set ({})",
-            match error {
-                Error::Conflict(message) | Error::Invalid(message) => message,
-                other => other.to_string(),
-            }
-        )));
+    let migrations = connection
+        .prepare(
+            "SELECT version,description,checksum,success FROM _sqlx_migrations ORDER BY version",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(unreadable("migration set unreadable"))?;
+    let compiled = sqlx::migrate!("./migrations");
+    if migrations.is_empty()
+        || migrations.iter().any(|row| row.3 == 0)
+        || migrations.len() != compiled.iter().count()
+        || migrations
+            .iter()
+            .zip(compiled.iter())
+            .any(|(saved, current)| {
+                saved.0 != current.version || saved.2 != current.checksum.as_ref()
+            })
+    {
+        return Err(Error::Conflict(
+            "migration set is not the compiled-in set".into(),
+        ));
     }
-
     let mut watermarks = BTreeMap::new();
-    let rows = sqlx::query("SELECT namespace,seq,digest FROM revoke_watermark ORDER BY namespace")
-        .fetch_all(&mut *tx)
-        .await
+    let rows = connection
+        .prepare("SELECT namespace,seq,digest FROM revoke_watermark ORDER BY namespace")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
         .map_err(unreadable("revoke watermarks unreadable"))?;
-    for row in rows {
-        let namespace: String = row
-            .try_get("namespace")
-            .map_err(unreadable("revoke watermark namespace"))?;
-        watermarks.insert(
-            namespace,
-            WatermarkFact {
-                seq: row
-                    .try_get("seq")
-                    .map_err(unreadable("revoke watermark seq"))?,
-                digest: row
-                    .try_get("digest")
-                    .map_err(unreadable("revoke watermark digest"))?,
-            },
-        );
+    for (namespace, seq, digest) in rows {
+        watermarks.insert(namespace, WatermarkFact { seq, digest });
     }
 
     let mut tombstones = BTreeMap::new();
     let mut protected_objects = BTreeMap::new();
-    let rows = sqlx::query("SELECT namespace,kind,id,body FROM objects ORDER BY namespace,kind,id")
-        .fetch_all(&mut *tx)
-        .await
+    let rows = connection
+        .prepare("SELECT namespace,kind,id,body FROM objects ORDER BY namespace,kind,id")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
         .map_err(unreadable("objects unreadable"))?;
-    for row in rows {
-        let namespace: String = row
-            .try_get("namespace")
-            .map_err(unreadable("object namespace"))?;
-        let kind: String = row.try_get("kind").map_err(unreadable("object kind"))?;
-        let id: String = row.try_get("id").map_err(unreadable("object id"))?;
+    for (namespace, kind, id, body) in rows {
         let in_scope = watermarks.contains_key(&namespace);
         if !in_scope && kind != "tombstone" {
             continue;
         }
-        let body: String = row.try_get("body").map_err(unreadable("object body"))?;
         let value = parse_strict_json(&body).map_err(|error| {
             Error::Invalid(format!(
-                "object {namespace}/{kind}/{id} has an unreadable body: {}",
-                match error {
-                    Error::Invalid(message) => message,
-                    other => other.to_string(),
-                }
+                "object {namespace}/{kind}/{id} has an unreadable body: {error}"
             ))
         })?;
         let schema = match &value {
@@ -3812,19 +5147,25 @@ async fn read_facts_from(connection: &mut sqlx::SqliteConnection) -> Result<Cont
         }
     }
 
-    let mut tables: Vec<String> = sqlx::query_scalar(ROOT_BUDGET_TABLE_QUERY)
-        .fetch_all(&mut *tx)
-        .await
+    let mut tables = connection
+        .prepare(ROOT_BUDGET_TABLE_QUERY)
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
         .map_err(unreadable("root budget tables unreadable"))?;
     tables.sort();
     let mut root_budget_tables = BTreeMap::new();
     for table in tables {
-        let columns: Vec<String> =
-            sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
-                .bind(&table)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(unreadable("root budget columns unreadable"))?;
+        let columns = connection
+            .prepare("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([&table], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(unreadable("root budget columns unreadable"))?;
         if columns.is_empty() {
             return Err(Error::Invalid(format!(
                 "root budget table {table} has no columns"
@@ -3835,19 +5176,20 @@ async fn read_facts_from(connection: &mut sqlx::SqliteConnection) -> Result<Cont
             .map(|column| format!("quote({})", quote_identifier(column)))
             .collect::<Vec<_>>()
             .join("||','||");
-        let mut rows: Vec<String> = sqlx::query_scalar(&format!(
-            "SELECT {quoted} FROM {}",
-            quote_identifier(&table)
-        ))
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(unreadable("root budget rows unreadable"))?;
+        let mut rows = connection
+            .prepare(&format!(
+                "SELECT {quoted} FROM {}",
+                quote_identifier(&table),
+            ))
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(unreadable("root budget rows unreadable"))?;
         rows.sort();
         root_budget_tables.insert(table, rows);
     }
-    tx.rollback()
-        .await
-        .map_err(unreadable("cannot end read transaction"))?;
     Ok(ControlPlaneFacts {
         watermarks,
         tombstones,
@@ -4014,4 +5356,1687 @@ mod publication_tests {
             assert!(matches!(a, Err(Error::Conflict(_))));
         }
     }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod directory_capability_tests {
+    use super::*;
+
+    #[test]
+    fn the_fixture_clock_refuses_before_the_first_directory_member() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("unopened").join("db.sqlite3");
+        let source = WallClock::fixture_seconds(Arc::new(|| -1));
+        assert!(matches!(
+            DirectoryWriterGuard::acquire_checked_with_clock(&data, &[], &source),
+            Err(Error::ClockRegressed)
+        ));
+        assert!(!data_parent(&data).exists());
+    }
+
+    #[test]
+    fn the_lock_recheck_uses_the_original_fixture_reader() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("db.sqlite3");
+        let first = AtomicBool::new(true);
+        let source = WallClock::fixture_seconds(Arc::new(move || {
+            if first.swap(false, Ordering::SeqCst) {
+                100
+            } else {
+                -1
+            }
+        }));
+        assert!(matches!(
+            DirectoryWriterGuard::acquire_checked_with_clock(&data, &[], &source),
+            Err(Error::ClockRegressed)
+        ));
+        assert!(!data.exists());
+        assert!(!root.path().join(WRITER_LOCK_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn the_preflight_worker_keeps_the_same_fixture_source() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("db.sqlite3");
+        let value = Arc::new(AtomicI64::new(-1));
+        let reader = Arc::clone(&value);
+        let source = WallClock::fixture_seconds(Arc::new(move || reader.load(Ordering::SeqCst)));
+        assert!(matches!(
+            preflight_occurrence_clock_with_clock(&data, &[], source.clone()).await,
+            Err(Error::ClockRegressed)
+        ));
+        value.store(100, Ordering::SeqCst);
+        preflight_occurrence_clock_with_clock(&data, &[], source)
+            .await
+            .unwrap();
+        assert!(!data.exists());
+        assert!(!root.path().join(WRITER_LOCK_NAME).exists());
+    }
+
+    #[test]
+    fn a_second_mount_cannot_reuse_an_existing_owner_but_owned_stores_can() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("first.sqlite3");
+        let other = root.path().join("other.sqlite3");
+        let first = DirectoryWriterGuard::acquire_new_mount_checked(&data, &[]).unwrap();
+        assert!(matches!(
+            DirectoryWriterGuard::acquire_new_mount_checked(&other, &[]),
+            Err(Error::Conflict(_))
+        ));
+        let shared = DirectoryWriterGuard::acquire_checked(&other, &[]).unwrap();
+        assert!(Arc::ptr_eq(&first, &shared));
+        drop(shared);
+        drop(first);
+        assert!(DirectoryWriterGuard::acquire_new_mount_checked(&data, &[]).is_ok());
+        assert!(!data.exists());
+        assert!(!other.exists());
+    }
+
+    #[test]
+    fn a_replaced_directory_is_not_the_retained_fd_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("original");
+        let data = directory.join("db.sqlite3");
+        let guard = DirectoryWriterGuard::acquire_new_mount_checked(&data, &[]).unwrap();
+        std::fs::rename(&directory, root.path().join("retained")).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        assert!(!guard.matches_data(&data));
+    }
+
+    #[test]
+    fn a_replaced_compatibility_file_is_not_the_retained_fd_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("db.sqlite3");
+        let guard = DirectoryWriterGuard::acquire_new_mount_checked(&data, &[]).unwrap();
+        let lock = root.path().join(WRITER_LOCK_NAME);
+        std::fs::rename(&lock, root.path().join("old.lock")).unwrap();
+        std::fs::write(&lock, []).unwrap();
+        assert!(!guard.matches_data(&data));
+    }
+
+    use std::io::{Read as _, Write as _};
+
+    type R34Pipe = std::thread::JoinHandle<std::io::Result<Vec<u8>>>;
+    type R34Output = (std::process::ExitStatus, Vec<u8>, Vec<u8>);
+    const R34_READY: &[u8] = b"RSIA_R34_READY\n";
+
+    fn r34_drain(
+        mut pipe: impl std::io::Read + Send + 'static,
+        mut ready: Option<std::sync::mpsc::Sender<()>>,
+    ) -> R34Pipe {
+        std::thread::spawn(move || {
+            let mut all = Vec::new();
+            let mut chunk = [0; 1024];
+            loop {
+                let count = pipe.read(&mut chunk)?;
+                if count == 0 {
+                    break;
+                }
+                all.extend_from_slice(&chunk[..count]);
+                if all.windows(R34_READY.len()).any(|part| part == R34_READY)
+                    && let Some(sender) = ready.take()
+                {
+                    let _ = sender.send(());
+                }
+            }
+            Ok(all)
+        })
+    }
+
+    fn r34_join(pipe: Option<R34Pipe>) -> std::io::Result<Vec<u8>> {
+        match pipe {
+            Some(pipe) => pipe
+                .join()
+                .map_err(|_| std::io::Error::other("pipe thread panicked"))?,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    struct R34Child {
+        child: Option<std::process::Child>,
+        stdout: Option<R34Pipe>,
+        stderr: Option<R34Pipe>,
+        ready: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl R34Child {
+        fn start(test: &str, case: &str, directory: &Path) -> Self {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test])
+                .env("RSIA_R34_CASE", case)
+                .env("RSIA_R34_DIR", directory)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let (sender, ready) = std::sync::mpsc::channel();
+            let mut owner = Self {
+                child: Some(child),
+                stdout: None,
+                stderr: None,
+                ready,
+            };
+            let stdout = owner.child.as_mut().unwrap().stdout.take().unwrap();
+            owner.stdout = Some(r34_drain(stdout, Some(sender)));
+            let stderr = owner.child.as_mut().unwrap().stderr.take().unwrap();
+            owner.stderr = Some(r34_drain(stderr, None));
+            owner
+        }
+
+        fn reap(&mut self, kill: bool) -> std::io::Result<R34Output> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let child = self.child.as_mut().unwrap();
+            if kill {
+                drop(child.stdin.take());
+            }
+            let mut observed = child.try_wait()?;
+            if kill
+                && observed.is_none()
+                && let Err(error) = child.kill()
+            {
+                observed = child.try_wait()?;
+                if observed.is_none() {
+                    return Err(error);
+                }
+            }
+            let status = loop {
+                if let Some(status) = observed {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::other(
+                        "child exit unconfirmed after reap deadline",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+                observed = child.try_wait()?;
+            };
+            drop(self.child.take());
+            let stdout = r34_join(self.stdout.take());
+            let stderr = r34_join(self.stderr.take());
+            Ok((status, stdout?, stderr?))
+        }
+
+        fn done(&mut self) -> std::io::Result<R34Output> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if self.child.as_mut().unwrap().try_wait()?.is_some() {
+                    return self.reap(false);
+                }
+                if std::time::Instant::now() >= deadline {
+                    let output = self.reap(true)?;
+                    return Err(std::io::Error::other(format!("child deadline: {output:?}")));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    impl Drop for R34Child {
+        fn drop(&mut self) {
+            if self.child.is_some() && self.reap(true).is_err() {
+                // No unconfirmed child may be followed by TempDir removal.
+                // Abort is a failed test-binary terminal, never a passed case.
+                std::process::abort();
+            }
+        }
+    }
+
+    fn r34_seed(directory: &Path) {
+        std::fs::create_dir(directory).unwrap();
+        let connection = ReadConnection::open(directory.join("db.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE r34_marker(value INTEGER); INSERT INTO r34_marker VALUES(7);",
+            )
+            .unwrap();
+        connection.close().map_err(|(_, error)| error).unwrap();
+    }
+
+    fn r34_holder(case: &str, directory: &Path) {
+        let data = directory.join("db.sqlite3");
+        let read = |connection: &ReadConnection| -> Result<i64> {
+            let value = connection
+                .query_row("SELECT value FROM r34_marker", [], |row| row.get(0))
+                .map_err(|_| Error::ClockRegressed)?;
+            if case.contains("busy") {
+                let statement = connection.prepare("SELECT value FROM r34_marker").unwrap();
+                std::mem::forget(statement);
+            }
+            if case.contains("panic") {
+                panic!("r34 callback panic");
+            }
+            if case.contains("primary") {
+                return Err(Error::Invalid("r34 primary".into()));
+            }
+            Ok(value)
+        };
+        let outcome = if case.starts_with("borrowed") {
+            let directory = directory.canonicalize().unwrap();
+            let file = Arc::new(File::open(&directory).unwrap());
+            file.try_lock_shared().unwrap();
+            let outcome = {
+                let scope = LockedOriginalSource {
+                    directory: &directory,
+                    file: &file,
+                    legacy: None,
+                };
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    original_read_scoped(&data, Some(&scope), read)
+                }))
+            };
+            drop(file);
+            outcome
+        } else {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| original_read(&data, read)))
+        };
+        if case.contains("panic") {
+            assert!(outcome.is_err());
+        } else if case.contains("primary") {
+            assert!(matches!(outcome, Ok(Err(Error::Invalid(value))) if value == "r34 primary"));
+        } else if case.contains("busy") {
+            assert!(matches!(outcome, Ok(Err(Error::ClockRegressed))));
+        } else {
+            assert!(matches!(outcome, Ok(Ok(7))));
+        }
+    }
+
+    fn r34_close_test(local_name: &str, cases: &[&str]) {
+        let module = module_path!().split_once("::").unwrap().1;
+        let test = format!("{module}::{local_name}");
+        if let Some(case) = std::env::var_os("RSIA_R34_CASE") {
+            let case = case.to_str().unwrap();
+            assert!(cases.contains(&case));
+            let args: Vec<_> = std::env::args().collect();
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--exact" && pair[1] == test)
+            );
+            let directory = PathBuf::from(std::env::var_os("RSIA_R34_DIR").unwrap());
+            r34_holder(case, &directory);
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(R34_READY).unwrap();
+            stdout.flush().unwrap();
+            drop(stdout);
+            let mut release = [0];
+            std::io::stdin().read_exact(&mut release).unwrap();
+            assert_eq!(release, [b'x']);
+            return;
+        }
+        assert!(std::env::var_os("RSIA_R34_DIR").is_none());
+        let root = tempfile::tempdir().unwrap();
+        for case in cases {
+            let directory = root.path().join(case);
+            r34_seed(&directory);
+            let mut child = R34Child::start(&test, case, &directory);
+            child.ready.recv_timeout(Duration::from_secs(30)).unwrap();
+            let alive_before = child.child.as_mut().unwrap().try_wait().unwrap().is_none();
+            let observed = {
+                let probe = File::open(&directory).unwrap();
+                match probe.try_lock() {
+                    Ok(()) => false,
+                    Err(TryLockError::WouldBlock) => true,
+                    Err(error) => panic!("directory lock probe failed: {error:?}"),
+                }
+            };
+            let alive_after = child.child.as_mut().unwrap().try_wait().unwrap().is_none();
+            child
+                .child
+                .as_mut()
+                .unwrap()
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"x")
+                .unwrap();
+            let output = child.done().unwrap();
+            assert!(output.0.success(), "child {case}: {output:?}");
+            assert!(
+                alive_before && alive_after,
+                "holder exited before the lock probe"
+            );
+            assert_eq!(observed, case.contains("busy"), "case {case}: {output:?}");
+            {
+                let after_exit = File::open(&directory).unwrap();
+                after_exit.try_lock().unwrap();
+            }
+        }
+        root.close().unwrap();
+    }
+
+    #[test]
+    fn r34_owned_close_lifetime() {
+        r34_close_test(
+            "r34_owned_close_lifetime",
+            &["owned-normal", "owned-panic", "owned-busy-panic"],
+        );
+    }
+
+    #[test]
+    fn r34_borrowed_close_lifetime() {
+        r34_close_test(
+            "r34_borrowed_close_lifetime",
+            &[
+                "borrowed-normal",
+                "borrowed-panic",
+                "borrowed-busy",
+                "borrowed-primary-busy",
+                "borrowed-busy-panic",
+            ],
+        );
+    }
+
+    #[test]
+    fn readonly_shm_uri_preserves_unix_path_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(OsStr::from_bytes(b"/tmp/rsia ?%#\xc3\xa9\xff"));
+        assert_eq!(
+            original_read_shm_uri(path).unwrap(),
+            "file:///tmp/rsia%20%3F%25%23%C3%A9%FF?readonly_shm=1"
+        );
+        assert!(matches!(
+            original_read_shm_uri(Path::new("relative")),
+            Err(Error::ClockRegressed)
+        ));
+        assert!(matches!(
+            original_read_shm_uri(Path::new(OsStr::from_bytes(b"/tmp/bad\0name"))),
+            Err(Error::ClockRegressed)
+        ));
+    }
+
+    const WAL_BASE: i64 = 2_000_000_000;
+    const WAL_FLOOR: i64 = WAL_BASE + 64;
+
+    fn wal_clock(seconds: i64) -> WallClock {
+        WallClock::fixture_seconds(Arc::new(move || seconds))
+    }
+
+    async fn wal_audit(store: &Store, name: &str) {
+        let context = Context::new("wal-clock", "wal-admin", Role::Admin).unwrap();
+        let mut session = store.session().await.unwrap();
+        session.audit(&context, name, "wal-fixture").await.unwrap();
+        session.commit().await.unwrap();
+    }
+
+    fn wal_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn wal_seed(directory: &Path) -> Vec<u8> {
+        std::fs::create_dir(directory).unwrap();
+        let data = directory.join("db.sqlite3");
+        wal_runtime().block_on(async {
+            let store = Store::open_with_fixture_clock(&data, Vec::new(), wal_clock(WAL_BASE))
+                .await
+                .unwrap();
+            wal_audit(&store, "wal.seed").await;
+            {
+                let mut native = store.pool.acquire().await.unwrap();
+                sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .execute(&mut *native)
+                    .await
+                    .unwrap();
+            }
+            store.close().await;
+        });
+        assert_eq!(
+            original_read(&data, |connection| {
+                Ok(collect_floor_rusqlite(connection, &PreparePreimages::default())?.max_nanos())
+            })
+            .unwrap(),
+            Some(i128::from(WAL_BASE) * 1_000_000_000)
+        );
+        std::fs::read(data).unwrap()
+    }
+
+    fn wal_live_child(directory: &Path) {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let seconds = Arc::new(AtomicI64::new(WAL_FLOOR));
+        let actual = Arc::clone(&seconds);
+        let clock = WallClock::fixture_seconds(Arc::new(move || actual.load(Ordering::SeqCst)));
+        let runtime = wal_runtime();
+        let store = runtime
+            .block_on(Store::open_with_fixture_clock(
+                &directory.join("db.sqlite3"),
+                Vec::new(),
+                clock,
+            ))
+            .unwrap();
+        runtime.block_on(async {
+            let mut native = store.pool.acquire().await.unwrap();
+            sqlx::query("PRAGMA wal_autocheckpoint=0")
+                .execute(&mut *native)
+                .await
+                .unwrap();
+        });
+        runtime.block_on(wal_audit(&store, "wal.first"));
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(R34_READY).unwrap();
+        stdout.flush().unwrap();
+        drop(stdout);
+        let mut command = [0];
+        std::io::stdin().read_exact(&mut command).unwrap();
+        assert_eq!(command, [b'x']);
+        seconds.store(WAL_FLOOR + 1, Ordering::SeqCst);
+        runtime.block_on(wal_audit(&store, "wal.parallel"));
+        // Keep a committed WAL instead of letting graceful close checkpoint it.
+        std::process::exit(0);
+    }
+
+    fn wal_sample(data: &Path, value: i64) -> Result<i64> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let samples = Arc::new(AtomicUsize::new(0));
+        let actual = Arc::clone(&samples);
+        let clock = WallClock::fixture_seconds(Arc::new(move || {
+            actual.fetch_add(1, Ordering::SeqCst);
+            value
+        }));
+        let result = readonly_wall_seconds_with_clock(data, &[], &[], &clock);
+        assert_eq!(samples.load(Ordering::SeqCst), 1);
+        result
+    }
+
+    #[test]
+    fn live_and_retained_wal_keep_the_qualified_floor_and_snapshot() {
+        let name = "live_and_retained_wal_keep_the_qualified_floor_and_snapshot";
+        let module = module_path!().split_once("::").unwrap().1;
+        let test = format!("{module}::{name}");
+        if let Some(case) = std::env::var_os("RSIA_R34_CASE") {
+            assert_eq!(case, "wal-live");
+            let args: Vec<_> = std::env::args().collect();
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--exact" && pair[1] == test)
+            );
+            wal_live_child(&PathBuf::from(std::env::var_os("RSIA_R34_DIR").unwrap()));
+            unreachable!();
+        }
+        assert!(std::env::var_os("RSIA_R34_DIR").is_none());
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("live");
+        let original = wal_seed(&directory);
+        let data = directory.join("db.sqlite3");
+        let copy = root.path().join("only-main");
+        std::fs::create_dir(&copy).unwrap();
+        std::fs::write(copy.join("db.sqlite3"), &original).unwrap();
+        assert_eq!(
+            wal_sample(&copy.join("db.sqlite3"), WAL_BASE).unwrap(),
+            WAL_BASE
+        );
+        let mut child = R34Child::start(&test, "wal-live", &directory);
+        child.ready.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(std::fs::read(&data).unwrap(), original);
+        let wal = sidecar_path(&data, "-wal");
+        let shm = sidecar_path(&data, "-shm");
+        assert!(!std::fs::read(&wal).unwrap().is_empty());
+        assert!(shm.is_file());
+        // Force the same process to own a RW unixShmNode too. URI-only handling
+        // cannot qualify this reader by opening a new read-only node.
+        let rw = ReadConnection::open(&data).unwrap();
+        assert!(
+            rw.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+                .unwrap()
+        );
+        assert_eq!(
+            rw.query_row("SELECT count(*) FROM audit", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let directory_bytes = || {
+            std::fs::read_dir(&directory)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let kind = entry.file_type().unwrap();
+                    assert!(kind.is_file() && !kind.is_symlink());
+                    (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<std::ffi::OsString, Vec<u8>>>()
+        };
+        let live_directory = directory_bytes();
+        let before = [
+            std::fs::read(&data).unwrap(),
+            std::fs::read(&wal).unwrap(),
+            std::fs::read(&shm).unwrap(),
+        ];
+        assert!(matches!(
+            wal_sample(&data, WAL_FLOOR - 1),
+            Err(Error::ClockRegressed)
+        ));
+        assert_eq!(wal_sample(&data, WAL_FLOOR).unwrap(), WAL_FLOOR);
+        assert_eq!(
+            [
+                std::fs::read(&data).unwrap(),
+                std::fs::read(&wal).unwrap(),
+                std::fs::read(&shm).unwrap()
+            ],
+            before
+        );
+        assert_eq!(directory_bytes(), live_directory);
+        let captured = crate::readonly_worker::run_live_with_ready(
+            &data,
+            crate::readonly_worker::Operation::RawSnapshot,
+            None,
+            || {
+                child
+                    .child
+                    .as_mut()
+                    .unwrap()
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(b"x")
+                    .unwrap();
+                let output = child.done().unwrap();
+                assert!(output.0.success(), "child: {output:?}");
+                Ok(())
+            },
+        )
+        .unwrap();
+        let raw = crate::owned_occurrence::raw_from_worker_r50(captured.into_value()).unwrap();
+        let first =
+            crate::owned_occurrence::collect_floor_from_raw_r50(&raw, &PreparePreimages::default())
+                .unwrap()
+                .max_nanos();
+        // The worker verified the second native read after the actual writer
+        // commit against its first native snapshot digest before closing.
+        assert_eq!(first, Some(i128::from(WAL_FLOOR) * 1_000_000_000));
+        rw.close().map_err(|(_, error)| error).unwrap();
+        assert!(matches!(
+            wal_sample(&data, WAL_FLOOR),
+            Err(Error::ClockRegressed)
+        ));
+        assert_eq!(wal_sample(&data, WAL_FLOOR + 1).unwrap(), WAL_FLOOR + 1);
+        // After all real handles have closed, remove only the setup SHM. The
+        // production stable-source reader must qualify committed WAL without
+        // creating a new SHM or rewriting any original bytes.
+        std::fs::remove_file(&shm).unwrap();
+        let stable_directory = directory_bytes();
+        let stable = [std::fs::read(&data).unwrap(), std::fs::read(&wal).unwrap()];
+        assert!(matches!(
+            wal_sample(&data, WAL_FLOOR),
+            Err(Error::ClockRegressed)
+        ));
+        assert_eq!(wal_sample(&data, WAL_FLOOR + 1).unwrap(), WAL_FLOOR + 1);
+        assert!(!shm.exists());
+        assert_eq!(
+            [std::fs::read(&data).unwrap(), std::fs::read(&wal).unwrap()],
+            stable
+        );
+        assert_eq!(directory_bytes(), stable_directory);
+        root.close().unwrap();
+    }
+
+    #[test]
+    fn live_diagnostics_preserve_complete_dynamic_accounting_facts() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("facts");
+        wal_seed(&directory);
+        let data = directory.join("db.sqlite3");
+        let writer = ReadConnection::open(&data).unwrap();
+        assert!(
+            writer
+                .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+                .unwrap()
+        );
+        writer.execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE root_budget_forensic(i INTEGER,t TEXT,b BLOB);
+             INSERT INTO root_budget_forensic VALUES(1,'1',x'00FF');"
+        ).unwrap();
+        let expected = writer
+            .query_row(
+                "SELECT quote(i)||','||quote(t)||','||quote(b) FROM root_budget_forensic",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let members = [
+            data.clone(),
+            sidecar_path(&data, "-wal"),
+            sidecar_path(&data, "-shm"),
+        ];
+        let before = members
+            .iter()
+            .map(std::fs::read)
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        // Diagnostics do not require a caller's clock to qualify as a writer.
+        assert!(wal_sample(&data, WAL_BASE - 1).is_err());
+        let facts = wal_runtime()
+            .block_on(read_control_plane_facts(&data))
+            .unwrap();
+        assert_eq!(
+            facts.root_budget_tables["root_budget_forensic"],
+            vec![expected]
+        );
+        assert_eq!(
+            members
+                .iter()
+                .map(std::fs::read)
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap(),
+            before
+        );
+        writer.close().map_err(|(_, error)| error).unwrap();
+        root.close().unwrap();
+    }
+
+    #[test]
+    fn live_reader_unwind_and_cancel_wait_for_owned_child_drain() {
+        let name = "live_reader_unwind_and_cancel_wait_for_owned_child_drain";
+        let module = module_path!().split_once("::").unwrap().1;
+        let test = format!("{module}::{name}");
+        if let Some(case) = std::env::var_os("RSIA_R34_CASE") {
+            let case = case.to_str().unwrap();
+            assert!(["live-lock-held", "live-lock-free"].contains(&case));
+            assert!(
+                std::env::args()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|pair| pair[0] == "--exact" && pair[1] == test)
+            );
+            let directory = PathBuf::from(std::env::var_os("RSIA_R34_DIR").unwrap());
+            let probe = File::open(directory).unwrap();
+            match probe.try_lock() {
+                Ok(()) => assert_eq!(case, "live-lock-free"),
+                Err(TryLockError::WouldBlock) => assert_eq!(case, "live-lock-held"),
+                Err(error) => panic!("directory lock probe failed: {error:?}"),
+            }
+            return;
+        }
+        assert!(std::env::var_os("RSIA_R34_DIR").is_none());
+        fn probe(test: &str, directory: &Path, held: bool) {
+            let case = if held {
+                "live-lock-held"
+            } else {
+                "live-lock-free"
+            };
+            let mut child = R34Child::start(test, case, directory);
+            let output = child.done().unwrap();
+            assert!(output.0.success(), "lock probe: {output:?}");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("cancel");
+        wal_seed(&directory);
+        let data = directory.join("db.sqlite3");
+        let writer = ReadConnection::open(&data).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE live_probe(value); INSERT INTO live_probe VALUES(1);").unwrap();
+        assert!(sidecar_path(&data, "-shm").is_file());
+        let mount = || {
+            let mount =
+                DirectoryWriterGuard::acquire_checked_with_clock(&data, &[], &wal_clock(WAL_BASE))
+                    .unwrap();
+            assert_eq!(Arc::strong_count(&mount), 1);
+            mount
+        };
+        let retained = mount();
+        let probed = std::cell::Cell::new(false);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::readonly_worker::run_live_with_ready(
+                &data,
+                crate::readonly_worker::Operation::RawSnapshot,
+                Some(retained),
+                || {
+                    probe(&test, &directory, true);
+                    probed.set(true);
+                    panic!("parent abandoned an actual open reader")
+                },
+            )
+        }));
+        assert!(outcome.is_err());
+        assert!(probed.get());
+        probe(&test, &directory, false);
+        // A fresh production worker succeeds after the abandoned one was reaped.
+        assert!(
+            crate::readonly_worker::run_live(
+                &data,
+                crate::readonly_worker::Operation::RawSnapshot,
+                Some(mount()),
+            )
+            .is_ok()
+        );
+        let runtime = wal_runtime();
+        let (ready, ready_rx) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        let (done, done_rx) = std::sync::mpsc::channel();
+        let path = data.clone();
+        let retained = mount();
+        let task = runtime.spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let result = crate::readonly_worker::run_live_with_ready(
+                    &path,
+                    crate::readonly_worker::Operation::RawSnapshot,
+                    Some(retained),
+                    || {
+                        ready.send(()).map_err(|_| Error::Internal)?;
+                        resume_rx.recv().map_err(internal)?;
+                        Ok(())
+                    },
+                );
+                let healthy = result.is_ok();
+                let _ = done.send(healthy);
+                result
+            })
+            .await
+            .map_err(internal)?
+        });
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(30), ready_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        task.abort();
+        runtime.block_on(async {
+            assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        });
+        probe(&test, &directory, true);
+        resume.send(()).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_secs(30)).unwrap());
+        probe(&test, &directory, false);
+        drop(runtime);
+        writer.close().map_err(|(_, error)| error).unwrap();
+        root.close().unwrap();
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RestoreReadRequestR50 {
+    pub(super) path: Vec<u8>,
+    pub(super) prepare_configs: Vec<HostPrepareConfig>,
+    pub(super) extra_occurrences: Vec<i64>,
+    pub(super) related_path: Option<Vec<u8>>,
+}
+
+fn restore_path_r50(bytes: Vec<u8>) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        if bytes.contains(&0) {
+            return Err(Error::ClockRegressed);
+        }
+        let path = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+        if !path.is_absolute() {
+            return Err(Error::ClockRegressed);
+        }
+        Ok(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = bytes;
+        Err(Error::Invalid("unsupported restore platform".into()))
+    }
+}
+
+fn restore_original_rows_r50(path: &Path) -> Result<crate::owned_occurrence::RestoreNativeRowsR50> {
+    let file = restore_regular_file_r50(path)?;
+    let value = if live_original_source_r50(path, None)? {
+        crate::readonly_worker::run_live(
+            path,
+            crate::readonly_worker::Operation::RestoreSnapshot,
+            None,
+        )?
+        .into_value()
+    } else {
+        original_read(path, crate::owned_occurrence::restore_worker_value_r50)?
+    };
+    if !same_regular_file(&file, path).map_err(internal)? {
+        return Err(Error::ClockRegressed);
+    }
+    crate::owned_occurrence::restore_value_from_worker_r50(value)
+}
+
+fn restore_qualify_rows_r50(
+    rows: &crate::owned_occurrence::RestoreNativeRowsR50,
+    inputs: &PreparePreimages,
+    extra_occurrences: &[i64],
+    clock: &mut OperationClock,
+) -> Result<()> {
+    let mut floor = crate::owned_occurrence::collect_floor_from_raw_r50(&rows.raw, inputs)
+        .map_err(|_| clock.fail())?;
+    for value in extra_occurrences {
+        floor.observe_seconds(*value).map_err(|_| clock.fail())?;
+    }
+    let stamp = clock.nanos(&floor)?;
+    let _ = clock.take_nanos(stamp)?;
+    Ok(())
+}
+
+pub(super) fn restore_read_r50(request: RestoreReadRequestR50) -> Result<serde_json::Value> {
+    let path = restore_path_r50(request.path)?;
+    restore_check_ancestors_r50(&path, false)?;
+    for config in &request.prepare_configs {
+        config.validate()?;
+    }
+    let inputs = PreparePreimages {
+        candidates: request.prepare_configs,
+        ..Default::default()
+    };
+    let rows = restore_original_rows_r50(&path)?;
+    let related = request
+        .related_path
+        .map(restore_path_r50)
+        .transpose()?
+        .map(|path| {
+            restore_check_ancestors_r50(&path, false)?;
+            restore_original_rows_r50(&path)
+        })
+        .transpose()?;
+    let mut floor = if let Some(related) = &related {
+        crate::owned_occurrence::restore_union_floor_r50(&rows.raw, &related.raw, &inputs, &[])?
+    } else {
+        crate::owned_occurrence::collect_floor_from_raw_r50(&rows.raw, &inputs)?
+    };
+    for value in request.extra_occurrences {
+        floor.observe_seconds(value)?;
+    }
+    let sample = admitted_sample(
+        &floor,
+        &mut OperationClock::with_source(WallClock::system()),
+    )?;
+    let (seconds, nanos) = sample.into_parts();
+    let mut facts = rows.facts;
+    facts.as_object_mut().ok_or(Error::ClockRegressed)?.insert(
+        "wall".into(),
+        serde_json::json!({"seconds":seconds,"nanos":nanos}),
+    );
+    Ok(facts)
+}
+
+fn restore_check_ancestors_r50(path: &Path, missing_last: bool) -> Result<()> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(Error::Invalid("restore path must be absolute".into()));
+    }
+    let mut current = PathBuf::new();
+    let components: Vec<_> = path.components().collect();
+    for (index, part) in components.iter().enumerate() {
+        if matches!(part, Component::ParentDir | Component::CurDir) {
+            return Err(Error::Invalid("non-canonical restore path".into()));
+        }
+        current.push(part.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Error::Invalid("symlink in restore path".into()));
+            }
+            Ok(_) => {}
+            Err(error)
+                if missing_last
+                    && index + 1 == components.len()
+                    && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(internal(error)),
+        }
+    }
+    Ok(())
+}
+
+fn restore_regular_file_r50(path: &Path) -> Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        restore_check_ancestors_r50(path, false)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+            .open(path)
+            .map_err(internal)?;
+        let metadata = file.metadata().map_err(internal)?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || !same_regular_file(&file, path).map_err(internal)?
+        {
+            return Err(Error::Invalid("linked or nonregular restore member".into()));
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(Error::Invalid("unsupported restore platform".into()))
+    }
+}
+
+fn restore_relative_r50(root: &Path, relative: &str) -> Result<PathBuf> {
+    use std::path::Component;
+    let path = Path::new(relative);
+    if relative.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+        || path
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+            != relative
+    {
+        return Err(Error::Invalid("unsafe restore member".into()));
+    }
+    let result = root.join(path);
+    restore_check_ancestors_r50(&result, false)?;
+    Ok(result)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RestoreEventR50 {
+    seq: u64,
+    previous_digest: String,
+    digest: String,
+    source_kind: String,
+    source_id: String,
+    tombstone_digest: String,
+    reason: String,
+    created_at: i64,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RestoreDeltaNamespaceR50 {
+    namespace: String,
+    base_seq: u64,
+    base_digest: String,
+    events: Vec<RestoreEventR50>,
+    latest_seq: u64,
+    latest_digest: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RestoreDeltaR50 {
+    schema_version: String,
+    base_manifest_sha256: String,
+    namespaces: Vec<RestoreDeltaNamespaceR50>,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RestoreCopyRequestR50 {
+    backup: Vec<u8>,
+    dest: Vec<u8>,
+    anchor: Vec<u8>,
+    manifest_sha256: String,
+    delta: RestoreDeltaR50,
+    prepare_configs: Vec<HostPrepareConfig>,
+}
+
+fn restore_rows_r50<'a>(
+    facts: &'a serde_json::Value,
+    key: &str,
+) -> Result<&'a Vec<serde_json::Value>> {
+    facts
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .ok_or(Error::ClockRegressed)
+}
+fn restore_tombstones_r50(
+    facts: &serde_json::Value,
+) -> Result<BTreeMap<(String, String), (RevokeTombstone, String)>> {
+    let mut result = BTreeMap::new();
+    for value in restore_rows_r50(facts, "objects")? {
+        let row: (String, String, String, String) =
+            serde_json::from_value(value.clone()).map_err(internal)?;
+        if row.1 != "tombstone" {
+            continue;
+        }
+        let body = parse_strict_json(&row.3)?;
+        let tombstone: RevokeTombstone = serde_json::from_value(body).map_err(internal)?;
+        if tombstone.id != row.2
+            || tombstone.schema_version != REVOKE_TOMBSTONE_SCHEMA
+            || !matches!(tombstone.source_kind.as_str(), "run" | "artifact")
+            || result.insert((row.0, row.2), (tombstone, row.3)).is_some()
+        {
+            return Err(Error::ClockRegressed);
+        }
+    }
+    Ok(result)
+}
+
+fn restore_events_r50(
+    manifest: &BackupManifest,
+    manifest_sha: &str,
+    delta: &RestoreDeltaR50,
+    backup: &serde_json::Value,
+    anchor: &serde_json::Value,
+) -> Result<Vec<(String, RestoreEventR50)>> {
+    if delta.schema_version != "rsia.revoke_delta.v1"
+        || delta.base_manifest_sha256 != manifest_sha
+        || delta.namespaces.len() != manifest.watermarks.len()
+    {
+        return Err(Error::Invalid(
+            "delta schema or backup binding differs".into(),
+        ));
+    }
+    // The manifest describes these actual original rows, not caller claims.
+    let migrations = restore_rows_r50(backup, "migrations")?;
+    if migrations.len() != manifest.migrations.len()
+        || manifest
+            .migrations
+            .iter()
+            .zip(migrations)
+            .any(|(expected, actual)| {
+                actual["version"].as_i64() != Some(expected.version)
+                    || actual["description"].as_str() != Some(expected.description.as_str())
+                    || actual["checksum_hex"].as_str() != Some(expected.checksum_hex.as_str())
+                    || actual["success"].as_i64() != Some(if expected.success { 1 } else { 0 })
+            })
+    {
+        return Err(Error::Invalid(
+            "backup migrations differ from manifest".into(),
+        ));
+    }
+    let mut observed: Vec<(String, i64, String)> = restore_rows_r50(backup, "watermarks")?
+        .iter()
+        .map(|row| serde_json::from_value(row.clone()).map_err(internal))
+        .collect::<Result<_>>()?;
+    let mut declared: Vec<_> = manifest
+        .watermarks
+        .iter()
+        .map(|row| (row.namespace.clone(), row.seq, row.digest.clone()))
+        .collect();
+    observed.sort();
+    declared.sort();
+    if observed != declared {
+        return Err(Error::Invalid(
+            "backup watermarks differ from manifest".into(),
+        ));
+    }
+    let base: BTreeMap<_, _> = manifest
+        .watermarks
+        .iter()
+        .map(|row| (row.namespace.clone(), (row.seq, row.digest.clone())))
+        .collect();
+    if base.len() != manifest.watermarks.len() || base.is_empty() {
+        return Err(Error::ClockRegressed);
+    }
+    let latest: BTreeMap<String, (i64, String)> = restore_rows_r50(anchor, "watermarks")?
+        .iter()
+        .map(|value| {
+            let (ns, seq, digest): (String, i64, String) =
+                serde_json::from_value(value.clone()).map_err(internal)?;
+            Ok((ns, (seq, digest)))
+        })
+        .collect::<Result<_>>()?;
+    let old = restore_tombstones_r50(backup)?;
+    let trusted = restore_tombstones_r50(anchor)?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut output = Vec::new();
+    for entry in &delta.namespaces {
+        if !seen.insert(&entry.namespace) {
+            return Err(Error::ClockRegressed);
+        }
+        let (seq, digest) = base.get(&entry.namespace).ok_or(Error::ClockRegressed)?;
+        let (latest_seq, latest_digest) =
+            latest.get(&entry.namespace).ok_or(Error::ClockRegressed)?;
+        if u64::try_from(*seq).ok() != Some(entry.base_seq)
+            || *digest != entry.base_digest
+            || u64::try_from(*latest_seq).ok() != Some(entry.latest_seq)
+            || *latest_digest != entry.latest_digest
+        {
+            return Err(Error::Invalid(
+                "delta does not reach trusted latest watermark".into(),
+            ));
+        }
+        let mut expected = Vec::new();
+        for ((ns, id), (body, raw)) in &trusted {
+            if ns != &entry.namespace {
+                continue;
+            }
+            if body.watermark_seq <= entry.base_seq {
+                let prior = old.get(&(ns.clone(), id.clone())).ok_or_else(|| {
+                    Error::Invalid("backup omits an already consumed revocation".into())
+                })?;
+                if parse_strict_json(&prior.1)? != parse_strict_json(raw)? {
+                    return Err(Error::Invalid(
+                        "backup omits an already consumed revocation".into(),
+                    ));
+                }
+            } else {
+                expected.push((body.clone(), evo_core::hash(raw.as_bytes())));
+            }
+        }
+        expected.sort_by_key(|value| value.0.watermark_seq);
+        let mut previous = entry.base_digest.clone();
+        let mut sequence = entry.base_seq;
+        let mut events = Vec::new();
+        for (body, raw_digest) in expected {
+            sequence = sequence.checked_add(1).ok_or(Error::ClockRegressed)?;
+            if body.watermark_seq != sequence {
+                return Err(Error::ClockRegressed);
+            }
+            let event = RestoreEventR50 {
+                seq: body.watermark_seq,
+                previous_digest: previous,
+                digest: body.watermark_digest.clone(),
+                source_kind: body.source_kind,
+                source_id: body.id,
+                tombstone_digest: raw_digest,
+                reason: body.reason,
+                created_at: body.created_at,
+            };
+            previous = body.watermark_digest;
+            events.push(event);
+        }
+        if sequence != entry.latest_seq || previous != entry.latest_digest || events != entry.events
+        {
+            return Err(Error::Invalid(
+                "delta is incomplete or differs from trusted revocation events".into(),
+            ));
+        }
+        output.extend(
+            events
+                .into_iter()
+                .map(|event| (entry.namespace.clone(), event)),
+        );
+    }
+    Ok(output)
+}
+
+fn restore_sql_literal_r50(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+fn restore_replay_sql_r50(events: &[(String, RestoreEventR50)]) -> Result<String> {
+    // Fixed statements only. Caller data is never interpreted as SQL.
+    let mut sql = String::new();
+    for (namespace, event) in events {
+        identifier(namespace)?;
+        identifier(&event.source_id)?;
+        let body = serde_json::to_string(&json!({
+            "id":event.source_id,"schema_version":REVOKE_TOMBSTONE_SCHEMA,
+            "source_kind":event.source_kind,"reason":event.reason,
+            "watermark_seq":event.seq,"watermark_digest":event.digest,"created_at":event.created_at
+        }))
+        .map_err(internal)?;
+        let identity = serde_json::to_vec(&(
+            namespace,
+            &event.source_kind,
+            &event.source_id,
+            event.seq,
+            &event.digest,
+        ))
+        .map_err(internal)?;
+        let job = format!("revoke-{}", &evo_core::hash(&identity)[..32]);
+        let ns = restore_sql_literal_r50(namespace);
+        let id = restore_sql_literal_r50(&event.source_id);
+        let kind = restore_sql_literal_r50(&event.source_kind);
+        let watermark = restore_sql_literal_r50(&event.digest);
+        let job = restore_sql_literal_r50(&job);
+        let body = restore_sql_literal_r50(&body);
+        let details = restore_sql_literal_r50(
+            &serde_json::to_string(&json!({
+                "watermark_seq":event.seq,"watermark_digest":event.digest
+            }))
+            .map_err(internal)?,
+        );
+        sql.push_str(&format!(
+            "INSERT INTO objects(namespace,kind,id,owner,body) VALUES({ns},'tombstone',{id},'restore',{body}) \
+             ON CONFLICT(namespace,kind,id) DO UPDATE SET body=excluded.body,revision=objects.revision+1;\n\
+             UPDATE revoke_watermark SET seq={},digest={watermark} WHERE namespace={ns};\n\
+             INSERT INTO revoke_cleanup_jobs(namespace,job_id,source_kind,source_id,watermark_seq,watermark_digest,state,created_at,updated_at) \
+             VALUES({ns},{job},{kind},{id},{},{watermark},'pending',{},{});\n",
+             event.seq,event.seq,event.created_at,event.created_at
+        ));
+        for node_kind in ["__budget_scan", "__world_scan", event.source_kind.as_str()] {
+            sql.push_str(&format!(
+                "INSERT INTO revoke_cleanup_frontier(namespace,job_id,node_kind,node_id) \
+                 VALUES({ns},{job},{},{id});\n",
+                restore_sql_literal_r50(node_kind)
+            ));
+        }
+        sql.push_str(&format!(
+            "INSERT INTO revoke_cleanup_events(namespace,job_id,node_kind,node_id,event_kind,event_at,details) \
+             VALUES({ns},{job},{kind},{id},'logical_block_restored',{},{});\n",
+             event.created_at, details
+        ));
+    }
+    Ok(sql)
+}
+
+fn restore_manifest_r50(backup: &Path, expected_sha: &str) -> Result<BackupManifest> {
+    use std::io::Read;
+    let mut file = restore_regular_file_r50(&backup.join("backup-manifest.json"))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(internal)?;
+    if evo_core::hash(&bytes) != expected_sha {
+        return Err(Error::Invalid("backup manifest changed".into()));
+    }
+    let value =
+        crate::owned_occurrence::parse_owned_json(std::str::from_utf8(&bytes).map_err(internal)?)?;
+    let manifest: BackupManifest = serde_json::from_value(value).map_err(internal)?;
+    let compiled = sqlx::migrate!("./migrations");
+    let versions: Vec<i64> = compiled.iter().map(|migration| migration.version).collect();
+    let actual: Vec<i64> = manifest
+        .migrations
+        .iter()
+        .map(|migration| migration.version)
+        .collect();
+    if manifest.schema_version != BACKUP_SCHEMA
+        || !manifest.complete
+        || manifest.database.path != "rsia.sqlite3"
+        || manifest.created_at < 0
+        || actual.is_empty()
+        || actual.len() > versions.len()
+        || actual != versions[..actual.len()]
+        || actual.last().copied().unwrap_or(0) < 5
+        || manifest
+            .migrations
+            .iter()
+            .zip(compiled.iter())
+            .any(|(old, code)| !old.success || old.checksum_hex != hex(code.checksum.as_ref()))
+    {
+        return Err(Error::Invalid("unsupported backup migration prefix".into()));
+    }
+    Ok(manifest)
+}
+fn restore_packet_r50(backup: &Path, manifest: &BackupManifest) -> Result<Vec<BackupFileEntry>> {
+    use std::collections::BTreeSet;
+    use std::io::Read;
+    let mut allowed_files = BTreeSet::from(["backup-manifest.json".to_owned()]);
+    let mut allowed_dirs = BTreeSet::new();
+    let mut output = Vec::new();
+    for (index, entry) in std::iter::once(&manifest.database)
+        .chain(&manifest.blobs)
+        .enumerate()
+    {
+        if !allowed_files.insert(entry.path.clone())
+            || (index > 0
+                && (entry.path.split('/').count() != 3
+                    || !entry.path.starts_with("blobs/")
+                    || Path::new(&entry.path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        != Some(entry.sha256.as_str())))
+        {
+            return Err(Error::Invalid("duplicate or invalid backup member".into()));
+        }
+        for parent in Path::new(&entry.path).ancestors().skip(1) {
+            if !parent.as_os_str().is_empty() {
+                allowed_dirs.insert(parent.to_path_buf());
+            }
+        }
+        let path = restore_relative_r50(backup, &entry.path)?;
+        let mut file = restore_regular_file_r50(&path)?;
+        if file.metadata().map_err(internal)?.len() != entry.bytes {
+            return Err(Error::Invalid("member bytes or digest mismatch".into()));
+        }
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).map_err(internal)?;
+        if u64::try_from(data.len()).map_err(internal)? != entry.bytes
+            || evo_core::hash(&data) != entry.sha256
+        {
+            return Err(Error::Invalid("member bytes or digest mismatch".into()));
+        }
+        output.push(entry.clone());
+    }
+    let mut stack = vec![backup.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        for entry in std::fs::read_dir(&directory).map_err(internal)? {
+            let entry = entry.map_err(internal)?;
+            let path = entry.path();
+            let relative = path.strip_prefix(backup).map_err(internal)?;
+            let metadata = std::fs::symlink_metadata(&path).map_err(internal)?;
+            if metadata.file_type().is_symlink() {
+                return Err(Error::Invalid("linked backup member".into()));
+            }
+            if metadata.is_dir() {
+                if !allowed_dirs.contains(relative) {
+                    return Err(Error::Invalid("linked or unlisted backup directory".into()));
+                }
+                stack.push(path);
+            } else if !metadata.is_file()
+                || !allowed_files.contains(relative.to_str().ok_or(Error::ClockRegressed)?)
+            {
+                return Err(Error::Invalid("unlisted backup file".into()));
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn restore_private_owner_r50(
+    temp: &Path,
+    mut before: impl FnMut() -> Result<()>,
+) -> Result<Arc<DirectoryWriterGuard>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+        // mkdir is atomic and refuses EEXIST: this owner creates the namespace.
+        before()?;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(temp)
+            .map_err(internal)?;
+        let directory = Arc::new(File::open(temp).map_err(internal)?);
+        let metadata = directory.metadata().map_err(internal)?;
+        if metadata.mode() & 0o777 != 0o700
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || !same_directory(&directory, temp).map_err(internal)?
+        {
+            return Err(Error::Invalid("insecure private restore directory".into()));
+        }
+        try_exclusive(&directory).map_err(internal)?;
+        before()?;
+        let legacy = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+                .open(temp.join(WRITER_LOCK_NAME))
+                .map_err(internal)?,
+        );
+        try_exclusive(&legacy).map_err(internal)?;
+        Ok(Arc::new(DirectoryWriterGuard {
+            directory: temp.to_path_buf(),
+            _directory_file: directory,
+            _legacy_file: legacy,
+            activity: Arc::new(RwLock::new(())),
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = temp;
+        Err(Error::Invalid("unsupported restore platform".into()))
+    }
+}
+fn restore_fresh_fs_r50(
+    backup: &crate::owned_occurrence::RestoreNativeRowsR50,
+    anchor: &crate::owned_occurrence::RestoreNativeRowsR50,
+    inputs: &PreparePreimages,
+    manifest_time: i64,
+    clock: &mut OperationClock,
+) -> Result<()> {
+    let floor = crate::owned_occurrence::restore_union_floor_r50(
+        &backup.raw,
+        &anchor.raw,
+        inputs,
+        &[manifest_time],
+    )
+    .map_err(|_| clock.fail())?;
+    let stamp = clock.nanos(&floor)?;
+    let _ = clock.take_nanos(stamp)?;
+    Ok(())
+}
+async fn restore_copy_transaction_r50(
+    connection: &mut sqlx::SqliteConnection,
+    inputs: &PreparePreimages,
+    clock: &mut OperationClock,
+    events: &[(String, RestoreEventR50)],
+) -> Result<crate::owned_occurrence::RestoreNativeRowsR50> {
+    if !events.is_empty() {
+        let sql = restore_replay_sql_r50(events)?;
+        let mut tx = connection
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal)?;
+        let result: Result<()> = async {
+            crate::write_clock::seconds_in_transaction(&mut tx, inputs, clock).await?;
+            // The original fixed replay statements form one logical batch.
+            // No async gap exposes an unqualified intermediate tombstone prefix.
+            sqlx::raw_sql(&sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal)?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            if let Err(rollback) = tx.rollback().await {
+                clock.record_rollback_error(rollback);
+            }
+            return Err(error);
+        }
+        crate::write_clock::finish_transaction(tx, inputs, clock, true)
+            .await
+            .map_err(crate::write_clock::TransactionFailure::into_error)?;
+    }
+    let mut tx = connection.begin().await.map_err(internal)?;
+    let value = crate::owned_occurrence::restore_sqlx_value_r50(&mut tx).await;
+    let rollback = tx.rollback().await.map_err(internal);
+    let value = match (value, rollback) {
+        (Err(error), _) => return Err(error),
+        (Ok(_), Err(error)) => return Err(error),
+        (Ok(value), Ok(())) => value,
+    };
+    let rows = crate::owned_occurrence::restore_value_from_worker_r50(value)?;
+    restore_qualify_rows_r50(&rows, inputs, &[], clock)?;
+    Ok(rows)
+}
+
+pub(super) async fn restore_copy_r50(request: RestoreCopyRequestR50) -> Result<serde_json::Value> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    };
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return Err(Error::Invalid("unsupported restore platform".into()));
+    }
+    #[cfg(unix)]
+    rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+    let backup = restore_path_r50(request.backup)?;
+    let destination = restore_path_r50(request.dest)?;
+    let anchor_path = restore_path_r50(request.anchor)?;
+    restore_check_ancestors_r50(&backup, false)?;
+    restore_check_ancestors_r50(&anchor_path, false)?;
+    restore_check_ancestors_r50(&destination, true)?;
+    if std::fs::symlink_metadata(&destination).is_ok() {
+        return Err(Error::Conflict("dest exists; refusing overwrite".into()));
+    }
+    if anchor_path.starts_with(&backup)
+        || anchor_path
+            .parent()
+            .is_some_and(|parent| parent.join("backup-manifest.json").exists())
+    {
+        return Err(Error::Invalid(
+            "revocation anchor must be independent of backup".into(),
+        ));
+    }
+    let manifest = restore_manifest_r50(&backup, &request.manifest_sha256)?;
+    let packet = restore_packet_r50(&backup, &manifest)?;
+    for config in &request.prepare_configs {
+        config.validate()?;
+    }
+    let inputs = PreparePreimages {
+        candidates: request.prepare_configs,
+        ..Default::default()
+    };
+    let backup_rows = restore_original_rows_r50(&backup.join("rsia.sqlite3"))?;
+    let anchor_rows = restore_original_rows_r50(&anchor_path)?;
+    let events = restore_events_r50(
+        &manifest,
+        &request.manifest_sha256,
+        &request.delta,
+        &backup_rows.facts,
+        &anchor_rows.facts,
+    )?;
+    let mut clock = OperationClock::with_source(WallClock::system());
+    restore_fresh_fs_r50(
+        &backup_rows,
+        &anchor_rows,
+        &inputs,
+        manifest.created_at,
+        &mut clock,
+    )?;
+    let parent = destination.parent().ok_or(Error::ClockRegressed)?;
+    let name = destination
+        .file_name()
+        .ok_or(Error::ClockRegressed)?
+        .to_string_lossy();
+    let temp = parent.join(format!(".{name}.restore-{}", uuid::Uuid::new_v4().simple()));
+    let guard = restore_private_owner_r50(&temp, || {
+        restore_fresh_fs_r50(
+            &backup_rows,
+            &anchor_rows,
+            &inputs,
+            manifest.created_at,
+            &mut clock,
+        )
+    })?;
+    let result: Result<serde_json::Value> = async {
+        for entry in &packet {
+            // Retain one verified member at a time, never all backup blobs.
+            let source = restore_relative_r50(&backup, &entry.path)?;
+            let mut original = restore_regular_file_r50(&source)?;
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut original, &mut data).map_err(internal)?;
+            if u64::try_from(data.len()).map_err(internal)? != entry.bytes
+                || evo_core::hash(&data) != entry.sha256
+            {
+                return Err(Error::Invalid("backup member changed before copy".into()));
+            }
+            let target = temp.join(&entry.path);
+            restore_fresh_fs_r50(
+                &backup_rows,
+                &anchor_rows,
+                &inputs,
+                manifest.created_at,
+                &mut clock,
+            )?;
+            #[cfg(unix)]
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(target.parent().ok_or(Error::ClockRegressed)?)
+                .map_err(internal)?;
+            #[cfg(not(unix))]
+            return Err(Error::Invalid("unsupported restore platform".into()));
+            restore_fresh_fs_r50(
+                &backup_rows,
+                &anchor_rows,
+                &inputs,
+                manifest.created_at,
+                &mut clock,
+            )?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options
+                .mode(0o600)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+            let mut file = options.open(&target).map_err(internal)?;
+            restore_fresh_fs_r50(
+                &backup_rows,
+                &anchor_rows,
+                &inputs,
+                manifest.created_at,
+                &mut clock,
+            )?;
+            file.write_all(&data).map_err(internal)?;
+            file.sync_all().map_err(internal)?;
+            if file.metadata().map_err(internal)?.len() != entry.bytes {
+                return Err(Error::Invalid("copied member digest differs".into()));
+            }
+        }
+        let data = temp.join("rsia.sqlite3");
+        let source_versions: Vec<i64> = manifest.migrations.iter().map(|row| row.version).collect();
+        let compiled = sqlx::migrate!("./migrations");
+        let applied: Vec<serde_json::Value> = compiled
+            .iter()
+            .filter(|migration| !source_versions.contains(&migration.version))
+            .map(|migration| {
+                json!({"version":migration.version,
+                "checksum_sha384":hex(migration.checksum.as_ref())})
+            })
+            .collect();
+        let pool = super::NativePool::new(Arc::clone(&guard));
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&data)
+            .create_if_missing(false)
+            .foreign_keys(true)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Full)
+            .busy_timeout(Duration::from_secs(5))
+            .disable_statement_logging();
+        // Original-source admission precedes the driver's neutral initialization.
+        restore_fresh_fs_r50(
+            &backup_rows,
+            &anchor_rows,
+            &inputs,
+            manifest.created_at,
+            &mut clock,
+        )?;
+        let initialized = pool.initialize(options, clock).await;
+        let mut clock = match initialized {
+            Ok(clock) => clock,
+            Err(error) => {
+                let close = pool.close().await;
+                if close.is_err() {
+                    std::mem::forget(Arc::clone(&guard));
+                }
+                return Err(error);
+            }
+        };
+        let acquired = pool.acquire().await;
+        let mut connection = match acquired {
+            Ok(connection) => connection,
+            Err(error) => {
+                if pool.close().await.is_err() {
+                    std::mem::forget(Arc::clone(&guard));
+                }
+                return Err(internal(error));
+            }
+        };
+        let changed: Result<crate::owned_occurrence::RestoreNativeRowsR50> = async {
+            crate::write_clock::seconds_on_connection(&mut connection, &inputs, &mut clock).await?;
+            if let Err(failure) =
+                crate::migration_clock::run_migrations(&mut connection, &inputs, &mut clock).await
+            {
+                tracing::error!(migration_error=?failure.migration_error,
+                    rollback_error=?failure.rollback_error,
+                    committed_versions=?failure.committed_versions,
+                    commit_outcome_unknown=failure.commit_outcome_unknown,
+                    "private restore migrations stopped");
+                return Err(failure.error);
+            }
+            restore_copy_transaction_r50(&mut connection, &inputs, &mut clock, &events).await
+        }
+        .await;
+        let release = connection.release().await.map_err(internal);
+        let close = pool.close().await.map_err(internal);
+        if close.is_err() {
+            std::mem::forget(Arc::clone(&guard));
+        }
+        let rows = match (changed, release, close) {
+            (Err(error), _, _) => return Err(error),
+            (Ok(_), Err(error), _) => return Err(error),
+            (Ok(_), Ok(()), Err(error)) => return Err(error),
+            (Ok(rows), Ok(()), Ok(())) => rows,
+        };
+        // The private database is now actually closed under our live directory FD.
+        // No path, caller boolean or serialized stamp creates this writer owner.
+        if !guard.matches_data(&data) {
+            return Err(Error::ClockRegressed);
+        }
+        restore_qualify_rows_r50(&rows, &inputs, &[], &mut clock)?;
+        std::fs::remove_file(temp.join(WRITER_LOCK_NAME)).map_err(internal)?;
+        let mut db = restore_regular_file_r50(&data)?;
+        let metadata = db.metadata().map_err(internal)?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut db, &mut bytes).map_err(internal)?;
+        guard._directory_file.sync_all().map_err(internal)?;
+        #[cfg(unix)]
+        return Ok(json!({
+            "private_path":temp.as_os_str().as_bytes(),
+            "directory":{"dev":guard._directory_file.metadata().map_err(internal)?.dev(),
+                "ino":guard._directory_file.metadata().map_err(internal)?.ino(),
+                "uid":guard._directory_file.metadata().map_err(internal)?.uid(),"mode":0o700},
+            "database":{"dev":metadata.dev(),"ino":metadata.ino(),"bytes":metadata.len(),
+                "sha256":evo_core::hash(&bytes)},
+            "applied":applied,"source_versions":source_versions
+        }));
+        #[cfg(not(unix))]
+        Err(Error::Invalid("unsupported restore platform".into()))
+    }
+    .await;
+    // Failure preserves a private copy for diagnosis; never remove a DB whose
+    // close may be unknown. It is never published or granted admission here.
+    result
 }

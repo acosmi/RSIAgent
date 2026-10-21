@@ -8,7 +8,7 @@ use evo_engine::formal_authority::{
     FormalAuthorityIssuer, RegisteredExternalTransport, TypedContentRef, prepare_formal_task,
 };
 use evo_engine::streaming_evaluator::{
-    BrokerTaskView, GraderReceiptRequest, IndependentEvaluationControl,
+    BrokerTaskView, GraderReceiptIntent, GraderReceiptRequest, IndependentEvaluationControl,
 };
 use evo_storage::Store;
 use serde::Deserialize;
@@ -61,6 +61,16 @@ enum Command {
         candidate_execution_receipt_id: String,
         baseline_execution_receipt_id: String,
         issued_at_unix_seconds: i64,
+    },
+    GradeNow {
+        database: String,
+        namespace: String,
+        actor: String,
+        receipt_id: String,
+        ticket_id: String,
+        target_id: String,
+        candidate_execution_receipt_id: String,
+        baseline_execution_receipt_id: String,
     },
     Cost {
         database: String,
@@ -178,6 +188,12 @@ async fn run() -> Result<serde_json::Value> {
             actor,
             ..
         }
+        | Command::GradeNow {
+            database,
+            namespace,
+            actor,
+            ..
+        }
         | Command::Finalize {
             database,
             namespace,
@@ -191,6 +207,20 @@ async fn run() -> Result<serde_json::Value> {
     // These launch fields are trusted supervisor input. Skill and task text
     // enter only the fixed request projection and never choose a role or path.
     let ctx = Context::new(namespace, actor, role)?;
+    if matches!(&command, Command::Grade { .. }) {
+        ctx.require(&[Role::Evaluator])?;
+        return Err(Error::Invalid(
+            "legacy_timed_grader_receipt_disabled".into(),
+        ));
+    }
+    if let Command::Finalize { ticket_id, .. } = &command {
+        Store::reject_known_host_complete_before_open_r49(
+            &ctx,
+            std::path::Path::new(database),
+            ticket_id,
+        )
+        .await?;
+    }
     let (_data_lock, gate) = mount_gate(std::path::Path::new(database), None)
         .await
         .map_err(|error| Error::Conflict(error.to_string()))?;
@@ -265,6 +295,28 @@ async fn execute(ctx: &Context, store: &Store, command: Command) -> Result<serde
             .await?,
         )
         .map_err(|_| Error::Internal),
+        Command::GradeNow {
+            receipt_id,
+            ticket_id,
+            target_id,
+            candidate_execution_receipt_id,
+            baseline_execution_receipt_id,
+            ..
+        } => serde_json::to_value(
+            IndependentEvaluationControl::record_grader_receipt_now(
+                ctx,
+                store,
+                GraderReceiptIntent {
+                    receipt_id,
+                    ticket_id,
+                    target_id,
+                    candidate_execution_receipt_id,
+                    baseline_execution_receipt_id,
+                },
+            )
+            .await?,
+        )
+        .map_err(|_| Error::Internal),
         Command::Cost {
             ticket_id,
             profile_registration_id,
@@ -300,13 +352,7 @@ async fn execute(ctx: &Context, store: &Store, command: Command) -> Result<serde
             )
         }
         Command::Finalize { ticket_id, .. } => serde_json::to_value(
-            IndependentEvaluationControl::finalize_complete(
-                ctx,
-                store,
-                &ticket_id,
-                evo_core::now()?,
-            )
-            .await?,
+            IndependentEvaluationControl::finalize_complete_now(ctx, store, &ticket_id).await?,
         )
         .map_err(|_| Error::Internal),
         Command::Fixture { .. } | Command::Authority { .. } | Command::Operator { .. } => {
@@ -422,4 +468,44 @@ async fn operator(
         .await
         .map_err(|_| Error::Internal)?;
     evo_engine::formal_authority::decode_formal_operator_response(&response)
+}
+
+#[cfg(test)]
+mod native_intent_tests {
+    use super::*;
+
+    #[test]
+    fn grade_now_is_a_separate_strict_time_free_command() {
+        let command = serde_json::json!({
+            "operation":"grade_now", "database":"fixture.db",
+            "namespace":"fixture", "actor":"evaluator", "receipt_id":"grade",
+            "ticket_id":"ticket", "target_id":"target",
+            "candidate_execution_receipt_id":"candidate",
+            "baseline_execution_receipt_id":"baseline"
+        });
+        assert!(matches!(
+            serde_json::from_value::<Command>(command.clone()).unwrap(),
+            Command::GradeNow { .. }
+        ));
+        for field in [
+            "issued_at_unix_seconds",
+            "issued_at_unix_ms",
+            "phase",
+            "verified",
+        ] {
+            let mut changed = command.clone();
+            changed[field] = serde_json::json!(1);
+            assert!(serde_json::from_value::<Command>(changed).is_err());
+        }
+        let mut old = command;
+        old["operation"] = serde_json::json!("grade");
+        old["issued_at_unix_seconds"] = serde_json::json!(1);
+        assert!(matches!(
+            serde_json::from_value::<Command>(old).unwrap(),
+            Command::Grade {
+                issued_at_unix_seconds: 1,
+                ..
+            }
+        ));
+    }
 }

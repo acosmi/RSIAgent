@@ -11,6 +11,7 @@ pub mod curriculum;
 pub mod evaluation;
 pub mod evidence;
 pub mod features;
+pub mod formal_version;
 pub mod holdout;
 pub mod import_fixture;
 pub mod improver;
@@ -711,6 +712,134 @@ pub fn search_tokens(s: &str) -> Vec<String> {
         out.insert(word);
     }
     out.into_iter().take(128).collect()
+}
+
+/// Shared complete-batch mathematics; callers first qualify the complete provenance.
+pub mod formal_complete_statistics {
+    use crate::evaluation::{
+        BernsteinReport, ClusterObservation, ExperimentPlan, ProfileKind, Verdict, decide,
+        empirical_bernstein,
+    };
+    use crate::sequential::{FormalClaimKind, ResearchFamilyAlphaPlan};
+    use crate::{Error, Result};
+
+    pub fn derive_complete_report(
+        control_schema: &str,
+        profile: ProfileKind,
+        v1_plan_snapshot: &ExperimentPlan,
+        candidate_binding: (&str, &str),
+        fixed_sample_claim: (&ResearchFamilyAlphaPlan, &str, &str),
+        rows: &[ClusterObservation],
+        ratios: (f64, f64),
+    ) -> Result<BernsteinReport> {
+        let (candidate_digest, expected_bound_plan_digest) = candidate_binding;
+        let (alpha_plan, fixed_sample_claim_id, attempt_id) = fixed_sample_claim;
+        let (cost_ratio, p95_ratio) = ratios;
+        let alpha = alpha_plan.allocation(
+            fixed_sample_claim_id,
+            attempt_id,
+            FormalClaimKind::FixedSampleGain,
+        )?;
+        let alpha = alpha
+            .parse::<f64>()
+            .map_err(|_| Error::Invalid("invalid fixed-sample alpha".into()))?;
+        let raw = empirical_bernstein(rows, alpha)?;
+        let mut bound_v1_plan = (*v1_plan_snapshot).clone();
+        bound_v1_plan.bind_candidate(candidate_digest.to_owned())?;
+        if bound_v1_plan.digest()? != expected_bound_plan_digest {
+            return Err(Error::Conflict("bound v1 plan digest mismatch".into()));
+        }
+        postprocess_complete_report(
+            control_schema,
+            profile,
+            decide(&bound_v1_plan, raw, cost_ratio, p95_ratio, true)?,
+        )
+    }
+
+    pub fn postprocess_complete_report(
+        control_schema: &str,
+        profile: ProfileKind,
+        mut report: BernsteinReport,
+    ) -> Result<BernsteinReport> {
+        match control_schema {
+            "rsia.registered_evaluation_control.v1" => {
+                // Preserve frozen v1 reports, including their original reason order.
+                if profile == ProfileKind::NoninferiorSavings {
+                    report.verdict = Verdict::Inconclusive;
+                    report
+                        .reasons
+                        .push("cost_savings_statistical_proof_unsupported".into());
+                }
+                report.verdict = Verdict::Inconclusive;
+                report
+                    .reasons
+                    .push("complete_optimization_cost_not_verified".into());
+            }
+            "rsia.registered_evaluation_control.v2" => {
+                if profile == ProfileKind::NoninferiorSavings
+                    && report.verdict == Verdict::Noninferior
+                {
+                    report.verdict = Verdict::Inconclusive;
+                    report
+                        .reasons
+                        .push("cost_savings_statistical_proof_unsupported".into());
+                } else if report.verdict == Verdict::Regressed
+                    && report.reasons.iter().any(|reason| reason == "negative_lcb")
+                {
+                    // E05 L1605: an average regression is confirmed only when the
+                    // UCB is below zero. decide() reports Regressed from a negative
+                    // mean and LCB alone, so the UCB check happens here and the
+                    // stored reason names the check that was actually made.
+                    if regression_ucb(&report) < 0.0 {
+                        report
+                            .reasons
+                            .push("regression_confirmed_ucb_below_zero".into());
+                    } else {
+                        report.verdict = Verdict::Inconclusive;
+                        report
+                            .reasons
+                            .push("regression_not_confirmed_ucb_boundary_not_crossed".into());
+                    }
+                    // Keep decide()'s sorted, deduplicated reasons after appending.
+                    report.reasons.sort();
+                    report.reasons.dedup();
+                }
+            }
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported registered-control schema".into(),
+                ));
+            }
+        }
+        Ok(report)
+    }
+
+    /// One-sided upper confidence bound on the mean paired difference: the mirror
+    /// of the section 3.4 LCB, `UCB = mean + radius`, with the same `radius` (same
+    /// alpha_i, s^2, n and R) that `empirical_bernstein` stored in the report. The
+    /// radius is read from the report rather than recovered as `mean - lcb`,
+    /// because the stored `lcb` is clamped at -1 and then `mean - lcb` is not it.
+    /// A non-finite bound never compares below zero, so it confirms nothing.
+    fn regression_ucb(report: &BernsteinReport) -> f64 {
+        report.mean + report.radius
+    }
+
+    pub fn finite_decimal(value: f64) -> Result<String> {
+        if !value.is_finite() {
+            return Err(Error::Invalid("non-finite formal statistic".into()));
+        }
+        let mut rendered = format!("{value:.17}");
+        while rendered.contains('.') && rendered.ends_with('0') {
+            rendered.pop();
+        }
+        if rendered.ends_with('.') {
+            rendered.pop();
+        }
+        if rendered == "-0" {
+            rendered = "0".into();
+        }
+        Ok(rendered)
+    }
 }
 
 #[cfg(test)]

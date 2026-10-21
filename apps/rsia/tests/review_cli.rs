@@ -217,9 +217,33 @@ async fn registered_review_bundle(
 async fn fixture(scratch: &Scratch) -> HttpState {
     let service_path = scratch.root.join("service");
     std::fs::create_dir(&service_path).unwrap();
-    let store = Store::open(&service_path.join("stored.sqlite3"))
-        .await
-        .unwrap();
+    let caps = HostCapabilities {
+        available: BTreeSet::new(),
+        granted: BTreeSet::new(),
+    };
+    let snapshot = SystemSnapshot {
+        schema_version: "rsia.system_snapshot.v2".into(),
+        profile_id: "cli-profile".into(),
+        host_id: "cli-host".into(),
+        host_version: "1.0.0".into(),
+        model_id: "disabled".into(),
+        tools: vec![],
+        mandatory_context_digest: d("mandatory"),
+    };
+    let prepare_config = HostPrepareConfig {
+        profile_id: "cli-profile".into(),
+        system_snapshot: snapshot.clone(),
+        host_surface_id: "unused-review-surface".into(),
+        host_capabilities: caps.clone(),
+        evolution_enabled: true,
+        capability_level: CapabilityLevel::ToolOnly,
+    };
+    let store = Store::open_with_prepare_configs(
+        &service_path.join("stored.sqlite3"),
+        vec![prepare_config.clone()],
+    )
+    .await
+    .unwrap();
     let host = ctx("host", Role::Host);
     let authority = StoredTraceAuthority {
         schema_version: "rsia.optimization.source.v1".into(),
@@ -253,10 +277,6 @@ async fn fixture(scratch: &Scratch) -> HttpState {
         .await
         .unwrap();
     session.commit().await.unwrap();
-    let caps = HostCapabilities {
-        available: BTreeSet::new(),
-        granted: BTreeSet::new(),
-    };
 
     let parent = SkillSnapshot {
         content: "CLI stored full rule 中文🙂".into(),
@@ -266,15 +286,6 @@ async fn fixture(scratch: &Scratch) -> HttpState {
         dependencies: vec![],
     };
 
-    let snapshot = SystemSnapshot {
-        schema_version: "rsia.system_snapshot.v2".into(),
-        profile_id: "cli-profile".into(),
-        host_id: "cli-host".into(),
-        host_version: "1.0.0".into(),
-        model_id: "disabled".into(),
-        tools: vec![],
-        mandatory_context_digest: d("mandatory"),
-    };
     let bundle = registered_review_bundle(&store, NS, &snapshot, &parent, &caps).await;
     let proposer = ctx("proposer", Role::Worker);
     ReleaseStore::stage_bundle(
@@ -308,14 +319,7 @@ async fn fixture(scratch: &Scratch) -> HttpState {
     .unwrap();
     HttpState {
         service,
-        prepare_config: HostPrepareConfig {
-            profile_id: "cli-profile".into(),
-            system_snapshot: snapshot,
-            host_surface_id: "unused-review-surface".into(),
-            host_capabilities: caps,
-            evolution_enabled: true,
-            capability_level: CapabilityLevel::ToolOnly,
-        },
+        prepare_config,
         auth,
         management,
     }

@@ -224,6 +224,59 @@ pub(crate) struct PersistedCompilerBinding {
 pub struct ReleaseStore;
 
 impl ReleaseStore {
+    pub async fn approve_current(
+        ctx: &Context,
+        store: &Store,
+        credential: evo_storage::NativeOperatorCredentialR49,
+    ) -> Result<evo_core::formal_version::PersistentReleaseV2<PersistentRelease>> {
+        ctx.require(&[Role::Admin])?;
+        let operation = store
+            .session()
+            .await?
+            .begin_formal_approval_r49(ctx.clone(), credential)?;
+        let release: evo_core::formal_version::PersistentReleaseV2<PersistentRelease> =
+            crate::streaming_evaluator::finish_e05_native(
+                operation,
+                "native_approval",
+                "approve_current_v2",
+            )
+            .await?;
+        release.validate_known().map_err(|_| {
+            tracing::error!(
+                commit_confirmed = true,
+                "native approval committed but returned invalid release envelope"
+            );
+            Error::Internal
+        })?;
+        Ok(release)
+    }
+    pub async fn transition_current(
+        ctx: &Context,
+        store: &Store,
+        credential: evo_storage::NativeReleaseCredentialR49,
+    ) -> Result<evo_core::formal_version::PersistentReleaseV2<PersistentRelease>> {
+        ctx.require(&[Role::Admin])?;
+        let operation = store
+            .session()
+            .await?
+            .begin_formal_release_transition_r49(ctx.clone(), credential)?;
+        let release: evo_core::formal_version::PersistentReleaseV2<PersistentRelease> =
+            crate::streaming_evaluator::finish_e05_native(
+                operation,
+                "native_release",
+                "release_transition_v2",
+            )
+            .await?;
+        release.validate_known().map_err(|_| {
+            tracing::error!(
+                commit_confirmed = true,
+                "native release transition committed but returned invalid envelope"
+            );
+            Error::Internal
+        })?;
+        Ok(release)
+    }
+
     /// A read-only Admin gate; staging and release transitions retain their
     /// existing identity rules. Reviewers need not be the candidate's proposer.
     pub(crate) async fn read_review_candidate_in_session(
@@ -401,6 +454,21 @@ impl ReleaseStore {
         let view = verified_report_view_in_session(ctx, &mut session, report_id).await?;
         validate_verified_report_identity(&candidate, &view)?;
         validate_approval_actor(ctx, &candidate, &view)?;
+        let native_source = session
+            .inspect_formal_data_r49(
+                ctx,
+                evo_storage::FormalReadSelectorR38::Ticket(report_id.into()),
+            )
+            .await?;
+        if matches!(native_source.reference(),
+            evo_core::formal_version::AnyReportRef::VersionedV3(reference)
+                if reference.engine_version==evo_core::formal_version::ENGINE_V4
+                &&reference.input_schema_version==evo_core::formal_version::INPUT_SCHEMA_V2)
+        {
+            return Err(Error::Invalid(
+                "new native formal content requires approve_current_v2".into(),
+            ));
+        }
         let pointer = load_pointer(&mut session, ctx, &candidate.profile_id).await?;
         let release_id = format!(
             "release-{}",

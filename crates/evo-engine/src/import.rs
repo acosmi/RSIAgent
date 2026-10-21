@@ -1691,9 +1691,13 @@ impl PersistentImportService {
     ) -> Result<SourceSelectionRecord> {
         ctx.require(&[Role::Admin])?;
         validate_registration_request(&request)?;
+        let import_preimage = serde_json::to_value(&request).map_err(|_| Error::Internal)?;
         let _guard = self.operation_lock.lock().await;
         let selection_id = format!("e16sel-{}", &fingerprint(&request)?[..24]);
-        let mut session = self.store.session().await?;
+        let mut session = self
+            .store
+            .session_with_import_request(ctx, &import_preimage)
+            .await?;
         if let Some(cached) = session
             .cached::<SourceSelectionRecord, _>(
                 ctx,
@@ -1827,7 +1831,10 @@ impl PersistentImportService {
         let mut finalized_selection = selection;
         finalized_selection.source_refs = source_record_refs(&source_records)?;
         finalized_selection.updated_at = now()?;
-        let mut session = self.store.session().await?;
+        let mut session = self
+            .store
+            .session_with_import_request(ctx, &import_preimage)
+            .await?;
         if let Some(cached) = session
             .cached::<SourceSelectionRecord, _>(
                 ctx,

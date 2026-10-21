@@ -186,6 +186,9 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(code) = evo_storage::readonly_original_worker_entry() {
+        std::process::exit(code);
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Review {
@@ -209,8 +212,11 @@ async fn main() -> Result<()> {
             evaluator_token,
             trusted_revocations_db,
         } => {
-            let (_data_lock, gate) = mount_gate(&data, trusted_revocations_db.as_deref()).await?;
-            let (service, prepare_config) = bootstrap(&data, &namespace).await?;
+            let prepare_config = reference_prepare_config()?;
+            let (data_lock, gate) =
+                mount_gate(&data, trusted_revocations_db.as_deref(), &prepare_config).await?;
+            let (service, prepare_config) =
+                bootstrap(&data, &namespace, &data_lock, prepare_config).await?;
             let mounted_store = service.store().clone();
             let serving: Result<()> = async {
                 gate.admit()?;
@@ -285,8 +291,11 @@ async fn main() -> Result<()> {
             actor,
             trusted_revocations_db,
         } => {
-            let (_data_lock, gate) = mount_gate(&data, trusted_revocations_db.as_deref()).await?;
-            let (service, prepare_config) = bootstrap(&data, &namespace).await?;
+            let prepare_config = reference_prepare_config()?;
+            let (data_lock, gate) =
+                mount_gate(&data, trusted_revocations_db.as_deref(), &prepare_config).await?;
+            let (service, prepare_config) =
+                bootstrap(&data, &namespace, &data_lock, prepare_config).await?;
             let mounted_store = service.store().clone();
             let serving: Result<()> = async {
                 gate.admit()?;
@@ -374,8 +383,14 @@ async fn main() -> Result<()> {
 async fn mount_gate(
     data: &Path,
     trusted_revocations_db: Option<&Path>,
+    prepare_config: &HostPrepareConfig,
 ) -> Result<(DataDirectoryLock, GateDecision)> {
-    let mounted = evo_engine::data_directory_lock::mount_gate(data, trusted_revocations_db).await?;
+    let mounted = evo_engine::data_directory_lock::mount_gate_with_prepare_configs(
+        data,
+        trusted_revocations_db,
+        std::slice::from_ref(prepare_config),
+    )
+    .await?;
     // stderr only: stdout is the MCP JSON-RPC channel.
     eprintln!("{}", mounted.1.startup_line());
     Ok(mounted)
@@ -391,8 +406,39 @@ fn lock_directory(data: &Path) -> PathBuf {
     data_directory(data)
 }
 
-async fn bootstrap(data: &Path, namespace: &str) -> Result<(HostService, HostPrepareConfig)> {
-    let store = Store::open(data).await?;
+/// The same fixed typed data is constructed before any mount/open side
+/// effect and carried through both read-only gates, Store and the host API.
+fn reference_prepare_config() -> Result<HostPrepareConfig> {
+    let prepare_config = HostPrepareConfig {
+        profile_id: "default".into(),
+        system_snapshot: SystemSnapshot {
+            schema_version: "rsia.system_snapshot.v2".into(),
+            profile_id: "default".into(),
+            host_id: "reference-host".into(),
+            host_version: "1.0.0".into(),
+            model_id: "disabled".into(),
+            tools: vec!["read_config".into()],
+            mandatory_context_digest: hash(b"reference-host-mandatory-context-v1"),
+        },
+        host_surface_id: REFERENCE_SURFACE_ID.into(),
+        host_capabilities: HostCapabilities {
+            available: ["fs_read".into()].into_iter().collect::<BTreeSet<_>>(),
+            granted: ["fs_read".into()].into_iter().collect::<BTreeSet<_>>(),
+        },
+        evolution_enabled: true,
+        capability_level: CapabilityLevel::ToolOnly,
+    };
+    prepare_config.validate()?;
+    Ok(prepare_config)
+}
+
+async fn bootstrap(
+    data: &Path,
+    namespace: &str,
+    data_lock: &DataDirectoryLock,
+    prepare_config: HostPrepareConfig,
+) -> Result<(HostService, HostPrepareConfig)> {
+    let store = Store::open_locked(data, data_lock.guard(), vec![prepare_config.clone()]).await?;
     let initialized: Result<(HostService, HostPrepareConfig)> = async {
         let host = Context::new(namespace, GATEWAY_HOST_ACTOR, Role::Host)?;
         let admin = Context::new(namespace, "service-admin", Role::Admin)?;
@@ -418,25 +464,6 @@ async fn bootstrap(data: &Path, namespace: &str) -> Result<(HostService, HostPre
             vec!["model".into()],
         )
         .await?;
-        let prepare_config = HostPrepareConfig {
-            profile_id: "default".into(),
-            system_snapshot: SystemSnapshot {
-                schema_version: "rsia.system_snapshot.v2".into(),
-                profile_id: "default".into(),
-                host_id: "reference-host".into(),
-                host_version: "1.0.0".into(),
-                model_id: "disabled".into(),
-                tools: vec!["read_config".into()],
-                mandatory_context_digest: hash(b"reference-host-mandatory-context-v1"),
-            },
-            host_surface_id: REFERENCE_SURFACE_ID.into(),
-            host_capabilities: HostCapabilities {
-                available: ["fs_read".into()].into_iter().collect::<BTreeSet<_>>(),
-                granted: ["fs_read".into()].into_iter().collect::<BTreeSet<_>>(),
-            },
-            evolution_enabled: true,
-            capability_level: CapabilityLevel::ToolOnly,
-        };
         Ok((HostService::new(store.clone(), host)?, prepare_config))
     }
     .await;
@@ -674,7 +701,9 @@ mod tests {
     async fn an_ordinary_directory_mounts_under_the_lock_and_reports_its_posture() {
         let scratch = Scratch::new("normal");
         let data = scratch.0.join("rsia.sqlite3");
-        let (lock, gate) = mount_gate(&data, None).await.unwrap();
+        let (lock, gate) = mount_gate(&data, None, &reference_prepare_config().unwrap())
+            .await
+            .unwrap();
         assert_eq!(gate.posture(), RecoveryPosture::Normal);
         assert_eq!(
             gate.startup_line(),
@@ -698,6 +727,7 @@ mod tests {
         let error = mount_gate(
             &missing.join("rsia.sqlite3"),
             Some(Path::new("/anchor/rsia.sqlite3")),
+            &reference_prepare_config().unwrap(),
         )
         .await
         .err()
@@ -718,10 +748,14 @@ mod tests {
         std::fs::write(restored.join(RESTORE_RECEIPT_FILE), b"{}").unwrap();
         std::fs::write(restored.join("rsia.sqlite3"), b"not opened").unwrap();
         let before = std::fs::read_dir(&restored).unwrap().count();
-        let error = mount_gate(&restored.join("rsia.sqlite3"), None)
-            .await
-            .err()
-            .unwrap();
+        let error = mount_gate(
+            &restored.join("rsia.sqlite3"),
+            None,
+            &reference_prepare_config().unwrap(),
+        )
+        .await
+        .err()
+        .unwrap();
         assert!(
             error.to_string().starts_with("recovery_quarantine: ")
                 && error.to_string().ends_with("; not mounting"),

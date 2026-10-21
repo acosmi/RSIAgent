@@ -533,72 +533,140 @@ async fn validate_sources_live(
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+    use sqlx::Row;
 
     async fn read(
-        store: &Store,
+        session: &mut Session,
         ctx: &Context,
         id: &str,
     ) -> Result<Option<ReplayStoreEnvelope<Value>>> {
-        let mut session = store.session().await.unwrap();
-        let envelope = read_envelope::<Value>(&mut session, ctx, REPLAY_POOL_RECORD_KIND, id).await;
-        session.commit().await.unwrap();
-        envelope
+        read_envelope::<Value>(session, ctx, REPLAY_POOL_RECORD_KIND, id).await
+    }
+
+    async fn bodies(session: &mut Session) -> Vec<(String, String, String, String, String, i64)> {
+        sqlx::query(
+            "SELECT namespace,kind,id,owner,body,revision FROM objects
+             ORDER BY namespace,kind,id",
+        )
+        .fetch_all(&mut **session.transaction().unwrap())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get("namespace").unwrap(),
+                row.try_get("kind").unwrap(),
+                row.try_get("id").unwrap(),
+                row.try_get("owner").unwrap(),
+                row.try_get("body").unwrap(),
+                row.try_get("revision").unwrap(),
+            )
+        })
+        .collect()
     }
 
     #[tokio::test]
     async fn an_envelope_read_names_a_redacted_record_and_leaves_every_other_body_alone() {
+        use evo_core::replay::{WorldPartition, replay_baseline_observation_bytes};
+
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("replay-envelope.sqlite3"))
             .await
             .unwrap();
         let ctx = Context::new("n", "admin", Role::Admin).unwrap();
-        let put = |id: &'static str, body: Value| {
-            let (store, ctx) = (store.clone(), ctx.clone());
-            async move {
-                let mut session = store.session().await.unwrap();
-                session
-                    .put(&ctx, "artifact", id, "admin", &body)
-                    .await
-                    .unwrap();
-                session.commit().await.unwrap();
-            }
-        };
-        put(
-            "live",
-            json!({
-                "schema_version": REPLAY_STORE_ENVELOPE_SCHEMA,
-                "id": "live",
-                "namespace": "n",
-                "record_kind": REPLAY_POOL_RECORD_KIND,
-                "payload": {"member": 1},
-            }),
+        let mut train = crate::tests::replay_fixture_world("train", WorldPartition::Train);
+        let mut select = crate::tests::replay_fixture_world("select", WorldPartition::Select);
+        let mut session = store.session().await.unwrap();
+        for world in [&train, &select] {
+            let id = &world.manifest.baseline_observation_source_id;
+            let bytes = replay_baseline_observation_bytes(&world.manifest).unwrap();
+            session
+                .put(
+                    &ctx,
+                    "run",
+                    id,
+                    ctx.actor(),
+                    &crate::tests::native_run_fixture(id, &bytes),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            session
+                .bump_watermark(&ctx, &hash(b"pool-source-watermark"))
+                .await
+                .unwrap(),
+            1
+        );
+        session.commit().await.unwrap();
+        train.seal().unwrap();
+        select.seal().unwrap();
+        seal_replay_world(&ctx, &store, &train).await.unwrap();
+        seal_replay_world(&ctx, &store, &select).await.unwrap();
+        let pool = register_replay_pool(
+            &ctx,
+            &store,
+            &[
+                select.manifest.world_id.clone(),
+                train.manifest.world_id.clone(),
+            ],
         )
-        .await;
-        put(
-            "redacted",
-            json!({"id": "redacted", "schema_version": REDACTED_SCHEMA, "state": "source_revoked"}),
-        )
-        .await;
-        put(
-            "damaged",
-            json!({"schema_version": REPLAY_STORE_ENVELOPE_SCHEMA, "id": "damaged"}),
-        )
-        .await;
-        put(
-            "not-a-tombstone",
-            json!({"schema_version": "rsia.redacted.v2"}),
-        )
-        .await;
-        put("not-an-object", json!([REDACTED_SCHEMA])).await;
+        .await
+        .unwrap();
+        let live_id = replay_pool_storage_id(&pool.pool_digest).unwrap();
+        let loaded = load_live_replay_pool(&ctx, &store, &pool.pool_digest)
+            .await
+            .unwrap();
+        assert_eq!(loaded.manifest, pool);
+        assert_eq!(loaded.worlds.len(), 2);
+        let expected_payload = serde_json::to_value(&pool).unwrap();
+        let mut session = store.session().await.unwrap();
+        let lawful_bodies = bodies(&mut session).await;
+        let live = read(&mut session, &ctx, &live_id).await.unwrap().unwrap();
+        assert_eq!(live.id, live_id);
+        assert_eq!(live.payload, expected_payload);
+        assert_eq!(bodies(&mut session).await, lawful_bodies);
+        session.commit().await.unwrap();
 
+        // Deliberately damaged legacy input is arranged in this test-owned
+        // transaction only. Read errors must not rewrite any body. It is never
+        // a qualified producer or a successful commit of corrupt data.
+        let mut session = store.session().await.unwrap();
+        for (id, body) in [
+            (
+                "redacted",
+                json!({"id":"redacted","schema_version":REDACTED_SCHEMA,"state":"source_revoked"}),
+            ),
+            (
+                "damaged",
+                json!({"schema_version":REPLAY_STORE_ENVELOPE_SCHEMA,"id":"damaged"}),
+            ),
+            (
+                "not-a-tombstone",
+                json!({"schema_version":"rsia.redacted.v2"}),
+            ),
+            ("not-an-object", json!([REDACTED_SCHEMA])),
+        ] {
+            sqlx::query(
+                "INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,'artifact',?,?,?)",
+            )
+            .bind(ctx.namespace())
+            .bind(id)
+            .bind(ctx.actor())
+            .bind(body.to_string())
+            .execute(&mut **session.transaction().unwrap())
+            .await
+            .unwrap();
+        }
+        let damaged_bodies = bodies(&mut session).await;
         // Absent: no row, no error (the caller decides what absence means).
-        assert!(read(&store, &ctx, "absent").await.unwrap().is_none());
-        // A decodable envelope is returned as it is.
-        let envelope = read(&store, &ctx, "live").await.unwrap().unwrap();
-        assert_eq!(envelope.id, "live");
-        assert_eq!(envelope.payload, json!({"member": 1}));
+        assert!(read(&mut session, &ctx, "absent").await.unwrap().is_none());
+        // The real producer's decodable envelope is returned unchanged.
+        let envelope = read(&mut session, &ctx, &live_id).await.unwrap().unwrap();
+        assert_eq!(envelope.id, live_id);
+        assert_eq!(envelope.payload, expected_payload);
         // A tombstone is the expected state of a revoked record: a named Conflict.
-        match read(&store, &ctx, "redacted").await {
+        match read(&mut session, &ctx, "redacted").await {
             Err(Error::Conflict(message)) => assert_eq!(
                 message,
                 "replay replay_pool_manifest_v1 redacted was redacted because its source was revoked"
@@ -608,9 +676,22 @@ mod tests {
         // Everything else that does not decode is corruption.
         for id in ["damaged", "not-a-tombstone", "not-an-object"] {
             assert!(
-                matches!(read(&store, &ctx, id).await, Err(Error::Internal)),
+                matches!(read(&mut session, &ctx, id).await, Err(Error::Internal)),
                 "{id} must stay Internal"
             );
         }
+        assert_eq!(bodies(&mut session).await, damaged_bodies);
+        session.tx.take().unwrap().rollback().await.unwrap();
+        drop(session);
+
+        let mut session = store.session().await.unwrap();
+        assert_eq!(bodies(&mut session).await, lawful_bodies);
+        session.commit().await.unwrap();
+        let loaded = load_live_replay_pool(&ctx, &store, &pool.pool_digest)
+            .await
+            .unwrap();
+        assert_eq!(loaded.manifest, pool);
+        assert_eq!(loaded.worlds.len(), 2);
+        store.close().await;
     }
 }

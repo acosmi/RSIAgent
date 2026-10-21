@@ -12,7 +12,7 @@ use evo_core::evaluation::OptimizationStage;
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, text};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{Acquire, Row, Sqlite, Transaction};
+use sqlx::Row;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -348,7 +348,7 @@ impl BudgetArtifact {
         Ok(artifact)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         self.validate_typed()?
             .map_err(BudgetPreDispatchRefusal::into_reservation_error)
     }
@@ -688,7 +688,7 @@ impl Store {
     ) -> Result<RootBudgetRecord> {
         ctx.require(&[Role::Admin])?;
         let namespaces = validate_authorization(ctx, authorization)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         if let Some(row) = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
             .bind(&authorization.billing_scope)
             .fetch_optional(&mut *tx)
@@ -713,10 +713,11 @@ impl Store {
                     "billing_scope_already_bound_to_different_root_or_authorization".into(),
                 ));
             }
-            tx.commit().await.map_err(internal)?;
+            self.commit_write_transaction(tx, &mut clock).await?;
             return Ok(existing);
         }
 
+        self.guard_transaction(&mut tx, &mut clock).await?;
         sqlx::query(
             "INSERT INTO root_budgets(
                billing_scope,root_budget_id,authorizing_namespace,currency,pricing_version,
@@ -762,7 +763,7 @@ impl Store {
             }),
         )
         .await?;
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         self.root_budget(ctx, &authorization.billing_scope)
             .await?
             .ok_or(Error::Internal)
@@ -853,7 +854,7 @@ impl Store {
             Ok(ids) => ids,
             Err(refusal) => return Ok(Err(refusal)),
         };
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         if let Some(existing) = load_call(&mut tx, &request.billing_scope, &request.call_id).await?
             && existing.namespace == ctx.namespace()
             && typed_budget::call_mode_in_tx(&mut tx, &existing).await? != E16CallMode::Legacy
@@ -874,7 +875,9 @@ impl Store {
             reserve_budget_call_with_sources_in_tx_typed(&mut tx, ctx, request, &source_ids)
                 .await?;
         if outcome.is_ok() {
-            tx.commit().await.map_err(internal)?;
+            self.commit_write_transaction(tx, &mut clock).await?;
+        } else {
+            tx.rollback().await.map_err(internal)?;
         }
         Ok(outcome)
     }
@@ -908,7 +911,7 @@ impl Store {
                 other => other.into_reservation_error(),
             });
         }
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         let existing = load_call(&mut tx, &request.billing_scope, &request.call_id).await?;
         if let Some(call) = &existing {
             require_call_access(&mut tx, ctx, call).await?;
@@ -954,7 +957,7 @@ impl Store {
         if existing.is_none() {
             typed_budget::create_ref_in_tx(&mut tx, ctx, &call).await?;
         }
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         Ok(call)
     }
 
@@ -996,9 +999,9 @@ impl Store {
         request: &BudgetCallRefence,
     ) -> Result<BudgetCallRecord> {
         validate_budget_refence(ctx, request)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         let updated = refence_reserved_budget_call_in_tx(&mut tx, ctx, request).await?;
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         Ok(updated)
     }
 
@@ -1028,12 +1031,13 @@ impl Store {
         ctx: &Context,
         fence: &BudgetCallFence,
     ) -> BudgetPreDispatchResult<BudgetDispatchDecision> {
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         let decision = begin_budget_dispatch_in_tx_typed(&mut tx, ctx, fence).await?;
         if decision.is_err() {
+            tx.rollback().await.map_err(internal)?;
             return Ok(decision);
         }
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         Ok(decision)
     }
 
@@ -1063,7 +1067,7 @@ impl Store {
         require_budget_caller(ctx)?;
         validate_fence(fence)?;
         validate_charge(charge)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -1071,7 +1075,7 @@ impl Store {
         fence_call(&call, fence, false)?;
         if call.state == BudgetCallState::Finalized {
             ensure_same_charge(&call, charge)?;
-            tx.commit().await.map_err(internal)?;
+            self.commit_write_transaction(tx, &mut clock).await?;
             return Ok(call);
         }
         if call.state != BudgetCallState::Dispatched {
@@ -1085,7 +1089,7 @@ impl Store {
         let updated = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::Internal)?;
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         if accounting_overflow {
             return Err(Error::Conflict("cost_accounting_overflow".into()));
         }
@@ -1120,7 +1124,7 @@ impl Store {
                 "registered settlement differs from its fence and charge".into(),
             ));
         }
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -1152,7 +1156,7 @@ impl Store {
                 ));
             }
             ensure_same_charge(&call, charge)?;
-            tx.commit().await.map_err(internal)?;
+            self.commit_write_transaction(tx, &mut clock).await?;
             return Ok(call);
         }
         if call.state != BudgetCallState::Dispatched {
@@ -1233,7 +1237,7 @@ impl Store {
         let updated = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::Internal)?;
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         if accounting_overflow {
             return Err(Error::Conflict("cost_accounting_overflow".into()));
         }
@@ -1283,7 +1287,7 @@ impl Store {
         validate_fence(fence)?;
         validate_charge(charge)?;
         validate_model_settlement_evidence(evidence)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -1302,7 +1306,7 @@ impl Store {
             }
             ensure_same_model_settlement(&call, evidence)?;
             let settlement = settlement_from_call(call, false)?;
-            tx.commit().await.map_err(internal)?;
+            self.commit_write_transaction(tx, &mut clock).await?;
             return Ok(settlement);
         }
         let e16_mode = typed_budget::call_mode_in_tx(&mut tx, &call).await?;
@@ -1499,7 +1503,7 @@ impl Store {
             .await?
             .ok_or(Error::Internal)?;
         let settlement = settlement_from_call(call, accounting_overflow)?;
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         Ok(settlement)
     }
 
@@ -1512,14 +1516,14 @@ impl Store {
         require_budget_caller(ctx)?;
         validate_fence(fence)?;
         validate_reason(reason)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::NotFound)?;
         require_call_access(&mut tx, ctx, &call).await?;
         fence_call(&call, fence, false)?;
         if call.state == BudgetCallState::Uncertain {
-            tx.commit().await.map_err(internal)?;
+            self.commit_write_transaction(tx, &mut clock).await?;
             return Ok(call);
         }
         if call.state != BudgetCallState::Dispatched {
@@ -1547,7 +1551,7 @@ impl Store {
         let updated = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::Internal)?;
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         Ok(updated)
     }
 
@@ -1557,9 +1561,9 @@ impl Store {
         fence: &BudgetCallFence,
         reason: &str,
     ) -> Result<BudgetCallRecord> {
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         let call = release_undispatched_in_tx(&mut tx, ctx, fence, reason).await?;
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         Ok(call)
     }
 
@@ -1572,7 +1576,7 @@ impl Store {
         require_budget_caller(ctx)?;
         validate_fence(fence)?;
         validate_reason(reason)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -1618,7 +1622,7 @@ impl Store {
         let updated = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::Internal)?;
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         Ok(updated)
     }
 
@@ -1635,14 +1639,14 @@ impl Store {
         identifier(call_id)?;
         valid_time(now)?;
         validate_charge(charge)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         let call = load_call(&mut tx, billing_scope, call_id)
             .await?
             .ok_or(Error::NotFound)?;
         require_call_access(&mut tx, ctx, &call).await?;
         if call.state == BudgetCallState::Finalized {
             ensure_same_charge(&call, charge)?;
-            tx.commit().await.map_err(internal)?;
+            self.commit_write_transaction(tx, &mut clock).await?;
             return Ok(call);
         }
         if !matches!(
@@ -1658,7 +1662,7 @@ impl Store {
         let updated = load_call(&mut tx, billing_scope, call_id)
             .await?
             .ok_or(Error::Internal)?;
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         if accounting_overflow {
             return Err(Error::Conflict("cost_accounting_overflow".into()));
         }
@@ -1680,7 +1684,7 @@ impl Store {
         identifier(dispatch_id)?;
         validate_reason(reason)?;
         valid_time(now)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         let call = load_call(&mut tx, billing_scope, call_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -1689,7 +1693,7 @@ impl Store {
             return Err(Error::Cancelled);
         }
         if call.execution_closed {
-            tx.commit().await.map_err(internal)?;
+            self.commit_write_transaction(tx, &mut clock).await?;
             return Ok(call);
         }
         if !matches!(
@@ -1721,7 +1725,7 @@ impl Store {
         let updated = load_call(&mut tx, billing_scope, call_id)
             .await?
             .ok_or(Error::Internal)?;
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         Ok(updated)
     }
 
@@ -1850,9 +1854,9 @@ impl Store {
         identifier(billing_scope)?;
         validate_reason(reason)?;
         valid_time(now)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         let root = stop_root_budget_in_tx(&mut tx, ctx, billing_scope, reason, now).await?;
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         Ok(root)
     }
 
@@ -1864,11 +1868,11 @@ impl Store {
         reason: &str,
         now: i64,
     ) -> Result<DispatchGroupRecord> {
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (mut tx, mut clock, _activity) = self.begin_write_transaction().await?;
         let updated =
             stop_dispatch_group_in_tx(&mut tx, ctx, billing_scope, dispatch_group_id, reason, now)
                 .await?;
-        tx.commit().await.map_err(internal)?;
+        self.commit_write_transaction(tx, &mut clock).await?;
         Ok(updated)
     }
 
@@ -1915,7 +1919,7 @@ impl Session {
         ctx: &Context,
         billing_scope: &str,
     ) -> Result<Option<RootBudgetRecord>> {
-        root_budget_in_tx(&mut self.tx, ctx, billing_scope).await
+        root_budget_in_tx(self.transaction()?, ctx, billing_scope).await
     }
 
     pub async fn reserve_budget_call(
@@ -1957,7 +1961,8 @@ impl Session {
         request: &BudgetCallReservation,
         source_ids: &[String],
     ) -> BudgetPreDispatchResult<BudgetCallRecord> {
-        let mut savepoint = (&mut self.tx).begin().await.map_err(internal)?;
+        self.guard_write().await?;
+        let mut savepoint = (self.transaction()?).begin().await.map_err(internal)?;
         let result =
             reserve_budget_call_with_sources_in_tx_typed(&mut savepoint, ctx, request, source_ids)
                 .await;
@@ -1981,8 +1986,9 @@ impl Session {
         ctx: &Context,
         request: &BudgetCallRefence,
     ) -> Result<BudgetCallRecord> {
+        self.guard_write().await?;
         validate_budget_refence(ctx, request)?;
-        let mut savepoint = (&mut self.tx).begin().await.map_err(internal)?;
+        let mut savepoint = (self.transaction()?).begin().await.map_err(internal)?;
         let result = refence_reserved_budget_call_in_tx(&mut savepoint, ctx, request).await;
         match result {
             Ok(call) => {
@@ -2004,10 +2010,10 @@ impl Session {
         billing_scope: &str,
     ) -> Result<RootBudgetMonetarySnapshot> {
         ctx.require(&[Role::Admin])?;
-        root_budget_in_tx(&mut self.tx, ctx, billing_scope)
+        root_budget_in_tx(self.transaction()?, ctx, billing_scope)
             .await?
             .ok_or(Error::NotFound)?;
-        root_budget_monetary_snapshot_in_tx(&mut self.tx, billing_scope).await
+        root_budget_monetary_snapshot_in_tx(self.transaction()?, billing_scope).await
     }
 
     /// Stops new reservations and dispatches on the same transaction fence.
@@ -2019,7 +2025,8 @@ impl Session {
         reason: &str,
         now: i64,
     ) -> Result<RootBudgetRecord> {
-        stop_root_budget_in_tx(&mut self.tx, ctx, billing_scope, reason, now).await
+        self.guard_write().await?;
+        stop_root_budget_in_tx(self.transaction()?, ctx, billing_scope, reason, now).await
     }
 
     /// A seal is an immutable event in the private budget ledger. An unresolved
@@ -2032,8 +2039,10 @@ impl Session {
         reason: &str,
         now: i64,
     ) -> Result<SealedRootBudgetEvidence> {
-        stop_root_budget_in_tx(&mut self.tx, ctx, billing_scope, reason, now).await?;
-        let snapshot = root_budget_monetary_snapshot_in_tx(&mut self.tx, billing_scope).await?;
+        self.guard_write().await?;
+        stop_root_budget_in_tx(self.transaction()?, ctx, billing_scope, reason, now).await?;
+        let snapshot =
+            root_budget_monetary_snapshot_in_tx(self.transaction()?, billing_scope).await?;
         let latest_event = snapshot
             .ledger_events
             .iter()
@@ -2050,7 +2059,7 @@ impl Session {
         }
         let evidence = root_budget_seal_summary(&snapshot, ctx.namespace(), ctx.actor(), now);
         insert_event(
-            &mut self.tx,
+            self.transaction()?,
             billing_scope,
             None,
             ROOT_MONETARY_SEAL_EVENT,
@@ -2068,7 +2077,7 @@ impl Session {
         ctx: &Context,
         billing_scope: &str,
     ) -> Result<Option<SealedRootBudgetEvidence>> {
-        let Some(root) = root_budget_in_tx(&mut self.tx, ctx, billing_scope).await? else {
+        let Some(root) = root_budget_in_tx(self.transaction()?, ctx, billing_scope).await? else {
             return Ok(None);
         };
         let row = sqlx::query(
@@ -2076,7 +2085,7 @@ impl Session {
         )
         .bind(billing_scope)
         .bind(ROOT_MONETARY_SEAL_EVENT)
-        .fetch_optional(&mut *self.tx)
+        .fetch_optional(&mut **self.transaction()?)
         .await
         .map_err(internal)?;
         let Some(row) = row else {
@@ -2099,7 +2108,8 @@ impl Session {
             ));
         }
         identifier(&evidence.sealed_by_actor)?;
-        let snapshot = root_budget_monetary_snapshot_in_tx(&mut self.tx, billing_scope).await?;
+        let snapshot =
+            root_budget_monetary_snapshot_in_tx(self.transaction()?, billing_scope).await?;
         let current = root_budget_seal_summary(
             &snapshot,
             &evidence.sealed_by_namespace,
@@ -2121,7 +2131,9 @@ impl Session {
         call_id: &str,
         reason: &str,
     ) -> Result<BudgetCallRecord> {
-        redact_budget_call_content_in_tx(&mut self.tx, ctx, billing_scope, call_id, reason).await
+        self.guard_write().await?;
+        redact_budget_call_content_in_tx(self.transaction()?, ctx, billing_scope, call_id, reason)
+            .await
     }
 
     pub async fn budget_call(
@@ -2130,7 +2142,7 @@ impl Session {
         billing_scope: &str,
         call_id: &str,
     ) -> Result<Option<BudgetCallRecord>> {
-        budget_call_in_tx(&mut self.tx, ctx, billing_scope, call_id).await
+        budget_call_in_tx(self.transaction()?, ctx, billing_scope, call_id).await
     }
 
     pub async fn budget_calls_for_group(
@@ -2139,7 +2151,8 @@ impl Session {
         billing_scope: &str,
         dispatch_group_id: &str,
     ) -> Result<Vec<BudgetCallRecord>> {
-        budget_calls_for_group_in_tx(&mut self.tx, ctx, billing_scope, dispatch_group_id).await
+        budget_calls_for_group_in_tx(self.transaction()?, ctx, billing_scope, dispatch_group_id)
+            .await
     }
 
     /// The billing scopes under which `dispatch_group_id` has call rows in the
@@ -2156,7 +2169,7 @@ impl Session {
         ctx: &Context,
         dispatch_group_id: &str,
     ) -> Result<Vec<String>> {
-        budget_call_scopes_for_group_in_tx(&mut self.tx, ctx, dispatch_group_id).await
+        budget_call_scopes_for_group_in_tx(self.transaction()?, ctx, dispatch_group_id).await
     }
 
     /// `Store::begin_budget_dispatch` in the caller's transaction, with the same
@@ -2166,7 +2179,8 @@ impl Session {
         ctx: &Context,
         fence: &BudgetCallFence,
     ) -> Result<BudgetDispatchDecision> {
-        begin_budget_dispatch_in_tx(&mut self.tx, ctx, fence).await
+        self.guard_write().await?;
+        begin_budget_dispatch_in_tx(self.transaction()?, ctx, fence).await
     }
 
     pub async fn begin_budget_dispatch_typed(
@@ -2174,7 +2188,8 @@ impl Session {
         ctx: &Context,
         fence: &BudgetCallFence,
     ) -> BudgetPreDispatchResult<BudgetDispatchDecision> {
-        begin_budget_dispatch_in_tx_typed(&mut self.tx, ctx, fence).await
+        self.guard_write().await?;
+        begin_budget_dispatch_in_tx_typed(self.transaction()?, ctx, fence).await
     }
 
     pub async fn release_undispatched_budget_call(
@@ -2183,7 +2198,8 @@ impl Session {
         fence: &BudgetCallFence,
         reason: &str,
     ) -> Result<BudgetCallRecord> {
-        release_undispatched_in_tx(&mut self.tx, ctx, fence, reason).await
+        self.guard_write().await?;
+        release_undispatched_in_tx(self.transaction()?, ctx, fence, reason).await
     }
 
     /// Persists the dispatch-group stop in the caller's existing transaction.
@@ -2196,8 +2212,9 @@ impl Session {
         reason: &str,
         now: i64,
     ) -> Result<DispatchGroupRecord> {
+        self.guard_write().await?;
         stop_dispatch_group_in_tx(
-            &mut self.tx,
+            self.transaction()?,
             ctx,
             billing_scope,
             dispatch_group_id,
@@ -2221,7 +2238,7 @@ fn validate_budget_refence(ctx: &Context, request: &BudgetCallRefence) -> Result
 }
 
 async fn refence_reserved_budget_call_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     request: &BudgetCallRefence,
 ) -> Result<BudgetCallRecord> {
@@ -2300,7 +2317,7 @@ fn add_exact_micros(total: &mut i128, amount: i64) -> Result<()> {
 /// Every page is read from the caller's transaction and from the whole billing
 /// scope; neither caller namespace nor dispatch group can narrow the accounting.
 async fn root_budget_monetary_snapshot_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     billing_scope: &str,
 ) -> Result<RootBudgetMonetarySnapshot> {
     let row = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
@@ -2626,7 +2643,7 @@ fn root_budget_seal_summary(
 }
 
 async fn root_budget_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     billing_scope: &str,
 ) -> Result<Option<RootBudgetRecord>> {
@@ -2654,7 +2671,7 @@ async fn root_budget_in_tx(
 }
 
 async fn stop_root_budget_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     billing_scope: &str,
     reason: &str,
@@ -2697,7 +2714,7 @@ async fn stop_root_budget_in_tx(
 }
 
 async fn reserve_budget_call_with_sources_in_tx_typed(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     request: &BudgetCallReservation,
     source_ids: &[String],
@@ -2878,7 +2895,7 @@ async fn reserve_budget_call_with_sources_in_tx_typed(
 }
 
 pub(crate) async fn index_budget_call_ref_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     billing_scope: &str,
     call_id: &str,
@@ -2893,7 +2910,7 @@ pub(crate) async fn index_budget_call_ref_in_tx(
 }
 
 pub(crate) async fn redact_budget_call_content_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     billing_scope: &str,
     call_id: &str,
@@ -2912,7 +2929,7 @@ pub(crate) async fn redact_budget_call_content_in_tx(
 
 /// New-mode cleanup reports only actual content/flag changes as progress.
 pub(crate) async fn redact_e16_budget_call_content_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     billing_scope: &str,
     call_id: &str,
@@ -2963,7 +2980,7 @@ pub(crate) async fn redact_e16_budget_call_content_in_tx(
 }
 
 pub(crate) async fn redact_budget_call_content_with_block_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     billing_scope: &str,
     call_id: &str,
@@ -3020,7 +3037,7 @@ pub(crate) async fn redact_budget_call_content_with_block_in_tx(
 }
 
 async fn budget_call_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     billing_scope: &str,
     call_id: &str,
@@ -3031,7 +3048,7 @@ async fn budget_call_in_tx(
 }
 
 async fn budget_call_in_tx_typed(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     billing_scope: &str,
     call_id: &str,
@@ -3055,7 +3072,7 @@ async fn budget_call_in_tx_typed(
 }
 
 async fn budget_calls_for_group_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     billing_scope: &str,
     dispatch_group_id: &str,
@@ -3100,7 +3117,7 @@ async fn budget_calls_for_group_in_tx(
 }
 
 async fn budget_call_scopes_for_group_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     dispatch_group_id: &str,
 ) -> Result<Vec<String>> {
@@ -3119,7 +3136,7 @@ async fn budget_call_scopes_for_group_in_tx(
 }
 
 async fn begin_budget_dispatch_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     fence: &BudgetCallFence,
 ) -> Result<BudgetDispatchDecision> {
@@ -3129,7 +3146,7 @@ async fn begin_budget_dispatch_in_tx(
 }
 
 async fn begin_budget_dispatch_in_tx_typed(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     fence: &BudgetCallFence,
 ) -> BudgetPreDispatchResult<BudgetDispatchDecision> {
@@ -3258,7 +3275,7 @@ async fn begin_budget_dispatch_in_tx_typed(
 }
 
 async fn stop_dispatch_group_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     billing_scope: &str,
     dispatch_group_id: &str,
@@ -3330,7 +3347,7 @@ async fn stop_dispatch_group_in_tx(
 }
 
 async fn release_undispatched_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     fence: &BudgetCallFence,
     reason: &str,
@@ -3358,7 +3375,7 @@ async fn release_undispatched_in_tx(
 }
 
 async fn release_reserved(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     call: &BudgetCallRecord,
     target: BudgetCallState,
     reason: &str,
@@ -3406,7 +3423,7 @@ async fn release_reserved(
 }
 
 async fn apply_charge(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     call: &BudgetCallRecord,
     charge: &UsageCharge,
     now: i64,
@@ -3491,7 +3508,7 @@ async fn apply_charge(
 }
 
 async fn preserve_accounting_overflow(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     call: &BudgetCallRecord,
     charge: &UsageCharge,
     now: i64,
@@ -3542,7 +3559,7 @@ async fn preserve_accounting_overflow(
 }
 
 async fn preserve_charge_identity_mismatch(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     call: &BudgetCallRecord,
     charge: &UsageCharge,
     now: i64,
@@ -3733,7 +3750,7 @@ fn canonical_source_ids_typed(values: &[String]) -> BudgetPreDispatchResult<Vec<
 }
 
 async fn ensure_budget_call_ref(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     call: &BudgetCallRecord,
     source_ids: &[String],
@@ -3744,7 +3761,7 @@ async fn ensure_budget_call_ref(
 }
 
 async fn ensure_budget_call_ref_typed(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     call: &BudgetCallRecord,
     source_ids: &[String],
@@ -3818,7 +3835,7 @@ async fn ensure_budget_call_ref_typed(
 /// `run` nor `artifact`) cannot be matched to anything and fails closed, the
 /// same rule the other tombstone gates follow (`ensure_dependencies_live`).
 async fn any_run_source_revoked(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     namespace: &str,
     source_ids: &[String],
 ) -> Result<bool> {
@@ -3874,7 +3891,7 @@ pub(crate) enum RegisteredCallSources {
 /// its recheck, so the gates and the cleanup judge a call by the same registered
 /// closure, and fall back to the persisted request only when there is no reference.
 pub(crate) async fn registered_call_source_ids(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     namespace: &str,
     billing_scope: &str,
     call_id: &str,
@@ -3903,7 +3920,7 @@ pub(crate) async fn registered_call_source_ids(
 /// not decode fails the dispatch and the settlement with `Internal`, as it does in
 /// `ensure_budget_call_ref`: it is neither trusted nor guessed at.
 async fn registered_source_ids(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     call: &BudgetCallRecord,
 ) -> Result<Option<Vec<String>>> {
     match registered_call_source_ids(tx, &call.namespace, &call.billing_scope, &call.call_id)
@@ -3942,7 +3959,7 @@ enum LegacyCallSources {
 /// rescan (such calls are reserved without a closure at the library level only;
 /// every production reservation carries its request).
 async fn legacy_call_sources(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     call: &BudgetCallRecord,
 ) -> Result<LegacyCallSources> {
     if let Some(source_ids) = registered_source_ids(tx, call).await? {
@@ -4022,7 +4039,7 @@ fn require_budget_caller(ctx: &Context) -> Result<()> {
 }
 
 async fn require_call_access(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     ctx: &Context,
     call: &BudgetCallRecord,
 ) -> Result<()> {
@@ -4123,7 +4140,7 @@ fn settlement_from_call(
 }
 
 async fn require_namespace(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     billing_scope: &str,
     namespace: &str,
 ) -> Result<()> {
@@ -4134,7 +4151,7 @@ async fn require_namespace(
 }
 
 async fn namespace_allowed(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     billing_scope: &str,
     namespace: &str,
 ) -> Result<bool> {
@@ -4159,7 +4176,7 @@ fn reservation_validation_refusal<T>(error: Error) -> BudgetPreDispatchResult<T>
 }
 
 async fn load_namespaces(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     billing_scope: &str,
 ) -> Result<Vec<String>> {
     sqlx::query_scalar(
@@ -4172,7 +4189,7 @@ async fn load_namespaces(
 }
 
 async fn load_dispatch_group(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     billing_scope: &str,
     dispatch_group_id: &str,
 ) -> Result<Option<DispatchGroupRecord>> {
@@ -4190,7 +4207,7 @@ async fn load_dispatch_group(
 }
 
 pub(crate) async fn load_call(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     billing_scope: &str,
     call_id: &str,
 ) -> Result<Option<BudgetCallRecord>> {
@@ -4204,7 +4221,7 @@ pub(crate) async fn load_call(
         .transpose()
 }
 
-fn root_from_row(
+pub(super) fn root_from_row(
     row: &sqlx::sqlite::SqliteRow,
     namespaces: Vec<String>,
 ) -> Result<RootBudgetRecord> {
@@ -4230,7 +4247,7 @@ fn root_from_row(
     })
 }
 
-fn call_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<BudgetCallRecord> {
+pub(super) fn call_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<BudgetCallRecord> {
     let stage: String = row.try_get("stage").map_err(internal)?;
     let state: String = row.try_get("state").map_err(internal)?;
     Ok(BudgetCallRecord {
@@ -4307,7 +4324,9 @@ fn artifact_from_row(
     }
 }
 
-fn dispatch_group_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<DispatchGroupRecord> {
+pub(super) fn dispatch_group_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<DispatchGroupRecord> {
     Ok(DispatchGroupRecord {
         billing_scope: row.try_get("billing_scope").map_err(internal)?,
         dispatch_group_id: row.try_get("dispatch_group_id").map_err(internal)?,
@@ -4320,7 +4339,7 @@ fn dispatch_group_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<DispatchGrou
 }
 
 async fn insert_event(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut impl std::ops::DerefMut<Target = sqlx::SqliteConnection>,
     billing_scope: &str,
     call_id: Option<&str>,
     event_kind: &str,

@@ -2,6 +2,9 @@
 """Offline, anchored restore. Unknown schemas or stale accounting remain isolated."""
 from __future__ import annotations
 import argparse
+import fcntl
+import struct
+import subprocess
 import ctypes
 from datetime import datetime, timezone
 import hashlib
@@ -194,10 +197,10 @@ def current_migrations():
     return {version: checksum for version,(_,_,checksum) in code_migrations().items()}
 
 def verify_db_schema(con, expected):
-    rows = con.execute("SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version").fetchall()
+    rows = [(m["version"],bytes.fromhex(m["checksum_hex"]),m["success"]) for m in con["migrations"]] if isinstance(con,dict) else con.execute("SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version").fetchall()
     if {v: bytes(c).hex() for v,c,ok in rows if ok==1} != expected or len(rows)!=len(expected):
         raise IsolationError("database migration checksums differ from current code")
-    if con.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+    if (con["integrity"] if isinstance(con,dict) else [v[0] for v in con.execute("PRAGMA integrity_check")]) != ["ok"]:
         raise IsolationError("database integrity failed")
 
 def missing_migrations(versions):
@@ -215,14 +218,14 @@ def missing_migrations(versions):
 def verify_backup_migrations(con, versions, expected):
     """The backup database holds exactly the manifest's ledger, every row successful
     with the current file's checksum, and passes the integrity check."""
-    rows = con.execute("SELECT version,success FROM _sqlx_migrations ORDER BY version").fetchall()
+    rows = [(m["version"],m["success"]) for m in con["migrations"]] if isinstance(con,dict) else con.execute("SELECT version,success FROM _sqlx_migrations ORDER BY version").fetchall()
     if [version for version,_ in rows] != versions:
         raise IsolationError("backup database migrations differ from its manifest")
     if any(success!=1 for _,success in rows):
         raise IsolationError("backup database has an unsuccessful migration")
     verify_db_schema(con,{version: expected[version] for version in versions})
 
-def verify_manifest(backup):
+def verify_manifest_files(backup):
     manifest, raw = load_json(safe_member(backup,"backup-manifest.json"))
     exact_object(manifest,("schema_version","complete","database","blobs","migrations",
         "watermarks","created_at"),"backup manifest")
@@ -276,10 +279,14 @@ def verify_manifest(backup):
         watermarks[ns]=(seq,digest)
     if not watermarks:
         raise IsolationError("missing backup watermark")
-    with readonly(backup/"rsia.sqlite3") as con:
-        verify_backup_migrations(con,versions,expected)
-        if dict((n,(s,d)) for n,s,d in con.execute("SELECT namespace,seq,digest FROM revoke_watermark")) != watermarks:
-            raise IsolationError("manifest/database watermark mismatch")
+    return manifest,raw,watermarks
+
+def verify_manifest(backup,snapshot):
+    manifest,raw,watermarks=verify_manifest_files(backup)
+    versions=[m["version"] for m in manifest["migrations"]]
+    verify_backup_migrations(snapshot,versions,current_migrations())
+    if {n:(s,d) for n,s,d in snapshot["watermarks"]}!=watermarks:
+        raise IsolationError("manifest/database watermark mismatch")
     return manifest,raw,watermarks
 
 def protected_facts(con,namespaces):
@@ -287,7 +294,8 @@ def protected_facts(con,namespaces):
     # The schema list below is mirrored by evo-storage lifecycle.rs (PROTECTED_SCHEMA_VERSIONS
     # plus PROTECTED_ACTION_SCHEMA_VERSIONS); the tests assert that the two stay equal.
     facts=[]
-    for ns,kind,id,body in con.execute("SELECT namespace,kind,id,body FROM objects ORDER BY namespace,kind,id"):
+    selected = con["objects"] if isinstance(con,dict) else con.execute("SELECT namespace,kind,id,body FROM objects ORDER BY namespace,kind,id")
+    for ns,kind,id,body in selected:
         if ns not in namespaces:
             continue
         value=read_json(body)
@@ -306,13 +314,14 @@ def protected_facts(con,namespaces):
             "rsia.management_job.v1","rsia.replay_economic_artifact_envelope.v1"):
             facts.append((ns,kind,id,value))
     # Monetary state and irreversible dispatch counters must also agree.
-    tables=[r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'root_budget%'")]
+    native_tables=dict(con["root_budget_tables"]) if isinstance(con,dict) else None
+    tables=list(native_tables) if native_tables is not None else [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'root_budget%'")]
     for table in sorted(tables):
-        rows=con.execute('SELECT * FROM "'+table+'"').fetchall()
+        rows=[tuple(_native_cell(v) for v in row) for row in native_tables[table]] if native_tables is not None else con.execute('SELECT * FROM "'+table+'"').fetchall()
         facts.append((table,sorted(rows,key=repr)))
     return facts
 
-def verify_delta(path,manifest_raw,base,anchor,backup,database=None):
+def verify_delta(path,manifest_raw,base,anchor,backup,trusted,old):
     if anchor is None:
         raise IsolationError("--trusted-revocations-db is required")
     anchor=Path(anchor)
@@ -339,108 +348,53 @@ def verify_delta(path,manifest_raw,base,anchor,backup,database=None):
     replay=[]
     latest_watermarks={}
     anchored_tombstones=[]
-    with readonly(anchor) as trusted, readonly(database or backup/"rsia.sqlite3") as old:
-        trusted.execute("BEGIN")
-        verify_db_schema(trusted,current_migrations())
-        accounting=protected_facts(trusted,base)
-        if accounting!=protected_facts(old,base):
-            raise IsolationError("consumed query/alpha/dispatch/accounting facts changed; make a fresh backup")
-        for entry in entries:
-            ns=entry["namespace"]; seq,digest=base[ns]
-            latest=trusted.execute("SELECT seq,digest FROM revoke_watermark WHERE namespace=?",(ns,)).fetchone()
-            if latest is None or latest[0]<seq or (latest[0]==seq and latest[1]!=digest):
-                raise IsolationError("missing or stale trusted revocation anchor")
-            if (entry.get("base_seq"),entry.get("base_digest"))!=(seq,digest) or (entry.get("latest_seq"),entry.get("latest_digest"))!=latest:
-                raise IsolationError("delta does not reach trusted latest watermark")
-            latest_watermarks[ns]={"seq":latest[0],"digest":latest[1]}
-            authoritative=[]
-            for id,raw in trusted.execute("SELECT id,body FROM objects WHERE namespace=? AND kind='tombstone'",(ns,)):
-                t=read_json(raw)
-                required={"id","schema_version","source_kind","reason","watermark_seq","watermark_digest","created_at"}
-                if set(t)!=required or t["schema_version"]!="rsia.revoke_tombstone.v1" or t["id"]!=id or t["source_kind"] not in ("run","artifact"):
-                    raise IsolationError("unknown trusted tombstone schema")
-                anchored_tombstones.append((ns,id,t))
-                if t["watermark_seq"]<=seq:
-                    row=old.execute("SELECT body FROM objects WHERE namespace=? AND kind='tombstone' AND id=?",(ns,id)).fetchone()
-                    if row is None or read_json(row[0])!=t:
-                        raise IsolationError("backup omits an already consumed revocation")
-                else:
-                    authoritative.append((t,hashlib.sha256(raw.encode()).hexdigest()))
-            authoritative.sort(key=lambda pair:pair[0]["watermark_seq"])
-            expected=[];previous=digest
-            for t,td in authoritative:
-                expected.append({"seq":t["watermark_seq"],"previous_digest":previous,"digest":t["watermark_digest"],"source_kind":t["source_kind"],"source_id":t["id"],"tombstone_digest":td,"reason":t["reason"],"created_at":t["created_at"]})
-                previous=t["watermark_digest"]
-            if [e["seq"] for e in expected]!=list(range(seq+1,latest[0]+1)) or previous!=latest[1] or entry.get("events")!=expected:
-                raise IsolationError("delta is incomplete or differs from trusted revocation events")
-            replay.extend({"namespace":ns,**event} for event in expected)
+    verify_db_schema(trusted,current_migrations())
+    accounting=protected_facts(trusted,base)
+    if accounting!=protected_facts(old,base):
+        raise IsolationError("consumed query/alpha/dispatch/accounting facts changed; make a fresh backup")
+    for entry in entries:
+        ns=entry["namespace"]; seq,digest=base[ns]
+        latest=_native_watermark(trusted,ns)
+        if latest is None or latest[0]<seq or (latest[0]==seq and latest[1]!=digest):
+            raise IsolationError("missing or stale trusted revocation anchor")
+        if (entry.get("base_seq"),entry.get("base_digest"))!=(seq,digest) or (entry.get("latest_seq"),entry.get("latest_digest"))!=latest:
+            raise IsolationError("delta does not reach trusted latest watermark")
+        latest_watermarks[ns]={"seq":latest[0],"digest":latest[1]}
+        authoritative=[]
+        for namespace,kind,id,raw in trusted["objects"]:
+            if namespace!=ns or kind!="tombstone": continue
+            t=read_json(raw)
+            required={"id","schema_version","source_kind","reason","watermark_seq","watermark_digest","created_at"}
+            if set(t)!=required or t["schema_version"]!="rsia.revoke_tombstone.v1" or t["id"]!=id or t["source_kind"] not in ("run","artifact"):
+                raise IsolationError("unknown trusted tombstone schema")
+            anchored_tombstones.append((ns,id,t))
+            if t["watermark_seq"]<=seq:
+                row=_native_object(old,ns,"tombstone",id)
+                if row is None or read_json(row[0])!=t:
+                    raise IsolationError("backup omits an already consumed revocation")
+            else:
+                authoritative.append((t,hashlib.sha256(raw.encode()).hexdigest()))
+        authoritative.sort(key=lambda pair:pair[0]["watermark_seq"])
+        expected=[];previous=digest
+        for t,td in authoritative:
+            expected.append({"seq":t["watermark_seq"],"previous_digest":previous,"digest":t["watermark_digest"],"source_kind":t["source_kind"],"source_id":t["id"],"tombstone_digest":td,"reason":t["reason"],"created_at":t["created_at"]})
+            previous=t["watermark_digest"]
+        if [e["seq"] for e in expected]!=list(range(seq+1,latest[0]+1)) or previous!=latest[1] or entry.get("events")!=expected:
+            raise IsolationError("delta is incomplete or differs from trusted revocation events")
+        replay.extend({"namespace":ns,**event} for event in expected)
     snapshot={"watermarks":latest_watermarks,"tombstones":sorted(anchored_tombstones,key=lambda row:(row[0],row[1])),"accounting":accounting}
     snapshot_bytes=json.dumps(snapshot,sort_keys=True,separators=(",",":"),default=lambda v:bytes(v).hex()).encode()
     return replay,{"path_local_only":str(anchor.resolve()),"watermarks":latest_watermarks,
         "control_plane_digest":hashlib.sha256(snapshot_bytes).hexdigest(),
-        "verified_at":datetime.now(timezone.utc).isoformat(),
+        "verified_at":_admitted_datetime(trusted["wall"]).isoformat(),
         "scope":"Operator designates this SQLite path as the current trusted control plane. Verification covers backup namespaces, all anchored revocations and non-rewound consumed facts at this observed snapshot. It cannot authenticate a stale copy falsely designated as current; administrator switching remains separate."}
 
 def replay_delta(database,events):
-    with sqlite3.connect(database) as con:
-        con.execute("BEGIN IMMEDIATE")
-        for e in events:
-            body={"id":e["source_id"],"schema_version":"rsia.revoke_tombstone.v1","source_kind":e["source_kind"],"reason":e["reason"],"watermark_seq":e["seq"],"watermark_digest":e["digest"],"created_at":e["created_at"]}
-            con.execute("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,'tombstone',?,'restore',?) ON CONFLICT(namespace,kind,id) DO UPDATE SET body=excluded.body,revision=objects.revision+1",(e["namespace"],e["source_id"],json.dumps(body)))
-            con.execute("UPDATE revoke_watermark SET seq=?,digest=? WHERE namespace=?",(e["seq"],e["digest"],e["namespace"]))
-            identity=json.dumps([e["namespace"],e["source_kind"],e["source_id"],e["seq"],e["digest"]],ensure_ascii=False,separators=(",",":")).encode()
-            job_id="revoke-"+hashlib.sha256(identity).hexdigest()[:32]
-            con.execute("INSERT INTO revoke_cleanup_jobs(namespace,job_id,source_kind,source_id,watermark_seq,watermark_digest,state,created_at,updated_at) VALUES(?,?,?,?,?,?,'pending',?,?)",(e["namespace"],job_id,e["source_kind"],e["source_id"],e["seq"],e["digest"],e["created_at"],e["created_at"]))
-            for kind in ("__budget_scan","__world_scan",e["source_kind"]):
-                con.execute("INSERT INTO revoke_cleanup_frontier(namespace,job_id,node_kind,node_id) VALUES(?,?,?,?)",(e["namespace"],job_id,kind,e["source_id"]))
-            con.execute("INSERT INTO revoke_cleanup_events(namespace,job_id,node_kind,node_id,event_kind,event_at,details) VALUES(?,?,?,?,?,?,?)",(e["namespace"],job_id,e["source_kind"],e["source_id"],"logical_block_restored",e["created_at"],json.dumps({"watermark_seq":e["seq"],"watermark_digest":e["digest"]})))
+    raise IsolationError("SQLite replay requires the fixed native restore-copy operation")
 
 def apply_missing_migrations(database,versions):
-    """Upgrade the private restore copy from a strict prefix to the current migration set.
-
-    Does what sqlx 0.8.6 does when Store::open runs sqlx::migrate! (Migrator::run_direct,
-    SqliteConnection::apply), with foreign keys ON as Store::open connects: in version
-    order, one transaction per migration runs the file's SQL and inserts its ledger row
-    (version, description derived from the file name, success TRUE, checksum = SHA-384
-    of the file bytes, execution_time -1); after the commit execution_time becomes the
-    elapsed nanoseconds. The upgraded copy must then pass the full-set check again.
-    Returns [{"version","checksum_sha384"}] of the applied migrations."""
-    missing=missing_migrations(versions)
-    if not missing:
-        return []
-    code=code_migrations()
-    applied=[]
-    con=sqlite3.connect(database,isolation_level=None)
-    try:
-        con.execute("PRAGMA foreign_keys=ON")
-        for version in missing:
-            description,raw,checksum=code[version]
-            sql=raw.decode("utf-8")
-            started=time.perf_counter_ns()
-            try:
-                # executescript() hands each statement to SQLite's own parser, as sqlx does.
-                # It would commit a transaction that is already open, so BEGIN goes first.
-                con.executescript("BEGIN IMMEDIATE;\n"+sql)
-                if not con.in_transaction:
-                    raise IsolationError(f"migration {version} ended its own transaction")
-                con.execute("INSERT INTO _sqlx_migrations ( version, description, success, checksum, execution_time ) VALUES ( ?, ?, TRUE, ?, -1 )",(version,description,bytes.fromhex(checksum)))
-                con.execute("COMMIT")
-            except BaseException:
-                if con.in_transaction:
-                    try: con.execute("ROLLBACK")
-                    except sqlite3.Error: pass
-                raise
-            elapsed=time.perf_counter_ns()-started
-            con.execute("UPDATE _sqlx_migrations SET execution_time = ? WHERE version = ?",(elapsed,version))
-            applied.append({"version":version,"checksum_sha384":checksum})
-    finally:
-        con.close()
-    check=readonly(database)
-    try:
-        verify_db_schema(check,{version: entry[2] for version,entry in code.items()})
-    finally:
-        check.close()
-    return applied
+    if not missing_migrations(versions): return []
+    raise IsolationError("SQLite migration requires the fixed native restore-copy operation")
 
 def publish_exclusive(source,dest):
     libc=ctypes.CDLL(None,use_errno=True)
@@ -453,58 +407,229 @@ def publish_exclusive(source,dest):
     if result:
         raise OSError(ctypes.get_errno(),"exclusive directory publication failed")
 
+
+def _native_cell(cell):
+    exact_object(cell,("type",) if cell.get("type")=="null" else ("type","value"),"native cell")
+    kind=cell["type"]; value=cell.get("value")
+    if kind=="null": return None
+    if kind=="integer":
+        if type(value) is not int or not -(1<<63)<=value<(1<<63): raise IsolationError("invalid native integer")
+        return value
+    if kind=="real_bits":
+        exact_int(value,"native REAL bits")
+        if value>=1<<64: raise IsolationError("invalid native REAL bits")
+        return struct.unpack(">d",value.to_bytes(8,"big"))[0]
+    if kind=="text": return exact_string(value,"native TEXT",True)
+    if kind=="blob":
+        if not isinstance(value,list) or any(type(v) is not int or not 0<=v<=255 for v in value):
+            raise IsolationError("invalid native BLOB")
+        return bytes(value)
+    raise IsolationError("unknown native cell")
+
+def _native_rows(snapshot,name):
+    rows=snapshot[name]
+    if not isinstance(rows,list): raise IsolationError("invalid native rows")
+    return rows
+
+def _native_watermark(snapshot,namespace):
+    rows=[(seq,digest) for ns,seq,digest in _native_rows(snapshot,"watermarks") if ns==namespace]
+    if len(rows)>1: raise IsolationError("duplicate native watermark")
+    return rows[0] if rows else None
+
+def _native_object(snapshot,namespace,kind,id):
+    rows=[(body,) for ns,k,i,body in _native_rows(snapshot,"objects") if (ns,k,i)==(namespace,kind,id)]
+    if len(rows)>1: raise IsolationError("duplicate native object")
+    return rows[0] if rows else None
+
+def _admitted_datetime(sample):
+    exact_object(sample,("seconds","nanos"),"native wall")
+    seconds=exact_int(sample["seconds"],"native wall seconds")
+    nanos=exact_int(sample["nanos"],"native wall nanos")
+    if seconds>=(1<<63) or nanos>=(1<<128) or nanos//1_000_000_000!=seconds:
+        raise IsolationError("invalid native wall parts")
+    try:
+        return datetime.fromtimestamp(seconds,timezone.utc).replace(microsecond=(nanos%1_000_000_000)//1000)
+    except (ValueError,OverflowError,OSError):
+        raise IsolationError("unrepresentable native wall")
+
+def _native_call(reader,operation,payload):
+    reject_path_links(reader)
+    before=regular(reader)
+    if not reader.is_absolute() or before.st_uid!=os.geteuid() or before.st_mode&0o022 or not before.st_mode&0o111:
+        raise IsolationError("insecure native reader")
+    identity=(before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,sha256_file(reader))
+    nonce=str(uuid.uuid4())
+    request=json.dumps({"version":1,"nonce":nonce,"payload":payload},ensure_ascii=False,separators=(",",":")).encode()+b"\n"
+    flag={"restore_read":"--rsia-private-restore-read-v1","restore_copy":"--rsia-private-restore-copy-v1"}[operation]
+    child=subprocess.Popen([str(reader),flag],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env={})
+    try:
+        output,error=child.communicate(request)
+    except BaseException:
+        try: child.kill()
+        except ProcessLookupError: pass
+        # communicate drains both actual pipes and waits for this actual child.
+        child.communicate()
+        raise
+    after=regular(reader)
+    if identity!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,sha256_file(reader)):
+        raise IsolationError("native reader changed")
+    if not output.endswith(b"\n") or output.count(b"\n")!=1:
+        raise IsolationError("truncated or trailing native output")
+    reply=read_json(output)
+    exact_object(reply,("version","nonce","pid","build","operation","request_sha256","result","error"),"native result")
+    exact_hex(reply["build"],64,"native build")
+    exact_int(reply["version"],"native version")
+    exact_int(reply["pid"],"native pid",1)
+    if (reply["version"],reply["nonce"],reply["pid"],reply["operation"],reply["request_sha256"])!=(1,nonce,child.pid,operation,hashlib.sha256(request).hexdigest()):
+        raise IsolationError("native result binding differs")
+    if child.returncode!=0 or reply["error"] is not None:
+        fault=reply["error"]
+        code=fault.get("code","invalid") if isinstance(fault,dict) else "invalid"
+        raise IsolationError("native restore refused: "+code)
+    if error or not isinstance(reply["result"],dict):
+        raise IsolationError("invalid native terminal")
+    return reply["result"]
+
+def _native_read(reader,configs,database,extra=(),related=None):
+    reject_path_links(database);regular(database)
+    if related is not None:
+        reject_path_links(related);regular(related)
+    snapshot=_native_call(reader,"restore_read",{
+        "path":list(os.fsencode(database.resolve())),"prepare_configs":configs,
+        "extra_occurrences":list(extra),
+        "related_path":list(os.fsencode(related.resolve())) if related is not None else None})
+    exact_object(snapshot,("native_version","native_source_id","integrity","migrations","watermarks","objects","root_budget_tables","wall"),"native snapshot")
+    if not snapshot["native_version"] or not snapshot["native_source_id"] or snapshot["integrity"]!=["ok"]:
+        raise IsolationError("native snapshot refused")
+    _admitted_datetime(snapshot["wall"])
+    return snapshot
+
+class _PrivateNativeCopy:
+    """Created only after our actual native child's zero exit and two pipe EOFs."""
+    def __init__(self,result):
+        exact_object(result,("private_path","directory","database","applied","source_versions"),"private copy")
+        value=result["private_path"]
+        if not isinstance(value,list) or any(type(v) is not int or not 0<=v<=255 for v in value):
+            raise IsolationError("invalid private path bytes")
+        self.path=Path(os.fsdecode(bytes(value)))
+        exact_object(result["directory"],("dev","ino","uid","mode"),"private directory")
+        exact_object(result["database"],("dev","ino","bytes","sha256"),"private database")
+        for key in ("dev","ino","uid","mode"): exact_int(result["directory"][key],"private directory "+key)
+        for key in ("dev","ino","bytes"): exact_int(result["database"][key],"private database "+key)
+        exact_hex(result["database"]["sha256"],64,"private database hash")
+        self.directory=result["directory"]; self.database=result["database"]
+        self.applied=result["applied"]; self.fd=None
+        reject_path_links(self.path)
+        self.fd=os.open(self.path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:
+            self.check()
+            info=regular(self.path/"rsia.sqlite3")
+            if (info.st_dev,info.st_ino,info.st_size,sha256_file(self.path/"rsia.sqlite3"))!=(self.database["dev"],self.database["ino"],self.database["bytes"],self.database["sha256"]):
+                raise IsolationError("native private database changed")
+        except BaseException:
+            self.close()
+            raise
+    def check(self):
+        info=os.fstat(self.fd); current=self.path.lstat()
+        if (info.st_dev,info.st_ino)!=(current.st_dev,current.st_ino) or (info.st_dev,info.st_ino,info.st_uid,stat.S_IMODE(info.st_mode))!=(self.directory["dev"],self.directory["ino"],os.geteuid(),0o700):
+            raise IsolationError("native private directory changed")
+    def before_fs(self,reader,configs,anchor,extra=()):
+        self.check()
+        # This sole O_EXCL private-copy FS owner holds real SH stability;
+        # native DB writers still require their original exclusive lock.
+        fcntl.flock(self.fd,fcntl.LOCK_SH|fcntl.LOCK_NB)
+        try:
+            self.check()
+            snapshot=_native_read(reader,configs,self.path/"rsia.sqlite3",extra,anchor)
+            self.check()
+            return snapshot["wall"]
+        except BaseException:
+            self.unlock()
+            raise
+    def unlock(self):
+        if self.fd is not None: fcntl.flock(self.fd,fcntl.LOCK_UN)
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd); self.fd=None
+
 def main():
+    os.umask(0o077)
     parser=argparse.ArgumentParser()
-    for name in ("backup","dest","revoke-delta"):
+    for name in ("backup","dest","revoke-delta","native-reader","prepare-configs-file"):
         parser.add_argument("--"+name,required=True)
     parser.add_argument("--trusted-revocations-db")
     args=parser.parse_args();backup=Path(args.backup);dest=Path(args.dest)
     if os.path.lexists(dest):
         print("dest exists; refusing overwrite",file=sys.stderr);return 2
-    temp=dest.parent/f".{dest.name}.restore-{uuid.uuid4().hex}"
+    owner=None
     try:
+        if sys.platform not in ("darwin","linux"): raise IsolationError("unsupported restore platform")
         reject_path_links(dest.parent)
-        manifest,raw,base=verify_manifest(backup)
-        events,anchor_receipt=verify_delta(Path(args.revoke_delta),raw,base,args.trusted_revocations_db,backup)
-        temp.mkdir()
-        for entry in [manifest["database"],*manifest["blobs"]]:
-            source=safe_member(backup,entry["path"]);target=temp/entry["path"]
-            target.parent.mkdir(parents=True,exist_ok=True)
-            # Open final component with O_NOFOLLOW and verify the copied bytes again.
-            fd=open_member(backup,entry["path"])
-            with os.fdopen(fd,"rb") as reader, target.open("xb") as writer:
-                info=os.fstat(reader.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1:
-                    raise IsolationError("member changed during copy")
-                shutil.copyfileobj(reader,writer);writer.flush();os.fsync(writer.fileno())
-            if target.stat().st_size!=entry["bytes"] or sha256_file(target)!=entry["sha256"]:
-                raise IsolationError("copied member digest differs")
-        # A backup on a strict migration prefix is upgraded here, inside the private copy,
-        # before the anchor comparison, the delta replay and publication (plan §11).
-        source_versions=[m["version"] for m in manifest["migrations"]]
-        applied=apply_missing_migrations(temp/"rsia.sqlite3",source_versions)
-        # Re-read the independent anchor immediately before applying/publishing.
-        latest_events,latest_anchor=verify_delta(Path(args.revoke_delta),raw,base,args.trusted_revocations_db,backup,temp/"rsia.sqlite3")
+        reader=Path(args.native_reader)
+        configs_path=Path(args.prepare_configs_file)
+        reject_path_links(configs_path);regular(configs_path)
+        configs=read_json(configs_path.read_bytes())
+        if not isinstance(configs,list): raise IsolationError("prepare originals must be an array")
+        manifest,raw,base=verify_manifest_files(backup)
+        if not args.trusted_revocations_db: raise IsolationError("--trusted-revocations-db is required")
+        anchor=Path(args.trusted_revocations_db)
+        backup_snapshot=_native_read(reader,configs,backup/"rsia.sqlite3",(manifest["created_at"],))
+        verify_manifest(backup,backup_snapshot)
+        trusted=_native_read(reader,configs,anchor,(manifest["created_at"],),backup/"rsia.sqlite3")
+        events,anchor_receipt=verify_delta(Path(args.revoke_delta),raw,base,anchor,backup,trusted,backup_snapshot)
+        delta,_=load_json(Path(args.revoke_delta))
+        result=_native_call(reader,"restore_copy",{
+            "backup":list(os.fsencode(backup.resolve())),
+            "dest":list(os.fsencode(Path(os.path.abspath(dest)))),
+            "anchor":list(os.fsencode(anchor.resolve())),
+            "manifest_sha256":hashlib.sha256(raw).hexdigest(),
+            "delta":delta,"prepare_configs":configs})
+        owner=_PrivateNativeCopy(result)
+        # Replayed bytes are still private. The original latest-anchor and
+        # accounting assertions still precede every public receipt/publication.
+        old=_native_read(reader,configs,owner.path/"rsia.sqlite3",(),anchor)
+        trusted=_native_read(reader,configs,anchor,(),owner.path/"rsia.sqlite3")
+        latest_events,latest_anchor=verify_delta(Path(args.revoke_delta),raw,base,anchor,backup,trusted,old)
         if events!=latest_events or anchor_receipt["control_plane_digest"]!=latest_anchor["control_plane_digest"]:
             raise IsolationError("trusted anchor changed during restore")
         anchor_receipt=latest_anchor
-        replay_delta(temp/"rsia.sqlite3",events)
-        with (temp/"restore.json").open("x") as receipt:
-            receipt.write(json.dumps({"schema_version":"rsia.restore_receipt.v2","backup_manifest_sha256":hashlib.sha256(raw).hexdigest(),"replayed_revoke_events":len(events),"isolated":False,"trusted_anchor":anchor_receipt,"receipt_scope":"local_only_not_for_export"})+"\n")
-            receipt.flush();os.fsync(receipt.fileno())
+        applied=owner.applied
+        owner.before_fs(reader,configs,anchor)
+        try:
+            fd=os.open(owner.path/"restore.json",os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+            with os.fdopen(fd,"w") as receipt:
+                receipt.write(json.dumps({"schema_version":"rsia.restore_receipt.v2","backup_manifest_sha256":hashlib.sha256(raw).hexdigest(),"replayed_revoke_events":len(events),"isolated":False,"trusted_anchor":anchor_receipt,"receipt_scope":"local_only_not_for_export"})+"\n")
+                receipt.flush();os.fsync(receipt.fileno())
+        finally: owner.unlock()
         if applied:
-            # Operator-facing side record; restore.json and the startup gate are unchanged.
-            with (temp/"restore.migrations.json").open("x") as record:
-                record.write(json.dumps({"schema":MIGRATIONS_RECORD_SCHEMA,"source_versions":source_versions,"applied":applied,"current_versions":KNOWN_MIGRATIONS})+"\n")
-                record.flush();os.fsync(record.fileno())
-        for directory,_,_ in os.walk(temp,topdown=False):
-            directory_fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)
-            try: os.fsync(directory_fd)
-            finally: os.close(directory_fd)
-        publish_exclusive(temp,dest)
-    except (IsolationError,OSError,sqlite3.Error,ValueError,KeyError,TypeError) as error:
-        shutil.rmtree(temp,ignore_errors=True)
+            owner.before_fs(reader,configs,anchor)
+            try:
+                fd=os.open(owner.path/"restore.migrations.json",os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                with os.fdopen(fd,"w") as record:
+                    record.write(json.dumps({"schema":MIGRATIONS_RECORD_SCHEMA,"source_versions":[m["version"] for m in manifest["migrations"]],"applied":applied,"current_versions":KNOWN_MIGRATIONS})+"\n")
+                    record.flush();os.fsync(record.fileno())
+            finally: owner.unlock()
+        for directory,_,_ in os.walk(owner.path,topdown=False):
+            owner.before_fs(reader,configs,anchor)
+            try:
+                directory_fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+                try: os.fsync(directory_fd)
+                finally: os.close(directory_fd)
+            finally: owner.unlock()
+        owner.before_fs(reader,configs,anchor)
+        try:
+            publish_exclusive(owner.path,dest)
+            owner.path=dest
+            parent_fd=os.open(dest.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+            try: os.fsync(parent_fd)
+            finally: os.close(parent_fd)
+        finally: owner.unlock()
+    except (IsolationError,OSError,sqlite3.Error,ValueError,KeyError,TypeError,OverflowError) as error:
+        # A clock/floor refusal grants no filesystem cleanup admission.
+        # Keep the unpublished private copy; a later explicit cleanup must qualify.
         print(f"ISOLATE {error}; not mounting",file=sys.stderr);return 1
+    finally:
+        if owner is not None: owner.close()
     print(f"RESTORE_OK events={len(events)} migrations_applied={','.join(str(m['version']) for m in applied) or 'none'}");return 0
 
 if __name__=="__main__":

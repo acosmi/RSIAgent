@@ -78,7 +78,7 @@ impl Session {
                 .bind(&cursor.after.dst_kind)
                 .bind(&cursor.after.dst_id)
                 .bind(fetch_limit)
-                .fetch_all(&mut *self.tx)
+                .fetch_all(&mut **self.transaction()?)
                 .await
                 .map_err(internal)?
         } else {
@@ -87,7 +87,7 @@ impl Session {
                 .bind(src_kind)
                 .bind(src_id)
                 .bind(fetch_limit)
-                .fetch_all(&mut *self.tx)
+                .fetch_all(&mut **self.transaction()?)
                 .await
                 .map_err(internal)?
         };

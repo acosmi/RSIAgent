@@ -229,6 +229,13 @@ impl Fixture {
         let output = Command::new("python3")
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .arg(RESTORE_SCRIPT)
+            .arg("--native-reader")
+            .arg(std::env::var_os("RSIA_TEST_NATIVE_READER").expect("fresh native reader required"))
+            .arg("--prepare-configs-file")
+            .arg(
+                std::env::var_os("RSIA_TEST_PREPARE_CONFIGS_FILE")
+                    .expect("actual complete PrepareConfig originals required"),
+            )
             .arg("--backup")
             .arg(backup)
             .arg("--dest")

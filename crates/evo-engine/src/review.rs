@@ -17,7 +17,7 @@ use crate::release_store::{RELEASE_CANDIDATE_SCHEMA, ReleaseStore, TypedSourceRe
 use crate::streaming_evaluator::{
     AnchorEvidenceStatus, CostEvidenceScope, DependencyEvidenceStatus, EvaluationEvidenceScope,
     EvaluationTicketV2, ExecutionReceiptV2, TargetState, VerifiedReportVariant,
-    verified_report_view_in_session,
+    ticket_issue_receipt_kind_in_session, verified_report_view_in_session,
 };
 use evo_core::contract::{
     BUNDLE_SCHEMA, HostCapabilities, ImproverPatch, OriginLayer, PatchOp, Profile, ResolvedBundle,
@@ -284,6 +284,7 @@ pub enum FormalIneligibilityReason {
     ResourceEvidenceAbsent,
     CompleteOptimizationCostNotVerified,
     FormalVerdictNotApprovable,
+    HistoricalEvaluatorUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -323,6 +324,12 @@ pub enum ReviewPayload {
     TypedCandidate(Box<CandidateView>),
     StageFact(Box<StageView>),
     FormalReport(Box<FormalView>),
+    FormalReportV3 {
+        reference_digest: String,
+        physical_report_id: TextView,
+        source_legacy: bool,
+        view: Box<FormalView>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -576,6 +583,158 @@ async fn finish_read_set(
 
 /// Reads stored authority twice. There is deliberately no model, compiler,
 /// broker, evaluator-state, approval, release or storage write entry point here.
+fn project_current_formal_review_r49(
+    view: crate::streaming_evaluator::VerifiedFormalReportView,
+    projection: &mut Projection,
+) -> ReadResult<FormalView> {
+    let reasons = view
+        .ineligibility_reasons
+        .iter()
+        .map(|r| match r.as_str() {
+            "program_fixture_not_production_authority" => {
+                Ok(FormalIneligibilityReason::ProgramFixtureNotProductionAuthority)
+            }
+            "independent_process_isolation_not_verified" => {
+                Ok(FormalIneligibilityReason::IndependentProcessIsolationNotVerified)
+            }
+            "dependency_revocation_closure_unverified" => {
+                Ok(FormalIneligibilityReason::DependencyRevocationClosureUnverified)
+            }
+            "report_variant_not_complete_batch" => {
+                Ok(FormalIneligibilityReason::ReportVariantNotCompleteBatch)
+            }
+            "resource_evidence_absent" => Ok(FormalIneligibilityReason::ResourceEvidenceAbsent),
+            "complete_optimization_cost_not_verified" => {
+                Ok(FormalIneligibilityReason::CompleteOptimizationCostNotVerified)
+            }
+            "formal_verdict_not_approvable" => {
+                Ok(FormalIneligibilityReason::FormalVerdictNotApprovable)
+            }
+            "historical_evaluator_unavailable" => {
+                Ok(FormalIneligibilityReason::HistoricalEvaluatorUnavailable)
+            }
+            _ => Err(ReadFailure::Gap(ReviewGap::UnsupportedSchema)),
+        })
+        .collect::<ReadResult<Vec<_>>>()?;
+    Ok(FormalView {
+        report_id: projection.text(&view.report_id)?,
+        report_digest: view.report_digest,
+        variant: view.variant,
+        verdict: view.verdict,
+        ticket_id: projection.text(&view.ticket_id)?,
+        ticket_digest: view.ticket_digest,
+        v1_plan_snapshot_digest: view.v1_plan_snapshot_digest,
+        formal_plan_digest: view.formal_plan_digest,
+        manifest_digest: view.manifest_digest,
+        candidate_digest: view.candidate_digest,
+        baseline_parent_digest: view.baseline_parent_digest,
+        candidate_bundle_digest: view.candidate_bundle_digest,
+        baseline_bundle_digest: view.baseline_bundle_digest,
+        environment_digest: view.environment_digest,
+        profile: view.profile,
+        proposer_actor: projection.text(&view.proposer_actor)?,
+        evaluator_actor: projection.text(&view.evaluator_actor)?,
+        approver_actor: projection.text(&view.approver_actor)?,
+        anchor_evidence_digest: view.anchor_evidence_digest,
+        resource_evidence_digest: view.resource_evidence_digest,
+        anchor_status: view.anchor_status,
+        evidence_scope: view.evidence_scope,
+        cost_evidence_scope: view.cost_evidence_scope,
+        revoke_watermark: watermark_view(view.revoke_watermark)?,
+        dependency_status: view.dependency_status,
+        promotion_eligible: view.promotion_eligible,
+        ineligibility_reasons: reasons,
+    })
+}
+
+async fn read_current_formal_review_r49(
+    ctx: &Context,
+    store: &Store,
+    request: &ReviewRequest,
+) -> ReadResult<(String, ReviewResponse)> {
+    let closed = store
+        .read_formal_snapshot(
+            ctx,
+            evo_storage::FormalReadSelectorR38::Ticket(request.id.clone()),
+        )
+        .await
+        .map_err(|error| match error {
+            Error::NotFound => ReadFailure::Unavailable,
+            Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
+            Error::Forbidden => ReadFailure::Gap(ReviewGap::ReferenceUnavailable),
+            _ => ReadFailure::Gap(ReviewGap::MaterialInvalid),
+        })?;
+    let data = closed.data_view_r49().map_err(material_error)?;
+    let wire =
+        crate::streaming_evaluator::formal_current_data_view_r49(&data).map_err(material_error)?;
+    let mut projection = Projection::new(request.detail);
+    let view = project_current_formal_review_r49(wire.view, &mut projection)?;
+    let material_fingerprint = fingerprint(&(
+        closed
+            .records()
+            .material_digest_r49()
+            .map_err(storage_error)?,
+        closed.watermark(),
+        &wire.report_ref,
+        data.frozen_ticket(),
+        data.payload(),
+        data.host_authority(),
+    ))
+    .map_err(|_| ReadFailure::Internal)?;
+    let mut response = ReviewResponse::empty(request, ReviewGap::CostUnobserved);
+    response.schema_version = "rsia.review_response.v3";
+    response.snapshot_semantics = "verified_at_second_original_readonly_snapshot";
+    let physical = match &wire.report_ref {
+        evo_core::formal_version::AnyReportRef::ImplicitLegacyV2(reference) => {
+            &reference.physical_id
+        }
+        evo_core::formal_version::AnyReportRef::VersionedV3(reference) => &reference.physical_id,
+    };
+    let physical_report_id = projection.text(physical)?;
+    response.gaps = projection.gaps.into_iter().collect();
+    response.payload = Some(ReviewPayload::FormalReportV3 {
+        reference_digest: fingerprint(&wire.report_ref).map_err(|_| ReadFailure::Internal)?,
+        physical_report_id,
+        source_legacy: wire.source_legacy,
+        view: Box::new(view),
+    });
+    if serde_json::to_vec(&response)
+        .map_err(|_| ReadFailure::Internal)?
+        .len()
+        > MAX_REVIEW_BYTES
+    {
+        return Err(ReadFailure::Gap(ReviewGap::SupportLimit));
+    }
+    Ok((material_fingerprint, response))
+}
+async fn review_current_formal_r49(
+    ctx: &Context,
+    store: &Store,
+    request: &ReviewRequest,
+) -> Result<ReviewResponse> {
+    // Each call completes its original rollback and native close before the
+    // next actual snapshot. There is no RW Session and no stored authority.
+    let first = read_current_formal_review_r49(ctx, store, request).await;
+    let second = read_current_formal_review_r49(ctx, store, request).await;
+    match (first, second) {
+        (Err(ReadFailure::Unavailable), _) | (_, Err(ReadFailure::Unavailable)) => {
+            Err(Error::NotFound)
+        }
+        (Err(ReadFailure::Internal), _) | (_, Err(ReadFailure::Internal)) => Err(Error::Internal),
+        (Ok((a, _)), Ok((b, response))) if a == b => Ok(response),
+        (Err(ReadFailure::Gap(a)), Err(ReadFailure::Gap(b))) if a == b => {
+            let mut response = ReviewResponse::empty(request, a);
+            response.schema_version = "rsia.review_response.v3";
+            Ok(response)
+        }
+        _ => {
+            let mut response = ReviewResponse::empty(request, ReviewGap::ReadChanged);
+            response.schema_version = "rsia.review_response.v3";
+            Ok(response)
+        }
+    }
+}
+
 pub async fn review_stored(
     ctx: &Context,
     store: &Store,
@@ -583,6 +742,9 @@ pub async fn review_stored(
 ) -> Result<ReviewResponse> {
     ctx.require(&[Role::Admin])?;
     identifier(&request.id).map_err(|_| Error::Invalid("invalid review request".into()))?;
+    if request.kind == ReviewKind::FormalReport {
+        return review_current_formal_r49(ctx, store, &request).await;
+    }
     let mut first_session = store.session().await?;
     let first = read_recipe(ctx, &mut first_session, &request).await;
     first_session.commit().await?;
@@ -937,10 +1099,19 @@ async fn read_formal(
             ticket.registration_id.as_str(),
         ),
         ("protected_holdout_v41", ticket.holdout_id.as_str()),
-        ("evaluation_ticket_issue_receipt_v1", id),
     ] {
         envelope(ctx, session, set, kind, reference).await?;
     }
+    // Each read independently rejects absent, dual or mismatched protocols;
+    // then captures the actual same-snapshot envelope in the original ReadSet.
+    let issue_kind = ticket_issue_receipt_kind_in_session(session, ctx, &ticket)
+        .await
+        .map_err(|error| match error {
+            Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
+            Error::NotFound | Error::Forbidden => ReadFailure::Gap(ReviewGap::ReferenceUnavailable),
+            _ => ReadFailure::Gap(ReviewGap::MaterialInvalid),
+        })?;
+    envelope(ctx, session, set, issue_kind, id).await?;
     for target in &ticket.targets {
         if let TargetState::Completed {
             candidate_receipt_id,

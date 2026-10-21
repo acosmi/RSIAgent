@@ -2,8 +2,9 @@
 use crate::exploration::ExplorationWorldV1;
 use crate::revocation_gate;
 use crate::streaming_evaluator::{
-    IndependentEvaluationControl, IssueTicketRequest, ProtectedHoldoutRecord,
-    RegisteredEvaluationControl, StreamingEvaluationStatus,
+    IndependentEvaluationControl, IssueTicketIntent, IssueTicketRequest,
+    LEGACY_TIMED_ISSUE_DISABLED, ProtectedHoldoutRecord, RegisteredEvaluationControl,
+    StreamingEvaluationStatus,
 };
 use evo_core::contract::{MODEL_TOOLS, admin_ops, reject_admin_as_model_tool};
 use evo_core::curriculum::ProbeTerminal;
@@ -100,6 +101,17 @@ pub enum ManagementResult {
         planned_targets: usize,
         has_formal_terminal: bool,
     },
+    /// Explicit new data response. The historical four-field variant above is
+    /// retained byte-for-byte as a decoder for already persisted job results.
+    EvaluationStatusV3 {
+        schema_version: String,
+        ticket_id: String,
+        lifecycle: String,
+        planned_targets: usize,
+        has_formal_terminal: bool,
+        ticket_source: crate::streaming_evaluator::EvaluationStatusTicketSourceV3,
+        formal_source: Option<crate::streaming_evaluator::FormalReadSourceV3>,
+    },
     ReplayStored {
         report_id: String,
         pool_digest: String,
@@ -191,6 +203,14 @@ pub struct EvaluationStartRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct EvaluationStartRequestV2 {
+    pub schema_version: String,
+    pub request_key: String,
+    pub ticket: IssueTicketIntent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IssueTicketRequestWire {
     pub ticket_id: String,
     pub registration_id: String,
@@ -262,6 +282,8 @@ pub struct BlockedManagementRequest {
 enum ParsedRequest {
     ExperimentRegister(Box<ExperimentRegisterRequest>),
     EvaluationStart(EvaluationStartRequest),
+    #[serde(rename = "evaluation_start_v2")]
+    EvaluationStartV2(EvaluationStartRequestV2),
     EvaluationStatus(EvaluationStatusRequest),
     ReplayRun(Box<ReplayRunRequest>),
     CurriculumStep(CurriculumStepRequest),
@@ -728,6 +750,7 @@ impl ParsedRequest {
         match self {
             Self::ExperimentRegister(request) => &request.request_key,
             Self::EvaluationStart(request) => &request.request_key,
+            Self::EvaluationStartV2(request) => &request.request_key,
             Self::EvaluationStatus(request) => &request.request_key,
             Self::ReplayRun(request) => &request.request_key,
             Self::CurriculumStep(request) => &request.request_key,
@@ -757,8 +780,28 @@ async fn persist_management(
     {
         let current: ManagementJob = session.need(ctx, "job", &cached.id).await?;
         ensure_owner(ctx, &current)?;
+        if matches!(
+            &request,
+            ParsedRequest::EvaluationStart(_) | ParsedRequest::EvaluationStartV2(_)
+        ) && (cached.id != job_id
+            || cached.payload_digest != payload_digest
+            || current.id != job_id
+            || current.operation != operation
+            || current.request_key != request.request_key()
+            || current.payload_digest != payload_digest
+            || current.private_input_ref != private_id)
+        {
+            return Err(Error::Conflict(
+                "cached evaluation request identity differs".into(),
+            ));
+        }
         session.commit().await?;
         return Ok(current);
+    }
+    // A v1 cache miss must refuse before the first private input, job, edge,
+    // cache or audit write. Existing exact cached v1 requests above are read.
+    if matches!(&request, ParsedRequest::EvaluationStart(_)) {
+        return Err(Error::Invalid(LEGACY_TIMED_ISSUE_DISABLED.into()));
     }
     // A new request is not accepted over a dependency whose source was revoked
     // (plan §11: a revocation refuses new access at once). The check runs in this
@@ -867,7 +910,11 @@ impl JobOutcome {
                 | ManagementResult::ProbeScheduled { .. }
                 | ManagementResult::ExplorationStarted { .. },
             ) => true,
-            Some(ManagementResult::EvaluationStatus { .. }) | None => false,
+            Some(
+                ManagementResult::EvaluationStatus { .. }
+                | ManagementResult::EvaluationStatusV3 { .. },
+            )
+            | None => false,
         }
     }
 }
@@ -885,6 +932,9 @@ async fn execute_request(
         }
         ParsedRequest::EvaluationStart(request) => {
             run_evaluation_start(ctx, store, &mut job, request).await
+        }
+        ParsedRequest::EvaluationStartV2(request) => {
+            run_evaluation_start_v2(ctx, store, &mut job, request).await
         }
         ParsedRequest::EvaluationStatus(request) => {
             run_evaluation_status(ctx, store, &mut job, request).await
@@ -1003,38 +1053,62 @@ async fn run_evaluation_start(
     job: &mut ManagementJob,
     request: EvaluationStartRequest,
 ) -> Result<()> {
-    checkpoint_claim(ctx, store, job, "before_ticket_issue").await?;
-    let ticket = match IndependentEvaluationControl::issue_ticket(
+    checkpoint_claim(ctx, store, job, "before_legacy_ticket_recovery").await?;
+    let ticket = IndependentEvaluationControl::recover_legacy_ticket_issue(
         ctx,
         store,
-        request.ticket.engine_request(),
+        &request.ticket.engine_request(),
     )
-    .await
+    .await?
+    .ok_or_else(|| Error::Invalid(LEGACY_TIMED_ISSUE_DISABLED.into()))?;
+    record_issued_ticket_result(job, ticket.id);
+    Ok(())
+}
+
+async fn run_evaluation_start_v2(
+    ctx: &Context,
+    store: &Store,
+    job: &mut ManagementJob,
+    request: EvaluationStartRequestV2,
+) -> Result<()> {
+    checkpoint_claim(ctx, store, job, "before_ticket_issue").await?;
+    let ticket = if let Some(existing) =
+        IndependentEvaluationControl::recover_native_ticket_issue(ctx, store, &request.ticket)
+            .await?
     {
-        Ok(ticket) => ticket,
-        Err(Error::Conflict(_)) => {
-            let existing =
-                IndependentEvaluationControl::status(ctx, store, &request.ticket.ticket_id).await?;
-            if existing.ticket.registration_id != request.ticket.registration_id
-                || existing.ticket.holdout_id != request.ticket.holdout_id
-                || existing.ticket.issued_at_unix_seconds != request.ticket.issued_at_unix_seconds
-                || existing.ticket.evaluator_actor != ctx.actor()
-            {
-                return Err(Error::Conflict(
-                    "existing ticket differs from request".into(),
-                ));
+        existing
+    } else {
+        match IndependentEvaluationControl::issue_ticket_now(ctx, store, request.ticket.clone())
+            .await
+        {
+            Ok(ticket) => ticket,
+            Err(original @ Error::Conflict(_)) => {
+                // Another actual commit may have won. Only exact protocol2
+                // recovery is acceptable; an absent ticket retains the original
+                // failure rather than laundering every Conflict into NotFound.
+                match IndependentEvaluationControl::recover_native_ticket_issue(
+                    ctx,
+                    store,
+                    &request.ticket,
+                )
+                .await?
+                {
+                    Some(existing) => existing,
+                    None => return Err(original),
+                }
             }
-            existing.ticket
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
     };
+    record_issued_ticket_result(job, ticket.id);
+    Ok(())
+}
+
+fn record_issued_ticket_result(job: &mut ManagementJob, ticket_id: String) {
     job.state = ManagementJobState::Blocked;
     job.step = "ticket_issued_execution_blocked".into();
     job.error_code = Some("execution_provider_unconfigured".into());
-    job.result = Some(ManagementResult::EvaluationTicketBlocked {
-        ticket_id: ticket.id,
-    });
-    Ok(())
+    job.result = Some(ManagementResult::EvaluationTicketBlocked { ticket_id });
 }
 
 async fn run_evaluation_status(
@@ -1056,11 +1130,14 @@ fn public_evaluation_status(status: &StreamingEvaluationStatus) -> ManagementRes
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unknown".into());
-    ManagementResult::EvaluationStatus {
+    ManagementResult::EvaluationStatusV3 {
+        schema_version: status.schema_version.clone(),
         ticket_id: status.ticket.id.clone(),
         lifecycle,
         planned_targets: status.ticket.targets.len(),
         has_formal_terminal: status.formal.is_some(),
+        ticket_source: status.ticket_source,
+        formal_source: status.formal_source.clone(),
     }
 }
 
@@ -1301,6 +1378,7 @@ fn decode_private_request(body: Value, job: &ManagementJob) -> Result<ParsedRequ
     }
     let request: ParsedRequest = serde_json::from_value(private.payload)
         .map_err(|_| Error::Invalid("invalid persisted management input".into()))?;
+    validate_request_schema(&request, &job.operation)?;
     if fingerprint(&request)? != job.payload_digest {
         return Err(Error::Conflict(
             "persisted management payload digest changed".into(),
@@ -1434,9 +1512,19 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         "experiment.register" => ParsedRequest::ExperimentRegister(Box::new(
             serde_json::from_value(payload).map_err(|_| invalid())?,
         )),
-        "evaluation.start" => {
-            ParsedRequest::EvaluationStart(serde_json::from_value(payload).map_err(|_| invalid())?)
-        }
+        "evaluation.start" => match payload.get("schema_version").and_then(Value::as_str) {
+            Some("rsia.management.evaluation_start.v1") => ParsedRequest::EvaluationStart(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            ),
+            Some("rsia.management.evaluation_start.v2") => ParsedRequest::EvaluationStartV2(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            ),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
         "evaluation.status" => {
             ParsedRequest::EvaluationStatus(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
@@ -1454,22 +1542,28 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         }
         _ => return Err(Error::Invalid("unknown management operation".into())),
     };
-    let expected = format!("rsia.management.{}.v1", operation.replace('.', "_"));
-    let actual = match &parsed {
-        ParsedRequest::ExperimentRegister(request) => &request.schema_version,
-        ParsedRequest::EvaluationStart(request) => &request.schema_version,
-        ParsedRequest::EvaluationStatus(request) => &request.schema_version,
-        ParsedRequest::ReplayRun(request) => &request.schema_version,
-        ParsedRequest::CurriculumStep(request) => &request.schema_version,
-        ParsedRequest::ExplorationStart(request) => &request.schema_version,
-        ParsedRequest::Blocked(request) => &request.schema_version,
+    validate_request_schema(&parsed, operation)?;
+    Ok(parsed)
+}
+
+fn validate_request_schema(parsed: &ParsedRequest, operation: &str) -> Result<()> {
+    let (actual_operation, actual_schema, version) = match parsed {
+        ParsedRequest::ExperimentRegister(v) => ("experiment.register", &v.schema_version, "v1"),
+        ParsedRequest::EvaluationStart(v) => ("evaluation.start", &v.schema_version, "v1"),
+        ParsedRequest::EvaluationStartV2(v) => ("evaluation.start", &v.schema_version, "v2"),
+        ParsedRequest::EvaluationStatus(v) => ("evaluation.status", &v.schema_version, "v1"),
+        ParsedRequest::ReplayRun(v) => ("replay.run", &v.schema_version, "v1"),
+        ParsedRequest::CurriculumStep(v) => ("curriculum.step", &v.schema_version, "v1"),
+        ParsedRequest::ExplorationStart(v) => ("exploration.start", &v.schema_version, "v1"),
+        ParsedRequest::Blocked(v) => ("meta.start", &v.schema_version, "v1"),
     };
-    if actual != &expected {
+    let expected = format!("rsia.management.{}.{version}", operation.replace('.', "_"));
+    if operation != actual_operation || actual_schema != &expected {
         return Err(Error::Invalid(
             "unsupported management payload schema".into(),
         ));
     }
-    Ok(parsed)
+    Ok(())
 }
 
 fn stable_id(prefix: &str, ctx: &Context, operation: &str, request_key: &str) -> String {
@@ -1508,6 +1602,19 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
             }
         }
         ParsedRequest::EvaluationStart(request) => {
+            dependencies.push((
+                "artifact".into(),
+                e05_storage_id(
+                    "registered_evaluation_control_v41",
+                    &request.ticket.registration_id,
+                )?,
+            ));
+            dependencies.push((
+                "artifact".into(),
+                e05_storage_id("protected_holdout_v41", &request.ticket.holdout_id)?,
+            ));
+        }
+        ParsedRequest::EvaluationStartV2(request) => {
             dependencies.push((
                 "artifact".into(),
                 e05_storage_id(
@@ -1587,6 +1694,83 @@ fn error_code(error: &Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evaluation_start_v1_wire_identity_is_preserved_and_v2_is_separate() {
+        let legacy = serde_json::json!({
+            "schema_version":"rsia.management.evaluation_start.v1",
+            "request_key":"fixed-key",
+            "ticket":{"ticket_id":"t","registration_id":"r","holdout_id":"h","issued_at_unix_seconds":5}
+        });
+        let parsed = parse_request("evaluation.start", legacy.clone()).unwrap();
+        let mut expected = legacy;
+        expected["operation"] = serde_json::json!("evaluation_start");
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), expected);
+        let current = parse_request(
+            "evaluation.start",
+            serde_json::json!({
+                "schema_version":"rsia.management.evaluation_start.v2",
+                "request_key":"fixed-key",
+                "ticket":{"ticket_id":"t","registration_id":"r","holdout_id":"h"}
+            }),
+        )
+        .unwrap();
+        assert_ne!(
+            fingerprint(&parsed).unwrap(),
+            fingerprint(&current).unwrap()
+        );
+        assert_eq!(parsed.request_key(), current.request_key());
+        assert_eq!(
+            private_dependencies(&parsed).unwrap(),
+            private_dependencies(&current).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&current).unwrap()["operation"],
+            "evaluation_start_v2"
+        );
+        assert!(validate_request_schema(&current, "evaluation.status").is_err());
+    }
+
+    #[test]
+    fn evaluation_start_v2_rejects_caller_time_and_protocol_mixing() {
+        for field in ["issued_at_unix_seconds", "now", "phase", "source_checked"] {
+            let mut current = serde_json::json!({
+                "schema_version":"rsia.management.evaluation_start.v2",
+                "request_key":"new-key",
+                "ticket":{"ticket_id":"t","registration_id":"r","holdout_id":"h"}
+            });
+            current["ticket"][field] = serde_json::json!(i64::MAX);
+            assert!(
+                parse_request("evaluation.start", current).is_err(),
+                "{field}"
+            );
+        }
+        for schema in [
+            "rsia.management.evaluation_start.v1",
+            "rsia.management.evaluation_start.v3",
+        ] {
+            assert!(
+                parse_request(
+                    "evaluation.start",
+                    serde_json::json!({
+                        "schema_version":schema,"request_key":"new-key",
+                        "ticket":{"ticket_id":"t","registration_id":"r","holdout_id":"h"}
+                    })
+                )
+                .is_err()
+            );
+        }
+        let mixed = ParsedRequest::EvaluationStartV2(EvaluationStartRequestV2 {
+            schema_version: "rsia.management.evaluation_start.v1".into(),
+            request_key: "new-key".into(),
+            ticket: IssueTicketIntent {
+                ticket_id: "t".into(),
+                registration_id: "r".into(),
+                holdout_id: "h".into(),
+            },
+        });
+        assert!(validate_request_schema(&mixed, "evaluation.start").is_err());
+    }
 
     #[test]
     fn model_and_management_surfaces_remain_separate() {
@@ -1958,3 +2142,31 @@ print(json.dumps(result,sort_keys=True))
 #[cfg(test)]
 #[path = "dispatch_late_cancel_tests.rs"]
 mod late_cancel_tests;
+
+#[cfg(test)]
+mod evaluation_status_v3_wire_controls {
+    use super::*;
+
+    #[test]
+    fn old_status_result_keeps_its_exact_original_wire_fields() {
+        let old = serde_json::json!({
+            "result": "evaluation_status", "ticket_id": "retained-ticket",
+            "lifecycle": "invalid", "planned_targets": 2, "has_formal_terminal": true
+        });
+        let decoded: ManagementResult = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(
+            &decoded,
+            ManagementResult::EvaluationStatus { .. }
+        ));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), old);
+    }
+
+    #[test]
+    fn new_status_protocol_cannot_decode_an_old_missing_policy_response() {
+        let missing = serde_json::json!({
+            "result": "evaluation_status_v3", "ticket_id": "retained-ticket",
+            "lifecycle": "invalid", "planned_targets": 2, "has_formal_terminal": true
+        });
+        assert!(serde_json::from_value::<ManagementResult>(missing).is_err());
+    }
+}

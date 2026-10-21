@@ -9,9 +9,13 @@ use crate::release_store::{
 use crate::revocation_gate::{MAX_UPSTREAM_CLOSURE_NODES, judge_dependency};
 use evo_core::evaluation::{
     BernsteinReport, ClusterObservation, ExperimentPlan, FormalExperimentPlanV41,
-    OptimizationBudgetPlan, OptimizerComparisonContract, ProfileKind, Verdict, decide,
-    empirical_bernstein, parse_decimal,
+    OptimizationBudgetPlan, OptimizerComparisonContract, Verdict, parse_decimal,
 };
+#[cfg(test)]
+use evo_core::evaluation::{ProfileKind, decide, empirical_bernstein};
+use evo_core::formal_complete_statistics::finite_decimal;
+#[cfg(test)]
+use evo_core::formal_complete_statistics::postprocess_complete_report;
 use evo_core::holdout::{
     AnchorCoverageMatrix, AnchorResult, ExposureLedger, ExposureState, FrozenCandidatePair,
     HoldoutManifest, MonetaryReservationState, SequentialMode,
@@ -20,9 +24,7 @@ use evo_core::sequential::{
     CompletePairedUnit, EarlyStopCertificate, EarlyStopCertificateParts, EarlyStopDecision,
     EarlyStopPlan, FormalClaimKind, ResearchFamilyAlphaPlan, SequentialRejectOnly,
 };
-use evo_core::{
-    Context, Error, Result, Role, canonical_fingerprint, fingerprint, hash, identifier,
-};
+use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier};
 use evo_storage::budget::{
     BudgetCallFence, BudgetCallRecord, BudgetCallState, BudgetDispatchDecision, BudgetStage,
 };
@@ -31,7 +33,7 @@ use serde::{
     Deserialize, Deserializer, Serialize,
     de::{DeserializeOwned, Error as DeError, MapAccess, SeqAccess, Visitor},
 };
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Number, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 const CONTROL_KIND: &str = "registered_evaluation_control_v41";
@@ -40,6 +42,8 @@ const LEDGER_KIND: &str = "exposure_ledger_v1";
 const ALPHA_USE_KIND: &str = "alpha_claim_reservation_v1";
 const TICKET_KIND: &str = "evaluation_ticket_v2";
 const TICKET_RECEIPT_KIND: &str = "evaluation_ticket_issue_receipt_v1";
+const TICKET_RECEIPT_KIND_V2: &str = "evaluation_ticket_issue_receipt_v2";
+pub const LEGACY_TIMED_ISSUE_DISABLED: &str = "legacy_timed_ticket_issue_disabled";
 const EXECUTION_RECEIPT_KIND: &str = "execution_receipt_v2";
 const GRADER_RECEIPT_KIND: &str = "independent_grader_receipt_v2";
 const FORMAL_KIND: &str = "formal_evaluation_v2";
@@ -544,7 +548,7 @@ pub struct EvaluationTicketV2 {
 impl EvaluationTicketV2 {
     pub const SCHEMA: &'static str = "rsia.evaluation_ticket.v2";
 
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         if self.schema_version != Self::SCHEMA {
             return Err(Error::Invalid(
                 "unsupported evaluation-ticket schema".into(),
@@ -676,6 +680,49 @@ struct TicketIssueReceipt {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct TicketIssueReceiptV2 {
+    schema_version: String,
+    ticket_id: String,
+    registration_digest: String,
+    manifest_digest: String,
+    evaluator_actor: String,
+    issued_at_unix_seconds: i64,
+    issued_at_unix_ms: i64,
+}
+
+impl TicketIssueReceiptV2 {
+    fn validate(&self) -> Result<()> {
+        identifier(&self.ticket_id)?;
+        identifier(&self.evaluator_actor)?;
+        digest(&self.registration_digest, "registration_digest")?;
+        digest(&self.manifest_digest, "manifest_digest")?;
+        valid_time(self.issued_at_unix_seconds)?;
+        if self.schema_version != "rsia.evaluation_ticket_issue_receipt.v2"
+            || self.issued_at_unix_ms < 0
+            || self.issued_at_unix_ms / 1_000 != self.issued_at_unix_seconds
+        {
+            return Err(Error::Conflict(
+                "native issue event precision differs".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// Rebuilt from the actual uniquely selected stored record in this Session.
+// This view is not serialized, cached, or accepted as caller authority.
+struct TicketIssueReceiptView {
+    ticket_id: String,
+    registration_digest: String,
+    manifest_digest: String,
+    evaluator_actor: String,
+    issued_at_unix_seconds: i64,
+    issued_at_unix_ms: Option<i64>,
+    canonical_receipt_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AlphaClaimReservation {
     schema_version: String,
     research_family_id: String,
@@ -755,6 +802,32 @@ pub struct GraderReceiptRequest {
     pub issued_at_unix_seconds: i64,
 }
 
+/// New execution receipts accept evidence identifiers and output, never a clock.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionReceiptIntent {
+    pub receipt_id: String,
+    pub ticket_id: String,
+    pub target_id: String,
+    pub side: ExecutionSide,
+    pub request_digest: String,
+    pub output_artifact_id: String,
+    pub output_utf8: String,
+    pub budget_call_id: String,
+    pub latency_micros: u64,
+}
+
+/// The fixed independent grader obtains time from the native operation owner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraderReceiptIntent {
+    pub receipt_id: String,
+    pub ticket_id: String,
+    pub target_id: String,
+    pub candidate_execution_receipt_id: String,
+    pub baseline_execution_receipt_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecutionOutputArtifact {
@@ -818,23 +891,6 @@ impl BernsteinReportWire {
     }
 }
 
-fn finite_decimal(value: f64) -> Result<String> {
-    if !value.is_finite() {
-        return Err(Error::Invalid("non-finite formal statistic".into()));
-    }
-    let mut rendered = format!("{value:.17}");
-    while rendered.contains('.') && rendered.ends_with('0') {
-        rendered.pop();
-    }
-    if rendered.ends_with('.') {
-        rendered.pop();
-    }
-    if rendered == "-0" {
-        rendered = "0".into();
-    }
-    Ok(rendered)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResourceEvidenceRecord {
@@ -888,6 +944,50 @@ impl FormalEvaluationV2 {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LegacyFormalInspectionV3 {
+    pub report_ref: evo_core::formal_version::LegacyRef,
+    pub formal: FormalEvaluationV2,
+    pub read_state: &'static str,
+    pub reason: &'static str,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyFormalReadEnvelopeR24 {
+    schema_version: String,
+    id: String,
+    record_kind: String,
+    payload: FormalEvaluationV2,
+}
+pub async fn inspect_legacy_formal_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    ticket_id: &str,
+    expected: Option<&evo_core::formal_version::AnyReportRef>,
+) -> Result<LegacyFormalInspectionV3> {
+    // The storage fixed API validates the reference before lookup, and fingerprints
+    // its original private typed DTO. Cross-crate transaction/native types stay private.
+    let material = session
+        .read_legacy_formal_material(ctx, ticket_id, expected)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let original: LegacyFormalReadEnvelopeR24 = serde_json::from_str(&material.raw_body)
+        .map_err(|_| Error::Conflict("formal_invalid_content".into()))?;
+    if original.schema_version != evo_core::formal_version::OLD_SCHEMA
+        || original.record_kind != evo_core::formal_version::OLD_KIND
+        || original.id != material.report_ref.physical_id
+        || fingerprint(&original.payload)? != material.report_ref.payload_digest
+    {
+        return Err(Error::Conflict("formal_invalid_material_binding".into()));
+    }
+    Ok(LegacyFormalInspectionV3 {
+        report_ref: material.report_ref,
+        formal: original.payload,
+        read_state: "legacy",
+        reason: "implicit_v2_historical_evaluator_unavailable",
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct IssueTicketRequest {
     pub ticket_id: String,
@@ -896,11 +996,61 @@ pub struct IssueTicketRequest {
     pub issued_at_unix_seconds: i64,
 }
 
+/// New issuance intent contains identifiers only. Time is assigned by the
+/// current native owner; deserialization rejects every caller time field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueTicketIntent {
+    pub ticket_id: String,
+    pub registration_id: String,
+    pub holdout_id: String,
+}
+
+/// Versioned response data. Neither this DTO nor its serialized read state is a
+/// native Current capability or a permission to approve a later transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormalReportReadStateV3 {
+    CurrentVerified,
+    Legacy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationStatusTicketSourceV3 {
+    LiveSnapshot,
+    FrozenFormalInput,
+}
+
+/// Deterministic lookup addresses only. Their presence does not assert that a
+/// historical row exists or that its original input has authenticated ancestry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormalLineageLookupV3 {
+    pub namespace: String,
+    pub input_digest: String,
+    pub known_versioned: Vec<(String, String, String)>,
+    pub implicit_v2_lookup_candidate: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormalReadSourceV3 {
+    pub report_ref: evo_core::formal_version::AnyReportRef,
+    pub read_state: FormalReportReadStateV3,
+    pub source_legacy: bool,
+    pub reasons: Vec<String>,
+    pub lineage_lookup_candidates: Option<FormalLineageLookupV3>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamingEvaluationStatus {
+    pub schema_version: String,
+    pub ticket_source: EvaluationStatusTicketSourceV3,
     pub ticket: EvaluationTicketV2,
     pub formal: Option<FormalEvaluationV2>,
+    pub formal_source: Option<FormalReadSourceV3>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1186,279 +1336,149 @@ impl IndependentEvaluationControl {
         Ok(digest)
     }
 
+    /// Historical caller-timed issuance is retained as a decoding/API boundary.
+    /// New issuance must use the native-clock intent path below.
     pub async fn issue_ticket(
         ctx: &Context,
-        store: &Store,
-        request: IssueTicketRequest,
+        _store: &Store,
+        _request: IssueTicketRequest,
     ) -> Result<EvaluationTicketV2> {
         ctx.require(&[Role::Evaluator])?;
-        identifier(&request.ticket_id)?;
-        identifier(&request.registration_id)?;
-        identifier(&request.holdout_id)?;
-        valid_time(request.issued_at_unix_seconds)?;
-        let mut session = store.session().await?;
+        Err(Error::Invalid(LEGACY_TIMED_ISSUE_DISABLED.into()))
+    }
+
+    /// Issue from current stored facts and this operation's native wall clock.
+    /// No request, DTO or environment field supplies the occurrence timestamp.
+    pub async fn issue_ticket_now(
+        ctx: &Context,
+        store: &Store,
+        intent: IssueTicketIntent,
+    ) -> Result<EvaluationTicketV2> {
+        ctx.require(&[Role::Evaluator])?;
+        identifier(&intent.ticket_id)?;
+        identifier(&intent.registration_id)?;
+        identifier(&intent.holdout_id)?;
+        // Preserve the producer's original role, candidate and closure-cap
+        // admission. The native owner independently requalifies the actual
+        // same-transaction facts; this read is never a transferable proof.
+        let mut preflight = store.session().await?;
         let control: RegisteredEvaluationControl =
-            need_record(&mut session, ctx, CONTROL_KIND, &request.registration_id).await?;
+            need_record(&mut preflight, ctx, CONTROL_KIND, &intent.registration_id).await?;
         let holdout: ProtectedHoldoutRecord =
-            need_record(&mut session, ctx, HOLDOUT_KIND, &request.holdout_id).await?;
-        if control.evaluator_actor != ctx.actor() {
-            return Err(Error::Forbidden);
-        }
-        control.validate()?;
-        holdout.validate_against(&control)?;
-        let issued_at_unix_ms = request
-            .issued_at_unix_seconds
-            .checked_mul(1_000)
-            .ok_or_else(|| Error::Invalid("ticket timestamp conversion overflow".into()))?;
-        if request.issued_at_unix_seconds < control.created_at_unix_seconds
-            || issued_at_unix_ms < holdout.manifest.issued_at_unix_ms
-        {
-            return Err(Error::Invalid(
-                "ticket must be issued after control and manifest registration facts".into(),
-            ));
-        }
-        let issue_control_digest = fingerprint(&control)?;
-        let issue_holdout_digest = fingerprint(&holdout)?;
-        session.commit().await?;
-        validate_root_budget(ctx, store, &control).await?;
-        let mut session = store.session().await?;
-        let control: RegisteredEvaluationControl =
-            need_record(&mut session, ctx, CONTROL_KIND, &request.registration_id).await?;
-        let holdout: ProtectedHoldoutRecord =
-            need_record(&mut session, ctx, HOLDOUT_KIND, &request.holdout_id).await?;
+            need_record(&mut preflight, ctx, HOLDOUT_KIND, &intent.holdout_id).await?;
         control.validate()?;
         holdout.validate_against(&control)?;
         if control.evaluator_actor != ctx.actor() {
             return Err(Error::Forbidden);
         }
-        if fingerprint(&control)? != issue_control_digest
-            || fingerprint(&holdout)? != issue_holdout_digest
-        {
-            return Err(Error::Conflict(
-                "registration facts changed during ticket issue".into(),
-            ));
-        }
-        let candidate_dependency_binding =
-            bind_candidate_in_session(&mut session, ctx, &control, &holdout).await?;
-        // Every issued ticket binds its frozen candidate (L564). Without a
-        // candidate record there is nothing to bind: the issue is refused here,
-        // before its first write and under every control schema, instead of
-        // issuing an unbound ticket (L1055/L1057). Stored unbound tickets keep
-        // their original interpretation (L696).
-        if candidate_dependency_binding.is_none() {
+        let binding = bind_candidate_in_session(&mut preflight, ctx, &control, &holdout).await?;
+        if binding.is_none() {
             return Err(Error::Conflict(CANDIDATE_RECORD_MISSING.into()));
         }
-        if candidate_dependency_binding.is_some() {
-            let existing = collect_dependency_nodes(
-                &mut session,
-                ctx,
-                vec![
-                    ("artifact".into(), holdout.pair.candidate_digest.clone()),
-                    artifact_edge(HOLDOUT_KIND, &holdout.id)?,
-                ],
-            )
-            .await?;
-            let new_claims = control
-                .alpha_plan
-                .allocations
-                .iter()
-                .filter(|allocation| allocation.attempt_id == control.attempt_id)
-                .count();
-            // Capacity accounting for this transaction's actual ticket, issue
-            // receipt and claim writes is not a content snapshot or future proof.
-            if existing.len().saturating_add(2).saturating_add(new_claims)
-                > MAX_UPSTREAM_CLOSURE_NODES
-            {
-                return Err(Error::Conflict(
-                    "formal dependency closure exceeds 10000 nodes; refused, not truncated".into(),
-                ));
-            }
-        }
-        if get_record::<EvaluationTicketV2>(&mut session, ctx, TICKET_KIND, &request.ticket_id)
-            .await?
-            .is_some()
-        {
-            return Err(Error::Conflict("ticket already issued".into()));
-        }
-        let mut ledger = match get_record::<ExposureLedger>(
-            &mut session,
+        let existing = collect_dependency_nodes(
+            &mut preflight,
             ctx,
-            LEDGER_KIND,
-            &control.alpha_plan.research_family_id,
+            vec![
+                ("artifact".into(), holdout.pair.candidate_digest.clone()),
+                artifact_edge(HOLDOUT_KIND, &holdout.id)?,
+            ],
         )
-        .await?
-        {
-            Some(ledger) => ledger,
-            None => ExposureLedger::new(
-                control.alpha_plan.research_family_id.clone(),
-                control.alpha_plan.digest()?,
-                control.v1_plan_snapshot.query_limit,
-            )?,
-        };
-        ledger.reserve(request.ticket_id.clone(), &holdout.manifest)?;
-        let claim_allocations: Vec<_> = control
+        .await?;
+        let new_claims = control
             .alpha_plan
             .allocations
             .iter()
             .filter(|allocation| allocation.attempt_id == control.attempt_id)
-            .collect();
-        if claim_allocations.is_empty() {
-            return Err(Error::Invalid(
-                "attempt has no preregistered alpha claims".into(),
+            .count();
+        if existing.len().saturating_add(2).saturating_add(new_claims) > MAX_UPSTREAM_CLOSURE_NODES
+        {
+            return Err(Error::Conflict(
+                "formal dependency closure exceeds 10000 nodes; refused, not truncated".into(),
             ));
         }
-        for allocation in claim_allocations {
-            let id = format!(
-                "{}:{}",
-                control.alpha_plan.research_family_id, allocation.claim_id
-            );
-            if get_record::<AlphaClaimReservation>(&mut session, ctx, ALPHA_USE_KIND, &id)
-                .await?
-                .is_some()
-            {
-                return Err(Error::Conflict("alpha claim already reserved".into()));
+        preflight.commit().await?;
+        validate_root_budget(ctx, store, &control).await?;
+        let operation = store.session().await?.begin_e05_issue(
+            ctx.clone(),
+            json!({
+                "schema_version": "rsia.e05_issue_intent.v2",
+                "ticket_id": intent.ticket_id,
+                "registration_id": intent.registration_id,
+                "holdout_id": intent.holdout_id,
+            }),
+        )?;
+        let outcome = operation.finish_outcome().await;
+        let committed = match outcome.result {
+            Ok(committed) => committed,
+            Err(failure) => {
+                tracing::error!(
+                    ticket_id=%intent.ticket_id,
+                    native_facts=?outcome.native,
+                    commit_outcome_unknown=failure.commit_outcome_unknown,
+                    commit_confirmed=failure.commit_confirmed,
+                    rollback_error=?failure.rollback_error,
+                    error=%failure.error,
+                    "native issue failed; preserve terminal and reconciliation facts"
+                );
+                return Err(failure.error);
             }
-            let reservation = AlphaClaimReservation {
-                schema_version: "rsia.alpha_claim_reservation.v1".into(),
-                research_family_id: control.alpha_plan.research_family_id.clone(),
-                claim_id: allocation.claim_id.clone(),
-                attempt_id: allocation.attempt_id.clone(),
-                ticket_id: request.ticket_id.clone(),
-            };
-            put_record(
-                &mut session,
-                ctx,
-                ALPHA_USE_KIND,
-                &id,
-                ctx.actor(),
-                &reservation,
-            )
-            .await?;
-        }
-        let registration_digest = control.digest()?;
-        let manifest_digest = holdout.manifest.digest()?;
-        let issue_receipt = TicketIssueReceipt {
-            schema_version: "rsia.evaluation_ticket_issue_receipt.v1".into(),
-            ticket_id: request.ticket_id.clone(),
-            registration_digest: registration_digest.clone(),
-            manifest_digest: manifest_digest.clone(),
-            evaluator_actor: ctx.actor().into(),
-            issued_at_unix_seconds: request.issued_at_unix_seconds,
         };
-        let issue_receipt_digest = fingerprint(&issue_receipt)?;
-        let mut bound_v1_plan = control.v1_plan_snapshot.clone();
-        bound_v1_plan.bind_candidate(holdout.pair.candidate_digest.clone())?;
-        let rotating = holdout
-            .rotating_inputs
-            .iter()
-            .map(|input| EvaluationTarget {
-                target_id: input.target_id.clone(),
-                kind: EvaluationTargetKind::Rotating {
-                    cluster_id: input.cluster_or_anchor_id.clone(),
-                },
-                input_artifact_id: input.input_artifact_id.clone(),
-                input_digest: input.input_digest.clone(),
-                state: TargetState::Planned,
-            });
-        let anchors = holdout.anchor_inputs.iter().map(|input| EvaluationTarget {
-            target_id: input.target_id.clone(),
-            kind: EvaluationTargetKind::Anchor {
-                anchor_id: input.cluster_or_anchor_id.clone(),
-            },
-            input_artifact_id: input.input_artifact_id.clone(),
-            input_digest: input.input_digest.clone(),
-            state: TargetState::Planned,
-        });
-        let ticket = EvaluationTicketV2 {
-            schema_version: EvaluationTicketV2::SCHEMA.into(),
-            id: request.ticket_id.clone(),
-            registration_id: control.id.clone(),
-            registration_digest,
-            holdout_id: holdout.id.clone(),
-            manifest_digest,
-            v1_plan_snapshot_digest: control.formal_plan.v1_plan_snapshot_digest.clone(),
-            bound_v1_plan_digest: bound_v1_plan.digest()?,
-            formal_plan_digest: control.formal_plan.digest()?,
-            profile: control.formal_plan.profile,
-            n_planned: control.formal_plan.n_planned,
-            research_family_id: control.alpha_plan.research_family_id.clone(),
-            alpha_plan_digest: control.alpha_plan.digest()?,
-            candidate_digest: holdout.pair.candidate_digest.clone(),
-            baseline_digest: holdout.pair.baseline_digest.clone(),
-            candidate_bundle_digest: holdout.candidate_bundle_digest.clone(),
-            baseline_bundle_digest: holdout.baseline_bundle_digest.clone(),
-            environment_digest: holdout.manifest.environment_digest.clone(),
-            proposer_actor: control.proposer_actor.clone(),
-            evaluator_actor: control.evaluator_actor.clone(),
-            executor_actor: control.executor_actor.clone(),
-            approver_actor: control.approver_actor.clone(),
-            issue_receipt_digest,
-            evidence_scope: control.evidence_scope,
-            attempt_id: control.attempt_id.clone(),
-            targets: rotating.chain(anchors).collect(),
-            lifecycle: TicketLifecycle::Reserved,
-            next_sequence: 1,
-            pending_certificate: None,
-            stop_member_terminal_digest: None,
-            late_execution_receipt_ids: Vec::new(),
-            late_grader_receipt_ids: Vec::new(),
-            unattributed_budget_call_ids: Vec::new(),
-            invalid_reasons: Vec::new(),
-            issued_at_unix_seconds: request.issued_at_unix_seconds,
-            candidate_dependency_binding,
+        let decoded: Result<EvaluationTicketV2> =
+            serde_json::from_value(committed).map_err(|_| Error::Internal);
+        let ticket = match decoded {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                tracing::error!(
+                    ticket_id=%intent.ticket_id,
+                    commit_confirmed=true,
+                    "native issue committed but producer decoding failed; reconcile stored ticket"
+                );
+                return Err(error);
+            }
         };
-        ticket.validate()?;
-        put_record(
-            &mut session,
-            ctx,
-            LEDGER_KIND,
-            &control.alpha_plan.research_family_id,
-            ctx.actor(),
-            &ledger,
-        )
-        .await?;
-        put_record(
-            &mut session,
-            ctx,
-            TICKET_RECEIPT_KIND,
-            &request.ticket_id,
-            ctx.actor(),
-            &issue_receipt,
-        )
-        .await?;
-        put_record(
-            &mut session,
-            ctx,
-            TICKET_KIND,
-            &request.ticket_id,
-            ctx.actor(),
-            &ticket,
-        )
-        .await?;
-        session
-            .put_edge(
-                ctx,
-                "artifact",
-                &storage_id(TICKET_KIND, &request.ticket_id)?,
-                "artifact",
-                &storage_id(HOLDOUT_KIND, &holdout.id)?,
-            )
-            .await?;
-        if ticket.candidate_dependency_binding.is_some() {
-            let edges = required_ticket_edges(&mut session, ctx, &ticket, &control).await?;
-            put_fact_edges(
-                &mut session,
-                ctx,
-                &storage_id(TICKET_KIND, &ticket.id)?,
-                edges,
-            )
-            .await?;
+        if let Err(error) = ticket.validate() {
+            tracing::error!(
+                ticket_id=%intent.ticket_id,
+                commit_confirmed=true,
+                "native issue committed but producer shape verification failed; reconcile stored ticket"
+            );
+            return Err(error);
         }
-        session
-            .audit(ctx, "issue_evaluation_ticket", &request.ticket_id)
-            .await?;
-        session.commit().await?;
+        if ticket.id != intent.ticket_id
+            || ticket.registration_id != intent.registration_id
+            || ticket.holdout_id != intent.holdout_id
+            || ticket.evaluator_actor != ctx.actor()
+        {
+            tracing::error!(
+                ticket_id=%intent.ticket_id,
+                commit_confirmed=true,
+                "native issue committed with unexpected producer identity; reconciliation required"
+            );
+            return Err(Error::Conflict(
+                "committed native issue identity differs".into(),
+            ));
+        }
         Ok(ticket)
+    }
+
+    /// Only recover a genuinely persisted v1 issuance; never convert a queued
+    /// legacy timestamp into a newly sampled issuance.
+    pub(crate) async fn recover_legacy_ticket_issue(
+        ctx: &Context,
+        store: &Store,
+        request: &IssueTicketRequest,
+    ) -> Result<Option<EvaluationTicketV2>> {
+        recover_ticket_issue(ctx, store, TicketIssueRecovery::Legacy(request)).await
+    }
+
+    /// Native retries read the original time and exact source closure without
+    /// allocating another claim, quota slice, ledger entry or wall-clock sample.
+    pub(crate) async fn recover_native_ticket_issue(
+        ctx: &Context,
+        store: &Store,
+        intent: &IssueTicketIntent,
+    ) -> Result<Option<EvaluationTicketV2>> {
+        recover_ticket_issue(ctx, store, TicketIssueRecovery::Native(intent)).await
     }
 
     pub async fn broker_task(
@@ -1495,1089 +1515,355 @@ impl IndependentEvaluationControl {
         store: &Store,
         request: StartExecutionRequest,
     ) -> Result<BudgetDispatchDecision> {
-        ctx.require(&[Role::Worker, Role::Host])?;
-        let mut session = store.session().await?;
-        let mut ticket: EvaluationTicketV2 =
-            need_record(&mut session, ctx, TICKET_KIND, &request.ticket_id).await?;
-        let control: RegisteredEvaluationControl =
-            need_record(&mut session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
-        if ticket.executor_actor != ctx.actor() || is_stopping(ticket.lifecycle) {
-            return Err(Error::Forbidden);
-        }
-        validate_status_closure(&mut session, ctx, &ticket, None).await?;
-        let view = broker_view(&ticket, &request.target_id, request.side)?;
-        live_task_candidate_in_session(ctx, &mut session, &view).await?;
-        if request.fence.billing_scope != control.billing_scope
-            || request.fence.actual_input_digest != view.request_digest
-        {
-            return Err(Error::Conflict(
-                "execution fence differs from the frozen ticket slot".into(),
-            ));
-        }
-        let call = session
-            .budget_call(ctx, &control.billing_scope, &request.fence.call_id)
-            .await?
-            .ok_or(Error::NotFound)?;
-        if call.dispatch_group_id != ticket.id
-            || call.stage != BudgetStage::TaskExecution
-            || call.actual_input_digest != view.request_digest
-            || call.state != BudgetCallState::Reserved
-        {
-            return Err(Error::Conflict(
-                "budget call is not a reserved member of this ticket".into(),
-            ));
-        }
-        bind_slot(
-            ticket.target_mut(&request.target_id)?,
-            ExecutionSlotBinding {
-                side: request.side,
-                budget_call_id: call.call_id.clone(),
-                request_digest: view.request_digest,
-                phase: ExecutionSlotPhase::ReservedBound,
-                receipt_id: None,
-            },
-        )?;
-        put_record(
-            &mut session,
-            ctx,
-            TICKET_KIND,
-            &ticket.id,
-            ticket.evaluator_actor.as_str(),
-            &ticket,
-        )
-        .await?;
-        let decision = session.begin_budget_dispatch(ctx, &request.fence).await?;
-        let dispatch_id =
-            decision.call.dispatch_id.clone().ok_or_else(|| {
+        // The execution state is nested in native closure readers; keep it on the heap.
+        Box::pin(async move {
+            ctx.require(&[Role::Worker, Role::Host])?;
+            let mut session = store.session().await?;
+            let mut ticket: EvaluationTicketV2 =
+                need_record(&mut session, ctx, TICKET_KIND, &request.ticket_id).await?;
+            let control: RegisteredEvaluationControl =
+                need_record(&mut session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
+            if ticket.executor_actor != ctx.actor() || is_stopping(ticket.lifecycle) {
+                return Err(Error::Forbidden);
+            }
+            validate_status_closure(&mut session, ctx, &ticket, None).await?;
+            let view = broker_view(&ticket, &request.target_id, request.side)?;
+            live_task_candidate_in_session(ctx, &mut session, &view).await?;
+            if request.fence.billing_scope != control.billing_scope
+                || request.fence.actual_input_digest != view.request_digest
+            {
+                return Err(Error::Conflict(
+                    "execution fence differs from the frozen ticket slot".into(),
+                ));
+            }
+            let call = session
+                .budget_call(ctx, &control.billing_scope, &request.fence.call_id)
+                .await?
+                .ok_or(Error::NotFound)?;
+            if call.dispatch_group_id != ticket.id
+                || call.stage != BudgetStage::TaskExecution
+                || call.actual_input_digest != view.request_digest
+                || call.state != BudgetCallState::Reserved
+            {
+                return Err(Error::Conflict(
+                    "budget call is not a reserved member of this ticket".into(),
+                ));
+            }
+            bind_slot(
+                ticket.target_mut(&request.target_id)?,
+                ExecutionSlotBinding {
+                    side: request.side,
+                    budget_call_id: call.call_id.clone(),
+                    request_digest: view.request_digest,
+                    phase: ExecutionSlotPhase::ReservedBound,
+                    receipt_id: None,
+                },
+            )?;
+            put_record(
+                &mut session,
+                ctx,
+                TICKET_KIND,
+                &ticket.id,
+                ticket.evaluator_actor.as_str(),
+                &ticket,
+            )
+            .await?;
+            let decision = session.begin_budget_dispatch(ctx, &request.fence).await?;
+            let dispatch_id = decision.call.dispatch_id.clone().ok_or_else(|| {
                 Error::Conflict("budget call did not enter dispatched state".into())
             })?;
-        mark_slot_dispatched(
-            ticket.target_mut(&request.target_id)?,
-            request.side,
-            &call.call_id,
-            &dispatch_id,
-            request.fence.now,
-        )?;
-        ticket.lifecycle = TicketLifecycle::Running;
-        mark_exposure_dispatched_if_needed(&mut session, ctx, &ticket, request.fence.now).await?;
-        put_record(
-            &mut session,
-            ctx,
-            TICKET_KIND,
-            &ticket.id,
-            ticket.evaluator_actor.as_str(),
-            &ticket,
-        )
-        .await?;
-        session.commit().await?;
-        Ok(decision)
+            mark_slot_dispatched(
+                ticket.target_mut(&request.target_id)?,
+                request.side,
+                &call.call_id,
+                &dispatch_id,
+                request.fence.now,
+            )?;
+            ticket.lifecycle = TicketLifecycle::Running;
+            mark_exposure_dispatched_if_needed(&mut session, ctx, &ticket, request.fence.now)
+                .await?;
+            put_record(
+                &mut session,
+                ctx,
+                TICKET_KIND,
+                &ticket.id,
+                ticket.evaluator_actor.as_str(),
+                &ticket,
+            )
+            .await?;
+            session.commit().await?;
+            Ok(decision)
+        })
+        .await
     }
 
     pub async fn record_execution_receipt(
         ctx: &Context,
-        store: &Store,
-        request: ExecutionReceiptRequest,
+        _store: &Store,
+        _request: ExecutionReceiptRequest,
     ) -> Result<ExecutionReceiptV2> {
         ctx.require(&[Role::Worker, Role::Host])?;
-        identifier(&request.receipt_id)?;
-        identifier(&request.ticket_id)?;
-        identifier(&request.target_id)?;
-        identifier(&request.budget_call_id)?;
-        identifier(&request.output_artifact_id)?;
-        digest(&request.request_digest, "request_digest")?;
-        if request.output_utf8.is_empty() || request.output_utf8.len() > 256 * 1024 {
+        Err(Error::Invalid(
+            "legacy_timed_execution_receipt_disabled".into(),
+        ))
+    }
+
+    pub async fn record_execution_receipt_now(
+        ctx: &Context,
+        store: &Store,
+        intent: ExecutionReceiptIntent,
+    ) -> Result<ExecutionReceiptV2> {
+        ctx.require(&[Role::Worker, Role::Host])?;
+        for id in [
+            &intent.receipt_id,
+            &intent.ticket_id,
+            &intent.target_id,
+            &intent.output_artifact_id,
+            &intent.budget_call_id,
+        ] {
+            identifier(id)?;
+        }
+        digest(&intent.request_digest, "request_digest")?;
+        if intent.output_utf8.is_empty() || intent.output_utf8.len() > 256 * 1024 {
             return Err(Error::Invalid(
                 "execution output must be 1..=262144 UTF-8 bytes".into(),
             ));
         }
-        valid_time(request.issued_at_unix_seconds)?;
-        let ticket: EvaluationTicketV2 = load(store, ctx, TICKET_KIND, &request.ticket_id).await?;
-        if ticket.executor_actor != ctx.actor() {
-            return Err(Error::Forbidden);
-        }
-        let target = ticket.target(&request.target_id)?;
-        let bundle_digest = match request.side {
-            ExecutionSide::Candidate => ticket.candidate_bundle_digest.clone(),
-            ExecutionSide::Baseline => ticket.baseline_bundle_digest.clone(),
-        };
-        let expected_request = request_digest(
-            &ticket,
-            target,
-            request.side,
-            &bundle_digest,
-            &ticket.environment_digest,
+        let operation = store.session().await?.begin_e05_execution(
+            ctx.clone(),
+            json!({
+                "schema_version":"rsia.e05_execution_intent.v2",
+                "receipt_id":&intent.receipt_id,
+                "ticket_id":&intent.ticket_id,
+                "target_id":&intent.target_id,
+                "side":intent.side,
+                "request_digest":&intent.request_digest,
+                "budget_call_id":&intent.budget_call_id,
+                "output_artifact_id":&intent.output_artifact_id,
+                "output_utf8":&intent.output_utf8,
+                "latency_micros":intent.latency_micros,
+            }),
         )?;
-        if expected_request != request.request_digest {
-            return Err(Error::Conflict(
-                "execution request differs from the frozen ticket member".into(),
+        let receipt: ExecutionReceiptV2 =
+            finish_e05_native(operation, &intent.ticket_id, "execution_receipt").await?;
+        if receipt.schema_version != "rsia.execution_receipt.v2"
+            || receipt.receipt_id != intent.receipt_id
+            || receipt.ticket_id != intent.ticket_id
+            || receipt.target_id != intent.target_id
+            || receipt.side != intent.side
+            || receipt.request_digest != intent.request_digest
+            || receipt.budget_call_id != intent.budget_call_id
+            || receipt.output_artifact_id != intent.output_artifact_id
+            || receipt.output_digest != hash(intent.output_utf8.as_bytes())
+            || receipt.executor_actor != ctx.actor()
+            || receipt.latency_micros != intent.latency_micros
+            || receipt.issued_at_unix_seconds < 0
+        {
+            return Err(committed_e05_identity_error(
+                &intent.ticket_id,
+                "execution_receipt",
             ));
         }
-        let call = store
-            .budget_call(
-                ctx,
-                &control_billing_scope(store, ctx, &ticket).await?,
-                &request.budget_call_id,
-            )
-            .await?
-            .ok_or(Error::NotFound)?;
-        if call.dispatch_group_id != ticket.id
-            || call.stage != BudgetStage::TaskExecution
-            || call.actual_input_digest != request.request_digest
-            || !matches!(
-                call.state,
-                BudgetCallState::Dispatched
-                    | BudgetCallState::Uncertain
-                    | BudgetCallState::Finalized
-            )
-        {
-            return Err(Error::Conflict(
-                "execution receipt lacks the matching dispatched budget call".into(),
-            ));
-        }
-        let output_digest = hash(request.output_utf8.as_bytes());
-        let output = ExecutionOutputArtifact {
-            schema_version: "rsia.execution_output.v1".into(),
-            id: request.output_artifact_id.clone(),
-            ticket_id: ticket.id.clone(),
-            target_id: request.target_id.clone(),
-            side: request.side,
-            output_utf8: request.output_utf8,
-            output_digest: output_digest.clone(),
-        };
-        let receipt = ExecutionReceiptV2 {
-            schema_version: "rsia.execution_receipt.v2".into(),
-            receipt_id: request.receipt_id.clone(),
-            ticket_id: ticket.id.clone(),
-            target_id: request.target_id.clone(),
-            side: request.side,
-            request_digest: request.request_digest,
-            bundle_digest,
-            environment_digest: ticket.environment_digest.clone(),
-            output_digest,
-            output_artifact_id: output.id.clone(),
-            budget_call_id: request.budget_call_id,
-            executor_actor: ctx.actor().into(),
-            latency_micros: request.latency_micros,
-            issued_at_unix_seconds: request.issued_at_unix_seconds,
-        };
-        let mut session = store.session().await?;
-        let mut latest: EvaluationTicketV2 =
-            need_record(&mut session, ctx, TICKET_KIND, &request.ticket_id).await?;
-        if !is_stopping(latest.lifecycle) {
-            validate_status_closure(&mut session, ctx, &latest, None).await?;
-        }
-        if let Some(existing) = get_record::<ExecutionReceiptV2>(
-            &mut session,
-            ctx,
-            EXECUTION_RECEIPT_KIND,
-            &request.receipt_id,
-        )
-        .await?
-        {
-            if fingerprint(&existing)? == fingerprint(&receipt)? {
-                let existing_output: ExecutionOutputArtifact =
-                    need_record(&mut session, ctx, OUTPUT_KIND, &existing.output_artifact_id)
-                        .await?;
-                if fingerprint(&existing_output)? != fingerprint(&output)? {
-                    return Err(Error::Conflict(
-                        "stored execution output differs from idempotent receipt".into(),
-                    ));
-                }
-                return Ok(existing);
-            }
-            return Err(Error::Conflict(
-                "execution receipt id reused with different evidence".into(),
-            ));
-        }
-        if let Some(existing_output) =
-            get_record::<ExecutionOutputArtifact>(&mut session, ctx, OUTPUT_KIND, &output.id)
-                .await?
-        {
-            if fingerprint(&existing_output)? != fingerprint(&output)? {
-                return Err(Error::Conflict(
-                    "execution output id reused with different bytes or binding".into(),
-                ));
-            }
-        } else {
-            put_record(
-                &mut session,
-                ctx,
-                OUTPUT_KIND,
-                &output.id,
-                ctx.actor(),
-                &output,
-            )
-            .await?;
-        }
-        put_record(
-            &mut session,
-            ctx,
-            EXECUTION_RECEIPT_KIND,
-            &request.receipt_id,
-            ctx.actor(),
-            &receipt,
-        )
-        .await?;
-        if latest.candidate_dependency_binding.is_some() && !is_stopping(latest.lifecycle) {
-            put_fact_edges(
-                &mut session,
-                ctx,
-                &storage_id(EXECUTION_RECEIPT_KIND, &receipt.receipt_id)?,
-                vec![
-                    artifact_edge(TICKET_KIND, &latest.id)?,
-                    artifact_edge(OUTPUT_KIND, &output.id)?,
-                ],
-            )
-            .await?;
-            put_fact_edges(
-                &mut session,
-                ctx,
-                &storage_id(TICKET_KIND, &latest.id)?,
-                vec![artifact_edge(EXECUTION_RECEIPT_KIND, &receipt.receipt_id)?],
-            )
-            .await?;
-        }
-        if is_stopping(latest.lifecycle) {
-            validate_started_slot(
-                latest.target(&request.target_id)?,
-                request.side,
-                &receipt.budget_call_id,
-                &receipt.request_digest,
-            )?;
-            // AG-118 (§6.6 L705/L707): once an Invalid report is final (its
-            // reasons fixed, no re-derivation), the paid late result keeps its
-            // stored receipt and output as audit evidence; the ticket, its
-            // edges and the report stay as persisted. EarlyStopped keeps the
-            // AG-091 path of the grader side: the receipt joins the ticket's
-            // late list and the report is re-derived below with an unchanged
-            // certificate. Draining keeps it for settle_after_stop. A
-            // CompleteBatch ticket has no started slot left, so
-            // validate_started_slot above already refused it.
-            if latest.lifecycle == TicketLifecycle::Invalid {
-                session
-                    .audit(ctx, LATE_EXECUTION_AFTER_FORMAL_AUDIT, &receipt.receipt_id)
-                    .await?;
-                session.commit().await?;
-                return Ok(receipt);
-            }
-            latest.late_execution_receipt_ids.push(request.receipt_id);
-        } else {
-            validate_started_slot(
-                latest.target(&request.target_id)?,
-                request.side,
-                &receipt.budget_call_id,
-                &receipt.request_digest,
-            )?;
-            set_running_receipt(
-                latest.target_mut(&request.target_id)?,
-                request.side,
-                &receipt.receipt_id,
-            )?;
-            latest.lifecycle = TicketLifecycle::Running;
-        }
-        latest.validate()?;
-        put_record(
-            &mut session,
-            ctx,
-            TICKET_KIND,
-            &latest.id,
-            latest.evaluator_actor.as_str(),
-            &latest,
-        )
-        .await?;
-        if latest.candidate_dependency_binding.is_some() && !is_stopping(latest.lifecycle) {
-            collect_dependency_nodes(
-                &mut session,
-                ctx,
-                vec![artifact_edge(TICKET_KIND, &latest.id)?],
-            )
-            .await?;
-        }
-        // AG-118: an EarlyStopped report pins the ticket it was derived from.
-        maybe_store_early_formal(&mut session, ctx, &latest).await?;
-        session.commit().await?;
         Ok(receipt)
     }
 
     pub async fn record_grader_receipt(
         ctx: &Context,
-        store: &Store,
-        request: GraderReceiptRequest,
+        _store: &Store,
+        _request: GraderReceiptRequest,
     ) -> Result<IndependentGraderReceiptV2> {
         ctx.require(&[Role::Evaluator])?;
-        valid_time(request.issued_at_unix_seconds)?;
-        let mut session = store.session().await?;
-        let mut ticket: EvaluationTicketV2 =
-            need_record(&mut session, ctx, TICKET_KIND, &request.ticket_id).await?;
-        let control: RegisteredEvaluationControl =
-            need_record(&mut session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
-        let holdout: ProtectedHoldoutRecord =
-            need_record(&mut session, ctx, HOLDOUT_KIND, &ticket.holdout_id).await?;
-        if ticket.evaluator_actor != ctx.actor()
-            || ctx.actor() == ticket.proposer_actor
-            || ctx.actor() == ticket.approver_actor
-        {
-            return Err(Error::Forbidden);
+        Err(Error::Invalid(
+            "legacy_timed_grader_receipt_disabled".into(),
+        ))
+    }
+
+    pub async fn record_grader_receipt_now(
+        ctx: &Context,
+        store: &Store,
+        intent: GraderReceiptIntent,
+    ) -> Result<IndependentGraderReceiptV2> {
+        ctx.require(&[Role::Evaluator])?;
+        for id in [
+            &intent.receipt_id,
+            &intent.ticket_id,
+            &intent.target_id,
+            &intent.candidate_execution_receipt_id,
+            &intent.baseline_execution_receipt_id,
+        ] {
+            identifier(id)?;
         }
-        let bind_accepted_facts =
-            ticket.candidate_dependency_binding.is_some() && !is_stopping(ticket.lifecycle);
-        // A delayed grading error cannot replace an already confirmed bound stop.
-        let preserve_confirmed_stop = ticket.candidate_dependency_binding.is_some()
-            && matches!(
-                ticket.lifecycle,
-                TicketLifecycle::Draining | TicketLifecycle::EarlyStopped
-            )
-            && ticket.pending_certificate.is_some();
-        if !is_stopping(ticket.lifecycle) {
-            validate_status_closure(&mut session, ctx, &ticket, None).await?;
-        }
-        let candidate: ExecutionReceiptV2 = need_record(
-            &mut session,
-            ctx,
-            EXECUTION_RECEIPT_KIND,
-            &request.candidate_execution_receipt_id,
-        )
-        .await?;
-        let baseline: ExecutionReceiptV2 = need_record(
-            &mut session,
-            ctx,
-            EXECUTION_RECEIPT_KIND,
-            &request.baseline_execution_receipt_id,
-        )
-        .await?;
-        validate_execution_pair(&ticket, &request.target_id, &candidate, &baseline)?;
-        let target_kind = ticket.target(&request.target_id)?.kind.clone();
-        // AG-118: decided from the stored ticket alone, before any grading.
-        let after_final_report = late_grading_after_final_report(&ticket, &request.target_id)?;
-        let candidate_output: ExecutionOutputArtifact = need_record(
-            &mut session,
-            ctx,
-            OUTPUT_KIND,
-            &candidate.output_artifact_id,
-        )
-        .await?;
-        let baseline_output: ExecutionOutputArtifact =
-            need_record(&mut session, ctx, OUTPUT_KIND, &baseline.output_artifact_id).await?;
-        validate_output_artifact(&candidate, &candidate_output)?;
-        validate_output_artifact(&baseline, &baseline_output)?;
-        let oracle = holdout
-            .oracle_entries
-            .iter()
-            .find(|entry| entry.target_id == request.target_id)
-            .ok_or_else(|| Error::Invalid("frozen oracle entry missing".into()))?;
-        let candidate_score_micros = match grade_fixed_output(
-            &control.fixed_grader,
-            &candidate_output.output_utf8,
-            &oracle.expected_answer_json,
-        ) {
-            Ok(score) => score,
-            Err(error) => {
-                if after_final_report {
-                    audit_late_grading_error(session, ctx, &request.receipt_id).await?;
-                } else if !preserve_confirmed_stop {
-                    invalidate_in_session(
-                        &mut session,
-                        ctx,
-                        &control,
-                        &mut ticket,
-                        "candidate_output_schema_invalid",
-                        request.issued_at_unix_seconds,
-                    )
-                    .await?;
-                    session.commit().await?;
-                }
-                return Err(error);
-            }
-        };
-        let baseline_score_micros = match grade_fixed_output(
-            &control.fixed_grader,
-            &baseline_output.output_utf8,
-            &oracle.expected_answer_json,
-        ) {
-            Ok(score) => score,
-            Err(error) => {
-                if after_final_report {
-                    audit_late_grading_error(session, ctx, &request.receipt_id).await?;
-                } else if !preserve_confirmed_stop {
-                    invalidate_in_session(
-                        &mut session,
-                        ctx,
-                        &control,
-                        &mut ticket,
-                        "baseline_output_schema_invalid",
-                        request.issued_at_unix_seconds,
-                    )
-                    .await?;
-                    session.commit().await?;
-                }
-                return Err(error);
-            }
-        };
-        let anchor_result = match target_kind {
-            EvaluationTargetKind::Rotating { .. } => None,
-            EvaluationTargetKind::Anchor { .. } if baseline_score_micros != 1_000_000 => {
-                if after_final_report {
-                    audit_late_grading_error(session, ctx, &request.receipt_id).await?;
-                } else if !preserve_confirmed_stop {
-                    invalidate_in_session(
-                        &mut session,
-                        ctx,
-                        &control,
-                        &mut ticket,
-                        "baseline_anchor_invalid",
-                        request.issued_at_unix_seconds,
-                    )
-                    .await?;
-                    session.commit().await?;
-                }
-                return Err(Error::Invalid(
-                    "baseline failed a frozen critical anchor; comparison is invalid".into(),
-                ));
-            }
-            EvaluationTargetKind::Anchor { .. } if candidate_score_micros == 1_000_000 => {
-                Some(AnchorResult::Passed)
-            }
-            EvaluationTargetKind::Anchor { .. } => Some(AnchorResult::CriticalRegression),
-        };
-        let scored_output_pair_digest = fingerprint(&(
-            &candidate.output_digest,
-            &baseline.output_digest,
-            &control.oracle_digest,
-            &control.grader_digest,
-            candidate_score_micros,
-            baseline_score_micros,
-            anchor_result,
-        ))?;
-        let receipt = IndependentGraderReceiptV2 {
-            schema_version: "rsia.independent_grader_receipt.v2".into(),
-            receipt_id: request.receipt_id.clone(),
-            ticket_id: ticket.id.clone(),
-            target_id: request.target_id.clone(),
-            candidate_execution_receipt_id: candidate.receipt_id.clone(),
-            baseline_execution_receipt_id: baseline.receipt_id.clone(),
-            candidate_output_digest: candidate.output_digest.clone(),
-            baseline_output_digest: baseline.output_digest.clone(),
-            oracle_digest: control.oracle_digest.clone(),
-            grader_digest: control.grader_digest.clone(),
-            scored_output_pair_digest,
-            candidate_score_micros,
-            baseline_score_micros,
-            anchor_result,
-            evaluator_actor: ctx.actor().into(),
-            issued_at_unix_seconds: request.issued_at_unix_seconds,
-        };
-        mark_feedback_used_if_needed(&mut session, ctx, &ticket, request.issued_at_unix_seconds)
-            .await?;
-        if let Some(existing) = get_record::<IndependentGraderReceiptV2>(
-            &mut session,
-            ctx,
-            GRADER_RECEIPT_KIND,
-            &request.receipt_id,
-        )
-        .await?
+        let operation = store.session().await?.begin_e05_grade(
+            ctx.clone(),
+            json!({
+                "schema_version":"rsia.e05_grade_intent.v2",
+                "receipt_id":&intent.receipt_id,
+                "ticket_id":&intent.ticket_id,
+                "target_id":&intent.target_id,
+                "candidate_execution_receipt_id":&intent.candidate_execution_receipt_id,
+                "baseline_execution_receipt_id":&intent.baseline_execution_receipt_id,
+            }),
+        )?;
+        let receipt: IndependentGraderReceiptV2 =
+            finish_e05_native(operation, &intent.ticket_id, "grader_receipt").await?;
+        if receipt.schema_version != "rsia.independent_grader_receipt.v2"
+            || receipt.receipt_id != intent.receipt_id
+            || receipt.ticket_id != intent.ticket_id
+            || receipt.target_id != intent.target_id
+            || receipt.candidate_execution_receipt_id != intent.candidate_execution_receipt_id
+            || receipt.baseline_execution_receipt_id != intent.baseline_execution_receipt_id
+            || receipt.evaluator_actor != ctx.actor()
+            || receipt.candidate_score_micros > 1_000_000
+            || receipt.baseline_score_micros > 1_000_000
+            || receipt.issued_at_unix_seconds < 0
         {
-            if fingerprint(&existing)? == fingerprint(&receipt)? {
-                session.commit().await?;
-                return Ok(existing);
-            }
-            return Err(Error::Conflict(
-                "grader receipt id reused with different evidence".into(),
+            return Err(committed_e05_identity_error(
+                &intent.ticket_id,
+                "grader_receipt",
             ));
         }
-        // AG-118 (§6.6 L705/L707): after the formal report is final the late
-        // grading is retained as audit evidence only. The final ticket, its
-        // fact edges and its report stay exactly as persisted.
-        if after_final_report {
-            put_record(
-                &mut session,
-                ctx,
-                GRADER_RECEIPT_KIND,
-                &request.receipt_id,
-                ctx.actor(),
-                &receipt,
-            )
-            .await?;
-            session
-                .audit(ctx, LATE_GRADER_AFTER_FINAL_AUDIT, &receipt.receipt_id)
-                .await?;
-            session.commit().await?;
-            return Ok(receipt);
-        }
-        if !is_stopping(ticket.lifecycle) {
-            validate_target_receipt_pair(
-                ticket.target(&request.target_id)?,
-                &candidate.receipt_id,
-                &baseline.receipt_id,
-            )?;
-        }
-        if !is_stopping(ticket.lifecycle)
-            && matches!(
-                ticket.target(&request.target_id)?.state,
-                TargetState::Completed { .. }
-            )
-        {
-            return Err(Error::Conflict(
-                "completed target score is immutable".into(),
-            ));
-        }
-        put_record(
-            &mut session,
-            ctx,
-            GRADER_RECEIPT_KIND,
-            &request.receipt_id,
-            ctx.actor(),
-            &receipt,
-        )
-        .await?;
-        if bind_accepted_facts {
-            put_fact_edges(
-                &mut session,
-                ctx,
-                &storage_id(GRADER_RECEIPT_KIND, &receipt.receipt_id)?,
-                vec![
-                    artifact_edge(EXECUTION_RECEIPT_KIND, &candidate.receipt_id)?,
-                    artifact_edge(EXECUTION_RECEIPT_KIND, &baseline.receipt_id)?,
-                ],
-            )
-            .await?;
-            put_fact_edges(
-                &mut session,
-                ctx,
-                &storage_id(TICKET_KIND, &ticket.id)?,
-                vec![artifact_edge(GRADER_RECEIPT_KIND, &receipt.receipt_id)?],
-            )
-            .await?;
-        }
-        if is_stopping(ticket.lifecycle) {
-            ticket.late_grader_receipt_ids.push(request.receipt_id);
-        } else {
-            if control.evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
-                // Issuance recomputes this from the stored receipt: one
-                // canonical rule on both sides, not declaration order here.
-                crate::formal_authority::capture_independent_grade(
-                    &mut session,
-                    ctx,
-                    &ticket,
-                    &request.target_id,
-                    &receipt.receipt_id,
-                    &canonical_fingerprint(&receipt)?,
-                )
-                .await?;
-            }
-            let sequence = ticket.next_sequence;
-            ticket.next_sequence = ticket
-                .next_sequence
-                .checked_add(1)
-                .ok_or_else(|| Error::Invalid("ticket sequence overflow".into()))?;
-            ticket.target_mut(&request.target_id)?.state = TargetState::Completed {
-                candidate_score_micros,
-                baseline_score_micros,
-                anchor_result,
-                candidate_receipt_id: candidate.receipt_id,
-                baseline_receipt_id: baseline.receipt_id,
-                grader_receipt_id: receipt.receipt_id.clone(),
-                completion_sequence: sequence,
-            };
-            if anchor_result == Some(AnchorResult::CriticalRegression) {
-                stop_ticket(
-                    &mut session,
-                    ctx,
-                    &control,
-                    &mut ticket,
-                    EarlyStopDecision::CriticalRegression,
-                    &receipt,
-                    request.issued_at_unix_seconds,
-                )
-                .await?;
-            } else if let Some(plan) = &control.early_stop_plan {
-                let (decision, stream) = rebuild_stream(&ticket, plan, &control.alpha_plan)?;
-                if decision.is_early_stop() {
-                    stop_ticket(
-                        &mut session,
-                        ctx,
-                        &control,
-                        &mut ticket,
-                        decision,
-                        &receipt,
-                        request.issued_at_unix_seconds,
-                    )
-                    .await?;
-                    debug_assert_eq!(stream.decision()?, decision);
-                } else if decision == EarlyStopDecision::FinalFixedSample && anchors_passed(&ticket)
-                {
-                    ticket.lifecycle = TicketLifecycle::ReadyForFinal;
-                }
-            } else if rotating_complete(&ticket) && anchors_passed(&ticket) {
-                ticket.lifecycle = TicketLifecycle::ReadyForFinal;
-            }
-        }
-        ticket.validate()?;
-        put_record(
-            &mut session,
-            ctx,
-            TICKET_KIND,
-            &ticket.id,
-            ticket.evaluator_actor.as_str(),
-            &ticket,
-        )
-        .await?;
-        if bind_accepted_facts {
-            collect_dependency_nodes(
-                &mut session,
-                ctx,
-                vec![artifact_edge(TICKET_KIND, &ticket.id)?],
-            )
-            .await?;
-        }
-        maybe_store_early_formal(&mut session, ctx, &ticket).await?;
-        session.commit().await?;
         Ok(receipt)
     }
 
     pub async fn finalize_complete(
         ctx: &Context,
-        store: &Store,
-        ticket_id: &str,
-        now: i64,
+        _store: &Store,
+        _ticket_id: &str,
+        _now: i64,
     ) -> Result<FormalEvaluationV2> {
         ctx.require(&[Role::Evaluator])?;
-        valid_time(now)?;
-        let ticket: EvaluationTicketV2 = load(store, ctx, TICKET_KIND, ticket_id).await?;
-        let control: RegisteredEvaluationControl =
-            load(store, ctx, CONTROL_KIND, &ticket.registration_id).await?;
-        if ticket.evaluator_actor != ctx.actor()
-            || ticket.lifecycle != TicketLifecycle::ReadyForFinal
+        Err(Error::Invalid("legacy_timed_finalization_disabled".into()))
+    }
+
+    pub async fn finalize_complete_frozen_now(
+        ctx: &Context,
+        store: &Store,
+        ticket_id: &str,
+    ) -> Result<evo_core::formal_version::NativeCompleteContent<FormalEvaluationV2>> {
+        ctx.require(&[Role::Evaluator])?;
+        identifier(ticket_id)?;
+        let operation = store.session().await?.begin_e05_complete(
+            ctx.clone(),
+            json!({"schema_version":"rsia.e05_complete_intent.v2","ticket_id":ticket_id}),
+        )?;
+        let content: evo_core::formal_version::NativeCompleteContent<FormalEvaluationV2> =
+            finish_e05_native(operation, ticket_id, "complete").await?;
+        content
+            .report_ref
+            .validate_wire()
+            .map_err(|_| Error::Conflict("committed_formal_reference_invalid".into()))?;
+        if !matches!(&content.formal, FormalEvaluationV2::CompleteBatch { ticket_id: actual, .. } if actual == ticket_id)
+            || content.report_ref.namespace != ctx.namespace()
+            || content.report_ref.owner != ctx.actor()
+            || content.report_ref.ticket_id != ticket_id
+            || content.report_ref.payload_digest != fingerprint(&content.formal)?
         {
-            return Err(Error::Conflict(
-                "ticket is not ready for fixed-sample finalization".into(),
-            ));
+            return Err(committed_e05_identity_error(ticket_id, "complete"));
         }
-        let registration_digest = control.digest()?;
-        if registration_digest != ticket.registration_digest {
-            return Err(Error::Conflict(
-                "registered control digest differs from the frozen ticket".into(),
-            ));
-        }
-        let mut calls = Vec::new();
-        let mut execution_content_pins = BTreeMap::new();
-        let mut candidate_cost = 0i128;
-        let mut baseline_cost = 0i128;
-        let mut candidate_latencies = Vec::new();
-        let mut baseline_latencies = Vec::new();
-        for target in &ticket.targets {
-            let TargetState::Completed {
-                candidate_receipt_id,
-                baseline_receipt_id,
-                ..
-            } = &target.state
-            else {
-                return Err(Error::Invalid(
-                    "complete ticket contains a non-complete target".into(),
-                ));
-            };
-            for (receipt_id, side) in [
-                (candidate_receipt_id, ExecutionSide::Candidate),
-                (baseline_receipt_id, ExecutionSide::Baseline),
-            ] {
-                let receipt: ExecutionReceiptV2 =
-                    load(store, ctx, EXECUTION_RECEIPT_KIND, receipt_id).await?;
-                execution_content_pins.insert(receipt_id.clone(), fingerprint(&receipt)?);
-                let call = store
-                    .budget_call(ctx, &control.billing_scope, &receipt.budget_call_id)
-                    .await?
-                    .ok_or(Error::NotFound)?;
-                if call.dispatch_group_id != ticket.id
-                    || call.state != BudgetCallState::Finalized
-                    || call.actual_cost_micros.is_none()
-                    || !call.execution_closed
-                {
-                    return Err(Error::Conflict(
-                        "formal completion requires finalized execution usage".into(),
-                    ));
-                }
-                let amount = i128::from(call.actual_cost_micros.unwrap_or_default());
-                match side {
-                    ExecutionSide::Candidate => {
-                        candidate_cost += amount;
-                        candidate_latencies.push(receipt.latency_micros);
-                    }
-                    ExecutionSide::Baseline => {
-                        baseline_cost += amount;
-                        baseline_latencies.push(receipt.latency_micros);
-                    }
-                }
-                calls.push(call);
-            }
-        }
-        if baseline_cost <= 0 || candidate_cost < 0 {
-            return Err(Error::Invalid(
-                "baseline cost must be positive and observable".into(),
-            ));
-        }
-        let baseline_p95 = p95(&mut baseline_latencies)?;
-        let candidate_p95 = p95(&mut candidate_latencies)?;
-        if baseline_p95 == 0 {
-            return Err(Error::Invalid("baseline p95 must be observable".into()));
-        }
-        let cost_ratio = candidate_cost as f64 / baseline_cost as f64;
-        let p95_ratio = candidate_p95 as f64 / baseline_p95 as f64;
-        let rows: Vec<_> = ticket
-            .targets
-            .iter()
-            .filter_map(|target| match (&target.kind, &target.state) {
-                (
-                    EvaluationTargetKind::Rotating { cluster_id },
-                    TargetState::Completed {
-                        candidate_score_micros,
-                        baseline_score_micros,
-                        ..
-                    },
-                ) => Some(ClusterObservation {
-                    cluster_id: cluster_id.clone(),
-                    d: (i64::from(*candidate_score_micros) - i64::from(*baseline_score_micros))
-                        as f64
-                        / 1_000_000.0,
-                    weight: 1.0,
-                }),
-                _ => None,
-            })
-            .collect();
-        let report = derive_complete_report(&ticket, &control, &rows, cost_ratio, p95_ratio)?;
-        let anchor_evidence_digest = anchor_evidence_digest(&ticket)?;
-        let resource_evidence = ResourceEvidenceRecord {
-            schema_version: "rsia.evaluation_resource_evidence.v1".into(),
-            ticket_id: ticket.id.clone(),
-            billing_scope: control.billing_scope.clone(),
-            cost_scope: CostEvidenceScope::TicketExecutionOnly,
-            calls,
-        };
-        let resource_evidence_digest = fingerprint(&resource_evidence)?;
-        let mut session = store.session().await?;
-        let mut latest: EvaluationTicketV2 =
-            need_record(&mut session, ctx, TICKET_KIND, ticket_id).await?;
-        if latest.lifecycle != TicketLifecycle::ReadyForFinal
-            || fingerprint(&latest)? != fingerprint(&ticket)?
+        // The native complete owner has already ACKed the real Host authority
+        // in its SAME transaction before COMMIT; no post-commit authorization.
+        Ok(content)
+    }
+
+    pub async fn finalize_complete_now(
+        ctx: &Context,
+        store: &Store,
+        ticket_id: &str,
+    ) -> Result<FormalEvaluationV2> {
+        ctx.require(&[Role::Evaluator])?;
+        identifier(ticket_id)?;
+        let content = Self::finalize_complete_frozen_now(ctx, store, ticket_id).await?;
+        let formal = content.formal;
+        if !matches!(&formal, FormalEvaluationV2::CompleteBatch { ticket_id: actual, .. } if actual == ticket_id)
         {
-            return Err(Error::Conflict("ticket changed during finalization".into()));
+            return Err(committed_e05_identity_error(ticket_id, "complete"));
         }
-        let latest_control: RegisteredEvaluationControl =
-            need_record(&mut session, ctx, CONTROL_KIND, &latest.registration_id).await?;
-        if latest_control.digest()? != registration_digest {
-            return Err(Error::Conflict(
-                "registered control digest changed during finalization".into(),
-            ));
-        }
-        // Revalidate actual facts after external cost/statistical precomputation,
-        // before stop, settlement, resource, ticket or formal writes.
-        validate_status_closure(&mut session, ctx, &latest, None).await?;
-        let latest_holdout: ProtectedHoldoutRecord =
-            need_record(&mut session, ctx, HOLDOUT_KIND, &latest.holdout_id).await?;
-        for target in &latest.targets {
-            validate_completed_target_evidence(
-                &mut session,
-                ctx,
-                &latest,
-                &latest_control,
-                &latest_holdout,
-                target,
-            )
-            .await?;
-        }
-        for (receipt_id, expected_digest) in execution_content_pins {
-            let actual: ExecutionReceiptV2 =
-                need_record(&mut session, ctx, EXECUTION_RECEIPT_KIND, &receipt_id).await?;
-            if fingerprint(&actual)? != expected_digest {
-                return Err(Error::Conflict(
-                    "execution receipt changed during finalization".into(),
-                ));
-            }
-        }
-        let mut verified_calls = Vec::new();
-        for expected in &resource_evidence.calls {
-            let actual = session
-                .budget_call(ctx, &control.billing_scope, &expected.call_id)
-                .await?
-                .ok_or(Error::NotFound)?;
-            if fingerprint(&actual)? != fingerprint(expected)? {
-                return Err(Error::Conflict(
-                    "execution usage changed during finalization".into(),
-                ));
-            }
-            if latest.candidate_dependency_binding.is_some() {
-                verified_calls.push(actual);
-            }
-        }
-        if latest.candidate_dependency_binding.is_some() {
-            let expected_report = recompute_bound_complete_report_in_session(
-                &mut session,
-                ctx,
-                &latest,
-                &latest_control,
-                &latest_holdout,
-                &verified_calls,
-            )
-            .await?;
-            if expected_report != BernsteinReportWire::from_report(&report)?
-                || expected_report.verdict != report.verdict
-                || resource_evidence.cost_scope != CostEvidenceScope::TicketExecutionOnly
-                || latest.evidence_scope != latest_control.evidence_scope
-            {
-                return Err(Error::Conflict(STATISTICS_CHANGED.into()));
-            }
-        }
-        session
-            .stop_dispatch_group(
-                ctx,
-                &control.billing_scope,
-                ticket_id,
-                "complete_batch",
-                now,
-            )
-            .await?;
-        let group_calls = session
-            .budget_calls_for_group(ctx, &control.billing_scope, ticket_id)
-            .await?;
-        let expected_call_ids: BTreeSet<_> = resource_evidence
-            .calls
-            .iter()
-            .map(|call| call.call_id.as_str())
-            .collect();
-        let actual_call_ids: BTreeSet<_> = group_calls
-            .iter()
-            .map(|call| call.call_id.as_str())
-            .collect();
-        if expected_call_ids != actual_call_ids {
-            invalidate_in_session(
-                &mut session,
-                ctx,
-                &control,
-                &mut latest,
-                "unattributed_dispatch_group_call",
-                now,
-            )
-            .await?;
-            session.commit().await?;
-            return Err(Error::Invalid(
-                "ticket dispatch group contains unattributed calls".into(),
-            ));
-        }
-        settle_exposure_money(&mut session, ctx, &latest, false).await?;
-        latest.lifecycle = TicketLifecycle::CompleteBatch;
-        put_record(
-            &mut session,
-            ctx,
-            RESOURCE_KIND,
-            ticket_id,
-            ctx.actor(),
-            &resource_evidence,
-        )
-        .await?;
-        if latest.candidate_dependency_binding.is_some() {
-            put_fact_edges(
-                &mut session,
-                ctx,
-                &storage_id(RESOURCE_KIND, ticket_id)?,
-                vec![artifact_edge(TICKET_KIND, ticket_id)?],
-            )
-            .await?;
-        }
-        put_record(
-            &mut session,
-            ctx,
-            TICKET_KIND,
-            ticket_id,
-            ctx.actor(),
-            &latest,
-        )
-        .await?;
-        let stored_dependency_binding =
-            bind_stored_facts_in_session(&mut session, ctx, &latest).await?;
-        let formal = FormalEvaluationV2::CompleteBatch {
-            evidence_scope: control.evidence_scope,
-            cost_evidence_scope: CostEvidenceScope::TicketExecutionOnly,
-            ticket_id: ticket_id.into(),
-            ticket_digest: fingerprint(&latest)?,
-            manifest_digest: latest.manifest_digest.clone(),
-            candidate_bundle_digest: latest.candidate_bundle_digest.clone(),
-            baseline_bundle_digest: latest.baseline_bundle_digest.clone(),
-            environment_digest: latest.environment_digest.clone(),
-            verdict: report.verdict,
-            report: BernsteinReportWire::from_report(&report)?,
-            anchor_evidence_digest,
-            resource_evidence_digest,
-            stored_dependency_binding,
-        };
-        put_record(
-            &mut session,
-            ctx,
-            FORMAL_KIND,
-            ticket_id,
-            ctx.actor(),
-            &formal,
-        )
-        .await?;
-        if latest.candidate_dependency_binding.is_some() {
-            put_fact_edges(
-                &mut session,
-                ctx,
-                &storage_id(FORMAL_KIND, ticket_id)?,
-                vec![
-                    artifact_edge(TICKET_KIND, ticket_id)?,
-                    artifact_edge(RESOURCE_KIND, ticket_id)?,
-                ],
-            )
-            .await?;
-        }
-        session
-            .audit(ctx, "complete_formal_evaluation", ticket_id)
-            .await?;
-        if control.evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
-            crate::formal_authority::issue_complete_authority_in_session(
-                &mut session,
-                ctx,
-                &latest,
-                &control,
-                &formal,
-            )
-            .await?;
-        }
-        session.commit().await?;
         Ok(formal)
     }
 
     pub async fn invalidate(
         ctx: &Context,
+        _store: &Store,
+        _ticket_id: &str,
+        _reason: &str,
+        _now: i64,
+    ) -> Result<FormalEvaluationV2> {
+        ctx.require(&[Role::Evaluator])?;
+        Err(Error::Invalid("legacy_timed_invalidation_disabled".into()))
+    }
+
+    pub async fn invalidate_now(
+        ctx: &Context,
         store: &Store,
         ticket_id: &str,
         reason: &str,
-        now: i64,
     ) -> Result<FormalEvaluationV2> {
         ctx.require(&[Role::Evaluator])?;
+        identifier(ticket_id)?;
         identifier(reason)?;
-        valid_time(now)?;
-        let mut session = store.session().await?;
-        let mut ticket: EvaluationTicketV2 =
-            need_record(&mut session, ctx, TICKET_KIND, ticket_id).await?;
-        let control: RegisteredEvaluationControl =
-            need_record(&mut session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
-        if ticket.evaluator_actor != ctx.actor() {
-            return Err(Error::Forbidden);
+        let operation = store.session().await?.begin_e05_invalidate(
+            ctx.clone(),
+            json!({"schema_version":"rsia.e05_invalidate_intent.v2","ticket_id":ticket_id,"reason":reason}),
+        )?;
+        let formal: FormalEvaluationV2 =
+            finish_e05_native(operation, ticket_id, "invalidate").await?;
+        if !matches!(&formal, FormalEvaluationV2::Invalid { ticket_id: actual, reasons, .. }
+            if actual == ticket_id && reasons.iter().any(|stored| stored == reason))
+        {
+            return Err(committed_e05_identity_error(ticket_id, "invalidate"));
         }
-        let formal =
-            invalidate_in_session(&mut session, ctx, &control, &mut ticket, reason, now).await?;
-        session.commit().await?;
         Ok(formal)
     }
 
     pub async fn settle_after_stop(
         ctx: &Context,
-        store: &Store,
-        ticket_id: &str,
-        now_unix_seconds: i64,
+        _store: &Store,
+        _ticket_id: &str,
+        _now_unix_seconds: i64,
     ) -> Result<StreamingEvaluationStatus> {
         ctx.require(&[Role::Evaluator])?;
-        valid_time(now_unix_seconds)?;
-        let ticket: EvaluationTicketV2 = load(store, ctx, TICKET_KIND, ticket_id).await?;
-        if ticket.evaluator_actor != ctx.actor() {
-            return Err(Error::Forbidden);
+        Err(Error::Invalid(
+            "legacy_timed_reconciliation_disabled".into(),
+        ))
+    }
+
+    pub async fn settle_after_stop_now(
+        ctx: &Context,
+        store: &Store,
+        ticket_id: &str,
+    ) -> Result<StreamingEvaluationStatus> {
+        ctx.require(&[Role::Evaluator])?;
+        identifier(ticket_id)?;
+        let operation = store.session().await?.begin_e05_reconcile(
+            ctx.clone(),
+            json!({"schema_version":"rsia.e05_reconcile_intent.v2","ticket_id":ticket_id}),
+        )?;
+        let committed: EvaluationTicketV2 =
+            finish_e05_native(operation, ticket_id, "reconcile").await?;
+        if committed.id != ticket_id || committed.evaluator_actor != ctx.actor() {
+            return Err(committed_e05_identity_error(ticket_id, "reconcile"));
         }
-        if ticket.lifecycle != TicketLifecycle::Draining {
-            return Self::status(ctx, store, ticket_id).await;
+        if let Err(error) = committed.validate() {
+            tracing::error!(
+                ticket_id,
+                commit_confirmed=true,
+                error=%error,
+                "native reconciliation committed but ticket decoding/shape requires reconciliation"
+            );
+            return Err(error);
         }
-        let control: RegisteredEvaluationControl =
-            load(store, ctx, CONTROL_KIND, &ticket.registration_id).await?;
-        for target in &ticket.targets {
-            if let TargetState::RunningUsageUnknown {
-                candidate,
-                baseline,
-            } = &target.state
-            {
-                for slot in [candidate, baseline].into_iter().flatten() {
-                    let call = store
-                        .budget_call(ctx, &control.billing_scope, &slot.budget_call_id)
-                        .await?
-                        .ok_or(Error::NotFound)?;
-                    if matches!(
-                        call.state,
-                        BudgetCallState::Dispatched | BudgetCallState::Uncertain
-                    ) || (call.state == BudgetCallState::Finalized && !call.execution_closed)
-                    {
-                        return Self::status(ctx, store, ticket_id).await;
-                    }
-                }
+        match Self::status(ctx, store, ticket_id).await {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                tracing::error!(
+                    ticket_id,
+                    commit_confirmed=true,
+                    error=%error,
+                    "native reconciliation committed; subsequent read failed, never auto-reissue"
+                );
+                Err(error)
             }
         }
-        for call_id in &ticket.unattributed_budget_call_ids {
-            let call = store
-                .budget_call(ctx, &control.billing_scope, call_id)
-                .await?
-                .ok_or(Error::NotFound)?;
-            if matches!(
-                call.state,
-                BudgetCallState::Dispatched | BudgetCallState::Uncertain
-            ) || (call.state == BudgetCallState::Finalized && !call.execution_closed)
-            {
-                return Self::status(ctx, store, ticket_id).await;
-            }
-        }
-        let mut session = store.session().await?;
-        let mut latest: EvaluationTicketV2 =
-            need_record(&mut session, ctx, TICKET_KIND, ticket_id).await?;
-        if latest.lifecycle != TicketLifecycle::Draining {
-            return Err(Error::Conflict(
-                "ticket changed while reconciling usage".into(),
-            ));
-        }
-        if latest
-            .invalid_reasons
-            .iter()
-            .any(|reason| reason == "unattributed_dispatch_group_call")
-        {
-            invalidate_in_session(
-                &mut session,
-                ctx,
-                &control,
-                &mut latest,
-                "unattributed_dispatch_group_call",
-                now_unix_seconds,
-            )
-            .await?;
-            session.commit().await?;
-            return Self::status(ctx, store, ticket_id).await;
-        }
-        for target in &mut latest.targets {
-            if let TargetState::RunningUsageUnknown {
-                candidate,
-                baseline,
-            } = &target.state
-            {
-                target.state = TargetState::CancelledAfterDispatch {
-                    candidate: candidate.clone(),
-                    baseline: baseline.clone(),
-                };
-            }
-        }
-        settle_exposure_money(&mut session, ctx, &latest, false).await?;
-        latest.pending_certificate = Some(
-            latest
-                .pending_certificate
-                .take()
-                .ok_or_else(|| Error::Invalid("draining stop lacks certificate".into()))?
-                .with_usage_reconciled()?,
-        );
-        latest.lifecycle = TicketLifecycle::EarlyStopped;
-        put_record(
-            &mut session,
-            ctx,
-            TICKET_KIND,
-            ticket_id,
-            ctx.actor(),
-            &latest,
-        )
-        .await?;
-        maybe_store_early_formal(&mut session, ctx, &latest).await?;
-        session.commit().await?;
-        Self::status(ctx, store, ticket_id).await
     }
 
     pub async fn status(
@@ -2586,32 +1872,14 @@ impl IndependentEvaluationControl {
         ticket_id: &str,
     ) -> Result<StreamingEvaluationStatus> {
         ctx.require(&[Role::Evaluator, Role::Admin])?;
-        let mut session = store.session().await?;
-        let ticket: EvaluationTicketV2 =
-            need_record(&mut session, ctx, TICKET_KIND, ticket_id).await?;
-        let formal =
-            get_record::<FormalEvaluationV2>(&mut session, ctx, FORMAL_KIND, ticket_id).await?;
-        validate_status_closure(&mut session, ctx, &ticket, formal.as_ref()).await?;
-        if matches!(
-            &formal,
-            Some(FormalEvaluationV2::CompleteBatch {
-                evidence_scope: EvaluationEvidenceScope::RegisteredExternalHost,
-                ..
-            })
-        ) {
-            let candidate = session
-                .need(ctx, "artifact", &ticket.candidate_digest)
-                .await?;
-            crate::formal_authority::verify_issued_authority(
-                &mut session,
+        identifier(ticket_id)?;
+        let closed = store
+            .read_formal_snapshot(
                 ctx,
-                ticket_id,
-                &candidate,
+                evo_storage::FormalReadSelectorR38::Ticket(ticket_id.to_owned()),
             )
             .await?;
-        }
-        session.commit().await?;
-        Ok(StreamingEvaluationStatus { ticket, formal })
+        status_from_closed_native_snapshot_r40(&closed, ticket_id)
     }
 
     pub async fn verified_report_view(
@@ -2619,11 +1887,193 @@ impl IndependentEvaluationControl {
         store: &Store,
         report_id: &str,
     ) -> Result<VerifiedFormalReportView> {
-        let mut session = store.session().await?;
-        let view = verified_report_view_in_session(ctx, &mut session, report_id).await?;
-        session.commit().await?;
-        Ok(view)
+        let current = Self::verified_report_view_current(
+            ctx,
+            store,
+            evo_storage::FormalReadSelectorR38::Ticket(report_id.into()),
+        )
+        .await?;
+        Ok(current.view)
     }
+    /// V3 names a real typed reference. The compatible V2-shaped data projection
+    /// above is not accepted by native approval as an authority.
+    pub async fn verified_report_view_current(
+        ctx: &Context,
+        store: &Store,
+        selector: evo_storage::FormalReadSelectorR38,
+    ) -> Result<evo_core::formal_version::FormalReportViewV3<VerifiedFormalReportView>> {
+        ctx.require(&[Role::Evaluator, Role::Admin])?;
+        let closed = store.read_formal_snapshot(ctx, selector).await?;
+        let data = closed.data_view_r49()?;
+        formal_current_data_view_r49(&data)
+    }
+}
+
+/// This projection accepts only the fixed native read result. The storage
+/// factory has already checked actual audit/as-of/producer/content facts and
+/// closed the one original RO transaction. No Session, second snapshot, model
+/// request, wall-clock sample or caller-supplied DTO participates here.
+fn status_from_closed_native_snapshot_r40(
+    closed: &evo_storage::ClosedFormalReadR39,
+    requested_ticket_id: &str,
+) -> Result<StreamingEvaluationStatus> {
+    use evo_core::formal_version as fv;
+    let decode_ticket = |value: &Value| -> Result<EvaluationTicketV2> {
+        let ticket: EvaluationTicketV2 = serde_json::from_value(value.clone())
+            .map_err(|_| Error::Conflict("formal_status_invalid_ticket_wire".into()))?;
+        ticket.validate()?;
+        if ticket.id != requested_ticket_id {
+            return Err(Error::Conflict("formal_status_ticket_identity".into()));
+        }
+        Ok(ticket)
+    };
+    let Some(source) = closed.formal() else {
+        // NoFormal is qualified by the same actual native capture: registration,
+        // holdout, issue identity, candidate binding and revocation are not
+        // replaced by accepting an arbitrary live ticket JSON object.
+        let ticket = decode_ticket(closed.live_ticket().ok_or(Error::NotFound)?)?;
+        if matches!(
+            ticket.lifecycle,
+            TicketLifecycle::EarlyStopped
+                | TicketLifecycle::CompleteBatch
+                | TicketLifecycle::Invalid
+        ) {
+            return Err(Error::Invalid(
+                "terminal ticket lacks formal evaluation".into(),
+            ));
+        }
+        return Ok(StreamingEvaluationStatus {
+            schema_version: "rsia.evaluation_status.v3".into(),
+            ticket_source: EvaluationStatusTicketSourceV3::LiveSnapshot,
+            ticket,
+            formal: None,
+            formal_source: None,
+        });
+    };
+    let reference = source.reference().clone();
+    let (ticket, ticket_source, payload, read_state) =
+        if let Some(current) = source.current_formal() {
+            if reference != fv::AnyReportRef::VersionedV3(current.reference().clone()) {
+                return Err(Error::Conflict("formal_status_current_reference".into()));
+            }
+            (
+                decode_ticket(&current.frozen_ticket()?)?,
+                EvaluationStatusTicketSourceV3::FrozenFormalInput,
+                current.payload().clone(),
+                FormalReportReadStateV3::CurrentVerified,
+            )
+        } else if source.source_class() == evo_storage::FormalSourceClassR38::StaticLegacy {
+            let original: Value = serde_json::from_str(source.raw_body())
+                .map_err(|_| Error::Conflict("formal_status_invalid_legacy_wire".into()))?;
+            (
+                decode_ticket(closed.live_ticket().ok_or(Error::NotFound)?)?,
+                EvaluationStatusTicketSourceV3::LiveSnapshot,
+                original
+                    .get("payload")
+                    .cloned()
+                    .ok_or_else(|| Error::Conflict("formal_status_legacy_payload_absent".into()))?,
+                FormalReportReadStateV3::Legacy,
+            )
+        } else {
+            // The source transport alone is never a successful Current read.
+            // Missing originals remain a distinct error from bad identity.
+            return Err(Error::Conflict("formal_read_source_insufficient".into()));
+        };
+    let formal: FormalEvaluationV2 = serde_json::from_value(payload)
+        .map_err(|_| Error::Conflict("formal_status_invalid_payload".into()))?;
+    if matches!(
+        &formal,
+        FormalEvaluationV2::CompleteBatch {
+            evidence_scope: EvaluationEvidenceScope::RegisteredExternalHost,
+            ..
+        }
+    ) {
+        // Current content alone is not the registered Host business status
+        // contract. Preserve its full same-capture authority prerequisite.
+        closed.host_evidence()?.ok_or_else(|| {
+            Error::Conflict("issued formal authority missing for external-host report".into())
+        })?;
+    }
+    let (formal_ticket_id, formal_ticket_digest) = match &formal {
+        FormalEvaluationV2::CompleteBatch {
+            ticket_id,
+            ticket_digest,
+            ..
+        }
+        | FormalEvaluationV2::EarlyStopped {
+            ticket_id,
+            ticket_digest,
+            ..
+        }
+        | FormalEvaluationV2::Invalid {
+            ticket_id,
+            ticket_digest,
+            ..
+        } => (ticket_id, ticket_digest),
+    };
+    let (reference_ticket, payload_digest, lineage_lookup_candidates) = match &reference {
+        fv::AnyReportRef::ImplicitLegacyV2(reference) => {
+            reference
+                .validate_wire()
+                .map_err(|_| Error::Conflict("formal_status_invalid_reference".into()))?;
+            (&reference.ticket_id, &reference.payload_digest, None)
+        }
+        fv::AnyReportRef::VersionedV3(reference) => {
+            reference
+                .validate_wire()
+                .map_err(|_| Error::Conflict("formal_status_invalid_reference".into()))?;
+            let lineage = fv::lineage_addresses(
+                &reference.namespace,
+                &reference.ticket_id,
+                &reference.input_digest,
+            )
+            .map_err(|_| Error::Conflict("formal_status_invalid_lineage_input".into()))?;
+            (
+                &reference.ticket_id,
+                &reference.payload_digest,
+                Some(FormalLineageLookupV3 {
+                    namespace: lineage.namespace,
+                    input_digest: lineage.input_digest,
+                    known_versioned: lineage.known_versioned,
+                    implicit_v2_lookup_candidate: lineage.implicit_v2_lookup_candidate,
+                }),
+            )
+        }
+    };
+    if reference_ticket != requested_ticket_id
+        || formal_ticket_id != requested_ticket_id
+        || fingerprint(&formal)? != *payload_digest
+    {
+        return Err(Error::Conflict(
+            "formal_status_payload_reference_identity".into(),
+        ));
+    }
+    if read_state == FormalReportReadStateV3::CurrentVerified
+        && formal_ticket_digest != &fingerprint(&ticket)?
+    {
+        return Err(Error::Conflict("formal_status_frozen_ticket_digest".into()));
+    }
+    let source_legacy = read_state == FormalReportReadStateV3::Legacy;
+    let mut reasons = Vec::new();
+    if source_legacy {
+        reasons.push("historical_evaluator_unavailable".into());
+        if lineage_lookup_candidates.is_none() {
+            reasons.push("implicit_v2_original_input_digest_unavailable".into());
+        }
+    }
+    Ok(StreamingEvaluationStatus {
+        schema_version: "rsia.evaluation_status.v3".into(),
+        ticket_source,
+        ticket,
+        formal: Some(formal),
+        formal_source: Some(FormalReadSourceV3 {
+            report_ref: reference,
+            read_state,
+            source_legacy,
+            reasons,
+            lineage_lookup_candidates,
+        }),
+    })
 }
 
 pub async fn verified_report_view_in_session(
@@ -2632,7 +2082,13 @@ pub async fn verified_report_view_in_session(
     report_id: &str,
 ) -> Result<VerifiedFormalReportView> {
     ctx.require(&[Role::Evaluator, Role::Admin])?;
-    verified_report_view_core(ctx, session, report_id).await
+    let data = session
+        .inspect_formal_data_r49(
+            ctx,
+            evo_storage::FormalReadSelectorR38::Ticket(report_id.into()),
+        )
+        .await?;
+    formal_data_view_r49(&data)
 }
 
 pub(crate) async fn verified_report_view_for_host_in_session(
@@ -2644,16 +2100,22 @@ pub(crate) async fn verified_report_view_for_host_in_session(
     verified_report_view_core(ctx, session, report_id).await
 }
 
-async fn verified_report_view_core(
-    ctx: &Context,
-    session: &mut Session,
-    report_id: &str,
-) -> Result<VerifiedFormalReportView> {
-    identifier(report_id)?;
-    let ticket: EvaluationTicketV2 = need_record(session, ctx, TICKET_KIND, report_id).await?;
-    let formal: FormalEvaluationV2 = need_record(session, ctx, FORMAL_KIND, report_id).await?;
-    validate_status_closure(session, ctx, &ticket, Some(&formal)).await?;
-    let revoke_watermark = session.watermark(ctx).await?;
+fn formal_data_view_r49(data: &evo_storage::FormalReadDataR49) -> Result<VerifiedFormalReportView> {
+    let ticket: EvaluationTicketV2 = serde_json::from_value(data.frozen_ticket().clone())
+        .map_err(|_| Error::Conflict("native formal ticket projection invalid".into()))?;
+    ticket.validate()?;
+    let formal: FormalEvaluationV2 = serde_json::from_value(data.payload().clone())
+        .map_err(|_| Error::Conflict("native formal payload projection invalid".into()))?;
+    let report_id = &ticket.id;
+    let revoke_watermark = data
+        .watermark()
+        .map(|(seq, digest)| {
+            Ok::<_, Error>((
+                i64::try_from(*seq).map_err(|_| Error::ClockRegressed)?,
+                digest.clone(),
+            ))
+        })
+        .transpose()?;
     let (
         variant,
         verdict,
@@ -2743,18 +2205,33 @@ async fn verified_report_view_core(
         promotion_eligible: false,
         ineligibility_reasons: reasons,
     };
-    if evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
+    if !data.source_legacy() && evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
         view.ineligibility_reasons
             .retain(|reason| reason != "program_fixture_not_production_authority");
         if variant == VerifiedReportVariant::CompleteBatch {
-            let candidate: crate::release_store::ReleaseCandidateRecord = session
-                .need(ctx, "artifact", &ticket.candidate_digest)
-                .await?;
-            let authority = crate::formal_authority::verify_issued_authority(
-                session, ctx, report_id, &candidate,
-            )
-            .await?;
-            view.report_digest = fingerprint(&(&formal, &authority))?;
+            // This is a data projection of the same capture. Native mutation
+            // never consumes this Serde view as a permission.
+            let authority = data
+                .host_authority()
+                .ok_or_else(|| Error::Conflict("formal_read_source_insufficient".into()))?;
+            let envelope: evo_core::formal_version::FormalAuthorityV3<
+                crate::formal_authority::IssuedFormalAuthority,
+            > = serde_json::from_value(authority.clone())
+                .map_err(|_| Error::Conflict("native Host authority projection invalid".into()))?;
+            envelope
+                .validate_known()
+                .map_err(|_| Error::Conflict("native Host authority projection identity".into()))?;
+            if data.reference()
+                != &evo_core::formal_version::AnyReportRef::VersionedV3(envelope.report_ref.clone())
+            {
+                return Err(Error::Conflict(
+                    "native Host authority reference differs".into(),
+                ));
+            }
+            view.report_digest = data
+                .host_report_digest()
+                .ok_or_else(|| Error::Conflict("native Host report digest absent".into()))?
+                .to_owned();
             view.cost_evidence_scope = Some(CostEvidenceScope::CompleteEpisodeRoot);
             view.dependency_status = DependencyEvidenceStatus::CompleteTypedContentClosure;
             view.promotion_eligible =
@@ -2764,7 +2241,204 @@ async fn verified_report_view_core(
                 .retain(|reason| reason == "formal_verdict_not_approvable");
         }
     }
+    if data.source_legacy() {
+        view.promotion_eligible = false;
+        view.ineligibility_reasons
+            .push("historical_evaluator_unavailable".into());
+        view.dependency_status = DependencyEvidenceStatus::NamespaceWatermarkOnly;
+        view.cost_evidence_scope = Some(CostEvidenceScope::TicketExecutionOnly);
+    }
     Ok(view)
+}
+
+pub(crate) fn formal_current_data_view_r49(
+    data: &evo_storage::FormalReadDataR49,
+) -> Result<evo_core::formal_version::FormalReportViewV3<VerifiedFormalReportView>> {
+    use evo_core::formal_version as fv;
+    let view = formal_data_view_r49(data)?;
+    let value = fv::FormalReportViewV3 {
+        schema_version: fv::VERIFIED_FORMAL_VIEW_V3.into(),
+        report_ref: data.reference().clone(),
+        ticket_id: view.ticket_id.clone(),
+        read_state: if data.source_legacy() {
+            "legacy"
+        } else {
+            "current_verified"
+        }
+        .into(),
+        source_legacy: data.source_legacy(),
+        view,
+    };
+    value
+        .validate_known()
+        .map_err(|_| Error::Conflict("explicit formal view source identity".into()))?;
+    Ok(value)
+}
+
+async fn verified_report_view_core(
+    ctx: &Context,
+    session: &mut Session,
+    report_id: &str,
+) -> Result<VerifiedFormalReportView> {
+    let data = session
+        .inspect_formal_data_r49(
+            ctx,
+            evo_storage::FormalReadSelectorR38::Ticket(report_id.into()),
+        )
+        .await?;
+    formal_data_view_r49(&data)
+}
+
+/// Select exactly one retained issue protocol. A newer receipt is a distinct
+/// record kind and schema; neither decoder rewrites a historical payload.
+enum TicketIssueRecovery<'a> {
+    Legacy(&'a IssueTicketRequest),
+    Native(&'a IssueTicketIntent),
+}
+
+async fn recover_ticket_issue(
+    ctx: &Context,
+    store: &Store,
+    recovery: TicketIssueRecovery<'_>,
+) -> Result<Option<EvaluationTicketV2>> {
+    ctx.require(&[Role::Evaluator])?;
+    let (id, registration, holdout, expected_kind, legacy_time) = match recovery {
+        TicketIssueRecovery::Legacy(request) => (
+            &request.ticket_id,
+            &request.registration_id,
+            &request.holdout_id,
+            TICKET_RECEIPT_KIND,
+            Some(request.issued_at_unix_seconds),
+        ),
+        TicketIssueRecovery::Native(intent) => (
+            &intent.ticket_id,
+            &intent.registration_id,
+            &intent.holdout_id,
+            TICKET_RECEIPT_KIND_V2,
+            None,
+        ),
+    };
+    for value in [id, registration, holdout] {
+        identifier(value)?;
+    }
+    let mut session = store.session().await?;
+    let Some(ticket) = get_record::<EvaluationTicketV2>(&mut session, ctx, TICKET_KIND, id).await?
+    else {
+        session.commit().await?;
+        return Ok(None);
+    };
+    if ticket.candidate_dependency_binding.is_none() {
+        return Err(Error::Conflict(
+            "ticket_issuance_recovery_source_insufficient".into(),
+        ));
+    }
+    let formal = get_record::<FormalEvaluationV2>(&mut session, ctx, FORMAL_KIND, id).await?;
+    validate_status_closure(&mut session, ctx, &ticket, formal.as_ref()).await?;
+    let (_, actual_kind) = ticket_issue_receipt_in_session(&mut session, ctx, &ticket).await?;
+    if ticket.id != *id
+        || ticket.registration_id != *registration
+        || ticket.holdout_id != *holdout
+        || ticket.evaluator_actor != ctx.actor()
+        || actual_kind != expected_kind
+        || legacy_time.is_some_and(|time| ticket.issued_at_unix_seconds != time)
+    {
+        return Err(Error::Conflict(
+            "stored issuance differs from request protocol or identity".into(),
+        ));
+    }
+    if matches!(
+        &formal,
+        Some(FormalEvaluationV2::CompleteBatch {
+            evidence_scope: EvaluationEvidenceScope::RegisteredExternalHost,
+            ..
+        })
+    ) {
+        let candidate = session
+            .need(ctx, "artifact", &ticket.candidate_digest)
+            .await?;
+        crate::formal_authority::verify_issued_authority(&mut session, ctx, id, &candidate).await?;
+    }
+    session.commit().await?;
+    Ok(Some(ticket))
+}
+
+pub(crate) async fn ticket_issue_receipt_kind_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    ticket: &EvaluationTicketV2,
+) -> Result<&'static str> {
+    let (_, kind) = ticket_issue_receipt_in_session(session, ctx, ticket).await?;
+    Ok(kind)
+}
+
+async fn ticket_issue_receipt_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    ticket: &EvaluationTicketV2,
+) -> Result<(TicketIssueReceiptView, &'static str)> {
+    let old: Option<TicketIssueReceipt> =
+        get_record(session, ctx, TICKET_RECEIPT_KIND, &ticket.id).await?;
+    let new: Option<TicketIssueReceiptV2> =
+        get_record(session, ctx, TICKET_RECEIPT_KIND_V2, &ticket.id).await?;
+    let (receipt, kind) = match (old, new) {
+        (Some(receipt), None) => {
+            if receipt.schema_version != "rsia.evaluation_ticket_issue_receipt.v1" {
+                return Err(Error::Conflict("stored legacy issue schema differs".into()));
+            }
+            let canonical_receipt_digest = fingerprint(&receipt)?;
+            (
+                TicketIssueReceiptView {
+                    ticket_id: receipt.ticket_id,
+                    registration_digest: receipt.registration_digest,
+                    manifest_digest: receipt.manifest_digest,
+                    evaluator_actor: receipt.evaluator_actor,
+                    issued_at_unix_seconds: receipt.issued_at_unix_seconds,
+                    issued_at_unix_ms: None,
+                    canonical_receipt_digest,
+                },
+                TICKET_RECEIPT_KIND,
+            )
+        }
+        (None, Some(receipt)) => {
+            receipt.validate()?;
+            if ticket.candidate_dependency_binding.is_none() {
+                return Err(Error::Conflict(
+                    "native issue source binding is absent".into(),
+                ));
+            }
+            let canonical_receipt_digest = fingerprint(&receipt)?;
+            (
+                TicketIssueReceiptView {
+                    ticket_id: receipt.ticket_id,
+                    registration_digest: receipt.registration_digest,
+                    manifest_digest: receipt.manifest_digest,
+                    evaluator_actor: receipt.evaluator_actor,
+                    issued_at_unix_seconds: receipt.issued_at_unix_seconds,
+                    issued_at_unix_ms: Some(receipt.issued_at_unix_ms),
+                    canonical_receipt_digest,
+                },
+                TICKET_RECEIPT_KIND_V2,
+            )
+        }
+        (None, None) => return Err(Error::NotFound),
+        (Some(_), Some(_)) => {
+            return Err(Error::Conflict(
+                "ambiguous stored ticket issue protocol".into(),
+            ));
+        }
+    };
+    if receipt.ticket_id != ticket.id
+        || receipt.evaluator_actor != ticket.evaluator_actor
+        || receipt.registration_digest != ticket.registration_digest
+        || receipt.manifest_digest != ticket.manifest_digest
+        || receipt.issued_at_unix_seconds != ticket.issued_at_unix_seconds
+        || receipt.canonical_receipt_digest != ticket.issue_receipt_digest
+    {
+        return Err(Error::Conflict(
+            "stored ticket issue identity differs".into(),
+        ));
+    }
+    Ok((receipt, kind))
 }
 
 async fn validate_status_closure(
@@ -2792,8 +2466,15 @@ async fn validate_status_closure(
     }
     control.validate()?;
     holdout.validate_against(&control)?;
-    let issue: TicketIssueReceipt =
-        need_record(session, ctx, TICKET_RECEIPT_KIND, &ticket.id).await?;
+    let (issue, _receipt_kind) = ticket_issue_receipt_in_session(session, ctx, ticket).await?;
+    if let Some(issued_ms) = issue.issued_at_unix_ms
+        && (issued_ms < holdout.manifest.issued_at_unix_ms
+            || issue.issued_at_unix_seconds < control.created_at_unix_seconds)
+    {
+        return Err(Error::Conflict(
+            "native issue precedes its stored registration facts".into(),
+        ));
+    }
     let mut expected_bound_plan = control.v1_plan_snapshot.clone();
     expected_bound_plan.bind_candidate(ticket.candidate_digest.clone())?;
     if ticket.registration_id != control.id
@@ -2810,13 +2491,12 @@ async fn validate_status_closure(
         || ticket.v1_plan_snapshot_digest != control.v1_plan_snapshot.digest()?
         || ticket.candidate_bundle_digest != holdout.candidate_bundle_digest
         || ticket.baseline_bundle_digest != holdout.baseline_bundle_digest
-        || issue.schema_version != "rsia.evaluation_ticket_issue_receipt.v1"
         || issue.registration_digest != ticket.registration_digest
         || issue.manifest_digest != ticket.manifest_digest
         || issue.issued_at_unix_seconds != ticket.issued_at_unix_seconds
         || ticket.registration_digest != control.digest()?
         || ticket.manifest_digest != holdout.manifest.digest()?
-        || ticket.issue_receipt_digest != fingerprint(&issue)?
+        || ticket.issue_receipt_digest != issue.canonical_receipt_digest
         || issue.ticket_id != ticket.id
         || issue.evaluator_actor != ticket.evaluator_actor
         || ticket.candidate_digest != holdout.pair.candidate_digest
@@ -3119,24 +2799,18 @@ fn derive_complete_report(
     cost_ratio: f64,
     p95_ratio: f64,
 ) -> Result<BernsteinReport> {
-    let alpha = control.alpha_plan.allocation(
-        &control.fixed_sample_claim_id,
-        &control.attempt_id,
-        FormalClaimKind::FixedSampleGain,
-    )?;
-    let alpha = alpha
-        .parse::<f64>()
-        .map_err(|_| Error::Invalid("invalid fixed-sample alpha".into()))?;
-    let raw = empirical_bernstein(rows, alpha)?;
-    let mut bound_v1_plan = control.v1_plan_snapshot.clone();
-    bound_v1_plan.bind_candidate(ticket.candidate_digest.clone())?;
-    if bound_v1_plan.digest()? != ticket.bound_v1_plan_digest {
-        return Err(Error::Conflict("bound v1 plan digest mismatch".into()));
-    }
-    postprocess_complete_report(
+    evo_core::formal_complete_statistics::derive_complete_report(
         &control.schema_version,
         ticket.profile,
-        decide(&bound_v1_plan, raw, cost_ratio, p95_ratio, true)?,
+        &control.v1_plan_snapshot,
+        (&ticket.candidate_digest, &ticket.bound_v1_plan_digest),
+        (
+            &control.alpha_plan,
+            &control.fixed_sample_claim_id,
+            &control.attempt_id,
+        ),
+        rows,
+        (cost_ratio, p95_ratio),
     )
 }
 
@@ -3836,16 +3510,59 @@ fn anchor_evidence_digest(ticket: &EvaluationTicketV2) -> Result<String> {
     )
 }
 
-async fn load<T: for<'de> Deserialize<'de>>(
-    store: &Store,
-    ctx: &Context,
-    kind: &str,
-    id: &str,
+/// Decode only the owner's actual committed value. Errors retain every native
+/// terminal fact; a post-COMMIT failure never authorizes automatic replay.
+pub(crate) async fn finish_e05_native<T: DeserializeOwned>(
+    operation: evo_storage::E05IssueOperation,
+    ticket_id: &str,
+    operation_name: &'static str,
 ) -> Result<T> {
-    let mut session = store.session().await?;
-    let value = need_record(&mut session, ctx, kind, id).await?;
-    session.commit().await?;
-    Ok(value)
+    let outcome = operation.finish_outcome().await;
+    let committed = match outcome.result {
+        Ok(value) => value,
+        Err(failure) => {
+            tracing::error!(
+                ticket_id,
+                operation=operation_name,
+                native_facts=?outcome.native,
+                commit_outcome_unknown=failure.commit_outcome_unknown,
+                commit_confirmed=failure.commit_confirmed,
+                rollback_error=?failure.rollback_error,
+                error=%failure.error,
+                "native E05 failed; preserve terminal and accounting facts"
+            );
+            return Err(failure.error);
+        }
+    };
+    if !outcome.native.commit_confirmed || outcome.native.terminal_unconfirmed {
+        tracing::error!(
+            ticket_id,
+            operation=operation_name,
+            native_facts=?outcome.native,
+            "native E05 returned a value without confirmed terminal commit; reconcile only"
+        );
+        return Err(Error::Conflict("native_e05_commit_not_confirmed".into()));
+    }
+    serde_json::from_value(committed).map_err(|error| {
+        tracing::error!(
+            ticket_id,
+            operation=operation_name,
+            commit_confirmed=true,
+            error=%error,
+            "native E05 committed but result decoding failed; never auto-reissue"
+        );
+        Error::Internal
+    })
+}
+
+fn committed_e05_identity_error(ticket_id: &str, operation_name: &'static str) -> Error {
+    tracing::error!(
+        ticket_id,
+        operation = operation_name,
+        commit_confirmed = true,
+        "native E05 committed but returned identity differs; reconciliation required"
+    );
+    Error::Conflict("committed_native_e05_identity_differs".into())
 }
 
 pub(crate) fn storage_id(record_kind: &str, id: &str) -> Result<String> {
@@ -3866,6 +3583,22 @@ pub(crate) fn validate_content_envelope(id: &str, body: &Value) -> Result<()> {
         return Err(Error::Conflict(
             "typed content envelope and payload must be JSON objects".into(),
         ));
+    }
+    if body["schema_version"] == evo_core::formal_version::NATIVE_TICKET_ENVELOPE {
+        let namespace = body
+            .get("native_first_stop")
+            .and_then(|v| v.get("namespace"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let payload = evo_core::formal_version::native_ticket_payload(body, namespace, id)
+            .map_err(|_| Error::Forbidden)?;
+        let ticket: EvaluationTicketV2 =
+            serde_json::from_value(payload.clone()).map_err(|_| Error::Forbidden)?;
+        ticket.validate()?;
+        if storage_id(TICKET_KIND, &ticket.id)? != id {
+            return Err(Error::Forbidden);
+        }
+        return Ok(());
     }
     let envelope: TypedArtifactEnvelope<Value> = serde_json::from_value(body.clone())
         .map_err(|_| Error::Conflict("unreadable typed content envelope".into()))?;
@@ -3940,6 +3673,12 @@ pub(crate) fn validate_content_envelope(id: &str, body: &Value) -> Result<()> {
                 serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
             (v.ticket_id, v.schema_version)
         }
+        TICKET_RECEIPT_KIND_V2 => {
+            let v: TicketIssueReceiptV2 =
+                serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
+            v.validate()?;
+            (v.ticket_id, v.schema_version)
+        }
         RESOURCE_KIND => {
             let v: ResourceEvidenceRecord =
                 serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
@@ -3960,6 +3699,7 @@ pub(crate) fn validate_content_envelope(id: &str, body: &Value) -> Result<()> {
         LEDGER_KIND => schema == "rsia.exposure_ledger.v1",
         ALPHA_USE_KIND => schema == "rsia.alpha_claim_reservation.v1",
         TICKET_RECEIPT_KIND => schema == "rsia.evaluation_ticket_issue_receipt.v1",
+        TICKET_RECEIPT_KIND_V2 => schema == "rsia.evaluation_ticket_issue_receipt.v2",
         RESOURCE_KIND => schema == "rsia.evaluation_resource_evidence.v1",
         _ => false,
     };
@@ -3996,6 +3736,17 @@ async fn get_record<T: DeserializeOwned>(
             )
             .await?;
         }
+    }
+    if record_kind == TICKET_KIND
+        && let Some(body) = raw.as_ref()
+        && body["schema_version"] == evo_core::formal_version::NATIVE_TICKET_ENVELOPE
+    {
+        let payload =
+            evo_core::formal_version::native_ticket_payload(body, ctx.namespace(), &storage_id)
+                .map_err(|_| Error::Conflict("native ticket envelope invalid".into()))?;
+        return serde_json::from_value(payload.clone())
+            .map(Some)
+            .map_err(|_| Error::Conflict("native ticket payload unreadable".into()));
     }
     let envelope: Option<TypedArtifactEnvelope<T>> = raw
         .map(serde_json::from_value)
@@ -4034,6 +3785,33 @@ async fn put_record<T: Serialize>(
     payload: &T,
 ) -> Result<()> {
     let storage_id = storage_id(record_kind, id)?;
+    if record_kind == TICKET_KIND
+        && let Some(old) = session.get::<Value>(ctx, "artifact", &storage_id).await?
+        && old["schema_version"] == evo_core::formal_version::NATIVE_TICKET_ENVELOPE
+    {
+        evo_core::formal_version::native_ticket_payload(&old, ctx.namespace(), &storage_id)
+            .map_err(|_| Error::Conflict("native old ticket envelope invalid".into()))?;
+        let source = old
+            .get("native_first_stop")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| Error::Internal)?;
+        let envelope = evo_core::formal_version::NativeTicketEnvelopeV2 {
+            schema_version: evo_core::formal_version::NATIVE_TICKET_ENVELOPE.into(),
+            id: storage_id.clone(),
+            record_kind: TICKET_KIND.into(),
+            payload,
+            native_first_stop: source,
+        };
+        let value = serde_json::to_value(&envelope).map_err(|_| Error::Internal)?;
+        evo_core::formal_version::native_ticket_payload(&value, ctx.namespace(), &storage_id)
+            .map_err(|_| Error::Conflict("native new ticket envelope invalid".into()))?;
+        return session
+            .put(ctx, "artifact", &storage_id, owner, &envelope)
+            .await;
+    }
     let envelope = TypedArtifactEnvelope {
         schema_version: ENVELOPE_SCHEMA.into(),
         id: storage_id.clone(),
@@ -4134,6 +3912,15 @@ fn validate_node_shape(nodes: &[FormalDependencyNode]) -> Result<()> {
             (None, RELEASE_CANDIDATE_SCHEMA) if node.kind == "artifact" => {}
             (None, schema)
                 if crate::formal_authority::compiler_dependency_schema(&node.kind, schema) => {}
+            (Some(kind), evo_core::formal_version::NATIVE_TICKET_ENVELOPE)
+                if node.kind == "artifact" && kind == TICKET_KIND =>
+            {
+                if storage_id(kind, &node.logical_id)? != node.id {
+                    return Err(Error::Invalid(
+                        "native ticket dependency physical identity".into(),
+                    ));
+                }
+            }
             (Some(kind), ENVELOPE_SCHEMA)
                 if node.kind == "artifact" && dependency_record_schema(kind).is_some() =>
             {
@@ -4285,6 +4072,7 @@ fn dependency_record_schema(kind: &str) -> Option<&'static str> {
         HOLDOUT_KIND => Some(ProtectedHoldoutRecord::SCHEMA),
         TICKET_KIND => Some(EvaluationTicketV2::SCHEMA),
         TICKET_RECEIPT_KIND => Some("rsia.evaluation_ticket_issue_receipt.v1"),
+        TICKET_RECEIPT_KIND_V2 => Some("rsia.evaluation_ticket_issue_receipt.v2"),
         ALPHA_USE_KIND => Some("rsia.alpha_claim_reservation.v1"),
         EXECUTION_RECEIPT_KIND => Some("rsia.execution_receipt.v2"),
         GRADER_RECEIPT_KIND => Some("rsia.independent_grader_receipt.v2"),
@@ -4297,8 +4085,13 @@ fn dependency_record_schema(kind: &str) -> Option<&'static str> {
 }
 
 fn validate_dependency_payload_identity(kind: &str, payload: &Value) -> Result<()> {
+    if kind == TICKET_RECEIPT_KIND_V2 {
+        let receipt: TicketIssueReceiptV2 =
+            serde_json::from_value(payload.clone()).map_err(|_| Error::Forbidden)?;
+        receipt.validate()?;
+    }
     let (ids, digests, timestamp): (&[&str], &[&str], Option<&str>) = match kind {
-        TICKET_RECEIPT_KIND => (
+        TICKET_RECEIPT_KIND | TICKET_RECEIPT_KIND_V2 => (
             &["ticket_id", "evaluator_actor"],
             &["registration_digest", "manifest_digest"],
             Some("issued_at_unix_seconds"),
@@ -4401,7 +4194,19 @@ async fn typed_node_fingerprint<T: DeserializeOwned + Serialize>(
     kind: &str,
     logical_id: &str,
 ) -> Result<String> {
-    let envelope: TypedArtifactEnvelope<T> = session.need(ctx, "artifact", physical_id).await?;
+    let raw: Value = session.need(ctx, "artifact", physical_id).await?;
+    if raw["schema_version"] == evo_core::formal_version::NATIVE_TICKET_ENVELOPE {
+        if kind != TICKET_KIND || storage_id(kind, logical_id)? != physical_id {
+            return Err(Error::Forbidden);
+        }
+        evo_core::formal_version::native_ticket_payload(&raw, ctx.namespace(), physical_id)
+            .map_err(|_| Error::Conflict("native dependency ticket invalid".into()))?;
+        let envelope: evo_core::formal_version::NativeTicketEnvelopeV2<T> =
+            serde_json::from_value(raw).map_err(|_| Error::Internal)?;
+        return fingerprint(&envelope);
+    }
+    let envelope: TypedArtifactEnvelope<T> =
+        serde_json::from_value(raw).map_err(|_| Error::Internal)?;
     if envelope.schema_version != ENVELOPE_SCHEMA
         || envelope.id != physical_id
         || envelope.record_kind != kind
@@ -4493,6 +4298,24 @@ async fn dependency_node_identity(
         validate_candidate_read_in_session(session, ctx, &candidate).await?;
         return Ok((schema.into(), None, id.into(), fingerprint(&candidate)?));
     }
+    if schema == evo_core::formal_version::NATIVE_TICKET_ENVELOPE {
+        evo_core::formal_version::native_ticket_payload(&value, ctx.namespace(), id)
+            .map_err(|_| Error::Conflict("native dependency envelope invalid".into()))?;
+        let ticket: EvaluationTicketV2 =
+            serde_json::from_value(value["payload"].clone()).map_err(|_| Error::Internal)?;
+        ticket.validate()?;
+        if storage_id(TICKET_KIND, &ticket.id)? != id {
+            return Err(Error::Forbidden);
+        }
+        let typed: evo_core::formal_version::NativeTicketEnvelopeV2<EvaluationTicketV2> =
+            serde_json::from_value(value.clone()).map_err(|_| Error::Internal)?;
+        return Ok((
+            schema.into(),
+            Some(TICKET_KIND.into()),
+            ticket.id,
+            fingerprint(&typed)?,
+        ));
+    }
     if schema != ENVELOPE_SCHEMA {
         return Err(Error::Invalid(
             "unsupported formal dependency schema".into(),
@@ -4577,6 +4400,19 @@ async fn dependency_node_identity(
         TICKET_RECEIPT_KIND => {
             typed_node_fingerprint::<TicketIssueReceipt>(session, ctx, id, record_kind, &logical_id)
                 .await?
+        }
+        TICKET_RECEIPT_KIND_V2 => {
+            let receipt: TicketIssueReceiptV2 =
+                need_record(session, ctx, TICKET_RECEIPT_KIND_V2, &logical_id).await?;
+            receipt.validate()?;
+            typed_node_fingerprint::<TicketIssueReceiptV2>(
+                session,
+                ctx,
+                id,
+                record_kind,
+                &logical_id,
+            )
+            .await?
         }
         ALPHA_USE_KIND => {
             typed_node_fingerprint::<AlphaClaimReservation>(
@@ -4844,20 +4680,6 @@ async fn validate_candidate_binding_in_session(
     Ok(())
 }
 
-async fn put_fact_edges(
-    session: &mut Session,
-    ctx: &Context,
-    src_id: &str,
-    edges: Vec<(String, String)>,
-) -> Result<()> {
-    for (kind, id) in edges {
-        session
-            .put_edge(ctx, "artifact", src_id, &kind, &id)
-            .await?;
-    }
-    Ok(())
-}
-
 fn artifact_edge(kind: &str, logical_id: &str) -> Result<(String, String)> {
     Ok(("artifact".into(), storage_id(kind, logical_id)?))
 }
@@ -4931,10 +4753,11 @@ async fn required_ticket_edges(
     ticket: &EvaluationTicketV2,
     control: &RegisteredEvaluationControl,
 ) -> Result<Vec<(String, String)>> {
+    let (_, receipt_kind) = ticket_issue_receipt_in_session(session, ctx, ticket).await?;
     let mut edges = vec![
         ("artifact".into(), ticket.candidate_digest.clone()),
         artifact_edge(HOLDOUT_KIND, &ticket.holdout_id)?,
-        artifact_edge(TICKET_RECEIPT_KIND, &ticket.id)?,
+        artifact_edge(receipt_kind, &ticket.id)?,
     ];
     for allocation in control
         .alpha_plan
@@ -5112,16 +4935,6 @@ async fn bind_stored_facts_in_session(
     Ok(Some(binding))
 }
 
-async fn control_billing_scope(
-    store: &Store,
-    ctx: &Context,
-    ticket: &EvaluationTicketV2,
-) -> Result<String> {
-    let control: RegisteredEvaluationControl =
-        load(store, ctx, CONTROL_KIND, &ticket.registration_id).await?;
-    Ok(control.billing_scope)
-}
-
 async fn validate_root_budget(
     ctx: &Context,
     store: &Store,
@@ -5163,29 +4976,6 @@ async fn validate_root_budget(
         ));
     }
     Ok(())
-}
-
-fn validate_target_receipt_pair(
-    target: &EvaluationTarget,
-    candidate_receipt_id: &str,
-    baseline_receipt_id: &str,
-) -> Result<()> {
-    match &target.state {
-        TargetState::Running {
-            candidate: Some(candidate),
-            baseline: Some(baseline),
-        } if candidate.receipt_id.as_deref() == Some(candidate_receipt_id)
-            && baseline.receipt_id.as_deref() == Some(baseline_receipt_id) =>
-        {
-            Ok(())
-        }
-        TargetState::Completed { .. } => Err(Error::Conflict(
-            "completed target score is immutable".into(),
-        )),
-        _ => Err(Error::Invalid(
-            "grader requires both execution receipts recorded on the target".into(),
-        )),
-    }
 }
 
 fn validate_output_artifact(
@@ -5443,83 +5233,6 @@ fn mark_slot_dispatched(
     Ok(())
 }
 
-fn validate_started_slot(
-    target: &EvaluationTarget,
-    side: ExecutionSide,
-    call_id: &str,
-    request_digest: &str,
-) -> Result<()> {
-    let (candidate, baseline) = match &target.state {
-        TargetState::Running {
-            candidate,
-            baseline,
-        }
-        | TargetState::RunningUsageUnknown {
-            candidate,
-            baseline,
-        }
-        | TargetState::CancelledAfterDispatch {
-            candidate,
-            baseline,
-        } => (candidate, baseline),
-        _ => {
-            return Err(Error::Conflict(
-                "execution target has no started slot".into(),
-            ));
-        }
-    };
-    let slot = match side {
-        ExecutionSide::Candidate => candidate,
-        ExecutionSide::Baseline => baseline,
-    }
-    .as_ref()
-    .ok_or_else(|| Error::Conflict("execution side has no started slot".into()))?;
-    if slot.budget_call_id != call_id
-        || slot.request_digest != request_digest
-        || !matches!(slot.phase, ExecutionSlotPhase::Dispatched { .. })
-    {
-        return Err(Error::Conflict(
-            "execution receipt differs from the persisted dispatch slot".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn set_running_receipt(
-    target: &mut EvaluationTarget,
-    side: ExecutionSide,
-    receipt_id: &str,
-) -> Result<()> {
-    let (mut candidate, mut baseline) = match &target.state {
-        TargetState::Running {
-            candidate,
-            baseline,
-        } => (candidate.clone(), baseline.clone()),
-        _ => {
-            return Err(Error::Conflict(
-                "target cannot accept a new execution receipt".into(),
-            ));
-        }
-    };
-    let slot = match side {
-        ExecutionSide::Candidate => &mut candidate,
-        ExecutionSide::Baseline => &mut baseline,
-    }
-    .as_mut()
-    .ok_or_else(|| Error::Conflict("execution side is not bound".into()))?;
-    if slot.receipt_id.is_some() || !matches!(slot.phase, ExecutionSlotPhase::Dispatched { .. }) {
-        return Err(Error::Conflict(
-            "execution side cannot accept a receipt".into(),
-        ));
-    }
-    slot.receipt_id = Some(receipt_id.into());
-    target.state = TargetState::Running {
-        candidate,
-        baseline,
-    };
-    Ok(())
-}
-
 fn validate_execution_pair(
     ticket: &EvaluationTicketV2,
     target_id: &str,
@@ -5553,58 +5266,6 @@ fn is_stopping(state: TicketLifecycle) -> bool {
             | TicketLifecycle::CompleteBatch
             | TicketLifecycle::Invalid
     )
-}
-
-/// Audit operation naming an execution receipt kept outside a final Invalid
-/// report.
-const LATE_EXECUTION_AFTER_FORMAL_AUDIT: &str = "late_execution_receipt_after_formal";
-/// Audit operation naming a grader receipt kept outside a final report (L707).
-const LATE_GRADER_AFTER_FINAL_AUDIT: &str = "late_grader_receipt_after_final_report";
-/// Audit operation naming a grader request whose outputs could not be graded
-/// after the formal report was final.
-const LATE_GRADER_ERROR_AFTER_FINAL_AUDIT: &str = "late_grader_error_after_final_report";
-
-/// AG-118 (§6.6 L705): once the formal report is final its reasons are fixed.
-/// A late grading error neither invalidates again nor appends a reason; one
-/// audit entry names the request by its receipt id (the requested id, as no
-/// receipt is stored), committed alone before the caller returns the same
-/// error. Reachable for an unscored Invalid target with a late output. A
-/// CompleteBatch target, or one an early stop had scored, cannot get there:
-/// a completed target accepts no new execution receipt (validate_started_slot,
-/// set_running_receipt), and its stored pair already graded successfully
-/// under the same fixed grader and frozen oracle.
-async fn audit_late_grading_error(
-    mut session: Session,
-    ctx: &Context,
-    receipt_id: &str,
-) -> Result<()> {
-    session
-        .audit(ctx, LATE_GRADER_ERROR_AFTER_FINAL_AUDIT, receipt_id)
-        .await?;
-    session.commit().await
-}
-
-/// AG-118: whether a grader receipt arrives after the formal report is final.
-/// Each of these lifecycles is persisted in the same transaction as its formal
-/// report. Any CompleteBatch or Invalid target qualifies; for EarlyStopped
-/// only a target the stop had already scored, as the AG-091 path keeps a
-/// later result for an unscored target on the ticket and re-derives its report.
-fn late_grading_after_final_report(ticket: &EvaluationTicketV2, target_id: &str) -> Result<bool> {
-    Ok(match ticket.lifecycle {
-        TicketLifecycle::CompleteBatch | TicketLifecycle::Invalid => true,
-        TicketLifecycle::EarlyStopped => matches!(
-            ticket.target(target_id)?.state,
-            TargetState::Completed { .. }
-        ),
-        _ => false,
-    })
-}
-
-fn rotating_complete(ticket: &EvaluationTicketV2) -> bool {
-    ticket.targets.iter().all(|target| {
-        !matches!(target.kind, EvaluationTargetKind::Rotating { .. })
-            || matches!(target.state, TargetState::Completed { .. })
-    })
 }
 
 fn anchors_passed(ticket: &EvaluationTicketV2) -> bool {
@@ -5694,521 +5355,6 @@ async fn mark_exposure_dispatched_if_needed(
     Ok(())
 }
 
-async fn mark_feedback_used_if_needed(
-    session: &mut Session,
-    ctx: &Context,
-    ticket: &EvaluationTicketV2,
-    at_unix_seconds: i64,
-) -> Result<()> {
-    let at_unix_ms = at_unix_seconds
-        .checked_mul(1_000)
-        .ok_or_else(|| Error::Invalid("feedback timestamp conversion overflow".into()))?;
-    let mut ledger: ExposureLedger =
-        need_record(session, ctx, LEDGER_KIND, &ticket.research_family_id).await?;
-    let entry = ledger
-        .entries
-        .iter()
-        .find(|entry| entry.ticket_id == ticket.id)
-        .ok_or(Error::NotFound)?;
-    match entry.state.clone() {
-        ExposureState::Dispatched { .. } => {
-            ledger.mark_feedback_used(&ticket.id, at_unix_ms)?;
-            put_record(
-                session,
-                ctx,
-                LEDGER_KIND,
-                &ticket.research_family_id,
-                ticket.evaluator_actor.as_str(),
-                &ledger,
-            )
-            .await?;
-        }
-        ExposureState::FeedbackUsed { .. } => {}
-        ExposureState::Reserved => {
-            return Err(Error::Conflict(
-                "grader feedback cannot precede real dispatch".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-async fn settle_exposure_money(
-    session: &mut Session,
-    ctx: &Context,
-    ticket: &EvaluationTicketV2,
-    usage_uncertain: bool,
-) -> Result<()> {
-    let mut ledger: ExposureLedger =
-        need_record(session, ctx, LEDGER_KIND, &ticket.research_family_id).await?;
-    let entry = ledger
-        .entries
-        .iter()
-        .find(|entry| entry.ticket_id == ticket.id)
-        .ok_or(Error::NotFound)?;
-    let mut changed = false;
-    let exposure_state = entry.state.clone();
-    let monetary_state = entry.monetary_state;
-    match (&exposure_state, monetary_state) {
-        (ExposureState::Reserved, MonetaryReservationState::HeldUndispatched)
-            if !usage_uncertain =>
-        {
-            ledger.release_undispatched_money(&ticket.id)?;
-            changed = true;
-        }
-        (ExposureState::Reserved, MonetaryReservationState::HeldUndispatched) => {
-            return Err(Error::Conflict(
-                "cannot release exposure money while dispatched usage is unknown".into(),
-            ));
-        }
-        (
-            ExposureState::Dispatched { .. } | ExposureState::FeedbackUsed { .. },
-            MonetaryReservationState::DispatchedCostPending,
-        ) if !usage_uncertain => {
-            ledger.finalize_dispatched_cost(&ticket.id)?;
-            changed = true;
-        }
-        (_, MonetaryReservationState::DispatchedCostPending) if usage_uncertain => {}
-        (
-            _,
-            MonetaryReservationState::Finalized | MonetaryReservationState::ReleasedUndispatched,
-        ) => {}
-        _ => {
-            return Err(Error::Conflict(
-                "exposure monetary state is inconsistent at terminal settlement".into(),
-            ));
-        }
-    }
-    if changed {
-        put_record(
-            session,
-            ctx,
-            LEDGER_KIND,
-            &ticket.research_family_id,
-            ticket.evaluator_actor.as_str(),
-            &ledger,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-async fn close_execution_slots(
-    session: &mut Session,
-    ctx: &Context,
-    control: &RegisteredEvaluationControl,
-    ticket: &mut EvaluationTicketV2,
-    reason: &str,
-    now: i64,
-) -> Result<bool> {
-    session
-        .stop_dispatch_group(ctx, &control.billing_scope, &ticket.id, reason, now)
-        .await?;
-    let calls = session
-        .budget_calls_for_group(ctx, &control.billing_scope, &ticket.id)
-        .await?;
-    let earliest_dispatch = calls
-        .iter()
-        .filter(|call| {
-            matches!(
-                call.state,
-                BudgetCallState::Dispatched
-                    | BudgetCallState::Uncertain
-                    | BudgetCallState::Finalized
-            )
-        })
-        .map(|call| {
-            call.dispatched_at.ok_or_else(|| {
-                Error::Conflict("dispatched budget call lacks dispatch timestamp".into())
-            })
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .min();
-    if let Some(dispatched_at) = earliest_dispatch {
-        mark_exposure_dispatched_if_needed(session, ctx, ticket, dispatched_at).await?;
-    }
-    let mut by_id: BTreeMap<String, BudgetCallRecord> = calls
-        .into_iter()
-        .map(|call| (call.call_id.clone(), call))
-        .collect();
-    let mut attributed = BTreeSet::new();
-    for target in &ticket.targets {
-        match &target.state {
-            TargetState::Running {
-                candidate,
-                baseline,
-            }
-            | TargetState::RunningUsageUnknown {
-                candidate,
-                baseline,
-            }
-            | TargetState::CancelledAfterDispatch {
-                candidate,
-                baseline,
-            } => {
-                for slot in [candidate, baseline].into_iter().flatten() {
-                    attributed.insert(slot.budget_call_id.clone());
-                }
-            }
-            TargetState::Completed {
-                candidate_receipt_id,
-                baseline_receipt_id,
-                ..
-            } => {
-                for receipt_id in [candidate_receipt_id, baseline_receipt_id] {
-                    let receipt: ExecutionReceiptV2 =
-                        need_record(session, ctx, EXECUTION_RECEIPT_KIND, receipt_id).await?;
-                    attributed.insert(receipt.budget_call_id);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut usage_uncertain = false;
-    for call in by_id.values_mut() {
-        if attributed.contains(&call.call_id) {
-            continue;
-        }
-        ticket
-            .unattributed_budget_call_ids
-            .push(call.call_id.clone());
-        if !ticket
-            .invalid_reasons
-            .iter()
-            .any(|value| value == "unattributed_dispatch_group_call")
-        {
-            ticket
-                .invalid_reasons
-                .push("unattributed_dispatch_group_call".into());
-        }
-        match call.state {
-            BudgetCallState::Reserved => {
-                let fence = call_fence(call, now);
-                *call = session
-                    .release_undispatched_budget_call(ctx, &fence, "unattributed_ticket_stop")
-                    .await?;
-            }
-            BudgetCallState::Dispatched | BudgetCallState::Uncertain => usage_uncertain = true,
-            BudgetCallState::Finalized if !call.execution_closed => usage_uncertain = true,
-            BudgetCallState::Finalized => {
-                // Cost is known, but this unregistered dispatch permanently
-                // invalidates the evaluation even after accounting closes.
-            }
-            BudgetCallState::Released | BudgetCallState::Cancelled => {}
-        }
-    }
-    for target in &mut ticket.targets {
-        let current = target.state.clone();
-        match current {
-            TargetState::Planned => {
-                target.state = TargetState::NotDispatched {
-                    released_call_ids: Vec::new(),
-                };
-            }
-            TargetState::Running {
-                candidate,
-                baseline,
-            } => {
-                let mut released = Vec::new();
-                let mut dispatched = false;
-                let mut target_uncertain = false;
-                for slot in [&candidate, &baseline].into_iter().flatten() {
-                    let call = by_id
-                        .get_mut(&slot.budget_call_id)
-                        .ok_or_else(|| Error::Conflict("bound budget call is missing".into()))?;
-                    match call.state {
-                        BudgetCallState::Reserved => {
-                            let fence = call_fence(call, now);
-                            *call = session
-                                .release_undispatched_budget_call(
-                                    ctx,
-                                    &fence,
-                                    "ticket_stopped_before_dispatch",
-                                )
-                                .await?;
-                            released.push(call.call_id.clone());
-                        }
-                        BudgetCallState::Released | BudgetCallState::Cancelled => {
-                            released.push(call.call_id.clone());
-                        }
-                        BudgetCallState::Dispatched | BudgetCallState::Uncertain => {
-                            dispatched = true;
-                            target_uncertain = true;
-                        }
-                        BudgetCallState::Finalized => {
-                            dispatched = true;
-                            target_uncertain |= !call.execution_closed;
-                        }
-                    }
-                }
-                usage_uncertain |= target_uncertain;
-                target.state = if target_uncertain {
-                    TargetState::RunningUsageUnknown {
-                        candidate,
-                        baseline,
-                    }
-                } else if dispatched {
-                    TargetState::CancelledAfterDispatch {
-                        candidate,
-                        baseline,
-                    }
-                } else {
-                    TargetState::NotDispatched {
-                        released_call_ids: released,
-                    }
-                };
-            }
-            _ => {}
-        }
-    }
-    ticket.unattributed_budget_call_ids.sort();
-    ticket.unattributed_budget_call_ids.dedup();
-    Ok(usage_uncertain)
-}
-
-fn call_fence(call: &BudgetCallRecord, now: i64) -> BudgetCallFence {
-    BudgetCallFence {
-        billing_scope: call.billing_scope.clone(),
-        call_id: call.call_id.clone(),
-        actual_input_digest: call.actual_input_digest.clone(),
-        lease_token: call.lease_token.clone(),
-        lease_epoch: call.lease_epoch,
-        now,
-    }
-}
-
-async fn stop_ticket(
-    session: &mut Session,
-    ctx: &Context,
-    control: &RegisteredEvaluationControl,
-    ticket: &mut EvaluationTicketV2,
-    decision: EarlyStopDecision,
-    issuer: &IndependentGraderReceiptV2,
-    now: i64,
-) -> Result<()> {
-    ticket.lifecycle = TicketLifecycle::StopRequested;
-    let usage_uncertain =
-        close_execution_slots(session, ctx, control, ticket, stop_reason(decision), now).await?;
-    settle_exposure_money(session, ctx, ticket, usage_uncertain).await?;
-    let (k, lcb, ucb, prefix_digest) = if decision == EarlyStopDecision::CriticalRegression {
-        (0, None, None, fingerprint(&Vec::<String>::new())?)
-    } else {
-        let plan = control
-            .early_stop_plan
-            .as_ref()
-            .ok_or_else(|| Error::Invalid("statistical stop lacks early-stop plan".into()))?;
-        let (_, stream) = rebuild_stream(ticket, plan, &control.alpha_plan)?;
-        let bound = stream
-            .boundary()?
-            .ok_or_else(|| Error::Invalid("statistical stop lacks a completed prefix".into()))?;
-        let wire = bound.to_wire()?;
-        (
-            bound.k,
-            Some(wire.lcb),
-            Some(wire.ucb),
-            stream.completed_prefix_digest()?,
-        )
-    };
-    let member_terminal_digest = fingerprint(&ticket.targets)?;
-    ticket.stop_member_terminal_digest = Some(member_terminal_digest.clone());
-    let certificate = EarlyStopCertificate::from_verified_parts(EarlyStopCertificateParts {
-        ticket_id: ticket.id.clone(),
-        v1_plan_snapshot_digest: ticket.v1_plan_snapshot_digest.clone(),
-        early_stop_plan_digest: control
-            .early_stop_plan
-            .as_ref()
-            .map(EarlyStopPlan::digest)
-            .transpose()?
-            .unwrap_or(control.formal_plan.digest()?),
-        alpha_plan_digest: ticket.alpha_plan_digest.clone(),
-        manifest_digest: ticket.manifest_digest.clone(),
-        slice_id: load_slice_id(session, ctx, &ticket.holdout_id).await?,
-        candidate_digest: ticket.candidate_digest.clone(),
-        baseline_digest: ticket.baseline_digest.clone(),
-        grader_digest: control.grader_digest.clone(),
-        issuer_receipt_digest: fingerprint(issuer)?,
-        k,
-        lcb,
-        ucb,
-        completed_prefix_digest: prefix_digest,
-        member_terminal_digest,
-        stop_reason: decision,
-        stopped_at_unix_ms: now
-            .checked_mul(1_000)
-            .ok_or_else(|| Error::Invalid("stop timestamp conversion overflow".into()))?,
-        stop_sequence: ticket.next_sequence,
-        usage_uncertain,
-    })?;
-    ticket.pending_certificate = Some(certificate);
-    ticket.lifecycle = if usage_uncertain {
-        TicketLifecycle::Draining
-    } else {
-        TicketLifecycle::EarlyStopped
-    };
-    Ok(())
-}
-
-async fn invalidate_in_session(
-    session: &mut Session,
-    ctx: &Context,
-    control: &RegisteredEvaluationControl,
-    ticket: &mut EvaluationTicketV2,
-    reason: &str,
-    now: i64,
-) -> Result<FormalEvaluationV2> {
-    identifier(reason)?;
-    valid_time(now)?;
-    ticket.lifecycle = TicketLifecycle::Invalid;
-    if !ticket
-        .invalid_reasons
-        .iter()
-        .any(|existing| existing == reason)
-    {
-        ticket.invalid_reasons.push(reason.into());
-    }
-    let usage_uncertain = close_execution_slots(session, ctx, control, ticket, reason, now).await?;
-    settle_exposure_money(session, ctx, ticket, usage_uncertain).await?;
-    let formal = FormalEvaluationV2::Invalid {
-        evidence_scope: control.evidence_scope,
-        ticket_id: ticket.id.clone(),
-        ticket_digest: fingerprint(ticket)?,
-        reasons: ticket.invalid_reasons.clone(),
-    };
-    put_record(session, ctx, TICKET_KIND, &ticket.id, ctx.actor(), ticket).await?;
-    put_record(session, ctx, FORMAL_KIND, &ticket.id, ctx.actor(), &formal).await?;
-    Ok(formal)
-}
-
-async fn load_slice_id(session: &mut Session, ctx: &Context, holdout_id: &str) -> Result<String> {
-    let holdout: ProtectedHoldoutRecord =
-        need_record(session, ctx, HOLDOUT_KIND, holdout_id).await?;
-    Ok(holdout.manifest.slice_id)
-}
-
-async fn maybe_store_early_formal(
-    session: &mut Session,
-    ctx: &Context,
-    ticket: &EvaluationTicketV2,
-) -> Result<()> {
-    if ticket.lifecycle == TicketLifecycle::EarlyStopped {
-        let certificate = ticket
-            .pending_certificate
-            .clone()
-            .ok_or_else(|| Error::Invalid("early-stopped ticket lacks certificate".into()))?;
-        if ticket.candidate_dependency_binding.is_some() {
-            let control: RegisteredEvaluationControl =
-                need_record(session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
-            let holdout: ProtectedHoldoutRecord =
-                need_record(session, ctx, HOLDOUT_KIND, &ticket.holdout_id).await?;
-            validate_bound_early_certificate_in_session(
-                session,
-                ctx,
-                ticket,
-                &control,
-                &holdout,
-                &certificate,
-            )
-            .await?;
-        }
-        let formal = FormalEvaluationV2::EarlyStopped {
-            evidence_scope: ticket.evidence_scope,
-            ticket_id: ticket.id.clone(),
-            ticket_digest: fingerprint(ticket)?,
-            certificate,
-        };
-        // The ticket's evaluator owns its report, also when a late execution
-        // receipt re-derives it; every other caller is that evaluator.
-        put_record(
-            session,
-            ctx,
-            FORMAL_KIND,
-            &ticket.id,
-            ticket.evaluator_actor.as_str(),
-            &formal,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-fn stop_reason(decision: EarlyStopDecision) -> &'static str {
-    match decision {
-        EarlyStopDecision::CriticalRegression => "critical_regression",
-        EarlyStopDecision::FutilityQualityGain => "futility_quality_gain",
-        EarlyStopDecision::FutilityNoninferiority => "futility_noninferiority",
-        EarlyStopDecision::RegressedSequential => "sequential_regression",
-        _ => "invalid_early_stop",
-    }
-}
-
-fn postprocess_complete_report(
-    control_schema: &str,
-    profile: ProfileKind,
-    mut report: BernsteinReport,
-) -> Result<BernsteinReport> {
-    match control_schema {
-        RegisteredEvaluationControl::SCHEMA_V1 => {
-            // Preserve frozen v1 reports, including their original reason order.
-            if profile == ProfileKind::NoninferiorSavings {
-                report.verdict = Verdict::Inconclusive;
-                report
-                    .reasons
-                    .push("cost_savings_statistical_proof_unsupported".into());
-            }
-            report.verdict = Verdict::Inconclusive;
-            report
-                .reasons
-                .push("complete_optimization_cost_not_verified".into());
-        }
-        RegisteredEvaluationControl::SCHEMA => {
-            if profile == ProfileKind::NoninferiorSavings && report.verdict == Verdict::Noninferior
-            {
-                report.verdict = Verdict::Inconclusive;
-                report
-                    .reasons
-                    .push("cost_savings_statistical_proof_unsupported".into());
-            } else if report.verdict == Verdict::Regressed
-                && report.reasons.iter().any(|reason| reason == "negative_lcb")
-            {
-                // E05 L1257: an average regression is confirmed only when the
-                // UCB is below zero. decide() reports Regressed from a negative
-                // mean and LCB alone, so the UCB check happens here and the
-                // stored reason names the check that was actually made.
-                if regression_ucb(&report) < 0.0 {
-                    report
-                        .reasons
-                        .push("regression_confirmed_ucb_below_zero".into());
-                } else {
-                    report.verdict = Verdict::Inconclusive;
-                    report
-                        .reasons
-                        .push("regression_not_confirmed_ucb_boundary_not_crossed".into());
-                }
-                // Keep decide()'s sorted, deduplicated reasons after appending.
-                report.reasons.sort();
-                report.reasons.dedup();
-            }
-        }
-        _ => {
-            return Err(Error::Invalid(
-                "unsupported registered-control schema".into(),
-            ));
-        }
-    }
-    Ok(report)
-}
-
-/// One-sided upper confidence bound on the mean paired difference: the mirror
-/// of the section 3.4 LCB, `UCB = mean + radius`, with the same `radius` (same
-/// alpha_i, s^2, n and R) that `empirical_bernstein` stored in the report. The
-/// radius is read from the report rather than recovered as `mean - lcb`,
-/// because the stored `lcb` is clamped at -1 and then `mean - lcb` is not it.
-/// A non-finite bound never compares below zero, so it confirms nothing.
-fn regression_ucb(report: &BernsteinReport) -> f64 {
-    report.mean + report.radius
-}
-
 fn p95(values: &mut [u64]) -> Result<u64> {
     if values.is_empty() {
         return Err(Error::Invalid("p95 requires observations".into()));
@@ -6224,6 +5370,36 @@ fn p95(values: &mut [u64]) -> Result<u64> {
 #[cfg(test)]
 mod complete_verdict_tests {
     use super::*;
+
+    #[test]
+    fn native_receipt_intents_do_not_accept_caller_occurrence_or_authority() {
+        let execution = json!({
+            "receipt_id":"execution", "ticket_id":"ticket", "target_id":"target",
+            "side":"candidate", "request_digest":"a".repeat(64),
+            "output_artifact_id":"output", "output_utf8":"actual",
+            "budget_call_id":"call", "latency_micros":1
+        });
+        let grade = json!({
+            "receipt_id":"grade", "ticket_id":"ticket", "target_id":"target",
+            "candidate_execution_receipt_id":"candidate",
+            "baseline_execution_receipt_id":"baseline"
+        });
+        assert!(serde_json::from_value::<ExecutionReceiptIntent>(execution.clone()).is_ok());
+        assert!(serde_json::from_value::<GraderReceiptIntent>(grade.clone()).is_ok());
+        for field in [
+            "issued_at_unix_seconds",
+            "issued_at_unix_ms",
+            "phase",
+            "verified",
+        ] {
+            let mut changed = execution.clone();
+            changed[field] = json!(1);
+            assert!(serde_json::from_value::<ExecutionReceiptIntent>(changed).is_err());
+            let mut changed = grade.clone();
+            changed[field] = json!(1);
+            assert!(serde_json::from_value::<GraderReceiptIntent>(changed).is_err());
+        }
+    }
 
     #[test]
     fn v2_postprocessing_preserves_safety_regression_without_negative_lcb() {
