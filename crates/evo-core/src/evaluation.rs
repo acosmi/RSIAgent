@@ -423,6 +423,29 @@ impl AlphaBudget {
     }
 }
 
+/// The v2 fixed-sample radius, with the original floating operation order.
+pub(crate) fn paired_bernstein_radius_v2(n: usize, variance: f64, alpha_i: f64) -> Result<f64> {
+    if !alpha_i.is_finite() || !(0.0001..0.5).contains(&alpha_i) {
+        return Err(Error::Invalid("alpha_i out of range".into()));
+    }
+    if n < 2 {
+        return Err(Error::Invalid("n<2".into()));
+    }
+    if !variance.is_finite() || variance < 0.0 {
+        return Err(Error::Invalid("variance not defined".into()));
+    }
+    let ln = (2.0 / alpha_i).ln();
+    if !ln.is_finite() || ln <= 0.0 {
+        return Err(Error::Invalid("log term invalid".into()));
+    }
+    let radius =
+        (2.0 * variance * ln / n as f64).sqrt() + 7.0 * RANGE_R * ln / (3.0 * (n as f64 - 1.0));
+    if !radius.is_finite() {
+        return Err(Error::Invalid("radius not finite".into()));
+    }
+    Ok(radius)
+}
+
 pub fn empirical_bernstein(rows: &[ClusterObservation], alpha_i: f64) -> Result<BernsteinReport> {
     if !alpha_i.is_finite() || !(0.0001..0.5).contains(&alpha_i) {
         return Ok(invalid("alpha_i out of range", alpha_i));
@@ -470,15 +493,11 @@ pub fn empirical_bernstein(rows: &[ClusterObservation], alpha_i: f64) -> Result<
     if !variance.is_finite() || variance < 0.0 {
         return Ok(invalid("variance not defined", alpha_i));
     }
-    let ln = (2.0 / alpha_i).ln();
-    if !ln.is_finite() || ln <= 0.0 {
-        return Ok(invalid("log term invalid", alpha_i));
-    }
-    let radius =
-        (2.0 * variance * ln / n as f64).sqrt() + 7.0 * RANGE_R * ln / (3.0 * (n as f64 - 1.0));
-    if !radius.is_finite() {
-        return Ok(invalid("radius not finite", alpha_i));
-    }
+    let radius = match paired_bernstein_radius_v2(n, variance, alpha_i) {
+        Ok(radius) => radius,
+        Err(Error::Invalid(reason)) => return Ok(invalid(&reason, alpha_i)),
+        Err(error) => return Err(error),
+    };
     let lcb = (mean - radius).max(-1.0);
     Ok(BernsteinReport {
         stats_version: STATS_BERNSTEIN_V2.into(),
@@ -859,20 +878,12 @@ pub fn estimate_n(
         return Err(Error::Invalid("invalid max_n".into()));
     }
     for n in 2..=max_n {
-        let dummy: Vec<ClusterObservation> = (0..n)
-            .map(|i| ClusterObservation {
-                cluster_id: format!("c{i}"),
-                d: 0.0,
-                weight: 1.0,
-            })
-            .collect();
-        let mut report = empirical_bernstein(&dummy, alpha_i)?;
-        report.variance = variance;
-        let ln = (2.0 / alpha_i).ln();
-        report.radius =
-            (2.0 * variance * ln / n as f64).sqrt() + 7.0 * RANGE_R * ln / (3.0 * (n as f64 - 1.0));
-        if min_effect > report.radius {
-            let cost = n as u64 * unit_cost;
+        let radius = paired_bernstein_radius_v2(n, variance, alpha_i)?;
+        if min_effect > radius {
+            let cost = u64::try_from(n)
+                .ok()
+                .and_then(|n| n.checked_mul(unit_cost))
+                .ok_or_else(|| Error::Invalid("estimator cost arithmetic overflow".into()))?;
             if cost > max_cost_units {
                 return Ok(SampleEstimate {
                     n,
@@ -891,6 +902,716 @@ pub fn estimate_n(
         n: max_n,
         feasible: false,
         reasons: vec!["n_cap_reached_without_radius_below_min_effect".into()],
+    })
+}
+
+/// A caller's mathematical declaration, not authenticated evidence.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlanningSource<T> {
+    Declared(T),
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanningPremise {
+    DeclaredApplicable,
+    Unavailable,
+}
+
+/// This model never authorizes payment, including a declared positive limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetAuthorizationModel {
+    Unfunded,
+    DeclaredLimitMicros(u64),
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MoneyPlanningInput<'a> {
+    pub currency: PlanningSource<&'a str>,
+    pub pricing_version: PlanningSource<&'a str>,
+    pub per_call_cap_micros: PlanningSource<u64>,
+    pub experiment_total_micros: PlanningSource<u64>,
+    pub payment_subject: PlanningSource<&'a str>,
+    pub authorization: BudgetAuthorizationModel,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UnitPlanningInput {
+    pub kind: FormalStatisticalUnit,
+    pub available_units: PlanningSource<u32>,
+    pub independence: PlanningPremise,
+    pub common_mean: PlanningPremise,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CostPlanningInput {
+    pub fixed_episode_upper_micros: PlanningSource<u64>,
+    pub paired_unit_upper_micros: PlanningSource<u64>,
+    pub largest_call_upper_micros: PlanningSource<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResourcePlanningInput {
+    pub expected_cost_ratio: PlanningSource<f64>,
+    pub expected_p95_ratio: PlanningSource<f64>,
+    pub baseline_cost_positive: PlanningPremise,
+    pub bounded_reconcilable_cost: PlanningPremise,
+    pub anchors_safety: PlanningPremise,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SequentialPlanning<'a> {
+    Disabled,
+    Enabled {
+        plan: &'a crate::sequential::EarlyStopPlan,
+        assumed_complete_path: PlanningSource<&'a [crate::sequential::CompletePairedUnit]>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PlanFeasibilityInput<'a> {
+    pub snapshot: &'a ExperimentPlan,
+    pub effect_hypothesis: f64,
+    pub effect_source: PlanningPremise,
+    pub variance_upper: PlanningSource<f64>,
+    pub max_n: u32,
+    pub alpha_plan: &'a crate::sequential::ResearchFamilyAlphaPlan,
+    pub fixed_claim_id: &'a str,
+    pub attempt_id: &'a str,
+    pub units: UnitPlanningInput,
+    pub money: MoneyPlanningInput<'a>,
+    pub costs: CostPlanningInput,
+    pub resources: ResourcePlanningInput,
+    pub sequential: SequentialPlanning<'a>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FixedFeasibilityProjection {
+    pub assessed_n: u32,
+    pub required_fixed_n: Option<u32>,
+    pub radius: f64,
+    pub mde_infimum: f64,
+    pub hypothesized_lcb: f64,
+    pub statistical_pass: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum SequentialFeasibilityProjection {
+    Disabled,
+    Unavailable,
+    Stopped {
+        first_k: u32,
+        decision: crate::sequential::EarlyStopDecision,
+        bound: crate::sequential::CsPrefix,
+    },
+    ReachesFixed {
+        last_bound: crate::sequential::CsPrefix,
+        checked_prefixes: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanFeasibilityDisposition {
+    NumericallyCompatible,
+    DescriptiveOnly,
+}
+
+/// Stable diagnostic order; none of these variants grants formal authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FeasibilityReason {
+    AssumptionsUnavailable,
+    VarianceUnavailable,
+    IndependentUnitsUnavailable,
+    PlannedUnitsExceeded,
+    RequiredFixedNNotFound,
+    PlannedNTooSmall,
+    CostBoundsUnavailable,
+    BudgetUnavailable,
+    Unfunded,
+    BudgetExceeded,
+    CallCapExceeded,
+    CostArithmeticOverflow,
+    ResourcePremisesUnavailable,
+    ResourceGateFailed,
+    SequentialProjectionUnavailable,
+    SequentialProjectionMisaligned,
+    SequentialProjectionStopped,
+    NoninferiorityEqualityPending,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanFeasibilityAssessment {
+    pub fixed: Option<FixedFeasibilityProjection>,
+    pub sequential: SequentialFeasibilityProjection,
+    pub planned_cost_upper_micros: Option<u64>,
+    pub disposition: PlanFeasibilityDisposition,
+    pub reasons: Vec<FeasibilityReason>,
+}
+
+fn planning_arithmetic_error() -> Error {
+    Error::Invalid("planning integer arithmetic overflow".into())
+}
+
+fn planning_micros(value: u64) -> Result<u64> {
+    if value > i64::MAX as u64 {
+        return Err(Error::Invalid("planning micros exceed i64 domain".into()));
+    }
+    Ok(value)
+}
+
+fn planning_optional_micros(value: PlanningSource<u64>) -> Result<Option<u64>> {
+    match value {
+        PlanningSource::Declared(value) => Ok(Some(planning_micros(value)?)),
+        PlanningSource::Unavailable => Ok(None),
+    }
+}
+
+fn planning_threshold_micros(value: f64) -> Result<u32> {
+    let scaled = value * f64::from(SCORE_MICROS_MAX);
+    if !scaled.is_finite()
+        || scaled <= 0.0
+        || scaled > f64::from(SCORE_MICROS_MAX)
+        || scaled.fract() != 0.0
+    {
+        return Err(Error::Invalid(
+            "planning threshold is not exactly representable in score micros".into(),
+        ));
+    }
+    let micros = scaled as u32;
+    if f64::from(micros) / f64::from(SCORE_MICROS_MAX) != value {
+        return Err(Error::Invalid(
+            "planning threshold does not round-trip through score micros".into(),
+        ));
+    }
+    Ok(micros)
+}
+
+/// Compare a bounded exact rational with a finite f64 without rounding the rational.
+fn planning_rational_cmp_f64(
+    numerator: i128,
+    denominator: i128,
+    value: f64,
+) -> Result<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+
+    if denominator <= 0 || !value.is_finite() || !(-2.0..=2.0).contains(&value) {
+        return Err(Error::Invalid(
+            "unsupported planning rational comparison".into(),
+        ));
+    }
+    if numerator == 0 {
+        return Ok(if value == 0.0 {
+            Ordering::Equal
+        } else if value.is_sign_negative() {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        });
+    }
+    if value == 0.0 {
+        return Ok(numerator.cmp(&0));
+    }
+    let negative = numerator < 0;
+    if negative != value.is_sign_negative() {
+        return Ok(if negative {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    let a = numerator
+        .checked_abs()
+        .and_then(|value| u128::try_from(value).ok())
+        .ok_or_else(planning_arithmetic_error)?;
+    let b = u128::try_from(denominator).map_err(|_| planning_arithmetic_error())?;
+    let bits = value.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as u32;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    let (mantissa, shift) = if exponent == 0 {
+        (u128::from(fraction), 1074)
+    } else {
+        (u128::from((1_u64 << 52) | fraction), 1075 - exponent)
+    };
+    let rhs = b
+        .checked_mul(mantissa)
+        .ok_or_else(planning_arithmetic_error)?;
+    // checked_shl alone would discard high bits. Check the value multiplication too.
+    let lhs = if shift >= 128 {
+        None
+    } else {
+        a.checked_mul(1_u128 << shift)
+    };
+    let ordering = match lhs {
+        Some(lhs) => lhs.cmp(&rhs),
+        // a > 0, and RHS was checked finite: the exact LHS is strictly larger.
+        None => Ordering::Greater,
+    };
+    Ok(if negative {
+        ordering.reverse()
+    } else {
+        ordering
+    })
+}
+
+fn planning_path_report(
+    plan: &crate::sequential::EarlyStopPlan,
+    path: &[crate::sequential::CompletePairedUnit],
+    alpha_i: f64,
+) -> Result<(i128, i128, i128, i128, BernsteinReport)> {
+    if path.len() != plan.n_planned as usize {
+        return Err(Error::Invalid(
+            "planning path must contain the whole frozen plan".into(),
+        ));
+    }
+    let mut sum = 0_i128;
+    let mut squares = 0_i128;
+    let mut rows = Vec::with_capacity(path.len());
+    for (unit, expected_id) in path.iter().zip(&plan.ordered_cluster_ids) {
+        identifier(&unit.cluster_id)?;
+        if &unit.cluster_id != expected_id
+            || unit.baseline_score_micros > SCORE_MICROS_MAX
+            || unit.candidate_score_micros > SCORE_MICROS_MAX
+        {
+            return Err(Error::Invalid(
+                "planning path differs from the frozen complete order".into(),
+            ));
+        }
+        let difference = i64::from(unit.candidate_score_micros)
+            .checked_sub(i64::from(unit.baseline_score_micros))
+            .ok_or_else(planning_arithmetic_error)?;
+        let integer = i128::from(difference);
+        sum = sum
+            .checked_add(integer)
+            .ok_or_else(planning_arithmetic_error)?;
+        squares = integer
+            .checked_mul(integer)
+            .and_then(|square| squares.checked_add(square))
+            .ok_or_else(planning_arithmetic_error)?;
+        rows.push(ClusterObservation {
+            cluster_id: unit.cluster_id.clone(),
+            d: difference as f64 / f64::from(SCORE_MICROS_MAX),
+            weight: 1.0,
+        });
+    }
+    let n = i128::from(plan.n_planned);
+    let scale = i128::from(SCORE_MICROS_MAX);
+    let mean_denominator = n.checked_mul(scale).ok_or_else(planning_arithmetic_error)?;
+    let variance_numerator = n
+        .checked_mul(squares)
+        .and_then(|value| {
+            sum.checked_mul(sum)
+                .and_then(|square| value.checked_sub(square))
+        })
+        .ok_or_else(planning_arithmetic_error)?;
+    if variance_numerator < 0 {
+        return Err(Error::Invalid(
+            "planning path has negative exact variance".into(),
+        ));
+    }
+    let variance_denominator = n
+        .checked_mul(n.checked_sub(1).ok_or_else(planning_arithmetic_error)?)
+        .and_then(|value| value.checked_mul(scale))
+        .and_then(|value| value.checked_mul(scale))
+        .ok_or_else(planning_arithmetic_error)?;
+    let report = empirical_bernstein(&rows, alpha_i)?;
+    Ok((
+        sum,
+        mean_denominator,
+        variance_numerator,
+        variance_denominator,
+        report,
+    ))
+}
+
+fn planning_sequential_projection(
+    plan: &crate::sequential::EarlyStopPlan,
+    alpha_plan: &crate::sequential::ResearchFamilyAlphaPlan,
+    path: &[crate::sequential::CompletePairedUnit],
+) -> Result<SequentialFeasibilityProjection> {
+    use crate::sequential::{EarlyStopDecision, SequentialRejectOnly};
+
+    let mut sequence = SequentialRejectOnly::open(plan.clone(), alpha_plan)?;
+    for (index, unit) in path.iter().enumerate() {
+        let decision = sequence.record_complete_unit(unit.clone())?;
+        let k = u32::try_from(index + 1).map_err(|_| planning_arithmetic_error())?;
+        let bound = sequence.boundary()?.ok_or_else(|| {
+            Error::Invalid("planning complete prefix has no confidence-sequence boundary".into())
+        })?;
+        if sequence.k() != k || bound.k != k || sequence.decision()? != decision {
+            return Err(Error::Invalid(
+                "planning prefix decision/boundary mismatch".into(),
+            ));
+        }
+        if decision.is_early_stop() {
+            return Ok(SequentialFeasibilityProjection::Stopped {
+                first_k: k,
+                decision,
+                bound,
+            });
+        }
+        match decision {
+            EarlyStopDecision::FinalFixedSample if k == plan.n_planned => {
+                return Ok(SequentialFeasibilityProjection::ReachesFixed {
+                    last_bound: bound,
+                    checked_prefixes: k,
+                });
+            }
+            EarlyStopDecision::Continue if k < plan.n_planned => {}
+            _ => {
+                return Err(Error::Invalid(
+                    "planning prefix reached an impossible state".into(),
+                ));
+            }
+        }
+    }
+    Err(Error::Invalid(
+        "planning path did not reach a terminal fixed-sample state".into(),
+    ))
+}
+
+/// Assess a frozen mathematical model without issuing evidence, tickets, or money authority.
+pub fn assess_plan_feasibility_v1(
+    input: &PlanFeasibilityInput<'_>,
+) -> Result<PlanFeasibilityAssessment> {
+    use crate::sequential::FormalClaimKind;
+    use FeasibilityReason as Reason;
+    use PlanningSource::{Declared, Unavailable};
+
+    let snapshot = input.snapshot;
+    snapshot.validate()?;
+    if snapshot.stats_version != STATS_BERNSTEIN_V2 || snapshot.candidate_digest.is_some() {
+        return Err(Error::Invalid(
+            "planning requires an unbound Bernstein-v2 snapshot".into(),
+        ));
+    }
+    if !input.effect_hypothesis.is_finite()
+        || !(-1.0..=1.0).contains(&input.effect_hypothesis)
+        || snapshot.min_effect <= 0.0
+        || -snapshot.noninferior_bound <= 0.0
+        || !(2..=100_000).contains(&input.max_n)
+    {
+        return Err(Error::Invalid(
+            "unsupported planning effect, threshold, or search cap".into(),
+        ));
+    }
+    let n = u32::try_from(snapshot.n_planned).map_err(|_| planning_arithmetic_error())?;
+    if n > input.max_n {
+        return Err(Error::Invalid(
+            "planned n exceeds planning search cap".into(),
+        ));
+    }
+    if let Declared(value) = input.variance_upper
+        && (!value.is_finite() || !(0.0..=2.0).contains(&value))
+    {
+        return Err(Error::Invalid(
+            "planning variance upper bound must be in [0,2]".into(),
+        ));
+    }
+    if let Declared(value) = input.units.available_units
+        && value > 100_000
+    {
+        return Err(Error::Invalid(
+            "available planning units exceed the supported domain".into(),
+        ));
+    }
+    match input.units.kind {
+        FormalStatisticalUnit::IndependentTaskCluster
+        | FormalStatisticalUnit::IndependentCompleteStratifiedBlock => {}
+    }
+    identifier(input.fixed_claim_id)?;
+    identifier(input.attempt_id)?;
+    input.alpha_plan.validate()?;
+    let allocation = input.alpha_plan.allocation(
+        input.fixed_claim_id,
+        input.attempt_id,
+        FormalClaimKind::FixedSampleGain,
+    )?;
+    let (_, alpha_units) = parse_decimal(allocation)?;
+    let alpha_i = alpha_units as f64 / 100_000_000.0;
+    if !(0.0001..0.5).contains(&alpha_i) {
+        return Err(Error::Invalid("planning fixed alpha_i out of range".into()));
+    }
+    let (_, family_units) = parse_decimal(&input.alpha_plan.alpha_total)?;
+    if (family_units as f64 / 100_000_000.0 - snapshot.alpha_total).abs() > 1e-15 {
+        return Err(Error::Invalid(
+            "planning family total differs from snapshot alpha_total".into(),
+        ));
+    }
+
+    let mut reasons = Vec::new();
+    if input.effect_source == PlanningPremise::Unavailable {
+        reasons.push(Reason::AssumptionsUnavailable);
+    }
+    if input.units.independence == PlanningPremise::Unavailable
+        || input.units.common_mean == PlanningPremise::Unavailable
+        || matches!(input.units.available_units, Unavailable)
+    {
+        reasons.push(Reason::IndependentUnitsUnavailable);
+    }
+    if let Declared(available) = input.units.available_units
+        && n > available
+    {
+        reasons.push(Reason::PlannedUnitsExceeded);
+    }
+
+    let threshold = match snapshot.profile {
+        ProfileKind::QualityGain => snapshot.min_effect,
+        ProfileKind::NoninferiorSavings => snapshot.noninferior_bound,
+    };
+    let fixed = match input.variance_upper {
+        Unavailable => {
+            reasons.push(Reason::VarianceUnavailable);
+            None
+        }
+        Declared(variance) => {
+            let radius = paired_bernstein_radius_v2(snapshot.n_planned, variance, alpha_i)?;
+            let hypothesized_lcb = (input.effect_hypothesis - radius).max(-1.0);
+            let statistical_pass = hypothesized_lcb > threshold;
+            let mut required_fixed_n = None;
+            for assessed_n in 2..=input.max_n {
+                let candidate_radius =
+                    paired_bernstein_radius_v2(assessed_n as usize, variance, alpha_i)?;
+                if (input.effect_hypothesis - candidate_radius).max(-1.0) > threshold {
+                    required_fixed_n = Some(assessed_n);
+                    break;
+                }
+            }
+            if required_fixed_n.is_none() {
+                reasons.push(Reason::RequiredFixedNNotFound);
+            }
+            if !statistical_pass {
+                reasons.push(Reason::PlannedNTooSmall);
+            }
+            if snapshot.profile == ProfileKind::NoninferiorSavings && hypothesized_lcb == threshold
+            {
+                reasons.push(Reason::NoninferiorityEqualityPending);
+            }
+            Some(FixedFeasibilityProjection {
+                assessed_n: n,
+                required_fixed_n,
+                radius,
+                mde_infimum: threshold + radius,
+                hypothesized_lcb,
+                statistical_pass,
+            })
+        }
+    };
+
+    for text in [
+        input.money.currency,
+        input.money.pricing_version,
+        input.money.payment_subject,
+    ] {
+        match text {
+            Declared(value) => identifier(value)?,
+            Unavailable => reasons.push(Reason::BudgetUnavailable),
+        }
+    }
+    if let Declared(value) = input.money.currency
+        && value != snapshot.monetary_budget.currency
+    {
+        return Err(Error::Invalid(
+            "planning currency differs from snapshot".into(),
+        ));
+    }
+    if let Declared(value) = input.money.pricing_version
+        && value != snapshot.monetary_budget.pricing_version
+    {
+        return Err(Error::Invalid(
+            "planning pricing version differs from snapshot".into(),
+        ));
+    }
+    let (negative, amount_units) = parse_decimal(&snapshot.monetary_budget.amount)?;
+    if negative || amount_units % 100 != 0 {
+        return Err(Error::Invalid(
+            "planning amount requires nonnegative exact micros".into(),
+        ));
+    }
+    let snapshot_total = u64::try_from(amount_units / 100)
+        .map_err(|_| Error::Invalid("planning amount exceeds micros domain".into()))?;
+    planning_micros(snapshot_total)?;
+    let per_call = planning_optional_micros(input.money.per_call_cap_micros)?;
+    let total = planning_optional_micros(input.money.experiment_total_micros)?;
+    let authorization = match input.money.authorization {
+        BudgetAuthorizationModel::DeclaredLimitMicros(value) => Some(planning_micros(value)?),
+        BudgetAuthorizationModel::Unfunded => {
+            reasons.push(Reason::Unfunded);
+            None
+        }
+        BudgetAuthorizationModel::Unavailable => {
+            reasons.push(Reason::BudgetUnavailable);
+            None
+        }
+    };
+    if per_call.is_none() || total.is_none() {
+        reasons.push(Reason::BudgetUnavailable);
+    }
+    if let Some(total) = total {
+        if total != snapshot_total {
+            return Err(Error::Invalid(
+                "planning total differs from snapshot amount".into(),
+            ));
+        }
+        if total == 0 {
+            reasons.push(Reason::Unfunded);
+        }
+        if let Some(authorization) = authorization
+            && total != authorization
+        {
+            return Err(Error::Invalid(
+                "planning authorization and experiment total differ".into(),
+            ));
+        }
+    }
+    let fixed_cost = planning_optional_micros(input.costs.fixed_episode_upper_micros)?;
+    let paired_cost = planning_optional_micros(input.costs.paired_unit_upper_micros)?;
+    let largest_call = planning_optional_micros(input.costs.largest_call_upper_micros)?;
+    if fixed_cost.is_none() || paired_cost.is_none() || largest_call.is_none() {
+        reasons.push(Reason::CostBoundsUnavailable);
+    }
+    let planned_cost_upper_micros = match (fixed_cost, paired_cost) {
+        (Some(fixed_cost), Some(paired_cost)) => {
+            match u64::from(n)
+                .checked_mul(paired_cost)
+                .and_then(|cost| fixed_cost.checked_add(cost))
+                .filter(|cost| *cost <= i64::MAX as u64)
+            {
+                Some(cost) => Some(cost),
+                None => {
+                    reasons.push(Reason::CostArithmeticOverflow);
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    if let Some(cost) = planned_cost_upper_micros
+        && (total.is_some_and(|total| cost > total)
+            || authorization.is_some_and(|limit| cost > limit))
+    {
+        reasons.push(Reason::BudgetExceeded);
+    }
+    if let (Some(largest_call), Some(per_call)) = (largest_call, per_call)
+        && largest_call > per_call
+    {
+        reasons.push(Reason::CallCapExceeded);
+    }
+
+    if input.resources.baseline_cost_positive == PlanningPremise::Unavailable
+        || input.resources.bounded_reconcilable_cost == PlanningPremise::Unavailable
+        || input.resources.anchors_safety == PlanningPremise::Unavailable
+        || matches!(input.resources.expected_cost_ratio, Unavailable)
+        || matches!(input.resources.expected_p95_ratio, Unavailable)
+    {
+        reasons.push(Reason::ResourcePremisesUnavailable);
+    }
+    for value in [
+        input.resources.expected_cost_ratio,
+        input.resources.expected_p95_ratio,
+    ] {
+        if let Declared(value) = value
+            && (!value.is_finite() || value < 0.0)
+        {
+            return Err(Error::Invalid(
+                "planning resource ratios must be finite and nonnegative".into(),
+            ));
+        }
+    }
+    if let Declared(p95) = input.resources.expected_p95_ratio
+        && p95 > snapshot.max_p95_latency_ratio
+    {
+        reasons.push(Reason::ResourceGateFailed);
+    }
+    if let Declared(cost_ratio) = input.resources.expected_cost_ratio {
+        let failed = cost_ratio == 0.0
+            || match snapshot.profile {
+                ProfileKind::QualityGain => cost_ratio > snapshot.max_cost_ratio,
+                ProfileKind::NoninferiorSavings => {
+                    1.0 - cost_ratio + 1e-12 < snapshot.savings_ratio
+                }
+            };
+        if failed {
+            reasons.push(Reason::ResourceGateFailed);
+        }
+    }
+
+    let sequential = match input.sequential {
+        SequentialPlanning::Disabled => SequentialFeasibilityProjection::Disabled,
+        SequentialPlanning::Enabled {
+            plan,
+            assumed_complete_path,
+        } => {
+            plan.validate_against(input.alpha_plan)?;
+            if plan.v1_plan_snapshot_digest != snapshot.digest()?
+                || plan.attempt_id != input.attempt_id
+                || plan.n_planned != n
+                || plan.profile != snapshot.profile
+                || plan.min_gain_micros != planning_threshold_micros(snapshot.min_effect)?
+                || plan.noninferiority_margin_micros
+                    != planning_threshold_micros(-snapshot.noninferior_bound)?
+            {
+                return Err(Error::Invalid(
+                    "planning sequence differs from the supplied contracts".into(),
+                ));
+            }
+            match assumed_complete_path {
+                Unavailable => {
+                    reasons.push(Reason::SequentialProjectionUnavailable);
+                    SequentialFeasibilityProjection::Unavailable
+                }
+                Declared(path) => {
+                    let (sum, mean_denominator, variance_numerator, variance_denominator, report) =
+                        planning_path_report(plan, path, alpha_i)?;
+                    let valid_report = report.verdict != Verdict::Invalid
+                        && [report.mean, report.variance, report.radius, report.lcb]
+                            .iter()
+                            .all(|value| value.is_finite());
+                    let mut misaligned = !valid_report
+                        || planning_rational_cmp_f64(
+                            sum,
+                            mean_denominator,
+                            input.effect_hypothesis,
+                        )?
+                        .is_lt()
+                        || input.effect_hypothesis > report.mean;
+                    if let Declared(variance) = input.variance_upper {
+                        misaligned |= planning_rational_cmp_f64(
+                            variance_numerator,
+                            variance_denominator,
+                            variance,
+                        )?
+                        .is_gt()
+                            || variance < report.variance;
+                    }
+                    if let Some(fixed) = &fixed {
+                        misaligned |=
+                            fixed.hypothesized_lcb > report.lcb || fixed.radius < report.radius;
+                    }
+                    if misaligned {
+                        reasons.push(Reason::SequentialProjectionMisaligned);
+                    }
+                    let projection = planning_sequential_projection(plan, input.alpha_plan, path)?;
+                    if matches!(projection, SequentialFeasibilityProjection::Stopped { .. }) {
+                        reasons.push(Reason::SequentialProjectionStopped);
+                    }
+                    projection
+                }
+            }
+        }
+    };
+    reasons.sort_unstable();
+    reasons.dedup();
+    Ok(PlanFeasibilityAssessment {
+        fixed,
+        sequential,
+        planned_cost_upper_micros,
+        disposition: if reasons.is_empty() {
+            PlanFeasibilityDisposition::NumericallyCompatible
+        } else {
+            PlanFeasibilityDisposition::DescriptiveOnly
+        },
+        reasons,
     })
 }
 
@@ -1661,5 +2382,45 @@ mod tests {
                 .iter()
                 .any(|r| r.contains("budget") || r.contains("n_cap"))
         );
+    }
+
+    #[test]
+    fn planning_exact_rationals_keep_sign_subnormals_and_checked_value_overflow() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
+        assert_eq!(planning_rational_cmp_f64(0, 1, -0.0).unwrap(), Equal);
+        assert_eq!(planning_rational_cmp_f64(1, 8, 0.125).unwrap(), Equal);
+        assert_eq!(planning_rational_cmp_f64(-1, 8, -0.125).unwrap(), Equal);
+        assert_eq!(planning_rational_cmp_f64(1, 10, 0.1).unwrap(), Less);
+        assert_eq!(planning_rational_cmp_f64(-1, 10, -0.1).unwrap(), Greater);
+        assert_eq!(
+            planning_rational_cmp_f64(0, 1, f64::from_bits(1)).unwrap(),
+            Less
+        );
+        assert_eq!(
+            planning_rational_cmp_f64(0, 1, -f64::from_bits(1)).unwrap(),
+            Greater
+        );
+        assert_eq!(
+            planning_rational_cmp_f64(1, 10_i128.pow(22), f64::from_bits(1)).unwrap(),
+            Greater
+        );
+        assert_eq!(
+            planning_rational_cmp_f64(-1, 10_i128.pow(22), -f64::from_bits(1)).unwrap(),
+            Less
+        );
+        assert_eq!(
+            planning_rational_cmp_f64(10_i128.pow(22), 1, 1.0).unwrap(),
+            Greater
+        );
+        assert_eq!(
+            planning_rational_cmp_f64(10_i128.pow(22), 10_i128.pow(22), 1.0).unwrap(),
+            Equal
+        );
+        assert_eq!(planning_rational_cmp_f64(2, 1, 2.0).unwrap(), Equal);
+        assert!(planning_rational_cmp_f64(1, 0, 0.0).is_err());
+        assert!(planning_rational_cmp_f64(i128::MIN, 1, -1.0).is_err());
+        assert!(planning_rational_cmp_f64(1, 1, f64::INFINITY).is_err());
+        assert!(planning_rational_cmp_f64(1, i128::MAX, 1.0).is_err());
     }
 }
