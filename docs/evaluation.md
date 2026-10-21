@@ -177,3 +177,68 @@ Report task quality/success rate and failure classes, per-family capability rete
 Report marginal cost, then cumulative cost and amortization assumptions. Net savings for N tasks is `N * (old task cost - new task cost) - additional one-time cost`; calculate break-even only when the difference is positive and supported. Fewer calls do not imply the same percentage of monetary savings. Register currency, pricing version, per-call cap, per-experiment total, and payer; the default monetary budget is zero and a model's price estimate grants no authority.
 
 Budget exhaustion, unsupported independence, insufficient gain evidence, critical regression, environmental drift, or inadequate world support may stop work and retain the incumbent. Continued non-update is a valid result. Preserve bills, pilot observations, exposure, attempted/rejected candidates, and negative/zero results; do not keep trying until chance yields a positive example. Real task/oracle registration, paid execution, formal effect, and deployment still require their respective evidence and authorization; this document and software fixtures do not supply them.
+
+
+## Pure planning feasibility (v4.3 implementation scope)
+
+The non-persistent `assess_plan_feasibility_v1` API models a declared plan before
+candidate binding. Its `PlanningSource::Declared` and `DeclaredApplicable`
+values are caller assertions, not authenticated E01 evidence. A
+`NumericallyCompatible` result grants no formal qualification, ticket, payment,
+power guarantee, release, or runtime change. `Unavailable` inputs remain explicit
+and produce `DescriptiveOnly`; no missing source or money becomes zero.
+
+The fixed projection uses the same empirical-Bernstein-v2 radius and operation
+order as final fixed-sample evaluation, with a declared conservative variance
+upper bound. It evaluates `max(effect_hypothesis - radius, -1)` directly against
+the frozen gain or negative noninferiority threshold. `mde_infimum` is the open
+boundary `threshold + radius`, not a replacement approval comparison.
+`required_fixed_n` is the first supported fixed n satisfying that strict
+comparison within the explicit search cap. The whole planned n must fit the cap,
+available independent complete units, and full declared cost bounds.
+
+The existing final `decide` accepts noninferiority equality. The new planner
+conservatively reports `NoninferiorityEqualityPending` at exact equality and
+requires strict crossing for numerical compatibility. This extra planning
+restriction awaits secondary acceptance adjudication; it does not change any
+old decision, report, threshold, digest, or wire format.
+
+Enabled sequence planning binds the existing early-stop plan to the snapshot,
+family/attempt allocation, n, profile, exact score-micro thresholds, and complete
+frozen unit order. The full hypothetical path is validated first, including any
+suffix beyond a first rejection. Exact checked integer moments define its
+nominal mean and unbiased variance. The declared mean lower bound and variance
+upper bound must conservatively cover both that exact rational model and one
+original ordered equal-weight fixed report. No epsilon repairs optimistic input.
+
+Every complete prefix then uses `SequentialRejectOnly` unchanged. A first
+actual early rejection produces `Stopped`; `FinalFixedSample` separately
+produces `ReachesFixed` only at the complete planned n. The CS LCB never approves
+a plan. An unavailable path cannot be silently replaced with disabled sequence
+planning. A favorable suffix cannot reopen a stopped projection.
+
+Critical-anchor regression remains an existing external event in the sequential
+state machine. The pure path API has no critical-event input and does not invent
+one from a declared path. An unavailable anchor-safety premise is descriptive.
+This model supplies no real critical-anchor qualification. Whether a declared
+nominal path supports stronger probabilistic or random-prefix claims remains
+outside this interface and awaits the registered evidence and secondary review.
+
+All five monetary declarations are explicit: currency, pricing version,
+per-call cap, experiment total, and payer. Monetary amounts are exact integer
+micros in the declared currency/version; the authorization limit is only a
+model declaration. Zero total or an unfunded model stays descriptive. Complete
+planning cost is the fixed episode upper bound plus planned n times the paired
+unit upper bound, using checked arithmetic. The paired bound includes both arms
+and every stage within the statistical unit; fixed costs include all remaining
+episode stages. The largest call must fit the per-call cap. Costs, resource
+ratios, independence, common mean, and anchor safety remain premises requiring
+separate real evidence.
+
+The legacy six-argument `estimate_n` retains its radius-only meaning, old valid
+input domain, result shape, and budget diagnostics. It now rejects invalid fixed
+alpha and checked cost overflow safely. Its feasible result is not the new plan
+assessment or formal authority. Existing plan/report schemas, default-field
+table, golden digests, fixed decisions, and sequential stopping order remain
+unchanged. E01 registration and formal ticket consumers require their separate
+versioned source and evidence contracts.
