@@ -1689,6 +1689,20 @@ impl IndependentEvaluationControl {
                 "execution receipt id reused with different evidence".into(),
             ));
         }
+        // Preserve the existing terminal no-slot refusal before the new call gate.
+        // Same-ID full-content reconnects have already returned above.
+        if is_stopping(latest.lifecycle) {
+            validate_started_slot(
+                latest.target(&request.target_id)?,
+                request.side,
+                &receipt.budget_call_id,
+                &receipt.request_digest,
+            )?;
+        }
+        if latest.id != request.ticket_id {
+            return Err(execution_receipt_history_conflict());
+        }
+        require_unreceipted_execution_call(&mut session, ctx, &latest, &receipt).await?;
         if let Some(existing_output) =
             get_record::<ExecutionOutputArtifact>(&mut session, ctx, OUTPUT_KIND, &output.id)
                 .await?
@@ -5110,6 +5124,392 @@ async fn bind_stored_facts_in_session(
     };
     binding.validate()?;
     Ok(Some(binding))
+}
+
+/// Probe all family-marker occurrences; unrelated bodies stay IgnoredAny.
+/// A redacted receipt is corrupt preserved accounting history, never absence.
+fn is_execution_receipt_row(row: &evo_storage::ObjectRowSnapshot) -> Result<bool> {
+    use serde::de::{DeserializeSeed, IgnoredAny};
+    const DIRECT_CLAIM: u8 = 1;
+    const OUTER_REDACTED: u8 = 2;
+    const METADATA_RECEIPT: u8 = 4;
+    #[derive(Clone, Copy)]
+    enum Probe<'a> {
+        Envelope(&'a str),
+        Payload(&'a str),
+        Kind,
+        Schema,
+        LogicalId(&'a str),
+        OuterSchema,
+        Metadata,
+        MetadataKind,
+    }
+    impl<'de> DeserializeSeed<'de> for Probe<'_> {
+        type Value = u8;
+        fn deserialize<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<u8, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Probe<'_> {
+        type Value = u8;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an object family marker")
+        }
+        fn visit_str<E: DeError>(self, value: &str) -> std::result::Result<u8, E> {
+            Ok(match self {
+                Self::Kind => u8::from(value == EXECUTION_RECEIPT_KIND) * DIRECT_CLAIM,
+                Self::Schema => u8::from(value == "rsia.execution_receipt.v2") * DIRECT_CLAIM,
+                Self::LogicalId(physical) => {
+                    u8::from(
+                        storage_id(EXECUTION_RECEIPT_KIND, value).is_ok_and(|id| id == physical),
+                    ) * DIRECT_CLAIM
+                }
+                Self::OuterSchema => u8::from(value == "rsia.redacted.v1") * OUTER_REDACTED,
+                Self::MetadataKind => u8::from(value == EXECUTION_RECEIPT_KIND) * METADATA_RECEIPT,
+                _ => 0,
+            })
+        }
+        fn visit_bool<E: DeError>(self, _: bool) -> std::result::Result<u8, E> {
+            Ok(0)
+        }
+        fn visit_i64<E: DeError>(self, _: i64) -> std::result::Result<u8, E> {
+            Ok(0)
+        }
+        fn visit_u64<E: DeError>(self, _: u64) -> std::result::Result<u8, E> {
+            Ok(0)
+        }
+        fn visit_f64<E: DeError>(self, _: f64) -> std::result::Result<u8, E> {
+            Ok(0)
+        }
+        fn visit_unit<E: DeError>(self) -> std::result::Result<u8, E> {
+            Ok(0)
+        }
+        fn visit_none<E: DeError>(self) -> std::result::Result<u8, E> {
+            Ok(0)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> std::result::Result<u8, A::Error> {
+            while sequence.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(0)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut fields: A) -> std::result::Result<u8, A::Error> {
+            let mut claims = 0_u8;
+            while let Some(key) = fields.next_key::<String>()? {
+                let next = match (self, key.as_str()) {
+                    (Self::Envelope(_), "record_kind") => Some(Self::Kind),
+                    (Self::Envelope(id), "payload") => Some(Self::Payload(id)),
+                    (Self::Envelope(_), "schema_version") => Some(Self::OuterSchema),
+                    (Self::Envelope(_), "metadata") => Some(Self::Metadata),
+                    (Self::Payload(_), "schema_version") => Some(Self::Schema),
+                    (Self::Payload(id), "receipt_id") => Some(Self::LogicalId(id)),
+                    (Self::Metadata, "record_kind") => Some(Self::MetadataKind),
+                    _ => None,
+                };
+                if let Some(next) = next {
+                    claims |= fields.next_value_seed(next)?;
+                } else {
+                    fields.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(claims)
+        }
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(&row.body);
+    let claims = Probe::Envelope(&row.id)
+        .deserialize(&mut deserializer)
+        .map_err(|_| execution_receipt_history_conflict())?;
+    deserializer
+        .end()
+        .map_err(|_| execution_receipt_history_conflict())?;
+    Ok(claims & DIRECT_CLAIM != 0
+        || claims & (OUTER_REDACTED | METADATA_RECEIPT) == (OUTER_REDACTED | METADATA_RECEIPT))
+}
+
+fn execution_receipt_history_conflict() -> Error {
+    Error::Conflict("stored execution receipt has an invalid historical binding".into())
+}
+
+fn historical_typed_payload<T: DeserializeOwned>(
+    row: &evo_storage::ObjectRowSnapshot,
+    kind: &str,
+    id: &str,
+) -> Result<T> {
+    let body = parse_strict_json(&row.body)
+        .map_err(|_| execution_receipt_history_conflict())?
+        .0;
+    let envelope: TypedArtifactEnvelope<T> =
+        serde_json::from_value(body).map_err(|_| execution_receipt_history_conflict())?;
+    if row.id != storage_id(kind, id)?
+        || envelope.id != row.id
+        || envelope.schema_version != ENVELOPE_SCHEMA
+        || envelope.record_kind != kind
+    {
+        return Err(execution_receipt_history_conflict());
+    }
+    Ok(envelope.payload)
+}
+
+fn validate_execution_history_binding(
+    ticket: &EvaluationTicketV2,
+    receipt: &ExecutionReceiptV2,
+) -> Result<()> {
+    let target = ticket
+        .target(&receipt.target_id)
+        .map_err(|_| execution_receipt_history_conflict())?;
+    let bundle = match receipt.side {
+        ExecutionSide::Candidate => &ticket.candidate_bundle_digest,
+        ExecutionSide::Baseline => &ticket.baseline_bundle_digest,
+    };
+    if ticket.id != receipt.ticket_id
+        || ticket.executor_actor != receipt.executor_actor
+        || receipt.bundle_digest != *bundle
+        || receipt.environment_digest != ticket.environment_digest
+        || request_digest(
+            ticket,
+            target,
+            receipt.side,
+            bundle,
+            &ticket.environment_digest,
+        )? != receipt.request_digest
+    {
+        return Err(execution_receipt_history_conflict());
+    }
+    Ok(())
+}
+
+fn execution_call_matches(
+    ctx: &Context,
+    ticket: &EvaluationTicketV2,
+    receipt: &ExecutionReceiptV2,
+    call: &BudgetCallRecord,
+) -> bool {
+    call.namespace == ctx.namespace()
+        && call.call_id == receipt.budget_call_id
+        && call.dispatch_group_id == ticket.id
+        && call.stage == BudgetStage::TaskExecution
+        && call.actual_input_digest == receipt.request_digest
+        && call.dispatch_id.is_some()
+        && call
+            .output_digest
+            .as_deref()
+            .is_none_or(|digest| digest == receipt.output_digest)
+        && matches!(
+            call.state,
+            BudgetCallState::Dispatched | BudgetCallState::Uncertain | BudgetCallState::Finalized
+        )
+}
+
+/// This is an accounting-history read, not a fresh consumption of a revoked
+/// control or output. Cleanup preserves the ticket, receipt and call rows.
+async fn execution_receipt_billing_scope(
+    session: &mut Session,
+    ctx: &Context,
+    receipt: &ExecutionReceiptV2,
+) -> Result<String> {
+    let row = session
+        .object_row(
+            ctx,
+            "artifact",
+            &storage_id(TICKET_KIND, &receipt.ticket_id)?,
+        )
+        .await?
+        .ok_or_else(execution_receipt_history_conflict)?;
+    let ticket: EvaluationTicketV2 =
+        historical_typed_payload(&row, TICKET_KIND, &receipt.ticket_id)?;
+    ticket
+        .validate()
+        .map_err(|_| execution_receipt_history_conflict())?;
+    if row.owner != ticket.evaluator_actor {
+        return Err(execution_receipt_history_conflict());
+    }
+    validate_execution_history_binding(&ticket, receipt)?;
+    let control_id = storage_id(CONTROL_KIND, &ticket.registration_id)?;
+    let control_row = session
+        .object_row(ctx, "artifact", &control_id)
+        .await?
+        .ok_or_else(execution_receipt_history_conflict)?;
+    let body = parse_strict_json(&control_row.body)
+        .map_err(|_| execution_receipt_history_conflict())?
+        .0;
+    if control_row.owner != ticket.evaluator_actor {
+        return Err(execution_receipt_history_conflict());
+    }
+    let scopes = if body["schema_version"] == "rsia.redacted.v1" {
+        // Only the existing cleanup wire is accepted. Its lost prompt content
+        // is never reconstructed from a name or an opaque digest.
+        let fields = body
+            .as_object()
+            .ok_or_else(execution_receipt_history_conflict)?;
+        if fields.len() != 7
+            || body["id"] != control_id
+            || body["state"] != "source_revoked"
+            || body["original_kind"] != "artifact"
+            || body["original_schema"] != ENVELOPE_SCHEMA
+            || body["metadata"]["record_kind"] != CONTROL_KIND
+            || body["original_digest"]
+                .as_str()
+                .is_none_or(|value| digest(value, "original_digest").is_err())
+        {
+            return Err(execution_receipt_history_conflict());
+        }
+        session
+            .budget_call_scopes_for_group(ctx, &ticket.id)
+            .await?
+    } else {
+        let control: RegisteredEvaluationControl =
+            historical_typed_payload(&control_row, CONTROL_KIND, &ticket.registration_id)?;
+        control
+            .validate()
+            .map_err(|_| execution_receipt_history_conflict())?;
+        if control.id != ticket.registration_id
+            || fingerprint(&control)? != ticket.registration_digest
+            || control.executor_actor != ticket.executor_actor
+        {
+            return Err(execution_receipt_history_conflict());
+        }
+        vec![control.billing_scope]
+    };
+    let mut matched = None;
+    for scope in scopes {
+        let Some(call) = session
+            .budget_call(ctx, &scope, &receipt.budget_call_id)
+            .await?
+        else {
+            continue;
+        };
+        if execution_call_matches(ctx, &ticket, receipt, &call) && matched.replace(scope).is_some()
+        {
+            return Err(execution_receipt_history_conflict());
+        }
+    }
+    matched.ok_or_else(execution_receipt_history_conflict)
+}
+
+/// Scan to EOF in the very transaction that will store the new output. A
+/// stopped ticket's late list is not complete: Invalid receipts are audit-only.
+async fn require_unreceipted_execution_call(
+    session: &mut Session,
+    ctx: &Context,
+    ticket: &EvaluationTicketV2,
+    receipt: &ExecutionReceiptV2,
+) -> Result<()> {
+    validate_execution_history_binding(ticket, receipt)?;
+    let ticket_row = session
+        .object_row(ctx, "artifact", &storage_id(TICKET_KIND, &ticket.id)?)
+        .await?
+        .ok_or_else(execution_receipt_history_conflict)?;
+    let stored_ticket: EvaluationTicketV2 =
+        historical_typed_payload(&ticket_row, TICKET_KIND, &ticket.id)?;
+    if ticket_row.owner != ticket.evaluator_actor
+        || stored_ticket.id != ticket.id
+        || fingerprint(&stored_ticket)? != fingerprint(ticket)?
+    {
+        return Err(execution_receipt_history_conflict());
+    }
+    // Keep the original current-content witness gate, then decode the same
+    // physical row strictly and check its SQL owner and logical payload ID.
+    let _: RegisteredEvaluationControl =
+        need_record(session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
+    let control_row = session
+        .object_row(
+            ctx,
+            "artifact",
+            &storage_id(CONTROL_KIND, &ticket.registration_id)?,
+        )
+        .await?
+        .ok_or_else(execution_receipt_history_conflict)?;
+    let control: RegisteredEvaluationControl =
+        historical_typed_payload(&control_row, CONTROL_KIND, &ticket.registration_id)?;
+    if control_row.owner != ticket.evaluator_actor
+        || control.id != ticket.registration_id
+        || fingerprint(&control)? != ticket.registration_digest
+    {
+        return Err(execution_receipt_history_conflict());
+    }
+    let call = session
+        .budget_call(ctx, &control.billing_scope, &receipt.budget_call_id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if ticket.executor_actor != ctx.actor() || !execution_call_matches(ctx, ticket, receipt, &call)
+    {
+        return Err(Error::Conflict(
+            "execution receipt lacks the matching dispatched budget call".into(),
+        ));
+    }
+    let mut cursor = None;
+    loop {
+        let rows = session.object_rows_page(ctx, "artifact", cursor).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for row in &rows {
+            if !is_execution_receipt_row(row)? {
+                continue;
+            }
+            let body = parse_strict_json(&row.body)
+                .map_err(|_| execution_receipt_history_conflict())?
+                .0;
+            let id = body["payload"]["receipt_id"]
+                .as_str()
+                .ok_or_else(execution_receipt_history_conflict)?;
+            let previous: ExecutionReceiptV2 =
+                historical_typed_payload(row, EXECUTION_RECEIPT_KIND, id)?;
+            for id in [
+                &previous.receipt_id,
+                &previous.ticket_id,
+                &previous.target_id,
+                &previous.output_artifact_id,
+                &previous.budget_call_id,
+                &previous.executor_actor,
+            ] {
+                identifier(id).map_err(|_| execution_receipt_history_conflict())?;
+            }
+            for value in [
+                &previous.request_digest,
+                &previous.bundle_digest,
+                &previous.environment_digest,
+                &previous.output_digest,
+            ] {
+                digest(value, "historical execution digest")
+                    .map_err(|_| execution_receipt_history_conflict())?;
+            }
+            if previous.schema_version != "rsia.execution_receipt.v2"
+                || row.owner != previous.executor_actor
+                || previous.issued_at_unix_seconds < 0
+            {
+                return Err(execution_receipt_history_conflict());
+            }
+            // Qualify every claimed receipt, even when its call string differs:
+            // a corrupted history must not hide an already used call by renaming it.
+            let previous_scope = if previous.ticket_id == ticket.id {
+                // The current physical ticket/control were strictly checked above.
+                validate_execution_history_binding(ticket, &previous)?;
+                let previous_call = session
+                    .budget_call(ctx, &control.billing_scope, &previous.budget_call_id)
+                    .await?
+                    .ok_or_else(execution_receipt_history_conflict)?;
+                if !execution_call_matches(ctx, ticket, &previous, &previous_call) {
+                    return Err(execution_receipt_history_conflict());
+                }
+                control.billing_scope.clone()
+            } else {
+                execution_receipt_billing_scope(session, ctx, &previous).await?
+            };
+            if previous.budget_call_id == receipt.budget_call_id
+                && previous_scope == control.billing_scope
+            {
+                return Err(Error::Conflict(
+                    "budget call already has an execution receipt".into(),
+                ));
+            }
+        }
+        cursor = rows.last().map(|row| row.rowid);
+    }
 }
 
 async fn control_billing_scope(
