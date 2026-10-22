@@ -108,6 +108,18 @@ pub struct Store {
     root: PathBuf,
     blob_lock: Arc<RwLock<()>>,
 }
+
+/// A physical object row from the caller's current transaction. This is a
+/// read-only snapshot, not a new persistent record or an authority token.
+#[derive(Debug, Clone)]
+pub struct ObjectRowSnapshot {
+    pub rowid: i64,
+    pub id: String,
+    pub owner: String,
+    /// Original JSON bytes, so consumers can reject duplicate keys before decoding.
+    pub body: String,
+}
+
 pub struct Session {
     tx: Transaction<'static, Sqlite>,
 }
@@ -2317,6 +2329,68 @@ impl Session {
             .map(|r| serde_json::from_str(&r).map_err(internal))
             .collect()
     }
+
+    /// Read a bounded page without truncating the collection. Keep this Session
+    /// open and use the last rowid as the next cursor until an empty page.
+    /// Namespace and kind are always SQL predicates, including the first page.
+    pub async fn object_rows_page(
+        &mut self,
+        ctx: &Context,
+        kind: &str,
+        after_rowid: Option<i64>,
+    ) -> Result<Vec<ObjectRowSnapshot>> {
+        let rows = sqlx::query(
+            "SELECT rowid,id,owner,body FROM objects
+             WHERE namespace=? AND kind=? AND (? IS NULL OR rowid>?)
+             ORDER BY rowid LIMIT 64",
+        )
+        .bind(ctx.namespace())
+        .bind(kind)
+        .bind(after_rowid)
+        .bind(after_rowid)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ObjectRowSnapshot {
+                    rowid: row.try_get("rowid").map_err(internal)?,
+                    id: row.try_get("id").map_err(internal)?,
+                    owner: row.try_get("owner").map_err(internal)?,
+                    body: row.try_get("body").map_err(internal)?,
+                })
+            })
+            .collect()
+    }
+
+    /// The physical identity and untouched body at one exact object key.
+    pub async fn object_row(
+        &mut self,
+        ctx: &Context,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<ObjectRowSnapshot>> {
+        identifier(id)?;
+        let row = sqlx::query(
+            "SELECT rowid,id,owner,body FROM objects WHERE namespace=? AND kind=? AND id=?",
+        )
+        .bind(ctx.namespace())
+        .bind(kind)
+        .bind(id)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        row.map(|row| {
+            Ok(ObjectRowSnapshot {
+                rowid: row.try_get("rowid").map_err(internal)?,
+                id: row.try_get("id").map_err(internal)?,
+                owner: row.try_get("owner").map_err(internal)?,
+                body: row.try_get("body").map_err(internal)?,
+            })
+        })
+        .transpose()
+    }
+
     pub async fn put<T: Serialize>(
         &mut self,
         ctx: &Context,
