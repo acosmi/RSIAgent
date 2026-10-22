@@ -1800,3 +1800,773 @@ con.close()
     );
     serde_json::from_slice(&output.stdout).unwrap()
 }
+
+// AG120 APP: old public APIs only. The complete original private fixture and
+// all prior assertions remain above, byte-exact. Software evidence is not
+// provider/OS authority; these four controls have not been compiled or run.
+fn ag120_one_execution_receipt_per_call(timely: bool, bound: bool) -> Boxed<'static, ()> {
+    Box::pin(async move {
+        let fixture = fixture(false).await;
+        issue(&fixture, bound).await;
+        let (request, first) = if timely {
+            grade(&fixture, "a0", "ok", "ok", 1).await;
+            let pending = start_pending(&fixture, 160).await;
+            let mut request = late_execution_request(&pending);
+            request.issued_at_unix_seconds = 161;
+            let first = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+                &fixture.worker,
+                &fixture.store,
+                request.clone(),
+            ))
+            .await
+            .expect("healthy timely first execution receipt");
+            let status = Box::pin(IndependentEvaluationControl::status(
+                &fixture.evaluator,
+                &fixture.store,
+                TICKET_ID,
+            ))
+            .await
+            .unwrap();
+            assert_eq!(status.ticket.lifecycle, TicketLifecycle::Running);
+            assert!(status.ticket.late_execution_receipt_ids.is_empty());
+            reconcile_without_receipt(&fixture, &pending).await;
+            Box::pin(IndependentEvaluationControl::invalidate(
+                &fixture.evaluator,
+                &fixture.store,
+                TICKET_ID,
+                EXPLICIT_INVALID,
+                1_300,
+            ))
+            .await
+            .unwrap();
+            (request, first)
+        } else {
+            let (pending, _) =
+                reach_report_with_unreceipted_call(&fixture, LateExecutionEndpoint::Invalid, false)
+                    .await;
+            let stopped = observe(&fixture, "AG120 before first late receipt").await;
+            assert_late_execution_shape(&stopped, LateExecutionEndpoint::Invalid, bound);
+            let request = late_execution_request(&pending);
+            let first = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+                &fixture.worker,
+                &fixture.store,
+                request.clone(),
+            ))
+            .await
+            .expect("healthy first late execution receipt");
+            assert_eq!(observe(&fixture, "AG120 first late receipt").await, stopped);
+            assert_eq!(assert_late_execution_stored(&fixture, &first).await, 1);
+            (request, first)
+        };
+        let before = observe(&fixture, "AG120 stopped healthy baseline").await;
+        assert_late_execution_shape(&before, LateExecutionEndpoint::Invalid, bound);
+        let ticket: EvaluationTicketV2 = serde_json::from_value(before.ticket.clone()).unwrap();
+        assert!(ticket.late_execution_receipt_ids.is_empty());
+        assert!(ticket.late_grader_receipt_ids.is_empty());
+        assert_eq!(first.budget_call_id, PENDING_CALL);
+        let before_catalog = catalog(&fixture.db_path);
+
+        // Full-content reconnect is healthy, including after stopping.
+        let same = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+            &fixture.worker,
+            &fixture.store,
+            request.clone(),
+        ))
+        .await
+        .expect("healthy same-ID complete reconnect");
+        assert_eq!(
+            serde_json::to_value(&same).unwrap(),
+            serde_json::to_value(&first).unwrap()
+        );
+        assert_eq!(observe(&fixture, "AG120 same-ID reconnect").await, before);
+        assert_eq!(catalog(&fixture.db_path), before_catalog);
+
+        // Keep every frozen call/output field valid; only receipt evidence changes.
+        let mut changed = request.clone();
+        changed.latency_micros += 1;
+        let changed = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+            &fixture.worker,
+            &fixture.store,
+            changed,
+        ))
+        .await;
+        assert!(
+            matches!(&changed, Err(Error::Conflict(message))
+            if message == "execution receipt id reused with different evidence"),
+            "{changed:?}"
+        );
+        assert_eq!(
+            observe(&fixture, "AG120 same-ID changed content refused").await,
+            before
+        );
+        assert_eq!(catalog(&fixture.db_path), before_catalog);
+
+        // All other typed inputs and exact UTF-8 are unchanged; this is the same
+        // real dispatched/paid call, not a second independent execution.
+        let mut duplicate = request;
+        duplicate.receipt_id = "ag120-second-execution-receipt".into();
+        duplicate.output_artifact_id = "ag120-second-execution-output".into();
+        let duplicate_id = duplicate.receipt_id.clone();
+        let result = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+            &fixture.worker,
+            &fixture.store,
+            duplicate,
+        ))
+        .await;
+        match result {
+            Err(Error::Conflict(message)) => assert_eq!(
+                message, "budget call already has an execution receipt",
+                "AG120_UNRELATED_REFUSAL: bound={bound}, timely={timely}",
+            ),
+            Ok(second) => {
+                // Parent semantic red is credited only after actual successful
+                // persistence through the original public production API.
+                assert_eq!(second.budget_call_id, first.budget_call_id);
+                assert_eq!(second.request_digest, first.request_digest);
+                assert_eq!(second.output_digest, first.output_digest);
+                assert_ne!(second.receipt_id, first.receipt_id);
+                let mut session = fixture.store.session().await.unwrap();
+                let stored: Envelope<Value> = session
+                    .need(
+                        &fixture.evaluator,
+                        "artifact",
+                        &physical_id("execution_receipt_v2", &duplicate_id),
+                    )
+                    .await
+                    .unwrap();
+                session.commit().await.unwrap();
+                assert_eq!(stored.payload, serde_json::to_value(&second).unwrap());
+                assert_ne!(catalog(&fixture.db_path), before_catalog);
+                panic!(
+                    "AG120_CPP_SEMANTIC_RED: second receipt actually persisted; bound={bound}, timely={timely}"
+                );
+            }
+            Err(error) => {
+                panic!("AG120_UNRELATED_FAILURE: bound={bound}, timely={timely}: {error:?}")
+            }
+        }
+        assert_eq!(
+            observe(&fixture, "AG120 second receipt refused").await,
+            before
+        );
+        // Every table, typed TEXT/BLOB, ledger, object, edge and audit row is in
+        // the original complete logical catalog. This claims no physical WAL proof.
+        assert_eq!(catalog(&fixture.db_path), before_catalog);
+        fixture.store.close().await;
+    })
+}
+
+#[tokio::test]
+async fn ag120_a_unbound_timely_then_stop_refuses_a_second_receipt_for_one_call() {
+    ag120_one_execution_receipt_per_call(true, false).await;
+}
+#[tokio::test]
+async fn ag120_a_bound_timely_then_stop_refuses_a_second_receipt_for_one_call() {
+    ag120_one_execution_receipt_per_call(true, true).await;
+}
+#[tokio::test]
+async fn ag120_b_unbound_invalid_audit_refuses_a_second_receipt_for_one_call() {
+    ag120_one_execution_receipt_per_call(false, false).await;
+}
+#[tokio::test]
+async fn ag120_b_bound_invalid_audit_refuses_a_second_receipt_for_one_call() {
+    ag120_one_execution_receipt_per_call(false, true).await;
+}
+
+// Head-only AG120 controls. The complete already-run M32 APP prefix above is
+// immutable. No helper or API below is needed by its four Parent CPP tests.
+fn ag120_head_sql_row(fixture: &Fixture, id: &str, fault: &str, saved: Option<&Value>) -> Value {
+    let code = r#"
+import json,sqlite3,sys
+db,ns,key,op,saved=sys.argv[1:6]
+con=sqlite3.connect('file:'+db+'?mode='+('ro' if op=='inspect' else 'rw'),uri=True)
+if op=='restore':
+    old=json.loads(saved)
+    row=con.execute("SELECT revision FROM objects WHERE rowid=? AND namespace=? AND kind='artifact'",(old['rowid'],ns)).fetchone()
+    assert row==(old['revision'],),row
+    assert con.execute("UPDATE objects SET id=?,owner=?,body=? WHERE rowid=? AND namespace=? AND kind='artifact'",(old['id'],old['owner'],old['body'],old['rowid'],ns)).rowcount==1
+    con.commit()
+    print(json.dumps(old,ensure_ascii=False))
+else:
+    row=con.execute("SELECT rowid,id,owner,body,revision FROM objects WHERE namespace=? AND kind='artifact' AND id=?",(ns,key)).fetchone()
+    assert row is not None,key
+    old=dict(zip(('rowid','id','owner','body','revision'),row))
+    new_id,owner,body=old['id'],old['owner'],old['body']
+    if op=='owner':
+        owner='ag120-wrong-sql-owner'
+    elif op=='physical_id':
+        doc=json.loads(body)
+        new_id='ag120-physical-alias-'+str(old['rowid'])
+        doc['id']=new_id
+        body=json.dumps(doc,ensure_ascii=False,separators=(',',':'))
+    elif op=='payload':
+        doc=json.loads(body)
+        doc['payload']['executor_actor']='ag120-wrong-payload-executor'
+        body=json.dumps(doc,ensure_ascii=False,separators=(',',':'))
+    elif op=='missing_call':
+        doc=json.loads(body)
+        doc['payload']['budget_call_id']='ag120-call-not-in-real-budget'
+        body=json.dumps(doc,ensure_ascii=False,separators=(',',':'))
+    elif op=='duplicate_kind':
+        assert body.count('"record_kind":')==1
+        body=body.replace('"record_kind":','"record_kind":"ordinary_note","record_kind":',1)
+    elif op=='escaped_kind':
+        doc=json.loads(body)
+        doc['payload']['receipt_id']+='-alias'
+        body=json.dumps(doc,ensure_ascii=False,separators=(',',':'))
+        body=body.replace('"record_kind":',r'"record_\u006bind":',1)
+        body=body.replace('"execution_receipt_v2"',r'"execution_receipt_v\u0032"',1)
+    elif op=='unrelated_deep_duplicates':
+        deep='['*200+'0'+']'*200
+        body='{"id":'+json.dumps(key)+',"record_kind":"ordinary_note","record_kind":"ordinary_note_2","payload":{"note":"execution_receipt_v2","nested":{"record_kind":"execution_receipt_v2"},"deep":'+deep+'},"ordinary":0,"ordinary":1}'
+    else:
+        assert op=='inspect',op
+    if op!='inspect':
+        assert con.execute("SELECT json_valid(?),json_extract(?,'$.id')",(body,body)).fetchone()==(1,new_id)
+        assert con.execute("UPDATE objects SET id=?,owner=?,body=? WHERE rowid=? AND namespace=? AND kind='artifact'",(new_id,owner,body,old['rowid'],ns)).rowcount==1
+        con.commit()
+    print(json.dumps(old,ensure_ascii=False))
+con.close()
+"#;
+    let saved = saved
+        .map(|v| serde_json::to_string(v).unwrap())
+        .unwrap_or_else(|| "null".into());
+    let output = Command::new("python3")
+        .args(["-B", "-c", code])
+        .arg(&fixture.db_path)
+        .arg(NAMESPACE)
+        .arg(id)
+        .arg(fault)
+        .arg(saved)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "SQL fixture {fault}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn ag120_head_final_pending() -> Boxed<'static, (Fixture, Pending, String)> {
+    Box::pin(async move {
+        let f = fixture(false).await;
+        issue(&f, false).await;
+        let anchor = grade(&f, "a0", "ok", "ok", 1).await;
+        let pending = start_pending(&f, 160).await;
+        Box::pin(IndependentEvaluationControl::invalidate(
+            &f.evaluator,
+            &f.store,
+            TICKET_ID,
+            EXPLICIT_INVALID,
+            170,
+        ))
+        .await
+        .unwrap();
+        reconcile_without_receipt(&f, &pending).await;
+        assert_late_execution_shape(
+            &observe(&f, "Head-only healthy Invalid setup").await,
+            LateExecutionEndpoint::Invalid,
+            false,
+        );
+        (f, pending, anchor.candidate)
+    })
+}
+
+fn ag120_head_assert_historical_refusal<'a>(
+    f: &'a Fixture,
+    pending: &'a Pending,
+    physical: &'a str,
+    fault: &'a str,
+) -> Boxed<'a, ()> {
+    Box::pin(async move {
+        let healthy = observe(f, "before own-DB single fault").await;
+        let healthy_catalog = catalog(&f.db_path);
+        let saved = ag120_head_sql_row(f, physical, fault, None);
+        let fault_catalog = catalog(&f.db_path);
+        let result = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+            &f.worker,
+            &f.store,
+            late_execution_request(pending),
+        ))
+        .await;
+        assert!(
+            matches!(&result, Err(Error::Conflict(message))
+            if message == "stored execution receipt has an invalid historical binding"),
+            "AG120_HEAD_TARGET_REFUSAL_REQUIRED: {fault}: {result:?}"
+        );
+        assert!(
+            catalog(&f.db_path) == fault_catalog,
+            "{fault}: refused write changed full catalog"
+        );
+        ag120_head_sql_row(f, physical, "restore", Some(&saved));
+        assert!(
+            catalog(&f.db_path) == healthy_catalog,
+            "{fault}: exact fixture restore failed"
+        );
+        assert_eq!(observe(f, "after exact own-DB restore").await, healthy);
+    })
+}
+
+#[tokio::test]
+async fn ag120_head_more_than_10000_artifacts_and_unrelated_raw_json_still_allow_a_new_call() {
+    let f = fixture(false).await;
+    issue(&f, false).await;
+    grade(&f, "a0", "ok", "ok", 1).await;
+    let pending = start_pending(&f, 160).await;
+    let mut session = f.store.session().await.unwrap();
+    for index in 0..10_050 {
+        let id = format!("ag120-ordinary-{index}");
+        // Ordinary artifact data, not a typed producer, receipt or authority.
+        session
+            .put(
+                &f.worker,
+                "artifact",
+                &id,
+                f.worker.actor(),
+                &json!({"id":id.clone(),"ordinary":index}),
+            )
+            .await
+            .unwrap();
+    }
+    session.commit().await.unwrap();
+    ag120_head_sql_row(&f, "ag120-ordinary-0", "unrelated_deep_duplicates", None);
+    ag120_head_sql_row(
+        &f,
+        "ag120-ordinary-10049",
+        "unrelated_deep_duplicates",
+        None,
+    );
+    let mut session = f.store.session().await.unwrap();
+    let old_bounded = session.list::<Value>(&f.worker, "artifact").await;
+    assert!(matches!(&old_bounded, Err(Error::Conflict(message))
+        if message.starts_with("scope collection exceeds bounded scan")));
+    let (mut cursor, mut count, mut pages) = (None, 0_usize, 0_usize);
+    loop {
+        let page = session
+            .object_rows_page(&f.worker, "artifact", cursor)
+            .await
+            .unwrap();
+        assert!(page.len() <= 64);
+        if page.is_empty() {
+            break;
+        }
+        let mut previous = cursor;
+        for row in &page {
+            assert!(previous.is_none_or(|value| row.rowid > value));
+            previous = Some(row.rowid);
+        }
+        cursor = previous;
+        count += page.len();
+        pages += 1;
+    }
+    session.commit().await.unwrap();
+    assert!(count > 10_000 && pages > 156);
+    let mut request = late_execution_request(&pending);
+    request.issued_at_unix_seconds = 161;
+    let first = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+        &f.worker,
+        &f.store,
+        request.clone(),
+    ))
+    .await
+    .expect("unrelated raw JSON and the old 10000 cap must not reject a new real call");
+    assert_eq!(first.budget_call_id, PENDING_CALL);
+    let snapshot = catalog(&f.db_path);
+    let same = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+        &f.worker, &f.store, request,
+    ))
+    .await
+    .expect("healthy complete reconnect after all pages");
+    assert_eq!(fingerprint(&same).unwrap(), fingerprint(&first).unwrap());
+    assert!(
+        catalog(&f.db_path) == snapshot,
+        "full catalog changed on reconnect"
+    );
+    f.store.close().await;
+}
+
+#[tokio::test]
+async fn ag120_head_claimed_duplicate_and_escaped_record_kind_cannot_hide_damage() {
+    for fault in ["duplicate_kind", "escaped_kind"] {
+        let (f, pending, old_id) = ag120_head_final_pending().await;
+        let physical = physical_id("execution_receipt_v2", &old_id);
+        ag120_head_assert_historical_refusal(&f, &pending, &physical, fault).await;
+        f.store.close().await;
+    }
+}
+
+#[tokio::test]
+async fn ag120_head_receipt_physical_id_sql_owner_and_payload_must_agree() {
+    for fault in ["physical_id", "owner", "payload", "missing_call"] {
+        let (f, pending, old_id) = ag120_head_final_pending().await;
+        let physical = physical_id("execution_receipt_v2", &old_id);
+        ag120_head_assert_historical_refusal(&f, &pending, &physical, fault).await;
+        f.store.close().await;
+    }
+}
+
+#[tokio::test]
+async fn ag120_head_current_ticket_sql_owner_is_checked_before_the_first_write() {
+    let (f, pending, _) = ag120_head_final_pending().await;
+    let physical = physical_id("evaluation_ticket_v2", TICKET_ID);
+    ag120_head_assert_historical_refusal(&f, &pending, &physical, "owner").await;
+    f.store.close().await;
+}
+
+#[tokio::test]
+async fn ag120_head_current_control_sql_owner_is_checked_before_the_first_write() {
+    let (f, pending, _) = ag120_head_final_pending().await;
+    let physical = physical_id("registered_evaluation_control_v41", &f.control.id);
+    ag120_head_assert_historical_refusal(&f, &pending, &physical, "owner").await;
+    f.store.close().await;
+}
+
+// Captured by the actual old M32 public writer, not a synthesized archive.
+const AG120_ACTUAL_OLD_M32_RECEIPT_JSON: &str = r#"{"schema_version":"rsia.execution_receipt.v2","receipt_id":"late-r58","ticket_id":"late-grader-final-ticket","target_id":"r58","side":"candidate","request_digest":"d5394926453b6693d9c9e9a1f06694ca1b920ac6386840dcd22f52e1b8ee7132","bundle_digest":"03846043c24087295db7878e3a9e70d275c02195addd34182fa52ee443642127","environment_digest":"0c46eb879e765db9f64b8e7ade372fbf127314fa929e54b3abc230cfe0ec1494","output_digest":"2b82c37965faf7db40dae134cc94675e0f6dac048a0173a1861b6ed1b8db7d5b","output_artifact_id":"late-output-r58","budget_call_id":"pending-r58","executor_actor":"executor","latency_micros":777,"issued_at_unix_seconds":161}"#;
+const AG120_ACTUAL_OLD_M32_RECEIPT_FINGERPRINT: &str =
+    "dd9032e93049e7b0108aa346057a2724f3e5095a2527f7ac6d4b12921afededb";
+
+#[tokio::test]
+async fn ag120_head_actual_old_wire_and_valid_new_producer_stay_field_exact() {
+    let old: ExecutionReceiptV2 = serde_json::from_str(AG120_ACTUAL_OLD_M32_RECEIPT_JSON).unwrap();
+    assert_eq!(old.schema_version, "rsia.execution_receipt.v2");
+    assert_eq!(
+        serde_json::to_string(&old).unwrap(),
+        AG120_ACTUAL_OLD_M32_RECEIPT_JSON
+    );
+    assert_eq!(
+        fingerprint(&old).unwrap(),
+        AG120_ACTUAL_OLD_M32_RECEIPT_FINGERPRINT
+    );
+    // The old bytes grant nothing: derive a new legal request through the
+    // original registered fixture and actual broker task; never copy its pins.
+    let f = fixture(false).await;
+    issue(&f, false).await;
+    grade(&f, "a0", "ok", "ok", 1).await;
+    let pending = start_pending(&f, 160).await;
+    let mut request = late_execution_request(&pending);
+    request.issued_at_unix_seconds = 161;
+    let actual = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+        &f.worker, &f.store, request,
+    ))
+    .await
+    .expect("legal new input must preserve old v2 complete wire");
+    assert_eq!(
+        serde_json::to_value(&actual).unwrap(),
+        serde_json::to_value(&old).unwrap()
+    );
+    assert_eq!(
+        fingerprint(&actual).unwrap(),
+        AG120_ACTUAL_OLD_M32_RECEIPT_FINGERPRINT
+    );
+    f.store.close().await;
+}
+
+// PR197 R3: a receipt is a preserved accounting fact. The redactor's exact
+// wire at that physical row is one corruption, not a lawful cleanup of it.
+fn ag120_r3_replace_body_preserving_row(
+    f: &Fixture,
+    physical: &str,
+    expected: &Value,
+    replacement: &str,
+) -> Value {
+    let code = r#"
+import json,sqlite3,sys
+db,ns,key,expected,replacement=sys.argv[1:6]
+expected=json.loads(expected)
+con=sqlite3.connect('file:'+db+'?mode=rw',uri=True)
+row=con.execute("SELECT rowid,id,owner,body,revision FROM objects WHERE namespace=? AND kind='artifact' AND id=?",(ns,key)).fetchone()
+assert row is not None
+before=dict(zip(('rowid','id','owner','body','revision'),row))
+assert before==expected,(before,expected)
+assert con.execute("SELECT json_valid(?),json_extract(?,'$.id')",(replacement,replacement)).fetchone()==(1,key)
+changed=con.execute("UPDATE objects SET body=? WHERE namespace=? AND kind='artifact' AND id=? AND rowid=? AND owner=? AND revision=? AND body=?",(replacement,ns,key,before['rowid'],before['owner'],before['revision'],before['body']))
+assert changed.rowcount==1
+con.commit()
+row=con.execute("SELECT rowid,id,owner,body,revision FROM objects WHERE namespace=? AND kind='artifact' AND id=?",(ns,key)).fetchone()
+after=dict(zip(('rowid','id','owner','body','revision'),row))
+assert all(after[field]==before[field] for field in ('rowid','id','owner','revision'))
+assert after['body']==replacement
+print(json.dumps(after,ensure_ascii=False))
+con.close()
+"#;
+    let output = Command::new("python3")
+        .args(["-B", "-c", code])
+        .arg(&f.db_path)
+        .arg(NAMESPACE)
+        .arg(physical)
+        .arg(serde_json::to_string(expected).unwrap())
+        .arg(replacement)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "R3 single-body fixture fault: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn ag120_r3_redacted_owned_receipt(bound: bool) -> Boxed<'static, ()> {
+    Box::pin(async move {
+        let f = fixture(false).await;
+        issue(&f, bound).await;
+        let (pending, _) =
+            reach_report_with_unreceipted_call(&f, LateExecutionEndpoint::Invalid, false).await;
+        let stopped = observe(&f, "R3 healthy Invalid before r1").await;
+        assert_late_execution_shape(&stopped, LateExecutionEndpoint::Invalid, bound);
+        let first_request = late_execution_request(&pending);
+        let first = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+            &f.worker,
+            &f.store,
+            first_request.clone(),
+        ))
+        .await
+        .expect("R3 first audit-only execution receipt must actually persist");
+        assert_eq!(first.budget_call_id, PENDING_CALL);
+        assert_eq!(
+            observe(&f, "R3 r1 leaves frozen report intact").await,
+            stopped
+        );
+        assert_eq!(assert_late_execution_stored(&f, &first).await, 1);
+        let healthy_catalog = catalog(&f.db_path);
+        let same = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+            &f.worker,
+            &f.store,
+            first_request.clone(),
+        ))
+        .await
+        .expect("R3 healthy same-ID reconnect before corruption");
+        assert_eq!(fingerprint(&same).unwrap(), fingerprint(&first).unwrap());
+        assert_eq!(catalog(&f.db_path), healthy_catalog);
+
+        let physical = physical_id("execution_receipt_v2", &first.receipt_id);
+        let saved = ag120_head_sql_row(&f, &physical, "inspect", None);
+        assert_eq!(saved["id"], physical);
+        assert_eq!(saved["owner"], f.worker.actor());
+        assert!(saved["revision"].as_i64().unwrap() > 0);
+        let body = saved["body"].as_str().unwrap();
+        let original: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(original["payload"], serde_json::to_value(&first).unwrap());
+        let redacted =
+            evo_storage::lifecycle::redacted_object_body("artifact", &physical, &original, body);
+        assert_eq!(redacted["id"], physical);
+        assert_eq!(redacted["schema_version"], "rsia.redacted.v1");
+        assert_eq!(
+            redacted["original_schema"],
+            "rsia.typed_artifact_envelope.v1"
+        );
+        assert_eq!(redacted["metadata"]["record_kind"], "execution_receipt_v2");
+        let raw = serde_json::to_string(&redacted).unwrap();
+        for fault in [
+            "plain",
+            "duplicate_metadata",
+            "duplicate_schema",
+            "escaped_markers",
+        ] {
+            let replacement = match fault {
+                "plain" => raw.clone(),
+                "duplicate_metadata" => {
+                    let marker = r#""metadata":{"record_kind":"execution_receipt_v2"}"#;
+                    assert_eq!(raw.matches(marker).count(), 1);
+                    raw.replacen(
+                        marker,
+                        r#""metadata":{"record_kind":"execution_receipt_v2"},"metadata":{"record_kind":"ordinary_note"}"#,
+                        1,
+                    )
+                }
+                "duplicate_schema" => raw.replacen(
+                    r#""schema_version":"rsia.redacted.v1""#,
+                    r#""schema_version":"rsia.redacted.v1","schema_version":"rsia.ordinary_note.v1""#,
+                    1,
+                ),
+                "escaped_markers" => raw
+                    .replace(r#""schema_version""#, r#""schema_\u0076ersion""#)
+                    .replace(r#""rsia.redacted.v1""#, r#""rsia.redacted.\u00761""#)
+                    .replace(r#""metadata""#, r#""meta\u0064ata""#)
+                    .replace(r#""record_kind""#, r#""record_\u006bind""#)
+                    .replace(r#""execution_receipt_v2""#, r#""execution_receipt_v\u0032""#),
+                _ => unreachable!(),
+            };
+            assert_ne!(replacement, body);
+            let changed = ag120_r3_replace_body_preserving_row(&f, &physical, &saved, &replacement);
+            for field in ["rowid", "id", "owner", "revision"] {
+                assert_eq!(
+                    changed[field], saved[field],
+                    "{fault}: physical identity changed"
+                );
+            }
+            let fault_catalog = catalog(&f.db_path);
+            let mut second = first_request.clone();
+            second.receipt_id = format!("ag120-r3-second-{fault}");
+            second.output_artifact_id = format!("ag120-r3-output-{fault}");
+            let second_id = second.receipt_id.clone();
+            let result = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+                &f.worker, &f.store, second,
+            ))
+            .await;
+            assert!(
+                matches!(&result, Err(Error::Conflict(message))
+                if message == "stored execution receipt has an invalid historical binding"),
+                "R3 owned redaction escaped its family: bound={bound} fault={fault}: {result:?}"
+            );
+            assert_eq!(
+                catalog(&f.db_path),
+                fault_catalog,
+                "{fault}: refusal wrote state"
+            );
+            assert_eq!(
+                audit_entries(&f.db_path, LATE_EXECUTION_AUDIT_OPERATION, &second_id),
+                0,
+            );
+            let restored = ag120_r3_replace_body_preserving_row(&f, &physical, &changed, body);
+            assert_eq!(restored, saved);
+            assert_eq!(catalog(&f.db_path), healthy_catalog);
+        }
+        assert_eq!(observe(&f, "R3 exact restoration").await, stopped);
+        assert_eq!(assert_late_execution_stored(&f, &first).await, 1);
+        f.store.close().await;
+    })
+}
+
+#[tokio::test]
+async fn ag120_r3_unbound_invalid_redacted_owned_receipt_is_not_absence() {
+    ag120_r3_redacted_owned_receipt(false).await;
+}
+#[tokio::test]
+async fn ag120_r3_bound_invalid_redacted_owned_receipt_is_not_absence() {
+    ag120_r3_redacted_owned_receipt(true).await;
+}
+
+fn ag120_r3_unrelated_redacted_shapes() -> Boxed<'static, ()> {
+    Box::pin(async move {
+        let f = fixture(false).await;
+        issue(&f, false).await;
+        // This extra control uses the real registration API and is not the
+        // control that authorizes the current ticket.
+        let mut unrelated = f.control.clone();
+        unrelated.id = "ag120-r3-unused-control".into();
+        let registered = Box::pin(IndependentEvaluationControl::register_control(
+            &f.evaluator,
+            &f.store,
+            unrelated.clone(),
+        ))
+        .await
+        .expect("unrelated real control registration");
+        assert_eq!(registered, unrelated.digest().unwrap());
+        let control_key = physical_id("registered_evaluation_control_v41", &unrelated.id);
+        let stored = ag120_head_sql_row(&f, &control_key, "inspect", None);
+        let control_body = stored["body"].as_str().unwrap();
+        let control_value: Value = serde_json::from_str(control_body).unwrap();
+        let redacted_control = evo_storage::lifecycle::redacted_object_body(
+            "artifact",
+            &control_key,
+            &control_value,
+            control_body,
+        );
+        assert_eq!(
+            redacted_control["metadata"]["record_kind"],
+            "registered_evaluation_control_v41"
+        );
+        ag120_r3_replace_body_preserving_row(
+            &f,
+            &control_key,
+            &stored,
+            &serde_json::to_string(&redacted_control).unwrap(),
+        );
+
+        // Obtain an output from a separate real software producer. Only its
+        // redacted, unreferenced family shape is imported into this private DB;
+        // it is not a receipt, a second execution, or a source authority here.
+        let producer = fixture(false).await;
+        issue(&producer, false).await;
+        let receipt_id =
+            execute_raw(&producer, "r0", ExecutionSide::Candidate, GOOD_OUTPUT, 1).await;
+        let producer_receipt = ag120_head_sql_row(
+            &producer,
+            &physical_id("execution_receipt_v2", &receipt_id),
+            "inspect",
+            None,
+        );
+        let receipt_value: Value =
+            serde_json::from_str(producer_receipt["body"].as_str().unwrap()).unwrap();
+        let output_id = receipt_value["payload"]["output_artifact_id"]
+            .as_str()
+            .unwrap();
+        let output_key = physical_id("evaluation_execution_output_v1", output_id);
+        let producer_output = ag120_head_sql_row(&producer, &output_key, "inspect", None);
+        let output_body = producer_output["body"].as_str().unwrap();
+        let output_value: Value = serde_json::from_str(output_body).unwrap();
+        let redacted_output = evo_storage::lifecycle::redacted_object_body(
+            "artifact",
+            &output_key,
+            &output_value,
+            output_body,
+        );
+        assert_eq!(
+            redacted_output["metadata"]["record_kind"],
+            "evaluation_execution_output_v1"
+        );
+        producer.store.close().await;
+
+        let mut session = f.store.session().await.unwrap();
+        assert!(
+            session
+                .object_row(&f.worker, "artifact", &output_key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        session
+            .put(
+                &f.worker,
+                "artifact",
+                &output_key,
+                f.worker.actor(),
+                &redacted_output,
+            )
+            .await
+            .unwrap();
+        session
+            .put(
+                &f.worker,
+                "artifact",
+                "ag120-r3-metadata-only",
+                f.worker.actor(),
+                &json!({
+                    "id":"ag120-r3-metadata-only",
+                    "schema_version":"rsia.ordinary_note.v1",
+                    "metadata":{"record_kind":"execution_receipt_v2"}
+                }),
+            )
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let pending = start_pending(&f, 160).await;
+        let mut request = late_execution_request(&pending);
+        request.issued_at_unix_seconds = 161;
+        let receipt = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+            &f.worker,
+            &f.store,
+            request.clone(),
+        ))
+        .await
+        .expect("unrelated redacted families and metadata alone must allow the real new call");
+        assert_eq!(receipt.budget_call_id, PENDING_CALL);
+        let image = catalog(&f.db_path);
+        let same = Box::pin(IndependentEvaluationControl::record_execution_receipt(
+            &f.worker, &f.store, request,
+        ))
+        .await
+        .expect("positive-shape case keeps full-content same-ID reconnect");
+        assert_eq!(fingerprint(&same).unwrap(), fingerprint(&receipt).unwrap());
+        assert_eq!(catalog(&f.db_path), image);
+        f.store.close().await;
+    })
+}
+
+#[tokio::test]
+async fn ag120_r3_unrelated_redacted_families_and_metadata_alone_remain_healthy() {
+    ag120_r3_unrelated_redacted_shapes().await;
+}
