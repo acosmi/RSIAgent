@@ -267,7 +267,7 @@ fn world(id: &str, cluster: &str, source_id: &str, partition: WorldPartition) ->
     world
 }
 
-fn experiment(report: &StoredReplayReportV1) -> ReplayEconomicExperimentV1 {
+fn experiment(report: &StoredReplayReportV2) -> ReplayEconomicExperimentV1 {
     ReplayEconomicExperimentV1 {
         schema_version: EXPERIMENT_SCHEMA.into(),
         id: "economic-exp-1".into(),
@@ -492,7 +492,7 @@ async fn prerequisites(store: &Store) -> ReplayEconomicExperimentV1 {
         },
     )
     .unwrap();
-    let stored_report = StoredReplayReportV1::build(
+    let stored_report = StoredReplayReportV2::build(
         NS,
         WorldPartition::Select,
         &pool,
@@ -502,7 +502,7 @@ async fn prerequisites(store: &Store) -> ReplayEconomicExperimentV1 {
         vec![replay],
     )
     .unwrap();
-    evo_storage::replay::put_replay_report(&admin, store, &stored_report)
+    evo_storage::replay::put_current_replay_report(&admin, store, &stored_report)
         .await
         .unwrap();
     experiment(&stored_report)
@@ -1629,5 +1629,344 @@ async fn schemas_next_to_the_envelope_do_not_isolate_a_backup() {
     scenario.restore_without_events("restored").assert_restored(
         "a v2 envelope, a payload schema and an unrelated artifact",
         0,
+    );
+}
+
+#[tokio::test]
+async fn actual_parent_and_current_reports_remain_revoked_after_real_backup_restore_cleanup() {
+    let metadata_raw = include_bytes!("fixtures/ag147_m33_restore_ready_history.json");
+    let database_raw = include_bytes!("fixtures/ag147_m33_restore_ready_history.sqlite3");
+    assert_eq!(
+        hash(metadata_raw),
+        "e47a064eb9bdba2712319190838ab144708249747745ebc449e6537c60866552"
+    );
+    assert_eq!(
+        hash(database_raw),
+        "0b60f6b1ff251ea865343ec4de1cefc0b41cca62c41e45a80e3218b5ae66da0e"
+    );
+    // Exact actual Parent manifest provenance; the restore below still uses
+    // its own normal Head Store::backup after the actual new report is written.
+    let captured_parent_manifest_raw = br###"{
+  "schema_version": "rsia.backup.v2",
+  "complete": true,
+  "database": {
+    "path": "rsia.sqlite3",
+    "sha256": "0b60f6b1ff251ea865343ec4de1cefc0b41cca62c41e45a80e3218b5ae66da0e",
+    "bytes": 299008
+  },
+  "blobs": [],
+  "migrations": [
+    {
+      "version": 1,
+      "description": "runtime",
+      "checksum_hex": "0e6345ee05ea56807bcd56fa7c634081cb4e2fa920a2ee18af47603af211e4c05a161b04c1dcd3309d24328ef7dea110",
+      "success": true
+    },
+    {
+      "version": 2,
+      "description": "revoke graph",
+      "checksum_hex": "34c753159160d311e72e5a8ed046bbdd7a4f506beb5752062ec316ac57505917d91d08f2bd1c36b491ea03765b5d6270",
+      "success": true
+    },
+    {
+      "version": 4,
+      "description": "replay worlds",
+      "checksum_hex": "5371d1f447143dbad639729f416d0983211c207f350e5ee05fd09b1f88196481f4016022fe596f4f2a39e4526b74b8e1",
+      "success": true
+    },
+    {
+      "version": 5,
+      "description": "root budget",
+      "checksum_hex": "d2114e8c1fa7277dc298d699fd2868eae699152b473325adbe6f233f5c72d8f5a2f546a675d61182bf58f03c1e7cacc8",
+      "success": true
+    },
+    {
+      "version": 6,
+      "description": "revoke cleanup",
+      "checksum_hex": "562e6392a78b82d7a1a458f12eeb05ef223c9a8e77dc9de01e78e35b52a4360e7b9bba0a6c1d767a49398fbbd5aa961e",
+      "success": true
+    },
+    {
+      "version": 7,
+      "description": "formal parent kind",
+      "checksum_hex": "631ca7337e43bac5e5341c8b857e417031595e7fe117127154e8f3ef10379f8eda2c2af7943a2cffcd8412995227adc4",
+      "success": true
+    }
+  ],
+  "watermarks": [
+    {
+      "namespace": "n",
+      "seq": 1,
+      "digest": "70390d70e8550f8da9b0e105dacdce8b76c2d3e52f715e8ddc682994acc0f68f"
+    }
+  ],
+  "created_at": 1792709346
+}"###;
+    assert_eq!(
+        hash(captured_parent_manifest_raw),
+        "ce3ec972590893baf2afd65e28979dc47013c9caa2c2a4edcd3e631f82989282"
+    );
+    let captured_parent_manifest: BackupManifest =
+        serde_json::from_slice(captured_parent_manifest_raw).unwrap();
+    assert_eq!(captured_parent_manifest.database.sha256, hash(database_raw));
+    assert_eq!(
+        captured_parent_manifest.database.bytes,
+        u64::try_from(database_raw.len()).unwrap()
+    );
+    let metadata: Value = serde_json::from_slice(metadata_raw).unwrap();
+    let captured_watermark = captured_parent_manifest
+        .watermarks
+        .iter()
+        .find(|row| row.namespace == "n")
+        .unwrap();
+    assert_eq!(
+        captured_watermark.seq,
+        metadata["original_watermark"]["seq"].as_i64().unwrap()
+    );
+    assert_eq!(
+        captured_watermark.digest,
+        metadata["original_watermark"]["digest"].as_str().unwrap()
+    );
+    assert_eq!(metadata["scope"]["external_provider_calls"], 0);
+    assert_eq!(metadata["scope"]["real_paid_effect_claimed"], false);
+    let directory = tempfile::tempdir().unwrap();
+    // The existing restore CLI rejects symlinked path components on macOS.
+    let root = directory.path().canonicalize().unwrap();
+    let live = root.join("history-copy.sqlite3");
+    std::fs::write(&live, database_raw).unwrap();
+    let store = Store::open(&live).await.unwrap();
+    let administrator = Context::new("n", "admin", Role::Admin).unwrap();
+    let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();
+    let original: StoredReplayReportV1 =
+        serde_json::from_value(metadata["selection"].clone()).unwrap();
+    let old_view =
+        evo_engine::replay::query_replay_report_record(&evaluator, &store, &original.report_id)
+            .await
+            .unwrap();
+    assert_eq!(old_view.record.state(), ReplayRecordState::Legacy);
+    assert_eq!(old_view.raw_payload, Some(metadata["selection"].clone()));
+    let current = evo_engine::replay::run_and_persist_pool_replay(
+        &administrator,
+        &store,
+        &original.pool_digest,
+        original.partition,
+        &original.policy,
+        &original.profile,
+        &original.caps,
+    )
+    .await
+    .unwrap();
+    assert_ne!(current.report_id, original.report_id);
+    assert_eq!(
+        evo_engine::replay::query_replay_report_record(&evaluator, &store, &current.report_id)
+            .await
+            .unwrap()
+            .record
+            .state(),
+        ReplayRecordState::CurrentVerified
+    );
+    let pool =
+        evo_storage::replay::load_live_replay_pool(&administrator, &store, &original.pool_digest)
+            .await
+            .unwrap();
+    let source = match pool
+        .worlds
+        .iter()
+        .find(|world| world.partition() == original.partition)
+        .unwrap()
+    {
+        evo_storage::replay::LoadedReplayWorld::LegacyV2(world) => {
+            world.manifest.baseline_observation_source_id.clone()
+        }
+        evo_storage::replay::LoadedReplayWorld::CurrentV3(_) => {
+            panic!("the exact Parent input unexpectedly changed schema")
+        }
+    };
+    let protected_before = read_control_plane_facts(&live).await.unwrap();
+    let backup = root.join("backup-with-both-report-versions");
+    store.backup(&backup).await.unwrap();
+    let manifest_raw = std::fs::read(backup.join("backup-manifest.json")).unwrap();
+    let manifest: BackupManifest = serde_json::from_slice(&manifest_raw).unwrap();
+    let base = manifest
+        .watermarks
+        .iter()
+        .find(|row| row.namespace == "n")
+        .unwrap();
+    let mut status = LifecycleStore::begin_revoke(
+        &administrator,
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: source.clone(),
+        },
+        "controlled actual Parent baseline revoked after backup",
+        evo_core::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    for _ in 0..128 {
+        if matches!(status.state, CleanupState::Complete | CleanupState::Failed) {
+            break;
+        }
+        status = LifecycleStore::cleanup_step(
+            &administrator,
+            &store,
+            &status.job_id,
+            100,
+            evo_core::now().unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(status.state, CleanupState::Complete, "{status:?}");
+    let mut session = store.session().await.unwrap();
+    let tombstone: RevokeTombstone = session
+        .need(&administrator, "tombstone", &source)
+        .await
+        .unwrap();
+    for (id, kind) in [
+        (
+            &original.report_id,
+            evo_storage::replay::REPLAY_REPORT_RECORD_KIND,
+        ),
+        (
+            &current.report_id,
+            evo_storage::replay::CURRENT_REPLAY_REPORT_RECORD_KIND,
+        ),
+    ] {
+        let body: Value = session.need(&administrator, "artifact", id).await.unwrap();
+        assert_eq!(body["schema_version"], "rsia.redacted.v1");
+        assert_eq!(body["metadata"]["record_kind"], kind);
+        assert!(body.get("payload").is_none());
+        assert!(body["metadata"]["irreversible_usage"].as_array().is_some());
+    }
+    let row = &metadata["management_job_raw"];
+    let original_job = session
+        .object_row(&administrator, "job", row["physical_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original_job.body, row["body_utf8"].as_str().unwrap());
+    session.commit().await.unwrap();
+    let protected_after = read_control_plane_facts(&live).await.unwrap();
+    assert_eq!(
+        protected_after.protected_objects,
+        protected_before.protected_objects
+    );
+    assert_eq!(
+        protected_after.root_budget_tables,
+        protected_before.root_budget_tables
+    );
+    for id in [&original.report_id, &current.report_id] {
+        assert!(matches!(
+            evo_engine::replay::query_replay_report_record(&evaluator, &store, id).await,
+            Err(ReplayReadIsolation::Source(evo_core::Error::Conflict(_)))
+        ));
+    }
+    // Exact real tombstone values are supplied to the existing delta contract;
+    // there is no hand-written history or new restore/import implementation.
+    assert_eq!(
+        tombstone.watermark_seq,
+        u64::try_from(base.seq).unwrap() + 1
+    );
+    let delta = root.join("actual-revocation-delta.json");
+    std::fs::write(
+        &delta,
+        serde_json::to_vec(&json!({
+            "schema_version":"rsia.revoke_delta.v1",
+            "base_manifest_sha256":hash(&manifest_raw),
+            "namespaces":[{
+                "namespace":"n","base_seq":base.seq,"base_digest":base.digest,
+                "events":[{
+                    "seq":tombstone.watermark_seq,"previous_digest":base.digest,
+                    "digest":tombstone.watermark_digest,"source_kind":"run",
+                    "source_id":source,
+                    "tombstone_digest":hash(&serde_json::to_vec(&tombstone).unwrap()),
+                    "reason":tombstone.reason,"created_at":tombstone.created_at
+                }],
+                "latest_seq":tombstone.watermark_seq,"latest_digest":tombstone.watermark_digest
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    store.close().await;
+    let destination = root.join("restored-with-revocation");
+    let output = Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg(RESTORE_SCRIPT)
+        .arg("--backup")
+        .arg(&backup)
+        .arg("--dest")
+        .arg(&destination)
+        .arg("--revoke-delta")
+        .arg(&delta)
+        .arg("--trusted-revocations-db")
+        .arg(&live)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "real restore failed: {:?}\n{}\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let restored_path = destination.join("rsia.sqlite3");
+    let decision = StartupGate::new(&restored_path, Some(&live))
+        .evaluate()
+        .await
+        .unwrap();
+    assert_eq!(decision.posture(), RecoveryPosture::RestoredVerified);
+    let restored = Store::open(&restored_path).await.unwrap();
+    decision.admit().unwrap();
+    let mut restored_status =
+        LifecycleStore::cleanup_status(&administrator, &restored, &status.job_id)
+            .await
+            .unwrap();
+    for _ in 0..128 {
+        if matches!(
+            restored_status.state,
+            CleanupState::Complete | CleanupState::Failed
+        ) {
+            break;
+        }
+        restored_status = LifecycleStore::cleanup_step(
+            &administrator,
+            &restored,
+            &restored_status.job_id,
+            100,
+            evo_core::now().unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        restored_status.state,
+        CleanupState::Complete,
+        "{restored_status:?}"
+    );
+    for id in [&original.report_id, &current.report_id] {
+        assert!(matches!(
+            evo_engine::replay::query_replay_report_record(&evaluator, &restored, id).await,
+            Err(ReplayReadIsolation::Source(evo_core::Error::Conflict(_)))
+        ));
+    }
+    let restored_facts = read_control_plane_facts(&restored_path).await.unwrap();
+    assert_eq!(
+        restored_facts.protected_objects,
+        protected_before.protected_objects
+    );
+    assert_eq!(
+        restored_facts.root_budget_tables,
+        protected_before.root_budget_tables
+    );
+    assert_eq!(restored_facts.watermarks, protected_after.watermarks);
+    assert_eq!(restored_facts.tombstones, protected_after.tombstones);
+    restored.close().await;
+    // include_bytes inputs are never opened by Store or restored in place.
+    assert_eq!(
+        hash(database_raw),
+        "0b60f6b1ff251ea865343ec4de1cefc0b41cca62c41e45a80e3218b5ae66da0e"
     );
 }

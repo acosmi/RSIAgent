@@ -4,6 +4,7 @@ use evo_core::replay::*;
 use evo_core::strategy::{ActionKindV1, ElasticPolicyV1, ExplorationCapsV1, ObservedStatus};
 use evo_core::{Context, Error, Role, fingerprint, hash};
 use evo_storage::Store;
+use evo_storage::replay::{load_current_replay_report, put_current_replay_report};
 use evo_storage::replay::{
     load_live_replay_pool, load_live_replay_report, load_live_replay_world, put_replay_report,
     put_replay_world_draft, register_replay_pool, seal_replay_world,
@@ -142,6 +143,47 @@ fn report(
         coverage: ReplayCoverage::default(),
         terminal: ReplayTerminal::PolicyStop,
         terminal_reason: "fixture stop".into(),
+        development_only: true,
+        revealed_prefix: None,
+    }
+}
+
+// Storage-level wire/source tests, not an engine semantic verifier. The
+// incomplete report is deliberately unscored and cannot mint CurrentVerified.
+fn current_report(
+    world: &ReplayWorldV2,
+    policy: &ElasticPolicyV1,
+    profile: &ReplaySimulationProfile,
+    quality: u32,
+) -> ReplayReportV3 {
+    ReplayReportV3 {
+        schema_version: REPLAY_REPORT_SCHEMA_V3.into(),
+        world_id: world.manifest.world_id.clone(),
+        world_digest: world.sealed_digest.clone().unwrap(),
+        cluster_id: world.manifest.cluster_id.clone(),
+        partition: world.manifest.partition,
+        policy_digest: fingerprint(policy).unwrap(),
+        profile_digest: fingerprint(profile).unwrap(),
+        objective_version: profile.objective.version().into(),
+        batches: vec![],
+        probe_best_quality_micros: vec![],
+        round_best_quality_micros: vec![],
+        final_quality_micros: quality,
+        probes: 0,
+        simulated_rounds: 0,
+        parallel_penalty: None,
+        no_probe: true,
+        attainment_auc_micros: None,
+        q_auc_sim_micros: None,
+        score_v2_micros: None,
+        historical_usage: HistoricalUsage::default(),
+        replay_cpu_nanos: 7,
+        coverage: ReplayCoverage::default(),
+        terminal: ReplayTerminal::OutOfSupport,
+        terminal_reason: "storage wire fixture; root universe unknown; not a semantic verifier"
+            .into(),
+        policy_stop_exclusions: ReplayPolicyStopExclusions::default(),
+        root_contract_state: ReplayRootContractState::Unknown,
         development_only: true,
         revealed_prefix: None,
     }
@@ -463,17 +505,19 @@ async fn baseline_source_revocation_blocks_pool_and_stored_report_view() {
     let (train, _select, pool) = registered_pool(&store, &worker).await;
     let policy = ElasticPolicyV1::default();
     let profile = ReplaySimulationProfile::default_v2(1, pool.pool_digest.clone());
-    let record = StoredReplayReportV1::build(
+    let record = StoredReplayReportV2::build(
         "n",
         WorldPartition::Train,
         &pool,
         policy.clone(),
         profile.clone(),
         ExplorationCapsV1::online(),
-        vec![report(&train, &policy, &profile, 100_000)],
+        vec![current_report(&train, &policy, &profile, 100_000)],
     )
     .unwrap();
-    put_replay_report(&worker, &store, &record).await.unwrap();
+    put_current_replay_report(&worker, &store, &record)
+        .await
+        .unwrap();
     let mut session = store.session().await.unwrap();
     session
         .put(
@@ -497,7 +541,7 @@ async fn baseline_source_revocation_blocks_pool_and_stored_report_view() {
             .is_err()
     );
     assert!(
-        load_live_replay_report(&evaluator, &store, &record.report_id)
+        load_current_replay_report(&evaluator, &store, &record.report_id)
             .await
             .is_err()
     );
@@ -511,7 +555,7 @@ async fn reports_require_complete_partition_and_are_immutable() {
     let profile = ReplaySimulationProfile::default_v2(1, pool.pool_digest.clone());
     let caps = ExplorationCapsV1::online();
     assert!(
-        StoredReplayReportV1::build(
+        StoredReplayReportV2::build(
             "n",
             WorldPartition::Select,
             &pool,
@@ -522,36 +566,48 @@ async fn reports_require_complete_partition_and_are_immutable() {
         )
         .is_err()
     );
-    let first = StoredReplayReportV1::build(
+    let first = StoredReplayReportV2::build(
         "n",
         WorldPartition::Train,
         &pool,
         policy.clone(),
         profile.clone(),
         caps.clone(),
-        vec![report(&train, &policy, &profile, 100_000)],
+        vec![current_report(&train, &policy, &profile, 100_000)],
     )
     .unwrap();
-    put_replay_report(&worker, &store, &first).await.unwrap();
-    put_replay_report(&worker, &store, &first).await.unwrap();
-    let changed = StoredReplayReportV1::build(
+    put_current_replay_report(&worker, &store, &first)
+        .await
+        .unwrap();
+    put_current_replay_report(&worker, &store, &first)
+        .await
+        .unwrap();
+    let changed = StoredReplayReportV2::build(
         "n",
         WorldPartition::Train,
         &pool,
         policy.clone(),
         profile.clone(),
         caps,
-        vec![report(&train, &policy, &profile, 200_000)],
+        vec![current_report(&train, &policy, &profile, 200_000)],
     )
     .unwrap();
     assert_eq!(first.report_id, changed.report_id);
-    assert!(put_replay_report(&worker, &store, &changed).await.is_err());
+    assert!(
+        put_current_replay_report(&worker, &store, &changed)
+            .await
+            .is_err()
+    );
     let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();
-    let loaded = load_live_replay_report(&evaluator, &store, &first.report_id)
+    let loaded = load_current_replay_report(&evaluator, &store, &first.report_id)
         .await
         .unwrap();
     assert_eq!(loaded.reports_body_digest, first.reports_body_digest);
-    assert!(put_replay_report(&evaluator, &store, &first).await.is_err());
+    assert!(
+        put_current_replay_report(&evaluator, &store, &first)
+            .await
+            .is_err()
+    );
 
     let mut leaking_select = select;
     leaking_select.manifest.world_id = "world-leaking-select".into();
@@ -740,4 +796,93 @@ async fn hundredth_replay_world_is_admitted_and_sealing_it_is_not_a_new_world() 
     let mut session = store.session().await.unwrap();
     assert_eq!(session.replay_world_count().await.unwrap(), 100);
     session.commit().await.unwrap();
+}
+
+async fn legacy_write_tables_snapshot(
+    store: &Store,
+) -> std::collections::BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+    let directory = tempfile::tempdir().unwrap();
+    let backup = directory.path().join("snapshot");
+    store.backup(&backup).await.unwrap();
+    let connection = rusqlite::Connection::open_with_flags(
+        backup.join("rsia.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let mut result = std::collections::BTreeMap::new();
+    // Complete tables, not sample counts: rejection must not add/update an
+    // object, edge, or audit fact. Read only the independent public backup.
+    for table in ["objects", "dependencies", "audit"] {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let columns = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        result.insert(table.to_owned(), rows);
+    }
+    result
+}
+
+#[tokio::test]
+async fn claimed_legacy_dto_cannot_create_a_new_report_or_grant_current_qualification() {
+    let (_dir, store, worker) = setup().await;
+    let (train, _select, pool) = registered_pool(&store, &worker).await;
+    let policy = ElasticPolicyV1::default();
+    let profile = ReplaySimulationProfile::default_v2(1, pool.pool_digest.clone());
+    // A newly constructed old DTO is only a claimed legacy body; it is not
+    // presented as an actual historical parent capture.
+    let claimed = StoredReplayReportV1::build(
+        "n",
+        WorldPartition::Train,
+        &pool,
+        policy.clone(),
+        profile.clone(),
+        ExplorationCapsV1::online(),
+        vec![report(&train, &policy, &profile, 100_000)],
+    )
+    .unwrap();
+    let mut session = store.session().await.unwrap();
+    assert!(
+        session
+            .object_row(&worker, "artifact", &claimed.report_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    session.commit().await.unwrap();
+    let before = legacy_write_tables_snapshot(&store).await;
+    match put_replay_report(&worker, &store, &claimed).await {
+        Err(Error::Invalid(reason)) => assert_eq!(reason, "legacy_replay_new_write_forbidden"),
+        other => panic!("new legacy write: expected exact rejection, got {other:?}"),
+    }
+    assert_eq!(legacy_write_tables_snapshot(&store).await, before);
+    let mut session = store.session().await.unwrap();
+    assert!(
+        session
+            .object_row(&worker, "artifact", &claimed.report_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        session
+            .dependency_edges(&worker, "artifact", &claimed.report_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    session.commit().await.unwrap();
+    assert!(matches!(
+        load_live_replay_report(&worker, &store, &claimed.report_id).await,
+        Err(Error::NotFound)
+    ));
+    store.close().await;
 }

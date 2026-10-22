@@ -7,7 +7,7 @@ use evo_core::strategy::{
 };
 use evo_core::{Context, Error, Role};
 use evo_engine::replay::{
-    LiveWorldAuthority, compare_complete_v2, replay_v2_is_not_formal, run_and_persist_pool_replay,
+    LiveWorldAuthority, compare_complete_v3, replay_v3_is_not_formal, run_and_persist_pool_replay,
     run_persisted_replay, run_replay, score_completed_trajectory, verified_replay_report_view,
 };
 use evo_storage::Store;
@@ -384,7 +384,15 @@ fn censored_policy_stop_world_exhausted_and_revoked_are_distinct() {
         &authority(),
     )
     .unwrap();
-    assert_eq!(stop_report.terminal, ReplayTerminal::PolicyStop);
+    // WorldV2 has no root contract: filtering a known action is not proof that every unused root was represented.
+    assert_eq!(stop_report.terminal, ReplayTerminal::OutOfSupport);
+    assert_eq!(stop_report.terminal_reason, "frontier_not_covered");
+    assert_eq!(
+        stop_report.root_contract_state,
+        ReplayRootContractState::Unknown
+    );
+    assert!(!stop_report.coverage.complete_support);
+    assert_eq!(stop_report.score_v2_micros, None);
     assert_eq!(stop_report.probes, 0);
     assert!(stop_report.parallel_penalty.is_none());
 
@@ -407,7 +415,15 @@ fn censored_policy_stop_world_exhausted_and_revoked_are_distinct() {
         &authority(),
     )
     .unwrap();
-    assert_eq!(exhausted_report.terminal, ReplayTerminal::WorldExhausted);
+    // An empty legacy catalog and exhausted flag likewise prove no root bound.
+    assert_eq!(exhausted_report.terminal, ReplayTerminal::OutOfSupport);
+    assert_eq!(exhausted_report.terminal_reason, "frontier_not_covered");
+    assert_eq!(
+        exhausted_report.root_contract_state,
+        ReplayRootContractState::Unknown
+    );
+    assert!(!exhausted_report.coverage.complete_support);
+    assert_eq!(exhausted_report.score_v2_micros, None);
 
     let mut revoked = authority();
     revoked.revoked_source_ids.insert("source-2".into());
@@ -459,7 +475,7 @@ fn invalid_world_is_terminal_and_report_is_never_formal() {
     )
     .unwrap();
     assert_eq!(report.terminal, ReplayTerminal::InvalidWorld);
-    assert!(replay_v2_is_not_formal(&report).is_err());
+    assert!(replay_v3_is_not_formal(&report).is_err());
 }
 
 #[test]
@@ -476,16 +492,16 @@ fn dominated_complete_report_cannot_win_and_unknown_cost_is_not_zero() {
     let mut worse = better.clone();
     worse.score_v2_micros = better.score_v2_micros.map(|score| score - 1);
     assert_eq!(
-        compare_complete_v2(&better, &worse).unwrap(),
+        compare_complete_v3(&better, &worse).unwrap(),
         std::cmp::Ordering::Greater
     );
     let mut unknown = better.clone();
     unknown.historical_usage.cost_micros = None;
-    assert!(compare_complete_v2(&unknown, &better).is_err());
+    assert!(compare_complete_v3(&unknown, &better).is_err());
 
     let mut legacy = better.clone();
     legacy.objective_version = OBJECTIVE_V1.into();
-    assert!(compare_complete_v2(&legacy, &better).is_err());
+    assert!(compare_complete_v3(&legacy, &better).is_err());
 }
 
 #[test]

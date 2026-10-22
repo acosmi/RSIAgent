@@ -146,6 +146,10 @@ pub fn router(state: HttpState) -> Router {
         .route(evo_core::management_registry::REVIEW_ROUTE, post(review))
         .route("/v1/manage/{operation}", post(management))
         .route("/v1/manage/jobs/{job_id}", get(management_status))
+        .route(
+            "/v1/manage/replay/economic-reports/{report_id}",
+            get(economic_report_read),
+        )
         .route("/v1/manage/jobs/{job_id}/cancel", post(management_cancel))
         .layer(RequestBodyLimitLayer::new(MAX_HTTP_BODY_BYTES))
         .with_state(state)
@@ -319,7 +323,29 @@ async fn management_status(
     headers: HeaderMap,
 ) -> std::result::Result<Json<Value>, HttpError> {
     let caller = state.auth.authenticate(&headers)?;
-    to_json(state.management.status(&caller, &job_id).await?)
+    to_json(
+        state
+            .management
+            .status_with_replay_read_view(&caller, &job_id)
+            .await?,
+    )
+}
+
+async fn economic_report_read(
+    State(state): State<HttpState>,
+    Path(report_id): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Value>, HttpError> {
+    let caller = state.auth.authenticate(&headers)?;
+    caller.require(&[Role::Evaluator, Role::Admin])?;
+    to_json(
+        evo_engine::replay_experiment::PersistentReplayEconomicCoordinator::query_report(
+            &caller,
+            state.service.store(),
+            &report_id,
+        )
+        .await?,
+    )
 }
 
 async fn management_cancel(

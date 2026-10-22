@@ -24,8 +24,11 @@
 //! pool, exploration world), `tests/replay_v41.rs` and `tests/replay_economics.rs`
 //! (test crates cannot import each other); the originals are untouched.
 
+// AG147: every report created by this file uses the actual current persistent
+// engine. Redaction/corruption/authorization assertions stay exact for that new
+// record kind; retained real v2 bytes are separately audited as Legacy.
 use evo_core::evidence::Purpose;
-use evo_core::replay::{ReplayPoolManifestV1, StoredReplayReportV1, WorldPartition};
+use evo_core::replay::{ReplayPoolManifestV1, StoredReplayReportV2, WorldPartition};
 use evo_core::strategy::{ElasticPolicyV1, ExplorationCapsV1};
 use evo_core::{Context, Error, Role};
 use evo_engine::dispatch::{
@@ -38,9 +41,9 @@ use evo_engine::replay_experiment::PersistentReplayEconomicCoordinator;
 use evo_storage::Store;
 use evo_storage::lifecycle::{CleanupState, LifecycleStore, RevokeTombstone};
 use evo_storage::replay::{
-    REPLAY_POOL_RECORD_KIND, REPLAY_REPORT_RECORD_KIND, REPLAY_STORE_ENVELOPE_SCHEMA,
-    load_live_replay_pool, load_live_replay_report, load_live_replay_world, put_replay_report,
-    register_replay_pool, replay_pool_storage_id,
+    CURRENT_REPLAY_REPORT_RECORD_KIND, REPLAY_POOL_RECORD_KIND, REPLAY_STORE_ENVELOPE_SCHEMA,
+    load_current_replay_report, load_live_replay_pool, load_live_replay_world,
+    put_current_replay_report, register_replay_pool, replay_pool_storage_id,
 };
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -720,7 +723,7 @@ mod replay_fx {
         ctx: &Context,
         store: &Store,
         pool: &ReplayPoolManifestV1,
-    ) -> StoredReplayReportV1 {
+    ) -> StoredReplayReportV2 {
         run_and_persist_pool_replay(
             ctx,
             store,
@@ -825,7 +828,7 @@ mod economic_fx {
         }
     }
 
-    pub fn experiment(report: &StoredReplayReportV1) -> ReplayEconomicExperimentV1 {
+    pub fn experiment(report: &StoredReplayReportV2) -> ReplayEconomicExperimentV1 {
         ReplayEconomicExperimentV1 {
             schema_version: EXPERIMENT_SCHEMA.into(),
             id: "economic-exp-1".into(),
@@ -928,7 +931,7 @@ async fn reads_of_a_cleaned_replay_chain_name_the_redacted_record() {
     };
 
     // Control: before the revocation every read of the chain works.
-    load_live_replay_report(&admin, &store, report_id)
+    load_current_replay_report(&admin, &store, report_id)
         .await
         .unwrap();
     load_live_replay_pool(&evaluator, &store, &pool.pool_digest)
@@ -956,15 +959,15 @@ async fn reads_of_a_cleaned_replay_chain_name_the_redacted_record() {
     session.commit().await.unwrap();
     assert_eq!(world["schema_version"], REDACTED, "{world}");
 
-    let report = redacted_message(REPLAY_REPORT_RECORD_KIND, report_id);
+    let report = redacted_message(CURRENT_REPLAY_REPORT_RECORD_KIND, report_id);
     let pool_message = redacted_message(REPLAY_POOL_RECORD_KIND, &pool_row);
     let world_message = redacted_message(WORLD_KIND, "world-1");
 
     // The report read, directly and through the verified view.
     assert_eq!(
         expect_conflict(
-            load_live_replay_report(&admin, &store, report_id).await,
-            "load_live_replay_report"
+            load_current_replay_report(&admin, &store, report_id).await,
+            "load_current_replay_report"
         ),
         report
     );
@@ -1078,7 +1081,7 @@ async fn the_economic_coordinator_propagates_the_named_conflict_of_a_redacted_se
     );
     assert_eq!(
         message,
-        redacted_message(REPLAY_REPORT_RECORD_KIND, &stored.report_id)
+        redacted_message(CURRENT_REPLAY_REPORT_RECORD_KIND, &stored.report_id)
     );
 }
 
@@ -1099,23 +1102,23 @@ async fn each_replay_read_point_names_the_record_that_was_redacted() {
         &admin,
         "artifact",
         &stored.report_id,
-        &redacted_store_row(&stored.report_id, REPLAY_REPORT_RECORD_KIND),
+        &redacted_store_row(&stored.report_id, CURRENT_REPLAY_REPORT_RECORD_KIND),
     )
     .await;
-    let report = redacted_message(REPLAY_REPORT_RECORD_KIND, &stored.report_id);
+    let report = redacted_message(CURRENT_REPLAY_REPORT_RECORD_KIND, &stored.report_id);
     assert_eq!(
         expect_conflict(
-            load_live_replay_report(&evaluator, &store, &stored.report_id).await,
-            "load_live_replay_report"
+            load_current_replay_report(&evaluator, &store, &stored.report_id).await,
+            "load_current_replay_report"
         ),
         report
     );
-    // `put_replay_report` finds the report already stored (the read of an existing
+    // `put_current_replay_report` finds the report already stored (the read of an existing
     // report) and `run_and_persist_pool_replay` looks it up before it recomputes.
     assert_eq!(
         expect_conflict(
-            put_replay_report(&admin, &store, &stored).await,
-            "put_replay_report over a redacted report"
+            put_current_replay_report(&admin, &store, &stored).await,
+            "put_current_replay_report over a redacted report"
         ),
         report
     );
@@ -1171,15 +1174,15 @@ async fn each_replay_read_point_names_the_record_that_was_redacted() {
     // The live report loads its pool: the redacted pool is named there too.
     assert_eq!(
         expect_conflict(
-            load_live_replay_report(&evaluator, &store, &stored.report_id).await,
-            "load_live_replay_report over a redacted pool"
+            load_current_replay_report(&evaluator, &store, &stored.report_id).await,
+            "load_current_replay_report over a redacted pool"
         ),
         pool_message
     );
     assert_eq!(
         expect_conflict(
-            put_replay_report(&admin, &store, &stored).await,
-            "put_replay_report over a redacted pool"
+            put_current_replay_report(&admin, &store, &stored).await,
+            "put_current_replay_report over a redacted pool"
         ),
         pool_message
     );
@@ -1252,17 +1255,19 @@ async fn a_replay_body_that_is_not_a_tombstone_and_does_not_decode_keeps_its_cla
     for body in damaged(&stored.report_id) {
         put_raw(&store, &admin, "artifact", &stored.report_id, &body).await;
         expect_internal(
-            load_live_replay_report(&evaluator, &store, &stored.report_id).await,
-            &format!("load_live_replay_report over {body}"),
+            load_current_replay_report(&evaluator, &store, &stored.report_id).await,
+            &format!("load_current_replay_report over {body}"),
         );
         expect_internal(
-            put_replay_report(&admin, &store, &stored).await,
-            &format!("put_replay_report over {body}"),
+            put_current_replay_report(&admin, &store, &stored).await,
+            &format!("put_current_replay_report over {body}"),
         );
-        expect_internal(
-            verified_replay_report_view(&evaluator, &store, &stored.report_id).await,
-            &format!("verified_replay_report_view over {body}"),
-        );
+        // Legacy loaders keep their original Internal decode classification.
+        // The new versioned view has a distinct, closed invalid-record state.
+        match verified_replay_report_view(&evaluator, &store, &stored.report_id).await {
+            Err(Error::Invalid(reason)) => assert_eq!(reason, "invalid_replay_record"),
+            other => panic!("versioned view over {body}: expected typed invalid, got {other:?}"),
+        }
     }
 
     // Pool row.
@@ -1277,8 +1282,8 @@ async fn a_replay_body_that_is_not_a_tombstone_and_does_not_decode_keeps_its_cla
             &format!("load_live_replay_pool over {body}"),
         );
         expect_internal(
-            load_live_replay_report(&evaluator, &store, &stored.report_id).await,
-            &format!("load_live_replay_report over a pool of {body}"),
+            load_current_replay_report(&evaluator, &store, &stored.report_id).await,
+            &format!("load_current_replay_report over a pool of {body}"),
         );
         expect_internal(
             register_replay_pool(
@@ -1573,4 +1578,65 @@ async fn an_unreadable_tombstone_fails_the_submit_check_closed() {
         assert_eq!(counts(&store, &admin).await, before, "{body}");
         assert_no_idempotency_row(&store, &admin, "exploration.start", &key).await;
     }
+}
+
+#[tokio::test]
+async fn claimed_redacted_report_metadata_only_selects_a_closed_error_name() {
+    // Claimed tombstone input is a rejection fixture, never a historical report
+    // or evidence that any Current/Legacy/source qualification succeeded.
+    let (_dir, store, admin) = open("redacted-report-known-kind.sqlite3").await;
+    for (index, kind) in [
+        evo_storage::replay::REPLAY_REPORT_RECORD_KIND,
+        evo_storage::replay::CURRENT_REPLAY_REPORT_RECORD_KIND,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("report-closed-name-{index}");
+        let body = redacted_store_row(&id, kind);
+        put_raw(&store, &admin, "artifact", &id, &body).await;
+        let before = raw(&store, &admin, "artifact", &id).await;
+        let mut session = store.session().await.unwrap();
+        let rejected =
+            evo_storage::replay::replay_report_version_in_session(&mut session, &admin, &id).await;
+        session.commit().await.unwrap();
+        assert!(
+            matches!(rejected,
+            Err(evo_core::replay::ReplayReadIsolation::Source(Error::Conflict(ref message)))
+            if message == &redacted_message(kind, &id)),
+            "{rejected:?}"
+        );
+        assert_eq!(raw(&store, &admin, "artifact", &id).await, before);
+    }
+    store.close().await;
+}
+
+#[tokio::test]
+async fn unknown_redacted_report_metadata_never_leaks_or_grants_a_version() {
+    let (_dir, store, admin) = open("redacted-report-private-kind.sqlite3").await;
+    let canary = "unknown-private-content-must-never-be-an-error-kind";
+    for (index, kind) in [json!(canary), json!({"private":canary}), Value::Null]
+        .into_iter()
+        .enumerate()
+    {
+        let id = format!("report-private-name-{index}");
+        let mut body = redacted_store_row(&id, "placeholder");
+        body["metadata"]["record_kind"] = kind;
+        body["metadata"]["private_canary"] = json!(canary);
+        put_raw(&store, &admin, "artifact", &id, &body).await;
+        let before = raw(&store, &admin, "artifact", &id).await;
+        let mut session = store.session().await.unwrap();
+        let rejected =
+            evo_storage::replay::replay_report_version_in_session(&mut session, &admin, &id).await;
+        session.commit().await.unwrap();
+        match rejected {
+            Err(evo_core::replay::ReplayReadIsolation::Source(Error::Conflict(message))) => {
+                assert_eq!(message, redacted_message("replay_report", &id));
+                assert!(!message.contains(canary));
+            }
+            other => panic!("unqualified metadata must stay rejected: {other:?}"),
+        }
+        assert_eq!(raw(&store, &admin, "artifact", &id).await, before);
+    }
+    store.close().await;
 }

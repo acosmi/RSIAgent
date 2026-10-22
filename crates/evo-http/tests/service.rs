@@ -789,6 +789,23 @@ async fn authenticated_async_replay_flow_and_role_rejection() {
     assert_eq!(status["result"]["result"], "replay_stored");
     assert_eq!(status["result"]["pool_digest"], pool.pool_digest);
     assert!(status["result"]["report_id"].as_str().is_some());
+    assert_eq!(
+        status["replay_read_view"]["record"]["state"],
+        "current_verified"
+    );
+    assert_eq!(status["replay_read_view"]["source_legacy"], false);
+    assert_eq!(
+        status["replay_read_view"]["raw_payload"]["report_id"],
+        status["result"]["report_id"]
+    );
+    assert_eq!(
+        status["replay_read_view"]["raw_payload"]["replay_engine_version"],
+        NEXT_REPLAY_ENGINE_VERSION_V3
+    );
+    assert_eq!(
+        status["replay_read_view"]["raw_payload"]["schema_version"],
+        STORED_REPLAY_REPORT_SCHEMA_V2
+    );
 
     // 7. Non-management role cannot access management job endpoint (403 Forbidden)
     assert_eq!(
@@ -1525,4 +1542,455 @@ async fn authenticated_async_exploration_start_flow_and_role_rejection() {
     assert_eq!(persisted["result"], terminal["result"]);
 
     task.abort();
+}
+
+// These fixed R6 inputs are actual Parent bytes. Each case opens only its own copy.
+const AG147_HISTORY_WORKER_TOKEN: &str = "history-worker-token-0123456789";
+
+async fn ag147_parent_history_http_state() -> (tempfile::TempDir, Store, Value, HttpState) {
+    let metadata_bytes =
+        include_bytes!("../../evo-engine/tests/fixtures/ag147_m33_legacy_history.json");
+    let database_bytes =
+        include_bytes!("../../evo-engine/tests/fixtures/ag147_m33_legacy_history.sqlite3");
+    assert_eq!(
+        hash(metadata_bytes),
+        "a0f9227027e927ec5cd6f7c8422b93b2893cb2dbfe0055e87efe3ebb3eaccb71"
+    );
+    assert_eq!(
+        hash(database_bytes),
+        "0d22863a74877098e16d2b2ce651a9af7eb48b517930db6ef021cfa68a013c38"
+    );
+    let metadata: Value = serde_json::from_slice(metadata_bytes).unwrap();
+    assert_eq!(
+        metadata["schema_version"],
+        "ag147.parent-retained-history.v1"
+    );
+    assert_eq!(metadata["namespace"], "n");
+    assert_eq!(metadata["scope"]["external_provider_calls"], 0);
+    assert_eq!(metadata["scope"]["real_paid_effect_claimed"], false);
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("history-copy.sqlite3");
+    std::fs::write(&database, database_bytes).unwrap();
+    let store = Store::open(&database).await.unwrap();
+    let auth = AuthRegistry::from_plaintext(vec![
+        (
+            ADMIN_TOKEN.into(),
+            AuthIdentity::new("n", "admin", Role::Admin).unwrap(),
+        ),
+        (
+            EVALUATOR_TOKEN.into(),
+            AuthIdentity::new("n", "evaluator", Role::Evaluator).unwrap(),
+        ),
+        (
+            AGENT_A_TOKEN.into(),
+            AuthIdentity::new("n", "agent-a", Role::Agent).unwrap(),
+        ),
+        (
+            AG147_HISTORY_WORKER_TOKEN.into(),
+            AuthIdentity::new("n", "worker", Role::Worker).unwrap(),
+        ),
+        (
+            "history-other-owner-0123456789".into(),
+            AuthIdentity::new("n", "other-admin", Role::Admin).unwrap(),
+        ),
+        (
+            HOST_TOKEN.into(),
+            AuthIdentity::new("n", "fixture-host", Role::Host).unwrap(),
+        ),
+        (
+            "history-other-eval-0123456789".into(),
+            AuthIdentity::new("n", "other-evaluator", Role::Evaluator).unwrap(),
+        ),
+        (
+            "history-other-admin-0123456789".into(),
+            AuthIdentity::new("other", "admin", Role::Admin).unwrap(),
+        ),
+    ])
+    .unwrap();
+    let management = evo_engine::dispatch::ManagementDispatcher::new(
+        store.clone(),
+        auth.management_contexts().unwrap(),
+    )
+    .unwrap();
+    // This HTTP state only exercises existing authenticated GET readers.
+    // It never prepares a host, executes a model, or authorizes a paid source.
+    let state = HttpState {
+        service: HostService::new(
+            store.clone(),
+            Context::new("n", "fixture-host", Role::Host).unwrap(),
+        )
+        .unwrap(),
+        prepare_config: HostPrepareConfig {
+            profile_id: "unused-read-only-profile".into(),
+            system_snapshot: SystemSnapshot {
+                schema_version: "rsia.system_snapshot.v2".into(),
+                profile_id: "unused-read-only-profile".into(),
+                host_id: "fixture-host".into(),
+                host_version: "1".into(),
+                model_id: "disabled".into(),
+                tools: vec![],
+                mandatory_context_digest: d("unused-read-only-context"),
+            },
+            host_surface_id: "unused-read-only-surface".into(),
+            host_capabilities: HostCapabilities {
+                available: BTreeSet::new(),
+                granted: BTreeSet::new(),
+            },
+            evolution_enabled: false,
+            capability_level: CapabilityLevel::ToolOnly,
+        },
+        auth,
+        management,
+    };
+    (directory, store, metadata, state)
+}
+
+async fn ag147_history_get_error(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    status: StatusCode,
+    code: &str,
+) {
+    let response = client.get(url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(response.status(), status);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error":{"code":code}})
+    );
+}
+
+#[tokio::test]
+async fn actual_parent_http_reads_preserve_old_job_and_economic_payloads_and_roles() {
+    let (_directory, store, metadata, state) = ag147_parent_history_http_state().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let audit_before = store.verify_audit(&admin).await.unwrap();
+    let (base, task) = spawn(state).await;
+    let client = reqwest::Client::new();
+    let management_id = metadata["management_job"]["id"].as_str().unwrap();
+    let job_url = format!("{base}/v1/manage/jobs/{management_id}");
+    assert_eq!(
+        client.get(&job_url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let job_response = client
+        .get(&job_url)
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(job_response.status(), StatusCode::OK);
+    let mut job_body: Value = job_response.json().await.unwrap();
+    let replay_view = job_body
+        .as_object_mut()
+        .unwrap()
+        .remove("replay_read_view")
+        .unwrap();
+    assert_eq!(job_body, metadata["management_job"]);
+    assert_eq!(replay_view["record"]["state"], "legacy");
+    assert_eq!(replay_view["source_legacy"], true);
+    assert_eq!(replay_view["raw_payload"], metadata["selection"]);
+    for token in [AGENT_A_TOKEN, HOST_TOKEN, AG147_HISTORY_WORKER_TOKEN] {
+        assert_eq!(
+            client
+                .get(&job_url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    for token in [
+        EVALUATOR_TOKEN,
+        "history-other-eval-0123456789",
+        "history-other-owner-0123456789",
+    ] {
+        ag147_history_get_error(&client, &job_url, token, StatusCode::NOT_FOUND, "not_found").await;
+    }
+    let other_namespace = client
+        .get(&job_url)
+        .bearer_auth("history-other-admin-0123456789")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_namespace.status(), StatusCode::NOT_FOUND);
+    let forged = client
+        .get(&job_url)
+        .bearer_auth(ADMIN_TOKEN)
+        .header("x-namespace", "other")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), StatusCode::FORBIDDEN);
+
+    for name in ["blocked_report", "cancelled_report"] {
+        let report_id = metadata[name]["id"].as_str().unwrap();
+        let url = format!("{base}/v1/manage/replay/economic-reports/{report_id}");
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        for token in [ADMIN_TOKEN, EVALUATOR_TOKEN] {
+            let response = client.get(&url).bearer_auth(token).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["raw_payload"], metadata[name]);
+            assert_eq!(body["source_legacy"], true);
+            assert_eq!(body["replay_read_view"]["record"]["state"], "legacy");
+            assert_eq!(
+                body["replay_read_view"]["raw_payload"],
+                metadata["selection"]
+            );
+        }
+        for token in [
+            AGENT_A_TOKEN,
+            HOST_TOKEN,
+            AG147_HISTORY_WORKER_TOKEN,
+            "history-other-eval-0123456789",
+        ] {
+            assert_eq!(
+                client
+                    .get(&url)
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth("history-other-admin-0123456789")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(metadata["cancelled_job"]["state"], "cancelled");
+    assert_eq!(metadata["cancelled_report"]["terminal"], "usage_uncertain");
+    assert_eq!(
+        metadata["cost_receipts"][0]["measurement_state"],
+        "not_incurred"
+    );
+    assert_eq!(
+        metadata["cost_receipts"][1]["measurement_state"],
+        "usage_uncertain"
+    );
+    assert_eq!(metadata["cost_receipts"][1]["amount_micros"], Value::Null);
+    // GET projections must not replace any persisted original job, input,
+    // selection, economic report, cost receipt or cancellation bytes.
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let mut session = store.session().await.unwrap();
+    for row in metadata["artifact_rows"].as_array().unwrap().iter().chain([
+        &metadata["management_job_raw"],
+        &metadata["management_private_input_raw"],
+    ]) {
+        let kind = row["kind"].as_str().unwrap();
+        let actual = session
+            .object_row(&admin, kind, row["physical_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.owner, row["owner"].as_str().unwrap());
+        assert_eq!(actual.body, row["body_utf8"].as_str().unwrap());
+    }
+    assert_eq!(
+        session
+            .namespace_object_count(&admin, "artifact")
+            .await
+            .unwrap(),
+        u64::try_from(metadata["artifact_rows"].as_array().unwrap().len()).unwrap()
+    );
+    assert_eq!(
+        session.namespace_object_count(&admin, "job").await.unwrap(),
+        1
+    );
+    session.commit().await.unwrap();
+    assert_eq!(store.verify_audit(&admin).await.unwrap(), audit_before);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    store.close().await;
+}
+
+#[tokio::test]
+async fn actual_parent_http_source_cleanup_refuses_private_input_and_economic_reads_keeps_facts() {
+    use evo_storage::lifecycle::{CleanupState, LifecycleStore, RevokeTombstone, TypedObjectRef};
+
+    let (_directory, store, metadata, state) = ag147_parent_history_http_state().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let world_id = metadata["selection"]["member_reports"][0]["world_id"]
+        .as_str()
+        .unwrap();
+    let world =
+        evo_storage::replay::load_live_replay_world(&admin, &store, world_id, Purpose::Development)
+            .await
+            .unwrap();
+    // Choose a real original run of the sealed selection; never invent a
+    // revocable artifact or hand-write a redacted input/tombstone.
+    let source_id = world.manifest.source_closure[0].source_id.clone();
+    let mut session = store.session().await.unwrap();
+    let original_source = session
+        .object_row(&admin, "run", &source_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original_source.id, source_id);
+    let authority: Value = serde_json::from_str(&original_source.body).unwrap();
+    assert_eq!(authority["record"]["id"], source_id);
+    assert_eq!(authority["schema_version"], "rsia.optimization.source.v1");
+    session.commit().await.unwrap();
+
+    let (base, task) = spawn(state).await;
+    let client = reqwest::Client::new();
+    let job_id = metadata["management_job"]["id"].as_str().unwrap();
+    let input_id = metadata["management_job"]["private_input_ref"]
+        .as_str()
+        .unwrap();
+    let job_url = format!("{base}/v1/manage/jobs/{job_id}");
+    let report_urls: Vec<_> = ["blocked_report", "cancelled_report"]
+        .into_iter()
+        .map(|key| {
+            format!(
+                "{base}/v1/manage/replay/economic-reports/{}",
+                metadata[key]["id"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(
+        client
+            .get(&job_url)
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    for url in &report_urls {
+        for token in [ADMIN_TOKEN, EVALUATOR_TOKEN] {
+            let response = client.get(url).bearer_auth(token).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["source_legacy"],
+                true
+            );
+        }
+    }
+
+    let mut cleanup = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: source_id.clone(),
+        },
+        "controlled Parent fixture source revoked",
+        evo_core::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    for _ in 0..256 {
+        if cleanup.state == CleanupState::Complete {
+            break;
+        }
+        assert_ne!(cleanup.state, CleanupState::Failed, "{cleanup:?}");
+        cleanup = LifecycleStore::cleanup_step(
+            &admin,
+            &store,
+            &cleanup.job_id,
+            32,
+            evo_core::now().unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(cleanup.state, CleanupState::Complete, "{cleanup:?}");
+    assert_eq!(cleanup.pending_nodes, 0);
+    assert_eq!(cleanup.last_error, None);
+
+    let audit_after_cleanup = store.verify_audit(&admin).await.unwrap();
+    // Existing routing maps the private-input and moved source watermark
+    // Conflicts to 409/conflict. An arbitrary error/500 is not acceptable.
+    ag147_history_get_error(
+        &client,
+        &job_url,
+        ADMIN_TOKEN,
+        StatusCode::CONFLICT,
+        "conflict",
+    )
+    .await;
+    for url in &report_urls {
+        for token in [ADMIN_TOKEN, EVALUATOR_TOKEN] {
+            ag147_history_get_error(&client, url, token, StatusCode::CONFLICT, "conflict").await;
+        }
+    }
+    let mut session = store.session().await.unwrap();
+    let tombstone: RevokeTombstone = session.need(&admin, "tombstone", &source_id).await.unwrap();
+    assert_eq!(tombstone.id, source_id);
+    assert_eq!(tombstone.source_kind, "run");
+    let redacted: Value = session.need(&admin, "artifact", input_id).await.unwrap();
+    assert_eq!(redacted["schema_version"], "rsia.redacted.v1");
+    let old_job = session
+        .object_row(&admin, "job", job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        old_job.body,
+        metadata["management_job_raw"]["body_utf8"]
+            .as_str()
+            .unwrap()
+    );
+    assert_eq!(
+        old_job.owner,
+        metadata["management_job_raw"]["owner"].as_str().unwrap()
+    );
+    // Cancellation, cost/uncertainty and original economic reports are durable
+    // facts even when a selected source and the job's private input are revoked.
+    for row in metadata["economic_record_rows"]
+        .as_object()
+        .unwrap()
+        .values()
+    {
+        let actual = session
+            .object_row(&admin, "artifact", row["physical_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.owner, row["owner"].as_str().unwrap());
+        assert_eq!(actual.body, row["body_utf8"].as_str().unwrap());
+    }
+    let cost_rows: Vec<_> = metadata["artifact_rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| {
+            let body: Value = serde_json::from_str(row["body_utf8"].as_str().unwrap()).unwrap();
+            body["record_kind"] == "replay_economic_cost_receipt_v1"
+        })
+        .collect();
+    assert_eq!(cost_rows.len(), 2);
+    for row in cost_rows {
+        let actual = session
+            .object_row(&admin, "artifact", row["physical_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.owner, row["owner"].as_str().unwrap());
+        assert_eq!(actual.body, row["body_utf8"].as_str().unwrap());
+    }
+    session.commit().await.unwrap();
+    assert_eq!(
+        store.verify_audit(&admin).await.unwrap(),
+        audit_after_cleanup
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    store.close().await;
 }

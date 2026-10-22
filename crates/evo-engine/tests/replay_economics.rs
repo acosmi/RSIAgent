@@ -178,7 +178,7 @@ fn world(id: &str, cluster: &str, source_id: &str, partition: WorldPartition) ->
     world
 }
 
-fn experiment(report: &StoredReplayReportV1) -> ReplayEconomicExperimentV1 {
+fn experiment(report: &StoredReplayReportV2) -> ReplayEconomicExperimentV1 {
     ReplayEconomicExperimentV1 {
         schema_version: EXPERIMENT_SCHEMA.into(),
         id: "economic-exp-1".into(),
@@ -407,7 +407,7 @@ async fn setup() -> (
         },
     )
     .unwrap();
-    let stored_report = StoredReplayReportV1::build(
+    let stored_report = StoredReplayReportV2::build(
         "n",
         WorldPartition::Select,
         &pool,
@@ -417,7 +417,7 @@ async fn setup() -> (
         vec![replay],
     )
     .unwrap();
-    evo_storage::replay::put_replay_report(&admin, &store, &stored_report)
+    evo_storage::replay::put_current_replay_report(&admin, &store, &stored_report)
         .await
         .unwrap();
     let experiment = experiment(&stored_report);
@@ -1103,4 +1103,726 @@ async fn actor_source_and_watermark_changes_block_reuse() {
         .await
         .is_err()
     );
+}
+
+// Actual Parent capture, copied under the card's explicit fixture allowlist.
+// These constants are filled only from the retained producer and copy receipt.
+// Each test opens a fresh DB copy; the committed fixture is never opened.
+const M33_HISTORY_METADATA: &str = include_str!("fixtures/ag147_m33_legacy_history.json");
+const M33_HISTORY_DATABASE: &[u8] = include_bytes!("fixtures/ag147_m33_legacy_history.sqlite3");
+const M33_HISTORY_METADATA_SHA256: &str =
+    "a0f9227027e927ec5cd6f7c8422b93b2893cb2dbfe0055e87efe3ebb3eaccb71";
+const M33_HISTORY_DATABASE_SHA256: &str =
+    "0d22863a74877098e16d2b2ce651a9af7eb48b517930db6ef021cfa68a013c38";
+
+async fn actual_m33_history_copy() -> (
+    tempfile::TempDir,
+    Store,
+    Context,
+    Context,
+    serde_json::Value,
+) {
+    assert_eq!(
+        hash(M33_HISTORY_METADATA.as_bytes()),
+        M33_HISTORY_METADATA_SHA256
+    );
+    assert_eq!(hash(M33_HISTORY_DATABASE), M33_HISTORY_DATABASE_SHA256);
+    let metadata: serde_json::Value = serde_json::from_str(M33_HISTORY_METADATA).unwrap();
+    assert_eq!(
+        metadata["schema_version"],
+        "ag147.parent-retained-history.v1"
+    );
+    assert_eq!(
+        metadata["parent"],
+        "a730b9a9935bee7a41e8a47e86f329b99012566b"
+    );
+    assert_eq!(metadata["namespace"], "n");
+    assert_eq!(
+        metadata["snapshot"]["database_sha256"].as_str(),
+        Some(M33_HISTORY_DATABASE_SHA256)
+    );
+    assert_eq!(
+        metadata["snapshot"]["database_bytes"].as_u64(),
+        Some(u64::try_from(M33_HISTORY_DATABASE.len()).unwrap())
+    );
+    assert_eq!(metadata["scope"]["external_provider_calls"], 0);
+    assert_eq!(metadata["scope"]["real_paid_effect_claimed"], false);
+    assert_eq!(metadata["scope"]["current_v3_authority_claimed"], false);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("history-copy.sqlite3");
+    std::fs::write(&path, M33_HISTORY_DATABASE).unwrap();
+    let store = Store::open(&path).await.unwrap();
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();
+    let mut session = store.session().await.unwrap();
+    for row in metadata["artifact_rows"].as_array().unwrap() {
+        let physical_id = row["physical_id"].as_str().unwrap();
+        let actual = session
+            .object_row(&admin, "artifact", physical_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.id, physical_id);
+        assert_eq!(actual.owner, row["owner"].as_str().unwrap());
+        assert_eq!(actual.body, row["body_utf8"].as_str().unwrap());
+        assert_eq!(
+            hash(actual.body.as_bytes()),
+            row["body_sha256"].as_str().unwrap()
+        );
+    }
+    assert_eq!(
+        session.watermark(&admin).await.unwrap().unwrap().0,
+        metadata["original_watermark"]["seq"].as_i64().unwrap()
+    );
+    session.commit().await.unwrap();
+    (dir, store, admin, evaluator, metadata)
+}
+
+async fn original_m33_rows_unchanged(store: &Store, admin: &Context, metadata: &serde_json::Value) {
+    let mut session = store.session().await.unwrap();
+    for row in metadata["artifact_rows"].as_array().unwrap() {
+        let actual = session
+            .object_row(admin, "artifact", row["physical_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.owner, row["owner"].as_str().unwrap());
+        assert_eq!(actual.body, row["body_utf8"].as_str().unwrap());
+    }
+    for name in ["management_job_raw", "management_private_input_raw"] {
+        let row = &metadata[name];
+        let actual = session
+            .object_row(
+                admin,
+                row["kind"].as_str().unwrap(),
+                row["physical_id"].as_str().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.owner, row["owner"].as_str().unwrap());
+        assert_eq!(actual.body, row["body_utf8"].as_str().unwrap());
+    }
+    session.commit().await.unwrap();
+}
+
+fn is_legacy_consumption_error(error: &Error) -> bool {
+    matches!(error, Error::Invalid(reason) if reason == "legacy_replay_not_consumable")
+}
+
+#[tokio::test]
+async fn actual_parent_selection_is_auditable_but_rejected_at_all_new_e11_write_gates() {
+    let (directory, store, admin, evaluator, metadata) = actual_m33_history_copy().await;
+    let old: StoredReplayReportV1 = serde_json::from_value(metadata["selection"].clone()).unwrap();
+    let experiment: ReplayEconomicExperimentV1 =
+        serde_json::from_value(metadata["experiment"].clone()).unwrap();
+    let blocked: evo_engine::replay_experiment::ReplayEconomicJobV1 =
+        serde_json::from_value(metadata["blocked_job"].clone()).unwrap();
+    let read = evo_engine::replay::query_replay_report_record(&evaluator, &store, &old.report_id)
+        .await
+        .unwrap();
+    assert_eq!(read.record.state(), ReplayRecordState::Legacy);
+    assert!(read.source_legacy);
+    assert!(read.record.current_report().is_none());
+    assert_eq!(read.raw_payload, Some(metadata["selection"].clone()));
+    assert_eq!(
+        serde_json::to_value(read.record.report().unwrap()).unwrap(),
+        metadata["selection"]
+    );
+    let complete_before = directory.path().join("before-legacy-new-consumption");
+    store.backup(&complete_before).await.unwrap();
+    let strong =
+        evo_engine::replay::verified_replay_report_view(&evaluator, &store, &old.report_id)
+            .await
+            .unwrap_err();
+    assert!(is_legacy_consumption_error(&strong), "{strong:?}");
+    let register =
+        PersistentReplayEconomicCoordinator::register(&evaluator, &store, experiment.clone())
+            .await
+            .unwrap_err();
+    assert!(is_legacy_consumption_error(&register), "{register:?}");
+    let start = PersistentReplayEconomicCoordinator::start(
+        &evaluator,
+        &store,
+        &experiment.id,
+        &blocked.request_key,
+        blocked.created_seq,
+    )
+    .await
+    .unwrap_err();
+    assert!(is_legacy_consumption_error(&start), "{start:?}");
+    // This is the coordinator's existing final write Session. Supplying the
+    // actual old job must not bypass the new selection check via idempotency.
+    let final_write = PersistentReplayEconomicCoordinator::write_started_job(
+        &evaluator,
+        &store,
+        &experiment,
+        blocked,
+    )
+    .await
+    .unwrap_err();
+    assert!(is_legacy_consumption_error(&final_write), "{final_write:?}");
+    original_m33_rows_unchanged(&store, &admin, &metadata).await;
+
+    let complete_after = directory.path().join("after-legacy-new-consumption");
+    store.backup(&complete_after).await.unwrap();
+    assert_eq!(
+        std::fs::read(complete_after.join("rsia.sqlite3")).unwrap(),
+        std::fs::read(complete_before.join("rsia.sqlite3")).unwrap(),
+        "legacy strong/register/same-key start/final Session checks changed persistent facts"
+    );
+
+    // Explicit new v3 execution uses the real old sources and a separate v3
+    // report identity. It cannot relabel or overwrite the old report bytes.
+    let current = evo_engine::replay::run_and_persist_pool_replay(
+        &admin,
+        &store,
+        &old.pool_digest,
+        old.partition,
+        &old.policy,
+        &old.profile,
+        &old.caps,
+    )
+    .await
+    .unwrap();
+    assert_ne!(current.report_id, old.report_id);
+    assert_eq!(current.replay_engine_version, NEXT_REPLAY_ENGINE_VERSION_V3);
+    assert_eq!(current.schema_version, STORED_REPLAY_REPORT_SCHEMA_V2);
+    let current_read =
+        evo_engine::replay::query_replay_report_record(&evaluator, &store, &current.report_id)
+            .await
+            .unwrap();
+    assert_eq!(
+        current_read.record.state(),
+        ReplayRecordState::CurrentVerified
+    );
+    assert!(!current_read.source_legacy);
+    let old_again =
+        evo_engine::replay::query_replay_report_record(&evaluator, &store, &old.report_id)
+            .await
+            .unwrap();
+    assert_eq!(old_again.record.state(), ReplayRecordState::Legacy);
+    assert_eq!(old_again.raw_payload, Some(metadata["selection"].clone()));
+    assert_eq!(old_again.lineage.len(), 2);
+    original_m33_rows_unchanged(&store, &admin, &metadata).await;
+    store.close().await;
+}
+
+#[tokio::test]
+async fn actual_parent_e11_paid_uncertain_cancel_and_owner_history_is_preserved() {
+    let (_dir, store, admin, evaluator, metadata) = actual_m33_history_copy().await;
+    for (job_key, status_key) in [
+        ("blocked_job", "blocked_status"),
+        ("cancelled_job", "cancelled_status"),
+    ] {
+        let id = metadata[job_key]["id"].as_str().unwrap();
+        let status = PersistentReplayEconomicCoordinator::status(&evaluator, &store, id)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_value(status).unwrap(), metadata[status_key]);
+    }
+    for report_key in ["blocked_report", "cancelled_report"] {
+        let id = metadata[report_key]["id"].as_str().unwrap();
+        for caller in [&evaluator, &admin] {
+            let audit = PersistentReplayEconomicCoordinator::query_report(caller, &store, id)
+                .await
+                .unwrap();
+            assert!(audit.source_legacy);
+            assert_eq!(
+                audit.replay_read_view.record.state(),
+                ReplayRecordState::Legacy
+            );
+            assert_eq!(audit.raw_payload, metadata[report_key]);
+            assert_eq!(
+                audit.replay_read_view.raw_payload,
+                Some(metadata["selection"].clone())
+            );
+        }
+        for caller in [
+            Context::new("n", "other-evaluator", Role::Evaluator).unwrap(),
+            Context::new("n", "agent", Role::Agent).unwrap(),
+            Context::new("n", "fixture-host", Role::Host).unwrap(),
+        ] {
+            assert!(matches!(
+                PersistentReplayEconomicCoordinator::query_report(&caller, &store, id).await,
+                Err(Error::Forbidden)
+            ));
+        }
+        let other_namespace = Context::new("other", "admin", Role::Admin).unwrap();
+        assert!(
+            PersistentReplayEconomicCoordinator::query_report(&other_namespace, &store, id)
+                .await
+                .is_err()
+        );
+    }
+    let cancelled: evo_engine::replay_experiment::ReplayEconomicJobV1 =
+        serde_json::from_value(metadata["cancelled_job"].clone()).unwrap();
+    let original_cancelled = PersistentReplayEconomicCoordinator::cancel(
+        &evaluator,
+        &store,
+        &cancelled.id,
+        cancelled.cancel_reason.as_deref().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(original_cancelled).unwrap(),
+        metadata["cancelled_job"]
+    );
+    let repeated_receipt = PersistentReplayEconomicCoordinator::record_budget_cost(
+        &evaluator,
+        &store,
+        &cancelled.id,
+        "economic-scope",
+        "replay-call",
+        CostComponentKind::OnlineDevelopmentReplaySelected,
+        CostScope::PerTask,
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&repeated_receipt).unwrap(),
+        metadata["cost_receipts"][1]
+    );
+    assert_eq!(
+        repeated_receipt.measurement_state,
+        MeasurementState::UsageUncertain
+    );
+    assert_eq!(repeated_receipt.amount_micros, None);
+    assert_eq!(
+        metadata["cost_receipts"][0]["measurement_state"],
+        "not_incurred"
+    );
+    for (call, position) in [("released-call", 0), ("replay-call", 1)] {
+        let actual = store
+            .budget_call(&evaluator, "economic-scope", call)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            metadata["budget_calls"][position]
+        );
+    }
+    original_m33_rows_unchanged(&store, &admin, &metadata).await;
+    store.close().await;
+}
+
+// Invalid variants are deliberate corruptions of a copied actual Parent row.
+// They do not create an historical/current report or any source authority.
+#[tokio::test]
+async fn actual_parent_report_corruption_and_future_versions_are_never_legacy_or_public_payload() {
+    let mutations = [
+        "body_digest",
+        "semantic_digest",
+        "member_binding",
+        "payload_report_id",
+        "row_namespace",
+        "payload_namespace",
+        "outer_schema",
+        "inner_schema",
+        "mixed_current_header",
+        "extra_field",
+        "unknown_engine",
+    ];
+    for mutation in mutations {
+        let (_dir, store, admin, evaluator, metadata) = actual_m33_history_copy().await;
+        let id = metadata["selection"]["report_id"].as_str().unwrap();
+        let original = metadata["artifact_rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["physical_id"].as_str() == Some(id))
+            .unwrap();
+        let mut body: serde_json::Value =
+            serde_json::from_str(original["body_utf8"].as_str().unwrap()).unwrap();
+        match mutation {
+            "body_digest" => {
+                body["payload"]["reports_body_digest"] = serde_json::json!(hash(b"wrong-body"))
+            }
+            "semantic_digest" => {
+                body["payload"]["semantic_reports_digest"] =
+                    serde_json::json!(hash(b"wrong-semantics"))
+            }
+            "member_binding" => {
+                body["payload"]["member_reports"][0]["world_digest"] =
+                    serde_json::json!(hash(b"other-world"))
+            }
+            "payload_report_id" => {
+                body["payload"]["report_id"] = serde_json::json!("claimed-other-row")
+            }
+            "row_namespace" => body["namespace"] = serde_json::json!("other"),
+            "payload_namespace" => body["payload"]["namespace"] = serde_json::json!("other"),
+            "outer_schema" => {
+                body["payload"]["schema_version"] =
+                    serde_json::json!(STORED_REPLAY_REPORT_SCHEMA_V2)
+            }
+            "inner_schema" => {
+                body["payload"]["member_reports"][0]["report"]["schema_version"] =
+                    serde_json::json!(REPLAY_REPORT_SCHEMA_V3)
+            }
+            "mixed_current_header" => {
+                body["payload"]["replay_engine_version"] =
+                    serde_json::json!(NEXT_REPLAY_ENGINE_VERSION_V3)
+            }
+            "extra_field" => {
+                body["payload"]["unregistered_private_field"] =
+                    serde_json::json!("PRIVATE-CANARY-MUST-NOT-ESCAPE")
+            }
+            "unknown_engine" => {
+                body["payload"]["replay_engine_version"] =
+                    serde_json::json!("rsia.replay.engine.v999-PRIVATE-CANARY-MUST-NOT-ESCAPE")
+            }
+            _ => unreachable!(),
+        }
+        let mut session = store.session().await.unwrap();
+        session
+            .put(
+                &admin,
+                "artifact",
+                id,
+                original["owner"].as_str().unwrap(),
+                &body,
+            )
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let result = evo_engine::replay::query_replay_report_record(&evaluator, &store, id).await;
+        if mutation == "unknown_engine" {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ReplayReadIsolation::UnqualifiedVersionOutsideStaticTable
+                ),
+                "{error:?}"
+            );
+            assert!(!error.to_string().contains("PRIVATE-CANARY"));
+        } else {
+            let read = result.unwrap();
+            assert_eq!(
+                read.record.state(),
+                ReplayRecordState::Invalid,
+                "{mutation}"
+            );
+            assert!(read.raw_payload.is_none(), "{mutation}");
+            assert!(!read.source_legacy, "{mutation}");
+            assert!(read.lineage.is_empty(), "{mutation}");
+            assert!(
+                !serde_json::to_string(&read)
+                    .unwrap()
+                    .contains("PRIVATE-CANARY")
+            );
+        }
+        store.close().await;
+    }
+}
+
+#[tokio::test]
+async fn actual_parent_reader_roles_remain_distinct_and_duplicate_wire_fails_closed() {
+    let (_dir, store, admin, evaluator, metadata) = actual_m33_history_copy().await;
+    let id = metadata["selection"]["report_id"].as_str().unwrap();
+    let worker = Context::new("n", "worker", Role::Worker).unwrap();
+    for caller in [&admin, &evaluator, &worker] {
+        let read = evo_storage::replay::query_replay_report_record(caller, &store, id)
+            .await
+            .unwrap();
+        assert_eq!(read.record.state(), ReplayRecordState::Legacy);
+        assert_eq!(read.raw_payload, Some(metadata["selection"].clone()));
+    }
+    assert!(matches!(
+        evo_engine::replay::query_replay_report_record(&worker, &store, id).await,
+        Err(ReplayReadIsolation::Source(Error::Forbidden))
+    ));
+    for role in [Role::Agent, Role::Host] {
+        let caller = Context::new("n", "unqualified-reader", role).unwrap();
+        assert!(matches!(
+            evo_storage::replay::query_replay_report_record(&caller, &store, id).await,
+            Err(ReplayReadIsolation::Source(Error::Forbidden))
+        ));
+        assert!(matches!(
+            evo_engine::replay::query_replay_report_record(&caller, &store, id).await,
+            Err(ReplayReadIsolation::Source(Error::Forbidden))
+        ));
+    }
+    original_m33_rows_unchanged(&store, &admin, &metadata).await;
+    let original = metadata["artifact_rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["physical_id"].as_str() == Some(id))
+        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(original["body_utf8"].as_str().unwrap()).unwrap();
+    struct DuplicateEnvelope<'a>(&'a serde_json::Value);
+    impl serde::Serialize for DuplicateEnvelope<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeMap;
+            let object = self.0.as_object().unwrap();
+            let mut map = serializer.serialize_map(Some(object.len() + 1))?;
+            map.serialize_entry("namespace", "claimed-other-namespace")?;
+            for (key, value) in object {
+                map.serialize_entry(key, value)?;
+            }
+            map.end()
+        }
+    }
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "artifact",
+            id,
+            original["owner"].as_str().unwrap(),
+            &DuplicateEnvelope(&body),
+        )
+        .await
+        .unwrap();
+    let actual = session
+        .object_row(&admin, "artifact", id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual.body.matches("\"namespace\":").count(), 3); // envelope twice + payload
+    session.commit().await.unwrap();
+    let read = evo_engine::replay::query_replay_report_record(&evaluator, &store, id)
+        .await
+        .unwrap();
+    assert_eq!(read.record.state(), ReplayRecordState::Invalid);
+    assert!(read.raw_payload.is_none());
+    assert!(!read.source_legacy);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn actual_parent_legacy_writer_retries_existing_only_and_conflicts_without_any_write() {
+    let (directory, store, admin, evaluator, metadata) = actual_m33_history_copy().await;
+    let old: StoredReplayReportV1 = serde_json::from_value(metadata["selection"].clone()).unwrap();
+    let before = directory.path().join("before-old-writer");
+    store.backup(&before).await.unwrap();
+    let before_bytes = std::fs::read(before.join("rsia.sqlite3")).unwrap();
+    evo_storage::replay::put_replay_report(&admin, &store, &old)
+        .await
+        .unwrap();
+    original_m33_rows_unchanged(&store, &admin, &metadata).await;
+
+    let mut changed = old.clone();
+    changed.member_reports[0].report.replay_cpu_nanos = changed.member_reports[0]
+        .report
+        .replay_cpu_nanos
+        .checked_add(1)
+        .unwrap();
+    changed.reports_body_digest = fingerprint(&changed.member_reports).unwrap();
+    assert_eq!(
+        replay_report_semantic_digest(&changed.member_reports).unwrap(),
+        old.semantic_reports_digest
+    );
+    assert_eq!(changed.report_id, old.report_id);
+    match evo_storage::replay::put_replay_report(&admin, &store, &changed).await {
+        Err(Error::Conflict(reason)) => assert_eq!(reason, "immutable replay report differs"),
+        other => panic!("different body at actual old ID: {other:?}"),
+    }
+    assert!(matches!(
+        evo_storage::replay::put_replay_report(&evaluator, &store, &old).await,
+        Err(Error::Forbidden)
+    ));
+    let other_namespace = Context::new("other", "admin", Role::Admin).unwrap();
+    assert!(matches!(
+        evo_storage::replay::put_replay_report(&other_namespace, &store, &old).await,
+        Err(Error::Forbidden)
+    ));
+    original_m33_rows_unchanged(&store, &admin, &metadata).await;
+    let after = directory.path().join("after-old-writer");
+    store.backup(&after).await.unwrap();
+    assert_eq!(
+        std::fs::read(after.join("rsia.sqlite3")).unwrap(),
+        before_bytes,
+        "exact retries, conflicts and forbidden attempts changed persistent tables"
+    );
+    store.close().await;
+}
+
+#[tokio::test]
+async fn actual_parent_outer_row_id_constraint_refuses_damage_before_any_reader() {
+    let (directory, store, admin, evaluator, metadata) = actual_m33_history_copy().await;
+    let id = metadata["selection"]["report_id"].as_str().unwrap();
+    let row = metadata["artifact_rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["physical_id"].as_str() == Some(id))
+        .unwrap();
+    let mut damaged: serde_json::Value =
+        serde_json::from_str(row["body_utf8"].as_str().unwrap()).unwrap();
+    damaged["id"] = serde_json::json!("claimed-other-physical-row");
+    let backup_before = directory.path().join("before-physical-id-refusal");
+    store.backup(&backup_before).await.unwrap();
+    let mut session = store.session().await.unwrap();
+    // Existing SQLite json_extract(body,'$.id') = id is the first guard.
+    // Keep its exact mapping; never bypass it to manufacture a reader fixture.
+    assert!(matches!(
+        session
+            .put(
+                &admin,
+                "artifact",
+                id,
+                row["owner"].as_str().unwrap(),
+                &damaged
+            )
+            .await,
+        Err(Error::Internal)
+    ));
+    session.commit().await.unwrap();
+    original_m33_rows_unchanged(&store, &admin, &metadata).await;
+    let backup_after = directory.path().join("after-physical-id-refusal");
+    store.backup(&backup_after).await.unwrap();
+    assert_eq!(
+        std::fs::read(backup_after.join("rsia.sqlite3")).unwrap(),
+        std::fs::read(backup_before.join("rsia.sqlite3")).unwrap()
+    );
+    // Rejection left the actual historical object readable and still Legacy.
+    let original = evo_engine::replay::query_replay_report_record(&evaluator, &store, id)
+        .await
+        .unwrap();
+    assert_eq!(original.record.state(), ReplayRecordState::Legacy);
+    assert_eq!(original.raw_payload, Some(metadata["selection"].clone()));
+    store.close().await;
+}
+
+#[tokio::test]
+async fn invalid_derived_current_edges_preserve_the_real_parent_audit_and_all_read_facts() {
+    let (directory, store, admin, evaluator, metadata) = actual_m33_history_copy().await;
+    let old: StoredReplayReportV1 = serde_json::from_value(metadata["selection"].clone()).unwrap();
+    let current = evo_engine::replay::run_and_persist_pool_replay(
+        &admin,
+        &store,
+        &old.pool_digest,
+        old.partition,
+        &old.policy,
+        &old.profile,
+        &old.caps,
+    )
+    .await
+    .unwrap();
+    let healthy =
+        evo_engine::replay::query_replay_report_record(&evaluator, &store, &current.report_id)
+            .await
+            .unwrap();
+    assert_eq!(healthy.record.state(), ReplayRecordState::CurrentVerified);
+    let old_before =
+        evo_engine::replay::query_replay_report_record(&evaluator, &store, &old.report_id)
+            .await
+            .unwrap();
+    assert_eq!(old_before.record.state(), ReplayRecordState::Legacy);
+    assert_eq!(old_before.raw_payload, Some(metadata["selection"].clone()));
+    let mut session = store.session().await.unwrap();
+    let current_row = session
+        .object_row(&admin, "artifact", &current.report_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let old_row = session
+        .object_row(&admin, "artifact", &old.report_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Only an actual public dependency edge changes. The immutable report body,
+    // physical identity, self-digests, original pool and old source remain exact.
+    session
+        .put_edge(
+            &admin,
+            "artifact",
+            &current.report_id,
+            "artifact",
+            &old.report_id,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let before_reads = directory.path().join("before-invalid-neighbor-reads");
+    store.backup(&before_reads).await.unwrap();
+    for caller in [&evaluator, &admin] {
+        assert!(matches!(
+            evo_storage::replay::load_current_replay_report(caller, &store, &current.report_id).await,
+            Err(Error::Invalid(reason)) if reason == "current replay dependency edges differ"
+        ));
+        assert!(matches!(
+            evo_engine::replay::verified_replay_report_view(caller, &store, &current.report_id).await,
+            Err(Error::Invalid(reason)) if reason == "current replay dependency edges differ"
+        ));
+        let historical =
+            evo_engine::replay::query_replay_report_record(caller, &store, &old.report_id)
+                .await
+                .unwrap();
+        assert_eq!(historical.record.state(), ReplayRecordState::Legacy);
+        assert!(historical.source_legacy);
+        assert_eq!(historical.raw_payload, Some(metadata["selection"].clone()));
+        let neighbor = historical
+            .lineage
+            .iter()
+            .find(|item| item.report_id == current.report_id)
+            .unwrap();
+        assert!(neighbor.exists);
+        assert_eq!(neighbor.record_state, Some(ReplayRecordState::Invalid));
+        assert!(neighbor.isolation_reason.is_none());
+        let direct =
+            evo_engine::replay::query_replay_report_record(caller, &store, &current.report_id)
+                .await
+                .unwrap();
+        assert_eq!(direct.record.state(), ReplayRecordState::Invalid);
+        assert!(direct.raw_payload.is_none());
+        assert!(direct.record.current_report().is_none());
+        let economic = PersistentReplayEconomicCoordinator::query_report(
+            caller,
+            &store,
+            metadata["blocked_report"]["id"].as_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(economic.source_legacy);
+        assert_eq!(economic.raw_payload, metadata["blocked_report"]);
+        assert_eq!(
+            economic.replay_read_view.record.state(),
+            ReplayRecordState::Legacy
+        );
+        assert!(
+            economic
+                .replay_read_view
+                .lineage
+                .iter()
+                .any(|item| item.report_id == current.report_id
+                    && item.exists
+                    && item.record_state == Some(ReplayRecordState::Invalid))
+        );
+    }
+    original_m33_rows_unchanged(&store, &admin, &metadata).await;
+    let mut session = store.session().await.unwrap();
+    assert_eq!(
+        session
+            .object_row(&admin, "artifact", &current.report_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        current_row.body
+    );
+    assert_eq!(
+        session
+            .object_row(&admin, "artifact", &old.report_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        old_row.body
+    );
+    session.commit().await.unwrap();
+    let after_reads = directory.path().join("after-invalid-neighbor-reads");
+    store.backup(&after_reads).await.unwrap();
+    assert_eq!(
+        std::fs::read(after_reads.join("rsia.sqlite3")).unwrap(),
+        std::fs::read(before_reads.join("rsia.sqlite3")).unwrap(),
+        "historical/current/economic reads changed objects, dependency edges, audit or other database facts"
+    );
+    store.close().await;
 }

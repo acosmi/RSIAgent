@@ -205,7 +205,7 @@ fn run_with(
     world: &ReplayWorldV2,
     p: &ReplaySimulationProfile,
     caps: &ExplorationCapsV1,
-) -> evo_core::Result<ReplayReportV2> {
+) -> evo_core::Result<ReplayReportV3> {
     run_replay(
         world,
         &ElasticPolicyV1::default(),
@@ -217,7 +217,7 @@ fn run_with(
         },
     )
 }
-fn run(steps: &[Step], width: u8, global: u8) -> ReplayReportV2 {
+fn run(steps: &[Step], width: u8, global: u8) -> ReplayReportV3 {
     run_with(
         &world("select", WorldPartition::Select, steps),
         &profile(width, global, 12),
@@ -232,7 +232,33 @@ fn selected(report: &ReplayReportV2) -> Vec<u32> {
         .flat_map(|b| b.action_seqs.clone())
         .collect()
 }
+
+fn selected_current(report: &ReplayReportV3) -> Vec<u32> {
+    report
+        .batches
+        .iter()
+        .flat_map(|b| b.action_seqs.clone())
+        .collect()
+}
 fn counter(report: &ReplayReportV2, seq: u32) -> u8 {
+    match &report
+        .revealed_prefix
+        .as_ref()
+        .unwrap()
+        .nodes
+        .iter()
+        .find(|n| n.node_seq == seq)
+        .unwrap()
+        .status
+    {
+        ObservedStatus::RepairableFailure {
+            dispatched_repairs, ..
+        } => *dispatched_repairs,
+        other => panic!("expected failure, got {other:?}"),
+    }
+}
+
+fn counter_current(report: &ReplayReportV3, seq: u32) -> u8 {
     match &report
         .revealed_prefix
         .as_ref()
@@ -261,8 +287,11 @@ fn cross_roots(second_episode: &str, counter: u8) -> Vec<Step> {
 #[test]
 fn later_root_of_an_episode_cannot_reopen_its_used_recovery() {
     let report = run(&cross_roots("same", 0), 1, 2);
-    assert_eq!(selected(&report), vec![1, 2, 3]);
-    assert_eq!((counter(&report, 1), counter(&report, 3)), (1, 1));
+    assert_eq!(selected_current(&report), vec![1, 2, 3]);
+    assert_eq!(
+        (counter_current(&report, 1), counter_current(&report, 3)),
+        (1, 1)
+    );
     assert_eq!(
         report
             .revealed_prefix
@@ -274,7 +303,7 @@ fn later_root_of_an_episode_cannot_reopen_its_used_recovery() {
     assert_eq!(report.coverage.observed_actions, 3);
     assert_eq!(report.historical_usage.cost_micros, Some(6));
     let independent = run(&cross_roots("other", 0), 1, 2);
-    assert_eq!(selected(&independent), vec![1, 2, 3, 4]);
+    assert_eq!(selected_current(&independent), vec![1, 2, 3, 4]);
     assert_eq!(independent.historical_usage.cost_micros, Some(10));
     assert_eq!(
         independent
@@ -302,8 +331,8 @@ fn failed_repair_child_cannot_retry_under_the_same_or_a_new_episode() {
                 "must stop before a second failed repair corrupts the prefix: {result:?}"
             );
             let report = result.unwrap();
-            assert_eq!(selected(&report), vec![1, 2, 4]);
-            assert_eq!(counter(&report, 2), u8::from(episode == "same"));
+            assert_eq!(selected_current(&report), vec![1, 2, 4]);
+            assert_eq!(counter_current(&report, 2), u8::from(episode == "same"));
             assert_eq!(
                 report.revealed_prefix.as_ref().unwrap().nodes[1].repair_failures_dispatched,
                 1
@@ -333,14 +362,18 @@ fn historical_counters_do_not_replace_revealed_dispatch_facts() {
         w.validate_sealed().unwrap();
         let original = serde_json::to_vec(&w).unwrap();
         let report = run_with(&w, &profile(1, 2, 12), &ExplorationCapsV1::online()).unwrap();
-        assert_eq!(selected(&report), vec![1, 2, 3], "supplied {supplied}");
+        assert_eq!(
+            selected_current(&report),
+            vec![1, 2, 3],
+            "supplied {supplied}"
+        );
         for seq in 1..=3 {
-            assert_eq!(counter(&report, seq), 1);
+            assert_eq!(counter_current(&report, seq), 1);
         }
         assert_eq!(report.revealed_prefix.unwrap().recovery_dispatches_used, 1);
         assert_eq!(serde_json::to_vec(&w).unwrap(), original);
         let unused = run(&[root(1, 1, failure("same", supplied))], 1, 0);
-        assert_eq!(counter(&unused, 1), 0);
+        assert_eq!(counter_current(&unused, 1), 0);
     }
 }
 
@@ -365,15 +398,18 @@ fn wide_replay_deduplicates_an_episode_before_the_batch_reveal() {
     ];
     for width in [1, 2, 4] {
         let report = run(&steps, width, 2);
-        assert!(selected(&report).contains(&3));
+        assert!(selected_current(&report).contains(&3));
         assert!(
-            !selected(&report).contains(&4),
+            !selected_current(&report).contains(&4),
             "width {width}: {:?}",
-            selected(&report)
+            selected_current(&report)
         );
-        assert!(selected(&report).contains(&6));
-        assert!(selected(&report).contains(&8));
-        assert_eq!((counter(&report, 1), counter(&report, 2)), (1, 1));
+        assert!(selected_current(&report).contains(&6));
+        assert!(selected_current(&report).contains(&8));
+        assert_eq!(
+            (counter_current(&report, 1), counter_current(&report, 2)),
+            (1, 1)
+        );
         assert_eq!(
             report
                 .revealed_prefix
@@ -408,17 +444,28 @@ fn observed_cancel_and_uncertain_consume_but_lookup_terminals_do_not() {
             1,
             2,
         );
-        assert_eq!(selected(&report), vec![1, 2]);
-        assert_eq!(counter(&report, 1), 1);
+        assert_eq!(selected_current(&report), vec![1, 2]);
+        assert_eq!(counter_current(&report, 1), 1);
         assert_eq!(report.revealed_prefix.unwrap().recovery_dispatches_used, 1);
         assert_eq!(
             report.terminal,
             if matches!(status, ObservedStatus::UsageUncertain) {
                 ReplayTerminal::Censored
             } else {
-                ReplayTerminal::WorldExhausted
+                ReplayTerminal::OutOfSupport
             }
         );
+        assert_eq!(report.probes, 2);
+        assert_eq!(
+            report.coverage.observed_actions + report.coverage.censored_actions,
+            2
+        );
+        if matches!(&status, ObservedStatus::Cancelled) {
+            assert_eq!(report.terminal_reason, "frontier_not_covered");
+            assert_eq!(report.root_contract_state, ReplayRootContractState::Unknown);
+            assert!(!report.coverage.complete_support);
+            assert_eq!(report.score_v2_micros, None);
+        }
     }
     for mode in 0..3 {
         let mut steps = vec![
@@ -440,8 +487,8 @@ fn observed_cancel_and_uncertain_consume_but_lookup_terminals_do_not() {
             refresh(&mut w);
         }
         let report = run_with(&w, &profile(1, 2, 12), &ExplorationCapsV1::online()).unwrap();
-        assert_eq!(selected(&report), vec![1, 2]);
-        assert_eq!(counter(&report, 1), 0);
+        assert_eq!(selected_current(&report), vec![1, 2]);
+        assert_eq!(counter_current(&report, 1), 0);
         assert_eq!(report.revealed_prefix.unwrap().recovery_dispatches_used, 0);
         assert_eq!(report.coverage.observed_actions, 1);
         assert_eq!(
@@ -470,7 +517,7 @@ fn successful_recovery_keeps_a_normal_deepen_legal() {
         },
     ];
     let report = run(&steps, 1, 2);
-    assert_eq!(selected(&report), vec![1, 2, 3]);
+    assert_eq!(selected_current(&report), vec![1, 2, 3]);
     assert_eq!(
         report.revealed_prefix.as_ref().unwrap().nodes[2].repair_failures_dispatched,
         0
@@ -483,7 +530,7 @@ fn successful_recovery_keeps_a_normal_deepen_legal() {
             .recovery_dispatches_used,
         1
     );
-    assert!(replay_v2_is_not_formal(&report).is_err());
+    assert!(evo_engine::replay::replay_v3_is_not_formal(&report).is_err());
 }
 
 #[test]
@@ -523,11 +570,11 @@ fn recovery_still_respects_frozen_caps_and_unknown_cost() {
             &caps,
         )
         .unwrap();
-        assert!(!selected(&report).contains(&4), "mode {mode}");
+        assert!(!selected_current(&report).contains(&4), "mode {mode}");
         if mode != 1 {
-            assert!(!selected(&report).contains(&2), "mode {mode}");
+            assert!(!selected_current(&report).contains(&2), "mode {mode}");
         } else {
-            assert!(selected(&report).contains(&2));
+            assert!(selected_current(&report).contains(&2));
         }
     }
     let mut steps = cross_roots("other", 0);
@@ -555,7 +602,7 @@ fn future_quality_and_opaque_names_do_not_change_earlier_batches() {
     let caps = ExplorationCapsV1::online();
     let first = run_with(&w, &p, &caps).unwrap();
     let second = run_with(&w, &p, &caps).unwrap();
-    let strip_cpu = |report: ReplayReportV2| {
+    let strip_cpu = |report: ReplayReportV3| {
         let mut value = serde_json::to_value(report).unwrap();
         value.as_object_mut().unwrap().remove("replay_cpu_nanos");
         value
@@ -670,7 +717,7 @@ impl Persistent {
             p,
         }
     }
-    async fn replay(&self) -> evo_core::Result<StoredReplayReportV1> {
+    async fn replay(&self) -> evo_core::Result<StoredReplayReportV2> {
         run_and_persist_pool_replay(
             &self.worker,
             &self.store,
@@ -710,9 +757,10 @@ async fn stored_envelope(env: &Persistent, id: &str) -> Vec<u8> {
 #[tokio::test]
 async fn old_affected_report_is_static_readable_but_semantically_rejected_without_overwrite() {
     assert_eq!(hash(LEGACY_AFFECTED.as_bytes()), LEGACY_AFFECTED_SHA256);
-    let env = Persistent::new("affected").await;
+    let env = Persistent::from_actual_parent_history("affected").await;
     let old: StoredReplayReportV1 = serde_json::from_str(LEGACY_AFFECTED).unwrap();
     old.validate_static(&env.pool).unwrap();
+    assert!(replay_v2_is_not_formal(&old.member_reports[0].report).is_err());
     put_replay_report(&env.worker, &env.store, &old)
         .await
         .unwrap();
@@ -721,38 +769,62 @@ async fn old_affected_report_is_static_readable_but_semantically_rejected_withou
         .await
         .unwrap();
     assert_eq!(serde_json::to_string(&loaded).unwrap(), LEGACY_AFFECTED);
-    for result in [
-        verified_replay_report_view(&env.evaluator, &env.store, &old.report_id)
+    // v2 has no retained semantic verifier. Its bytes remain auditable, but
+    // source compatibility or a coincident v3 result never upgrades this record.
+    assert!(matches!(
+        verified_replay_report_view(&env.evaluator, &env.store, &old.report_id).await,
+        Err(Error::Invalid(ref reason)) if reason == "legacy_replay_not_consumable"
+    ));
+    let audit =
+        evo_engine::replay::query_replay_report_record(&env.evaluator, &env.store, &old.report_id)
             .await
-            .map(|_| ()),
-        env.replay().await.map(|_| ()),
-    ] {
-        assert!(
-            matches!(result, Err(Error::Conflict(ref reason)) if reason == "stored replay report differs from semantic recomputation"),
-            "{result:?}"
-        );
-    }
+            .unwrap();
+    assert_eq!(audit.record.state(), ReplayRecordState::Legacy);
+    assert!(audit.source_legacy);
+    assert_eq!(
+        serde_json::to_string(audit.record.report().unwrap()).unwrap(),
+        LEGACY_AFFECTED
+    );
+    assert!(audit.record.current_report().is_none());
+    assert!(audit.raw_payload.is_some());
     assert_eq!(stored_envelope(&env, &old.report_id).await, before);
-    let fresh = Persistent::new("affected").await;
-    let new = fresh.replay().await.unwrap();
-    assert_eq!(old.report_id, new.report_id);
+
+    let new = env.replay().await.unwrap();
+    assert_ne!(old.report_id, new.report_id);
     assert_ne!(old.semantic_reports_digest, new.semantic_reports_digest);
     assert_eq!(
         selected(&old.member_reports[0].report),
-        selected(&new.member_reports[0].report)
+        selected_current(&new.member_reports[0].report)
     );
     assert_eq!(counter(&old.member_reports[0].report, 2), 0);
-    assert_eq!(counter(&new.member_reports[0].report, 2), 1);
-    let view = verified_replay_report_view(&fresh.evaluator, &fresh.store, &new.report_id)
+    assert_eq!(counter_current(&new.member_reports[0].report, 2), 1);
+    let view = verified_replay_report_view(&env.evaluator, &env.store, &new.report_id)
         .await
         .unwrap();
     assert!(!view.promotion_eligible);
     assert!(view.development_only);
-    assert!(replay_v2_is_not_formal(&new.member_reports[0].report).is_err());
-    assert!(
-        matches!(put_replay_report(&env.worker, &env.store, &new).await, Err(Error::Conflict(ref reason)) if reason == "immutable replay report differs")
+    assert!(evo_engine::replay::replay_v3_is_not_formal(&new.member_reports[0].report).is_err());
+    assert_eq!(
+        fingerprint(&env.replay().await.unwrap()).unwrap(),
+        fingerprint(&new).unwrap()
     );
+    put_replay_report(&env.worker, &env.store, &old)
+        .await
+        .unwrap();
     assert_eq!(stored_envelope(&env, &old.report_id).await, before);
+    let audit =
+        evo_engine::replay::query_replay_report_record(&env.evaluator, &env.store, &old.report_id)
+            .await
+            .unwrap();
+    assert_eq!(audit.record.state(), ReplayRecordState::Legacy);
+    assert!(
+        audit
+            .lineage
+            .iter()
+            .any(|entry| entry.report_id == new.report_id
+                && entry.exists
+                && entry.record_state == Some(ReplayRecordState::CurrentVerified))
+    );
 }
 
 #[tokio::test]
@@ -762,23 +834,326 @@ async fn unaffected_old_single_recoveries_remain_verified_and_idempotent() {
         ("hard", LEGACY_HARD, LEGACY_HARD_SHA256),
     ] {
         assert_eq!(hash(bytes.as_bytes()), digest);
-        let env = Persistent::new(kind).await;
+        let env = Persistent::from_actual_parent_history(kind).await;
         let old: StoredReplayReportV1 = serde_json::from_str(bytes).unwrap();
         old.validate_static(&env.pool).unwrap();
         put_replay_report(&env.worker, &env.store, &old)
             .await
             .unwrap();
         let before = stored_envelope(&env, &old.report_id).await;
-        let view = verified_replay_report_view(&env.evaluator, &env.store, &old.report_id)
+        let audit = evo_engine::replay::query_replay_report_record(
+            &env.evaluator,
+            &env.store,
+            &old.report_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(audit.record.state(), ReplayRecordState::Legacy);
+        assert!(audit.source_legacy);
+        assert_eq!(
+            audit.record.report().unwrap().semantic_reports_digest,
+            old.semantic_reports_digest
+        );
+        assert_eq!(
+            serde_json::to_string(audit.record.report().unwrap()).unwrap(),
+            bytes
+        );
+        assert!(matches!(
+            verified_replay_report_view(&env.evaluator, &env.store, &old.report_id).await,
+            Err(Error::Invalid(ref reason)) if reason == "legacy_replay_not_consumable"
+        ));
+        let current = env.replay().await.unwrap();
+        assert_ne!(current.report_id, old.report_id);
+        let view = verified_replay_report_view(&env.evaluator, &env.store, &current.report_id)
             .await
             .unwrap();
-        assert_eq!(view.semantic_digest, old.semantic_reports_digest);
         assert!(!view.promotion_eligible);
         assert!(view.development_only);
         assert_eq!(
             fingerprint(&env.replay().await.unwrap()).unwrap(),
-            fingerprint(&old).unwrap()
+            fingerprint(&current).unwrap()
         );
+        // Idempotent v2 import is still byte-identical, independent of v3.
+        put_replay_report(&env.worker, &env.store, &old)
+            .await
+            .unwrap();
         assert_eq!(stored_envelope(&env, &old.report_id).await, before);
     }
+}
+
+#[tokio::test]
+async fn invalid_current_pool_claim_cannot_poison_a_legal_legacy_audit() {
+    let env = Persistent::from_actual_parent_history("affected").await;
+    let old: StoredReplayReportV1 = serde_json::from_str(LEGACY_AFFECTED).unwrap();
+    old.validate_static(&env.pool).unwrap();
+    put_replay_report(&env.worker, &env.store, &old)
+        .await
+        .unwrap();
+    let before = stored_envelope(&env, &old.report_id).await;
+    let current = env.replay().await.unwrap();
+    let mut session = env.store.session().await.unwrap();
+    let mut raw: serde_json::Value = session
+        .need(&env.worker, "artifact", &current.report_id)
+        .await
+        .unwrap();
+    let missing_pool = d("ag147-absent-pool");
+    assert_ne!(missing_pool, current.pool_digest);
+    raw["payload"]["pool_digest"] = serde_json::Value::String(missing_pool);
+    session
+        .put(
+            &env.worker,
+            "artifact",
+            &current.report_id,
+            env.worker.actor(),
+            &raw,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let audit =
+        evo_engine::replay::query_replay_report_record(&env.evaluator, &env.store, &old.report_id)
+            .await
+            .unwrap();
+    assert_eq!(audit.record.state(), ReplayRecordState::Legacy);
+    assert!(audit.source_legacy);
+    assert_eq!(
+        serde_json::to_string(audit.record.report().unwrap()).unwrap(),
+        LEGACY_AFFECTED
+    );
+    assert!(
+        audit
+            .lineage
+            .iter()
+            .any(|entry| entry.report_id == current.report_id
+                && entry.exists
+                && entry.record_state == Some(ReplayRecordState::Invalid))
+    );
+    assert_eq!(stored_envelope(&env, &old.report_id).await, before);
+}
+
+#[tokio::test]
+async fn legacy_qualification_never_bypasses_real_source_revocation_or_cleanup() {
+    use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
+    let env = Persistent::from_actual_parent_history("affected").await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let old: StoredReplayReportV1 = serde_json::from_str(LEGACY_AFFECTED).unwrap();
+    old.validate_static(&env.pool).unwrap();
+    put_replay_report(&env.worker, &env.store, &old)
+        .await
+        .unwrap();
+    let audit =
+        evo_engine::replay::query_replay_report_record(&env.evaluator, &env.store, &old.report_id)
+            .await
+            .unwrap();
+    assert_eq!(audit.record.state(), ReplayRecordState::Legacy);
+    assert_eq!(
+        serde_json::to_string(audit.record.report().unwrap()).unwrap(),
+        LEGACY_AFFECTED
+    );
+    let mut status = LifecycleStore::begin_revoke(
+        &admin,
+        &env.store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: "affected-select-source-1".into(),
+        },
+        "actual retained legacy source revoked",
+        500,
+    )
+    .await
+    .unwrap();
+    assert!(
+        evo_engine::replay::query_replay_report_record(&env.evaluator, &env.store, &old.report_id,)
+            .await
+            .is_err()
+    );
+    for now in 501..2_500 {
+        if matches!(status.state, CleanupState::Complete | CleanupState::Failed) {
+            break;
+        }
+        status = LifecycleStore::cleanup_step(&admin, &env.store, &status.job_id, 8, now)
+            .await
+            .unwrap();
+    }
+    assert_eq!(status.state, CleanupState::Complete, "{status:?}");
+    assert_eq!(status.last_error, None);
+    assert_eq!(status.pending_nodes, 0);
+    let expected = format!(
+        "replay {} {} was redacted because its source was revoked",
+        evo_storage::replay::REPLAY_REPORT_RECORD_KIND,
+        old.report_id
+    );
+    assert!(matches!(load_live_replay_report(
+        &env.evaluator, &env.store, &old.report_id,
+    ).await, Err(Error::Conflict(ref message)) if message == &expected));
+    assert!(matches!(evo_engine::replay::query_replay_report_record(
+        &env.evaluator, &env.store, &old.report_id,
+    ).await, Err(ReplayReadIsolation::Source(Error::Conflict(ref message))) if message == &expected));
+}
+
+impl Persistent {
+    // This fixture is a full database captured through the unchanged M33
+    // parent Store/old writer. It is copied before Store::open; the source
+    // fixture is never opened, rewritten or imported through raw Session.put.
+    async fn from_actual_parent_history(kind: &str) -> Self {
+        let (database, database_sha256, metadata_bytes, metadata_sha256): (
+            &[u8],
+            &str,
+            &[u8],
+            &str,
+        ) = match kind {
+            "affected" => (
+                include_bytes!("fixtures/ag147_m33_recovery_affected.sqlite3"),
+                "d8aac6f928a0ace87bc2b709daffbd14b75af48d576c29129144818a0470217a",
+                include_bytes!("fixtures/ag147_m33_recovery_affected.json"),
+                "b535c4c023389efdedbcb1828879c9eb59929d875fc294383662976e97e09f3e",
+            ),
+            "valid" => (
+                include_bytes!("fixtures/ag147_m33_recovery_valid.sqlite3"),
+                "3304784cf5e35a63722b7365f1e841712d7ee193755f211d5ffc1323ba3e19d5",
+                include_bytes!("fixtures/ag147_m33_recovery_valid.json"),
+                "66017c7369753b7508fa2aaffd383c5493237e7eb2857e239e790131b688f8b4",
+            ),
+            "hard" => (
+                include_bytes!("fixtures/ag147_m33_recovery_hard.sqlite3"),
+                "7155e98f5d9509cdf5bddf999cb3e0d5124546516b8889d279a570983fbd5405",
+                include_bytes!("fixtures/ag147_m33_recovery_hard.json"),
+                "617936dad5278505af27737e0f3a43e8146f1aaa69aad5192dfd4639c665d9d6",
+            ),
+            _ => panic!("unknown actual Parent history fixture"),
+        };
+        assert_eq!(hash(database), database_sha256);
+        assert_eq!(hash(metadata_bytes), metadata_sha256);
+        let metadata: serde_json::Value = serde_json::from_slice(metadata_bytes).unwrap();
+        let old: StoredReplayReportV1 =
+            serde_json::from_str(metadata["golden_utf8"].as_str().unwrap()).unwrap();
+        let worlds: Vec<ReplayWorldV2> =
+            serde_json::from_str(metadata["worlds_utf8"].as_str().unwrap()).unwrap();
+        let original_pool: ReplayPoolManifestV1 =
+            serde_json::from_str(metadata["pool_utf8"].as_str().unwrap()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay.sqlite3");
+        std::fs::write(&path, database).unwrap();
+        let store = Store::open(&path).await.unwrap();
+        let worker = Context::new("n", "worker", Role::Worker).unwrap();
+        let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();
+        assert_eq!(old.namespace, worker.namespace());
+        assert_eq!(metadata["namespace"], worker.namespace());
+        assert_eq!(metadata["worker"]["actor"], worker.actor());
+        assert_eq!(metadata["worker"]["role"], "worker");
+        assert_eq!(metadata["evaluator"]["actor"], evaluator.actor());
+        assert_eq!(metadata["evaluator"]["role"], "evaluator");
+        assert_eq!(old.replay_engine_version, LEGACY_REPLAY_ENGINE_VERSION_V2);
+        assert_eq!(
+            hash(metadata["golden_utf8"].as_str().unwrap().as_bytes()),
+            metadata["golden_sha256"].as_str().unwrap()
+        );
+        assert_eq!(
+            hash(metadata["worlds_utf8"].as_str().unwrap().as_bytes()),
+            metadata["worlds_sha256"].as_str().unwrap()
+        );
+        assert_eq!(
+            hash(metadata["pool_utf8"].as_str().unwrap().as_bytes()),
+            metadata["pool_sha256"].as_str().unwrap()
+        );
+        let mut session = store.session().await.unwrap();
+        let watermark = session.watermark(&worker).await.unwrap().unwrap();
+        assert_eq!(
+            watermark.0,
+            metadata["original_watermark"]["seq"].as_i64().unwrap()
+        );
+        assert_eq!(
+            watermark.1,
+            metadata["original_watermark"]["digest"].as_str().unwrap()
+        );
+        let row = session
+            .object_row(&worker, "artifact", &old.report_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.owner, worker.actor());
+        assert_eq!(
+            row.body,
+            metadata["report_row"]["body_utf8"].as_str().unwrap()
+        );
+        assert_eq!(
+            hash(row.body.as_bytes()),
+            metadata["report_row"]["body_sha256"].as_str().unwrap()
+        );
+        session.commit().await.unwrap();
+        let pool = evo_storage::replay::load_live_replay_pool(&worker, &store, &old.pool_digest)
+            .await
+            .unwrap();
+        assert_eq!(
+            fingerprint(&pool.manifest).unwrap(),
+            fingerprint(&original_pool).unwrap()
+        );
+        assert_eq!(worlds.len(), pool.worlds.len());
+        for original in &worlds {
+            let loaded = pool
+                .worlds
+                .iter()
+                .find(|loaded| loaded.world_id() == original.manifest.world_id)
+                .unwrap();
+            let evo_storage::replay::LoadedReplayWorld::LegacyV2(loaded) = loaded else {
+                panic!("actual Parent fixture was silently replaced by Current data");
+            };
+            assert_eq!(fingerprint(loaded).unwrap(), fingerprint(original).unwrap());
+        }
+        // The exact persisted row must already exist; all original calls of
+        // put_replay_report(old) below remain real existing-ID retries.
+        let original = load_live_replay_report(&evaluator, &store, &old.report_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_string(&original).unwrap(),
+            metadata["golden_utf8"].as_str().unwrap()
+        );
+        let p = old.profile.clone();
+        Self {
+            _dir: dir,
+            store,
+            worker,
+            evaluator,
+
+            pool: pool.manifest,
+            p,
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_original_new_constructor_produces_a_source_checked_current_report() {
+    // Keep the normal synthetic producer exercised independently of imported
+    // historical snapshots. This grants no real Host, Provider or paid claim.
+    let env = Persistent::new("valid").await;
+    let current = env.replay().await.unwrap();
+    assert_eq!(current.schema_version, STORED_REPLAY_REPORT_SCHEMA_V2);
+    assert_eq!(current.replay_engine_version, NEXT_REPLAY_ENGINE_VERSION_V3);
+    let member = &current.member_reports[0].report;
+    assert_eq!(selected_current(member), vec![1, 2]);
+    assert_eq!(member.probes, 2);
+    assert_eq!(member.terminal, ReplayTerminal::BudgetExhausted);
+    assert_eq!(member.root_contract_state, ReplayRootContractState::Unknown);
+    assert!(member.coverage.complete_support);
+    let view = verified_replay_report_view(&env.evaluator, &env.store, &current.report_id)
+        .await
+        .unwrap();
+    assert!(view.development_only);
+    assert!(!view.promotion_eligible);
+    let audit = evo_engine::replay::query_replay_report_record(
+        &env.evaluator,
+        &env.store,
+        &current.report_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(audit.record.state(), ReplayRecordState::CurrentVerified);
+    assert!(!audit.source_legacy);
+    assert!(audit.record.report().is_none());
+    assert_eq!(
+        audit.raw_payload,
+        Some(serde_json::to_value(&current).unwrap())
+    );
+    env.store.close().await;
 }

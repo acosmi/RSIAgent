@@ -759,7 +759,7 @@ async fn replay_run_admin_e2e_and_idempotency() {
     assert_eq!(pool_digest, pool.pool_digest);
 
     // Verify report in store
-    let loaded = evo_storage::replay::load_live_replay_report(&admin, &store, &report_id)
+    let loaded = evo_storage::replay::load_current_replay_report(&admin, &store, &report_id)
         .await
         .unwrap();
     assert_eq!(loaded.report_id, report_id);

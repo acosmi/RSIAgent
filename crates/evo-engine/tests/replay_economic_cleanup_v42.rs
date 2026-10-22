@@ -44,7 +44,7 @@ use evo_storage::budget::{
     BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization, UsageCharge,
 };
 use evo_storage::lifecycle::{CleanupState, CleanupStatus, LifecycleStore, TypedObjectRef};
-use evo_storage::replay::{REPLAY_REPORT_RECORD_KIND, replay_pool_storage_id};
+use evo_storage::replay::{CURRENT_REPLAY_REPORT_RECORD_KIND, replay_pool_storage_id};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -227,7 +227,7 @@ fn world(id: &str, cluster: &str, source_id: &str, partition: WorldPartition) ->
     world
 }
 
-fn experiment(report: &StoredReplayReportV1) -> ReplayEconomicExperimentV1 {
+fn experiment(report: &StoredReplayReportV2) -> ReplayEconomicExperimentV1 {
     ReplayEconomicExperimentV1 {
         schema_version: EXPERIMENT_SCHEMA.into(),
         id: "economic-exp-1".into(),
@@ -307,7 +307,7 @@ struct Fx {
     admin: Context,
     evaluator: Context,
     experiment: ReplayEconomicExperimentV1,
-    stored_report: StoredReplayReportV1,
+    stored_report: StoredReplayReportV2,
 }
 
 /// Two sealed worlds over their trusted runs, the pool over both, the Select
@@ -462,7 +462,7 @@ async fn setup() -> Fx {
         },
     )
     .unwrap();
-    let stored_report = StoredReplayReportV1::build(
+    let stored_report = StoredReplayReportV2::build(
         "n",
         WorldPartition::Select,
         &pool,
@@ -472,7 +472,7 @@ async fn setup() -> Fx {
         vec![replay],
     )
     .unwrap();
-    evo_storage::replay::put_replay_report(&admin, &store, &stored_report)
+    evo_storage::replay::put_current_replay_report(&admin, &store, &stored_report)
         .await
         .unwrap();
     let experiment = experiment(&stored_report);
@@ -1070,7 +1070,10 @@ async fn another_record_kind_or_schema_version_of_the_economic_envelope_still_fa
 async fn after_the_cleanup_the_coordinator_answers_by_name_and_accounting_still_books() {
     let history = history().await;
     let fx = &history.fx;
-    let report_message = redacted_message(REPLAY_REPORT_RECORD_KIND, &fx.stored_report.report_id);
+    let report_message = redacted_message(
+        CURRENT_REPLAY_REPORT_RECORD_KIND,
+        &fx.stored_report.report_id,
+    );
 
     let status = begin(&fx.store, &fx.admin, "run", REVOKED_RUN).await;
     let (status, _) = drive(&fx.store, &fx.admin, status, 8, 0).await;
