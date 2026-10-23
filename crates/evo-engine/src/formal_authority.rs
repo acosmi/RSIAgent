@@ -546,14 +546,10 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
     }
     Ok(schema.into())
 }
-/// Traverses every typed edge, including releases and intermediate controls.
-/// Missing objects, unsupported schema, cycles and conflicting identities fail.
-/// One edge class takes no part in the cycle check: the GA-18 attachment edge
-/// from a bound `evaluation_ticket_v2` to an `execution_receipt_v2` or
-/// `independent_grader_receipt_v2` written after issue, judged from both
-/// validated envelope bodies. It is still traversed and kept in the closure's
-/// edges and digest; any cycle of other edges (a Skill or StageFact dependency
-/// cycle, L618/V048) still fails.
+/// Traverses every typed edge, retaining every node/edge in the digest.
+/// Only a cyclic SCC consisting entirely of same-ticket GA-18 fact relations
+/// may pass. Actual receipt/output/call/source bindings are rechecked in this
+/// Session; ordinary DAG edges are neither removed nor globally restricted.
 pub async fn read_typed_closure(
     s: &mut Session,
     ctx: &Context,
@@ -569,9 +565,7 @@ pub async fn read_typed_closure(
     let mut nodes = BTreeMap::new();
     let mut edges = BTreeSet::new();
     let mut total_bytes = 0usize;
-    // Validated E05 envelopes at either end of a GA-18 attachment edge.
-    let mut tickets = BTreeSet::new();
-    let mut attached_facts = BTreeSet::new();
+    let mut bodies = BTreeMap::new();
     while let Some((kind, id)) = pending.pop() {
         identifier(&kind)?;
         identifier(&id)?;
@@ -596,17 +590,6 @@ pub async fn read_typed_closure(
             ));
         }
         let schema = supported_node_schema(&kind, &id, &body)?;
-        if schema == "rsia.typed_artifact_envelope.v1" {
-            match body["record_kind"].as_str() {
-                Some("evaluation_ticket_v2") => {
-                    tickets.insert((kind.clone(), id.clone()));
-                }
-                Some("execution_receipt_v2" | "independent_grader_receipt_v2") => {
-                    attached_facts.insert((kind.clone(), id.clone()));
-                }
-                _ => {}
-            }
-        }
         let authority_role = match schema.as_str() {
             PROFILE_SCHEMA
             | ROOT_SCHEMA
@@ -666,50 +649,31 @@ pub async fn read_typed_closure(
             }
             pending.push((to_kind, to_id));
         }
+        let content_digest = fingerprint(&body)?;
+        bodies.insert((kind.clone(), id.clone()), body);
         nodes.insert(
             (kind.clone(), id.clone()),
             TypedContentRef {
                 kind,
                 id,
                 schema_version: schema,
-                content_digest: fingerprint(&body)?,
+                content_digest,
             },
         );
     }
-    // Kahn's algorithm detects a real directed cycle without recursion. A
-    // ticket -> receipt attachment edge is not counted, so only a cycle it
-    // closes is accepted; output order and digest below never depend on this.
-    let mut degrees: BTreeMap<_, usize> = nodes.keys().cloned().map(|key| (key, 0)).collect();
-    let mut children: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
-    for edge in &edges {
-        let parent = (edge.from_kind.clone(), edge.from_id.clone());
-        let child = (edge.to_kind.clone(), edge.to_id.clone());
-        if tickets.contains(&parent) && attached_facts.contains(&child) {
-            continue;
+    let cyclic_edges = ga18_cyclic_edges(&nodes, &edges, &bodies)?;
+    if !cyclic_edges.is_empty() {
+        let qualified = Box::pin(crate::streaming_evaluator::ga18_qualified_cycle_edges(
+            s,
+            ctx,
+            &bodies,
+            &edges,
+            &cyclic_edges,
+        ))
+        .await?;
+        if cyclic_edges.iter().any(|edge| !qualified.contains(edge)) {
+            return Err(typed_cycle());
         }
-        *degrees.get_mut(&child).ok_or(Error::NotFound)? += 1;
-        children.entry(parent).or_default().push(child);
-    }
-    let mut ready: Vec<_> = degrees
-        .iter()
-        .filter(|(_, n)| **n == 0)
-        .map(|(key, _)| key.clone())
-        .collect();
-    let mut visited = 0;
-    while let Some(key) = ready.pop() {
-        visited += 1;
-        if let Some(outgoing) = children.remove(&key) {
-            for child in outgoing {
-                let n = degrees.get_mut(&child).ok_or(Error::NotFound)?;
-                *n -= 1;
-                if *n == 0 {
-                    ready.push(child);
-                }
-            }
-        }
-    }
-    if visited != nodes.len() {
-        return Err(Error::Conflict("typed content dependency cycle".into()));
     }
     let nodes: Vec<_> = nodes.into_values().collect();
     let edges: Vec<_> = edges.into_iter().collect();
@@ -719,6 +683,129 @@ pub async fn read_typed_closure(
         edges,
         digest,
     })
+}
+
+type Ga18NodeKey = (String, String);
+
+fn typed_cycle() -> Error {
+    Error::Conflict("typed content dependency cycle".into())
+}
+
+/// Kosaraju over the full graph; no attachment is removed from the graph,
+/// returned closure, or digest. Only edges inside a cyclic SCC need GA-18
+/// qualification. Both passes use explicit stacks bounded by the node set.
+fn ga18_cyclic_edges(
+    nodes: &BTreeMap<Ga18NodeKey, TypedContentRef>,
+    edges: &BTreeSet<TypedContentEdge>,
+    bodies: &BTreeMap<Ga18NodeKey, Value>,
+) -> Result<BTreeSet<TypedContentEdge>> {
+    let keys: Vec<_> = nodes.keys().cloned().collect();
+    let indices: BTreeMap<_, _> = keys
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, key)| (key, index))
+        .collect();
+    let mut children = vec![Vec::new(); keys.len()];
+    let mut parents = vec![Vec::new(); keys.len()];
+    for edge in edges {
+        let from = *indices
+            .get(&(edge.from_kind.clone(), edge.from_id.clone()))
+            .ok_or(Error::NotFound)?;
+        let to = *indices
+            .get(&(edge.to_kind.clone(), edge.to_id.clone()))
+            .ok_or(Error::NotFound)?;
+        children[from].push(to);
+        parents[to].push(from);
+    }
+    let mut seen = vec![false; keys.len()];
+    let mut order = Vec::with_capacity(keys.len());
+    for start in 0..keys.len() {
+        if seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut stack = vec![(start, 0usize)];
+        while let Some((node, cursor)) = stack.last_mut() {
+            if *cursor == children[*node].len() {
+                let finished = *node;
+                stack.pop();
+                order.push(finished);
+            } else {
+                let child = children[*node][*cursor];
+                *cursor += 1;
+                if !seen[child] {
+                    seen[child] = true;
+                    stack.push((child, 0));
+                }
+            }
+        }
+    }
+    let mut component = vec![usize::MAX; keys.len()];
+    let mut sizes = Vec::new();
+    for start in order.into_iter().rev() {
+        if component[start] != usize::MAX {
+            continue;
+        }
+        let label = sizes.len();
+        component[start] = label;
+        let mut count = 0usize;
+        let mut pending = vec![start];
+        while let Some(node) = pending.pop() {
+            count += 1;
+            for parent in &parents[node] {
+                if component[*parent] == usize::MAX {
+                    component[*parent] = label;
+                    pending.push(*parent);
+                }
+            }
+        }
+        sizes.push(count);
+    }
+    let record_kind = |key: &Ga18NodeKey| -> Option<&'static str> {
+        let body = bodies.get(key)?;
+        if key.0 != "artifact" || body["schema_version"] != "rsia.typed_artifact_envelope.v1" {
+            return None;
+        }
+        match body["record_kind"].as_str() {
+            Some("evaluation_ticket_v2") => Some("evaluation_ticket_v2"),
+            Some("execution_receipt_v2") => Some("execution_receipt_v2"),
+            Some("independent_grader_receipt_v2") => Some("independent_grader_receipt_v2"),
+            _ => None,
+        }
+    };
+    let mut attached = vec![false; sizes.len()];
+    let mut cyclic = BTreeSet::new();
+    for edge in edges {
+        let from_key = (edge.from_kind.clone(), edge.from_id.clone());
+        let to_key = (edge.to_kind.clone(), edge.to_id.clone());
+        let from = indices[&from_key];
+        let to = indices[&to_key];
+        let label = component[from];
+        if label != component[to] || (sizes[label] == 1 && from != to) {
+            continue;
+        }
+        let relation = (record_kind(&from_key), record_kind(&to_key));
+        match relation {
+            (
+                Some("evaluation_ticket_v2"),
+                Some("execution_receipt_v2" | "independent_grader_receipt_v2"),
+            ) => {
+                attached[label] = true;
+            }
+            (Some("execution_receipt_v2"), Some("evaluation_ticket_v2"))
+            | (Some("independent_grader_receipt_v2"), Some("execution_receipt_v2")) => {}
+            _ => return Err(typed_cycle()),
+        }
+        cyclic.insert(edge.clone());
+    }
+    for edge in &cyclic {
+        let from = indices[&(edge.from_kind.clone(), edge.from_id.clone())];
+        if !attached[component[from]] {
+            return Err(typed_cycle());
+        }
+    }
+    Ok(cyclic)
 }
 pub async fn verify_typed_closure(
     s: &mut Session,
