@@ -1443,11 +1443,14 @@ async fn expand_world_scan(
     for row in rows.iter().take(limit) {
         let id: String = row.try_get("id").map_err(internal)?;
         let body: String = row.try_get("manifest").map_err(internal)?;
-        let value: serde_json::Value = serde_json::from_str(&body).map_err(internal)?;
+        let value = parse_strict_json(&body)?;
         if value["schema_version"] == "rsia.redacted.v1" {
             continue;
         }
-        if value["schema_version"] != "rsia.replay_world.v2" {
+        if !matches!(
+            value["schema_version"].as_str(),
+            Some("rsia.replay_world.v2" | "rsia.replay_world.v3")
+        ) {
             mark_unknown_scope(
                 tx,
                 ctx,
@@ -1462,13 +1465,34 @@ async fn expand_world_scan(
             .await?;
             continue;
         }
-        let sources = value["manifest"]["source_closure"]
-            .as_array()
-            .ok_or_else(|| Error::Invalid("world source closure missing".into()))?;
-        if sources
-            .iter()
-            .any(|v| v["source_id"].as_str() == Some(source_id))
-        {
+        let uses_source = if value["schema_version"] == "rsia.replay_world.v3" {
+            match replay_world_v3_cleanup_source_ids(ctx, &id, &value) {
+                Ok(ids) => ids.iter().any(|candidate| candidate == source_id),
+                Err(_) => {
+                    mark_unknown_scope(
+                        tx,
+                        ctx,
+                        job_id,
+                        &TypedObjectRef {
+                            kind: "replay_world".into(),
+                            id,
+                        },
+                        "blocked_unknown_scope:current_world_scan",
+                        now,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+        } else {
+            let sources = value["manifest"]["source_closure"]
+                .as_array()
+                .ok_or_else(|| Error::Invalid("world source closure missing".into()))?;
+            sources
+                .iter()
+                .any(|v| v["source_id"].as_str() == Some(source_id))
+        };
+        if uses_source {
             // Draft worlds also hold source content before E10 seals their ordinary edges.
             sqlx::query("INSERT OR IGNORE INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id) VALUES(?,'replay_world',?,'run',?)")
                 .bind(ctx.namespace()).bind(&id).bind(source_id).execute(&mut **tx).await.map_err(internal)?;
@@ -1978,6 +2002,118 @@ async fn redact_replay_store_envelope(
                 "reports_body_digest": wire.payload.reports_body_digest,
                 "semantic_reports_digest": wire.payload.semantic_reports_digest,
                 "irreversible_usage": usage,
+                "report_invalidated": true,
+            })
+        }
+        crate::replay::CURRENT_REPLAY_REPORT_RECORD_KIND => {
+            let wire: ReplayCleanupEnvelope<evo_core::replay::StoredReplayReportV2> =
+                match parse_strict_json(body).and_then(|strict| {
+                    serde_json::from_value(strict)
+                        .map_err(|_| Error::Invalid("invalid current replay report wire".into()))
+                }) {
+                    Ok(wire) => wire,
+                    Err(_) => {
+                        return mark_unknown_scope(
+                            tx,
+                            ctx,
+                            job_id,
+                            node,
+                            "blocked_unknown_scope:stored_replay_report_wire",
+                            now,
+                        )
+                        .await;
+                    }
+                };
+            if !valid_replay_cleanup_envelope(
+                ctx,
+                node,
+                &wire.schema_version,
+                &wire.id,
+                &wire.namespace,
+                &wire.record_kind,
+                crate::replay::CURRENT_REPLAY_REPORT_RECORD_KIND,
+            ) || evo_core::replay::validate_current_v3_report_without_pool(&wire.payload)
+                .is_err()
+                || wire.id != wire.payload.report_id
+            {
+                return mark_unknown_scope(
+                    tx,
+                    ctx,
+                    job_id,
+                    node,
+                    "blocked_unknown_scope:stored_replay_report_identity",
+                    now,
+                )
+                .await;
+            }
+            let pool_id = format!("replay-pool-{}", wire.payload.pool_digest);
+            let pool_body: Option<String> = sqlx::query_scalar(
+                "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+            )
+            .bind(ctx.namespace())
+            .bind(&pool_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(internal)?;
+            let Some(pool_body) = pool_body else {
+                return mark_unknown_scope(
+                    tx,
+                    ctx,
+                    job_id,
+                    node,
+                    "blocked_unknown_scope:stored_replay_report_pool_missing",
+                    now,
+                )
+                .await;
+            };
+            let pool_manifest = replay_pool_from_cleanup_body(ctx, &pool_id, &pool_body);
+            if !matches!(
+                pool_manifest.as_ref(),
+                Ok(pool) if wire.payload.validate_static(pool).is_ok()
+            ) {
+                return mark_unknown_scope(
+                    tx,
+                    ctx,
+                    job_id,
+                    node,
+                    "blocked_unknown_scope:stored_replay_report_pool_binding",
+                    now,
+                )
+                .await;
+            }
+            let usage = wire
+                .payload
+                .member_reports
+                .iter()
+                .map(|member| {
+                    json!({
+                        "world_id":member.world_id,
+                        "world_digest":member.world_digest,
+                        "historical_usage":member.report.historical_usage,
+                        "probes":member.report.probes,
+                        "simulated_rounds":member.report.simulated_rounds,
+                        "replay_cpu_nanos":member.report.replay_cpu_nanos,
+                        "coverage":member.report.coverage,
+                        "terminal":member.report.terminal,
+                        "root_contract_state":member.report.root_contract_state,
+                        "policy_stop_exclusions":member.report.policy_stop_exclusions,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "record_kind": wire.record_kind,
+                "report_id": wire.payload.report_id,
+                "pool_digest": wire.payload.pool_digest,
+                "partition": wire.payload.partition,
+                "policy_digest": wire.payload.policy_digest,
+                "profile_digest": wire.payload.profile_digest,
+                "caps_digest": wire.payload.caps_digest,
+                "reports_body_digest": wire.payload.reports_body_digest,
+                "semantic_reports_digest": wire.payload.semantic_reports_digest,
+                "irreversible_usage": usage,
+                "replay_engine_version": wire.payload.replay_engine_version,
+                "attempted_worlds": wire.payload.attempted_worlds,
+                "failed_worlds": wire.payload.failed_worlds,
                 "report_invalidated": true,
             })
         }
@@ -2721,32 +2857,46 @@ fn valid_replay_cleanup_envelope(
 }
 
 fn valid_stored_report_without_pool(report: &evo_core::replay::StoredReplayReportV1) -> bool {
-    if report.schema_version != evo_core::replay::STORED_REPLAY_REPORT_SCHEMA
-        || report.replay_engine_version != evo_core::replay::REPLAY_ENGINE_VERSION
-        || report.purpose != evo_core::evidence::Purpose::Development
-        || report.policy.validate().is_err()
-        || report.profile.validate(&report.caps).is_err()
-    {
-        return false;
+    // Retirement never revokes historical content or changes its old identity.
+    evo_core::replay::validate_historical_v2_report_without_pool(report).is_ok()
+}
+
+fn replay_world_v3_cleanup_source_ids(
+    ctx: &Context,
+    id: &str,
+    value: &serde_json::Value,
+) -> Result<Vec<String>> {
+    let world: evo_core::replay::ReplayWorldV3 = serde_json::from_value(value.clone())
+        .map_err(|_| Error::Invalid("invalid current replay cleanup world".into()))?;
+    if world.manifest.world_id != id || world.manifest.root_source.namespace != ctx.namespace() {
+        return Err(Error::Invalid(
+            "current replay cleanup identity differs".into(),
+        ));
     }
-    let body_digest = fingerprint(&report.member_reports).ok();
-    let semantic_digest =
-        evo_core::replay::replay_report_semantic_digest(&report.member_reports).ok();
-    let report_id = evo_core::replay::replay_report_id(
-        &report.namespace,
-        report.partition,
-        &report.pool_digest,
-        &report.policy_digest,
-        &report.profile_digest,
-        &report.caps_digest,
-    )
-    .ok();
-    report.policy_digest == fingerprint(&report.policy).unwrap_or_default()
-        && report.profile_digest == fingerprint(&report.profile).unwrap_or_default()
-        && report.caps_digest == fingerprint(&report.caps).unwrap_or_default()
-        && body_digest.as_deref() == Some(report.reports_body_digest.as_str())
-        && semantic_digest.as_deref() == Some(report.semantic_reports_digest.as_str())
-        && report_id.as_deref() == Some(report.report_id.as_str())
+    if world.sealed_digest.is_some() {
+        world.validate_sealed()?;
+    } else {
+        world.validate_draft()?;
+    }
+    let image = evo_core::replay::ReplayRegistrationImageV1::parse_for_source(
+        &world.registration_image_utf8,
+        &world.manifest.root_source,
+    )?;
+    let mut sources: Vec<_> = world
+        .manifest
+        .source_closure
+        .iter()
+        .map(|s| s.source_id.clone())
+        .collect();
+    sources.extend(
+        image
+            .source_closure
+            .into_iter()
+            .filter_map(|(kind, id, _)| (kind == "run").then_some(id)),
+    );
+    sources.sort();
+    sources.dedup();
+    Ok(sources)
 }
 
 async fn cleanup_node_content(
@@ -2788,17 +2938,33 @@ async fn cleanup_node_content(
         let Some(body) = body else {
             return Ok(());
         };
-        let value: serde_json::Value = serde_json::from_str(&body).map_err(internal)?;
+        let value = parse_strict_json(&body)?;
         if value["schema_version"] == "rsia.redacted.v1" {
             return Ok(());
         }
-        if value["schema_version"] != "rsia.replay_world.v2" {
+        if !matches!(
+            value["schema_version"].as_str(),
+            Some("rsia.replay_world.v2" | "rsia.replay_world.v3")
+        ) {
             return mark_unknown_scope(
                 tx,
                 ctx,
                 job_id,
                 node,
                 "blocked_unknown_scope:replay_world",
+                now,
+            )
+            .await;
+        }
+        if value["schema_version"] == "rsia.replay_world.v3"
+            && replay_world_v3_cleanup_source_ids(ctx, &node.id, &value).is_err()
+        {
+            return mark_unknown_scope(
+                tx,
+                ctx,
+                job_id,
+                node,
+                "blocked_unknown_scope:current_replay_world",
                 now,
             )
             .await;
@@ -2833,7 +2999,7 @@ async fn cleanup_node_content(
             )
             .await;
         };
-        let redacted = json!({"schema_version":"rsia.redacted.v1","state":"source_revoked","original_schema":"rsia.replay_world.v2",
+        let redacted = json!({"schema_version":"rsia.redacted.v1","state":"source_revoked","original_schema":value["schema_version"],
             "original_digest":evo_core::hash(body.as_bytes()),"sealed_digest":value["sealed_digest"],
             "metadata":minimal_metadata(&value["manifest"]),"historical_transitions":transitions});
         sqlx::query("UPDATE replay_worlds SET manifest=? WHERE namespace=? AND id=?")

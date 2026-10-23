@@ -5,6 +5,10 @@ use evo_core::replay::{
     ReplaySimulationProfile, ReplaySourceRef, ReplayTerminal, ReplayTransitionOutcome,
     ReplayTransitionV2, ReplayWorldManifestV2, ReplayWorldV2, StoredReplayReportV1, WorldPartition,
 };
+use evo_core::replay::{
+    REPLAY_REPORT_SCHEMA_V3, RationalValue, ReplayPolicyStopExclusions, ReplayReportV3,
+    ReplayRootContractState, StoredReplayReportV2,
+};
 use evo_core::strategy::{ActionKindV1, ElasticPolicyV1, ExplorationCapsV1, ObservedStatus};
 use evo_core::{Context, Role, fingerprint, hash};
 use evo_storage::Store;
@@ -14,7 +18,9 @@ use evo_storage::budget::{
     UsageCharge,
 };
 use evo_storage::lifecycle::{BackupManifest, CleanupState, LifecycleStore, TypedObjectRef};
-use evo_storage::replay::{put_replay_report, register_replay_pool, seal_replay_world};
+use evo_storage::replay::{
+    put_current_replay_report, put_replay_report, register_replay_pool, seal_replay_world,
+};
 use serde_json::json;
 use std::process::Command;
 
@@ -191,6 +197,59 @@ fn lifecycle_replay_report(
         },
         terminal: ReplayTerminal::PolicyStop,
         terminal_reason: secret.into(),
+        development_only: true,
+        revealed_prefix: None,
+    }
+}
+
+// Unscored current wire fixture; not an engine semantic verifier.
+fn lifecycle_current_replay_report(
+    world: &ReplayWorldV2,
+    policy: &ElasticPolicyV1,
+    profile: &ReplaySimulationProfile,
+    secret: &str,
+) -> ReplayReportV3 {
+    ReplayReportV3 {
+        schema_version: REPLAY_REPORT_SCHEMA_V3.into(),
+        world_id: world.manifest.world_id.clone(),
+        world_digest: world.sealed_digest.clone().unwrap(),
+        cluster_id: world.manifest.cluster_id.clone(),
+        partition: world.manifest.partition,
+        policy_digest: fingerprint(policy).unwrap(),
+        profile_digest: fingerprint(profile).unwrap(),
+        objective_version: profile.objective.version().into(),
+        batches: vec![],
+        probe_best_quality_micros: vec![600_000],
+        round_best_quality_micros: vec![600_000],
+        final_quality_micros: 600_000,
+        probes: 1,
+        simulated_rounds: 1,
+        parallel_penalty: Some(RationalValue {
+            numerator: 1,
+            denominator: 1,
+        }),
+        no_probe: false,
+        attainment_auc_micros: None,
+        q_auc_sim_micros: None,
+        score_v2_micros: None,
+        historical_usage: HistoricalUsage {
+            input_tokens: 2,
+            output_tokens: 3,
+            cost_micros: Some(7),
+            latency_millis: Some(11),
+        },
+        replay_cpu_nanos: 13,
+        coverage: ReplayCoverage {
+            attempted_actions: 1,
+            observed_actions: 1,
+            censored_actions: 0,
+            out_of_support_actions: 0,
+            complete_support: false,
+        },
+        terminal: ReplayTerminal::OutOfSupport,
+        terminal_reason: secret.into(),
+        policy_stop_exclusions: ReplayPolicyStopExclusions::default(),
+        root_contract_state: ReplayRootContractState::Unknown,
         development_only: true,
         revealed_prefix: None,
     }
@@ -725,7 +784,7 @@ async fn cleanup_redacts_replay_pool_and_report_but_keeps_irreversible_usage() {
     .unwrap();
     let policy = ElasticPolicyV1::default();
     let profile = ReplaySimulationProfile::default_v2(1, pool.pool_digest.clone());
-    let report = StoredReplayReportV1::build(
+    let rejected_legacy = StoredReplayReportV1::build(
         "n",
         WorldPartition::Train,
         &pool,
@@ -740,7 +799,28 @@ async fn cleanup_redacts_replay_pool_and_report_but_keeps_irreversible_usage() {
         )],
     )
     .unwrap();
-    put_replay_report(&admin, &store, &report).await.unwrap();
+    assert!(matches!(
+        put_replay_report(&admin, &store, &rejected_legacy).await,
+        Err(evo_core::Error::Invalid(reason)) if reason == "legacy_replay_new_write_forbidden"
+    ));
+    let report = StoredReplayReportV2::build(
+        "n",
+        WorldPartition::Train,
+        &pool,
+        policy.clone(),
+        profile.clone(),
+        ExplorationCapsV1::online(),
+        vec![lifecycle_current_replay_report(
+            &train,
+            &policy,
+            &profile,
+            "REPLAY-SOURCE-SECRET",
+        )],
+    )
+    .unwrap();
+    put_current_replay_report(&admin, &store, &report)
+        .await
+        .unwrap();
     let mut status = LifecycleStore::begin_revoke(
         &admin,
         &store,

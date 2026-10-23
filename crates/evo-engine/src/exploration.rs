@@ -3385,6 +3385,90 @@ async fn put_world_edge(
         .await
 }
 
+/// The only engine constructor reloads the actual registration in its caller's
+/// Session. There is no public-field or Deserialize constructor and no role cast.
+pub(crate) struct CapturedReplayRegistration {
+    material: evo_storage::replay::ValidatedReplayRootSource,
+    s0: CapturedReplayS0,
+}
+struct CapturedReplayS0 {
+    approved_parent_digest: String,
+    world_context_signature: String,
+    model_digest: String,
+    tools_digest: String,
+    scorer_digest: String,
+    initial_baseline_quality_micros: u32,
+    source_watermark: u64,
+}
+impl CapturedReplayRegistration {
+    pub(crate) fn source(&self) -> &evo_core::replay::ReplayRootSourceV1 {
+        self.material.source()
+    }
+    pub(crate) fn registration_image_utf8(&self) -> &[u8] {
+        self.material.registration_image_utf8()
+    }
+    pub(crate) fn validate_replay_v3_s0(
+        &self,
+        manifest: &evo_core::replay::ReplayWorldManifestV3,
+    ) -> Result<()> {
+        if manifest.approved_parent_digest != self.s0.approved_parent_digest
+            || manifest.world_context_signature != self.s0.world_context_signature
+            || manifest.model_digest != self.s0.model_digest
+            || manifest.tools_digest != self.s0.tools_digest
+            || manifest.scorer_digest != self.s0.scorer_digest
+            || manifest.initial_baseline_quality_micros != self.s0.initial_baseline_quality_micros
+            || manifest.revoke_watermark != self.s0.source_watermark
+        {
+            return Err(Error::Conflict("replay_root_source_unproven".into()));
+        }
+        Ok(())
+    }
+}
+pub(crate) async fn capture_replay_registration_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    exploration_world_id: &str,
+) -> Result<CapturedReplayRegistration> {
+    ctx.require(&[Role::Admin])?;
+    identifier(exploration_world_id)?;
+    // The bridge first strict-parses all physical source rows, private originals
+    // and job identities through storage, then uses the real old typed decoder.
+    // Both operations share this supplied Session, with no intervening write.
+    let (material, requested_worlds) =
+        crate::dispatch::management_replay_registration_images_in_session(
+            session,
+            ctx,
+            exploration_world_id,
+        )
+        .await?;
+    let world: ExplorationWorldV1 =
+        need_record(session, ctx, WORLD_RECORD_KIND, exploration_world_id).await?;
+    world.validate()?;
+    if world.id != exploration_world_id {
+        return Err(Error::Conflict("replay_root_source_unproven".into()));
+    }
+    check_world_live(session, ctx, &world).await?;
+    // This uses the real private ParsedRequest decoder and original idempotent
+    // registration/budget comparison, not a public caller-supplied requested world.
+    for requested in requested_worlds {
+        ensure_new_world_shape(&requested)?;
+        ensure_registered_as(session, ctx, &world, &requested).await?;
+    }
+    if material.source().registration_digest != world.registration_fingerprint()? {
+        return Err(Error::Conflict("replay_root_source_unproven".into()));
+    }
+    let s0 = CapturedReplayS0 {
+        approved_parent_digest: world.approved_parent_digest,
+        world_context_signature: world.context_signature,
+        model_digest: world.model_digest,
+        tools_digest: world.tools_digest,
+        scorer_digest: world.grader_digest,
+        initial_baseline_quality_micros: world.initial_baseline_quality_micros,
+        source_watermark: world.source_watermark,
+    };
+    Ok(CapturedReplayRegistration { material, s0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,814 @@
+{
+  "artifact_rows": [
+    {
+      "body_bytes": 54,
+      "body_sha256": "89ad0d19ec2b9bfbbbcdd1b53f7841f4e7f53780ad1be57a279fe46cffe1e824",
+      "body_utf8": "{\"id\":\"source-1\",\"schema_version\":\"fixture.source.v1\"}",
+      "kind": "artifact",
+      "owner": "admin",
+      "physical_id": "source-1",
+      "rowid_nonsemantic": 5
+    },
+    {
+      "body_bytes": 1372,
+      "body_sha256": "846f6bd34a113922422fd4972d2fb1b16ffe203cd75a5c2262a7e6a3b49c1625",
+      "body_utf8": "{\"schema_version\":\"rsia.replay.store_envelope.v1\",\"id\":\"replay-pool-1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27\",\"namespace\":\"n\",\"record_kind\":\"replay_pool_manifest_v1\",\"payload\":{\"schema_version\":\"rsia.replay_pool.v1\",\"compiler_version\":\"rsia.replay_pool.compiler.v1\",\"pool_digest\":\"1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27\",\"compatibility\":{\"purpose\":\"development\",\"generation_signature\":\"e661f4c935e8a5a83349afb5e347695c2e972e967b50efcd618f93b0b7b4c24b\",\"approved_parent_digest\":\"a50399b580df41a70a8fe9c128cbf6cc1133701d1435185e4b6112510eb9ae58\",\"model_digest\":\"9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4\",\"tools_digest\":\"f9d35d43770d39092a663e665e82ae1d84a9e0da3d0d10c407acada6a40cd281\",\"scorer_digest\":\"c528cab03ad47ed5fceb01fd4f4557f12d8f2bcb2aa9f6e78087380aab8fde5f\",\"guidance_digest\":\"f8aac527f9c928fcec7b1d67c73839a57741bf86271b16731e01d75bba683c53\",\"repair_template_digest\":\"a1a14ff4aab4f1d3efbe2f3fe8e32ec686289ba95e5b2fc3e1f38052d64da522\",\"revoke_watermark\":1},\"members\":[{\"world_id\":\"world-select\",\"world_digest\":\"e7ef2078d600a0e1d268fc0c463595d11356a63b29e9f6d4aa93e91da3f887dd\",\"cluster_id\":\"cluster-select\",\"partition\":\"select\"},{\"world_id\":\"world-train\",\"world_digest\":\"66aadc0cdb757de85ca40a4ab4acbbfef1cf0fc73da57d6b1178a603e4e75967\",\"cluster_id\":\"cluster-train\",\"partition\":\"train\"}]}}",
+      "kind": "artifact",
+      "owner": "admin",
+      "physical_id": "replay-pool-1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27",
+      "rowid_nonsemantic": 6
+    },
+    {
+      "body_bytes": 3696,
+      "body_sha256": "8364d629a90acbbe6c85acf1cdfc3ff5b9117caef6d95e13310d94f5b1a01dd9",
+      "body_utf8": "{\"schema_version\":\"rsia.replay.store_envelope.v1\",\"id\":\"replay-report-eaa0299113cdb7efad1ef99026abdba1d3929c68b200333e71f655495573279d\",\"namespace\":\"n\",\"record_kind\":\"stored_replay_report_v1\",\"payload\":{\"schema_version\":\"rsia.stored_replay_report.v1\",\"replay_engine_version\":\"rsia.replay.engine.v2\",\"report_id\":\"replay-report-eaa0299113cdb7efad1ef99026abdba1d3929c68b200333e71f655495573279d\",\"namespace\":\"n\",\"purpose\":\"development\",\"partition\":\"select\",\"pool_digest\":\"1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27\",\"policy\":{\"schema_version\":\"rsia.elastic_priority.v1\",\"significant_gain_micros\":20000,\"stagnation_abs_gain_micros\":5000,\"stagnation_window\":2,\"max_focus_actions\":2,\"fairness_wait_rounds\":4},\"policy_digest\":\"1ad1c74c6632e1edc116c7e430f0ec32d7aec0dbe34617612cdc9009aa30c423\",\"profile\":{\"simulation_version\":\"rsia.unit_probe_barrier.v1\",\"objective\":\"pareto_attainment_v2\",\"w_sim\":1,\"probe_budget\":1,\"horizon\":1,\"lambda_work_micros\":50000,\"lambda_round_micros\":50000,\"fixed_seed\":7,\"global_recovery_dispatch_limit\":1,\"pool_digest\":\"1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27\",\"purpose\":\"development\",\"target_runtime_profile\":\"online-w1\"},\"profile_digest\":\"76923cf095b1c75ab8a9e5723e2273a48388f6d5e7e72fd650ecc95bc2c4e2be\",\"caps\":{\"schema_version\":\"rsia.exploration_caps.v1\",\"w_online\":1,\"max_nodes\":12,\"max_depth\":4,\"max_repair_dispatches_per_episode\":1},\"caps_digest\":\"81f3bf209b41d41276ab87a00fa7fd30e9fdf3792ed08b27174c0f27a0cdf67f\",\"member_reports\":[{\"world_id\":\"world-select\",\"world_digest\":\"e7ef2078d600a0e1d268fc0c463595d11356a63b29e9f6d4aa93e91da3f887dd\",\"report\":{\"schema_version\":\"rsia.replay_report.v2\",\"world_id\":\"world-select\",\"world_digest\":\"e7ef2078d600a0e1d268fc0c463595d11356a63b29e9f6d4aa93e91da3f887dd\",\"cluster_id\":\"cluster-select\",\"partition\":\"select\",\"policy_digest\":\"1ad1c74c6632e1edc116c7e430f0ec32d7aec0dbe34617612cdc9009aa30c423\",\"profile_digest\":\"76923cf095b1c75ab8a9e5723e2273a48388f6d5e7e72fd650ecc95bc2c4e2be\",\"objective_version\":\"rsia.pareto_attainment.v2\",\"batches\":[{\"decision_round\":1,\"action_seqs\":[1],\"record_seqs\":[1],\"revealed_quality_micros\":[600000]}],\"probe_best_quality_micros\":[600000],\"round_best_quality_micros\":[600000],\"final_quality_micros\":600000,\"probes\":1,\"simulated_rounds\":1,\"parallel_penalty\":{\"numerator\":1,\"denominator\":1},\"no_probe\":false,\"attainment_auc_micros\":600000,\"q_auc_sim_micros\":600000,\"score_v2_micros\":500000,\"historical_usage\":{\"input_tokens\":1,\"output_tokens\":1,\"cost_micros\":1,\"latency_millis\":1},\"replay_cpu_nanos\":1001084,\"coverage\":{\"attempted_actions\":1,\"observed_actions\":1,\"censored_actions\":0,\"out_of_support_actions\":0,\"complete_support\":true},\"terminal\":\"budget_exhausted\",\"terminal_reason\":\"probe budget exhausted\",\"development_only\":true,\"revealed_prefix\":{\"schema_version\":\"rsia.prefix_view.v2\",\"context_signature\":\"9dfc2d475ba34d340ef0031c734aeb9b01099e0012bdb37692ad081f05a0ae23\",\"approved_parent_digest\":\"a50399b580df41a70a8fe9c128cbf6cc1133701d1435185e4b6112510eb9ae58\",\"initial_baseline_quality_micros\":500000,\"nodes\":[{\"node_seq\":1,\"branch_seq\":1,\"search_parent_seq\":null,\"approved_parent_digest\":\"a50399b580df41a70a8fe9c128cbf6cc1133701d1435185e4b6112510eb9ae58\",\"depth\":1,\"status\":{\"status\":\"valid\",\"quality_micros\":600000},\"best_valid_ancestor_micros\":600000,\"recent_valid_gains_micros\":[100000],\"repair_failures_dispatched\":0}],\"current_branch_seq\":1,\"current_branch_focus_actions\":1,\"decisions_completed\":1,\"waits\":[],\"nodes_used\":1,\"recovery_dispatches_used\":0}}}],\"reports_body_digest\":\"017f6119d3ad600f0cfe367c1f93b6cee7aad33ef93dfa35c7d97734eb1f5cc8\",\"semantic_reports_digest\":\"fd07c3138e7eec8c2a3b278848ec41c0319456870310e6fb770ecb8799872e8b\"}}",
+      "kind": "artifact",
+      "owner": "admin",
+      "physical_id": "replay-report-eaa0299113cdb7efad1ef99026abdba1d3929c68b200333e71f655495573279d",
+      "rowid_nonsemantic": 7
+    },
+    {
+      "body_bytes": 4854,
+      "body_sha256": "50792eaf437df2a61467556d93ea6df3d11b6772f0d60c29dbede3f0217ce9e3",
+      "body_utf8": "{\"schema_version\":\"rsia.replay_economic_artifact_envelope.v1\",\"id\":\"e11-972a6a42fe92a43dc7149a2e304e9d9717c27144124e51d056b522f342e044f2\",\"record_kind\":\"replay_economic_experiment_v1\",\"payload\":{\"schema_version\":\"rsia.replay_economic_experiment.v1\",\"id\":\"economic-exp-1\",\"profile_id\":\"profile-1\",\"evaluator_actor\":\"evaluator\",\"executor_actor\":\"executor\",\"proposer_actor\":\"proposer\",\"approver_actor\":\"approver\",\"primary_claim\":\"noninferior_savings\",\"min_gain_micros\":20000,\"noninferiority_margin_micros\":10000,\"preregistration_digest\":\"f19694d36724a9d624e6a68548f6102b0ea70670a9e325f90dc8c99dcad9b7c8\",\"paired_ticket_id\":\"paired-ticket\",\"paired_ticket_digest\":\"1a708645fe31616bac1b9f93d5c5e2f13dafc8f3b855bca6195a7835c4b3e91a\",\"dataset_epoch\":\"epoch-1\",\"tasks\":[{\"ordinal\":1,\"task_id\":\"task-1\",\"task_digest\":\"7afaa346b4bf92bf9dc21e9ae809887412a86beb766842e99df7fee6573a4781\",\"cluster_id\":\"cluster-1\",\"arm_order\":\"fixed_then_replay_selected\"}],\"runtime\":{\"w_online\":1,\"fixed_policy_digest\":\"9efbbac34bcd05a88f81ab2e80bdee0af4f32f98c9c67a47f4bcc06a353c56be\",\"replay_selected_policy_digest\":\"1ad1c74c6632e1edc116c7e430f0ec32d7aec0dbe34617612cdc9009aa30c423\",\"generation_strategy_digest\":\"e661f4c935e8a5a83349afb5e347695c2e972e967b50efcd618f93b0b7b4c24b\",\"candidate_bundle_digest\":\"9840f40ce082e0186e4ed17444bfca2d005a4014993cb1212ca544d220e515fb\",\"baseline_bundle_digest\":\"42d582727e80985cc3d2140697d6cd801fb0e79deea844f4fb3a48ea4469b2ae\",\"environment_digest\":\"ba5285161ba6eed0085fb13784ce5c92f70ebc268b94fd66aa1d68a32884204d\",\"model_digest\":\"9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4\",\"tools_digest\":\"f9d35d43770d39092a663e665e82ae1d84a9e0da3d0d10c407acada6a40cd281\",\"runner_digest\":\"527aa9f431539da8e151d5434d1d5e611d973f601d8e970790882624554146b0\",\"grader_digest\":\"c528cab03ad47ed5fceb01fd4f4557f12d8f2bcb2aa9f6e78087380aab8fde5f\",\"guidance_digest\":\"f8aac527f9c928fcec7b1d67c73839a57741bf86271b16731e01d75bba683c53\",\"rules_digest\":\"6c621d1a05138a7888d37d9269a9da8e2e11e4aced2f6cfd24b05ab1b9e61bb0\",\"context_signature\":\"ea7792a26f405e2ae9c6f49ca93bbe6076ceac0a1fc53d83426c7d7f2d9377e4\",\"target_runtime_profile\":\"online-w1\",\"per_arm_node_budget\":12,\"per_arm_root_budget_micros\":1000},\"replay_selection\":{\"report_artifact_id\":\"replay-report-eaa0299113cdb7efad1ef99026abdba1d3929c68b200333e71f655495573279d\",\"report_digest\":\"d064c3153ffba4cdb8c955a24562b5324573200162397ecb5936a023ee519656\",\"semantic_digest\":\"fd07c3138e7eec8c2a3b278848ec41c0319456870310e6fb770ecb8799872e8b\",\"world_pool_digest\":\"1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27\",\"policy_digest\":\"1ad1c74c6632e1edc116c7e430f0ec32d7aec0dbe34617612cdc9009aa30c423\",\"profile_digest\":\"76923cf095b1c75ab8a9e5723e2273a48388f6d5e7e72fd650ecc95bc2c4e2be\",\"caps_digest\":\"81f3bf209b41d41276ab87a00fa7fd30e9fdf3792ed08b27174c0f27a0cdf67f\",\"selection_rule_version\":\"rsia.pareto_attainment.v2\",\"selected_with_w_sim\":1,\"target_w_online\":1,\"simulation_only\":[{\"w_sim\":2,\"report_id\":\"simulation-w2\",\"report_digest\":\"33d7543ccd46a825518eefa5fae883aa45a5d05494639f9e2169d040732e8f5e\"}]},\"cost_plan\":{\"component_kinds\":[\"history_collection\",\"policy_generation\",\"replay_cpu\",\"replay_storage\",\"online_development_fixed\",\"online_development_replay_selected\",\"independent_acceptance\",\"canary_operations\",\"human_review\"],\"currency\":\"usd\",\"pricing_version\":\"price-v1\",\"payment_subject\":\"payer-1\"},\"budget_binding\":{\"billing_scope\":\"economic-scope\",\"root_budget_id\":\"root-1\",\"currency\":\"usd\",\"pricing_version\":\"price-v1\",\"payment_subject\":\"payer-1\",\"components\":[{\"component\":\"history_collection\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-history\",\"stage\":\"history_collection\"}},{\"component\":\"policy_generation\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-policy\",\"stage\":\"candidate_generation\"}},{\"component\":\"replay_cpu\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-replay-cpu\",\"stage\":\"storage_cpu\"}},{\"component\":\"replay_storage\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-replay-storage\",\"stage\":\"storage_cpu\"}},{\"component\":\"online_development_fixed\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-fixed\",\"stage\":\"development_execution\"}},{\"component\":\"online_development_replay_selected\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-replay\",\"stage\":\"development_execution\"}},{\"component\":\"independent_acceptance\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-acceptance\",\"stage\":\"formal_evaluation\"}},{\"component\":\"canary_operations\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-canary\",\"stage\":\"gray_operations\"}},{\"component\":\"human_review\",\"source\":{\"source\":\"admin_measurement\",\"source_id\":\"admin-review-receipt\"}}]},\"sources\":[{\"id\":\"source-1\",\"digest\":\"89ad0d19ec2b9bfbbbcdd1b53f7841f4e7f53780ad1be57a279fe46cffe1e824\"}],\"source_watermark\":1}}",
+      "kind": "artifact",
+      "owner": "evaluator",
+      "physical_id": "e11-972a6a42fe92a43dc7149a2e304e9d9717c27144124e51d056b522f342e044f2",
+      "rowid_nonsemantic": 8
+    },
+    {
+      "body_bytes": 716,
+      "body_sha256": "c9e92c46a68b1a9cd61ab22d749be2c7017819671bc82ae47a47e5ca8661f37d",
+      "body_utf8": "{\"schema_version\":\"rsia.replay_economic_artifact_envelope.v1\",\"id\":\"e11-891d03c53bc424d533c33aac3d31c8a851e5b48b9e1e69dfe7aa41851d3a9f56\",\"record_kind\":\"replay_economic_job_v1\",\"payload\":{\"schema_version\":\"rsia.replay_economic_job.v1\",\"id\":\"replay-economic-job-3e581092007ab0c4e94272a5\",\"experiment_id\":\"economic-exp-1\",\"request_key\":\"start-key-1\",\"request_digest\":\"0a2799cb2cd76cd1cf7d534c8a5da17959f2e812e2ae607a24dd365273a5fcd3\",\"paired_ticket_id\":\"paired-ticket\",\"state\":\"blocked_support\",\"blocked_reasons\":[\"e05_paired_ticket_not_found\",\"real_provider_and_independent_runner_unavailable\"],\"cost_receipt_ids\":[],\"report_id\":\"replay-economic-report-deddffc2e36f640df68c9e67\",\"cancel_reason\":null,\"created_seq\":1}}",
+      "kind": "artifact",
+      "owner": "evaluator",
+      "physical_id": "e11-891d03c53bc424d533c33aac3d31c8a851e5b48b9e1e69dfe7aa41851d3a9f56",
+      "rowid_nonsemantic": 9
+    },
+    {
+      "body_bytes": 888,
+      "body_sha256": "9b857f8a4d0b2310e0f59c6e4ce72602ea8c089f1666988789c68b3b299701e2",
+      "body_utf8": "{\"schema_version\":\"rsia.replay_economic_artifact_envelope.v1\",\"id\":\"e11-7c0c436b0e54d2101378ed4de239b743adf79259e692686e57a23d59ad46bdef\",\"record_kind\":\"replay_economic_report_v1\",\"payload\":{\"schema_version\":\"rsia.replay_economic_report.v1\",\"id\":\"replay-economic-report-deddffc2e36f640df68c9e67\",\"experiment_id\":\"economic-exp-1\",\"experiment_digest\":\"724b27e8d4cbc060484fe07313a08e476031c67558c2a0cf25719b93ab7b2fe6\",\"paired_ticket_id\":\"paired-ticket\",\"paired_ticket_digest\":\"1a708645fe31616bac1b9f93d5c5e2f13dafc8f3b855bca6195a7835c4b3e91a\",\"paired_receipt_closure_digest\":null,\"completed_paired_tasks\":0,\"paired_units\":[],\"latency\":null,\"quality_outcome\":\"zero_or_inconclusive\",\"cost_receipt_ids\":[],\"economics\":{\"status\":\"blocked\",\"reasons\":[\"no_cost_receipts\"]},\"terminal\":\"blocked_support\",\"reasons\":[\"e05_paired_ticket_not_found\",\"real_provider_and_independent_runner_unavailable\"]}}",
+      "kind": "artifact",
+      "owner": "evaluator",
+      "physical_id": "e11-7c0c436b0e54d2101378ed4de239b743adf79259e692686e57a23d59ad46bdef",
+      "rowid_nonsemantic": 10
+    },
+    {
+      "body_bytes": 828,
+      "body_sha256": "2fc3456eb3186560abf181c079c5772248106fea1a0562c38c6b72753dca42f8",
+      "body_utf8": "{\"schema_version\":\"rsia.replay_economic_artifact_envelope.v1\",\"id\":\"e11-c7ff1fd0b883a98e0b9c18d2c789a952c8b2c36be0413cdc4414c8332bb3ba1e\",\"record_kind\":\"replay_economic_job_v1\",\"payload\":{\"schema_version\":\"rsia.replay_economic_job.v1\",\"id\":\"replay-economic-job-0a16718f1790315d15de45ac\",\"experiment_id\":\"economic-exp-1\",\"request_key\":\"cancel-key-1\",\"request_digest\":\"f91fe67afdd8eb849c7c43bdc51f787ca1c597e1572d23d8ec395bc462b60a9e\",\"paired_ticket_id\":\"paired-ticket\",\"state\":\"cancelled\",\"blocked_reasons\":[\"e05_paired_ticket_not_found\",\"real_provider_and_independent_runner_unavailable\"],\"cost_receipt_ids\":[\"economic-cost-892cb38a638c46492177cd53\",\"economic-cost-b230517a7f216f699b5c4f2b\"],\"report_id\":\"replay-economic-report-49088875502815866d3d70aa\",\"cancel_reason\":\"external execution remains unavailable\",\"created_seq\":2}}",
+      "kind": "artifact",
+      "owner": "evaluator",
+      "physical_id": "e11-c7ff1fd0b883a98e0b9c18d2c789a952c8b2c36be0413cdc4414c8332bb3ba1e",
+      "rowid_nonsemantic": 11
+    },
+    {
+      "body_bytes": 954,
+      "body_sha256": "2db348043998347b60cd02dc6224990d216a34b76cab022d75b7ad3bf609ff39",
+      "body_utf8": "{\"schema_version\":\"rsia.replay_economic_artifact_envelope.v1\",\"id\":\"e11-78be6d1001e2e20e0a1e9c1ec1dbcc7ce17480960a793393fb8d5f04704c006d\",\"record_kind\":\"replay_economic_cost_receipt_v1\",\"payload\":{\"schema_version\":\"rsia.replay_economic_cost_receipt.v1\",\"id\":\"economic-cost-b230517a7f216f699b5c4f2b\",\"experiment_id\":\"economic-exp-1\",\"component\":\"history_collection\",\"scope\":\"one_time\",\"source_kind\":\"budget_call\",\"source_id\":\"released-call\",\"source_digest\":\"55806c98ceb76a97304de2f887e184b0fe33ff432da74cee1bed69e17e75d38f\",\"billing_scope\":\"economic-scope\",\"budget_call_id\":\"released-call\",\"amount_micros\":null,\"currency\":null,\"pricing_version\":null,\"payment_subject\":null,\"tokens\":null,\"latency_micros\":null,\"storage_bytes\":null,\"cpu_nanos\":null,\"human_minutes\":null,\"measurement_state\":\"not_incurred\",\"proof_digest\":\"8ef7210b748a7eac857a8a0fe854d5d6beee89aa7331f0c520cc402d1ebe4379\",\"reason\":\"budget call was provably never dispatched\",\"created_seq\":1}}",
+      "kind": "artifact",
+      "owner": "evaluator",
+      "physical_id": "e11-78be6d1001e2e20e0a1e9c1ec1dbcc7ce17480960a793393fb8d5f04704c006d",
+      "rowid_nonsemantic": 12
+    },
+    {
+      "body_bytes": 920,
+      "body_sha256": "206221e3f481f120259d8d97ff350dba510b5886bc87e496b82ec7ba9d467236",
+      "body_utf8": "{\"schema_version\":\"rsia.replay_economic_artifact_envelope.v1\",\"id\":\"e11-f32705d8a6b51ed84d7ed53951b727cb5dada09b05abe6f9a16699dae83eee85\",\"record_kind\":\"replay_economic_cost_receipt_v1\",\"payload\":{\"schema_version\":\"rsia.replay_economic_cost_receipt.v1\",\"id\":\"economic-cost-892cb38a638c46492177cd53\",\"experiment_id\":\"economic-exp-1\",\"component\":\"online_development_replay_selected\",\"scope\":\"per_task\",\"source_kind\":\"budget_call\",\"source_id\":\"replay-call\",\"source_digest\":\"dd81e584377ba22a8828bbd0c17ae5995b9aff96bcaa8fd78411787fd2f60dec\",\"billing_scope\":\"economic-scope\",\"budget_call_id\":\"replay-call\",\"amount_micros\":null,\"currency\":null,\"pricing_version\":null,\"payment_subject\":null,\"tokens\":null,\"latency_micros\":null,\"storage_bytes\":null,\"cpu_nanos\":null,\"human_minutes\":null,\"measurement_state\":\"usage_uncertain\",\"proof_digest\":null,\"reason\":\"dispatched usage is not finalized and execution-closed\",\"created_seq\":2}}",
+      "kind": "artifact",
+      "owner": "evaluator",
+      "physical_id": "e11-f32705d8a6b51ed84d7ed53951b727cb5dada09b05abe6f9a16699dae83eee85",
+      "rowid_nonsemantic": 13
+    },
+    {
+      "body_bytes": 1003,
+      "body_sha256": "2d15468f0e3e5719d1d4ecc616374ea459090bf37b9351901cbabeb3763846a5",
+      "body_utf8": "{\"schema_version\":\"rsia.replay_economic_artifact_envelope.v1\",\"id\":\"e11-1fa6695aea30f21d847d8962f0b4a8e5ad9df2ad0d6669becdcdedc816cbff89\",\"record_kind\":\"replay_economic_report_v1\",\"payload\":{\"schema_version\":\"rsia.replay_economic_report.v1\",\"id\":\"replay-economic-report-49088875502815866d3d70aa\",\"experiment_id\":\"economic-exp-1\",\"experiment_digest\":\"724b27e8d4cbc060484fe07313a08e476031c67558c2a0cf25719b93ab7b2fe6\",\"paired_ticket_id\":\"paired-ticket\",\"paired_ticket_digest\":\"1a708645fe31616bac1b9f93d5c5e2f13dafc8f3b855bca6195a7835c4b3e91a\",\"paired_receipt_closure_digest\":null,\"completed_paired_tasks\":0,\"paired_units\":[],\"latency\":null,\"quality_outcome\":\"zero_or_inconclusive\",\"cost_receipt_ids\":[\"economic-cost-892cb38a638c46492177cd53\",\"economic-cost-b230517a7f216f699b5c4f2b\"],\"economics\":{\"status\":\"usage_uncertain\",\"receipt_ids\":[\"economic-cost-892cb38a638c46492177cd53\"]},\"terminal\":\"usage_uncertain\",\"reasons\":[\"e05_paired_ticket_not_found\",\"real_provider_and_independent_runner_unavailable\"]}}",
+      "kind": "artifact",
+      "owner": "evaluator",
+      "physical_id": "e11-1fa6695aea30f21d847d8962f0b4a8e5ad9df2ad0d6669becdcdedc816cbff89",
+      "rowid_nonsemantic": 14
+    },
+    {
+      "body_bytes": 1146,
+      "body_sha256": "ce731f37ea90ec88c6bab81368ac3fc5d28fa55024cde60ee68dc5129cc0aa02",
+      "body_utf8": "{\"id\":\"management-input-250cb28fa666f439cf963e3d\",\"schema_version\":\"rsia.management_private_input.v1\",\"operation\":\"replay.run\",\"payload_digest\":\"3faf37db2674e2d234b1ce1d5a9bb1c7482f00ac4cfbecb7e68a5ffc078fabe1\",\"payload\":{\"caps\":{\"max_depth\":4,\"max_nodes\":12,\"max_repair_dispatches_per_episode\":1,\"schema_version\":\"rsia.exploration_caps.v1\",\"w_online\":1},\"operation\":\"replay_run\",\"partition\":\"select\",\"policy\":{\"fairness_wait_rounds\":4,\"max_focus_actions\":2,\"schema_version\":\"rsia.elastic_priority.v1\",\"significant_gain_micros\":20000,\"stagnation_abs_gain_micros\":5000,\"stagnation_window\":2},\"pool_digest\":\"1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27\",\"profile\":{\"fixed_seed\":7,\"global_recovery_dispatch_limit\":1,\"horizon\":1,\"lambda_round_micros\":50000,\"lambda_work_micros\":50000,\"objective\":\"pareto_attainment_v2\",\"pool_digest\":\"1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27\",\"probe_budget\":1,\"purpose\":\"development\",\"simulation_version\":\"rsia.unit_probe_barrier.v1\",\"target_runtime_profile\":\"online-w1\",\"w_sim\":1},\"request_key\":\"ag147-history-replay-run\",\"schema_version\":\"rsia.management.replay_run.v1\"}}",
+      "kind": "artifact",
+      "owner": "admin",
+      "physical_id": "management-input-250cb28fa666f439cf963e3d",
+      "rowid_nonsemantic": 15
+    }
+  ],
+  "auth_identities": [
+    {
+      "actor": "admin",
+      "namespace": "n",
+      "role": "admin"
+    },
+    {
+      "actor": "evaluator",
+      "namespace": "n",
+      "role": "evaluator"
+    }
+  ],
+  "blocked_job": {
+    "blocked_reasons": [
+      "e05_paired_ticket_not_found",
+      "real_provider_and_independent_runner_unavailable"
+    ],
+    "cancel_reason": null,
+    "cost_receipt_ids": [],
+    "created_seq": 1,
+    "experiment_id": "economic-exp-1",
+    "id": "replay-economic-job-3e581092007ab0c4e94272a5",
+    "paired_ticket_id": "paired-ticket",
+    "report_id": "replay-economic-report-deddffc2e36f640df68c9e67",
+    "request_digest": "0a2799cb2cd76cd1cf7d534c8a5da17959f2e812e2ae607a24dd365273a5fcd3",
+    "request_key": "start-key-1",
+    "schema_version": "rsia.replay_economic_job.v1",
+    "state": "blocked_support"
+  },
+  "blocked_report": {
+    "completed_paired_tasks": 0,
+    "cost_receipt_ids": [],
+    "economics": {
+      "reasons": [
+        "no_cost_receipts"
+      ],
+      "status": "blocked"
+    },
+    "experiment_digest": "724b27e8d4cbc060484fe07313a08e476031c67558c2a0cf25719b93ab7b2fe6",
+    "experiment_id": "economic-exp-1",
+    "id": "replay-economic-report-deddffc2e36f640df68c9e67",
+    "latency": null,
+    "paired_receipt_closure_digest": null,
+    "paired_ticket_digest": "1a708645fe31616bac1b9f93d5c5e2f13dafc8f3b855bca6195a7835c4b3e91a",
+    "paired_ticket_id": "paired-ticket",
+    "paired_units": [],
+    "quality_outcome": "zero_or_inconclusive",
+    "reasons": [
+      "e05_paired_ticket_not_found",
+      "real_provider_and_independent_runner_unavailable"
+    ],
+    "schema_version": "rsia.replay_economic_report.v1",
+    "terminal": "blocked_support"
+  },
+  "blocked_start_response": {
+    "blocked_reasons": [
+      "e05_paired_ticket_not_found",
+      "real_provider_and_independent_runner_unavailable"
+    ],
+    "cancel_reason": null,
+    "cost_receipt_ids": [],
+    "created_seq": 1,
+    "experiment_id": "economic-exp-1",
+    "id": "replay-economic-job-3e581092007ab0c4e94272a5",
+    "paired_ticket_id": "paired-ticket",
+    "report_id": null,
+    "request_digest": "0a2799cb2cd76cd1cf7d534c8a5da17959f2e812e2ae607a24dd365273a5fcd3",
+    "request_key": "start-key-1",
+    "schema_version": "rsia.replay_economic_job.v1",
+    "state": "blocked_support"
+  },
+  "blocked_status": {
+    "blocked_reasons": [
+      "e05_paired_ticket_not_found",
+      "real_provider_and_independent_runner_unavailable"
+    ],
+    "cost_receipt_count": 0,
+    "experiment_id": "economic-exp-1",
+    "job_id": "replay-economic-job-3e581092007ab0c4e94272a5",
+    "paired_ticket_id": "paired-ticket",
+    "report_id": "replay-economic-report-deddffc2e36f640df68c9e67",
+    "state": "blocked_support"
+  },
+  "budget_calls": [
+    {
+      "actual_cost_micros": null,
+      "actual_currency": null,
+      "actual_input_digest": "2c200406d3369f22741c722347734e8f6663c781161e23c793df819587ae7853",
+      "actual_model_digest": null,
+      "actual_pricing_version": null,
+      "billing_scope": "economic-scope",
+      "call_id": "released-call",
+      "created_at": 1792705342,
+      "dispatch_group_id": "group-history",
+      "dispatch_id": null,
+      "dispatched_at": null,
+      "execution_close_reason": null,
+      "execution_closed": true,
+      "execution_closed_at": null,
+      "execution_provenance": null,
+      "finalized_at": null,
+      "lease_epoch": 1,
+      "lease_token": "lease-released-call",
+      "lease_until": 1792705442,
+      "namespace": "n",
+      "output_digest": null,
+      "provider_request_id": null,
+      "request_artifact": null,
+      "reserved_micros": 100,
+      "response_artifact": null,
+      "response_block_reason": null,
+      "response_usable": null,
+      "stage": "history_collection",
+      "state": "released",
+      "terminal_reason": "controlled fixture stopped before dispatch; no provider call",
+      "transport_artifact": null,
+      "usage_record_id": null
+    },
+    {
+      "actual_cost_micros": null,
+      "actual_currency": null,
+      "actual_input_digest": "52c6f206e40dc5111b357a7fbe76242af83db24c48d38dd4524dd7b816159a13",
+      "actual_model_digest": null,
+      "actual_pricing_version": null,
+      "billing_scope": "economic-scope",
+      "call_id": "replay-call",
+      "created_at": 1792705342,
+      "dispatch_group_id": "group-replay",
+      "dispatch_id": "e41cf64e-114c-4ab2-8a95-22122e1bd678",
+      "dispatched_at": 1792705342,
+      "execution_close_reason": "local budget-state fixture finished; no external process started",
+      "execution_closed": true,
+      "execution_closed_at": 1792705342,
+      "execution_provenance": null,
+      "finalized_at": null,
+      "lease_epoch": 1,
+      "lease_token": "lease-replay-call",
+      "lease_until": 1792705442,
+      "namespace": "n",
+      "output_digest": null,
+      "provider_request_id": null,
+      "request_artifact": null,
+      "reserved_micros": 100,
+      "response_artifact": null,
+      "response_block_reason": null,
+      "response_usable": null,
+      "stage": "development_execution",
+      "state": "uncertain",
+      "terminal_reason": "controlled budget state fixture; no provider I/O",
+      "transport_artifact": null,
+      "usage_record_id": null
+    }
+  ],
+  "cancelled_job": {
+    "blocked_reasons": [
+      "e05_paired_ticket_not_found",
+      "real_provider_and_independent_runner_unavailable"
+    ],
+    "cancel_reason": "external execution remains unavailable",
+    "cost_receipt_ids": [
+      "economic-cost-892cb38a638c46492177cd53",
+      "economic-cost-b230517a7f216f699b5c4f2b"
+    ],
+    "created_seq": 2,
+    "experiment_id": "economic-exp-1",
+    "id": "replay-economic-job-0a16718f1790315d15de45ac",
+    "paired_ticket_id": "paired-ticket",
+    "report_id": "replay-economic-report-49088875502815866d3d70aa",
+    "request_digest": "f91fe67afdd8eb849c7c43bdc51f787ca1c597e1572d23d8ec395bc462b60a9e",
+    "request_key": "cancel-key-1",
+    "schema_version": "rsia.replay_economic_job.v1",
+    "state": "cancelled"
+  },
+  "cancelled_report": {
+    "completed_paired_tasks": 0,
+    "cost_receipt_ids": [
+      "economic-cost-892cb38a638c46492177cd53",
+      "economic-cost-b230517a7f216f699b5c4f2b"
+    ],
+    "economics": {
+      "receipt_ids": [
+        "economic-cost-892cb38a638c46492177cd53"
+      ],
+      "status": "usage_uncertain"
+    },
+    "experiment_digest": "724b27e8d4cbc060484fe07313a08e476031c67558c2a0cf25719b93ab7b2fe6",
+    "experiment_id": "economic-exp-1",
+    "id": "replay-economic-report-49088875502815866d3d70aa",
+    "latency": null,
+    "paired_receipt_closure_digest": null,
+    "paired_ticket_digest": "1a708645fe31616bac1b9f93d5c5e2f13dafc8f3b855bca6195a7835c4b3e91a",
+    "paired_ticket_id": "paired-ticket",
+    "paired_units": [],
+    "quality_outcome": "zero_or_inconclusive",
+    "reasons": [
+      "e05_paired_ticket_not_found",
+      "real_provider_and_independent_runner_unavailable"
+    ],
+    "schema_version": "rsia.replay_economic_report.v1",
+    "terminal": "usage_uncertain"
+  },
+  "cancelled_status": {
+    "blocked_reasons": [
+      "e05_paired_ticket_not_found",
+      "real_provider_and_independent_runner_unavailable"
+    ],
+    "cost_receipt_count": 2,
+    "experiment_id": "economic-exp-1",
+    "job_id": "replay-economic-job-0a16718f1790315d15de45ac",
+    "paired_ticket_id": "paired-ticket",
+    "report_id": "replay-economic-report-49088875502815866d3d70aa",
+    "state": "cancelled"
+  },
+  "cost_receipts": [
+    {
+      "amount_micros": null,
+      "billing_scope": "economic-scope",
+      "budget_call_id": "released-call",
+      "component": "history_collection",
+      "cpu_nanos": null,
+      "created_seq": 1,
+      "currency": null,
+      "experiment_id": "economic-exp-1",
+      "human_minutes": null,
+      "id": "economic-cost-b230517a7f216f699b5c4f2b",
+      "latency_micros": null,
+      "measurement_state": "not_incurred",
+      "payment_subject": null,
+      "pricing_version": null,
+      "proof_digest": "8ef7210b748a7eac857a8a0fe854d5d6beee89aa7331f0c520cc402d1ebe4379",
+      "reason": "budget call was provably never dispatched",
+      "schema_version": "rsia.replay_economic_cost_receipt.v1",
+      "scope": "one_time",
+      "source_digest": "55806c98ceb76a97304de2f887e184b0fe33ff432da74cee1bed69e17e75d38f",
+      "source_id": "released-call",
+      "source_kind": "budget_call",
+      "storage_bytes": null,
+      "tokens": null
+    },
+    {
+      "amount_micros": null,
+      "billing_scope": "economic-scope",
+      "budget_call_id": "replay-call",
+      "component": "online_development_replay_selected",
+      "cpu_nanos": null,
+      "created_seq": 2,
+      "currency": null,
+      "experiment_id": "economic-exp-1",
+      "human_minutes": null,
+      "id": "economic-cost-892cb38a638c46492177cd53",
+      "latency_micros": null,
+      "measurement_state": "usage_uncertain",
+      "payment_subject": null,
+      "pricing_version": null,
+      "proof_digest": null,
+      "reason": "dispatched usage is not finalized and execution-closed",
+      "schema_version": "rsia.replay_economic_cost_receipt.v1",
+      "scope": "per_task",
+      "source_digest": "dd81e584377ba22a8828bbd0c17ae5995b9aff96bcaa8fd78411787fd2f60dec",
+      "source_id": "replay-call",
+      "source_kind": "budget_call",
+      "storage_bytes": null,
+      "tokens": null
+    }
+  ],
+  "economic_record_rows": {
+    "blocked_job": {
+      "body_bytes": 716,
+      "body_sha256": "c9e92c46a68b1a9cd61ab22d749be2c7017819671bc82ae47a47e5ca8661f37d",
+      "body_utf8": "{\"schema_version\":\"rsia.replay_economic_artifact_envelope.v1\",\"id\":\"e11-891d03c53bc424d533c33aac3d31c8a851e5b48b9e1e69dfe7aa41851d3a9f56\",\"record_kind\":\"replay_economic_job_v1\",\"payload\":{\"schema_version\":\"rsia.replay_economic_job.v1\",\"id\":\"replay-economic-job-3e581092007ab0c4e94272a5\",\"experiment_id\":\"economic-exp-1\",\"request_key\":\"start-key-1\",\"request_digest\":\"0a2799cb2cd76cd1cf7d534c8a5da17959f2e812e2ae607a24dd365273a5fcd3\",\"paired_ticket_id\":\"paired-ticket\",\"state\":\"blocked_support\",\"blocked_reasons\":[\"e05_paired_ticket_not_found\",\"real_provider_and_independent_runner_unavailable\"],\"cost_receipt_ids\":[],\"report_id\":\"replay-economic-report-deddffc2e36f640df68c9e67\",\"cancel_reason\":null,\"created_seq\":1}}",
+      "kind": "artifact",
+      "owner": "evaluator",
+      "physical_id": "e11-891d03c53bc424d533c33aac3d31c8a851e5b48b9e1e69dfe7aa41851d3a9f56",
+      "rowid_nonsemantic": 9
+    },
+    "blocked_report": {
+      "body_bytes": 888,
+      "body_sha256": "9b857f8a4d0b2310e0f59c6e4ce72602ea8c089f1666988789c68b3b299701e2",
+      "body_utf8": "{\"schema_version\":\"rsia.replay_economic_artifact_envelope.v1\",\"id\":\"e11-7c0c436b0e54d2101378ed4de239b743adf79259e692686e57a23d59ad46bdef\",\"record_kind\":\"replay_economic_report_v1\",\"payload\":{\"schema_version\":\"rsia.replay_economic_report.v1\",\"id\":\"replay-economic-report-deddffc2e36f640df68c9e67\",\"experiment_id\":\"economic-exp-1\",\"experiment_digest\":\"724b27e8d4cbc060484fe07313a08e476031c67558c2a0cf25719b93ab7b2fe6\",\"paired_ticket_id\":\"paired-ticket\",\"paired_ticket_digest\":\"1a708645fe31616bac1b9f93d5c5e2f13dafc8f3b855bca6195a7835c4b3e91a\",\"paired_receipt_closure_digest\":null,\"completed_paired_tasks\":0,\"paired_units\":[],\"latency\":null,\"quality_outcome\":\"zero_or_inconclusive\",\"cost_receipt_ids\":[],\"economics\":{\"status\":\"blocked\",\"reasons\":[\"no_cost_receipts\"]},\"terminal\":\"blocked_support\",\"reasons\":[\"e05_paired_ticket_not_found\",\"real_provider_and_independent_runner_unavailable\"]}}",
+      "kind": "artifact",
+      "owner": "evaluator",
+      "physical_id": "e11-7c0c436b0e54d2101378ed4de239b743adf79259e692686e57a23d59ad46bdef",
+      "rowid_nonsemantic": 10
+    },
+    "cancelled_job": {
+      "body_bytes": 828,
+      "body_sha256": "2fc3456eb3186560abf181c079c5772248106fea1a0562c38c6b72753dca42f8",
+      "body_utf8": "{\"schema_version\":\"rsia.replay_economic_artifact_envelope.v1\",\"id\":\"e11-c7ff1fd0b883a98e0b9c18d2c789a952c8b2c36be0413cdc4414c8332bb3ba1e\",\"record_kind\":\"replay_economic_job_v1\",\"payload\":{\"schema_version\":\"rsia.replay_economic_job.v1\",\"id\":\"replay-economic-job-0a16718f1790315d15de45ac\",\"experiment_id\":\"economic-exp-1\",\"request_key\":\"cancel-key-1\",\"request_digest\":\"f91fe67afdd8eb849c7c43bdc51f787ca1c597e1572d23d8ec395bc462b60a9e\",\"paired_ticket_id\":\"paired-ticket\",\"state\":\"cancelled\",\"blocked_reasons\":[\"e05_paired_ticket_not_found\",\"real_provider_and_independent_runner_unavailable\"],\"cost_receipt_ids\":[\"economic-cost-892cb38a638c46492177cd53\",\"economic-cost-b230517a7f216f699b5c4f2b\"],\"report_id\":\"replay-economic-report-49088875502815866d3d70aa\",\"cancel_reason\":\"external execution remains unavailable\",\"created_seq\":2}}",
+      "kind": "artifact",
+      "owner": "evaluator",
+      "physical_id": "e11-c7ff1fd0b883a98e0b9c18d2c789a952c8b2c36be0413cdc4414c8332bb3ba1e",
+      "rowid_nonsemantic": 11
+    },
+    "cancelled_report": {
+      "body_bytes": 1003,
+      "body_sha256": "2d15468f0e3e5719d1d4ecc616374ea459090bf37b9351901cbabeb3763846a5",
+      "body_utf8": "{\"schema_version\":\"rsia.replay_economic_artifact_envelope.v1\",\"id\":\"e11-1fa6695aea30f21d847d8962f0b4a8e5ad9df2ad0d6669becdcdedc816cbff89\",\"record_kind\":\"replay_economic_report_v1\",\"payload\":{\"schema_version\":\"rsia.replay_economic_report.v1\",\"id\":\"replay-economic-report-49088875502815866d3d70aa\",\"experiment_id\":\"economic-exp-1\",\"experiment_digest\":\"724b27e8d4cbc060484fe07313a08e476031c67558c2a0cf25719b93ab7b2fe6\",\"paired_ticket_id\":\"paired-ticket\",\"paired_ticket_digest\":\"1a708645fe31616bac1b9f93d5c5e2f13dafc8f3b855bca6195a7835c4b3e91a\",\"paired_receipt_closure_digest\":null,\"completed_paired_tasks\":0,\"paired_units\":[],\"latency\":null,\"quality_outcome\":\"zero_or_inconclusive\",\"cost_receipt_ids\":[\"economic-cost-892cb38a638c46492177cd53\",\"economic-cost-b230517a7f216f699b5c4f2b\"],\"economics\":{\"status\":\"usage_uncertain\",\"receipt_ids\":[\"economic-cost-892cb38a638c46492177cd53\"]},\"terminal\":\"usage_uncertain\",\"reasons\":[\"e05_paired_ticket_not_found\",\"real_provider_and_independent_runner_unavailable\"]}}",
+      "kind": "artifact",
+      "owner": "evaluator",
+      "physical_id": "e11-1fa6695aea30f21d847d8962f0b4a8e5ad9df2ad0d6669becdcdedc816cbff89",
+      "rowid_nonsemantic": 14
+    },
+    "experiment": {
+      "body_bytes": 4854,
+      "body_sha256": "50792eaf437df2a61467556d93ea6df3d11b6772f0d60c29dbede3f0217ce9e3",
+      "body_utf8": "{\"schema_version\":\"rsia.replay_economic_artifact_envelope.v1\",\"id\":\"e11-972a6a42fe92a43dc7149a2e304e9d9717c27144124e51d056b522f342e044f2\",\"record_kind\":\"replay_economic_experiment_v1\",\"payload\":{\"schema_version\":\"rsia.replay_economic_experiment.v1\",\"id\":\"economic-exp-1\",\"profile_id\":\"profile-1\",\"evaluator_actor\":\"evaluator\",\"executor_actor\":\"executor\",\"proposer_actor\":\"proposer\",\"approver_actor\":\"approver\",\"primary_claim\":\"noninferior_savings\",\"min_gain_micros\":20000,\"noninferiority_margin_micros\":10000,\"preregistration_digest\":\"f19694d36724a9d624e6a68548f6102b0ea70670a9e325f90dc8c99dcad9b7c8\",\"paired_ticket_id\":\"paired-ticket\",\"paired_ticket_digest\":\"1a708645fe31616bac1b9f93d5c5e2f13dafc8f3b855bca6195a7835c4b3e91a\",\"dataset_epoch\":\"epoch-1\",\"tasks\":[{\"ordinal\":1,\"task_id\":\"task-1\",\"task_digest\":\"7afaa346b4bf92bf9dc21e9ae809887412a86beb766842e99df7fee6573a4781\",\"cluster_id\":\"cluster-1\",\"arm_order\":\"fixed_then_replay_selected\"}],\"runtime\":{\"w_online\":1,\"fixed_policy_digest\":\"9efbbac34bcd05a88f81ab2e80bdee0af4f32f98c9c67a47f4bcc06a353c56be\",\"replay_selected_policy_digest\":\"1ad1c74c6632e1edc116c7e430f0ec32d7aec0dbe34617612cdc9009aa30c423\",\"generation_strategy_digest\":\"e661f4c935e8a5a83349afb5e347695c2e972e967b50efcd618f93b0b7b4c24b\",\"candidate_bundle_digest\":\"9840f40ce082e0186e4ed17444bfca2d005a4014993cb1212ca544d220e515fb\",\"baseline_bundle_digest\":\"42d582727e80985cc3d2140697d6cd801fb0e79deea844f4fb3a48ea4469b2ae\",\"environment_digest\":\"ba5285161ba6eed0085fb13784ce5c92f70ebc268b94fd66aa1d68a32884204d\",\"model_digest\":\"9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4\",\"tools_digest\":\"f9d35d43770d39092a663e665e82ae1d84a9e0da3d0d10c407acada6a40cd281\",\"runner_digest\":\"527aa9f431539da8e151d5434d1d5e611d973f601d8e970790882624554146b0\",\"grader_digest\":\"c528cab03ad47ed5fceb01fd4f4557f12d8f2bcb2aa9f6e78087380aab8fde5f\",\"guidance_digest\":\"f8aac527f9c928fcec7b1d67c73839a57741bf86271b16731e01d75bba683c53\",\"rules_digest\":\"6c621d1a05138a7888d37d9269a9da8e2e11e4aced2f6cfd24b05ab1b9e61bb0\",\"context_signature\":\"ea7792a26f405e2ae9c6f49ca93bbe6076ceac0a1fc53d83426c7d7f2d9377e4\",\"target_runtime_profile\":\"online-w1\",\"per_arm_node_budget\":12,\"per_arm_root_budget_micros\":1000},\"replay_selection\":{\"report_artifact_id\":\"replay-report-eaa0299113cdb7efad1ef99026abdba1d3929c68b200333e71f655495573279d\",\"report_digest\":\"d064c3153ffba4cdb8c955a24562b5324573200162397ecb5936a023ee519656\",\"semantic_digest\":\"fd07c3138e7eec8c2a3b278848ec41c0319456870310e6fb770ecb8799872e8b\",\"world_pool_digest\":\"1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27\",\"policy_digest\":\"1ad1c74c6632e1edc116c7e430f0ec32d7aec0dbe34617612cdc9009aa30c423\",\"profile_digest\":\"76923cf095b1c75ab8a9e5723e2273a48388f6d5e7e72fd650ecc95bc2c4e2be\",\"caps_digest\":\"81f3bf209b41d41276ab87a00fa7fd30e9fdf3792ed08b27174c0f27a0cdf67f\",\"selection_rule_version\":\"rsia.pareto_attainment.v2\",\"selected_with_w_sim\":1,\"target_w_online\":1,\"simulation_only\":[{\"w_sim\":2,\"report_id\":\"simulation-w2\",\"report_digest\":\"33d7543ccd46a825518eefa5fae883aa45a5d05494639f9e2169d040732e8f5e\"}]},\"cost_plan\":{\"component_kinds\":[\"history_collection\",\"policy_generation\",\"replay_cpu\",\"replay_storage\",\"online_development_fixed\",\"online_development_replay_selected\",\"independent_acceptance\",\"canary_operations\",\"human_review\"],\"currency\":\"usd\",\"pricing_version\":\"price-v1\",\"payment_subject\":\"payer-1\"},\"budget_binding\":{\"billing_scope\":\"economic-scope\",\"root_budget_id\":\"root-1\",\"currency\":\"usd\",\"pricing_version\":\"price-v1\",\"payment_subject\":\"payer-1\",\"components\":[{\"component\":\"history_collection\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-history\",\"stage\":\"history_collection\"}},{\"component\":\"policy_generation\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-policy\",\"stage\":\"candidate_generation\"}},{\"component\":\"replay_cpu\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-replay-cpu\",\"stage\":\"storage_cpu\"}},{\"component\":\"replay_storage\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-replay-storage\",\"stage\":\"storage_cpu\"}},{\"component\":\"online_development_fixed\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-fixed\",\"stage\":\"development_execution\"}},{\"component\":\"online_development_replay_selected\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-replay\",\"stage\":\"development_execution\"}},{\"component\":\"independent_acceptance\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-acceptance\",\"stage\":\"formal_evaluation\"}},{\"component\":\"canary_operations\",\"source\":{\"source\":\"budget_call\",\"dispatch_group_id\":\"group-canary\",\"stage\":\"gray_operations\"}},{\"component\":\"human_review\",\"source\":{\"source\":\"admin_measurement\",\"source_id\":\"admin-review-receipt\"}}]},\"sources\":[{\"id\":\"source-1\",\"digest\":\"89ad0d19ec2b9bfbbbcdd1b53f7841f4e7f53780ad1be57a279fe46cffe1e824\"}],\"source_watermark\":1}}",
+      "kind": "artifact",
+      "owner": "evaluator",
+      "physical_id": "e11-972a6a42fe92a43dc7149a2e304e9d9717c27144124e51d056b522f342e044f2",
+      "rowid_nonsemantic": 8
+    }
+  },
+  "experiment": {
+    "approver_actor": "approver",
+    "budget_binding": {
+      "billing_scope": "economic-scope",
+      "components": [
+        {
+          "component": "history_collection",
+          "source": {
+            "dispatch_group_id": "group-history",
+            "source": "budget_call",
+            "stage": "history_collection"
+          }
+        },
+        {
+          "component": "policy_generation",
+          "source": {
+            "dispatch_group_id": "group-policy",
+            "source": "budget_call",
+            "stage": "candidate_generation"
+          }
+        },
+        {
+          "component": "replay_cpu",
+          "source": {
+            "dispatch_group_id": "group-replay-cpu",
+            "source": "budget_call",
+            "stage": "storage_cpu"
+          }
+        },
+        {
+          "component": "replay_storage",
+          "source": {
+            "dispatch_group_id": "group-replay-storage",
+            "source": "budget_call",
+            "stage": "storage_cpu"
+          }
+        },
+        {
+          "component": "online_development_fixed",
+          "source": {
+            "dispatch_group_id": "group-fixed",
+            "source": "budget_call",
+            "stage": "development_execution"
+          }
+        },
+        {
+          "component": "online_development_replay_selected",
+          "source": {
+            "dispatch_group_id": "group-replay",
+            "source": "budget_call",
+            "stage": "development_execution"
+          }
+        },
+        {
+          "component": "independent_acceptance",
+          "source": {
+            "dispatch_group_id": "group-acceptance",
+            "source": "budget_call",
+            "stage": "formal_evaluation"
+          }
+        },
+        {
+          "component": "canary_operations",
+          "source": {
+            "dispatch_group_id": "group-canary",
+            "source": "budget_call",
+            "stage": "gray_operations"
+          }
+        },
+        {
+          "component": "human_review",
+          "source": {
+            "source": "admin_measurement",
+            "source_id": "admin-review-receipt"
+          }
+        }
+      ],
+      "currency": "usd",
+      "payment_subject": "payer-1",
+      "pricing_version": "price-v1",
+      "root_budget_id": "root-1"
+    },
+    "cost_plan": {
+      "component_kinds": [
+        "history_collection",
+        "policy_generation",
+        "replay_cpu",
+        "replay_storage",
+        "online_development_fixed",
+        "online_development_replay_selected",
+        "independent_acceptance",
+        "canary_operations",
+        "human_review"
+      ],
+      "currency": "usd",
+      "payment_subject": "payer-1",
+      "pricing_version": "price-v1"
+    },
+    "dataset_epoch": "epoch-1",
+    "evaluator_actor": "evaluator",
+    "executor_actor": "executor",
+    "id": "economic-exp-1",
+    "min_gain_micros": 20000,
+    "noninferiority_margin_micros": 10000,
+    "paired_ticket_digest": "1a708645fe31616bac1b9f93d5c5e2f13dafc8f3b855bca6195a7835c4b3e91a",
+    "paired_ticket_id": "paired-ticket",
+    "preregistration_digest": "f19694d36724a9d624e6a68548f6102b0ea70670a9e325f90dc8c99dcad9b7c8",
+    "primary_claim": "noninferior_savings",
+    "profile_id": "profile-1",
+    "proposer_actor": "proposer",
+    "replay_selection": {
+      "caps_digest": "81f3bf209b41d41276ab87a00fa7fd30e9fdf3792ed08b27174c0f27a0cdf67f",
+      "policy_digest": "1ad1c74c6632e1edc116c7e430f0ec32d7aec0dbe34617612cdc9009aa30c423",
+      "profile_digest": "76923cf095b1c75ab8a9e5723e2273a48388f6d5e7e72fd650ecc95bc2c4e2be",
+      "report_artifact_id": "replay-report-eaa0299113cdb7efad1ef99026abdba1d3929c68b200333e71f655495573279d",
+      "report_digest": "d064c3153ffba4cdb8c955a24562b5324573200162397ecb5936a023ee519656",
+      "selected_with_w_sim": 1,
+      "selection_rule_version": "rsia.pareto_attainment.v2",
+      "semantic_digest": "fd07c3138e7eec8c2a3b278848ec41c0319456870310e6fb770ecb8799872e8b",
+      "simulation_only": [
+        {
+          "report_digest": "33d7543ccd46a825518eefa5fae883aa45a5d05494639f9e2169d040732e8f5e",
+          "report_id": "simulation-w2",
+          "w_sim": 2
+        }
+      ],
+      "target_w_online": 1,
+      "world_pool_digest": "1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27"
+    },
+    "runtime": {
+      "baseline_bundle_digest": "42d582727e80985cc3d2140697d6cd801fb0e79deea844f4fb3a48ea4469b2ae",
+      "candidate_bundle_digest": "9840f40ce082e0186e4ed17444bfca2d005a4014993cb1212ca544d220e515fb",
+      "context_signature": "ea7792a26f405e2ae9c6f49ca93bbe6076ceac0a1fc53d83426c7d7f2d9377e4",
+      "environment_digest": "ba5285161ba6eed0085fb13784ce5c92f70ebc268b94fd66aa1d68a32884204d",
+      "fixed_policy_digest": "9efbbac34bcd05a88f81ab2e80bdee0af4f32f98c9c67a47f4bcc06a353c56be",
+      "generation_strategy_digest": "e661f4c935e8a5a83349afb5e347695c2e972e967b50efcd618f93b0b7b4c24b",
+      "grader_digest": "c528cab03ad47ed5fceb01fd4f4557f12d8f2bcb2aa9f6e78087380aab8fde5f",
+      "guidance_digest": "f8aac527f9c928fcec7b1d67c73839a57741bf86271b16731e01d75bba683c53",
+      "model_digest": "9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4",
+      "per_arm_node_budget": 12,
+      "per_arm_root_budget_micros": 1000,
+      "replay_selected_policy_digest": "1ad1c74c6632e1edc116c7e430f0ec32d7aec0dbe34617612cdc9009aa30c423",
+      "rules_digest": "6c621d1a05138a7888d37d9269a9da8e2e11e4aced2f6cfd24b05ab1b9e61bb0",
+      "runner_digest": "527aa9f431539da8e151d5434d1d5e611d973f601d8e970790882624554146b0",
+      "target_runtime_profile": "online-w1",
+      "tools_digest": "f9d35d43770d39092a663e665e82ae1d84a9e0da3d0d10c407acada6a40cd281",
+      "w_online": 1
+    },
+    "schema_version": "rsia.replay_economic_experiment.v1",
+    "source_watermark": 1,
+    "sources": [
+      {
+        "digest": "89ad0d19ec2b9bfbbbcdd1b53f7841f4e7f53780ad1be57a279fe46cffe1e824",
+        "id": "source-1"
+      }
+    ],
+    "tasks": [
+      {
+        "arm_order": "fixed_then_replay_selected",
+        "cluster_id": "cluster-1",
+        "ordinal": 1,
+        "task_digest": "7afaa346b4bf92bf9dc21e9ae809887412a86beb766842e99df7fee6573a4781",
+        "task_id": "task-1"
+      }
+    ]
+  },
+  "head_consumption": "Verify all pins, then copy snapshot DB into each fresh test directory. Never open or mutate the retained original; preserve namespace n and actual actors. Cleanup/restore operate only on copies.",
+  "management_job": {
+    "cancel_requested": false,
+    "created_at": 1792705342,
+    "diagnostics": [],
+    "error_code": null,
+    "generation": 1,
+    "id": "management-job-250cb28fa666f439cf963e3d",
+    "lease_token": null,
+    "lease_until": 0,
+    "operation": "replay.run",
+    "owner_actor": "admin",
+    "owner_role": "admin",
+    "payload_digest": "3faf37db2674e2d234b1ce1d5a9bb1c7482f00ac4cfbecb7e68a5ffc078fabe1",
+    "private_input_ref": "management-input-250cb28fa666f439cf963e3d",
+    "request_key": "ag147-history-replay-run",
+    "result": {
+      "pool_digest": "1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27",
+      "report_id": "replay-report-eaa0299113cdb7efad1ef99026abdba1d3929c68b200333e71f655495573279d",
+      "result": "replay_stored",
+      "semantic_reports_digest": "fd07c3138e7eec8c2a3b278848ec41c0319456870310e6fb770ecb8799872e8b"
+    },
+    "schema_version": "rsia.management_job.v1",
+    "state": "succeeded",
+    "step": "replay_stored"
+  },
+  "management_job_raw": {
+    "body_bytes": 827,
+    "body_sha256": "6c5ad1bd561981f91fe346703136c3f29f29a9737baf8412c31ee13366f1f4e5",
+    "body_utf8": "{\"id\":\"management-job-250cb28fa666f439cf963e3d\",\"schema_version\":\"rsia.management_job.v1\",\"operation\":\"replay.run\",\"request_key\":\"ag147-history-replay-run\",\"payload_digest\":\"3faf37db2674e2d234b1ce1d5a9bb1c7482f00ac4cfbecb7e68a5ffc078fabe1\",\"owner_actor\":\"admin\",\"owner_role\":\"admin\",\"state\":\"succeeded\",\"step\":\"replay_stored\",\"private_input_ref\":\"management-input-250cb28fa666f439cf963e3d\",\"result\":{\"result\":\"replay_stored\",\"report_id\":\"replay-report-eaa0299113cdb7efad1ef99026abdba1d3929c68b200333e71f655495573279d\",\"pool_digest\":\"1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27\",\"semantic_reports_digest\":\"fd07c3138e7eec8c2a3b278848ec41c0319456870310e6fb770ecb8799872e8b\"},\"error_code\":null,\"cancel_requested\":false,\"lease_token\":null,\"lease_until\":0,\"generation\":1,\"diagnostics\":[],\"created_at\":1792705342}",
+    "kind": "job",
+    "owner": "admin",
+    "physical_id": "management-job-250cb28fa666f439cf963e3d",
+    "rowid_nonsemantic": 16
+  },
+  "management_private_input_raw": {
+    "body_bytes": 1146,
+    "body_sha256": "ce731f37ea90ec88c6bab81368ac3fc5d28fa55024cde60ee68dc5129cc0aa02",
+    "body_utf8": "{\"id\":\"management-input-250cb28fa666f439cf963e3d\",\"schema_version\":\"rsia.management_private_input.v1\",\"operation\":\"replay.run\",\"payload_digest\":\"3faf37db2674e2d234b1ce1d5a9bb1c7482f00ac4cfbecb7e68a5ffc078fabe1\",\"payload\":{\"caps\":{\"max_depth\":4,\"max_nodes\":12,\"max_repair_dispatches_per_episode\":1,\"schema_version\":\"rsia.exploration_caps.v1\",\"w_online\":1},\"operation\":\"replay_run\",\"partition\":\"select\",\"policy\":{\"fairness_wait_rounds\":4,\"max_focus_actions\":2,\"schema_version\":\"rsia.elastic_priority.v1\",\"significant_gain_micros\":20000,\"stagnation_abs_gain_micros\":5000,\"stagnation_window\":2},\"pool_digest\":\"1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27\",\"profile\":{\"fixed_seed\":7,\"global_recovery_dispatch_limit\":1,\"horizon\":1,\"lambda_round_micros\":50000,\"lambda_work_micros\":50000,\"objective\":\"pareto_attainment_v2\",\"pool_digest\":\"1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27\",\"probe_budget\":1,\"purpose\":\"development\",\"simulation_version\":\"rsia.unit_probe_barrier.v1\",\"target_runtime_profile\":\"online-w1\",\"w_sim\":1},\"request_key\":\"ag147-history-replay-run\",\"schema_version\":\"rsia.management.replay_run.v1\"}}",
+    "kind": "artifact",
+    "owner": "admin",
+    "physical_id": "management-input-250cb28fa666f439cf963e3d",
+    "rowid_nonsemantic": 15
+  },
+  "namespace": "n",
+  "original_watermark": {
+    "digest": "economic-initial-watermark",
+    "seq": 1
+  },
+  "parent": "a730b9a9935bee7a41e8a47e86f329b99012566b",
+  "pool": {
+    "compatibility": {
+      "approved_parent_digest": "a50399b580df41a70a8fe9c128cbf6cc1133701d1435185e4b6112510eb9ae58",
+      "generation_signature": "e661f4c935e8a5a83349afb5e347695c2e972e967b50efcd618f93b0b7b4c24b",
+      "guidance_digest": "f8aac527f9c928fcec7b1d67c73839a57741bf86271b16731e01d75bba683c53",
+      "model_digest": "9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4",
+      "purpose": "development",
+      "repair_template_digest": "a1a14ff4aab4f1d3efbe2f3fe8e32ec686289ba95e5b2fc3e1f38052d64da522",
+      "revoke_watermark": 1,
+      "scorer_digest": "c528cab03ad47ed5fceb01fd4f4557f12d8f2bcb2aa9f6e78087380aab8fde5f",
+      "tools_digest": "f9d35d43770d39092a663e665e82ae1d84a9e0da3d0d10c407acada6a40cd281"
+    },
+    "compiler_version": "rsia.replay_pool.compiler.v1",
+    "members": [
+      {
+        "cluster_id": "cluster-select",
+        "partition": "select",
+        "world_digest": "e7ef2078d600a0e1d268fc0c463595d11356a63b29e9f6d4aa93e91da3f887dd",
+        "world_id": "world-select"
+      },
+      {
+        "cluster_id": "cluster-train",
+        "partition": "train",
+        "world_digest": "66aadc0cdb757de85ca40a4ab4acbbfef1cf0fc73da57d6b1178a603e4e75967",
+        "world_id": "world-train"
+      }
+    ],
+    "pool_digest": "1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27",
+    "schema_version": "rsia.replay_pool.v1"
+  },
+  "registered_digest": "724b27e8d4cbc060484fe07313a08e476031c67558c2a0cf25719b93ab7b2fe6",
+  "schema_version": "ag147.parent-retained-history.v1",
+  "scope": {
+    "current_v3_authority_claimed": false,
+    "external_provider_calls": 0,
+    "local_budget_state_fixture": true,
+    "real_paid_effect_claimed": false
+  },
+  "selection": {
+    "caps": {
+      "max_depth": 4,
+      "max_nodes": 12,
+      "max_repair_dispatches_per_episode": 1,
+      "schema_version": "rsia.exploration_caps.v1",
+      "w_online": 1
+    },
+    "caps_digest": "81f3bf209b41d41276ab87a00fa7fd30e9fdf3792ed08b27174c0f27a0cdf67f",
+    "member_reports": [
+      {
+        "report": {
+          "attainment_auc_micros": 600000,
+          "batches": [
+            {
+              "action_seqs": [
+                1
+              ],
+              "decision_round": 1,
+              "record_seqs": [
+                1
+              ],
+              "revealed_quality_micros": [
+                600000
+              ]
+            }
+          ],
+          "cluster_id": "cluster-select",
+          "coverage": {
+            "attempted_actions": 1,
+            "censored_actions": 0,
+            "complete_support": true,
+            "observed_actions": 1,
+            "out_of_support_actions": 0
+          },
+          "development_only": true,
+          "final_quality_micros": 600000,
+          "historical_usage": {
+            "cost_micros": 1,
+            "input_tokens": 1,
+            "latency_millis": 1,
+            "output_tokens": 1
+          },
+          "no_probe": false,
+          "objective_version": "rsia.pareto_attainment.v2",
+          "parallel_penalty": {
+            "denominator": 1,
+            "numerator": 1
+          },
+          "partition": "select",
+          "policy_digest": "1ad1c74c6632e1edc116c7e430f0ec32d7aec0dbe34617612cdc9009aa30c423",
+          "probe_best_quality_micros": [
+            600000
+          ],
+          "probes": 1,
+          "profile_digest": "76923cf095b1c75ab8a9e5723e2273a48388f6d5e7e72fd650ecc95bc2c4e2be",
+          "q_auc_sim_micros": 600000,
+          "replay_cpu_nanos": 1001084,
+          "revealed_prefix": {
+            "approved_parent_digest": "a50399b580df41a70a8fe9c128cbf6cc1133701d1435185e4b6112510eb9ae58",
+            "context_signature": "9dfc2d475ba34d340ef0031c734aeb9b01099e0012bdb37692ad081f05a0ae23",
+            "current_branch_focus_actions": 1,
+            "current_branch_seq": 1,
+            "decisions_completed": 1,
+            "initial_baseline_quality_micros": 500000,
+            "nodes": [
+              {
+                "approved_parent_digest": "a50399b580df41a70a8fe9c128cbf6cc1133701d1435185e4b6112510eb9ae58",
+                "best_valid_ancestor_micros": 600000,
+                "branch_seq": 1,
+                "depth": 1,
+                "node_seq": 1,
+                "recent_valid_gains_micros": [
+                  100000
+                ],
+                "repair_failures_dispatched": 0,
+                "search_parent_seq": null,
+                "status": {
+                  "quality_micros": 600000,
+                  "status": "valid"
+                }
+              }
+            ],
+            "nodes_used": 1,
+            "recovery_dispatches_used": 0,
+            "schema_version": "rsia.prefix_view.v2",
+            "waits": []
+          },
+          "round_best_quality_micros": [
+            600000
+          ],
+          "schema_version": "rsia.replay_report.v2",
+          "score_v2_micros": 500000,
+          "simulated_rounds": 1,
+          "terminal": "budget_exhausted",
+          "terminal_reason": "probe budget exhausted",
+          "world_digest": "e7ef2078d600a0e1d268fc0c463595d11356a63b29e9f6d4aa93e91da3f887dd",
+          "world_id": "world-select"
+        },
+        "world_digest": "e7ef2078d600a0e1d268fc0c463595d11356a63b29e9f6d4aa93e91da3f887dd",
+        "world_id": "world-select"
+      }
+    ],
+    "namespace": "n",
+    "partition": "select",
+    "policy": {
+      "fairness_wait_rounds": 4,
+      "max_focus_actions": 2,
+      "schema_version": "rsia.elastic_priority.v1",
+      "significant_gain_micros": 20000,
+      "stagnation_abs_gain_micros": 5000,
+      "stagnation_window": 2
+    },
+    "policy_digest": "1ad1c74c6632e1edc116c7e430f0ec32d7aec0dbe34617612cdc9009aa30c423",
+    "pool_digest": "1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27",
+    "profile": {
+      "fixed_seed": 7,
+      "global_recovery_dispatch_limit": 1,
+      "horizon": 1,
+      "lambda_round_micros": 50000,
+      "lambda_work_micros": 50000,
+      "objective": "pareto_attainment_v2",
+      "pool_digest": "1c831f4b31b85f8a56179af943aa49650d1422a0adc0e97e086ce3be8297ea27",
+      "probe_budget": 1,
+      "purpose": "development",
+      "simulation_version": "rsia.unit_probe_barrier.v1",
+      "target_runtime_profile": "online-w1",
+      "w_sim": 1
+    },
+    "profile_digest": "76923cf095b1c75ab8a9e5723e2273a48388f6d5e7e72fd650ecc95bc2c4e2be",
+    "purpose": "development",
+    "replay_engine_version": "rsia.replay.engine.v2",
+    "report_id": "replay-report-eaa0299113cdb7efad1ef99026abdba1d3929c68b200333e71f655495573279d",
+    "reports_body_digest": "017f6119d3ad600f0cfe367c1f93b6cee7aad33ef93dfa35c7d97734eb1f5cc8",
+    "schema_version": "rsia.stored_replay_report.v1",
+    "semantic_reports_digest": "fd07c3138e7eec8c2a3b278848ec41c0319456870310e6fb770ecb8799872e8b"
+  },
+  "snapshot": {
+    "database": "snapshot/rsia.sqlite3",
+    "database_bytes": 299008,
+    "database_sha256": "0d22863a74877098e16d2b2ce651a9af7eb48b517930db6ef021cfa68a013c38",
+    "directory": "snapshot",
+    "manifest": "snapshot/backup-manifest.json",
+    "manifest_sha256": "92ea8cfffff710c1033f8777b4bd43dc39cf7083107b9293d9b4517a0e067aea"
+  }
+}

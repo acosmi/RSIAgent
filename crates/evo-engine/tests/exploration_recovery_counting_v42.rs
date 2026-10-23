@@ -53,7 +53,7 @@ use evo_core::optimization::{
 };
 use evo_core::replay::{
     DEFAULT_LAMBDA_MICROS, HistoricalUsage, PrefixCoverageV1, REPLAY_MANIFEST_SCHEMA,
-    REPLAY_WORLD_SCHEMA, ReplayActionSpecV1, ReplayObjective, ReplayReportV2,
+    REPLAY_WORLD_SCHEMA, ReplayActionSpecV1, ReplayObjective, ReplayReportV3,
     ReplaySimulationProfile, ReplaySourceRef, ReplayTerminal, ReplayTransitionOutcome,
     ReplayTransitionV2, ReplayWorldManifestV2, ReplayWorldV2, SIMULATION_VERSION, WorldPartition,
     replay_baseline_observation_digest, replay_observation_digest,
@@ -2176,9 +2176,9 @@ fn replay_world(records: &[Replayed]) -> ReplayWorldV2 {
 }
 
 /// What the replay does with `records` when it may dispatch `recovery_limit` recoveries
-/// in all. It follows the history: it ends by exhausting the world, its budget or its
-/// policy, never as an invalid, out of support, censored or revoked world.
-fn replayed_report(records: &[Replayed], recovery_limit: u8) -> ReplayReportV2 {
+/// in all. It reveals the same recorded dispatch facts. V2 has unknown unused roots,
+/// so finishing the represented history alone is not proof of a complete world.
+fn replayed_report(records: &[Replayed], recovery_limit: u8) -> ReplayReportV3 {
     let probes = u8::try_from(records.len()).unwrap() + 1;
     let report = run_replay(
         &replay_world(records),
@@ -2205,12 +2205,16 @@ fn replayed_report(records: &[Replayed], recovery_limit: u8) -> ReplayReportV2 {
     )
     .unwrap();
     assert!(
-        matches!(
-            report.terminal,
-            ReplayTerminal::WorldExhausted
-                | ReplayTerminal::BudgetExhausted
-                | ReplayTerminal::PolicyStop
-        ),
+        report.terminal == ReplayTerminal::BudgetExhausted
+            || (report.terminal == ReplayTerminal::OutOfSupport
+                && report.terminal_reason == "frontier_not_covered"
+                && report.root_contract_state
+                    == evo_core::replay::ReplayRootContractState::Unknown
+                && !report.coverage.complete_support
+                && report.score_v2_micros.is_none())
+            || (report.terminal == ReplayTerminal::PolicyStop
+                && report.revealed_prefix.as_ref().unwrap().nodes_used
+                    >= ExplorationCapsV1::online().max_nodes),
         "the replay did not follow the history: {:?} ({})",
         report.terminal,
         report.terminal_reason

@@ -42,7 +42,7 @@ pub fn replay_report_is_not_online_evidence(_: &ReplayReport) -> bool {
     true
 }
 
-use crate::replay::{VerifiedReplayReportView, verified_replay_report_view};
+use crate::replay::VerifiedReplayReportView;
 use crate::streaming_evaluator::IndependentEvaluationControl;
 use evo_core::fingerprint;
 use evo_core::replay::{OBJECTIVE_V2, ReplayTerminal, WorldPartition};
@@ -127,6 +127,7 @@ impl PersistentReplayEconomicCoordinator {
         load_live_selection(ctx, store, &experiment).await?;
         let mut session = store.session().await?;
         verify_experiment_sources(&mut session, ctx, &experiment).await?;
+        load_live_selection_in_session(&mut session, ctx, &experiment).await?;
         if let Some(existing) = get_record::<ReplayEconomicExperimentV1>(
             &mut session,
             ctx,
@@ -192,6 +193,7 @@ impl PersistentReplayEconomicCoordinator {
             return Err(Error::Forbidden);
         }
         verify_experiment_sources(&mut session, ctx, &experiment).await?;
+        load_live_selection_in_session(&mut session, ctx, &experiment).await?;
         let request_digest = fingerprint(&(
             experiment.digest()?,
             request_key,
@@ -309,6 +311,7 @@ impl PersistentReplayEconomicCoordinator {
         }
         let mut session = store.session().await?;
         verify_experiment_sources(&mut session, ctx, experiment).await?;
+        load_live_selection_in_session(&mut session, ctx, experiment).await?;
         if let Some(existing) =
             get_record::<ReplayEconomicJobV1>(&mut session, ctx, JOB_KIND, &job.id).await?
         {
@@ -582,6 +585,7 @@ impl PersistentReplayEconomicCoordinator {
         load_live_selection(ctx, store, &experiment).await?;
         let mut session = store.session().await?;
         verify_experiment_sources(&mut session, ctx, &experiment).await?;
+        load_live_selection_in_session(&mut session, ctx, &experiment).await?;
         if let Some(report_id) = &job.report_id {
             let existing: ReplayEconomicReportV1 =
                 need_record(&mut session, ctx, REPORT_KIND, report_id).await?;
@@ -664,6 +668,7 @@ impl PersistentReplayEconomicCoordinator {
             return Err(Error::Cancelled);
         }
         verify_experiment_sources(&mut session, ctx, &current_experiment).await?;
+        load_live_selection_in_session(&mut session, ctx, &current_experiment).await?;
         let mut current_receipts = Vec::with_capacity(current_job.cost_receipt_ids.len());
         for receipt_id in &current_job.cost_receipt_ids {
             current_receipts.push(
@@ -846,7 +851,12 @@ async fn verify_experiment_sources(
         return Err(Error::Conflict("economic source watermark changed".into()));
     }
     for source in &experiment.sources {
-        let value = session.raw_object(ctx, "artifact", &source.id).await?;
+        let row = session
+            .object_row(ctx, "artifact", &source.id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        let value = evo_storage::lifecycle::parse_strict_json(&row.body)
+            .map_err(|_| Error::Invalid("economic_source_invalid_json".into()))?;
         if fingerprint(&value)? != source.digest {
             return Err(Error::Conflict(
                 "economic source artifact digest changed".into(),
@@ -861,12 +871,26 @@ async fn load_live_selection(
     store: &Store,
     experiment: &ReplayEconomicExperimentV1,
 ) -> Result<VerifiedReplayReportView> {
-    let selection =
-        verified_replay_report_view(ctx, store, &experiment.replay_selection.report_artifact_id)
-            .await?;
-    let pool = evo_storage::replay::load_live_replay_pool(
+    let mut session = store.session().await?;
+    let result = load_live_selection_in_session(&mut session, ctx, experiment).await?;
+    session.commit().await?;
+    Ok(result)
+}
+
+async fn load_live_selection_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    experiment: &ReplayEconomicExperimentV1,
+) -> Result<VerifiedReplayReportView> {
+    let selection = crate::replay::verified_replay_report_view_in_session(
+        session,
         ctx,
-        store,
+        &experiment.replay_selection.report_artifact_id,
+    )
+    .await?;
+    let pool = evo_storage::replay::load_live_replay_pool_in_session(
+        session,
+        ctx,
         &experiment.replay_selection.world_pool_digest,
     )
     .await?;
@@ -878,6 +902,8 @@ async fn load_live_selection(
         || selection.caps_digest != experiment.replay_selection.caps_digest
         || selection.partition != WorldPartition::Select
         || !selection.support_complete
+        || !selection.failed_worlds.is_empty()
+        || usize::try_from(selection.attempted_worlds).ok() != Some(selection.reports.len())
         || !selection.development_only
         || selection
             .ineligibility_reasons
@@ -1030,5 +1056,94 @@ mod tests {
             censored: false,
         };
         assert!(replay_report_is_not_online_evidence(&r));
+    }
+}
+
+/// Read-only wrapper; the original economic report and all paid receipts remain
+/// byte-for-byte persistent history. A retired selection is disclosed as Legacy,
+/// never reinterpreted as a new registration or selection authorization.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayEconomicReportAuditView {
+    pub raw_payload: serde_json::Value,
+    pub source_legacy: bool,
+    pub replay_read_view: crate::replay::ReplayReportAuditView,
+    pub lineage: Vec<evo_storage::replay::ReplayLineageEntry>,
+}
+impl PersistentReplayEconomicCoordinator {
+    pub async fn query_report(
+        ctx: &Context,
+        store: &Store,
+        report_id: &str,
+    ) -> Result<ReplayEconomicReportAuditView> {
+        ctx.require(&[Role::Evaluator, Role::Admin])?;
+        identifier(report_id)?;
+        let mut session = store.session().await?;
+        let report: ReplayEconomicReportV1 =
+            need_record(&mut session, ctx, REPORT_KIND, report_id).await?;
+        let experiment: ReplayEconomicExperimentV1 =
+            need_record(&mut session, ctx, EXPERIMENT_KIND, &report.experiment_id).await?;
+        if ctx.role() == Role::Evaluator && experiment.evaluator_actor != ctx.actor() {
+            return Err(Error::Forbidden);
+        }
+        if report.id != report_id {
+            return Err(Error::Invalid("economic_report_identity_invalid".into()));
+        }
+        report.validate_against(&experiment)?;
+        verify_experiment_sources(&mut session, ctx, &experiment).await?;
+        let read = crate::replay::query_replay_report_record_in_session(
+            &mut session,
+            ctx,
+            &experiment.replay_selection.report_artifact_id,
+        )
+        .await
+        .map_err(crate::replay::replay_read_isolation_for_existing_api)?;
+        if read.record.state() == evo_core::replay::ReplayRecordState::Invalid {
+            return Err(Error::Invalid("economic_report_selection_invalid".into()));
+        }
+        // Preserve the original selection binding even in legacy audit mode.
+        let payload = read.raw_payload.as_ref().ok_or(Error::Internal)?;
+        let report_digest = if let Some(legacy) = read.record.report() {
+            fingerprint(legacy)?
+        } else if let Some(current) = read.record.current_report() {
+            fingerprint(current)?
+        } else {
+            return Err(Error::Invalid("economic_report_selection_invalid".into()));
+        };
+        if payload.get("report_id").and_then(serde_json::Value::as_str)
+            != Some(experiment.replay_selection.report_artifact_id.as_str())
+            || report_digest != experiment.replay_selection.report_digest
+            || payload
+                .get("semantic_reports_digest")
+                .and_then(serde_json::Value::as_str)
+                != Some(experiment.replay_selection.semantic_digest.as_str())
+            || payload
+                .get("pool_digest")
+                .and_then(serde_json::Value::as_str)
+                != Some(experiment.replay_selection.world_pool_digest.as_str())
+            || payload
+                .get("policy_digest")
+                .and_then(serde_json::Value::as_str)
+                != Some(experiment.replay_selection.policy_digest.as_str())
+            || payload
+                .get("profile_digest")
+                .and_then(serde_json::Value::as_str)
+                != Some(experiment.replay_selection.profile_digest.as_str())
+            || payload
+                .get("caps_digest")
+                .and_then(serde_json::Value::as_str)
+                != Some(experiment.replay_selection.caps_digest.as_str())
+        {
+            return Err(Error::Conflict(
+                "economic report selection history differs".into(),
+            ));
+        }
+        let result = ReplayEconomicReportAuditView {
+            raw_payload: serde_json::to_value(&report).map_err(|_| Error::Internal)?,
+            source_legacy: read.source_legacy,
+            lineage: read.lineage.clone(),
+            replay_read_view: read,
+        };
+        session.commit().await?;
+        Ok(result)
     }
 }

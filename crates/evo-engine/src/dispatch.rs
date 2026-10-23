@@ -386,12 +386,27 @@ impl ManagementDispatcher {
                 semantic_reports_digest,
             }) = &job.result
             {
-                let view =
-                    crate::replay::verified_replay_report_view(ctx, &self.store, report_id).await?;
-                if &view.report_id != report_id
-                    || &view.pool_digest != pool_digest
-                    || &view.semantic_digest != semantic_reports_digest
-                {
+                // A completed job is an audit fact. Legacy selection is refused
+                // by new consumers, while status still returns this exact result.
+                let read = crate::replay::query_replay_report_record(ctx, &self.store, report_id)
+                    .await
+                    .map_err(crate::replay::replay_read_isolation_for_existing_api)?;
+                let binding = if let Some(old) = read.record.report() {
+                    (
+                        &old.report_id,
+                        &old.pool_digest,
+                        &old.semantic_reports_digest,
+                    )
+                } else if let Some(current) = read.record.current_report() {
+                    (
+                        &current.report_id,
+                        &current.pool_digest,
+                        &current.semantic_reports_digest,
+                    )
+                } else {
+                    return Err(Error::Invalid("invalid replay audit record".into()));
+                };
+                if binding != (report_id, pool_digest, semantic_reports_digest) {
                     return Err(Error::Conflict("replay report view digest mismatch".into()));
                 }
             } else {
@@ -1581,6 +1596,161 @@ fn error_code(error: &Error) -> &'static str {
         Error::Cancelled => "cancelled",
         Error::ClockRegressed => "clock_regressed",
         Error::Internal => "internal_error",
+    }
+}
+
+/// Admin-only internal bridge; it does not expose private inputs to Worker or
+/// Evaluator, accept a caller-selected job, create a Context, or open a Session.
+pub(crate) async fn management_replay_registration_images_in_session(
+    session: &mut evo_storage::Session,
+    ctx: &Context,
+    exploration_world_id: &str,
+) -> Result<(
+    evo_storage::replay::ValidatedReplayRootSource,
+    Vec<ExplorationWorldV1>,
+)> {
+    ctx.require(&[Role::Admin])?;
+    // Strict physical JSON admission happens before ANY legacy Value/typed read.
+    // Storage also proves every incoming job that this bridge visits. No write
+    // or second Session separates the raw gate from the old ParsedRequest guard.
+    let material = evo_storage::replay::capture_replay_root_source_in_session(
+        session,
+        ctx,
+        exploration_world_id,
+    )
+    .await?;
+    let world_id = crate::exploration::exploration_world_storage_id(exploration_world_id)?;
+    let mut inputs = session.dependents(ctx, "artifact", &world_id).await?;
+    inputs.sort();
+    inputs.dedup();
+    let mut originals = Vec::new();
+    for (kind, input_id) in inputs {
+        if kind != "artifact" || !input_id.starts_with("management-input-") {
+            continue;
+        }
+        let body: Value = session.need(ctx, "artifact", &input_id).await?;
+        if is_redacted(&body) {
+            return Err(redacted_input_error(&input_id));
+        }
+        let mut owners = session.dependents(ctx, "artifact", &input_id).await?;
+        owners.sort();
+        owners.dedup();
+        let mut matched = false;
+        for (job_kind, job_id) in owners {
+            if job_kind != "job" {
+                continue;
+            }
+            let job: ManagementJob = session.need(ctx, "job", &job_id).await?;
+            if job.id != job_id
+                || job.private_input_ref != input_id
+                || job.operation != "exploration.start"
+                || job.id != stable_id("management-job", ctx, &job.operation, &job.request_key)
+                || input_id != stable_id("management-input", ctx, &job.operation, &job.request_key)
+            {
+                return Err(Error::Conflict("replay_root_source_unproven".into()));
+            }
+            ensure_owner(ctx, &job)?;
+            let ParsedRequest::ExplorationStart(request) =
+                decode_private_request(body.clone(), &job)?
+            else {
+                return Err(Error::Conflict("replay_root_source_unproven".into()));
+            };
+            if request.world.id != exploration_world_id || request.request_key != job.request_key {
+                return Err(Error::Conflict("replay_root_source_unproven".into()));
+            }
+            originals.push(request.world);
+            matched = true;
+        }
+        if !matched {
+            return Err(Error::Conflict("replay_root_source_unproven".into()));
+        }
+    }
+    Ok((material, originals))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManagementJobReadView {
+    #[serde(flatten)]
+    pub job: ManagementJob,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_read_view: Option<crate::replay::ReplayReportAuditView>,
+}
+impl ManagementDispatcher {
+    /// Adds a non-persistent read projection only for replay.run. Original job,
+    /// result, cancellation, owner and private-input revocation checks remain.
+    pub async fn status_with_replay_read_view(
+        &self,
+        ctx: &Context,
+        job_id: &str,
+    ) -> Result<ManagementJobReadView> {
+        let job = self.status(ctx, job_id).await?;
+        if job.operation != "replay.run" {
+            return Ok(ManagementJobReadView {
+                job,
+                replay_read_view: None,
+            });
+        }
+        let mut session = self.store.session().await?;
+        let current: ManagementJob = session.need(ctx, "job", job_id).await?;
+        ensure_owner(ctx, &current)?;
+        if fingerprint(&current)? != fingerprint(&job)? {
+            return Err(Error::Conflict(
+                "replay job changed during read projection".into(),
+            ));
+        }
+        if current.state == ManagementJobState::Succeeded
+            && let Some(row) = session
+                .object_row(ctx, "artifact", &current.private_input_ref)
+                .await?
+        {
+            let body = evo_storage::lifecycle::parse_strict_json(&row.body)
+                .map_err(|_| Error::Invalid("management_private_input_invalid_json".into()))?;
+            if is_redacted(&body) {
+                return Err(redacted_input_error(&current.private_input_ref));
+            }
+        }
+        let replay_read_view = match &current.result {
+            Some(ManagementResult::ReplayStored {
+                report_id,
+                pool_digest,
+                semantic_reports_digest,
+            }) => {
+                let read = crate::replay::query_replay_report_record_in_session(
+                    &mut session,
+                    ctx,
+                    report_id,
+                )
+                .await
+                .map_err(crate::replay::replay_read_isolation_for_existing_api)?;
+                let binding = if let Some(old) = read.record.report() {
+                    (
+                        &old.report_id,
+                        &old.pool_digest,
+                        &old.semantic_reports_digest,
+                    )
+                } else if let Some(current) = read.record.current_report() {
+                    (
+                        &current.report_id,
+                        &current.pool_digest,
+                        &current.semantic_reports_digest,
+                    )
+                } else {
+                    return Err(Error::Invalid("invalid replay audit record".into()));
+                };
+                if binding != (report_id, pool_digest, semantic_reports_digest) {
+                    return Err(Error::Conflict(
+                        "replay read projection binding mismatch".into(),
+                    ));
+                }
+                Some(read)
+            }
+            _ => None,
+        };
+        session.commit().await?;
+        Ok(ManagementJobReadView {
+            job: current,
+            replay_read_view,
+        })
     }
 }
 
