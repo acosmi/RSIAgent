@@ -743,6 +743,14 @@ async fn prepare_or_refuse(order: TicketOrder) -> Option<Fx> {
 
 /// The control-only scope stops before ticket issue or any batch execution.
 async fn prepare_with_scope(order: TicketOrder, execute_batch: bool) -> Option<Fx> {
+    prepare_ag122_scope(order, execute_batch, false).await
+}
+
+async fn prepare_ag122_scope(
+    order: TicketOrder,
+    execute_batch: bool,
+    critical_anchor: bool,
+) -> Option<Fx> {
     let db_dir = tempfile::tempdir().unwrap();
     let db = db_dir.path().join("ag095.sqlite3");
     // The registered grader workspace is private to this test user (0700).
@@ -1235,6 +1243,11 @@ async fn prepare_with_scope(order: TicketOrder, execute_batch: bool) -> Option<F
     for (index, target) in targets.iter().enumerate() {
         let baseline_answer = if target == "a0" { "ok" } else { "wrong" };
         let ordinal = u32::try_from(index).unwrap() * 2;
+        let candidate_answer = if critical_anchor && target == "a0" {
+            "wrong"
+        } else {
+            "ok"
+        };
         let (candidate_receipt, candidate_capture) = execute(
             &store,
             &ticket,
@@ -1243,7 +1256,7 @@ async fn prepare_with_scope(order: TicketOrder, execute_batch: bool) -> Option<F
             &candidate,
             target,
             ExecutionSide::Candidate,
-            &json!({"answer":"ok"}).to_string(),
+            &json!({"answer":candidate_answer}).to_string(),
             ordinal,
         )
         .await;
@@ -1288,6 +1301,14 @@ async fn prepare_with_scope(order: TicketOrder, execute_batch: bool) -> Option<F
         .unwrap_or_else(|reason| panic!("registered grader refused {target}: {reason}"));
         assert_eq!(receipt["receipt_id"], receipt_id.as_str());
         fx.graded.insert(target.clone(), receipt_id);
+    }
+
+    if critical_anchor {
+        let store = Store::open(&fx.db).await.unwrap();
+        let ticket = stored_ticket(&store).await;
+        assert_eq!(ticket.lifecycle, TicketLifecycle::EarlyStopped);
+        store.close().await;
+        return Some(fx);
     }
 
     // Administrator closes the ticket group and seals the root; the registered
@@ -2352,6 +2373,744 @@ async fn acyclic_typed_closure_keeps_its_exact_bytes() {
     assert_eq!(closure.nodes, nodes);
     assert_eq!(closure.edges, edges);
     assert_eq!(closure.digest, fingerprint(&(&nodes, &edges)).unwrap());
+    drop(s);
+    store.close().await;
+}
+
+// AG-122 R2: this exact append uses only the M33 public API on both trees.
+async fn ag122_closure_as(db: &Path, reader: &Context) -> Result<TypedContentClosure, Error> {
+    let store = Store::open(db).await.unwrap();
+    let mut s = store.session().await.unwrap();
+    let result = read_typed_closure(
+        &mut s,
+        reader,
+        &[("artifact".into(), storage_id(TICKET_KIND, TICKET))],
+    )
+    .await;
+    drop(s);
+    store.close().await;
+    result
+}
+
+async fn ag122_execution_ids(db: &Path) -> (String, String, String, String) {
+    let store = Store::open(db).await.unwrap();
+    let ticket = stored_ticket(&store).await;
+    let target = &ticket.targets[0];
+    let TargetState::Completed {
+        candidate_receipt_id,
+        baseline_receipt_id,
+        ..
+    } = &target.state
+    else {
+        panic!("AG122_CPP_HEALTHY: target is not completed")
+    };
+    assert_ne!(candidate_receipt_id, baseline_receipt_id);
+    let mut s = store.session().await.unwrap();
+    let candidate: Value = s
+        .need(
+            &ctx(Role::Evaluator, GRADER),
+            "artifact",
+            &storage_id(EXECUTION_RECEIPT_KIND, candidate_receipt_id),
+        )
+        .await
+        .unwrap();
+    let output = candidate["payload"]["output_artifact_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(s);
+    store.close().await;
+    (
+        candidate_receipt_id.clone(),
+        baseline_receipt_id.clone(),
+        output,
+        target.target_id.clone(),
+    )
+}
+
+async fn ag122_cpp_healthy(db: &Path) -> TypedContentClosure {
+    let evaluator = ag122_closure_as(db, &ctx(Role::Evaluator, GRADER))
+        .await
+        .expect("AG122_CPP_HEALTHY: evaluator closure");
+    let agent = ag122_closure_as(db, &ctx(Role::Agent, "ag122-other-reader"))
+        .await
+        .expect("AG122_CPP_HEALTHY: legal Agent closure");
+    assert_eq!(
+        serde_json::to_vec(&evaluator).unwrap(),
+        serde_json::to_vec(&agent).unwrap()
+    );
+    evaluator
+}
+
+#[tokio::test]
+async fn ctrl_probe_ag122_output_to_ticket() {
+    let fx = prepare_in(TicketOrder::StagedBeforeIssue).await;
+    let healthy = ag122_cpp_healthy(&fx.db).await;
+    assert!(!healthy.nodes.is_empty());
+    let (_, _, output, _) = ag122_execution_ids(&fx.db).await;
+    let (_dir, db) = copy_database(&fx);
+    add_artifact_edge(
+        &db,
+        &storage_id("evaluation_execution_output_v1", &output),
+        &storage_id(TICKET_KIND, TICKET),
+    )
+    .await;
+    let before = catalog(&db);
+    let result = ag122_closure_as(&db, &ctx(Role::Agent, "ag122-other-reader")).await;
+    assert_eq!(
+        catalog(&db),
+        before,
+        "AG122_CPP: closure read changed state"
+    );
+    assert!(
+        matches!(&result, Err(Error::Conflict(message)) if message == "typed content dependency cycle"),
+        "AG122_CPP_SEMANTIC_RED output_to_ticket actual={:?}",
+        result
+            .as_ref()
+            .map(|closure| (&closure.digest, closure.nodes.len())),
+    );
+}
+
+#[tokio::test]
+async fn ctrl_probe_ag122_output_to_other_receipt() {
+    let fx = prepare_in(TicketOrder::StagedBeforeIssue).await;
+    let healthy = ag122_cpp_healthy(&fx.db).await;
+    assert!(!healthy.edges.is_empty());
+    let (candidate, baseline, output, _) = ag122_execution_ids(&fx.db).await;
+    assert_ne!(candidate, baseline);
+    let (_dir, db) = copy_database(&fx);
+    add_artifact_edge(
+        &db,
+        &storage_id("evaluation_execution_output_v1", &output),
+        &storage_id(EXECUTION_RECEIPT_KIND, &baseline),
+    )
+    .await;
+    let before = catalog(&db);
+    let result = ag122_closure_as(&db, &ctx(Role::Agent, "ag122-other-reader")).await;
+    assert_eq!(
+        catalog(&db),
+        before,
+        "AG122_CPP: closure read changed state"
+    );
+    assert!(
+        matches!(&result, Err(Error::Conflict(message)) if message == "typed content dependency cycle"),
+        "AG122_CPP_SEMANTIC_RED output_to_other_receipt actual={:?}",
+        result
+            .as_ref()
+            .map(|closure| (&closure.digest, closure.nodes.len())),
+    );
+}
+
+async fn ag122_all_readers(db: &Path) -> TypedContentClosure {
+    let before = catalog(db);
+    let reference = ag122_closure_as(db, &ctx(Role::Evaluator, GRADER))
+        .await
+        .unwrap();
+    let bytes = serde_json::to_vec(&reference).unwrap();
+    for role in [
+        Role::Agent,
+        Role::Worker,
+        Role::Host,
+        Role::Evaluator,
+        Role::Admin,
+    ] {
+        for actor in ["ag122-other-reader", HOST] {
+            let actual = ag122_closure_as(db, &ctx(role, actor)).await.unwrap();
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                bytes,
+                "{role:?}/{actor}"
+            );
+            assert_eq!(
+                actual.digest,
+                fingerprint(&(&actual.nodes, &actual.edges)).unwrap()
+            );
+        }
+    }
+    assert_eq!(
+        catalog(db),
+        before,
+        "read-only role matrix changed the store"
+    );
+    reference
+}
+
+#[tokio::test]
+async fn ag122_role_actor_and_complete_batch_domain_is_unchanged() {
+    let fx = prepare_in(TicketOrder::StagedBeforeIssue).await;
+    ag122_all_readers(&fx.db).await;
+    let formal = finalize(&fx, &fx.db).unwrap();
+    assert_eq!(formal["variant"], "complete_batch");
+    let reference = ag122_all_readers(&fx.db).await;
+    let store = Store::open(&fx.db).await.unwrap();
+    let ticket = stored_ticket(&store).await;
+    assert_eq!(ticket.lifecycle, TicketLifecycle::CompleteBatch);
+    let (receipt, _, _, _) = ag122_execution_ids_closed_ticket(&store, &ticket).await;
+    let call = receipt["payload"]["budget_call_id"].as_str().unwrap();
+    let mut s = store.session().await.unwrap();
+    assert!(matches!(
+        s.budget_call(&ctx(Role::Agent, "ag122-other-reader"), BILLING, call)
+            .await,
+        Err(Error::Forbidden),
+    ));
+    for role in [Role::Worker, Role::Host, Role::Evaluator, Role::Admin] {
+        assert!(
+            s.budget_call(&ctx(role, "ag122-other-reader"), BILLING, call)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    let mut independent = reachable(
+        &mut s,
+        &[("artifact".into(), storage_id(TICKET_KIND, TICKET))],
+    )
+    .await;
+    for node in reference.nodes {
+        assert!(independent.remove(&(node.kind, node.id)));
+    }
+    assert!(independent.is_empty());
+    drop(s);
+    store.close().await;
+}
+
+async fn ag122_execution_ids_closed_ticket(
+    store: &Store,
+    ticket: &EvaluationTicketV2,
+) -> (Value, String, String, String) {
+    let TargetState::Completed {
+        candidate_receipt_id,
+        baseline_receipt_id,
+        ..
+    } = &ticket.targets[0].state
+    else {
+        panic!("expected actual completed target")
+    };
+    let mut s = store.session().await.unwrap();
+    let candidate: Value = s
+        .need(
+            &ctx(Role::Evaluator, GRADER),
+            "artifact",
+            &storage_id(EXECUTION_RECEIPT_KIND, candidate_receipt_id),
+        )
+        .await
+        .unwrap();
+    let output = candidate["payload"]["output_artifact_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(s);
+    (
+        candidate,
+        candidate_receipt_id.clone(),
+        baseline_receipt_id.clone(),
+        output,
+    )
+}
+
+fn ag122_fact() -> evo_engine::optimization::StageFact {
+    evo_engine::optimization::StageFact {
+        schema_version: evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+        artifact_id: "pending".into(),
+        namespace: NS.into(),
+        episode_id: "ag122-dag".into(),
+        step: 0,
+        attempt: 0,
+        stage: evo_engine::optimization::OptimizationJournalStage::Merge,
+        kind: evo_engine::optimization::StageFactKind::StepPrepared,
+        request_id: "ag122-dag".into(),
+        input_digest: d("ag122-dag"),
+        output_digest: None,
+        dependencies: vec![],
+        payload: json!({"request":"ag122-dag"}),
+    }
+    .seal()
+    .unwrap()
+}
+
+#[tokio::test]
+async fn ag122_cross_component_dag_edges_and_root_order_keep_the_complete_graph() {
+    let fx = prepare_in(TicketOrder::StagedBeforeIssue).await;
+    ag122_cpp_healthy(&fx.db).await;
+    let (candidate, _, _, _) = ag122_execution_ids(&fx.db).await;
+    let (_dir, db) = copy_database(&fx);
+    let store = Store::open(&db).await.unwrap();
+    let worker = ctx(Role::Worker, PROPOSER);
+    let fact = ag122_fact();
+    let mut s = store.session().await.unwrap();
+    s.put(
+        &worker,
+        "artifact",
+        &fact.artifact_id,
+        worker.actor(),
+        &fact,
+    )
+    .await
+    .unwrap();
+    // These two ordinary DAG edges stay in the digest; (ii) does not impose
+    // the separate (iii) rule of an exact whole outgoing edge set.
+    for from in [
+        storage_id(EXECUTION_RECEIPT_KIND, &candidate),
+        storage_id(TICKET_KIND, TICKET),
+    ] {
+        s.put_edge(&worker, "artifact", &from, "artifact", &fact.artifact_id)
+            .await
+            .unwrap();
+    }
+    s.commit().await.unwrap();
+    store.close().await;
+    let reference = ag122_all_readers(&db).await;
+    assert!(
+        reference
+            .nodes
+            .iter()
+            .any(|node| node.id == fact.artifact_id)
+    );
+    assert_eq!(
+        reference
+            .edges
+            .iter()
+            .filter(|edge| edge.to_id == fact.artifact_id)
+            .count(),
+        2
+    );
+    let store = Store::open(&db).await.unwrap();
+    let mut s = store.session().await.unwrap();
+    let roots = [
+        ("artifact".into(), fact.artifact_id.clone()),
+        ("artifact".into(), storage_id(TICKET_KIND, TICKET)),
+    ];
+    let first = read_typed_closure(&mut s, &worker, &roots).await.unwrap();
+    let reversed = read_typed_closure(&mut s, &worker, &[roots[1].clone(), roots[0].clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&reversed).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&reference).unwrap()
+    );
+    drop(s);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn ag122_single_receipt_faults_cannot_mint_ga18_edges() {
+    let fx = prepare_in(TicketOrder::StagedBeforeIssue).await;
+    ag122_cpp_healthy(&fx.db).await;
+    let (candidate, _, _, _) = ag122_execution_ids(&fx.db).await;
+    for fault in ["side", "request", "call", "owner", "missing_binding"] {
+        let (_dir, db) = copy_database(&fx);
+        let store = Store::open(&db).await.unwrap();
+        let reader = ctx(Role::Host, HOST);
+        let mut s = store.session().await.unwrap();
+        let (id, mut body): (String, Value) = if fault == "missing_binding" {
+            let id = storage_id(TICKET_KIND, TICKET);
+            let body = s.need(&reader, "artifact", &id).await.unwrap();
+            (id, body)
+        } else {
+            let id = storage_id(EXECUTION_RECEIPT_KIND, &candidate);
+            let body = s.need(&reader, "artifact", &id).await.unwrap();
+            (id, body)
+        };
+        match fault {
+            "side" => body["payload"]["side"] = json!("baseline"),
+            "request" => body["payload"]["request_digest"] = json!(d("wrong-request")),
+            "call" => body["payload"]["budget_call_id"] = json!("missing-call"),
+            "missing_binding" => {
+                body["payload"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("candidate_dependency_binding");
+            }
+            "owner" => {}
+            _ => unreachable!(),
+        }
+        let owner = match fault {
+            "owner" => "ag122-intruder",
+            "missing_binding" => GRADER,
+            _ => HOST,
+        };
+        s.put(&reader, "artifact", &id, owner, &body).await.unwrap();
+        s.commit().await.unwrap();
+        store.close().await;
+        let before = catalog(&db);
+        let result = ag122_closure_as(&db, &ctx(Role::Agent, "ag122-other-reader")).await;
+        assert!(
+            matches!(result, Err(Error::Conflict(message)) if message == "typed content dependency cycle"),
+            "{fault}"
+        );
+        assert_eq!(catalog(&db), before, "{fault} read wrote state");
+    }
+}
+
+#[tokio::test]
+async fn ag122_real_early_stop_and_late_audit_keep_original_fact_membership() {
+    let fx = prepare_ag122_scope(TicketOrder::StagedBeforeIssue, true, true)
+        .await
+        .unwrap();
+    let store = Store::open(&fx.db).await.unwrap();
+    let ticket = stored_ticket(&store).await;
+    assert_eq!(ticket.lifecycle, TicketLifecycle::EarlyStopped);
+    let stopped = IndependentEvaluationControl::settle_after_stop(
+        &ctx(Role::Evaluator, GRADER),
+        &store,
+        TICKET,
+        evo_core::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stopped.ticket.lifecycle, TicketLifecycle::EarlyStopped);
+    store.close().await;
+    let reference = ag122_all_readers(&fx.db).await;
+    for invalid in [false, true] {
+        let (_dir, db) = copy_database(&fx);
+        let store = Store::open(&db).await.unwrap();
+        if invalid {
+            IndependentEvaluationControl::invalidate(
+                &ctx(Role::Evaluator, GRADER),
+                &store,
+                TICKET,
+                "ag122_after_real_stop",
+                evo_core::now().unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let ticket = stored_ticket(&store).await;
+        let TargetState::Completed {
+            candidate_receipt_id,
+            baseline_receipt_id,
+            ..
+        } = &ticket.targets[0].state
+        else {
+            panic!("original scored member was lost")
+        };
+        let mut s = store.session().await.unwrap();
+        let formal_id = storage_id("formal_evaluation_v2", TICKET);
+        let before_formal: Value = s
+            .need(&ctx(Role::Evaluator, GRADER), "artifact", &formal_id)
+            .await
+            .unwrap();
+        let before_ticket: Value = s
+            .need(
+                &ctx(Role::Evaluator, GRADER),
+                "artifact",
+                &storage_id(TICKET_KIND, TICKET),
+            )
+            .await
+            .unwrap();
+        drop(s);
+        let late = IndependentEvaluationControl::record_grader_receipt(
+            &ctx(Role::Evaluator, GRADER),
+            &store,
+            evo_engine::streaming_evaluator::GraderReceiptRequest {
+                receipt_id: "ag122-audit-only-late".into(),
+                ticket_id: TICKET.into(),
+                target_id: ticket.targets[0].target_id.clone(),
+                candidate_execution_receipt_id: candidate_receipt_id.clone(),
+                baseline_execution_receipt_id: baseline_receipt_id.clone(),
+                issued_at_unix_seconds: evo_core::now().unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut s = store.session().await.unwrap();
+        let after_formal: Value = s
+            .need(&ctx(Role::Evaluator, GRADER), "artifact", &formal_id)
+            .await
+            .unwrap();
+        let after_ticket: Value = s
+            .need(
+                &ctx(Role::Evaluator, GRADER),
+                "artifact",
+                &storage_id(TICKET_KIND, TICKET),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_formal, before_formal);
+        assert_eq!(after_ticket, before_ticket);
+        assert!(
+            s.dependency_edges(
+                &ctx(Role::Evaluator, GRADER),
+                "artifact",
+                &storage_id(GRADER_RECEIPT_KIND, &late.receipt_id),
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        drop(s);
+        store.close().await;
+        let actual = ag122_all_readers(&db).await;
+        assert!(
+            !actual
+                .nodes
+                .iter()
+                .any(|node| node.id == storage_id(GRADER_RECEIPT_KIND, &late.receipt_id))
+        );
+        if !invalid {
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&reference).unwrap()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn ag122_unit_matcher_preserves_roles_lifecycle_and_opaque_refusals() {
+    let fx = prepare_in(TicketOrder::StagedBeforeIssue).await;
+    let (_dir, db) = copy_database(&fx);
+    let store = Store::open(&db).await.unwrap();
+    let admin = ctx(Role::Admin, ADMIN);
+    let host = ctx(Role::Host, HOST);
+    let now = evo_core::now().unwrap();
+    let scope = "ag122-unit-scope";
+    let call_id = "ag122-unit-call";
+    let group = "ag122-unit-group";
+    let request = d("unit-request");
+    let output = d("unit-output");
+    store
+        .authorize_root_budget(
+            &admin,
+            &RootBudgetAuthorization {
+                root_budget_id: "ag122-unit-root".into(),
+                billing_scope: scope.into(),
+                allowed_namespaces: vec![NS.into(), "ag122-other-ns".into()],
+                currency: "USD".into(),
+                pricing_version: "pricing-v1".into(),
+                payment_subject: "software-fixture".into(),
+                authorization_receipt_digest: d("unit-authorization"),
+                per_call_cap_micros: 100,
+                total_limit_micros: 1_000,
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+    let sources: Vec<_> = fx
+        .candidate
+        .sources
+        .iter()
+        .map(|source| source.id.clone())
+        .collect();
+    let reserved = store
+        .reserve_budget_call_with_sources(
+            &host,
+            &BudgetCallReservation {
+                billing_scope: scope.into(),
+                call_id: call_id.into(),
+                dispatch_group_id: group.into(),
+                stage: BudgetStage::TaskExecution,
+                actual_input_digest: request.clone(),
+                request_artifact: None,
+                max_cost_micros: 10,
+                lease_token: d("unit-lease"),
+                lease_until: now + 300,
+                now,
+            },
+            &sources,
+        )
+        .await
+        .unwrap();
+    let mut s = store.session().await.unwrap();
+    let result = s
+        .require_task_execution_call_binding(
+            &ctx(Role::Agent, "reader"),
+            scope,
+            call_id,
+            group,
+            &request,
+            &output,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::Conflict(message)) if message == "task execution call binding mismatch")
+    );
+    drop(s);
+    let fence = BudgetCallFence {
+        billing_scope: scope.into(),
+        call_id: call_id.into(),
+        actual_input_digest: request.clone(),
+        lease_token: reserved.lease_token,
+        lease_epoch: reserved.lease_epoch,
+        now,
+    };
+    let dispatched = store.begin_budget_dispatch(&host, &fence).await.unwrap();
+    assert!(dispatched.new_dispatch);
+    for state in ["dispatched", "uncertain", "finalized"] {
+        if state == "uncertain" {
+            store
+                .mark_budget_call_uncertain(&host, &fence, "software_fixture_uncertain")
+                .await
+                .unwrap();
+        } else if state == "finalized" {
+            store
+                .reconcile_budget_call_cost(
+                    &admin,
+                    scope,
+                    call_id,
+                    &UsageCharge {
+                        amount_micros: 1,
+                        currency: "USD".into(),
+                        pricing_version: "pricing-v1".into(),
+                        provider_request_id: "ag122-unit-provider-receipt".into(),
+                        usage_record_id: "ag122-unit-usage".into(),
+                        output_digest: output.clone(),
+                    },
+                    now + 1,
+                )
+                .await
+                .unwrap();
+        }
+        let before = catalog(&db);
+        let mut s = store.session().await.unwrap();
+        for role in [
+            Role::Agent,
+            Role::Worker,
+            Role::Host,
+            Role::Evaluator,
+            Role::Admin,
+        ] {
+            s.require_task_execution_call_binding(
+                &ctx(role, "ag122-other-reader"),
+                scope,
+                call_id,
+                group,
+                &request,
+                &output,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(matches!(
+            s.budget_call(&ctx(Role::Agent, "reader"), scope, call_id)
+                .await,
+            Err(Error::Forbidden)
+        ));
+        for (scope_arg, call_arg, group_arg, request_arg) in [
+            ("other-scope", call_id, group, request.clone()),
+            (scope, "other-call", group, request.clone()),
+            (scope, call_id, "other-group", request.clone()),
+            (scope, call_id, group, d("other-request")),
+            ("bad scope", call_id, group, request.clone()),
+        ] {
+            let result = s
+                .require_task_execution_call_binding(
+                    &ctx(Role::Agent, "reader"),
+                    scope_arg,
+                    call_arg,
+                    group_arg,
+                    &request_arg,
+                    &output,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(Error::Conflict(message)) if message == "task execution call binding mismatch")
+            );
+        }
+        let other_namespace = Context::new("ag122-other-ns", "reader", Role::Admin).unwrap();
+        assert!(matches!(
+            s.require_task_execution_call_binding(&other_namespace, scope, call_id, group, &request, &output).await,
+            Err(Error::Conflict(message)) if message == "task execution call binding mismatch",
+        ));
+        if state == "finalized" {
+            assert!(matches!(
+                s.require_task_execution_call_binding(&ctx(Role::Agent, "reader"), scope, call_id, group, &request, &d("other-output")).await,
+                Err(Error::Conflict(message)) if message == "task execution call binding mismatch",
+            ));
+        } else {
+            // NULL output metadata is deliberately permitted by the old predicate.
+            s.require_task_execution_call_binding(
+                &ctx(Role::Agent, "reader"),
+                scope,
+                call_id,
+                group,
+                &request,
+                &d("not-yet-recorded-output"),
+            )
+            .await
+            .unwrap();
+        }
+        drop(s);
+        assert_eq!(catalog(&db), before, "{state} matcher wrote state");
+    }
+    store
+        .close_budget_call_execution(
+            &host,
+            scope,
+            call_id,
+            dispatched.call.dispatch_id.as_deref().unwrap(),
+            "software_fixture_closed",
+            now + 2,
+        )
+        .await
+        .unwrap();
+    let wrong_stage = store
+        .reserve_budget_call_with_sources(
+            &host,
+            &BudgetCallReservation {
+                billing_scope: scope.into(),
+                call_id: "ag122-other-stage".into(),
+                dispatch_group_id: "ag122-other-stage-group".into(),
+                stage: BudgetStage::Reflection,
+                actual_input_digest: request.clone(),
+                request_artifact: None,
+                max_cost_micros: 10,
+                lease_token: d("other-stage-lease"),
+                lease_until: now + 300,
+                now: now + 2,
+            },
+            &sources,
+        )
+        .await
+        .unwrap();
+    let other_fence = BudgetCallFence {
+        billing_scope: scope.into(),
+        call_id: wrong_stage.call_id.clone(),
+        actual_input_digest: request.clone(),
+        lease_token: wrong_stage.lease_token,
+        lease_epoch: wrong_stage.lease_epoch,
+        now: now + 2,
+    };
+    let other_dispatch = store
+        .begin_budget_dispatch(&host, &other_fence)
+        .await
+        .unwrap();
+    assert!(other_dispatch.new_dispatch);
+    let mut s = store.session().await.unwrap();
+    assert!(matches!(
+        s.require_task_execution_call_binding(&ctx(Role::Agent, "reader"), scope,
+            &wrong_stage.call_id, &wrong_stage.dispatch_group_id, &request, &output).await,
+        Err(Error::Conflict(message)) if message == "task execution call binding mismatch",
+    ));
+    drop(s);
+    store
+        .cancel_budget_call(&host, &other_fence, "software_fixture_cancel")
+        .await
+        .unwrap();
+    store
+        .stop_dispatch_group(&admin, scope, group, "software_fixture_stopped", now + 3)
+        .await
+        .unwrap();
+    store
+        .stop_root_budget(&admin, scope, "software_fixture_stopped", now + 3)
+        .await
+        .unwrap();
+    let mut s = store.session().await.unwrap();
+    s.require_task_execution_call_binding(
+        &ctx(Role::Agent, "reader"),
+        scope,
+        call_id,
+        group,
+        &request,
+        &output,
+    )
+    .await
+    .unwrap();
     drop(s);
     store.close().await;
 }

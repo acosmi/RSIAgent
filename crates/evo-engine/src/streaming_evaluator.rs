@@ -6621,6 +6621,616 @@ fn p95(values: &mut [u64]) -> Result<u64> {
     Ok(values[rank.saturating_sub(1)])
 }
 
+type Ga18Key = (String, String);
+
+fn ga18_cycle_error() -> Error {
+    Error::Conflict("typed content dependency cycle".into())
+}
+
+fn ga18_edge(from: Ga18Key, to: Ga18Key) -> crate::formal_authority::TypedContentEdge {
+    crate::formal_authority::TypedContentEdge {
+        from_kind: from.0,
+        from_id: from.1,
+        to_kind: to.0,
+        to_id: to.1,
+    }
+}
+
+/// Every body used here must already belong to the caller's complete typed
+/// traversal. The reread adds the physical owner/raw-envelope binding in the
+/// same transaction. A caller's Role is never substituted for a content writer.
+async fn ga18_owned_record<T: DeserializeOwned>(
+    session: &mut Session,
+    ctx: &Context,
+    bodies: &BTreeMap<Ga18Key, Value>,
+    kind: &str,
+    logical_id: &str,
+    owner: &str,
+) -> Result<T> {
+    let id = storage_id(kind, logical_id)?;
+    let expected = bodies
+        .get(&("artifact".into(), id.clone()))
+        .ok_or_else(ga18_cycle_error)?;
+    let row = session
+        .object_row(ctx, "artifact", &id)
+        .await?
+        .ok_or_else(ga18_cycle_error)?;
+    let actual = parse_strict_json(&row.body)
+        .map_err(|_| ga18_cycle_error())?
+        .0;
+    if row.owner != owner || &actual != expected {
+        return Err(ga18_cycle_error());
+    }
+    historical_typed_payload(&row, kind, logical_id).map_err(|_| ga18_cycle_error())
+}
+
+/// The old collector fingerprints typed envelopes, while compiler records
+/// intentionally use their original Value encoding. This is only that data
+/// projection over an already traversed body, not another authority reader.
+fn ga18_node_identity(
+    kind: &str,
+    id: &str,
+    value: &Value,
+) -> Result<(String, Option<String>, String, String)> {
+    fn typed<T: DeserializeOwned + Serialize>(value: &Value) -> Result<String> {
+        let envelope: TypedArtifactEnvelope<T> =
+            serde_json::from_value(value.clone()).map_err(|_| ga18_cycle_error())?;
+        fingerprint(&envelope)
+    }
+    if kind == "run" {
+        let authority: crate::evidence::StoredTraceAuthority =
+            serde_json::from_value(value.clone()).map_err(|_| ga18_cycle_error())?;
+        authority.validate()?;
+        return Ok((
+            authority.schema_version.clone(),
+            None,
+            id.into(),
+            fingerprint(&authority)?,
+        ));
+    }
+    if kind == "artifact" && id.starts_with("optgrant-") && value.get("schema_version").is_none() {
+        return Ok((
+            "rsia.legacy_source_selection.v1".into(),
+            None,
+            id.into(),
+            fingerprint(value)?,
+        ));
+    }
+    let schema = value["schema_version"]
+        .as_str()
+        .ok_or_else(ga18_cycle_error)?;
+    if crate::formal_authority::compiler_dependency_schema(kind, schema) {
+        return Ok((schema.into(), None, id.into(), fingerprint(value)?));
+    }
+    if kind == "artifact" && schema == RELEASE_CANDIDATE_SCHEMA {
+        let candidate: ReleaseCandidateRecord =
+            serde_json::from_value(value.clone()).map_err(|_| ga18_cycle_error())?;
+        return Ok((schema.into(), None, id.into(), fingerprint(&candidate)?));
+    }
+    if kind != "artifact" || schema != ENVELOPE_SCHEMA {
+        return Err(ga18_cycle_error());
+    }
+    let envelope: TypedArtifactEnvelope<Value> =
+        serde_json::from_value(value.clone()).map_err(|_| ga18_cycle_error())?;
+    let record_kind = envelope.record_kind.as_str();
+    let expected_schema = dependency_record_schema(record_kind).ok_or_else(ga18_cycle_error)?;
+    let payload = &envelope.payload;
+    let actual_schema = payload["schema_version"].as_str();
+    if actual_schema != Some(expected_schema)
+        && !(record_kind == CONTROL_KIND
+            && actual_schema == Some(RegisteredEvaluationControl::SCHEMA_V1))
+    {
+        return Err(ga18_cycle_error());
+    }
+    validate_dependency_payload_identity(record_kind, payload)?;
+    let logical_id = if record_kind == ALPHA_USE_KIND {
+        format!(
+            "{}:{}",
+            payload["research_family_id"]
+                .as_str()
+                .ok_or_else(ga18_cycle_error)?,
+            payload["claim_id"].as_str().ok_or_else(ga18_cycle_error)?,
+        )
+    } else {
+        let field = match record_kind {
+            CONTROL_KIND | HOLDOUT_KIND | TICKET_KIND | OUTPUT_KIND => "id",
+            EXECUTION_RECEIPT_KIND | GRADER_RECEIPT_KIND => "receipt_id",
+            _ => "ticket_id",
+        };
+        payload[field].as_str().ok_or_else(ga18_cycle_error)?.into()
+    };
+    if envelope.id != id || storage_id(record_kind, &logical_id)? != id {
+        return Err(ga18_cycle_error());
+    }
+    let content = match record_kind {
+        CONTROL_KIND => typed::<RegisteredEvaluationControl>(value)?,
+        HOLDOUT_KIND => typed::<ProtectedHoldoutRecord>(value)?,
+        TICKET_KIND => typed::<EvaluationTicketV2>(value)?,
+        TICKET_RECEIPT_KIND => typed::<TicketIssueReceipt>(value)?,
+        ALPHA_USE_KIND => typed::<AlphaClaimReservation>(value)?,
+        EXECUTION_RECEIPT_KIND => typed::<ExecutionReceiptV2>(value)?,
+        GRADER_RECEIPT_KIND => typed::<IndependentGraderReceiptV2>(value)?,
+        OUTPUT_KIND => typed::<ExecutionOutputArtifact>(value)?,
+        RESOURCE_KIND => typed::<ResourceEvidenceRecord>(value)?,
+        _ => return Err(ga18_cycle_error()),
+    };
+    Ok((
+        schema.into(),
+        Some(envelope.record_kind),
+        logical_id,
+        content,
+    ))
+}
+
+async fn ga18_candidate_binding(
+    session: &mut Session,
+    ctx: &Context,
+    ticket: &EvaluationTicketV2,
+    control: &RegisteredEvaluationControl,
+    holdout: &ProtectedHoldoutRecord,
+    bodies: &BTreeMap<Ga18Key, Value>,
+    outgoing: &BTreeMap<Ga18Key, Vec<Ga18Key>>,
+) -> Result<()> {
+    let binding = ticket
+        .candidate_dependency_binding
+        .as_ref()
+        .ok_or_else(ga18_cycle_error)?;
+    binding.validate()?;
+    let candidate_key = ("artifact".into(), ticket.candidate_digest.clone());
+    let candidate: ReleaseCandidateRecord = serde_json::from_value(
+        bodies
+            .get(&candidate_key)
+            .ok_or_else(ga18_cycle_error)?
+            .clone(),
+    )
+    .map_err(|_| ga18_cycle_error())?;
+    candidate_matches_frozen(&candidate, control, holdout)?;
+    validate_candidate_read_in_session(session, ctx, &candidate).await?;
+    let watermark = session.watermark(ctx).await?.ok_or_else(ga18_cycle_error)?;
+    let direct = outgoing.get(&candidate_key).cloned().unwrap_or_default();
+    for source in &candidate.sources {
+        if !direct.contains(&(source.kind.clone(), source.id.clone())) {
+            return Err(ga18_cycle_error());
+        }
+    }
+    let mut pending = vec![candidate_key];
+    let mut seen = BTreeSet::new();
+    let mut nodes = Vec::new();
+    while let Some(key) = pending.pop() {
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        if seen.len() > MAX_UPSTREAM_CLOSURE_NODES {
+            return Err(ga18_cycle_error());
+        }
+        let body = bodies.get(&key).ok_or_else(ga18_cycle_error)?;
+        let edges = outgoing.get(&key).cloned().unwrap_or_default();
+        let (schema_version, record_kind, logical_id, content_digest) =
+            ga18_node_identity(&key.0, &key.1, body)?;
+        nodes.push(FormalDependencyNode {
+            kind: key.0,
+            id: key.1,
+            schema_version,
+            record_kind,
+            logical_id,
+            content_digest,
+            outgoing_edge_digest: fingerprint(&edges)?,
+            outgoing_edge_count: edges.len(),
+        });
+        pending.extend(edges);
+    }
+    nodes.sort_by(|left, right| (&left.kind, &left.id).cmp(&(&right.kind, &right.id)));
+    let current = FormalCandidateDependencyBinding {
+        schema_version: CANDIDATE_BINDING_SCHEMA.into(),
+        namespace: ctx.namespace().into(),
+        candidate_id: candidate.id.clone(),
+        candidate_record_digest: fingerprint(&candidate)?,
+        bundle_digest: candidate.bundle_digest.clone(),
+        parent_digest: candidate.parent_digest.clone(),
+        profile_id: candidate.profile_id.clone(),
+        environment_digest: candidate.environment_digest.clone(),
+        proposer_actor: candidate.proposer_actor.clone(),
+        sources: candidate.sources.clone(),
+        revoke_watermark_seq: watermark.0,
+        revoke_watermark_digest: watermark.1,
+        nodes,
+    };
+    current.validate()?;
+    if binding != &current
+        || binding.candidate_id != ticket.candidate_digest
+        || binding.bundle_digest != ticket.candidate_bundle_digest
+        || binding.parent_digest != ticket.baseline_digest
+        || binding.environment_digest != ticket.environment_digest
+        || binding.proposer_actor != ticket.proposer_actor
+    {
+        return Err(ga18_cycle_error());
+    }
+    Ok(())
+}
+
+async fn ga18_execution(
+    session: &mut Session,
+    ctx: &Context,
+    bodies: &BTreeMap<Ga18Key, Value>,
+    outgoing: &BTreeMap<Ga18Key, Vec<Ga18Key>>,
+    binding: (&EvaluationTicketV2, &RegisteredEvaluationControl),
+    id: &str,
+    side: ExecutionSide,
+) -> Result<ExecutionReceiptV2> {
+    let (ticket, control) = binding;
+    let receipt: ExecutionReceiptV2 = ga18_owned_record(
+        session,
+        ctx,
+        bodies,
+        EXECUTION_RECEIPT_KIND,
+        id,
+        &ticket.executor_actor,
+    )
+    .await?;
+    validate_execution_history_binding(ticket, &receipt).map_err(|_| ga18_cycle_error())?;
+    if receipt.receipt_id != id || receipt.side != side {
+        return Err(ga18_cycle_error());
+    }
+    validate_dependency_payload_identity(
+        EXECUTION_RECEIPT_KIND,
+        &serde_json::to_value(&receipt).map_err(|_| Error::Internal)?,
+    )?;
+    let output: ExecutionOutputArtifact = ga18_owned_record(
+        session,
+        ctx,
+        bodies,
+        OUTPUT_KIND,
+        &receipt.output_artifact_id,
+        &ticket.executor_actor,
+    )
+    .await?;
+    validate_output_artifact(&receipt, &output)?;
+    if output.output_utf8.is_empty() || output.output_utf8.len() > 256 * 1024 {
+        return Err(ga18_cycle_error());
+    }
+    session
+        .require_task_execution_call_binding(
+            ctx,
+            &control.billing_scope,
+            &receipt.budget_call_id,
+            &ticket.id,
+            &receipt.request_digest,
+            &receipt.output_digest,
+        )
+        .await
+        .map_err(|error| match error {
+            Error::Conflict(message) if message == "task execution call binding mismatch" => {
+                ga18_cycle_error()
+            }
+            other => other,
+        })?;
+    let key = artifact_edge(EXECUTION_RECEIPT_KIND, id)?;
+    let edges = outgoing.get(&key).ok_or_else(ga18_cycle_error)?;
+    if !edges.contains(&artifact_edge(TICKET_KIND, &ticket.id)?)
+        || !edges.contains(&artifact_edge(OUTPUT_KIND, &receipt.output_artifact_id)?)
+    {
+        return Err(ga18_cycle_error());
+    }
+    Ok(receipt)
+}
+
+/// Internal classification only. It returns graph edges, never authority or a
+/// persistable proof. The formal reader has already validated every supplied
+/// body and all content witnesses in this very Session.
+pub(crate) async fn ga18_qualified_cycle_edges(
+    session: &mut Session,
+    ctx: &Context,
+    bodies: &BTreeMap<Ga18Key, Value>,
+    all_edges: &BTreeSet<crate::formal_authority::TypedContentEdge>,
+    cyclic_edges: &BTreeSet<crate::formal_authority::TypedContentEdge>,
+) -> Result<BTreeSet<crate::formal_authority::TypedContentEdge>> {
+    let mut outgoing: BTreeMap<Ga18Key, Vec<Ga18Key>> = BTreeMap::new();
+    for edge in all_edges {
+        outgoing
+            .entry((edge.from_kind.clone(), edge.from_id.clone()))
+            .or_default()
+            .push((edge.to_kind.clone(), edge.to_id.clone()));
+    }
+    let mut requested = BTreeSet::new();
+    let mut ticket_ids = BTreeSet::new();
+    for edge in cyclic_edges {
+        for key in [
+            (edge.from_kind.clone(), edge.from_id.clone()),
+            (edge.to_kind.clone(), edge.to_id.clone()),
+        ] {
+            let body = bodies.get(&key).ok_or_else(ga18_cycle_error)?;
+            match body["record_kind"].as_str() {
+                Some(TICKET_KIND) => {
+                    let id = body["payload"]["id"]
+                        .as_str()
+                        .ok_or_else(ga18_cycle_error)?;
+                    ticket_ids.insert(id.to_owned());
+                }
+                Some(EXECUTION_RECEIPT_KIND | GRADER_RECEIPT_KIND) => {
+                    requested.insert(key);
+                }
+                _ => return Err(ga18_cycle_error()),
+            }
+        }
+    }
+    let mut qualified = BTreeSet::new();
+    for ticket_id in ticket_ids {
+        let ticket_body = bodies
+            .get(&artifact_edge(TICKET_KIND, &ticket_id)?)
+            .ok_or_else(ga18_cycle_error)?;
+        let evaluator = ticket_body["payload"]["evaluator_actor"]
+            .as_str()
+            .ok_or_else(ga18_cycle_error)?
+            .to_owned();
+        let ticket: EvaluationTicketV2 =
+            ga18_owned_record(session, ctx, bodies, TICKET_KIND, &ticket_id, &evaluator).await?;
+        ticket.validate()?;
+        let control: RegisteredEvaluationControl = ga18_owned_record(
+            session,
+            ctx,
+            bodies,
+            CONTROL_KIND,
+            &ticket.registration_id,
+            &ticket.evaluator_actor,
+        )
+        .await?;
+        let holdout: ProtectedHoldoutRecord = ga18_owned_record(
+            session,
+            ctx,
+            bodies,
+            HOLDOUT_KIND,
+            &ticket.holdout_id,
+            &ticket.evaluator_actor,
+        )
+        .await?;
+        control.validate()?;
+        holdout.validate_against(&control)?;
+        let issue: TicketIssueReceipt = ga18_owned_record(
+            session,
+            ctx,
+            bodies,
+            TICKET_RECEIPT_KIND,
+            &ticket.id,
+            &ticket.evaluator_actor,
+        )
+        .await?;
+        let mut expected_plan = control.v1_plan_snapshot.clone();
+        expected_plan.bind_candidate(ticket.candidate_digest.clone())?;
+        if ticket.id != ticket_id
+            || ticket.registration_id != control.id
+            || ticket.holdout_id != holdout.id
+            || ticket.proposer_actor != control.proposer_actor
+            || ticket.evaluator_actor != control.evaluator_actor
+            || ticket.executor_actor != control.executor_actor
+            || ticket.approver_actor != control.approver_actor
+            || ticket.evidence_scope != control.evidence_scope
+            || ticket.attempt_id != control.attempt_id
+            || ticket.research_family_id != control.alpha_plan.research_family_id
+            || ticket.alpha_plan_digest != control.alpha_plan.digest()?
+            || ticket.formal_plan_digest != control.formal_plan.digest()?
+            || ticket.v1_plan_snapshot_digest != control.v1_plan_snapshot.digest()?
+            || ticket.registration_digest != control.digest()?
+            || ticket.manifest_digest != holdout.manifest.digest()?
+            || ticket.issue_receipt_digest != fingerprint(&issue)?
+            || ticket.candidate_digest != holdout.pair.candidate_digest
+            || ticket.baseline_digest != holdout.pair.baseline_digest
+            || ticket.candidate_bundle_digest != holdout.candidate_bundle_digest
+            || ticket.baseline_bundle_digest != holdout.baseline_bundle_digest
+            || ticket.environment_digest != holdout.manifest.environment_digest
+            || ticket.bound_v1_plan_digest != expected_plan.digest()?
+            || ticket.profile != control.formal_plan.profile
+            || ticket.n_planned != control.formal_plan.n_planned
+            || issue.schema_version != "rsia.evaluation_ticket_issue_receipt.v1"
+            || issue.ticket_id != ticket.id
+            || issue.evaluator_actor != ticket.evaluator_actor
+            || issue.registration_digest != ticket.registration_digest
+            || issue.manifest_digest != ticket.manifest_digest
+            || issue.issued_at_unix_seconds != ticket.issued_at_unix_seconds
+        {
+            return Err(ga18_cycle_error());
+        }
+        let expected_inputs = holdout
+            .rotating_inputs
+            .iter()
+            .map(|input| (input, false))
+            .chain(holdout.anchor_inputs.iter().map(|input| (input, true)))
+            .collect::<Vec<_>>();
+        if ticket.targets.len() != expected_inputs.len()
+            || ticket
+                .targets
+                .iter()
+                .zip(expected_inputs)
+                .any(|(target, (input, anchor))| {
+                    target.target_id != input.target_id
+                        || target.input_artifact_id != input.input_artifact_id
+                        || target.input_digest != input.input_digest
+                        || match &target.kind {
+                            EvaluationTargetKind::Rotating { cluster_id } => {
+                                anchor || cluster_id != &input.cluster_or_anchor_id
+                            }
+                            EvaluationTargetKind::Anchor { anchor_id } => {
+                                !anchor || anchor_id != &input.cluster_or_anchor_id
+                            }
+                        }
+                })
+        {
+            return Err(ga18_cycle_error());
+        }
+        ga18_candidate_binding(session, ctx, &ticket, &control, &holdout, bodies, &outgoing)
+            .await?;
+        let ticket_key = artifact_edge(TICKET_KIND, &ticket.id)?;
+        let ticket_edges = outgoing.get(&ticket_key).ok_or_else(ga18_cycle_error)?;
+        for required in [
+            ("artifact".into(), ticket.candidate_digest.clone()),
+            artifact_edge(HOLDOUT_KIND, &ticket.holdout_id)?,
+            artifact_edge(TICKET_RECEIPT_KIND, &ticket.id)?,
+        ] {
+            if !ticket_edges.contains(&required) {
+                return Err(ga18_cycle_error());
+            }
+        }
+        let holdout_edges = outgoing
+            .get(&artifact_edge(HOLDOUT_KIND, &ticket.holdout_id)?)
+            .ok_or_else(ga18_cycle_error)?;
+        if !holdout_edges.contains(&artifact_edge(CONTROL_KIND, &ticket.registration_id)?) {
+            return Err(ga18_cycle_error());
+        }
+        for allocation in control
+            .alpha_plan
+            .allocations
+            .iter()
+            .filter(|allocation| allocation.attempt_id == ticket.attempt_id)
+        {
+            let id = format!("{}:{}", ticket.research_family_id, allocation.claim_id);
+            let actual: AlphaClaimReservation = ga18_owned_record(
+                session,
+                ctx,
+                bodies,
+                ALPHA_USE_KIND,
+                &id,
+                &ticket.evaluator_actor,
+            )
+            .await?;
+            if actual.schema_version != "rsia.alpha_claim_reservation.v1"
+                || actual.research_family_id != ticket.research_family_id
+                || actual.claim_id != allocation.claim_id
+                || actual.attempt_id != ticket.attempt_id
+                || actual.ticket_id != ticket.id
+                || !ticket_edges.contains(&artifact_edge(ALPHA_USE_KIND, &id)?)
+            {
+                return Err(ga18_cycle_error());
+            }
+        }
+        for target in &ticket.targets {
+            let (executions, grader_id) = match &target.state {
+                TargetState::Completed {
+                    candidate_receipt_id,
+                    baseline_receipt_id,
+                    grader_receipt_id,
+                    ..
+                } => (
+                    vec![
+                        (candidate_receipt_id, ExecutionSide::Candidate),
+                        (baseline_receipt_id, ExecutionSide::Baseline),
+                    ],
+                    Some(grader_receipt_id),
+                ),
+                TargetState::Running {
+                    candidate,
+                    baseline,
+                }
+                | TargetState::RunningUsageUnknown {
+                    candidate,
+                    baseline,
+                }
+                | TargetState::CancelledAfterDispatch {
+                    candidate,
+                    baseline,
+                } => {
+                    let mut executions = Vec::new();
+                    for (slot, side) in [
+                        (candidate, ExecutionSide::Candidate),
+                        (baseline, ExecutionSide::Baseline),
+                    ] {
+                        if let Some(slot) = slot
+                            && let Some(id) = &slot.receipt_id
+                        {
+                            executions.push((id, side));
+                        }
+                    }
+                    (executions, None)
+                }
+                _ => (Vec::new(), None),
+            };
+            let grader_requested = grader_id
+                .map(|id| artifact_edge(GRADER_RECEIPT_KIND, id))
+                .transpose()?
+                .is_some_and(|key| requested.contains(&key));
+            for (id, side) in &executions {
+                let key = artifact_edge(EXECUTION_RECEIPT_KIND, id)?;
+                if !requested.contains(&key) && !grader_requested {
+                    continue;
+                }
+                let receipt = ga18_execution(
+                    session,
+                    ctx,
+                    bodies,
+                    &outgoing,
+                    (&ticket, &control),
+                    id,
+                    *side,
+                )
+                .await?;
+                if receipt.target_id != target.target_id || !ticket_edges.contains(&key) {
+                    return Err(ga18_cycle_error());
+                }
+                if let TargetState::Running {
+                    candidate,
+                    baseline,
+                }
+                | TargetState::RunningUsageUnknown {
+                    candidate,
+                    baseline,
+                }
+                | TargetState::CancelledAfterDispatch {
+                    candidate,
+                    baseline,
+                } = &target.state
+                {
+                    let slot = match side {
+                        ExecutionSide::Candidate => candidate.as_ref(),
+                        ExecutionSide::Baseline => baseline.as_ref(),
+                    }
+                    .ok_or_else(ga18_cycle_error)?;
+                    if slot.side != *side
+                        || slot.budget_call_id != receipt.budget_call_id
+                        || slot.request_digest != receipt.request_digest
+                    {
+                        return Err(ga18_cycle_error());
+                    }
+                }
+                qualified.insert(ga18_edge(ticket_key.clone(), key.clone()));
+                qualified.insert(ga18_edge(key, ticket_key.clone()));
+            }
+            if grader_requested {
+                let grader_id = grader_id.ok_or_else(ga18_cycle_error)?;
+                let grader: IndependentGraderReceiptV2 = ga18_owned_record(
+                    session,
+                    ctx,
+                    bodies,
+                    GRADER_RECEIPT_KIND,
+                    grader_id,
+                    &ticket.evaluator_actor,
+                )
+                .await?;
+                let checked = validate_completed_target_evidence(
+                    session, ctx, &ticket, &control, &holdout, target,
+                )
+                .await?;
+                if fingerprint(&grader)? != fingerprint(&checked)?
+                    || grader.receipt_id != *grader_id
+                {
+                    return Err(ga18_cycle_error());
+                }
+                let key = artifact_edge(GRADER_RECEIPT_KIND, grader_id)?;
+                let edges = outgoing.get(&key).ok_or_else(ga18_cycle_error)?;
+                for (id, _) in &executions {
+                    let execution_key = artifact_edge(EXECUTION_RECEIPT_KIND, id)?;
+                    if !edges.contains(&execution_key) {
+                        return Err(ga18_cycle_error());
+                    }
+                    qualified.insert(ga18_edge(key.clone(), execution_key));
+                }
+                if !ticket_edges.contains(&key) {
+                    return Err(ga18_cycle_error());
+                }
+                qualified.insert(ga18_edge(ticket_key.clone(), key));
+            }
+        }
+    }
+    Ok(qualified)
+}
+
 #[cfg(test)]
 mod complete_verdict_tests {
     use super::*;

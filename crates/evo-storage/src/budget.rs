@@ -2124,6 +2124,45 @@ impl Session {
         redact_budget_call_content_in_tx(&mut self.tx, ctx, billing_scope, call_id, reason).await
     }
 
+    /// Same-Session consistency only; this unit result authenticates no receipt/caller.
+    pub async fn require_task_execution_call_binding(
+        &mut self,
+        ctx: &Context,
+        billing_scope: &str,
+        call_id: &str,
+        dispatch_group_id: &str,
+        actual_input_digest: &str,
+        output_digest: &str,
+    ) -> Result<()> {
+        let mismatch = || Error::Conflict("task execution call binding mismatch".into());
+        identifier(billing_scope)
+            .and_then(|()| identifier(call_id))
+            .and_then(|()| identifier(dispatch_group_id))
+            .and_then(|()| validate_digest(actual_input_digest, "actual_input_digest"))
+            .and_then(|()| validate_digest(output_digest, "output_digest"))
+            .map_err(|_| mismatch())?;
+        let matched: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM root_budget_calls AS c
+             WHERE c.billing_scope=? AND c.call_id=? AND c.namespace=?
+               AND c.dispatch_group_id=? AND c.stage='task_execution'
+               AND c.actual_input_digest=? AND c.dispatch_id IS NOT NULL
+               AND c.state IN ('dispatched','uncertain','finalized')
+               AND (c.output_digest IS NULL OR c.output_digest=?)
+               AND EXISTS(SELECT 1 FROM root_budget_namespaces AS n
+                 WHERE n.billing_scope=c.billing_scope AND n.namespace=c.namespace)",
+        )
+        .bind(billing_scope)
+        .bind(call_id)
+        .bind(ctx.namespace())
+        .bind(dispatch_group_id)
+        .bind(actual_input_digest)
+        .bind(output_digest)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        matched.map(|_| ()).ok_or_else(mismatch)
+    }
+
     pub async fn budget_call(
         &mut self,
         ctx: &Context,
