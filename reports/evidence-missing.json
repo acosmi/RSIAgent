@@ -1,0 +1,454 @@
+{
+  "schema_version": "rsia.evidence_missing.v1",
+  "basis": "plan v4.5 §18.10 local missing evidence paths (Q-50): registered, not withdrawn, not rewritten and not re-created. Classification of 2026-10-23 at main a389c4e3: 42 paths of 25 verified records, none restorable from the 2026-10-23 archive catalog. D1 = v4.1 controller originals that only ever existed on the old machine; D2 = Task acceptance receipts present at the 2026-10-14T11:54:14Z checker run and absent at the 2026-10-23T14:35Z index audit; D3 = the AG-083 scratch raw log, already unavailable on 2026-10-12. Affected records are re-run by AG-182 as new records that name them in completes.",
+  "entries": [
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e00-directed-test.log",
+      "record_id": "E00.controller_acceptance",
+      "field": "log_path",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for log_path, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e00.json",
+      "record_id": "E00.controller_acceptance",
+      "field": "input_ref",
+      "expected_bytes": "unknown",
+      "expected_sha256": "e4a0a35dd9ee7b9194892387fd61f1934ee653d127f4dae9f442b6f8a0a1def7",
+      "unknown_reason": "byte length was never registered; the expected SHA-256 is the record's own input_digest",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e01-tests.log",
+      "record_id": "E01.controller_acceptance",
+      "field": "log_path",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for log_path, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e01-input.json",
+      "record_id": "E01.controller_acceptance",
+      "field": "input_ref",
+      "expected_bytes": "unknown",
+      "expected_sha256": "e30d77b22db111ec01676b6bcc93df70eee042484316644bda85d0e2d00edc92",
+      "unknown_reason": "byte length was never registered; the expected SHA-256 is the record's own input_digest",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e02-tests.log",
+      "record_id": "E02.controller_acceptance",
+      "field": "log_path",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for log_path, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e02-formatted-input.json",
+      "record_id": "E02.controller_acceptance",
+      "field": "input_ref",
+      "expected_bytes": "unknown",
+      "expected_sha256": "0885dd7d111c1368fcdc3be7f7ab98bdea6c1b370ff230ae2b30564158c45dec",
+      "unknown_reason": "byte length was never registered; the expected SHA-256 is the record's own input_digest",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/audit-20260930/qa/takeover-20261002/AG092-existing-current27df8c2-fixed39d2d86-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+      "record_id": "E02.ag092_local_scoped_acceptance",
+      "field": "log_path",
+      "expected_bytes": 816349,
+      "expected_sha256": "e5e631132fcbfe7964ee2aae709d37d1e443a35672f8eac0393d78e87ce403b4",
+      "missing_window": {
+        "after": "2026-10-14T11:54:14Z",
+        "before": "2026-10-23T14:35:00Z"
+      },
+      "group": "D2_task_receipt_lost_between_20261014_and_20261023"
+    },
+    {
+      "path": "out/audit-20260930/qa/takeover-20261002/AG093-existing-currentc04850d-fixed49806d7-ROOT-fresh14-actual-Task-accepted-conditional-admin-merge-r2-20261011.json",
+      "record_id": "E02.ag093_local_scoped_acceptance",
+      "field": "log_path",
+      "expected_bytes": 10996934,
+      "expected_sha256": "23b3f9971808c866af44023da0f8883fcddb85f715eff30fbb01ea5644ae22c0",
+      "missing_window": {
+        "after": "2026-10-14T11:54:14Z",
+        "before": "2026-10-23T14:35:00Z"
+      },
+      "group": "D2_task_receipt_lost_between_20261014_and_20261023"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e03-final-tests.log",
+      "record_id": "E03.controller_acceptance",
+      "field": "log_path",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for log_path, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e03-final-input.json",
+      "record_id": "E03.controller_acceptance",
+      "field": "input_ref",
+      "expected_bytes": "unknown",
+      "expected_sha256": "61f6e470ac3a2488ded8fde15786b1f6f327fe7fca3c2b93fbde62b2a939ebec",
+      "unknown_reason": "byte length was never registered; the expected SHA-256 is the record's own input_digest",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e04-storage-final.log",
+      "record_id": "E04.controller_acceptance",
+      "field": "log_path",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for log_path, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e04-final-input.json",
+      "record_id": "E04.controller_acceptance",
+      "field": "input_ref",
+      "expected_bytes": "unknown",
+      "expected_sha256": "24d50350c1948b5d2e037443d0ec419c5a6cdf9ae11bb19f313cd2a72797660b",
+      "unknown_reason": "byte length was never registered; the expected SHA-256 is the record's own input_digest",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/audit-20260930/qa/takeover-20261002/AG077-existing-PR125-current529-fixed26d3-ROOT-fresh12-actual-current-main-Task-accepted-conditional-admin-merge-r1-20261011.json",
+      "record_id": "E04.ag077_local_scoped_acceptance",
+      "field": "log_path",
+      "expected_bytes": 14342721,
+      "expected_sha256": "fda28ff3071a8ac3064752700831a86b9b43302ba442de325b9d42ab2a772ecd",
+      "missing_window": {
+        "after": "2026-10-14T11:54:14Z",
+        "before": "2026-10-23T14:35:00Z"
+      },
+      "group": "D2_task_receipt_lost_between_20261014_and_20261023"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e05-final-streaming.log",
+      "record_id": "E05.controller_acceptance",
+      "field": "log_path",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for log_path, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e05-final-input.json",
+      "record_id": "E05.controller_acceptance",
+      "field": "input_ref",
+      "expected_bytes": "unknown",
+      "expected_sha256": "7223e7dfd386a707f4037821db62225730a03b9b06b5fe23ca516d37fe523c3c",
+      "unknown_reason": "byte length was never registered; the expected SHA-256 is the record's own input_digest",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e05-acceptance.json",
+      "record_id": "E05.controller_acceptance",
+      "field": "record_source",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for record_source, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/scratch/ag-083-impl/current-fixed-single-clippy-repair-full8-direct-root-run-r1-user-continue-20261003/full-workspace-MAIN-original-native.json",
+      "record_id": "E05.ag083_partition_admission_rejection_atomicity",
+      "field": "log_path",
+      "expected_bytes": 283349,
+      "expected_sha256": "1d7bfd62a90ae85a5084ab1e1c713fb608b7def318f363b1b8ea5912233daca6",
+      "missing_window": {
+        "after": "unknown",
+        "before": "2026-10-12T16:15:59Z"
+      },
+      "group": "D3_ag083_scratch_raw_log_not_located"
+    },
+    {
+      "path": "out/audit-20260930/qa/takeover-20261002/AG087-existing-current77152-fixedfde3dd4-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+      "record_id": "E05.ag087_local_scoped_acceptance",
+      "field": "log_path",
+      "expected_bytes": 36684968,
+      "expected_sha256": "b710681e4412a80be8adeab96680da4507a18c63c912b83b136cd4dd24502393",
+      "missing_window": {
+        "after": "2026-10-14T11:54:14Z",
+        "before": "2026-10-23T14:35:00Z"
+      },
+      "group": "D2_task_receipt_lost_between_20261014_and_20261023"
+    },
+    {
+      "path": "out/audit-20260930/qa/takeover-20261002/AG088-existing-current8cbf82c-fixede538b96-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+      "record_id": "E05.ag088_local_scoped_acceptance",
+      "field": "log_path",
+      "expected_bytes": 13536179,
+      "expected_sha256": "ff6984a0ae79005cf945ba1c179c954a9d9fdbc20e5871755c0b0b566da36eb0",
+      "missing_window": {
+        "after": "2026-10-14T11:54:14Z",
+        "before": "2026-10-23T14:35:00Z"
+      },
+      "group": "D2_task_receipt_lost_between_20261014_and_20261023"
+    },
+    {
+      "path": "out/audit-20260930/qa/takeover-20261002/AG089-existing-currentbd20099-fixed6040bf3-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+      "record_id": "E05.ag089_local_scoped_acceptance",
+      "field": "log_path",
+      "expected_bytes": 11859475,
+      "expected_sha256": "6d8af68e1cdff97e6f1ea47774e3f4a111d50dffe7ee6768daa84951c78077d3",
+      "missing_window": {
+        "after": "2026-10-14T11:54:14Z",
+        "before": "2026-10-23T14:35:00Z"
+      },
+      "group": "D2_task_receipt_lost_between_20261014_and_20261023"
+    },
+    {
+      "path": "out/audit-20260930/qa/takeover-20261002/AG090-existing-currentc9aa71e-fixeda994443-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+      "record_id": "E05.ag090_local_scoped_acceptance",
+      "field": "log_path",
+      "expected_bytes": 6380453,
+      "expected_sha256": "45b0232c119739d83a8ea4ed3631ccd87069344c57f13ca75062fd9c659f8389",
+      "missing_window": {
+        "after": "2026-10-14T11:54:14Z",
+        "before": "2026-10-23T14:35:00Z"
+      },
+      "group": "D2_task_receipt_lost_between_20261014_and_20261023"
+    },
+    {
+      "path": "out/audit-20260930/qa/takeover-20261002/AG091-existing-current1f1b593-fixed730f242-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+      "record_id": "E05.ag091_local_scoped_acceptance",
+      "field": "log_path",
+      "expected_bytes": 9200823,
+      "expected_sha256": "af3233edb0fa0033b0528f90d584c93c9f6f79392f4d6ff6a873d4b95ee29476",
+      "missing_window": {
+        "after": "2026-10-14T11:54:14Z",
+        "before": "2026-10-23T14:35:00Z"
+      },
+      "group": "D2_task_receipt_lost_between_20261014_and_20261023"
+    },
+    {
+      "path": "out/audit-20260930/qa/takeover-20261002/AG084-existing-current349-fixed3c5-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+      "record_id": "E06.ag084_local_scoped_acceptance",
+      "field": "log_path",
+      "expected_bytes": 966024,
+      "expected_sha256": "4d88e92fa79f672423c856785ceb10032039e726a773df5a06033cbdc21716b8",
+      "missing_window": {
+        "after": "2026-10-14T11:54:14Z",
+        "before": "2026-10-23T14:35:00Z"
+      },
+      "group": "D2_task_receipt_lost_between_20261014_and_20261023"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e07-service.log",
+      "record_id": "E07.controller_acceptance",
+      "field": "log_path",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for log_path, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e07-protocol-input.json",
+      "record_id": "E07.controller_acceptance",
+      "field": "input_ref",
+      "expected_bytes": "unknown",
+      "expected_sha256": "862ded25f4ec0ceec566a787f7f4a1346363e57c882beab3a407c6885298804f",
+      "unknown_reason": "byte length was never registered; the expected SHA-256 is the record's own input_digest",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e07-protocol-acceptance.json",
+      "record_id": "E07.controller_acceptance",
+      "field": "record_source",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for record_source, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e08-storage-tests.log",
+      "record_id": "E08.controller_acceptance",
+      "field": "log_path",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for log_path, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e08-final-input.json",
+      "record_id": "E08.controller_acceptance",
+      "field": "input_ref",
+      "expected_bytes": "unknown",
+      "expected_sha256": "f80081e88aaae94cc1d179ec43fbc8ac926cf2544d56a97a0e4571d5f4db7fe8",
+      "unknown_reason": "byte length was never registered; the expected SHA-256 is the record's own input_digest",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e08-acceptance.json",
+      "record_id": "E08.controller_acceptance",
+      "field": "record_source",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for record_source, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/audit-20260930/qa/takeover-20261002/AG075-existing-current1132-fixed8a92e57-ROOT-fresh12-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+      "record_id": "E08.ag075_local_scoped_acceptance",
+      "field": "log_path",
+      "expected_bytes": 989686,
+      "expected_sha256": "aa67ddf53d47a3f6eea2183f5aaa257550fff98d505e1980b56ae6fcbc34888e",
+      "missing_window": {
+        "after": "2026-10-14T11:54:14Z",
+        "before": "2026-10-23T14:35:00Z"
+      },
+      "group": "D2_task_receipt_lost_between_20261014_and_20261023"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e09-engine.log",
+      "record_id": "E09.controller_acceptance",
+      "field": "log_path",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for log_path, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e09-input.json",
+      "record_id": "E09.controller_acceptance",
+      "field": "input_ref",
+      "expected_bytes": "unknown",
+      "expected_sha256": "c0c3a6889c0ca761fb3d180476fb557103e3184b839f003b407b1e5118fa6b7c",
+      "unknown_reason": "byte length was never registered; the expected SHA-256 is the record's own input_digest",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e09-acceptance.json",
+      "record_id": "E09.controller_acceptance",
+      "field": "record_source",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for record_source, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e11-core.log",
+      "record_id": "E11.controller_acceptance",
+      "field": "log_path",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for log_path, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e11-final-input.json",
+      "record_id": "E11.controller_acceptance",
+      "field": "input_ref",
+      "expected_bytes": "unknown",
+      "expected_sha256": "7d1f35d6a433730bbf99b6b580f8f2b8ee6f840e1788fa24288e13f539125cd9",
+      "unknown_reason": "byte length was never registered; the expected SHA-256 is the record's own input_digest",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e11-acceptance.json",
+      "record_id": "E11.controller_acceptance",
+      "field": "record_source",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for record_source, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e12-engine.log",
+      "record_id": "E12.controller_acceptance",
+      "field": "log_path",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for log_path, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e12-final-input.json",
+      "record_id": "E12.controller_acceptance",
+      "field": "input_ref",
+      "expected_bytes": "unknown",
+      "expected_sha256": "945313921ffc8446fb527c4d3e15fd3c15c9d417dc93da30484706eee7063d16",
+      "unknown_reason": "byte length was never registered; the expected SHA-256 is the record's own input_digest",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/implementation-v4.1-20260919/controller-e12-acceptance.json",
+      "record_id": "E12.controller_acceptance",
+      "field": "record_source",
+      "expected_bytes": "unknown",
+      "expected_sha256": "unknown",
+      "unknown_reason": "v4.1 controller original kept only on the old machine (handoff 2026-09-30); never present on this machine; the index pins no digest for record_source, so a reappearing copy cannot be authenticated by this register",
+      "missing_window": "unknown",
+      "group": "D1_old_machine_v41_controller_original"
+    },
+    {
+      "path": "out/audit-20260930/qa/takeover-20261002/AG076-existing-currentAA51-fixed1355e95-ROOT-fresh12-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+      "record_id": "E16.1.ag076_local_scoped_acceptance",
+      "field": "log_path",
+      "expected_bytes": 684501,
+      "expected_sha256": "1de069f7b3e78d9d34b27ba0f145367c7d391351bad7d787db8698e727b21e89",
+      "missing_window": {
+        "after": "2026-10-14T11:54:14Z",
+        "before": "2026-10-23T14:35:00Z"
+      },
+      "group": "D2_task_receipt_lost_between_20261014_and_20261023"
+    },
+    {
+      "path": "out/audit-20260930/qa/takeover-20261002/AG070-existing-current3ad-fixed887d97a-ROOT-standard8-head38-parent36-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+      "record_id": "E16.1.ag070_local_scoped_acceptance",
+      "field": "log_path",
+      "expected_bytes": 761525,
+      "expected_sha256": "aaf45b6c5f63f4d1f50cc39864cc7ac00b31c1b94dad25d5a1888e7d68ecc8c8",
+      "missing_window": {
+        "after": "2026-10-14T11:54:14Z",
+        "before": "2026-10-23T14:35:00Z"
+      },
+      "group": "D2_task_receipt_lost_between_20261014_and_20261023"
+    },
+    {
+      "path": "out/audit-20260930/qa/takeover-20261002/AG086-existing-currentAA831-fixed908eb85-ROOT-fresh10-actual-Task-accepted-conditional-admin-merge-r1-20261011.json",
+      "record_id": "E16.6.ag086_local_scoped_acceptance",
+      "field": "log_path",
+      "expected_bytes": 2563311,
+      "expected_sha256": "75f92393a9655d8b01cdf9befb0290b90feab395b92cb80432da3746b431c0b5",
+      "missing_window": {
+        "after": "2026-10-14T11:54:14Z",
+        "before": "2026-10-23T14:35:00Z"
+      },
+      "group": "D2_task_receipt_lost_between_20261014_and_20261023"
+    }
+  ]
+}

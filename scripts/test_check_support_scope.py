@@ -87,6 +87,18 @@ class FixtureRepo:
             _write(root / member / "src/lib.rs", "pub mod evaluator;\npub mod hosts;\n")
         # Runtime validation uses the same actual Rust fact table, never a Python copy.
         _write(root / "crates/evo-core/tests/support_scope.rs", (REAL_ROOT / "crates/evo-core/tests/support_scope.rs").read_text(encoding="utf-8"))
+        # The pinned missing-evidence register and the tracked (non out/) record sources travel with the checkout.
+        (root / css.DEFAULT_KNOWN_MISSING).parent.mkdir(parents=True, exist_ok=True)
+        (root / css.DEFAULT_KNOWN_MISSING).write_bytes((REAL_ROOT / css.DEFAULT_KNOWN_MISSING).read_bytes())
+        for scope in self.manifest["e_scopes"].values():
+            for record in scope["verified_subscopes"]:
+                source = record.get("record_source")
+                if isinstance(source, str) and not css.in_local_evidence_store(source):
+                    try:
+                        css.safe_relative(source, "fixture record source")
+                    except css.CheckerError:
+                        continue
+                    _write(root / source)
         self.write_manifest(self.manifest)
     def write_manifest(self, manifest: dict, rel: str = "reports/support-scope.json") -> None:
         _write(self.root / rel, json.dumps(manifest, ensure_ascii=False, indent=2))
@@ -369,7 +381,7 @@ class RejectionTests(unittest.TestCase):
     def test_rejects_range_or_trace_chain_disconnect(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = _valid_manifest_dict()
-            manifest["trace_index_coverage"]["E16.6"]["ranges"].remove("V001–V120")
+            manifest["trace_index_coverage"]["E16.6"]["ranges"].remove("V001–V123")
             repo = FixtureRepo(Path(tmp), manifest)
             self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
         with tempfile.TemporaryDirectory() as tmp:
@@ -672,6 +684,8 @@ class PlanLineageTests(unittest.TestCase):
     V42_SHA = "70ec06e48a04ae6c3a1c90b877ed3089c2b4cb7a1a3fc38177e9fb8813c8e455"
 
     V43_SHA = "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7"
+    V44_SHA = "45ae29d71396f77dffc3baab7fed50564334734623bcec15f267778ddebeb496"
+    V45_SHA = "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164"
 
     def _errors(self, manifest: dict) -> list[str]:
         with tempfile.TemporaryDirectory() as tmp:
@@ -688,19 +702,25 @@ class PlanLineageTests(unittest.TestCase):
         return report
 
     def test_constants_bind_the_current_plan_and_register_the_lineage(self):
-        self.assertEqual(css.PLAN_VERSION, "v4.3")
-        self.assertEqual(css.PLAN_SHA256, self.V43_SHA)
-        self.assertEqual(list(css.PLAN_LINEAGE), ["v4.1", "v4.2", "v4.3"])
+        self.assertEqual(css.PLAN_VERSION, "v4.5")
+        self.assertEqual(css.PLAN_SHA256, self.V45_SHA)
+        self.assertEqual(list(css.PLAN_LINEAGE), ["v4.1", "v4.2", "v4.3", "v4.4", "v4.5"])
         self.assertEqual(css.PLAN_LINEAGE["v4.1"]["sha256"], self.V41_SHA)
         self.assertEqual(css.PLAN_LINEAGE["v4.2"]["sha256"], self.V42_SHA)
-        self.assertEqual(css.PLAN_LINEAGE["v4.3"]["sha256"], css.PLAN_SHA256)
-        self.assertEqual(css.PLAN_RECHECK_VALUES, {"not_affected", "required", "rechecked_v4.2", "rechecked_v4.3"})
+        self.assertEqual(css.PLAN_LINEAGE["v4.3"]["sha256"], self.V43_SHA)
+        self.assertEqual(css.PLAN_LINEAGE["v4.4"]["sha256"], self.V44_SHA)
+        self.assertEqual(css.PLAN_LINEAGE["v4.5"]["sha256"], css.PLAN_SHA256)
+        self.assertEqual(css.PLAN_RECHECKED, "rechecked_v4.5")
+        self.assertEqual(css.PLAN_RECHECK_VALUES, {"not_affected", "required", "rechecked_v4.2", "rechecked_v4.3", "rechecked_v4.4", "rechecked_v4.5"})
 
     def test_rejects_top_level_still_bound_to_v41(self):
         manifest = _valid_manifest_dict()
         manifest["plan_version"], manifest["plan_sha256"] = "v4.1", self.V41_SHA
         errors = self._errors(manifest)
-        self.assertIn("manifest top level is not bound to the current plan v4.3", errors[0])
+        self.assertIn("manifest top level is not bound to the current plan v4.5", errors[0])
+        manifest = _valid_manifest_dict()
+        manifest["plan_version"], manifest["plan_sha256"] = "v4.3", self.V43_SHA
+        self.assertIn("manifest top level is not bound to the current plan v4.5", self._errors(manifest)[0])
 
     def test_records_bound_to_either_lineage_pair_are_accepted(self):
         manifest = _valid_manifest_dict()
@@ -715,7 +735,7 @@ class PlanLineageTests(unittest.TestCase):
             ("v4.2 version paired with the v4.1 digest", {"plan_version": "v4.2"}, f"plan_sha256 '{self.V41_SHA}' is not the registered digest of plan v4.2"),
             ("v4.1 version paired with the v4.2 digest", {"plan_sha256": self.V42_SHA}, f"plan_sha256 '{self.V42_SHA}' is not the registered digest of plan v4.1"),
             ("digest outside the lineage", {"plan_sha256": "a" * 64}, f"plan_sha256 '{'a' * 64}' is not the registered digest of plan v4.1"),
-            ("unregistered version", {"plan_version": "v4.0"}, "plan_version 'v4.0' is outside the registered plan lineage ['v4.1', 'v4.2', 'v4.3']"),
+            ("unregistered version", {"plan_version": "v4.0"}, "plan_version 'v4.0' is outside the registered plan lineage ['v4.1', 'v4.2', 'v4.3', 'v4.4', 'v4.5']"),
         ]
         for name, patch, expected in cases:
             with self.subTest(case=name):
@@ -734,24 +754,27 @@ class PlanLineageTests(unittest.TestCase):
                 manifest = _valid_manifest_dict()
                 manifest["e_scopes"]["E01"]["verified_subscopes"][0]["plan_recheck"] = value
                 errors = self._errors(manifest)
-                self.assertIn("E01.controller_acceptance: plan_recheck must be one of ['not_affected', 'rechecked_v4.2', 'rechecked_v4.3', 'required']", errors[0])
+                self.assertIn("E01.controller_acceptance: plan_recheck must be one of ['not_affected', 'rechecked_v4.2', 'rechecked_v4.3', 'rechecked_v4.4', 'rechecked_v4.5', 'required']", errors[0])
 
     def test_touched_tasks_require_recheck_marker_but_untouched_records_may_omit_it(self):
         baseline = _valid_manifest_dict()
         for task in sorted(css.PLAN_RECHECK_TASKS):
             if not baseline["e_scopes"][task]["verified_subscopes"]:
                 continue
-            for marker in (None, "not_affected", "rechecked_v4.2"):
+            for marker in (None, "not_affected", "rechecked_v4.2", "rechecked_v4.3", "rechecked_v4.4"):
                 with self.subTest(task=task, marker=marker):
                     manifest = copy.deepcopy(baseline)
                     record = manifest["e_scopes"][task]["verified_subscopes"][0]
-                    self.assertEqual(record["plan_recheck"], "rechecked_v4.3")
+                    self.assertEqual(record["plan_recheck"], "rechecked_v4.5")
                     if marker is None:
                         del record["plan_recheck"]
                     else:
                         record["plan_recheck"] = marker
                     errors = self._errors(manifest)
-                    self.assertIn(f"{record['id']}: task {task} is touched by the v4.3 revision", errors[0])
+                    self.assertTrue(
+                        f"{record['id']}: task {task} is touched by the v4.5 revision" in errors[0] or "does not name a plan later" in errors[0],
+                        errors[0],
+                    )
         for task in ("E17", "E18"):
             manifest = copy.deepcopy(baseline)
             manifest["e_scopes"][task]["verified_subscopes"][0].pop("plan_recheck", None)
@@ -759,18 +782,20 @@ class PlanLineageTests(unittest.TestCase):
         # A new record actually verified against the current plan does not need a historical recheck.
         manifest = copy.deepcopy(baseline)
         record = manifest["e_scopes"]["E00"]["verified_subscopes"][0]
-        record.update({"plan_version": "v4.3", "plan_sha256": self.V43_SHA})
+        record.update({"plan_version": "v4.5", "plan_sha256": self.V45_SHA})
         record.pop("plan_recheck", None)
         self._assert_valid(manifest)
 
-    def test_recheck_tasks_match_all_v43_landing_tasks(self):
-        expected = {f"E{i:02}" for i in range(17)} | {f"E16.{i}" for i in range(1, 7)}
+    def test_recheck_tasks_are_the_literal_v45_landing_union(self):
+        # plan §19.6 (as corrected by v4.5) ∪ §19.7 (plan §18.11); "E16" is the parent key only (plan §18.10).
+        expected = {"E00", "E01", "E02", "E03", "E04", "E05", "E06", "E07", "E08", "E09", "E10", "E13", "E16", "E16.1", "E16.3", "E16.5", "E16.6"}
         self.assertEqual(css.PLAN_RECHECK_TASKS, expected)
+        self.assertTrue({"E11", "E12", "E14", "E15", "E16.2", "E16.4", "E17", "E18"}.isdisjoint(css.PLAN_RECHECK_TASKS))
 
     def test_v43_scenarios_are_complete_and_not_execution_credit(self):
         manifest = _valid_manifest_dict()
         mapping = css.expected_v_to_e()
-        self.assertEqual(set(mapping), {f"V{i:03}" for i in range(1, 121)})
+        self.assertEqual(set(mapping), {f"V{i:03}" for i in range(1, 124)})
         self.assertEqual(mapping["V107"], {"E02", "E16", "E16.4"})
         # Registering the new scenario family alone cannot confer execution credit.
         tampered = copy.deepcopy(manifest)
@@ -862,7 +887,7 @@ class HonestMachineFieldTests(unittest.TestCase):
     def test_real_manifest_declares_the_pinned_field_semantics(self):
         semantics = _valid_manifest_dict()["field_semantics"]
         self.assertEqual(semantics, css.FIELD_SEMANTICS)
-        self.assertEqual(set(semantics), {"command", "exit_code", "log_path", "execution", "production_consumer"})
+        self.assertEqual(set(semantics), {"command", "exit_code", "log_path", "execution", "production_consumer", "execution_runners", "supersedes", "completes", "note", "withdrawn_records", "evidence_missing_register"})
         self.assertEqual(semantics["command"], self.CARD_COMMAND)
         self.assertEqual(semantics["exit_code"], self.CARD_EXIT_CODE)
         self.assertEqual(semantics["log_path"], self.CARD_LOG_PATH)
@@ -978,7 +1003,7 @@ class HonestMachineFieldTests(unittest.TestCase):
             ("list", [], ": must be an object"),
             ("string", "ctrl_verify.sh", ": must be an object"),
             ("unknown key", {**base, "verdict": "pass"}, ": unknown key(s) ['verdict']"),
-            ("runner outside the set", _valid_execution(runner="manual"), ": runner must be one of ['codex_task', 'ctrl_verify.sh', 'other']"),
+            ("runner outside the set", _valid_execution(runner="manual"), ": runner must be one of ['codex_task', 'ctrl_verify.sh', 'ctrl_verify_v43.sh', 'ctrl_verify_v45.sh', 'other']"),
             ("runner null", _valid_execution(runner=None), ": runner must be one of"),
             ("runner unhashable", _valid_execution(runner=["ctrl_verify.sh"]), ": runner must be one of"),
             ("scope outside the set", _valid_execution(scope="all"), ": scope must be one of ['single_target', 'workspace']"),
@@ -1095,6 +1120,370 @@ class HonestMachineFieldTests(unittest.TestCase):
             for vid in scenarios:
                 with self.subTest(record=record_id, scenario=vid):
                     self.assertIn(record_id, self._v_refs(manifest, vid))
+
+class V45RebindTests(unittest.TestCase):
+    """AG-182 (plan §18.10 machine form and §18.11, v4.5 Q-50; §2.9/§16.8; §13.5): every new field and structure has a
+    rejection branch, and the missing-evidence register decides the three local outcomes."""
+
+    def _report(self, manifest: dict, evidence: dict[str, bytes] | None = None, *, store: bool = False, register: bytes | None = None, repo_files: dict[str, bytes] | None = None) -> css.CheckReport:
+        """evidence goes into a separate --evidence-root store (used only when store=True); repo_files into the checkout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp) / "checkout", manifest)
+            if register is not None:
+                (repo.root / css.DEFAULT_KNOWN_MISSING).write_bytes(register)
+            for base, files in ((Path(tmp) / "evidence-store", evidence), (repo.root, repo_files)):
+                base.mkdir(parents=True, exist_ok=True)
+                for rel, body in (files or {}).items():
+                    path = base / rel
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(body)
+            return css.run_check(repo.root, "reports/support-scope.json", None, None, (Path(tmp) / "evidence-store") if store else None)
+
+    def _errors(self, manifest: dict, **kwargs) -> list[str]:
+        report = self._report(manifest, **kwargs)
+        self.assertFalse(report.structure_valid, "manipulated manifest must be rejected")
+        return report.errors
+
+    def _valid(self, manifest: dict, **kwargs) -> css.CheckReport:
+        report = self._report(manifest, **kwargs)
+        self.assertTrue(report.structure_valid, report.errors)
+        return report
+
+    @staticmethod
+    def _record(manifest: dict, identifier: str) -> dict:
+        return next(r for scope in manifest["e_scopes"].values() for r in scope["verified_subscopes"] if r["id"] == identifier)
+
+    @staticmethod
+    def _withdrawn(manifest: dict, identifier: str) -> dict:
+        return next(entry for entry in manifest["withdrawn_records"] if entry["id"] == identifier)
+
+    @staticmethod
+    def _register() -> dict:
+        return json.loads((REAL_ROOT / css.DEFAULT_KNOWN_MISSING).read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _pin(manifest: dict, register: dict) -> bytes:
+        raw = (json.dumps(register, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        manifest["evidence_missing_register"]["sha256"] = hashlib.sha256(raw).hexdigest()
+        return raw
+
+    @staticmethod
+    def _complete_store(manifest: dict, register: dict) -> dict[str, bytes]:
+        """Every out/ evidence path that is not registered missing; unregistered inputs get fixture bytes and the
+        records naming them get the matching input_digest (registered inputs keep their pinned digest)."""
+        registered = {(entry["record_id"], entry["field"]) for entry in register["entries"]}
+        files: dict[str, bytes] = {}
+        for scope in manifest["e_scopes"].values():
+            for record in scope["verified_subscopes"]:
+                for field in css.EVIDENCE_PATH_FIELDS:
+                    rel = record[field]
+                    if not css.in_local_evidence_store(rel) or (record["id"], field) in registered:
+                        continue
+                    body = files.setdefault(rel, f"fixture evidence {rel}\n".encode())
+                    if field == "input_ref":
+                        record["input_digest"] = hashlib.sha256(body).hexdigest()
+        return files
+
+    def test_plan_recheck_markers_name_a_later_plan_and_union_records_carry_v45(self):
+        manifest = _valid_manifest_dict()
+        outside = self._record(manifest, "E11.controller_acceptance")
+        self.assertEqual(outside["plan_recheck"], "rechecked_v4.3", "records outside the union keep their historical marker")
+        outside["plan_recheck"] = "rechecked_v4.4"
+        self._valid(manifest)
+        for marker in ("rechecked_v4.2", "rechecked_v4.3"):
+            with self.subTest(marker=marker):
+                manifest = _valid_manifest_dict()
+                record = self._record(manifest, "E16.4.ag126_v43_host_surface_record")
+                record["plan_recheck"] = marker
+                self.assertIn("does not name a plan later than the record's own plan_version 'v4.3'", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        record = self._record(manifest, "E09.ag039_legal_actions")
+        record["plan_recheck"] = "rechecked_v4.3"  # probe e
+        self.assertIn("E09.ag039_legal_actions: task E09 is touched by the v4.5 revision", self._errors(manifest)[0])
+        for value in ([], {}):
+            with self.subTest(value=value):
+                manifest = _valid_manifest_dict()
+                self._record(manifest, "E09.ag039_legal_actions")["plan_recheck"] = value
+                self.assertIn("plan_recheck must be one of", self._errors(manifest)[0])
+
+    def test_withdrawn_records_are_the_reviewed_list_and_ids_never_revive(self):
+        manifest = _valid_manifest_dict()
+        self.assertEqual({entry["id"] for entry in manifest["withdrawn_records"]}, css.EXPECTED_WITHDRAWN_IDS)
+        self.assertEqual(len(manifest["withdrawn_records"]), 24)
+        revived = copy.deepcopy(manifest["e_scopes"]["E09"]["verified_subscopes"][0])
+        revived.update({"id": "E09.ag033_run_next_trusted_gate", "log_path": "out/fixture/revived.log"})
+        manifest["e_scopes"]["E09"]["verified_subscopes"].append(revived)  # probe a
+        self.assertIn("E09.ag033_run_next_trusted_gate: withdrawn record reappears in verified_subscopes", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        revived = copy.deepcopy(manifest["e_scopes"]["E09"]["verified_subscopes"][0])
+        revived["id"] = "E09.ag033_run_next_trusted_gate"  # the controller probe keeps the cloned log_path
+        manifest["e_scopes"]["E09"]["verified_subscopes"].append(revived)
+        self.assertIn("withdrawn record reappears in verified_subscopes", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        manifest["withdrawn_records"] = [entry for entry in manifest["withdrawn_records"] if entry["id"] != "E05.ag080_local_scoped_acceptance"]
+        self.assertIn("missing=['E05.ag080_local_scoped_acceptance']", self._errors(manifest)[0])
+        cases = [
+            ("status", "withdrawn", "withdrawn status must be one of"),
+            ("status", None, "withdrawn status must be one of"),
+            ("owner_task", "AG187", "owner_task must be a registered task number"),
+            ("clause", "3.4", "clause must cite the plan section"),
+            ("withdrawn_in_pr", "#165", "withdrawn_in_pr must be a pull request URL"),
+            ("withdrawn_in_pr", "https://github.com/acosmi/RSIAgent/pull/999", "no reviewed merge status"),
+        ]
+        for field, value, expected in cases:
+            with self.subTest(field=field, value=value):
+                manifest = _valid_manifest_dict()
+                self._withdrawn(manifest, "E05.ag052_versioned_batch_verdicts")[field] = value
+                self.assertIn(expected, self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        self._withdrawn(manifest, "E05.ag052_versioned_batch_verdicts")["verdict"] = "improved"
+        self.assertIn("unknown key(s) ['verdict']", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        del self._withdrawn(manifest, "E05.ag052_versioned_batch_verdicts")["owner_task"]
+        self.assertIn("missing key(s) ['owner_task']", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        manifest["withdrawn_records"].append(copy.deepcopy(manifest["withdrawn_records"][0]))
+        self.assertIn("duplicate id", self._errors(manifest)[0])
+
+    def _with_reverification(self) -> tuple[dict, dict]:
+        manifest = _valid_manifest_dict()
+        self._withdrawn(manifest, "E05.ag101_streaming_verdicts_v42")["status"] = "superseded"
+        record = _fresh_record(manifest["e_scopes"]["E05"]["verified_subscopes"][0], "E05", "fixture_reverification", "e05-reverification")
+        record["supersedes"] = ["E05.ag101_streaming_verdicts_v42"]
+        manifest["e_scopes"]["E05"]["verified_subscopes"].append(record)
+        return manifest, record
+
+    def test_supersedes_points_at_a_superseded_withdrawn_record_of_the_same_task(self):
+        manifest, _ = self._with_reverification()
+        self._valid(manifest)
+        cases = [
+            ("E99.does_not_exist", "which is not a withdrawn record"),  # probe b
+            ("E05.controller_acceptance", "which is not a withdrawn record"),
+            ("E05.ag052_versioned_batch_verdicts", "its withdrawn status is 'pending_recheck', not 'superseded'"),
+            ("E04.ag054_typed_predispatch", "its withdrawn status is 'pending_recheck'"),
+        ]
+        for target, expected in cases:
+            with self.subTest(target=target):
+                manifest, record = self._with_reverification()
+                record["supersedes"] = [target]
+                self.assertIn(expected, self._errors(manifest)[0])
+        manifest, record = self._with_reverification()
+        self._withdrawn(manifest, "E04.ag054_typed_predispatch")["status"] = "superseded"
+        record["supersedes"] = ["E04.ag054_typed_predispatch"]
+        self.assertIn("the re-verification belongs to the withdrawn record's own E task", self._errors(manifest)[0])
+        manifest, record = self._with_reverification()
+        record["supersedes"] = []
+        self.assertIn("E05.ag101_streaming_verdicts_v42: withdrawn status is 'superseded' but no verified record supersedes it", self._errors(manifest)[0])
+
+    def test_completes_points_at_a_current_valid_record_and_relation_fields_are_shaped(self):
+        manifest = _valid_manifest_dict()
+        record = self._record(manifest, "E01.controller_acceptance")
+        record["completes"] = ["E01.ag057_explicit_sample_registration"]
+        record["note"] = "completion fixture"
+        self._valid(manifest)
+        cases = [
+            ("completes", ["E09.ag033_run_next_trusted_gate"], "completes the withdrawn record"),
+            ("completes", ["E01.not_a_record"], "which is not a current verified record"),
+            ("completes", ["E01.controller_acceptance"], "names the record itself"),
+            ("completes", "E01.ag057_explicit_sample_registration", "must be an array of evidence record ids"),
+            ("completes", ["bad id"], "must be an array of evidence record ids"),
+            ("completes", ["E01.ag057_explicit_sample_registration"] * 2, "lists an id twice"),
+            ("supersedes", ["E01.controller_acceptance"], "names the record itself"),
+            ("note", "", "note: must be a non-empty string"),
+            ("note", ["x"], "note: must be a non-empty string"),
+        ]
+        for field, value, expected in cases:
+            with self.subTest(field=field, value=value):
+                manifest = _valid_manifest_dict()
+                self._record(manifest, "E01.controller_acceptance")[field] = value
+                self.assertIn(expected, self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        record = self._record(manifest, "E01.controller_acceptance")
+        record["completes"] = record["supersedes"] = ["E01.ag057_explicit_sample_registration"]
+        self.assertIn("both superseded and completed", self._errors(manifest)[0])
+
+    def test_missing_evidence_outside_the_register_fails_when_the_store_is_checked(self):
+        register = self._register()
+        self.assertEqual(len(register["entries"]), 42)
+        # Complete store: every unregistered path present, registered paths absent -> valid and all 42 reported.
+        manifest = _valid_manifest_dict()
+        store = self._complete_store(manifest, register)
+        report = self._valid(manifest, evidence=store, store=True)
+        self.assertTrue(report.evidence_store_checked)
+        self.assertEqual(len(report.evidence_missing), 42)
+        self.assertIn("E00.controller_acceptance log_path out/implementation-v4.1-20260919/controller-e00-directed-test.log", report.evidence_missing)
+        # One unregistered path removed from the store -> failure naming it.
+        victim = next(rel for rel in sorted(store) if "/inputs/" not in rel)
+        errors = self._errors(manifest, evidence={rel: body for rel, body in store.items() if rel != victim}, store=True)
+        self.assertIn(f"{victim!r} is missing locally and is not listed in the missing-evidence register", errors[0])
+        # Without --evidence-root the same absences are reported, not judged.
+        report = self._valid(_valid_manifest_dict())
+        self.assertFalse(report.evidence_store_checked)
+        self.assertTrue(any("local evidence store not supplied (--evidence-root)" in item for item in report.needs_verification))
+        self.assertEqual(len(report.evidence_missing), 42)
+        # A tracked (non out/) evidence path is always checked.
+        manifest = _valid_manifest_dict()
+        self._record(manifest, "E01.ag057_explicit_sample_registration")["record_source"] = "docs/never_written.md"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            (repo.root / "docs/never_written.md").unlink()
+            report = css.run_check(repo.root, "reports/support-scope.json", None)
+        self.assertFalse(report.structure_valid)
+        self.assertIn("E01.ag057_explicit_sample_registration: record_source 'docs/never_written.md' is missing locally and is not listed in the missing-evidence register", report.errors[0])
+
+    def test_registered_missing_paths_are_listed_and_reappearance_is_checked(self):
+        register = self._register()
+        unknown = next(entry for entry in register["entries"] if entry["expected_sha256"] == "unknown")
+        self.assertTrue(unknown["unknown_reason"])
+        for files, kwargs in (({unknown["path"]: b"recovered elsewhere\n"}, {"repo_files": {unknown["path"]: b"recovered elsewhere\n"}}),):
+            errors = self._errors(_valid_manifest_dict(), **kwargs)
+            self.assertIn("is registered missing with unknown identity and has reappeared", errors[0])
+        # The same reappearance inside a supplied evidence store fails as well.
+        manifest = _valid_manifest_dict()
+        store = self._complete_store(manifest, register)
+        store[unknown["path"]] = b"recovered elsewhere\n"
+        self.assertIn("unknown identity", self._errors(manifest, evidence=store, store=True)[0])
+        known = next(entry for entry in register["entries"] if entry["expected_sha256"] != "unknown" and entry["field"] == "log_path")
+        errors = self._errors(_valid_manifest_dict(), repo_files={known["path"]: b"different bytes\n"})
+        self.assertIn("has reappeared with bytes or SHA-256 that differ from the register", errors[0])
+        # A path reappearing with exactly the registered identity passes and is flagged for removal.
+        body = b"exactly the registered bytes\n"
+        manifest = _valid_manifest_dict()
+        changed = copy.deepcopy(register)
+        for entry in changed["entries"]:
+            if entry["path"] == known["path"]:
+                entry["expected_sha256"], entry["expected_bytes"] = hashlib.sha256(body).hexdigest(), len(body)
+        raw = self._pin(manifest, changed)
+        report = self._valid(manifest, repo_files={known["path"]: body}, register=raw)
+        self.assertTrue(any("has reappeared with its registered identity" in item for item in report.needs_verification))
+        self.assertNotIn(f"{known['record_id']} log_path {known['path']}", report.evidence_missing)
+        self.assertEqual(len(report.evidence_missing), 41)
+
+    def test_register_is_pinned_and_names_real_record_fields(self):
+        manifest = _valid_manifest_dict()
+        register = self._register()
+        dropped = copy.deepcopy(register)
+        dropped["entries"].pop(0)  # probe c
+        raw = (json.dumps(dropped, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        self.assertIn("SHA-256 differs from evidence_missing_register.sha256", self._errors(manifest, register=raw)[0])
+        mutations = [
+            ("unknown record", lambda r: r["entries"][0].__setitem__("record_id", "E01.nothing"), "is not a current verified record"),
+            ("wrong path", lambda r: r["entries"][0].__setitem__("path", "out/fixture/other.log"), "not the registered path"),
+            ("bad field", lambda r: r["entries"][0].__setitem__("field", "scope"), "field must be one of"),
+            ("duplicate", lambda r: r["entries"].append(copy.deepcopy(r["entries"][0])), "is registered twice"),
+            ("unknown without reason", lambda r: next(e for e in r["entries"] if e["expected_sha256"] == "unknown").pop("unknown_reason"), "unknown_reason: must be a non-empty string"),
+            ("reason with a known identity", lambda r: next(e for e in r["entries"] if _identity_known(e)).__setitem__("unknown_reason", "x"), "unknown_reason is only allowed"),
+            ("bad window", lambda r: r["entries"][0].__setitem__("missing_window", {"after": "yesterday", "before": "unknown"}), "missing_window.after must be"),
+            ("bool bytes", lambda r: r["entries"][0].__setitem__("expected_bytes", True), "expected_bytes must be a non-negative integer"),
+            ("input digest", lambda r: next(e for e in r["entries"] if e["field"] == "input_ref" and e["expected_sha256"] != "unknown").__setitem__("expected_sha256", "0" * 64), "must equal the record's input_digest"),
+            ("schema", lambda r: r.__setitem__("schema_version", "rsia.evidence_missing.v0"), "schema_version must be"),
+            ("extra key", lambda r: r["entries"][0].__setitem__("restored", True), "unknown key(s) ['restored']"),
+        ]
+        for label, mutate, expected in mutations:
+            with self.subTest(case=label):
+                manifest = _valid_manifest_dict()
+                changed = copy.deepcopy(register)
+                mutate(changed)
+                raw = self._pin(manifest, changed)
+                self.assertIn(expected, self._errors(manifest, register=raw)[0])
+        manifest = _valid_manifest_dict()
+        manifest["evidence_missing_register"]["path"] = "reports/other.json"
+        self.assertIn("differs from the register in use", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        del manifest["evidence_missing_register"]
+        self.assertIn("evidence_missing_register", self._errors(manifest)[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp))
+            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--known-missing", "reports/other.json"])
+        self.assertEqual(code, 1)
+        self.assertIn("differs from the register in use", payload["errors"][0])
+
+    def test_harness2_borrowings_and_sources_follow_the_plan_tables(self):
+        manifest = _valid_manifest_dict()
+        self.assertEqual([entry["id"] for entry in manifest["traceability"]["hsf_sources"]], [f"HSF{i:02}" for i in range(1, 17)] + ["HSP01"])
+        self.assertEqual([entry["id"] for entry in manifest["traceability"]["hs_borrowings"]], [f"HS{i:02}" for i in range(1, 9)])
+        hsf_cases = [
+            (0, "commit", "a" * 40), (0, "tree", "b" * 40), (3, "blob_sha", "c" * 40), (3, "path", "harness2/core/other.py"),
+            (1, "license", "MIT"), (1, "repository", "https://github.com/google/harness2"), (2, "read_range", "全文"),
+            (16, "blob_sha", "d" * 40), (16, "license", "Apache-2.0"),
+        ]
+        for index, field, value in hsf_cases:
+            with self.subTest(hsf=index, field=field):
+                manifest = _valid_manifest_dict()
+                manifest["traceability"]["hsf_sources"][index][field] = value
+                self.assertIn("fixed Harness² source pin differs from plan §16.8", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        manifest["traceability"]["hsf_sources"][2]["e_tasks"] = ["E00"]
+        self.assertIn("E mapping differs", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        manifest["traceability"]["hsf_sources"].pop()
+        self.assertIn("hsf_sources must be exactly HSF01–HSF16 and HSP01", self._errors(manifest)[0])
+        hs_cases = [
+            (0, "section", "§6.7.5", "borrowing trace chain differs"), (0, "hsf_refs", ["HSF04"], "borrowing trace chain differs"),
+            (2, "e_tasks", ["E09"], "borrowing trace chain differs"), (6, "v_scenarios", ["V052"], "borrowing trace chain differs"),
+            (4, "adoption", "adopted", "borrowing trace chain differs"),
+            (4, "implementation_status", "planned", "registered-only borrowing is not implemented"),
+            (0, "verification_status", "verified", "incompatible verification"),
+            (0, "effect_status", "improved", "specification/effect axes differ"),
+            (0, "remaining", "", "remaining: must be a non-empty string"),
+            (0, "related_evidence_refs", ["E01.controller_acceptance"], "outside the mapped E scope"),
+            (0, "benefit", "improved", "unknown key(s) ['benefit']"),
+        ]
+        for index, field, value, expected in hs_cases:
+            with self.subTest(hs=index, field=field):
+                manifest = _valid_manifest_dict()
+                manifest["traceability"]["hs_borrowings"][index][field] = value
+                self.assertIn(expected, self._errors(manifest)[0])
+
+    def test_v121_to_v123_v048_and_v081_follow_the_v45_responsibility(self):
+        mapping = css.expected_v_to_e()
+        self.assertEqual(mapping["V121"], {"E03", "E07", "E09", "E13", "E16"})
+        self.assertEqual(mapping["V122"], {"E01", "E07", "E09", "E16"})
+        self.assertEqual(mapping["V123"], {"E00", "E16", "E16.5", "E16.6"})
+        self.assertEqual(mapping["V048"], {"E02", "E05"})
+        self.assertNotIn("E06", mapping["V081"], "E06 only touches V081 (v4.5 Q-49)")
+        for vid, task in (("V121", "E13"), ("V122", "E01"), ("V123", "E16.5"), ("V048", "E05")):
+            with self.subTest(scenario=vid):
+                manifest = _valid_manifest_dict()
+                entry = next(entry for entry in manifest["traceability"]["v_scenarios"] if entry["id"] == vid)
+                entry["e_tasks"].remove(task)  # probe d for V121/E13
+                self.assertIn(f"{vid}: E responsibility differs", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        manifest["e_scopes"]["E06"]["scenarios"].append("V081")
+        self.assertIn("E06: scenario execution responsibility differs", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        for vid in ("V121", "V122", "V123"):
+            entry = next(entry for entry in manifest["traceability"]["v_scenarios"] if entry["id"] == vid)
+            self.assertEqual((entry["status"], entry["verification_status"], entry["related_evidence_refs"]), ("planned", "planned", []))
+
+    def test_stage8_gate_scripts_are_registered_runners_and_coverage_spans_v123(self):
+        for runner in ("ctrl_verify_v43.sh", "ctrl_verify_v45.sh"):
+            css.validate_execution({"execution": _valid_execution(runner=runner)}, "E13.runner_fixture", 200)
+        for runner in ("ctrl_verify_v44.sh", "codex-r7-ctrl_verify.sh"):
+            with self.subTest(runner=runner), self.assertRaises(css.CheckerError):
+                css.validate_execution({"execution": _valid_execution(runner=runner)}, "E13.runner_fixture", 200)
+        for task, rng in (("E16.6", "HSP01"), ("E16.6", "HS01–HS08"), ("E00", "V087–V123"), ("E00", "HSF01–HSF16")):
+            with self.subTest(task=task, range=rng):
+                manifest = _valid_manifest_dict()
+                manifest["trace_index_coverage"][task]["ranges"].remove(rng)
+                self.assertIn(f"{task} trace index responsibility differs", self._errors(manifest)[0])
+
+    def test_cli_options_for_the_missing_register_and_evidence_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp))
+            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--evidence-root", str(Path(tmp) / "absent")])
+            self.assertEqual(code, 1)
+            self.assertIn("evidence root does not exist", payload["errors"][0])
+            for extra in (["--known-missing", "reports/evidence-missing.json"], ["--evidence-root", tmp]):
+                for mode in ("--workspace-packages-only", "--project-license-metadata-only"):
+                    with self.subTest(mode=mode, extra=extra), self.assertRaises(SystemExit) as caught:
+                        css.main(["--repo-root", str(repo.root), mode] + extra)
+                    self.assertEqual(caught.exception.code, 2)
+
+
+def _identity_known(entry: dict) -> bool:
+    return entry["expected_sha256"] != "unknown" and entry["expected_bytes"] != "unknown"
+
 
 class PathSafetyTests(unittest.TestCase):
     def test_rejects_dot_dot_path_escape(self):
@@ -1293,6 +1682,7 @@ class RealRepositoryTests(unittest.TestCase):
         self.assertFalse(payload["plan_binding_available"])
         self.assertFalse(payload["input_binding_available"])
         self.assertEqual((payload["plan_version"], payload["plan_sha256"]), (css.PLAN_VERSION, css.PLAN_SHA256))
+        self.assertFalse(payload["evidence_store_checked"])
 
 
 class IndexOwnershipAndMergeFactsTests(unittest.TestCase):
@@ -1303,9 +1693,10 @@ class IndexOwnershipAndMergeFactsTests(unittest.TestCase):
 
     def test_runtime_reads_the_single_reviewed_rust_table(self):
         facts = css.reviewed_merge_facts(REAL_ROOT)
-        self.assertEqual(len(facts), 118)
+        self.assertEqual(len(facts), 132)
+        self.assertIsNone(facts[200])  # the AG-182 rebind PR itself, unmerged when its records were registered
         records = [record for scope in _valid_manifest_dict()["e_scopes"].values() for record in scope["verified_subscopes"]]
-        self.assertEqual(len(records), 98)
+        self.assertEqual(len(records), 105)
         for record in records:
             self.assertEqual(record["merged_sha"], facts[int(record["pr"].rsplit("/", 1)[1])])
             self.assertNotEqual(record["source_sha"], record["merged_sha"])

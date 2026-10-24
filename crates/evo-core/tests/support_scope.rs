@@ -1,17 +1,19 @@
-//! Strict derived support-scope verification for E16.6 (V071/V072/V074/V080/V098).
-//! The current plan (lineage v4.1→v4.2→v4.3, plan §18.9) remains normative; this test rejects
-//! incomplete or inflated indexes. Historical evidence records keep the lineage digest they
-//! were verified against; only the top level must bind the current plan.
+//! Strict derived support-scope verification for E16.6 (V071/V072/V074/V080/V098/V123).
+//! The current plan (lineage v4.1→v4.2→v4.3→v4.4→v4.5, plan §18.9–§18.11) remains normative; this
+//! test rejects incomplete or inflated indexes. Historical evidence records keep the lineage digest
+//! they were verified against; only the top level must bind the current plan. The v4.5 machine form
+//! of plan §18.10 (Q-50) adds plan_recheck values, supersedes/completes, withdrawn_records and the
+//! missing-evidence register; plan §2.9/§16.8 add the Harness² borrowings and fixed sources.
 
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-const PLAN_VERSION: &str = "v4.3";
-const PLAN_SHA: &str = "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7";
-/// Registered plan lineage (plan §18.9) as (version, file, sha256), oldest first; the last
-/// entry is the current binding.
+const PLAN_VERSION: &str = "v4.5";
+const PLAN_SHA: &str = "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164";
+/// Registered plan lineage (plan §18.9–§18.11) as (version, file, sha256), oldest first; the last
+/// entry is the current binding. v4.4 was never bound on its own; the v4.5 rebind registers it.
 const PLAN_LINEAGE: &[(&str, &str, &str)] = &[
     (
         "v4.1",
@@ -28,15 +30,206 @@ const PLAN_LINEAGE: &[(&str, &str, &str)] = &[
         "RSIAgent-v4.3定稿-工程实施方案-2026-10-12.md",
         "73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7",
     ),
+    (
+        "v4.4",
+        "RSIAgent-v4.4定稿-工程实施方案-2026-10-23.md",
+        "45ae29d71396f77dffc3baab7fed50564334734623bcec15f267778ddebeb496",
+    ),
+    (
+        "v4.5",
+        "RSIAgent-v4.5定稿-工程实施方案-2026-10-24.md",
+        "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+    ),
 ];
-/// Optional per-record recheck marker; a missing key means not_affected and "required" never passes.
-const PLAN_RECHECKED: &str = "rechecked_v4.3";
-const PLAN_RECHECK_VALUES: &[&str] =
-    &["not_affected", "required", "rechecked_v4.2", PLAN_RECHECKED];
-/// Exact E-task union of v4.3 plan §19.5 landing points, regardless of behavior changes.
+/// Optional per-record recheck marker (plan §18.10, v4.5 Q-50); a missing key means not_affected,
+/// "required" never passes and rechecked_<version> must name a plan later than the record's own.
+const PLAN_RECHECKED: &str = "rechecked_v4.5";
+const PLAN_RECHECK_VALUES: &[&str] = &[
+    "not_affected",
+    "required",
+    "rechecked_v4.2",
+    "rechecked_v4.3",
+    "rechecked_v4.4",
+    PLAN_RECHECKED,
+];
+/// Exact E-task union of the landing points of plan §19.6 (as corrected by v4.5) and §19.7
+/// (plan §18.11); keys match literally, so "E16" is the parent key only (plan §18.10, Q-50).
 const PLAN_RECHECK_TASKS: &[&str] = &[
-    "E00", "E01", "E02", "E03", "E04", "E05", "E06", "E07", "E08", "E09", "E10", "E11", "E12",
-    "E13", "E14", "E15", "E16", "E16.1", "E16.2", "E16.3", "E16.4", "E16.5", "E16.6",
+    "E00", "E01", "E02", "E03", "E04", "E05", "E06", "E07", "E08", "E09", "E10", "E13", "E16",
+    "E16.1", "E16.3", "E16.5", "E16.6",
+];
+/// V001–V123 (plan §13; v4.5 adds no V number).
+const V_SCENARIO_COUNT: usize = 123;
+/// Reviewed pending-recheck list (plan §18.10): 19 records withdrawn by PR #165/#169 and the five
+/// withdrawn by the v4.5 rebind. Dropping an entry fails; a listed id never returns to
+/// verified_subscopes.
+const EXPECTED_WITHDRAWN_IDS: &[&str] = &[
+    "E10.controller_acceptance",
+    "E10.replay_management_controller_acceptance",
+    "E10.ag064_replay_episode_recovery",
+    "E10.ag103_replay_fairness_waits_legal_set_v42",
+    "E08.ag037_economic_replay_cleanup",
+    "E09.ag074_local_scoped_acceptance",
+    "E16.6.ag012_plan_v42_index_binding",
+    "E04.ag097_broker_close_before_refuse",
+    "E04.ag105_broker_bound_recovery_close_v42",
+    "E08.ag046_write_side_revocation",
+    "E08.ag059_manifest_prewrite_gate",
+    "E04.ag054_typed_predispatch",
+    "E06.controller_acceptance",
+    "E13.controller_acceptance",
+    "E16.4.real_store_rejection_controller_acceptance",
+    "E09.ag042_recovery_counting",
+    "E13.ag028_consolidation_trigger",
+    "E16.1.durable_import_controller_acceptance",
+    "E02.ag062_required_improver_baselines",
+    "E09.ag033_run_next_trusted_gate",
+    "E16.6.ag131_v43_project_license_metadata",
+    "E05.ag052_versioned_batch_verdicts",
+    "E05.ag080_local_scoped_acceptance",
+    "E05.ag101_streaming_verdicts_v42",
+];
+const WITHDRAWN_KEYS: &[&str] = &["clause", "id", "owner_task", "status", "withdrawn_in_pr"];
+const WITHDRAWN_STATUSES: &[&str] = &["pending_recheck", "superseded", "replaced_by_binding"];
+/// Missing-evidence register (plan §18.10 "本地缺失的证据路径", v4.5 Q-50).
+const MISSING_REGISTER_PATH: &str = "reports/evidence-missing.json";
+const MISSING_SCHEMA_VERSION: &str = "rsia.evidence_missing.v1";
+const EVIDENCE_PATH_FIELDS: &[&str] = &["input_ref", "log_path", "record_source"];
+/// The untracked local evidence store of the primary checkout (.gitignore /out/); a clone or
+/// worktree does not carry it, so only paths outside it must exist in the checkout.
+const LOCAL_EVIDENCE_STORE: &str = "out";
+/// Harness² fixed sources (plan §16.8).
+const HARNESS2_REPO: &str = "https://github.com/google-research/harness2";
+const HARNESS2_COMMIT: &str = "1cfe254e8d25b15f37048c3730134686abe60335";
+const HARNESS2_TREE: &str = "edc756a4d03a2826a248115482084a176e60e751";
+const HSP01_PATH: &str = "arXiv:2610.14224v1，Section 2.2.1与Appendix F";
+const EXPECTED_HSF: &[(&str, &str, &str)] = &[
+    (
+        "HSF01",
+        "README.md",
+        "a5e91206948cd3d5bbed30c2a951923020e780d2",
+    ),
+    (
+        "HSF02",
+        "LICENSE",
+        "d645695673349e3947e8e5ae42332d0ac3164cd7",
+    ),
+    (
+        "HSF03",
+        "docs/EXPERIMENTS.md",
+        "bd52e1506037d172a03c128427881d5342bbace7",
+    ),
+    (
+        "HSF04",
+        "harness2/core/recursion.py",
+        "dda6b98cd5af100b8941f33cbb079462299c5280",
+    ),
+    (
+        "HSF05",
+        "harness2/core/selection.py",
+        "2cf04f50e35fd82d7abaea279a83b4a7eb4c2193",
+    ),
+    (
+        "HSF06",
+        "harness2/core/prompts.py",
+        "9ccacf23b64ac15b06a1939f26224960f56d757c",
+    ),
+    (
+        "HSF07",
+        "harness2/core/library.py",
+        "39e50684b4044e483a3c16a447958044d4b5e6de",
+    ),
+    (
+        "HSF08",
+        "harness2/core/context.py",
+        "72f2868b06c13e30c031cb91c0f04dcd80293ec9",
+    ),
+    (
+        "HSF09",
+        "harness2/core/schedule.py",
+        "f91f450b1d01011982069f4b41e6e3a77abcc9cc",
+    ),
+    (
+        "HSF10",
+        "harness2/substrate/opencode.py",
+        "ad0a2ea4d59bda362838c76912e43b6f7c333254",
+    ),
+    (
+        "HSF11",
+        "harness2/core/report.py",
+        "b7ecf6e42a1061218b0eb8cde9c441c136e28e72",
+    ),
+    (
+        "HSF12",
+        "harness2/core/ledger.py",
+        "319a6697758d05294dab9f42e8f8700759d7e6f6",
+    ),
+    (
+        "HSF13",
+        "harness2/core/tree.py",
+        "c9bf1341226aac448f6ec82038cb6d3896799412",
+    ),
+    (
+        "HSF14",
+        "harness2/core/proposer.py",
+        "4a235075cae72059fa701001f31bf4505cbbc3ba",
+    ),
+    (
+        "HSF15",
+        "harness2/demo.py",
+        "487de02d44941754d955ad8a4b0a9e0e6f841db5",
+    ),
+    (
+        "HSF16",
+        "harness2/cli/run_sweep.py",
+        "0876f4e68f3b92a4cf9d6838223c00e2ef960d27",
+    ),
+];
+/// Harness² borrowings (plan §2.9): (id, section, hsf_refs, e_tasks, v_scenarios, adoption).
+const EXPECTED_HS: &[(&str, &str, &str, &str, &str, &str)] = &[
+    (
+        "HS01",
+        "§3.1.1/§6.7.5",
+        "HSF04 HSF05",
+        "E07 E09",
+        "V122",
+        "adopted",
+    ),
+    ("HS02", "§6.7.2/§6.7.5", "HSF06", "E09", "V122", "adopted"),
+    (
+        "HS03",
+        "§3.6/§6.7.5",
+        "HSF05",
+        "E09 E13",
+        "V091 V122",
+        "adopted",
+    ),
+    (
+        "HS04",
+        "§5.8/§11.5",
+        "HSF07 HSF09",
+        "E03 E09",
+        "V090",
+        "adopted",
+    ),
+    ("HS05", "§6.7.3", "HSF05", "E09", "V122", "registered_only"),
+    (
+        "HS06",
+        "§3.2/§6.3",
+        "HSF08",
+        "E03 E05",
+        "V090",
+        "registered_only",
+    ),
+    ("HS07", "§6.3", "HSF10", "E03 E16.1", "V052 V088", "adopted"),
+    (
+        "HS08",
+        "§3.5/§3.6",
+        "HSF11 HSF12",
+        "E04 E07",
+        "V096",
+        "adopted",
+    ),
 ];
 const SKILLOPT_REPO: &str = "https://github.com/microsoft/SkillOpt.git";
 const SKILLOPT_COMMIT: &str = "79124b37e9a6371e13b753f8bcd7adb1e493ade1";
@@ -52,7 +245,13 @@ const ALLOWED_STATUSES: &[&str] = &[
 /// `execution`; earlier records may omit it and are not backfilled or guessed.
 const EXECUTION_REQUIRED_ABOVE_PR: u64 = 141;
 const EXECUTION_KEYS: &[&str] = &["command", "evidence", "exit_code", "runner", "scope"];
-const EXECUTION_RUNNERS: &[&str] = &["ctrl_verify.sh", "codex_task", "other"];
+const EXECUTION_RUNNERS: &[&str] = &[
+    "ctrl_verify.sh",
+    "ctrl_verify_v43.sh",
+    "ctrl_verify_v45.sh",
+    "codex_task",
+    "other",
+];
 const EXECUTION_SCOPES: &[&str] = &["workspace", "single_target"];
 /// `execution.command` must be what was run, not the declared single-target command copied again.
 const DECLARED_COMMAND_PREFIX: &str = "cargo test --locked --offline";
@@ -214,29 +413,29 @@ fn validate_project_license(value: &Value, root: &Path) -> Result<(), String> {
 
 fn expected_e_scenarios() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
     [
-        ("E00", "V001 V071 V072 V073 V080 V098 V113 V116"),
-        ("E01", "V010 V011 V012 V013 V084 V085 V096 V097 V103 V114 V118"),
+        ("E00", "V001 V071 V072 V073 V080 V098 V113 V116 V123"),
+        ("E01", "V010 V011 V012 V013 V084 V085 V096 V097 V103 V114 V118 V122"),
         ("E02", "V002 V003 V005 V009 V043 V044 V045 V046 V047 V048 V060 V062 V078 V079 V081 V082 V083 V084 V085 V086 V087 V088 V089 V090 V091 V092 V093 V094 V095 V096 V100 V101 V107 V108 V109 V120"),
-        ("E03", "V004 V005 V006 V017 V051 V052 V054 V055 V056 V057 V058 V087 V088 V089 V090 V094 V096 V106 V108"),
+        ("E03", "V004 V005 V006 V017 V051 V052 V054 V055 V056 V057 V058 V087 V088 V089 V090 V094 V096 V106 V108 V121"),
         ("E04", "V007 V008 V009 V038 V083 V085 V086 V087 V093 V094 V096 V101 V103 V106 V110 V111 V112"),
-        ("E05", "V010 V011 V012 V013 V028 V084 V085 V090 V091 V094 V097 V101 V104 V114"),
-        ("E06", "V014 V015 V016 V017 V047 V049 V050 V059 V064 V070 V075 V077 V078 V081 V084 V085 V089 V091 V094 V095 V096 V100 V108 V119"),
-        ("E07", "V003 V010 V014 V015 V016 V042 V047 V059 V070 V077 V087 V088 V089 V091 V096 V097 V112 V114"),
+        ("E05", "V010 V011 V012 V013 V028 V048 V084 V085 V090 V091 V094 V097 V101 V104 V114"),
+        ("E06", "V014 V015 V016 V017 V047 V049 V050 V059 V064 V070 V075 V077 V078 V084 V085 V089 V091 V094 V095 V096 V100 V108 V119"),
+        ("E07", "V003 V010 V014 V015 V016 V042 V047 V059 V070 V077 V087 V088 V089 V091 V096 V097 V112 V114 V121 V122"),
         ("E08", "V017 V018 V038 V056 V069 V075 V081 V082 V083 V084 V085 V086 V090 V092 V094 V096 V099 V100 V102 V110 V111"),
-        ("E09", "V019 V020 V022 V024 V025 V081 V086 V088 V089 V090 V091 V093 V094 V095 V096 V097 V100 V105 V106"),
+        ("E09", "V019 V020 V022 V024 V025 V081 V086 V088 V089 V090 V091 V093 V094 V095 V096 V097 V100 V105 V106 V121 V122"),
         ("E10", "V020 V021 V022 V023 V025 V026 V027 V081 V086 V094 V096 V104 V105 V106"),
         ("E11", "V022 V026 V027 V028 V042 V081 V094 V096 V097 V104 V118"),
         ("E12", "V029 V030 V031 V034 V082 V083 V093 V094 V096 V109"),
-        ("E13", "V016 V032 V037 V038 V082 V084 V087 V090 V091 V094 V096 V097 V100 V109"),
+        ("E13", "V016 V032 V037 V038 V082 V084 V087 V090 V091 V094 V096 V097 V100 V109 V121"),
         ("E14", "V015 V033 V034 V035 V036 V086 V090 V092 V094 V096 V097 V118 V119"),
         ("E15", "V026 V033 V035 V036 V042 V085 V092 V096 V097 V118"),
-        ("E16", "V081 V082 V083 V084 V085 V086 V087 V088 V089 V090 V091 V092 V093 V094 V095 V096 V097 V098 V099 V100 V101 V102 V103 V104 V105 V106 V107 V108 V109 V110 V111 V112 V113 V114 V115 V116 V117 V118 V119 V120"),
+        ("E16", "V081 V082 V083 V084 V085 V086 V087 V088 V089 V090 V091 V092 V093 V094 V095 V096 V097 V098 V099 V100 V101 V102 V103 V104 V105 V106 V107 V108 V109 V110 V111 V112 V113 V114 V115 V116 V117 V118 V119 V120 V121 V122 V123"),
         ("E16.1", "V005 V006 V017 V051 V052 V053 V054 V055 V056 V076 V087 V090 V098 V117"),
         ("E16.2", "V017 V039 V066 V067 V068 V069 V070 V075 V091 V092 V098 V102 V117"),
         ("E16.3", "V014 V018 V038 V063 V064 V065 V078 V091 V092 V098 V115"),
         ("E16.4", "V002 V003 V009 V037 V039 V060 V061 V062 V077 V087 V091 V098 V101 V107 V108"),
-        ("E16.5", "V007 V008 V017 V018 V037 V038 V039 V066 V069 V073 V075 V081 V082 V083 V084 V085 V086 V089 V090 V092 V094 V096 V098 V099 V101 V102 V104 V110 V113 V116 V120"),
-        ("E16.6", "V001 V039 V042 V071 V072 V073 V074 V080 V098 V116"),
+        ("E16.5", "V007 V008 V017 V018 V037 V038 V039 V066 V069 V073 V075 V081 V082 V083 V084 V085 V086 V089 V090 V092 V094 V096 V098 V099 V101 V102 V104 V110 V113 V116 V120 V123"),
+        ("E16.6", "V001 V039 V042 V071 V072 V073 V074 V080 V098 V116 V123"),
         ("E17", "V040"),
         ("E18", "V041"),
     ]
@@ -583,6 +782,7 @@ fn expected_merge_for_pr(pr: u64) -> Result<Option<&'static str>, String> {
         161 => Some("5401effdfadf048dd4537fdf1e1ca843b9482ac3"),
         162 => Some("5718bf5c0389588781b8dd2e76518da7daab6fd5"),
         163 => Some("4d1fd6cb43fbe64db81177d336b6dae3f061ca98"),
+        165 => Some("2c35d2e0f663064de2f5ee76c46154db7a50cf63"),
         166 => Some("40c70df8e71e7d23a3f2ff373852451604b48ec4"),
         167 => Some("1ce4c0fc00b46f72d91b7595bd7911a9f3627c67"),
         168 => Some("9faa0b529fdb600b8c0e1e6d6cc866d278889353"),
@@ -593,6 +793,19 @@ fn expected_merge_for_pr(pr: u64) -> Result<Option<&'static str>, String> {
         173 => Some("59c0af57ee0fec291b12d5a7dab3ba62ca726579"),
         174 => Some("a5039eb21558cb466a0ee00a1b2ba022b11c12d1"),
         175 => Some("14f832e7bb9e321eafc38097538e9267183d5069"),
+        178 => Some("8f38f4e39cceb67976f9120dc3f76fecce232c5c"),
+        180 => Some("daa618a6a78cdb815102d22c57026d16e9d7aa90"),
+        187 => Some("b166053d8fcf0fd8d046d3274e132a883b95e0bd"),
+        188 => Some("85612648c313a032ea369b56b62e593203e1abff"),
+        189 => Some("86221ff7a9ecf678d86f4c733befd4595cffd55e"),
+        191 => Some("fc481354c047d63f90b687f1fef77b6f38ff9471"),
+        192 => Some("1f624445d66caa8a854b9fa78abff4264439f505"),
+        194 => Some("e9a90ad3acee6e9191cce75a3a808551b083e8f4"),
+        195 => Some("10f172eab7b97c5790bec88a3c6de2326c6e9cc5"),
+        197 => Some("a730b9a9935bee7a41e8a47e86f329b99012566b"),
+        198 => Some("e012bba09cb662e9c01d61b52124a709106f75b8"),
+        199 => Some("a389c4e32e315ff516eba996a0a3dd40faadba0f"),
+        200 => None,
         _ => return Err(format!("no reviewed merge status for PR {pr}")),
     })
 }
@@ -663,21 +876,29 @@ fn validate_production_consumer(id: &str, record: &Value) -> Result<(), String> 
     }
 }
 
-fn validate_evidence_namespace(id: &str, task: &str) -> Result<(), String> {
-    if id.is_empty()
-        || !id
+fn valid_evidence_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-    {
-        return Err(format!("{task} evidence id is invalid"));
-    }
-    let owner = expected_e_ids()
+}
+
+/// Owner task by the longest registered E-task prefix (E16.5.x belongs to E16.5, not E16).
+fn evidence_task(id: &str) -> Option<String> {
+    expected_e_ids()
         .into_iter()
         .filter(|candidate| {
             id.strip_prefix(candidate.as_str())
                 .is_some_and(|suffix| suffix.starts_with('.'))
         })
-        .max_by_key(String::len);
+        .max_by_key(String::len)
+}
+
+fn validate_evidence_namespace(id: &str, task: &str) -> Result<(), String> {
+    if !valid_evidence_id(id) {
+        return Err(format!("{task} evidence id is invalid"));
+    }
+    let owner = evidence_task(id);
     if owner.as_deref() != Some(task) {
         return Err(format!(
             "{task} evidence id {id} is not namespaced under its own task"
@@ -749,10 +970,41 @@ fn validate_evidence_record(
             "{id} still requires a recheck against plan {PLAN_VERSION}"
         ));
     }
+    if let Some(marker) = recheck.strip_prefix("rechecked_") {
+        let position = |wanted: &str| {
+            PLAN_LINEAGE
+                .iter()
+                .position(|(known, _, _)| *known == wanted)
+        };
+        if position(marker) <= position(version) {
+            return Err(format!(
+                "{id} plan_recheck {recheck} does not name a plan later than the record's own plan_version {version}"
+            ));
+        }
+    }
     if version != PLAN_VERSION && PLAN_RECHECK_TASKS.contains(&task) && recheck != PLAN_RECHECKED {
         return Err(format!(
             "{id} belongs to {task}, which the {PLAN_VERSION} revision touches, but was not rechecked"
         ));
+    }
+    let mut related = BTreeSet::new();
+    for field in ["supersedes", "completes"] {
+        if let Some(value) = record.get(field) {
+            for other in string_set(value, &format!("{id} {field}"))? {
+                if !valid_evidence_id(&other) {
+                    return Err(format!("{id} {field} lists an invalid record id"));
+                }
+                if other == id {
+                    return Err(format!("{id} {field} names the record itself"));
+                }
+                if !related.insert(other.clone()) {
+                    return Err(format!("{id} cannot both supersede and complete {other}"));
+                }
+            }
+        }
+    }
+    if let Some(note) = record.get("note") {
+        nonempty_string(note, &format!("{id} note"))?;
     }
     lower_hex(&record["source_sha"], 40, &format!("{id} source_sha"))?;
     let pr = nonempty_string(&record["pr"], &format!("{id} pr"))?;
@@ -1352,8 +1604,10 @@ fn validate_so_sources(
         .collect())
 }
 
+/// Derived from the per-E lists (plan §12 V-reference verbs, v4.5 Q-49: "新增"/"补充断言" count,
+/// "涉及" does not; E06 therefore no longer carries V081).
 fn expected_v_to_e() -> BTreeMap<String, BTreeSet<String>> {
-    let mut result: BTreeMap<String, BTreeSet<String>> = (1..=120)
+    let mut result: BTreeMap<String, BTreeSet<String>> = (1..=V_SCENARIO_COUNT)
         .map(|i| (format!("V{i:03}"), BTreeSet::new()))
         .collect();
     for (task, scenarios) in expected_e_scenarios() {
@@ -1380,7 +1634,7 @@ fn validate_v_scenarios(
     let actual_ids: BTreeSet<String> = by_id.keys().map(|id| (*id).to_string()).collect();
     let expected_ids: BTreeSet<String> = expected.keys().cloned().collect();
     if actual_ids != expected_ids {
-        return Err("V001-V120 exact set is incomplete".into());
+        return Err("V001-V123 exact set is incomplete".into());
     }
     for (id, expected_tasks) in &expected {
         let entry = by_id[id.as_str()];
@@ -1421,9 +1675,10 @@ fn validate_trace_index_coverage(value: &Value) -> Result<(), String> {
     {
         return Err("trace index coverage must be recorded separately for E00 and E16.6".into());
     }
+    // V080 (E00/E16.6) tracks V001–V123, HS01–HS08, HSF01–HSF16 and HSP01 (plan §18.11, Q-50).
     if object["E00"]["purpose"] != "index_consistency_only_not_scenario_execution"
         || string_set(&object["E00"]["ranges"], "E00 trace ranges")?
-            != split_set("K01–K10 SO01–SO18 V087–V120")
+            != split_set("K01–K10 SO01–SO18 V087–V123 HS01–HS08 HSF01–HSF16 HSP01")
     {
         return Err(format!(
             "E00 trace-only responsibility differs from plan {PLAN_VERSION}"
@@ -1431,7 +1686,9 @@ fn validate_trace_index_coverage(value: &Value) -> Result<(), String> {
     }
     if object["E16.6"]["purpose"] != "complete_derived_index_coverage_not_scenario_execution"
         || string_set(&object["E16.6"]["ranges"], "E16.6 trace ranges")?
-            != split_set("B01–B10 U01–U08 K01–K10 SO01–SO18 E00–E18 E16.1–E16.6 V001–V120")
+            != split_set(
+                "B01–B10 U01–U08 K01–K10 SO01–SO18 E00–E18 E16.1–E16.6 V001–V123 HS01–HS08 HSF01–HSF16 HSP01",
+            )
     {
         return Err(format!(
             "E16.6 complete index responsibility differs from plan {PLAN_VERSION}"
@@ -1498,6 +1755,31 @@ fn expected_field_semantics() -> Vec<(&'static str, String)> {
             "production_consumer",
             "optional record-level marker: none_library_only means the recorded module has no production caller in engine/http/mcp/apps as of the commit named in the record scope; wired means a production caller exists; an absent marker means this was not assessed".to_string(),
         ),
+        // Appended by the v4.5 rebind (plan §18.10 machine form, Q-50); the five above are unchanged.
+        (
+            "execution_runners",
+            "execution.runner additionally accepts the stage-8 gate scripts ctrl_verify_v43.sh and ctrl_verify_v45.sh; the runner names stated in the execution definition keep their meaning".to_string(),
+        ),
+        (
+            "supersedes",
+            "optional record-level array of withdrawn record ids that this re-verification replaces; every id must be listed in withdrawn_records with status superseded and belong to the same E task; the replaced record is neither rewritten nor revived".to_string(),
+        ),
+        (
+            "completes",
+            "optional record-level array of still-valid record ids whose evidence this new record completes (for example a re-run of a record with registered missing evidence); the completed records stay unchanged and keep their own credit".to_string(),
+        ),
+        (
+            "note",
+            "optional record-level free-text note (for example a category or the task that will complete the record); it carries no verification credit".to_string(),
+        ),
+        (
+            "withdrawn_records",
+            "top-level list of records withdrawn from verified_subscopes because a revision changed the behavior they asserted: id, withdrawn_in_pr, clause, owner_task and status (pending_recheck, superseded or replaced_by_binding); a listed id never reappears in verified_subscopes".to_string(),
+        ),
+        (
+            "evidence_missing_register",
+            "top-level path and SHA-256 of the missing-evidence register: a registered missing path is reported, a missing path outside the register fails once the local evidence store is checked, and a registered path that reappears fails unless its registered bytes and SHA-256 match (a path registered with unknown identity always fails on reappearance)".to_string(),
+        ),
     ]
 }
 
@@ -1521,6 +1803,535 @@ fn validate_field_semantics(value: &Value) -> Result<(), String> {
                 "field_semantics.{key} differs from the definition pinned by the checker"
             ));
         }
+    }
+    Ok(())
+}
+
+fn exact_keys(
+    object: &serde_json::Map<String, Value>,
+    required: &[&str],
+    optional: &[&str],
+    what: &str,
+) -> Result<(), String> {
+    let actual: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+    let required: BTreeSet<&str> = required.iter().copied().collect();
+    let allowed: BTreeSet<&str> = required
+        .iter()
+        .copied()
+        .chain(optional.iter().copied())
+        .collect();
+    if !actual.is_superset(&required) || !actual.is_subset(&allowed) {
+        return Err(format!(
+            "{what} keys differ: missing={:?} extra={:?}",
+            required.difference(&actual).collect::<Vec<_>>(),
+            actual.difference(&allowed).collect::<Vec<_>>()
+        ));
+    }
+    Ok(())
+}
+
+fn pull_request_number(value: &Value, what: &str) -> Result<u64, String> {
+    nonempty_string(value, what)?
+        .strip_prefix("https://github.com/acosmi/RSIAgent/pull/")
+        .filter(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|number| number.parse::<u64>().ok())
+        .ok_or_else(|| format!("{what} must be a pull request URL"))
+}
+
+fn valid_owner_task(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("AG-") else {
+        return false;
+    };
+    let (digits, suffix) = rest.split_at(rest.len().min(3));
+    digits.len() == 3
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && (suffix.is_empty()
+            || (suffix.len() == 1 && suffix.bytes().all(|b| b.is_ascii_lowercase())))
+}
+
+/// Every verified record by id, with its owning task (for the cross-record checks below).
+fn collect_records(e_scopes: &Value) -> BTreeMap<String, (String, Value)> {
+    let mut records = BTreeMap::new();
+    for (task, entry) in e_scopes.as_object().into_iter().flatten() {
+        for record in entry["verified_subscopes"].as_array().into_iter().flatten() {
+            if let Some(id) = record["id"].as_str() {
+                records.insert(id.to_string(), (task.clone(), record.clone()));
+            }
+        }
+    }
+    records
+}
+
+/// plan §18.10 (v4.5 Q-50): the reviewed pending-recheck list; withdrawn ids never reappear;
+/// supersedes and completes point at the right records.
+fn validate_withdrawn_records(
+    value: &Value,
+    records: &BTreeMap<String, (String, Value)>,
+) -> Result<(), String> {
+    let array = value
+        .as_array()
+        .ok_or("withdrawn_records must be an array")?;
+    let mut withdrawn: BTreeMap<String, &Value> = BTreeMap::new();
+    for entry in array {
+        let object = entry
+            .as_object()
+            .ok_or("withdrawn_records entries must be objects")?;
+        exact_keys(object, WITHDRAWN_KEYS, &[], "withdrawn_records entry")?;
+        let id = nonempty_string(&entry["id"], "withdrawn id")?;
+        if !valid_evidence_id(id) || evidence_task(id).is_none() {
+            return Err(format!(
+                "withdrawn id {id} is not namespaced under a registered E task"
+            ));
+        }
+        let pr = pull_request_number(&entry["withdrawn_in_pr"], &format!("{id} withdrawn_in_pr"))?;
+        expected_merge_for_pr(pr)?;
+        if !nonempty_string(&entry["clause"], &format!("{id} clause"))?.starts_with('§') {
+            return Err(format!(
+                "{id} clause must cite the plan section of the changed behavior"
+            ));
+        }
+        if !valid_owner_task(nonempty_string(
+            &entry["owner_task"],
+            &format!("{id} owner_task"),
+        )?) {
+            return Err(format!(
+                "{id} owner_task must be a registered task number such as AG-187"
+            ));
+        }
+        if !WITHDRAWN_STATUSES
+            .contains(&nonempty_string(&entry["status"], &format!("{id} status"))?)
+        {
+            return Err(format!(
+                "{id} withdrawn status must be one of {WITHDRAWN_STATUSES:?}"
+            ));
+        }
+        if withdrawn.insert(id.to_string(), entry).is_some() {
+            return Err(format!("withdrawn_records lists {id} twice"));
+        }
+    }
+    let expected: BTreeSet<String> = EXPECTED_WITHDRAWN_IDS
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    let actual: BTreeSet<String> = withdrawn.keys().cloned().collect();
+    if actual != expected {
+        return Err(format!(
+            "withdrawn_records differ from the reviewed withdrawn list: missing={:?} extra={:?}",
+            expected.difference(&actual).collect::<Vec<_>>(),
+            actual.difference(&expected).collect::<Vec<_>>()
+        ));
+    }
+    if let Some(revived) = withdrawn.keys().find(|id| records.contains_key(*id)) {
+        return Err(format!(
+            "withdrawn record {revived} reappears in verified_subscopes; a withdrawn record is never revived"
+        ));
+    }
+    let mut superseded = BTreeSet::new();
+    for (id, (task, record)) in records {
+        if let Some(list) = record.get("supersedes") {
+            for old in string_set(list, &format!("{id} supersedes"))? {
+                let entry = withdrawn.get(&old).ok_or_else(|| {
+                    format!("{id} supersedes {old}, which is not a withdrawn record")
+                })?;
+                if entry["status"] != "superseded" {
+                    return Err(format!(
+                        "{id} supersedes {old}, but its withdrawn status is not superseded"
+                    ));
+                }
+                if evidence_task(&old).as_deref() != Some(task.as_str()) {
+                    return Err(format!(
+                        "{id} supersedes {old} of another E task; the re-verification belongs to the withdrawn record's own task"
+                    ));
+                }
+                superseded.insert(old);
+            }
+        }
+        if let Some(list) = record.get("completes") {
+            for kept in string_set(list, &format!("{id} completes"))? {
+                if withdrawn.contains_key(&kept) {
+                    return Err(format!("{id} completes the withdrawn record {kept}"));
+                }
+                if !records.contains_key(&kept) {
+                    return Err(format!(
+                        "{id} completes {kept}, which is not a current verified record"
+                    ));
+                }
+            }
+        }
+    }
+    for (id, entry) in &withdrawn {
+        if entry["status"] == "superseded" && !superseded.contains(id) {
+            return Err(format!(
+                "{id} is marked superseded but no verified record supersedes it"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn iso_utc_or_unknown(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        text == "unknown"
+            || (text.len() == 20
+                && text.bytes().enumerate().all(|(index, byte)| match index {
+                    4 | 7 => byte == b'-',
+                    10 => byte == b'T',
+                    13 | 16 => byte == b':',
+                    19 => byte == b'Z',
+                    _ => byte.is_ascii_digit(),
+                }))
+    })
+}
+
+/// Whether a repository-relative evidence path is a present regular file without symlink
+/// components (Ok(false) when absent, Err for symlinks, non-files or escapes).
+fn evidence_file_present(root: &Path, relative: &str, field: &str) -> Result<bool, String> {
+    let relative_path = safe_relative(relative, field)?;
+    let mut path = root.to_path_buf();
+    for component in relative_path.components() {
+        path.push(component);
+        match std::fs::symlink_metadata(&path) {
+            Err(_) => return Ok(false),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!("{field} contains a symlink component: {relative}"));
+            }
+            Ok(_) => {}
+        }
+    }
+    validate_repo_file(root, relative, field)?;
+    Ok(true)
+}
+
+/// plan §18.10 (v4.5 Q-50): the missing-evidence register is pinned by path and SHA-256, names
+/// real record fields, and decides the three local outcomes this checkout can judge.
+fn validate_missing_register(
+    value: &Value,
+    root: &Path,
+    records: &BTreeMap<String, (String, Value)>,
+) -> Result<(), String> {
+    let pointer = value["evidence_missing_register"]
+        .as_object()
+        .ok_or("evidence_missing_register must be an object")?;
+    exact_keys(
+        pointer,
+        &["path", "sha256"],
+        &[],
+        "evidence_missing_register",
+    )?;
+    if pointer["path"] != MISSING_REGISTER_PATH {
+        return Err(format!(
+            "evidence_missing_register.path must be {MISSING_REGISTER_PATH}"
+        ));
+    }
+    lower_hex(&pointer["sha256"], 64, "evidence_missing_register.sha256")?;
+    validate_repo_file(root, MISSING_REGISTER_PATH, "missing-evidence register")?;
+    let bytes = std::fs::read(root.join(MISSING_REGISTER_PATH))
+        .map_err(|error| format!("cannot read the missing-evidence register: {error}"))?;
+    if pointer["sha256"] != evo_core::hash(&bytes).as_str() {
+        return Err(
+            "missing-evidence register SHA-256 differs from evidence_missing_register.sha256"
+                .into(),
+        );
+    }
+    let register = load_json_strict(
+        std::str::from_utf8(&bytes).map_err(|_| "missing-evidence register is not UTF-8")?,
+    )?;
+    exact_keys(
+        register
+            .as_object()
+            .ok_or("missing-evidence register must be an object")?,
+        &["basis", "entries", "schema_version"],
+        &[],
+        "missing-evidence register",
+    )?;
+    if register["schema_version"] != MISSING_SCHEMA_VERSION {
+        return Err(format!(
+            "missing-evidence register schema_version must be {MISSING_SCHEMA_VERSION}"
+        ));
+    }
+    nonempty_string(&register["basis"], "missing-evidence register basis")?;
+    let mut registered: BTreeMap<(String, String), (Option<u64>, Option<String>)> = BTreeMap::new();
+    for entry in register["entries"]
+        .as_array()
+        .ok_or("missing-evidence register entries must be an array")?
+    {
+        let object = entry
+            .as_object()
+            .ok_or("missing-evidence entries must be objects")?;
+        exact_keys(
+            object,
+            &[
+                "expected_bytes",
+                "expected_sha256",
+                "field",
+                "group",
+                "missing_window",
+                "path",
+                "record_id",
+            ],
+            &["unknown_reason"],
+            "missing-evidence entry",
+        )?;
+        let path = nonempty_string(&entry["path"], "missing-evidence path")?;
+        safe_relative(path, "missing-evidence path")?;
+        let field = nonempty_string(&entry["field"], "missing-evidence field")?;
+        if !EVIDENCE_PATH_FIELDS.contains(&field) {
+            return Err(format!(
+                "missing-evidence field {field} is not an evidence path field"
+            ));
+        }
+        let record_id = nonempty_string(&entry["record_id"], "missing-evidence record_id")?;
+        let (_, record) = records
+            .get(record_id)
+            .ok_or_else(|| format!("missing-evidence entry names unknown record {record_id}"))?;
+        if record[field] != path {
+            return Err(format!(
+                "missing-evidence entry {record_id} {field} does not match the record's path"
+            ));
+        }
+        let size = match &entry["expected_bytes"] {
+            Value::String(text) if text == "unknown" => None,
+            other => Some(other.as_u64().ok_or_else(|| {
+                format!("{record_id} {field} expected_bytes must be an integer or unknown")
+            })?),
+        };
+        let digest = match &entry["expected_sha256"] {
+            Value::String(text) if text == "unknown" => None,
+            other => {
+                lower_hex(other, 64, &format!("{record_id} {field} expected_sha256"))?;
+                other.as_str().map(str::to_string)
+            }
+        };
+        if size.is_none() || digest.is_none() {
+            nonempty_string(
+                &entry["unknown_reason"],
+                &format!("{record_id} {field} unknown_reason"),
+            )?;
+        } else if object.contains_key("unknown_reason") {
+            return Err(format!(
+                "{record_id} {field} unknown_reason is only allowed with an unknown identity"
+            ));
+        }
+        if field == "input_ref"
+            && let Some(digest) = &digest
+            && record["input_digest"] != digest.as_str()
+        {
+            return Err(format!(
+                "{record_id} input_ref expected_sha256 must equal its input_digest"
+            ));
+        }
+        let window = &entry["missing_window"];
+        let window_ok = window == "unknown"
+            || window.as_object().is_some_and(|object| {
+                object.len() == 2
+                    && iso_utc_or_unknown(&object.get("after").cloned().unwrap_or(Value::Null))
+                    && iso_utc_or_unknown(&object.get("before").cloned().unwrap_or(Value::Null))
+            });
+        if !window_ok {
+            return Err(format!("{record_id} {field} missing_window is malformed"));
+        }
+        nonempty_string(&entry["group"], &format!("{record_id} {field} group"))?;
+        if registered
+            .insert((record_id.to_string(), field.to_string()), (size, digest))
+            .is_some()
+        {
+            return Err(format!("{record_id} {field} is registered twice"));
+        }
+    }
+    for (id, (_, record)) in records {
+        for field in EVIDENCE_PATH_FIELDS {
+            let path = nonempty_string(&record[*field], &format!("{id} {field}"))?;
+            let present = evidence_file_present(root, path, &format!("{id} {field}"))?;
+            match (present, registered.get(&(id.clone(), field.to_string()))) {
+                (true, Some((size, digest))) => {
+                    let Some(digest) = digest else {
+                        return Err(format!(
+                            "{id} {field} is registered missing with unknown identity and has reappeared; it must be verified through another binding and registered as a new record"
+                        ));
+                    };
+                    let body = std::fs::read(root.join(path))
+                        .map_err(|error| format!("cannot read {id} {field}: {error}"))?;
+                    if evo_core::hash(&body) != *digest
+                        || size.is_some_and(|size| size != body.len() as u64)
+                    {
+                        return Err(format!(
+                            "{id} {field} is registered missing and has reappeared with different bytes or SHA-256"
+                        ));
+                    }
+                }
+                (false, None) if path.split('/').next() != Some(LOCAL_EVIDENCE_STORE) => {
+                    return Err(format!(
+                        "{id} {field} {path} is missing and not listed in the missing-evidence register"
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// plan §16.8 HSF01–HSF16 and HSP01 (V123).
+fn validate_hsf_sources(value: &Value) -> Result<(), String> {
+    let array = value.as_array().ok_or("hsf_sources must be an array")?;
+    let mut by_id = BTreeMap::new();
+    for entry in array {
+        let id = nonempty_string(&entry["id"], "HSF id")?;
+        if by_id.insert(id, entry).is_some() {
+            return Err(format!("duplicate HSF id {id}"));
+        }
+    }
+    let mut expected: Vec<(&str, Value, Value, Value, Value, Value, Value)> = EXPECTED_HSF
+        .iter()
+        .map(|(id, path, blob)| {
+            (
+                *id,
+                Value::from(HARNESS2_REPO),
+                Value::from(HARNESS2_COMMIT),
+                Value::from(HARNESS2_TREE),
+                Value::from(*path),
+                Value::from(*blob),
+                Value::from("Apache-2.0"),
+            )
+        })
+        .collect();
+    expected.push((
+        "HSP01",
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::from(HSP01_PATH),
+        Value::Null,
+        Value::Null,
+    ));
+    if by_id.len() != expected.len() || array.len() != expected.len() {
+        return Err("hsf_sources must be exactly HSF01–HSF16 and HSP01".into());
+    }
+    for (id, repository, commit, tree, path, blob, license) in expected {
+        let entry = by_id
+            .get(id)
+            .ok_or_else(|| format!("missing fixed source {id}"))?;
+        exact_keys(
+            entry.as_object().ok_or("HSF entries must be objects")?,
+            &[
+                "blob_sha",
+                "commit",
+                "e_tasks",
+                "id",
+                "license",
+                "path",
+                "read_range",
+                "repository",
+                "tree",
+            ],
+            &[],
+            id,
+        )?;
+        if entry["repository"] != repository
+            || entry["commit"] != commit
+            || entry["tree"] != tree
+            || entry["path"] != path
+            || entry["blob_sha"] != blob
+            || entry["license"] != license
+            || entry["read_range"] != "ledger"
+        {
+            return Err(format!(
+                "{id} fixed Harness² source pin differs from plan §16.8"
+            ));
+        }
+        if string_set(&entry["e_tasks"], &format!("{id} e_tasks"))? != split_set("E00 E16.5 E16.6")
+        {
+            return Err(format!(
+                "{id} E mapping differs from the V123 responsibility"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// plan §2.9 HS01–HS08 with the four tracking axes of plan §18.5 (v4.5 Q-50).
+fn validate_hs_borrowings(
+    value: &Value,
+    evidence_ids: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let array = value.as_array().ok_or("hs_borrowings must be an array")?;
+    let mut by_id = BTreeMap::new();
+    for entry in array {
+        let id = nonempty_string(&entry["id"], "HS id")?;
+        if by_id.insert(id, entry).is_some() {
+            return Err(format!("duplicate HS id {id}"));
+        }
+    }
+    if by_id.len() != EXPECTED_HS.len() || array.len() != EXPECTED_HS.len() {
+        return Err("hs_borrowings must be exactly HS01–HS08".into());
+    }
+    for (id, section, refs, tasks, scenarios, adoption) in EXPECTED_HS {
+        let entry = by_id
+            .get(id)
+            .ok_or_else(|| format!("missing borrowing {id}"))?;
+        exact_keys(
+            entry.as_object().ok_or("HS entries must be objects")?,
+            &[
+                "adoption",
+                "e_tasks",
+                "effect_status",
+                "hsf_refs",
+                "id",
+                "implementation_status",
+                "related_evidence_refs",
+                "remaining",
+                "section",
+                "specification_status",
+                "v_scenarios",
+                "verification_status",
+            ],
+            &[],
+            id,
+        )?;
+        let task_set = string_set(&entry["e_tasks"], &format!("{id} e_tasks"))?;
+        if entry["section"] != *section
+            || string_set(&entry["hsf_refs"], &format!("{id} hsf_refs"))? != split_set(refs)
+            || task_set != split_set(tasks)
+            || string_set(&entry["v_scenarios"], &format!("{id} v_scenarios"))?
+                != split_set(scenarios)
+            || entry["adoption"] != *adoption
+        {
+            return Err(format!("{id} borrowing trace chain differs from plan §2.9"));
+        }
+        if entry["specification_status"] != "included" || entry["effect_status"] != "not_claimed" {
+            return Err(format!("{id} conflates specification or effect status"));
+        }
+        let implementation = nonempty_string(
+            &entry["implementation_status"],
+            &format!("{id} implementation_status"),
+        )?;
+        let verification = nonempty_string(
+            &entry["verification_status"],
+            &format!("{id} verification_status"),
+        )?;
+        if !ALLOWED_STATUSES.contains(&implementation) || !ALLOWED_STATUSES.contains(&verification)
+        {
+            return Err(format!("{id} has an unknown tracking status"));
+        }
+        if *adoption == "registered_only"
+            && (implementation, verification)
+                != ("explicitly_out_of_scope", "explicitly_out_of_scope")
+        {
+            return Err(format!(
+                "{id} is registered only (plan §2.9, v4.5 Q-44) and is not implemented in this version"
+            ));
+        }
+        if (implementation == "planned" && verification != "planned") || verification == "verified"
+        {
+            return Err(format!("{id} tracking axes overstate the borrowing"));
+        }
+        validate_evidence_refs(
+            &entry["related_evidence_refs"],
+            &format!("{id} related_evidence_refs"),
+            &task_set,
+            evidence_ids,
+        )?;
+        nonempty_string(&entry["remaining"], &format!("{id} remaining"))?;
     }
     Ok(())
 }
@@ -1585,6 +2396,11 @@ fn validate_manifest(value: &Value, root: &Path) -> Result<(), String> {
         &so_ids,
         &evidence_ids,
     )?;
+    let records = collect_records(&value["e_scopes"]);
+    validate_withdrawn_records(&value["withdrawn_records"], &records)?;
+    validate_missing_register(value, root, &records)?;
+    validate_hsf_sources(&value["traceability"]["hsf_sources"])?;
+    validate_hs_borrowings(&value["traceability"]["hs_borrowings"], &evidence_ids)?;
     Ok(())
 }
 
@@ -1617,15 +2433,20 @@ fn historical_records_keep_lineage_digests_but_top_level_must_be_current() {
         Value::String(PLAN_VERSION.into());
     current["e_scopes"]["E01"]["verified_subscopes"][0]["plan_sha256"] =
         Value::String(PLAN_SHA.into());
+    // A record verified against the current plan carries no recheck marker of the same plan.
+    current["e_scopes"]["E01"]["verified_subscopes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("plan_recheck");
     validate_manifest(&current, &root).unwrap();
 
     let mut mismatched = load_manifest(&root);
     mismatched["e_scopes"]["E01"]["verified_subscopes"][0]["plan_version"] =
         Value::String(PLAN_VERSION.into());
     let error = validate_manifest(&mismatched, &root)
-        .expect_err("a v4.3 version paired with the v4.1 digest was accepted");
+        .expect_err("a v4.5 version paired with the v4.1 digest was accepted");
     assert!(
-        error.contains("not the registered digest of plan v4.3"),
+        error.contains("not the registered digest of plan v4.5"),
         "{error}"
     );
 
@@ -1653,7 +2474,7 @@ fn historical_records_keep_lineage_digests_but_top_level_must_be_current() {
     let error = validate_manifest(&stale_top, &root)
         .expect_err("a top level still bound to v4.1 was accepted");
     assert!(
-        error.contains("not bound to the current plan v4.3"),
+        error.contains("not bound to the current plan v4.5"),
         "{error}"
     );
 }
@@ -1699,13 +2520,15 @@ fn rejects_pending_or_unknown_plan_recheck_markers() {
             validate_manifest(&downgraded, &root).is_err(),
             "{task}: a v4.1 record of a touched task without a recheck was accepted"
         );
-        let mut previous_recheck = load_manifest(&root);
-        previous_recheck["e_scopes"][task]["verified_subscopes"][0]["plan_recheck"] =
-            Value::String("rechecked_v4.2".into());
-        assert!(
-            validate_manifest(&previous_recheck, &root).is_err(),
-            "{task}: a previous-plan marker was accepted in place of a v4.3 recheck"
-        );
+        for previous in ["rechecked_v4.2", "rechecked_v4.3", "rechecked_v4.4"] {
+            let mut previous_recheck = load_manifest(&root);
+            previous_recheck["e_scopes"][task]["verified_subscopes"][0]["plan_recheck"] =
+                Value::String(previous.into());
+            assert!(
+                validate_manifest(&previous_recheck, &root).is_err(),
+                "{task}: the previous-plan marker {previous} was accepted in place of a v4.5 recheck"
+            );
+        }
         let mut missing = load_manifest(&root);
         missing["e_scopes"][task]["verified_subscopes"][0]
             .as_object_mut()
@@ -1746,24 +2569,37 @@ fn rejects_missing_or_unregistered_plan_lineage() {
         .as_array_mut()
         .unwrap()
         .push(serde_json::json!({
-            "version": "v4.4",
+            "version": "v4.6",
             "file": "future.md",
             "sha256": "b".repeat(64),
         }));
     assert!(validate_manifest(&extended, &root).is_err());
+
+    let mut without_v44 = load_manifest(&root);
+    without_v44["plan_lineage"]
+        .as_array_mut()
+        .unwrap()
+        .remove(3);
+    assert!(
+        validate_manifest(&without_v44, &root).is_err(),
+        "a lineage skipping the never-bound v4.4 was accepted"
+    );
 }
 
 #[test]
-fn v43_recheck_tasks_cover_every_landing_task_except_optional_extensions() {
+fn v45_recheck_tasks_are_the_literal_union_of_the_plan_landing_points() {
+    // plan §19.6 (as corrected by v4.5) ∪ §19.7; "E16" is the parent key only (plan §18.10).
     let actual: BTreeSet<String> = PLAN_RECHECK_TASKS
         .iter()
         .map(|task| task.to_string())
         .collect();
-    let expected: BTreeSet<String> = expected_e_ids()
-        .into_iter()
-        .filter(|task| task != "E17" && task != "E18")
-        .collect();
-    assert_eq!(actual, expected);
+    assert_eq!(
+        actual,
+        split_set("E00 E01 E02 E03 E04 E05 E06 E07 E08 E09 E10 E13 E16 E16.1 E16.3 E16.5 E16.6")
+    );
+    for outside in ["E11", "E12", "E14", "E15", "E16.2", "E16.4", "E17", "E18"] {
+        assert!(!PLAN_RECHECK_TASKS.contains(&outside), "{outside}");
+    }
 }
 
 #[test]
@@ -1771,7 +2607,7 @@ fn v43_scenarios_are_registered_without_execution_credit_and_reject_tampering() 
     let root = repo_root();
     let baseline = load_manifest(&root);
     let mapping = expected_v_to_e();
-    assert_eq!(mapping.len(), 120);
+    assert_eq!(mapping.len(), V_SCENARIO_COUNT);
     assert_eq!(mapping["V107"], split_set("E02 E16 E16.4"));
     let mut unexecuted = baseline.clone();
     unexecuted["traceability"]["v_scenarios"][119]["status"] = serde_json::json!("verified");
@@ -2016,7 +2852,7 @@ fn field_semantics_must_be_present_and_equal_the_pinned_text() {
     let baseline = load_manifest(&root);
     validate_manifest(&baseline, &root).unwrap();
     let pinned = expected_field_semantics();
-    assert_eq!(pinned.len(), 5);
+    assert_eq!(pinned.len(), 11);
     assert_eq!(
         baseline["field_semantics"].as_object().unwrap().len(),
         pinned.len()
@@ -2606,5 +3442,620 @@ fn workspace_mapping_rejects_duplicate_ambiguous_or_escaping_metadata() {
             decode_workspace_packages(raw, &fixture.root).is_err(),
             "accepted {raw}"
         );
+    }
+}
+
+fn record_position(value: &Value, id: &str) -> (String, usize) {
+    for (task, entry) in value["e_scopes"].as_object().unwrap() {
+        for (index, record) in entry["verified_subscopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            if record["id"] == id {
+                return (task.clone(), index);
+            }
+        }
+    }
+    panic!("no record {id}");
+}
+
+fn withdrawn_entry_mut<'a>(value: &'a mut Value, id: &str) -> &'a mut Value {
+    value["withdrawn_records"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["id"] == id)
+        .unwrap()
+}
+
+#[test]
+fn v45_recheck_markers_follow_the_machine_form_and_name_a_later_plan() {
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    validate_manifest(&baseline, &root).unwrap();
+    assert_eq!(PLAN_RECHECKED, "rechecked_v4.5");
+    assert_eq!(
+        PLAN_RECHECK_VALUES.iter().copied().collect::<BTreeSet<_>>(),
+        [
+            "not_affected",
+            "required",
+            "rechecked_v4.2",
+            "rechecked_v4.3",
+            "rechecked_v4.4",
+            "rechecked_v4.5"
+        ]
+        .into_iter()
+        .collect()
+    );
+    // Outside the recheck union a historical marker stays valid (E11 keeps rechecked_v4.3).
+    let (task, index) = record_position(&baseline, "E11.controller_acceptance");
+    assert_eq!(
+        baseline["e_scopes"][&task]["verified_subscopes"][index]["plan_recheck"],
+        "rechecked_v4.3"
+    );
+    let mut later = baseline.clone();
+    later["e_scopes"][&task]["verified_subscopes"][index]["plan_recheck"] =
+        Value::String("rechecked_v4.4".into());
+    validate_manifest(&later, &root).unwrap();
+    // A marker naming the record's own (or an older) plan is not a recheck.
+    let (task, index) = record_position(&baseline, "E16.4.ag126_v43_host_surface_record");
+    for marker in ["rechecked_v4.2", "rechecked_v4.3"] {
+        let mut own = baseline.clone();
+        own["e_scopes"][&task]["verified_subscopes"][index]["plan_recheck"] =
+            Value::String(marker.into());
+        let error = validate_manifest(&own, &root).expect_err("a non-later recheck marker");
+        assert!(error.contains("does not name a plan later"), "{error}");
+    }
+    for invalid in [Value::Null, serde_json::json!(true), serde_json::json!([])] {
+        let mut value = baseline.clone();
+        value["e_scopes"][&task]["verified_subscopes"][index]["plan_recheck"] = invalid;
+        assert!(validate_manifest(&value, &root).is_err());
+    }
+    // Probe e: a union record rolled back to the v4.3 marker is rejected.
+    let (task, index) = record_position(&baseline, "E09.ag039_legal_actions");
+    let mut rolled_back = baseline;
+    rolled_back["e_scopes"][&task]["verified_subscopes"][index]["plan_recheck"] =
+        Value::String("rechecked_v4.3".into());
+    let error = validate_manifest(&rolled_back, &root).expect_err("rolled back marker");
+    assert!(error.contains("was not rechecked"), "{error}");
+}
+
+#[test]
+fn withdrawn_records_are_the_reviewed_list_and_never_revive() {
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let withdrawn = baseline["withdrawn_records"].as_array().unwrap();
+    assert_eq!(withdrawn.len(), EXPECTED_WITHDRAWN_IDS.len());
+    assert_eq!(withdrawn.len(), 24);
+
+    // Probe a: revive E09.ag033 inside verified_subscopes.
+    let mut revived = baseline.clone();
+    let mut clone = revived["e_scopes"]["E09"]["verified_subscopes"][0].clone();
+    clone["id"] = Value::String("E09.ag033_run_next_trusted_gate".into());
+    clone["log_path"] = Value::String("out/fixture/revived.log".into());
+    revived["e_scopes"]["E09"]["verified_subscopes"]
+        .as_array_mut()
+        .unwrap()
+        .push(clone);
+    let error = validate_manifest(&revived, &root).expect_err("a revived withdrawn id");
+    assert!(error.contains("is never revived"), "{error}");
+
+    let mut dropped = baseline.clone();
+    dropped["withdrawn_records"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["id"] != "E05.ag080_local_scoped_acceptance");
+    let error = validate_manifest(&dropped, &root).expect_err("a dropped withdrawn entry");
+    assert!(error.contains("reviewed withdrawn list"), "{error}");
+
+    let mut duplicated = baseline.clone();
+    let first = duplicated["withdrawn_records"][0].clone();
+    duplicated["withdrawn_records"]
+        .as_array_mut()
+        .unwrap()
+        .push(first);
+    assert!(validate_manifest(&duplicated, &root).is_err());
+
+    for (field, invalid) in [
+        ("status", serde_json::json!("withdrawn")),
+        ("status", Value::Null),
+        ("owner_task", serde_json::json!("AG187")),
+        ("owner_task", serde_json::json!("AG-18")),
+        ("clause", serde_json::json!("3.4")),
+        ("withdrawn_in_pr", serde_json::json!("#165")),
+        (
+            "withdrawn_in_pr",
+            serde_json::json!("https://github.com/acosmi/RSIAgent/pull/999"),
+        ),
+    ] {
+        let mut value = baseline.clone();
+        withdrawn_entry_mut(&mut value, "E05.ag052_versioned_batch_verdicts")[field] = invalid;
+        assert!(validate_manifest(&value, &root).is_err(), "{field}");
+    }
+    let mut extra_key = baseline.clone();
+    withdrawn_entry_mut(&mut extra_key, "E05.ag052_versioned_batch_verdicts")["verdict"] =
+        Value::String("improved".into());
+    assert!(validate_manifest(&extra_key, &root).is_err());
+    let mut missing_key = baseline;
+    withdrawn_entry_mut(&mut missing_key, "E05.ag052_versioned_batch_verdicts")
+        .as_object_mut()
+        .unwrap()
+        .remove("owner_task");
+    assert!(validate_manifest(&missing_key, &root).is_err());
+}
+
+/// A synthetic re-verification of the withdrawn E05.ag101 record (same task, own identity).
+fn with_synthetic_supersession(baseline: &Value) -> (Value, usize) {
+    let mut value = baseline.clone();
+    withdrawn_entry_mut(&mut value, "E05.ag101_streaming_verdicts_v42")["status"] =
+        Value::String("superseded".into());
+    let mut record = value["e_scopes"]["E05"]["verified_subscopes"][0].clone();
+    record["id"] = Value::String("E05.fixture_reverification".into());
+    record["log_path"] = Value::String("out/fixture/reverification.log".into());
+    record["source_sha"] = Value::String("e".repeat(40));
+    record["supersedes"] = serde_json::json!(["E05.ag101_streaming_verdicts_v42"]);
+    let records = value["e_scopes"]["E05"]["verified_subscopes"]
+        .as_array_mut()
+        .unwrap();
+    records.push(record);
+    let index = records.len() - 1;
+    (value, index)
+}
+
+#[test]
+fn supersedes_and_completes_point_at_the_right_records() {
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let (healthy, index) = with_synthetic_supersession(&baseline);
+    validate_manifest(&healthy, &root).unwrap();
+
+    // Probe b: supersedes pointing at a non-existent, non-withdrawn, pending or foreign id.
+    for target in [
+        "E99.does_not_exist",
+        "E05.controller_acceptance",
+        "E05.ag052_versioned_batch_verdicts",
+        "E04.ag054_typed_predispatch",
+    ] {
+        let mut value = healthy.clone();
+        value["e_scopes"]["E05"]["verified_subscopes"][index]["supersedes"] =
+            serde_json::json!([target]);
+        assert!(
+            validate_manifest(&value, &root).is_err(),
+            "supersedes {target} was accepted"
+        );
+    }
+    // A withdrawn entry marked superseded must be superseded by a verified record.
+    let mut orphaned = healthy.clone();
+    orphaned["e_scopes"]["E05"]["verified_subscopes"][index]["supersedes"] = serde_json::json!([]);
+    let error = validate_manifest(&orphaned, &root).expect_err("an orphaned superseded entry");
+    assert!(
+        error.contains("no verified record supersedes it"),
+        "{error}"
+    );
+
+    let (task, index) = record_position(&baseline, "E01.controller_acceptance");
+    for (field, list) in [
+        (
+            "completes",
+            serde_json::json!(["E09.ag033_run_next_trusted_gate"]),
+        ),
+        ("completes", serde_json::json!(["E01.not_a_record"])),
+        (
+            "completes",
+            serde_json::json!(["E01.controller_acceptance"]),
+        ),
+        (
+            "supersedes",
+            serde_json::json!(["E01.controller_acceptance"]),
+        ),
+        (
+            "completes",
+            serde_json::json!("E01.ag057_explicit_sample_registration"),
+        ),
+        (
+            "completes",
+            serde_json::json!([
+                "E01.ag057_explicit_sample_registration",
+                "E01.ag057_explicit_sample_registration"
+            ]),
+        ),
+        ("completes", serde_json::json!(["bad id"])),
+    ] {
+        let mut value = baseline.clone();
+        value["e_scopes"][&task]["verified_subscopes"][index][field] = list.clone();
+        assert!(
+            validate_manifest(&value, &root).is_err(),
+            "{field} {list} was accepted"
+        );
+    }
+    let mut both = baseline.clone();
+    both["e_scopes"][&task]["verified_subscopes"][index]["completes"] =
+        serde_json::json!(["E01.ag057_explicit_sample_registration"]);
+    validate_manifest(&both, &root).unwrap();
+    both["e_scopes"][&task]["verified_subscopes"][index]["supersedes"] =
+        serde_json::json!(["E01.ag057_explicit_sample_registration"]);
+    assert!(validate_manifest(&both, &root).is_err());
+    for note in [Value::Null, serde_json::json!(""), serde_json::json!(["x"])] {
+        let mut value = baseline.clone();
+        value["e_scopes"][&task]["verified_subscopes"][index]["note"] = note;
+        assert!(validate_manifest(&value, &root).is_err());
+    }
+}
+
+struct RegisterFixture {
+    root: PathBuf,
+}
+
+impl RegisterFixture {
+    fn new(register: &[u8]) -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rsia-support-register-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("reports")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join(MISSING_REGISTER_PATH), register).unwrap();
+        std::fs::write(
+            root.join("docs/implementation-ledger.md"),
+            b"ledger fixture\n",
+        )
+        .unwrap();
+        Self { root }
+    }
+
+    fn write(&self, relative: &str, body: &[u8]) {
+        let path = self.root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+}
+
+impl Drop for RegisterFixture {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.root).unwrap();
+    }
+}
+
+/// A labelled edit of the missing-evidence register used by the structural rejection cases.
+type RegisterMutation = (&'static str, Box<dyn Fn(&mut Value)>);
+
+fn register_bytes(root: &Path) -> Vec<u8> {
+    std::fs::read(root.join(MISSING_REGISTER_PATH)).unwrap()
+}
+
+fn pinned(value: &Value, register: &[u8]) -> Value {
+    let mut value = value.clone();
+    value["evidence_missing_register"]["sha256"] = Value::String(evo_core::hash(register));
+    value
+}
+
+#[test]
+fn missing_evidence_register_is_pinned_and_decides_local_outcomes() {
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let records = collect_records(&baseline["e_scopes"]);
+    let original = register_bytes(&root);
+    let register: Value = load_json_strict(std::str::from_utf8(&original).unwrap()).unwrap();
+    let entries = register["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 42);
+    let healthy = RegisterFixture::new(&original);
+    validate_missing_register(&baseline, &healthy.root, &records).unwrap();
+
+    // Probe c: dropping a registered path changes the pinned register.
+    let mut dropped: Value = register.clone();
+    dropped["entries"].as_array_mut().unwrap().remove(0);
+    let dropped_bytes = serde_json::to_vec_pretty(&dropped).unwrap();
+    let fixture = RegisterFixture::new(&dropped_bytes);
+    let error = validate_missing_register(&baseline, &fixture.root, &records)
+        .expect_err("an unpinned register edit");
+    assert!(error.contains("SHA-256 differs"), "{error}");
+
+    // A registered path reappearing: unknown identity always fails; a known identity must match.
+    let unknown = entries
+        .iter()
+        .find(|entry| entry["expected_sha256"] == "unknown")
+        .unwrap();
+    let fixture = RegisterFixture::new(&original);
+    fixture.write(
+        unknown["path"].as_str().unwrap(),
+        b"restored from somewhere\n",
+    );
+    let error = validate_missing_register(&baseline, &fixture.root, &records)
+        .expect_err("an unknown-identity path reappeared");
+    assert!(error.contains("unknown identity"), "{error}");
+    let known = entries
+        .iter()
+        .find(|entry| entry["expected_sha256"] != "unknown" && entry["field"] == "log_path")
+        .unwrap();
+    let fixture = RegisterFixture::new(&original);
+    fixture.write(known["path"].as_str().unwrap(), b"different bytes\n");
+    let error = validate_missing_register(&baseline, &fixture.root, &records)
+        .expect_err("a mismatched path reappeared");
+    assert!(error.contains("different bytes or SHA-256"), "{error}");
+    let body = b"exactly the registered bytes\n";
+    let mut matching: Value = register.clone();
+    for entry in matching["entries"].as_array_mut().unwrap() {
+        if entry["path"] == known["path"] {
+            entry["expected_sha256"] = Value::String(evo_core::hash(body));
+            entry["expected_bytes"] = serde_json::json!(body.len());
+        }
+    }
+    let matching_bytes = serde_json::to_vec_pretty(&matching).unwrap();
+    let fixture = RegisterFixture::new(&matching_bytes);
+    fixture.write(known["path"].as_str().unwrap(), body);
+    validate_missing_register(&pinned(&baseline, &matching_bytes), &fixture.root, &records)
+        .unwrap();
+
+    // A tracked evidence path that is missing and unregistered fails in any checkout.
+    let mut untracked = baseline.clone();
+    let (task, index) = record_position(&untracked, "E01.ag057_explicit_sample_registration");
+    untracked["e_scopes"][&task]["verified_subscopes"][index]["record_source"] =
+        Value::String("docs/never_written.md".into());
+    let error = validate_missing_register(
+        &untracked,
+        &healthy.root,
+        &collect_records(&untracked["e_scopes"]),
+    )
+    .expect_err("an unregistered missing tracked path");
+    assert!(
+        error.contains("not listed in the missing-evidence register"),
+        "{error}"
+    );
+
+    // Structural rejections, each re-pinned so only the named defect remains.
+    let mutations: Vec<RegisterMutation> = vec![
+        (
+            "unknown record",
+            Box::new(|r: &mut Value| {
+                r["entries"][0]["record_id"] = serde_json::json!("E01.nothing")
+            }),
+        ),
+        (
+            "wrong field path",
+            Box::new(|r: &mut Value| {
+                r["entries"][0]["path"] = serde_json::json!("out/fixture/other.log")
+            }),
+        ),
+        (
+            "bad field",
+            Box::new(|r: &mut Value| r["entries"][0]["field"] = serde_json::json!("scope")),
+        ),
+        (
+            "duplicate",
+            Box::new(|r: &mut Value| {
+                let first = r["entries"][0].clone();
+                r["entries"].as_array_mut().unwrap().push(first);
+            }),
+        ),
+        (
+            "unknown without reason",
+            Box::new(|r: &mut Value| {
+                for entry in r["entries"].as_array_mut().unwrap() {
+                    if entry["expected_sha256"] == "unknown" {
+                        entry.as_object_mut().unwrap().remove("unknown_reason");
+                        break;
+                    }
+                }
+            }),
+        ),
+        (
+            "reason with a known identity",
+            Box::new(|r: &mut Value| {
+                for entry in r["entries"].as_array_mut().unwrap() {
+                    if entry["expected_sha256"] != "unknown" && entry["expected_bytes"] != "unknown"
+                    {
+                        entry["unknown_reason"] = serde_json::json!("not needed");
+                        break;
+                    }
+                }
+            }),
+        ),
+        (
+            "malformed window",
+            Box::new(|r: &mut Value| {
+                r["entries"][0]["missing_window"] =
+                    serde_json::json!({"after": "yesterday", "before": "unknown"})
+            }),
+        ),
+        (
+            "negative bytes",
+            Box::new(|r: &mut Value| r["entries"][0]["expected_bytes"] = serde_json::json!(-1)),
+        ),
+        (
+            "bad schema",
+            Box::new(|r: &mut Value| {
+                r["schema_version"] = serde_json::json!("rsia.evidence_missing.v0")
+            }),
+        ),
+        (
+            "extra key",
+            Box::new(|r: &mut Value| r["entries"][0]["restored"] = serde_json::json!(true)),
+        ),
+    ];
+    for (label, mutate) in mutations {
+        let mut changed = register.clone();
+        mutate(&mut changed);
+        let bytes = serde_json::to_vec_pretty(&changed).unwrap();
+        let fixture = RegisterFixture::new(&bytes);
+        assert!(
+            validate_missing_register(&pinned(&baseline, &bytes), &fixture.root, &records).is_err(),
+            "{label} was accepted"
+        );
+    }
+    let mut moved = baseline.clone();
+    moved["evidence_missing_register"]["path"] = Value::String("reports/other.json".into());
+    assert!(validate_missing_register(&moved, &healthy.root, &records).is_err());
+    let mut unpinned = baseline;
+    unpinned
+        .as_object_mut()
+        .unwrap()
+        .remove("evidence_missing_register");
+    assert!(validate_manifest(&unpinned, &root).is_err());
+}
+
+#[test]
+fn harness2_borrowings_and_sources_match_the_plan_tables() {
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    validate_manifest(&baseline, &root).unwrap();
+    assert_eq!(
+        baseline["traceability"]["hsf_sources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        17
+    );
+    assert_eq!(
+        baseline["traceability"]["hs_borrowings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
+    for (index, field, invalid) in [
+        (0, "commit", serde_json::json!("a".repeat(40))),
+        (0, "tree", serde_json::json!("b".repeat(40))),
+        (3, "blob_sha", serde_json::json!("c".repeat(40))),
+        (3, "path", serde_json::json!("harness2/core/other.py")),
+        (1, "license", serde_json::json!("MIT")),
+        (
+            1,
+            "repository",
+            serde_json::json!("https://github.com/google/harness2"),
+        ),
+        (2, "read_range", serde_json::json!("全文")),
+        (2, "e_tasks", serde_json::json!(["E00"])),
+        (16, "blob_sha", serde_json::json!("d".repeat(40))),
+    ] {
+        let mut value = baseline.clone();
+        value["traceability"]["hsf_sources"][index][field] = invalid;
+        assert!(
+            validate_manifest(&value, &root).is_err(),
+            "HSF {index} {field}"
+        );
+    }
+    let mut missing = baseline.clone();
+    missing["traceability"]["hsf_sources"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    assert!(validate_manifest(&missing, &root).is_err());
+    for (index, field, invalid) in [
+        (0, "section", serde_json::json!("§6.7.5")),
+        (0, "hsf_refs", serde_json::json!(["HSF04"])),
+        (2, "e_tasks", serde_json::json!(["E09"])),
+        (6, "v_scenarios", serde_json::json!(["V052"])),
+        (4, "adoption", serde_json::json!("adopted")),
+        (4, "implementation_status", serde_json::json!("planned")),
+        (0, "verification_status", serde_json::json!("verified")),
+        (0, "effect_status", serde_json::json!("improved")),
+        (0, "remaining", serde_json::json!("")),
+        (
+            0,
+            "related_evidence_refs",
+            serde_json::json!(["E01.controller_acceptance"]),
+        ),
+        (0, "benefit", serde_json::json!("improved")),
+    ] {
+        let mut value = baseline.clone();
+        value["traceability"]["hs_borrowings"][index][field] = invalid;
+        assert!(
+            validate_manifest(&value, &root).is_err(),
+            "HS {index} {field}"
+        );
+    }
+}
+
+#[test]
+fn v121_to_v123_and_v048_follow_the_v45_responsibility_table() {
+    let mapping = expected_v_to_e();
+    assert_eq!(mapping["V121"], split_set("E03 E07 E09 E13 E16"));
+    assert_eq!(mapping["V122"], split_set("E01 E07 E09 E16"));
+    assert_eq!(mapping["V123"], split_set("E00 E16 E16.5 E16.6"));
+    assert_eq!(mapping["V048"], split_set("E02 E05"));
+    assert!(
+        !mapping["V081"].contains("E06"),
+        "E06 only touches V081 (Q-49)"
+    );
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    for (vid, drop) in [
+        ("V121", "E13"),
+        ("V122", "E01"),
+        ("V123", "E16.5"),
+        ("V048", "E05"),
+    ] {
+        // Probe d (V121/E13) and its siblings.
+        let mut value = baseline.clone();
+        let entry = value["traceability"]["v_scenarios"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["id"] == vid)
+            .unwrap();
+        entry["e_tasks"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|task| task != drop);
+        let error = validate_manifest(&value, &root).expect_err("a dropped responsibility");
+        assert!(
+            error.contains("E responsibility mapping differs"),
+            "{vid}: {error}"
+        );
+    }
+    let mut v081 = baseline;
+    let entry = v081["traceability"]["v_scenarios"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["id"] == "V081")
+        .unwrap();
+    entry["e_tasks"]
+        .as_array_mut()
+        .unwrap()
+        .push(Value::String("E06".into()));
+    assert!(validate_manifest(&v081, &root).is_err());
+}
+
+#[test]
+fn stage8_gate_scripts_are_registered_execution_runners() {
+    for runner in ["ctrl_verify_v43.sh", "ctrl_verify_v45.sh"] {
+        let mut execution = well_formed_execution();
+        execution["runner"] = Value::String(runner.into());
+        execution_result(execution).unwrap();
+    }
+    for runner in [
+        "ctrl_verify_v44.sh",
+        "ctrl_verify_v46.sh",
+        "codex-r7-ctrl_verify.sh",
+    ] {
+        let mut execution = well_formed_execution();
+        execution["runner"] = Value::String(runner.into());
+        assert!(execution_result(execution).is_err(), "{runner}");
+    }
+}
+
+#[test]
+fn trace_index_coverage_spans_v123_and_the_harness2_ranges() {
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    for (task, range) in [
+        ("E16.6", "V001–V123"),
+        ("E16.6", "HSP01"),
+        ("E00", "V087–V123"),
+        ("E00", "HSF01–HSF16"),
+    ] {
+        let mut value = baseline.clone();
+        value["trace_index_coverage"][task]["ranges"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|item| item != range);
+        assert!(validate_manifest(&value, &root).is_err(), "{task} {range}");
     }
 }

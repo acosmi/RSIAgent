@@ -4121,3 +4121,367 @@ V110/V113/V116与其余新增场景族仍 planned；related_evidence_refs 仅导
 - 此登记写入时固定新 head 全八、真实两侧父编译语义反例、独立控制器和 hosted CI 尚未运行，退出码不预填。后续结果须以本任务私有实际首验/合并证明复算；最高状态不因此上调。
 
 不声明整 E/V、完整许可或离线包、真实模型/付费实验/宿主/沙箱、历史 T 等价、效果收益、发行或 Claude 二次验收。货币预算0。
+
+
+## 第八阶段 AG-182：v4.5 绑定与复核
+
+本节登记 E16.6 增量 AG-182（PR #200）：派生索引、Python 检查器与 Rust 索引测试由 v4.3 直接绑定到当前 v4.5（v4.4 未经索引单独绑定，由本 PR 一并完成，§18.11），并按 §18.10 的 v4.5 机器口径（Q-50）完成并集 84 条记录的逐条复核、撤出清单、缺失清单、重跑登记与第七阶段补登。状态最高 implemented_not_verified；W0 首次验收（十一门、索引篡改探针、独立对抗审查）与管理员合并尚未发生，Claude/GPT 二次验收 not_executed。正文、归档与 out/ 下原始材料不上传；本节只登记文件名、摘要与相对路径。
+
+### 真源身份、谱系与动作合同
+
+- 当前唯一入口：`RSIAgent-v4.5定稿-工程实施方案-2026-10-24.md`，SHA-256 `f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164`，544,031 字节，3,552 行；修订只来自 §19.7 的 Q-43–Q-60（2026-10-23 四段对抗复核 87 条发现，主控裁决），底稿 D44 = v4.4 定稿。
+- v4.4：`RSIAgent-v4.4定稿-工程实施方案-2026-10-23.md`，SHA-256 `45ae29d71396f77dffc3baab7fed50564334734623bcec15f267778ddebeb496`，490,305 字节；已按原名原字节移入本地 `archive/2026-10-24-pre-v4.5/`，只作谱系，不作条款依据；修订 Q-27–Q-42（§19.6，Harness² 借鉴与 G1–G11 真源空白）。
+- v4.3：`RSIAgent-v4.3定稿-工程实施方案-2026-10-12.md`，SHA-256 `73dd00bf5ef6e9757d0c391c9a8be4ca92b6e06a750aacb542817f82cbd208a7`，归档于本地 `archive/2026-10-23-pre-v4.4/`（AG-124/#165 的绑定对象）。
+- 谱系 `v4.1→v4.2→v4.3→v4.4→v4.5`；历史记录保留其验证时的 plan_version/plan_sha256；本 PR 新写入的记录 plan_version 一律为 v4.5（§18.10 v4.5 补充）。
+- 动作合同（§18.10/§18.11）：正文生成与 SHA、原件归档、修订清单与裁决记录已由 W0 在本地完成（v4.4：2026-10-23T20:58Z；v4.5：2026-10-24T01:58Z；裁决与工具留存本地 v44/、v45/）；派生索引、检查器与索引测试的版本绑定、谱系、plan_recheck、supersedes/completes、withdrawn_records、待重验清单与缺失清单由本 PR 完成；§16.8 读取范围与授权外研究动作的台账登记见下文。
+
+### 机器口径落点（§18.10 v4.5 补充 Q-50；§2.9、§16.8；§13.5）
+
+- 两套检查器同步：`scripts/check_support_scope.py` 与 `crates/evo-core/tests/support_scope.rs` 均绑定 v4.5 文件名/SHA 与五段谱系；`plan_recheck` 取值 not_affected、required、rechecked_v4.2、rechecked_v4.3、rechecked_v4.4、rechecked_v4.5，`rechecked_<版本>` 必须晚于记录自身 plan_version；复核并集 = §19.6（v4.5 更正后）∪ §19.7 落点按字面 = E00、E01、E02、E03、E04、E05、E06、E07、E08、E09、E10、E13、E16、E16.1、E16.3、E16.5、E16.6；并集外 E11、E12、E14、E15、E16.2、E16.4、E17、E18 的记录保留历史值。
+- 记录可选字段 `supersedes`（只能指向 withdrawn_records 中 status=superseded 且同一 E 的条目）、`completes`（只能指向现存有效记录）、`note`；顶层 `withdrawn_records`（id、withdrawn_in_pr、clause、owner_task、status ∈ pending_recheck/superseded/replaced_by_binding；24 个 id 由两套检查器钉死，任一 id 不得再出现在 verified_subscopes；status=superseded 必须有记录 supersedes 它）；顶层 `evidence_missing_register` 钉 `reports/evidence-missing.json` 的路径与 SHA-256。field_semantics 只追加 execution_runners、supersedes、completes、note、withdrawn_records、evidence_missing_register 六条语义，原五条原文不变；execution.runner 追加 ctrl_verify_v43.sh、ctrl_verify_v45.sh。
+- 缺失清单三种结果（§18.10“本地缺失的证据路径”）：登记且仍缺 → 报告字段 `evidence_missing` 列出；清单外缺失 → 失败；登记路径重新出现 → 登记了 SHA-256（及字节）则必须一致，登记为 unknown 一律失败（须经主控以其他绑定验真后另立新记录，不恢复旧证据）。out/ 是主检出未入库的本地证据库：克隆/worktree 不携带它，检查器只有在 `--evidence-root <主检出>` 给出时才对 out/ 路径的缺失判失败，否则只报告；out/ 外的路径（如 record_source 指向的本台账）任何时候都检查；`--known-missing` 默认 `reports/evidence-missing.json` 且须与清单指针一致。
+- V→E（§12 V 引用动词 Q-49：新增/补充断言计入，涉及不计入）：V121 = E03/E07/E09/E13（E16 统一追踪），V122 = E01/E07/E09（E16），V123 = E00/E16.5/E16.6（E16），V048 加 E05（Q-48），E06 对 V081 改为“涉及”而移出 V081 责任（Q-49；卡未列，以真源为准）。v_scenarios 增 V121–V123（planned、无执行信用）；trace_index_coverage：E00 = K01–K10、SO01–SO18、V087–V123、HS01–HS08、HSF01–HSF16、HSP01，E16.6 = B/U/K/SO/E 全集、V001–V123 与同三组 HS/HSF/HSP（V080 为 E00/E16.6 责任）。
+- traceability 新增 `hs_borrowings`（HS01–HS08：正文小节、HSF 来源、E、V、adoption；HS05、HS06 为 registered_only = explicitly_out_of_scope，其余 adopted 但实现/验证均 planned；四列追踪按 §18.5 v4.5 补充）与 `hsf_sources`（HSF01–HSF16：`https://github.com/google-research/harness2`、commit `1cfe254e8d25b15f37048c3730134686abe60335`、tree `edc756a4d03a2826a248115482084a176e60e751`、路径、blob、Apache-2.0、read_range=ledger、E00/E16.5/E16.6；HSP01：arXiv:2610.14224v1 Section 2.2.1 与 Appendix F，无仓库对象）。卡写的 `google/harness2` 与真源 §16.8 地址不符，以真源为准。
+
+### v4.4/v4.5 逐条复核表（并集 84 条；按 §18.11 一次重绑定同时完成两轮复核）
+
+判定口径：只按适用的“改变实现行为=是”项判定；断言了被修订改变的旧行为 = 行为被改变（撤出并指派补全/修补任务）；只调用或触及但未断言该旧行为 = 相邻不矛盾；未触及 = 行为未变。依据中的源码行号为基线 main a389c4e3（M35）现行文件；结论按侦察表 recheck-table.json 与 recheck-delta.json 的 verdict_combined 执行，本卡未改判。行为未变与相邻不矛盾者均标 rechecked_v4.5。
+
+| 记录 id | E | 适用 Q | 结论 | 依据 |
+|---|---|---|---|---|
+| E00.controller_acceptance | E00 | v4.4：Q-27否、Q-28否、Q-32是、Q-39否；v4.5：Q-56是、Q-59否 | 行为未变 | v4.4：记录验证固定基线定向回归（evaluator.rs:182–273：不完整行使票据失败且不退款、执行票据失配、无效统计先于完成拒绝）；适用Q项中唯一“是”的Q-32只改许可状态登记与README徽章，本记录未断言许可状态，Q-27/28/39为登记或现行已符，故不改变其行为。 v4.5：记录验证固定基线定向回归（evaluator.rs:182–273：不完整行使票据失败且不退款、执行票据失配、无效统计先于完成拒绝）；v4.5适用是项Q-56只涉README徽章/许可措辞机检与第三方定义，本记录无许可断言，Q-59仅登记，行为未改变。 |
+| E00.ag099_step_future_default_test_stack | E00 | v4.4：Q-27否、Q-28否、Q-32是、Q-39否；v4.5：Q-56是、Q-59否 | 行为未变 | v4.4：记录验证step路径future装箱后默认2MiB测试栈下终态与决策语义不变（step_terminal_classes_v42.rs:1476–1960,2407–2547）；Q-32只涉许可状态/README，未被本记录断言，Q-27/28/39仅登记，行为未改变。 v4.5：记录验证step路径future装箱后默认2MiB测试栈下终态与决策语义不变（step_terminal_classes_v42.rs:1476–1960,2407–2547）；v4.5适用是项Q-56只涉README徽章/许可措辞机检与第三方定义，本记录无许可断言，Q-59仅登记，行为未改变。 |
+| E01.controller_acceptance | E01 | v4.4：Q-30是、Q-34是；v4.5：Q-57是、Q-47是、Q-45是、Q-46是 | 相邻不矛盾 | v4.4：记录验证统计与留出合同静态子范围（evaluation_v41.rs:122–264,388–531）；Q-34只把可行性规划的等号与最终批准门对齐且最终批准门不变，Q-30只新增默认关闭的C子条件登记，本记录均未触及，行为未改变。 v4.5：记录验证统计与留出合同静态子范围：序贯UCB退化、alpha一次分配、锚点覆盖与C_simple/C_skillopt同起点合同（evaluation_v41.rs:191–209,372–490,596–635）；不调用decide()与可行性门，Q-57/Q-47未触及；Q-45把候选生成前登记扩到C_simple/C_skillopt，与所验同起点/先登记合同相邻不矛盾（缺每步候选数/重复次数为新增义务），Q-46不涉，行为未改变。 |
+| E01.ag057_explicit_sample_registration | E01 | v4.4：Q-30是、Q-34是；v4.5：Q-57是、Q-47是、Q-45是、Q-46是 | 相邻不矛盾 | v4.4：记录验证显式样本量登记、越界拒绝与旧v1计划字节/摘要不变（evaluation_contract_v42.rs:60–123）；Q-30新增的C子条件登记属新义务、首轮仍A/B1/C，与所冻结v1 conditions字段相邻但不矛盾，Q-34不涉n校验，行为未改变。 v4.5：记录验证显式样本量登记、越界拒绝、旧v1计划字节/摘要不变及文档阈值（含max_regression=0.01）可装入早停计划（evaluation_contract_v42.rs:59–123,170–219）；不调用decide()与可行性门，Q-57/Q-47未触及（AG-192为固定样本引入max_regression时须保持冻结v1字节）；Q-45的c_subcondition_registry为新增登记，与冻结conditions相邻不矛盾，Q-46不涉，行为未改变。 |
+| E02.controller_acceptance | E02 | v4.4：Q-37否、Q-38是、Q-40是；v4.5：Q-52是、Q-53是、Q-48否 | 行为未变 | v4.4：记录验证有界原子编辑/编译（skill_edit.rs:92–154,442–571：UTF-8前像、锚点、整包原子与确定性）；Q-38/Q-40只改管理操作未接线固定码与作业记录版本，本记录不涉，Q-37附着边为否，行为未改变。 v4.5：记录验证有界原子编辑/编译（skill_edit.rs:92–154,442–571）；Q-52/Q-53只改作业记录v2、管理作业终点固定码与已接线/平面错配判定，本记录不涉管理操作，Q-48仅登记，行为未改变。 |
+| E02.ag055_v1_wire_goldens | E02 | v4.4：Q-37否、Q-38是、Q-40是；v4.5：Q-52是、Q-53是、Q-48否 | 行为未变 | v4.4：记录验证五个v1请求、Strategy与旧Evaluation的冻结字节及描述符扰动检出（v1_golden.rs:39–56,83–142,145–243）；Q-38/Q-40不改模型侧wire，Q-37为否，行为未改变。 v4.5：记录验证五个v1请求、Strategy与旧Evaluation的冻结字节及描述符扰动检出（v1_golden.rs:39–56,83–142,145–243）；Q-52/Q-53只改作业记录v2、管理作业终点固定码与已接线/平面错配判定，本记录不涉管理操作，Q-48仅登记，行为未改变。 |
+| E02.ag065_host_surface_name_coverage | E02 | v4.4：Q-37否、Q-38是、Q-40是；v4.5：Q-52是、Q-53是、Q-48否 | 行为未变 | v4.4：记录验证宿主面名称反向覆盖（core:39–99、engine:299–314）；Q-38/Q-40与宿主面无关，Q-37为否，行为未改变。 v4.5：记录验证宿主面名称反向覆盖（core:39–99、engine:299–314）；Q-52/Q-53只改作业记录v2、管理作业终点固定码与已接线/平面错配判定，本记录不涉管理操作，Q-48仅登记，行为未改变。 |
+| E02.ag092_local_scoped_acceptance | E02 | v4.4：Q-37否、Q-38是、Q-40是；v4.5：Q-52是、Q-53是、Q-48否 | 行为未变 | v4.4：记录验证P/B输入已知直接依赖撤销不可被Set/Reset隐藏（baseline_dependency_revocation_v42.rs:196–315,428–512）；所涉为摘要依赖边，Q-37附着边定义为否且现行已按严格条件，Q-38/Q-40不涉，行为未改变。 v4.5：记录验证P/B输入已知直接依赖撤销不可被Set/Reset隐藏（baseline_dependency_revocation_v42.rs:196–315,428–512）；Q-52/Q-53只改作业记录v2、管理作业终点固定码与已接线/平面错配判定，本记录不涉管理操作，Q-48仅登记，行为未改变。 |
+| E02.ag093_local_scoped_acceptance | E02 | v4.4：Q-37否、Q-38是、Q-40是；v4.5：Q-52是、Q-53是、Q-48否 | 行为未变 | v4.4：记录验证正式编译P/B输入解析、权威见证与typed版本绑定（compiler_input_binding_v42.rs:41–155,158–335）；Q-38/Q-40不涉，Q-37为否，行为未改变。 v4.5：记录验证正式编译P/B输入解析、权威见证与typed版本绑定（compiler_input_binding_v42.rs:41–155,158–335）；Q-52/Q-53只改作业记录v2、管理作业终点固定码与已接线/平面错配判定，本记录不涉管理操作，Q-48仅登记，行为未改变。 |
+| E02.ag126_v43_host_surface_duplicates | E02 | v4.4：Q-37否、Q-38是、Q-40是；v4.5：Q-52是、Q-53是、Q-48否 | 行为未变 | v4.4：记录验证冻结host_surface v1拒绝同名不同内容、保留完全相同克隆与golden字节（host_surface_duplicates_v43.rs:27–114）；Q-38/Q-40不涉宿主面，Q-37为否，行为未改变。 v4.5：记录验证冻结host_surface v1拒绝同名不同内容、保留完全相同克隆与golden字节（host_surface_duplicates_v43.rs:27–114）；Q-52/Q-53只改作业记录v2、管理作业终点固定码与已接线/平面错配判定，本记录不涉管理操作，Q-48仅登记，行为未改变。 |
+| E03.controller_acceptance | E03 | v4.4：Q-27否、Q-29是；v4.5：Q-43是、Q-45是、Q-44否 | 相邻不矛盾 | v4.4：记录验证程序fixture下G1单步消费者、journal与开发选择（optimization.rs:496–728），其开发报告自标Fixture出处、只证程序路径；Q-29的identity_only拒作Skill证据与HS07另计参数截断均为新增义务，与本记录相邻但不矛盾，行为未改变。 v4.5：记录验证程序fixture下G1单步消费者、journal与开发选择（optimization.rs:496–728）；Q-43/Q-45不触及（v4.4 Q-29的adjacent保留）。 |
+| E03.ag016_development_receipts | E03 | v4.4：Q-27否、Q-29是；v4.5：Q-43是、Q-45是、Q-44否 | 相邻不矛盾 | v4.4：记录验证开发执行/评分收据schema、登记纯函数runner与E03观察门（development_receipts.rs:451–828,1279–1438），断言的是身份、收据、账本与撤销收口且两侧分数恒等；v4.4只禁止把identity_only结果当Skill内容证据，本记录未如此断言，属相邻不矛盾。 v4.5：记录验证开发收据schema、登记纯函数runner与E03观察门（development_receipts.rs:451–828,1279–1438）；Q-45在既有登记/角色分离核验上新增candidate_consumption核验，相邻不矛盾。 |
+| E03.ag079_local_scoped_acceptance | E03 | v4.4：Q-27否、Q-29是；v4.5：Q-43是、Q-45是、Q-44否 | 行为未变 | v4.4：记录验证复制诊断RuleHypothesis前的结构拒绝（diagnosis_hypothesis_structure_v42.rs:368–447,462–490）；其truncated为宿主投影截断而非HS07所改的轨迹覆盖计数，Q-29不涉执行器，行为未改变。 v4.5：记录验证复制诊断RuleHypothesis前的结构拒绝；Q-43/Q-45不触及。 |
+| E04.controller_acceptance | E04 | v4.4：Q-27否、Q-33否、Q-40是、Q-41是；v4.5：Q-54是、Q-52是、Q-51否、Q-27否 | 行为未变 | v4.4：记录验证持久根预算预留/dispatch/结算与取消已派发不退款（budget.rs:74–410,456–517）；Q-41只界定时钟下界取哪些发生时间列、Q-40只改作业记录版本，本记录未断言二者，Q-33为否，行为未改变。 v4.5：记录验证持久根预算预留/dispatch/结算与取消已派发不退款（budget.rs:74–410,456–517）；未断言参与时钟下界的列集合或installed_on不参与（M35无该下界），Q-54维持原结论；所涉取消/清理不属管理作业记录，Q-52不涉，Q-51/Q-27仅登记，行为未改变。 |
+| E04.ag082_local_scoped_acceptance | E04 | v4.4：Q-27否、Q-33否、Q-40是、Q-41是；v4.5：Q-54是、Q-52是、Q-51否、Q-27否 | 行为未变 | v4.4：记录验证根预算授权在自有事件中止时整体回滚并可同请求恢复（budget_sql_fault_rollback_v42.rs:584–592）；Q-40/Q-41不涉，Q-33为否，行为未改变。 v4.5：记录验证根预算授权在自有事件中止时整体回滚并可同请求恢复（budget_sql_fault_rollback_v42.rs:584–592）；未断言参与时钟下界的列集合或installed_on不参与（M35无该下界），Q-54维持原结论；所涉取消/清理不属管理作业记录，Q-52不涉，Q-51/Q-27仅登记，行为未改变。 |
+| E04.ag077_local_scoped_acceptance | E04 | v4.4：Q-27否、Q-33否、Q-40是、Q-41是；v4.5：Q-54是、Q-52是、Q-51否、Q-27否 | 行为未变 | v4.4：记录验证typed E16预算来源快照、引用丢失后的费用与清理（e16_budget_binding_v42.rs:140–243，library-only）；Q-40/Q-41不涉，Q-33为否，行为未改变。 v4.5：记录验证typed E16预算来源快照、引用丢失后的费用与清理（e16_budget_binding_v42.rs:140–243，library-only）；未断言参与时钟下界的列集合或installed_on不参与（M35无该下界），Q-54维持原结论；所涉取消/清理不属管理作业记录，Q-52不涉，Q-51/Q-27仅登记，行为未改变。 |
+| E04.ag121_v43_redacted_bound_request_identity | E04 | v4.4：Q-27否、Q-33否、Q-40是、Q-41是；v4.5：Q-54是、Q-52是、Q-51否、Q-27否 | 行为未变 | v4.4：记录验证脱敏bound请求严格读取、身份保持与同身份恰好一次关闭（broker_redacted_bound_guards_v42.rs:1240–1500,1757–1786）；该关闭即v4.4§11.3.1窄豁免（Q-33为否、现行实现不改），Q-40/Q-41未被断言，行为未改变。 v4.5：记录验证脱敏bound请求严格读取、身份保持与同身份恰好一次关闭（broker_redacted_bound_guards_v42.rs:1240–1500,1757–1786）；未断言参与时钟下界的列集合或installed_on不参与（M35无该下界），Q-54维持原结论；所涉取消/清理不属管理作业记录，Q-52不涉，Q-51/Q-27仅登记，行为未改变。 |
+| E05.controller_acceptance | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 相邻不矛盾 | v4.4：记录验证程序fixture流式评测：真实receipt、乱序连续前缀、停机阻断、费用/曝光保留（streaming_evaluator.rs:748–1067,1242–1459）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划，行为未改变。 v4.5：记录验证程序fixture流式评测：真实receipt、乱序连续前缀、停机阻断、费用/曝光保留（streaming_evaluator.rs:748–1067,1242–1459）；完整批用例经finalize_complete间接调用decide()但为正效应，未断言LCB<0⇒regressed分支（1010–1063），与Q-57相邻不矛盾；不涉可行性门，行为未改变。 |
+| E05.ag052_versioned_batch_verdicts | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 行为被改变（撤出） | v4.4：记录验证显式控制v2保留统计判定、v1固定字节与理由（最终批准门后处理）（streaming_verdicts_v42.rs:815–958,1085–1164）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划，行为未改变。 v4.5：记录验证显式控制v2保留统计判定、v1冻结字节/摘要/理由（streaming_verdicts_v42.rs:829–901）；其v1后处理用例把decide()在d=−1时的Regressed+negative_lcb作为预期原始判定与存储理由（858–864,882–895），正是v4.5 Q-57改变且纠正前不作依据的退化分支，须撤出并在AG-192纠正decide()后按v4.5重验。 |
+| E05.ag083_partition_admission_rejection_atomicity | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 行为未变 | v4.4：记录验证分区准入拒绝不留部分成员/家族写入（partition_admission_atomic_v42.rs:165–398,771–851）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划，行为未改变。 v4.5：记录验证分区准入拒绝不留部分成员/家族写入（partition_admission_atomic_v42.rs:165–398,771–851）；不调用decide()与可行性门，Q-57/Q-47未触及，Q-44/Q-48仅登记，行为未改变。 |
+| E05.ag080_local_scoped_acceptance | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 行为被改变（撤出） | v4.4：记录验证QueryBook/Evaluator冻结计划绑定与失配前拒绝（evaluator_plan_binding_v42.rs:136–317,452–650）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划，行为未改变。 v4.5：记录验证QueryBook/Evaluator冻结计划绑定与失配前拒绝（evaluator_plan_binding_v42.rs:136–317,452–650）；同一目标的旧wire逐字节golden（701–776）冻结了regression场景下decide()的Regressed+negative_lcb输出，属以Q-57所改分支结论作正向断言（字节级），须撤出并在AG-192纠正后按v4.5重验（重验时该golden随退化判据/理由更新或剔除该场景）。 |
+| E05.ag087_local_scoped_acceptance | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 相邻不矛盾 | v4.4：记录验证正式冻结候选直接依赖与撤销绑定（formal_candidate_dependency_binding_v42.rs:923–1256,1416–1494）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划，Q-37为否，行为未改变。 v4.5：记录验证正式冻结候选直接依赖与撤销绑定（formal_candidate_dependency_binding_v42.rs:923–1256,1416–1494）；完整批终结经finalize_complete间接调用decide()但为正效应、只断言Improved，与Q-57相邻不矛盾；不涉可行性门，行为未改变。 |
+| E05.ag088_local_scoped_acceptance | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 相邻不矛盾 | v4.4：记录验证完整批报告绑定实际统计、篡改均值拒绝（complete_batch_statistics_binding_v42.rs:1062–1081）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划，行为未改变。 v4.5：记录验证完整批报告绑定实际统计、篡改均值拒绝（complete_batch_statistics_binding_v42.rs:1062–1081）；其完整批经finalize_complete间接调用decide()但均值为1，未断言LCB<0⇒regressed，与Q-57相邻不矛盾；不涉可行性门，行为未改变。 |
+| E05.ag089_local_scoped_acceptance | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 相邻不矛盾 | v4.4：记录验证早停报告绑定实际首个证书与迟到费用（early_stop_certificate_binding_v42.rs:1271–1465,1531–1655）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划，行为未改变。 v4.5：记录验证早停报告绑定实际首个证书与迟到费用（early_stop_certificate_binding_v42.rs:1271–1465,1531–1655）；同目标完整批用例经finalize_complete间接调用decide()但为正效应，未断言退化分支，与Q-57相邻不矛盾；不涉可行性门，行为未改变。 |
+| E05.ag090_local_scoped_acceptance | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 行为未变 | v4.4：记录验证invalid理由绑定实际Some-ticket付费事实（invalid_formal_reason_binding_v42.rs:1225–1301）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划，行为未改变。 v4.5：记录验证invalid理由绑定实际Some-ticket付费事实（invalid_formal_reason_binding_v42.rs:1225–1301）；不经decide()与可行性门，Q-57/Q-47未触及，行为未改变。 |
+| E05.ag091_local_scoped_acceptance | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 行为未变 | v4.4：记录验证迟到grader错误不撤销已确认早停（late_grader_stop_preservation_v42.rs:1115–1197,1411–1561）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划，行为未改变。 v4.5：记录验证迟到grader错误不撤销已确认早停（late_grader_stop_preservation_v42.rs:1115–1197,1411–1561）；早停走§3.4.1序贯界、不经decide()，Q-57/Q-47未触及，行为未改变。 |
+| E05.ag095_canonical_grader_receipt_digest | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 相邻不矛盾 | v4.4：记录验证外部宿主权威的独立grader收据规范摘要与伪造拒绝（M35经#187插入F02用例，所引两函数体与AG-124基线逐字相同）（formal_external_host_authority_v42.rs:1634–1819）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划，行为未改变。 v4.5：记录验证外部宿主权威的独立grader收据规范摘要与伪造拒绝（formal_external_host_authority_v42.rs:1634–1819）；终结经finalize间接调用decide()但为正效应、只断言improved，与Q-57相邻不矛盾；不涉可行性门，行为未改变。 |
+| E05.ag101_streaming_verdicts_v42 | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 行为被改变（撤出） | v4.4：记录验证v2完整批仅当UCB<0才确认退化（退化门，不是可行性门）（streaming_verdicts_v42.rs:959–1048）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划，行为未改变。 v4.5：记录验证v2完整批“仅当UCB<0才确认退化”（streaming_verdicts_v42.rs:958–1047）；其用例以decide()的LCB<0且均值<0⇒Regressed为原始判定（962–963,997–998,1030–1031），确认阈值又为0而非v4.5的−max_regression，属v4.5 Q-57改变的行为，须撤出并在AG-192纠正后按v4.5重验。 |
+| E05.ag109_external_host_authority_bound_ticket | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 相邻不矛盾 | v4.4：记录验证bound票据权威签发、附着环通过与其他边之环拒绝（所引函数体与AG-124基线逐字相同）（formal_external_host_authority_v42.rs:2012–2298）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划；所涉附着环正是Q-37（否，现行已按严格条件）的内容，行为未改变。 v4.5：记录验证bound票据权威签发、附着环通过与其他边之环拒绝（formal_external_host_authority_v42.rs:2012–2298）；终结经finalize间接调用decide()但为正效应，与Q-57相邻不矛盾；不涉可行性门，行为未改变。 |
+| E05.ag100_formal_candidate_dependency_binding_v42 | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 相邻不矛盾 | v4.4：记录验证任一控制schema缺候选时签发前拒绝（formal_candidate_dependency_binding_v42.rs:1746–1856）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划，Q-37为否，行为未改变。 v4.5：记录验证任一控制schema缺候选时签发前拒绝（formal_candidate_dependency_binding_v42.rs:1746–1856）；同目标终结用例经finalize_complete间接调用decide()但为正效应、只断言Improved，与Q-57相邻不矛盾；不涉可行性门，行为未改变。 |
+| E05.ag118_late_receipts_after_final_report_v42 | E05 | v4.4：Q-27否、Q-34是、Q-37否；v4.5：Q-57是、Q-47是、Q-44否、Q-48否 | 相邻不矛盾 | v4.4：记录验证最终报告后迟到收据只留审计、报告字节不变（#197后所引函数体未变）（late_grader_after_final_report_v42.rs:1685–1773）；Q-34只把可行性规划与最终批准门在等号处对齐且最终批准门不变，本记录不涉可行性规划，行为未改变。 v4.5：记录验证最终报告后迟到收据只留审计、报告字节不变（late_grader_after_final_report_v42.rs:1685–1773）；完整批端点经finalize_complete间接调用decide()但为正效应、只断言Improved，与Q-57相邻不矛盾；不涉可行性门，行为未改变。 |
+| E06.ag084_local_scoped_acceptance | E06 | v4.4：—（v4.4 并集外）；v4.5：Q-38是、Q-49否 | 相邻不矛盾 | v4.5：记录验证存储候选与阶段事实审阅不授予批准（candidate_review.rs:707–1231,2271–2380）；其调用的是同步只读审阅路径，且断言零写入、角色/命名空间限制与隐藏材料不泄露，均与v4.5 Q-53/Q-38同向，未断言not_wired/未知操作或平面错配旧行为，属相邻不矛盾。 |
+| E06.ag116_edit_compiled_produce_review_v42 | E06 | v4.4：—（v4.4 并集外）；v4.5：Q-38是、Q-49否 | 相邻不矛盾 | v4.5：记录验证生产写入的EditCompiled事实经review_stored得精确diff、单字节改动被拒（edit_compiled_produce_review_v42.rs:715–882）；调用同步只读审阅路径但不涉已接线定义、平面错配码或只读HTTP入口登记，与Q-53相邻不矛盾，行为未改变。 |
+| E07.controller_acceptance | E07 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-46是 | 行为未变 | v4.4：记录验证本地协议认证/身份/幂等与禁用模型范围（service.rs:178–426）；Q-29要求E07真实链用projection_consumed执行器、Q-30为默认关闭新功能，本记录不声明真实链也不涉多候选，行为未改变。 v4.5：Q-46只新增默认关闭方法的启用/停用事实与登记行，本记录未触及。 |
+| E07.ag015_curriculum_step_consumer | E07 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-46是 | 行为未变 | v4.4：记录验证curriculum.step管理消费者、幂等探针调度收据与读侧重核（dispatch_management.rs:1235–1757）；其中“probe”是课程探针、纯函数只作课程夹具，Q-29/Q-30均未被触及，行为未改变。 v4.5：Q-46只新增默认关闭方法的启用/停用事实与登记行，本记录未触及。 |
+| E07.ag017_exploration_start_consumer | E07 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-46是 | 行为未变 | v4.4：记录验证exploration.start的幂等世界登记与读侧纯决策重算（dispatch_management.rs:2290–3071）；不涉开发执行器或多候选合成，行为未改变。 v4.5：Q-46只新增默认关闭方法的启用/停用事实与登记行，本记录未触及。 |
+| E07.ag027_management_cleanup_closure | E07 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-46是 | 行为未变 | v4.4：记录验证管理作业与私有输入进入撤销清理闭包、撤销依赖提交前拒绝（management_cleanup_v42.rs:1828–2031,3177–3445）；纯函数执行器只作产生收据的夹具，正是v4.4允许identity_only证明的收口链，行为未改变。 v4.5：Q-46只新增默认关闭方法的启用/停用事实与登记行，本记录未触及。 |
+| E07.ag044_submit_upstream_gate | E07 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-46是 | 行为未变 | v4.4：记录验证提交时上游闭包撤销拒绝且零写入、同key回放原作业（submit_upstream_gate_v42.rs:1811–1880,2152–2342,2407–2538）；执行器只作闭包夹具，Q-29/Q-30未触及，行为未改变。 v4.5：Q-46只新增默认关闭方法的启用/停用事实与登记行，本记录未触及。 |
+| E07.ag108_candidate_review | E07 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-46是 | 行为未变 | v4.4：记录验证EditCompiled审阅仅在producer原规则摘要下给出精确diff（candidate_review.rs:1523–1782，#188后所引函数体与基线逐字相同）；Q-29/Q-30不涉，行为未改变。 v4.5：Q-46只新增默认关闭方法的启用/停用事实与登记行，本记录未触及。 |
+| E08.controller_acceptance | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证离线撤销即时封锁、分页清理、不可逆费用保留与独立锚恢复（M35行号经#198平移，函数体与AG-124基线逐字相同）（lifecycle.rs:305–518,1107–1318,1488–1546）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag036_revocation_source_collision | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证另一kind墓碑上的二次撤销返回命名Conflict/NotFound且零写入（revocation_source_collision.rs:262–307,312–365）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag035_cleanup_fixpoint | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证清理在闭包不动点才Complete、未知对象失败、重启续清（cleanup_fixpoint.rs:235–342,586–775）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag038_budget_revoke_gate | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证撤销来源不再预留/派发、已派发结算照记（budget_revoke_gate.rs:345–500,585–726,779–913）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag043_late_response_revoked | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证撤销后结算照记费、响应封锁、传输脱敏（late_settlement_revoked.rs:1–18）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag045_late_stage_fact_redaction | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证撤销后写入的阶段事实以rsia.redacted.v1存储（late_stage_fact_redaction_v42.rs:1385–1515,1518–1563,2149–2156）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag053_bounded_dependency_snapshots | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证依赖快照递归有界且语义/指纹不变（local_export.rs:135–199,304–611）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag068_native_authority_cleanup | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证登记原生权威后继在新撤销作业中逻辑清理（import_source_successor_cleanup_v42.rs:374–392,395–505,796–864）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag069_local_scoped_acceptance | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证Failed清理整前沿Admin重试与Worker续清（failed_cleanup_resume_v42.rs:248–463,888–1183）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag073_local_scoped_acceptance | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证已完成缓存对来源撤销拒绝且不重付（broker_cache_revoke_v42.rs:376–610,676–706）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免）；补close属已撤出的AG097，不计入本记录，行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag075_local_scoped_acceptance | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证typed导入来源/结果依赖只读绑定（library-only）（dependency_read_v42.rs:35–153,155–243）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag096_unreadable_bound_request_isolated | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证不可读历史预算请求单行隔离而不回滚命名空间（cleanup_unreadable_bound_request_v42.rs:698–842,972–1054）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag107_budget_ref_missing_fail_closed_v42 | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证预算引用丢失按存储闭包失败关闭（budget_ref_missing_fail_closed_v42.rs:518–830）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag106_budget_startup_recovery_v42 | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证启动时为崩溃丢失close的已结算调用补关闭一次、第二遍不写（budget_startup_recovery_v42.rs:565–822,899–958）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免）；该补关闭属已结算调用，与Q-33窄豁免方向一致，行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag104_restore_prefix_migration_upgrade_v42 | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证严格前缀旧迁移备份在私有副本升级、异常隔离（restore_prefix_upgrade_v42.rs:835–924,969–1046）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E08.ag117_formal_call_revoke_cleanup_v42 | E08 | v4.4：Q-33否；v4.5：Q-51否 | 行为未变 | v4.4：记录验证清理按登记来源引用判定正式调用闭包（formal_call_revoke_cleanup_v42.rs:619–856,1204–1268）；E08适用的唯一Q项Q-33为“否”（现行broker实现不改，仅为已结算调用执行关闭设窄豁免），行为未改变。 v4.5：v4.5 只适用 Q-51（否：执行关闭写集即现状），维持 v4.4 结论。 |
+| E09.controller_acceptance | E09 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-45是、Q-46是、Q-44否 | 相邻不矛盾 | v4.4：记录验证确定性程序fixture探索协调、调用既有单步消费者、历史与中间节点拒发布（exploration_v41.rs:495–1234），fixture开发报告被标fixture_declared不作有效候选；与Q-29同语义区且同向，Q-30不涉，属相邻不矛盾。 v4.5：Q-45/Q-46只新增字段登记、runner合同核验与C_probe_compose启用事实；本记录未触及。 |
+| E09.ag021_skill_group_jobs | E09 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-45是、Q-46是、Q-44否 | 相邻不矛盾 | v4.4：记录验证§7.7每作业至多两组、组间隔离与组合仅作标记且须完整重跑与独立验收（skill_groups_v42.rs:863–1028,1271–1301）；与Q-30合成须重新评估的方向一致、未禁止合成，开发报告为fixture，属相邻不矛盾。 v4.5：Q-45/Q-46只新增字段登记、runner合同核验与C_probe_compose启用事实；本记录所验内容与之相邻不矛盾。 |
+| E09.ag024_exploration_cleanup_edges | E09 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-45是、Q-46是、Q-44否 | 行为未变 | v4.4：记录验证探索节点/派发事实/历史首写同事务写世界依赖边与脱敏读拒绝（exploration_cleanup_v42.rs:1187–1200,1514–1725,1769–1937）；不涉开发证据资格或多候选，行为未改变。 v4.5：Q-45/Q-46只新增字段登记、runner合同核验与C_probe_compose启用事实；本记录未触及。 |
+| E09.ag026_practice_attempt_sets | E09 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-45是、Q-46是、Q-44否 | 相邻不矛盾 | v4.4：记录验证§8.5同题对比练习K=1缺省、K=3须登记且只授权一集、尝试不计独立样本或周期（practice_v42.rs:957–1212,2425–2764）；其纯函数/对比执行只服务练习登记、明确不作开发周期，与Q-29/Q-30相邻但不矛盾。 v4.5：Q-45/Q-46只新增字段登记、runner合同核验与C_probe_compose启用事实；本记录所验内容与之相邻不矛盾。 |
+| E09.ag033_run_next_trusted_gate | E09 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-45是、Q-46是、Q-44否 | 行为被改变（撤出） | v4.4：记录验证run_next只把经E03门核验的开发证据记为Valid（exploration_trust_v42.rs:1497–1803,2194–2315），但其正向路径把RegisteredPureFunction出处、输出不依赖Skill内容的执行结果固定为Trusted节点质量与最终候选资格；v4.4§6.7.4规定identity_only结果不得作Skill内容开发证据，故该正向断言属被改变的旧行为，须撤出重验（fixture/伪造/篡改拒绝部分方向不变）。 v4.5：Q-45/Q-46只新增字段登记、runner合同核验与C_probe_compose启用事实；本记录所验内容与之相邻不矛盾。 |
+| E09.ag039_legal_actions | E09 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-45是、Q-46是、Q-44否 | 相邻不矛盾 | v4.4：记录验证Deepen只授Trusted、已展开父不重复加深、最佳祖先规则（exploration_legal_actions_v42.rs:1656–1895），规则以标签为输入、v4.4未改；但Trusted来源夹具与E09.ag033同为identity_only，属相邻（夹具依赖），Q-29落地时须换投影消费替身后再跑。 v4.5：Q-45/Q-46只新增字段登记、runner合同核验与C_probe_compose启用事实；本记录所验内容与之相邻不矛盾。 |
+| E09.ag040_exploration_registration | E09 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-45是、Q-46是、Q-44否 | 行为未变 | v4.4：记录验证注册指纹只覆盖不可变字段、计数与成本由真实派发事实反推（exploration_start_after_dispatch_v42.rs:1146–1331,1664–1792,2410–2474）；不涉证据资格或多候选，行为未改变。 v4.5：Q-45/Q-46只新增字段登记、runner合同核验与C_probe_compose启用事实；本记录未触及。 |
+| E09.ag041_postpaid_convergence | E09 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-45是、Q-46是、Q-44否 | 行为未变 | v4.4：记录验证付费后前缀/claim漂移或目标丢失收为唯一Uncertain、支付事实不丢（exploration_postpaid_v42.rs:1311–1583,1735–1964）；不涉开发证据资格或多候选，行为未改变。 v4.5：Q-45/Q-46只新增字段登记、runner合同核验与C_probe_compose启用事实；本记录未触及。 |
+| E09.ag048_terminal_classes | E09 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-45是、Q-46是、Q-44否 | 相邻不矛盾 | v4.4：记录验证优化步终态使用封闭typed类与固定码、决策行为不变（step_terminal_classes_v42.rs:2337–2547）；类来源于fixture开发选择、与Q-29同语义区但未把执行结果当Skill证据，属相邻不矛盾。 v4.5：Q-45/Q-46只新增字段登记、runner合同核验与C_probe_compose启用事实；本记录未触及。 |
+| E09.ag103_fairness_waits_legal_set_v42 | E09 | v4.4：Q-27否、Q-29是、Q-30是；v4.5：Q-45是、Q-46是、Q-44否 | 行为未变 | v4.4：记录验证core legal_candidates预选过滤与公平等待只对完成轮合法跳过机会（fairness_waits_legal_set_v42.rs:419–636）；Q-29/Q-30不涉，行为未改变。 v4.5：Q-45/Q-46只新增字段登记、runner合同核验与C_probe_compose启用事实；本记录未触及。 |
+| E10.ag032_replay_redacted_reads | E10 | v4.4：Q-36否；v4.5：Q-54是、Q-36否 | 行为未变 | v4.4：记录验证回放各读点在清理中间态返回命名Conflict、墓碑kind精确比较（replay_redacted_reads_v42.rs:912–1233,1319–1519；#198将记录种类适配为current v3，命名Conflict语义不变）；E10适用的Q-36为“否”（v3已按首命中计数），行为未改变。 v4.5：记录验证回放脱敏读命名Conflict语义；Q-54的E10部分只登记过滤次序，本记录未触及。 |
+| E13.ag022_consolidation_closure | E13 | v4.4：Q-27否；v4.5：Q-29是、Q-58否、Q-27否 | 相邻不矛盾 | v4.4：记录验证监测撤销闭包、pass/fail配对v2、持久提案与唯一staging（monitoring_consolidation_v42.rs:1430–1531,1723–1851,2386–2512,2766–2991）；E13适用的Q-27只对应HS03逐编辑标注“仅登记、只作假设”，不改变本记录行为。 v4.5：记录验证监测撤销闭包、pass/fail配对v2、持久提案与唯一staging（monitoring_consolidation_v42.rs:1430–1531,1723–1851,2386–2512,2766–2991）；配对与提案均来自Fixture出处报告且出处恒标ProgramFixture、伪标trusted_execution被拒，不以identity_only配对作Skill内容证据，与Q-58/Q-29相邻不矛盾，行为未改变。 |
+| E13.ag030_consolidation_budget_stage | E13 | v4.4：Q-27否；v4.5：Q-29是、Q-58否、Q-27否 | 行为未变 | v4.4：记录验证巩固调用记入Consolidation预算阶段与双向阶段校验（consolidation_budget_stage_v42.rs:377–430,1568–1766,1869–2004）；E13适用的Q-27只对应HS03逐编辑标注“仅登记、只作假设”，不改变本记录行为。 v4.5：记录验证巩固调用记入Consolidation预算阶段与双向阶段校验（consolidation_budget_stage_v42.rs:377–430,1568–1766,1869–2004）；不涉配对证据资格，Q-29/Q-58未触及，行为未改变。 |
+| E13.ag031_bounded_terminal_category | E13 | v4.4：Q-27否；v4.5：Q-29是、Q-58否、Q-27否 | 行为未变 | v4.4：记录验证128字节UTF-8安全终态类别与长理由收口（consolidation_terminal_category_v42.rs:133–257,1164–1336）；E13适用的Q-27只对应HS03逐编辑标注“仅登记、只作假设”，不改变本记录行为。 v4.5：记录验证128字节UTF-8安全终态类别与长理由收口（consolidation_terminal_category_v42.rs:133–257,1164–1336）；不涉配对证据资格，Q-29/Q-58未触及，行为未改变。 |
+| E13.ag081_local_scoped_acceptance | E13 | v4.4：Q-27否；v4.5：Q-29是、Q-58否、Q-27否 | 相邻不矛盾 | v4.4：记录验证监测/巩固原报告与执行输入实际绑定（头注明言登记纯函数控制只证typed收据）（monitoring_evidence_binding_v42.rs:1475–1583,1793–1968,2032–2095）；E13适用的Q-27只对应HS03逐编辑标注“仅登记、只作假设”，不改变本记录行为。 v4.5：记录验证监测/巩固原报告与执行输入实际绑定（monitoring_evidence_binding_v42.rs:1475–1583,1793–1968,2032–2095）；其登记纯函数（identity_only性质）配对只得NoContrast/NoChange并只证收据与绑定链，提案出处为ProgramFixture，正是v4.5 §11.5允许identity_only证明的内容，相邻不矛盾，行为未改变。 |
+| E16.1.ag076_local_scoped_acceptance | E16.1 | v4.4：Q-27否；v4.5：Q-43是 | 行为未变 | v4.4：记录验证有界内容驱动导入ProgramFixture的操作/匹配/闭包/编码（import_fixture_v42.rs:283–327,607–737,1024–1095）；HS07另计参数截断针对轨迹覆盖记录，本记录未涉，行为未改变。 v4.5：Q-43未触及。 |
+| E16.1.ag070_local_scoped_acceptance | E16.1 | v4.4：Q-27否；v4.5：Q-43是 | 相邻不矛盾 | v4.4：记录验证有界本地开发物料读取器（import_development_material_v42.rs:326–405）及其字符截断计数与partial标记（748–749）；HS07只在条数/字符截断之外另计参数截断，与本记录相邻但不矛盾，行为未改变。 v4.5：所验字符截断计数与partial与Q-43同向，参数截断计数为新增义务，相邻不矛盾。 |
+| E16.3.seed_install_reset_controller_acceptance | E16.3 | v4.4：Q-35否；v4.5：Q-55否、Q-59否 | 行为未变 | v4.4：记录验证种子B/L/U安装与reset staging不auto-Active（seeds_v41.rs:33–156,434–501；#168已把缺失/损坏B改为Unknown，L148–155）；E16.3适用的Q-35为“否”（现行已取Unknown），行为未改变。 v4.5：记录验证种子B/L/U安装与reset staging不auto-Active（seeds_v41.rs:33–156,434–501）；Q-55为否且本记录未把身份字段赋予U，Q-59为措辞登记，行为未改变。 |
+| E16.3.ag127_v43_seed_classification | E16.3 | v4.4：Q-35否；v4.5：Q-55否、Q-59否 | 行为未变 | v4.4：记录验证纯B/L/U分类对损坏摘要或缺身份失败关闭为Unknown（seed_classification_v43.rs:21–167，其中L/U缺失或无效亦为Unknown见90–103）；与v4.4 Q-35一致且Q-35为“否”，行为未改变。 v4.5：记录验证纯B/L/U分类对损坏摘要或缺身份失败关闭为Unknown（seed_classification_v43.rs:21–167）；其身份字段只在B/L、U以内容摘要为身份，正与v4.5 Q-55表述一致（Q-55为否），行为未改变。 |
+| E16.5.gate_functions_controller_acceptance | E16.5 | v4.4：Q-28否、Q-32是、Q-39否、Q-41是；v4.5：Q-54是、Q-56是、Q-27否、Q-59否 | 行为未变 | v4.4：记录验证容量/恢复闭包/部署安全纯函数门（头注V073仅为场景族列举，无许可断言）（capacity_v41.rs:137–284,286–486,544–794）；Q-32只改许可登记/README、Q-41只界定时钟下界的发生时间列，本记录均未断言，Q-28/Q-39为否，行为未改变。 v4.5：记录验证容量/恢复闭包/部署安全纯函数门（capacity_v41.rs:137–284,286–486,544–794）；未断言参与下界的列集合或installed_on不参与（M35无该下界），Q-54维持原结论；Q-56只涉README/许可措辞机检，本记录不涉，Q-27/Q-59仅登记，行为未改变。 |
+| E16.5.ag014_capacity_gates_wired | E16.5 | v4.4：Q-28否、Q-32是、Q-39否、Q-41是；v4.5：Q-54是、Q-56是、Q-27否、Q-59否 | 行为未变 | v4.4：记录验证MVP容量门接入六个真实入口并跨命名空间计数（capacity_v41.rs:796–867）；Q-32只改许可登记/README、Q-41只界定时钟下界的发生时间列，本记录均未断言，Q-28/Q-39为否，行为未改变。 v4.5：记录验证MVP容量门接入六个真实入口并跨命名空间计数（capacity_v41.rs:796–867）；未断言参与下界的列集合或installed_on不参与（M35无该下界），Q-54维持原结论；Q-56只涉README/许可措辞机检，本记录不涉，Q-27/Q-59仅登记，行为未改变。 |
+| E16.5.ag018_startup_recovery_gate | E16.5 | v4.4：Q-28否、Q-32是、Q-39否、Q-41是；v4.5：Q-54是、Q-56是、Q-27否、Q-59否 | 行为未变 | v4.4：记录验证启动恢复隔离门只读复核、独立锚与无覆盖准入回执（startup_gate_v42.rs:296–624,625–808,1354–1437）；Q-32只改许可登记/README、Q-41只界定时钟下界的发生时间列，本记录均未断言，Q-28/Q-39为否，行为未改变。 v4.5：记录验证启动恢复隔离门只读复核、独立锚与无覆盖准入回执（startup_gate_v42.rs:296–624,625–808,1354–1437）；未断言参与下界的列集合或installed_on不参与（M35无该下界），Q-54维持原结论；Q-56只涉README/许可措辞机检，本记录不涉，Q-27/Q-59仅登记，行为未改变。 |
+| E16.5.ag029_restore_coverage | E16.5 | v4.4：Q-28否、Q-32是、Q-39否、Q-41是；v4.5：Q-54是、Q-56是、Q-27否、Q-59否 | 行为未变 | v4.4：记录验证恢复保护动作schema集合Rust/Python相等与锚前进隔离（restore_coverage_v42.rs:1024–1207,1385–1430,1510–1570）；Q-32只改许可登记/README、Q-41只界定时钟下界的发生时间列，本记录均未断言，Q-28/Q-39为否，行为未改变。 v4.5：记录验证恢复保护动作schema集合Rust/Python相等与锚前进隔离（restore_coverage_v42.rs:1024–1207,1385–1430,1510–1570）；未断言参与下界的列集合或installed_on不参与（M35无该下界），Q-54维持原结论；Q-56只涉README/许可措辞机检，本记录不涉，Q-27/Q-59仅登记，行为未改变。 |
+| E16.5.ag051_economic_restore | E16.5 | v4.4：Q-28否、Q-32是、Q-39否、Q-41是；v4.5：Q-54是、Q-56是、Q-27否、Q-59否 | 行为未变 | v4.4：记录验证经济回放记录按精确schema纳入恢复与启动保护（#198改动未触及所引函数体）（restore_economic_v42.rs:1248–1346,1487–1622）；Q-32只改许可登记/README、Q-41只界定时钟下界的发生时间列，本记录均未断言，Q-28/Q-39为否，行为未改变。 v4.5：记录验证经济回放记录按精确schema纳入恢复与启动保护（restore_economic_v42.rs:1248–1346,1487–1622）；未断言参与下界的列集合或installed_on不参与（M35无该下界），Q-54维持原结论；Q-56只涉README/许可措辞机检，本记录不涉，Q-27/Q-59仅登记，行为未改变。 |
+| E16.5.ag125_v43_single_writer | E16.5 | v4.4：Q-28否、Q-32是、Q-39否、Q-41是；v4.5：Q-54是、Q-56是、Q-27否、Q-59否 | 行为未变 | v4.4：记录验证本地OS单写者目录独占、生产入口门与活写者保留（single_writer_v43.rs:78–296）；Q-32只改许可登记/README、Q-41只界定时钟下界的发生时间列，本记录均未断言，Q-28/Q-39为否，行为未改变。 v4.5：记录验证本地OS单写者目录独占、生产入口门与活写者保留（single_writer_v43.rs:78–296）；未断言参与下界的列集合或installed_on不参与（M35无该下界），Q-54维持原结论；Q-56只涉README/许可措辞机检，本记录不涉，Q-27/Q-59仅登记，行为未改变。 |
+| E16.5.ag129_v43_system_clock_conversion | E16.5 | v4.4：Q-28否、Q-32是、Q-39否、Q-41是；v4.5：Q-54是、Q-56是、Q-27否、Q-59否 | 相邻不矛盾 | v4.4：记录验证系统墙钟换算单位保持且纪元前样本命名拒绝（clock_unix_v43.rs:6–32）；Q-41只界定“本库最大发生时间”取哪些列，未改纪元前拒绝，属同条款相邻不矛盾。 v4.5：记录验证系统墙钟换算单位保持且纪元前样本命名拒绝（clock_unix_v43.rs:6–32）；其断言纪元前/首个时钟拒绝与Q-54新增的发生时间列条目校验相邻不矛盾（M35无数据库下界），维持原adjacent；Q-56只涉README/许可措辞机检，本记录不涉，Q-27/Q-59仅登记，行为未改变。 |
+| E16.5.ag129_v43_broker_first_clock_refusal | E16.5 | v4.4：Q-28否、Q-32是、Q-39否、Q-41是；v4.5：Q-54是、Q-56是、Q-27否、Q-59否 | 相邻不矛盾 | v4.4：记录验证broker首个时钟拒绝先于预留与夹具派发（clock_fail_closed_v43.rs:31–133）；Q-41新增的发生时间列清单与类型校验未被本记录断言或否定，属相邻不矛盾。 v4.5：记录验证broker首个时钟拒绝先于预留与夹具派发（clock_fail_closed_v43.rs:31–133）；其断言纪元前/首个时钟拒绝与Q-54新增的发生时间列条目校验相邻不矛盾（M35无数据库下界），维持原adjacent；Q-56只涉README/许可措辞机检，本记录不涉，Q-27/Q-59仅登记，行为未改变。 |
+| E16.6.ag086_local_scoped_acceptance | E16.6 | v4.4：Q-27否、Q-31否、Q-32是、Q-42否；v4.5：Q-50是、Q-49否、Q-60否 | 相邻不矛盾 | v4.4：记录验证部分证据登记表（expected_merge_for_pr，support_scope.rs:476–570，#132在L562）与历史记录保留原plan摘要（1607–1659）；Q-32许可状态不在其验证范围，Q-31/Q-42的入口切换与撤出治理由AG-182另行更新，行为未改变。 v4.5：记录验证部分证据登记与历史记录不改写（support_scope.rs:476–570,1606–1719）；Q-50/Q-42把复核标记、替代关系与撤出清单写成机器口径，与所验历史记录保留、required不计入的规则同向不矛盾，新增字段属E16.6本次重绑定的新增义务；Q-49/Q-60仅登记，行为未改变。 |
+| E16.6.ag131_v43_project_license_metadata | E16.6 | v4.4：Q-27否、Q-31否、Q-32是、Q-42否；v4.5：Q-50是、Q-49否、Q-60否 | 行为被改变（撤出） | v4.4：记录验证项目许可manifest登记与Rust元数据守卫，但其登记的验证（源4232a226、摘录日志）断言许可状态为proprietary_unreleased；v4.4§2.8.1已把状态改为source_available_personal_noncommercial_free并替代旧状态，故属被改变的旧行为，须撤出并按M35现行测试重新登记新记录。 v4.5：v4.5增量项不改变本记录：其所验project_license登记不涉Q-50机器口径；但v4.4复核已判changed（记录源4232a226断言proprietary_unreleased，Q-32），综合仍为changed，按recheck-table既定指派处理。 |
+
+计数：84 条 = 行为未变 54 + 相邻不矛盾 25 + 行为被改变 5；79 条标 rechecked_v4.5，5 条移入 withdrawn_records；并集外 14 条（E11 1、E12 3、E14 3、E16.2 3、E16.4 2、E17 1、E18 1）保留原 plan_recheck 值。侦察中的四项口径（只按“是”项判定、以记录当时验证内容定性、E09.ag033 changed 与 E09.ag039 adjacent、fixture 出处不算 identity_only）与 R2 四项裁决（E05.ag080 wire golden 判 changed、经 finalize/grade 间接调用 decide 记 adjacent、E06 两条与 E16.6.ag086 记 adjacent）按卡执行。
+
+### 撤出记录归属表（待重验清单，24 条；§18.10 撤出记录的重验归属）
+
+| 记录 id | 所属 E | 撤出 PR | 落点条款 | 重验方式 | 负责的修补任务 | 状态 |
+|---|---|---|---|---|---|---|
+| E10.controller_acceptance | E10 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | pending_recheck |
+| E10.replay_management_controller_acceptance | E10 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | pending_recheck |
+| E10.ag064_replay_episode_recovery | E10 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | pending_recheck |
+| E10.ag103_replay_fairness_waits_legal_set_v42 | E10 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | pending_recheck |
+| E08.ag037_economic_replay_cleanup | E08 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | pending_recheck |
+| E09.ag074_local_scoped_acceptance | E09 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | pending_recheck |
+| E16.6.ag012_plan_v42_index_binding | E16.6 | #165 | §18.9 | 已被 v4.3 索引绑定替代：只登记替代关系，不重验、不复活；当前版本绑定见 E16.6.ag182_plan_v45_index_binding | AG-124 | replaced_by_binding |
+| E04.ag097_broker_close_before_refuse | E04 | #165 | §11.3.1/§11.6 | 随统一撤销判定的修补任务，按 §11.3.1 执行关闭写集重验（Q-51） | AG-119 | pending_recheck |
+| E04.ag105_broker_bound_recovery_close_v42 | E04 | #165 | §11.3.1/§11.6 | 随统一撤销判定的修补任务，按 §11.3.1 执行关闭写集重验（Q-51） | AG-119 | pending_recheck |
+| E08.ag046_write_side_revocation | E08 | #165 | §11.3.1 | 随统一撤销判定的修补任务，按 §11.3.1 统一撤销判定（精确 kind、首写前零写入）重验（Q-50） | AG-119 | pending_recheck |
+| E08.ag059_manifest_prewrite_gate | E08 | #165 | §11.3.1 | 随统一撤销判定的修补任务，按 §11.3.1 统一撤销判定（精确 kind、首写前零写入）重验（Q-50） | AG-119 | pending_recheck |
+| E04.ag054_typed_predispatch | E04 | #169 | §7.3.1 | 随时钟下界的修补任务重验（含 v4.4 发生时间列） | AG-132 | pending_recheck |
+| E06.controller_acceptance | E06 | #165 | §5.5.2 | 随 Tool-only 映射与能力上限的修补任务重验 | AG-169 | pending_recheck |
+| E13.controller_acceptance | E13 | #165 | §5.5.2 | 随 Tool-only 映射与能力上限的修补任务重验 | AG-169 | pending_recheck |
+| E16.4.real_store_rejection_controller_acceptance | E16.4 | #165 | §5.5.2 | 随 Tool-only 映射与能力上限的修补任务重验 | AG-169 | pending_recheck |
+| E09.ag042_recovery_counting | E09 | #165 | §7.2.3 | 随可修复失败来源与重置收据的修补任务重验 | AG-171 | pending_recheck |
+| E13.ag028_consolidation_trigger | E13 | #165 | §6.1.2 | 随巩固管理入口的修补任务重验 | AG-139 | pending_recheck |
+| E16.1.durable_import_controller_acceptance | E16.1 | #165 | §11.2.1 | 随原生 Trace 导出的修补任务重验 | AG-148 | pending_recheck |
+| E02.ag062_required_improver_baselines | E02 | #165 | §5.1.2 | 随摘要字段可重算的修补任务重验 | AG-135b | pending_recheck |
+| E09.ag033_run_next_trusted_gate | E09 | #200 | §6.7.4 | v4.4 Q-29：identity_only 纯函数执行结果被固定为 Trusted 节点质量与候选资格；随 candidate_consumption 合同按新记录重验 | AG-187 | pending_recheck |
+| E16.6.ag131_v43_project_license_metadata | E16.6 | #200 | §2.8.1 | v4.4 Q-32：所登记的验证断言 proprietary_unreleased；本 PR 在 head 上重跑同名目标并以新记录 supersedes 替代 | AG-182 | pending_recheck |
+| E05.ag052_versioned_batch_verdicts | E05 | #200 | §3.4 | v4.5 Q-57：断言 decide() 以 LCB<0 判 regressed（含 wire golden 冻结该分支输出）；修补任务纠正判据后按新记录 supersedes 重验 | AG-192 | pending_recheck |
+| E05.ag080_local_scoped_acceptance | E05 | #200 | §3.4 | v4.5 Q-57：断言 decide() 以 LCB<0 判 regressed（含 wire golden 冻结该分支输出）；修补任务纠正判据后按新记录 supersedes 重验 | AG-192 | pending_recheck |
+| E05.ag101_streaming_verdicts_v42 | E05 | #200 | §3.4 | v4.5 Q-57：断言 decide() 以 LCB<0 判 regressed（含 wire golden 冻结该分支输出）；修补任务纠正判据后按新记录 supersedes 重验 | AG-192 | pending_recheck |
+
+19 条（#165 撤出 18 条 + #169 AG128-R2 更正撤出 E04.ag054）按真源 §18.10 表登记；本 PR 新撤出 5 条（E09.ag033、E16.6.ag131、E05.ag052、E05.ag080、E05.ag101）。卡验收条件 6 写“21 行”是 R2 增量侦察并入三条 E05 之前的数字，按真源与卡验收条件 5 登记 24 行。三条 E05 撤出记录由 AG-192 重验，本卡不重验、不复活。
+
+### 缺失清单（reports/evidence-missing.json：42 路径 / 25 条记录）
+
+按 §18.10：缺失路径不撤出已验状态、不改写路径与摘要、不重造文件；逐条登记路径、记录 id、字段、预期字节与 SHA-256、消失窗口与分组；预期身份不可得者登记 unknown 并写原因，重现一律失败。分组：
+- `D1_old_machine_v41_controller_original`：28 路径 / 11 条记录（input_ref 11、log_path 11、record_source 6）。
+- `D2_task_receipt_lost_between_20261014_and_20261023`：13 路径 / 13 条记录（log_path 13）。
+- `D3_ag083_scratch_raw_log_not_located`：1 路径 / 1 条记录（log_path 1）。
+- D1 的 log_path/record_source 身份为 unknown（索引从未钉其摘要；原件只在旧机，2026-09-30 交接即已登记），D1 的 input_ref 以记录自身 input_digest 为预期 SHA-256、字节未登记；D2 的 13 份 Task 回执以既有 input_ref 中钉住的字节与 SHA-256 为预期身份，消失窗口为 2026-10-14T11:54:14Z（最后一次主检出检查器仍见到）至 2026-10-23T14:35Z（索引审计已缺）；D3（AG-083 scratch 原始日志）预期身份取自 ctrl-input-ag-083 回执，2026-10-12T16:15:59Z 前已缺。分类与检索过程见本地 qa/claude-r8-prep/missing-evidence/（不上传）。
+- 25 条受影响记录按其登记命令在本 PR head 上单目标重跑，以新记录 `completes`=[旧 id] 登记（见下文“重跑与重验”）；不冒充旧证据。
+
+### §16.8 固定来源读取范围与授权外研究动作（§18.10 动作合同）
+
+- HSF01–HSF16、HSP01 的实际读取：由 Harness² 审计代理在本地快照与固定提交 1cfe254（tree edc756a4）的原始克隆上读取，用于事实核验与借鉴矩阵裁决；16 个 blob 由起草代理在本地快照上现算与 §16.8 一致，tree 由 W0 经 GitHub API 核对（2026-10-23 读取，commit date 2026-10-14T02:22:49Z）。本轮未按行段单独记录各文件读取范围，登记为“快照全文/定位读取，未分行段”；直接复制或改编前须按 §2.8 重新逐文件登记行段与许可。HSP01 为 arXiv:2610.14224v1 Section 2.2.1 与 Appendix F（审计代理 2026-10-23 核对）。派生索引 hsf_sources 的 read_range 统一为 `ledger`，即指向本条登记。
+- 授权外研究动作（§2.8 v4.4 补充；V123.c v4.5 补充）：GPT 在本地研究目录以子进程执行上游 harness2/demo.py（2 个任务、28 次本地执行、32 次脚本化编辑器调用、无模型调用），属 §2.8 第一段授权之外；其结果不作任何依据（含“经验库被读取”的说法——实际编辑器读库 0 次），不出现在派生索引记录、验证记录、研究计划参数或效果报告的任何字段中。
+
+### 派生索引说明槽更正
+
+- E04 remaining[0] 原写“no actual provider transport … is wired”，与同条目已由 #165 更正的 status_reason（formal_local_host 已接外部 provider transport）矛盾；改为“provider transport 已接线、合格隔离 runner 未接线、无真实 provider 调用已验证”。
+- E16.5 remaining[2]、E16 remaining[1] 与 overall_remaining 末项原写“round 2 内部对象容量须先修订 §3.3.1”，但 v4.3 §3.3.2（Q-01）已登记这些初值；改为“初值已由 §3.3.2 登记，真实入口的执行仍未验证”。E16 status_reason 的“bound to v4.2 (AG-012)”改为 v4.5（AG-182），E16.6 status_reason 改写为 v4.5 口径并追加 remaining 一条；E16.6 implementation_files 加入 reports/evidence-missing.json。
+
+### 索引补登（backfill.json 可进索引 10 条 + 有条件 2 条）
+
+均为既有首验全量运行中的单目标结果，按 §18.10 以 plan_version v4.5 新写入（不是新执行）；command 为声明式 8 词单目标，execution.command 为产生该 .log.test 的字面命令（codex-r7-ctrl_verify.sh 的 test 门 `cargom test --workspace --locked --no-fail-fast`）；多目标 PR 只登记一个主目标，其余目标与 lib 单测只登台账。
+
+| PR | 任务 | 记录 id | E | 单目标（计数） | 首验日志 | 说明 |
+|---|---|---|---|---|---|---|
+| #178 | AG-150 | E16.5.ag150_readonly_dependency_api_v43 | E16.5 | readonly_dependency_api_v43（1 过 / 0 败） | `out/audit-20260930/qa/codex-r7-ag150/controller-9ab6d39-M13-r1.log.test` | — |
+| #180 | AG-136 | E02.ag136_management_registry_single_source_v43 | E02 | management_registry_v43（6 过 / 0 败） | `out/audit-20260930/qa/external-ag136-r7/independent-accept-eight-gates-m15-r1.log.test` | 有条件：engine 目标 management_registry_boundary_v43 断言已登记未接线名返回 unknown（Q-38/Q-53 已改变），不入本记录，待 AG-186 补全 |
+| #187 | AG-137（F02） | E05.ag137_evaluator_control_authentication | E05 | formal_external_host_authority_v42（9 过 / 0 败） | `out/audit-v43-remediation-20261016/F02-head-r5.full.log.test` | lib 单测模块（formal_authority::…）不合 `--lib …::tests` 语法，只登台账 |
+| #188 | F01 | E06.f01_builtin_generation_strategy_authority | E06 | compiler_formal_binding_v42（5 过 / 0 败） | `out/audit-v43-remediation-20261016/F01-head-r1.full.log.test` | lib 单测模块（formal_authority::…）不合 `--lib …::tests` 语法，只登台账 |
+| #189 | AG-143（F06） | E04.ag143_external_sampling_projection_v43 | E04 | external_model_sampling_projection_v43（3 过 / 0 败） | `out/audit-v43-remediation-20261016/F06-head-r1.full.log.test` | lib 单测模块（formal_authority::…）不合 `--lib …::tests` 语法，只登台账 |
+| #191 | AG-134 | E04.ag134_root_budget_cancellation_v43 | E04 | root_budget_cancellation_v43（8 过 / 0 败） | `out/audit-20260930/qa/codex-r7-ag134/controller-dae0d8e-M26-r1.log.test` | — |
+| #192 | AG-153 | E16.5.ag153_shared_prepare_contract_v43 | E16.5 | prepare_contract_v43（12 过 / 0 败） | `out/audit-20260930/qa/codex-r7-ag153/controller-a76d734-M27-r2.log.test` | — |
+| #194 | AG-114 | E16.6.ag114_evidence_identity_ownership | E16.6 | support_scope（33 过 / 0 败） | `out/audit-20260930/qa/codex-r7-ag114/newcomplete-controller-17579a3-M29-r1.log.test` | — |
+| #195 | AG-144 | E01.ag144_feasibility_approval_alignment_v43 | E01 | statistical_feasibility_v43（21 过 / 0 败） | `out/audit-20260930/qa/codex-r7-ag144/ctrl-0be75c2-M30-r1-runtime/eight/full-eight.log.test` | 有条件：非劣等号用例（Q-34/Q-47 已改变）不入本记录，待 AG-185 补全 |
+| #197 | AG-120 | E05.ag120_one_execution_receipt_per_call | E05 | late_grader_after_final_report_v42（29 过 / 0 败） | `out/audit-20260930/qa/codex-r7-ag120/AG120-controller-M32-r1-runtime/full-eight.log.test` | — |
+| #198 | AG-147 | E10.ag147_replay_lineage_versioning_v43 | E10 | replay_lineage_v43（7 过 / 0 败） | `out/audit-20260930/qa/codex-r7-ag147/AG147-M33-controller-79f1c7b-r1-runtime/full-eight.log.test` | 六条回放撤出记录另由本 PR 单目标重验，不以 #198 首验替代 |
+| #199 | AG-122 | E05.ag122_ga18_bound_cycle_validation | E05 | formal_external_host_authority_v42（16 过 / 0 败） | `out/audit-20260930/qa/codex-r7-ag122/AG122-M34-independent-22609c6-r3-runtime/full-eight.log.test` | — |
+
+只登台账 17 条：#165、#169、#172、#176（台账/索引 PR，其自身检查器子范围由后续绑定替代）、#171、#175、#177、#184、#196（无 Rust 单目标或只改 CI/依赖登记/Python）、#179、#181、#182、#183、#185、#186（README，#181/#185 的许可状态由 E16.6.ag182_v45_project_license_metadata 承载）、#190（台账 PR）、#193（只有 `dispatch::late_cancel_tests` 经 #[path] 引入的 lib 单测，现行语法不可声明；其 `:cancel_after_side_effect` 后缀属 Q-40/Q-52 过渡条款）。检查器 `--lib` 语法本卡不扩展。
+
+### 第七阶段 PR 台账补登（#169、#176–#199，共 25 节）
+
+每节只登记合并事实与首验材料位置；状态最高 implemented_not_verified + 首次技术验收（README/文档 PR 无运行时验收）；GPT 二验状态按 final-pr-matrix 原文登记，不是 Claude 二次验收。所有节通用的不可声明项：整 E/V、真实 provider/宿主/沙箱、付费实验、历史 T001–T126 与 E14 冻结合同、效果、收益、发行、Claude 二次验收。
+
+#### #169 AG-128 — AG-128 record v4.3 scoped deliveries and corrected history
+- 合并：merged `58c013572c806dc464a248331aeca41bcc4226c3`，merged_at 2026-10-13T07:53:55Z；验收 head `4bf224198eb74e0499b068c96a11170a4ad700d4`。
+- 首验材料：`out/audit-20260930/qa/inputs/codex-input-ag-128-4bf22419.json`；`out/audit-20260930/qa/codex-r7-ag128/accept-final-r2-4bf22419.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:149,160。
+- GPT 二验（final-pr-matrix）：original_scope_pass_new_historical_ownership_counterexample_failed_closed_by_PR194_and_M35。
+- 索引：只登台账（台账/索引PR（登记#165–#168合并与v4.3交付）；GPT二验新增历史归属反例在其head上失败（exit 101），已由#194/M35关闭——台账须如实登记该失败与关闭）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #176 AG-149 — AG-149 record scoped first acceptance for PR173-175 [skip ci]
+- 合并：merged `5958b21096da4d4bfd9c8c602b7a82f57bddde77`，merged_at 2026-10-14T15:24:21Z；验收 head `ca04856b4936200ee077a57ef9e6388f6d8e5a9c`。
+- 首验材料：`out/audit-20260930/qa/inputs/codex-input-ag-149-ca04856b-pr176.json`；`out/audit-20260930/qa/codex-r7-ag149/accept-ca04856b-pr176-r1.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:404,410。
+- GPT 二验（final-pr-matrix）：original_scope_pass_new_historical_ownership_counterexample_failed_closed_by_PR194_and_M35。
+- 索引：只登台账（台账/索引PR（登记#173–#175首验）；GPT二验新增归属反例在其head上失败（exit 101），已由#194/M35关闭）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #177 AG-151 — AG-151 register exact legacy license expressions [skip ci]
+- 合并：merged `c0110181f0f83846dc14609613cb734300d04fe4`，merged_at 2026-10-15T00:13:59Z；验收 head `0c21916fdd1da21a66344c82c1a3082e524a5b53`。
+- 首验材料：`out/audit-20260930/qa/inputs/codex-input-ag-151-0c21916-pr177.json`；`out/audit-20260930/qa/codex-r7-ag151/controller-0c21916-M12-r1.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:418,430。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：只登台账（无Rust单目标测试（依赖登记JSON与Python检查器））。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #178 AG-150 — AG-150: register safe SQLite reader dependency [skip ci]
+- 合并：merged `8f38f4e39cceb67976f9120dc3f76fecce232c5c`，merged_at 2026-10-15T04:12:20Z；验收 head `9ab6d39dedebf481fae507269dbdc6672d9ce3e9`。
+- 首验材料：`out/audit-20260930/qa/inputs/codex-input-ag-150-9ab6d39-pr178.json`；`out/audit-20260930/qa/codex-r7-ag150/controller-9ab6d39-M13-r1.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:528,536。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：本 PR 补登 `E16.5.ag150_readonly_dependency_api_v43`（见上表）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #179 README — Update README progress to the v4.3 scoped baseline
+- 合并：merged `6773dc4180dc4a6668e593d2823d808350215293`，merged_at 2026-10-15T08:41:42Z；验收 head `779cf2ff75f293f662767aeb0e81ba072e91e486`。
+- 首验材料：out/audit-20260930/codex-r7-acceptance.md:726（仅进度提及）。
+- GPT 二验（final-pr-matrix）：documentation_scope_reviewed_runtime_not_applicable。
+- 索引：只登台账（纯文档PR；GPT二验 documentation_scope_reviewed_runtime_not_applicable）。
+- 状态：文档范围已审，运行时不适用；不可声明项见本小节开头。
+
+#### #180 AG-136 — AG-136: single-source management registry and real control.review route [skip ci]
+- 合并：merged `daa618a6a78cdb815102d22c57026d16e9d7aa90`，merged_at 2026-10-15T11:56:15Z；验收 head `b16ea35367afd73d14061f8f85d905c44371b137`。
+- 首验材料：`out/audit-20260930/qa/external-ag136-r7/independent-acceptance-m15-r1.json`；`out/audit-20260930/qa/external-ag136-r7/independent-accept-eight-gates-m15-r1.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:915。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：本 PR 补登 `E02.ag136_management_registry_single_source_v43`（见上表）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #181 README — README intro refresh and source-available personal license [skip ci]
+- 合并：merged `d576d98649fddc589b286712a15dc6655b5c970d`，merged_at 2026-10-15T14:17:56Z；验收 head `3c877b7f83440e36b8dda7e1530cd15e92c862a4`。
+- 首验材料：out/audit-20260930/codex-r7-acceptance.md:1062（仅提及合并）。
+- GPT 二验（final-pr-matrix）：license_validator_scope_pass_no_separate_original_CPP_material_D1_open。
+- 索引：只登台账（无Codex首验原件（GPT二验仅2项过滤运行，head exit 0）；其support_scope许可状态改动应由替代E16.6.ag131的新记录承载（在AG-182验收head重跑8词命令），不单列本PR记录）。
+- 状态：文档范围已审，运行时不适用；不可声明项见本小节开头。
+
+#### #182 README — README research-basis citations: link arXiv ids and pin commits [skip ci]
+- 合并：merged `564b40d5c1e1b586835d025149c063820fd6f38f`，merged_at 2026-10-15T14:23:10Z；验收 head `4ea90dc8634c1442a6598a6a0d381d1f7045ea19`。
+- 首验材料：无独立首验原件（文档 PR）。
+- GPT 二验（final-pr-matrix）：documentation_scope_reviewed_runtime_not_applicable。
+- 索引：只登台账（纯文档PR）。
+- 状态：文档范围已审，运行时不适用；不可声明项见本小节开头。
+
+#### #183 README — README: paper institutions and visible B0-L5 ladder [skip ci]
+- 合并：merged `f3b7bc683915600615f118e3ceb5549df496d00d`，merged_at 2026-10-15T14:48:08Z；验收 head `90510186782b622ee06af9e8e2e017d742bbf0cc`。
+- 首验材料：out/audit-20260930/codex-r7-acceptance.md:1082–1085（仅提及合并）。
+- GPT 二验（final-pr-matrix）：documentation_scope_reviewed_runtime_not_applicable。
+- 索引：只登台账（纯文档PR）。
+- 状态：文档范围已审，运行时不适用；不可声明项见本小节开头。
+
+#### #184 AG-152 — AG-152: enable governed rustix process feature [skip ci]
+- 合并：merged `658b50d94ad1f73f907e205d190f927d00ca3ab9`，merged_at 2026-10-15T20:08:43Z；验收 head `0604629ca771bcb6a067a229ed48b755928443b5`。
+- 首验材料：`out/audit-20260930/qa/codex-r7-ag152/Root-first-acceptance-H0604629-M19-r1/Root-first-acceptance-receipt-H0604629-M19-r1.json`；`out/audit-20260930/qa/codex-r7-ag152/controller-0604629-M19-r1.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:1399,1406。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：只登台账（只改evo-storage Cargo feature与依赖登记，无新增/修改Rust测试目标）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #185 README — README: bilingual Hy-Memory highlights, centered header/badges, and friendlier license [skip ci]
+- 合并：merged `51a5f59c2048d3c146d534d9c81420a45fd6115c`，merged_at 2026-10-16T19:11:03Z；验收 head `deb64551872ca827bcc7d2b3f3452f43c2cc0bd2`。
+- 首验材料：无独立首验原件（文档 PR）。
+- GPT 二验（final-pr-matrix）：license_validator_scope_pass_no_separate_original_CPP_material_D1_open。
+- 索引：只登台账（同#181：无Codex首验原件；LICENSE终版字节（SHA 164d4296…）的Rust守卫由替代E16.6.ag131的新记录承载）。
+- 状态：文档范围已审，运行时不适用；不可声明项见本小节开头。
+
+#### #186 README — README: add Antigravity to multi-host client examples [skip ci]
+- 合并：merged `951124ea70290240b51a5e4cbd7841869884e5fa`，merged_at 2026-10-16T19:24:47Z；验收 head `d57830189c9690d7927d535cdbd95796e42fe7c5`。
+- 首验材料：无独立首验原件（文档 PR）。
+- GPT 二验（final-pr-matrix）：documentation_scope_reviewed_runtime_not_applicable。
+- 索引：只登台账（纯文档PR）。
+- 状态：文档范围已审，运行时不适用；不可声明项见本小节开头。
+
+#### #187 AG-137 — fix: authenticate control registration as Evaluator [AG137/F02] [skip ci]
+- 合并：merged `b166053d8fcf0fd8d046d3274e132a883b95e0bd`，merged_at 2026-10-17T06:25:46Z；验收 head `0cb69f9873d6520b49dc27a79ff03a571dd05052`。
+- 首验材料：`out/audit-v43-remediation-20261016/delivery-receipt.json`；`out/audit-v43-remediation-20261016/F02-acceptance.json`；`out/audit-v43-remediation-20261016/F02-head-r5.full.log.test`（test 门退出 0）；out/audit-v43-remediation-20261016/delivery-receipt.json:repairs[0]。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：本 PR 补登 `E05.ag137_evaluator_control_authentication`（见上表）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #188 F01 (collaboration) — fix: enforce builtin generation strategy authority [skip ci]
+- 合并：merged `85612648c313a032ea369b56b62e593203e1abff`，merged_at 2026-10-17T08:14:29Z；验收 head `922af286abe641a96c24bea889537929f91922c3`。
+- 首验材料：`out/audit-v43-remediation-20261016/delivery-receipt.json`；`out/audit-v43-remediation-20261016/F01-acceptance.json`；`out/audit-v43-remediation-20261016/F01-head-r1.full.log.test`（test 门退出 0）；out/audit-v43-remediation-20261016/delivery-receipt.json:repairs[1]。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：本 PR 补登 `E06.f01_builtin_generation_strategy_authority`（见上表）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #189 F06 (collaboration) — fix: bind chat sampling projection and reject unbound sends [skip ci]
+- 合并：merged `86221ff7a9ecf678d86f4c733befd4595cffd55e`，merged_at 2026-10-17T08:43:13Z；验收 head `8c19961c412a09192ba93a150bf9ec1a3080b699`。
+- 首验材料：`out/audit-v43-remediation-20261016/delivery-receipt.json`；`out/audit-v43-remediation-20261016/F06-acceptance.json`；`out/audit-v43-remediation-20261016/F06-head-r1.full.log.test`（test 门退出 0）；out/audit-v43-remediation-20261016/delivery-receipt.json:repairs[2]。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：本 PR 补登 `E04.ag143_external_sampling_projection_v43`（见上表）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #190 AG-111 — AG-111: preserve historical ledger facts [skip ci]
+- 合并：merged `a8cbd08ac546b95f4ac3add51de464cae2af2bbe`，merged_at 2026-10-17T18:50:12Z；验收 head `ae49a0a045f0d5e6887cf765c5eee0339b25bb39`。
+- 首验材料：`out/audit-20260930/qa/codex-r7-ag111/Root-AG111-PR190-fixed-head-first-acceptance-r1.json`；`out/audit-20260930/qa/codex-r7-ag111/controller-ae49a0a-M25-r1.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:1671,1680。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：只登台账（台账PR（P1/P2/P3历史事实守恒），无Rust测试）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #191 AG-134 — fix(engine): preserve root budget cancellation accounting [skip ci]
+- 合并：merged `fc481354c047d63f90b687f1fef77b6f38ff9471`，merged_at 2026-10-18T02:26:55Z；验收 head `dae0d8e0da878a73991cb952bdd394f8d21b7ed5`。
+- 首验材料：`out/audit-20260930/qa/codex-r7-ag134/controller-dae0d8e-M26-r1/Root-PR191-first-acceptance-r1.json`；`out/audit-20260930/qa/codex-r7-ag134/controller-dae0d8e-M26-r1.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:1759。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：本 PR 补登 `E04.ag134_root_budget_cancellation_v43`（见上表）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #192 AG-153 — AG-153: share prepare contract across core and engine
+- 合并：merged `1f624445d66caa8a854b9fa78abff4264439f505`，merged_at 2026-10-18T10:07:55Z；验收 head `a76d7341167b659ba2b996d9df9517b799f3005d`。
+- 首验材料：`out/audit-20260930/qa/codex-r7-ag153/Root-PR192-first-acceptance-r1.json`；`out/audit-20260930/qa/codex-r7-ag153/controller-a76d734-M27-r2.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:1872,1877。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：本 PR 补登 `E16.5.ag153_shared_prepare_contract_v43`（见上表）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #193 AG-154 — fix(engine): preserve committed results on late cancellation
+- 合并：merged `6f13f82dd55243d8f33ae9152c85bcc09aaeaacd`，merged_at 2026-10-18T16:35:54Z；验收 head `2eeab6a41a75ccb11d93f0b853b512fc9eed764e`。
+- 首验材料：`out/audit-20260930/qa/codex-r7-ag154/AG154-2eeab6a-M28-actual-independent-controller-native-and-raw-proof-r3.json`；`out/audit-20260930/qa/codex-r7-ag154/controller-2eeab6a-M28-r3.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:1896。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：只登台账（仅有src内cfg(test)模块dispatch::late_cancel_tests（经#[path]引入，crates/evo-engine/src/dispatch.rs:2128–2130），模块路径不以`::tests`结尾且不映射src/dispatch/late_cancel_tests.rs，现行8词语法不可声明→只能进台账；另其断言写入`:cancel_after_side_effect`后缀（dispatch_late_cancel_tests.rs:893–904，dispatch.rs:1380），属v4.4 Q-40过渡条款（L780），status v1落地后须改）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #194 AG-114 — AG-114: enforce evidence identity and ownership across validators [skip ci]
+- 合并：merged `e9a90ad3acee6e9191cce75a3a808551b083e8f4`，merged_at 2026-10-20T17:02:05Z；验收 head `17579a391699a178f961f91f4ad4d2d6832d239b`。
+- 首验材料：`out/audit-20260930/qa/codex-r7-ag114/AG114-M29-newcomplete-Root-first-acceptance-r1.json`；`out/audit-20260930/qa/codex-r7-ag114/newcomplete-controller-17579a3-M29-r1.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:2149,2152。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：本 PR 补登 `E16.6.ag114_evidence_identity_ownership`（见上表）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #195 AG-144 — AG-144: Align feasibility planning with approval bounds [skip ci]
+- 合并：merged `10f172eab7b97c5790bec88a3c6de2326c6e9cc5`，merged_at 2026-10-21T09:19:48Z；验收 head `0be75c234f436088a05a2ebb513b3bff2d0ddfd5`。
+- 首验材料：`out/audit-20260930/qa/codex-r7-ag144/AG144-H0be75c2-PR195-Root-first-acceptance-r1.json`；`out/audit-20260930/qa/codex-r7-ag144/ctrl-0be75c2-M30-r1-runtime/eight/full-eight.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:2282。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：本 PR 补登 `E01.ag144_feasibility_approval_alignment_v43`（见上表）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #196 AG-156 — AG-156: complete Q24 non-Rust CI and approved-egress checks [skip ci]
+- 合并：merged `bdb4d79539c90ccbbc4d4350d473dc6e84d201bd`，merged_at 2026-10-22T07:19:52Z；验收 head `ecf2ea13e44c97fd013955548bd5e5464ae7f505`。
+- 首验材料：`out/audit-20260930/qa/codex-r7-ag156/AG156-ecf2ea1-Controller-first-acceptance-r1.json`；out/audit-20260930/codex-r7-acceptance.md:2396,2399。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：只登台账（非Rust CI与外发登记（Python/工作流），无Rust测试；台账L4112有AG-156自述节但写于首验前、无PR号与合并事实）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #197 AG-120 — AG-120 Enforce one execution receipt per budget call [skip ci]
+- 合并：merged `a730b9a9935bee7a41e8a47e86f329b99012566b`，merged_at 2026-10-22T19:55:32Z；验收 head `e433edc63cc6c37ff5185622fd93f5bc3e6a9201`。
+- 首验材料：`out/audit-20260930/qa/codex-r7-ag120/AG120-PR197-e433edc-first-technical-acceptance-r1.json`；`out/audit-20260930/qa/codex-r7-ag120/AG120-controller-M32-r1-runtime/full-eight.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:2549。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：本 PR 补登 `E05.ag120_one_execution_receipt_per_call`（见上表）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #198 AG-147 — AG-147: qualify replay terminals and versioned lineage [skip ci]
+- 合并：merged `e012bba09cb662e9c01d61b52124a709106f75b8`，merged_at 2026-10-23T02:36:34Z；验收 head `79f1c7bd9e582cdf44560782fbbe75d7ef39fcc0`。
+- 首验材料：`out/audit-20260930/qa/codex-r7-ag147/Root-AG147-H79-PR198-first-controller-acceptance-r1.json`；`out/audit-20260930/qa/codex-r7-ag147/AG147-M33-controller-79f1c7b-r1-runtime/full-eight.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:2730。
+- GPT 二验（final-pr-matrix）：scoped_second_acceptance_pass。
+- 索引：本 PR 补登 `E10.ag147_replay_lineage_versioning_v43`（见上表）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+#### #199 AG-122 — AG-122: validate GA18 cycles against bound execution facts [skip ci]
+- 合并：merged `a389c4e32e315ff516eba996a0a3dd40faadba0f`，merged_at 2026-10-23T11:18:51Z；验收 head `22609c6fab10bb163e6f3ec03880ef8cdfb09143`。
+- 首验材料：`out/audit-20260930/qa/codex-r7-ag122/Root-AG122-H226-PR199-first-acceptance-r1.json`；`out/audit-20260930/qa/codex-r7-ag122/AG122-M34-independent-22609c6-r3-runtime/full-eight.log.test`（test 门退出 0）；out/audit-20260930/codex-r7-acceptance.md:2882。
+- GPT 二验（final-pr-matrix）：scoped_pass_from_previous_phase_same_fixed_M35_and_true_M34。
+- 索引：本 PR 补登 `E05.ag122_ga18_bound_cycle_validation`（见上表）。
+- 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
