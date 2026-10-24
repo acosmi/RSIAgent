@@ -151,6 +151,36 @@
             "exit_code": 0,
             "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-099-45377b9.log.test"
           }
+        },
+        {
+          "id": "E00.ag182_rerun_controller_acceptance",
+          "description": "Single-target re-run of E00.controller_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/src/evaluator.rs",
+          "command": "cargo test --locked --offline -p evo-engine --lib evaluator::tests",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E00.controller_acceptance.log",
+          "actual_result": "evo-engine --lib evaluator::tests: 6 passed / 0 failed (181 filtered out by the --lib filter) in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:12:19Z–2026-10-24T02:12:34Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E00; same declared target and scope as the completed record E00.controller_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --lib evaluator::tests",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E00.controller_acceptance.log"
+          },
+          "completes": [
+            "E00.controller_acceptance"
+          ]
         }
       ],
       "remaining": [
@@ -254,6 +284,36 @@
             "evidence": "out/audit-20260930/qa/codex-r7-ag144/ctrl-0be75c2-M30-r1-runtime/eight/full-eight.log.test"
           },
           "note": "Conditional backfill by AG-182: the non-inferiority equality of PR #195 is pending completion by AG-185 (completion of AG-144/#195); this record does not credit it."
+        },
+        {
+          "id": "E01.ag182_rerun_controller_acceptance",
+          "description": "Single-target re-run of E01.controller_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-core/tests/evaluation_v41.rs",
+          "command": "cargo test --locked --offline -p evo-core --test evaluation_v41",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E01.controller_acceptance.log",
+          "actual_result": "evo-core --test evaluation_v41: 13 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:12:34Z–2026-10-24T02:12:49Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E01; same declared target and scope as the completed record E01.controller_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-core --test evaluation_v41",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E01.controller_acceptance.log"
+          },
+          "completes": [
+            "E01.controller_acceptance"
+          ]
         }
       ],
       "remaining": [
@@ -477,6 +537,96 @@
             "evidence": "out/audit-20260930/qa/external-ag136-r7/independent-accept-eight-gates-m15-r1.log.test"
           },
           "note": "Conditional backfill by AG-182: the not-wired/plane-mismatch behavior of PR #180 is pending completion by AG-186 (completion of AG-136/#180); this record does not credit it."
+        },
+        {
+          "id": "E02.ag182_rerun_ag092_local_scoped_acceptance",
+          "description": "Single-target re-run of E02.ag092_local_scoped_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-core/tests/baseline_dependency_revocation_v42.rs",
+          "command": "cargo test --locked --offline -p evo-core --test baseline_dependency_revocation_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E02.ag092_local_scoped_acceptance.log",
+          "actual_result": "evo-core --test baseline_dependency_revocation_v42: 13 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:12:49Z–2026-10-24T02:13:04Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E02; same declared target and scope as the completed record E02.ag092_local_scoped_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-core --test baseline_dependency_revocation_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E02.ag092_local_scoped_acceptance.log"
+          },
+          "completes": [
+            "E02.ag092_local_scoped_acceptance"
+          ]
+        },
+        {
+          "id": "E02.ag182_rerun_ag093_local_scoped_acceptance",
+          "description": "Single-target re-run of E02.ag093_local_scoped_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/compiler_input_binding_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test compiler_input_binding_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E02.ag093_local_scoped_acceptance.log",
+          "actual_result": "evo-engine --test compiler_input_binding_v42: 5 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:13:04Z–2026-10-24T02:13:19Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E02; same declared target and scope as the completed record E02.ag093_local_scoped_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test compiler_input_binding_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E02.ag093_local_scoped_acceptance.log"
+          },
+          "completes": [
+            "E02.ag093_local_scoped_acceptance"
+          ]
+        },
+        {
+          "id": "E02.ag182_rerun_controller_acceptance",
+          "description": "Single-target re-run of E02.controller_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-core/tests/skill_edit.rs",
+          "command": "cargo test --locked --offline -p evo-core --test skill_edit",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E02.controller_acceptance.log",
+          "actual_result": "evo-core --test skill_edit: 14 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:13:19Z–2026-10-24T02:13:34Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E02; same declared target and scope as the completed record E02.controller_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-core --test skill_edit",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E02.controller_acceptance.log"
+          },
+          "completes": [
+            "E02.controller_acceptance"
+          ]
         }
       ],
       "remaining": [
@@ -584,6 +734,36 @@
           "scope": "E03; Copied diagnosis RuleHypothesis structural input refusal software/component boundary only.",
           "source_sha": "d0958acfdd234007056aec09277cca676b87dd52",
           "test_entry": "crates/evo-core/tests/diagnosis_hypothesis_structure_v42.rs"
+        },
+        {
+          "id": "E03.ag182_rerun_controller_acceptance",
+          "description": "Single-target re-run of E03.controller_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/optimization.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test optimization",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E03.controller_acceptance.log",
+          "actual_result": "evo-engine --test optimization: 7 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:13:34Z–2026-10-24T02:13:49Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E03; same declared target and scope as the completed record E03.controller_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test optimization",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E03.controller_acceptance.log"
+          },
+          "completes": [
+            "E03.controller_acceptance"
+          ]
         }
       ],
       "remaining": [
@@ -775,6 +955,66 @@
             "exit_code": 0,
             "evidence": "out/audit-20260930/qa/codex-r7-ag134/controller-dae0d8e-M26-r1.log.test"
           }
+        },
+        {
+          "id": "E04.ag182_rerun_ag077_local_scoped_acceptance",
+          "description": "Single-target re-run of E04.ag077_local_scoped_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-storage/tests/e16_budget_binding_v42.rs",
+          "command": "cargo test --locked --offline -p evo-storage --test e16_budget_binding_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E04.ag077_local_scoped_acceptance.log",
+          "actual_result": "evo-storage --test e16_budget_binding_v42: 31 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:13:49Z–2026-10-24T02:14:04Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E04; same declared target and scope as the completed record E04.ag077_local_scoped_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-storage --test e16_budget_binding_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E04.ag077_local_scoped_acceptance.log"
+          },
+          "completes": [
+            "E04.ag077_local_scoped_acceptance"
+          ]
+        },
+        {
+          "id": "E04.ag182_rerun_controller_acceptance",
+          "description": "Single-target re-run of E04.controller_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-storage/tests/budget.rs",
+          "command": "cargo test --locked --offline -p evo-storage --test budget",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E04.controller_acceptance.log",
+          "actual_result": "evo-storage --test budget: 26 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:14:05Z–2026-10-24T02:14:20Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E04; same declared target and scope as the completed record E04.controller_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-storage --test budget",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E04.controller_acceptance.log"
+          },
+          "completes": [
+            "E04.controller_acceptance"
+          ]
         }
       ],
       "remaining": [
@@ -1171,6 +1411,216 @@
             "exit_code": 0,
             "evidence": "out/audit-20260930/qa/codex-r7-ag122/AG122-M34-independent-22609c6-r3-runtime/full-eight.log.test"
           }
+        },
+        {
+          "id": "E05.ag182_rerun_ag083_partition_admission_rejection_atomicity",
+          "description": "Single-target re-run of E05.ag083_partition_admission_rejection_atomicity, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-core/tests/partition_admission_atomic_v42.rs",
+          "command": "cargo test --locked --offline -p evo-core --test partition_admission_atomic_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag083_partition_admission_rejection_atomicity.log",
+          "actual_result": "evo-core --test partition_admission_atomic_v42: 31 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:14:20Z–2026-10-24T02:14:35Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E05; same declared target and scope as the completed record E05.ag083_partition_admission_rejection_atomicity (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-core --test partition_admission_atomic_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag083_partition_admission_rejection_atomicity.log"
+          },
+          "completes": [
+            "E05.ag083_partition_admission_rejection_atomicity"
+          ]
+        },
+        {
+          "id": "E05.ag182_rerun_ag087_local_scoped_acceptance",
+          "description": "Single-target re-run of E05.ag087_local_scoped_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/formal_candidate_dependency_binding_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test formal_candidate_dependency_binding_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag087_local_scoped_acceptance.log",
+          "actual_result": "evo-engine --test formal_candidate_dependency_binding_v42: 27 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:14:35Z–2026-10-24T02:15:20Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E05; same declared target and scope as the completed record E05.ag087_local_scoped_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test formal_candidate_dependency_binding_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag087_local_scoped_acceptance.log"
+          },
+          "completes": [
+            "E05.ag087_local_scoped_acceptance"
+          ]
+        },
+        {
+          "id": "E05.ag182_rerun_ag088_local_scoped_acceptance",
+          "description": "Single-target re-run of E05.ag088_local_scoped_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/complete_batch_statistics_binding_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test complete_batch_statistics_binding_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag088_local_scoped_acceptance.log",
+          "actual_result": "evo-engine --test complete_batch_statistics_binding_v42: 2 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:15:20Z–2026-10-24T02:16:50Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E05; same declared target and scope as the completed record E05.ag088_local_scoped_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test complete_batch_statistics_binding_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag088_local_scoped_acceptance.log"
+          },
+          "completes": [
+            "E05.ag088_local_scoped_acceptance"
+          ]
+        },
+        {
+          "id": "E05.ag182_rerun_ag089_local_scoped_acceptance",
+          "description": "Single-target re-run of E05.ag089_local_scoped_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/early_stop_certificate_binding_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test early_stop_certificate_binding_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag089_local_scoped_acceptance.log",
+          "actual_result": "evo-engine --test early_stop_certificate_binding_v42: 10 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:16:50Z–2026-10-24T02:18:20Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E05; same declared target and scope as the completed record E05.ag089_local_scoped_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test early_stop_certificate_binding_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag089_local_scoped_acceptance.log"
+          },
+          "completes": [
+            "E05.ag089_local_scoped_acceptance"
+          ]
+        },
+        {
+          "id": "E05.ag182_rerun_ag090_local_scoped_acceptance",
+          "description": "Single-target re-run of E05.ag090_local_scoped_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/invalid_formal_reason_binding_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test invalid_formal_reason_binding_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag090_local_scoped_acceptance.log",
+          "actual_result": "evo-engine --test invalid_formal_reason_binding_v42: 7 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:18:20Z–2026-10-24T02:18:35Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E05; same declared target and scope as the completed record E05.ag090_local_scoped_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test invalid_formal_reason_binding_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag090_local_scoped_acceptance.log"
+          },
+          "completes": [
+            "E05.ag090_local_scoped_acceptance"
+          ]
+        },
+        {
+          "id": "E05.ag182_rerun_ag091_local_scoped_acceptance",
+          "description": "Single-target re-run of E05.ag091_local_scoped_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/late_grader_stop_preservation_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test late_grader_stop_preservation_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag091_local_scoped_acceptance.log",
+          "actual_result": "evo-engine --test late_grader_stop_preservation_v42: 8 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:18:35Z–2026-10-24T02:19:05Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E05; same declared target and scope as the completed record E05.ag091_local_scoped_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test late_grader_stop_preservation_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag091_local_scoped_acceptance.log"
+          },
+          "completes": [
+            "E05.ag091_local_scoped_acceptance"
+          ]
+        },
+        {
+          "id": "E05.ag182_rerun_controller_acceptance",
+          "description": "Single-target re-run of E05.controller_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/streaming_evaluator.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test streaming_evaluator",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.controller_acceptance.log",
+          "actual_result": "evo-engine --test streaming_evaluator: 14 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:19:05Z–2026-10-24T02:19:35Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E05; same declared target and scope as the completed record E05.controller_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test streaming_evaluator",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E05.controller_acceptance.log"
+          },
+          "completes": [
+            "E05.controller_acceptance"
+          ]
         }
       ],
       "remaining": [
@@ -1291,6 +1741,36 @@
             "exit_code": 0,
             "evidence": "out/audit-v43-remediation-20261016/F01-head-r1.full.log.test"
           }
+        },
+        {
+          "id": "E06.ag182_rerun_ag084_local_scoped_acceptance",
+          "description": "Single-target re-run of E06.ag084_local_scoped_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/candidate_review.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test candidate_review",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E06.ag084_local_scoped_acceptance.log",
+          "actual_result": "evo-engine --test candidate_review: 16 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:19:35Z–2026-10-24T02:19:50Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E06; same declared target and scope as the completed record E06.ag084_local_scoped_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test candidate_review",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E06.ag084_local_scoped_acceptance.log"
+          },
+          "completes": [
+            "E06.ag084_local_scoped_acceptance"
+          ]
         }
       ],
       "remaining": [
@@ -1469,6 +1949,36 @@
             "exit_code": 0,
             "evidence": "out/audit-20260930/qa/claude-r4fix-ctrl-ag-108-f853917.log.test"
           }
+        },
+        {
+          "id": "E07.ag182_rerun_controller_acceptance",
+          "description": "Single-target re-run of E07.controller_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-http/tests/service.rs",
+          "command": "cargo test --locked --offline -p evo-http --test service",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E07.controller_acceptance.log",
+          "actual_result": "evo-http --test service: 7 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:19:51Z–2026-10-24T02:20:21Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E07; same declared target and scope as the completed record E07.controller_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-http --test service",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E07.controller_acceptance.log"
+          },
+          "completes": [
+            "E07.controller_acceptance"
+          ]
         }
       ],
       "remaining": [
@@ -1901,6 +2411,96 @@
             "exit_code": 0,
             "evidence": "out/audit-20260930/qa/claude-r6-ctrl-ag-117-92f12e1.log.test"
           }
+        },
+        {
+          "id": "E08.ag182_replay_v3_economic_cleanup",
+          "description": "rsia.replay.engine.v3 re-verification of the withdrawn E08.ag037_economic_replay_cleanup",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/replay_economic_cleanup_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test replay_economic_cleanup_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E08.ag037_economic_replay_cleanup.log",
+          "actual_result": "evo-engine --test replay_economic_cleanup_v42: 9 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:11:34Z–2026-10-24T02:11:49Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E08; plan v4.5 §7.4.2–§7.4.3 (§18.10 re-verification by the current version) subset: economic replay cleanup on current StoredReplayReportV2 records (CURRENT_REPLAY_REPORT_RECORD_KIND); legacy v2 reports no longer enter economic experiments",
+          "risk": "No online target-environment effect, production release or replay benefit; legacy v2 reports are audit-readable only. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test replay_economic_cleanup_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E08.ag037_economic_replay_cleanup.log"
+          },
+          "supersedes": [
+            "E08.ag037_economic_replay_cleanup"
+          ]
+        },
+        {
+          "id": "E08.ag182_rerun_ag075_local_scoped_acceptance",
+          "description": "Single-target re-run of E08.ag075_local_scoped_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-storage/tests/dependency_read_v42.rs",
+          "command": "cargo test --locked --offline -p evo-storage --test dependency_read_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E08.ag075_local_scoped_acceptance.log",
+          "actual_result": "evo-storage --test dependency_read_v42: 4 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:20:21Z–2026-10-24T02:20:36Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E08; same declared target and scope as the completed record E08.ag075_local_scoped_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-storage --test dependency_read_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E08.ag075_local_scoped_acceptance.log"
+          },
+          "completes": [
+            "E08.ag075_local_scoped_acceptance"
+          ]
+        },
+        {
+          "id": "E08.ag182_rerun_controller_acceptance",
+          "description": "Single-target re-run of E08.controller_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-storage/tests/lifecycle.rs",
+          "command": "cargo test --locked --offline -p evo-storage --test lifecycle",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E08.controller_acceptance.log",
+          "actual_result": "evo-storage --test lifecycle: 23 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:20:36Z–2026-10-24T02:20:51Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E08; same declared target and scope as the completed record E08.controller_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-storage --test lifecycle",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E08.controller_acceptance.log"
+          },
+          "completes": [
+            "E08.controller_acceptance"
+          ]
         }
       ],
       "remaining": [
@@ -2151,6 +2751,66 @@
             "exit_code": 0,
             "evidence": "out/audit-20260930/qa/accept-ag103/ctrl-ag103-final.log.test"
           }
+        },
+        {
+          "id": "E09.ag182_replay_v3_legal_prefix",
+          "description": "rsia.replay.engine.v3 re-verification of the withdrawn E09.ag074_local_scoped_acceptance",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/replay_legal_prefix_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test replay_legal_prefix_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E09.ag074_local_scoped_acceptance.log",
+          "actual_result": "evo-engine --test replay_legal_prefix_v42: 11 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:11:49Z–2026-10-24T02:12:04Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E09; plan v4.5 §7.4.2–§7.4.3 (§18.10 re-verification by the current version) subset: legal replay prefix under v3: old v2 reports read as Legacy with legacy_replay_not_consumable; pure prefix cases read ReplayReportV3",
+          "risk": "No online target-environment effect, production release or replay benefit; legacy v2 reports are audit-readable only. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test replay_legal_prefix_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E09.ag074_local_scoped_acceptance.log"
+          },
+          "supersedes": [
+            "E09.ag074_local_scoped_acceptance"
+          ]
+        },
+        {
+          "id": "E09.ag182_rerun_controller_acceptance",
+          "description": "Single-target re-run of E09.controller_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/exploration_v41.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test exploration_v41",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E09.controller_acceptance.log",
+          "actual_result": "evo-engine --test exploration_v41: 5 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:20:51Z–2026-10-24T02:21:06Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E09; same declared target and scope as the completed record E09.controller_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test exploration_v41",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E09.controller_acceptance.log"
+          },
+          "completes": [
+            "E09.controller_acceptance"
+          ]
         }
       ],
       "remaining": [
@@ -2237,6 +2897,126 @@
             "exit_code": 0,
             "evidence": "out/audit-20260930/qa/codex-r7-ag147/AG147-M33-controller-79f1c7b-r1-runtime/full-eight.log.test"
           }
+        },
+        {
+          "id": "E10.ag182_replay_v3_controller_acceptance",
+          "description": "rsia.replay.engine.v3 re-verification of the withdrawn E10.controller_acceptance",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/replay_v41.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test replay_v41",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E10.controller_acceptance.log",
+          "actual_result": "evo-engine --test replay_v41: 13 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:10:18Z–2026-10-24T02:10:48Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E10; plan v4.5 §7.4.2–§7.4.3 (§18.10 re-verification by the current version) subset: replay_v41 under rsia.replay.engine.v3: v1 AUC objective, censored/out-of-support terminal qualification (PolicyStop/WorldExhausted cases now OutOfSupport with frontier_not_covered) and v3 compare/formal-exclusion behavior",
+          "risk": "No online target-environment effect, production release or replay benefit; legacy v2 reports are audit-readable only. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test replay_v41",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E10.controller_acceptance.log"
+          },
+          "supersedes": [
+            "E10.controller_acceptance"
+          ]
+        },
+        {
+          "id": "E10.ag182_replay_v3_management_controller_acceptance",
+          "description": "rsia.replay.engine.v3 re-verification of the withdrawn E10.replay_management_controller_acceptance",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/dispatch_management.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test dispatch_management",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E10.replay_management_controller_acceptance.log",
+          "actual_result": "evo-engine --test dispatch_management: 31 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:10:48Z–2026-10-24T02:11:03Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E10; plan v4.5 §7.4.2–§7.4.3 (§18.10 re-verification by the current version) subset: replay.run management consumer on the current v3 report (replay_run_* five cases) and the eight original general job cases; the curriculum/exploration/capacity cases added to the target later are not credited to this record",
+          "risk": "No online target-environment effect, production release or replay benefit; legacy v2 reports are audit-readable only. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test dispatch_management",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E10.replay_management_controller_acceptance.log"
+          },
+          "supersedes": [
+            "E10.replay_management_controller_acceptance"
+          ]
+        },
+        {
+          "id": "E10.ag182_replay_v3_episode_recovery",
+          "description": "rsia.replay.engine.v3 re-verification of the withdrawn E10.ag064_replay_episode_recovery",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/replay_recovery_contract_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test replay_recovery_contract_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E10.ag064_replay_episode_recovery.log",
+          "actual_result": "evo-engine --test replay_recovery_contract_v42: 13 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:11:03Z–2026-10-24T02:11:18Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E10; plan v4.5 §7.4.2–§7.4.3 (§18.10 re-verification by the current version) subset: episode recovery contract under v3: old v2 single-recovery reports read as Legacy with legacy_replay_not_consumable and recomputation cannot overwrite them; the test named unaffected_old_single_recoveries_remain_verified_and_idempotent keeps its old name but asserts the Legacy outcome",
+          "risk": "No online target-environment effect, production release or replay benefit; legacy v2 reports are audit-readable only. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test replay_recovery_contract_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E10.ag064_replay_episode_recovery.log"
+          },
+          "supersedes": [
+            "E10.ag064_replay_episode_recovery"
+          ]
+        },
+        {
+          "id": "E10.ag182_replay_v3_fairness_waits_legal_set",
+          "description": "rsia.replay.engine.v3 re-verification of the withdrawn E10.ag103_replay_fairness_waits_legal_set_v42",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/replay_fairness_waits_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test replay_fairness_waits_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E10.ag103_replay_fairness_waits_legal_set_v42.log",
+          "actual_result": "evo-engine --test replay_fairness_waits_v42: 9 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:11:19Z–2026-10-24T02:11:34Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E10; plan v4.5 §7.4.2–§7.4.3 (§18.10 re-verification by the current version) subset: fairness waits and legal set under v3: the depth-capped world ends OutOfSupport/frontier_not_covered and old v2 reports stay readable as Legacy, not consumable",
+          "risk": "No online target-environment effect, production release or replay benefit; legacy v2 reports are audit-readable only. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test replay_fairness_waits_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E10.ag103_replay_fairness_waits_legal_set_v42.log"
+          },
+          "supersedes": [
+            "E10.ag103_replay_fairness_waits_legal_set_v42"
+          ]
         }
       ],
       "remaining": [
@@ -2288,6 +3068,36 @@
           "rollback": "disable the scoped feature and retain immutable evidence, costs, and revocation state",
           "record_source": "out/implementation-v4.1-20260919/controller-e11-acceptance.json",
           "input_ref": "out/implementation-v4.1-20260919/controller-e11-final-input.json"
+        },
+        {
+          "id": "E11.ag182_rerun_controller_acceptance",
+          "description": "Single-target re-run of E11.controller_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-core/tests/replay_economics.rs",
+          "command": "cargo test --locked --offline -p evo-core --test replay_economics",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E11.controller_acceptance.log",
+          "actual_result": "evo-core --test replay_economics: 4 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:21:06Z–2026-10-24T02:21:21Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E11; same declared target and scope as the completed record E11.controller_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-core --test replay_economics",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E11.controller_acceptance.log"
+          },
+          "completes": [
+            "E11.controller_acceptance"
+          ]
         }
       ],
       "remaining": [
@@ -2383,6 +3193,36 @@
           "rollback": "revert PR #94 through an independent revert PR; accepted-head parent 81449ccd1a3a9f73b464438d8a6edd26a0ff9734; preserve revocation, budget, cost and audit facts",
           "record_source": "docs/implementation-ledger.md",
           "input_ref": "out/audit-20260930/qa/inputs/ctrl-input-ag-050-a4a60c8.json"
+        },
+        {
+          "id": "E12.ag182_rerun_controller_acceptance",
+          "description": "Single-target re-run of E12.controller_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/curriculum_v41.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test curriculum_v41",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E12.controller_acceptance.log",
+          "actual_result": "evo-engine --test curriculum_v41: 3 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:21:21Z–2026-10-24T02:21:36Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E12; same declared target and scope as the completed record E12.controller_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test curriculum_v41",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E12.controller_acceptance.log"
+          },
+          "completes": [
+            "E12.controller_acceptance"
+          ]
         }
       ],
       "remaining": [
@@ -2707,6 +3547,66 @@
           "scope": "E16.1; Bounded local development-material reader software/component boundary only. Library-only as of e727d1c: no production caller in engine/http/mcp/apps.",
           "source_sha": "887d97a345e947c754dd01c0fd0e1dd15b635d5c",
           "test_entry": "crates/evo-engine/tests/import_development_material_v42.rs"
+        },
+        {
+          "id": "E16.1.ag182_rerun_ag070_local_scoped_acceptance",
+          "description": "Single-target re-run of E16.1.ag070_local_scoped_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-engine/tests/import_development_material_v42.rs",
+          "command": "cargo test --locked --offline -p evo-engine --test import_development_material_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E16.1.ag070_local_scoped_acceptance.log",
+          "actual_result": "evo-engine --test import_development_material_v42: 12 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:21:36Z–2026-10-24T02:21:51Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E16.1; same declared target and scope as the completed record E16.1.ag070_local_scoped_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-engine --test import_development_material_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E16.1.ag070_local_scoped_acceptance.log"
+          },
+          "completes": [
+            "E16.1.ag070_local_scoped_acceptance"
+          ]
+        },
+        {
+          "id": "E16.1.ag182_rerun_ag076_local_scoped_acceptance",
+          "description": "Single-target re-run of E16.1.ag076_local_scoped_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-core/tests/import_fixture_v42.rs",
+          "command": "cargo test --locked --offline -p evo-core --test import_fixture_v42",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E16.1.ag076_local_scoped_acceptance.log",
+          "actual_result": "evo-core --test import_fixture_v42: 34 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:21:51Z–2026-10-24T02:22:06Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E16.1; same declared target and scope as the completed record E16.1.ag076_local_scoped_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-core --test import_fixture_v42",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E16.1.ag076_local_scoped_acceptance.log"
+          },
+          "completes": [
+            "E16.1.ag076_local_scoped_acceptance"
+          ]
         }
       ],
       "remaining": [
@@ -3371,6 +4271,95 @@
             "exit_code": 0,
             "evidence": "out/audit-20260930/qa/codex-r7-ag114/newcomplete-controller-17579a3-M29-r1.log.test"
           }
+        },
+        {
+          "id": "E16.6.ag182_v45_project_license_metadata",
+          "description": "Project-license manifest registration and committed Rust metadata guards, re-verified against the selected license status",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-core/tests/support_scope.rs",
+          "command": "cargo test --locked --offline -p evo-core --test support_scope",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E16.6.ag131_v43_project_license_metadata.log",
+          "actual_result": "evo-core --test support_scope: 41 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:12:04Z–2026-10-24T02:12:19Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E16.6; plan v4.5 §2.8.1 (v4.4 Q-32, v4.5 Q-56) and V116.d machine-readable project-license registration subset: status source_available_personal_noncommercial_free, LICENSE SHA-256 164d4296…, publish=false and the reviewed README License section; replaces the withdrawn proprietary_unreleased assertion of E16.6.ag131",
+          "risk": "No legal sufficiency, README badge/wording check (AG-180), complete upstream notices, crate publication or whole V116/E16.6. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-core --test support_scope",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-withdrawn/E16.6.ag131_v43_project_license_metadata.log"
+          },
+          "supersedes": [
+            "E16.6.ag131_v43_project_license_metadata"
+          ]
+        },
+        {
+          "id": "E16.6.ag182_rerun_ag086_local_scoped_acceptance",
+          "description": "Single-target re-run of E16.6.ag086_local_scoped_acceptance, whose original evidence is registered missing",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-core/tests/support_scope.rs",
+          "command": "cargo test --locked --offline -p evo-core --test support_scope",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-missing/E16.6.ag086_local_scoped_acceptance.log",
+          "actual_result": "evo-core --test support_scope: 41 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:22:06Z–2026-10-24T02:22:21Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E16.6; same declared target and scope as the completed record E16.6.ag086_local_scoped_acceptance (its scope text is unchanged and governs); tests added to the target after that record do not extend its credit; this record only restores a local execution for that scope",
+          "risk": "A re-run at a later head, not the original evidence; the completed record keeps its own historical facts. No real provider/host/sandbox, paid experiment, historical T001-T126/E14 contract, whole E/V, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-core --test support_scope",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-missing/E16.6.ag086_local_scoped_acceptance.log"
+          },
+          "completes": [
+            "E16.6.ag086_local_scoped_acceptance"
+          ]
+        },
+        {
+          "id": "E16.6.ag182_plan_v45_index_binding",
+          "description": "Derived index, checker and index test bound to plan v4.5 with the plan 18.10 machine form",
+          "plan_version": "v4.5",
+          "plan_sha256": "f6f9b1e44f3b1f364c0db8720f7eaec490ed7a03ddc053de8bfbab65326e6164",
+          "source_sha": "a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9",
+          "pr": "https://github.com/acosmi/RSIAgent/pull/200",
+          "merged_sha": null,
+          "test_entry": "crates/evo-core/tests/support_scope.rs",
+          "command": "cargo test --locked --offline -p evo-core --test support_scope",
+          "input_digest": "ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89",
+          "exit_code": 0,
+          "log_path": "out/audit-20260930/qa/claude-r8-rerun-binding/E16.6.ag182_plan_v45_index_binding.log",
+          "actual_result": "evo-core --test support_scope: 41 passed / 0 failed in a guarded single-target re-run at a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 (exit 0, 2026-10-24T02:22:21Z–2026-10-24T02:22:36Z); implemented_not_verified pending the controller first acceptance of PR #200.",
+          "scope": "E16.6; plan v4.5 §18.10–§18.11 (Q-50), E16.6 v4.4/v4.5 专项 and V071/V080 index-consistency subset: top-level v4.5 binding, five-entry lineage, plan_recheck union, withdrawn_records, supersedes/completes, the pinned missing-evidence register, V121–V123/V048 responsibilities and HS/HSF tracking",
+          "risk": "Structure only: the missing-evidence absence rule is judged only with --evidence-root; no V080.d fixture for a re-verification that omits completes; no whole V071/V080/V116/V123, E16.6 closure, real host/sandbox/provider, second acceptance, effects or release.",
+          "rollback": "Independent reviewed revert of PR #200; preserve the re-run logs, the receipt, sources, costs, dispatch, revocation and audit facts.",
+          "record_source": "docs/implementation-ledger.md",
+          "input_ref": "out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json",
+          "execution": {
+            "runner": "other",
+            "command": "bash \"$PWD/../../audit-20260930/qa/r6_guarded.sh\" \"$CARGO_TARGET_DIR\" 0 -- cargom test --locked -p evo-core --test support_scope",
+            "scope": "single_target",
+            "exit_code": 0,
+            "evidence": "out/audit-20260930/qa/claude-r8-rerun-binding/E16.6.ag182_plan_v45_index_binding.log"
+          },
+          "supersedes": [],
+          "note": "替代 E16.6.ag012（已于 #165 撤出）的谱系绑定"
         }
       ],
       "remaining": [
@@ -3897,7 +4886,10 @@
           "E09.controller_acceptance",
           "E11.controller_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -3926,7 +4918,9 @@
           "crates/evo-core/src/replay_economics.rs"
         ],
         "related_evidence_refs": [
-          "E11.controller_acceptance"
+          "E11.controller_acceptance",
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -4092,7 +5086,8 @@
           "crates/evo-engine/src/exploration.rs"
         ],
         "related_evidence_refs": [
-          "E09.controller_acceptance"
+          "E09.controller_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -4144,7 +5139,10 @@
           "E05.ag088_local_scoped_acceptance",
           "E05.ag089_local_scoped_acceptance",
           "E05.ag090_local_scoped_acceptance",
-          "E05.ag091_local_scoped_acceptance"
+          "E05.ag091_local_scoped_acceptance",
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       }
@@ -4219,7 +5217,8 @@
         "related_evidence_refs": [
           "E03.controller_acceptance",
           "E09.controller_acceptance",
-          "E03.ag079_local_scoped_acceptance"
+          "E03.ag079_local_scoped_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -4257,7 +5256,8 @@
           "E03.ag079_local_scoped_acceptance",
           "E06.ag084_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -4306,7 +5306,8 @@
           "E05.ag088_local_scoped_acceptance",
           "E05.ag089_local_scoped_acceptance",
           "E05.ag090_local_scoped_acceptance",
-          "E05.ag091_local_scoped_acceptance"
+          "E05.ag091_local_scoped_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -4347,7 +5348,8 @@
           "E05.ag088_local_scoped_acceptance",
           "E05.ag089_local_scoped_acceptance",
           "E05.ag090_local_scoped_acceptance",
-          "E05.ag091_local_scoped_acceptance"
+          "E05.ag091_local_scoped_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -4414,7 +5416,10 @@
           "E09.controller_acceptance",
           "E12.controller_acceptance",
           "E04.ag082_local_scoped_acceptance",
-          "E04.ag077_local_scoped_acceptance"
+          "E04.ag077_local_scoped_acceptance",
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -4444,7 +5449,8 @@
         ],
         "related_evidence_refs": [
           "E09.controller_acceptance",
-          "E06.ag084_local_scoped_acceptance"
+          "E06.ag084_local_scoped_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "full chain and effect require task-specific acceptance; related evidence proves only named subscopes"
       },
@@ -5315,7 +6321,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E09.controller_acceptance"
+          "E09.controller_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5331,7 +6338,11 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E09.controller_acceptance",
-          "E09.ag103_fairness_waits_legal_set_v42"
+          "E09.ag103_fairness_waits_legal_set_v42",
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance",
+          "E10.ag182_replay_v3_fairness_waits_legal_set",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5344,7 +6355,10 @@
         "status": "implemented_not_verified",
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -5361,7 +6375,11 @@
         "related_evidence_refs": [
           "E09.controller_acceptance",
           "E11.controller_acceptance",
-          "E09.ag103_fairness_waits_legal_set_v42"
+          "E09.ag103_fairness_waits_legal_set_v42",
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance",
+          "E10.ag182_replay_v3_fairness_waits_legal_set",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5374,7 +6392,11 @@
         "status": "implemented_not_verified",
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance",
+          "E10.ag182_replay_v3_fairness_waits_legal_set"
+        ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
       {
@@ -5387,7 +6409,8 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E09.controller_acceptance"
+          "E09.controller_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5403,7 +6426,11 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E09.controller_acceptance",
-          "E09.ag103_fairness_waits_legal_set_v42"
+          "E09.ag103_fairness_waits_legal_set_v42",
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance",
+          "E10.ag182_replay_v3_fairness_waits_legal_set",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5419,7 +6446,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E11.controller_acceptance"
+          "E11.controller_acceptance",
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -5434,7 +6463,9 @@
         "verification_status": "implemented_not_verified",
         "effect_status": "not_claimed",
         "related_evidence_refs": [
-          "E11.controller_acceptance"
+          "E11.controller_acceptance",
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6159,7 +7190,8 @@
         "effect_status": "not_claimed",
         "related_evidence_refs": [
           "E00.controller_acceptance",
-          "E16.6.ag086_local_scoped_acceptance"
+          "E16.6.ag086_local_scoped_acceptance",
+          "E16.6.ag182_plan_v45_index_binding"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6316,7 +7348,8 @@
         "related_evidence_refs": [
           "E00.controller_acceptance",
           "E16.6.ag086_local_scoped_acceptance",
-          "E00.ag099_step_future_default_test_stack"
+          "E00.ag099_step_future_default_test_stack",
+          "E16.6.ag182_plan_v45_index_binding"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6347,7 +7380,11 @@
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance",
           "E09.ag103_fairness_waits_legal_set_v42",
-          "E08.ag104_restore_prefix_migration_upgrade_v42"
+          "E08.ag104_restore_prefix_migration_upgrade_v42",
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance",
+          "E10.ag182_replay_v3_fairness_waits_legal_set",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6525,7 +7562,11 @@
           "E08.ag075_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
           "E02.ag093_local_scoped_acceptance",
-          "E09.ag103_fairness_waits_legal_set_v42"
+          "E09.ag103_fairness_waits_legal_set_v42",
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance",
+          "E10.ag182_replay_v3_fairness_waits_legal_set",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6581,7 +7622,8 @@
           "E09.controller_acceptance",
           "E03.ag079_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6609,7 +7651,8 @@
           "E03.ag079_local_scoped_acceptance",
           "E06.ag084_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6651,7 +7694,8 @@
           "E05.ag090_local_scoped_acceptance",
           "E05.ag091_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6688,7 +7732,8 @@
           "E05.ag090_local_scoped_acceptance",
           "E05.ag091_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6743,7 +7788,8 @@
           "E04.ag082_local_scoped_acceptance",
           "E04.ag077_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6793,7 +7839,10 @@
           "E05.ag090_local_scoped_acceptance",
           "E05.ag091_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6814,7 +7863,8 @@
           "E09.controller_acceptance",
           "E06.ag084_local_scoped_acceptance",
           "E02.ag092_local_scoped_acceptance",
-          "E02.ag093_local_scoped_acceptance"
+          "E02.ag093_local_scoped_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6866,7 +7916,10 @@
           "E01.ag057_explicit_sample_registration",
           "E08.ag096_unreadable_bound_request_isolated",
           "E08.ag107_budget_ref_missing_fail_closed_v42",
-          "E08.ag106_budget_startup_recovery_v42"
+          "E08.ag106_budget_startup_recovery_v42",
+          "E10.ag182_replay_v3_controller_acceptance",
+          "E10.ag182_replay_v3_management_controller_acceptance",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -6898,7 +7951,8 @@
           "E05.ag089_local_scoped_acceptance",
           "E05.ag090_local_scoped_acceptance",
           "E05.ag091_local_scoped_acceptance",
-          "E01.ag057_explicit_sample_registration"
+          "E01.ag057_explicit_sample_registration",
+          "E09.ag182_replay_v3_legal_prefix"
         ],
         "remaining": "scenario-level end-to-end evidence is not complete; related evidence is scoped and non-transitive"
       },
@@ -7205,7 +8259,9 @@
         "status": "planned",
         "verification_status": "planned",
         "effect_status": "not_claimed",
-        "related_evidence_refs": [],
+        "related_evidence_refs": [
+          "E16.6.ag182_v45_project_license_metadata"
+        ],
         "remaining": "v4.3 scenario registered for traceability; scenario execution and independent second acceptance have not been performed; AG131 links only committed project-license metadata guards; legal/notice, non-Rust/frontend/CI-egress and full offline-kit obligations remain, while AG133 has no new verified record"
       },
       {
@@ -7778,42 +8834,42 @@
       "withdrawn_in_pr": "https://github.com/acosmi/RSIAgent/pull/165",
       "clause": "§7.4.2–§7.4.3",
       "owner_task": "AG-182",
-      "status": "pending_recheck"
+      "status": "superseded"
     },
     {
       "id": "E10.replay_management_controller_acceptance",
       "withdrawn_in_pr": "https://github.com/acosmi/RSIAgent/pull/165",
       "clause": "§7.4.2–§7.4.3",
       "owner_task": "AG-182",
-      "status": "pending_recheck"
+      "status": "superseded"
     },
     {
       "id": "E10.ag064_replay_episode_recovery",
       "withdrawn_in_pr": "https://github.com/acosmi/RSIAgent/pull/165",
       "clause": "§7.4.2–§7.4.3",
       "owner_task": "AG-182",
-      "status": "pending_recheck"
+      "status": "superseded"
     },
     {
       "id": "E10.ag103_replay_fairness_waits_legal_set_v42",
       "withdrawn_in_pr": "https://github.com/acosmi/RSIAgent/pull/165",
       "clause": "§7.4.2–§7.4.3",
       "owner_task": "AG-182",
-      "status": "pending_recheck"
+      "status": "superseded"
     },
     {
       "id": "E08.ag037_economic_replay_cleanup",
       "withdrawn_in_pr": "https://github.com/acosmi/RSIAgent/pull/165",
       "clause": "§7.4.2–§7.4.3",
       "owner_task": "AG-182",
-      "status": "pending_recheck"
+      "status": "superseded"
     },
     {
       "id": "E09.ag074_local_scoped_acceptance",
       "withdrawn_in_pr": "https://github.com/acosmi/RSIAgent/pull/165",
       "clause": "§7.4.2–§7.4.3",
       "owner_task": "AG-182",
-      "status": "pending_recheck"
+      "status": "superseded"
     },
     {
       "id": "E16.6.ag012_plan_v42_index_binding",
@@ -7918,7 +8974,7 @@
       "withdrawn_in_pr": "https://github.com/acosmi/RSIAgent/pull/200",
       "clause": "§2.8.1",
       "owner_task": "AG-182",
-      "status": "pending_recheck"
+      "status": "superseded"
     },
     {
       "id": "E05.ag052_versioned_batch_verdicts",

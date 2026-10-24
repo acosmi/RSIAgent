@@ -4240,12 +4240,12 @@ V110/V113/V116与其余新增场景族仍 planned；related_evidence_refs 仅导
 
 | 记录 id | 所属 E | 撤出 PR | 落点条款 | 重验方式 | 负责的修补任务 | 状态 |
 |---|---|---|---|---|---|---|
-| E10.controller_acceptance | E10 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | pending_recheck |
-| E10.replay_management_controller_acceptance | E10 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | pending_recheck |
-| E10.ag064_replay_episode_recovery | E10 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | pending_recheck |
-| E10.ag103_replay_fairness_waits_legal_set_v42 | E10 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | pending_recheck |
-| E08.ag037_economic_replay_cleanup | E08 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | pending_recheck |
-| E09.ag074_local_scoped_acceptance | E09 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | pending_recheck |
+| E10.controller_acceptance | E10 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | superseded（→ E10.ag182_replay_v3_controller_acceptance） |
+| E10.replay_management_controller_acceptance | E10 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | superseded（→ E10.ag182_replay_v3_management_controller_acceptance） |
+| E10.ag064_replay_episode_recovery | E10 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | superseded（→ E10.ag182_replay_v3_episode_recovery） |
+| E10.ag103_replay_fairness_waits_legal_set_v42 | E10 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | superseded（→ E10.ag182_replay_v3_fairness_waits_legal_set） |
+| E08.ag037_economic_replay_cleanup | E08 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | superseded（→ E08.ag182_replay_v3_economic_cleanup） |
+| E09.ag074_local_scoped_acceptance | E09 | #165 | §7.4.2–§7.4.3 | 以 rsia.replay.engine.v3 按当前版本直接重验（本 PR 单目标重跑，新记录 supersedes 旧 id） | AG-182 | superseded（→ E09.ag182_replay_v3_legal_prefix） |
 | E16.6.ag012_plan_v42_index_binding | E16.6 | #165 | §18.9 | 已被 v4.3 索引绑定替代：只登记替代关系，不重验、不复活；当前版本绑定见 E16.6.ag182_plan_v45_index_binding | AG-124 | replaced_by_binding |
 | E04.ag097_broker_close_before_refuse | E04 | #165 | §11.3.1/§11.6 | 随统一撤销判定的修补任务，按 §11.3.1 执行关闭写集重验（Q-51） | AG-119 | pending_recheck |
 | E04.ag105_broker_bound_recovery_close_v42 | E04 | #165 | §11.3.1/§11.6 | 随统一撤销判定的修补任务，按 §11.3.1 执行关闭写集重验（Q-51） | AG-119 | pending_recheck |
@@ -4260,7 +4260,7 @@ V110/V113/V116与其余新增场景族仍 planned；related_evidence_refs 仅导
 | E16.1.durable_import_controller_acceptance | E16.1 | #165 | §11.2.1 | 随原生 Trace 导出的修补任务重验 | AG-148 | pending_recheck |
 | E02.ag062_required_improver_baselines | E02 | #165 | §5.1.2 | 随摘要字段可重算的修补任务重验 | AG-135b | pending_recheck |
 | E09.ag033_run_next_trusted_gate | E09 | #200 | §6.7.4 | v4.4 Q-29：identity_only 纯函数执行结果被固定为 Trusted 节点质量与候选资格；随 candidate_consumption 合同按新记录重验 | AG-187 | pending_recheck |
-| E16.6.ag131_v43_project_license_metadata | E16.6 | #200 | §2.8.1 | v4.4 Q-32：所登记的验证断言 proprietary_unreleased；本 PR 在 head 上重跑同名目标并以新记录 supersedes 替代 | AG-182 | pending_recheck |
+| E16.6.ag131_v43_project_license_metadata | E16.6 | #200 | §2.8.1 | v4.4 Q-32：所登记的验证断言 proprietary_unreleased；本 PR 在 head 上重跑同名目标并以新记录 supersedes 替代 | AG-182 | superseded（→ E16.6.ag182_v45_project_license_metadata） |
 | E05.ag052_versioned_batch_verdicts | E05 | #200 | §3.4 | v4.5 Q-57：断言 decide() 以 LCB<0 判 regressed（含 wire golden 冻结该分支输出）；修补任务纠正判据后按新记录 supersedes 重验 | AG-192 | pending_recheck |
 | E05.ag080_local_scoped_acceptance | E05 | #200 | §3.4 | v4.5 Q-57：断言 decide() 以 LCB<0 判 regressed（含 wire golden 冻结该分支输出）；修补任务纠正判据后按新记录 supersedes 重验 | AG-192 | pending_recheck |
 | E05.ag101_streaming_verdicts_v42 | E05 | #200 | §3.4 | v4.5 Q-57：断言 decide() 以 LCB<0 判 regressed（含 wire golden 冻结该分支输出）；修补任务纠正判据后按新记录 supersedes 重验 | AG-192 | pending_recheck |
@@ -4358,7 +4358,7 @@ V110/V113/V116与其余新增场景族仍 planned；related_evidence_refs 仅导
 - 首验材料：out/audit-20260930/codex-r7-acceptance.md:1062（仅提及合并）。
 - GPT 二验（final-pr-matrix）：license_validator_scope_pass_no_separate_original_CPP_material_D1_open。
 - 索引：只登台账（无Codex首验原件（GPT二验仅2项过滤运行，head exit 0）；其support_scope许可状态改动应由替代E16.6.ag131的新记录承载（在AG-182验收head重跑8词命令），不单列本PR记录）。
-- 状态：文档范围已审，运行时不适用；不可声明项见本小节开头。
+- 状态：README 与项目许可校验器（support_scope.rs 许可状态与 LICENSE 守卫）改动，implemented_not_verified；许可子范围由 E16.6.ag182_v45_project_license_metadata 重跑承载，README 徽章与措辞（Q-32/Q-56）由 AG-180 承接；不可声明项见本小节开头。
 
 #### #182 README — README research-basis citations: link arXiv ids and pin commits [skip ci]
 - 合并：merged `564b40d5c1e1b586835d025149c063820fd6f38f`，merged_at 2026-10-15T14:23:10Z；验收 head `4ea90dc8634c1442a6598a6a0d381d1f7045ea19`。
@@ -4383,10 +4383,10 @@ V110/V113/V116与其余新增场景族仍 planned；related_evidence_refs 仅导
 
 #### #185 README — README: bilingual Hy-Memory highlights, centered header/badges, and friendlier license [skip ci]
 - 合并：merged `51a5f59c2048d3c146d534d9c81420a45fd6115c`，merged_at 2026-10-16T19:11:03Z；验收 head `deb64551872ca827bcc7d2b3f3452f43c2cc0bd2`。
-- 首验材料：无独立首验原件（文档 PR）。
+- 首验材料：无独立 Codex 首验原件（GPT 二验做了许可校验器两组过滤运行）。
 - GPT 二验（final-pr-matrix）：license_validator_scope_pass_no_separate_original_CPP_material_D1_open。
 - 索引：只登台账（同#181：无Codex首验原件；LICENSE终版字节（SHA 164d4296…）的Rust守卫由替代E16.6.ag131的新记录承载）。
-- 状态：文档范围已审，运行时不适用；不可声明项见本小节开头。
+- 状态：README 与项目许可校验器（support_scope.rs 许可状态与 LICENSE 守卫）改动，implemented_not_verified；许可子范围由 E16.6.ag182_v45_project_license_metadata 重跑承载，README 徽章与措辞（Q-32/Q-56）由 AG-180 承接；不可声明项见本小节开头。
 
 #### #186 README — README: add Antigravity to multi-host client examples [skip ci]
 - 合并：merged `951124ea70290240b51a5e4cbd7841869884e5fa`，merged_at 2026-10-16T19:24:47Z；验收 head `d57830189c9690d7927d535cdbd95796e42fe7c5`。
@@ -4485,3 +4485,51 @@ V110/V113/V116与其余新增场景族仍 planned；related_evidence_refs 仅导
 - GPT 二验（final-pr-matrix）：scoped_pass_from_previous_phase_same_fixed_M35_and_true_M34。
 - 索引：本 PR 补登 `E05.ag122_ga18_bound_cycle_validation`（见上表）。
 - 状态：implemented_not_verified + 首次技术验收；不可声明项见本小节开头。
+
+### 重跑与重验（33 条；在本 PR 首个提交 a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9 上执行，每条独立日志）
+
+每条都是守卫下的单目标命令（`bash "$PWD/../../audit-20260930/qa/r6_guarded.sh" "$CARGO_TARGET_DIR" 0 -- cargom test --locked -p <包> --test|--lib <目标>`，cwd 为 AG-182 worktree，CARGO_TARGET_DIR 为本卡独立 target，rsproxy 镜像，非 --offline），日志首行写字面命令；新记录 plan_version v4.5、source_sha = a9ad4587c5f8b70f0c6a2f6435ea8186b9a533c9（本 PR 首个提交；本节所在的登记提交是其子提交，因提交无法包含自身 SHA）、pr = #200（未合并，merged_sha 为 null，事实表登记 200 => None）、command 为声明式 8 词单目标、execution.command 为字面命令；input_ref 统一为回执 `out/audit-20260930/qa/inputs/w0-input-ag-182-a9ad458.json`（SHA-256 `ac957637a78fb52e3dce6cb7d8ce6881b4e04b1d7219beb8d7aeba50f2390d89`，列出 33 份日志的字节与 SHA-256）。
+
+| 新记录 id | E | 关系 | 旧记录 | 单目标 | 结果 | 日志 |
+|---|---|---|---|---|---|---|
+| E08.ag182_replay_v3_economic_cleanup | E08 | supersedes | E08.ag037_economic_replay_cleanup | evo-engine --test replay_economic_cleanup_v42 | 9 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-withdrawn/E08.ag037_economic_replay_cleanup.log` |
+| E09.ag182_replay_v3_legal_prefix | E09 | supersedes | E09.ag074_local_scoped_acceptance | evo-engine --test replay_legal_prefix_v42 | 11 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-withdrawn/E09.ag074_local_scoped_acceptance.log` |
+| E10.ag182_replay_v3_episode_recovery | E10 | supersedes | E10.ag064_replay_episode_recovery | evo-engine --test replay_recovery_contract_v42 | 13 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-withdrawn/E10.ag064_replay_episode_recovery.log` |
+| E10.ag182_replay_v3_fairness_waits_legal_set | E10 | supersedes | E10.ag103_replay_fairness_waits_legal_set_v42 | evo-engine --test replay_fairness_waits_v42 | 9 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-withdrawn/E10.ag103_replay_fairness_waits_legal_set_v42.log` |
+| E10.ag182_replay_v3_controller_acceptance | E10 | supersedes | E10.controller_acceptance | evo-engine --test replay_v41 | 13 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-withdrawn/E10.controller_acceptance.log` |
+| E10.ag182_replay_v3_management_controller_acceptance | E10 | supersedes | E10.replay_management_controller_acceptance | evo-engine --test dispatch_management | 31 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-withdrawn/E10.replay_management_controller_acceptance.log` |
+| E16.6.ag182_v45_project_license_metadata | E16.6 | supersedes | E16.6.ag131_v43_project_license_metadata | evo-core --test support_scope | 41 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-withdrawn/E16.6.ag131_v43_project_license_metadata.log` |
+| E16.6.ag182_plan_v45_index_binding | E16.6 | supersedes=[]（note：替代 E16.6.ag012 的谱系绑定） | — | evo-core --test support_scope | 41 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-binding/E16.6.ag182_plan_v45_index_binding.log` |
+| E00.ag182_rerun_controller_acceptance | E00 | completes | E00.controller_acceptance | evo-engine --lib evaluator::tests | 6 过 / 0 败，181 filtered，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E00.controller_acceptance.log` |
+| E01.ag182_rerun_controller_acceptance | E01 | completes | E01.controller_acceptance | evo-core --test evaluation_v41 | 13 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E01.controller_acceptance.log` |
+| E02.ag182_rerun_ag092_local_scoped_acceptance | E02 | completes | E02.ag092_local_scoped_acceptance | evo-core --test baseline_dependency_revocation_v42 | 13 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E02.ag092_local_scoped_acceptance.log` |
+| E02.ag182_rerun_ag093_local_scoped_acceptance | E02 | completes | E02.ag093_local_scoped_acceptance | evo-engine --test compiler_input_binding_v42 | 5 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E02.ag093_local_scoped_acceptance.log` |
+| E02.ag182_rerun_controller_acceptance | E02 | completes | E02.controller_acceptance | evo-core --test skill_edit | 14 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E02.controller_acceptance.log` |
+| E03.ag182_rerun_controller_acceptance | E03 | completes | E03.controller_acceptance | evo-engine --test optimization | 7 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E03.controller_acceptance.log` |
+| E04.ag182_rerun_ag077_local_scoped_acceptance | E04 | completes | E04.ag077_local_scoped_acceptance | evo-storage --test e16_budget_binding_v42 | 31 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E04.ag077_local_scoped_acceptance.log` |
+| E04.ag182_rerun_controller_acceptance | E04 | completes | E04.controller_acceptance | evo-storage --test budget | 26 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E04.controller_acceptance.log` |
+| E05.ag182_rerun_ag083_partition_admission_rejection_atomicity | E05 | completes | E05.ag083_partition_admission_rejection_atomicity | evo-core --test partition_admission_atomic_v42 | 31 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag083_partition_admission_rejection_atomicity.log` |
+| E05.ag182_rerun_ag087_local_scoped_acceptance | E05 | completes | E05.ag087_local_scoped_acceptance | evo-engine --test formal_candidate_dependency_binding_v42 | 27 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag087_local_scoped_acceptance.log` |
+| E05.ag182_rerun_ag088_local_scoped_acceptance | E05 | completes | E05.ag088_local_scoped_acceptance | evo-engine --test complete_batch_statistics_binding_v42 | 2 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag088_local_scoped_acceptance.log` |
+| E05.ag182_rerun_ag089_local_scoped_acceptance | E05 | completes | E05.ag089_local_scoped_acceptance | evo-engine --test early_stop_certificate_binding_v42 | 10 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag089_local_scoped_acceptance.log` |
+| E05.ag182_rerun_ag090_local_scoped_acceptance | E05 | completes | E05.ag090_local_scoped_acceptance | evo-engine --test invalid_formal_reason_binding_v42 | 7 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag090_local_scoped_acceptance.log` |
+| E05.ag182_rerun_ag091_local_scoped_acceptance | E05 | completes | E05.ag091_local_scoped_acceptance | evo-engine --test late_grader_stop_preservation_v42 | 8 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E05.ag091_local_scoped_acceptance.log` |
+| E05.ag182_rerun_controller_acceptance | E05 | completes | E05.controller_acceptance | evo-engine --test streaming_evaluator | 14 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E05.controller_acceptance.log` |
+| E06.ag182_rerun_ag084_local_scoped_acceptance | E06 | completes | E06.ag084_local_scoped_acceptance | evo-engine --test candidate_review | 16 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E06.ag084_local_scoped_acceptance.log` |
+| E07.ag182_rerun_controller_acceptance | E07 | completes | E07.controller_acceptance | evo-http --test service | 7 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E07.controller_acceptance.log` |
+| E08.ag182_rerun_ag075_local_scoped_acceptance | E08 | completes | E08.ag075_local_scoped_acceptance | evo-storage --test dependency_read_v42 | 4 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E08.ag075_local_scoped_acceptance.log` |
+| E08.ag182_rerun_controller_acceptance | E08 | completes | E08.controller_acceptance | evo-storage --test lifecycle | 23 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E08.controller_acceptance.log` |
+| E09.ag182_rerun_controller_acceptance | E09 | completes | E09.controller_acceptance | evo-engine --test exploration_v41 | 5 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E09.controller_acceptance.log` |
+| E11.ag182_rerun_controller_acceptance | E11 | completes | E11.controller_acceptance | evo-core --test replay_economics | 4 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E11.controller_acceptance.log` |
+| E12.ag182_rerun_controller_acceptance | E12 | completes | E12.controller_acceptance | evo-engine --test curriculum_v41 | 3 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E12.controller_acceptance.log` |
+| E16.1.ag182_rerun_ag070_local_scoped_acceptance | E16.1 | completes | E16.1.ag070_local_scoped_acceptance | evo-engine --test import_development_material_v42 | 12 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E16.1.ag070_local_scoped_acceptance.log` |
+| E16.1.ag182_rerun_ag076_local_scoped_acceptance | E16.1 | completes | E16.1.ag076_local_scoped_acceptance | evo-core --test import_fixture_v42 | 34 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E16.1.ag076_local_scoped_acceptance.log` |
+| E16.6.ag182_rerun_ag086_local_scoped_acceptance | E16.6 | completes | E16.6.ag086_local_scoped_acceptance | evo-core --test support_scope | 41 过 / 0 败，exit 0 | `out/audit-20260930/qa/claude-r8-rerun-missing/E16.6.ag086_local_scoped_acceptance.log` |
+
+- 六条回放撤出记录与 E16.6.ag131 的 withdrawn_records 状态由 pending_recheck 改为 superseded，并由新记录 supersedes 指向；新记录 scope 只声明旧记录原作用域（E10.replay_management 只计 replay.run 五例与原八个通用作业用例；E10.ag064 的“…remain_verified_and_idempotent”测试名旧实新，按断言内容登记）；回放新记录的 related_evidence_refs 按撤出前的导航位置恢复（只限其 E 在映射内的条目），E16.6.ag182_v45_project_license_metadata 接回 V116，E16.6.ag182_plan_v45_index_binding 登记于 V071/V080。
+- 25 条缺件记录的重跑以 completes=[旧 id] 登记，旧记录及其登记路径/摘要不改写、不撤出；计数按本次运行如实登记（后来加入同一目标的用例不扩成旧记录的信用）。三条 E05 撤出记录（E05.ag052/ag080/ag101）不在本表，由 AG-192 在新判据下重验。
+
+### 计数与不可声明项
+
+- verified_subscopes：98 − 5（撤出）+ 12（补登，含有条件 2）+ 33（本节）= 138；withdrawn_records 24（pending_recheck 16、superseded 7、replaced_by_binding 1）；缺失清单 42 路径 / 25 条记录。
+- 不可声明：二次验收、完整 V071/V080/V116/V123、E16.6 或 E16 关闭、真实宿主/沙箱/provider、付费实验、任何效果或收益、发行；本 PR 状态最高 implemented_not_verified，首次技术验收由 W0 另行执行。

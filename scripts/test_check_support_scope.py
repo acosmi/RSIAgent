@@ -1696,7 +1696,7 @@ class IndexOwnershipAndMergeFactsTests(unittest.TestCase):
         self.assertEqual(len(facts), 132)
         self.assertIsNone(facts[200])  # the AG-182 rebind PR itself, unmerged when its records were registered
         records = [record for scope in _valid_manifest_dict()["e_scopes"].values() for record in scope["verified_subscopes"]]
-        self.assertEqual(len(records), 105)
+        self.assertEqual(len(records), 138)
         for record in records:
             self.assertEqual(record["merged_sha"], facts[int(record["pr"].rsplit("/", 1)[1])])
             self.assertNotEqual(record["source_sha"], record["merged_sha"])
