@@ -1567,6 +1567,25 @@ class V45RebindTests(unittest.TestCase):
         self.assertEqual(report.evidence_missing, [])
         self.assertEqual(len(report.evidence_registered_not_checked), 41)
 
+    def test_early_exit_reports_the_unjudged_paths_counted_so_far(self):
+        """AG-200 rework R8-1 (review F-04): a reappearance raised inside the per-path loop leaves evidence_unjudged at the count
+        reached, in the structure-only and in the default mode."""
+        register = self._register()
+        known = next(entry for entry in register["entries"] if entry["expected_sha256"] != "unknown" and entry["field"] == "log_path")
+        total = _out_path_count(_valid_manifest_dict())
+        for default_mode in (False, True):
+            with self.subTest(default_mode=default_mode):
+                report = self._report(_valid_manifest_dict(), repo_files={known["path"]: b"different bytes\n"}, default_mode=default_mode)
+                self.assertFalse(report.structure_valid)
+                self.assertEqual(len(report.errors), 1)
+                self.assertIn("has reappeared with bytes or SHA-256 that differ from the register", report.errors[0])
+                self.assertGreater(report.evidence_unjudged, 0)
+                self.assertLess(report.evidence_unjudged, total)
+                unavailable = sum(1 for item in report.needs_verification if item.endswith(" is unavailable"))
+                self.assertEqual(report.evidence_unjudged, unavailable + len(report.evidence_registered_not_checked))
+                self.assertEqual(report.to_dict()["evidence_unjudged"], report.evidence_unjudged)
+                self.assertEqual(report.evidence_judgment, "not_performed" if default_mode else "not_performed_structure_only")
+
     def test_register_triples_are_pinned_in_both_checkers(self):
         register = self._register()
         triples = {(entry["record_id"], entry["field"], entry["path"]) for entry in register["entries"]}
@@ -1929,6 +1948,40 @@ class RustParityRejectionTests(unittest.TestCase):
                 manifest = _valid_manifest_dict()
                 manifest["traceability"]["v_scenarios"][0]["status"] = status
                 self.assertIn(expected, self._errors(manifest)[0])
+
+    def test_v_scenario_remaining_follows_the_status(self):
+        """AG-200 rework R8-1 (review F-02, the Rust test now follows the same rule): a verified scenario names its completion
+        evidence and retains no remaining scope; any other scenario states its remaining scope."""
+        absent = object()
+
+        def with_remaining(entry: dict, remaining) -> None:
+            if remaining is absent:
+                del entry["remaining"]
+            else:
+                entry["remaining"] = remaining
+
+        def verified_v120(remaining) -> dict:
+            manifest = _valid_manifest_dict()
+            entry = manifest["traceability"]["v_scenarios"][119]
+            self.assertEqual(entry["id"], "V120")
+            entry.update({"status": "verified", "verification_status": "verified", "related_evidence_refs": ["E02.controller_acceptance"], "completion_evidence_refs": ["E02.controller_acceptance"]})
+            with_remaining(entry, remaining)
+            return manifest
+
+        for remaining in ("", [], None, absent):
+            with self.subTest(verified_remaining=remaining):
+                self._assert_valid(verified_v120(remaining))
+        for remaining in ("still unfinished", ["unfinished"]):
+            with self.subTest(verified_remaining=remaining):
+                self.assertIn("V120: verified scenario lacks completion evidence or retains unfinished scope", self._errors(verified_v120(remaining))[0])
+        for remaining in ("", None, absent):
+            with self.subTest(started_remaining=remaining):
+                manifest = _valid_manifest_dict()
+                entry = manifest["traceability"]["v_scenarios"][0]
+                self.assertEqual(entry["id"], "V001")
+                self.assertNotEqual(entry["status"], "verified")
+                with_remaining(entry, remaining)
+                self.assertIn("V001 remaining: must be a non-empty string", self._errors(manifest)[0])
 
     def test_non_ascii_digits_are_rejected_like_the_rust_checker(self):
         """R1 §Q4.9: \\d accepted other Unicode digits; every pattern now uses [0-9]."""

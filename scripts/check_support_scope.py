@@ -140,9 +140,10 @@ FIELD_SEMANTICS = {
         "--evidence-root, out/ paths are judged in the local evidence store it names, the directory holding out/, normally the primary checkout); "
         "not_performed_structure_only when --structure-only is given, which counts the absent out/ evidence paths, registered or not, in "
         "evidence_unjudged without judging them; not_performed when the check stopped before every path was judged, in particular when neither "
-        "option is given and an out/ evidence path is unjudged, which fails the check (fail closed); --structure-only and --evidence-root are "
-        "mutually exclusive; the Rust test judges out/ evidence paths only when the environment variable RSIA_SUPPORT_SCOPE_EVIDENCE_ROOT names "
-        "that store and otherwise reports that the evidence judgment was not performed"
+        "option is given and an out/ evidence path is unjudged, which fails the check (fail closed); evidence_unjudged counts the unjudged paths as "
+        "they are met, so a check that stops early reports the count reached; --structure-only and --evidence-root are mutually exclusive; the "
+        "Rust test judges out/ evidence paths only when the environment variable RSIA_SUPPORT_SCOPE_EVIDENCE_ROOT names that store and "
+        "otherwise reports that the evidence judgment was not performed"
     ),
     "evidence_missing_register_pin": (
         "both checkers pin the missing-evidence register file itself: evidence_missing_register.path must be reports/evidence-missing.json and "
@@ -1644,8 +1645,9 @@ def check_local_evidence(report: CheckReport, evidence: list[dict[str, Any]], re
     absence was not checked); a missing path outside the register fails (for out/ paths only when the evidence store is supplied);
     a registered path that reappears fails unless the registered SHA-256 (and bytes, when registered) match, and always
     fails when its identity was registered as unknown. Every absent out/ path left unjudged (registered or not) is counted in
-    evidence_unjudged; after every path has been examined, a nonzero count fails the check (fail closed, AG-200) unless
-    structure_only states that only the structure is checked. Returns whether every input manifest is present and matching."""
+    evidence_unjudged as it is met, so a check that stops early still reports the count reached (review F-04); after every
+    path has been examined, a nonzero count fails the check (fail closed, AG-200) unless structure_only states that only the
+    structure is checked. Returns whether every input manifest is present and matching."""
     store_checked = evidence_root is not None
     all_inputs = bool(evidence)
     unjudged = 0
@@ -1671,15 +1673,16 @@ def check_local_evidence(report: CheckReport, evidence: list[dict[str, Any]], re
                 all_inputs = False
             if entry is not None and in_store and not store_checked:
                 report.evidence_registered_not_checked.append(f"{identifier} {field_name} {rel}")
+                report.evidence_unjudged += 1
             elif entry is not None:
                 report.evidence_missing.append(f"{identifier} {field_name} {rel}")
             elif in_store and not store_checked:
                 unjudged += 1
+                report.evidence_unjudged += 1
                 label = "input manifest" if field_name == "input_ref" else field_name
                 report.needs_verification.append(f"{identifier}: local {label} is unavailable")
             else:
                 raise CheckerError(f"{identifier}: {field_name} {rel!r} is missing locally and is not listed in the missing-evidence register {register_rel}")
-    report.evidence_unjudged = unjudged + len(report.evidence_registered_not_checked)
     if not store_checked:
         report.needs_verification.append(
             f"local evidence store not supplied (--evidence-root): {unjudged} absent {LOCAL_EVIDENCE_STORE}/ evidence path(s) were reported, not judged against "

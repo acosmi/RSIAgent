@@ -2806,6 +2806,21 @@ fn validate_commitments(
                 return Err(format!("{} has invalid {field}", expected.id));
             }
         }
+        // The two tracking axes agree (Python parity, AG-200 rework R8-1).
+        let implementation = entry["implementation_status"].as_str().unwrap_or_default();
+        let verification = entry["verification_status"].as_str().unwrap_or_default();
+        if implementation == "planned" && verification != "planned" {
+            return Err(format!(
+                "{}: planned implementation has incompatible verification",
+                expected.id
+            ));
+        }
+        if verification == "verified" && matches!(implementation, "planned" | "blocked") {
+            return Err(format!(
+                "{}: verified commitment has incompatible implementation status",
+                expected.id
+            ));
+        }
         if entry["implementation_status"] != expected_commitment_implementation_status(expected.id)
         {
             return Err(format!(
@@ -2851,6 +2866,16 @@ fn validate_commitments(
             .ok_or_else(|| format!("{} local_artifacts must be an array", expected.id))?;
         if artifacts.is_empty() {
             return Err(format!("{} has no local consumer/artifact", expected.id));
+        }
+        let mut seen = BTreeSet::new();
+        if artifacts
+            .iter()
+            .any(|artifact| !seen.insert(artifact.to_string()))
+        {
+            return Err(format!(
+                "{}: local artifacts are absent or duplicated",
+                expected.id
+            ));
         }
         for artifact in artifacts {
             let artifact = nonempty_string(artifact, "local artifact")?;
@@ -3121,6 +3146,16 @@ fn validate_so_sources(
         if artifacts.is_empty() {
             return Err(format!("{} has no explicit local landing", expected.id));
         }
+        let mut seen = BTreeSet::new();
+        if artifacts
+            .iter()
+            .any(|artifact| !seen.insert(artifact.to_string()))
+        {
+            return Err(format!(
+                "{}: local landing is absent or duplicated",
+                expected.id
+            ));
+        }
         for artifact in artifacts {
             validate_repo_file(
                 root,
@@ -3203,7 +3238,7 @@ fn validate_v_scenarios(
             evidence_ids,
         )?;
         // A verified scenario names completion evidence among its refs and retains no unfinished
-        // scope (Python parity, AG-200); the remaining rule below keeps this checker stricter.
+        // scope; any other scenario states its remaining scope (Python parity, AG-200 and R8-1).
         if status == "verified" {
             let refs = string_set(
                 &entry["related_evidence_refs"],
@@ -3228,8 +3263,9 @@ fn validate_v_scenarios(
                     "{id}: verified scenario lacks completion evidence or retains unfinished scope"
                 ));
             }
+        } else {
+            nonempty_string(&entry["remaining"], &format!("{id} remaining"))?;
         }
-        nonempty_string(&entry["remaining"], &format!("{id} remaining"))?;
     }
     Ok(actual_ids)
 }
@@ -3370,7 +3406,7 @@ fn expected_field_semantics() -> Vec<(&'static str, String)> {
         // pin, merge facts); the thirteen definitions above are unchanged.
         (
             "evidence_judgment",
-            "top-level key of the Python checker report, with evidence_unjudged: judged when every evidence path was judged and none failed (with --evidence-root, out/ paths are judged in the local evidence store it names, the directory holding out/, normally the primary checkout); not_performed_structure_only when --structure-only is given, which counts the absent out/ evidence paths, registered or not, in evidence_unjudged without judging them; not_performed when the check stopped before every path was judged, in particular when neither option is given and an out/ evidence path is unjudged, which fails the check (fail closed); --structure-only and --evidence-root are mutually exclusive; the Rust test judges out/ evidence paths only when the environment variable RSIA_SUPPORT_SCOPE_EVIDENCE_ROOT names that store and otherwise reports that the evidence judgment was not performed".to_string(),
+            "top-level key of the Python checker report, with evidence_unjudged: judged when every evidence path was judged and none failed (with --evidence-root, out/ paths are judged in the local evidence store it names, the directory holding out/, normally the primary checkout); not_performed_structure_only when --structure-only is given, which counts the absent out/ evidence paths, registered or not, in evidence_unjudged without judging them; not_performed when the check stopped before every path was judged, in particular when neither option is given and an out/ evidence path is unjudged, which fails the check (fail closed); evidence_unjudged counts the unjudged paths as they are met, so a check that stops early reports the count reached; --structure-only and --evidence-root are mutually exclusive; the Rust test judges out/ evidence paths only when the environment variable RSIA_SUPPORT_SCOPE_EVIDENCE_ROOT names that store and otherwise reports that the evidence judgment was not performed".to_string(),
         ),
         (
             "evidence_missing_register_pin",
@@ -7613,17 +7649,27 @@ fn non_ascii_digits_are_rejected_like_the_python_checker() {
     // R1 §Q4 item 9: this checker accepts only ASCII digits; the Python checker now uses [0-9].
     let root = repo_root();
     let baseline = load_manifest(&root);
+    // Escaped so that no editor or review tool can normalize them to ASCII digits.
+    let owner_task = "AG-\u{661}\u{669}\u{662}";
+    let pr_url = "https://github.com/acosmi/RSIAgent/pull/\u{663}\u{660}";
+    let window_after = "\u{ff12}\u{ff10}\u{ff12}\u{ff16}-10-14T11:54:14Z";
+    for text in [owner_task, pr_url, window_after] {
+        assert!(
+            text.chars()
+                .any(|character| character.is_numeric() && !character.is_ascii_digit()),
+            "{text}"
+        );
+    }
     let mut owner = baseline.clone();
     withdrawn_entry_mut(&mut owner, "E05.ag052_versioned_batch_verdicts")["owner_task"] =
-        Value::String("AG-١٩٢".into());
+        Value::String(owner_task.into());
     let error = validate_manifest(&owner, &root).expect_err("a non-ASCII owner task");
     assert!(
         error.contains("E05.ag052_versioned_batch_verdicts owner_task must be a registered task number such as AG-187"),
         "{error}"
     );
     let mut pr = baseline.clone();
-    pr["e_scopes"]["E01"]["verified_subscopes"][0]["pr"] =
-        Value::String("https://github.com/acosmi/RSIAgent/pull/٣٠".into());
+    pr["e_scopes"]["E01"]["verified_subscopes"][0]["pr"] = Value::String(pr_url.into());
     let error = validate_manifest(&pr, &root).expect_err("a non-ASCII pull request number");
     assert!(
         error.contains("E01.controller_acceptance has an invalid pull request URL"),
@@ -7632,7 +7678,7 @@ fn non_ascii_digits_are_rejected_like_the_python_checker() {
     let original = register_bytes(&root);
     let mut register: Value = load_json_strict(std::str::from_utf8(&original).unwrap()).unwrap();
     register["entries"][0]["missing_window"] =
-        serde_json::json!({"after": "２０２６-10-14T11:54:14Z", "before": "unknown"});
+        serde_json::json!({"after": window_after, "before": "unknown"});
     let bytes = serde_json::to_vec_pretty(&register).unwrap();
     let fixture = RegisterFixture::new(&bytes);
     let error = validate_missing_register(
@@ -7644,4 +7690,144 @@ fn non_ascii_digits_are_rejected_like_the_python_checker() {
     )
     .expect_err("a non-ASCII missing window");
     assert!(error.contains("missing_window is malformed"), "{error}");
+}
+
+fn commitment_position(value: &Value, group: &str, id: &str) -> usize {
+    value["traceability"][group]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|entry| entry["id"] == id)
+        .unwrap()
+}
+
+#[test]
+fn commitment_axes_and_artifact_lists_match_the_python_checker() {
+    // AG-200 rework R8-1 (review F-01): the four Python rules that the R1 §Q4 list missed.
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    validate_manifest(&baseline, &root).unwrap();
+    let b09 = commitment_position(&baseline, "b_commitments", "B09");
+    let k06 = commitment_position(&baseline, "k_commitments", "K06");
+    for (group, index) in [("b_commitments", b09), ("k_commitments", k06)] {
+        let entry = &baseline["traceability"][group][index];
+        assert_eq!(entry["implementation_status"], "planned");
+        assert_eq!(entry["verification_status"], "planned");
+    }
+    let cases: Vec<ManifestMutation> = vec![
+        (
+            "planned implementation with a later verification",
+            "B09: planned implementation has incompatible verification".into(),
+            Box::new(move |value: &mut Value| {
+                value["traceability"]["b_commitments"][b09]["verification_status"] =
+                    "implemented_not_verified".into()
+            }),
+        ),
+        (
+            "planned implementation claimed verified",
+            "K06: planned implementation has incompatible verification".into(),
+            Box::new(move |value: &mut Value| {
+                value["traceability"]["k_commitments"][k06]["verification_status"] =
+                    "verified".into()
+            }),
+        ),
+        (
+            "verified commitment with a blocked implementation",
+            "B01: verified commitment has incompatible implementation status".into(),
+            Box::new(|value: &mut Value| {
+                let entry = &mut value["traceability"]["b_commitments"][0];
+                entry["implementation_status"] = "blocked".into();
+                entry["verification_status"] = "verified".into();
+            }),
+        ),
+        (
+            "duplicated commitment artifact",
+            "B01: local artifacts are absent or duplicated".into(),
+            Box::new(|value: &mut Value| {
+                let artifacts = &mut value["traceability"]["b_commitments"][0]["local_artifacts"];
+                let first = artifacts[0].clone();
+                artifacts.as_array_mut().unwrap().push(first);
+            }),
+        ),
+        (
+            "duplicated SO local landing",
+            "SO01: local landing is absent or duplicated".into(),
+            Box::new(|value: &mut Value| {
+                let artifacts =
+                    &mut value["traceability"]["so_sources"][0]["local_use"]["artifacts"];
+                let first = artifacts[0].clone();
+                artifacts.as_array_mut().unwrap().push(first);
+            }),
+        ),
+    ];
+    for (name, expected, mutate) in cases {
+        let mut value = baseline.clone();
+        mutate(&mut value);
+        let error =
+            validate_manifest(&value, &root).expect_err("a commitment or artifact rule violation");
+        assert!(error.contains(&expected), "{name}: {error}");
+    }
+}
+
+#[test]
+fn v_scenario_remaining_follows_the_status_like_the_python_checker() {
+    // AG-200 rework R8-1 (review F-02): a scenario that is not verified states its remaining scope;
+    // a verified one names its completion evidence and retains none.
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let verified_v120 = |remaining: Option<Value>| {
+        let mut value = baseline.clone();
+        let entry = &mut value["traceability"]["v_scenarios"][119];
+        assert_eq!(entry["id"], "V120");
+        entry["status"] = "verified".into();
+        entry["verification_status"] = "verified".into();
+        entry["related_evidence_refs"] = serde_json::json!(["E02.controller_acceptance"]);
+        entry["completion_evidence_refs"] = serde_json::json!(["E02.controller_acceptance"]);
+        match remaining {
+            Some(remaining) => entry["remaining"] = remaining,
+            None => {
+                entry.as_object_mut().unwrap().remove("remaining");
+            }
+        }
+        value
+    };
+    for remaining in [
+        Some(serde_json::json!("")),
+        Some(serde_json::json!([])),
+        Some(Value::Null),
+        None,
+    ] {
+        validate_manifest(&verified_v120(remaining), &root).unwrap();
+    }
+    for remaining in [
+        serde_json::json!("still unfinished"),
+        serde_json::json!(["unfinished"]),
+    ] {
+        let error = validate_manifest(&verified_v120(Some(remaining)), &root)
+            .expect_err("a verified scenario that retains remaining scope");
+        assert!(
+            error.contains(
+                "V120: verified scenario lacks completion evidence or retains unfinished scope"
+            ),
+            "{error}"
+        );
+    }
+    for remaining in [Some(serde_json::json!("")), Some(Value::Null), None] {
+        let mut value = baseline.clone();
+        let entry = &mut value["traceability"]["v_scenarios"][0];
+        assert_eq!(entry["id"], "V001");
+        assert_ne!(entry["status"], "verified");
+        match remaining {
+            Some(remaining) => entry["remaining"] = remaining,
+            None => {
+                entry.as_object_mut().unwrap().remove("remaining");
+            }
+        }
+        let error = validate_manifest(&value, &root)
+            .expect_err("a scenario that is not verified without remaining scope");
+        assert!(
+            error.contains("V001 remaining must be a non-empty string"),
+            "{error}"
+        );
+    }
 }
