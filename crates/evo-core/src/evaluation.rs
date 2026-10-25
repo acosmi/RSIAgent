@@ -2578,3 +2578,746 @@ mod tests {
         assert!(planning_rational_cmp_f64(1, i128::MAX, 1.0).is_err());
     }
 }
+
+/// Library-only registration: these contracts neither execute tasks nor grant authority.
+pub const CONTROLLED_TASK_PROFILE_SCHEMA_V1: &str = "rsia.controlled_task_profile.v1";
+pub const CONTROLLED_TASK_PROFILE_ID_V1: &str = "config_precedence.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlledTaskRiskV1 {
+    ReadOnlyNoNetworkNoWriteNoCodeExecution,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlledTaskSourceV1 {
+    pub version: String,
+    pub source_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlledTaskTemplateV1 {
+    pub template_id: String,
+    pub layer_combinations: Vec<Vec<String>>,
+    pub key_types: Vec<String>,
+    pub parameter_sets: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlledTaskTemplateCatalogV1 {
+    pub templates: Vec<ControlledTaskTemplateV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlledTaskCommitmentV1 {
+    pub task_id: String,
+    pub template_id: String,
+    pub layer_combination: Vec<String>,
+    pub key_type: String,
+    pub data_use: DataUse,
+    pub commitment_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlledTaskAnswerV1 {
+    pub key: String,
+    pub present: bool,
+    pub value: serde_json::Value,
+    // Value keeps all six keys required while allowing explicit JSON null.
+    pub source_layer: serde_json::Value,
+    pub source_path: serde_json::Value,
+    pub json_pointer: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlledTaskAnchorRejectionV1 {
+    WriteForbidden,
+    WorkspaceBoundary,
+    UnsupportedFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ControlledTaskAnchorExpectedV1 {
+    Answer {
+        output: ControlledTaskAnswerV1,
+    },
+    Rejected {
+        reason: ControlledTaskAnchorRejectionV1,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlledTaskAnchorMaterialV1 {
+    pub anchor_id: String,
+    pub input: serde_json::Value,
+    pub expected: ControlledTaskAnchorExpectedV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ControlledTaskAlphaRegistrationV1 {
+    Descriptive {},
+    Formal {
+        plan: crate::sequential::ResearchFamilyAlphaPlan,
+        fixed_claim_id: String,
+        attempt_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlledTaskBudgetV1 {
+    pub currency: String,
+    pub pricing_version: String,
+    pub per_call_cap_micros: String,
+    pub experiment_total_micros: String,
+    pub payment_subject: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlledTaskProfileV1 {
+    pub schema_version: String,
+    pub profile_id: String,
+    pub risk: ControlledTaskRiskV1,
+    pub layer_order: Vec<String>,
+    pub config_formats: Vec<String>,
+    pub generator: ControlledTaskSourceV1,
+    pub resolver: ControlledTaskSourceV1,
+    pub template_catalog_digest: String,
+    pub task_commitments: Vec<ControlledTaskCommitmentV1>,
+    pub anchor_coverage: crate::holdout::AnchorCoverageMatrix,
+    pub anchor_material_digest: String,
+    pub n_planned: u64,
+    pub alpha_registration: ControlledTaskAlphaRegistrationV1,
+    pub budget: ControlledTaskBudgetV1,
+    pub environment_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlledTaskProfileMaterialsV1 {
+    pub generator_source: String,
+    pub resolver_source: String,
+    pub template_catalog: ControlledTaskTemplateCatalogV1,
+    #[serde(deserialize_with = "deserialize_controlled_task_materials_v1")]
+    pub task_materials: BTreeMap<String, serde_json::Value>,
+    pub anchor_materials: Vec<ControlledTaskAnchorMaterialV1>,
+    pub environment: serde_json::Value,
+}
+
+fn deserialize_controlled_task_materials_v1<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct MaterialsVisitor;
+    impl<'de> serde::de::Visitor<'de> for MaterialsVisitor {
+        type Value = BTreeMap<String, serde_json::Value>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a map of unique task ids to task materials")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut materials = BTreeMap::new();
+            while let Some((id, material)) = map.next_entry::<String, serde_json::Value>()? {
+                if materials.insert(id, material).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "duplicate controlled task material id",
+                    ));
+                }
+            }
+            Ok(materials)
+        }
+    }
+    deserializer.deserialize_map(MaterialsVisitor)
+}
+
+const CONTROLLED_TASK_CAPABILITIES_V1: [&str; 9] = [
+    "no_write",
+    "workspace_boundary",
+    "explicit_false",
+    "explicit_zero",
+    "explicit_empty_string",
+    "default_inheritance",
+    "layer_precedence",
+    "not_found",
+    "unknown_format_rejection",
+];
+
+fn controlled_task_nonempty(value: &str, field: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(Error::Invalid(format!(
+            "controlled task {field} must be nonempty"
+        )));
+    }
+    Ok(())
+}
+
+fn controlled_task_text_set(values: &[String], field: &str) -> Result<()> {
+    if values.is_empty() {
+        return Err(Error::Invalid(format!(
+            "controlled task {field} must be nonempty"
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for value in values {
+        controlled_task_nonempty(value, field)?;
+        if !seen.insert(value) {
+            return Err(Error::Invalid(format!("duplicate controlled task {field}")));
+        }
+    }
+    Ok(())
+}
+
+fn controlled_task_object(value: &serde_json::Value, field: &str) -> Result<()> {
+    if !value.as_object().is_some_and(|object| !object.is_empty()) {
+        return Err(Error::Invalid(format!(
+            "controlled task {field} must be a nonempty JSON object"
+        )));
+    }
+    Ok(())
+}
+
+fn controlled_task_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    serde_json::to_vec(&serde_json::to_value(value).map_err(|_| Error::Internal)?)
+        .map_err(|_| Error::Internal)
+}
+
+fn controlled_task_json_set<T: Clone + Serialize>(values: &[T], field: &str) -> Result<Vec<T>> {
+    if values.is_empty() {
+        return Err(Error::Invalid(format!(
+            "controlled task {field} must be nonempty"
+        )));
+    }
+    let mut rows = values
+        .iter()
+        .map(|value| Ok((controlled_task_json_bytes(value)?, value.clone())))
+        .collect::<Result<Vec<_>>>()?;
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    if rows.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(Error::Invalid(format!("duplicate controlled task {field}")));
+    }
+    Ok(rows.into_iter().map(|(_, value)| value).collect())
+}
+
+fn controlled_task_layers(layers: &[String], order: &[String]) -> Result<()> {
+    controlled_task_text_set(layers, "layer_combination")?;
+    let mut previous = None;
+    for layer in layers {
+        let position = order
+            .iter()
+            .position(|known| known == layer)
+            .ok_or_else(|| {
+                Error::Invalid("controlled task layer_combination has an unknown layer".into())
+            })?;
+        if previous.is_some_and(|before| before >= position) {
+            return Err(Error::Invalid(
+                "controlled task layer_combination must follow layer_order".into(),
+            ));
+        }
+        previous = Some(position);
+    }
+    Ok(())
+}
+
+fn controlled_task_catalog(
+    catalog: &ControlledTaskTemplateCatalogV1,
+    layer_order: &[String],
+) -> Result<ControlledTaskTemplateCatalogV1> {
+    if catalog.templates.is_empty() {
+        return Err(Error::Invalid(
+            "controlled task templates must be nonempty".into(),
+        ));
+    }
+    let mut normalized = catalog.clone();
+    let mut template_ids = BTreeSet::new();
+    for template in &mut normalized.templates {
+        controlled_task_nonempty(&template.template_id, "template_id")?;
+        if !template_ids.insert(template.template_id.clone()) {
+            return Err(Error::Invalid(
+                "duplicate controlled task template_id".into(),
+            ));
+        }
+        controlled_task_text_set(&template.key_types, "key_types")?;
+        for layers in &template.layer_combinations {
+            controlled_task_layers(layers, layer_order)?;
+        }
+        for parameters in &template.parameter_sets {
+            controlled_task_object(parameters, "parameter set")?;
+        }
+        template.layer_combinations =
+            controlled_task_json_set(&template.layer_combinations, "layer_combinations")?;
+        template.parameter_sets =
+            controlled_task_json_set(&template.parameter_sets, "parameter_sets")?;
+        template.key_types.sort();
+    }
+    normalized
+        .templates
+        .sort_by(|a, b| a.template_id.cmp(&b.template_id));
+    Ok(normalized)
+}
+
+fn controlled_task_cluster_digest(
+    profile_id: &str,
+    task: &ControlledTaskCommitmentV1,
+) -> Result<String> {
+    crate::canonical_fingerprint(&serde_json::json!({
+        "domain": "rsia.controlled_task_cluster.v1",
+        "profile_id": profile_id,
+        "template_id": task.template_id,
+        "layer_combination": task.layer_combination,
+        "key_type": task.key_type,
+    }))
+}
+
+fn controlled_task_answer(output: &ControlledTaskAnswerV1, layers: &[String]) -> Result<()> {
+    controlled_task_nonempty(&output.key, "anchor answer key")?;
+    if !output.present {
+        if !output.value.is_null()
+            || !output.source_layer.is_null()
+            || !output.source_path.is_null()
+            || !output.json_pointer.is_null()
+        {
+            return Err(Error::Invalid(
+                "controlled task absent answer must have null value and sources".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if !output
+        .source_layer
+        .as_str()
+        .is_some_and(|layer| layers.iter().any(|known| known == layer))
+    {
+        return Err(Error::Invalid(
+            "controlled task anchor answer source_layer is unknown".into(),
+        ));
+    }
+    let valid_path = output.source_path.as_str().is_some_and(|path| {
+        !path.is_empty()
+            && !path.starts_with('/')
+            && !path.contains(['\\', '\0'])
+            && !path.split('/').any(|part| matches!(part, "" | "." | ".."))
+            && !(path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic())
+    });
+    if !valid_path {
+        return Err(Error::Invalid(
+            "controlled task anchor answer source_path is invalid".into(),
+        ));
+    }
+    let valid_pointer = output.json_pointer.as_str().is_some_and(|pointer| {
+        if !pointer.is_empty() && !pointer.starts_with('/') {
+            return false;
+        }
+        let mut bytes = pointer.bytes();
+        while let Some(byte) = bytes.next() {
+            if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
+                return false;
+            }
+        }
+        true
+    });
+    if !valid_pointer {
+        return Err(Error::Invalid(
+            "controlled task anchor answer json_pointer is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn controlled_task_endpoint(
+    capability: &str,
+    expected: &ControlledTaskAnchorExpectedV1,
+) -> Result<()> {
+    use ControlledTaskAnchorExpectedV1::{Answer, Rejected};
+    use ControlledTaskAnchorRejectionV1::{UnsupportedFormat, WorkspaceBoundary, WriteForbidden};
+    let matches = match (capability, expected) {
+        (
+            "no_write",
+            Rejected {
+                reason: WriteForbidden,
+            },
+        )
+        | (
+            "workspace_boundary",
+            Rejected {
+                reason: WorkspaceBoundary,
+            },
+        )
+        | (
+            "unknown_format_rejection",
+            Rejected {
+                reason: UnsupportedFormat,
+            },
+        ) => true,
+        ("explicit_false", Answer { output }) => {
+            output.present && output.value == serde_json::json!(false)
+        }
+        ("explicit_zero", Answer { output }) => {
+            output.present && output.value.is_number() && output.value.as_f64() == Some(0.0)
+        }
+        ("explicit_empty_string", Answer { output }) => {
+            output.present && output.value == serde_json::json!("")
+        }
+        ("not_found", Answer { output }) => !output.present,
+        ("default_inheritance" | "layer_precedence", Answer { output }) => output.present,
+        _ => false,
+    };
+    if !matches {
+        return Err(Error::Invalid(format!(
+            "controlled task anchor endpoint does not match capability: {capability}"
+        )));
+    }
+    Ok(())
+}
+
+fn controlled_task_micros(raw: &str, field: &str) -> Result<u64> {
+    if raw.is_empty()
+        || !raw.bytes().all(|byte| byte.is_ascii_digit())
+        || (raw.len() > 1 && raw.starts_with('0'))
+    {
+        return Err(Error::Invalid(format!(
+            "controlled task {field} must be a canonical unsigned micros string"
+        )));
+    }
+    raw.parse()
+        .map_err(|_| Error::Invalid(format!("controlled task {field} exceeds u64")))
+}
+
+impl ControlledTaskProfileV1 {
+    /// Recomputes supplied materials; success grants no execution or formal qualification.
+    pub fn validate_against(&self, materials: &ControlledTaskProfileMaterialsV1) -> Result<()> {
+        if self.schema_version != CONTROLLED_TASK_PROFILE_SCHEMA_V1 {
+            return Err(Error::Invalid(
+                "unsupported controlled task profile schema".into(),
+            ));
+        }
+        if self.profile_id != CONTROLLED_TASK_PROFILE_ID_V1 {
+            return Err(Error::Invalid(
+                "unsupported controlled task profile id".into(),
+            ));
+        }
+        controlled_task_text_set(&self.layer_order, "layer_order")?;
+        controlled_task_text_set(&self.config_formats, "config_formats")?;
+        for (name, source) in [("generator", &self.generator), ("resolver", &self.resolver)] {
+            controlled_task_nonempty(&source.version, &format!("{name} version"))?;
+            validate_sha256_digest(
+                &source.source_digest,
+                &format!("controlled task {name} source_digest"),
+            )?;
+        }
+        for (name, digest) in [
+            ("template_catalog_digest", &self.template_catalog_digest),
+            ("anchor_material_digest", &self.anchor_material_digest),
+            ("environment_digest", &self.environment_digest),
+        ] {
+            validate_sha256_digest(digest, &format!("controlled task {name}"))?;
+        }
+        controlled_task_nonempty(&materials.generator_source, "generator source")?;
+        controlled_task_nonempty(&materials.resolver_source, "resolver source")?;
+        controlled_task_object(&materials.environment, "environment")?;
+        let catalog = controlled_task_catalog(&materials.template_catalog, &self.layer_order)?;
+        if self.task_commitments.is_empty() {
+            return Err(Error::Invalid(
+                "controlled task task_commitments must be nonempty".into(),
+            ));
+        }
+        let mut tasks = BTreeSet::new();
+        let mut clusters = BTreeMap::new();
+        for task in &self.task_commitments {
+            controlled_task_nonempty(&task.task_id, "task_id")?;
+            controlled_task_nonempty(&task.template_id, "task template_id")?;
+            controlled_task_nonempty(&task.key_type, "task key_type")?;
+            validate_sha256_digest(&task.commitment_digest, "controlled task commitment_digest")?;
+            if !tasks.insert(task.task_id.as_str()) {
+                return Err(Error::Invalid("duplicate controlled task task_id".into()));
+            }
+            if !matches!(
+                task.data_use,
+                DataUse::Development
+                    | DataUse::ReplayTrain
+                    | DataUse::ReplaySelect
+                    | DataUse::AcceptanceEpoch
+            ) {
+                return Err(Error::Invalid(
+                    "controlled task data_use is not a development or holdout use".into(),
+                ));
+            }
+            controlled_task_layers(&task.layer_combination, &self.layer_order)?;
+            let template = catalog
+                .templates
+                .iter()
+                .find(|entry| entry.template_id == task.template_id)
+                .ok_or_else(|| {
+                    Error::Invalid("controlled task references an unknown template".into())
+                })?;
+            if !template
+                .layer_combinations
+                .contains(&task.layer_combination)
+            {
+                return Err(Error::Invalid(
+                    "controlled task layer_combination is not in the template catalog".into(),
+                ));
+            }
+            if !template.key_types.contains(&task.key_type) {
+                return Err(Error::Invalid(
+                    "controlled task key_type is not in the template catalog".into(),
+                ));
+            }
+            let cluster = controlled_task_cluster_digest(&self.profile_id, task)?;
+            if clusters
+                .insert(cluster, task.data_use)
+                .is_some_and(|prior| prior != task.data_use)
+            {
+                return Err(Error::Conflict(
+                    "controlled task semantic cluster crosses data_use partitions".into(),
+                ));
+            }
+        }
+        if tasks
+            != materials
+                .task_materials
+                .keys()
+                .map(String::as_str)
+                .collect()
+        {
+            return Err(Error::Conflict(
+                "controlled task task material ids differ from commitments".into(),
+            ));
+        }
+        for material in materials.task_materials.values() {
+            controlled_task_object(material, "task material")?;
+        }
+
+        self.anchor_coverage.validate()?;
+        if self.anchor_coverage.profile_id != self.profile_id {
+            return Err(Error::Invalid(
+                "controlled task anchor coverage profile differs".into(),
+            ));
+        }
+        for capability in &self.anchor_coverage.critical_capabilities {
+            if !CONTROLLED_TASK_CAPABILITIES_V1.contains(&capability.capability_id.as_str()) {
+                return Err(Error::Invalid(format!(
+                    "unsupported controlled task anchor capability: {}",
+                    capability.capability_id
+                )));
+            }
+        }
+        for capability in CONTROLLED_TASK_CAPABILITIES_V1 {
+            if !self
+                .anchor_coverage
+                .critical_capabilities
+                .iter()
+                .any(|row| row.capability_id == capability)
+            {
+                return Err(Error::Invalid(format!(
+                    "controlled task anchor capability missing: {capability}"
+                )));
+            }
+        }
+        let mut anchors = BTreeMap::new();
+        for material in &materials.anchor_materials {
+            controlled_task_nonempty(&material.anchor_id, "anchor_id")?;
+            if anchors
+                .insert(material.anchor_id.as_str(), material)
+                .is_some()
+            {
+                return Err(Error::Invalid("duplicate controlled task anchor_id".into()));
+            }
+            controlled_task_object(&material.input, "anchor input")?;
+            if let ControlledTaskAnchorExpectedV1::Answer { output } = &material.expected {
+                controlled_task_answer(output, &self.layer_order)?;
+            }
+        }
+        if self.anchor_coverage.anchor_ids() != anchors.keys().copied().collect() {
+            return Err(Error::Conflict(
+                "controlled task anchor material ids differ from coverage".into(),
+            ));
+        }
+        for coverage in &self.anchor_coverage.critical_capabilities {
+            for anchor in &coverage.anchor_ids {
+                controlled_task_endpoint(
+                    &coverage.capability_id,
+                    &anchors[anchor.as_str()].expected,
+                )?;
+            }
+        }
+
+        for (name, source, registered) in [
+            (
+                "generator",
+                &materials.generator_source,
+                &self.generator.source_digest,
+            ),
+            (
+                "resolver",
+                &materials.resolver_source,
+                &self.resolver.source_digest,
+            ),
+        ] {
+            if crate::hash(source.as_bytes()) != *registered {
+                return Err(Error::Conflict(format!(
+                    "controlled task {name} source digest differs from material"
+                )));
+            }
+        }
+        if crate::canonical_fingerprint(&serde_json::json!({
+            "domain": "rsia.controlled_task_catalog.v1", "profile_id": self.profile_id, "catalog": catalog,
+        }))? != self.template_catalog_digest
+        {
+            return Err(Error::Conflict(
+                "controlled task template catalog digest differs from material".into(),
+            ));
+        }
+        for task in &self.task_commitments {
+            let actual = crate::canonical_fingerprint(&serde_json::json!({
+                "domain": "rsia.controlled_task_commitment.v1", "profile_id": self.profile_id,
+                "task_id": task.task_id, "template_id": task.template_id,
+                "layer_combination": task.layer_combination, "key_type": task.key_type,
+                "data_use": task.data_use, "material": materials.task_materials[&task.task_id],
+            }))?;
+            if actual != task.commitment_digest {
+                return Err(Error::Conflict(
+                    "controlled task commitment digest differs from material".into(),
+                ));
+            }
+        }
+        let mut sorted_anchors = materials.anchor_materials.clone();
+        sorted_anchors.sort_by(|a, b| a.anchor_id.cmp(&b.anchor_id));
+        if crate::canonical_fingerprint(&serde_json::json!({
+            "domain": "rsia.controlled_task_anchors.v1", "profile_id": self.profile_id, "anchors": sorted_anchors,
+        }))? != self.anchor_material_digest
+        {
+            return Err(Error::Conflict(
+                "controlled task anchor material digest differs from material".into(),
+            ));
+        }
+        if crate::canonical_fingerprint(&serde_json::json!({
+            "domain": "rsia.controlled_task_environment.v1", "profile_id": self.profile_id,
+            "environment": materials.environment,
+        }))? != self.environment_digest
+        {
+            return Err(Error::Conflict(
+                "controlled task environment digest differs from material".into(),
+            ));
+        }
+
+        if self.n_planned == 0 {
+            return Err(Error::Invalid(
+                "controlled task n_planned must be nonzero".into(),
+            ));
+        }
+        if let ControlledTaskAlphaRegistrationV1::Formal {
+            plan,
+            fixed_claim_id,
+            attempt_id,
+        } = &self.alpha_registration
+        {
+            controlled_task_nonempty(fixed_claim_id, "fixed_claim_id")?;
+            controlled_task_nonempty(attempt_id, "attempt_id")?;
+            plan.allocation(
+                fixed_claim_id,
+                attempt_id,
+                crate::sequential::FormalClaimKind::FixedSampleGain,
+            )?;
+        }
+        controlled_task_nonempty(&self.budget.currency, "budget currency")?;
+        controlled_task_nonempty(&self.budget.pricing_version, "budget pricing_version")?;
+        controlled_task_nonempty(&self.budget.payment_subject, "budget payment_subject")?;
+        let per_call =
+            controlled_task_micros(&self.budget.per_call_cap_micros, "per_call_cap_micros")?;
+        let total = controlled_task_micros(
+            &self.budget.experiment_total_micros,
+            "experiment_total_micros",
+        )?;
+        if per_call > total {
+            return Err(Error::Invalid(
+                "controlled task per-call budget exceeds experiment total".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Hashes a normalized clone only after all supplied material bindings pass.
+    pub fn digest_against(&self, materials: &ControlledTaskProfileMaterialsV1) -> Result<String> {
+        self.validate_against(materials)?;
+        let mut normalized = self.clone();
+        normalized.config_formats.sort();
+        normalized
+            .task_commitments
+            .sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        normalized
+            .anchor_coverage
+            .critical_capabilities
+            .sort_by(|a, b| a.capability_id.cmp(&b.capability_id));
+        for capability in &mut normalized.anchor_coverage.critical_capabilities {
+            capability.anchor_ids.sort();
+        }
+        if let ControlledTaskAlphaRegistrationV1::Formal { plan, .. } =
+            &mut normalized.alpha_registration
+        {
+            let mut allocations = plan
+                .allocations
+                .iter()
+                .map(|allocation| {
+                    Ok((
+                        (
+                            allocation.claim_id.clone(),
+                            allocation.attempt_id.clone(),
+                            controlled_task_json_bytes(&allocation.kind)?,
+                        ),
+                        allocation.clone(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            allocations.sort_by(|a, b| a.0.cmp(&b.0));
+            plan.allocations = allocations
+                .into_iter()
+                .map(|(_, allocation)| allocation)
+                .collect();
+        }
+        crate::canonical_fingerprint(&normalized)
+    }
+
+    /// Counts registered semantic triples, not empirically independent or formally usable n.
+    pub fn registered_cluster_count_against(
+        &self,
+        materials: &ControlledTaskProfileMaterialsV1,
+    ) -> Result<usize> {
+        self.validate_against(materials)?;
+        self.task_commitments
+            .iter()
+            .map(|task| controlled_task_cluster_digest(&self.profile_id, task))
+            .collect::<Result<BTreeSet<_>>>()
+            .map(|clusters| clusters.len())
+    }
+
+    /// Reads the validated triple identity; seeds, task ids and payloads do not mint clusters.
+    pub fn registered_cluster_id_against(
+        &self,
+        materials: &ControlledTaskProfileMaterialsV1,
+        task_id: &str,
+    ) -> Result<String> {
+        self.validate_against(materials)?;
+        let task = self
+            .task_commitments
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .ok_or_else(|| Error::Invalid("unknown controlled task task_id".into()))?;
+        controlled_task_cluster_digest(&self.profile_id, task)
+    }
+}
