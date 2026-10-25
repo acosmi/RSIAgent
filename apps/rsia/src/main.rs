@@ -129,8 +129,6 @@ enum Command {
         detail: ReviewDetailArgument,
         #[arg(long, default_value = "http://127.0.0.1:7788")]
         url: String,
-        #[arg(long, env = "RSIA_MANAGEMENT_TOKEN", hide_env_values = true)]
-        auth_token: String,
     },
     /// Serve the authenticated HTTP API. No token means every sensitive route returns 503.
     Serve {
@@ -144,14 +142,6 @@ enum Command {
         actor: String,
         #[arg(long, default_value = "evaluator")]
         evaluator_actor: String,
-        #[arg(long, env = "RSIA_HTTP_TOKEN", hide_env_values = true)]
-        auth_token: Option<String>,
-        #[arg(long, env = "RSIA_HOST_TOKEN", hide_env_values = true)]
-        host_token: Option<String>,
-        #[arg(long, env = "RSIA_ADMIN_TOKEN", hide_env_values = true)]
-        admin_token: Option<String>,
-        #[arg(long, env = "RSIA_EVALUATOR_TOKEN", hide_env_values = true)]
-        evaluator_token: Option<String>,
         /// Current control-plane database that vouches for a restored data directory.
         /// Accepted only for a restored directory that has not been admitted yet.
         #[arg(long)]
@@ -175,8 +165,6 @@ enum Command {
         operation: String,
         #[arg(long, default_value = "http://127.0.0.1:7788")]
         url: String,
-        #[arg(long, env = "RSIA_MANAGEMENT_TOKEN", hide_env_values = true)]
-        auth_token: String,
         #[arg(long)]
         request_file: Option<PathBuf>,
         #[arg(long)]
@@ -184,17 +172,46 @@ enum Command {
     },
 }
 
+// These names are fixed by the trusted entry point, never selected by argv.
+// Do not attach them to clap: a field without `long` becomes positional.
+fn environment_token(name: &str) -> Result<Option<String>> {
+    let token = match std::env::var(name) {
+        Ok(token) => token,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("invalid authentication environment: {name}")
+        }
+    };
+    if token.len() < 16 || token.len() > 4096 || token.chars().any(char::is_control) {
+        bail!("invalid authentication environment: {name}");
+    }
+    Ok(Some(token))
+}
+
+fn required_management_token() -> Result<String> {
+    environment_token("RSIA_MANAGEMENT_TOKEN")?.context("RSIA_MANAGEMENT_TOKEN is required")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Parse diagnostics can contain arbitrary argv values, including a rejected
+    // credential. Help/version contain only the fixed argument model.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) if error.exit_code() == 0 => error.exit(),
+        Err(_) => {
+            eprintln!("error: unexpected argument or invalid command line; use --help for usage");
+            std::process::exit(2);
+        }
+    };
     match cli.command {
         Command::Review {
             kind,
             id,
             detail,
             url,
-            auth_token,
         } => {
+            let auth_token = required_management_token()?;
             review_client(kind, id, detail, url, auth_token).await?;
         }
         Command::Serve {
@@ -203,12 +220,12 @@ async fn main() -> Result<()> {
             namespace,
             actor,
             evaluator_actor,
-            auth_token,
-            host_token,
-            admin_token,
-            evaluator_token,
             trusted_revocations_db,
         } => {
+            let auth_token = environment_token("RSIA_HTTP_TOKEN")?;
+            let host_token = environment_token("RSIA_HOST_TOKEN")?;
+            let admin_token = environment_token("RSIA_ADMIN_TOKEN")?;
+            let evaluator_token = environment_token("RSIA_EVALUATOR_TOKEN")?;
             let (_data_lock, gate) = mount_gate(&data, trusted_revocations_db.as_deref()).await?;
             let (service, prepare_config) = bootstrap(&data, &namespace).await?;
             let mounted_store = service.store().clone();
@@ -304,10 +321,10 @@ async fn main() -> Result<()> {
         Command::Manage {
             operation,
             url,
-            auth_token,
             request_file,
             job_id,
         } => {
+            let auth_token = required_management_token()?;
             let client = reqwest::Client::new();
             let base = url.trim_end_matches('/');
             let response = match operation.as_str() {
@@ -583,7 +600,7 @@ mod tests {
                 Command::Manage { .. } | Command::Review { .. } => panic!("unexpected subcommand"),
             }
         }
-        let manage = ["rsia", "manage", "job.status", "--auth-token", "token"];
+        let manage = ["rsia", "manage", "job.status"];
         assert!(Cli::try_parse_from(manage).is_ok());
         assert!(
             Cli::try_parse_from(

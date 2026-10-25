@@ -83,6 +83,17 @@ def subject_id(tool: str, key: str, namespace: str, actor: str) -> str:
     return f"{prefix}-{hashlib.sha256(chr(0).join(parts).encode()).hexdigest()[:24]}"
 
 
+TOKEN_ENVIRONMENT_KEYS = (
+    "RSIA_HTTP_TOKEN", "RSIA_HOST_TOKEN", "RSIA_ADMIN_TOKEN",
+    "RSIA_EVALUATOR_TOKEN", "RSIA_MANAGEMENT_TOKEN",
+)
+
+
+def credential_free_environment() -> dict[str, str]:
+    return {key: value for key, value in os.environ.items()
+            if key not in TOKEN_ENVIRONMENT_KEYS}
+
+
 class StdioHost:
     exit_counts: Counter[int] = Counter()
 
@@ -104,6 +115,7 @@ class StdioHost:
                 [str(binary), "mcp", "--data", str(data),
                  "--namespace", namespace, "--actor", actor],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr, bufsize=0,
+                env=credential_free_environment(),
             )
             require(self.process.stdin is not None and self.process.stdout is not None, "missing pipes")
             self.reader = selectors.DefaultSelector()
@@ -391,6 +403,35 @@ class McpStdioTests(unittest.TestCase):
             "evo_prepare": (prepare_args, prepare), "evo_feedback": (feedback_args, feedback),
             "evo_propose": (proposal_args, proposal), "evo_inspect": (inspect_args, inspected),
         }
+
+    def test_mcp_rejects_credential_arguments_without_echo_or_writes(self) -> None:
+        secret = "mcp-argv-must-not-appear-0123456789"
+        for flag in ("--auth-token", "--host-token", "--admin-token", "--evaluator-token"):
+            for arguments in ([flag, secret], [f"{flag}={secret}"]):
+                rejected = subprocess.run(
+                    [str(self.binary), "mcp", "--data", str(self.data), *arguments],
+                    capture_output=True, text=True, timeout=TIMEOUT,
+                    env=credential_free_environment(),
+                )
+                self.assertEqual(rejected.returncode, 2)
+                require(secret not in rejected.stdout + rejected.stderr, "MCP echoed rejected credential")
+                self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+        rejected = subprocess.run(
+            [str(self.binary), "mcp", "--data", str(self.data), secret],
+            capture_output=True, text=True, timeout=TIMEOUT,
+            env=credential_free_environment(),
+        )
+        self.assertEqual(rejected.returncode, 2)
+        require(secret not in rejected.stdout + rejected.stderr, "MCP echoed positional credential")
+        self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+        environment = credential_free_environment()
+        environment.update(dict.fromkeys(TOKEN_ENVIRONMENT_KEYS, secret))
+        help_result = subprocess.run(
+            [str(self.binary), "mcp", "--help"], capture_output=True, text=True,
+            timeout=TIMEOUT, env=environment,
+        )
+        self.assertEqual(help_result.returncode, 0)
+        require(secret not in help_result.stdout + help_result.stderr, "MCP help echoed inherited credential")
 
     def test_handshake_four_v1_goldens(self) -> None:
         lock = tomllib.loads((ROOT / "Cargo.lock").read_text(encoding="utf-8"))

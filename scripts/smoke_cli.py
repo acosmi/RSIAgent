@@ -49,6 +49,31 @@ FORBIDDEN_SWITCHES = [
 ]
 
 
+TOKEN_ENVIRONMENT_KEYS = (
+    "RSIA_HTTP_TOKEN", "RSIA_HOST_TOKEN", "RSIA_ADMIN_TOKEN",
+    "RSIA_EVALUATOR_TOKEN", "RSIA_MANAGEMENT_TOKEN",
+)
+
+
+def credential_environment(**tokens: str) -> dict[str, str]:
+    if set(tokens) - set(TOKEN_ENVIRONMENT_KEYS):
+        raise ValueError("unknown credential environment key")
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in TOKEN_ENVIRONMENT_KEYS}
+    environment.update(tokens)
+    return environment
+
+
+def run_process(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    kwargs.setdefault("env", credential_environment())
+    return subprocess.run(*args, **kwargs)
+
+
+def start_process(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+    kwargs.setdefault("env", credential_environment())
+    return subprocess.Popen(*args, **kwargs)
+
+
 def fail(message: str) -> None:
     raise RuntimeError(message)
 
@@ -101,10 +126,10 @@ def replay_run_request(request_key: str, pool_digest: str) -> dict[str, Any]:
 def cli_manage(
     binary: Path, base: str, operation: str, *extra: str
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [str(binary), "manage", operation, "--url", base,
-         "--auth-token", ADMIN_TOKEN, *extra],
+    return run_process(
+        [str(binary), "manage", operation, "--url", base, *extra],
         capture_output=True, text=True, timeout=5,
+        env=credential_environment(RSIA_MANAGEMENT_TOKEN=ADMIN_TOKEN),
     )
 
 
@@ -201,7 +226,7 @@ def smoke_http(binary: Path, root: Path) -> None:
     port = free_port()
     base = f"http://127.0.0.1:{port}"
     data = root / "http.sqlite3"
-    process = subprocess.Popen(
+    process = start_process(
         [
             str(binary),
             "serve",
@@ -213,21 +238,16 @@ def smoke_http(binary: Path, root: Path) -> None:
             "smoke",
             "--actor",
             "agent-a",
-            "--auth-token",
-            AGENT_TOKEN,
-            "--host-token",
-            HOST_TOKEN,
-            "--admin-token",
-            ADMIN_TOKEN,
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=credential_environment(RSIA_HTTP_TOKEN=AGENT_TOKEN, RSIA_HOST_TOKEN=HOST_TOKEN, RSIA_ADMIN_TOKEN=ADMIN_TOKEN),
     )
     serve_stderr = ""
     try:
         wait_http(base)
-        second = subprocess.run(
+        second = run_process(
             [
                 str(binary),
                 "serve",
@@ -235,16 +255,15 @@ def smoke_http(binary: Path, root: Path) -> None:
                 f"127.0.0.1:{port + 1}",
                 "--data",
                 str(data),
-                "--auth-token",
-                AGENT_TOKEN,
             ],
             capture_output=True,
             text=True,
             timeout=5,
+            env=credential_environment(RSIA_HTTP_TOKEN=AGENT_TOKEN),
         )
         if second.returncode == 0 or "already locked" not in second.stderr:
             fail("second HTTP process acquired the same data directory")
-        second_mcp = subprocess.run(
+        second_mcp = run_process(
             [str(binary), "mcp", "--data", str(data)],
             input="",
             capture_output=True,
@@ -461,7 +480,7 @@ def mcp_tool(client: McpClient, request_id: int, name: str, arguments: dict[str,
 
 
 def smoke_mcp(binary: Path, root: Path) -> None:
-    process = subprocess.Popen(
+    process = start_process(
         [
             str(binary),
             "mcp",
@@ -570,7 +589,7 @@ def smoke_mcp_duplicate(binary: Path, root: Path) -> None:
         "--actor",
         "stdio-agent",
     ]
-    process = subprocess.Popen(
+    process = start_process(
         command,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -601,7 +620,7 @@ def smoke_mcp_duplicate(binary: Path, root: Path) -> None:
     if code == 0:
         fail("MCP duplicate-key process exited successfully")
 
-    retry = subprocess.Popen(
+    retry = start_process(
         command,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -680,14 +699,14 @@ def smoke_recovery_gate(binary: Path, root: Path) -> None:
     port = free_port() + 2
 
     def serve(data: Path, *extra: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return run_process(
             [str(binary), "serve", "--bind", f"127.0.0.1:{port}",
              "--data", str(data), "--namespace", "smoke", *extra],
             capture_output=True, text=True, timeout=10,
         )
 
     def mcp(data: Path, *extra: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return run_process(
             [str(binary), "mcp", "--data", str(data), "--namespace", "smoke", *extra],
             input="", capture_output=True, text=True, timeout=10,
         )
@@ -695,7 +714,7 @@ def smoke_recovery_gate(binary: Path, root: Path) -> None:
     # No switch can enable code execution, a sandbox or external network.
     for command in ("serve", "mcp"):
         for switch in FORBIDDEN_SWITCHES:
-            refused = subprocess.run(
+            refused = run_process(
                 [str(binary), command, switch],
                 input="", capture_output=True, text=True, timeout=10,
             )
@@ -841,7 +860,7 @@ def restore_inputs(base: Path, source: Path) -> tuple[Path, Path, Path]:
 def restore_into(base: Path, name: str, live: Path, backup: Path, delta: Path) -> Path:
     """Run the real restore script; returns the new data directory."""
     destination = base / name
-    restored = subprocess.run(
+    restored = run_process(
         [
             sys.executable,
             str(Path(__file__).resolve().parent / "restore_backup.py"),
@@ -889,11 +908,12 @@ def smoke_restore_admission(binary: Path, root: Path) -> None:
     url = f"http://127.0.0.1:{port}"
 
     def start_serve(data: Path, *extra: str) -> subprocess.Popen[str]:
-        return subprocess.Popen(
+        return start_process(
             [str(binary), "serve", "--bind", f"127.0.0.1:{port}", "--data", str(data),
-             "--namespace", "smoke", "--actor", "agent-a", "--auth-token", AGENT_TOKEN,
+             "--namespace", "smoke", "--actor", "agent-a",
              *extra],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=credential_environment(RSIA_HTTP_TOKEN=AGENT_TOKEN),
         )
 
     def posture(label: str) -> str:
@@ -942,7 +962,7 @@ def smoke_restore_admission(binary: Path, root: Path) -> None:
         fail(f"serve did not report an admitted directory: {stderr!r}")
     # ... and refuses one.
     before = tree_digest(serve_dir)
-    refused = subprocess.run(
+    refused = run_process(
         [str(binary), "serve", "--bind", f"127.0.0.1:{port}", "--data", str(serve_dir / "rsia.sqlite3"),
          "--trusted-revocations-db", str(live)],
         capture_output=True, text=True, timeout=10,
@@ -954,7 +974,7 @@ def smoke_restore_admission(binary: Path, root: Path) -> None:
 
     # 3. MCP entry point: the admission lands before stdin is even read.
     receipt = (mcp_dir / "restore.json").read_bytes()
-    started = subprocess.run(
+    started = run_process(
         [str(binary), "mcp", "--data", str(mcp_dir / "rsia.sqlite3"), "--namespace", "smoke",
          "--trusted-revocations-db", str(live)],
         input="", capture_output=True, text=True, timeout=30,
@@ -972,7 +992,7 @@ def smoke_restore_admission(binary: Path, root: Path) -> None:
             (hashlib.sha256(b"revoked-after-restore").hexdigest(),),
         )
     before = tree_digest(stale_dir)
-    stale = subprocess.run(
+    stale = run_process(
         [str(binary), "serve", "--bind", f"127.0.0.1:{port}", "--data", str(stale_dir / "rsia.sqlite3"),
          "--trusted-revocations-db", str(live)],
         capture_output=True, text=True, timeout=30,
@@ -1002,8 +1022,7 @@ def smoke_bare_data_path(binary: Path, root: Path) -> None:
 
     def serve_command(bind_port: int, *data: str) -> list[str]:
         return [str(binary), "serve", "--bind", f"127.0.0.1:{bind_port}",
-                "--namespace", "smoke", "--actor", "agent-a",
-                "--auth-token", AGENT_TOKEN, *data]
+                "--namespace", "smoke", "--actor", "agent-a", *data]
 
     def start_directory(name: str) -> Path:
         directory = root / name
@@ -1011,9 +1030,10 @@ def smoke_bare_data_path(binary: Path, root: Path) -> None:
         return directory
 
     def start_serve(directory: Path, bind_port: int, *data: str) -> subprocess.Popen[str]:
-        return subprocess.Popen(
+        return start_process(
             serve_command(bind_port, *data), cwd=directory, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=credential_environment(RSIA_HTTP_TOKEN=AGENT_TOKEN),
         )
 
     def wait_serving(process: subprocess.Popen[str], bind_port: int, label: str) -> None:
@@ -1045,8 +1065,9 @@ def smoke_bare_data_path(binary: Path, root: Path) -> None:
              [str(binary), "mcp", "--data", str(explicit / "rsia.sqlite3"), "--namespace", "smoke"],
              root),
         ):
-            second = subprocess.run(
+            second = run_process(
                 command, input="", capture_output=True, text=True, timeout=10, cwd=directory,
+                env=credential_environment(**({"RSIA_HTTP_TOKEN": AGENT_TOKEN} if command[1] == "serve" else {})),
             )
             if second.returncode == 0 or "already locked" not in second.stderr:
                 fail(
@@ -1079,7 +1100,7 @@ def smoke_bare_data_path(binary: Path, root: Path) -> None:
         ("mcp (default --data)", (), "bare-mcp-default"),
     ):
         directory = start_directory(name)
-        started = subprocess.run(
+        started = run_process(
             [str(binary), "mcp", "--namespace", "smoke", *data_args],
             input="", capture_output=True, text=True, timeout=30, cwd=directory,
         )
@@ -1115,16 +1136,16 @@ def smoke_formal_single_writer(binary: Path, root: Path) -> None:
     served = root / "service-versus-formal"
     served.mkdir()
     port = free_port()
-    service = subprocess.Popen([str(binary), "serve", "--bind", f"127.0.0.1:{port}",
-        "--data", str(served / "service.sqlite3"), "--namespace", "smoke", "--auth-token", AGENT_TOKEN],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    service = start_process([str(binary), "serve", "--bind", f"127.0.0.1:{port}",
+        "--data", str(served / "service.sqlite3"), "--namespace", "smoke",],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=credential_environment(RSIA_HTTP_TOKEN=AGENT_TOKEN))
     try:
         wait_http(f"http://127.0.0.1:{port}")
         staging = served / ".blob-staging" / "live-writer"
         staging.mkdir(parents=True)
         (staging / "payload.tmp").write_bytes(b"live payload must survive refusal")
         before = tree_digest(served)
-        refused = subprocess.run([str(formal)], input=command(served / "other.sqlite3"),
+        refused = run_process([str(formal)], input=command(served / "other.sqlite3"),
             capture_output=True, text=True, timeout=10)
         refuse(refused, "formal while CLI owns the directory")
         if tree_digest(served) != before:
@@ -1146,7 +1167,7 @@ def smoke_formal_single_writer(binary: Path, root: Path) -> None:
             # Keep Store::open awaiting migration while its OS lock is held.
             # This fixture supplies no formal identity or evaluation eligibility.
             blocker.execute("BEGIN IMMEDIATE")
-            process = subprocess.Popen([str(formal)], stdin=subprocess.PIPE,
+            process = start_process([str(formal)], stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             assert process.stdin is not None
             process.stdin.write(command(data))
@@ -1184,9 +1205,9 @@ def smoke_formal_single_writer(binary: Path, root: Path) -> None:
                     args = [str(binary), entry, "--data", str(directory / "./another.sqlite3"), "--namespace", "smoke"]
                     if entry == "serve":
                         args += ["--bind", f"127.0.0.1:{free_port()}"]
-                    refuse(subprocess.run(args, input="", capture_output=True,
+                    refuse(run_process(args, input="", capture_output=True,
                         text=True, timeout=10), f"{entry} while formal owns the directory")
-                refuse(subprocess.run([str(formal)], input=command(directory / "another.sqlite3"),
+                refuse(run_process([str(formal)], input=command(directory / "another.sqlite3"),
                     capture_output=True, text=True, timeout=10), "second formal writer")
                 after = tree_digest(directory)
                 if after != before:
@@ -1203,7 +1224,7 @@ def smoke_formal_single_writer(binary: Path, root: Path) -> None:
             with (directory / ".rsia.lock").open("r+b") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(lock, fcntl.LOCK_UN)
-            reopened = subprocess.run([str(formal)], input=command(data),
+            reopened = run_process([str(formal)], input=command(data),
                 capture_output=True, text=True, timeout=15)
             if reopened.returncode == 0 or json.loads(reopened.stderr).get("status") != "refused":
                 fail("finite formal error did not terminate after the preceding process exited")
@@ -1225,28 +1246,28 @@ def main(argv: list[str]) -> int:
     if not binary.is_file():
         print(f"missing binary: {binary}", file=sys.stderr)
         return 1
-    help_run = subprocess.run([str(binary), "--help"], capture_output=True, text=True)
+    help_run = run_process([str(binary), "--help"], capture_output=True, text=True)
     if help_run.returncode != 0 or "serve" not in help_run.stdout or "mcp" not in help_run.stdout:
         print("CLI help does not expose serve and mcp", file=sys.stderr)
         return 1
     secret = "must-not-appear-in-help-0123456789"
-    help_environment = os.environ.copy()
-    help_environment["RSIA_HTTP_TOKEN"] = secret
-    help_environment["RSIA_MANAGEMENT_TOKEN"] = secret
-    serve_help = subprocess.run(
-        [str(binary), "serve", "--help"],
-        capture_output=True,
-        text=True,
-        env=help_environment,
-    )
-    if serve_help.returncode != 0 or secret in (serve_help.stdout + serve_help.stderr):
-        print("CLI help exposed an environment token", file=sys.stderr)
-        return 1
+    help_environment = credential_environment(**dict.fromkeys(TOKEN_ENVIRONMENT_KEYS, secret))
+    for command in ("serve", "manage", "review", "mcp"):
+        command_help = run_process(
+            [str(binary), command, "--help"],
+            capture_output=True,
+            text=True,
+            env=help_environment,
+        )
+        if command_help.returncode != 0 or secret in (command_help.stdout + command_help.stderr):
+            print("CLI help exposed an environment token", file=sys.stderr)
+            return 1
     unusual_operation = 'unknown"\noperation'
-    unusual = subprocess.run(
-        [str(binary), "manage", unusual_operation, "--auth-token", ADMIN_TOKEN],
+    unusual = run_process(
+        [str(binary), "manage", unusual_operation],
         capture_output=True,
         text=True,
+        env=credential_environment(RSIA_MANAGEMENT_TOKEN=ADMIN_TOKEN),
     )
     try:
         unusual_json = json.loads(unusual.stderr.splitlines()[0])
