@@ -85,6 +85,7 @@ pub fn proposal_from_text(id: &str, family: &str, body: &str) -> Result<TaskProp
 
 pub const CURRICULUM_PROFILE_SCHEMA: &str = "rsia.curriculum_control_profile.v1";
 pub const LEARNER_STATE_V2_SCHEMA: &str = "rsia.learner_state.v2";
+pub const LEARNER_STATE_V3_SCHEMA: &str = "rsia.learner_state.v3";
 pub const PLATEAU_SIGNAL_SCHEMA: &str = "rsia.coverage_probe_trigger.v1";
 
 fn digest(value: &str, name: &str) -> Result<()> {
@@ -126,6 +127,14 @@ pub struct CurriculumControlProfileV1 {
     pub max_concurrent_probe_jobs: u8,
     pub monetary_limit_micros: u64,
     pub runtime_status: CurriculumRuntimeStatus,
+    /// Commitment to the pre-registered fixed seed of the fixed random
+    /// curriculum arm (plan §8.4.1). It is a digest of the committed seed
+    /// material, never the seed itself, and stays separate from any broker
+    /// private seed. Profiles registered before this field existed read as
+    /// `None`, in which case the fixed-random arm falls back to the frozen
+    /// arm's choice and the selection record says so.
+    #[serde(default)]
+    pub fixed_random_seed_commitment: Option<String>,
 }
 
 impl CurriculumControlProfileV1 {
@@ -153,6 +162,7 @@ impl CurriculumControlProfileV1 {
             max_concurrent_probe_jobs: 1,
             monetary_limit_micros: 0,
             runtime_status: CurriculumRuntimeStatus::Disabled,
+            fixed_random_seed_commitment: None,
         };
         profile.validate()?;
         Ok(profile)
@@ -181,6 +191,12 @@ impl CurriculumControlProfileV1 {
         digest(&self.task_space_digest, "task_space_digest")?;
         digest(&self.oracle_digest, "oracle_digest")?;
         digest(&self.runner_digest, "runner_digest")?;
+        if let Some(commitment) = &self.fixed_random_seed_commitment {
+            // The fixed-random arm's seed commitment is a digest, and it must
+            // not be the empty string or a bare readable name (plan §5.1.2:
+            // names never stand in for digests).
+            digest(commitment, "fixed_random_seed_commitment")?;
+        }
         Ok(())
     }
 
@@ -431,6 +447,431 @@ impl LearnerStateV2 {
     }
 }
 
+/// Type of a curriculum failure record (plan §8.1.1, v4.3).
+///
+/// An absolute failure (`!passed`) constitutes a failure gap. A regression
+/// (`passed` but scored below its parent) only enters the diagnostic/retention
+/// flow and never constitutes a failure gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureRecordType {
+    AbsoluteFailure,
+    Regression,
+}
+
+/// The four states of a failure record (plan §8.1.1, v4.3): `active` counts as
+/// a current gap, `retest_due` awaits the one-shot retest after an applied
+/// learner asset, `resolved` keeps the record for history, and `diagnostic`
+/// marks a record whose environment or grading drifted (it is no longer a
+/// current gap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureRecordStatus {
+    Active,
+    RetestDue,
+    Resolved,
+    Diagnostic,
+}
+
+/// One failure record: the unit of a failure gap is an independent development
+/// cluster bound to verified execution and grading receipts (plan §8.1.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailureRecordV1 {
+    pub record_id: String,
+    pub cluster_id: String,
+    pub record_type: FailureRecordType,
+    pub status: FailureRecordStatus,
+    pub cycle_id: String,
+    pub execution_receipt_digest: String,
+    pub grader_receipt_digest: String,
+    pub skill_snapshot_digest: String,
+    pub environment_digest: String,
+    pub grader_version_digest: String,
+    /// Set when the record moved to `diagnostic` because the environment or
+    /// grading version drifted, and when it moved to `retest_due` because of a
+    /// specific approved asset (`retest_after:<release_id>`).
+    pub transition_note: Option<String>,
+    /// Release whose trusted application moved an active record to
+    /// `retest_due`; `None` for every other transition.
+    pub retest_release_id: Option<String>,
+}
+
+impl FailureRecordV1 {
+    pub fn validate(&self) -> Result<()> {
+        identifier(&self.record_id)?;
+        identifier(&self.cluster_id)?;
+        identifier(&self.cycle_id)?;
+        for (value, name) in [
+            (
+                &self.execution_receipt_digest,
+                "failure execution_receipt_digest",
+            ),
+            (&self.grader_receipt_digest, "failure grader_receipt_digest"),
+            (&self.skill_snapshot_digest, "failure skill_snapshot_digest"),
+            (&self.environment_digest, "failure environment_digest"),
+            (&self.grader_version_digest, "failure grader_version_digest"),
+        ] {
+            digest(value, name)?;
+        }
+        if let Some(note) = &self.transition_note {
+            text(note, "failure transition_note", 256)?;
+        }
+        if let Some(release) = &self.retest_release_id {
+            identifier(release)?;
+            if self.status != FailureRecordStatus::RetestDue {
+                return Err(Error::Invalid(
+                    "retest_release_id is only valid on a retest_due record".into(),
+                ));
+            }
+        } else if self.status == FailureRecordStatus::RetestDue {
+            return Err(Error::Invalid(
+                "a retest_due record names the release that caused it".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One verified task outcome as the failure-record reduction consumes it. The
+/// execution receipt digest binds both sides of the pair; the grader receipt
+/// digest is the grading authority for the pair.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailureCycleOutcome {
+    pub cluster_id: String,
+    pub passed: bool,
+    pub paired_gain_micros: i64,
+    pub execution_receipt_digest: String,
+    pub grader_receipt_digest: String,
+}
+
+/// One-shot retest priority granted to the development family an approved
+/// asset is bound to (plan §8.4.1). A family without failure records gets the
+/// mark directly; a family with active records gets its records moved to
+/// `retest_due` instead. The mark is consumed by one selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetestPriorityMarkV1 {
+    pub family: String,
+    pub release_id: String,
+    pub consumed: bool,
+}
+
+impl RetestPriorityMarkV1 {
+    pub fn validate(&self) -> Result<()> {
+        identifier(&self.family)?;
+        identifier(&self.release_id)?;
+        Ok(())
+    }
+}
+
+/// Stable record id of the per-cluster state machine of one failure type.
+pub fn failure_record_id(cluster: &str, record_type: FailureRecordType) -> String {
+    match record_type {
+        FailureRecordType::AbsoluteFailure => format!("failure-{cluster}"),
+        FailureRecordType::Regression => format!("regression-{cluster}"),
+    }
+}
+
+/// Reduces one verified development cycle into the failure records (plan
+/// §8.1.1). Within one environment and grading version:
+///
+/// - an absolute failure (`!passed`) activates (or re-activates) the cluster's
+///   absolute-failure record;
+/// - a regression (`passed` with a negative paired gain) activates the
+///   cluster's regression record, which never counts as a failure gap;
+/// - a verified pass resolves the cluster's active or retest-due records while
+///   keeping the records themselves;
+/// - records from another environment or grading version move to `diagnostic`
+///   with a drift note and stop counting as a current gap.
+///
+/// Failures never retire by time or a fixed number of rounds here, and an
+/// applied asset never clears a record: only a later verified pass resolves it.
+// The reduction inserts and re-sorts records, so it really needs the Vec.
+#[allow(clippy::ptr_arg)]
+pub fn apply_cycle_to_failure_records(
+    records: &mut Vec<FailureRecordV1>,
+    cycle_id: &str,
+    environment_digest: &str,
+    grader_digest: &str,
+    skill_snapshot_digest: &str,
+    outcomes: &[FailureCycleOutcome],
+) -> Result<()> {
+    identifier(cycle_id)?;
+    digest(environment_digest, "cycle environment_digest")?;
+    digest(grader_digest, "cycle grader_digest")?;
+    digest(skill_snapshot_digest, "cycle skill_snapshot_digest")?;
+    let mut clusters = std::collections::BTreeSet::new();
+    for outcome in outcomes {
+        identifier(&outcome.cluster_id)?;
+        if !clusters.insert(outcome.cluster_id.as_str()) {
+            return Err(Error::Invalid(
+                "duplicate cluster in failure cycle outcomes".into(),
+            ));
+        }
+        digest(
+            &outcome.execution_receipt_digest,
+            "outcome execution receipt",
+        )?;
+        digest(&outcome.grader_receipt_digest, "outcome grader receipt")?;
+    }
+    for record in records.iter_mut() {
+        record.validate()?;
+        if record.status != FailureRecordStatus::Diagnostic
+            && (record.environment_digest != environment_digest
+                || record.grader_version_digest != grader_digest)
+        {
+            record.status = FailureRecordStatus::Diagnostic;
+            record.transition_note = Some("environment_or_grader_drift".into());
+            record.retest_release_id = None;
+        }
+    }
+    for outcome in outcomes {
+        let regression = outcome.passed && outcome.paired_gain_micros < 0;
+        if outcome.passed && !regression {
+            // A verified pass resolves every active or retest-due record of
+            // the cluster — of both types — and keeps the records themselves.
+            for record in records
+                .iter_mut()
+                .filter(|record| record.cluster_id == outcome.cluster_id)
+            {
+                if record.status == FailureRecordStatus::Active
+                    || record.status == FailureRecordStatus::RetestDue
+                {
+                    record.status = FailureRecordStatus::Resolved;
+                    record.cycle_id = cycle_id.to_string();
+                    record.execution_receipt_digest = outcome.execution_receipt_digest.clone();
+                    record.grader_receipt_digest = outcome.grader_receipt_digest.clone();
+                    record.skill_snapshot_digest = skill_snapshot_digest.to_string();
+                    record.environment_digest = environment_digest.to_string();
+                    record.grader_version_digest = grader_digest.to_string();
+                    record.transition_note = None;
+                    record.retest_release_id = None;
+                }
+            }
+            continue;
+        }
+        let record_type = if outcome.passed {
+            FailureRecordType::Regression
+        } else {
+            FailureRecordType::AbsoluteFailure
+        };
+        let record_id = failure_record_id(&outcome.cluster_id, record_type);
+        if let Some(record) = records
+            .iter_mut()
+            .find(|record| record.record_id == record_id)
+        {
+            record.status = FailureRecordStatus::Active;
+            record.cycle_id = cycle_id.to_string();
+            record.execution_receipt_digest = outcome.execution_receipt_digest.clone();
+            record.grader_receipt_digest = outcome.grader_receipt_digest.clone();
+            record.skill_snapshot_digest = skill_snapshot_digest.to_string();
+            record.environment_digest = environment_digest.to_string();
+            record.grader_version_digest = grader_digest.to_string();
+            record.transition_note = None;
+            record.retest_release_id = None;
+        } else {
+            records.push(FailureRecordV1 {
+                record_id,
+                cluster_id: outcome.cluster_id.clone(),
+                record_type,
+                status: FailureRecordStatus::Active,
+                cycle_id: cycle_id.to_string(),
+                execution_receipt_digest: outcome.execution_receipt_digest.clone(),
+                grader_receipt_digest: outcome.grader_receipt_digest.clone(),
+                skill_snapshot_digest: skill_snapshot_digest.to_string(),
+                environment_digest: environment_digest.to_string(),
+                grader_version_digest: grader_digest.to_string(),
+                transition_note: None,
+                retest_release_id: None,
+            });
+        }
+    }
+    records.sort_by(|left, right| left.record_id.cmp(&right.record_id));
+    for record in records.iter() {
+        record.validate()?;
+    }
+    Ok(())
+}
+
+/// Moves the active failure records of the families an approved asset is bound
+/// to `retest_due`, and grants the families without any failure record a
+/// one-shot retest-priority mark (plan §8.1.1, §8.4.1). Applied assets never
+/// clear records.
+// The mark list is inserted into and re-sorted, so it needs the Vec.
+#[allow(clippy::ptr_arg)]
+pub fn mark_retest_due_after_asset(
+    records: &mut Vec<FailureRecordV1>,
+    marks: &mut Vec<RetestPriorityMarkV1>,
+    families: &[String],
+    release_id: &str,
+) -> Result<()> {
+    identifier(release_id)?;
+    for family in families {
+        identifier(family)?;
+        marks.retain(|mark| !(mark.family == *family && mark.release_id == release_id));
+        let has_records = records.iter().any(|record| record.cluster_id == *family);
+        if has_records {
+            for record in records.iter_mut() {
+                if record.cluster_id == *family && record.status == FailureRecordStatus::Active {
+                    record.status = FailureRecordStatus::RetestDue;
+                    record.transition_note = Some(format!("retest_after:{release_id}"));
+                    record.retest_release_id = Some(release_id.to_string());
+                }
+            }
+        } else {
+            marks.push(RetestPriorityMarkV1 {
+                family: family.clone(),
+                release_id: release_id.to_string(),
+                consumed: false,
+            });
+        }
+    }
+    marks.sort_by(|left, right| {
+        (&left.family, &left.release_id).cmp(&(&right.family, &right.release_id))
+    });
+    for mark in marks.iter() {
+        mark.validate()?;
+    }
+    for record in records.iter() {
+        record.validate()?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearnerStateV3 {
+    pub schema_version: String,
+    pub id: String,
+    pub profile_id: String,
+    pub skill_snapshot_digest: String,
+    pub improver_snapshot_digest: String,
+    pub environment_digest: String,
+    pub grader_digest: String,
+    pub model_tools_digest: String,
+    pub runner_digest: String,
+    pub rules_digest: String,
+    pub source_watermark: u64,
+    pub source_artifact_ids: Vec<String>,
+    pub development_fact_ids: Vec<String>,
+    pub completed_cycles: Vec<DevelopmentCycleObservation>,
+    /// Kept in sync with the active absolute-failure records by the write
+    /// side; a legacy v2 projection may still hold mixed clusters until the
+    /// next cycle re-derives it. The v3 trigger reads the records, not this
+    /// field.
+    pub failure_clusters: Vec<String>,
+    pub coverage_buckets: Vec<CoverageBucketState>,
+    pub applied_assets: Vec<AppliedLearnerAssetRef>,
+    pub failure_records: Vec<FailureRecordV1>,
+    pub retest_priority_marks: Vec<RetestPriorityMarkV1>,
+    pub active_probe_job_id: Option<String>,
+    pub last_trigger_window_digest: Option<String>,
+    pub cooldown_remaining_cycles: u8,
+}
+
+impl LearnerStateV3 {
+    pub const SCHEMA: &'static str = LEARNER_STATE_V3_SCHEMA;
+
+    /// Read-side interpretation of a stored v2 learner state: no failure
+    /// records existed in v2, so the projection starts empty and keeps the
+    /// legacy failure clusters as-is until the next cycle re-derives them.
+    pub fn from_v2(state: LearnerStateV2) -> Self {
+        Self {
+            schema_version: LEARNER_STATE_V3_SCHEMA.into(),
+            id: state.id,
+            profile_id: state.profile_id,
+            skill_snapshot_digest: state.skill_snapshot_digest,
+            improver_snapshot_digest: state.improver_snapshot_digest,
+            environment_digest: state.environment_digest,
+            grader_digest: state.grader_digest,
+            model_tools_digest: state.model_tools_digest,
+            runner_digest: state.runner_digest,
+            rules_digest: state.rules_digest,
+            source_watermark: state.source_watermark,
+            source_artifact_ids: state.source_artifact_ids,
+            development_fact_ids: state.development_fact_ids,
+            completed_cycles: state.completed_cycles,
+            failure_clusters: state.failure_clusters,
+            coverage_buckets: state.coverage_buckets,
+            applied_assets: state.applied_assets,
+            failure_records: vec![],
+            retest_priority_marks: vec![],
+            active_probe_job_id: state.active_probe_job_id,
+            last_trigger_window_digest: state.last_trigger_window_digest,
+            cooldown_remaining_cycles: state.cooldown_remaining_cycles,
+        }
+    }
+
+    /// The clusters whose active absolute-failure records constitute the
+    /// current failure gap. Regression records are deliberately absent.
+    pub fn active_absolute_failure_clusters(&self) -> Vec<String> {
+        let mut clusters: Vec<String> = self
+            .failure_records
+            .iter()
+            .filter(|record| {
+                record.status == FailureRecordStatus::Active
+                    && record.record_type == FailureRecordType::AbsoluteFailure
+            })
+            .map(|record| record.cluster_id.clone())
+            .collect();
+        clusters.sort();
+        clusters.dedup();
+        clusters
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != LEARNER_STATE_V3_SCHEMA {
+            return Err(Error::Invalid("unsupported learner state schema".into()));
+        }
+        // Reuse the v2 field validation by projecting the shared fields.
+        LearnerStateV2 {
+            schema_version: LEARNER_STATE_V2_SCHEMA.into(),
+            id: self.id.clone(),
+            profile_id: self.profile_id.clone(),
+            skill_snapshot_digest: self.skill_snapshot_digest.clone(),
+            improver_snapshot_digest: self.improver_snapshot_digest.clone(),
+            environment_digest: self.environment_digest.clone(),
+            grader_digest: self.grader_digest.clone(),
+            model_tools_digest: self.model_tools_digest.clone(),
+            runner_digest: self.runner_digest.clone(),
+            rules_digest: self.rules_digest.clone(),
+            source_watermark: self.source_watermark,
+            source_artifact_ids: self.source_artifact_ids.clone(),
+            development_fact_ids: self.development_fact_ids.clone(),
+            completed_cycles: self.completed_cycles.clone(),
+            failure_clusters: self.failure_clusters.clone(),
+            coverage_buckets: self.coverage_buckets.clone(),
+            applied_assets: self.applied_assets.clone(),
+            active_probe_job_id: self.active_probe_job_id.clone(),
+            last_trigger_window_digest: self.last_trigger_window_digest.clone(),
+            cooldown_remaining_cycles: self.cooldown_remaining_cycles,
+        }
+        .validate()?;
+        let mut record_ids = std::collections::BTreeSet::new();
+        for record in &self.failure_records {
+            record.validate()?;
+            if record.record_id != failure_record_id(&record.cluster_id, record.record_type) {
+                return Err(Error::Invalid(
+                    "failure record id differs from its cluster and type".into(),
+                ));
+            }
+            if !record_ids.insert(record.record_id.as_str()) {
+                return Err(Error::Invalid("duplicate failure record".into()));
+            }
+        }
+        let mut marks = std::collections::BTreeSet::new();
+        for mark in &self.retest_priority_marks {
+            mark.validate()?;
+            if !marks.insert((mark.family.as_str(), mark.release_id.as_str())) {
+                return Err(Error::Invalid("duplicate retest priority mark".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "trigger", deny_unknown_fields)]
 pub enum PlateauSignalV1 {
@@ -534,6 +975,68 @@ pub fn detect_plateau_signal(
         mean_gain_micros: means,
         sample_variance_micros_squared: variance,
     })
+}
+
+/// v3 trigger (plan §8.1.1): only the clusters with active absolute-failure
+/// records constitute a failure gap. Regression records, resolved records and
+/// records moved to `diagnostic` by an environment or grading drift never
+/// trigger `failure_gap`. Everything else matches the v2 window logic.
+pub fn detect_plateau_signal_v3(
+    profile: &CurriculumControlProfileV1,
+    state: &LearnerStateV3,
+) -> Result<PlateauSignalV1> {
+    profile.validate()?;
+    state.validate()?;
+    if state.cooldown_remaining_cycles > 0 {
+        return Ok(PlateauSignalV1::NotTriggered {
+            reasons: vec!["cooldown".into()],
+        });
+    }
+    let failure_cluster_ids = state.active_absolute_failure_clusters();
+    if !failure_cluster_ids.is_empty() {
+        return Ok(PlateauSignalV1::FailureGap {
+            failure_cluster_ids,
+        });
+    }
+    let gaps: Vec<_> = state
+        .coverage_buckets
+        .iter()
+        .filter(|bucket| {
+            bucket.observed_independent_clusters < bucket.required_independent_clusters
+        })
+        .map(|bucket| bucket.bucket_id.clone())
+        .collect();
+    if !gaps.is_empty() {
+        return Ok(PlateauSignalV1::CoverageGap {
+            authorized_bucket_ids: gaps,
+        });
+    }
+    let legacy = LearnerStateV2 {
+        schema_version: LEARNER_STATE_V2_SCHEMA.into(),
+        id: state.id.clone(),
+        profile_id: state.profile_id.clone(),
+        skill_snapshot_digest: state.skill_snapshot_digest.clone(),
+        improver_snapshot_digest: state.improver_snapshot_digest.clone(),
+        environment_digest: state.environment_digest.clone(),
+        grader_digest: state.grader_digest.clone(),
+        model_tools_digest: state.model_tools_digest.clone(),
+        runner_digest: state.runner_digest.clone(),
+        rules_digest: state.rules_digest.clone(),
+        source_watermark: state.source_watermark,
+        source_artifact_ids: state.source_artifact_ids.clone(),
+        development_fact_ids: state.development_fact_ids.clone(),
+        completed_cycles: state.completed_cycles.clone(),
+        // The v3 failure gap above is decided by the records; the legacy field
+        // is emptied here so it cannot leak a mixed (regression-bearing) list
+        // into the plateau path.
+        failure_clusters: vec![],
+        coverage_buckets: state.coverage_buckets.clone(),
+        applied_assets: state.applied_assets.clone(),
+        active_probe_job_id: state.active_probe_job_id.clone(),
+        last_trigger_window_digest: state.last_trigger_window_digest.clone(),
+        cooldown_remaining_cycles: state.cooldown_remaining_cycles,
+    };
+    detect_plateau_signal(profile, &legacy)
 }
 
 fn sample_variance_micros_squared(values: &[(i128, i128)], threshold: u64) -> Result<(u64, bool)> {

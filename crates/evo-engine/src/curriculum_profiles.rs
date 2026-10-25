@@ -278,26 +278,50 @@ pub enum ValidityReportV1 {
         oracle_digest: String,
         runner_digest: String,
     },
+    /// Runner-verified development eligibility (plan §8.4.1, V109): the
+    /// proposal's family has a verified development observation — a
+    /// `DevelopmentRequestPrepared`/`DevelopmentObserved` stage-fact pair whose
+    /// execution and grader receipts were reloaded and verified against the
+    /// registered pure-function control (`verified_development_observation_in_session`).
+    ///
+    /// This binds the proposal to already-verified in-process
+    /// `RegisteredPureFunctionExecution` facts only. It still grants no
+    /// sandbox: the profile runtime status stays `DisabledSandboxUnavailable`
+    /// and no provider, model or host execution is implied.
+    RunnerVerified {
+        profile_id: String,
+        proposal_id: String,
+        proposal_digest: String,
+        target_digest: String,
+        oracle_digest: String,
+        runner_digest: String,
+        development_request_fact_id: String,
+        development_observed_fact_id: String,
+    },
 }
 
 impl ValidityReportV1 {
     pub fn profile_id(&self) -> &str {
         match self {
-            Self::Quarantined { profile_id, .. } | Self::SandboxUnavailable { profile_id, .. } => {
-                profile_id
-            }
+            Self::Quarantined { profile_id, .. }
+            | Self::SandboxUnavailable { profile_id, .. }
+            | Self::RunnerVerified { profile_id, .. } => profile_id,
         }
     }
 
     pub fn proposal_id(&self) -> &str {
         match self {
             Self::Quarantined { proposal_id, .. }
-            | Self::SandboxUnavailable { proposal_id, .. } => proposal_id,
+            | Self::SandboxUnavailable { proposal_id, .. }
+            | Self::RunnerVerified { proposal_id, .. } => proposal_id,
         }
     }
 
+    /// Only a report bound to a verified development observation makes a
+    /// proposal development-eligible. Quarantined and sandbox-unavailable
+    /// reports stay ineligible, exactly as before.
     pub fn is_development_eligible(&self) -> bool {
-        false
+        matches!(self, Self::RunnerVerified { .. })
     }
 
     pub fn binding_digests(&self) -> (&str, &str, &str, &str) {
@@ -315,9 +339,42 @@ impl ValidityReportV1 {
                 oracle_digest,
                 runner_digest,
                 ..
+            }
+            | Self::RunnerVerified {
+                proposal_digest,
+                target_digest,
+                oracle_digest,
+                runner_digest,
+                ..
             } => (proposal_digest, target_digest, oracle_digest, runner_digest),
         }
     }
+}
+
+/// Builds the runner-verified report for a proposal whose family a verified
+/// development observation covers. The observation itself is not trusted here:
+/// the engine re-verifies the stage-fact pair before persisting the report, so
+/// this constructor alone grants nothing.
+pub fn runner_verified_report(
+    profile: &RegisteredPureFunctionProfileV1,
+    proposal: &StructuredTestProposalV1,
+    development_request_fact_id: &str,
+    development_observed_fact_id: &str,
+) -> Result<ValidityReportV1> {
+    profile.validate()?;
+    proposal.validate()?;
+    identifier(development_request_fact_id)?;
+    identifier(development_observed_fact_id)?;
+    Ok(ValidityReportV1::RunnerVerified {
+        profile_id: profile.profile_id.clone(),
+        proposal_id: proposal.id.clone(),
+        proposal_digest: fingerprint(proposal)?,
+        target_digest: profile.target_digest.clone(),
+        oracle_digest: profile.oracle_digest.clone(),
+        runner_digest: profile.runner_digest.clone(),
+        development_request_fact_id: development_request_fact_id.into(),
+        development_observed_fact_id: development_observed_fact_id.into(),
+    })
 }
 
 pub fn runtime_validity_report(

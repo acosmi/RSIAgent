@@ -2,14 +2,20 @@
 use crate::curriculum_profiles::{RegisteredPureFunctionProfileV1, ValidityReportV1};
 use crate::executor::RootBudget;
 use crate::optimization::verified_development_observation_in_session;
-use crate::release_store::{HostApplicationRecord, ReleaseStore, TrustedHostExecutionReceipt};
+use crate::release_store::{
+    HostApplicationRecord, PERSISTENT_RELEASE_SCHEMA, PersistentRelease, RELEASE_CANDIDATE_SCHEMA,
+    ReleaseCandidateRecord, ReleaseStore, TrustedHostExecutionReceipt,
+};
 use evo_core::curriculum::{
-    CurriculumControlProfileV1, CurriculumRuntimeStatus, DevelopmentCycleObservation, LearnerState,
-    LearnerStateV2, PlateauSignalV1, ProbeJobV1, ProbeTerminal, ProposalAttemptOutcome,
-    StructuredTestProposalV1, TaskProposal, detect_plateau_signal, next_task,
+    CurriculumControlProfileV1, CurriculumRuntimeStatus, DevelopmentCycleObservation,
+    FailureCycleOutcome, FailureRecordStatus, FailureRecordType, FailureRecordV1,
+    LEARNER_STATE_V2_SCHEMA, LEARNER_STATE_V3_SCHEMA, LearnerState, LearnerStateV2, LearnerStateV3,
+    PlateauSignalV1, ProbeJobV1, ProbeTerminal, ProposalAttemptOutcome, StructuredTestProposalV1,
+    TaskProposal, apply_cycle_to_failure_records, detect_plateau_signal_v3,
+    mark_retest_due_after_asset, next_task,
 };
 use evo_core::evaluation::DataUse;
-use evo_core::{Context, Error, Result, Role, fingerprint, identifier};
+use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier};
 use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -40,7 +46,7 @@ async fn record_applied_asset(
     run_id: &str,
     application_record_id: &str,
     execution_receipt_id: &str,
-) -> Result<LearnerStateV2> {
+) -> Result<LearnerStateV3> {
     context.require(&[Role::Admin])?;
     for value in [
         state_id,
@@ -51,8 +57,7 @@ async fn record_applied_asset(
         identifier(value)?;
     }
     let mut session = store.session().await?;
-    let mut state: LearnerStateV2 =
-        need_record(&mut session, context, STATE_KIND, state_id).await?;
+    let mut state: LearnerStateV3 = load_state_v3(&mut session, context, state_id).await?;
     verify_watermark(&mut session, context, &state).await?;
     verify_state_sources(&mut session, context, &state).await?;
     let snapshot =
@@ -119,6 +124,54 @@ async fn record_applied_asset(
     state
         .applied_assets
         .sort_by(|left, right| left.release_id.cmp(&right.release_id));
+    // Plan §8.1.1/§8.4.1: a trusted application of an approved asset moves the
+    // active failure records of the development families the release is bound
+    // to `retest_due` (naming the release), and grants families without any
+    // failure record a one-shot retest-priority mark. The bound families come
+    // only from the release candidate's development evidence sources: the
+    // clusters whose completed development cycles consumed one of those
+    // sources. Applying an asset never clears a record.
+    let release: PersistentRelease = session.need(context, "release", &release_id).await?;
+    if release.schema_version != PERSISTENT_RELEASE_SCHEMA || release.id != release_id {
+        return Err(Error::Conflict(
+            "applied release differs from its record".into(),
+        ));
+    }
+    let candidate: ReleaseCandidateRecord = session
+        .need(context, "artifact", &release.candidate_id)
+        .await?;
+    if candidate.schema_version != RELEASE_CANDIDATE_SCHEMA
+        || candidate.id != release.candidate_id
+        || candidate.bundle_digest != release.bundle_digest
+    {
+        return Err(Error::Conflict(
+            "applied release and its candidate record differ".into(),
+        ));
+    }
+    let evidence_source_ids: std::collections::BTreeSet<&str> = candidate
+        .sources
+        .iter()
+        .map(|source| source.id.as_str())
+        .collect();
+    let mut bound_families: Vec<String> = state
+        .completed_cycles
+        .iter()
+        .filter(|cycle| {
+            cycle
+                .source_artifact_ids
+                .iter()
+                .any(|source| evidence_source_ids.contains(source.as_str()))
+        })
+        .flat_map(|cycle| cycle.cluster_ids.iter().cloned())
+        .collect();
+    bound_families.sort();
+    bound_families.dedup();
+    mark_retest_due_after_asset(
+        &mut state.failure_records,
+        &mut state.retest_priority_marks,
+        &bound_families,
+        &release_id,
+    )?;
     state.validate()?;
     put_record(&mut session, context, STATE_KIND, &state.id, owner, &state).await?;
     let state_storage_id = storage_id(STATE_KIND, &state.id)?;
@@ -137,15 +190,23 @@ async fn record_applied_asset(
 }
 
 const PROFILE_KIND: &str = "curriculum_profile_v1";
+/// Record kind of the persisted learner state. It keeps its v2 name so every
+/// stored learner state stays at one storage address (and inside the storage
+/// revocation bookkeeping, which keys on the record kind); the payload wire is
+/// `rsia.learner_state.v3` on every new write and the read side explains both.
 const STATE_KIND: &str = "learner_state_v2";
 const CYCLE_KIND: &str = "development_cycle_receipt_v1";
 const JOB_KIND: &str = "coverage_probe_job_v1";
 const ATTEMPT_KIND: &str = "curriculum_proposal_attempt_v1";
 const PROPOSAL_KIND: &str = "structured_test_proposal_v1";
 const VALIDITY_KIND: &str = "curriculum_validity_report_v1";
+/// Keeps the v1 record kind for the same reason as `STATE_KIND`: the storage
+/// address and the revocation bookkeeping stay put while the payload wire
+/// moves to `rsia.curriculum_selection.v2`.
 const SELECTION_KIND: &str = "curriculum_selection_v1";
 const RECEIPT_KIND: &str = "probe_schedule_receipt_v1";
 const ENVELOPE_SCHEMA: &str = "rsia.curriculum_artifact_envelope.v1";
+const SELECTION_V2_SCHEMA: &str = "rsia.curriculum_selection.v2";
 /// Schema of the tombstone the revocation cleanup leaves in place of a record
 /// whose source was revoked (plan §11.5, E08).
 const REDACTED_SCHEMA: &str = "rsia.redacted.v1";
@@ -301,6 +362,196 @@ pub struct TaskSelectionDecisionV1 {
     pub budget_status: String,
 }
 
+/// Priority category of one selection (plan §8.4.1): a family whose active
+/// records moved to `retest_due` (or that holds an unconsumed one-shot retest
+/// mark) outranks every active failure gap, which outranks a coverage gap,
+/// which outranks the remaining candidates. Same category ties break by the
+/// stable choice sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionPriorityCategory {
+    RetestDue,
+    ActiveFailureGap,
+    CoverageGap,
+    Other,
+}
+
+/// The consumed asset influence of one selection (plan §8.4.1). The only
+/// influence type of the first version is `retest_after_apply`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumedAssetInfluenceV1 {
+    pub release_id: String,
+    pub influence: String,
+}
+
+/// v2 selection record (plan §8.4.1, V109): the state and candidate-set
+/// digests, the priority category, the failure records and coverage buckets
+/// the choice consumed, the applied asset it answers to, and the two
+/// counterfactual arms — the choice the frozen learner state would have made
+/// and the choice of the pre-registered fixed random curriculum. The
+/// selection basis is derived from the live state, never a constant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSelectionDecisionV2 {
+    pub schema_version: String,
+    pub id: String,
+    pub state_id: String,
+    pub state_digest: String,
+    pub candidate_set_digest: String,
+    pub chosen_task_id: String,
+    pub proposal_id: String,
+    pub stable_choice_seq: u32,
+    pub priority_category: SelectionPriorityCategory,
+    pub consumed_failure_record_ids: Vec<String>,
+    pub consumed_coverage_bucket_ids: Vec<String>,
+    pub consumed_asset: Option<ConsumedAssetInfluenceV1>,
+    pub frozen_state_choice_task_id: String,
+    pub fixed_random_choice_task_id: String,
+    pub fixed_random_seed_commitment: Option<String>,
+    pub selection_basis: String,
+    pub budget_status: String,
+}
+
+/// The fixed random curriculum arm (plan §8.4.1): a deterministic,
+/// reproducible pick from the eligible set keyed by the profile's committed
+/// seed. Without a commitment the arm is the frozen arm's choice and callers
+/// record that fact.
+fn fixed_random_arm_choice(
+    eligible: &[&CurriculumTaskCandidateV1],
+    seed_commitment: Option<&str>,
+) -> String {
+    let Some(seed) = seed_commitment else {
+        return frozen_arm_choice(eligible);
+    };
+    let mut order: Vec<&str> = eligible.iter().map(|c| c.id.as_str()).collect();
+    order.sort_by_cached_key(|id| hash(format!("{seed}:{id}").as_bytes()));
+    order
+        .first()
+        .map(|id| (*id).to_string())
+        .unwrap_or_default()
+}
+
+/// The frozen learner-state arm: the counterfactual choice of a learner whose
+/// state never absorbed any failure record, retest mark or asset influence.
+/// It is the lowest stable sequence of the eligible set.
+fn frozen_arm_choice(eligible: &[&CurriculumTaskCandidateV1]) -> String {
+    eligible
+        .iter()
+        .min_by_key(|candidate| candidate.stable_choice_seq)
+        .map(|candidate| candidate.id.clone())
+        .unwrap_or_default()
+}
+
+/// One adaptive-arm ranking entry.
+struct PriorityRanking<'a> {
+    candidate: &'a CurriculumTaskCandidateV1,
+    category: SelectionPriorityCategory,
+    failure_record_ids: Vec<String>,
+    coverage_bucket_id: Option<String>,
+    release_id: Option<String>,
+}
+
+/// Ranks the eligible candidates by the §8.4.1 priority order against the
+/// live v3 learner state: retest_due (an unconsumed mark or a `retest_due`
+/// failure record of the family) > active failure gap (an `active` absolute
+/// failure record) > coverage gap (the candidate's registered bucket is still
+/// short of its required independent clusters) > other. Ties break by the
+/// stable choice sequence, so the order is fully deterministic.
+fn rank_by_priority<'a>(
+    eligible: &[&'a CurriculumTaskCandidateV1],
+    state: &LearnerStateV3,
+) -> Vec<PriorityRanking<'a>> {
+    let uncovered: std::collections::BTreeSet<&str> = state
+        .coverage_buckets
+        .iter()
+        .filter(|bucket| {
+            bucket.observed_independent_clusters < bucket.required_independent_clusters
+        })
+        .map(|bucket| bucket.bucket_id.as_str())
+        .collect();
+    let mut ranked: Vec<PriorityRanking> = eligible
+        .iter()
+        .map(|candidate| {
+            let candidate = *candidate;
+            let family_records: Vec<&FailureRecordV1> = state
+                .failure_records
+                .iter()
+                .filter(|record| record.cluster_id == candidate.parent_family)
+                .collect();
+            let mark = state
+                .retest_priority_marks
+                .iter()
+                .find(|mark| !mark.consumed && mark.family == candidate.parent_family);
+            let retest_records: Vec<&FailureRecordV1> = family_records
+                .iter()
+                .copied()
+                .filter(|record| record.status == FailureRecordStatus::RetestDue)
+                .collect();
+            let active_gap = family_records.iter().any(|record| {
+                record.status == FailureRecordStatus::Active
+                    && record.record_type == FailureRecordType::AbsoluteFailure
+            });
+            let coverage = candidate
+                .coverage_bucket_id
+                .as_deref()
+                .is_some_and(|bucket| uncovered.contains(bucket));
+            let (category, release_id) = if !retest_records.is_empty() || mark.is_some() {
+                let release = mark.map(|mark| mark.release_id.clone()).or_else(|| {
+                    retest_records
+                        .iter()
+                        .find_map(|record| record.retest_release_id.clone())
+                });
+                (SelectionPriorityCategory::RetestDue, release)
+            } else if active_gap {
+                (SelectionPriorityCategory::ActiveFailureGap, None)
+            } else if coverage {
+                (SelectionPriorityCategory::CoverageGap, None)
+            } else {
+                (SelectionPriorityCategory::Other, None)
+            };
+            PriorityRanking {
+                candidate,
+                category,
+                failure_record_ids: retest_records
+                    .iter()
+                    .chain(family_records.iter().filter(|record| {
+                        record.status == FailureRecordStatus::Active
+                            && record.record_type == FailureRecordType::AbsoluteFailure
+                    }))
+                    .map(|record| record.record_id.clone())
+                    .collect(),
+                coverage_bucket_id: if coverage {
+                    candidate.coverage_bucket_id.clone()
+                } else {
+                    None
+                },
+                release_id,
+            }
+        })
+        .collect();
+    ranked.sort_by(|left, right| {
+        category_rank(left.category)
+            .cmp(&category_rank(right.category))
+            .then_with(|| {
+                left.candidate
+                    .stable_choice_seq
+                    .cmp(&right.candidate.stable_choice_seq)
+            })
+            .then_with(|| left.candidate.id.cmp(&right.candidate.id))
+    });
+    ranked
+}
+
+fn category_rank(category: SelectionPriorityCategory) -> u8 {
+    match category {
+        SelectionPriorityCategory::RetestDue => 0,
+        SelectionPriorityCategory::ActiveFailureGap => 1,
+        SelectionPriorityCategory::CoverageGap => 2,
+        SelectionPriorityCategory::Other => 3,
+    }
+}
+
 #[derive(Clone)]
 pub struct PersistentCurriculumCoordinator {
     store: Store,
@@ -366,6 +617,10 @@ impl PersistentCurriculumCoordinator {
         self.context.require(&[Role::Admin])?;
         profile.validate()?;
         state.validate()?;
+        // Every registration persists the v3 payload wire (failure records
+        // start empty) at the fixed v2 storage address.
+        let state = LearnerStateV3::from_v2(state);
+        state.validate()?;
         if !state.completed_cycles.is_empty()
             || !state.failure_clusters.is_empty()
             || !state.applied_assets.is_empty()
@@ -386,6 +641,7 @@ impl PersistentCurriculumCoordinator {
             return Err(Error::Conflict("profile and learner state differ".into()));
         }
         let mut session = self.store.session().await?;
+        let state_storage_id = storage_id(STATE_KIND, &state.id)?;
         if get_record::<CurriculumControlProfileV1>(
             &mut session,
             &self.context,
@@ -394,7 +650,8 @@ impl PersistentCurriculumCoordinator {
         )
         .await?
         .is_some()
-            || get_record::<LearnerStateV2>(&mut session, &self.context, STATE_KIND, &state.id)
+            || session
+                .get::<serde_json::Value>(&self.context, "artifact", &state_storage_id)
                 .await?
                 .is_some()
         {
@@ -423,7 +680,6 @@ impl PersistentCurriculumCoordinator {
             &state,
         )
         .await?;
-        let state_storage_id = storage_id(STATE_KIND, &state.id)?;
         let profile_storage_id = storage_id(PROFILE_KIND, &profile.profile_id)?;
         for source in &state.source_artifact_ids {
             for target in [&state_storage_id, &profile_storage_id] {
@@ -435,7 +691,7 @@ impl PersistentCurriculumCoordinator {
         session.commit().await
     }
 
-    pub async fn record_cycle(&self, receipt: DevelopmentCycleReceiptV1) -> Result<LearnerStateV2> {
+    pub async fn record_cycle(&self, receipt: DevelopmentCycleReceiptV1) -> Result<LearnerStateV3> {
         if receipt.schema_version != "rsia.development_cycle_receipt.v1" {
             return Err(Error::Invalid("unsupported cycle receipt schema".into()));
         }
@@ -444,8 +700,8 @@ impl PersistentCurriculumCoordinator {
         identifier(&receipt.development_request_fact_id)?;
         identifier(&receipt.development_observed_fact_id)?;
         let mut session = self.store.session().await?;
-        let mut state: LearnerStateV2 =
-            need_record(&mut session, &self.context, STATE_KIND, &receipt.state_id).await?;
+        let mut state: LearnerStateV3 =
+            load_state_v3(&mut session, &self.context, &receipt.state_id).await?;
         verify_watermark(&mut session, &self.context, &state).await?;
         verify_state_sources(&mut session, &self.context, &state).await?;
         if let Some(existing) = get_record::<DevelopmentCycleReceiptV1>(
@@ -524,13 +780,34 @@ impl PersistentCurriculumCoordinator {
                 state.development_fact_ids.push(source.clone());
             }
         }
+        // Plan §8.1.1 (v4.5 Q-10): the cycle first reduces into typed failure
+        // records bound to the verified receipt pair — an absolute failure
+        // (`!passed`) activates the cluster's failure-gap record, a regression
+        // (`passed` below its parent) activates a record that never counts as
+        // a gap, a verified pass resolves the cluster's records while keeping
+        // them, and drift moves stale records to diagnostic. The legacy
+        // cluster list then mirrors only the active absolute-failure records.
+        let failure_outcomes: Vec<FailureCycleOutcome> = verified
+            .outcomes
+            .iter()
+            .map(|outcome| FailureCycleOutcome {
+                cluster_id: outcome.parent_family.clone(),
+                passed: outcome.candidate_passed,
+                paired_gain_micros: i64::from(outcome.candidate_score_micros)
+                    - i64::from(outcome.parent_score_micros),
+                execution_receipt_digest: hash(receipt.development_request_fact_id.as_bytes()),
+                grader_receipt_digest: hash(receipt.development_observed_fact_id.as_bytes()),
+            })
+            .collect();
+        apply_cycle_to_failure_records(
+            &mut state.failure_records,
+            &observation.cycle_id,
+            &state.environment_digest,
+            &state.grader_digest,
+            &state.skill_snapshot_digest,
+            &failure_outcomes,
+        )?;
         for outcome in &verified.outcomes {
-            if (!outcome.candidate_passed
-                || outcome.candidate_score_micros < outcome.parent_score_micros)
-                && !state.failure_clusters.contains(&outcome.parent_family)
-            {
-                state.failure_clusters.push(outcome.parent_family.clone());
-            }
             if let Some(bucket) = state
                 .coverage_buckets
                 .iter_mut()
@@ -542,7 +819,7 @@ impl PersistentCurriculumCoordinator {
                     .ok_or(Error::Budget)?;
             }
         }
-        state.failure_clusters.sort();
+        state.failure_clusters = state.active_absolute_failure_clusters();
         state.development_fact_ids.sort();
         state.completed_cycles.push(observation);
         state.cooldown_remaining_cycles = state.cooldown_remaining_cycles.saturating_sub(1);
@@ -658,8 +935,8 @@ impl PersistentCurriculumCoordinator {
             }
             // Fail closed like every other entry point: the recorded job is only
             // returned while the learner state it was scheduled from is live.
-            let state: LearnerStateV2 =
-                need_record(&mut session, &self.context, STATE_KIND, state_id).await?;
+            let state: LearnerStateV3 =
+                load_state_v3(&mut session, &self.context, state_id).await?;
             verify_watermark(&mut session, &self.context, &state).await?;
             verify_state_sources(&mut session, &self.context, &state).await?;
             session.commit().await?;
@@ -722,11 +999,33 @@ impl PersistentCurriculumCoordinator {
     ) -> Result<ProbeJobV1> {
         let profile: CurriculumControlProfileV1 =
             need_record(session, &self.context, PROFILE_KIND, profile_id).await?;
-        let mut state: LearnerStateV2 =
-            need_record(session, &self.context, STATE_KIND, state_id).await?;
+        let mut state: LearnerStateV3 = load_state_v3(session, &self.context, state_id).await?;
         verify_watermark(session, &self.context, &state).await?;
         verify_state_sources(session, &self.context, &state).await?;
-        let trigger = detect_plateau_signal(&profile, &state)?;
+        let trigger = detect_plateau_signal_v3(&profile, &state)?;
+        // Plan §8.1.1: an active failure record only carries an executable
+        // improvement direction while its cluster sits in the registered
+        // authorized task space (a registered task bucket). Otherwise the
+        // failure gap must not schedule a probe: the call fails closed with
+        // `unsupported_scope` instead of firing FailureGap.
+        if let PlateauSignalV1::FailureGap {
+            failure_cluster_ids,
+        } = &trigger
+        {
+            let registered_buckets: std::collections::BTreeSet<&str> = state
+                .coverage_buckets
+                .iter()
+                .map(|bucket| bucket.bucket_id.as_str())
+                .collect();
+            if let Some(cluster) = failure_cluster_ids
+                .iter()
+                .find(|cluster| !registered_buckets.contains(cluster.as_str()))
+            {
+                return Err(Error::Conflict(format!(
+                    "unsupported_scope: active failure cluster {cluster} has no registered task bucket"
+                )));
+            }
+        }
         let trigger_digest = fingerprint(&trigger)?;
         let job_id = format!(
             "probe-{}",
@@ -837,8 +1136,8 @@ impl PersistentCurriculumCoordinator {
             need_record(&mut session, &self.context, JOB_KIND, &receipt.job_id).await?;
         let profile: CurriculumControlProfileV1 =
             need_record(&mut session, &self.context, PROFILE_KIND, &job.profile_id).await?;
-        let mut state: LearnerStateV2 =
-            need_record(&mut session, &self.context, STATE_KIND, &job.state_id).await?;
+        let mut state: LearnerStateV3 =
+            load_state_v3(&mut session, &self.context, &job.state_id).await?;
         verify_watermark(&mut session, &self.context, &state).await?;
         verify_state_sources(&mut session, &self.context, &state).await?;
         if let Some(existing) = get_record::<ProposalAttemptReceiptV1>(
@@ -933,8 +1232,7 @@ impl PersistentCurriculumCoordinator {
     ) -> Result<()> {
         proposal.validate()?;
         let mut session = self.store.session().await?;
-        let state: LearnerStateV2 =
-            need_record(&mut session, &self.context, STATE_KIND, state_id).await?;
+        let state: LearnerStateV3 = load_state_v3(&mut session, &self.context, state_id).await?;
         verify_watermark(&mut session, &self.context, &state).await?;
         verify_state_sources(&mut session, &self.context, &state).await?;
         let job: ProbeJobV1 = need_record(
@@ -1018,10 +1316,34 @@ impl PersistentCurriculumCoordinator {
             &fingerprint(&(state_id, proposal_id.as_str(), &report))?[..24]
         );
         let mut session = self.store.session().await?;
-        let state: LearnerStateV2 =
-            need_record(&mut session, &self.context, STATE_KIND, state_id).await?;
+        let state: LearnerStateV3 = load_state_v3(&mut session, &self.context, state_id).await?;
         verify_watermark(&mut session, &self.context, &state).await?;
         verify_state_sources(&mut session, &self.context, &state).await?;
+        // A runner-verified report is only persisted after its bound
+        // development observation pair reloads and verifies in this session
+        // (plan §8.4.1/V109: eligibility binds to already-verified in-process
+        // registered-pure-function facts, never to a sandbox claim).
+        if let ValidityReportV1::RunnerVerified {
+            development_request_fact_id,
+            development_observed_fact_id,
+            ..
+        } = &report
+        {
+            let verified = verified_development_observation_in_session(
+                &self.context,
+                &mut session,
+                development_request_fact_id,
+                development_observed_fact_id,
+            )
+            .await?;
+            if verified.environment_digest != state.environment_digest
+                || verified.grader_digest != state.grader_digest
+            {
+                return Err(Error::Conflict(
+                    "runner-verified report context differs from learner state".into(),
+                ));
+            }
+        }
         let proposal: StructuredTestProposalV1 =
             need_record(&mut session, &self.context, PROPOSAL_KIND, &proposal_id).await?;
         let job: ProbeJobV1 = need_record(
@@ -1076,17 +1398,29 @@ impl PersistentCurriculumCoordinator {
         Ok(report_id)
     }
 
+    /// Adaptive selection over the runner-verified candidates of one state
+    /// (plan §8.4.1, V109). The chosen arm ranks by retest_due > active
+    /// failure gap > coverage gap > other (ties by stable sequence); the
+    /// record also persists the two counterfactual arms — the frozen
+    /// learner-state choice and the pre-registered fixed random curriculum
+    /// choice — the failure records and coverage buckets the choice consumed,
+    /// and the applied asset it answers to. The selection basis is derived
+    /// from the live state and is never a constant. A one-shot retest mark
+    /// consumed by this selection is flipped to consumed in the same
+    /// transaction, so the priority really is one-shot.
     pub async fn select_next_task(
         &self,
         state_id: &str,
         candidates: &[CurriculumTaskCandidateV1],
-    ) -> Result<TaskSelectionDecisionV1> {
+    ) -> Result<TaskSelectionDecisionV2> {
         let mut session = self.store.session().await?;
-        let state: LearnerStateV2 =
-            need_record(&mut session, &self.context, STATE_KIND, state_id).await?;
+        let mut state: LearnerStateV3 =
+            load_state_v3(&mut session, &self.context, state_id).await?;
         verify_watermark(&mut session, &self.context, &state).await?;
         verify_state_sources(&mut session, &self.context, &state).await?;
-        let mut eligible: Vec<_> = Vec::new();
+        let profile: CurriculumControlProfileV1 =
+            need_record(&mut session, &self.context, PROFILE_KIND, &state.profile_id).await?;
+        let mut eligible: Vec<&CurriculumTaskCandidateV1> = Vec::new();
         for candidate in candidates {
             identifier(&candidate.id)?;
             identifier(&candidate.parent_family)?;
@@ -1113,13 +1447,9 @@ impl PersistentCurriculumCoordinator {
                 "no runner-verified development task; sandbox unavailable".into(),
             ));
         }
-        eligible.sort_by_key(|candidate| candidate.stable_choice_seq);
-        let chosen = eligible
-            .iter()
-            .find(|candidate| state.failure_clusters.contains(&candidate.parent_family))
-            .copied()
-            .or_else(|| eligible.first().copied())
-            .ok_or(Error::NotFound)?;
+        let ranked = rank_by_priority(&eligible, &state);
+        let top = ranked.first().ok_or(Error::NotFound)?;
+        let chosen = top.candidate;
         let proposal: StructuredTestProposalV1 = need_record(
             &mut session,
             &self.context,
@@ -1132,21 +1462,72 @@ impl PersistentCurriculumCoordinator {
                 "selection candidate and proposal family differ".into(),
             ));
         }
+        // Consume the one-shot retest marks of the chosen family before the
+        // digest is taken, so the recorded state is the state that selected.
+        let mut consumed_mark_release: Option<String> = None;
+        for mark in state.retest_priority_marks.iter_mut() {
+            if !mark.consumed && mark.family == chosen.parent_family {
+                mark.consumed = true;
+                consumed_mark_release = Some(mark.release_id.clone());
+            }
+        }
         let state_digest = fingerprint(&state)?;
-        let decision = TaskSelectionDecisionV1 {
-            schema_version: "rsia.curriculum_selection.v1".into(),
+        let candidate_set_digest = fingerprint(&eligible)?;
+        let frozen_choice = frozen_arm_choice(&eligible);
+        let fixed_random_choice =
+            fixed_random_arm_choice(&eligible, profile.fixed_random_seed_commitment.as_deref());
+        let active_gap_clusters = state.active_absolute_failure_clusters();
+        let uncovered_buckets: Vec<&str> = state
+            .coverage_buckets
+            .iter()
+            .filter(|bucket| {
+                bucket.observed_independent_clusters < bucket.required_independent_clusters
+            })
+            .map(|bucket| bucket.bucket_id.as_str())
+            .collect();
+        let decision = TaskSelectionDecisionV2 {
+            schema_version: SELECTION_V2_SCHEMA.into(),
             id: format!(
                 "selection-{}",
                 &fingerprint(&(state_id, chosen.id.as_str(), &state_digest))?[..24]
             ),
             state_id: state.id.clone(),
             state_digest,
+            candidate_set_digest,
             chosen_task_id: chosen.id.clone(),
             proposal_id: chosen.proposal_id.clone(),
             stable_choice_seq: chosen.stable_choice_seq,
-            reason: "runner_verified".into(),
+            priority_category: top.category,
+            consumed_failure_record_ids: top.failure_record_ids.clone(),
+            consumed_coverage_bucket_ids: top.coverage_bucket_id.clone().into_iter().collect(),
+            consumed_asset: top
+                .release_id
+                .clone()
+                .or(consumed_mark_release)
+                .map(|release_id| ConsumedAssetInfluenceV1 {
+                    release_id,
+                    influence: "retest_after_apply".into(),
+                }),
+            frozen_state_choice_task_id: frozen_choice,
+            fixed_random_choice_task_id: fixed_random_choice,
+            fixed_random_seed_commitment: profile.fixed_random_seed_commitment.clone(),
+            // The basis reflects the live state that drove the choice, so two
+            // different states never share one basis string (V109.c).
+            selection_basis: format!(
+                "priority={:?};active_failure_clusters={};retest_due_families={};uncovered_buckets={};eligible={}",
+                top.category,
+                active_gap_clusters.len(),
+                state
+                    .retest_priority_marks
+                    .iter()
+                    .filter(|mark| !mark.consumed)
+                    .count(),
+                uncovered_buckets.len(),
+                eligible.len(),
+            ),
             budget_status: "disabled_zero_budget".into(),
         };
+        state.validate()?;
         put_record(
             &mut session,
             &self.context,
@@ -1154,6 +1535,15 @@ impl PersistentCurriculumCoordinator {
             &decision.id,
             &self.owner,
             &decision,
+        )
+        .await?;
+        put_record(
+            &mut session,
+            &self.context,
+            STATE_KIND,
+            &state.id,
+            &self.owner,
+            &state,
         )
         .await?;
         let selection_storage_id = storage_id(SELECTION_KIND, &decision.id)?;
@@ -1185,7 +1575,7 @@ impl PersistentCurriculumCoordinator {
         run_id: &str,
         application_record_id: &str,
         execution_receipt_id: &str,
-    ) -> Result<LearnerStateV2> {
+    ) -> Result<LearnerStateV3> {
         record_applied_asset(
             &self.store,
             &self.context,
@@ -1217,7 +1607,7 @@ pub async fn verified_probe_job_view(
             "stored probe job differs from its storage identity".into(),
         ));
     }
-    let state: LearnerStateV2 = need_record(&mut session, ctx, STATE_KIND, &job.state_id).await?;
+    let state: LearnerStateV3 = load_state_v3(&mut session, ctx, &job.state_id).await?;
     if state.id != job.state_id || state.profile_id != job.profile_id {
         return Err(Error::Conflict(
             "probe job and learner state identities differ".into(),
@@ -1232,7 +1622,7 @@ pub async fn verified_probe_job_view(
 async fn verify_watermark(
     session: &mut Session,
     context: &Context,
-    state: &LearnerStateV2,
+    state: &LearnerStateV3,
 ) -> Result<()> {
     let current = session
         .watermark(context)
@@ -1269,7 +1659,7 @@ async fn need_typed_source(
 async fn verify_state_sources(
     session: &mut Session,
     context: &Context,
-    state: &LearnerStateV2,
+    state: &LearnerStateV3,
 ) -> Result<Vec<CurriculumSourceArtifactV1>> {
     let mut sources = Vec::new();
     let mut pending = state.source_artifact_ids.clone();
@@ -1360,6 +1750,76 @@ fn storage_id(record_kind: &str, id: &str) -> Result<String> {
 /// inspected before it is decoded, so the expected state does not raise the
 /// storage layer's "database operation failed" error log either. Any other body
 /// that does not decode is corruption and stays `Internal`.
+/// Loads the learner state at its fixed `STATE_KIND` storage address and
+/// explains both payload wires: a `rsia.learner_state.v3` body decodes
+/// directly, a `rsia.learner_state.v2` body is projected through
+/// [`LearnerStateV3::from_v2`] (v2 never carried failure records, so the
+/// projection starts empty), and anything else fails closed. A redacted body
+/// names the revocation the same way `get_record` does.
+async fn load_state_v3(
+    session: &mut Session,
+    context: &Context,
+    state_id: &str,
+) -> Result<LearnerStateV3> {
+    let id = storage_id(STATE_KIND, state_id)?;
+    let Some(body) = session
+        .get::<serde_json::Value>(context, "artifact", &id)
+        .await?
+    else {
+        return Err(Error::NotFound);
+    };
+    if body
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        == Some(REDACTED_SCHEMA)
+    {
+        return Err(Error::Conflict(format!(
+            "curriculum record {STATE_KIND} {state_id} was redacted because its source was revoked"
+        )));
+    }
+    let envelope: ArtifactEnvelope<serde_json::Value> = serde_json::from_value(body).map_err(
+        |error| {
+            tracing::error!(%error, record_kind = STATE_KIND, state_id, "stored curriculum record does not decode");
+            Error::Internal
+        },
+    )?;
+    if envelope.schema_version != ENVELOPE_SCHEMA
+        || envelope.id != id
+        || envelope.record_kind != STATE_KIND
+    {
+        return Err(Error::Conflict(
+            "curriculum artifact envelope mismatch".into(),
+        ));
+    }
+    let payload = envelope.payload;
+    match payload
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(LEARNER_STATE_V3_SCHEMA) => {
+            let state: LearnerStateV3 = serde_json::from_value(payload).map_err(|error| {
+                tracing::error!(%error, record_kind = STATE_KIND, state_id, "stored v3 learner state does not decode");
+                Error::Internal
+            })?;
+            state.validate()?;
+            Ok(state)
+        }
+        Some(LEARNER_STATE_V2_SCHEMA) => {
+            let legacy: LearnerStateV2 = serde_json::from_value(payload).map_err(|error| {
+                tracing::error!(%error, record_kind = STATE_KIND, state_id, "stored v2 learner state does not decode");
+                Error::Internal
+            })?;
+            legacy.validate()?;
+            Ok(LearnerStateV3::from_v2(legacy))
+        }
+        // Any other payload body is corruption, exactly like a `get_record`
+        // decode failure: an unknown future wire is not a readable state and
+        // fails closed as Internal (the pinned test
+        // `a_curriculum_body_that_is_not_a_tombstone_and_does_not_decode_stays_internal`).
+        _ => Err(Error::Internal),
+    }
+}
+
 async fn get_record<T: DeserializeOwned>(
     session: &mut Session,
     context: &Context,
