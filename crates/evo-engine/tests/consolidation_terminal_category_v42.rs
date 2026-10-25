@@ -394,7 +394,7 @@ impl Fixture {
         let admin = context("admin", Role::Admin);
         let host = context("host", Role::Host);
         let worker = context("worker", Role::Worker);
-        ReleaseStore::register_host_surface(
+        trusted_compiler_inputs::register_fixture_host_surface(
             &admin,
             &store,
             "surface",

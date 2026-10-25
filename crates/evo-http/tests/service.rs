@@ -1,13 +1,9 @@
 //! Real loopback HTTP process tests.
-use evo_core::contract::{
-    CapabilityLevel, HostCapabilities, HostSurfaceManifest, SurfaceCoverage, SurfaceItem,
-    SystemSnapshot,
-};
+use evo_core::contract::{CapabilityLevel, HostCapabilities, SurfaceCoverage, SystemSnapshot};
 use evo_core::evidence::Purpose;
 use evo_core::replay::*;
 use evo_core::strategy::{ActionKindV1, ElasticPolicyV1, ExplorationCapsV1, ObservedStatus};
 use evo_core::{Context, Role, hash};
-use evo_engine::release_store::ReleaseStore;
 use evo_engine::service::{HostPrepareConfig, HostService};
 use evo_http::{AuthIdentity, AuthRegistry, HttpState, router};
 use evo_storage::Store;
@@ -31,25 +27,34 @@ async fn state(auth: AuthRegistry) -> (tempfile::TempDir, HttpState) {
     let store = Store::open(&dir.path().join("http.sqlite3")).await.unwrap();
     let host = Context::new("tenant-a", "gateway-host", Role::Host).unwrap();
     let admin = Context::new("tenant-a", "admin", Role::Admin).unwrap();
-    ReleaseStore::register_host_surface(
+    let source = evo_core::contract::ReviewedHostSourceEnvelopeV1 {
+        schema_version: "rsia.host_source_envelope.v1".into(),
+        source_kind: "reviewed_fixture".into(),
+        source_schema: "rsia.host_reviewed_declarations.v1".into(),
+        extractor_version: "rsia.host_reviewed_declarations.extractor.v1".into(),
+        original_utf8: r#"{"schema_version":"rsia.host_reviewed_declarations.v1","host":"reference-host","host_version":"1.0.0","declarations":[{"name":"model","value_type":"string","enum_values":[],"default":{"kind":"value","value":"disabled"}}]}"#.into(),
+    };
+    let raw = serde_json::to_string(&source).unwrap();
+    evo_engine::hosts::register_reviewed_host_surface_json(
         &admin,
         &store,
         "reference-surface",
-        HostSurfaceManifest {
-            schema_version: "rsia.host_surface.v1".into(),
-            host: "reference-host".into(),
-            host_version: "1.0.0".into(),
+        &raw,
+        evo_core::contract::HostSurfaceRegistrationV2 {
             adapter_version: "1.0.0".into(),
-            source_digest: d("surface"),
-            items: vec![SurfaceItem {
+            retired: vec![],
+            classifications: vec![evo_core::contract::HostSurfaceClassificationV2 {
                 name: "model".into(),
                 coverage: SurfaceCoverage::Supported,
                 mapped_field: Some("host.model".into()),
-                consumer: Some("reference-host".into()),
-                reason: "fixture".into(),
+                consumer: Some("runner".into()),
+                reason: "fixed disabled-model software fixture".into(),
+                renamed_from: None,
+                test_ref: Some("existing service integration assertions".into()),
+                capability: Some("fixture-model".into()),
             }],
         },
-        vec!["model".into()],
+        None,
     )
     .await
     .unwrap();

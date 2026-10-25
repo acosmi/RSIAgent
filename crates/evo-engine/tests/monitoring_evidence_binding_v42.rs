@@ -423,7 +423,7 @@ impl Fixture {
         let worker = context("worker", Role::Worker);
         let executor = context("dev-executor", Role::Worker);
         let grader = context("dev-grader", Role::Evaluator);
-        ReleaseStore::register_host_surface(
+        trusted_compiler_inputs::register_fixture_host_surface(
             &admin,
             &store,
             "surface",
@@ -856,6 +856,20 @@ impl ModelPort for EditingModelPort {
     ) -> evo_core::Result<evo_engine::model::ModelResponse> {
         request.validate()?;
         self.dispatch(request.request).await
+    }
+
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
     }
 
     async fn dispatch(&self, request: ModelRequest) -> evo_core::Result<ModelResponse> {
@@ -1649,7 +1663,7 @@ async fn valid_fixture_paths_export_actual_parent_golden() {
         run.proposal_id.as_ref().unwrap(),
     )
     .await;
-    let staged = MonitoringCoordinator::stage_consolidation_candidate(
+    let staged = MonitoringCoordinator::stage_current_consolidation_candidate(
         &fixture.worker,
         &fixture.store,
         run.proposal_id.as_ref().unwrap(),
@@ -1657,7 +1671,7 @@ async fn valid_fixture_paths_export_actual_parent_golden() {
     )
     .await
     .unwrap();
-    let again = MonitoringCoordinator::stage_consolidation_candidate(
+    let again = MonitoringCoordinator::stage_current_consolidation_candidate(
         &fixture.worker,
         &fixture.store,
         run.proposal_id.as_ref().unwrap(),
@@ -2333,6 +2347,82 @@ struct ProposalBoundaryJournal<'a> {
 
 #[async_trait]
 impl OptimizationJournal for ProposalBoundaryJournal<'_> {
+    async fn current_compiler_inputs(
+        &self,
+        r: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::CurrentVerifiedCompilerInputs> {
+        self.inner.current_compiler_inputs(r).await
+    }
+
+    async fn commit_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> evo_core::Result<()> {
+        self.inner.commit_source_bound(fact.clone(), inputs).await?;
+        if fact.kind == StageFactKind::StepCompleted && fact.payload["status"] == "candidate" {
+            let stored = self
+                .inner
+                .lookup_source_bound(&fact.artifact_id, inputs)
+                .await?
+                .ok_or(Error::NotFound)?;
+            *self.terminal.lock().unwrap() = Some(stored);
+            let mut s = self.store.session().await?;
+            let root = s
+                .root_budget(&self.admin, SCOPE)
+                .await?
+                .ok_or(Error::Budget)?;
+            let calls = s
+                .budget_calls_for_group(&self.admin, SCOPE, &fact.episode_id)
+                .await?;
+            *self.paid_ledger_digest.lock().unwrap() = Some(fingerprint(&(&root, &calls))?);
+            let watermark = s.watermark(&self.admin).await?;
+            if self.switch_pointer {
+                let id = format!("profile-pointer-{}", inputs.request.profile.id);
+                let pointer = evo_engine::release_store::PersistentProfilePointer {
+                    id: id.clone(),
+                    schema_version: evo_engine::release_store::PROFILE_POINTER_SCHEMA.into(),
+                    profile_id: inputs.request.profile.id.clone(),
+                    active_release_id: None,
+                    active_bundle_digest: None,
+                    epoch: 1,
+                };
+                s.put(&self.admin, "pointer", &id, self.admin.actor(), &pointer)
+                    .await?;
+                let operation = format!(
+                    "formal.admin.content.v1.{}",
+                    fingerprint(&(self.admin.namespace(), "pointer", &id))?
+                );
+                let entity = fingerprint(&(
+                    self.admin.namespace(),
+                    "pointer",
+                    &id,
+                    evo_engine::formal_authority::content_digest(&pointer)?,
+                ))?;
+                s.audit(&self.admin, &operation, &entity).await?;
+            }
+            assert_eq!(s.watermark(&self.admin).await?, watermark);
+            s.commit().await?;
+        }
+        Ok(())
+    }
+
+    async fn claim_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> evo_core::Result<bool> {
+        self.inner.claim_source_bound(fact, inputs).await
+    }
+
+    async fn lookup_source_bound(
+        &self,
+        id: &str,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> evo_core::Result<Option<StageFact>> {
+        self.inner.lookup_source_bound(id, inputs).await
+    }
+
     async fn compiler_inputs(
         &self,
         r: &evo_engine::formal_authority::CompilerInputRequest,
@@ -2499,7 +2589,7 @@ async fn candidate_proposal_uses_the_full_terminal_binding_and_current_authority
                 artifacts_with_schema(
                     &fixture.store,
                     &fixture.worker,
-                    evo_engine::monitoring::CONSOLIDATION_PROPOSAL_SCHEMA
+                    evo_engine::monitoring::CONSOLIDATION_PROPOSAL_SCHEMA_V2
                 )
                 .await
                 .is_empty()
@@ -2524,7 +2614,7 @@ async fn candidate_proposal_uses_the_full_terminal_binding_and_current_authority
                 Some(terminal.input_digest.as_str())
             );
             let mut s = fixture.store.session().await.unwrap();
-            let proposal: evo_engine::monitoring::ConsolidationProposal = s
+            let proposal: evo_engine::monitoring::CurrentConsolidationProposal = s
                 .need(
                     &fixture.worker,
                     "artifact",
@@ -2626,10 +2716,13 @@ struct RunningClaimHandoffJournal<'a> {
     switch_pointer: bool,
     compiler_reads: AtomicUsize,
     original_a: Mutex<Option<evo_engine::model::CompilerInputUse>>,
+    original_current_a: Mutex<Option<evo_engine::model::CurrentCompilerInputUse>>,
     running_claim: Mutex<Option<ConsolidationClaim>>,
     boundary_budget: Mutex<Option<evo_storage::budget::RootBudgetMonetarySnapshot>>,
     post_setup_snapshot: Mutex<Option<String>>,
     child_fresh_binding: Mutex<Option<evo_engine::formal_authority::FormalCompilerInputBinding>>,
+    child_fresh_current_binding:
+        Mutex<Option<evo_engine::formal_authority::CurrentFormalCompilerInputBinding>>,
     bound_uses: Mutex<Vec<String>>,
 }
 impl RunningClaimHandoffJournal<'_> {
@@ -2646,9 +2739,121 @@ impl RunningClaimHandoffJournal<'_> {
             .unwrap()
             .push(fingerprint(inputs).unwrap());
     }
+
+    fn observe_original_current_bound_use(
+        &self,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) {
+        let a = self
+            .original_current_a
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("real initial compiler input A");
+        assert_eq!(fingerprint(inputs).unwrap(), fingerprint(&a).unwrap());
+        self.bound_uses
+            .lock()
+            .unwrap()
+            .push(fingerprint(inputs).unwrap());
+    }
 }
 #[async_trait]
 impl OptimizationJournal for RunningClaimHandoffJournal<'_> {
+    async fn current_compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::CurrentVerifiedCompilerInputs> {
+        let read = self.compiler_reads.fetch_add(1, Ordering::SeqCst);
+        if read == 1 {
+            let a = self
+                .original_current_a
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("initial A resolved successfully");
+            assert_eq!(fingerprint(request)?, fingerprint(&a.request)?);
+            let mut s = self.store.session().await?;
+            let claim: ConsolidationClaim = s.need(&self.admin, "artifact", &self.claim_id).await?;
+            assert_eq!(claim.state, ConsolidationClaimState::Running);
+            assert!(claim.execution_input_digest.is_some());
+            let watermark = s.watermark(&self.admin).await?;
+            assert_eq!(watermark, a.binding.watermark);
+            let budget = s.root_budget_monetary_snapshot(&self.admin, SCOPE).await?;
+            assert!(budget.calls.is_empty());
+            assert_eq!(budget.root.spent_micros, 0);
+            assert_eq!(budget.root.reserved_micros, 0);
+            let all: Vec<Value> = s.list(&self.admin, "artifact").await?;
+            assert!(
+                !all.iter()
+                    .any(|v| v["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA
+                        && v["episode_id"] == self.claim_id)
+            );
+            *self.running_claim.lock().unwrap() = Some(claim);
+            *self.boundary_budget.lock().unwrap() = Some(budget);
+            if self.switch_pointer {
+                let id = format!("profile-pointer-{}", request.profile.id);
+                let before: evo_engine::release_store::PersistentProfilePointer =
+                    s.need(&self.admin, "pointer", &id).await?;
+                advance_handoff_fixture_pointer(&mut s, &self.admin, &request.profile.id).await?;
+                let after: evo_engine::release_store::PersistentProfilePointer =
+                    s.need(&self.admin, "pointer", &id).await?;
+                assert_eq!(after.epoch, before.epoch + 1);
+                assert_eq!(after.active_release_id, before.active_release_id);
+                assert_eq!(after.active_bundle_digest, before.active_bundle_digest);
+                assert_eq!(after.profile_id, before.profile_id);
+            }
+            assert_eq!(s.watermark(&self.admin).await?, watermark);
+            s.commit().await?;
+        }
+        let verified = self.inner.current_compiler_inputs(request).await?;
+        if read == 0 {
+            *self.original_current_a.lock().unwrap() =
+                Some(evo_engine::model::CurrentCompilerInputUse::new(
+                    request.clone(),
+                    verified.binding().clone(),
+                ));
+        } else if read == 1 {
+            let a = self.original_current_a.lock().unwrap().clone().unwrap();
+            assert_eq!(
+                fingerprint(verified.binding())? == fingerprint(&a.binding)?,
+                !self.switch_pointer
+            );
+            *self.child_fresh_current_binding.lock().unwrap() = Some(verified.binding().clone());
+            // Existing complete logical oracle is reached only after the real
+            // Admin update and successful fresh child resolve. Setup failure
+            // cannot stand in for the production fixed-A refusal.
+            *self.post_setup_snapshot.lock().unwrap() = Some(logical_snapshot(&self.database));
+        }
+        Ok(verified)
+    }
+
+    async fn commit_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> evo_core::Result<()> {
+        self.observe_original_current_bound_use(inputs);
+        self.inner.commit_source_bound(fact, inputs).await
+    }
+
+    async fn claim_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> evo_core::Result<bool> {
+        self.observe_original_current_bound_use(inputs);
+        self.inner.claim_source_bound(fact, inputs).await
+    }
+
+    async fn lookup_source_bound(
+        &self,
+        id: &str,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> evo_core::Result<Option<StageFact>> {
+        self.observe_original_current_bound_use(inputs);
+        self.inner.lookup_source_bound(id, inputs).await
+    }
+
     async fn compiler_inputs(
         &self,
         request: &evo_engine::formal_authority::CompilerInputRequest,
@@ -2791,10 +2996,12 @@ async fn running_claim_keeps_original_compiler_use_across_the_child_handoff() {
             switch_pointer,
             compiler_reads: AtomicUsize::new(0),
             original_a: Mutex::new(None),
+            original_current_a: Mutex::new(None),
             running_claim: Mutex::new(None),
             boundary_budget: Mutex::new(None),
             post_setup_snapshot: Mutex::new(None),
             child_fresh_binding: Mutex::new(None),
+            child_fresh_current_binding: Mutex::new(None),
             bound_uses: Mutex::new(Vec::new()),
         };
         let result = MonitoringCoordinator::run_consolidation(
@@ -2808,7 +3015,7 @@ async fn running_claim_keeps_original_compiler_use_across_the_child_handoff() {
         )
         .await;
         assert_eq!(journal.compiler_reads.load(Ordering::SeqCst), 2);
-        let a = journal.original_a.lock().unwrap().clone().unwrap();
+        let a = journal.original_current_a.lock().unwrap().clone().unwrap();
         let running = journal
             .running_claim
             .lock()
@@ -2816,7 +3023,7 @@ async fn running_claim_keeps_original_compiler_use_across_the_child_handoff() {
             .clone()
             .expect("actual Running commit reached child entry");
         let child = journal
-            .child_fresh_binding
+            .child_fresh_current_binding
             .lock()
             .unwrap()
             .clone()
@@ -2877,7 +3084,7 @@ async fn running_claim_keeps_original_compiler_use_across_the_child_handoff() {
                 artifacts_with_schema(
                     &fixture.store,
                     &fixture.worker,
-                    evo_engine::monitoring::CONSOLIDATION_PROPOSAL_SCHEMA
+                    evo_engine::monitoring::CONSOLIDATION_PROPOSAL_SCHEMA_V2
                 )
                 .await
                 .is_empty()
@@ -2902,7 +3109,7 @@ async fn running_claim_keeps_original_compiler_use_across_the_child_handoff() {
                 .expect("real StepPrepared");
             let prepared: StageFact = serde_json::from_value((**prepared_body).clone()).unwrap();
             assert_eq!(Some(prepared.input_digest), running.execution_input_digest);
-            let prepared_binding: evo_engine::formal_authority::FormalCompilerInputBinding =
+            let prepared_binding: evo_engine::formal_authority::CurrentFormalCompilerInputBinding =
                 serde_json::from_value(prepared.payload["compiler_binding"].clone()).unwrap();
             assert_eq!(
                 serde_json::to_value(&prepared_binding).unwrap(),
@@ -2916,7 +3123,7 @@ async fn running_claim_keeps_original_compiler_use_across_the_child_handoff() {
                 .iter()
                 .filter(|v| v["kind"] == "dispatch_prepared" && v["stage"] != "development")
             {
-                let bound: evo_engine::model::BoundModelRequest =
+                let bound: evo_engine::model::CurrentBoundModelRequest =
                     serde_json::from_value(body["payload"].clone()).unwrap();
                 assert_eq!(
                     fingerprint(&bound.compiler_use).unwrap(),

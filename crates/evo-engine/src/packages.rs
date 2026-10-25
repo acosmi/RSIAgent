@@ -4,8 +4,6 @@ use crate::capacity::{
     CapacityField, CapacityLimits, V41CapacityUsage, admit_field, unix_now_secs,
 };
 use crate::evidence::{load_stored_source, validate_stored_sources};
-use crate::release_store::{RELEASE_CANDIDATE_SCHEMA, ReleaseCandidateRecord};
-use crate::releases::validate_resolved_bundle_identity;
 use crate::revocation_gate::{judge_dependency, judge_upstream};
 use evo_core::contract::SkillSnapshot;
 use evo_core::{
@@ -1759,8 +1757,12 @@ impl PersistentPackageStore {
         }
         verify_sources(&mut session, ctx, &current_staged.source_refs).await?;
 
-        let candidate: ReleaseCandidateRecord = session.need(ctx, "artifact", candidate_id).await?;
-        if candidate.schema_version != RELEASE_CANDIDATE_SCHEMA
+        let candidate: crate::release_store::ReadCandidate =
+            session.need(ctx, "artifact", candidate_id).await?;
+        candidate.current()?;
+        crate::release_store::validate_read_candidate_in_session(&mut session, ctx, &candidate)
+            .await?;
+        if candidate.schema_version != crate::release_store::RELEASE_CANDIDATE_SCHEMA_V2
             || candidate.id != candidate_id
             || candidate.environment_digest != current_staged.payload.environment_digest
             || candidate.revoke_watermark != watermark
@@ -1770,7 +1772,7 @@ impl PersistentPackageStore {
                 "release candidate does not match staged asset control plane".into(),
             ));
         }
-        validate_resolved_bundle_identity(&candidate.bundle)?;
+        candidate.bundle.validate_identity()?;
         if fingerprint(&candidate.bundle.skill)? != fingerprint(&staged_skill)?
             || fingerprint(&candidate.bundle.improver)? != fingerprint(&staged_strategy)?
         {

@@ -82,6 +82,20 @@ impl ModelPort for FixtureModelPort {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let output = "[]".to_string();
         Ok(ModelResponse::Completed {
@@ -267,6 +281,20 @@ impl ModelPort for EditingFixtureModelPort {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let source = request.source_closure[0].clone();
         let parent: SkillSnapshot = serde_json::from_str(
@@ -348,10 +376,79 @@ impl ModelPort for EditingFixtureModelPort {
 struct FixtureJournal {
     facts: Mutex<Vec<StageFact>>,
     recovery_facts: Mutex<Vec<StageFact>>,
+    // The test owns this Store for its whole lifetime; Current never borrows
+    // a resolver-created database or manufactures the request's watermark.
+    current_store: Option<(Store, Context)>,
+}
+
+impl FixtureJournal {
+    async fn verify_current_use(
+        &self,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<()> {
+        let (store, context) = self.current_store.as_ref().ok_or(Error::Forbidden)?;
+        let mut session = store.session().await?;
+        Box::pin(inputs.verify_current(&mut session, context)).await?;
+        session.commit().await
+    }
 }
 
 #[async_trait]
 impl OptimizationJournal for FixtureJournal {
+    async fn current_compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> Result<evo_engine::formal_authority::CurrentVerifiedCompilerInputs> {
+        let (store, context) = self.current_store.as_ref().ok_or(Error::Forbidden)?;
+        trusted_compiler_inputs::resolve_software_fixture_current(store, context, request).await
+    }
+
+    async fn commit_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<()> {
+        self.verify_current_use(inputs).await?;
+        let recovery = matches!(
+            fact.kind,
+            StageFactKind::StepPrepared
+                | StageFactKind::StepCompleted
+                | StageFactKind::DispatchPrepared
+                | StageFactKind::DispatchObserved
+        );
+        if recovery {
+            self.recovery_facts.lock().unwrap().push(fact);
+        } else {
+            self.facts.lock().unwrap().push(fact);
+        }
+        Ok(())
+    }
+
+    async fn claim_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<bool> {
+        self.commit_source_bound(fact, inputs).await?;
+        Ok(true)
+    }
+
+    async fn lookup_source_bound(
+        &self,
+        id: &str,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        self.verify_current_use(inputs).await?;
+        Ok(self
+            .facts
+            .lock()
+            .unwrap()
+            .iter()
+            .chain(self.recovery_facts.lock().unwrap().iter())
+            .find(|f| f.artifact_id == id)
+            .cloned())
+    }
+
     async fn commit_bound(
         &self,
         fact: StageFact,
@@ -555,7 +652,15 @@ async fn g1_step_requires_journal_and_reaches_development_candidate_without_acti
         granted: BTreeSet::new(),
     };
     let revoked = BTreeSet::new();
-    let journal = FixtureJournal::default();
+    let directory = tempfile::tempdir().unwrap();
+    let current_store = Store::open(&directory.path().join("fixture-journal.sqlite3"))
+        .await
+        .unwrap();
+    let current_context = Context::new("tenant", "worker", Role::Worker).unwrap();
+    let journal = FixtureJournal {
+        current_store: Some((current_store.clone(), current_context)),
+        ..FixtureJournal::default()
+    };
     let source_selection = SourceSelection {
         roots: vec![],
         run_ids: vec!["run-failure".into(), "run-success".into()],
@@ -618,6 +723,9 @@ async fn g1_step_requires_journal_and_reaches_development_candidate_without_acti
             allow_rank_call: false,
         })
     };
+    // Install the real source/grant closure and advance its own durable
+    // watermark once, using the original fixture producer and Clock.
+    seed_authority(&current_store, &make_request()).await;
     let missing = run_optimization_step(
         Some(&EditingFixtureModelPort),
         Some(&FixtureDevRunner),
@@ -655,13 +763,17 @@ async fn g1_step_requires_journal_and_reaches_development_candidate_without_acti
     )
     .await
     .unwrap();
-    assert!(matches!(outcome, OptimizationStepOutcome::Candidate { .. }));
+    assert!(matches!(
+        outcome,
+        OptimizationStepOutcome::CurrentCandidate { .. }
+    ));
     assert_eq!(journal.facts.lock().unwrap().len(), 8);
     exercise_sqlite_recovery(&make_request).await;
     exercise_rank_and_authority(&make_request).await;
     exercise_late_revocation(&make_request).await;
     exercise_terminal_outcomes(&make_request).await;
     exercise_missing_watermark(&make_request).await;
+    current_store.close().await;
 }
 
 #[tokio::test]
@@ -742,6 +854,20 @@ impl ModelPort for CountModel {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         EditingFixtureModelPort.dispatch(request).await
@@ -765,6 +891,45 @@ struct CrashJournal {
 }
 #[async_trait]
 impl OptimizationJournal for CrashJournal {
+    async fn current_compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::CurrentVerifiedCompilerInputs> {
+        self.inner.current_compiler_inputs(request).await
+    }
+
+    async fn commit_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<()> {
+        if (fact.kind == self.kind && fact.stage == self.stage)
+            || self.failed.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(Error::Conflict(
+                "fixture crash before durable commit".into(),
+            ));
+        }
+        self.inner.commit_source_bound(fact, inputs).await
+    }
+
+    async fn claim_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<bool> {
+        self.inner.claim_source_bound(fact, inputs).await
+    }
+
+    async fn lookup_source_bound(
+        &self,
+        id: &str,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        self.inner.lookup_source_bound(id, inputs).await
+    }
+
     async fn commit_bound(
         &self,
         fact: StageFact,
@@ -965,7 +1130,7 @@ async fn exercise_sqlite_recovery<'a>(make_request: impl Fn() -> OptimizationSte
         if expected_uncertain {
             assert!(matches!(outcome, OptimizationStepOutcome::Uncertain { .. }));
         } else {
-            let OptimizationStepOutcome::Candidate {
+            let OptimizationStepOutcome::CurrentCandidate {
                 edit,
                 bundle,
                 selection,
@@ -982,7 +1147,7 @@ async fn exercise_sqlite_recovery<'a>(make_request: impl Fn() -> OptimizationSte
             let recovered = run_optimization_step(None, None, Some(&journal), make_request())
                 .await
                 .unwrap();
-            let OptimizationStepOutcome::Candidate {
+            let OptimizationStepOutcome::CurrentCandidate {
                 edit: again,
                 bundle: again_bundle,
                 selection: again_selection,
@@ -1119,6 +1284,20 @@ impl ModelPort for RankingFixture {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         use std::sync::atomic::Ordering::SeqCst;
         if request.stage == ModelStage::Rank {
@@ -1198,7 +1377,10 @@ async fn exercise_rank_and_authority<'a>(make_request: impl Fn() -> Optimization
             assert!(matches!(outcome, OptimizationStepOutcome::Rejected { .. }));
             assert_eq!(runner.0.load(SeqCst), 0);
         } else {
-            assert!(matches!(outcome, OptimizationStepOutcome::Candidate { .. }));
+            assert!(matches!(
+                outcome,
+                OptimizationStepOutcome::CurrentCandidate { .. }
+            ));
             assert_eq!(runner.0.load(SeqCst), 1);
         }
         let mut request = make_request();
@@ -1219,7 +1401,7 @@ async fn exercise_rank_and_authority<'a>(make_request: impl Fn() -> Optimization
         if !invalid {
             assert!(matches!(
                 second_case,
-                OptimizationStepOutcome::Candidate { .. }
+                OptimizationStepOutcome::CurrentCandidate { .. }
             ));
         }
         assert_eq!(model.ranks.load(SeqCst), 2);
@@ -1362,6 +1544,20 @@ impl ModelPort for RevokingModel {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let response = EditingFixtureModelPort.dispatch(request).await?;
@@ -1435,6 +1631,20 @@ impl ModelPort for TerminalFixture {
     ) -> evo_core::Result<evo_engine::model::ModelResponse> {
         request.validate()?;
         self.dispatch(request.request).await
+    }
+
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
     }
 
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {

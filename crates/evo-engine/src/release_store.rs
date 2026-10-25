@@ -9,11 +9,14 @@ use crate::streaming_evaluator::{
     verified_report_view_in_session,
 };
 use evo_core::contract::{
-    AppliedReceipt, CapabilityLevel, HostCapabilities, HostSurfaceManifest, ResolvedBundle,
-    RunProjection, SystemSnapshot, project_run,
+    AppliedReceipt, CapabilityLevel, HostCapabilities, HostSurfaceDeclarationV2,
+    HostSurfaceManifest, HostSurfaceManifestV2, HostSurfacePredecessorV2,
+    HostSurfaceRegistrationV2, HostSurfaceUpgradeDiffV2, ResolvedBundle,
+    ReviewedHostSourceEnvelopeV1, RunProjection, SystemSnapshot, host_surface_upgrade_diff_v2,
+    host_surface_v2_allows_field, host_surface_v2_from_source,
 };
 use evo_core::evaluation::Verdict;
-use evo_core::{Context, Error, Result, Role, fingerprint, identifier};
+use evo_core::{Context, Error, Result, Role, Validate, fingerprint, identifier};
 use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -131,6 +134,245 @@ where
     Ok(schema)
 }
 
+pub const HOST_SURFACE_RECORD_SCHEMA_V2: &str = "rsia.host_surface_record.v2";
+pub const RUN_APPLICATION_SCHEMA_V2: &str = "rsia.run_application.v2";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostSurfaceRecordV2 {
+    pub id: String,
+    #[serde(deserialize_with = "deserialize_host_surface_record_v2_schema")]
+    pub schema_version: String,
+    pub manifest: HostSurfaceManifestV2,
+    pub manifest_digest: String,
+    pub source: ReviewedHostSourceEnvelopeV1,
+    pub extracted: Vec<String>,
+    pub extracted_typed: Vec<HostSurfaceDeclarationV2>,
+    pub predecessor_surface_id: Option<String>,
+    pub upgrade_diff: HostSurfaceUpgradeDiffV2,
+}
+
+fn deserialize_host_surface_record_v2_schema<'de, D>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value != HOST_SURFACE_RECORD_SCHEMA_V2 {
+        return Err(serde::de::Error::custom(
+            "unsupported current host surface schema",
+        ));
+    }
+    Ok(value)
+}
+
+/// Source equality validates content only. Actual callers also re-read the
+/// predecessor and require the original Admin content/registered authority.
+pub fn validate_host_record_v2_source(record: &HostSurfaceRecordV2) -> Result<()> {
+    identifier(&record.id)?;
+    if record.schema_version != HOST_SURFACE_RECORD_SCHEMA_V2
+        || record.predecessor_surface_id.as_deref() == Some(record.id.as_str())
+        || record.manifest_digest != fingerprint(&record.manifest)?
+    {
+        return Err(Error::Conflict(
+            "current host surface identity/source differs".into(),
+        ));
+    }
+    if let Some(id) = &record.predecessor_surface_id {
+        identifier(id)?;
+    }
+    evo_core::contract::validate_host_surface_v2_source(
+        &record.manifest,
+        &record.source,
+        &record.extracted,
+        &record.extracted_typed,
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunApplicationSnapshotV2 {
+    pub id: String,
+    #[serde(deserialize_with = "deserialize_run_application_v2_schema")]
+    pub schema_version: String,
+    pub run_id: String,
+    pub profile_id: String,
+    pub pointer_epoch: u64,
+    pub release_id: Option<String>,
+    pub bundle_digest: Option<String>,
+    pub environment_digest: String,
+    pub system_snapshot: SystemSnapshot,
+    pub host_surface_id: String,
+    pub host_surface_digest: String,
+    pub host_capabilities_digest: String,
+    pub host_capabilities: HostCapabilities,
+    pub projection: RunProjection,
+    pub request_material: AppliedRequestMaterial,
+    pub request_digest: String,
+    pub capability_level: CapabilityLevel,
+    pub evolution_enabled: bool,
+}
+
+fn deserialize_run_application_v2_schema<'de, D>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value != RUN_APPLICATION_SCHEMA_V2 {
+        return Err(serde::de::Error::custom(
+            "unsupported current run application schema",
+        ));
+    }
+    Ok(value)
+}
+
+pub(crate) fn validate_run_application_v2_binding(record: &RunApplicationSnapshotV2) -> Result<()> {
+    identifier(&record.run_id)?;
+    identifier(&record.profile_id)?;
+    identifier(&record.host_surface_id)?;
+    validate_digest(
+        &record.request_material.task_input_digest,
+        "task input digest",
+    )?;
+    for capability in record
+        .host_capabilities
+        .available
+        .iter()
+        .chain(&record.host_capabilities.granted)
+    {
+        identifier(capability)?;
+    }
+    if record.schema_version != RUN_APPLICATION_SCHEMA_V2
+        || record.id != format!("run-snapshot-{}", record.run_id)
+        || record.host_capabilities_digest != fingerprint(&record.host_capabilities)?
+        || record.system_snapshot.profile_id != record.profile_id
+        || record.environment_digest != record.system_snapshot.digest()?
+        || record.request_digest != fingerprint(&record.request_material)?
+        || record.request_material.instructions != record.projection.instructions
+        || record.request_material.tools != record.projection.tools
+        || record.request_material.mandatory_context_digest
+            != record.system_snapshot.mandatory_context_digest
+    {
+        return Err(Error::Conflict(
+            "current run source/capability binding differs".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Non-serializable, read-only field view. It cannot stand in for either wire.
+#[derive(Debug, Clone)]
+pub struct RunApplicationView {
+    pub id: String,
+    pub schema_version: String,
+    pub run_id: String,
+    pub profile_id: String,
+    pub pointer_epoch: u64,
+    pub release_id: Option<String>,
+    pub bundle_digest: Option<String>,
+    pub environment_digest: String,
+    pub system_snapshot: SystemSnapshot,
+    pub host_surface_id: String,
+    pub host_surface_digest: String,
+    pub host_capabilities_digest: String,
+    pub projection: RunProjection,
+    pub request_material: AppliedRequestMaterial,
+    pub request_digest: String,
+    pub capability_level: CapabilityLevel,
+    pub evolution_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum RunApplicationWire {
+    Legacy(RunApplicationSnapshot),
+    Current(RunApplicationSnapshotV2),
+}
+
+/// Wire and cached view are constructed together and never exposed mutably.
+/// fingerprint()/Session serialization always see the complete original wire.
+#[derive(Debug, Clone)]
+pub struct LoadedRunApplicationSnapshot {
+    wire: RunApplicationWire,
+    view: RunApplicationView,
+}
+
+impl LoadedRunApplicationSnapshot {
+    fn from_wire(wire: RunApplicationWire) -> Result<Self> {
+        match &wire {
+            RunApplicationWire::Legacy(value) if value.schema_version != RUN_APPLICATION_SCHEMA => {
+                return Err(Error::Invalid(
+                    "unsupported legacy run application schema".into(),
+                ));
+            }
+            RunApplicationWire::Current(value) => validate_run_application_v2_binding(value)?,
+            _ => {}
+        }
+        macro_rules! field_view {
+            ($value:expr) => {{
+                let value = $value;
+                RunApplicationView {
+                    id: value.id.clone(),
+                    schema_version: value.schema_version.clone(),
+                    run_id: value.run_id.clone(),
+                    profile_id: value.profile_id.clone(),
+                    pointer_epoch: value.pointer_epoch,
+                    release_id: value.release_id.clone(),
+                    bundle_digest: value.bundle_digest.clone(),
+                    environment_digest: value.environment_digest.clone(),
+                    system_snapshot: value.system_snapshot.clone(),
+                    host_surface_id: value.host_surface_id.clone(),
+                    host_surface_digest: value.host_surface_digest.clone(),
+                    host_capabilities_digest: value.host_capabilities_digest.clone(),
+                    projection: value.projection.clone(),
+                    request_material: value.request_material.clone(),
+                    request_digest: value.request_digest.clone(),
+                    capability_level: value.capability_level,
+                    evolution_enabled: value.evolution_enabled,
+                }
+            }};
+        }
+        let view = match &wire {
+            RunApplicationWire::Legacy(value) => field_view!(value),
+            RunApplicationWire::Current(value) => field_view!(value),
+        };
+        Ok(Self { wire, view })
+    }
+    pub fn current_v2(&self) -> Option<&RunApplicationSnapshotV2> {
+        match &self.wire {
+            RunApplicationWire::Current(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+impl std::ops::Deref for LoadedRunApplicationSnapshot {
+    type Target = RunApplicationView;
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+
+impl Serialize for LoadedRunApplicationSnapshot {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LoadedRunApplicationSnapshot {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let wire = RunApplicationWire::deserialize(deserializer)?;
+        Self::from_wire(wire).map_err(serde::de::Error::custom)
+    }
+}
 #[derive(Debug, Clone)]
 pub struct PrepareRunRequest {
     pub run_id: String,
@@ -301,86 +543,13 @@ impl ReleaseStore {
                 "candidate id reused with different content".into(),
             ));
         }
-        let binding = crate::formal_authority::resolve_bundle_in_session(
-            session,
-            ctx,
-            &candidate.bundle,
-            &candidate.environment_digest,
-            candidate.revoke_watermark,
-            evo_core::evidence::Purpose::Development,
-        )
-        .await?;
-        validate_candidate_sources(session, ctx, &candidate).await?;
-        crate::compiler::persist_authenticated_bundle(
-            session,
-            ctx,
-            &binding.request_for_search_parent(candidate.bundle.skill.clone()),
-            &candidate.bundle,
-        )
-        .await?;
         if let Some(existing) = existing {
-            crate::formal_authority::bind_candidate_principal_from_binding(
-                session,
-                ctx,
-                binding.binding(),
-                &existing,
-            )
-            .await?;
+            validate_candidate_read_in_session(session, ctx, &existing).await?;
             return Ok(existing);
         }
-        session
-            .put(ctx, "artifact", &candidate.id, ctx.actor(), &candidate)
-            .await?;
-        for source in &candidate.sources {
-            session
-                .put_edge(ctx, "artifact", &candidate.id, &source.kind, &source.id)
-                .await?;
-        }
-        let binding_id = format!(
-            "compiler-binding-{}",
-            fingerprint(&(&candidate.id, &candidate.bundle_digest))?
-        );
-        let binding_record = PersistedCompilerBinding {
-            id: binding_id.clone(),
-            schema_version: "rsia.persisted_compiler_binding.v1".into(),
-            candidate_id: candidate.id.clone(),
-            binding: binding.binding().clone(),
-        };
-        if let Some(old) = session
-            .get::<serde_json::Value>(ctx, "artifact", &binding_id)
-            .await?
-        {
-            if crate::formal_authority::content_digest(&old)?
-                != crate::formal_authority::content_digest(&binding_record)?
-            {
-                return Err(Error::Conflict(
-                    "compiler binding identity collision".into(),
-                ));
-            }
-        } else {
-            session
-                .put(ctx, "artifact", &binding_id, ctx.actor(), &binding_record)
-                .await?;
-            for node in &binding.binding().closure.nodes {
-                session
-                    .put_edge(ctx, "artifact", &binding_id, &node.kind, &node.id)
-                    .await?;
-            }
-        }
-        session
-            .put_edge(ctx, "artifact", &candidate.id, "artifact", &binding_id)
-            .await?;
-        crate::formal_authority::bind_candidate_principal_from_binding(
-            session,
-            ctx,
-            binding.binding(),
-            &candidate,
-        )
-        .await?;
-        session
-            .audit(ctx, "release.candidate.stage", &candidate.id)
-            .await?;
-        Ok(candidate)
+        Err(Error::Conflict(
+            "legacy stage cannot create a new candidate; use Current source-bound staging".into(),
+        ))
     }
 
     pub async fn approve_verified(
@@ -393,14 +562,15 @@ impl ReleaseStore {
         identifier(candidate_id)?;
         identifier(report_id)?;
         let mut session = store.session().await?;
-        let candidate: ReleaseCandidateRecord = session.need(ctx, "artifact", candidate_id).await?;
+        let candidate: ReadCandidate = session.need(ctx, "artifact", candidate_id).await?;
         if candidate.proposer_actor == ctx.actor() {
             return Err(Error::Forbidden);
         }
-        validate_candidate_sources(&mut session, ctx, &candidate).await?;
+        candidate.current()?;
+        validate_read_candidate_sources(&mut session, ctx, &candidate).await?;
         let view = verified_report_view_in_session(ctx, &mut session, report_id).await?;
-        validate_verified_report_identity(&candidate, &view)?;
-        validate_approval_actor(ctx, &candidate, &view)?;
+        validate_read_verified_report_identity(&candidate, &view)?;
+        validate_read_approval_actor(ctx, &candidate, &view)?;
         let pointer = load_pointer(&mut session, ctx, &candidate.profile_id).await?;
         let release_id = format!(
             "release-{}",
@@ -461,7 +631,7 @@ impl ReleaseStore {
         if release.state != PersistentReleaseState::Approved || release.approved_by != ctx.actor() {
             return Err(Error::Forbidden);
         }
-        revalidate_release(&mut session, ctx, &release).await?;
+        revalidate_current_release(&mut session, ctx, &release).await?;
         release.state = PersistentReleaseState::Canary;
         write_release_state(&mut session, ctx, &release).await?;
         session.audit(ctx, "release.canary", release_id).await?;
@@ -481,7 +651,7 @@ impl ReleaseStore {
         if release.state != PersistentReleaseState::Canary || release.approved_by != ctx.actor() {
             return Err(Error::Forbidden);
         }
-        revalidate_release(&mut session, ctx, &release).await?;
+        revalidate_current_release(&mut session, ctx, &release).await?;
         cas_pointer_in_session(
             &mut session,
             ctx,
@@ -562,9 +732,91 @@ impl ReleaseStore {
             session.commit().await?;
             return Ok(existing);
         }
+        // The frozen v1 API has no original source material. Existing,
+        // authenticated records above remain read-only/idempotent; a new
+        // registration must use the source-bound writer instead of trusting
+        // a caller-provided digest.
+        Err(Error::Conflict(
+            "new v1 host surface registration lacks original source; use source-bound registration"
+                .into(),
+        ))
+    }
+
+    /// Admin source-based registration. Classification metadata cannot inject
+    /// extraction/digests/diff or confer host execution/smoke authority.
+    pub async fn register_host_surface_from_source(
+        ctx: &Context,
+        store: &Store,
+        id: &str,
+        source: ReviewedHostSourceEnvelopeV1,
+        registration: HostSurfaceRegistrationV2,
+        predecessor_surface_id: Option<String>,
+    ) -> Result<HostSurfaceRecordV2> {
+        ctx.require(&[Role::Admin])?;
+        identifier(id)?;
+        let (manifest, extracted_typed) = host_surface_v2_from_source(&source, &registration)?;
+        crate::hosts::validate_registerable_host_v2(&manifest.host, &manifest.host_version)?;
+        if predecessor_surface_id.as_deref() == Some(id) {
+            return Err(Error::Conflict("self predecessor".into()));
+        }
+        let mut session = store.session().await?;
+        let predecessor = match predecessor_surface_id.as_deref() {
+            Some(id) => Some(load_host_surface_predecessor_v2(&mut session, ctx, id).await?),
+            None => None,
+        };
+        if predecessor
+            .as_ref()
+            .is_some_and(|previous| previous.host() != manifest.host)
+        {
+            return Err(Error::Conflict(
+                "host surface predecessor belongs to another host".into(),
+            ));
+        }
+        let upgrade_diff = host_surface_upgrade_diff_v2(
+            &manifest,
+            predecessor.as_ref().map(|value| value.manifest()),
+        )?;
+        let record = HostSurfaceRecordV2 {
+            id: id.into(),
+            schema_version: HOST_SURFACE_RECORD_SCHEMA_V2.into(),
+            manifest_digest: fingerprint(&manifest)?,
+            source,
+            extracted: extracted_typed
+                .iter()
+                .map(|item| item.name.clone())
+                .collect(),
+            extracted_typed,
+            manifest,
+            predecessor_surface_id,
+            upgrade_diff,
+        };
+        validate_host_record_v2_source(&record)?;
+        validate_host_surface_v2_predecessor(&record, predecessor.as_ref())?;
+        if let Some(existing) = session
+            .get::<serde_json::Value>(ctx, "artifact", id)
+            .await?
+        {
+            let existing: HostSurfaceRecordV2 = serde_json::from_value(existing).map_err(|_| {
+                Error::Conflict("host surface id reused with different content".into())
+            })?;
+            if fingerprint(&existing)? != fingerprint(&record)? {
+                return Err(Error::Conflict(
+                    "host surface id reused with different content".into(),
+                ));
+            }
+            let existing = validate_host_surface_v2_live_in_session(&mut session, ctx, id).await?;
+            session.commit().await?;
+            return Ok(existing);
+        }
+        // Every new source/typed/upgrade guard above precedes this first DML.
         session
             .put(ctx, "artifact", id, ctx.actor(), &record)
             .await?;
+        if let Some(predecessor_id) = &record.predecessor_surface_id {
+            session
+                .put_edge(ctx, "artifact", id, "artifact", predecessor_id)
+                .await?;
+        }
         crate::formal_authority::attest_content(&mut session, ctx, "artifact", id, &record).await?;
         session.audit(ctx, "host_surface.register", id).await?;
         session.commit().await?;
@@ -575,7 +827,7 @@ impl ReleaseStore {
         ctx: &Context,
         store: &Store,
         request: PrepareRunRequest,
-    ) -> Result<RunApplicationSnapshot> {
+    ) -> Result<LoadedRunApplicationSnapshot> {
         ctx.require(&[Role::Host])?;
         validate_prepare_request(&request)?;
         let snapshot_id = format!("run-snapshot-{}", request.run_id);
@@ -583,7 +835,7 @@ impl ReleaseStore {
         let requested_caps_digest = fingerprint(&request.host_capabilities)?;
         let mut session = store.session().await?;
         if let Some(existing) = session
-            .get::<RunApplicationSnapshot>(ctx, "artifact", &snapshot_id)
+            .get::<LoadedRunApplicationSnapshot>(ctx, "artifact", &snapshot_id)
             .await?
         {
             if existing.profile_id != request.profile_id
@@ -598,27 +850,18 @@ impl ReleaseStore {
                     "run id reused with different frozen inputs".into(),
                 ));
             }
+            // Replays retain their actual wire. Caller capabilities never
+            // upgrade or fill a historical v1 snapshot.
             let existing =
                 Self::validate_run_snapshot_live_in_session(ctx, &mut session, &request.run_id)
                     .await?;
+            require_current_run_source(&mut session, ctx, &existing).await?;
             session.commit().await?;
             return Ok(existing);
         }
-        let surface: HostSurfaceRecord = session
-            .need(ctx, "artifact", &request.host_surface_id)
-            .await?;
-        surface
-            .manifest
-            .validate_against_extraction(&surface.extracted)?;
-        require_body_witness(
-            &mut session,
-            ctx,
-            "artifact",
-            &request.host_surface_id,
-            &surface,
-            Role::Admin,
-        )
-        .await?;
+        let surface =
+            validate_host_surface_v2_live_in_session(&mut session, ctx, &request.host_surface_id)
+                .await?;
         if surface.manifest.host != request.system_snapshot.host_id
             || surface.manifest.host_version != request.system_snapshot.host_version
         {
@@ -639,20 +882,16 @@ impl ReleaseStore {
                 {
                     return Err(Error::Conflict("active release is incompatible".into()));
                 }
-                revalidate_release(&mut session, ctx, &release).await?;
-                let candidate: ReleaseCandidateRecord =
+                revalidate_current_release(&mut session, ctx, &release).await?;
+                let candidate: ReadCandidate =
                     session.need(ctx, "artifact", &release.candidate_id).await?;
-                if !request
-                    .host_capabilities
-                    .allows(&candidate.bundle.skill.required_capabilities)
-                {
-                    return Err(Error::Forbidden);
-                }
-                (
-                    Some(release.id),
-                    Some(release.bundle_digest),
-                    project_run(&candidate.bundle, &request.system_snapshot, true)?,
-                )
+                let projection = project_read_run_surface_v2(
+                    &surface,
+                    &request.host_capabilities,
+                    &candidate.bundle,
+                    &request.system_snapshot,
+                )?;
+                (Some(release.id), Some(release.bundle_digest), projection)
             } else {
                 (None, None, baseline_projection(&request.system_snapshot))
             }
@@ -665,9 +904,9 @@ impl ReleaseStore {
             instructions: projection.instructions.clone(),
             tools: projection.tools.clone(),
         };
-        let record = RunApplicationSnapshot {
+        let current = RunApplicationSnapshotV2 {
             id: snapshot_id.clone(),
-            schema_version: RUN_APPLICATION_SCHEMA.into(),
+            schema_version: RUN_APPLICATION_SCHEMA_V2.into(),
             run_id: request.run_id,
             profile_id: request.profile_id,
             pointer_epoch: pointer.epoch,
@@ -678,12 +917,14 @@ impl ReleaseStore {
             host_surface_id: surface.id,
             host_surface_digest: surface.manifest_digest,
             host_capabilities_digest: caps_digest,
+            host_capabilities: request.host_capabilities,
             projection,
             request_digest: fingerprint(&material)?,
             request_material: material,
             capability_level: request.capability_level,
             evolution_enabled: request.evolution_enabled,
         };
+        let record = LoadedRunApplicationSnapshot::from_wire(RunApplicationWire::Current(current))?;
         session
             .put(ctx, "artifact", &snapshot_id, ctx.actor(), &record)
             .await?;
@@ -692,6 +933,15 @@ impl ReleaseStore {
                 .put_edge(ctx, "artifact", &snapshot_id, "release", release_id)
                 .await?;
         }
+        session
+            .put_edge(
+                ctx,
+                "artifact",
+                &snapshot_id,
+                "artifact",
+                &record.host_surface_id,
+            )
+            .await?;
         crate::formal_authority::attest_content(
             &mut session,
             ctx,
@@ -711,7 +961,7 @@ impl ReleaseStore {
         ctx: &Context,
         store: &Store,
         run_id: &str,
-    ) -> Result<RunApplicationSnapshot> {
+    ) -> Result<LoadedRunApplicationSnapshot> {
         Self::validate_run_snapshot_live(ctx, store, run_id).await
     }
 
@@ -719,7 +969,7 @@ impl ReleaseStore {
         ctx: &Context,
         store: &Store,
         run_id: &str,
-    ) -> Result<RunApplicationSnapshot> {
+    ) -> Result<LoadedRunApplicationSnapshot> {
         let mut session = store.session().await?;
         let snapshot =
             Self::validate_run_snapshot_live_in_session(ctx, &mut session, run_id).await?;
@@ -731,11 +981,12 @@ impl ReleaseStore {
         ctx: &Context,
         session: &mut Session,
         run_id: &str,
-    ) -> Result<RunApplicationSnapshot> {
+    ) -> Result<LoadedRunApplicationSnapshot> {
         ctx.require(&[Role::Host, Role::Admin])?;
         identifier(run_id)?;
         let snapshot_id = format!("run-snapshot-{run_id}");
-        let snapshot: RunApplicationSnapshot = session.need(ctx, "artifact", &snapshot_id).await?;
+        let snapshot: LoadedRunApplicationSnapshot =
+            session.need(ctx, "artifact", &snapshot_id).await?;
         require_body_witness(
             session,
             ctx,
@@ -745,8 +996,7 @@ impl ReleaseStore {
             Role::Host,
         )
         .await?;
-        if snapshot.schema_version != RUN_APPLICATION_SCHEMA
-            || snapshot.id != snapshot_id
+        if snapshot.id != snapshot_id
             || snapshot.run_id != run_id
             || snapshot.system_snapshot.profile_id != snapshot.profile_id
             || snapshot.environment_digest != snapshot.system_snapshot.digest()?
@@ -760,18 +1010,45 @@ impl ReleaseStore {
                 "restored run application binding differs".into(),
             ));
         }
-        let surface: HostSurfaceRecord = session
-            .need(ctx, "artifact", &snapshot.host_surface_id)
-            .await?;
-        require_body_witness(session, ctx, "artifact", &surface.id, &surface, Role::Admin).await?;
-        surface
-            .manifest
-            .validate_against_extraction(&surface.extracted)?;
-        if surface.manifest_digest != snapshot.host_surface_digest
-            || surface.manifest_digest != fingerprint(&surface.manifest)?
-        {
-            return Err(Error::Conflict("host surface changed".into()));
-        }
+        let current_surface = match &snapshot.wire {
+            RunApplicationWire::Legacy(_) => {
+                // Original v1 historical path: no new fields, fabricated raw
+                // capabilities, source upgrade or current-wire fallback.
+                let surface: HostSurfaceRecord = session
+                    .need(ctx, "artifact", &snapshot.host_surface_id)
+                    .await?;
+                require_body_witness(session, ctx, "artifact", &surface.id, &surface, Role::Admin)
+                    .await?;
+                surface
+                    .manifest
+                    .validate_against_extraction(&surface.extracted)?;
+                if surface.manifest_digest != snapshot.host_surface_digest
+                    || surface.manifest_digest != fingerprint(&surface.manifest)?
+                {
+                    return Err(Error::Conflict("host surface changed".into()));
+                }
+                None
+            }
+            RunApplicationWire::Current(current) => {
+                validate_run_application_v2_binding(current)?;
+                let surface = validate_host_surface_v2_live_in_session(
+                    session,
+                    ctx,
+                    &snapshot.host_surface_id,
+                )
+                .await?;
+                if surface.manifest_digest != snapshot.host_surface_digest
+                    || surface.manifest.host != snapshot.system_snapshot.host_id
+                    || surface.manifest.host_version != snapshot.system_snapshot.host_version
+                    || (!snapshot.evolution_enabled && snapshot.release_id.is_some())
+                {
+                    return Err(Error::Conflict(
+                        "current host surface/run source changed".into(),
+                    ));
+                }
+                Some(surface)
+            }
+        };
         if let Some(release_id) = &snapshot.release_id {
             let release: PersistentRelease = session.need(ctx, "release", release_id).await?;
             if !matches!(
@@ -783,7 +1060,7 @@ impl ReleaseStore {
             {
                 return Err(Error::Forbidden);
             }
-            let candidate: ReleaseCandidateRecord =
+            let candidate: ReadCandidate =
                 session.need(ctx, "artifact", &release.candidate_id).await?;
             if candidate.bundle_digest != release.bundle_digest
                 || candidate.environment_digest != release.environment_digest
@@ -792,10 +1069,34 @@ impl ReleaseStore {
                     "run release candidate identity changed".into(),
                 ));
             }
-            revalidate_release(session, ctx, &release).await?;
+            if candidate.is_current() {
+                revalidate_current_release(session, ctx, &release).await?;
+            } else {
+                revalidate_release(session, ctx, &release).await?;
+            }
+            if let (Some(surface), Some(current)) = (&current_surface, snapshot.current_v2()) {
+                let projection = project_read_run_surface_v2(
+                    surface,
+                    &current.host_capabilities,
+                    &candidate.bundle,
+                    &snapshot.system_snapshot,
+                )?;
+                if fingerprint(&projection)? != fingerprint(&snapshot.projection)? {
+                    return Err(Error::Conflict(
+                        "current projection/capability intersection changed".into(),
+                    ));
+                }
+            }
         } else if snapshot.bundle_digest.is_some() {
             return Err(Error::Conflict(
                 "run snapshot has a bundle without an active release".into(),
+            ));
+        } else if current_surface.is_some()
+            && fingerprint(&snapshot.projection)?
+                != fingerprint(&baseline_projection(&snapshot.system_snapshot))?
+        {
+            return Err(Error::Conflict(
+                "current baseline projection changed".into(),
             ));
         }
         Ok(snapshot)
@@ -812,6 +1113,15 @@ impl ReleaseStore {
         let mut session = store.session().await?;
         let snapshot =
             Self::validate_run_snapshot_live_in_session(ctx, &mut session, run_id).await?;
+        // Historical snapshots remain readable and replayable, but cannot
+        // authorize a new application record, including zero-skill baselines
+        // whose release_id is None.
+        if snapshot.current_v2().is_none() {
+            return Err(Error::Conflict(
+                "legacy run snapshot cannot authorize a new applied request".into(),
+            ));
+        }
+        require_current_run_source(&mut session, ctx, &snapshot).await?;
         let actual_request_digest = fingerprint(&evidence.actual_request_material)?;
         if actual_request_digest != snapshot.request_digest
             || evidence.actual_request_material != snapshot.request_material
@@ -1017,7 +1327,7 @@ impl ReleaseStore {
                 "rollback target is not a compatible prior approved release".into(),
             ));
         }
-        revalidate_release(&mut session, ctx, &target).await?;
+        revalidate_current_release(&mut session, ctx, &target).await?;
         cas_pointer_in_session(
             &mut session,
             ctx,
@@ -1167,6 +1477,7 @@ fn validate_verified_report_identity(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_approval_actor(
     ctx: &Context,
     candidate: &ReleaseCandidateRecord,
@@ -1498,6 +1809,169 @@ async fn write_pointer_content(
         .await?;
     crate::formal_authority::write_content_witness(session, ctx, "pointer", &pointer.id, pointer)
         .await
+}
+
+enum StoredHostSurfacePredecessorV2 {
+    Legacy(Box<HostSurfaceRecord>),
+    Current(Box<HostSurfaceRecordV2>),
+}
+
+impl StoredHostSurfacePredecessorV2 {
+    fn manifest(&self) -> HostSurfacePredecessorV2<'_> {
+        match self {
+            Self::Legacy(value) => HostSurfacePredecessorV2::Legacy(&value.manifest),
+            Self::Current(value) => HostSurfacePredecessorV2::Current(&value.manifest),
+        }
+    }
+    fn host(&self) -> &str {
+        match self {
+            Self::Legacy(value) => &value.manifest.host,
+            Self::Current(value) => &value.manifest.host,
+        }
+    }
+}
+
+fn validate_host_surface_v2_predecessor(
+    record: &HostSurfaceRecordV2,
+    predecessor: Option<&StoredHostSurfacePredecessorV2>,
+) -> Result<()> {
+    if predecessor.is_some_and(|previous| previous.host() != record.manifest.host) {
+        return Err(Error::Conflict(
+            "host surface predecessor belongs to another host".into(),
+        ));
+    }
+    let diff =
+        host_surface_upgrade_diff_v2(&record.manifest, predecessor.map(|value| value.manifest()))?;
+    if record.upgrade_diff != diff {
+        return Err(Error::Conflict(
+            "host surface upgrade diff differs from its predecessor".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Iterative exact-id chain re-read: no fabricated predecessor or depth quota.
+/// A v1 terminal remains its original wire; it supplies no typed/default facts.
+pub(crate) async fn validate_host_surface_v2_live_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    id: &str,
+) -> Result<HostSurfaceRecordV2> {
+    identifier(id)?;
+    let mut cursor = id.to_owned();
+    let mut visited = BTreeSet::new();
+    let mut records = Vec::new();
+    let mut predecessor = None;
+    loop {
+        if !visited.insert(cursor.clone()) {
+            return Err(Error::Conflict("cyclic host surface predecessor".into()));
+        }
+        let body: serde_json::Value = session.need(ctx, "artifact", &cursor).await?;
+        match body
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(HOST_SURFACE_RECORD_SCHEMA_V2) => {
+                let record: HostSurfaceRecordV2 = serde_json::from_value(body)
+                    .map_err(|_| Error::Invalid("invalid host surface v2".into()))?;
+                if record.id != cursor {
+                    return Err(Error::Conflict("host surface id alias".into()));
+                }
+                validate_host_record_v2_source(&record)?;
+                crate::hosts::validate_registerable_host_v2(
+                    &record.manifest.host,
+                    &record.manifest.host_version,
+                )?;
+                require_body_witness(session, ctx, "artifact", &cursor, &record, Role::Admin)
+                    .await?;
+                let next = record.predecessor_surface_id.clone();
+                records.push(record);
+                match next {
+                    Some(next) => cursor = next,
+                    None => break,
+                }
+            }
+            Some(HOST_SURFACE_RECORD_SCHEMA) if !records.is_empty() => {
+                let record: HostSurfaceRecord = serde_json::from_value(body)
+                    .map_err(|_| Error::Invalid("invalid legacy host surface".into()))?;
+                if record.id != cursor || record.manifest_digest != fingerprint(&record.manifest)? {
+                    return Err(Error::Conflict(
+                        "legacy predecessor identity differs".into(),
+                    ));
+                }
+                record
+                    .manifest
+                    .validate_against_extraction(&record.extracted)?;
+                require_body_witness(session, ctx, "artifact", &cursor, &record, Role::Admin)
+                    .await?;
+                predecessor = Some(StoredHostSurfacePredecessorV2::Legacy(Box::new(record)));
+                break;
+            }
+            Some(HOST_SURFACE_RECORD_SCHEMA) => {
+                // Keep the original malformed-v1 diagnostic before the new-use
+                // boundary. A healthy frozen v1 remains audit-only material.
+                let record: HostSurfaceRecord = serde_json::from_value(body)
+                    .map_err(|_| Error::Invalid("invalid legacy host surface".into()))?;
+                record
+                    .manifest
+                    .validate_against_extraction(&record.extracted)?;
+                if record.id != cursor || record.manifest_digest != fingerprint(&record.manifest)? {
+                    return Err(Error::Conflict(
+                        "legacy predecessor identity differs".into(),
+                    ));
+                }
+                return Err(Error::Invalid(
+                    "current prepare requires a source-bound host surface v2".into(),
+                ));
+            }
+            _ => {
+                return Err(Error::Invalid(
+                    "current prepare requires a source-bound host surface v2".into(),
+                ));
+            }
+        }
+    }
+    // Consume the chain from the oldest source towards the requested current record.
+    for record in records.into_iter().rev() {
+        validate_host_surface_v2_predecessor(&record, predecessor.as_ref())?;
+        predecessor = Some(StoredHostSurfacePredecessorV2::Current(Box::new(record)));
+    }
+    match predecessor {
+        Some(StoredHostSurfacePredecessorV2::Current(record)) => Ok(*record),
+        _ => Err(Error::Invalid("missing current host surface".into())),
+    }
+}
+
+async fn load_host_surface_predecessor_v2(
+    session: &mut Session,
+    ctx: &Context,
+    id: &str,
+) -> Result<StoredHostSurfacePredecessorV2> {
+    identifier(id)?;
+    let body: serde_json::Value = session.need(ctx, "artifact", id).await?;
+    match body
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(HOST_SURFACE_RECORD_SCHEMA_V2) => Ok(StoredHostSurfacePredecessorV2::Current(
+            Box::new(validate_host_surface_v2_live_in_session(session, ctx, id).await?),
+        )),
+        Some(HOST_SURFACE_RECORD_SCHEMA) => {
+            let record: HostSurfaceRecord = serde_json::from_value(body)
+                .map_err(|_| Error::Invalid("invalid legacy predecessor".into()))?;
+            if record.id != id || record.manifest_digest != fingerprint(&record.manifest)? {
+                return Err(Error::Conflict(
+                    "legacy predecessor identity differs".into(),
+                ));
+            }
+            record
+                .manifest
+                .validate_against_extraction(&record.extracted)?;
+            require_body_witness(session, ctx, "artifact", id, &record, Role::Admin).await?;
+            Ok(StoredHostSurfacePredecessorV2::Legacy(Box::new(record)))
+        }
+        _ => Err(Error::Invalid("unsupported predecessor schema".into())),
+    }
 }
 
 fn baseline_projection(snapshot: &SystemSnapshot) -> RunProjection {
@@ -2013,4 +2487,632 @@ mod tests {
         session.commit().await.unwrap();
         store.close().await;
     }
+}
+
+pub const RELEASE_CANDIDATE_SCHEMA_V2: &str = "rsia.release_candidate.v2";
+pub const STORED_BINDING_SCHEMA_V2: &str = "rsia.persisted_compiler_binding.v2";
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum StageRequestWire {
+    Current(CurrentStageBundleRequest),
+    Legacy(StageBundleRequest),
+}
+impl CurrentStageBundleRequest {
+    pub(crate) fn candidate(&self) -> Result<CurrentReleaseCandidateRecord> {
+        Ok(CurrentReleaseCandidateRecord {
+            id: self.candidate_id.clone(),
+            schema_version: RELEASE_CANDIDATE_SCHEMA_V2.into(),
+            bundle: self.bundle.clone(),
+            bundle_digest: self.bundle.digest.clone(),
+            environment_digest: self.environment_digest.clone(),
+            profile_id: self.bundle.profile_id.clone(),
+            parent_digest: self.bundle.parent_digest.clone(),
+            proposer_actor: self.proposer_actor.clone(),
+            sources: canonical_sources(self.sources.clone())?,
+            revoke_watermark: self.revoke_watermark,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentStageBundleRequest {
+    pub candidate_id: String,
+    pub bundle: evo_core::contract::ResolvedBundleV3,
+    pub environment_digest: String,
+    pub proposer_actor: String,
+    pub sources: Vec<TypedSourceRef>,
+    pub revoke_watermark: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentReleaseCandidateRecord {
+    pub id: String,
+    pub schema_version: String,
+    pub bundle: evo_core::contract::ResolvedBundleV3,
+    pub bundle_digest: String,
+    pub environment_digest: String,
+    pub profile_id: String,
+    pub parent_digest: String,
+    pub proposer_actor: String,
+    pub sources: Vec<TypedSourceRef>,
+    pub revoke_watermark: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CurrentPersistedCompilerBinding {
+    pub id: String,
+    pub schema_version: String,
+    pub candidate_id: String,
+    pub binding: crate::formal_authority::CurrentFormalCompilerInputBinding,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ReadCandidateWire {
+    Current(CurrentReleaseCandidateRecord),
+    Legacy(ReleaseCandidateRecord),
+}
+/// Immutable view only; it has no Serialize or authority constructor.
+#[derive(Debug, Clone)]
+pub struct ReadCandidateView {
+    pub id: String,
+    pub schema_version: String,
+    pub bundle: crate::compiler::ReadBundle,
+    pub bundle_digest: String,
+    pub environment_digest: String,
+    pub profile_id: String,
+    pub parent_digest: String,
+    pub proposer_actor: String,
+    pub sources: Vec<TypedSourceRef>,
+    pub revoke_watermark: u64,
+}
+#[derive(Debug, Clone)]
+pub struct ReadCandidate {
+    wire: Box<ReadCandidateWire>,
+    view: Box<ReadCandidateView>,
+}
+impl ReadCandidate {
+    fn from_wire(wire: ReadCandidateWire) -> Result<Self> {
+        let view = match &wire {
+            ReadCandidateWire::Current(record) => {
+                if record.schema_version != RELEASE_CANDIDATE_SCHEMA_V2 {
+                    return Err(Error::Invalid(
+                        "unsupported current ReadCandidate schema".into(),
+                    ));
+                }
+                ReadCandidateView {
+                    id: record.id.clone(),
+                    schema_version: record.schema_version.clone(),
+                    bundle: crate::compiler::ReadBundle::from_current(record.bundle.clone())?,
+                    bundle_digest: record.bundle_digest.clone(),
+                    environment_digest: record.environment_digest.clone(),
+                    profile_id: record.profile_id.clone(),
+                    parent_digest: record.parent_digest.clone(),
+                    proposer_actor: record.proposer_actor.clone(),
+                    sources: record.sources.clone(),
+                    revoke_watermark: record.revoke_watermark,
+                }
+            }
+            ReadCandidateWire::Legacy(record) => {
+                if record.schema_version != RELEASE_CANDIDATE_SCHEMA {
+                    return Err(Error::Invalid(
+                        "unsupported legacy ReadCandidate schema".into(),
+                    ));
+                }
+                ReadCandidateView {
+                    id: record.id.clone(),
+                    schema_version: record.schema_version.clone(),
+                    bundle: crate::compiler::ReadBundle::from_legacy(record.bundle.clone())?,
+                    bundle_digest: record.bundle_digest.clone(),
+                    environment_digest: record.environment_digest.clone(),
+                    profile_id: record.profile_id.clone(),
+                    parent_digest: record.parent_digest.clone(),
+                    proposer_actor: record.proposer_actor.clone(),
+                    sources: record.sources.clone(),
+                    revoke_watermark: record.revoke_watermark,
+                }
+            }
+        };
+        let value = Self {
+            wire: Box::new(wire),
+            view: Box::new(view),
+        };
+
+        Ok(value)
+    }
+    pub(crate) fn from_current(record: CurrentReleaseCandidateRecord) -> Result<Self> {
+        Self::from_wire(ReadCandidateWire::Current(record))
+    }
+    pub(crate) fn is_current(&self) -> bool {
+        matches!(self.wire.as_ref(), ReadCandidateWire::Current(_))
+    }
+
+    pub(crate) fn validate_content(&self) -> Result<()> {
+        identifier(&self.id)?;
+        identifier(&self.profile_id)?;
+        identifier(&self.proposer_actor)?;
+        validate_digest(&self.environment_digest, "environment_digest")?;
+        validate_digest(&self.bundle_digest, "bundle_digest")?;
+        validate_digest(&self.parent_digest, "parent_digest")?;
+        self.bundle.validate_identity()?;
+        if self.bundle_digest != self.bundle.digest
+            || self.profile_id != self.bundle.profile_id
+            || self.parent_digest != self.bundle.parent_digest
+            || self.sources.is_empty()
+            || canonical_sources(self.sources.clone())? != self.sources
+        {
+            return Err(Error::Conflict(
+                "release candidate identity is incomplete or noncanonical".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn current(&self) -> Result<&CurrentReleaseCandidateRecord> {
+        self.validate_content()?;
+        match self.wire.as_ref() {
+            ReadCandidateWire::Current(record) => Ok(record),
+            ReadCandidateWire::Legacy(_) => Err(Error::Conflict(
+                "legacy candidate is not Current input".into(),
+            )),
+        }
+    }
+}
+impl std::ops::Deref for ReadCandidate {
+    type Target = ReadCandidateView;
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+impl Serialize for ReadCandidate {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self.wire.as_ref() {
+            ReadCandidateWire::Current(record) => record.serialize(serializer),
+            ReadCandidateWire::Legacy(record) => record.serialize(serializer),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for ReadCandidate {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let wire = ReadCandidateWire::deserialize(deserializer)?;
+        Self::from_wire(wire).map_err(serde::de::Error::custom)
+    }
+}
+
+impl ReleaseStore {
+    pub async fn stage_current_bundle(
+        ctx: &Context,
+        store: &Store,
+        request: CurrentStageBundleRequest,
+    ) -> Result<CurrentReleaseCandidateRecord> {
+        let mut session = store.session().await?;
+        let candidate = Self::stage_current_bundle_in_session(ctx, &mut session, request).await?;
+        session.commit().await?;
+        Ok(candidate)
+    }
+    pub async fn stage_current_bundle_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        request: CurrentStageBundleRequest,
+    ) -> Result<CurrentReleaseCandidateRecord> {
+        ctx.require(&[Role::Worker, Role::Admin])?;
+        validate_current_stage_request(ctx, &request)?;
+        let candidate = CurrentReleaseCandidateRecord {
+            id: request.candidate_id,
+            schema_version: RELEASE_CANDIDATE_SCHEMA_V2.into(),
+            bundle_digest: request.bundle.digest.clone(),
+            environment_digest: request.environment_digest,
+            profile_id: request.bundle.profile_id.clone(),
+            parent_digest: request.bundle.parent_digest.clone(),
+            proposer_actor: request.proposer_actor,
+            sources: canonical_sources(request.sources)?,
+            revoke_watermark: request.revoke_watermark,
+            bundle: request.bundle,
+        };
+        let existing = session
+            .get::<ReadCandidate>(ctx, "artifact", &candidate.id)
+            .await?;
+        if let Some(existing) = &existing {
+            existing.validate_content()?;
+            if existing.id != candidate.id {
+                return Err(Error::Conflict(
+                    "stored candidate physical identity differs".into(),
+                ));
+            }
+        }
+        if let Some(existing) = &existing
+            && (!existing.is_current() || fingerprint(&existing)? != fingerprint(&candidate)?)
+        {
+            return Err(Error::Conflict(
+                "candidate id reused with different content".into(),
+            ));
+        }
+        let binding = crate::formal_authority::resolve_current_bundle_in_session(
+            session,
+            ctx,
+            &candidate.bundle,
+            &candidate.environment_digest,
+            candidate.revoke_watermark,
+            evo_core::evidence::Purpose::Development,
+        )
+        .await?;
+        validate_current_candidate_sources(session, ctx, &candidate).await?;
+        crate::formal_authority::preflight_current_candidate_principal(
+            session,
+            ctx,
+            binding.binding(),
+            &candidate,
+        )
+        .await?;
+        crate::compiler::preflight_current_authenticated_bundle(
+            session,
+            ctx,
+            &binding.request_for_search_parent(candidate.bundle.skill.clone()),
+            &candidate.bundle,
+        )
+        .await?;
+        let preflight_binding_id = format!(
+            "compiler-binding-{}",
+            fingerprint(&(&candidate.id, &candidate.bundle_digest))?
+        );
+        let preflight_binding = CurrentPersistedCompilerBinding {
+            id: preflight_binding_id.clone(),
+            schema_version: STORED_BINDING_SCHEMA_V2.into(),
+            candidate_id: candidate.id.clone(),
+            binding: binding.binding().clone(),
+        };
+        if let Some(old) = session
+            .get::<serde_json::Value>(ctx, "artifact", &preflight_binding_id)
+            .await?
+            && crate::formal_authority::content_digest(&old)?
+                != crate::formal_authority::content_digest(&preflight_binding)?
+        {
+            return Err(Error::Conflict(
+                "compiler binding identity collision".into(),
+            ));
+        }
+
+        crate::compiler::persist_current_authenticated_bundle(
+            session,
+            ctx,
+            &binding.request_for_search_parent(candidate.bundle.skill.clone()),
+            &candidate.bundle,
+        )
+        .await?;
+        if let Some(existing) = existing {
+            let existing = existing.current()?.clone();
+            crate::formal_authority::bind_current_candidate_principal_from_binding(
+                session,
+                ctx,
+                binding.binding(),
+                &existing,
+            )
+            .await?;
+            return Ok(existing);
+        }
+        session
+            .put(ctx, "artifact", &candidate.id, ctx.actor(), &candidate)
+            .await?;
+        for source in &candidate.sources {
+            session
+                .put_edge(ctx, "artifact", &candidate.id, &source.kind, &source.id)
+                .await?;
+        }
+        session
+            .put_edge(
+                ctx,
+                "artifact",
+                &candidate.id,
+                "artifact",
+                &format!("formal-bundle-{}", candidate.bundle_digest),
+            )
+            .await?;
+
+        let binding_id = format!(
+            "compiler-binding-{}",
+            fingerprint(&(&candidate.id, &candidate.bundle_digest))?
+        );
+        let binding_record = CurrentPersistedCompilerBinding {
+            id: binding_id.clone(),
+            schema_version: STORED_BINDING_SCHEMA_V2.into(),
+            candidate_id: candidate.id.clone(),
+            binding: binding.binding().clone(),
+        };
+        if let Some(old) = session
+            .get::<serde_json::Value>(ctx, "artifact", &binding_id)
+            .await?
+        {
+            if crate::formal_authority::content_digest(&old)?
+                != crate::formal_authority::content_digest(&binding_record)?
+            {
+                return Err(Error::Conflict(
+                    "compiler binding identity collision".into(),
+                ));
+            }
+        } else {
+            session
+                .put(ctx, "artifact", &binding_id, ctx.actor(), &binding_record)
+                .await?;
+            for node in &binding.binding().closure.nodes {
+                session
+                    .put_edge(ctx, "artifact", &binding_id, &node.kind, &node.id)
+                    .await?;
+            }
+        }
+        session
+            .put_edge(ctx, "artifact", &candidate.id, "artifact", &binding_id)
+            .await?;
+        crate::formal_authority::bind_current_candidate_principal_from_binding(
+            session,
+            ctx,
+            binding.binding(),
+            &candidate,
+        )
+        .await?;
+        session
+            .audit(ctx, "release.candidate.stage", &candidate.id)
+            .await?;
+        Ok(candidate)
+    }
+}
+fn validate_current_stage_request(
+    ctx: &Context,
+    request: &CurrentStageBundleRequest,
+) -> Result<()> {
+    identifier(&request.candidate_id)?;
+    identifier(&request.proposer_actor)?;
+    if request.proposer_actor != ctx.actor() {
+        return Err(Error::Forbidden);
+    }
+    validate_digest(&request.environment_digest, "environment_digest")?;
+    validate_current_bundle_identity(&request.bundle)?;
+    crate::formal_authority::require_builtin_parent_strategy(&request.bundle.improver)?;
+    if request.sources.is_empty() {
+        return Err(Error::Invalid(
+            "release candidate requires source closure".into(),
+        ));
+    }
+    Ok(())
+}
+async fn validate_current_candidate_sources(
+    session: &mut Session,
+    ctx: &Context,
+    candidate: &CurrentReleaseCandidateRecord,
+) -> Result<()> {
+    let ids = candidate
+        .sources
+        .iter()
+        .map(|source| source.id.clone())
+        .collect::<Vec<_>>();
+    validate_stored_sources(session, ctx, &ids, candidate.revoke_watermark).await?;
+    for source in &candidate.sources {
+        let authority = load_stored_source(session, ctx, &source.id).await?;
+        if authority.trace.source_digest != source.content_digest {
+            return Err(Error::Conflict("source content digest changed".into()));
+        }
+    }
+    Ok(())
+}
+pub(crate) async fn validate_current_candidate_read_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    candidate: &CurrentReleaseCandidateRecord,
+) -> Result<()> {
+    if candidate.schema_version != RELEASE_CANDIDATE_SCHEMA_V2 {
+        return Err(Error::Invalid(
+            "unsupported release candidate schema".into(),
+        ));
+    }
+    identifier(&candidate.id)?;
+    identifier(&candidate.profile_id)?;
+    identifier(&candidate.proposer_actor)?;
+    validate_digest(&candidate.environment_digest, "environment_digest")?;
+    validate_digest(&candidate.bundle_digest, "bundle_digest")?;
+    validate_digest(&candidate.parent_digest, "parent_digest")?;
+    validate_current_bundle_identity(&candidate.bundle)?;
+    crate::formal_authority::require_builtin_parent_strategy(&candidate.bundle.improver)?;
+    if candidate.bundle_digest != candidate.bundle.digest
+        || candidate.profile_id != candidate.bundle.profile_id
+        || candidate.parent_digest != candidate.bundle.parent_digest
+        || candidate.sources.is_empty()
+        || canonical_sources(candidate.sources.clone())? != candidate.sources
+    {
+        return Err(Error::Conflict(
+            "release candidate identity is incomplete or noncanonical".into(),
+        ));
+    }
+    validate_current_candidate_sources(session, ctx, candidate).await
+}
+
+fn validate_current_bundle_identity(bundle: &evo_core::contract::ResolvedBundleV3) -> Result<()> {
+    if bundle.schema_version != evo_core::contract::BUNDLE_SCHEMA_V3
+        || bundle.compiler_version != evo_core::contract::BUNDLE_COMPILER_VERSION_V3
+        || evo_core::contract::resolved_bundle_digest_v3(bundle)? != bundle.digest
+    {
+        return Err(Error::Conflict(
+            "Current resolved bundle identity differs".into(),
+        ));
+    }
+    identifier(&bundle.profile_id)?;
+    bundle.skill.validate()?;
+    bundle.improver.validate()?;
+    Ok(())
+}
+pub(crate) async fn validate_read_candidate_in_session(
+    s: &mut Session,
+    ctx: &Context,
+    candidate: &ReadCandidate,
+) -> Result<()> {
+    match candidate.wire.as_ref() {
+        ReadCandidateWire::Current(record) => {
+            validate_current_candidate_read_in_session(s, ctx, record).await
+        }
+        ReadCandidateWire::Legacy(record) => {
+            validate_candidate_read_in_session(s, ctx, record).await
+        }
+    }
+}
+
+fn validate_read_verified_report_identity(
+    candidate: &ReadCandidate,
+    view: &crate::streaming_evaluator::VerifiedFormalReportView,
+) -> Result<()> {
+    if view.variant != VerifiedReportVariant::CompleteBatch
+        || !matches!(view.verdict, Some(Verdict::Improved | Verdict::Noninferior))
+        || view.anchor_status != AnchorEvidenceStatus::CompletePassedStoredClosure
+        || view.anchor_evidence_digest.is_none()
+        || view.resource_evidence_digest.is_none()
+        || view.evidence_scope != EvaluationEvidenceScope::RegisteredExternalHost
+        || view.cost_evidence_scope != Some(CostEvidenceScope::CompleteEpisodeRoot)
+        || view.dependency_status != DependencyEvidenceStatus::CompleteTypedContentClosure
+        || !view.promotion_eligible
+    {
+        return Err(Error::Forbidden);
+    }
+    if view.candidate_digest != candidate.id
+        || view.candidate_bundle_digest != candidate.bundle_digest
+        || view.baseline_parent_digest != candidate.parent_digest
+        || view.environment_digest != candidate.environment_digest
+        || view.proposer_actor != candidate.proposer_actor
+    {
+        return Err(Error::Conflict(
+            "verified report does not match release candidate".into(),
+        ));
+    }
+    let watermark = view
+        .revoke_watermark
+        .as_ref()
+        .and_then(|(seq, _)| u64::try_from(*seq).ok());
+    if watermark != Some(candidate.revoke_watermark) {
+        return Err(Error::Conflict("report revoke watermark mismatch".into()));
+    }
+    Ok(())
+}
+fn validate_read_approval_actor(
+    ctx: &Context,
+    candidate: &ReadCandidate,
+    view: &crate::streaming_evaluator::VerifiedFormalReportView,
+) -> Result<()> {
+    if view.approver_actor != ctx.actor()
+        || ctx.actor() == candidate.proposer_actor
+        || ctx.actor() == view.evaluator_actor
+    {
+        return Err(Error::Forbidden);
+    }
+    Ok(())
+}
+async fn validate_read_candidate_sources(
+    session: &mut Session,
+    ctx: &Context,
+    candidate: &ReadCandidate,
+) -> Result<()> {
+    let ids = candidate
+        .sources
+        .iter()
+        .map(|source| source.id.clone())
+        .collect::<Vec<_>>();
+    validate_stored_sources(session, ctx, &ids, candidate.revoke_watermark).await?;
+    for source in &candidate.sources {
+        let authority = load_stored_source(session, ctx, &source.id).await?;
+        if authority.trace.source_digest != source.content_digest {
+            return Err(Error::Conflict("source content digest changed".into()));
+        }
+    }
+    Ok(())
+}
+fn validate_read_persisted_approval_binding(
+    release: &PersistentRelease,
+    candidate: &ReadCandidate,
+) -> Result<()> {
+    identifier(&release.report_id)?;
+    validate_digest(&release.report_digest, "release report digest")?;
+    if candidate.id != release.candidate_id
+        || candidate.bundle_digest != release.bundle_digest
+        || candidate.environment_digest != release.environment_digest
+        || candidate.parent_digest != release.parent_digest
+        || candidate.proposer_actor != release.proposer_actor
+        || release.approved_by == release.proposer_actor
+        || release.approved_by == release.evaluator_actor
+    {
+        return Err(Error::Conflict(
+            "stored release approval binding is inconsistent".into(),
+        ));
+    }
+    Ok(())
+}
+fn validate_read_stored_release_identity(
+    release: &PersistentRelease,
+    candidate: &ReadCandidate,
+    view: &crate::streaming_evaluator::VerifiedFormalReportView,
+) -> Result<()> {
+    if view.report_digest != release.report_digest
+        || candidate.bundle_digest != release.bundle_digest
+        || candidate.environment_digest != release.environment_digest
+        || release.proposer_actor != view.proposer_actor
+        || release.evaluator_actor != view.evaluator_actor
+        || release.approved_by != view.approver_actor
+        || release.approved_by == release.proposer_actor
+        || release.approved_by == release.evaluator_actor
+    {
+        return Err(Error::Conflict(
+            "release evidence changed after approval".into(),
+        ));
+    }
+    Ok(())
+}
+async fn revalidate_current_release(
+    session: &mut Session,
+    ctx: &Context,
+    release: &PersistentRelease,
+) -> Result<()> {
+    require_body_witness(session, ctx, "release", &release.id, release, Role::Admin).await?;
+    let candidate: ReadCandidate = session.need(ctx, "artifact", &release.candidate_id).await?;
+    candidate.current()?;
+    validate_read_candidate_sources(session, ctx, &candidate).await?;
+    validate_read_persisted_approval_binding(release, &candidate)?;
+    crate::formal_authority::verify_read_release_principal(session, ctx, release, &candidate)
+        .await?;
+    let view = if ctx.role() == Role::Host {
+        verified_report_view_for_host_in_session(ctx, session, &release.report_id).await?
+    } else {
+        verified_report_view_in_session(ctx, session, &release.report_id).await?
+    };
+    validate_read_verified_report_identity(&candidate, &view)?;
+    validate_read_stored_release_identity(release, &candidate, &view)
+}
+fn project_read_run_surface_v2(
+    surface: &HostSurfaceRecordV2,
+    capabilities: &HostCapabilities,
+    bundle: &crate::compiler::ReadBundle,
+    snapshot: &SystemSnapshot,
+) -> Result<RunProjection> {
+    if !capabilities.allows(&bundle.skill.required_capabilities) {
+        return Err(Error::Forbidden);
+    }
+    let projection = crate::compiler::projection_for_read_bundle(bundle, snapshot, true)?;
+    // SystemSnapshot.tools is the unchanged host baseline. The only candidate
+    // content emitted by the existing project_run is skill.content.
+    if !projection.instructions.is_empty()
+        && !host_surface_v2_allows_field(&surface.manifest, capabilities, "skill.content")
+    {
+        return Err(Error::Forbidden);
+    }
+    Ok(projection)
+}
+
+async fn require_current_run_source(
+    s: &mut Session,
+    ctx: &Context,
+    snapshot: &LoadedRunApplicationSnapshot,
+) -> Result<()> {
+    if let Some(id) = &snapshot.release_id {
+        let release: PersistentRelease = s.need(ctx, "release", id).await?;
+        revalidate_current_release(s, ctx, &release).await?;
+    }
+    Ok(())
 }

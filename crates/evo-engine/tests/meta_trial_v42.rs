@@ -463,6 +463,20 @@ impl ModelPort for HangingModel {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, _: ModelRequest) -> Result<ModelResponse> {
         self.entered.notify_one();
         std::future::pending().await
@@ -1520,7 +1534,11 @@ async fn two_real_streams_share_no_journal_dispatch_node_history_or_cache_key() 
         for call in calls {
             assert_eq!(call.dispatch_group_id, world_id);
             assert_eq!(call.state, BudgetCallState::Finalized);
-            let bound: evo_engine::model::BoundModelRequest =
+            assert_eq!(
+                call.request_artifact.as_ref().unwrap().schema_version,
+                evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA,
+            );
+            let bound: evo_engine::model::CurrentBoundModelRequest =
                 serde_json::from_str(&call.request_artifact.as_ref().unwrap().body).unwrap();
             bound.validate().unwrap();
             assert_eq!(bound.request.episode_id, world_id);
@@ -1682,7 +1700,15 @@ async fn a_request_id_reused_across_streams_is_refused_by_the_budget_layer() {
     // here the same call id
     // but the episode of the new stream. Built from the very request the old
     // stream's call stored, with only the stream's world changed.
-    let bound: evo_engine::model::BoundModelRequest =
+    assert_eq!(
+        old_calls[0]
+            .request_artifact
+            .as_ref()
+            .unwrap()
+            .schema_version,
+        evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA,
+    );
+    let bound: evo_engine::model::CurrentBoundModelRequest =
         serde_json::from_str(&old_calls[0].request_artifact.as_ref().unwrap().body).unwrap();
     bound.validate().unwrap();
     let stored = bound.request.clone();
@@ -1710,14 +1736,12 @@ async fn a_request_id_reused_across_streams_is_refused_by_the_budget_layer() {
     )
     .unwrap();
     assert_ne!(reused.cache_key_digest, stored.cache_key_digest);
-    match env
-        .broker
-        .dispatch_bound(
-            evo_engine::model::BoundModelRequest::new(reused, bound.compiler_use).unwrap(),
-        )
-        .await
-        .unwrap()
-    {
+    let rebound =
+        evo_engine::model::CurrentBoundModelRequest::new(reused, bound.compiler_use).unwrap();
+    let wire = serde_json::to_vec(&rebound).unwrap();
+    let rebound: evo_engine::model::ReadBoundModelRequest = serde_json::from_slice(&wire).unwrap();
+    assert_eq!(serde_json::to_vec(&rebound).unwrap(), wire);
+    match env.broker.dispatch_compiler_bound(rebound).await.unwrap() {
         ModelResponse::Rejected {
             kind,
             reason,

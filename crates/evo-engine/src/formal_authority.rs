@@ -290,26 +290,33 @@ pub(crate) fn compiler_dependency_schema(kind: &str, schema: &str) -> bool {
             PROFILE_SCHEMA
                 | ROOT_SCHEMA
                 | FORMAL_SCHEMA
+                | CURRENT_FORMAL_SCHEMA
                 | HOST_SCHEMA
                 | PROVIDER_SCHEMA
                 | PROVIDER_CURRENT_SCHEMA
+                | PROVIDER_SOURCE_SCHEMA
                 | METER_SCHEMA
                 | PRINCIPAL_ACTION_SCHEMA
                 | CONTROL_PRINCIPAL_ACTION_SCHEMA
                 | "rsia.formal_principal_set_observation.v1"
                 | "rsia.formal_profile_selection.v1"
                 | "rsia.persisted_compiler_binding.v1"
+                | "rsia.persisted_compiler_binding.v2"
                 | "rsia.authenticated_bundle.v1"
+                | "rsia.authenticated_bundle.v2"
                 | "rsia.actual_formal_provider_capture.v1"
                 | "rsia.independent_grade_capture.v1"
                 | "rsia.complete_episode_cost.v1"
                 | "rsia.trusted_resource_meter.v1"
                 | "rsia.host_surface_record.v1"
+                | "rsia.host_surface_record.v2"
                 | "rsia.run_application.v1"
+                | "rsia.run_application.v2"
                 | "rsia.host_execution_receipt.v1"
                 | "rsia.exploration_artifact_envelope.v1"
                 | "rsia.optimization.stage_fact.v1"
                 | "rsia.optimization.compiler_use.v1"
+                | "rsia.optimization.compiler_use.v2"
                 | "rsia.monitoring.environment.v1"
                 | "rsia.monitoring.observation.v1"
                 | "rsia.monitoring.development_cycle.v2"
@@ -317,6 +324,7 @@ pub(crate) fn compiler_dependency_schema(kind: &str, schema: &str) -> bool {
                 | "rsia.monitoring.consolidation_scope.v1"
                 | "rsia.monitoring.consolidation_claim.v1"
                 | "rsia.monitoring.consolidation_proposal.v1"
+                | "rsia.monitoring.consolidation_proposal.v2"
                 | "rsia.monitoring.consolidation_staging.v1"
                 | "rsia.monitoring.consolidation_run.v1"
                 | "rsia.monitoring.environment_drift.v1"
@@ -352,26 +360,33 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
             PROFILE_SCHEMA
                 | ROOT_SCHEMA
                 | FORMAL_SCHEMA
+                | CURRENT_FORMAL_SCHEMA
                 | HOST_SCHEMA
                 | PROVIDER_SCHEMA
                 | PROVIDER_CURRENT_SCHEMA
+                | PROVIDER_SOURCE_SCHEMA
                 | METER_SCHEMA
                 | PRINCIPAL_ACTION_SCHEMA
                 | CONTROL_PRINCIPAL_ACTION_SCHEMA
                 | "rsia.formal_principal_set_observation.v1"
                 | "rsia.formal_profile_selection.v1"
                 | "rsia.persisted_compiler_binding.v1"
+                | "rsia.persisted_compiler_binding.v2"
                 | "rsia.actual_formal_provider_capture.v1"
                 | "rsia.independent_grade_capture.v1"
                 | "rsia.complete_episode_cost.v1"
                 | "rsia.trusted_resource_meter.v1"
                 | "rsia.release_candidate.v1"
+                | "rsia.release_candidate.v2"
                 | "rsia.host_surface_record.v1"
+                | "rsia.host_surface_record.v2"
                 | "rsia.run_application.v1"
+                | "rsia.run_application.v2"
                 | "rsia.typed_artifact_envelope.v1"
                 | "rsia.exploration_artifact_envelope.v1"
                 | "rsia.optimization.stage_fact.v1"
                 | "rsia.optimization.compiler_use.v1"
+                | "rsia.optimization.compiler_use.v2"
                 | "rsia.monitoring.environment.v1"
                 | "rsia.monitoring.observation.v1"
                 | "rsia.monitoring.development_cycle.v2"
@@ -379,10 +394,12 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
                 | "rsia.monitoring.consolidation_scope.v1"
                 | "rsia.monitoring.consolidation_claim.v1"
                 | "rsia.monitoring.consolidation_proposal.v1"
+                | "rsia.monitoring.consolidation_proposal.v2"
                 | "rsia.monitoring.consolidation_staging.v1"
                 | "rsia.monitoring.consolidation_run.v1"
                 | "rsia.monitoring.environment_drift.v1"
                 | "rsia.authenticated_bundle.v1"
+                | "rsia.authenticated_bundle.v2"
                 | "rsia.host_execution_receipt.v1"
         ),
         _ => false,
@@ -419,6 +436,9 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
         FORMAL_SCHEMA => {
             let _: IssuedFormalAuthority = decode(body.clone())?;
         }
+        CURRENT_FORMAL_SCHEMA => {
+            let _: ReadIssuedAuthority = decode(body.clone())?;
+        }
         HOST_SCHEMA => {
             let _: RegisteredFormalHost = decode(body.clone())?;
         }
@@ -435,6 +455,10 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
             let provider: RegisteredExternalProviderV2 = decode(body.clone())?;
             provider.validate_public_fields()?;
         }
+        PROVIDER_SOURCE_SCHEMA => {
+            let provider: RegisteredExternalProviderV3 = decode(body.clone())?;
+            provider.parameters_v2().validate_public_fields()?;
+        }
         METER_SCHEMA => {
             let _: RegisteredResourceInstrumentation = decode(body.clone())?;
         }
@@ -446,6 +470,14 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
         }
         "rsia.persisted_compiler_binding.v1" => {
             let _: crate::release_store::PersistedCompilerBinding = decode(body.clone())?;
+        }
+        "rsia.persisted_compiler_binding.v2" => {
+            let r: crate::release_store::CurrentPersistedCompilerBinding = decode(body.clone())?;
+            if r.binding.schema_version != CURRENT_BINDING_SCHEMA {
+                return Err(Error::Conflict(
+                    "current stored compiler binding version differs".into(),
+                ));
+            }
         }
         "rsia.actual_formal_provider_capture.v1" => {
             let c: FormalProviderCaptureRecord = decode(body.clone())?;
@@ -461,6 +493,17 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
         "rsia.trusted_resource_meter.v1" => {
             let c: ResourceMeasurementRecord = decode(body.clone())?;
             validate_meter_response(&c)?;
+        }
+
+        "rsia.release_candidate.v2" => {
+            let c: crate::release_store::ReadCandidate = decode(body.clone())?;
+            if !c.is_current()
+                || c.bundle.digest != c.bundle_digest
+                || c.bundle.profile_id != c.profile_id
+                || c.bundle.parent_digest != c.parent_digest
+            {
+                return Err(Error::Conflict("typed candidate content mismatch".into()));
+            }
         }
         "rsia.release_candidate.v1" => {
             let c: crate::release_store::ReleaseCandidateRecord = decode(body.clone())?;
@@ -480,8 +523,16 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
         "rsia.host_surface_record.v1" => {
             let _: crate::release_store::HostSurfaceRecord = decode(body.clone())?;
         }
+        "rsia.host_surface_record.v2" => {
+            let record: crate::release_store::HostSurfaceRecordV2 = decode(body.clone())?;
+            crate::release_store::validate_host_record_v2_source(&record)?;
+        }
         "rsia.run_application.v1" => {
             let _: crate::release_store::RunApplicationSnapshot = decode(body.clone())?;
+        }
+        "rsia.run_application.v2" => {
+            let record: crate::release_store::RunApplicationSnapshotV2 = decode(body.clone())?;
+            crate::release_store::validate_run_application_v2_binding(&record)?;
         }
         "rsia.host_application.v1" => {
             let _: crate::release_store::HostApplicationRecord = decode(body.clone())?;
@@ -493,8 +544,8 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
             let f: crate::optimization::StageFact = decode(body.clone())?;
             f.validate()?;
         }
-        "rsia.optimization.compiler_use.v1" => {
-            let u: crate::model::CompilerInputUse = decode(body.clone())?;
+        "rsia.optimization.compiler_use.v1" | "rsia.optimization.compiler_use.v2" => {
+            let u: crate::model::ReadCompilerInputUse = decode(body.clone())?;
             if u.artifact_id()? != id {
                 return Err(Error::Conflict("compiler use identity alias".into()));
             }
@@ -520,6 +571,9 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
         "rsia.monitoring.consolidation_proposal.v1" => {
             let _: crate::monitoring::ConsolidationProposal = decode(body.clone())?;
         }
+        "rsia.monitoring.consolidation_proposal.v2" => {
+            let _: crate::monitoring::CurrentConsolidationProposal = decode(body.clone())?;
+        }
         "rsia.monitoring.consolidation_staging.v1" => {
             let _: crate::monitoring::ConsolidationStagingBinding = decode(body.clone())?;
         }
@@ -528,6 +582,19 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
         }
         "rsia.monitoring.environment_drift.v1" => {
             let _: crate::monitoring::EnvironmentDriftRecord = decode(body.clone())?;
+        }
+
+        "rsia.authenticated_bundle.v2" => {
+            let r: crate::compiler::CurrentAuthenticatedBundleRecord = decode(body.clone())?;
+            if r.id != format!("formal-bundle-{}", r.bundle.digest)
+                || r.binding.schema_version != CURRENT_BINDING_SCHEMA
+                || r.bundle.schema_version != evo_core::contract::BUNDLE_SCHEMA_V3
+                || r.bundle.compiler_version != evo_core::contract::BUNDLE_COMPILER_VERSION_V3
+            {
+                return Err(Error::Conflict(
+                    "compiled bundle alias/version differs".into(),
+                ));
+            }
         }
         "rsia.authenticated_bundle.v1" => {
             let r: crate::compiler::AuthenticatedBundleRecord = decode(body.clone())?;
@@ -596,17 +663,22 @@ pub async fn read_typed_closure(
             | HOST_SCHEMA
             | PROVIDER_SCHEMA
             | PROVIDER_CURRENT_SCHEMA
+            | PROVIDER_SOURCE_SCHEMA
             | METER_SCHEMA
             | "rsia.formal_profile_selection.v1"
             | "rsia.formal_parent_selection.v1"
             | "rsia.persistent_release.v1"
             | "rsia.profile_pointer.v1"
-            | "rsia.host_surface_record.v1" => Some(Role::Admin),
-            FORMAL_SCHEMA | "rsia.independent_grade_capture.v1" => Some(Role::Evaluator),
+            | "rsia.host_surface_record.v1"
+            | "rsia.host_surface_record.v2" => Some(Role::Admin),
+            FORMAL_SCHEMA | CURRENT_FORMAL_SCHEMA | "rsia.independent_grade_capture.v1" => {
+                Some(Role::Evaluator)
+            }
             "rsia.actual_formal_provider_capture.v1"
             | "rsia.complete_episode_cost.v1"
             | "rsia.trusted_resource_meter.v1"
             | "rsia.run_application.v1"
+            | "rsia.run_application.v2"
             | "rsia.host_application.v1"
             | "rsia.host_execution_receipt.v1" => Some(Role::Host),
             _ => None,
@@ -616,6 +688,9 @@ pub async fn read_typed_closure(
         }
         if authority_role == Some(Role::Admin) {
             require_registered_body_authority(s, ctx, &kind, &id, &body).await?;
+        }
+        if schema == "rsia.host_surface_record.v2" {
+            crate::release_store::validate_host_surface_v2_live_in_session(s, ctx, &id).await?;
         }
         if matches!(
             schema.as_str(),
@@ -1067,11 +1142,15 @@ async fn registered_subject_host(
         .unwrap_or("");
     let host_id = match schema {
         HOST_SCHEMA => body.get("id").and_then(Value::as_str).map(str::to_owned),
-        PROFILE_SCHEMA | ROOT_SCHEMA | PROVIDER_SCHEMA | PROVIDER_CURRENT_SCHEMA | METER_SCHEMA => {
-            body.get("host_registration_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        }
+        PROFILE_SCHEMA
+        | ROOT_SCHEMA
+        | PROVIDER_SCHEMA
+        | PROVIDER_CURRENT_SCHEMA
+        | PROVIDER_SOURCE_SCHEMA
+        | METER_SCHEMA => body
+            .get("host_registration_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         "rsia.formal_profile_selection.v1" => {
             let id = body["registration_id"].as_str().ok_or(Error::Forbidden)?;
             let profile: Value = s.need(ctx, "artifact", id).await?;
@@ -1145,6 +1224,11 @@ pub(crate) async fn require_registered_body_authority(
     id: &str,
     body: &Value,
 ) -> Result<()> {
+    if kind == "artifact"
+        && body.get("schema_version").and_then(Value::as_str) == Some(PROVIDER_SOURCE_SCHEMA)
+    {
+        return require_provider_v3_registered_source(s, ctx, id, body).await;
+    }
     if let Some(host) = registered_subject_host(s, ctx, kind, body).await?
         && s.get::<Value>(ctx, "artifact", &format!("formal-principals-{}", host.id))
             .await?
@@ -1565,24 +1649,7 @@ async fn require_registered_admin(
         })
         .map_err(|_| Error::Forbidden)?
 }
-pub(crate) async fn verify_candidate_principals_from_binding(
-    s: &mut Session,
-    ctx: &Context,
-    binding: &FormalCompilerInputBinding,
-    candidate: &crate::release_store::ReleaseCandidateRecord,
-    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
-) -> Result<()> {
-    let profile: FrozenCompilerProfile = attested_read(
-        s,
-        ctx,
-        "artifact",
-        &binding.profile_registration_id,
-        Role::Admin,
-    )
-    .await?;
-    verify_candidate_principals(s, ctx, &profile.host_registration_id, candidate, control).await?;
-    Ok(())
-}
+
 pub(crate) async fn verify_candidate_principals(
     s: &mut Session,
     ctx: &Context,
@@ -1672,62 +1739,7 @@ pub(crate) async fn verify_release_principal(
     }
     Ok(())
 }
-pub(crate) async fn bind_candidate_principal_from_binding(
-    s: &mut Session,
-    ctx: &Context,
-    binding: &FormalCompilerInputBinding,
-    candidate: &crate::release_store::ReleaseCandidateRecord,
-) -> Result<()> {
-    let profile: FrozenCompilerProfile = attested_read(
-        s,
-        ctx,
-        "artifact",
-        &binding.profile_registration_id,
-        Role::Admin,
-    )
-    .await?;
-    bind_candidate_principal(s, ctx, &profile.host_registration_id, candidate).await
-}
-pub(crate) async fn bind_candidate_principal(
-    s: &mut Session,
-    ctx: &Context,
-    host_id: &str,
-    candidate: &crate::release_store::ReleaseCandidateRecord,
-) -> Result<()> {
-    let host: RegisteredFormalHost =
-        attested_read(s, ctx, "artifact", host_id, Role::Admin).await?;
-    // Explicit old ProgramFixture/EmptyRoot diagnostics remain usable. They
-    // cannot execute a registered provider or obtain an issued formal report.
-    if s.get::<Value>(ctx, "artifact", &format!("formal-principals-{}", host.id))
-        .await?
-        .is_none()
-    {
-        return Ok(());
-    }
-    if ctx.role() != Role::Worker || ctx.actor() != candidate.proposer_actor {
-        return Err(Error::Forbidden);
-    }
-    let expected = fingerprint(candidate)?;
-    OPERATOR_CREDENTIAL
-        .try_with(|cap| {
-            if cap.operation == "stage" && cap.request_digest == expected {
-                Ok(())
-            } else {
-                Err(Error::Forbidden)
-            }
-        })
-        .map_err(|_| Error::Forbidden)??;
-    record_operator_action(
-        s,
-        ctx,
-        &host,
-        "artifact",
-        &candidate.id,
-        candidate,
-        Role::Worker,
-    )
-    .await
-}
+
 pub(crate) async fn bind_control_principals(
     s: &mut Session,
     ctx: &Context,
@@ -1769,9 +1781,9 @@ pub(crate) async fn bind_release_principal(
     ctx: &Context,
     release: &crate::release_store::PersistentRelease,
 ) -> Result<()> {
-    let candidate: crate::release_store::ReleaseCandidateRecord =
+    let candidate: crate::release_store::ReadCandidate =
         s.need(ctx, "artifact", &release.candidate_id).await?;
-    let inputs = resolve_bundle_in_session(
+    let inputs = resolve_read_bundle_in_session(
         s,
         ctx,
         &candidate.bundle,
@@ -1821,6 +1833,10 @@ pub enum FormalOperatorCommand {
     RegisterProviderCurrent {
         provider: Box<RegisteredExternalProviderV2>,
     },
+    #[serde(rename = "register_provider")]
+    RegisterProviderSource {
+        provider: Box<RegisteredExternalProviderV3>,
+    },
     RegisterMeter {
         meter: Box<RegisteredResourceInstrumentation>,
     },
@@ -1832,6 +1848,10 @@ pub enum FormalOperatorCommand {
     },
     Stage {
         request: Box<crate::release_store::StageBundleRequest>,
+    },
+    #[serde(rename = "stage")]
+    StageCurrent {
+        request: Box<crate::release_store::CurrentStageBundleRequest>,
     },
     RegisterControl {
         control: Box<crate::streaming_evaluator::RegisteredEvaluationControl>,
@@ -1879,7 +1899,7 @@ impl<'de> Deserialize<'de> for FormalOperatorCommand {
                 root: Box<EmptyRootAuthorization>,
             },
             Stage {
-                request: Box<crate::release_store::StageBundleRequest>,
+                request: Box<crate::release_store::StageRequestWire>,
             },
             RegisterControl {
                 control: Box<crate::streaming_evaluator::RegisteredEvaluationControl>,
@@ -1928,11 +1948,31 @@ impl<'de> Deserialize<'de> for FormalOperatorCommand {
                 ProviderRegistrationWire::Current(provider) => Self::RegisterProviderCurrent {
                     provider: Box::new(provider),
                 },
+                ProviderRegistrationWire::SourceBound(provider) => {
+                    Self::RegisterProviderSource { provider }
+                }
             },
             Wire::RegisterMeter { meter } => Self::RegisterMeter { meter },
             Wire::FreezeProfile { profile } => Self::FreezeProfile { profile },
             Wire::EmptyRoot { root } => Self::EmptyRoot { root },
-            Wire::Stage { request } => Self::Stage { request },
+            Wire::Stage { request } => match *request {
+                crate::release_store::StageRequestWire::Current(request) => {
+                    if request.bundle.schema_version != evo_core::contract::BUNDLE_SCHEMA_V3
+                        || request.bundle.compiler_version
+                            != evo_core::contract::BUNDLE_COMPILER_VERSION_V3
+                    {
+                        return Err(serde::de::Error::custom(
+                            "unsupported Current stage bundle version",
+                        ));
+                    }
+                    Self::StageCurrent {
+                        request: Box::new(request),
+                    }
+                }
+                crate::release_store::StageRequestWire::Legacy(request) => Self::Stage {
+                    request: Box::new(request),
+                },
+            },
             Wire::RegisterControl { control } => Self::RegisterControl { control },
             Wire::Approve {
                 candidate_id,
@@ -1967,7 +2007,7 @@ impl<'de> Deserialize<'de> for FormalOperatorCommand {
 impl FormalOperatorCommand {
     fn role(&self) -> Role {
         match self {
-            Self::Stage { .. } => Role::Worker,
+            Self::Stage { .. } | Self::StageCurrent { .. } => Role::Worker,
             Self::RegisterControl { .. } => Role::Evaluator,
             _ => Role::Admin,
         }
@@ -1975,13 +2015,13 @@ impl FormalOperatorCommand {
     fn operation(&self) -> &'static str {
         match self {
             Self::Bootstrap => "bootstrap",
-            Self::RegisterProvider { .. } | Self::RegisterProviderCurrent { .. } => {
-                "register_provider"
-            }
+            Self::RegisterProvider { .. }
+            | Self::RegisterProviderCurrent { .. }
+            | Self::RegisterProviderSource { .. } => "register_provider",
             Self::RegisterMeter { .. } => "register_meter",
             Self::FreezeProfile { .. } => "freeze_profile",
             Self::EmptyRoot { .. } => "empty_root",
-            Self::Stage { .. } => "stage",
+            Self::Stage { .. } | Self::StageCurrent { .. } => "stage",
             Self::RegisterControl { .. } => "register_control",
             Self::Approve { .. } => "approve",
             Self::Canary { .. } => "canary",
@@ -2008,6 +2048,9 @@ impl FormalOperatorCommand {
                 revoke_watermark: request.revoke_watermark,
             };
             return fingerprint(&candidate);
+        }
+        if let Self::StageCurrent { request } = self {
+            return fingerprint(&request.candidate()?);
         }
         fingerprint(self)
     }
@@ -2164,6 +2207,9 @@ impl PrincipalAuthorityService {
                 FormalRegistry::register_provider_current(ctx, store, *provider).await?;
                 Ok(Value::Null)
             }
+            FormalOperatorCommand::RegisterProviderSource { .. } => Err(Error::Conflict(
+                "provider source requires owned authority".into(),
+            )),
             FormalOperatorCommand::RegisterMeter { meter } => {
                 FormalRegistry::register_resource_instrumentation(ctx, store, *meter).await?;
                 Ok(Value::Null)
@@ -2175,10 +2221,13 @@ impl PrincipalAuthorityService {
             FormalOperatorCommand::EmptyRoot { root } => Ok(Value::String(
                 FormalRegistry::authorize_empty_root(ctx, store, *root).await?,
             )),
-            FormalOperatorCommand::Stage { request } => {
-                serde_json::to_value(ReleaseStore::stage_bundle(ctx, store, *request).await?)
-                    .map_err(|_| Error::Internal)
+            FormalOperatorCommand::Stage { request: _ } => {
+                Err(Error::Conflict("legacy bundle is not Current input".into()))
             }
+            FormalOperatorCommand::StageCurrent { request } => serde_json::to_value(
+                ReleaseStore::stage_current_bundle(ctx, store, *request).await?,
+            )
+            .map_err(|_| Error::Internal),
             FormalOperatorCommand::RegisterControl { control } => Ok(Value::String(
                 crate::streaming_evaluator::IndependentEvaluationControl::register_control(
                     ctx, store, *control,
@@ -2430,6 +2479,7 @@ impl RegisteredExternalProviderV2 {
 enum ProviderRegistrationWire {
     Legacy(RegisteredExternalProvider),
     Current(RegisteredExternalProviderV2),
+    SourceBound(Box<RegisteredExternalProviderV3>),
 }
 
 /// Immutable common field projection for consumers; serialization always uses
@@ -2445,6 +2495,7 @@ impl FrozenProviderRegistration {
         let common = match &record {
             ProviderRegistrationWire::Legacy(p) => p.clone(),
             ProviderRegistrationWire::Current(p) => p.common_view(),
+            ProviderRegistrationWire::SourceBound(p) => p.parameters_v2().common_view(),
         };
         Self {
             record: Box::new(record),
@@ -2456,6 +2507,9 @@ impl FrozenProviderRegistration {
         self.common.validate(ctx)?;
         if let ProviderRegistrationWire::Current(p) = self.record.as_ref() {
             p.validate_public_fields()?;
+        }
+        if let ProviderRegistrationWire::SourceBound(p) = self.record.as_ref() {
+            p.derive_and_check_source(ctx)?;
         }
         Ok(())
     }
@@ -2474,18 +2528,20 @@ impl FrozenProviderRegistration {
                 }
             }
             ProviderRegistrationWire::Current(p) => p.projection_input(),
+            ProviderRegistrationWire::SourceBound(p) => p.parameters_v2().projection_input(),
         }
     }
     fn request_timeout_seconds(&self) -> u32 {
         match self.record.as_ref() {
             ProviderRegistrationWire::Legacy(_) => 120,
             ProviderRegistrationWire::Current(p) => p.request_timeout_seconds,
+            ProviderRegistrationWire::SourceBound(p) => p.request_timeout_seconds,
         }
     }
     fn sampling_authority(&self) -> ProviderSamplingAuthority {
         match self.record.as_ref() {
             ProviderRegistrationWire::Legacy(_) => ProviderSamplingAuthority::LegacyUnboundSampling,
-            ProviderRegistrationWire::Current(_) => {
+            ProviderRegistrationWire::Current(_) | ProviderRegistrationWire::SourceBound(_) => {
                 ProviderSamplingAuthority::CurrentSourceUnavailable
             }
         }
@@ -2493,9 +2549,9 @@ impl FrozenProviderRegistration {
     fn require_legacy_profile(&self) -> Result<()> {
         match self.record.as_ref() {
             ProviderRegistrationWire::Legacy(_) => Ok(()),
-            ProviderRegistrationWire::Current(_) => Err(Error::Conflict(
-                "current_provider_source_unavailable".into(),
-            )),
+            ProviderRegistrationWire::Current(_) | ProviderRegistrationWire::SourceBound(_) => Err(
+                Error::Conflict("current_provider_source_unavailable".into()),
+            ),
         }
     }
 }
@@ -2526,22 +2582,33 @@ impl<'de> Deserialize<'de> for FrozenProviderRegistration {
     }
 }
 
-/// The current code has no authenticated same-owner, same-TX producer. No
-/// public digest or DTO can manufacture a successful state of this authority.
-#[derive(Clone, Copy)]
+/// Successful state is private and non-Deserialize, minted by a same-Session
+/// registered source reload; V1/V2 and an unverified V3 DTO retain their refusal.
+#[derive(Clone)]
 enum ProviderSamplingAuthority {
     LegacyUnboundSampling,
     CurrentSourceUnavailable,
+    RegisteredSource(VerifiedProviderSource),
 }
 impl ProviderSamplingAuthority {
     fn require_new_dispatch(&self) -> Result<()> {
-        Err(Error::Conflict(
-            match self {
-                Self::LegacyUnboundSampling => "LegacyUnboundSampling",
-                Self::CurrentSourceUnavailable => "current_provider_source_unavailable",
+        match self {
+            Self::RegisteredSource(source) => {
+                // These exact values were derived and checked with the stored
+                // full body and principal action in verified_sampling_in_session.
+                if source.provider_digest.is_empty()
+                    || source.command_digest.is_empty()
+                    || source.principal_set_digest.is_empty()
+                {
+                    return Err(Error::Forbidden);
+                }
+                Ok(())
             }
-            .into(),
-        ))
+            Self::LegacyUnboundSampling => Err(Error::Conflict("LegacyUnboundSampling".into())),
+            Self::CurrentSourceUnavailable => Err(Error::Conflict(
+                "current_provider_source_unavailable".into(),
+            )),
+        }
     }
 }
 
@@ -2848,7 +2915,7 @@ impl FormalRegistry {
         host.validate(ctx)?;
         require_registered_admin(&mut s, ctx, &host).await?;
         provider.validate(ctx)?;
-        provider.require_legacy_profile()?;
+        provider.require_profile_source(&mut s, ctx).await?;
         if fingerprint(&host.snapshot)? != fingerprint(&profile.system_snapshot)?
             || fingerprint(&host.capabilities)? != fingerprint(&profile.capabilities)?
             || provider.host_registration_id != host.id
@@ -3506,6 +3573,7 @@ pub struct RegisteredExternalTransport {
     host: RegisteredFormalHost,
     credential: String,
     process: crate::executor::ObservedProcessIdentity,
+    sampling_authority: ProviderSamplingAuthority,
 }
 /// No public constructor or Deserialize; a provenance label cannot make one.
 pub struct FormalTransportCapability {
@@ -3525,7 +3593,7 @@ impl FormalTransportCapability {
         &self,
         s: &mut Session,
         ctx: &Context,
-        bound: &crate::model::BoundModelRequest,
+        bound: &crate::model::ReadBoundModelRequest,
     ) -> Result<()> {
         let provider: FrozenProviderRegistration =
             attested_read(s, ctx, "artifact", &self.provider_id, Role::Admin).await?;
@@ -3539,6 +3607,14 @@ impl FormalTransportCapability {
             Role::Admin,
         )
         .await?;
+        provider.require_profile_source(s, ctx).await?;
+        if !bound.compiler_use.is_current()
+            || bound.compiler_use.binding.schema_version != CURRENT_BINDING_SCHEMA
+        {
+            return Err(Error::Conflict(
+                "legacy compiler use is not Current input".into(),
+            ));
+        }
         let set = principal_set(s, ctx, &host).await?;
         let observed = crate::executor::observe_registered_process(
             host.host_uid,
@@ -3576,6 +3652,7 @@ impl FormalTransportCapability {
             Role::Admin,
         )
         .await?;
+        provider.require_profile_source(s, ctx).await?;
         let set = principal_set(s, ctx, &host).await?;
         if ctx.actor() != set.host.actor || ctx.role() != Role::Host {
             return Err(Error::Forbidden);
@@ -3613,7 +3690,8 @@ impl RegisteredExternalTransport {
         )
         .await?;
         provider.validate(ctx)?;
-        provider.require_legacy_profile()?;
+        provider.require_profile_source(&mut s, ctx).await?;
+        let sampling_authority = provider.verified_sampling_in_session(&mut s, ctx).await?;
         host.validate(ctx)?;
         let set = principal_set(&mut s, ctx, &host).await?;
         if ctx.actor() != set.host.actor || ctx.role() != Role::Host {
@@ -3640,6 +3718,7 @@ impl RegisteredExternalTransport {
             host,
             credential,
             process,
+            sampling_authority,
         })
     }
     async fn complete(
@@ -3647,7 +3726,7 @@ impl RegisteredExternalTransport {
         projection: evo_core::model_protocol::ProjectedChatRequest,
         model_digest: &str,
     ) -> Result<(crate::broker::TransportCompletion, String, u64, u64)> {
-        self.provider.sampling_authority().require_new_dispatch()?;
+        self.sampling_authority.require_new_dispatch()?;
         if model_digest != self.provider.model_digest {
             return Err(Error::Forbidden);
         }
@@ -3739,7 +3818,7 @@ impl RegisteredExternalTransport {
 impl crate::broker::ModelTransport for RegisteredExternalTransport {
     fn formal_capability(&self) -> Option<FormalTransportCapability> {
         Some(FormalTransportCapability {
-            sampling_authority: self.provider.sampling_authority(),
+            sampling_authority: self.sampling_authority.clone(),
             provider_id: self.provider.id.clone(),
             provider_digest: fingerprint(&self.provider).ok()?,
             host_id: self.host.id.clone(),
@@ -3754,10 +3833,11 @@ impl crate::broker::ModelTransport for RegisteredExternalTransport {
     async fn execute(
         &self,
         request: &evo_core::optimization::ModelRequest,
-        _dispatch_id: &str,
+        dispatch_id: &str,
     ) -> Result<crate::broker::TransportCompletion> {
         request.validate()?;
-        self.provider.sampling_authority().require_new_dispatch()?;
+        self.sampling_authority.require_new_dispatch()?;
+        crate::broker::require_registered_model_dispatch(request, dispatch_id)?;
         let projection = evo_core::model_protocol::project_bound_chat_v1(
             request,
             &self.provider.projection_input(),
@@ -3772,7 +3852,8 @@ impl crate::broker::ModelTransport for RegisteredExternalTransport {
         dispatch_id: &str,
     ) -> Result<CapturedFormalCompletion> {
         request.validate()?;
-        self.provider.sampling_authority().require_new_dispatch()?;
+        self.sampling_authority.require_new_dispatch()?;
+        crate::broker::require_registered_formal_dispatch(request, dispatch_id)?;
         let process = crate::executor::observe_registered_process(
             self.host.host_uid,
             &self.host.code_digest,
@@ -3859,7 +3940,7 @@ pub async fn prepare_formal_task(
     let mut s = store.session().await?;
     let (candidate, _) =
         crate::streaming_evaluator::live_task_candidate_in_session(ctx, &mut s, &task).await?;
-    let verified = resolve_bundle_in_session(
+    let verified = resolve_read_bundle_in_session(
         &mut s,
         ctx,
         &candidate.bundle,
@@ -3904,13 +3985,16 @@ pub async fn prepare_formal_task(
         Role::Admin,
     )
     .await?;
-    let projection =
-        evo_core::contract::project_run(&bundle, &verified.profile.system_snapshot, true)?;
+    let projection = crate::compiler::projection_for_read_bundle(
+        &bundle,
+        &verified.profile.system_snapshot,
+        true,
+    )?;
     let request = crate::model::FormalTaskRequest {
         task,
-        candidate_id: candidate.id,
-        profile_registration_id: verified.profile.id,
-        compiler_binding_digest: verified.binding.binding_digest,
+        candidate_id: candidate.id.clone(),
+        profile_registration_id: verified.profile.id.clone(),
+        compiler_binding_digest: verified.binding.binding_digest.clone(),
         model_digest: provider.model_digest.clone(),
         mandatory_context,
         projection,
@@ -3924,11 +4008,11 @@ pub(crate) async fn verify_formal_task_in_session(
     ctx: &Context,
     s: &mut Session,
     request: &crate::model::FormalTaskRequest,
-) -> Result<(crate::release_store::ReleaseCandidateRecord, String)> {
+) -> Result<(crate::release_store::ReadCandidate, String)> {
     request.validate()?;
     let (candidate, billing) =
         crate::streaming_evaluator::live_task_candidate_in_session(ctx, s, &request.task).await?;
-    let inputs = resolve_bundle_in_session(
+    let inputs = resolve_read_bundle_in_session(
         s,
         ctx,
         &candidate.bundle,
@@ -3965,8 +4049,11 @@ pub(crate) async fn verify_formal_task_in_session(
             },
         )?
     };
-    let projection =
-        evo_core::contract::project_run(&bundle, &inputs.profile.system_snapshot, true)?;
+    let projection = crate::compiler::projection_for_read_bundle(
+        &bundle,
+        &inputs.profile.system_snapshot,
+        true,
+    )?;
     if fingerprint(&projection)? != fingerprint(&request.projection)?
         || bundle.digest != request.task.bundle_digest
     {
@@ -4161,7 +4248,7 @@ async fn validate_episode_meter_sources(
     ctx: &Context,
     profile: &FrozenCompilerProfile,
     host: &RegisteredFormalHost,
-    ticket: &crate::streaming_evaluator::EvaluationTicketV2,
+    ticket: &crate::streaming_evaluator::ReadEvaluationTicket,
     control: &crate::streaming_evaluator::RegisteredEvaluationControl,
     seal: &evo_storage::budget::SealedRootBudgetEvidence,
     measurements: &CompleteEpisodeCostMeasurements,
@@ -4337,7 +4424,7 @@ impl FormalAuthorityIssuer {
         .await?;
         meter.validate(ctx)?;
         host.validate(ctx)?;
-        let ticket: crate::streaming_evaluator::EvaluationTicketV2 =
+        let ticket: crate::streaming_evaluator::ReadEvaluationTicket =
             crate::streaming_evaluator::need_record(&mut s, ctx, "evaluation_ticket_v2", ticket_id)
                 .await?;
         let control: crate::streaming_evaluator::RegisteredEvaluationControl =
@@ -4530,7 +4617,7 @@ impl FormalAuthorityIssuer {
                 "episode measurements have undeclared instrumentation".into(),
             ));
         }
-        let ticket: crate::streaming_evaluator::EvaluationTicketV2 =
+        let ticket: crate::streaming_evaluator::ReadEvaluationTicket =
             crate::streaming_evaluator::need_record(s, ctx, "evaluation_ticket_v2", ticket_id)
                 .await?;
         let control: crate::streaming_evaluator::RegisteredEvaluationControl =
@@ -4591,15 +4678,15 @@ impl FormalAuthorityIssuer {
 pub(crate) async fn capture_independent_grade(
     s: &mut Session,
     ctx: &Context,
-    ticket: &crate::streaming_evaluator::EvaluationTicketV2,
+    ticket: &crate::streaming_evaluator::ReadEvaluationTicket,
     target_id: &str,
     receipt_id: &str,
     receipt_digest: &str,
 ) -> Result<()> {
     ctx.require(&[Role::Evaluator])?;
-    let candidate: crate::release_store::ReleaseCandidateRecord =
+    let candidate: crate::release_store::ReadCandidate =
         s.need(ctx, "artifact", &ticket.candidate_digest).await?;
-    let inputs = resolve_bundle_in_session(
+    let inputs = resolve_read_bundle_in_session(
         s,
         ctx,
         &candidate.bundle,
@@ -4625,7 +4712,7 @@ pub(crate) async fn capture_independent_grade(
             &ticket.registration_id,
         )
         .await?;
-    let set = verify_candidate_principals(s, ctx, &host.id, &candidate, &control).await?;
+    let set = verify_read_candidate_principals(s, ctx, &host.id, &candidate, &control).await?;
     process_principal(ctx, &host, &set, Role::Evaluator)?;
     let credential =
         std::env::var(&host.grader_credential_environment_key).map_err(|_| Error::Forbidden)?;
@@ -4672,7 +4759,7 @@ pub(crate) async fn capture_independent_grade(
 pub(crate) async fn issue_complete_authority_in_session(
     s: &mut Session,
     ctx: &Context,
-    ticket: &crate::streaming_evaluator::EvaluationTicketV2,
+    ticket: &crate::streaming_evaluator::ReadEvaluationTicket,
     control: &crate::streaming_evaluator::RegisteredEvaluationControl,
     formal: &crate::streaming_evaluator::FormalEvaluationV2,
 ) -> Result<()> {
@@ -4682,13 +4769,14 @@ pub(crate) async fn issue_complete_authority_in_session(
     {
         return Err(Error::Forbidden);
     }
-    let candidate: crate::release_store::ReleaseCandidateRecord =
+    let candidate: crate::release_store::ReadCandidate =
         s.need(ctx, "artifact", &ticket.candidate_digest).await?;
-    let inputs = resolve_bundle_in_session(
+    candidate.current()?;
+    let inputs = resolve_read_bundle_in_session(
         s,
         ctx,
         &candidate.bundle,
-        &candidate.environment_digest,
+        &candidate.environment_digest.clone(),
         candidate.revoke_watermark,
         Purpose::Development,
     )
@@ -4702,7 +4790,7 @@ pub(crate) async fn issue_complete_authority_in_session(
     )
     .await?;
     host.validate(ctx)?;
-    let set = verify_candidate_principals(s, ctx, &host.id, &candidate, control).await?;
+    let set = verify_read_candidate_principals(s, ctx, &host.id, &candidate, control).await?;
     process_principal(ctx, &host, &set, Role::Evaluator)?;
     let report_storage_id =
         crate::streaming_evaluator::storage_id("formal_evaluation_v2", &ticket.id)?;
@@ -4850,7 +4938,7 @@ pub(crate) async fn issue_complete_authority_in_session(
                         },
                     )?
                 };
-            let projection = evo_core::contract::project_run(
+            let projection = crate::compiler::projection_for_read_bundle(
                 &applied_bundle,
                 &inputs.profile.system_snapshot,
                 true,
@@ -4975,16 +5063,21 @@ pub(crate) async fn issue_complete_authority_in_session(
         ));
     }
     let closure = read_typed_closure(s, ctx, &roots).await?;
-    let record = IssuedFormalAuthority {
+    let record = ReadIssuedAuthority::from_parts(ReadIssuedAuthorityView {
         id: format!("formal-authority-{}", ticket.id),
-        schema_version: FORMAL_SCHEMA.into(),
+        schema_version: if inputs.binding.is_current() {
+            CURRENT_FORMAL_SCHEMA
+        } else {
+            FORMAL_SCHEMA
+        }
+        .into(),
         report_id: ticket.id.clone(),
         raw_report_digest: fingerprint(formal)?,
         ticket_digest: fingerprint(ticket)?,
-        candidate_id: candidate.id,
-        candidate_bundle_digest: candidate.bundle_digest,
-        environment_digest: candidate.environment_digest,
-        compiler_binding: inputs.binding,
+        candidate_id: candidate.id.clone(),
+        candidate_bundle_digest: candidate.bundle_digest.clone(),
+        environment_digest: candidate.environment_digest.clone(),
+        compiler_binding: inputs.binding.clone(),
         billing_scope: control.billing_scope.clone(),
         root_seal_digest: fingerprint(&seal)?,
         episode_cost_digest: fingerprint(&cost)?,
@@ -4997,7 +5090,7 @@ pub(crate) async fn issue_complete_authority_in_session(
         closure,
         watermark: s.watermark(ctx).await?,
         issued_by: ctx.actor().into(),
-    };
+    })?;
     immutable(s, ctx, "artifact", &record.id, &record).await?;
     attest_content(s, ctx, "artifact", &record.id, &record).await?;
     edges(s, ctx, "artifact", &record.id, &record.closure.nodes).await?;
@@ -5033,7 +5126,7 @@ pub async fn verify_issued_authority(
     verify_typed_closure(s, ctx, &record.closure_roots, &record.closure).await?;
     let formal: crate::streaming_evaluator::FormalEvaluationV2 =
         crate::streaming_evaluator::need_record(s, ctx, "formal_evaluation_v2", report_id).await?;
-    let ticket: crate::streaming_evaluator::EvaluationTicketV2 =
+    let ticket: crate::streaming_evaluator::ReadEvaluationTicket =
         crate::streaming_evaluator::need_record(s, ctx, "evaluation_ticket_v2", report_id).await?;
     if record.raw_report_digest != fingerprint(&formal)?
         || record.ticket_digest != fingerprint(&ticket)?
@@ -6186,4 +6279,2658 @@ mod audit_f06_contract_tests {
             Err(Error::Forbidden)
         ));
     }
+}
+
+use evo_core::contract::{
+    CompilePartsV3, CompilerDependencyContentV1, EmptyRootContentV1,
+    FrozenCompilerProfileContentV1, ParentContentV3, ProfileContentProofV3, ResolvedBundleV3,
+    compile_bundle_v3, replay_resolved_bundle_v3,
+};
+pub const CURRENT_BINDING_SCHEMA: &str = "rsia.formal_compiler_input_binding.v3";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentFormalCompilerInputBinding {
+    #[serde(deserialize_with = "deserialize_current_binding_schema")]
+    pub schema_version: String,
+    pub namespace: String,
+    pub profile_registration_id: String,
+    pub profile_digest: String,
+    pub parent_digest: String,
+    pub baseline_digest: String,
+    pub parent_skill_digest: String,
+    pub parent_strategy_digest: String,
+    pub search_parent_skill_digest: String,
+    pub search_parent_strategy_digest: String,
+    pub baseline_skill_digest: String,
+    pub baseline_strategy_digest: String,
+    pub environment_digest: String,
+    pub capabilities_digest: String,
+    pub purpose: Purpose,
+    pub application_order: Vec<String>,
+    pub watermark: Option<(i64, String)>,
+    pub live_profile_pointer_digest: Option<String>,
+    pub closure: TypedContentClosure,
+    pub binding_digest: String,
+}
+
+// Current data can be built only after the existing same-Session resolver guards.
+#[derive(Debug, Clone)]
+enum CurrentParentBody {
+    EmptyRoot(EmptyRootAuthorization),
+    Bundle {
+        release_id: String,
+        bundle: ResolvedBundleV3,
+    },
+}
+#[derive(Debug, Clone)]
+pub struct CurrentVerifiedCompilerInputs {
+    profile: FrozenCompilerProfile,
+    parent: CurrentParentBody,
+    search_parent_strategy: Strategy,
+    binding: CurrentFormalCompilerInputBinding,
+}
+fn exact_profile_projection(
+    original: &FrozenCompilerProfile,
+    projected: &FrozenCompilerProfileContentV1,
+) -> Result<()> {
+    if serde_json::to_vec(original).map_err(|_| Error::Internal)?
+        != serde_json::to_vec(projected).map_err(|_| Error::Internal)?
+    {
+        return Err(Error::Conflict(
+            "full frozen profile projection differs".into(),
+        ));
+    }
+    Ok(())
+}
+fn exact_root_projection(
+    original: &EmptyRootAuthorization,
+    projected: &EmptyRootContentV1,
+) -> Result<()> {
+    if serde_json::to_vec(original).map_err(|_| Error::Internal)?
+        != serde_json::to_vec(projected).map_err(|_| Error::Internal)?
+    {
+        return Err(Error::Conflict("full empty root projection differs".into()));
+    }
+    Ok(())
+}
+fn project_frozen_profile(
+    original: &FrozenCompilerProfile,
+) -> Result<FrozenCompilerProfileContentV1> {
+    let projected = FrozenCompilerProfileContentV1 {
+        id: original.id.clone(),
+        schema_version: original.schema_version.clone(),
+        namespace: original.namespace.clone(),
+        profile_id: original.profile_id.clone(),
+        version: original.version,
+        host_registration_id: original.host_registration_id.clone(),
+        provider_registration_id: original.provider_registration_id.clone(),
+        resource_instrumentation_id: original.resource_instrumentation_id.clone(),
+        system_snapshot: original.system_snapshot.clone(),
+        capabilities: original.capabilities.clone(),
+        environment_digest: original.environment_digest.clone(),
+        baseline_skill: original.baseline_skill.clone(),
+        baseline_strategy: original.baseline_strategy.clone(),
+        dependencies: original
+            .dependencies
+            .iter()
+            .map(|r| CompilerDependencyContentV1 {
+                kind: r.kind.clone(),
+                id: r.id.clone(),
+                schema_version: r.schema_version.clone(),
+                content_digest: r.content_digest.clone(),
+            })
+            .collect(),
+        purpose: original.purpose,
+        application_order: original.application_order.clone(),
+        authorized_by: original.authorized_by.clone(),
+    };
+    exact_profile_projection(original, &projected)?;
+    Ok(projected)
+}
+fn project_empty_root(original: &EmptyRootAuthorization) -> Result<EmptyRootContentV1> {
+    let projected = EmptyRootContentV1 {
+        id: original.id.clone(),
+        schema_version: original.schema_version.clone(),
+        namespace: original.namespace.clone(),
+        profile_registration_id: original.profile_registration_id.clone(),
+        profile_digest: original.profile_digest.clone(),
+        host_registration_id: original.host_registration_id.clone(),
+        skill: original.skill.clone(),
+        strategy: original.strategy.clone(),
+        authorized_by: original.authorized_by.clone(),
+    };
+    exact_root_projection(original, &projected)?;
+    Ok(projected)
+}
+impl CurrentVerifiedCompilerInputs {
+    fn parent_values(&self) -> (&SkillSnapshot, &Strategy) {
+        match &self.parent {
+            CurrentParentBody::EmptyRoot(root) => (&root.skill, &root.strategy),
+            CurrentParentBody::Bundle { bundle, .. } => (&bundle.skill, &bundle.improver),
+        }
+    }
+    fn content(&self) -> Result<ProfileContentProofV3> {
+        let baseline = project_frozen_profile(&self.profile)?;
+        let parent = match &self.parent {
+            CurrentParentBody::EmptyRoot(root) => {
+                ParentContentV3::EmptyRoot(project_empty_root(root)?)
+            }
+            CurrentParentBody::Bundle { bundle, .. } => {
+                let projected = bundle.clone();
+                if serde_json::to_vec(bundle).map_err(|_| Error::Internal)?
+                    != serde_json::to_vec(&projected).map_err(|_| Error::Internal)?
+                {
+                    return Err(Error::Conflict(
+                        "full parent bundle projection differs".into(),
+                    ));
+                }
+                ParentContentV3::CurrentBundle(projected)
+            }
+        };
+        ProfileContentProofV3::from_content(
+            Profile {
+                id: self.profile.profile_id.clone(),
+                evolution_enabled: true,
+                parent_digest: self.binding.parent_digest.clone(),
+                baseline_digest: self.binding.baseline_digest.clone(),
+            },
+            parent,
+            baseline,
+        )
+    }
+    pub fn binding(&self) -> &CurrentFormalCompilerInputBinding {
+        &self.binding
+    }
+    pub fn parent_skill(&self) -> &SkillSnapshot {
+        self.parent_values().0
+    }
+    pub fn request_for_search_parent(&self, search_parent: SkillSnapshot) -> CompilerInputRequest {
+        CompilerInputRequest {
+            profile: Profile {
+                id: self.profile.profile_id.clone(),
+                evolution_enabled: true,
+                parent_digest: self.binding.parent_digest.clone(),
+                baseline_digest: self.binding.baseline_digest.clone(),
+            },
+            search_parent,
+            baseline: self.profile.baseline_skill.clone(),
+            search_parent_strategy: self.search_parent_strategy.clone(),
+            expected_parent_strategy_digest: Some(self.binding.parent_strategy_digest.clone()),
+            baseline_strategy: self.profile.baseline_strategy.clone(),
+            capabilities: self.profile.capabilities.clone(),
+            environment_digest: self.profile.environment_digest.clone(),
+            purpose: self.profile.purpose,
+            revoke_watermark: self
+                .binding
+                .watermark
+                .as_ref()
+                .map(|w| w.0 as u64)
+                .unwrap_or(0),
+        }
+    }
+    pub fn compile(
+        &self,
+        skill_patch: &SkillPatch,
+        improver_patch: &ImproverPatch,
+    ) -> Result<ResolvedBundleV3> {
+        let content = self.content()?;
+        let bundle = compile_bundle_v3(CompilePartsV3 {
+            content: &content,
+            skill_patch,
+            improver_patch,
+            revoked: &BTreeSet::new(),
+        })?;
+        require_resolved_strategy(&bundle.improver, self.parent_values().1)?;
+        Ok(bundle)
+    }
+    pub fn compile_search_edit(
+        &self,
+        desired: &SkillSnapshot,
+        patch: &ImproverPatch,
+    ) -> Result<ResolvedBundleV3> {
+        let profile = Profile {
+            id: self.profile.profile_id.clone(),
+            evolution_enabled: true,
+            parent_digest: self.binding.parent_digest.clone(),
+            baseline_digest: self.binding.baseline_digest.clone(),
+        };
+        let (strategy, _) = evo_core::contract::compile_improver(
+            &profile,
+            &self.search_parent_strategy,
+            &self.profile.baseline_strategy,
+            patch,
+        )?;
+        self.compile(
+            &rebase_skill_patch(self.parent_skill(), desired)?,
+            &ImproverPatch {
+                instruction: evo_core::contract::PatchOp::Set {
+                    value: strategy.instruction,
+                },
+                max_candidates: evo_core::contract::PatchOp::Set {
+                    value: strategy.max_candidates,
+                },
+                max_rounds: evo_core::contract::PatchOp::Set {
+                    value: strategy.max_rounds,
+                },
+            },
+        )
+    }
+    pub fn replay(&self, bundle: &ResolvedBundleV3) -> Result<()> {
+        require_resolved_strategy(&bundle.improver, self.parent_values().1)?;
+        let content = self.content()?;
+        replay_resolved_bundle_v3(bundle, &content, &BTreeSet::new())
+    }
+}
+
+pub async fn resolve_current_compiler_inputs(
+    s: &mut Session,
+    ctx: &Context,
+    request: &CompilerInputRequest,
+) -> Result<CurrentVerifiedCompilerInputs> {
+    resolve_current_compiler_inputs_inner(s, ctx, request, &mut BTreeSet::new()).await
+}
+
+pub(crate) async fn resolve_current_compiler_inputs_inner(
+    s: &mut Session,
+    ctx: &Context,
+    request: &CompilerInputRequest,
+    visiting: &mut BTreeSet<String>,
+) -> Result<CurrentVerifiedCompilerInputs> {
+    let key = request.profile.parent_digest.clone();
+    if !visiting.insert(key.clone()) {
+        return Err(Error::Conflict("cyclic compiler parent lineage".into()));
+    }
+    let result = async {
+        ctx.require(&[Role::Worker, Role::Host, Role::Admin, Role::Evaluator])?;
+        // Current labels are content commitments, including all-Set patches.
+        // Validate their format before a lookup or a full-original mismatch.
+        digest(&request.profile.parent_digest)?;
+        digest(&request.profile.baseline_digest)?;
+        request.search_parent.validate()?;
+        request.baseline.validate()?;
+        request.search_parent_strategy.validate()?;
+        request.baseline_strategy.validate()?;
+        let selection: ProfileSelection = attested_read(
+            s,
+            ctx,
+            "artifact",
+            &format!("formal-profile-{}", request.profile.id),
+            Role::Admin,
+        )
+        .await?;
+        let profile: FrozenCompilerProfile =
+            attested_read(s, ctx, "artifact", &selection.registration_id, Role::Admin).await?;
+        profile.validate(ctx)?;
+        let watermark = s.watermark(ctx).await?;
+        if watermark.is_none() && request.revoke_watermark != 0 {
+            return Err(Error::Conflict("missing source revoke watermark".into()));
+        }
+        let sequence = watermark
+            .as_ref()
+            .map(|w| u64::try_from(w.0).map_err(|_| Error::Conflict("unknown watermark".into())))
+            .transpose()?
+            .unwrap_or(0);
+        if selection.schema_version != "rsia.formal_profile_selection.v1"
+            || selection.profile_id != request.profile.id
+            || selection.registration_digest != fingerprint(&profile)?
+            || profile.environment_digest != request.environment_digest
+            || profile.purpose != request.purpose
+            || request.revoke_watermark != sequence
+            || fingerprint(&profile.baseline_skill)? != fingerprint(&request.baseline)?
+            || fingerprint(&profile.baseline_strategy)? != fingerprint(&request.baseline_strategy)?
+            || fingerprint(&profile.capabilities)? != fingerprint(&request.capabilities)?
+            || profile.baseline_digest()? != request.profile.baseline_digest
+        {
+            return Err(Error::Conflict(
+                "full P/B profile/environment/version/capability binding mismatch".into(),
+            ));
+        }
+        let pointer_id = format!("profile-pointer-{}", request.profile.id);
+        let live_profile_pointer_digest = match s.get::<Value>(ctx, "pointer", &pointer_id).await? {
+            Some(body) => {
+                require_content_witness(s, ctx, "pointer", &pointer_id, &body, Role::Admin).await?;
+                supported_node_schema("pointer", &pointer_id, &body)?;
+                require_registered_body_authority(s, ctx, "pointer", &pointer_id, &body).await?;
+                Some(content_digest(&body)?)
+            }
+            None => None,
+        };
+        let authority = parent_selection(s, ctx, &request.profile.parent_digest).await?;
+        let (parent_skill, parent_strategy, parent_root, parent_body) = match authority {
+            ParentAuthority::EmptyRoot { id } => {
+                let root: EmptyRootAuthorization =
+                    attested_read(s, ctx, "artifact", &id, Role::Admin).await?;
+                root.validate(ctx, &profile)?;
+                if root.digest()? != request.profile.parent_digest {
+                    return Err(Error::Conflict("empty root digest mismatch".into()));
+                }
+                (
+                    root.skill.clone(),
+                    root.strategy.clone(),
+                    ("artifact".into(), id),
+                    CurrentParentBody::EmptyRoot(root),
+                )
+            }
+            ParentAuthority::ApprovedRelease { release_id } => {
+                let release: crate::release_store::PersistentRelease =
+                    attested_read(s, ctx, "release", &release_id, Role::Admin).await?;
+                if !matches!(
+                    release.state,
+                    crate::release_store::PersistentReleaseState::Approved
+                        | crate::release_store::PersistentReleaseState::Canary
+                        | crate::release_store::PersistentReleaseState::Active
+                        | crate::release_store::PersistentReleaseState::Superseded
+                ) {
+                    return Err(Error::Forbidden);
+                }
+                let wire: crate::release_store::ReadCandidate =
+                    s.need(ctx, "artifact", &release.candidate_id).await?;
+                let candidate = wire.current()?;
+                verify_current_release_principal(s, ctx, &release, candidate).await?;
+                verify_current_issued_authority(s, ctx, &release.report_id, candidate).await?;
+                if release.profile_id != profile.profile_id
+                    || release.environment_digest != profile.environment_digest
+                    || release.bundle_digest != candidate.bundle.digest
+                    || release.report_digest.is_empty()
+                    || candidate.bundle.digest != request.profile.parent_digest
+                {
+                    return Err(Error::Conflict("approved P lineage mismatch".into()));
+                }
+                let original = Box::pin(crate::compiler::read_current_parent_bundle_in_session(
+                    s,
+                    ctx,
+                    &candidate.bundle.digest,
+                    &candidate.environment_digest,
+                    candidate.revoke_watermark,
+                    visiting,
+                ))
+                .await?;
+                if serde_json::to_vec(&original.bundle).map_err(|_| Error::Internal)?
+                    != serde_json::to_vec(&candidate.bundle).map_err(|_| Error::Internal)?
+                {
+                    return Err(Error::Conflict("approved P original bundle differs".into()));
+                }
+                (
+                    candidate.bundle.skill.clone(),
+                    candidate.bundle.improver.clone(),
+                    ("release".into(), release.id.clone()),
+                    CurrentParentBody::Bundle {
+                        release_id: release.id.clone(),
+                        bundle: candidate.bundle.clone(),
+                    },
+                )
+            }
+        };
+        require_builtin_parent_strategy(&parent_strategy)?;
+        require_resolved_strategy(&request.search_parent_strategy, &parent_strategy)?;
+        let parent_strategy_digest = fingerprint(&parent_strategy)?;
+        if request
+            .expected_parent_strategy_digest
+            .as_ref()
+            .is_some_and(|expected| expected != &parent_strategy_digest)
+        {
+            return Err(Error::Conflict("P strategy body substitution".into()));
+        }
+        let mut roots = vec![
+            parent_root,
+            ("artifact".into(), profile.id.clone()),
+            ("artifact".into(), selection.id),
+            (
+                "formal_parent".into(),
+                request.profile.parent_digest.clone(),
+            ),
+        ];
+        // Both original P and B dependencies are resolved before any Reset/Set.
+        for dep in parent_skill
+            .dependencies
+            .iter()
+            .chain(&profile.baseline_skill.dependencies)
+            .chain(&request.search_parent.dependencies)
+        {
+            let run = s.get::<Value>(ctx, "run", dep).await?.is_some();
+            let artifact = s.get::<Value>(ctx, "artifact", dep).await?.is_some();
+            if run == artifact {
+                return Err(Error::Conflict(
+                    "missing or ambiguous untyped Skill dependency".into(),
+                ));
+            }
+            roots.push((if run { "run" } else { "artifact" }.into(), dep.clone()));
+        }
+        let closure = read_typed_closure(s, ctx, &roots).await?;
+        let mut binding = CurrentFormalCompilerInputBinding {
+            schema_version: CURRENT_BINDING_SCHEMA.into(),
+            namespace: ctx.namespace().into(),
+            profile_registration_id: profile.id.clone(),
+            profile_digest: fingerprint(&profile)?,
+            parent_digest: request.profile.parent_digest.clone(),
+            baseline_digest: request.profile.baseline_digest.clone(),
+            parent_skill_digest: fingerprint(&parent_skill)?,
+            parent_strategy_digest,
+            search_parent_skill_digest: fingerprint(&request.search_parent)?,
+            search_parent_strategy_digest: fingerprint(&request.search_parent_strategy)?,
+            baseline_skill_digest: fingerprint(&profile.baseline_skill)?,
+            baseline_strategy_digest: fingerprint(&profile.baseline_strategy)?,
+            environment_digest: profile.environment_digest.clone(),
+            capabilities_digest: fingerprint(&profile.capabilities)?,
+            purpose: request.purpose,
+            application_order: profile.application_order.clone(),
+            watermark,
+            live_profile_pointer_digest,
+            closure,
+            binding_digest: String::new(),
+        };
+        binding.binding_digest = fingerprint(&binding)?;
+        let verified = CurrentVerifiedCompilerInputs {
+            profile,
+            parent: parent_body,
+            search_parent_strategy: request.search_parent_strategy.clone(),
+            binding,
+        };
+        verified.content()?;
+        Ok(verified)
+    }
+    .await;
+    visiting.remove(&key);
+    result
+}
+
+fn deserialize_current_binding_schema<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<String, D::Error> {
+    let value = String::deserialize(d)?;
+    if value != CURRENT_BINDING_SCHEMA {
+        return Err(serde::de::Error::custom(
+            "unsupported Current compiler binding schema",
+        ));
+    }
+    Ok(value)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ReadCompilerBindingWire {
+    Current(CurrentFormalCompilerInputBinding),
+    Legacy(FormalCompilerInputBinding),
+}
+/// Immutable view only; it has no Serialize or authority constructor.
+#[derive(Debug, Clone)]
+pub struct ReadCompilerBindingView {
+    pub schema_version: String,
+    pub namespace: String,
+    pub profile_registration_id: String,
+    pub profile_digest: String,
+    pub parent_digest: String,
+    pub baseline_digest: String,
+    pub parent_skill_digest: String,
+    pub parent_strategy_digest: String,
+    pub search_parent_skill_digest: String,
+    pub search_parent_strategy_digest: String,
+    pub baseline_skill_digest: String,
+    pub baseline_strategy_digest: String,
+    pub environment_digest: String,
+    pub capabilities_digest: String,
+    pub purpose: Purpose,
+    pub application_order: Vec<String>,
+    pub watermark: Option<(i64, String)>,
+    pub live_profile_pointer_digest: Option<String>,
+    pub closure: TypedContentClosure,
+    pub binding_digest: String,
+}
+#[derive(Debug, Clone)]
+pub struct ReadCompilerBinding {
+    wire: Box<ReadCompilerBindingWire>,
+    view: Box<ReadCompilerBindingView>,
+}
+impl ReadCompilerBinding {
+    fn from_wire(wire: ReadCompilerBindingWire) -> Result<Self> {
+        let view = match &wire {
+            ReadCompilerBindingWire::Current(record) => {
+                if record.schema_version != CURRENT_BINDING_SCHEMA {
+                    return Err(Error::Invalid(
+                        "unsupported current ReadCompilerBinding schema".into(),
+                    ));
+                }
+                ReadCompilerBindingView {
+                    schema_version: record.schema_version.clone(),
+                    namespace: record.namespace.clone(),
+                    profile_registration_id: record.profile_registration_id.clone(),
+                    profile_digest: record.profile_digest.clone(),
+                    parent_digest: record.parent_digest.clone(),
+                    baseline_digest: record.baseline_digest.clone(),
+                    parent_skill_digest: record.parent_skill_digest.clone(),
+                    parent_strategy_digest: record.parent_strategy_digest.clone(),
+                    search_parent_skill_digest: record.search_parent_skill_digest.clone(),
+                    search_parent_strategy_digest: record.search_parent_strategy_digest.clone(),
+                    baseline_skill_digest: record.baseline_skill_digest.clone(),
+                    baseline_strategy_digest: record.baseline_strategy_digest.clone(),
+                    environment_digest: record.environment_digest.clone(),
+                    capabilities_digest: record.capabilities_digest.clone(),
+                    purpose: record.purpose,
+                    application_order: record.application_order.clone(),
+                    watermark: record.watermark.clone(),
+                    live_profile_pointer_digest: record.live_profile_pointer_digest.clone(),
+                    closure: record.closure.clone(),
+                    binding_digest: record.binding_digest.clone(),
+                }
+            }
+            ReadCompilerBindingWire::Legacy(record) => {
+                if record.schema_version != BINDING_SCHEMA {
+                    return Err(Error::Invalid(
+                        "unsupported legacy ReadCompilerBinding schema".into(),
+                    ));
+                }
+                ReadCompilerBindingView {
+                    schema_version: record.schema_version.clone(),
+                    namespace: record.namespace.clone(),
+                    profile_registration_id: record.profile_registration_id.clone(),
+                    profile_digest: record.profile_digest.clone(),
+                    parent_digest: record.parent_digest.clone(),
+                    baseline_digest: record.baseline_digest.clone(),
+                    parent_skill_digest: record.parent_skill_digest.clone(),
+                    parent_strategy_digest: record.parent_strategy_digest.clone(),
+                    search_parent_skill_digest: record.search_parent_skill_digest.clone(),
+                    search_parent_strategy_digest: record.search_parent_strategy_digest.clone(),
+                    baseline_skill_digest: record.baseline_skill_digest.clone(),
+                    baseline_strategy_digest: record.baseline_strategy_digest.clone(),
+                    environment_digest: record.environment_digest.clone(),
+                    capabilities_digest: record.capabilities_digest.clone(),
+                    purpose: record.purpose,
+                    application_order: record.application_order.clone(),
+                    watermark: record.watermark.clone(),
+                    live_profile_pointer_digest: record.live_profile_pointer_digest.clone(),
+                    closure: record.closure.clone(),
+                    binding_digest: record.binding_digest.clone(),
+                }
+            }
+        };
+        let value = Self {
+            wire: Box::new(wire),
+            view: Box::new(view),
+        };
+
+        Ok(value)
+    }
+    pub(crate) fn from_current(record: CurrentFormalCompilerInputBinding) -> Result<Self> {
+        Self::from_wire(ReadCompilerBindingWire::Current(record))
+    }
+    pub(crate) fn from_legacy(record: FormalCompilerInputBinding) -> Result<Self> {
+        Self::from_wire(ReadCompilerBindingWire::Legacy(record))
+    }
+    pub(crate) fn is_current(&self) -> bool {
+        matches!(self.wire.as_ref(), ReadCompilerBindingWire::Current(_))
+    }
+    pub(crate) fn current(&self) -> Result<&CurrentFormalCompilerInputBinding> {
+        match self.wire.as_ref() {
+            ReadCompilerBindingWire::Current(v) => Ok(v),
+            ReadCompilerBindingWire::Legacy(_) => Err(Error::Conflict(
+                "legacy compiler binding is not Current input".into(),
+            )),
+        }
+    }
+    pub(crate) fn legacy(&self) -> Option<&FormalCompilerInputBinding> {
+        match self.wire.as_ref() {
+            ReadCompilerBindingWire::Legacy(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+impl std::ops::Deref for ReadCompilerBinding {
+    type Target = ReadCompilerBindingView;
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+impl Serialize for ReadCompilerBinding {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self.wire.as_ref() {
+            ReadCompilerBindingWire::Current(record) => record.serialize(serializer),
+            ReadCompilerBindingWire::Legacy(record) => record.serialize(serializer),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for ReadCompilerBinding {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let wire = ReadCompilerBindingWire::deserialize(deserializer)?;
+        Self::from_wire(wire).map_err(serde::de::Error::custom)
+    }
+}
+
+impl ReadCompilerBinding {
+    pub(crate) fn seal_is_valid(&self) -> Result<bool> {
+        match self.wire.as_ref() {
+            ReadCompilerBindingWire::Current(original) => {
+                let mut value = original.clone();
+                let digest = std::mem::take(&mut value.binding_digest);
+                Ok(fingerprint(&value)? == digest)
+            }
+            ReadCompilerBindingWire::Legacy(original) => {
+                let mut value = original.clone();
+                let digest = std::mem::take(&mut value.binding_digest);
+                Ok(fingerprint(&value)? == digest)
+            }
+        }
+    }
+}
+
+pub async fn resolve_current_bundle_in_session(
+    s: &mut Session,
+    ctx: &Context,
+    bundle: &ResolvedBundleV3,
+    environment_digest: &str,
+    watermark: u64,
+    purpose: Purpose,
+) -> Result<CurrentVerifiedCompilerInputs> {
+    let selection: ProfileSelection = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &format!("formal-profile-{}", bundle.profile_id),
+        Role::Admin,
+    )
+    .await?;
+    let profile: FrozenCompilerProfile =
+        attested_read(s, ctx, "artifact", &selection.registration_id, Role::Admin).await?;
+    let authority = parent_selection(s, ctx, &bundle.parent_digest).await?;
+    let parent_strategy = match authority {
+        ParentAuthority::EmptyRoot { id } => {
+            attested_read::<EmptyRootAuthorization>(s, ctx, "artifact", &id, Role::Admin)
+                .await?
+                .strategy
+        }
+        ParentAuthority::ApprovedRelease { release_id } => {
+            let release: crate::release_store::PersistentRelease =
+                attested_read(s, ctx, "release", &release_id, Role::Admin).await?;
+            s.need::<crate::release_store::ReadCandidate>(ctx, "artifact", &release.candidate_id)
+                .await?
+                .current()?
+                .bundle
+                .improver
+                .clone()
+        }
+    };
+    let verified = resolve_current_compiler_inputs(
+        s,
+        ctx,
+        &CompilerInputRequest {
+            profile: Profile {
+                id: bundle.profile_id.clone(),
+                evolution_enabled: true,
+                parent_digest: bundle.parent_digest.clone(),
+                baseline_digest: bundle.baseline_digest.clone(),
+            },
+            search_parent: bundle.skill.clone(),
+            baseline: profile.baseline_skill,
+            search_parent_strategy: bundle.improver.clone(),
+            expected_parent_strategy_digest: Some(fingerprint(&parent_strategy)?),
+            baseline_strategy: profile.baseline_strategy,
+            capabilities: profile.capabilities,
+            environment_digest: environment_digest.into(),
+            purpose,
+            revoke_watermark: watermark,
+        },
+    )
+    .await?;
+    verified.replay(bundle)?;
+    // Set dependencies are new reads and are checked after replay as well.
+    let output_roots = bundle
+        .skill
+        .dependencies
+        .iter()
+        .map(|id| {
+            let found = verified.binding.closure.nodes.iter().find(|r| &r.id == id);
+            found
+                .map(|r| (r.kind.clone(), r.id.clone()))
+                .ok_or_else(|| Error::Conflict("undeclared output dependency".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    read_typed_closure(s, ctx, &output_roots).await?;
+    Ok(verified)
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadVerifiedView {
+    pub profile: FrozenCompilerProfile,
+    pub binding: ReadCompilerBinding,
+}
+/// An in-Session resolver result, never a caller-deserializable authority.
+#[derive(Debug, Clone)]
+pub struct ReadVerifiedInputs {
+    wire: Box<CurrentVerifiedCompilerInputs>,
+    view: Box<ReadVerifiedView>,
+}
+impl std::ops::Deref for ReadVerifiedInputs {
+    type Target = ReadVerifiedView;
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+impl ReadVerifiedInputs {
+    fn from_current(value: CurrentVerifiedCompilerInputs) -> Result<Self> {
+        let view = ReadVerifiedView {
+            profile: value.profile.clone(),
+            binding: ReadCompilerBinding::from_current(value.binding.clone())?,
+        };
+        Ok(Self {
+            wire: Box::new(value),
+            view: Box::new(view),
+        })
+    }
+    pub(crate) fn binding(&self) -> &ReadCompilerBinding {
+        &self.view.binding
+    }
+    pub(crate) fn compile(
+        &self,
+        skill: &SkillPatch,
+        improver: &ImproverPatch,
+    ) -> Result<crate::compiler::ReadBundle> {
+        crate::compiler::ReadBundle::from_current(self.wire.compile(skill, improver)?)
+    }
+}
+pub(crate) async fn resolve_read_bundle_in_session(
+    s: &mut Session,
+    ctx: &Context,
+    bundle: &crate::compiler::ReadBundle,
+    environment_digest: &str,
+    watermark: u64,
+    purpose: Purpose,
+) -> Result<ReadVerifiedInputs> {
+    if bundle.is_current() {
+        ReadVerifiedInputs::from_current(
+            resolve_current_bundle_in_session(
+                s,
+                ctx,
+                bundle.current()?,
+                environment_digest,
+                watermark,
+                purpose,
+            )
+            .await?,
+        )
+    } else {
+        bundle.validate_identity()?;
+        Err(Error::Conflict("legacy bundle is not Current input".into()))
+    }
+}
+
+/// Same-Session admission without DML. The later action writer repeats these
+/// checks, but no bundle, candidate, dependency or audit may precede this gate.
+pub(crate) async fn preflight_current_candidate_principal(
+    s: &mut Session,
+    ctx: &Context,
+    binding: &CurrentFormalCompilerInputBinding,
+    candidate: &crate::release_store::CurrentReleaseCandidateRecord,
+) -> Result<()> {
+    let profile: FrozenCompilerProfile = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &binding.profile_registration_id,
+        Role::Admin,
+    )
+    .await?;
+    let host: RegisteredFormalHost = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &profile.host_registration_id,
+        Role::Admin,
+    )
+    .await?;
+    if s.get::<Value>(ctx, "artifact", &format!("formal-principals-{}", host.id))
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+    let set = principal_set(s, ctx, &host).await?;
+    if ctx.role() != Role::Worker || ctx.actor() != candidate.proposer_actor {
+        return Err(Error::Forbidden);
+    }
+    let expected = fingerprint(candidate)?;
+    OPERATOR_CREDENTIAL
+        .try_with(|cap| -> Result<()> {
+            let principal = set.principal(Role::Worker)?;
+            if cap.role != Role::Worker
+                || cap.namespace != ctx.namespace()
+                || cap.actor != ctx.actor()
+                || cap.host_digest != fingerprint(&host)?
+                || cap.principals.binding_digest()? != set.binding_digest()?
+                || cap.operation != "stage"
+                || cap.request_digest != expected
+                || cap.peer.uid() != principal.uid
+                || cap.authority.uid != set.grader.uid
+            {
+                return Err(Error::Forbidden);
+            }
+            Ok(())
+        })
+        .map_err(|_| Error::Forbidden)??;
+    let grader = Context::new(ctx.namespace(), &set.grader.actor, Role::Evaluator)?;
+    process_principal(&grader, &host, &set, Role::Evaluator)?;
+    Ok(())
+}
+
+pub(crate) async fn bind_current_candidate_principal(
+    s: &mut Session,
+    ctx: &Context,
+    host_id: &str,
+    candidate: &crate::release_store::CurrentReleaseCandidateRecord,
+) -> Result<()> {
+    let host: RegisteredFormalHost =
+        attested_read(s, ctx, "artifact", host_id, Role::Admin).await?;
+    // Explicit old ProgramFixture/EmptyRoot diagnostics remain usable. They
+    // cannot execute a registered provider or obtain an issued formal report.
+    if s.get::<Value>(ctx, "artifact", &format!("formal-principals-{}", host.id))
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+    if ctx.role() != Role::Worker || ctx.actor() != candidate.proposer_actor {
+        return Err(Error::Forbidden);
+    }
+    let expected = fingerprint(candidate)?;
+    OPERATOR_CREDENTIAL
+        .try_with(|cap| {
+            if cap.operation == "stage" && cap.request_digest == expected {
+                Ok(())
+            } else {
+                Err(Error::Forbidden)
+            }
+        })
+        .map_err(|_| Error::Forbidden)??;
+    record_operator_action(
+        s,
+        ctx,
+        &host,
+        "artifact",
+        &candidate.id,
+        candidate,
+        Role::Worker,
+    )
+    .await
+}
+pub(crate) async fn bind_current_candidate_principal_from_binding(
+    s: &mut Session,
+    ctx: &Context,
+    binding: &CurrentFormalCompilerInputBinding,
+    candidate: &crate::release_store::CurrentReleaseCandidateRecord,
+) -> Result<()> {
+    let profile: FrozenCompilerProfile = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &binding.profile_registration_id,
+        Role::Admin,
+    )
+    .await?;
+    bind_current_candidate_principal(s, ctx, &profile.host_registration_id, candidate).await
+}
+pub(crate) async fn verify_current_release_principal(
+    s: &mut Session,
+    ctx: &Context,
+    release: &crate::release_store::PersistentRelease,
+    candidate: &crate::release_store::CurrentReleaseCandidateRecord,
+) -> Result<()> {
+    let selection: ProfileSelection = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &format!("formal-profile-{}", candidate.profile_id),
+        Role::Admin,
+    )
+    .await?;
+    let profile: FrozenCompilerProfile =
+        attested_read(s, ctx, "artifact", &selection.registration_id, Role::Admin).await?;
+    let host: RegisteredFormalHost = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &profile.host_registration_id,
+        Role::Admin,
+    )
+    .await?;
+    let admin =
+        require_principal_action(s, ctx, &host, "release", &release.id, release, Role::Admin)
+            .await?;
+    let worker = require_principal_action(
+        s,
+        ctx,
+        &host,
+        "artifact",
+        &candidate.id,
+        candidate,
+        Role::Worker,
+    )
+    .await?;
+    if admin.actor != release.approved_by
+        || worker.actor != candidate.proposer_actor
+        || worker.actor != release.proposer_actor
+        || admin.uid == worker.uid
+        || admin.principal == worker.principal
+    {
+        return Err(Error::Forbidden);
+    }
+    Ok(())
+}
+pub(crate) async fn verify_read_candidate_principals(
+    s: &mut Session,
+    ctx: &Context,
+    host_id: &str,
+    candidate: &crate::release_store::ReadCandidate,
+    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
+) -> Result<RegisteredPrincipalSet> {
+    let host: RegisteredFormalHost =
+        attested_read(s, ctx, "artifact", host_id, Role::Admin).await?;
+    let set = principal_set(s, ctx, &host).await?;
+    let worker = require_principal_action(
+        s,
+        ctx,
+        &host,
+        "artifact",
+        &candidate.id,
+        candidate,
+        Role::Worker,
+    )
+    .await?;
+    let grader = require_principal_action(
+        s,
+        ctx,
+        &host,
+        "artifact",
+        &crate::streaming_evaluator::storage_id("registered_evaluation_control_v41", &control.id)?,
+        control,
+        Role::Evaluator,
+    )
+    .await?;
+    if candidate.proposer_actor != worker.actor
+        || control.proposer_actor != worker.actor
+        || control.evaluator_actor != grader.actor
+        || control.approver_actor != set.administrator.actor
+        || control.executor_actor != set.host.actor
+        || control.evidence_scope
+            != crate::streaming_evaluator::EvaluationEvidenceScope::RegisteredExternalHost
+    {
+        return Err(Error::Forbidden);
+    }
+    Ok(set)
+}
+pub(crate) async fn verify_read_candidate_principals_from_binding(
+    s: &mut Session,
+    ctx: &Context,
+    binding: &ReadCompilerBinding,
+    candidate: &crate::release_store::ReadCandidate,
+    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
+) -> Result<()> {
+    let profile: FrozenCompilerProfile = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &binding.profile_registration_id,
+        Role::Admin,
+    )
+    .await?;
+    verify_read_candidate_principals(s, ctx, &profile.host_registration_id, candidate, control)
+        .await?;
+    Ok(())
+}
+pub const CURRENT_FORMAL_SCHEMA: &str = "rsia.issued_formal_authority.v3";
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentIssuedFormalAuthority {
+    pub id: String,
+    pub schema_version: String,
+    pub report_id: String,
+    pub raw_report_digest: String,
+    pub ticket_digest: String,
+    pub candidate_id: String,
+    pub candidate_bundle_digest: String,
+    pub environment_digest: String,
+    pub compiler_binding: CurrentFormalCompilerInputBinding,
+    pub billing_scope: String,
+    pub root_seal_digest: String,
+    pub episode_cost_digest: String,
+    pub host_registration_id: String,
+    pub principal_set_digest: String,
+    pub report_principal_action_id: String,
+    pub provider_captures: Vec<TypedContentRef>,
+    pub grader_captures: Vec<TypedContentRef>,
+    pub closure_roots: Vec<(String, String)>,
+    pub closure: TypedContentClosure,
+    pub watermark: Option<(i64, String)>,
+    pub issued_by: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ReadIssuedAuthorityWire {
+    Current(CurrentIssuedFormalAuthority),
+    Legacy(IssuedFormalAuthority),
+}
+/// Immutable view only; it has no Serialize or authority constructor.
+#[derive(Debug, Clone)]
+pub struct ReadIssuedAuthorityView {
+    pub id: String,
+    pub schema_version: String,
+    pub report_id: String,
+    pub raw_report_digest: String,
+    pub ticket_digest: String,
+    pub candidate_id: String,
+    pub candidate_bundle_digest: String,
+    pub environment_digest: String,
+    pub compiler_binding: ReadCompilerBinding,
+    pub billing_scope: String,
+    pub root_seal_digest: String,
+    pub episode_cost_digest: String,
+    pub host_registration_id: String,
+    pub principal_set_digest: String,
+    pub report_principal_action_id: String,
+    pub provider_captures: Vec<TypedContentRef>,
+    pub grader_captures: Vec<TypedContentRef>,
+    pub closure_roots: Vec<(String, String)>,
+    pub closure: TypedContentClosure,
+    pub watermark: Option<(i64, String)>,
+    pub issued_by: String,
+}
+#[derive(Debug, Clone)]
+pub struct ReadIssuedAuthority {
+    wire: Box<ReadIssuedAuthorityWire>,
+    view: Box<ReadIssuedAuthorityView>,
+}
+impl ReadIssuedAuthority {
+    fn from_wire(wire: ReadIssuedAuthorityWire) -> Result<Self> {
+        let view = match &wire {
+            ReadIssuedAuthorityWire::Current(record) => {
+                if record.schema_version != CURRENT_FORMAL_SCHEMA {
+                    return Err(Error::Invalid(
+                        "unsupported current ReadIssuedAuthority schema".into(),
+                    ));
+                }
+                ReadIssuedAuthorityView {
+                    id: record.id.clone(),
+                    schema_version: record.schema_version.clone(),
+                    report_id: record.report_id.clone(),
+                    raw_report_digest: record.raw_report_digest.clone(),
+                    ticket_digest: record.ticket_digest.clone(),
+                    candidate_id: record.candidate_id.clone(),
+                    candidate_bundle_digest: record.candidate_bundle_digest.clone(),
+                    environment_digest: record.environment_digest.clone(),
+                    compiler_binding: ReadCompilerBinding::from_current(
+                        record.compiler_binding.clone(),
+                    )?,
+                    billing_scope: record.billing_scope.clone(),
+                    root_seal_digest: record.root_seal_digest.clone(),
+                    episode_cost_digest: record.episode_cost_digest.clone(),
+                    host_registration_id: record.host_registration_id.clone(),
+                    principal_set_digest: record.principal_set_digest.clone(),
+                    report_principal_action_id: record.report_principal_action_id.clone(),
+                    provider_captures: record.provider_captures.clone(),
+                    grader_captures: record.grader_captures.clone(),
+                    closure_roots: record.closure_roots.clone(),
+                    closure: record.closure.clone(),
+                    watermark: record.watermark.clone(),
+                    issued_by: record.issued_by.clone(),
+                }
+            }
+            ReadIssuedAuthorityWire::Legacy(record) => {
+                if record.schema_version != FORMAL_SCHEMA {
+                    return Err(Error::Invalid(
+                        "unsupported legacy ReadIssuedAuthority schema".into(),
+                    ));
+                }
+                ReadIssuedAuthorityView {
+                    id: record.id.clone(),
+                    schema_version: record.schema_version.clone(),
+                    report_id: record.report_id.clone(),
+                    raw_report_digest: record.raw_report_digest.clone(),
+                    ticket_digest: record.ticket_digest.clone(),
+                    candidate_id: record.candidate_id.clone(),
+                    candidate_bundle_digest: record.candidate_bundle_digest.clone(),
+                    environment_digest: record.environment_digest.clone(),
+                    compiler_binding: ReadCompilerBinding::from_legacy(
+                        record.compiler_binding.clone(),
+                    )?,
+                    billing_scope: record.billing_scope.clone(),
+                    root_seal_digest: record.root_seal_digest.clone(),
+                    episode_cost_digest: record.episode_cost_digest.clone(),
+                    host_registration_id: record.host_registration_id.clone(),
+                    principal_set_digest: record.principal_set_digest.clone(),
+                    report_principal_action_id: record.report_principal_action_id.clone(),
+                    provider_captures: record.provider_captures.clone(),
+                    grader_captures: record.grader_captures.clone(),
+                    closure_roots: record.closure_roots.clone(),
+                    closure: record.closure.clone(),
+                    watermark: record.watermark.clone(),
+                    issued_by: record.issued_by.clone(),
+                }
+            }
+        };
+        let value = Self {
+            wire: Box::new(wire),
+            view: Box::new(view),
+        };
+
+        Ok(value)
+    }
+    pub(crate) fn from_current(record: CurrentIssuedFormalAuthority) -> Result<Self> {
+        Self::from_wire(ReadIssuedAuthorityWire::Current(record))
+    }
+    pub(crate) fn from_legacy(record: IssuedFormalAuthority) -> Result<Self> {
+        Self::from_wire(ReadIssuedAuthorityWire::Legacy(record))
+    }
+    pub(crate) fn is_current(&self) -> bool {
+        matches!(self.wire.as_ref(), ReadIssuedAuthorityWire::Current(_))
+    }
+}
+impl std::ops::Deref for ReadIssuedAuthority {
+    type Target = ReadIssuedAuthorityView;
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+impl Serialize for ReadIssuedAuthority {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self.wire.as_ref() {
+            ReadIssuedAuthorityWire::Current(record) => record.serialize(serializer),
+            ReadIssuedAuthorityWire::Legacy(record) => record.serialize(serializer),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for ReadIssuedAuthority {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let wire = ReadIssuedAuthorityWire::deserialize(deserializer)?;
+        Self::from_wire(wire).map_err(serde::de::Error::custom)
+    }
+}
+
+impl ReadIssuedAuthority {
+    fn from_parts(view: ReadIssuedAuthorityView) -> Result<Self> {
+        if view.schema_version
+            != if view.compiler_binding.is_current() {
+                CURRENT_FORMAL_SCHEMA
+            } else {
+                FORMAL_SCHEMA
+            }
+        {
+            return Err(Error::Conflict(
+                "issued authority version differs from compiler binding".into(),
+            ));
+        }
+        match view.compiler_binding.wire.as_ref() {
+            ReadCompilerBindingWire::Current(binding) => {
+                Self::from_current(CurrentIssuedFormalAuthority {
+                    id: view.id.clone(),
+                    schema_version: CURRENT_FORMAL_SCHEMA.into(),
+                    report_id: view.report_id.clone(),
+                    raw_report_digest: view.raw_report_digest.clone(),
+                    ticket_digest: view.ticket_digest.clone(),
+                    candidate_id: view.candidate_id.clone(),
+                    candidate_bundle_digest: view.candidate_bundle_digest.clone(),
+                    environment_digest: view.environment_digest.clone(),
+                    compiler_binding: binding.clone(),
+                    billing_scope: view.billing_scope.clone(),
+                    root_seal_digest: view.root_seal_digest.clone(),
+                    episode_cost_digest: view.episode_cost_digest.clone(),
+                    host_registration_id: view.host_registration_id.clone(),
+                    principal_set_digest: view.principal_set_digest.clone(),
+                    report_principal_action_id: view.report_principal_action_id.clone(),
+                    provider_captures: view.provider_captures.clone(),
+                    grader_captures: view.grader_captures.clone(),
+                    closure_roots: view.closure_roots.clone(),
+                    closure: view.closure.clone(),
+                    watermark: view.watermark.clone(),
+                    issued_by: view.issued_by.clone(),
+                })
+            }
+            ReadCompilerBindingWire::Legacy(binding) => Self::from_legacy(IssuedFormalAuthority {
+                id: view.id.clone(),
+                schema_version: FORMAL_SCHEMA.into(),
+                report_id: view.report_id.clone(),
+                raw_report_digest: view.raw_report_digest.clone(),
+                ticket_digest: view.ticket_digest.clone(),
+                candidate_id: view.candidate_id.clone(),
+                candidate_bundle_digest: view.candidate_bundle_digest.clone(),
+                environment_digest: view.environment_digest.clone(),
+                compiler_binding: binding.clone(),
+                billing_scope: view.billing_scope.clone(),
+                root_seal_digest: view.root_seal_digest.clone(),
+                episode_cost_digest: view.episode_cost_digest.clone(),
+                host_registration_id: view.host_registration_id.clone(),
+                principal_set_digest: view.principal_set_digest.clone(),
+                report_principal_action_id: view.report_principal_action_id.clone(),
+                provider_captures: view.provider_captures.clone(),
+                grader_captures: view.grader_captures.clone(),
+                closure_roots: view.closure_roots.clone(),
+                closure: view.closure.clone(),
+                watermark: view.watermark.clone(),
+                issued_by: view.issued_by.clone(),
+            }),
+        }
+    }
+}
+
+pub async fn verify_read_issued_authority(
+    s: &mut Session,
+    ctx: &Context,
+    report_id: &str,
+    candidate: &crate::release_store::ReadCandidate,
+) -> Result<ReadIssuedAuthority> {
+    let record: ReadIssuedAuthority = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &format!("formal-authority-{report_id}"),
+        Role::Evaluator,
+    )
+    .await?;
+    if record.is_current() != candidate.is_current()
+        || record.report_id != report_id
+        || record.candidate_id != candidate.id
+        || record.candidate_bundle_digest != candidate.bundle_digest
+        || record.environment_digest != candidate.environment_digest
+        || record.watermark != s.watermark(ctx).await?
+        || record.provider_captures.is_empty()
+        || record.grader_captures.is_empty()
+    {
+        return Err(Error::Conflict(
+            "unknown/stale formal authority; quarantine".into(),
+        ));
+    }
+    verify_typed_closure(s, ctx, &record.closure_roots, &record.closure).await?;
+    let formal: crate::streaming_evaluator::FormalEvaluationV2 =
+        crate::streaming_evaluator::need_record(s, ctx, "formal_evaluation_v2", report_id).await?;
+    let ticket: crate::streaming_evaluator::ReadEvaluationTicket =
+        crate::streaming_evaluator::need_record(s, ctx, "evaluation_ticket_v2", report_id).await?;
+    if record.raw_report_digest != fingerprint(&formal)?
+        || record.ticket_digest != fingerprint(&ticket)?
+    {
+        return Err(Error::Conflict("issued report/ticket bytes differ".into()));
+    }
+    let seal = s
+        .sealed_root_budget_evidence(ctx, &record.billing_scope)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if !seal.monetary_complete || fingerprint(&seal)? != record.root_seal_digest {
+        return Err(Error::Conflict("root cost seal stale".into()));
+    }
+    let cost: EpisodeCostRecord = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &format!("formal-cost-{report_id}"),
+        Role::Host,
+    )
+    .await?;
+    cost.measurements.validate_complete()?;
+    if fingerprint(&cost)? != record.episode_cost_digest {
+        return Err(Error::Conflict("episode cost changed".into()));
+    }
+    let control: crate::streaming_evaluator::RegisteredEvaluationControl =
+        crate::streaming_evaluator::need_record(
+            s,
+            ctx,
+            "registered_evaluation_control_v41",
+            &ticket.registration_id,
+        )
+        .await?;
+    let profile: FrozenCompilerProfile = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &record.compiler_binding.profile_registration_id,
+        Role::Admin,
+    )
+    .await?;
+    let selection: ProfileSelection = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &format!("formal-profile-{}", profile.profile_id),
+        Role::Admin,
+    )
+    .await?;
+    let host: RegisteredFormalHost = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &record.host_registration_id,
+        Role::Admin,
+    )
+    .await?;
+    let set = verify_read_candidate_principals(s, ctx, &host.id, candidate, &control).await?;
+    let report_storage_id =
+        crate::streaming_evaluator::storage_id("formal_evaluation_v2", report_id)?;
+    require_principal_action(
+        s,
+        ctx,
+        &host,
+        "artifact",
+        &report_storage_id,
+        &formal,
+        Role::Evaluator,
+    )
+    .await?;
+    if record.principal_set_digest != set.binding_digest()?
+        || record.report_principal_action_id
+            != principal_action_id("artifact", &report_storage_id, Role::Evaluator)?
+    {
+        return Err(Error::Forbidden);
+    }
+    if selection.registration_id != profile.id
+        || fingerprint(&profile)? != record.compiler_binding.profile_digest
+        || profile.host_registration_id != host.id
+        || cost.profile_registration_id != profile.id
+        || cost.ticket_id != ticket.id
+        || record.billing_scope != control.billing_scope
+    {
+        return Err(Error::Forbidden);
+    }
+    verify_refs(s, ctx, &cost.measurement_sources).await?;
+    validate_episode_meter_sources(
+        s,
+        ctx,
+        &profile,
+        &host,
+        &ticket,
+        &control,
+        &seal,
+        &cost.measurements,
+        &cost.measurement_sources,
+    )
+    .await?;
+    for r in &record.provider_captures {
+        let capture: FormalProviderCaptureRecord =
+            attested_read(s, ctx, &r.kind, &r.id, Role::Host).await?;
+        verify_provider_registration(s, ctx, &capture, &host).await?;
+    }
+    let binding = &record.compiler_binding;
+    if !binding.seal_is_valid()?
+        || binding.parent_digest != candidate.parent_digest
+        || binding.baseline_digest != candidate.bundle.baseline_digest
+    {
+        return Err(Error::Conflict("compiler input seal mismatch".into()));
+    }
+    verify_refs(s, ctx, &record.provider_captures).await?;
+    verify_refs(s, ctx, &record.grader_captures).await?;
+    Ok(record)
+}
+async fn verify_current_issued_authority(
+    s: &mut Session,
+    ctx: &Context,
+    report: &str,
+    candidate: &crate::release_store::CurrentReleaseCandidateRecord,
+) -> Result<ReadIssuedAuthority> {
+    let candidate = crate::release_store::ReadCandidate::from_current(candidate.clone())?;
+    verify_read_issued_authority(s, ctx, report, &candidate).await
+}
+
+/// Mandatory original bodies in authenticated_bundle.v2; data alone is no authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "authority", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CurrentParentMaterial {
+    EmptyRoot {
+        root: EmptyRootAuthorization,
+    },
+    ApprovedRelease {
+        release_id: String,
+        bundle: ResolvedBundleV3,
+    },
+}
+impl CurrentVerifiedCompilerInputs {
+    pub(crate) fn original_material(&self) -> (FrozenCompilerProfile, CurrentParentMaterial) {
+        let parent = match &self.parent {
+            CurrentParentBody::EmptyRoot(root) => {
+                CurrentParentMaterial::EmptyRoot { root: root.clone() }
+            }
+            CurrentParentBody::Bundle { release_id, bundle } => {
+                CurrentParentMaterial::ApprovedRelease {
+                    release_id: release_id.clone(),
+                    bundle: bundle.clone(),
+                }
+            }
+        };
+        (self.profile.clone(), parent)
+    }
+}
+pub(crate) async fn replay_current_record_material(
+    s: &mut Session,
+    ctx: &Context,
+    record: &crate::compiler::CurrentAuthenticatedBundleRecord,
+    visiting: &mut BTreeSet<String>,
+) -> Result<()> {
+    let baseline: FrozenCompilerProfile = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &record.original_baseline.id,
+        Role::Admin,
+    )
+    .await?;
+    baseline.validate(ctx)?;
+    exact_profile_projection(
+        &baseline,
+        &project_frozen_profile(&record.original_baseline)?,
+    )?;
+    let parent = match &record.original_parent {
+        CurrentParentMaterial::EmptyRoot { root: stored } => {
+            let original: EmptyRootAuthorization =
+                attested_read(s, ctx, "artifact", &stored.id, Role::Admin).await?;
+            original.validate(ctx, &baseline)?;
+            exact_root_projection(&original, &project_empty_root(stored)?)?;
+            match parent_selection(s, ctx, &record.bundle.parent_digest).await? {
+                ParentAuthority::EmptyRoot { id } if id == original.id => {}
+                _ => return Err(Error::Forbidden),
+            }
+            ParentContentV3::EmptyRoot(project_empty_root(&original)?)
+        }
+        CurrentParentMaterial::ApprovedRelease {
+            release_id,
+            bundle: stored,
+        } => {
+            match parent_selection(s, ctx, &record.bundle.parent_digest).await? {
+                ParentAuthority::ApprovedRelease { release_id: id } if id == *release_id => {}
+                _ => return Err(Error::Forbidden),
+            }
+            let release: crate::release_store::PersistentRelease =
+                attested_read(s, ctx, "release", release_id, Role::Admin).await?;
+            if !matches!(
+                release.state,
+                crate::release_store::PersistentReleaseState::Approved
+                    | crate::release_store::PersistentReleaseState::Canary
+                    | crate::release_store::PersistentReleaseState::Active
+                    | crate::release_store::PersistentReleaseState::Superseded
+            ) {
+                return Err(Error::Forbidden);
+            }
+            let wire: crate::release_store::ReadCandidate =
+                s.need(ctx, "artifact", &release.candidate_id).await?;
+            let candidate = wire.current()?;
+            verify_current_release_principal(s, ctx, &release, candidate).await?;
+            verify_current_issued_authority(s, ctx, &release.report_id, candidate).await?;
+            if release.bundle_digest != stored.digest
+                || release.profile_id != baseline.profile_id
+                || release.environment_digest != baseline.environment_digest
+                || serde_json::to_vec(&candidate.bundle).map_err(|_| Error::Internal)?
+                    != serde_json::to_vec(stored).map_err(|_| Error::Internal)?
+            {
+                return Err(Error::Conflict(
+                    "authenticated parent original differs".into(),
+                ));
+            }
+            let parent = Box::pin(crate::compiler::read_current_parent_bundle_in_session(
+                s,
+                ctx,
+                &stored.digest,
+                &release.environment_digest,
+                candidate.revoke_watermark,
+                visiting,
+            ))
+            .await?;
+            if serde_json::to_vec(&parent.bundle).map_err(|_| Error::Internal)?
+                != serde_json::to_vec(stored).map_err(|_| Error::Internal)?
+            {
+                return Err(Error::Conflict(
+                    "authenticated parent material differs".into(),
+                ));
+            }
+            ParentContentV3::CurrentBundle(stored.clone())
+        }
+    };
+    let parent_skill = match &parent {
+        ParentContentV3::EmptyRoot(root) => &root.skill,
+        ParentContentV3::CurrentBundle(bundle) => &bundle.skill,
+    };
+    let parent_strategy = match &parent {
+        ParentContentV3::EmptyRoot(root) => &root.strategy,
+        ParentContentV3::CurrentBundle(bundle) => &bundle.improver,
+    };
+    require_builtin_parent_strategy(parent_strategy)?;
+    require_resolved_strategy(&record.bundle.improver, parent_strategy)?;
+    let expected_parent_strategy = fingerprint(parent_strategy)?;
+    let seal = ReadCompilerBinding::from_current(record.binding.clone())?;
+    let sequence = seal
+        .watermark
+        .as_ref()
+        .map(|v| u64::try_from(v.0))
+        .transpose()
+        .map_err(|_| Error::Conflict("unknown watermark".into()))?
+        .unwrap_or(0);
+    if !seal.seal_is_valid()?
+        || seal.namespace != ctx.namespace()
+        || !record.input.profile.evolution_enabled
+        || record.input.expected_parent_strategy_digest.as_deref()
+            != Some(expected_parent_strategy.as_str())
+        || seal.search_parent_skill_digest != fingerprint(&record.input.search_parent)?
+        || seal.search_parent_strategy_digest != fingerprint(&record.input.search_parent_strategy)?
+        || seal.profile_registration_id != baseline.id
+        || seal.profile_digest != fingerprint(&baseline)?
+        || seal.parent_digest != record.bundle.parent_digest
+        || seal.baseline_digest != record.bundle.baseline_digest
+        || seal.parent_skill_digest != fingerprint(parent_skill)?
+        || seal.parent_strategy_digest != fingerprint(parent_strategy)?
+        || seal.baseline_skill_digest != fingerprint(&baseline.baseline_skill)?
+        || seal.baseline_strategy_digest != fingerprint(&baseline.baseline_strategy)?
+        || seal.capabilities_digest != fingerprint(&baseline.capabilities)?
+        || seal.environment_digest != baseline.environment_digest
+        || seal.purpose != baseline.purpose
+        || seal.application_order != baseline.application_order
+        || record.input.environment_digest != baseline.environment_digest
+        || record.input.purpose != baseline.purpose
+        || record.input.revoke_watermark != sequence
+        || fingerprint(&record.input.baseline)? != fingerprint(&baseline.baseline_skill)?
+        || fingerprint(&record.input.baseline_strategy)?
+            != fingerprint(&baseline.baseline_strategy)?
+        || fingerprint(&record.input.capabilities)? != fingerprint(&baseline.capabilities)?
+        || fingerprint(&record.input.search_parent)? != fingerprint(&record.bundle.skill)?
+        || fingerprint(&record.input.search_parent_strategy)?
+            != fingerprint(&record.bundle.improver)?
+    {
+        return Err(Error::Conflict(
+            "authenticated original P/B/input seal differs".into(),
+        ));
+    }
+    let proof = ProfileContentProofV3::from_content(
+        record.input.profile.clone(),
+        parent,
+        project_frozen_profile(&baseline)?,
+    )?;
+    replay_resolved_bundle_v3(&record.bundle, &proof, &BTreeSet::new())?;
+    // Liveness of these original immutable dependencies is current. Historical
+    // profile-selection/pointer/watermark observations are not rewritten as new input.
+    let roots = baseline
+        .dependencies
+        .iter()
+        .map(|d| (d.kind.clone(), d.id.clone()))
+        .collect::<Vec<_>>();
+    read_typed_closure(s, ctx, &roots).await?;
+    Ok(())
+}
+
+/// Callable Session controls for a future qualified fixture. These definitions
+/// are not #[test] entries and their existence is not an executed control.
+#[cfg(test)]
+#[allow(dead_code)] // Callable controls require a future qualified fixture; no automatic pass.
+pub(crate) mod current_bridge_session_controls {
+    use super::*;
+
+    pub(crate) async fn h1_empty_root_compile_persist_reload(
+        store: &Store,
+        ctx: &Context,
+        request: &CompilerInputRequest,
+    ) -> Result<()> {
+        let mut s = store.session().await?;
+        let original = resolve_current_compiler_inputs(&mut s, ctx, request).await?;
+        assert!(matches!(&original.parent, CurrentParentBody::EmptyRoot(_)));
+        let bundle = crate::compiler::compile_current_in_session(
+            &mut s,
+            ctx,
+            request,
+            &SkillPatch::default(),
+            &ImproverPatch::default(),
+        )
+        .await?;
+        assert_eq!(bundle.schema_version, evo_core::contract::BUNDLE_SCHEMA_V3);
+        assert_eq!(bundle.baseline_digest, fingerprint(&original.profile)?);
+        s.commit().await?;
+        let mut s = store.session().await?;
+        let reloaded = crate::compiler::verify_current_bundle_in_session(
+            &mut s,
+            ctx,
+            &bundle.digest,
+            &request.environment_digest,
+            request.revoke_watermark,
+        )
+        .await?;
+        assert_eq!(
+            serde_json::to_vec(&reloaded.bundle).unwrap(),
+            serde_json::to_vec(&bundle).unwrap()
+        );
+        exact_profile_projection(
+            &reloaded.original_baseline,
+            &project_frozen_profile(&original.profile)?,
+        )?;
+        s.commit().await
+    }
+
+    pub(crate) async fn h2_real_approved_parent_keeps_complete_originals(
+        store: &Store,
+        ctx: &Context,
+        request: &CompilerInputRequest,
+        expected_candidate_id: &str,
+    ) -> Result<()> {
+        let mut s = store.session().await?;
+        let original = resolve_current_compiler_inputs(&mut s, ctx, request).await?;
+        // Resolver already required actual Admin release, Worker action,
+        // issued Evaluator report, full closure and all unchanged live guards.
+        let CurrentParentBody::Bundle {
+            release_id,
+            bundle: parent,
+        } = &original.parent
+        else {
+            panic!("H2 requires the independently qualified approved-P fixture");
+        };
+        let release: crate::release_store::PersistentRelease =
+            attested_read(&mut s, ctx, "release", release_id, Role::Admin).await?;
+        assert_eq!(release.candidate_id, expected_candidate_id);
+        let candidate: crate::release_store::CurrentReleaseCandidateRecord =
+            s.need(ctx, "artifact", expected_candidate_id).await?;
+        assert_eq!(
+            serde_json::to_vec(parent).unwrap(),
+            serde_json::to_vec(&candidate.bundle).unwrap()
+        );
+        let bundle = crate::compiler::compile_current_in_session(
+            &mut s,
+            ctx,
+            request,
+            &SkillPatch::default(),
+            &ImproverPatch::default(),
+        )
+        .await?;
+        let original_baseline = serde_json::to_vec(&original.profile).unwrap();
+        let original_parent = serde_json::to_vec(parent).unwrap();
+        s.commit().await?;
+        let mut s = store.session().await?;
+        let reloaded = crate::compiler::verify_current_bundle_in_session(
+            &mut s,
+            ctx,
+            &bundle.digest,
+            &request.environment_digest,
+            request.revoke_watermark,
+        )
+        .await?;
+        assert_eq!(
+            serde_json::to_vec(&reloaded.original_baseline).unwrap(),
+            original_baseline
+        );
+        let CurrentParentMaterial::ApprovedRelease {
+            release_id: restored_id,
+            bundle: restored,
+        } = &reloaded.original_parent
+        else {
+            panic!("approved-P material was truncated")
+        };
+        assert_eq!(restored_id, release_id);
+        assert_eq!(serde_json::to_vec(restored).unwrap(), original_parent);
+        s.commit().await
+    }
+
+    pub(crate) async fn n1_authenticated_instrumentation_some_cannot_project_none(
+        s: &mut Session,
+        ctx: &Context,
+        request: &CompilerInputRequest,
+    ) -> Result<()> {
+        let original = resolve_current_compiler_inputs(s, ctx, request).await?;
+        assert!(
+            original.profile.resource_instrumentation_id.is_some(),
+            "N1 fixture must actually register the instrumented visibility source"
+        );
+        original.compile(&SkillPatch::default(), &ImproverPatch::default())?;
+        let bytes = serde_json::to_vec(&original.profile).unwrap();
+        let mut projected = project_frozen_profile(&original.profile)?;
+        exact_profile_projection(&original.profile, &projected)?;
+        projected.resource_instrumentation_id = None;
+        assert!(
+            matches!(exact_profile_projection(&original.profile, &projected),
+            Err(Error::Conflict(message)) if message == "full frozen profile projection differs")
+        );
+        assert_eq!(serde_json::to_vec(&original.profile).unwrap(), bytes);
+        Ok(())
+    }
+
+    pub(crate) async fn n2_authenticated_root_authorizer_cannot_be_substituted(
+        s: &mut Session,
+        ctx: &Context,
+        request: &CompilerInputRequest,
+    ) -> Result<()> {
+        let original = resolve_current_compiler_inputs(s, ctx, request).await?;
+        original.compile(&SkillPatch::default(), &ImproverPatch::default())?;
+        let CurrentParentBody::EmptyRoot(root) = &original.parent else {
+            panic!("N2 requires an authenticated EmptyRoot fixture");
+        };
+        let bytes = serde_json::to_vec(root).unwrap();
+        let mut projected = project_empty_root(root)?;
+        exact_root_projection(root, &projected)?;
+        projected.authorized_by = if root.authorized_by == "another-admin" {
+            "different-admin".into()
+        } else {
+            "another-admin".into()
+        };
+        identifier(&projected.authorized_by)?;
+        assert!(matches!(exact_root_projection(root, &projected),
+            Err(Error::Conflict(message)) if message == "full empty root projection differs"));
+        assert_eq!(serde_json::to_vec(root).unwrap(), bytes);
+        Ok(())
+    }
+}
+
+pub(crate) async fn verify_read_release_principal(
+    s: &mut Session,
+    ctx: &Context,
+    release: &crate::release_store::PersistentRelease,
+    candidate: &crate::release_store::ReadCandidate,
+) -> Result<()> {
+    let selection: ProfileSelection = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &format!("formal-profile-{}", candidate.profile_id),
+        Role::Admin,
+    )
+    .await?;
+    let profile: FrozenCompilerProfile =
+        attested_read(s, ctx, "artifact", &selection.registration_id, Role::Admin).await?;
+    let host: RegisteredFormalHost = attested_read(
+        s,
+        ctx,
+        "artifact",
+        &profile.host_registration_id,
+        Role::Admin,
+    )
+    .await?;
+    let admin =
+        require_principal_action(s, ctx, &host, "release", &release.id, release, Role::Admin)
+            .await?;
+    let worker = require_principal_action(
+        s,
+        ctx,
+        &host,
+        "artifact",
+        &candidate.id,
+        candidate,
+        Role::Worker,
+    )
+    .await?;
+    if admin.actor != release.approved_by
+        || worker.actor != candidate.proposer_actor
+        || worker.actor != release.proposer_actor
+        || admin.uid == worker.uid
+        || admin.principal == worker.principal
+    {
+        return Err(Error::Forbidden);
+    }
+    Ok(())
+}
+const PROVIDER_SOURCE_SCHEMA: &str = "rsia.registered_external_provider.v3";
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelIdentityMaterialV1 {
+    pub domain: String,
+    pub schema_version: String,
+    pub namespace: String,
+    pub host_registration_id: String,
+    pub service_category: ExternalServiceCategory,
+    pub endpoint: String,
+    pub provider_model: String,
+    pub currency: String,
+    pub pricing_version: String,
+    pub input_micros_per_million_tokens: u64,
+    pub output_micros_per_million_tokens: u64,
+    pub max_output_tokens: u32,
+    pub request_timeout_seconds: u32,
+    pub protocol_id: evo_core::model_protocol::ModelProtocolId,
+    pub sampling_profile: evo_core::model_protocol::SamplingProfileId,
+    pub sampling_digest: String,
+    pub transport_code_digest: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisteredExternalProviderV3 {
+    pub id: String,
+    pub schema_version: String,
+    pub namespace: String,
+    pub host_registration_id: String,
+    pub endpoint: String,
+    pub provider_model: String,
+    pub model_digest: String,
+    pub transport_code_digest: String,
+    pub credential_environment_key: String,
+    pub credential_principal: String,
+    pub currency: String,
+    pub pricing_version: String,
+    pub input_micros_per_million_tokens: u64,
+    pub output_micros_per_million_tokens: u64,
+    pub max_output_tokens: u32,
+    pub authorized_by: String,
+    pub service_category: ExternalServiceCategory,
+    pub protocol_id: evo_core::model_protocol::ModelProtocolId,
+    pub sampling_profile: evo_core::model_protocol::SamplingProfileId,
+    pub sampling_digest: String,
+    pub request_timeout_seconds: u32,
+    pub model_identity_material: ModelIdentityMaterialV1,
+}
+impl RegisteredExternalProviderV3 {
+    /// Configuration content only. Registration still requires the owned
+    /// authority and actual authenticated peer in its own Store/Session.
+    pub fn from_configuration(parameters: RegisteredExternalProviderV2) -> Result<Self> {
+        parameters.validate_public_fields()?;
+        let material = ModelIdentityMaterialV1 {
+            domain: "rsia.model_identity".into(),
+            schema_version: "rsia.model_identity_material.v1".into(),
+            namespace: parameters.namespace.clone(),
+            host_registration_id: parameters.host_registration_id.clone(),
+            service_category: parameters.service_category,
+            endpoint: parameters.endpoint.clone(),
+            provider_model: parameters.provider_model.clone(),
+            currency: parameters.currency.clone(),
+            pricing_version: parameters.pricing_version.clone(),
+            input_micros_per_million_tokens: parameters.input_micros_per_million_tokens,
+            output_micros_per_million_tokens: parameters.output_micros_per_million_tokens,
+            max_output_tokens: parameters.max_output_tokens,
+            request_timeout_seconds: parameters.request_timeout_seconds,
+            protocol_id: parameters.protocol_id,
+            sampling_profile: parameters.sampling_profile,
+            sampling_digest: evo_core::model_protocol::sampling_digest_v1(
+                parameters.protocol_id,
+                parameters.sampling_profile,
+            )?,
+            transport_code_digest: hash(include_bytes!("formal_authority.rs")),
+        };
+        Ok(Self {
+            id: parameters.id,
+            schema_version: PROVIDER_SOURCE_SCHEMA.into(),
+            namespace: parameters.namespace,
+            host_registration_id: parameters.host_registration_id,
+            endpoint: parameters.endpoint,
+            provider_model: parameters.provider_model,
+            model_digest: evo_core::canonical_fingerprint(&material)?,
+            transport_code_digest: material.transport_code_digest.clone(),
+            credential_environment_key: parameters.credential_environment_key,
+            credential_principal: parameters.credential_principal,
+            currency: parameters.currency,
+            pricing_version: parameters.pricing_version,
+            input_micros_per_million_tokens: parameters.input_micros_per_million_tokens,
+            output_micros_per_million_tokens: parameters.output_micros_per_million_tokens,
+            max_output_tokens: parameters.max_output_tokens,
+            authorized_by: parameters.authorized_by,
+            service_category: parameters.service_category,
+            protocol_id: parameters.protocol_id,
+            sampling_profile: parameters.sampling_profile,
+            sampling_digest: material.sampling_digest.clone(),
+            request_timeout_seconds: parameters.request_timeout_seconds,
+            model_identity_material: material,
+        })
+    }
+
+    // Private configuration projection only, for the exact old field guards.
+    // Never store/serialize this instead of V3, register it or dispatch it.
+    fn parameters_v2(&self) -> RegisteredExternalProviderV2 {
+        RegisteredExternalProviderV2 {
+            id: self.id.clone(),
+            schema_version: PROVIDER_CURRENT_SCHEMA.into(),
+            namespace: self.namespace.clone(),
+            host_registration_id: self.host_registration_id.clone(),
+            endpoint: self.endpoint.clone(),
+            provider_model: self.provider_model.clone(),
+            model_digest: self.model_digest.clone(),
+            transport_code_digest: self.transport_code_digest.clone(),
+            credential_environment_key: self.credential_environment_key.clone(),
+            credential_principal: self.credential_principal.clone(),
+            currency: self.currency.clone(),
+            pricing_version: self.pricing_version.clone(),
+            input_micros_per_million_tokens: self.input_micros_per_million_tokens,
+            output_micros_per_million_tokens: self.output_micros_per_million_tokens,
+            max_output_tokens: self.max_output_tokens,
+            authorized_by: self.authorized_by.clone(),
+            service_category: self.service_category,
+            protocol_id: self.protocol_id,
+            sampling_profile: self.sampling_profile,
+            sampling_digest: self.sampling_digest.clone(),
+            request_timeout_seconds: self.request_timeout_seconds,
+        }
+    }
+    // Normal content derivation, not an authority constructor. Both writer and
+    // CURRENT-use reader call it. Historical version classification stays I2.
+    fn derive_and_check_source(&self, ctx: &Context) -> Result<Self> {
+        if self.schema_version != PROVIDER_SOURCE_SCHEMA {
+            return Err(Error::Forbidden);
+        }
+        let p = self.parameters_v2();
+        p.validate_public_fields()?;
+        p.common_view().validate(ctx)?;
+        let material = ModelIdentityMaterialV1 {
+            domain: "rsia.model_identity".into(),
+            schema_version: "rsia.model_identity_material.v1".into(),
+            namespace: p.namespace,
+            host_registration_id: p.host_registration_id,
+            service_category: p.service_category,
+            endpoint: p.endpoint,
+            provider_model: p.provider_model,
+            currency: p.currency,
+            pricing_version: p.pricing_version,
+            input_micros_per_million_tokens: p.input_micros_per_million_tokens,
+            output_micros_per_million_tokens: p.output_micros_per_million_tokens,
+            max_output_tokens: p.max_output_tokens,
+            request_timeout_seconds: p.request_timeout_seconds,
+            protocol_id: p.protocol_id,
+            sampling_profile: p.sampling_profile,
+            sampling_digest: evo_core::model_protocol::sampling_digest_v1(
+                p.protocol_id,
+                p.sampling_profile,
+            )?,
+            transport_code_digest: hash(include_bytes!("formal_authority.rs")),
+        };
+        let mut actual = self.clone();
+        actual.transport_code_digest = material.transport_code_digest.clone();
+        actual.sampling_digest = material.sampling_digest.clone();
+        actual.model_digest = evo_core::canonical_fingerprint(&material)?;
+        actual.model_identity_material = material;
+        if content_digest(self)? != content_digest(&actual)? {
+            return Err(Error::Conflict(
+                "provider source material does not recompute".into(),
+            ));
+        }
+        Ok(actual)
+    }
+}
+fn provider_v3_command_digest(p: &RegisteredExternalProviderV3) -> Result<String> {
+    FormalOperatorCommand::RegisterProviderSource {
+        provider: Box::new(p.clone()),
+    }
+    .authentication_digest()
+}
+// NEW private, non-Clone/non-Serialize/non-Deserialize, single-use credential.
+// Created only by the private owned authority, while its directory guard is held.
+struct ProviderSourceInSession<'s> {
+    owner: &'s OwnedPrincipalAuthority,
+    session: &'s mut Session,
+    ctx: &'s Context,
+    record: RegisteredExternalProviderV3,
+    host_digest: String,
+    principals_digest: String,
+    command_digest: String,
+}
+impl OwnedPrincipalAuthority {
+    async fn check_provider_source_scope(
+        &self,
+        s: &mut Session,
+        ctx: &Context,
+        p: &RegisteredExternalProviderV3,
+        command_digest: &str,
+    ) -> Result<(RegisteredFormalHost, String)> {
+        ctx.require(&[Role::Admin])?;
+        if p.namespace != ctx.namespace() || p.authorized_by != ctx.actor() {
+            return Err(Error::Forbidden);
+        }
+        let host: RegisteredFormalHost =
+            attested_read(s, ctx, "artifact", &p.host_registration_id, Role::Admin).await?;
+        host.validate(ctx)?;
+        // V3 requires the actual stored dual-witness set, never the old
+        // require_registered_admin no-principal-set diagnostic exemption.
+        let set = principal_set(s, ctx, &host).await?;
+        let host_digest = fingerprint(&host)?;
+        let principals_digest = set.binding_digest()?;
+        if host_digest != fingerprint(&self.service.host)?
+            || principals_digest != self.service.principals.binding_digest()?
+            || ctx.actor() != set.administrator.actor
+            || p.credential_principal != host.host_principal
+        {
+            return Err(Error::Forbidden);
+        }
+        OPERATOR_CREDENTIAL
+            .try_with(|cap| -> Result<()> {
+                if cap.role != Role::Admin
+                    || cap.namespace != ctx.namespace()
+                    || cap.actor != ctx.actor()
+                    || cap.operation != "register_provider"
+                    || cap.request_digest != command_digest
+                    || cap.host_digest != host_digest
+                    || cap.principals.binding_digest()? != principals_digest
+                    || cap.peer.uid() != set.administrator.uid
+                    || cap.authority.pid != self.service.observed.pid
+                    || cap.authority.uid != self.service.observed.uid
+                    || cap.authority.uid != set.grader.uid
+                    || cap.authority.executable_digest != self.service.observed.executable_digest
+                    || cap.authority.executable_digest != host.grader_code_digest
+                {
+                    return Err(Error::Forbidden);
+                }
+                Ok(())
+            })
+            .map_err(|_| Error::Forbidden)??;
+        Ok((host, principals_digest))
+    }
+    // Only the owned V3 arm calls this, with a Session from its own Store.
+    async fn prepare_provider_source<'s>(
+        &'s self,
+        s: &'s mut Session,
+        ctx: &'s Context,
+        submitted: RegisteredExternalProviderV3,
+    ) -> Result<ProviderSourceInSession<'s>> {
+        let record = submitted.derive_and_check_source(ctx)?;
+        let command_digest = provider_v3_command_digest(&record)?;
+        let (host, principals_digest) = self
+            .check_provider_source_scope(s, ctx, &record, &command_digest)
+            .await?;
+        Ok(ProviderSourceInSession {
+            owner: self,
+            session: s,
+            ctx,
+            record,
+            host_digest: fingerprint(&host)?,
+            principals_digest,
+            command_digest,
+        })
+    }
+}
+impl ProviderSourceInSession<'_> {
+    // No replacement Session/Context/Store argument. Consumes self exactly once.
+    // The consumed credential retains the same owned service and Session.
+    // It creates no Clock, paid reservation or operator approval authority.
+    async fn persist(self) -> Result<RegisteredExternalProviderV3> {
+        let record = self.record.derive_and_check_source(self.ctx)?;
+        let (host, principals_digest) = self
+            .owner
+            .check_provider_source_scope(self.session, self.ctx, &record, &self.command_digest)
+            .await?;
+        if fingerprint(&host)? != self.host_digest
+            || principals_digest != self.principals_digest
+            || provider_v3_command_digest(&record)? != self.command_digest
+        {
+            return Err(Error::Forbidden);
+        }
+        immutable(self.session, self.ctx, "artifact", &record.id, &record).await?;
+        attest_content(self.session, self.ctx, "artifact", &record.id, &record).await?;
+        self.session
+            .put_edge(self.ctx, "artifact", &record.id, "artifact", &host.id)
+            .await?;
+        self.session
+            .audit(self.ctx, "formal.provider.register", &record.id)
+            .await?;
+        let stored: RegisteredExternalProviderV3 =
+            attested_read(self.session, self.ctx, "artifact", &record.id, Role::Admin).await?;
+        stored.derive_and_check_source(self.ctx)?;
+        if content_digest(&stored)? != content_digest(&record)? {
+            return Err(Error::Conflict(
+                "provider source changed in registration".into(),
+            ));
+        }
+        Ok(stored)
+    }
+}
+// NEW strict CURRENT-use V3 registered-body verifier; never an execution token.
+async fn require_provider_v3_registered_source(
+    s: &mut Session,
+    ctx: &Context,
+    id: &str,
+    body: &Value,
+) -> Result<()> {
+    let p: RegisteredExternalProviderV3 = decode(body.clone())?;
+    if p.id != id {
+        return Err(Error::Forbidden);
+    }
+    p.derive_and_check_source(ctx)?;
+    let host = registered_subject_host(s, ctx, "artifact", body)
+        .await?
+        .ok_or(Error::Forbidden)?;
+    principal_set(s, ctx, &host).await?;
+    require_principal_action(s, ctx, &host, "artifact", id, body, Role::Admin).await?;
+    let action: PrincipalAction = s
+        .need(
+            ctx,
+            "artifact",
+            &principal_action_id("artifact", id, Role::Admin)?,
+        )
+        .await?;
+    if action.operation != "register_provider"
+        || action.authenticated_request_digest != provider_v3_command_digest(&p)?
+    {
+        return Err(Error::Conflict(
+            "provider source not from exact authenticated request".into(),
+        ));
+    }
+    Ok(())
+}
+
+// Private composition of the original authority's directory guard, Store and
+// observed service. No external Store/guard pair or caller flag constructs it.
+struct OwnedPrincipalAuthority {
+    service: PrincipalAuthorityService,
+    store: Store,
+    _data_lock: crate::data_directory_lock::DataDirectoryLock,
+}
+impl PrincipalAuthorityService {
+    /// The existing finite host entry point, moved here so the V3 producer
+    /// opens its own Store under the original physical mount gate.
+    pub async fn serve_owned(
+        database: std::path::PathBuf,
+        host: RegisteredFormalHost,
+        principals: RegisteredPrincipalSet,
+        socket: std::path::PathBuf,
+        connections: u16,
+    ) -> Result<Value> {
+        // Detaching this one owned run on caller cancellation retains the guard
+        // through its finite connection drain and explicit Store close.
+        tokio::spawn(async move {
+            use std::os::unix::fs::MetadataExt;
+            if connections == 0 || connections > 64 {
+                return Err(Error::Invalid(
+                    "authority connection count outside finite bound".into(),
+                ));
+            }
+            let service = Self::new(host.clone(), principals)?;
+            let parent = socket.parent().ok_or(Error::Forbidden)?;
+            let metadata = std::fs::metadata(parent).map_err(|_| Error::Forbidden)?;
+            if metadata.uid() != host.grader_uid || metadata.mode() & 0o002 != 0 || socket.exists()
+            {
+                return Err(Error::Forbidden);
+            }
+            let (data_lock, gate) = crate::data_directory_lock::mount_gate(&database, None)
+                .await
+                .map_err(|error| Error::Conflict(error.to_string()))?;
+            let store = Store::open(&database).await?;
+            let owner = OwnedPrincipalAuthority {
+                service,
+                store,
+                _data_lock: data_lock,
+            };
+            let result = async {
+                gate.admit()
+                    .map_err(|error| Error::Conflict(error.to_string()))?;
+                owner.serve(&socket, connections).await
+            }
+            .await;
+            // Every accepted stream has closed on returning from serve. The
+            // directory guard is still in owner while the real pool closes.
+            owner.store.close().await;
+            drop(owner);
+            result
+        })
+        .await
+        .map_err(|_| Error::Internal)?
+    }
+}
+impl OwnedPrincipalAuthority {
+    async fn serve(&self, path: &std::path::Path, connections: u16) -> Result<Value> {
+        use std::os::unix::fs::PermissionsExt;
+        let listener = tokio::net::UnixListener::bind(path).map_err(|_| Error::Forbidden)?;
+        let serving = async {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
+                .map_err(|_| Error::Forbidden)?;
+            let mut completed = 0u16;
+            let mut refused = 0u16;
+            for _ in 0..connections {
+                let (stream, _) = tokio::time::timeout(
+                    std::time::Duration::from_secs(300), listener.accept(),
+                ).await.map_err(|_| Error::Cancelled)?.map_err(|_| Error::Internal)?;
+                match self.serve_connection(stream).await {
+                    Ok(_) => completed += 1,
+                    Err(Error::ClockRegressed) => return Err(Error::ClockRegressed),
+                    Err(_) => refused += 1,
+                }
+            }
+            Ok(serde_json::json!({"schema_version":"rsia.finite_principal_authority_run.v1",
+                "completed":completed,"refused":refused,"ordinary_p_eligible":false,
+                "note":"Authentication does not replace formal evaluation, full costs or operator approval."}))
+        }.await;
+        drop(listener);
+        // Only this invocation's successfully bound socket is removed.
+        let cleanup = std::fs::remove_file(path).map_err(|_| Error::Internal);
+        if matches!(&serving, Err(Error::ClockRegressed)) {
+            if cleanup.is_err() {
+                tracing::warn!("authority socket cleanup failed after clock refusal");
+            }
+            return Err(Error::ClockRegressed);
+        }
+        cleanup?;
+        serving
+    }
+    async fn execute(&self, ctx: &Context, command: FormalOperatorCommand) -> Result<Value> {
+        match command {
+            FormalOperatorCommand::RegisterProviderSource { provider } => {
+                let mut session = self.store.session().await?;
+                self.prepare_provider_source(&mut session, ctx, *provider)
+                    .await?
+                    .persist()
+                    .await?;
+                session.commit().await?;
+                Ok(Value::Null)
+            }
+            other => self.service.execute(&self.store, ctx, other).await,
+        }
+    }
+}
+
+impl OwnedPrincipalAuthority {
+    async fn serve_connection(&self, mut stream: tokio::net::UnixStream) -> Result<Value> {
+        use tokio::io::AsyncReadExt;
+        let peer = crate::executor::observe_kernel_peer(&stream)?;
+        let size = tokio::time::timeout(std::time::Duration::from_secs(30), stream.read_u32())
+            .await
+            .map_err(|_| Error::Forbidden)?
+            .map_err(|_| Error::Forbidden)? as usize;
+        if size == 0 || size > 1024 * 1024 {
+            return Err(Error::Forbidden);
+        }
+        let mut bytes = vec![0; size];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stream.read_exact(&mut bytes),
+        )
+        .await
+        .map_err(|_| Error::Forbidden)?
+        .map_err(|_| Error::Forbidden)?;
+        let mut envelope: OperatorEnvelope = strict_raw_object(&bytes, 1024 * 1024)?;
+        let role = envelope.command.role();
+        let p = authenticate_operator_peer(
+            &self.service.principals,
+            &peer,
+            &envelope.credential,
+            &envelope.command,
+        )?;
+        // The secret has no representable field in the persisted observation.
+        envelope.credential.clear();
+        bytes.fill(0);
+        let ctx = Context::new(&self.service.host.namespace, &p.actor, role)?;
+        let cap = OperatorCredential {
+            namespace: ctx.namespace().into(),
+            actor: ctx.actor().into(),
+            role,
+            host_digest: fingerprint(&self.service.host)?,
+            principals: self.service.principals.clone(),
+            peer,
+            authority: self.service.observed.clone(),
+            operation: envelope.command.operation().into(),
+            request_digest: envelope.command.authentication_digest()?,
+        };
+        let result = OPERATOR_CREDENTIAL
+            .scope(cap, self.execute(&ctx, envelope.command))
+            .await;
+        let response = write_operator_response(&mut stream, &result).await;
+        operator_result_after_response(result, response)
+    }
+}
+
+// Data alone cannot construct this successful sampling state. It is returned
+// only after the full registered V3 and its exact Admin request are reloaded.
+#[derive(Clone)]
+struct VerifiedProviderSource {
+    provider_digest: String,
+    command_digest: String,
+    principal_set_digest: String,
+}
+impl FrozenProviderRegistration {
+    async fn verified_sampling_in_session(
+        &self,
+        s: &mut Session,
+        ctx: &Context,
+    ) -> Result<ProviderSamplingAuthority> {
+        let ProviderRegistrationWire::SourceBound(source) = self.record.as_ref() else {
+            return Ok(self.sampling_authority());
+        };
+        source.derive_and_check_source(ctx)?;
+        let stored: RegisteredExternalProviderV3 =
+            attested_read(s, ctx, "artifact", &source.id, Role::Admin).await?;
+        stored.derive_and_check_source(ctx)?;
+        if content_digest(&stored)? != content_digest(source)? {
+            return Err(Error::Conflict("registered provider source changed".into()));
+        }
+        let host: RegisteredFormalHost = attested_read(
+            s,
+            ctx,
+            "artifact",
+            &stored.host_registration_id,
+            Role::Admin,
+        )
+        .await?;
+        let principals = principal_set(s, ctx, &host).await?;
+        Ok(ProviderSamplingAuthority::RegisteredSource(
+            VerifiedProviderSource {
+                provider_digest: fingerprint(self)?,
+                command_digest: provider_v3_command_digest(&stored)?,
+                principal_set_digest: principals.binding_digest()?,
+            },
+        ))
+    }
+    async fn require_profile_source(&self, s: &mut Session, ctx: &Context) -> Result<()> {
+        match self.record.as_ref() {
+            ProviderRegistrationWire::SourceBound(_) => self
+                .verified_sampling_in_session(s, ctx)
+                .await?
+                .require_new_dispatch(),
+            _ => self.require_legacy_profile(),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod current_source_test_support {
+    use super::*;
+    #[derive(Clone)]
+    pub(crate) struct FixtureInputs {
+        pub host: RegisteredFormalHost,
+        pub provider: RegisteredExternalProvider,
+        pub frozen: FrozenCompilerProfile,
+        pub root: EmptyRootAuthorization,
+        pub profile: Profile,
+    }
+    fn inputs(
+        namespace: &str,
+        profile_id: &str,
+        baseline: SkillSnapshot,
+        baseline_strategy: Strategy,
+        capabilities: HostCapabilities,
+        environment: &str,
+    ) -> FixtureInputs {
+        let scope = fingerprint(&(
+            namespace,
+            profile_id,
+            &baseline,
+            &baseline_strategy,
+            &capabilities,
+            environment,
+        ))
+        .unwrap();
+        let snapshot = SystemSnapshot {
+            schema_version: "rsia.system_snapshot.v1".into(),
+            profile_id: profile_id.into(),
+            host_id: format!("fixture-host-{}", &scope[..16]),
+            host_version: "fixture-v1".into(),
+            model_id: "fixture-model".into(),
+            tools: vec![],
+            mandatory_context_digest: hash(b"fixture-mandatory-context"),
+        };
+        let host = RegisteredFormalHost {
+            id: format!("fixture-host-registration-{scope}"),
+            schema_version: HOST_SCHEMA.into(),
+            namespace: namespace.into(),
+            host_id: snapshot.host_id.clone(),
+            host_version: snapshot.host_version.clone(),
+            code_digest: hash(b"fixture-program-code"),
+            grader_code_digest: hash(b"fixture-grader-code"),
+            host_uid: 10001,
+            grader_uid: 10002,
+            administrator_uid: 10003,
+            host_workspace: "/unavailable/fixture-host".into(),
+            grader_workspace: "/unavailable/fixture-grader".into(),
+            grader_credential_environment_key: "RSIA_FIXTURE_UNAVAILABLE_GRADER_KEY".into(),
+            host_principal: hash(b"fixture-host-principal"),
+            grader_principal: hash(b"fixture-grader-principal"),
+            administrator_principal: hash(b"fixture-admin-principal"),
+            worker_principal: hash(b"fixture-worker-principal"),
+            credential_binding_digest: hash(b"fixture-config-only"),
+            isolated_workspace_digest: hash(b"fixture-host-workspace"),
+            grader_workspace_digest: hash(b"fixture-grader-workspace"),
+            snapshot,
+            capabilities: capabilities.clone(),
+            host_surface_digest: hash(b"fixture-surface"),
+            adapter_digest: hash(b"fixture-adapter"),
+            authorized_by: "fixture-admin".into(),
+        };
+        let provider = RegisteredExternalProvider {
+            id: format!("fixture-provider-{scope}"),
+            schema_version: PROVIDER_SCHEMA.into(),
+            namespace: namespace.into(),
+            host_registration_id: host.id.clone(),
+            endpoint: "https://fixture.invalid/v1/chat/completions".into(),
+            provider_model: "fixture-model".into(),
+            model_digest: hash(b"fixture-model"),
+            transport_code_digest: host.code_digest.clone(),
+            credential_environment_key: "RSIA_FIXTURE_UNAVAILABLE_PROVIDER_KEY".into(),
+            credential_principal: host.host_principal.clone(),
+            currency: "USD".into(),
+            pricing_version: "fixture-pricing".into(),
+            input_micros_per_million_tokens: 1,
+            output_micros_per_million_tokens: 1,
+            max_output_tokens: 256,
+            authorized_by: "fixture-admin".into(),
+        };
+        let frozen = FrozenCompilerProfile {
+            id: format!("fixture-profile-{scope}"),
+            schema_version: PROFILE_SCHEMA.into(),
+            namespace: namespace.into(),
+            profile_id: profile_id.into(),
+            version: 1,
+            host_registration_id: host.id.clone(),
+            provider_registration_id: provider.id.clone(),
+            resource_instrumentation_id: None,
+            system_snapshot: host.snapshot.clone(),
+            capabilities,
+            environment_digest: environment.into(),
+            baseline_skill: baseline,
+            baseline_strategy,
+            dependencies: vec![],
+            purpose: Purpose::Development,
+            application_order: vec!["mandatory_context".into(), "skill".into(), "task".into()],
+            authorized_by: "fixture-admin".into(),
+        };
+        let root = EmptyRootAuthorization {
+            id: format!("fixture-root-{scope}"),
+            schema_version: ROOT_SCHEMA.into(),
+            namespace: namespace.into(),
+            profile_registration_id: frozen.id.clone(),
+            profile_digest: fingerprint(&frozen).unwrap(),
+            host_registration_id: host.id.clone(),
+            skill: SkillSnapshot::empty(),
+            strategy: empty_root_strategy(),
+            authorized_by: "fixture-admin".into(),
+        };
+        let profile = Profile {
+            id: profile_id.into(),
+            evolution_enabled: true,
+            parent_digest: root.digest().unwrap(),
+            baseline_digest: frozen.baseline_digest().unwrap(),
+        };
+        let fixture = FixtureInputs {
+            host,
+            provider,
+            frozen,
+            root,
+            profile,
+        };
+        fixture
+    }
+
+    pub(crate) async fn diagnostic_fixture() -> (
+        tempfile::TempDir,
+        Store,
+        Context,
+        FixtureInputs,
+        CompilerInputRequest,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("current-source.sqlite3"))
+            .await
+            .unwrap();
+        let f = inputs(
+            "current-source",
+            "profile",
+            SkillSnapshot::empty(),
+            Strategy::default(),
+            HostCapabilities {
+                available: BTreeSet::new(),
+                granted: BTreeSet::new(),
+            },
+            &hash(b"source environment"),
+        );
+        let admin = Context::new("current-source", "fixture-admin", Role::Admin).unwrap();
+        FormalRegistry::register_host(&admin, &store, f.host.clone())
+            .await
+            .unwrap();
+        FormalRegistry::register_provider(&admin, &store, f.provider.clone())
+            .await
+            .unwrap();
+        FormalRegistry::freeze_profile(&admin, &store, f.frozen.clone())
+            .await
+            .unwrap();
+        FormalRegistry::authorize_empty_root(&admin, &store, f.root.clone())
+            .await
+            .unwrap();
+        let worker = Context::new("current-source", "worker", Role::Worker).unwrap();
+        let request = CompilerInputRequest {
+            profile: f.profile.clone(),
+            search_parent: f.root.skill.clone(),
+            baseline: f.frozen.baseline_skill.clone(),
+            search_parent_strategy: f.root.strategy.clone(),
+            expected_parent_strategy_digest: Some(fingerprint(&f.root.strategy).unwrap()),
+            baseline_strategy: f.frozen.baseline_strategy.clone(),
+            capabilities: f.frozen.capabilities.clone(),
+            environment_digest: f.frozen.environment_digest.clone(),
+            purpose: Purpose::Development,
+            revoke_watermark: 0,
+        };
+        (directory, store, worker, f, request)
+    }
+
+    #[tokio::test]
+    async fn current_empty_root_preimages_are_reloaded_in_one_session() {
+        let (_directory, store, worker, f, request) = diagnostic_fixture().await;
+        current_bridge_session_controls::h1_empty_root_compile_persist_reload(
+            &store, &worker, &request,
+        )
+        .await
+        .unwrap();
+        let mut session = store.session().await.unwrap();
+        current_bridge_session_controls::n2_authenticated_root_authorizer_cannot_be_substituted(
+            &mut session,
+            &worker,
+            &request,
+        )
+        .await
+        .unwrap();
+        let original = resolve_current_compiler_inputs(&mut session, &worker, &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&original.profile).unwrap(),
+            serde_json::to_vec(&f.frozen).unwrap()
+        );
+        let bundle = crate::compiler::compile_current_in_session(
+            &mut session,
+            &worker,
+            &request,
+            &SkillPatch::default(),
+            &ImproverPatch::default(),
+        )
+        .await
+        .unwrap();
+        let before = session.list::<Value>(&worker, "artifact").await.unwrap();
+        let mut changed = f.root.clone();
+        changed.authorized_by = "another-admin".into();
+        session
+            .put(&worker, "artifact", &changed.id, worker.actor(), &changed)
+            .await
+            .unwrap();
+        let after_fault = session.list::<Value>(&worker, "artifact").await.unwrap();
+        assert!(matches!(
+            crate::compiler::compile_current_in_session(
+                &mut session,
+                &worker,
+                &request,
+                &SkillPatch::default(),
+                &ImproverPatch::default()
+            )
+            .await,
+            Err(Error::Forbidden)
+        ));
+        assert_eq!(
+            session.list::<Value>(&worker, "artifact").await.unwrap(),
+            after_fault
+        );
+        assert!(after_fault.len() == before.len());
+        drop(session);
+        let mut session = store.session().await.unwrap();
+        let restored = crate::compiler::verify_current_bundle_in_session(
+            &mut session,
+            &worker,
+            &bundle.digest,
+            &request.environment_digest,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&restored.bundle).unwrap(),
+            serde_json::to_vec(&bundle).unwrap()
+        );
+        session.commit().await.unwrap();
+        store.close().await;
+    }
+
+    fn provider_content(f: &FixtureInputs) -> RegisteredExternalProviderV3 {
+        let parameters = RegisteredExternalProviderV2::from_configuration(
+            f.provider.clone(),
+            evo_core::model_protocol::ModelProtocolId::ChatCompletionsNonstreamV1,
+            evo_core::model_protocol::SamplingProfileId::TemperatureZeroV1,
+            30,
+        ).unwrap();
+        RegisteredExternalProviderV3::from_configuration(parameters).unwrap()
+    }
+
+    #[tokio::test]
+    async fn provider_v3_registration_requires_owned_peer_authority() {
+        let (_directory, store, worker, f, _request) = diagnostic_fixture().await;
+        let admin = Context::new(worker.namespace(), "fixture-admin", Role::Admin).unwrap();
+        let provider = provider_content(&f);
+        let command = FormalOperatorCommand::RegisterProviderSource {
+            provider: Box::new(provider.clone()),
+        };
+        let wire = serde_json::to_vec(&command).unwrap();
+        let loaded: FormalOperatorCommand = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(loaded.authentication_digest().unwrap(), provider_v3_command_digest(&provider).unwrap());
+        let before = store.verify_audit(&admin).await.unwrap();
+        let mut session = store.session().await.unwrap();
+        let artifacts = session.list::<Value>(&admin, "artifact").await.unwrap();
+        // Complete public material has no corresponding authenticated Admin
+        // registration. Neither decoding it nor the V2 configuration API can
+        // mint the private owned capability or authorize a new send.
+        let registration = FrozenProviderRegistration::from_record(
+            ProviderRegistrationWire::SourceBound(Box::new(provider.clone())));
+        assert!(matches!(registration.sampling_authority().require_new_dispatch(),
+            Err(Error::Conflict(reason)) if reason == "current_provider_source_unavailable"));
+        assert!(matches!(registration.verified_sampling_in_session(&mut session, &worker).await,
+            Err(Error::NotFound)));
+        assert_eq!(session.list::<Value>(&admin, "artifact").await.unwrap(), artifacts);
+        session.commit().await.unwrap();
+        assert!(matches!(FormalRegistry::register_provider_current(&admin, &store, provider.parameters_v2()).await,
+            Err(Error::Conflict(reason)) if reason == "current_provider_source_unavailable"));
+        assert_eq!(store.verify_audit(&admin).await.unwrap(), before);
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn provider_v3_public_material_rederives_source_bytes_without_authority() {
+        let (_directory, store, worker, f, _request) = diagnostic_fixture().await;
+        let current = provider_content(&f);
+        let derived = current.derive_and_check_source(&worker).unwrap();
+        assert_eq!(serde_json::to_vec(&derived).unwrap(), serde_json::to_vec(&current).unwrap());
+        assert_eq!(current.model_digest, evo_core::canonical_fingerprint(&current.model_identity_material).unwrap());
+        for field in ["endpoint", "provider_model", "pricing_version", "model_digest", "transport_code_digest", "sampling_digest"] {
+            let mut wire = serde_json::to_value(&current).unwrap();
+            wire[field] = if field == "endpoint" { serde_json::json!("https://other.fixture.invalid/v1/chat/completions") }
+                else if field.ends_with("digest") { serde_json::json!(hash(b"another content")) }
+                else { serde_json::json!("another-value") };
+            let changed: RegisteredExternalProviderV3 = serde_json::from_value(wire).unwrap();
+            let refusal = changed.derive_and_check_source(&worker);
+            if field == "sampling_digest" {
+                assert!(matches!(refusal, Err(Error::Forbidden)), "{field}");
+            } else {
+                assert!(matches!(refusal, Err(Error::Conflict(reason))
+                    if reason == "provider source material does not recompute"), "{field}");
+            }
+        }
+        let mut material_changed = current.clone();
+        material_changed.model_identity_material.max_output_tokens += 1;
+        assert!(matches!(material_changed.derive_and_check_source(&worker), Err(Error::Conflict(reason))
+            if reason == "provider source material does not recompute"));
+        // Changing the original configuration rederives a different complete
+        // identity, but still supplies content only, never dispatch authority.
+        let mut parameters = current.parameters_v2();
+        parameters.max_output_tokens += 1;
+        let another = RegisteredExternalProviderV3::from_configuration(parameters).unwrap();
+        assert_ne!(another.model_digest, current.model_digest);
+        another.derive_and_check_source(&worker).unwrap();
+        store.close().await;
+    }
+
 }

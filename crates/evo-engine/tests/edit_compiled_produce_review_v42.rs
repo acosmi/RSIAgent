@@ -152,6 +152,20 @@ impl ModelPort for EditingFixtureModelPort {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let source = request.source_closure[0].clone();
         let parent: SkillSnapshot = serde_json::from_str(
@@ -514,7 +528,7 @@ async fn produce() -> Produced {
     )
     .await
     .unwrap();
-    let OptimizationStepOutcome::Candidate {
+    let OptimizationStepOutcome::CurrentCandidate {
         edit,
         bundle,
         selection,

@@ -650,6 +650,20 @@ impl ModelPort for ScriptedModel {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.total.fetch_add(1, SeqCst);
         *self
@@ -1986,7 +2000,10 @@ async fn groups_that_share_a_request_id_would_reuse_the_brokers_call_id() {
     )
     .await
     .unwrap();
-    assert!(matches!(first, OptimizationStepOutcome::Candidate { .. }));
+    assert!(matches!(
+        first,
+        OptimizationStepOutcome::CurrentCandidate { .. }
+    ));
     let calls_after_first = transport.load(SeqCst);
     let second = run_optimization_step(
         Some(&broker),

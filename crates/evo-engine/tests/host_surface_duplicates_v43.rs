@@ -1,7 +1,12 @@
-use evo_core::contract::{CapabilityLevel, HostCapabilities, HostSurfaceManifest, SystemSnapshot};
+use evo_core::contract::{
+    CapabilityLevel, HostCapabilities, HostSurfaceClassificationV2, HostSurfaceManifest,
+    HostSurfaceRegistrationV2, ReviewedHostSourceEnvelopeV1, RunProjection, SurfaceCoverage,
+    SystemSnapshot,
+};
 use evo_core::{Context, Error, Role, fingerprint, hash};
 use evo_engine::release_store::{
-    HOST_SURFACE_RECORD_SCHEMA, HostSurfaceRecord, PrepareRunRequest, ReleaseStore,
+    AppliedRequestMaterial, HOST_SURFACE_RECORD_SCHEMA, HostSurfaceRecord, PrepareRunRequest,
+    ReleaseStore, RunApplicationSnapshot,
 };
 use evo_storage::Store;
 use serde::Serialize;
@@ -143,6 +148,112 @@ fn record(manifest: HostSurfaceManifest, schema: &str) -> HostSurfaceRecord {
     }
 }
 
+// Complete historical v1 wire is constructed as v1, never projected from a
+// current snapshot. Local content witnesses model old component persistence,
+// not a new registered real-host or Current-source authorization.
+async fn historical_baseline(store: &Store) -> (HostSurfaceRecord, RunApplicationSnapshot) {
+    let registered = record(prepare_surface(), HOST_SURFACE_RECORD_SCHEMA);
+    put_historical_fixture(store, Role::Admin, SURFACE_ID, &registered).await;
+    let r = request();
+    let material = AppliedRequestMaterial {
+        mandatory_context_digest: r.system_snapshot.mandatory_context_digest.clone(),
+        task_input_digest: r.task_input_digest.clone(),
+        instructions: Vec::new(),
+        tools: r.system_snapshot.tools.clone(),
+    };
+    let snapshot = RunApplicationSnapshot {
+        id: format!("run-snapshot-{}", r.run_id),
+        schema_version: "rsia.run_application.v1".into(),
+        run_id: r.run_id,
+        profile_id: r.profile_id,
+        pointer_epoch: 0,
+        release_id: None,
+        bundle_digest: None,
+        environment_digest: r.system_snapshot.digest().unwrap(),
+        system_snapshot: r.system_snapshot,
+        host_surface_id: r.host_surface_id,
+        host_surface_digest: registered.manifest_digest.clone(),
+        host_capabilities_digest: fingerprint(&r.host_capabilities).unwrap(),
+        projection: RunProjection {
+            bundle_digest: String::new(),
+            instructions: material.instructions.clone(),
+            tools: material.tools.clone(),
+        },
+        request_digest: fingerprint(&material).unwrap(),
+        request_material: material,
+        capability_level: r.capability_level,
+        evolution_enabled: r.evolution_enabled,
+    };
+    put_historical_fixture(store, Role::Host, &snapshot.id, &snapshot).await;
+    let loaded = ReleaseStore::read_run_snapshot(&ctx(Role::Host), store, RUN_ID)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&loaded).unwrap(),
+        serde_json::to_vec(&snapshot).unwrap()
+    );
+    (registered, snapshot)
+}
+
+fn current_surface() -> (ReviewedHostSourceEnvelopeV1, HostSurfaceRegistrationV2) {
+    let names = ["instruction", "model", "theme"];
+    let declarations: Vec<_> = names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name":name,"value_type":"string","enum_values":[],"default":{"kind":"none"}
+            })
+        })
+        .collect();
+    let source = ReviewedHostSourceEnvelopeV1 {
+        schema_version: "rsia.host_source_envelope.v1".into(),
+        source_kind: "reviewed_fixture".into(),
+        source_schema: "rsia.host_reviewed_declarations.v1".into(),
+        extractor_version: "rsia.host_reviewed_declarations.extractor.v1".into(),
+        original_utf8: serde_json::to_string(&serde_json::json!({
+            "schema_version":"rsia.host_reviewed_declarations.v1",
+            "host":"reference","host_version":"0.1.0","declarations":declarations
+        }))
+        .unwrap(),
+    };
+    let registration = HostSurfaceRegistrationV2 {
+        adapter_version: "0.1.0".into(),
+        classifications: names
+            .into_iter()
+            .map(|name| HostSurfaceClassificationV2 {
+                name: name.into(),
+                coverage: if name == "theme" {
+                    SurfaceCoverage::Unsupported
+                } else {
+                    SurfaceCoverage::RuntimeOwned
+                },
+                mapped_field: None,
+                consumer: None,
+                reason: "ToolOnly software fixture; no native instruction attachment".into(),
+                renamed_from: None,
+                test_ref: None,
+                capability: None,
+            })
+            .collect(),
+        retired: vec![],
+    };
+    (source, registration)
+}
+
+// Distinguish fresh Current admission from the old snapshot reader/replay
+// diagnostics below; a legacy record cannot create a new run or any state.
+async fn assert_fresh_legacy_refused(store: &Store) {
+    let before = state(store).await;
+    let mut fresh = request();
+    fresh.run_id = "fresh-legacy-run".into();
+    assert!(matches!(
+        ReleaseStore::prepare_run(&ctx(Role::Host), store, fresh).await,
+        Err(Error::Invalid(message))
+            if message == "current prepare requires a source-bound host surface v2"
+    ));
+    assert_eq!(state(store).await, before);
+}
+
 fn assert_conflict<T: std::fmt::Debug>(result: evo_core::Result<T>) {
     assert!(
         matches!(result, Err(Error::Invalid(ref message))
@@ -186,11 +297,14 @@ async fn every_conflicting_registration_refuses_before_objects_audit_and_edges()
 #[tokio::test]
 async fn disk_legacy_conflict_is_readable_but_cannot_prepare_a_new_run() {
     let (dir, store) = database().await;
+    let (_, mut snapshot) = historical_baseline(&store).await;
     let mut m = prepare_surface();
     let mut conflict = m.items[0].clone();
     conflict.reason = "historical conflicting interpretation".into();
     m.items.push(conflict);
     let historical = record(m, HOST_SURFACE_RECORD_SCHEMA);
+    snapshot.host_surface_digest = historical.manifest_digest.clone();
+    put_historical_fixture(&store, Role::Host, &snapshot.id, &snapshot).await;
     put_historical_fixture(&store, Role::Admin, SURFACE_ID, &historical).await;
     let raw = serde_json::to_value(&historical).unwrap();
     let before = state(&store).await;
@@ -206,6 +320,7 @@ async fn disk_legacy_conflict_is_readable_but_cannot_prepare_a_new_run() {
     s.commit().await.unwrap();
     assert_eq!(serde_json::to_value(read).unwrap(), raw);
     assert_conflict(ReleaseStore::prepare_run(&ctx(Role::Host), &store, request()).await);
+    assert_fresh_legacy_refused(&store).await;
     assert_eq!(state(&store).await, before);
     assert_eq!(raw_surface(&store).await, raw);
     store.close().await;
@@ -213,8 +328,10 @@ async fn disk_legacy_conflict_is_readable_but_cannot_prepare_a_new_run() {
 
 #[tokio::test]
 async fn unknown_or_v2_record_schema_cannot_be_typed_read_or_prepared() {
+    // Each bad wire is an old v1 body relabelled, not a complete source-backed v2.
     for schema in ["", "unknown", "rsia.host_surface_record.v2"] {
         let (_dir, store) = database().await;
+        historical_baseline(&store).await;
         let bad = record(prepare_surface(), schema);
         put_historical_fixture(&store, Role::Admin, SURFACE_ID, &bad).await;
         let raw = serde_json::to_value(&bad).unwrap();
@@ -242,20 +359,44 @@ async fn exact_clones_keep_registration_idempotency_prepare_and_live_reload() {
     let (_dir, store) = database().await;
     let mut m = prepare_surface();
     m.items.extend(m.items.clone());
-    let first = ReleaseStore::register_host_surface(
+    // Preserve duplicate v1 items and old UTF-8 golden as historical mechanics.
+    // Current strict declarations are unique; the two contracts are not equivalent.
+    m.validate_against_extraction(&extracted()).unwrap();
+    let mut historical = record(m, HOST_SURFACE_RECORD_SCHEMA);
+    historical.id = format!("{SURFACE_ID}-historical-clones");
+    put_historical_fixture(&store, Role::Admin, &historical.id, &historical).await;
+    let mut s = store.session().await.unwrap();
+    let loaded: HostSurfaceRecord = s
+        .need(&ctx(Role::Admin), "artifact", &historical.id)
+        .await
+        .unwrap();
+    s.commit().await.unwrap();
+    assert_eq!(
+        serde_json::to_vec(&loaded).unwrap(),
+        serde_json::to_vec(&historical).unwrap()
+    );
+    let (source, registration) = current_surface();
+    let first = ReleaseStore::register_host_surface_from_source(
         &ctx(Role::Admin),
         &store,
         SURFACE_ID,
-        m.clone(),
-        extracted(),
+        source.clone(),
+        registration.clone(),
+        None,
     )
     .await
     .unwrap();
     let before = state(&store).await;
-    let second =
-        ReleaseStore::register_host_surface(&ctx(Role::Admin), &store, SURFACE_ID, m, extracted())
-            .await
-            .unwrap();
+    let second = ReleaseStore::register_host_surface_from_source(
+        &ctx(Role::Admin),
+        &store,
+        SURFACE_ID,
+        source,
+        registration,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         serde_json::to_vec(&first).unwrap(),
         serde_json::to_vec(&second).unwrap()
@@ -287,18 +428,7 @@ async fn exact_clones_keep_registration_idempotency_prepare_and_live_reload() {
 async fn existing_prepare_and_reload_revalidate_authenticated_legacy_surface() {
     for invalid_schema in [false, true] {
         let (_dir, store) = database().await;
-        let mut registered = ReleaseStore::register_host_surface(
-            &ctx(Role::Admin),
-            &store,
-            SURFACE_ID,
-            prepare_surface(),
-            extracted(),
-        )
-        .await
-        .unwrap();
-        let mut snapshot = ReleaseStore::prepare_run(&ctx(Role::Host), &store, request())
-            .await
-            .unwrap();
+        let (mut registered, mut snapshot) = historical_baseline(&store).await;
         if invalid_schema {
             registered.schema_version = "rsia.host_surface_record.v2".into();
         } else {

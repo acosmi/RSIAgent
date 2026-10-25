@@ -22,7 +22,8 @@ use evo_engine::dispatch::{
 };
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::release_store::{
-    ReleaseCandidateRecord, ReleaseStore, StageBundleRequest, TypedSourceRef,
+    CurrentStageBundleRequest as StageBundleRequest, ReleaseCandidateRecord, ReleaseStore,
+    TypedSourceRef,
 };
 use evo_engine::streaming_evaluator::{
     EvaluationEvidenceScope, ExecutionReceiptRequest, ExecutionReceiptV2, ExecutionSide,
@@ -152,12 +153,12 @@ async fn stored_ledger(store: &Store, context: &Context, family_id: &str) -> Exp
 async fn stage_fixture_candidate(store: &Store) -> ReleaseCandidateRecord {
     let host = Context::new("n", "host", Role::Host).unwrap();
     let proposer = Context::new("n", "proposer", Role::Worker).unwrap();
-    let bundle = trusted_compiler_inputs::software_candidate(
+    let bundle = trusted_compiler_inputs::software_candidate_content_current(
         "n",
         &d("environment"),
         "streaming execution fixture",
     );
-    trusted_compiler_inputs::install_bundle(store, &bundle)
+    trusted_compiler_inputs::install_bundle_current_sources(store, &bundle)
         .await
         .unwrap();
     let body = "trusted streaming fixture source";
@@ -191,7 +192,7 @@ async fn stage_fixture_candidate(store: &Store) -> ReleaseCandidateRecord {
         .await
         .unwrap();
     session.commit().await.unwrap();
-    ReleaseStore::stage_bundle(
+    ReleaseStore::stage_current_bundle(
         &proposer,
         store,
         StageBundleRequest {

@@ -113,13 +113,15 @@ pub fn ingest_trusted_runs(
         }
         coverage.bytes_read += body.len() as u64;
         coverage.parsed_ok += 1;
-        members.push(EvidenceMember {
+        let member = EvidenceMember {
             source_id: (*id).into(),
             content_digest: evo_core::hash(body),
             task_origin: TaskOrigin::TrustedRun,
             execution_attestation: ExecutionAttestation::TrustedHost,
             purpose: selection.purpose,
-        });
+        };
+        evo_core::evidence::verify_evidence_member_content_v3(&member, body)?;
+        members.push(member);
         clusters.insert((*id).into());
     }
     require_all_selected_runs(&selected, &seen)?;
@@ -176,13 +178,15 @@ pub fn ingest_trusted_run_records(
         }
         coverage.bytes_read += record.body.len() as u64;
         coverage.parsed_ok += 1;
-        members.push(EvidenceMember {
+        let member = EvidenceMember {
             source_id: record.id.clone(),
             content_digest: evo_core::hash(&record.body),
             task_origin: record.task_origin,
             execution_attestation: record.execution_attestation,
             purpose: record.purpose,
-        });
+        };
+        evo_core::evidence::verify_evidence_member_content_v3(&member, &record.body)?;
+        members.push(member);
         clusters.insert(record.parent_family.clone());
     }
     require_all_selected_runs(&selected, &seen)?;
@@ -286,6 +290,33 @@ mod tests {
     }
 
     #[test]
+    fn trusted_ingest_rebuilds_members_from_complete_record_bytes() {
+        let selection = selection();
+        let records = [stored("run1", "family-a"), stored("run2", "family-b")];
+        let set = ingest_trusted_run_records(&selection, &records).unwrap();
+        for (member, record) in set.members.iter().zip(&records) {
+            assert_eq!(member.content_digest, evo_core::hash(&record.body));
+            evo_core::evidence::verify_evidence_member_content_v3(member, &record.body).unwrap();
+            assert!(matches!(
+                evo_core::evidence::verify_evidence_member_content_v3(member, b"another actual body"),
+                Err(Error::Conflict(message)) if message == "evidence_content_digest_mismatch"
+            ));
+        }
+        let mut changed = records.to_vec();
+        changed[0].body = b"another actual body".to_vec();
+        let rebuilt = ingest_trusted_run_records(&selection, &changed).unwrap();
+        assert_ne!(
+            set.members[0].content_digest,
+            rebuilt.members[0].content_digest
+        );
+        assert_ne!(set.digest, rebuilt.digest);
+        assert_eq!(
+            set.members[1].content_digest,
+            rebuilt.members[1].content_digest
+        );
+    }
+
+    #[test]
     fn independent_clusters_come_from_parent_family() {
         let sel = selection();
         let same_family = ingest_trusted_run_records(
@@ -334,6 +365,17 @@ impl StoredTraceAuthority {
         }
         identifier(&r.id)?;
         identifier(&r.parent_family)?;
+        evo_core::evidence::verify_evidence_member_content_v3(
+            &EvidenceMember {
+                source_id: r.id.clone(),
+                content_digest: t.source_digest.clone(),
+                task_origin: r.task_origin,
+                execution_attestation: r.execution_attestation,
+                purpose: r.purpose,
+            },
+            &r.body,
+        )
+        .map_err(|_| Error::Forbidden)?;
         Ok(())
     }
 }

@@ -1,27 +1,31 @@
 //! Admin views of stored material. Every read recipe is executed in two separate
 //! transactions; neither its internal fingerprints nor hidden payloads are DTOs.
 
+use crate::compiler::ReadBundle;
 use crate::evidence::{load_stored_source, validate_stored_sources};
 use crate::formal_authority::{
-    CompilerInputRequest, FormalCompilerInputBinding, VerifiedCompilerInputs,
-    resolve_compiler_inputs,
+    CompilerInputRequest, CurrentVerifiedCompilerInputs, ReadCompilerBinding,
+    VerifiedCompilerInputs, resolve_compiler_inputs, resolve_current_compiler_inputs,
 };
-use crate::model::CompilerInputUse;
+use crate::model::{CompilerInputUse, CurrentCompilerInputUse, ReadCompilerInputUse};
 use crate::optimization::{
     DevelopmentRunRequest, DevelopmentSelection, DevelopmentSelectionDecision,
     OptimizationJournalStage, StageFact, StageFactKind, StepTerminalClass,
-    development_request_fact_id, edit_compiled_input_digest,
+    current_edit_compiled_input_digest, development_request_fact_id, edit_compiled_input_digest,
     verified_development_observation_in_session,
 };
-use crate::release_store::{RELEASE_CANDIDATE_SCHEMA, ReleaseStore, TypedSourceRef};
+use crate::release_store::{
+    RELEASE_CANDIDATE_SCHEMA, RELEASE_CANDIDATE_SCHEMA_V2, ReadCandidate, ReleaseStore,
+    TypedSourceRef, validate_read_candidate_in_session,
+};
 use crate::streaming_evaluator::{
     AnchorEvidenceStatus, CostEvidenceScope, DependencyEvidenceStatus, EvaluationEvidenceScope,
-    EvaluationTicketV2, ExecutionReceiptV2, TargetState, VerifiedReportVariant,
+    ExecutionReceiptV2, ReadEvaluationTicket, TargetState, VerifiedReportVariant,
     verified_report_view_in_session,
 };
 use evo_core::contract::{
-    BUNDLE_SCHEMA, HostCapabilities, ImproverPatch, OriginLayer, PatchOp, Profile, ResolvedBundle,
-    SkillPatch, SkillSnapshot,
+    BUNDLE_SCHEMA, BUNDLE_SCHEMA_V3, HostCapabilities, ImproverPatch, OriginLayer, PatchOp,
+    Profile, SkillPatch, SkillSnapshot,
 };
 use evo_core::evaluation::{ProfileKind, Verdict};
 use evo_core::evidence::{EvidenceSet, Purpose, SourceSelection};
@@ -829,22 +833,46 @@ async fn read_candidate(
     let raw = capture(ctx, session, set, "artifact", id)
         .await
         .map_err(primary_error)?;
-    if raw.get("schema_version").and_then(Value::as_str) != Some(RELEASE_CANDIDATE_SCHEMA) {
+    if !raw
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .is_some_and(|schema| {
+            matches!(
+                schema,
+                RELEASE_CANDIDATE_SCHEMA | RELEASE_CANDIDATE_SCHEMA_V2
+            )
+        })
+    {
         return Err(ReadFailure::Unavailable);
     }
-    let decoded: crate::release_store::ReleaseCandidateRecord = decode(&raw)?;
+    let decoded: ReadCandidate = decode(&raw)?;
     if decoded.sources.len() > MAX_REVIEW_REFS {
         return Err(ReadFailure::Gap(ReviewGap::SupportLimit));
     }
     skill_text_limits(&decoded.bundle.skill)?;
-    let candidate = ReleaseStore::read_review_candidate_in_session(ctx, session, id)
-        .await
-        .map_err(|error| match error {
-            Error::NotFound | Error::Forbidden => ReadFailure::Unavailable,
-            Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
-            Error::Conflict(_) => ReadFailure::Gap(ReviewGap::SourceChanged),
-            _ => ReadFailure::Gap(ReviewGap::MaterialInvalid),
-        })?;
+    let candidate = decoded;
+    let checked = if candidate.is_current() {
+        ctx.require(&[Role::Admin])
+            .and_then(|_| {
+                if candidate.id == id {
+                    Ok(())
+                } else {
+                    Err(Error::Conflict("review candidate identity alias".into()))
+                }
+            })
+            .map_err(material_error)?;
+        validate_read_candidate_in_session(session, ctx, &candidate).await
+    } else {
+        ReleaseStore::read_review_candidate_in_session(ctx, session, id)
+            .await
+            .map(|_| ())
+    };
+    checked.map_err(|error| match error {
+        Error::NotFound | Error::Forbidden => ReadFailure::Unavailable,
+        Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
+        Error::Conflict(_) => ReadFailure::Gap(ReviewGap::SourceChanged),
+        _ => ReadFailure::Gap(ReviewGap::MaterialInvalid),
+    })?;
     for source in &candidate.sources {
         capture(ctx, session, set, "run", &source.id).await?;
         check_edge(ctx, session, set, "artifact", id, "run", &source.id).await?;
@@ -859,7 +887,7 @@ async fn read_candidate(
         id: projection.text(&candidate.id)?,
         namespace: projection.text(ctx.namespace())?,
         proposer_actor: projection.text(&candidate.proposer_actor)?,
-        environment_digest: candidate.environment_digest,
+        environment_digest: candidate.environment_digest.clone(),
         bundle: project_bundle(projection, &candidate.bundle)?,
         sources: candidate
             .sources
@@ -915,7 +943,7 @@ async fn read_formal(
     envelope(ctx, session, set, "formal_evaluation_v2", id)
         .await
         .map_err(primary_error)?;
-    let ticket: EvaluationTicketV2 = decode(
+    let ticket: ReadEvaluationTicket = decode(
         &envelope(ctx, session, set, "evaluation_ticket_v2", id)
             .await?
             .payload,
@@ -1080,8 +1108,11 @@ fn unique_ids(values: &[String]) -> ReadResult<()> {
     Ok(())
 }
 
-fn project_bundle(projection: &mut Projection, bundle: &ResolvedBundle) -> ReadResult<BundleView> {
-    if bundle.schema_version != BUNDLE_SCHEMA {
+fn project_bundle(projection: &mut Projection, bundle: &ReadBundle) -> ReadResult<BundleView> {
+    if !matches!(
+        bundle.schema_version.as_str(),
+        BUNDLE_SCHEMA | BUNDLE_SCHEMA_V3
+    ) {
         return Err(ReadFailure::Gap(ReviewGap::UnsupportedSchema));
     }
     for value in [
@@ -1092,7 +1123,7 @@ fn project_bundle(projection: &mut Projection, bundle: &ResolvedBundle) -> ReadR
         digest(value)?;
     }
     identifier(&bundle.profile_id).map_err(material_error)?;
-    crate::releases::validate_resolved_bundle_identity(bundle).map_err(material_error)?;
+    bundle.validate_identity().map_err(material_error)?;
     bundle.skill.validate().map_err(material_error)?;
     bundle.improver.validate().map_err(material_error)?;
     if bundle.origins.len() != 8 {
@@ -1155,6 +1186,41 @@ fn project_bundle(projection: &mut Projection, bundle: &ResolvedBundle) -> ReadR
         if !seen.insert(field) || actual_digest.map_err(material_error)? != origin.value_digest {
             return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
         }
+        let explicit_source = if bundle.is_current() && origin.layer == OriginLayer::Explicit {
+            use evo_core::contract::explicit_field_source_v3;
+            Some(
+                match origin.field.as_str() {
+                    "skill.content" => {
+                        explicit_field_source_v3(&origin.field, &bundle.skill.content)
+                    }
+                    "skill.applicability" => {
+                        explicit_field_source_v3(&origin.field, &bundle.skill.applicability)
+                    }
+                    "skill.counterexample" => {
+                        explicit_field_source_v3(&origin.field, &bundle.skill.counterexample)
+                    }
+                    "skill.required_capabilities" => {
+                        explicit_field_source_v3(&origin.field, &bundle.skill.required_capabilities)
+                    }
+                    "skill.dependencies" => {
+                        explicit_field_source_v3(&origin.field, &bundle.skill.dependencies)
+                    }
+                    "improver.instruction" => {
+                        explicit_field_source_v3(&origin.field, &bundle.improver.instruction)
+                    }
+                    "improver.max_candidates" => {
+                        explicit_field_source_v3(&origin.field, &bundle.improver.max_candidates)
+                    }
+                    "improver.max_rounds" => {
+                        explicit_field_source_v3(&origin.field, &bundle.improver.max_rounds)
+                    }
+                    _ => return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid)),
+                }
+                .map_err(material_error)?,
+            )
+        } else {
+            None
+        };
         let (operation, expected_source, source_digest) = match origin.layer {
             OriginLayer::Parent => (
                 OriginOperation::Inherit,
@@ -1166,7 +1232,11 @@ fn project_bundle(projection: &mut Projection, bundle: &ResolvedBundle) -> ReadR
                 bundle.baseline_digest.as_str(),
                 Some(bundle.baseline_digest.clone()),
             ),
-            OriginLayer::Explicit => (OriginOperation::Set, "set", None),
+            OriginLayer::Explicit => (
+                OriginOperation::Set,
+                explicit_source.as_deref().unwrap_or("set"),
+                explicit_source.clone().filter(|_| safe),
+            ),
         };
         let expected_operation = match operation {
             OriginOperation::Inherit => "inherit",
@@ -1185,7 +1255,11 @@ fn project_bundle(projection: &mut Projection, bundle: &ResolvedBundle) -> ReadR
         });
     }
     Ok(BundleView {
-        schema_version: BUNDLE_SCHEMA,
+        schema_version: if bundle.is_current() {
+            BUNDLE_SCHEMA_V3
+        } else {
+            BUNDLE_SCHEMA
+        },
         profile_id: projection.text(&bundle.profile_id)?,
         bundle_digest: bundle.digest.clone(),
         declared_parent_digest: bundle.parent_digest.clone(),
@@ -1224,7 +1298,7 @@ struct PreparedMaterial {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compiler_request: Option<CompilerInputRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    compiler_binding: Option<FormalCompilerInputBinding>,
+    compiler_binding: Option<ReadCompilerBinding>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1233,12 +1307,12 @@ struct CompiledMaterial {
     output: SkillSnapshot,
     patch: SkillPatch,
     report: EditApplyReport,
-    bundle: ResolvedBundle,
+    bundle: ReadBundle,
     merge: MergeRecord,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compiler_request: Option<CompilerInputRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    compiler_binding: Option<FormalCompilerInputBinding>,
+    compiler_binding: Option<ReadCompilerBinding>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1248,7 +1322,7 @@ struct CandidateMaterial {
     output: SkillSnapshot,
     patch: SkillPatch,
     report: EditApplyReport,
-    bundle: ResolvedBundle,
+    bundle: ReadBundle,
     selection: DevelopmentSelection,
 }
 
@@ -1719,13 +1793,36 @@ async fn read_stage(
     Ok((view, complete))
 }
 
+// Resolver-owned inputs for read-only semantic replay; never deserialized or
+// returned to any production writer. Each branch keeps its actual bundle wire.
+enum ReviewCompilerInputs {
+    Current(Box<CurrentVerifiedCompilerInputs>),
+    Legacy(Box<VerifiedCompilerInputs>),
+}
+impl ReviewCompilerInputs {
+    fn compile_search_edit(
+        &self,
+        output: &SkillSnapshot,
+        improver: &ImproverPatch,
+    ) -> Result<ReadBundle> {
+        match self {
+            Self::Current(inputs) => {
+                ReadBundle::from_current(inputs.compile_search_edit(output, improver)?)
+            }
+            Self::Legacy(inputs) => {
+                ReadBundle::from_legacy(inputs.compile_search_edit(output, improver)?)
+            }
+        }
+    }
+}
+
 async fn read_prepared(
     ctx: &Context,
     session: &mut Session,
     set: &mut ReadSet,
     facts: &BTreeMap<String, StageFact>,
     fact: &StageFact,
-) -> ReadResult<(PreparedMaterial, Option<VerifiedCompilerInputs>)> {
+) -> ReadResult<(PreparedMaterial, Option<ReviewCompilerInputs>)> {
     let material: PreparedMaterial = decode(&fact.payload)?;
     let context = &material.context;
     let expected_input = match (&material.compiler_request, &material.compiler_binding) {
@@ -1847,17 +1944,35 @@ async fn read_prepared(
             {
                 return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
             }
-            let actual = resolve_compiler_inputs(session, ctx, request)
-                .await
-                .map_err(|error| match error {
-                    Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
-                    _ => ReadFailure::Gap(ReviewGap::SourceChanged),
-                })?;
-            if fingerprint(actual.binding()).map_err(material_error)?
-                != fingerprint(binding).map_err(material_error)?
-            {
-                return Err(ReadFailure::Gap(ReviewGap::SourceChanged));
-            }
+            let actual = if binding.is_current() {
+                let actual = resolve_current_compiler_inputs(session, ctx, request)
+                    .await
+                    .map_err(|error| match error {
+                        Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
+                        _ => ReadFailure::Gap(ReviewGap::SourceChanged),
+                    })?;
+                if fingerprint(actual.binding()).map_err(material_error)?
+                    != fingerprint(binding).map_err(material_error)?
+                {
+                    return Err(ReadFailure::Gap(ReviewGap::SourceChanged));
+                }
+                ReviewCompilerInputs::Current(Box::new(actual))
+            } else {
+                // Historical audit only. This value never reaches a dispatch or
+                // a new-use writer, and preserves the old replay algorithm.
+                let actual = resolve_compiler_inputs(session, ctx, request)
+                    .await
+                    .map_err(|error| match error {
+                        Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
+                        _ => ReadFailure::Gap(ReviewGap::SourceChanged),
+                    })?;
+                if fingerprint(actual.binding()).map_err(material_error)?
+                    != fingerprint(binding).map_err(material_error)?
+                {
+                    return Err(ReadFailure::Gap(ReviewGap::SourceChanged));
+                }
+                ReviewCompilerInputs::Legacy(Box::new(actual))
+            };
             capture_compiler_use(ctx, session, set, fact, request, binding).await?;
             Some(actual)
         }
@@ -1989,9 +2104,23 @@ async fn capture_compiler_use(
     set: &mut ReadSet,
     fact: &StageFact,
     request: &CompilerInputRequest,
-    binding: &FormalCompilerInputBinding,
+    binding: &ReadCompilerBinding,
 ) -> ReadResult<()> {
-    let expected = CompilerInputUse::new(request.clone(), binding.clone());
+    let expected = if binding.is_current() {
+        ReadCompilerInputUse::from_current(CurrentCompilerInputUse::new(
+            request.clone(),
+            binding.current().map_err(material_error)?.clone(),
+        ))
+    } else {
+        ReadCompilerInputUse::from_legacy(CompilerInputUse::new(
+            request.clone(),
+            binding
+                .legacy()
+                .ok_or(ReadFailure::Gap(ReviewGap::MaterialInvalid))?
+                .clone(),
+        ))
+    }
+    .map_err(material_error)?;
     let id = expected.artifact_id().map_err(material_error)?;
     if !fact
         .dependencies
@@ -2010,7 +2139,7 @@ async fn capture_compiler_use(
         &id,
     )
     .await?;
-    let stored: CompilerInputUse = decode(&capture(ctx, session, set, "artifact", &id).await?)?;
+    let stored: ReadCompilerInputUse = decode(&capture(ctx, session, set, "artifact", &id).await?)?;
     if fingerprint(&stored).map_err(material_error)?
         != fingerprint(&expected).map_err(material_error)?
     {
@@ -2079,7 +2208,7 @@ fn validate_compiled(
     prepared: &PreparedMaterial,
     fact: &StageFact,
     compiled: &CompiledMaterial,
-    compiler_inputs: Option<&VerifiedCompilerInputs>,
+    compiler_inputs: Option<&ReviewCompilerInputs>,
 ) -> ReadResult<()> {
     unique_ids(&compiled.merge.input_suggestion_ids)?;
     unique_ids(&compiled.merge.selected_suggestion_ids)?;
@@ -2127,7 +2256,23 @@ fn validate_compiled(
         (None, None) => None,
         _ => return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid)),
     };
-    if fact.input_digest != edit_compiled_input_digest(&batch, binding).map_err(material_error)? {
+    let expected_input = match binding {
+        Some(binding) if binding.is_current() => current_edit_compiled_input_digest(
+            &batch,
+            Some(binding.current().map_err(material_error)?),
+        ),
+        Some(binding) => edit_compiled_input_digest(
+            &batch,
+            Some(
+                binding
+                    .legacy()
+                    .ok_or(ReadFailure::Gap(ReviewGap::MaterialInvalid))?,
+            ),
+        ),
+        None => edit_compiled_input_digest(&batch, None),
+    }
+    .map_err(material_error)?;
+    if fact.input_digest != expected_input {
         return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
     }
     let report = &compiled.report;
@@ -2327,6 +2472,9 @@ fn validate_legacy_origins(
     prepared: &PreparedMaterial,
     compiled: &CompiledMaterial,
 ) -> ReadResult<()> {
+    if compiled.bundle.is_current() {
+        return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid));
+    }
     for origin in &compiled.bundle.origins {
         let expected = match origin.field.as_str() {
             "skill.content" => compiled.patch.content.name(),

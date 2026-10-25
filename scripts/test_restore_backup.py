@@ -588,5 +588,69 @@ class RestoreTests(unittest.TestCase):
         self.assert_isolated(scenario, dest, result, "table objects_formal_parent already exists")
 
 
+    def test_current_proposal_restore_protection_matches_rust(self):
+        import re
+        rust=(ROOT / "crates/evo-storage/src/lifecycle.rs").read_text()
+        body=re.search(r"PROTECTED_ACTION_SCHEMA_VERSIONS: \[&str; 12\] = \[(.*?)\];",rust,re.S).group(1)
+        schemas=re.findall(r'"([^"]+)"',body)
+        self.assertEqual(len(schemas),12)
+        self.assertEqual(schemas[-1],"rsia.monitoring.consolidation_proposal.v2")
+        con=sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        con.execute("CREATE TABLE objects(namespace,kind,id,body)")
+        for index,schema in enumerate(schemas):
+            con.execute("INSERT INTO objects VALUES('n','artifact',?,?)",(str(index),json.dumps({"id":str(index),"schema_version":schema,"content":"fixture content"})))
+        facts=restore.protected_facts(con,{"n"})
+        self.assertEqual(len(facts),12)
+        self.assertEqual({fact[3]["schema_version"] for fact in facts},set(schemas))
+
+    def test_current_proposal_tamper_isolates_restore(self):
+        scenario=Scenario(self,CURRENT)
+        con=connect(scenario.history)
+        for suffix in ("v1","v2"):
+            body=json.dumps({"id":"proposal-"+suffix,"schema_version":"rsia.monitoring.consolidation_proposal."+suffix,"payload":"original source-derived content"})
+            con.execute("INSERT INTO objects(namespace,kind,id,owner,body) VALUES('legacy-a','artifact',?,'admin',?)",("proposal-"+suffix,body))
+        con.close()
+        anchor=scenario.anchor()
+        backup=scenario.backup("healthy-proposals")
+        dest,result=scenario.restore(backup,anchor,"healthy-proposal-restore")
+        self.assert_restored(dest,result,0,"none")
+        changed=scenario.backup("changed-proposal",db_sql="UPDATE objects SET body=json_set(body,'$.payload','changed source-derived content') WHERE id='proposal-v2'")
+        before=database_image(anchor)
+        dest,result=scenario.restore(changed,anchor,"refused-proposal-restore")
+        self.assert_isolated(scenario,dest,result,"consumed query/alpha/dispatch/accounting facts changed; make a fresh backup")
+        self.assertEqual(database_image(anchor),before)
+
+    def test_current_host_raw_precision_refusal_preserves_old_restore_bytes(self):
+        scenario=Scenario(self,CURRENT)
+        # Raw decoder controls only. These records do not establish Host authority.
+        legacy='{"id":"host-old","schema_version":"rsia.host_surface_record.v1","default":{"kind":"value","value":0.100000000000000001}}'
+        current='{"id":"host-new","schema_version":"rsia.host_surface_record.v2","default":{"kind":"value","value":0.1}}'
+        con=connect(scenario.history)
+        for identity,body in (("host-old",legacy),("host-new",current)):
+            con.execute("INSERT INTO objects(namespace,kind,id,owner,body) VALUES('legacy-a','artifact',?,'admin',?)",(identity,body))
+        con.close()
+        anchor=scenario.anchor()
+        backup=scenario.backup("healthy-host-raw")
+        dest,result=scenario.restore(backup,anchor,"healthy-host-restore")
+        self.assert_restored(dest,result,0,"none")
+        con=connect(dest / "rsia.sqlite3")
+        self.assertEqual(con.execute("SELECT body FROM objects WHERE id='host-old'").fetchone()[0],legacy)
+        self.assertEqual(con.execute("SELECT body FROM objects WHERE id='host-new'").fetchone()[0],current)
+        con.close()
+        before_anchor=database_image(anchor)
+        damaged=current.replace("0.1}","0.100000000000000001}")
+        self.assertNotEqual(damaged,current)
+        con=connect(scenario.history)
+        con.execute("UPDATE objects SET body=? WHERE id='host-new'",(damaged,))
+        con.close()
+        changed=scenario.backup("precision-host")
+        before_backup=database_image(changed / "rsia.sqlite3")
+        dest,result=scenario.restore(changed,anchor,"refused-host-restore")
+        self.assert_isolated(scenario,dest,result,"invalid current host raw JSON")
+        self.assertEqual(database_image(anchor),before_anchor)
+        self.assertEqual(database_image(changed / "rsia.sqlite3"),before_backup)
+
+
 if __name__ == "__main__":
     unittest.main()

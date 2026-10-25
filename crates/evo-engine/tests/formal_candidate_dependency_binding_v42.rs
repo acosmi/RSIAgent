@@ -23,13 +23,15 @@ use evo_core::sequential::{
 };
 use evo_core::{Context, Error, Role, fingerprint, hash};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
-use evo_engine::release_store::{ReleaseStore, StageBundleRequest, TypedSourceRef};
+use evo_engine::release_store::{
+    CurrentStageBundleRequest as StageBundleRequest, ReleaseStore, TypedSourceRef,
+};
 use evo_engine::streaming_evaluator::{
-    CostEvidenceScope, DependencyEvidenceStatus, EvaluationEvidenceScope, EvaluationTicketV2,
-    ExecutionReceiptRequest, ExecutionSide, FixedGraderMethod, FixedGraderSpec, FormalEvaluationV2,
-    FrozenOracleEntry, GraderReceiptRequest, IndependentEvaluationControl, IssueTicketRequest,
-    ProtectedHoldoutRecord, ProtectedInputRef, RegisteredEvaluationControl, StartExecutionRequest,
-    TicketLifecycle, verified_report_view_in_session,
+    CostEvidenceScope, DependencyEvidenceStatus, EvaluationEvidenceScope, ExecutionReceiptRequest,
+    ExecutionSide, FixedGraderMethod, FixedGraderSpec, FormalEvaluationV2, FrozenOracleEntry,
+    GraderReceiptRequest, IndependentEvaluationControl, IssueTicketRequest, ProtectedHoldoutRecord,
+    ProtectedInputRef, ReadEvaluationTicket as EvaluationTicketV2, RegisteredEvaluationControl,
+    StartExecutionRequest, TicketLifecycle, verified_report_view_in_session,
 };
 use evo_storage::Store;
 use evo_storage::budget::{
@@ -81,6 +83,15 @@ struct Fixture {
     holdout: ProtectedHoldoutRecord,
     control: RegisteredEvaluationControl,
     candidate_cost: i64,
+    resolved_ticket_id: std::sync::OnceLock<String>,
+}
+impl Fixture {
+    fn ticket_id(&self) -> &str {
+        self.resolved_ticket_id
+            .get()
+            .map(String::as_str)
+            .unwrap_or(&self.ticket_id)
+    }
 }
 
 async fn unregistered_fixture(n: u32) -> Fixture {
@@ -302,6 +313,7 @@ async fn unregistered_fixture(n: u32) -> Fixture {
         oracle_entries,
     };
     Fixture {
+        resolved_ticket_id: std::sync::OnceLock::new(),
         _dir: dir,
         db_path,
         store,
@@ -324,7 +336,7 @@ async fn execute_output(
     let view = IndependentEvaluationControl::broker_task(
         &fixture.worker,
         &fixture.store,
-        &fixture.ticket_id,
+        fixture.ticket_id(),
         target_id,
         side,
     )
@@ -344,7 +356,7 @@ async fn execute_output(
             &BudgetCallReservation {
                 billing_scope: "billing-1".into(),
                 call_id: call_id.clone(),
-                dispatch_group_id: fixture.ticket_id.clone(),
+                dispatch_group_id: fixture.ticket_id().to_owned(),
                 stage: BudgetStage::TaskExecution,
                 actual_input_digest: view.request_digest.clone(),
                 request_artifact: None,
@@ -368,7 +380,7 @@ async fn execute_output(
         &fixture.worker,
         &fixture.store,
         StartExecutionRequest {
-            ticket_id: fixture.ticket_id.clone(),
+            ticket_id: fixture.ticket_id().to_owned(),
             target_id: target_id.into(),
             side,
             fence: fence.clone(),
@@ -382,7 +394,7 @@ async fn execute_output(
         &fixture.store,
         ExecutionReceiptRequest {
             receipt_id: receipt_id.clone(),
-            ticket_id: fixture.ticket_id.clone(),
+            ticket_id: fixture.ticket_id().to_owned(),
             target_id: target_id.into(),
             side,
             request_digest: view.request_digest,
@@ -477,7 +489,7 @@ async fn grade_target(
         &fixture.store,
         GraderReceiptRequest {
             receipt_id: receipt_id.clone(),
-            ticket_id: fixture.ticket_id.clone(),
+            ticket_id: fixture.ticket_id().to_owned(),
             target_id: target_id.into(),
             candidate_execution_receipt_id: candidate,
             baseline_execution_receipt_id: baseline,
@@ -489,7 +501,7 @@ async fn grade_target(
     receipt_id
 }
 
-fn release_bundle() -> evo_core::contract::ResolvedBundle {
+fn release_bundle() -> evo_core::contract::ResolvedBundleV3 {
     let profile = Profile {
         id: "p1".into(),
         evolution_enabled: true,
@@ -503,7 +515,7 @@ fn release_bundle() -> evo_core::contract::ResolvedBundle {
         required_capabilities: vec![],
         dependencies: vec![],
     };
-    trusted_compiler_inputs::bundle(
+    trusted_compiler_inputs::bundle_content_current(
         CompileParts {
             profile: &profile,
             parent: &parent,
@@ -575,10 +587,10 @@ async fn stage(fx: &Fixture) {
             .unwrap(),
     };
     session.commit().await.unwrap();
-    trusted_compiler_inputs::install_bundle(&fx.store, &release_bundle())
+    trusted_compiler_inputs::install_bundle_current_sources(&fx.store, &release_bundle())
         .await
         .unwrap();
-    ReleaseStore::stage_bundle(
+    ReleaseStore::stage_current_bundle(
         &proposer,
         &fx.store,
         StageBundleRequest {
@@ -626,18 +638,20 @@ async fn issue(fx: &Fixture) -> evo_core::Result<EvaluationTicketV2> {
         },
     )
     .await
+    .map(|ticket| {
+        let _ = fx.resolved_ticket_id.set(ticket.id.clone());
+        ticket
+    })
 }
 
 async fn ready(n: u32, bound: bool) -> Fixture {
     let fx = prepared(n, bound).await;
-    if bound {
-        issue(&fx).await.unwrap();
-    } else {
-        // AG-100: without a candidate record no ticket is issued. The
-        // historical ticket-only wire is the one a pre-AG-100 issue stored.
+    if !bound {
         assert_issue_refused_without_candidate(&fx).await;
-        persist_legacy_ticket(&fx).await;
+        trusted_compiler_inputs::assert_frozen_issuer_static_read("dependency-legacy").await.unwrap();
+        stage(&fx).await;
     }
+    issue(&fx).await.unwrap();
     for index in 0..n {
         grade_target(&fx, &format!("r{index}"), "ok", "wrong", index + 1).await;
     }
@@ -646,7 +660,7 @@ async fn ready(n: u32, bound: bool) -> Fixture {
 }
 
 async fn finalize(fx: &Fixture) -> FormalEvaluationV2 {
-    IndependentEvaluationControl::finalize_complete(&fx.evaluator, &fx.store, &fx.ticket_id, 2_000)
+    IndependentEvaluationControl::finalize_complete(&fx.evaluator, &fx.store, fx.ticket_id(), 2_000)
         .await
         .unwrap()
 }
@@ -736,7 +750,7 @@ print(json.dumps(result,sort_keys=True))
 async fn actual_calls(fx: &Fixture) -> Vec<evo_storage::budget::BudgetCallRecord> {
     let mut session = fx.store.session().await.unwrap();
     let calls = session
-        .budget_calls_for_group(&fx.worker, "billing-1", &fx.ticket_id)
+        .budget_calls_for_group(&fx.worker, "billing-1", fx.ticket_id())
         .await
         .unwrap();
     session.commit().await.unwrap();
@@ -744,21 +758,24 @@ async fn actual_calls(fx: &Fixture) -> Vec<evo_storage::budget::BudgetCallRecord
 }
 
 async fn all_read_errors(fx: &Fixture) -> Vec<Error> {
-    let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+    let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id())
         .await
         .unwrap_err();
-    let view =
-        IndependentEvaluationControl::verified_report_view(&fx.evaluator, &fx.store, &fx.ticket_id)
-            .await
-            .unwrap_err();
+    let view = IndependentEvaluationControl::verified_report_view(
+        &fx.evaluator,
+        &fx.store,
+        fx.ticket_id(),
+    )
+    .await
+    .unwrap_err();
     let mut session = fx.store.session().await.unwrap();
-    let same_session = verified_report_view_in_session(&fx.evaluator, &mut session, &fx.ticket_id)
+    let same_session = verified_report_view_in_session(&fx.evaluator, &mut session, fx.ticket_id())
         .await
         .unwrap_err();
     drop(session);
     let admin = Context::new("n", "approver", Role::Admin).unwrap();
     let admin_view =
-        IndependentEvaluationControl::verified_report_view(&admin, &fx.store, &fx.ticket_id)
+        IndependentEvaluationControl::verified_report_view(&admin, &fx.store, fx.ticket_id())
             .await
             .unwrap_err();
     vec![status, view, same_session, admin_view]
@@ -819,90 +836,6 @@ struct TicketEnvelope {
     payload: EvaluationTicketV2,
 }
 
-/// Rewrites the freshly issued ticket row in place (same row, revision 1) and
-/// deletes the named bound-only edges; refuses unless the stored body is the
-/// expected bound row and only ticket -> holdout remains afterwards.
-const LEGACY_TICKET_SQL: &str = r#"
-import sqlite3,sys
-db,ns,ticket,bound,legacy,holdout=sys.argv[1:7]
-remove=sys.argv[7:]
-con=sqlite3.connect(db)
-row=con.execute("SELECT body,revision FROM objects WHERE namespace=? AND kind='artifact' AND id=?",(ns,ticket)).fetchone()
-assert row==(bound,1),row
-con.execute("UPDATE objects SET body=? WHERE namespace=? AND kind='artifact' AND id=?",(legacy,ns,ticket))
-for dst in remove:
-    count=con.execute("DELETE FROM dependencies WHERE namespace=? AND src_kind='artifact' AND src_id=? AND dst_kind='artifact' AND dst_id=?",(ns,ticket,dst)).rowcount
-    assert count==1,(dst,count)
-left=con.execute("SELECT dst_kind,dst_id FROM dependencies WHERE namespace=? AND src_kind='artifact' AND src_id=?",(ns,ticket)).fetchall()
-assert left==[('artifact',holdout)],left
-con.commit()
-con.close()
-print(len(remove))
-"#;
-
-/// AG-100 (L564, L1055/L1057): with no candidate record no ticket is
-/// issued. The refusal precedes every write: the whole database is unchanged
-/// and the ticket does not exist.
-async fn assert_issue_refused_without_candidate(fx: &Fixture) {
-    let before = catalog(fx).await;
-    let result = issue(fx)
-        .await
-        .map(|ticket| ticket.candidate_dependency_binding.is_some());
-    assert!(
-        matches!(&result, Err(Error::Conflict(message)) if message == CANDIDATE_RECORD_MISSING),
-        "{result:?}"
-    );
-    assert_eq!(catalog(fx).await, before, "a refused issue wrote state");
-    assert!(matches!(
-        IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id).await,
-        Err(Error::NotFound)
-    ));
-}
-
-/// The pre-AG-100 history (L696: a stored record keeps its original
-/// interpretation and is never upgraded): the unbound ticket an issue stored
-/// when no candidate was recorded. AG-100 refuses that issue, so the fixture
-/// persists exactly its rows. The candidate is staged and the ticket issued
-/// bound (true-source order, L288); before any execution the stored envelope
-/// is rewritten in place without the binding and the bound-only issue edges
-/// (ticket -> candidate, -> issue receipt, -> alpha reservations) are
-/// deleted. The ledger, reservations, issue receipt, ticket -> holdout edge
-/// and audit entry are the ones both issues write.
-async fn persist_legacy_ticket(fx: &Fixture) {
-    stage(fx).await;
-    let ticket = issue(fx).await.unwrap();
-    assert!(ticket.candidate_dependency_binding.is_some());
-    let id = sid("evaluation_ticket_v2", &fx.ticket_id);
-    let mut envelope = TicketEnvelope {
-        schema_version: "rsia.typed_artifact_envelope.v1".into(),
-        id: id.clone(),
-        record_kind: "evaluation_ticket_v2".into(),
-        payload: ticket,
-    };
-    let bound = serde_json::to_string(&envelope).unwrap();
-    envelope.payload.candidate_dependency_binding = None;
-    let legacy = serde_json::to_string(&envelope).unwrap();
-    let mut args = vec![
-        "n".to_string(),
-        id,
-        bound,
-        legacy,
-        sid("protected_holdout_v41", &fx.holdout.id),
-        fx.holdout.pair.candidate_digest.clone(),
-        sid("evaluation_ticket_issue_receipt_v1", &fx.ticket_id),
-    ];
-    let plan = &fx.control.alpha_plan;
-    for allocation in &plan.allocations {
-        if allocation.attempt_id == fx.control.attempt_id {
-            let claim = format!("{}:{}", plan.research_family_id, allocation.claim_id);
-            args.push(sid("alpha_claim_reservation_v1", &claim));
-        }
-    }
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let removed = own_sqlite(fx, LEGACY_TICKET_SQL, &args);
-    assert_eq!(removed.trim(), (args.len() - 5).to_string());
-}
-
 /// The stored outgoing edges of the ticket.
 async fn ticket_edges(fx: &Fixture) -> Vec<(String, String)> {
     let mut session = fx.store.session().await.unwrap();
@@ -910,7 +843,7 @@ async fn ticket_edges(fx: &Fixture) -> Vec<(String, String)> {
         .outgoing_edges_bounded(
             &fx.evaluator,
             "artifact",
-            &sid("evaluation_ticket_v2", &fx.ticket_id),
+            &sid("evaluation_ticket_v2", fx.ticket_id()),
             100,
         )
         .await
@@ -924,7 +857,7 @@ async fn bound_software_positive_pins_full_candidate_sources_and_real_fact_slice
     let fx = ready(20, true).await;
     let formal = finalize(&fx).await;
     assert!(!formal.is_promotable());
-    let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+    let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id())
         .await
         .unwrap();
     let candidate = raw(&fx, "artifact", &fx.holdout.pair.candidate_digest).await;
@@ -966,12 +899,12 @@ async fn bound_software_positive_pins_full_candidate_sources_and_real_fact_slice
     );
     assert_eq!(stored.ticket_digest, *ticket_digest);
     assert_ne!(
-        sid("evaluation_ticket_v2", &fx.ticket_id),
-        sid("formal_evaluation_v2", &fx.ticket_id)
+        sid("evaluation_ticket_v2", fx.ticket_id()),
+        sid("formal_evaluation_v2", fx.ticket_id())
     );
     assert_eq!(
         stored.ticket_physical_id,
-        sid("evaluation_ticket_v2", &fx.ticket_id)
+        sid("evaluation_ticket_v2", fx.ticket_id())
     );
     assert!(
         stored
@@ -997,14 +930,10 @@ async fn bound_software_positive_pins_full_candidate_sources_and_real_fact_slice
             .iter()
             .any(|node| node.record_kind.as_deref() == Some("evaluation_execution_output_v1"))
     );
-    assert!(
-        !stored
-            .nodes
-            .iter()
-            .any(|node| node.id == sid("formal_evaluation_v2", &fx.ticket_id)
-                || node.record_kind.as_deref() == Some("exposure_ledger_v1")
-                || node.kind == "budget_call")
-    );
+    assert!(!stored.nodes.iter().any(|node| node.id
+        == sid("formal_evaluation_v2", fx.ticket_id())
+        || node.record_kind.as_deref() == Some("exposure_ledger_v1")
+        || node.kind == "budget_call"));
     assert!(
         !stored
             .nodes
@@ -1017,7 +946,7 @@ async fn bound_software_positive_pins_full_candidate_sources_and_real_fact_slice
         &Context::new("n", "approver", Role::Admin).unwrap(),
     ] {
         let view =
-            IndependentEvaluationControl::verified_report_view(ctx, &fx.store, &fx.ticket_id)
+            IndependentEvaluationControl::verified_report_view(ctx, &fx.store, fx.ticket_id())
                 .await
                 .unwrap();
         assert_eq!(view.report_digest, fingerprint(&formal).unwrap());
@@ -1033,14 +962,14 @@ async fn bound_software_positive_pins_full_candidate_sources_and_real_fact_slice
         assert!(!view.promotion_eligible);
     }
     let mut session = fx.store.session().await.unwrap();
-    verified_report_view_in_session(&fx.evaluator, &mut session, &fx.ticket_id)
+    verified_report_view_in_session(&fx.evaluator, &mut session, fx.ticket_id())
         .await
         .unwrap();
     let report_edges = session
         .outgoing_edges_bounded(
             &fx.evaluator,
             "artifact",
-            &sid("formal_evaluation_v2", &fx.ticket_id),
+            &sid("formal_evaluation_v2", fx.ticket_id()),
             10000,
         )
         .await
@@ -1049,11 +978,11 @@ async fn bound_software_positive_pins_full_candidate_sources_and_real_fact_slice
         let mut edges = vec![
             (
                 "artifact".into(),
-                sid("evaluation_ticket_v2", &fx.ticket_id),
+                sid("evaluation_ticket_v2", fx.ticket_id()),
             ),
             (
                 "artifact".into(),
-                sid("evaluation_resource_evidence_v1", &fx.ticket_id),
+                sid("evaluation_resource_evidence_v1", fx.ticket_id()),
             ),
         ];
         edges.sort();
@@ -1065,7 +994,7 @@ async fn bound_software_positive_pins_full_candidate_sources_and_real_fact_slice
             &Context::new("n", "approver", Role::Admin).unwrap(),
             &fx.store,
             &fx.holdout.pair.candidate_digest,
-            &fx.ticket_id
+            fx.ticket_id()
         )
         .await,
         Err(Error::Forbidden)
@@ -1121,7 +1050,7 @@ async fn start_refusal_is_atomic_for_reserved_budget_slot_dispatch_and_exposure(
     let view = IndependentEvaluationControl::broker_task(
         &fx.worker,
         &fx.store,
-        &fx.ticket_id,
+        fx.ticket_id(),
         "r0",
         ExecutionSide::Candidate,
     )
@@ -1133,7 +1062,7 @@ async fn start_refusal_is_atomic_for_reserved_budget_slot_dispatch_and_exposure(
             &BudgetCallReservation {
                 billing_scope: "billing-1".into(),
                 call_id: "reserved".into(),
-                dispatch_group_id: fx.ticket_id.clone(),
+                dispatch_group_id: fx.ticket_id().to_owned(),
                 stage: BudgetStage::TaskExecution,
                 actual_input_digest: view.request_digest.clone(),
                 request_artifact: None,
@@ -1151,7 +1080,7 @@ async fn start_refusal_is_atomic_for_reserved_budget_slot_dispatch_and_exposure(
         IndependentEvaluationControl::broker_task(
             &fx.worker,
             &fx.store,
-            &fx.ticket_id,
+            fx.ticket_id(),
             "r0",
             ExecutionSide::Candidate
         )
@@ -1163,7 +1092,7 @@ async fn start_refusal_is_atomic_for_reserved_budget_slot_dispatch_and_exposure(
             &fx.worker,
             &fx.store,
             StartExecutionRequest {
-                ticket_id: fx.ticket_id.clone(),
+                ticket_id: fx.ticket_id().to_owned(),
                 target_id: "r0".into(),
                 side: ExecutionSide::Candidate,
                 fence: BudgetCallFence {
@@ -1191,7 +1120,7 @@ async fn finalize_refusal_leaves_actual_billing_exposure_and_all_facts_unchanged
         IndependentEvaluationControl::finalize_complete(
             &fx.evaluator,
             &fx.store,
-            &fx.ticket_id,
+            fx.ticket_id(),
             2000
         )
         .await,
@@ -1258,7 +1187,7 @@ async fn real_lifecycle_begin_revoke_preserves_billing_and_exposure_while_blocki
 async fn complete_stored_slice_pins_latency_and_rejects_missing_or_conflicting_binding() {
     let fx = ready(2, true).await;
     finalize(&fx).await;
-    let ticket = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+    let ticket = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id())
         .await
         .unwrap()
         .ticket;
@@ -1276,7 +1205,7 @@ async fn complete_stored_slice_pins_latency_and_rejects_missing_or_conflicting_b
     write_raw(&fx, "artifact", &id, &changed).await;
     assert_changed_reads(&fx, "formal_stored_dependency_binding_changed").await;
     write_raw(&fx, "artifact", &id, &original).await;
-    let formal_id = sid("formal_evaluation_v2", &fx.ticket_id);
+    let formal_id = sid("formal_evaluation_v2", fx.ticket_id());
     let original_formal = raw(&fx, "artifact", &formal_id).await;
     let mut no_binding = original_formal.clone();
     no_binding["payload"]
@@ -1298,12 +1227,12 @@ async fn required_edges_use_physical_keys_and_extra_inconsistent_fact_edges_refu
     for alias in [false, true] {
         let fx = ready(2, true).await;
         finalize(&fx).await;
-        let report_id = sid("formal_evaluation_v2", &fx.ticket_id);
-        let ticket_id = sid("evaluation_ticket_v2", &fx.ticket_id);
+        let report_id = sid("formal_evaluation_v2", fx.ticket_id());
+        let ticket_id = sid("evaluation_ticket_v2", fx.ticket_id());
         if alias {
             remove_edge(&fx, &report_id, &ticket_id).await;
         }
-        add_edge(&fx, "artifact", &report_id, "artifact", &fx.ticket_id).await;
+        add_edge(&fx, "artifact", &report_id, "artifact", fx.ticket_id()).await;
         let before = catalog(&fx).await;
         for error in all_read_errors(&fx).await {
             assert!(
@@ -1354,7 +1283,7 @@ async fn canonical_extra_source_edges_are_included_and_revoked_even_when_not_dir
     fixed_watermark_tombstone(&fx, "run", "S3").await;
     let before = catalog(&fx).await;
     assert!(matches!(
-        IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id).await,
+        IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id()).await,
         Err(Error::Forbidden)
     ));
     assert_eq!(catalog(&fx).await, before);
@@ -1407,7 +1336,7 @@ async fn cycles_and_diamonds_deduplicate_complete_typed_closure() {
         ])
         .unwrap()
     );
-    IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+    IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id())
         .await
         .unwrap();
 }
@@ -1497,7 +1426,7 @@ async fn optional_binding_only_absence_is_legacy_null_unknown_version_and_incomp
 {
     let fx = ready(2, true).await;
     let formal = finalize(&fx).await;
-    let ticket = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+    let ticket = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id())
         .await
         .unwrap()
         .ticket;
@@ -1525,12 +1454,9 @@ async fn optional_binding_only_absence_is_legacy_null_unknown_version_and_incomp
         let mut absent = value.clone();
         absent.as_object_mut().unwrap().remove(field);
         if is_ticket {
-            assert!(
-                serde_json::from_value::<EvaluationTicketV2>(absent)
-                    .unwrap()
-                    .candidate_dependency_binding
-                    .is_none()
-            );
+            // V3 cannot lose its candidate while retaining a source-plan.
+            // Original V2 absence is checked from the frozen old producer.
+            assert!(serde_json::from_value::<EvaluationTicketV2>(absent).is_err());
         } else {
             assert!(matches!(
                 serde_json::from_value::<FormalEvaluationV2>(absent).unwrap(),
@@ -1646,97 +1572,24 @@ impl Serialize for LegacyTicket<'_> {
         record.end()
     }
 }
-struct LegacyFormal<'a>(&'a FormalEvaluationV2);
-impl Serialize for LegacyFormal<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let FormalEvaluationV2::CompleteBatch {
-            evidence_scope,
-            cost_evidence_scope,
-            ticket_id,
-            ticket_digest,
-            manifest_digest,
-            candidate_bundle_digest,
-            baseline_bundle_digest,
-            environment_digest,
-            verdict,
-            report,
-            anchor_evidence_digest,
-            resource_evidence_digest,
-            ..
-        } = self.0
-        else {
-            return Err(serde::ser::Error::custom("complete batch expected"));
-        };
-        let mut record = serializer.serialize_struct("FormalEvaluationV2", 13)?;
-        record.serialize_field("variant", "complete_batch")?;
-        record.serialize_field("evidence_scope", evidence_scope)?;
-        record.serialize_field("cost_evidence_scope", cost_evidence_scope)?;
-        record.serialize_field("ticket_id", ticket_id)?;
-        record.serialize_field("ticket_digest", ticket_digest)?;
-        record.serialize_field("manifest_digest", manifest_digest)?;
-        record.serialize_field("candidate_bundle_digest", candidate_bundle_digest)?;
-        record.serialize_field("baseline_bundle_digest", baseline_bundle_digest)?;
-        record.serialize_field("environment_digest", environment_digest)?;
-        record.serialize_field("verdict", verdict)?;
-        record.serialize_field("report", report)?;
-        record.serialize_field("anchor_evidence_digest", anchor_evidence_digest)?;
-        record.serialize_field("resource_evidence_digest", resource_evidence_digest)?;
-        record.end()
-    }
-}
-
 #[tokio::test]
 async fn legacy_absence_preserves_exact_parent_bytes_fingerprints_and_never_upgrades_later() {
-    // AG-100: the unstaged issue is refused without a write; the ticket is
-    // the pre-AG-100 unbound one, persisted as stored (L696).
-    let fx = ready(2, false).await;
-    let formal = finalize(&fx).await;
-    let ticket = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
-        .await
-        .unwrap()
-        .ticket;
+    trusted_compiler_inputs::assert_frozen_issuer_static_read("dependency-legacy").await.unwrap();
+    let frozen: Value = serde_json::from_str(include_str!("fixtures/ag135b_legacy_issuers.json")).unwrap();
+    let ticket = frozen["fixtures"]["dependency-legacy"]["tables"]["objects"]["rows"].as_array().unwrap().iter().find_map(|row| {
+        let body: Value = serde_json::from_str(row[4]["text"].as_str()?).ok()?;
+        (body["record_kind"] == "evaluation_ticket_v2").then(|| serde_json::from_value::<EvaluationTicketV2>(body["payload"].clone()).unwrap())
+    }).unwrap();
     assert!(ticket.candidate_dependency_binding.is_none());
-    assert!(matches!(
-        formal,
-        FormalEvaluationV2::CompleteBatch {
-            stored_dependency_binding: None,
-            ..
-        }
-    ));
-    let old_ticket_bytes = serde_json::to_vec(&LegacyTicket(&ticket)).unwrap();
-    let old_formal_bytes = serde_json::to_vec(&LegacyFormal(&formal)).unwrap();
-    assert_eq!(serde_json::to_vec(&ticket).unwrap(), old_ticket_bytes);
-    assert_eq!(serde_json::to_vec(&formal).unwrap(), old_formal_bytes);
-    assert_eq!(fingerprint(&ticket).unwrap(), hash(&old_ticket_bytes));
-    assert_eq!(fingerprint(&formal).unwrap(), hash(&old_formal_bytes));
-    assert!(
-        !String::from_utf8(old_ticket_bytes)
-            .unwrap()
-            .contains("candidate_dependency_binding")
-    );
-    assert!(
-        !String::from_utf8(old_formal_bytes)
-            .unwrap()
-            .contains("stored_dependency_binding")
-    );
-    stage(&fx).await;
-    fixed_watermark_tombstone(&fx, "run", "S2").await;
-    let after = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
-        .await
-        .unwrap();
-    assert!(after.ticket.candidate_dependency_binding.is_none());
-    assert_eq!(
-        fingerprint(&after.ticket).unwrap(),
-        fingerprint(&ticket).unwrap()
-    );
-    assert_eq!(
-        fingerprint(&after.formal.unwrap()).unwrap(),
-        fingerprint(&formal).unwrap()
-    );
-    IndependentEvaluationControl::verified_report_view(&fx.evaluator, &fx.store, &fx.ticket_id)
-        .await
-        .unwrap();
+    assert!(ticket.source_plan_binding.is_none());
+    let original = serde_json::to_vec(&LegacyTicket(&ticket)).unwrap();
+    assert_eq!(serde_json::to_vec(&ticket).unwrap(), original);
+    assert_eq!(fingerprint(&ticket).unwrap(), hash(&original));
+    let wire = String::from_utf8(original).unwrap();
+    assert!(!wire.contains("candidate_dependency_binding"));
+    assert!(!wire.contains("source_plan_binding"));
 }
+
 
 /// AG-100 T1 (L564, L1055/L1057). A ticket requested while no candidate
 /// record exists is refused under both control schemas before any write: the
@@ -1755,7 +1608,7 @@ async fn issue_without_a_candidate_record_is_refused_for_every_control_schema_be
             .await
             .map(|ticket| ticket.candidate_dependency_binding.is_some());
         let unchanged = catalog(&fx).await == before;
-        let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+        let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id())
             .await
             .map(|status| status.ticket.candidate_dependency_binding.is_some());
         println!(
@@ -1791,7 +1644,7 @@ async fn issue_after_the_candidate_is_staged_binds_it_for_every_control_schema()
         let binding = ticket.candidate_dependency_binding.as_ref().unwrap();
         assert_eq!(binding.candidate_id, fx.holdout.pair.candidate_digest);
         assert_eq!(binding.namespace, "n");
-        let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+        let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id())
             .await
             .unwrap();
         assert_eq!(
@@ -1813,46 +1666,9 @@ async fn issue_after_the_candidate_is_staged_binds_it_for_every_control_schema()
 /// registered now.
 #[tokio::test]
 async fn persisted_legacy_ticket_is_read_unbound_and_served_as_stored() {
-    let fx = prepared(2, false).await;
-    persist_legacy_ticket(&fx).await;
-    let before = catalog(&fx).await;
-    let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
-        .await
-        .unwrap();
-    assert!(status.ticket.candidate_dependency_binding.is_none());
-    assert_eq!(status.ticket.lifecycle, TicketLifecycle::Reserved);
-    assert!(status.formal.is_none());
-    let wire = serde_json::to_value(&status.ticket).unwrap();
-    assert!(wire.get("candidate_dependency_binding").is_none());
-    assert_eq!(
-        serde_json::to_vec(&status.ticket).unwrap(),
-        serde_json::to_vec(&LegacyTicket(&status.ticket)).unwrap()
-    );
-    assert_eq!(
-        ticket_edges(&fx).await,
-        vec![(
-            "artifact".to_string(),
-            sid("protected_holdout_v41", &fx.holdout.id)
-        )]
-    );
-    IndependentEvaluationControl::broker_task(
-        &fx.worker,
-        &fx.store,
-        &fx.ticket_id,
-        "r0",
-        ExecutionSide::Candidate,
-    )
-    .await
-    .unwrap();
-    let again = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
-        .await
-        .unwrap();
-    assert_eq!(
-        fingerprint(&again.ticket).unwrap(),
-        fingerprint(&status.ticket).unwrap()
-    );
-    assert_eq!(catalog(&fx).await, before, "legacy reads wrote state");
+    trusted_compiler_inputs::assert_frozen_issuer_static_read("dependency-legacy").await.unwrap();
 }
+
 
 #[tokio::test]
 async fn bounded_outgoing_api_orders_typed_ids_isolates_namespace_and_refuses_limit_plus_one() {
@@ -1982,13 +1798,13 @@ con.commit()
                     .len(),
                 9994
             );
-            IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+            IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id())
                 .await
                 .unwrap();
             let view = IndependentEvaluationControl::broker_task(
                 &fx.worker,
                 &fx.store,
-                &fx.ticket_id,
+                fx.ticket_id(),
                 "r0",
                 ExecutionSide::Candidate,
             )
@@ -2008,7 +1824,7 @@ con.commit()
                     &BudgetCallReservation {
                         billing_scope: fence.billing_scope.clone(),
                         call_id: fence.call_id.clone(),
-                        dispatch_group_id: fx.ticket_id.clone(),
+                        dispatch_group_id: fx.ticket_id().to_owned(),
                         stage: BudgetStage::TaskExecution,
                         actual_input_digest: fence.actual_input_digest.clone(),
                         request_artifact: None,
@@ -2024,7 +1840,7 @@ con.commit()
                 &fx.worker,
                 &fx.store,
                 StartExecutionRequest {
-                    ticket_id: fx.ticket_id.clone(),
+                    ticket_id: fx.ticket_id().to_owned(),
                     target_id: "r0".into(),
                     side: ExecutionSide::Candidate,
                     fence,
@@ -2036,7 +1852,7 @@ con.commit()
             assert!(
                 matches!(IndependentEvaluationControl::record_execution_receipt(
                 &fx.worker, &fx.store, ExecutionReceiptRequest {
-                    receipt_id: "capacity-receipt".into(), ticket_id: fx.ticket_id.clone(),
+                    receipt_id: "capacity-receipt".into(), ticket_id: fx.ticket_id().to_owned(),
                     target_id: "r0".into(), side: ExecutionSide::Candidate,
                     request_digest: view.request_digest, output_artifact_id: "capacity-output".into(),
                     output_utf8: json!({"answer":"yes"}).to_string(),
@@ -2083,7 +1899,7 @@ async fn candidate_content_change_refuses_start_and_finalize_atomically() {
             IndependentEvaluationControl::finalize_complete(
                 &fx.evaluator,
                 &fx.store,
-                &fx.ticket_id,
+                fx.ticket_id(),
                 2000,
             )
             .await
@@ -2093,7 +1909,7 @@ async fn candidate_content_change_refuses_start_and_finalize_atomically() {
                 &fx.worker,
                 &fx.store,
                 StartExecutionRequest {
-                    ticket_id: fx.ticket_id.clone(),
+                    ticket_id: fx.ticket_id().to_owned(),
                     target_id: "r0".into(),
                     side: ExecutionSide::Candidate,
                     fence: BudgetCallFence {
@@ -2124,7 +1940,7 @@ async fn revocation_preserves_dispatched_unknown_usage_and_late_receipt_settleme
     let view = IndependentEvaluationControl::broker_task(
         &fx.worker,
         &fx.store,
-        &fx.ticket_id,
+        fx.ticket_id(),
         "r0",
         ExecutionSide::Candidate,
     )
@@ -2144,7 +1960,7 @@ async fn revocation_preserves_dispatched_unknown_usage_and_late_receipt_settleme
             &BudgetCallReservation {
                 billing_scope: fence.billing_scope.clone(),
                 call_id: fence.call_id.clone(),
-                dispatch_group_id: fx.ticket_id.clone(),
+                dispatch_group_id: fx.ticket_id().to_owned(),
                 stage: BudgetStage::TaskExecution,
                 actual_input_digest: fence.actual_input_digest.clone(),
                 request_artifact: None,
@@ -2160,7 +1976,7 @@ async fn revocation_preserves_dispatched_unknown_usage_and_late_receipt_settleme
         &fx.worker,
         &fx.store,
         StartExecutionRequest {
-            ticket_id: fx.ticket_id.clone(),
+            ticket_id: fx.ticket_id().to_owned(),
             target_id: "r0".into(),
             side: ExecutionSide::Candidate,
             fence: fence.clone(),
@@ -2196,7 +2012,7 @@ async fn revocation_preserves_dispatched_unknown_usage_and_late_receipt_settleme
     .unwrap();
     let request = ExecutionReceiptRequest {
         receipt_id: "late-unknown-receipt".into(),
-        ticket_id: fx.ticket_id.clone(),
+        ticket_id: fx.ticket_id().to_owned(),
         target_id: "r0".into(),
         side: ExecutionSide::Candidate,
         request_digest: view.request_digest,
@@ -2230,7 +2046,7 @@ async fn revocation_preserves_dispatched_unknown_usage_and_late_receipt_settleme
     IndependentEvaluationControl::invalidate(
         &fx.evaluator,
         &fx.store,
-        &fx.ticket_id,
+        fx.ticket_id(),
         "source_revoked",
         16,
     )
@@ -2245,7 +2061,13 @@ async fn revocation_preserves_dispatched_unknown_usage_and_late_receipt_settleme
             .await
             .unwrap();
     let stored_ticket: EvaluationTicketV2 = serde_json::from_value(
-        raw(&fx, "artifact", &sid("evaluation_ticket_v2", &fx.ticket_id)).await["payload"].clone(),
+        raw(
+            &fx,
+            "artifact",
+            &sid("evaluation_ticket_v2", fx.ticket_id()),
+        )
+        .await["payload"]
+            .clone(),
     )
     .unwrap();
     assert_eq!(stored_ticket.lifecycle, TicketLifecycle::Invalid);
@@ -2253,7 +2075,12 @@ async fn revocation_preserves_dispatched_unknown_usage_and_late_receipt_settleme
     // output are audit evidence only; the ticket keeps the bytes its report
     // pins at invalidation, and one audit entry names the receipt.
     assert!(stored_ticket.late_execution_receipt_ids.is_empty());
-    let formal = raw(&fx, "artifact", &sid("formal_evaluation_v2", &fx.ticket_id)).await;
+    let formal = raw(
+        &fx,
+        "artifact",
+        &sid("formal_evaluation_v2", fx.ticket_id()),
+    )
+    .await;
     assert_eq!(
         formal["payload"]["ticket_digest"],
         json!(fingerprint(&stored_ticket).unwrap())
@@ -2295,7 +2122,7 @@ print(sum(1 for r in rows if r['operation']=='late_execution_receipt_after_forma
             .outgoing_edges_bounded(
                 &fx.worker,
                 "artifact",
-                &sid("evaluation_ticket_v2", &fx.ticket_id),
+                &sid("evaluation_ticket_v2", fx.ticket_id()),
                 10000,
             )
             .await
@@ -2345,7 +2172,7 @@ print(sum(1 for r in rows if r['operation']=='late_execution_receipt_after_forma
     assert!(paid[0].execution_closed);
     let before = catalog(&fx).await;
     assert!(matches!(
-        IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id,).await,
+        IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id(),).await,
         Err(Error::Forbidden)
     ));
     assert_eq!(catalog(&fx).await, before);
@@ -2416,7 +2243,7 @@ async fn known_typed_schema_with_incomplete_identity_is_not_a_dependency_proof()
 async fn rotating_anchor_category_tamper_refuses_active_bound_ticket_before_dispatch() {
     let fx = prepared(2, true).await;
     issue(&fx).await.unwrap();
-    let id = sid("evaluation_ticket_v2", &fx.ticket_id);
+    let id = sid("evaluation_ticket_v2", fx.ticket_id());
     let mut ticket = raw(&fx, "artifact", &id).await;
     // Preserve target order, IDs, protected input refs/digests and category
     // counts, but try to turn the frozen critical anchor into a rotating row.
@@ -2429,7 +2256,7 @@ async fn rotating_anchor_category_tamper_refuses_active_bound_ticket_before_disp
     });
     write_raw(&fx, "artifact", &id, &ticket).await;
     let before = catalog(&fx).await;
-    let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+    let status = IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id())
         .await
         .unwrap_err();
     assert!(
@@ -2438,7 +2265,7 @@ async fn rotating_anchor_category_tamper_refuses_active_bound_ticket_before_disp
     let broker = IndependentEvaluationControl::broker_task(
         &fx.worker,
         &fx.store,
-        &fx.ticket_id,
+        fx.ticket_id(),
         "r0",
         ExecutionSide::Candidate,
     )
@@ -2451,7 +2278,7 @@ async fn rotating_anchor_category_tamper_refuses_active_bound_ticket_before_disp
         &fx.worker,
         &fx.store,
         StartExecutionRequest {
-            ticket_id: fx.ticket_id.clone(),
+            ticket_id: fx.ticket_id().to_owned(),
             target_id: "r0".into(),
             side: ExecutionSide::Candidate,
             fence: BudgetCallFence {
@@ -2485,7 +2312,7 @@ async fn formal_report_direct_tombstone_refuses_every_read_without_watermark_bum
         }
     ));
     let positive_status =
-        IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id)
+        IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id())
             .await
             .unwrap();
     assert!(
@@ -2494,20 +2321,23 @@ async fn formal_report_direct_tombstone_refuses_every_read_without_watermark_bum
             .candidate_dependency_binding
             .is_some()
     );
-    let positive_view =
-        IndependentEvaluationControl::verified_report_view(&fx.evaluator, &fx.store, &fx.ticket_id)
-            .await
-            .unwrap();
+    let positive_view = IndependentEvaluationControl::verified_report_view(
+        &fx.evaluator,
+        &fx.store,
+        fx.ticket_id(),
+    )
+    .await
+    .unwrap();
     assert_eq!(positive_view.report_digest, fingerprint(&formal).unwrap());
     assert!(!positive_view.promotion_eligible);
     let mut session = fx.store.session().await.unwrap();
-    verified_report_view_in_session(&fx.evaluator, &mut session, &fx.ticket_id)
+    verified_report_view_in_session(&fx.evaluator, &mut session, fx.ticket_id())
         .await
         .unwrap();
     let watermark_before = session.watermark(&fx.evaluator).await.unwrap();
     session.commit().await.unwrap();
 
-    let formal_id = sid("formal_evaluation_v2", &fx.ticket_id);
+    let formal_id = sid("formal_evaluation_v2", fx.ticket_id());
     let formal_before = raw(&fx, "artifact", &formal_id).await;
     let candidate_before = raw(&fx, "artifact", &fx.holdout.pair.candidate_digest).await;
     // Add only the report's own correctly typed artifact tombstone. It remains
@@ -2518,13 +2348,16 @@ async fn formal_report_direct_tombstone_refuses_every_read_without_watermark_bum
     // Collect every actual entry's result before any refusal assertion, so a
     // failing self-probe still records all three live reads.
     let status =
-        IndependentEvaluationControl::status(&fx.evaluator, &fx.store, &fx.ticket_id).await;
-    let view =
-        IndependentEvaluationControl::verified_report_view(&fx.evaluator, &fx.store, &fx.ticket_id)
-            .await;
+        IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id()).await;
+    let view = IndependentEvaluationControl::verified_report_view(
+        &fx.evaluator,
+        &fx.store,
+        fx.ticket_id(),
+    )
+    .await;
     let mut session = fx.store.session().await.unwrap();
     let same_session =
-        verified_report_view_in_session(&fx.evaluator, &mut session, &fx.ticket_id).await;
+        verified_report_view_in_session(&fx.evaluator, &mut session, fx.ticket_id()).await;
     let watermark_after = session.watermark(&fx.evaluator).await.unwrap();
     drop(session);
     let after_reads = catalog(&fx).await;

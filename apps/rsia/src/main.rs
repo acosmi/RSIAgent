@@ -1,12 +1,11 @@
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use evo_core::contract::{
-    CapabilityLevel, HostCapabilities, HostSurfaceManifest, SurfaceCoverage, SurfaceItem,
-    SystemSnapshot,
+    CapabilityLevel, HostCapabilities, HostSurfaceClassificationV2, HostSurfaceRegistrationV2,
+    ReviewedHostSourceEnvelopeV1, SurfaceCoverage, SystemSnapshot,
 };
 use evo_core::{Context, Role, hash};
 use evo_engine::data_directory_lock::DataDirectoryLock;
-use evo_engine::release_store::ReleaseStore;
 use evo_engine::service::{HostPrepareConfig, HostService};
 use evo_engine::startup_gate::GateDecision;
 #[cfg(test)]
@@ -20,7 +19,7 @@ use std::{
 };
 
 const GATEWAY_HOST_ACTOR: &str = "reference-host-gateway";
-const REFERENCE_SURFACE_ID: &str = "reference-host-surface-v1";
+const REFERENCE_SURFACE_ID: &str = "reference-host-surface-v2-source-bound";
 
 async fn review_client(
     kind: ReviewKindArgument,
@@ -413,28 +412,29 @@ async fn bootstrap(data: &Path, namespace: &str) -> Result<(HostService, HostPre
     let initialized: Result<(HostService, HostPrepareConfig)> = async {
         let host = Context::new(namespace, GATEWAY_HOST_ACTOR, Role::Host)?;
         let admin = Context::new(namespace, "service-admin", Role::Admin)?;
-        let manifest = HostSurfaceManifest {
-            schema_version: "rsia.host_surface.v1".into(),
-            host: "reference-host".into(),
-            host_version: "1.0.0".into(),
-            adapter_version: "1.0.0".into(),
-            source_digest: hash(b"rsia-reference-host-surface-v1"),
-            items: vec![SurfaceItem {
-                name: "model".into(),
-                coverage: SurfaceCoverage::Supported,
-                mapped_field: Some("host.model".into()),
-                consumer: Some("reference-host".into()),
-                reason: "fixed disabled-model reference adapter".into(),
-            }],
+        let source = ReviewedHostSourceEnvelopeV1 {
+            schema_version: "rsia.host_source_envelope.v1".into(),
+            source_kind: "reviewed_fixture".into(),
+            source_schema: "rsia.host_reviewed_declarations.v1".into(),
+            extractor_version: "rsia.host_reviewed_declarations.extractor.v1".into(),
+            original_utf8: r#"{"schema_version":"rsia.host_reviewed_declarations.v1","host":"reference-host","host_version":"1.0.0","declarations":[{"name":"model","value_type":"string","enum_values":[],"default":{"kind":"value","value":"disabled"}}]}"#.into(),
         };
-        ReleaseStore::register_host_surface(
-            &admin,
-            &store,
-            REFERENCE_SURFACE_ID,
-            manifest,
-            vec!["model".into()],
-        )
-        .await?;
+        let raw_source = serde_json::to_string(&source)?;
+        evo_engine::hosts::register_reviewed_host_surface_json(
+            &admin, &store, REFERENCE_SURFACE_ID, &raw_source,
+            HostSurfaceRegistrationV2 {
+                adapter_version: "1.0.0".into(),
+                classifications: vec![HostSurfaceClassificationV2 {
+                    name: "model".into(), coverage: SurfaceCoverage::Supported,
+                    mapped_field: Some("host.model".into()), consumer: Some("runner".into()),
+                    reason: "fixed disabled-model reference adapter".into(),
+                    renamed_from: None,
+                    test_ref: Some("scripts/smoke_cli.py".into()),
+                    capability: Some("fs_read".into()),
+                }],
+                retired: vec![],
+            }, None,
+        ).await?;
         let prepare_config = HostPrepareConfig {
             profile_id: "default".into(),
             system_snapshot: SystemSnapshot {

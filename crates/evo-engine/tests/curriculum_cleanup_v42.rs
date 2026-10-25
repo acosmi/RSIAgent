@@ -251,6 +251,7 @@ struct Fixture {
     executor: Context,
     grader: Context,
     control: DevelopmentControlV1,
+    candidate_bundle_digest: String,
 }
 
 impl Fixture {
@@ -292,14 +293,18 @@ impl Fixture {
             .await
             .unwrap();
         let control = control();
-        let candidate = crate::trusted_compiler_inputs::software_candidate(
-            NAMESPACE,
+        let candidate = crate::trusted_compiler_inputs::software_candidate_current(
+            &store,
+            &executor,
             &control.environment_digest,
             "candidate-bundle",
-        );
-        crate::trusted_compiler_inputs::persist_bundle(
+            1,
+        )
+        .await
+        .unwrap();
+        crate::trusted_compiler_inputs::persist_bundle_current(
             &store,
-            NAMESPACE,
+            &executor,
             &candidate,
             &control.environment_digest,
             1,
@@ -318,6 +323,7 @@ impl Fixture {
             executor,
             grader,
             control,
+            candidate_bundle_digest: candidate.digest,
         }
     }
 
@@ -389,19 +395,21 @@ impl Fixture {
         .seal()
         .unwrap();
         let observed_fact = observed_fact(request, report, extras);
-        let inputs = crate::trusted_compiler_inputs::bundle_use(
+        let inputs = crate::trusted_compiler_inputs::bundle_use_current(
             &self.store,
-            NAMESPACE,
+            &self.admin,
             &request.candidate_bundle_digest,
+            &request.environment_digest,
+            request.revoke_watermark,
         )
         .await
         .unwrap();
         journal
-            .commit_bound(request_fact.clone(), &inputs)
+            .commit_source_bound(request_fact.clone(), &inputs)
             .await
             .unwrap();
         journal
-            .commit_bound(observed_fact.clone(), &inputs)
+            .commit_source_bound(observed_fact.clone(), &inputs)
             .await
             .unwrap();
         (request_fact.artifact_id, observed_fact.artifact_id)
@@ -579,8 +587,9 @@ impl Chain {
 
         let mut facts = Vec::new();
         for (n, episode) in ["episode-1", "episode-2"].into_iter().enumerate() {
-            let request =
+            let mut request =
                 build_request(&fixture.control, &format!("dev-request-{}", n + 1), episode);
+            request.candidate_bundle_digest = fixture.candidate_bundle_digest.clone();
             let report = fixture.runner().run(request.clone()).await.unwrap();
             let (request_fact_id, observed_fact_id) = fixture.commit_facts(&request, &report).await;
             let state = coordinator

@@ -6,7 +6,8 @@ use crate::evidence::{
 };
 use crate::exploration::{ExplorationDependency, RootOpportunity, WorldState};
 use crate::release_store::{
-    ReleaseCandidateRecord, ReleaseStore, StageBundleRequest, TypedSourceRef,
+    CurrentReleaseCandidateRecord, CurrentStageBundleRequest, ReadCandidate, ReleaseStore,
+    TypedSourceRef,
 };
 use crate::streaming_evaluator::{
     EvaluationEvidenceScope, FixedGraderMethod, FixedGraderSpec, FrozenOracleEntry,
@@ -39,16 +40,16 @@ fn d(label: &str) -> String {
 
 mod compiler_fixture {
     use crate::formal_authority::{
-        EmptyRootAuthorization, FormalRegistry, FrozenCompilerProfile, HOST_SCHEMA, PROFILE_SCHEMA,
-        PROVIDER_SCHEMA, ROOT_SCHEMA, RegisteredExternalProvider, RegisteredFormalHost,
-        empty_root_strategy,
+        CompilerInputRequest, EmptyRootAuthorization, FormalRegistry, FrozenCompilerProfile,
+        HOST_SCHEMA, PROFILE_SCHEMA, PROVIDER_SCHEMA, ROOT_SCHEMA, RegisteredExternalProvider,
+        RegisteredFormalHost, empty_root_strategy,
     };
     use evo_core::contract::{
-        CompileParts, HostCapabilities, ImproverPatch, PatchOp, Profile, ResolvedBundle,
-        SkillSnapshot, SystemSnapshot, compile_bundle,
+        HostCapabilities, ImproverPatch, PatchOp, Profile, ResolvedBundleV3, SkillPatch,
+        SkillSnapshot, SystemSnapshot,
     };
     use evo_core::evidence::Purpose;
-    use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, hash};
+    use evo_core::{Context, Result, Role, Strategy, fingerprint, hash};
     use evo_storage::Store;
     use std::collections::BTreeMap;
     use std::sync::{Mutex, OnceLock};
@@ -208,9 +209,17 @@ mod compiler_fixture {
         FormalRegistry::authorize_empty_root(&admin, store, fixture.root.clone()).await?;
         Ok(())
     }
-    pub fn software_candidate(namespace: &str, environment: &str, content: &str) -> ResolvedBundle {
+    // ProgramFixture content only. The existing no-principal EmptyRoot route
+    // cannot execute a provider or issue registered-host formal authority.
+    pub async fn software_candidate(
+        store: &Store,
+        proposer: &Context,
+        environment: &str,
+        content: &str,
+        watermark: u64,
+    ) -> Result<ResolvedBundleV3> {
         let f = inputs(
-            namespace,
+            proposer.namespace(),
             "development-fixture",
             SkillSnapshot::empty(),
             Strategy::default(),
@@ -220,32 +229,51 @@ mod compiler_fixture {
             },
             environment,
         );
-        compile_bundle(CompileParts {
-            profile: &f.profile,
-            parent: &f.root.skill,
-            baseline: &f.frozen.baseline_skill,
-            parent_strategy: &f.root.strategy,
-            baseline_strategy: &f.frozen.baseline_strategy,
-            skill_patch: &evo_core::contract::SkillPatch {
+        install(store, &f).await?;
+        let input = CompilerInputRequest {
+            profile: f.profile.clone(),
+            search_parent: f.root.skill.clone(),
+            baseline: f.frozen.baseline_skill.clone(),
+            search_parent_strategy: f.root.strategy.clone(),
+            expected_parent_strategy_digest: Some(fingerprint(&f.root.strategy)?),
+            baseline_strategy: f.frozen.baseline_strategy.clone(),
+            capabilities: f.frozen.capabilities.clone(),
+            environment_digest: environment.into(),
+            purpose: Purpose::Development,
+            revoke_watermark: watermark,
+        };
+        let mut session = store.session().await?;
+        let bundle = crate::compiler::compile_current_in_session(
+            &mut session,
+            proposer,
+            &input,
+            &SkillPatch {
                 content: PatchOp::Set {
                     value: content.into(),
                 },
-                ..Default::default()
+                ..SkillPatch::default()
             },
-            improver_patch: &ImproverPatch::default(),
-            caps: &f.frozen.capabilities,
-            revoked: &Default::default(),
-        })
-        .unwrap()
-    }
-    pub async fn install_bundle(store: &Store, bundle: &ResolvedBundle) -> Result<()> {
-        let f = fixtures()
-            .lock()
-            .map_err(|_| Error::Internal)?
-            .get(&bundle.parent_digest)
-            .cloned()
-            .ok_or(Error::Forbidden)?;
-        install(store, &f).await
+            &ImproverPatch::default(),
+        )
+        .await?;
+        let stored = crate::compiler::verify_current_bundle_in_session(
+            &mut session,
+            proposer,
+            &bundle.digest,
+            environment,
+            watermark,
+        )
+        .await?;
+        assert_eq!(
+            serde_json::to_vec(&stored.bundle).unwrap(),
+            serde_json::to_vec(&bundle).unwrap()
+        );
+        assert_eq!(
+            fingerprint(&stored.original_baseline)?,
+            fingerprint(&f.frozen)?
+        );
+        session.commit().await?;
+        Ok(bundle)
     }
 }
 const EXPLORATION_ENVELOPE_SCHEMA: &str = "rsia.exploration_artifact_envelope.v1";
@@ -585,14 +613,9 @@ fn optimizer(arm: FixedOptimizerArm, implementation: &str) -> FixedOptimizerSpec
     }
 }
 
-async fn stage_fixture_candidate(store: &Store) -> ReleaseCandidateRecord {
+async fn stage_fixture_candidate(store: &Store) -> CurrentReleaseCandidateRecord {
     let host = Context::new("n", "host", Role::Host).unwrap();
     let proposer = Context::new("n", "proposer", Role::Worker).unwrap();
-    let bundle =
-        compiler_fixture::software_candidate("n", &d("environment"), "streaming execution fixture");
-    compiler_fixture::install_bundle(store, &bundle)
-        .await
-        .unwrap();
     let body = "trusted streaming fixture source";
     let source = StoredTraceAuthority {
         schema_version: "rsia.optimization.source.v1".into(),
@@ -624,10 +647,19 @@ async fn stage_fixture_candidate(store: &Store) -> ReleaseCandidateRecord {
         .await
         .unwrap();
     session.commit().await.unwrap();
-    ReleaseStore::stage_bundle(
+    let bundle = compiler_fixture::software_candidate(
+        store,
+        &proposer,
+        &d("environment"),
+        "streaming execution fixture",
+        watermark as u64,
+    )
+    .await
+    .unwrap();
+    let candidate = ReleaseStore::stage_current_bundle(
         &proposer,
         store,
-        StageBundleRequest {
+        CurrentStageBundleRequest {
             candidate_id: d("candidate"),
             bundle,
             environment_digest: d("environment"),
@@ -641,7 +673,27 @@ async fn stage_fixture_candidate(store: &Store) -> ReleaseCandidateRecord {
         },
     )
     .await
-    .unwrap()
+    .unwrap();
+    let mut session = store.session().await.unwrap();
+    let stored: ReadCandidate = session
+        .need(&proposer, "artifact", &candidate.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(stored.current().unwrap()).unwrap(),
+        serde_json::to_vec(&candidate).unwrap(),
+    );
+    let edges = session
+        .outgoing_edges_bounded(&proposer, "artifact", &candidate.id, 10_000)
+        .await
+        .unwrap();
+    assert!(edges.contains(&("run".into(), "streaming-fixture-source".into())));
+    assert!(edges.contains(&(
+        "artifact".into(),
+        format!("formal-bundle-{}", candidate.bundle_digest)
+    )));
+    session.commit().await.unwrap();
+    candidate
 }
 
 async fn setup_evaluation(store: &Store) {
@@ -1072,15 +1124,32 @@ async fn committed_blocked_ticket_keeps_result_error_and_exposure_after_late_can
         outcome.error_code.as_deref(),
         Some("execution_provider_unconfigured")
     );
+    let ticket_id = match &outcome.result {
+        Some(ManagementResult::EvaluationTicketBlocked { ticket_id }) => ticket_id.clone(),
+        result => panic!("expected the committed blocked ticket, got {result:?}"),
+    };
+    let status = IndependentEvaluationControl::status(&evaluator, &store, &ticket_id)
+        .await
+        .unwrap();
     assert!(
-        matches!(&outcome.result, Some(ManagementResult::EvaluationTicketBlocked { ticket_id }) if ticket_id == "ticket-1")
+        matches!(&outcome.result, Some(ManagementResult::EvaluationTicketBlocked { ticket_id })
+            if ticket_id == &status.ticket.id)
     );
-    let ticket = serde_json::to_value(
-        IndependentEvaluationControl::status(&evaluator, &store, "ticket-1")
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    assert_eq!(
+        status
+            .ticket
+            .source_plan_binding
+            .as_ref()
+            .unwrap()
+            .logical_ticket_id,
+        "ticket-1"
+    );
+    assert_ne!(status.ticket.id, "ticket-1");
+    assert!(matches!(
+        IndependentEvaluationControl::status(&evaluator, &store, "ticket-1").await,
+        Err(Error::NotFound)
+    ));
+    let ticket = serde_json::to_value(status).unwrap();
     let before = dispatcher.cancel(&evaluator, &queued.id).await.unwrap();
     assert_eq!(before.state, ManagementJobState::Running);
     let expected = preserved_job(before, &outcome, true);
@@ -1100,7 +1169,7 @@ async fn committed_blocked_ticket_keeps_result_error_and_exposure_after_late_can
     .await;
     assert_eq!(
         serde_json::to_value(
-            IndependentEvaluationControl::status(&evaluator, &store, "ticket-1")
+            IndependentEvaluationControl::status(&evaluator, &store, &ticket_id)
                 .await
                 .unwrap()
         )
@@ -1115,7 +1184,7 @@ async fn readonly_status_some_is_not_a_committed_write() {
     let (_dir, store) = store().await;
     setup_evaluation(&store).await;
     let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();
-    IndependentEvaluationControl::issue_ticket(
+    let ticket = IndependentEvaluationControl::issue_ticket(
         &evaluator,
         &store,
         IssueTicketRequest {
@@ -1130,7 +1199,7 @@ async fn readonly_status_some_is_not_a_committed_write() {
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![evaluator.clone()]).unwrap();
     let request = json!({
         "schema_version": "rsia.management.evaluation_status.v1",
-        "request_key": "late-cancel-status", "ticket_id": "ticket-1"
+        "request_key": "late-cancel-status", "ticket_id": ticket.id
     });
     let queued = persist_management(&evaluator, &store, "evaluation.status", request.clone())
         .await
@@ -1138,8 +1207,8 @@ async fn readonly_status_some_is_not_a_committed_write() {
     let (ctx, claimed, outcome) = execute_claimed(&dispatcher, &store, &queued.id).await;
     assert_eq!(outcome.state, ManagementJobState::Succeeded);
     assert!(matches!(
-        outcome.result,
-        Some(ManagementResult::EvaluationStatus { .. })
+        &outcome.result,
+        Some(ManagementResult::EvaluationStatus { ticket_id, .. }) if ticket_id == &ticket.id
     ));
     let mut expected = dispatcher.cancel(&evaluator, &queued.id).await.unwrap();
     let committed = artifacts(&evaluator, &store).await;

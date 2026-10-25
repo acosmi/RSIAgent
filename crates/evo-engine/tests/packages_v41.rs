@@ -36,7 +36,7 @@ use evo_engine::packages::{
     package_dependency_ref_id, preview_package_diff, privacy_block, reject_member, reject_package,
     scan_privacy, validate_manifest,
 };
-use evo_engine::release_store::{ReleaseStore, StageBundleRequest, TypedSourceRef};
+use evo_engine::release_store::{ReleaseStore, CurrentStageBundleRequest as StageBundleRequest, TypedSourceRef};
 use evo_storage::Store;
 use evo_storage::lifecycle::{CleanupState, CleanupStatus, LifecycleStore, TypedObjectRef};
 use std::collections::{BTreeMap, BTreeSet};
@@ -775,7 +775,7 @@ fn trusted_authority(id: &str, body: &str) -> StoredTraceAuthority {
     }
 }
 
-fn candidate_bundle(content: &str) -> evo_core::contract::ResolvedBundle {
+fn candidate_bundle(content: &str) -> evo_core::contract::ResolvedBundleV3 {
     let profile = Profile {
         id: "package-profile".into(),
         evolution_enabled: true,
@@ -789,7 +789,7 @@ fn candidate_bundle(content: &str) -> evo_core::contract::ResolvedBundle {
         required_capabilities: vec![],
         dependencies: vec![],
     };
-    trusted_compiler_inputs::bundle(
+    trusted_compiler_inputs::bundle_content_current(
         CompileParts {
             profile: &profile,
             parent: &parent,
@@ -811,7 +811,7 @@ fn candidate_bundle(content: &str) -> evo_core::contract::ResolvedBundle {
 }
 
 fn candidate_material_package(
-    bundle: &evo_core::contract::ResolvedBundle,
+    bundle: &evo_core::contract::ResolvedBundleV3,
 ) -> (
     AssetPackageManifest,
     BTreeMap<String, Vec<u8>>,
@@ -1008,7 +1008,7 @@ async fn candidate_handoff_consumes_existing_e02_candidate_without_granting_rele
         })
         .collect::<Vec<_>>();
     let matching_bundle = candidate_bundle("candidate compiled through the existing E02 path");
-    trusted_compiler_inputs::install_bundle(&store, &matching_bundle)
+    trusted_compiler_inputs::install_bundle_current_sources(&store, &matching_bundle)
         .await
         .unwrap();
     let (material_manifest, material_files, material_binding) =
@@ -1031,7 +1031,7 @@ async fn candidate_handoff_consumes_existing_e02_candidate_without_granting_rele
             content_digest: authority.trace.source_digest.clone(),
         })
         .collect::<Vec<_>>();
-    ReleaseStore::stage_bundle(
+    ReleaseStore::stage_current_bundle(
         &proposer,
         &store,
         StageBundleRequest {
@@ -1072,7 +1072,7 @@ async fn candidate_handoff_consumes_existing_e02_candidate_without_granting_rele
         .await
         .is_err()
     );
-    ReleaseStore::stage_bundle(
+    ReleaseStore::stage_current_bundle(
         &proposer,
         &store,
         StageBundleRequest {
@@ -1096,7 +1096,7 @@ async fn candidate_handoff_consumes_existing_e02_candidate_without_granting_rele
         .await
         .is_err()
     );
-    ReleaseStore::stage_bundle(
+    ReleaseStore::stage_current_bundle(
         &proposer,
         &store,
         StageBundleRequest {
@@ -2373,4 +2373,39 @@ async fn twenty_first_staged_package_is_refused_and_aborted_or_failed_records_do
     .unwrap();
     assert_eq!(quarantined.payload.state, StagedAssetState::Quarantined);
     assert_eq!(staged_package_usage(&store, &admin).await.0, 20);
+}
+
+#[tokio::test]
+async fn current_handoff_binds_real_candidate_and_does_not_grant_release() {
+    let (_directory, store, admin, _ordinary_sources) = persistent_store().await;
+    let host = Context::new("n", "host", Role::Host).unwrap();
+    let proposer = Context::new("n", "proposer", Role::Worker).unwrap();
+    let authority = trusted_authority("current-handoff-source", "actual trusted handoff source");
+    store_trace_authority(&store, &host, &authority).await.unwrap();
+    let source = E16SourceRef { kind: "run".into(), id: authority.record.id.clone(), digest: fingerprint(&serde_json::to_value(&authority).unwrap()).unwrap() };
+    let bundle = candidate_bundle("actual Current handoff material");
+    trusted_compiler_inputs::install_bundle_current_sources(&store, &bundle).await.unwrap();
+    let (manifest, files, binding) = candidate_material_package(&bundle);
+    let mut request = persistent_stage_request("current-handoff-material", manifest, files, vec![source]);
+    request.candidate_material = Some(binding);
+    let staged = PersistentPackageStore::stage_package(&admin, &store, request).await.unwrap();
+    let candidate = ReleaseStore::stage_current_bundle(&proposer, &store, StageBundleRequest {
+        candidate_id: "current-handoff-candidate".into(), environment_digest: hash(b"environment"),
+        proposer_actor: proposer.actor().into(), bundle,
+        sources: vec![TypedSourceRef { kind: "run".into(), id: authority.record.id.clone(), content_digest: authority.trace.source_digest.clone() }], revoke_watermark: 1,
+    }).await.unwrap();
+    let handed_off = PersistentPackageStore::record_candidate_handoff(&admin, &store, &staged.id, &candidate.id).await.unwrap();
+    assert_eq!(handed_off.payload.candidate_ref.as_deref(), Some(candidate.id.as_str()));
+    assert_eq!(handed_off.payload.state, StagedAssetState::Staged);
+    let mut session = store.session().await.unwrap();
+    assert!(session.list::<serde_json::Value>(&admin, "release").await.unwrap().is_empty());
+    assert!(session.list::<serde_json::Value>(&admin, "pointer").await.unwrap().is_empty());
+    let candidate_wire: serde_json::Value = session.need(&admin, "artifact", &candidate.id).await.unwrap();
+    assert_eq!(candidate_wire, serde_json::to_value(&candidate).unwrap());
+    session.commit().await.unwrap();
+    let audit = store.verify_audit(&admin).await.unwrap();
+    assert!(matches!(PersistentPackageStore::record_candidate_handoff(&admin, &store, &staged.id, "missing-current-candidate").await, Err(Error::NotFound)));
+    assert_eq!(store.verify_audit(&admin).await.unwrap(), audit);
+    assert_eq!(PersistentPackageStore::read_staged(&admin, &store, &staged.id).await.unwrap().payload.candidate_ref, handed_off.payload.candidate_ref);
+    store.close().await;
 }

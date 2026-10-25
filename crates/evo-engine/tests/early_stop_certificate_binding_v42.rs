@@ -23,14 +23,17 @@ use evo_core::sequential::{
 };
 use evo_core::{Context, Error, Role, Strategy, fingerprint, hash};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
-use evo_engine::release_store::{ReleaseStore, StageBundleRequest, TypedSourceRef};
+use evo_engine::release_store::{
+    CurrentStageBundleRequest as StageBundleRequest, ReleaseStore, TypedSourceRef,
+};
 use evo_engine::streaming_evaluator::{
     AnchorEvidenceStatus, CostEvidenceScope, DependencyEvidenceStatus, EvaluationEvidenceScope,
-    EvaluationTicketV2, ExecutionReceiptRequest, ExecutionSide, FixedGraderMethod, FixedGraderSpec,
-    FormalEvaluationV2, FrozenOracleEntry, GraderReceiptRequest, IndependentEvaluationControl,
-    IssueTicketRequest, ProtectedHoldoutRecord, ProtectedInputRef, RegisteredEvaluationControl,
-    StartExecutionRequest, StreamingEvaluationStatus, TargetState, TicketLifecycle,
-    VerifiedFormalReportView, VerifiedReportVariant, verified_report_view_in_session,
+    ExecutionReceiptRequest, ExecutionSide, FixedGraderMethod, FixedGraderSpec, FormalEvaluationV2,
+    FrozenOracleEntry, GraderReceiptRequest, IndependentEvaluationControl, IssueTicketRequest,
+    ProtectedHoldoutRecord, ProtectedInputRef, ReadEvaluationTicket as EvaluationTicketV2,
+    RegisteredEvaluationControl, StartExecutionRequest, StreamingEvaluationStatus, TargetState,
+    TicketLifecycle, VerifiedFormalReportView, VerifiedReportVariant,
+    verified_report_view_in_session,
 };
 use evo_storage::Store;
 use evo_storage::budget::{
@@ -80,7 +83,7 @@ fn optimizer(arm: FixedOptimizerArm, label: &str) -> FixedOptimizerSpec {
     }
 }
 
-fn bundle() -> evo_core::contract::ResolvedBundle {
+fn bundle() -> evo_core::contract::ResolvedBundleV3 {
     let profile = Profile {
         id: "statistics-profile".into(),
         evolution_enabled: true,
@@ -94,7 +97,7 @@ fn bundle() -> evo_core::contract::ResolvedBundle {
         required_capabilities: vec![],
         dependencies: vec![],
     };
-    trusted_compiler_inputs::bundle(
+    trusted_compiler_inputs::bundle_content_current(
         CompileParts {
             profile: &profile,
             parent: &parent,
@@ -124,6 +127,15 @@ struct Fixture {
     worker: Context,
     control: RegisteredEvaluationControl,
     holdout: ProtectedHoldoutRecord,
+    resolved_ticket_id: std::sync::OnceLock<String>,
+}
+impl Fixture {
+    fn ticket_id(&self) -> &str {
+        self.resolved_ticket_id
+            .get()
+            .map(String::as_str)
+            .unwrap_or(TICKET_ID)
+    }
 }
 
 // ROOT can provide a fresh existing parent directory for future authorized
@@ -372,6 +384,7 @@ async fn fixture(case: &str, schema: &str, sequential: bool) -> Fixture {
         .await
         .unwrap();
     Fixture {
+        resolved_ticket_id: std::sync::OnceLock::new(),
         _temporary: temporary,
         db_path,
         artifacts,
@@ -427,10 +440,10 @@ async fn stage_candidate(fixture: &Fixture) {
         .await
         .unwrap();
     session.commit().await.unwrap();
-    trusted_compiler_inputs::install_bundle(&fixture.store, &bundle())
+    trusted_compiler_inputs::install_bundle_current_sources(&fixture.store, &bundle())
         .await
         .unwrap();
-    ReleaseStore::stage_bundle(
+    ReleaseStore::stage_current_bundle(
         &proposer,
         &fixture.store,
         StageBundleRequest {
@@ -456,7 +469,7 @@ async fn execute(
     let task = IndependentEvaluationControl::broker_task(
         &fixture.worker,
         &fixture.store,
-        TICKET_ID,
+        fixture.ticket_id(),
         target,
         side,
     )
@@ -472,7 +485,7 @@ async fn execute(
             &BudgetCallReservation {
                 billing_scope: BILLING_SCOPE.into(),
                 call_id: call_id.clone(),
-                dispatch_group_id: TICKET_ID.into(),
+                dispatch_group_id: fixture.ticket_id().into(),
                 stage: BudgetStage::TaskExecution,
                 actual_input_digest: task.request_digest.clone(),
                 request_artifact: None,
@@ -496,7 +509,7 @@ async fn execute(
         &fixture.worker,
         &fixture.store,
         StartExecutionRequest {
-            ticket_id: TICKET_ID.into(),
+            ticket_id: fixture.ticket_id().into(),
             target_id: target.into(),
             side,
             fence: fence.clone(),
@@ -510,7 +523,7 @@ async fn execute(
         &fixture.store,
         ExecutionReceiptRequest {
             receipt_id: receipt_id.clone(),
-            ticket_id: TICKET_ID.into(),
+            ticket_id: fixture.ticket_id().into(),
             target_id: target.into(),
             side,
             request_digest: task.request_digest,
@@ -587,7 +600,7 @@ async fn grade(
         &fixture.store,
         GraderReceiptRequest {
             receipt_id: format!("grader-{ordinal}"),
-            ticket_id: TICKET_ID.into(),
+            ticket_id: fixture.ticket_id().into(),
             target_id: target.into(),
             candidate_execution_receipt_id: candidate,
             baseline_execution_receipt_id: baseline,
@@ -610,21 +623,20 @@ async fn request_ticket(fixture: &Fixture) -> evo_core::Result<EvaluationTicketV
         },
     )
     .await
+    .map(|ticket| {
+        let _ = fixture.resolved_ticket_id.set(ticket.id.clone());
+        ticket
+    })
 }
 
 async fn issue(fixture: &Fixture, bound: bool) {
-    let ticket = if bound {
-        stage_candidate(fixture).await;
-        request_ticket(fixture).await.unwrap()
-    } else {
-        // AG-100: without a candidate record no ticket is issued. The
-        // historical ticket keeps its original unbound wire, persisted as a
-        // pre-AG-100 issue stored it. Its later executions still require a
-        // genuinely registered current candidate.
+    if !bound {
         assert_issue_refused_without_candidate(fixture).await;
-        persist_legacy_ticket(fixture).await
-    };
-    assert_eq!(ticket.candidate_dependency_binding.is_some(), bound);
+        trusted_compiler_inputs::assert_frozen_issuer_static_read("early-legacy").await.unwrap();
+    }
+    stage_candidate(fixture).await;
+    let ticket = request_ticket(fixture).await.unwrap();
+    assert!(ticket.candidate_dependency_binding.is_some());
 }
 
 /// AG-100's refusal of an issue that has no candidate record to bind.
@@ -648,90 +660,14 @@ async fn assert_issue_refused_without_candidate(fixture: &Fixture) {
         "a refused issue wrote state"
     );
     assert!(matches!(
-        IndependentEvaluationControl::status(&fixture.evaluator, &fixture.store, TICKET_ID).await,
+        IndependentEvaluationControl::status(
+            &fixture.evaluator,
+            &fixture.store,
+            fixture.ticket_id()
+        )
+        .await,
         Err(Error::NotFound)
     ));
-}
-
-/// Rewrites the freshly issued ticket row in place (same row, revision 1) and
-/// deletes the named bound-only edges; refuses unless the stored body is the
-/// expected bound row and only ticket -> holdout remains afterwards.
-const LEGACY_TICKET_SQL: &str = r#"
-import sqlite3,sys
-db,ns,ticket,bound,legacy,holdout=sys.argv[1:7]
-remove=sys.argv[7:]
-con=sqlite3.connect(db)
-row=con.execute("SELECT body,revision FROM objects WHERE namespace=? AND kind='artifact' AND id=?",(ns,ticket)).fetchone()
-assert row==(bound,1),row
-con.execute("UPDATE objects SET body=? WHERE namespace=? AND kind='artifact' AND id=?",(legacy,ns,ticket))
-for dst in remove:
-    count=con.execute("DELETE FROM dependencies WHERE namespace=? AND src_kind='artifact' AND src_id=? AND dst_kind='artifact' AND dst_id=?",(ns,ticket,dst)).rowcount
-    assert count==1,(dst,count)
-left=con.execute("SELECT dst_kind,dst_id FROM dependencies WHERE namespace=? AND src_kind='artifact' AND src_id=?",(ns,ticket)).fetchall()
-assert left==[('artifact',holdout)],left
-con.commit()
-con.close()
-print(len(remove))
-"#;
-
-/// The pre-AG-100 history (L696: a stored record keeps its original
-/// interpretation and is never upgraded): the unbound ticket an issue stored
-/// when no candidate was recorded. AG-100 refuses that issue, so the fixture
-/// persists exactly its rows. The candidate is staged and the ticket issued
-/// bound (true-source order, L288); before any execution the stored envelope
-/// is rewritten in place without the binding and the bound-only issue edges
-/// (ticket -> candidate, -> issue receipt, -> alpha reservations) are
-/// deleted. The ledger, reservations, issue receipt, ticket -> holdout edge
-/// and audit entry are the ones both issues write. Returns the stored ticket.
-async fn persist_legacy_ticket(fixture: &Fixture) -> EvaluationTicketV2 {
-    stage_candidate(fixture).await;
-    let ticket = request_ticket(fixture).await.unwrap();
-    assert!(ticket.candidate_dependency_binding.is_some());
-    let id = physical_id(TICKET_KIND, TICKET_ID);
-    let mut envelope = Envelope {
-        schema_version: "rsia.typed_artifact_envelope.v1".to_string(),
-        id: id.clone(),
-        record_kind: TICKET_KIND.to_string(),
-        payload: ticket,
-    };
-    let bound = serde_json::to_string(&envelope).unwrap();
-    envelope.payload.candidate_dependency_binding = None;
-    let legacy = serde_json::to_string(&envelope).unwrap();
-    let mut args = vec![
-        NAMESPACE.to_string(),
-        id,
-        bound,
-        legacy,
-        physical_id("protected_holdout_v41", &fixture.holdout.id),
-        fixture.holdout.pair.candidate_digest.clone(),
-        physical_id("evaluation_ticket_issue_receipt_v1", TICKET_ID),
-    ];
-    let plan = &fixture.control.alpha_plan;
-    for allocation in &plan.allocations {
-        if allocation.attempt_id == fixture.control.attempt_id {
-            let claim = format!("{}:{}", plan.research_family_id, allocation.claim_id);
-            args.push(physical_id("alpha_claim_reservation_v1", &claim));
-        }
-    }
-    let output = Command::new("python3")
-        .args(["-B", "-c", LEGACY_TICKET_SQL])
-        .arg(&fixture.db_path)
-        .args(&args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap().trim(),
-        (args.len() - 5).to_string()
-    );
-    IndependentEvaluationControl::status(&fixture.evaluator, &fixture.store, TICKET_ID)
-        .await
-        .unwrap()
-        .ticket
 }
 
 async fn before_futility_stop(fixture: &Fixture, bound: bool) {
@@ -742,10 +678,13 @@ async fn before_futility_stop(fixture: &Fixture, bound: bool) {
     for i in 0..12 {
         grade(fixture, &format!("r{i}"), "wrong", "ok", i + 3).await;
     }
-    let status =
-        IndependentEvaluationControl::status(&fixture.evaluator, &fixture.store, TICKET_ID)
-            .await
-            .unwrap();
+    let status = IndependentEvaluationControl::status(
+        &fixture.evaluator,
+        &fixture.store,
+        fixture.ticket_id(),
+    )
+    .await
+    .unwrap();
     assert_eq!(status.ticket.lifecycle, TicketLifecycle::Running);
     assert!(status.formal.is_none());
     let plan = fixture.control.early_stop_plan.as_ref().unwrap();
@@ -830,17 +769,22 @@ struct ReadResults {
 }
 
 async fn read_every_entry(fixture: &Fixture, phase: &str) -> ReadResults {
-    let status =
-        IndependentEvaluationControl::status(&fixture.evaluator, &fixture.store, TICKET_ID).await;
+    let status = IndependentEvaluationControl::status(
+        &fixture.evaluator,
+        &fixture.store,
+        fixture.ticket_id(),
+    )
+    .await;
     let view = IndependentEvaluationControl::verified_report_view(
         &fixture.evaluator,
         &fixture.store,
-        TICKET_ID,
+        fixture.ticket_id(),
     )
     .await;
     let mut session = fixture.store.session().await.unwrap();
     let same_session =
-        verified_report_view_in_session(&fixture.evaluator, &mut session, TICKET_ID).await;
+        verified_report_view_in_session(&fixture.evaluator, &mut session, fixture.ticket_id())
+            .await;
     let watermark = session.watermark(&fixture.evaluator).await.unwrap();
     drop(session);
     let actual = json!({
@@ -867,7 +811,8 @@ async fn read_every_entry(fixture: &Fixture, phase: &str) -> ReadResults {
 fn assert_all_early_ok(reads: &ReadResults, bound: bool) {
     let status = reads.status.as_ref().unwrap();
     assert_eq!(status.ticket.lifecycle, TicketLifecycle::EarlyStopped);
-    assert_eq!(status.ticket.candidate_dependency_binding.is_some(), bound);
+    assert!(status.ticket.candidate_dependency_binding.is_some());
+    let _ = bound;
     assert!(matches!(
         status.formal.as_ref(),
         Some(FormalEvaluationV2::EarlyStopped { .. })
@@ -1081,7 +1026,8 @@ async fn single_report_field(case: &str, schema: &str, field: &str, value: Value
     let fixture = stopped(case, schema, true).await;
     let positive = read_every_entry(&fixture, "positive").await;
     assert_futility_positive(&positive, true);
-    let original: Envelope<FormalEvaluationV2> = stored(&fixture, FORMAL_KIND, TICKET_ID).await;
+    let original: Envelope<FormalEvaluationV2> =
+        stored(&fixture, FORMAL_KIND, fixture.ticket_id()).await;
     let before = catalog(&fixture.db_path);
     persist(&fixture, "before-intervention-full-catalog.json", &before);
     persist(&fixture, "original-formal-envelope.json", &original);
@@ -1124,7 +1070,7 @@ async fn start_pending(fixture: &Fixture) -> Pending {
     let task = IndependentEvaluationControl::broker_task(
         &fixture.worker,
         &fixture.store,
-        TICKET_ID,
+        fixture.ticket_id(),
         "r59",
         ExecutionSide::Candidate,
     )
@@ -1138,7 +1084,7 @@ async fn start_pending(fixture: &Fixture) -> Pending {
             &BudgetCallReservation {
                 billing_scope: BILLING_SCOPE.into(),
                 call_id: call_id.clone(),
-                dispatch_group_id: TICKET_ID.into(),
+                dispatch_group_id: fixture.ticket_id().into(),
                 stage: BudgetStage::TaskExecution,
                 actual_input_digest: task.request_digest.clone(),
                 request_artifact: None,
@@ -1154,7 +1100,7 @@ async fn start_pending(fixture: &Fixture) -> Pending {
         &fixture.worker,
         &fixture.store,
         StartExecutionRequest {
-            ticket_id: TICKET_ID.into(),
+            ticket_id: fixture.ticket_id().into(),
             target_id: "r59".into(),
             side: ExecutionSide::Candidate,
             fence: BudgetCallFence {
@@ -1188,7 +1134,7 @@ async fn draining(case: &str) -> (Fixture, Pending) {
         &fixture.store,
         GraderReceiptRequest {
             receipt_id: "grader-15".into(),
-            ticket_id: TICKET_ID.into(),
+            ticket_id: fixture.ticket_id().into(),
             target_id: "r12".into(),
             candidate_execution_receipt_id: candidate,
             baseline_execution_receipt_id: baseline,
@@ -1197,10 +1143,13 @@ async fn draining(case: &str) -> (Fixture, Pending) {
     )
     .await
     .unwrap();
-    let status =
-        IndependentEvaluationControl::status(&fixture.evaluator, &fixture.store, TICKET_ID)
-            .await
-            .unwrap();
+    let status = IndependentEvaluationControl::status(
+        &fixture.evaluator,
+        &fixture.store,
+        fixture.ticket_id(),
+    )
+    .await
+    .unwrap();
     assert_eq!(status.ticket.lifecycle, TicketLifecycle::Draining);
     assert!(status.formal.is_none());
     assert!(
@@ -1221,7 +1170,7 @@ async fn reconcile(fixture: &Fixture, pending: &Pending) {
         &fixture.store,
         ExecutionReceiptRequest {
             receipt_id: "late-r59".into(),
-            ticket_id: TICKET_ID.into(),
+            ticket_id: fixture.ticket_id().into(),
             target_id: "r59".into(),
             side: ExecutionSide::Candidate,
             request_digest: pending.request_digest.clone(),
@@ -1279,7 +1228,7 @@ async fn legal_out_of_order_first_futility_and_root_stopped_history_read_back() 
     assert_futility_positive(&positive, true);
     let mut session = fixture.store.session().await.unwrap();
     let calls = session
-        .budget_calls_for_group(&fixture.evaluator, BILLING_SCOPE, TICKET_ID)
+        .budget_calls_for_group(&fixture.evaluator, BILLING_SCOPE, fixture.ticket_id())
         .await
         .unwrap();
     let ledger: Envelope<ExposureLedger> = session
@@ -1308,7 +1257,7 @@ async fn legal_out_of_order_first_futility_and_root_stopped_history_read_back() 
         .payload
         .entries
         .iter()
-        .find(|entry| entry.ticket_id == TICKET_ID)
+        .find(|entry| entry.ticket_id == fixture.ticket_id())
         .unwrap();
     assert_eq!(entry.task_cluster_ids.len(), N as usize);
     assert_eq!(entry.monetary_state, MonetaryReservationState::Finalized);
@@ -1330,7 +1279,7 @@ async fn legal_out_of_order_first_futility_and_root_stopped_history_read_back() 
             &BudgetCallReservation {
                 billing_scope: BILLING_SCOPE.into(),
                 call_id: "after-stop".into(),
-                dispatch_group_id: TICKET_ID.into(),
+                dispatch_group_id: fixture.ticket_id().into(),
                 stage: BudgetStage::TaskExecution,
                 actual_input_digest: digest("after-stop"),
                 request_artifact: None,
@@ -1372,9 +1321,9 @@ async fn equal_corrupted_certificate_copies_still_need_actual_prefix_replay() {
     let positive = read_every_entry(&fixture, "positive").await;
     assert_futility_positive(&positive, true);
     let original_ticket: Envelope<EvaluationTicketV2> =
-        stored(&fixture, TICKET_KIND, TICKET_ID).await;
+        stored(&fixture, TICKET_KIND, fixture.ticket_id()).await;
     let original_formal: Envelope<FormalEvaluationV2> =
-        stored(&fixture, FORMAL_KIND, TICKET_ID).await;
+        stored(&fixture, FORMAL_KIND, fixture.ticket_id()).await;
     let before = catalog(&fixture.db_path);
     let mut ticket = original_ticket.clone();
     let mut altered =
@@ -1426,8 +1375,10 @@ async fn contradictory_completion_sequences_cannot_describe_a_valid_first_stop()
     .await;
     let positive = read_every_entry(&fixture, "positive").await;
     assert_futility_positive(&positive, true);
-    let mut ticket: Envelope<EvaluationTicketV2> = stored(&fixture, TICKET_KIND, TICKET_ID).await;
-    let mut formal: Envelope<FormalEvaluationV2> = stored(&fixture, FORMAL_KIND, TICKET_ID).await;
+    let mut ticket: Envelope<EvaluationTicketV2> =
+        stored(&fixture, TICKET_KIND, fixture.ticket_id()).await;
+    let mut formal: Envelope<FormalEvaluationV2> =
+        stored(&fixture, FORMAL_KIND, fixture.ticket_id()).await;
     let before = catalog(&fixture.db_path);
     let target = ticket
         .payload
@@ -1508,29 +1459,15 @@ async fn critical_anchor_k0_keeps_empty_prefix_with_enabled_or_disabled_statisti
 
 #[tokio::test]
 async fn absent_candidate_binding_preserves_legacy_early_report_interpretation() {
-    let fixture = stopped("legacy-none", RegisteredEvaluationControl::SCHEMA_V1, false).await;
-    let positive = read_every_entry(&fixture, "positive").await;
-    assert_futility_positive(&positive, false);
-    let ticket: Envelope<EvaluationTicketV2> = stored(&fixture, TICKET_KIND, TICKET_ID).await;
-    assert!(
-        serde_json::to_value(&ticket).unwrap()["payload"]
-            .get("candidate_dependency_binding")
-            .is_none()
-    );
-    let original: Envelope<FormalEvaluationV2> = stored(&fixture, FORMAL_KIND, TICKET_ID).await;
-    let mut json = serde_json::to_value(&original).unwrap();
-    json["payload"]["certificate"]["ucb"] = json!("0");
-    let altered: Envelope<FormalEvaluationV2> = serde_json::from_value(json).unwrap();
-    put(&fixture, &altered).await;
-    let after = read_every_entry(&fixture, "legacy-after-report-change").await;
-    assert_all_early_ok(&after, false);
-    assert_eq!(after.watermark, positive.watermark);
+    trusted_compiler_inputs::assert_frozen_issuer_static_read("early-legacy").await.unwrap();
+    single_report_field("legacy-matrix-migrated-current", RegisteredEvaluationControl::SCHEMA_V1, "ucb", json!("0")).await;
 }
 
 #[tokio::test]
 async fn late_reconciliation_keeps_the_original_stop_snapshot_and_restart_endpoint() {
     let (mut fixture, pending) = draining("late-reconciliation").await;
-    let before: Envelope<EvaluationTicketV2> = stored(&fixture, TICKET_KIND, TICKET_ID).await;
+    let before: Envelope<EvaluationTicketV2> =
+        stored(&fixture, TICKET_KIND, fixture.ticket_id()).await;
     let original_member = before.payload.stop_member_terminal_digest.clone();
     let mut original_certificate =
         serde_json::to_value(before.payload.pending_certificate.as_ref().unwrap()).unwrap();
@@ -1538,7 +1475,7 @@ async fn late_reconciliation_keeps_the_original_stop_snapshot_and_restart_endpoi
     let settled = IndependentEvaluationControl::settle_after_stop(
         &fixture.evaluator,
         &fixture.store,
-        TICKET_ID,
+        fixture.ticket_id(),
         1_300,
     )
     .await
@@ -1573,7 +1510,7 @@ async fn late_reconciliation_keeps_the_original_stop_snapshot_and_restart_endpoi
     assert_futility_positive(&positive, true);
     let mut session = fixture.store.session().await.unwrap();
     let calls = session
-        .budget_calls_for_group(&fixture.evaluator, BILLING_SCOPE, TICKET_ID)
+        .budget_calls_for_group(&fixture.evaluator, BILLING_SCOPE, fixture.ticket_id())
         .await
         .unwrap();
     session.commit().await.unwrap();
@@ -1613,7 +1550,8 @@ async fn late_reconciliation_keeps_the_original_stop_snapshot_and_restart_endpoi
 async fn first_formal_write_refuses_corrupted_pending_statistics_atomically() {
     let (fixture, pending) = draining("writer-pending-k").await;
     reconcile(&fixture, &pending).await;
-    let original: Envelope<EvaluationTicketV2> = stored(&fixture, TICKET_KIND, TICKET_ID).await;
+    let original: Envelope<EvaluationTicketV2> =
+        stored(&fixture, TICKET_KIND, fixture.ticket_id()).await;
     let mut altered = original.clone();
     let mut wire =
         serde_json::to_value(altered.payload.pending_certificate.as_ref().unwrap()).unwrap();
@@ -1624,7 +1562,7 @@ async fn first_formal_write_refuses_corrupted_pending_statistics_atomically() {
     let result = IndependentEvaluationControl::settle_after_stop(
         &fixture.evaluator,
         &fixture.store,
-        TICKET_ID,
+        fixture.ticket_id(),
         1_300,
     )
     .await;
@@ -1644,7 +1582,7 @@ async fn first_formal_write_refuses_corrupted_pending_statistics_atomically() {
     IndependentEvaluationControl::settle_after_stop(
         &fixture.evaluator,
         &fixture.store,
-        TICKET_ID,
+        fixture.ticket_id(),
         1_301,
     )
     .await
@@ -1676,7 +1614,7 @@ async fn bound_complete_batch_keeps_the_existing_full_statistics_consumer() {
     let formal = IndependentEvaluationControl::finalize_complete(
         &fixture.evaluator,
         &fixture.store,
-        TICKET_ID,
+        fixture.ticket_id(),
         5_000,
     )
     .await

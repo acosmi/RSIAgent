@@ -43,7 +43,8 @@ use evo_engine::evidence::{
     store_trace_authority,
 };
 use evo_engine::model::{
-    BoundModelRequest, CompilerInputUse, ModelExecutionProvenance, ModelPort, ModelResponse,
+    BoundModelRequest, CurrentCompilerInputUse as CompilerInputUse, ModelExecutionProvenance,
+    ModelPort, ModelResponse, ReadBoundModelRequest,
 };
 use evo_engine::monitoring::{
     ClaimOutcome, CompleteDevelopmentCycleRequest, ConsolidationClaim, ConsolidationClaimState,
@@ -536,7 +537,7 @@ impl Fixture {
         let admin = context("admin", Role::Admin);
         let host = context("host", Role::Host);
         let worker = context("worker", Role::Worker);
-        ReleaseStore::register_host_surface(
+        trusted_compiler_inputs::register_fixture_host_surface(
             &admin,
             &store,
             "surface",
@@ -1338,7 +1339,7 @@ impl ModelTransport for ScriptedTransport {
 /// it to the same broker without replacing its compiler authority.
 struct RecordingModelPort<'a> {
     broker: &'a PersistentModelBroker<ScriptedTransport>,
-    bound: &'a Mutex<Vec<BoundModelRequest>>,
+    bound: &'a Mutex<Vec<ReadBoundModelRequest>>,
 }
 
 #[async_trait]
@@ -1348,8 +1349,16 @@ impl ModelPort for RecordingModelPort<'_> {
     }
 
     async fn dispatch_bound(&self, request: BoundModelRequest) -> Result<ModelResponse> {
-        self.bound.lock().unwrap().push(request.clone());
+        let read = serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        self.bound.lock().unwrap().push(read);
         self.broker.dispatch_bound(request).await
+    }
+    async fn dispatch_compiler_bound(
+        &self,
+        request: ReadBoundModelRequest,
+    ) -> Result<ModelResponse> {
+        self.bound.lock().unwrap().push(request.clone());
+        self.broker.dispatch_compiler_bound(request).await
     }
 }
 
@@ -1371,7 +1380,7 @@ struct World {
     /// The requests those calls carried.
     seen: Arc<Mutex<Vec<ModelRequest>>>,
     /// Complete incoming requests, before the broker dispatches the provider.
-    bound: Mutex<Vec<BoundModelRequest>>,
+    bound: Mutex<Vec<ReadBoundModelRequest>>,
 }
 
 impl World {
@@ -2013,7 +2022,10 @@ async fn environment_preparation(world: &World, episode: &str) -> (StageFact, Co
         Shape::at(ModelStage::ReflectFailure),
     );
     let compiler_request = step.compiler_input_request();
-    let verified = journal.compiler_inputs(&compiler_request).await.unwrap();
+    let verified = journal
+        .current_compiler_inputs(&compiler_request)
+        .await
+        .unwrap();
     let inputs = CompilerInputUse::new(compiler_request, verified.binding().clone());
     let request = step.development_request.clone();
     let mut dependencies = vec![

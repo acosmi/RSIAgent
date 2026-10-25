@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
@@ -50,6 +51,55 @@ def finite_json(value):
 def read_json(raw):
     return finite_json(json.loads(raw, object_pairs_hook=unique_object,
         parse_constant=reject_nonstandard_number))
+
+def read_current_host_raw(raw):
+    """Only the new Host body has this raw-token gate; old facts keep read_json."""
+    if not isinstance(raw,str) or len(raw.encode("utf-8"))>262144:
+        raise IsolationError("invalid current host raw JSON")
+    def decimal_token(token):
+        try:
+            exact=Decimal(token)
+            rounded=float(token)
+            if not math.isfinite(rounded) or Decimal(str(rounded))!=exact:
+                raise IsolationError("invalid current host raw JSON")
+            return exact
+        except (InvalidOperation,ValueError,OverflowError) as error:
+            raise IsolationError("invalid current host raw JSON") from error
+    def integer_token(token):
+        value=int(token)
+        if value<-(1<<63) or value>(1<<64)-1:
+            raise IsolationError("invalid current host raw JSON")
+        return value
+    try:
+        value=json.loads(raw,object_pairs_hook=unique_object,parse_float=decimal_token,
+            parse_int=integer_token,parse_constant=reject_nonstandard_number)
+    except (ValueError,RecursionError) as error:
+        raise IsolationError("invalid current host raw JSON") from error
+    nodes=0
+    stack=[(value,1)]
+    while stack:
+        item,depth=stack.pop()
+        nodes+=1
+        if nodes>32768 or depth>256:
+            raise IsolationError("invalid current host raw JSON")
+        if isinstance(item,dict):
+            if item.get("kind")=="value" and "value" in item:
+                def numbers(child):
+                    if isinstance(child,Decimal): return float(child)
+                    if isinstance(child,dict): return {key:numbers(part) for key,part in child.items()}
+                    if isinstance(child,list): return [numbers(part) for part in child]
+                    return child
+                canonical=json.dumps(numbers(item["value"]),sort_keys=True,ensure_ascii=False,separators=(",",":"))
+                if item["value"] is None or len(canonical.encode("utf-8"))>4096:
+                    raise IsolationError("invalid current host raw JSON")
+            stack.extend((part,depth+1) for part in item.values())
+        elif isinstance(item,list):
+            stack.extend((part,depth+1) for part in item)
+    if not isinstance(value,dict) or value.get("schema_version")!="rsia.host_surface_record.v2":
+        raise IsolationError("invalid current host raw JSON")
+    # Precision and resource checks above see the actual tokens before the
+    # ordinary protected-facts representation receives any binary floats.
+    return read_json(raw)
 
 def exact_object(value,keys,name):
     if not isinstance(value,dict) or set(value)!=set(keys):
@@ -287,10 +337,17 @@ def protected_facts(con,namespaces):
     # The schema list below is mirrored by evo-storage lifecycle.rs (PROTECTED_SCHEMA_VERSIONS
     # plus PROTECTED_ACTION_SCHEMA_VERSIONS); the tests assert that the two stay equal.
     facts=[]
-    for ns,kind,id,body in con.execute("SELECT namespace,kind,id,body FROM objects ORDER BY namespace,kind,id"):
+    for ns,kind,id,body,current_host in con.execute("""
+        SELECT namespace,kind,id,body,
+          CASE WHEN kind='artifact' AND json_valid(body) THEN EXISTS (
+            SELECT 1 FROM json_each(objects.body) member
+            WHERE member.key='schema_version' AND member.type='text'
+              AND member.value='rsia.host_surface_record.v2'
+          ) ELSE 0 END
+        FROM objects ORDER BY namespace,kind,id"""):
         if ns not in namespaces:
             continue
-        value=read_json(body)
+        value=read_current_host_raw(body) if current_host else read_json(body)
         schema=value.get("schema_version","")
         if kind in ("budget","reservation","evaluation","receipt") or schema in (
             "rsia.typed_artifact_envelope.v1","rsia.exploration_artifact_envelope.v1",
@@ -303,7 +360,8 @@ def protected_facts(con,namespaces):
             "rsia.monitoring.environment_drift.v1",
             "rsia.practice_registration.v1","rsia.practice_registration_binding.v1",
             "rsia.practice_attempt_set.v1","rsia.curriculum_artifact_envelope.v1",
-            "rsia.management_job.v1","rsia.replay_economic_artifact_envelope.v1"):
+            "rsia.management_job.v1","rsia.replay_economic_artifact_envelope.v1",
+            "rsia.monitoring.consolidation_proposal.v2"):
             facts.append((ns,kind,id,value))
     # Monetary state and irreversible dispatch counters must also agree.
     tables=[r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'root_budget%'")]

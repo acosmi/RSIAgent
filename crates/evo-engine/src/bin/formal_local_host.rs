@@ -322,58 +322,14 @@ async fn authority(
     socket: String,
     connections: u16,
 ) -> Result<serde_json::Value> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    if connections == 0 || connections > 64 {
-        return Err(Error::Invalid(
-            "authority connection count outside finite bound".into(),
-        ));
-    }
-    let service =
-        evo_engine::formal_authority::PrincipalAuthorityService::new(host.clone(), principals)?;
-    let path = std::path::Path::new(&socket);
-    let parent = path.parent().ok_or(Error::Forbidden)?;
-    let metadata = std::fs::metadata(parent).map_err(|_| Error::Forbidden)?;
-    if metadata.uid() != host.grader_uid || metadata.mode() & 0o002 != 0 || path.exists() {
-        return Err(Error::Forbidden);
-    }
-    let (_data_lock, gate) = mount_gate(std::path::Path::new(&database), None)
-        .await
-        .map_err(|error| Error::Conflict(error.to_string()))?;
-    let store = Store::open(std::path::Path::new(&database)).await?;
-    let result = async {
-        gate.admit().map_err(|error| Error::Conflict(error.to_string()))?;
-        let listener = tokio::net::UnixListener::bind(path).map_err(|_| Error::Forbidden)?;
-        let serving = async {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
-                .map_err(|_| Error::Forbidden)?;
-            let mut completed = 0u16;
-            let mut refused = 0u16;
-            for _ in 0..connections {
-                let (stream, _) = tokio::time::timeout(std::time::Duration::from_secs(300), listener.accept()).await
-                    .map_err(|_| Error::Cancelled)?.map_err(|_| Error::Internal)?;
-                match service.serve_connection(&store, stream).await {
-                    Ok(_) => completed += 1,
-                    Err(Error::ClockRegressed) => return Err(Error::ClockRegressed),
-                    Err(_) => refused += 1,
-                }
-            }
-            Ok(serde_json::json!({"schema_version":"rsia.finite_principal_authority_run.v1","completed":completed,"refused":refused,
-                "ordinary_p_eligible":false,"note":"Authentication does not replace formal evaluation, full costs or operator approval."}))
-        }.await;
-        drop(listener);
-        // Only this invocation's successfully bound socket is removed.
-        let cleanup = std::fs::remove_file(path).map_err(|_| Error::Internal);
-        if matches!(&serving, Err(Error::ClockRegressed)) {
-            if cleanup.is_err() {
-                tracing::warn!("authority socket cleanup failed after clock refusal");
-            }
-            return Err(Error::ClockRegressed);
-        }
-        cleanup?;
-        serving
-    }.await;
-    store.close().await;
-    result
+    evo_engine::formal_authority::PrincipalAuthorityService::serve_owned(
+        std::path::PathBuf::from(database),
+        host,
+        principals,
+        std::path::PathBuf::from(socket),
+        connections,
+    )
+    .await
 }
 async fn operator(
     socket: String,

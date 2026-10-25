@@ -953,7 +953,9 @@ async fn budget_call_source_closure(
 pub(crate) fn budget_request_source_ids(schema: &str, body: &str) -> BudgetRequestSources {
     let read = || parse_strict_json(body).ok();
     let ids = match schema {
-        "rsia.bound_model_request.v1" => read().as_ref().and_then(bound_request_closure_ids),
+        "rsia.bound_model_request.v1" | "rsia.bound_model_request.v2" => read()
+            .as_ref()
+            .and_then(|bound| bound_request_closure_ids(bound, schema)),
         "rsia.model_request.artifact.v1" => read().as_ref().and_then(closure_ids),
         crate::budget::REGISTERED_EXECUTION_REQUEST_SCHEMA => {
             read().as_ref().and_then(registered_execution_source_ids)
@@ -973,8 +975,12 @@ pub(crate) fn budget_request_source_ids(schema: &str, body: &str) -> BudgetReque
 /// The closure of the model request a bound request carries. A bound request
 /// declares its wire in the body as well; a body that declares another wire is
 /// not read as this one.
-fn bound_request_closure_ids(bound: &serde_json::Value) -> Option<Vec<String>> {
-    if bound.get("schema_version")?.as_str()? != "rsia.bound_model_request.v1" {
+fn bound_request_closure_ids(bound: &serde_json::Value, schema: &str) -> Option<Vec<String>> {
+    if !matches!(
+        schema,
+        "rsia.bound_model_request.v1" | "rsia.bound_model_request.v2"
+    ) || bound.get("schema_version")?.as_str()? != schema
+    {
         return None;
     }
     closure_ids(bound.get("request")?)
@@ -3023,19 +3029,29 @@ async fn cleanup_node_content(
     if node.kind == "blob" {
         return cleanup_e16_blob(tx, store, ctx, job_id, node, now).await;
     }
-    let body: Option<String> =
-        sqlx::query_scalar("SELECT body FROM objects WHERE namespace=? AND kind=? AND id=?")
-            .bind(ctx.namespace())
-            .bind(&node.kind)
-            .bind(&node.id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(internal)?;
-    let value = body
-        .as_deref()
-        .map(serde_json::from_str::<serde_json::Value>)
-        .transpose()
-        .map_err(internal)?;
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT body, CASE WHEN objects.kind='artifact' AND json_valid(objects.body)
+         THEN EXISTS (
+             SELECT 1 FROM json_each(objects.body) AS member
+             WHERE member.key='schema_version' AND member.type='text'
+               AND member.value='rsia.host_surface_record.v2'
+         ) ELSE 0 END
+         FROM objects WHERE namespace=? AND kind=? AND id=?",
+    )
+    .bind(ctx.namespace())
+    .bind(&node.kind)
+    .bind(&node.id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(internal)?;
+    let (body, value) = match row {
+        Some((body, current_host_surface)) => {
+            let value =
+                crate::decode_object_row_body::<serde_json::Value>(&body, current_host_surface)?;
+            (Some(body), Some(value))
+        }
+        None => (None, None),
+    };
     let redacted_export = node.kind == "artifact"
         && value.as_ref().is_some_and(|value| {
             value["schema_version"] == "rsia.redacted.v1"
@@ -3143,6 +3159,13 @@ async fn cleanup_node_content(
     let preserve = match (node.kind.as_str(), schema, record_kind) {
         // These historical accounting facts retain their consumer's schema and spent counters.
         ("artifact", "rsia.budget_call_ref.v1", _) => true,
+        // Compiler bindings retain only ids, digests, purposes, ordering and
+        // typed dependency metadata; they contain no original input or P/B body.
+        (
+            "artifact",
+            "rsia.persisted_compiler_binding.v1" | "rsia.persisted_compiler_binding.v2",
+            _,
+        ) => true,
         (
             "artifact",
             "rsia.typed_artifact_envelope.v1",
@@ -3276,9 +3299,21 @@ async fn cleanup_node_content(
         // revoked run to it.
         ("artifact", "rsia.exploration_artifact_envelope.v1", "meta_trial_v1") => true,
         ("candidate" | "artifact", "rsia.release_candidate.v1", _) => true,
+        ("artifact", "rsia.release_candidate.v2", _) => true,
         ("artifact", "rsia.run_application.v1", _)
+        | ("artifact", "rsia.run_application.v2", _)
         | ("receipt", "rsia.host_application.v1", _)
         | ("artifact", "rsia.host_execution_receipt.v1", _) => true,
+        // Both historical and Current compiler-use/bundle records carry full
+        // source-derived inputs; the Current bundle also holds original P/B.
+        (
+            "artifact",
+            "rsia.optimization.compiler_use.v1"
+            | "rsia.optimization.compiler_use.v2"
+            | "rsia.authenticated_bundle.v1"
+            | "rsia.authenticated_bundle.v2",
+            _,
+        ) => true,
         ("artifact", "rsia.resolved_bundle.v2", _) => true,
         // Monitoring content derived from source runs (environment and observation
         // identities, per-task pairings, the claim, the consolidation proposal with
@@ -3294,6 +3329,7 @@ async fn cleanup_node_content(
             | "rsia.monitoring.development_report_binding.v1"
             | "rsia.monitoring.consolidation_claim.v1"
             | "rsia.monitoring.consolidation_proposal.v1"
+            | "rsia.monitoring.consolidation_proposal.v2"
             | "rsia.monitoring.consolidation_staging.v1",
             _,
         ) => true,
@@ -3768,7 +3804,7 @@ pub const PROTECTED_SCHEMA_VERSIONS: [&str; 9] = [
 ///
 /// Kept apart from [`PROTECTED_SCHEMA_VERSIONS`], the accounting set whose size
 /// `tests/control_plane_facts.rs` pins. The script lists both groups in one tuple.
-pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 11] = [
+pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 12] = [
     "rsia.monitoring.consolidation_claim.v1",
     "rsia.monitoring.consolidation_run.v1",
     "rsia.monitoring.consolidation_staging.v1",
@@ -3780,6 +3816,7 @@ pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 11] = [
     "rsia.curriculum_artifact_envelope.v1",
     "rsia.management_job.v1",
     "rsia.replay_economic_artifact_envelope.v1",
+    "rsia.monitoring.consolidation_proposal.v2",
 ];
 
 fn is_protected_schema(schema: &str) -> bool {
@@ -3933,10 +3970,19 @@ async fn read_facts_from(connection: &mut sqlx::SqliteConnection) -> Result<Cont
 
     let mut tombstones = BTreeMap::new();
     let mut protected_objects = BTreeMap::new();
-    let rows = sqlx::query("SELECT namespace,kind,id,body FROM objects ORDER BY namespace,kind,id")
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(unreadable("objects unreadable"))?;
+    let rows = sqlx::query(
+        "SELECT namespace,kind,id,body,
+         CASE WHEN objects.kind='artifact' AND json_valid(objects.body)
+         THEN EXISTS (
+             SELECT 1 FROM json_each(objects.body) AS member
+             WHERE member.key='schema_version' AND member.type='text'
+               AND member.value='rsia.host_surface_record.v2'
+         ) ELSE 0 END AS current_host_surface
+         FROM objects ORDER BY namespace,kind,id",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(unreadable("objects unreadable"))?;
     for row in rows {
         let namespace: String = row
             .try_get("namespace")
@@ -3948,15 +3994,23 @@ async fn read_facts_from(connection: &mut sqlx::SqliteConnection) -> Result<Cont
             continue;
         }
         let body: String = row.try_get("body").map_err(unreadable("object body"))?;
-        let value = parse_strict_json(&body).map_err(|error| {
-            Error::Invalid(format!(
-                "object {namespace}/{kind}/{id} has an unreadable body: {}",
-                match error {
-                    Error::Invalid(message) => message,
-                    other => other.to_string(),
-                }
-            ))
-        })?;
+        let current_host_surface: i64 = row
+            .try_get("current_host_surface")
+            .map_err(unreadable("object current schema selector"))?;
+        let value = crate::current_host_surface_object_value(&body, current_host_surface)
+            .and_then(|value| match value {
+                Some(value) => Ok(value),
+                None => parse_strict_json(&body),
+            })
+            .map_err(|error| {
+                Error::Invalid(format!(
+                    "object {namespace}/{kind}/{id} has an unreadable body: {}",
+                    match error {
+                        Error::Invalid(message) => message,
+                        other => other.to_string(),
+                    }
+                ))
+            })?;
         let schema = match &value {
             serde_json::Value::Object(object) => object
                 .get("schema_version")
@@ -4180,5 +4234,95 @@ mod publication_tests {
             assert!(left.join("complete").exists());
             assert!(matches!(a, Err(Error::Conflict(_))));
         }
+    }
+}
+
+#[cfg(test)]
+mod current_bound_request_cleanup_source_tests {
+    use super::{BudgetRequestSources, budget_request_source_ids};
+
+    // This cleanup reader extracts source IDs only. The deliberately minimal
+    // input is not a complete model request, compiler proof or dispatch grant.
+    fn body(schema: &str) -> String {
+        serde_json::json!({
+            "schema_version": schema,
+            "request": {"source_closure": [{"id": "run-b"}, {"id": "run-a"}]}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn both_bound_request_versions_require_the_exact_column_body_pair() {
+        let schemas = ["rsia.bound_model_request.v1", "rsia.bound_model_request.v2"];
+        for column in schemas {
+            for wire in schemas {
+                let actual = budget_request_source_ids(column, &body(wire));
+                if column == wire {
+                    assert!(matches!(actual, BudgetRequestSources::Named(ids)
+                        if ids == vec!["run-b".to_string(), "run-a".to_string()]));
+                } else {
+                    assert!(matches!(actual, BudgetRequestSources::Unknown(reason)
+                        if reason == format!("unreadable_budget_request:{column}")));
+                }
+            }
+        }
+        let unknown = "rsia.bound_model_request.v3";
+        assert!(matches!(budget_request_source_ids(unknown, &body(unknown)),
+            BudgetRequestSources::Unknown(reason)
+                if reason == format!("unknown_budget_request_schema:{unknown}")));
+    }
+
+    #[test]
+    fn bound_request_cleanup_keeps_ambiguous_and_unreadable_sources_unknown() {
+        for schema in ["rsia.bound_model_request.v1", "rsia.bound_model_request.v2"] {
+            // Each healthy version must work before its single-fault cases.
+            assert!(matches!(budget_request_source_ids(schema, &body(schema)),
+                BudgetRequestSources::Named(ids) if ids.len() == 2));
+            let duplicate_schema = format!(
+                r#"{{"schema_version":"{schema}","schema_version":"{schema}","request":{{"source_closure":[{{"id":"run-a"}}]}}}}"#
+            );
+            let duplicate_closure = format!(
+                r#"{{"schema_version":"{schema}","request":{{"source_closure":[{{"id":"run-a"}}],"source_closure":[]}}}}"#
+            );
+            let invalid_id = format!(
+                r#"{{"schema_version":"{schema}","request":{{"source_closure":[{{"id":"bad id"}}]}}}}"#
+            );
+            let missing = format!(r#"{{"schema_version":"{schema}","request":{{}}}}"#);
+            let wrong_type = format!(
+                r#"{{"schema_version":"{schema}","request":{{"source_closure":[{{"id":7}}]}}}}"#
+            );
+            for bad in [
+                duplicate_schema,
+                duplicate_closure,
+                invalid_id,
+                missing,
+                wrong_type,
+            ] {
+                assert!(matches!(budget_request_source_ids(schema, &bad),
+                    BudgetRequestSources::Unknown(reason)
+                        if reason == format!("unreadable_budget_request:{schema}")));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod current_consolidation_proposal_schema_protection_tests {
+    use super::{PROTECTED_ACTION_SCHEMA_VERSIONS, is_protected_schema};
+
+    #[test]
+    fn both_known_consolidation_versions_keep_restore_protection() {
+        // Schema protection is conservative metadata handling, not authority to
+        // consume a proposal or a replacement for authenticating its full body.
+        for schema in [
+            "rsia.monitoring.consolidation_proposal.v1",
+            "rsia.monitoring.consolidation_proposal.v2",
+        ] {
+            assert!(PROTECTED_ACTION_SCHEMA_VERSIONS.contains(&schema));
+            assert!(is_protected_schema(schema));
+        }
+        assert!(!is_protected_schema(
+            "rsia.monitoring.consolidation_proposal.v3"
+        ));
     }
 }

@@ -176,6 +176,20 @@ impl ModelPort for NoChangeModel {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let output = "[]".to_string();
         Ok(ModelResponse::Completed {
@@ -209,6 +223,20 @@ impl ModelPort for EditingFixtureModel {
     ) -> evo_core::Result<evo_engine::model::ModelResponse> {
         request.validate()?;
         self.dispatch(request.request).await
+    }
+
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
     }
 
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
@@ -293,6 +321,20 @@ impl ModelPort for CountingEditingFixtureModel {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.0.fetch_add(1, Ordering::SeqCst);
         EditingFixtureModel.dispatch(request).await
@@ -312,6 +354,20 @@ impl ModelPort for NotFoundAfterDispatchModel {
     ) -> evo_core::Result<evo_engine::model::ModelResponse> {
         request.validate()?;
         self.dispatch(request.request).await
+    }
+
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
     }
 
     async fn dispatch(&self, _: ModelRequest) -> Result<ModelResponse> {
@@ -364,6 +420,20 @@ impl ModelPort for CountingNoChangeModel {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.0.fetch_add(1, Ordering::SeqCst);
         NoChangeModel.dispatch(request).await
@@ -388,6 +458,40 @@ struct CrashAfterDispatchJournal {
 
 #[async_trait]
 impl OptimizationJournal for CrashAfterDispatchJournal {
+    async fn current_compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::CurrentVerifiedCompilerInputs> {
+        self.inner.current_compiler_inputs(request).await
+    }
+
+    async fn commit_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<()> {
+        if fact.kind == StageFactKind::StepCompleted && !self.failed.swap(true, Ordering::SeqCst) {
+            return Err(Error::Internal);
+        }
+        self.inner.commit_source_bound(fact, inputs).await
+    }
+
+    async fn claim_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<bool> {
+        self.inner.claim_source_bound(fact, inputs).await
+    }
+
+    async fn lookup_source_bound(
+        &self,
+        artifact_id: &str,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        self.inner.lookup_source_bound(artifact_id, inputs).await
+    }
+
     async fn commit_bound(
         &self,
         fact: StageFact,

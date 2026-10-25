@@ -23,10 +23,13 @@ use evo_engine::broker::{
 use evo_engine::evidence::{
     StoredRunRecord, StoredTraceAuthority, store_source_selection, store_trace_authority,
 };
-use evo_engine::formal_authority::{CompilerInputRequest, resolve_compiler_inputs};
+use evo_engine::formal_authority::{
+    CompilerInputRequest, resolve_compiler_inputs, resolve_current_compiler_inputs,
+};
 use evo_engine::model::{
-    BoundModelRequest, CompilerInputUse, ModelExecutionProvenance, ModelExecutionReceipt,
-    ModelPort, ModelRejectionKind, ModelResponse, RejectedDispatch,
+    BoundModelRequest, CompilerInputUse, CurrentBoundModelRequest, CurrentCompilerInputUse,
+    ModelExecutionProvenance, ModelExecutionReceipt, ModelPort, ModelRejectionKind, ModelResponse,
+    ReadBoundModelRequest, RejectedDispatch,
 };
 use evo_storage::Store;
 use evo_storage::budget::{
@@ -276,6 +279,54 @@ fn bound_request(
     .expect("AG121_INVALID_SETUP_OR_OBSERVATION")
 }
 
+// Preserve the complete original wire. Authority still comes exclusively from
+// the real broker/resolver Session; this conversion is not an approval fixture.
+fn read_bound<T: serde::Serialize>(bound: &T) -> ReadBoundModelRequest {
+    let original = serde_json::to_vec(bound).expect("fixture bound wire serialization");
+    let read: ReadBoundModelRequest =
+        serde_json::from_slice(&original).expect("fixture exact supported bound wire");
+    assert_eq!(serde_json::to_vec(&read).unwrap(), original);
+    read
+}
+
+// Current health here means the existing ProgramFixture/EmptyRoot program
+// boundary only. No OS identity, provider source, grade or paid authority is minted.
+async fn current_compiler_use(store: &Store, watermark: u64) -> CurrentCompilerInputUse {
+    let request = compiler_request(watermark);
+    Box::pin(trusted_compiler_inputs::install_request(store, &request))
+        .await
+        .unwrap();
+    let mut session = store.session().await.unwrap();
+    let actual = Box::pin(resolve_current_compiler_inputs(
+        &mut session,
+        &worker(),
+        &request,
+    ))
+    .await
+    .unwrap();
+    let inputs = CurrentCompilerInputUse::new(request, actual.binding().clone());
+    inputs
+        .verify_current(&mut session, &worker())
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    inputs
+}
+
+fn current_bound_request(
+    tag: &str,
+    watermark: u64,
+    sources: &[&str],
+    content: &str,
+    inputs: &CurrentCompilerInputUse,
+) -> CurrentBoundModelRequest {
+    CurrentBoundModelRequest::new(
+        model_request(tag, watermark, sources, content),
+        inputs.clone(),
+    )
+    .expect("fixture complete Current request")
+}
+
 /// `repair_move_pointer_epoch`: a genuine scoped Admin audit of an empty software
 /// profile pointer. The bound compiler authority changes; the source watermark
 /// does not. It creates no Approved release, report, provider capture or history.
@@ -414,7 +465,15 @@ impl World {
         broker.dispatch_bound(bound.clone()).await
     }
 
-    async fn call(&self, bound: &BoundModelRequest) -> BudgetCallRecord {
+    async fn replay_current(&self, bound: &CurrentBoundModelRequest) -> Result<ModelResponse> {
+        self.broker()
+            .dispatch_compiler_bound(read_bound(bound))
+            .await
+    }
+
+    async fn call(&self, bound: &impl serde::Serialize) -> BudgetCallRecord {
+        let read = read_bound(bound);
+        let bound = &read;
         self.store
             .budget_call(&host(), SCOPE, &bound.request.request_id)
             .await
@@ -1101,10 +1160,12 @@ async fn ag121_fixed_settle_open_with_request(
 // Public kernel reader-shape fixture, not a claim of a revocation producer run.
 async fn ag121_session_settle_open_with_artifacts(
     world: &World,
-    bound: &BoundModelRequest,
+    bound: &impl serde::Serialize,
     stored_request: BudgetArtifact,
     redacted_blocked_response: bool,
 ) -> ModelResponse {
+    let read = read_bound(bound);
+    let bound = &read;
     let ctx = host();
     let request = &bound.request;
     let reservation = BudgetCallReservation {
@@ -1516,9 +1577,9 @@ fn ag121_session_redacted_artifact(original_schema: &str, original_digest: &str)
 async fn ag121_session_identity_control(case: &str, redaction: Option<(&str, bool)>) {
     ag121_phase(case, "SETUP");
     let world = World::new().await;
-    let inputs = compiler_use(&world.store, 1).await;
-    let bound = bound_request(case, 1, &RUNS, "software fixture", &inputs);
-    let original = BudgetArtifact::from_serializable("rsia.bound_model_request.v1", &bound)
+    let inputs = current_compiler_use(&world.store, 1).await;
+    let bound = current_bound_request(case, 1, &RUNS, "software fixture", &inputs);
+    let original = BudgetArtifact::from_serializable(bound.schema_version.clone(), &bound)
         .expect("AG121_INVALID_SETUP_OR_OBSERVATION");
     let same_identity = redaction
         .is_none_or(|(schema, other_digest)| schema == original.schema_version && !other_digest);
@@ -1586,7 +1647,7 @@ async fn ag121_session_identity_control(case: &str, redaction: Option<(&str, boo
     ag121_phase(case, "SNAPSHOT");
     let before = ag121_fixed_lossless_snapshot(&world.path);
     ag121_phase(case, "TARGET");
-    let result = world.replay(&bound).await;
+    let result = world.replay_current(&bound).await;
     eprintln!("AG121_TARGET case={case} result={result:?}");
     let response = match result {
         Ok(response) => response,
@@ -1727,7 +1788,7 @@ async fn ag121_session_identity_control(case: &str, redaction: Option<(&str, boo
     assert_eq!(world.call(&bound).await, observed_call);
     assert_eq!(world.provider_calls(), 1);
     assert_eq!(world.totals().await, (0, COST));
-    let replay = world.replay(&bound).await;
+    let replay = world.replay_current(&bound).await;
     eprintln!("AG121_TARGET case={case} replay={replay:?}");
     match replay {
         Ok(response) if same_identity => {
@@ -1757,7 +1818,7 @@ async fn ag121_session_identity_control(case: &str, redaction: Option<(&str, boo
 async fn ag121_session_same_redacted_identity_reaches_read_and_preserves_paid_no_output() {
     ag121_session_identity_control(
         "ag121-session-same",
-        Some(("rsia.bound_model_request.v1", false)),
+        Some((evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA, false)),
     )
     .await;
 }
@@ -1775,7 +1836,7 @@ async fn ag121_session_different_valid_original_schema_refuses_zero_logical_writ
 async fn ag121_session_different_lowercase_original_digest_refuses_zero_logical_writes() {
     ag121_session_identity_control(
         "ag121-session-digest",
-        Some(("rsia.bound_model_request.v1", true)),
+        Some((evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA, true)),
     )
     .await;
 }

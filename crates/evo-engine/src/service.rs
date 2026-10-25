@@ -10,8 +10,9 @@ use crate::capacity::{
 };
 use crate::evidence::{StoredTraceAuthority, load_stored_source, store_trace_authority};
 use crate::release_store::{
-    HostApplicationRecord, PersistentRelease, PrepareRunRequest, ReleaseCandidateRecord,
-    ReleaseStore, RunApplicationSnapshot, TrustedHostExecutionEvidence,
+    HostApplicationRecord, LoadedRunApplicationSnapshot as RunApplicationSnapshot,
+    PersistentRelease, PrepareRunRequest, ReadCandidate, ReleaseStore,
+    TrustedHostExecutionEvidence,
 };
 use evo_core::contract::{AppliedReceipt, CapabilityLevel};
 pub use evo_core::prepare_contract::HostPrepareConfig;
@@ -724,39 +725,73 @@ impl HostService {
         let release: PersistentRelease = session
             .need(&self.trusted_host, "release", release_id)
             .await?;
-        let candidate: ReleaseCandidateRecord = session
+        let candidate: ReadCandidate = session
             .need(&self.trusted_host, "artifact", &release.candidate_id)
             .await?;
+        candidate.current()?;
+        crate::release_store::validate_read_candidate_in_session(
+            &mut session,
+            &self.trusted_host,
+            &candidate,
+        )
+        .await?;
         session.commit().await?;
-        if snapshot.bundle_digest.as_deref() != Some(candidate.bundle_digest.as_str())
-            || candidate.bundle_digest != candidate.bundle.digest
-        {
-            return Err(Error::Conflict(
-                "prepared projection bundle identity changed".into(),
-            ));
-        }
-        let expected = if candidate.bundle.skill.content.is_empty()
-            && candidate.bundle.skill.applicability.is_empty()
-        {
-            Vec::new()
-        } else {
-            vec![candidate.bundle.skill.content.clone()]
-        };
-        if snapshot.projection.instructions != expected {
-            return Err(Error::Conflict(
-                "prepared projection differs from the active bundle".into(),
-            ));
-        }
-        if expected.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(vec![Skill {
-            id: candidate.id,
-            digest: hash(candidate.bundle.skill.content.as_bytes()),
-            content: candidate.bundle.skill.content,
-            applicability: candidate.bundle.skill.applicability,
-            counterexample: candidate.bundle.skill.counterexample,
-        }])
+        project_current_skill_material(
+            &candidate.id,
+            candidate.current()?.bundle.clone(),
+            snapshot.bundle_digest.as_deref(),
+            &snapshot.projection.instructions,
+        )
+    }
+}
+
+// Content projection only. The caller must first reload and validate the real
+// release, candidate and original compiler inputs in its Store Session.
+fn project_current_skill_material(
+    candidate_id: &str,
+    bundle: evo_core::contract::ResolvedBundleV3,
+    expected_digest: Option<&str>,
+    instructions: &[String],
+) -> Result<Vec<Skill>> {
+    crate::compiler::ReadBundle::from_current(bundle.clone())?.validate_identity()?;
+    if expected_digest != Some(bundle.digest.as_str()) {
+        return Err(Error::Conflict("prepared projection bundle identity changed".into()));
+    }
+    let expected = if bundle.skill.content.is_empty() && bundle.skill.applicability.is_empty() {
+        Vec::new()
+    } else { vec![bundle.skill.content.clone()] };
+    if instructions != expected {
+        return Err(Error::Conflict("prepared projection differs from the active bundle".into()));
+    }
+    if expected.is_empty() { return Ok(Vec::new()); }
+    Ok(vec![Skill {
+        id: candidate_id.into(), digest: hash(bundle.skill.content.as_bytes()),
+        content: bundle.skill.content, applicability: bundle.skill.applicability,
+        counterexample: bundle.skill.counterexample,
+    }])
+}
+
+#[cfg(test)]
+mod current_projection_controls {
+    use super::*;
+    #[test]
+    fn current_bundle_projection_keeps_complete_v3_skill_material() {
+        let (bundle, _legacy) = crate::compiler::current_carrier_content_controls::content_bundles();
+        let wire = serde_json::to_vec(&bundle).unwrap();
+        let projected = project_current_skill_material("content-candidate", bundle.clone(), Some(&bundle.digest), &[bundle.skill.content.clone()]).unwrap();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].id, "content-candidate");
+        assert_eq!(projected[0].digest, hash(bundle.skill.content.as_bytes()));
+        assert_eq!(projected[0].content, bundle.skill.content);
+        assert_eq!(projected[0].applicability, bundle.skill.applicability);
+        assert_eq!(projected[0].counterexample, bundle.skill.counterexample);
+        assert_eq!(serde_json::to_vec(&bundle).unwrap(), wire);
+        assert!(matches!(project_current_skill_material("content-candidate", bundle.clone(), Some(&hash(b"another bundle")), &[bundle.skill.content.clone()]),
+            Err(Error::Conflict(reason)) if reason == "prepared projection bundle identity changed"));
+        assert!(matches!(project_current_skill_material("content-candidate", bundle.clone(), Some(&bundle.digest), &["changed projection".into()]),
+            Err(Error::Conflict(reason)) if reason == "prepared projection differs from the active bundle"));
+        let mut tampered = bundle.clone(); tampered.skill.counterexample.push_str(" changed");
+        assert!(project_current_skill_material("content-candidate", tampered, Some(&bundle.digest), &[bundle.skill.content.clone()]).is_err());
     }
 }
 

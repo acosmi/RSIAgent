@@ -21,17 +21,21 @@ use crate::optimization::{
     DevelopmentSelectionDecision, OPTIMIZATION_STAGE_FACT_SCHEMA, OptimizationJournal,
     OptimizationJournalStage, OptimizationStepOutcome, OptimizationStepRequest, StageFact,
     StageFactKind, StepFuture, VerifiedDevelopmentObservationView, development_request_fact_id,
-    optimization_bound_request_digest, read_bound_stage_fact_in_session,
-    resolve_compiler_inputs_boxed, run_consolidation_step,
+    historical_optimization_bound_request_digest, optimization_bound_request_digest,
+    read_bound_stage_fact_in_session, resolve_compiler_inputs_boxed, run_consolidation_step,
     verified_development_observation_in_session, verify_compiler_use_boxed,
 };
+#[cfg(test)]
+use crate::release_store::StageBundleRequest;
 use crate::release_store::{
-    HostApplicationRecord, RELEASE_CANDIDATE_SCHEMA, ReleaseCandidateRecord, ReleaseStore,
-    RunApplicationSnapshot, StageBundleRequest, TrustedHostExecutionReceipt, TypedSourceRef,
+    CurrentReleaseCandidateRecord, CurrentStageBundleRequest, HostApplicationRecord,
+    LoadedRunApplicationSnapshot as RunApplicationSnapshot, RELEASE_CANDIDATE_SCHEMA,
+    RELEASE_CANDIDATE_SCHEMA_V2, ReleaseCandidateRecord, ReleaseStore, TrustedHostExecutionReceipt,
+    TypedSourceRef,
 };
 use crate::releases::validate_resolved_bundle_identity;
 use async_trait::async_trait;
-use evo_core::contract::ResolvedBundle;
+use evo_core::contract::{ResolvedBundle, ResolvedBundleV3};
 use evo_core::evidence::Purpose;
 use evo_core::optimization::{ModelRequest, ModelRequestContext, ModelStage, TraceOutcome};
 use evo_core::skill_edit::skill_snapshot_digest;
@@ -50,6 +54,7 @@ pub const DEVELOPMENT_REPORT_BINDING_SCHEMA: &str = "rsia.monitoring.development
 pub const CONSOLIDATION_SCOPE_SCHEMA: &str = "rsia.monitoring.consolidation_scope.v1";
 pub const CONSOLIDATION_CLAIM_SCHEMA: &str = "rsia.monitoring.consolidation_claim.v1";
 pub const CONSOLIDATION_PROPOSAL_SCHEMA: &str = "rsia.monitoring.consolidation_proposal.v1";
+pub const CONSOLIDATION_PROPOSAL_SCHEMA_V2: &str = "rsia.monitoring.consolidation_proposal.v2";
 pub const CONSOLIDATION_STAGING_SCHEMA: &str = "rsia.monitoring.consolidation_staging.v1";
 pub const CONSOLIDATION_RUN_SCHEMA: &str = "rsia.monitoring.consolidation_run.v1";
 pub const ENVIRONMENT_DRIFT_SCHEMA: &str = "rsia.monitoring.environment_drift.v1";
@@ -445,6 +450,35 @@ pub struct ConsolidationProposal {
     pub revoke_watermark: u64,
 }
 
+/// Current content retains the complete v3 bundle; this DTO grants no authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentConsolidationProposal {
+    pub id: String,
+    pub schema_version: String,
+    pub claim_id: String,
+    pub scope_id: String,
+    pub cycle_ids: Vec<String>,
+    /// Fingerprint of the per-task pairings of the claim's two cycles.
+    pub pairs_digest: String,
+    pub parent_skill_digest: String,
+    pub parent_bundle_digest: String,
+    pub candidate_skill_digest: String,
+    pub candidate_bundle: ResolvedBundleV3,
+    pub candidate_bundle_digest: String,
+    pub selection_digest: String,
+    /// The optimization journal's terminal `StepCompleted` fact this candidate
+    /// was read from; it also holds the edit, patch and report.
+    pub terminal_fact_id: String,
+    pub sources: Vec<SourceDependency>,
+    /// `ProgramFixture` when the environment or any backing cycle is fixture
+    /// evidence. Fixture proposals may be staged; formal approval still refuses
+    /// fixture evidence (`ReleaseStore::approve_verified`).
+    pub provenance: EnvironmentEvidenceScope,
+    pub environment_digest: String,
+    pub revoke_watermark: u64,
+}
+
 /// Result of staging a proposal as a release candidate. No release, pointer or
 /// Active state exists after staging. `provenance` is recomputed from the claim's
 /// frozen environment and cycles at staging time, never read back from the stored
@@ -452,6 +486,13 @@ pub struct ConsolidationProposal {
 #[derive(Debug, Clone)]
 pub struct StagedConsolidationCandidate {
     pub candidate: ReleaseCandidateRecord,
+    pub proposal_id: String,
+    pub provenance: EnvironmentEvidenceScope,
+}
+
+#[derive(Debug, Clone)]
+pub struct StagedCurrentConsolidationCandidate {
+    pub candidate: CurrentReleaseCandidateRecord,
     pub proposal_id: String,
     pub provenance: EnvironmentEvidenceScope,
 }
@@ -605,7 +646,7 @@ impl MonitoringCoordinator {
             schema_version: DEPLOYMENT_OBSERVATION_SCHEMA.into(),
             run_id: request.run_id,
             environment_id,
-            snapshot_id: snapshot.id,
+            snapshot_id: snapshot.id.clone(),
             application_id: application.id,
             request_digest: application.actual_request_digest,
             execution_receipt_id: application.execution_receipt_id,
@@ -1141,7 +1182,7 @@ impl MonitoringCoordinator {
         // Fixture adapters may install an explicit Admin EmptyRoot before use.
         // This preflight grants no authority: the caller Session resolves again.
         if let Some(journal) = journal {
-            journal.compiler_inputs(&compiler_request).await?;
+            journal.current_compiler_inputs(&compiler_request).await?;
         }
         let (claim, scope, compiler_use, input_digest) = {
             let mut session = store.session().await?;
@@ -1170,8 +1211,10 @@ impl MonitoringCoordinator {
             }
             let verified =
                 resolve_compiler_inputs_boxed(&mut session, ctx, &compiler_request).await?;
-            let compiler_use =
-                crate::model::CompilerInputUse::new(compiler_request, verified.binding().clone());
+            let compiler_use = crate::model::CurrentCompilerInputUse::new(
+                compiler_request,
+                verified.binding().clone(),
+            );
             let input_digest = optimization_bound_request_digest(&request, &compiler_use)?;
             let revoked_id = format!("consolidation-revoked-{}", claim.id);
             if let Some(existing) = session
@@ -1402,7 +1445,12 @@ impl MonitoringCoordinator {
                 ConsolidationClaimState::CompletedNoChange,
                 class.code().to_owned(),
             ),
-            OptimizationStepOutcome::Candidate {
+            OptimizationStepOutcome::Candidate { .. } => {
+                return Err(Error::Conflict(
+                    "legacy candidate is not Current input".into(),
+                ));
+            }
+            OptimizationStepOutcome::CurrentCandidate {
                 bundle, selection, ..
             } => {
                 // The proposal is durable before the terminal record names it. A
@@ -1526,9 +1574,39 @@ impl MonitoringCoordinator {
         identifier(proposal_id)?;
         identifier(candidate_id)?;
         let mut session = store.session().await?;
+        load_stageable_proposal(&mut session, ctx, proposal_id).await?;
+        Err(Error::Conflict(
+            "source_legacy: consolidation proposal is not Current input".into(),
+        ))
+    }
+
+    pub fn stage_current_consolidation_candidate<'a>(
+        ctx: &'a Context,
+        store: &'a Store,
+        proposal_id: &'a str,
+        candidate_id: &'a str,
+    ) -> StepFuture<'a, StagedCurrentConsolidationCandidate> {
+        Box::pin(Self::stage_current_consolidation_candidate_unboxed(
+            ctx,
+            store,
+            proposal_id,
+            candidate_id,
+        ))
+    }
+
+    async fn stage_current_consolidation_candidate_unboxed(
+        ctx: &Context,
+        store: &Store,
+        proposal_id: &str,
+        candidate_id: &str,
+    ) -> Result<StagedCurrentConsolidationCandidate> {
+        ctx.require(&[Role::Worker, Role::Admin])?;
+        identifier(proposal_id)?;
+        identifier(candidate_id)?;
+        let mut session = store.session().await?;
         let (proposal, provenance) =
-            load_stageable_proposal(&mut session, ctx, proposal_id).await?;
-        crate::formal_authority::resolve_bundle_in_session(
+            load_stageable_current_proposal(&mut session, ctx, proposal_id).await?;
+        crate::formal_authority::resolve_current_bundle_in_session(
             &mut session,
             ctx,
             &proposal.candidate_bundle,
@@ -1537,11 +1615,18 @@ impl MonitoringCoordinator {
             evo_core::evidence::Purpose::Development,
         )
         .await?;
-        reserve_staging_binding(&mut session, ctx, &proposal, candidate_id).await?;
-        let candidate = ReleaseStore::stage_bundle_in_session(
+        reserve_staging_identity(
+            &mut session,
+            ctx,
+            &proposal.id,
+            &proposal.candidate_bundle_digest,
+            candidate_id,
+        )
+        .await?;
+        let candidate = ReleaseStore::stage_current_bundle_in_session(
             ctx,
             &mut session,
-            StageBundleRequest {
+            CurrentStageBundleRequest {
                 candidate_id: candidate_id.into(),
                 bundle: proposal.candidate_bundle.clone(),
                 environment_digest: proposal.environment_digest.clone(),
@@ -1589,7 +1674,7 @@ impl MonitoringCoordinator {
             )
             .await?;
         session.commit().await?;
-        Ok(StagedConsolidationCandidate {
+        Ok(StagedCurrentConsolidationCandidate {
             candidate,
             proposal_id: proposal.id,
             provenance,
@@ -1713,6 +1798,32 @@ impl ModelPort for RootBoundModelPort<'_> {
         request: crate::model::BoundModelRequest,
     ) -> Result<ModelResponse> {
         let response = self.inner.dispatch_bound(request).await?;
+        let actual_root = match &response {
+            ModelResponse::Completed {
+                execution_receipt, ..
+            } => Some(execution_receipt.root_budget_id.as_str()),
+            ModelResponse::Rejected {
+                dispatch: RejectedDispatch::Dispatched { receipt },
+                ..
+            } => Some(receipt.root_budget_id.as_str()),
+            ModelResponse::Rejected {
+                dispatch: RejectedDispatch::NotDispatched,
+                ..
+            } => None,
+            ModelResponse::Uncertain { root_budget_id, .. } => Some(root_budget_id.as_str()),
+        };
+        if actual_root.is_some_and(|root| root != self.root_budget_id) {
+            return Err(Error::Conflict(
+                "model dispatch escaped the consolidation root budget".into(),
+            ));
+        }
+        Ok(response)
+    }
+    async fn dispatch_compiler_bound(
+        &self,
+        request: crate::model::ReadBoundModelRequest,
+    ) -> Result<ModelResponse> {
+        let response = self.inner.dispatch_compiler_bound(request).await?;
         let actual_root = match &response {
             ModelResponse::Completed {
                 execution_receipt, ..
@@ -1916,6 +2027,45 @@ impl CycleEvidence {
             Self::Fixture => declared,
             Self::Verified => DevelopmentExecutionProvenance::RegisteredPureFunction,
         }
+    }
+}
+
+#[cfg(test)]
+mod current_proposal_identity_controls {
+    use super::*;
+
+    #[test]
+    fn current_proposal_identity_binds_real_content_digest_and_terminal() {
+        let first = hash(b"Actual first candidate body.");
+        let second = hash(b"Actual distinct candidate body.");
+        let terminal_a = format!("terminal-{}", hash(b"Actual first terminal body."));
+        let terminal_b = format!("terminal-{}", hash(b"Actual second terminal body."));
+        let healthy = current_consolidation_proposal_id("claim", &first, &terminal_a).unwrap();
+        assert_eq!(
+            healthy,
+            current_consolidation_proposal_id("claim", &first, &terminal_a).unwrap()
+        );
+        assert_ne!(
+            healthy,
+            current_consolidation_proposal_id("claim", &second, &terminal_a).unwrap()
+        );
+        assert_ne!(
+            healthy,
+            current_consolidation_proposal_id("claim", &first, &terminal_b).unwrap()
+        );
+        assert_ne!(healthy, consolidation_proposal_id("claim"));
+    }
+
+    #[test]
+    fn candidate_reservation_recognizes_only_the_two_exact_candidate_versions() {
+        let digest = hash(b"Actual candidate content.");
+        for schema in [RELEASE_CANDIDATE_SCHEMA, RELEASE_CANDIDATE_SCHEMA_V2] {
+            let healthy = serde_json::json!({"schema_version":schema,"bundle_digest":digest});
+            assert!(holds_bundle(&healthy, &digest));
+            assert!(!holds_bundle(&healthy, &hash(b"Another actual content.")));
+        }
+        let unknown = serde_json::json!({"schema_version":"rsia.release_candidate.v99","bundle_digest":digest});
+        assert!(!holds_bundle(&unknown, &digest));
     }
 }
 
@@ -2636,6 +2786,22 @@ fn consolidation_proposal_id(claim_id: &str) -> String {
     format!("consolidation-proposal-{claim_id}")
 }
 
+fn current_consolidation_proposal_id(
+    claim_id: &str,
+    bundle_digest: &str,
+    terminal_fact_id: &str,
+) -> Result<String> {
+    Ok(format!(
+        "consolidation-proposal-v2-{}",
+        fingerprint(&(
+            CONSOLIDATION_PROPOSAL_SCHEMA_V2,
+            claim_id,
+            bundle_digest,
+            terminal_fact_id
+        ))?
+    ))
+}
+
 /// Only a historical terminal read may use the original persisted compiler
 /// binding. New execution and proposal admission still resolve current inputs.
 async fn historical_consolidation_input_matches(
@@ -2673,15 +2839,39 @@ async fn historical_consolidation_input_matches(
             "historical consolidation preparation differs".into(),
         ));
     }
-    let inputs = crate::model::CompilerInputUse::new(
-        serde_json::from_value(fact.payload["compiler_request"].clone())
-            .map_err(|_| Error::Forbidden)?,
+    let compiler_request = serde_json::from_value(fact.payload["compiler_request"].clone())
+        .map_err(|_| Error::Forbidden)?;
+    let binding: crate::formal_authority::ReadCompilerBinding =
         serde_json::from_value(fact.payload["compiler_binding"].clone())
-            .map_err(|_| Error::Forbidden)?,
-    );
+            .map_err(|_| Error::Forbidden)?;
+    if !binding.seal_is_valid()? {
+        return Err(Error::Conflict(
+            "historical compiler binding seal differs".into(),
+        ));
+    }
+    let (inputs, expected_digest) = if binding.is_current() {
+        let actual = crate::model::CurrentCompilerInputUse::new(
+            compiler_request,
+            binding.current()?.clone(),
+        );
+        let digest = optimization_bound_request_digest(request, &actual)?;
+        (
+            crate::model::ReadCompilerInputUse::from_current(actual)?,
+            digest,
+        )
+    } else {
+        let actual = crate::model::CompilerInputUse::new(
+            compiler_request,
+            binding.legacy().ok_or(Error::Forbidden)?.clone(),
+        );
+        let digest = historical_optimization_bound_request_digest(request, &actual)?;
+        (
+            crate::model::ReadCompilerInputUse::from_legacy(actual)?,
+            digest,
+        )
+    };
     let compiler_use_id = inputs.artifact_id()?;
-    if inputs.binding.schema_version != "rsia.formal_compiler_input_binding.v2"
-        || inputs.binding.namespace != ctx.namespace()
+    if inputs.binding.namespace != ctx.namespace()
         || !fact
             .dependencies
             .iter()
@@ -2691,18 +2881,14 @@ async fn historical_consolidation_input_matches(
             "historical consolidation lacks its bound input".into(),
         ));
     }
-    let persisted: crate::model::CompilerInputUse =
+    let persisted: crate::model::ReadCompilerInputUse =
         session.need(ctx, ARTIFACT_KIND, &compiler_use_id).await?;
     if fingerprint(&persisted)? != fingerprint(&inputs)? {
         return Err(Error::Conflict(
             "historical consolidation compiler input differs".into(),
         ));
     }
-    if optimization_bound_request_digest(request, &inputs)
-        .ok()
-        .as_deref()
-        != Some(input_digest)
-    {
+    if expected_digest != input_digest {
         return Err(Error::Conflict(
             if terminal.outcome == ConsolidationRunOutcome::Revoked {
                 "revoked consolidation input differs"
@@ -2749,7 +2935,7 @@ fn optimization_step_fact_id(
 }
 
 struct CandidateMaterial<'a> {
-    bundle: &'a ResolvedBundle,
+    bundle: &'a ResolvedBundleV3,
     selection: &'a DevelopmentSelection,
     terminal_fact_id: &'a str,
     input_digest: &'a str,
@@ -2779,6 +2965,16 @@ fn verify_terminal_candidate_fact(
         .and_then(|bundle| bundle.get("digest"))
         .and_then(|digest| digest.as_str());
     let selection = serde_json::to_value(material.selection).map_err(|_| Error::Internal)?;
+    let stored_bundle: ResolvedBundleV3 = serde_json::from_value(fact.payload["bundle"].clone())
+        .map_err(|_| Error::Invalid("terminal candidate is not a strict Current bundle".into()))?;
+    crate::compiler::ReadBundle::from_current(stored_bundle.clone())?.validate_identity()?;
+    if serde_json::to_vec(&stored_bundle).map_err(|_| Error::Internal)?
+        != serde_json::to_vec(material.bundle).map_err(|_| Error::Internal)?
+    {
+        return Err(Error::Conflict(
+            "terminal candidate full bundle differs".into(),
+        ));
+    }
     if fact
         .payload
         .get("status")
@@ -2883,10 +3079,10 @@ fn derive_proposal_fields(
 async fn persist_consolidation_proposal(
     ctx: &Context,
     store: &Store,
-    compiler_use: &crate::model::CompilerInputUse,
+    compiler_use: &crate::model::CurrentCompilerInputUse,
     claim: &ConsolidationClaim,
     material: CandidateMaterial<'_>,
-) -> Result<ConsolidationProposal> {
+) -> Result<CurrentConsolidationProposal> {
     if material.selection.decision != DevelopmentSelectionDecision::AcceptCandidate
         || material.selection.candidate_bundle_digest != material.bundle.digest
     {
@@ -2894,7 +3090,7 @@ async fn persist_consolidation_proposal(
             "development selection does not accept this candidate bundle".into(),
         ));
     }
-    validate_resolved_bundle_identity(material.bundle)?;
+    crate::compiler::ReadBundle::from_current(material.bundle.clone())?.validate_identity()?;
     // Terminal content, its original full compiler use, current authority and
     // the proposal are read/validated/written in one caller-owned Session.
     // No journal adapter can replace this private persisted terminal read.
@@ -2926,9 +3122,13 @@ async fn persist_consolidation_proposal(
     }
     let evidence = load_claim_evidence(&mut session, ctx, claim, scope).await?;
     let derived = derive_proposal_fields(scope, &evidence)?;
-    let proposal = ConsolidationProposal {
-        id: consolidation_proposal_id(&claim.id),
-        schema_version: CONSOLIDATION_PROPOSAL_SCHEMA.into(),
+    let proposal = CurrentConsolidationProposal {
+        id: current_consolidation_proposal_id(
+            &claim.id,
+            &material.bundle.digest,
+            material.terminal_fact_id,
+        )?,
+        schema_version: CONSOLIDATION_PROPOSAL_SCHEMA_V2.into(),
         claim_id: claim.id.clone(),
         scope_id: claim.scope_id.clone(),
         cycle_ids: claim.cycle_ids.clone(),
@@ -2945,12 +3145,12 @@ async fn persist_consolidation_proposal(
         environment_digest: derived.environment_digest,
         revoke_watermark: claim.revoke_watermark,
     };
-    validate_proposal(&proposal, claim)?;
+    validate_current_proposal(&proposal, claim)?;
     // Same content: nothing is written again. Other content under this identity is
     // a conflict (`put_immutable`). A transaction either holds the proposal with
     // all its edges or none of it, so an existing proposal already has its edges.
     let already_written = session
-        .get::<ConsolidationProposal>(ctx, ARTIFACT_KIND, &proposal.id)
+        .get::<CurrentConsolidationProposal>(ctx, ARTIFACT_KIND, &proposal.id)
         .await?
         .is_some();
     put_immutable(&mut session, ctx, &proposal.id, &proposal).await?;
@@ -3036,6 +3236,68 @@ fn validate_proposal(proposal: &ConsolidationProposal, claim: &ConsolidationClai
     Ok(())
 }
 
+fn validate_current_proposal(
+    proposal: &CurrentConsolidationProposal,
+    claim: &ConsolidationClaim,
+) -> Result<()> {
+    if proposal.schema_version != CONSOLIDATION_PROPOSAL_SCHEMA_V2 {
+        return Err(Error::Invalid(
+            "unsupported consolidation proposal schema".into(),
+        ));
+    }
+    if proposal.id
+        != current_consolidation_proposal_id(
+            &claim.id,
+            &proposal.candidate_bundle_digest,
+            &proposal.terminal_fact_id,
+        )?
+        || proposal.claim_id != claim.id
+        || proposal.scope_id != claim.scope_id
+        || proposal.cycle_ids != claim.cycle_ids
+        || proposal.sources != claim.sources
+        || proposal.revoke_watermark != claim.revoke_watermark
+    {
+        return Err(Error::Conflict(
+            "consolidation proposal differs from its claim".into(),
+        ));
+    }
+    for (value, name) in [
+        (&proposal.pairs_digest, "proposal pairs digest"),
+        (
+            &proposal.parent_skill_digest,
+            "proposal parent skill digest",
+        ),
+        (
+            &proposal.parent_bundle_digest,
+            "proposal parent bundle digest",
+        ),
+        (
+            &proposal.candidate_skill_digest,
+            "proposal candidate skill digest",
+        ),
+        (
+            &proposal.candidate_bundle_digest,
+            "proposal candidate bundle digest",
+        ),
+        (&proposal.selection_digest, "proposal selection digest"),
+        (&proposal.environment_digest, "proposal environment digest"),
+    ] {
+        validate_digest(value, name)?;
+    }
+    identifier(&proposal.terminal_fact_id)?;
+    crate::compiler::ReadBundle::from_current(proposal.candidate_bundle.clone())?
+        .validate_identity()?;
+    if proposal.candidate_bundle.digest != proposal.candidate_bundle_digest
+        || proposal.candidate_skill_digest
+            != skill_snapshot_digest(&proposal.candidate_bundle.skill)?
+    {
+        return Err(Error::Conflict(
+            "consolidation proposal candidate digests differ from its bundle".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Reads a proposal; content that cleanup redacted is reported as such.
 async fn load_proposal(
     session: &mut Session,
@@ -3063,6 +3325,54 @@ async fn load_proposal(
     serde_json::from_value(value).map_err(|_| Error::Internal)
 }
 
+async fn load_current_proposal(
+    session: &mut Session,
+    ctx: &Context,
+    proposal_id: &str,
+) -> Result<CurrentConsolidationProposal> {
+    identifier(proposal_id)?;
+    let value: serde_json::Value = session.need(ctx, ARTIFACT_KIND, proposal_id).await?;
+    match value
+        .get("schema_version")
+        .and_then(|schema| schema.as_str())
+    {
+        Some(CONSOLIDATION_PROPOSAL_SCHEMA_V2) => {}
+        Some(CONSOLIDATION_PROPOSAL_SCHEMA) => {
+            let legacy: ConsolidationProposal = serde_json::from_value(value)
+                .map_err(|_| Error::Invalid("invalid historical consolidation proposal".into()))?;
+            validate_resolved_bundle_identity(&legacy.candidate_bundle)?;
+            if legacy.id != proposal_id
+                || legacy.candidate_bundle_digest != legacy.candidate_bundle.digest
+            {
+                return Err(Error::Conflict(
+                    "invalid historical consolidation proposal identity".into(),
+                ));
+            }
+            return Err(Error::Conflict(
+                "source_legacy: consolidation proposal is not Current input".into(),
+            ));
+        }
+        Some(REDACTED_SCHEMA) => {
+            return Err(Error::Conflict(
+                "consolidation proposal was redacted after source revocation".into(),
+            ));
+        }
+        _ => {
+            return Err(Error::Invalid(
+                "unsupported consolidation proposal schema".into(),
+            ));
+        }
+    }
+    let proposal: CurrentConsolidationProposal =
+        serde_json::from_value(value).map_err(|_| Error::Internal)?;
+    if proposal.id != proposal_id {
+        return Err(Error::Conflict(
+            "consolidation proposal identity alias".into(),
+        ));
+    }
+    Ok(proposal)
+}
+
 /// A proposal can be staged only while it is the recorded candidate outcome of a
 /// live claim: its sources unrevoked, its scope undrifted and its terminal run
 /// record naming it. A proposal written but not yet named (a crash between the
@@ -3081,6 +3391,64 @@ async fn load_stageable_proposal(
     let proposal = load_proposal(session, ctx, proposal_id).await?;
     let claim = load_live_claim(session, ctx, &proposal.claim_id).await?;
     validate_proposal(&proposal, &claim)?;
+    let index: ConsolidationScopeIndex = session.need(ctx, ARTIFACT_KIND, &claim.scope_id).await?;
+    validate_scope_index(&index)?;
+    let evidence = load_claim_evidence(session, ctx, &claim, &index.scope).await?;
+    let derived = derive_proposal_fields(&index.scope, &evidence)?;
+    for (name, agrees) in [
+        (
+            "pairs digest",
+            proposal.pairs_digest == derived.pairs_digest,
+        ),
+        (
+            "parent skill digest",
+            proposal.parent_skill_digest == derived.parent_skill_digest,
+        ),
+        (
+            "parent bundle digest",
+            proposal.parent_bundle_digest == derived.parent_bundle_digest,
+        ),
+        (
+            "environment digest",
+            proposal.environment_digest == derived.environment_digest,
+        ),
+        ("provenance", proposal.provenance == derived.provenance),
+    ] {
+        if !agrees {
+            return Err(Error::Conflict(format!(
+                "consolidation proposal {name} differs from its evidence"
+            )));
+        }
+    }
+    let record = session
+        .get::<ConsolidationRunRecord>(
+            ctx,
+            ARTIFACT_KIND,
+            &format!("consolidation-run-{}", claim.id),
+        )
+        .await?
+        .ok_or_else(|| {
+            Error::Conflict("consolidation proposal has no terminal run record yet".into())
+        })?;
+    if claim.state != ConsolidationClaimState::CompletedCandidate
+        || record.outcome != ConsolidationRunOutcome::Candidate
+        || record.proposal_id.as_deref() != Some(proposal.id.as_str())
+    {
+        return Err(Error::Conflict(
+            "proposal is not the recorded candidate outcome of its claim".into(),
+        ));
+    }
+    Ok((proposal, derived.provenance))
+}
+
+async fn load_stageable_current_proposal(
+    session: &mut Session,
+    ctx: &Context,
+    proposal_id: &str,
+) -> Result<(CurrentConsolidationProposal, EnvironmentEvidenceScope)> {
+    let proposal = load_current_proposal(session, ctx, proposal_id).await?;
+    let claim = load_live_claim(session, ctx, &proposal.claim_id).await?;
+    validate_current_proposal(&proposal, &claim)?;
     let index: ConsolidationScopeIndex = session.need(ctx, ARTIFACT_KIND, &claim.scope_id).await?;
     validate_scope_index(&index)?;
     let evidence = load_claim_evidence(session, ctx, &claim, &index.scope).await?;
@@ -3209,7 +3577,12 @@ fn holds_bundle(stored: &serde_json::Value, bundle_digest: &str) -> bool {
     stored
         .get("schema_version")
         .and_then(|schema| schema.as_str())
-        == Some(RELEASE_CANDIDATE_SCHEMA)
+        .is_some_and(|schema| {
+            matches!(
+                schema,
+                RELEASE_CANDIDATE_SCHEMA | RELEASE_CANDIDATE_SCHEMA_V2
+            )
+        })
         && stored
             .get("bundle_digest")
             .and_then(|digest| digest.as_str())
@@ -3253,18 +3626,19 @@ fn parse_staging_binding(
 /// id is a conflict that names the id taken, unless that reservation can never
 /// be fulfilled because other content holds its candidate id; then it is
 /// replaced rather than left to wedge the proposal.
-async fn reserve_staging_binding(
+async fn reserve_staging_identity(
     session: &mut Session,
     ctx: &Context,
-    proposal: &ConsolidationProposal,
+    proposal_id: &str,
+    bundle_digest: &str,
     candidate_id: &str,
 ) -> Result<bool> {
-    let binding_id = consolidation_staging_id(&proposal.id);
+    let binding_id = consolidation_staging_id(proposal_id);
     if let Some(stored) = session
         .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &binding_id)
         .await?
     {
-        let bound = parse_staging_binding(stored, &proposal.id)?;
+        let bound = parse_staging_binding(stored, proposal_id)?;
         if bound.candidate_id == candidate_id {
             return Ok(false);
         }
@@ -3272,16 +3646,16 @@ async fn reserve_staging_binding(
             .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &bound.candidate_id)
             .await?
         {
-            Some(holder) if holds_bundle(&holder, &proposal.candidate_bundle_digest) => {
+            Some(holder) if holds_bundle(&holder, bundle_digest) => {
                 return Err(Error::Conflict(format!(
                     "consolidation proposal {} is already staged as candidate {}",
-                    proposal.id, bound.candidate_id
+                    proposal_id, bound.candidate_id
                 )));
             }
             None => {
                 return Err(Error::Conflict(format!(
                     "consolidation proposal {} is reserved for candidate {}; stage it under that id",
-                    proposal.id, bound.candidate_id
+                    proposal_id, bound.candidate_id
                 )));
             }
             Some(_) => {
@@ -3295,7 +3669,7 @@ async fn reserve_staging_binding(
     if let Some(existing) = session
         .get::<serde_json::Value>(ctx, ARTIFACT_KIND, candidate_id)
         .await?
-        && !holds_bundle(&existing, &proposal.candidate_bundle_digest)
+        && !holds_bundle(&existing, bundle_digest)
     {
         return Err(Error::Conflict(format!(
             "candidate id {candidate_id} already holds other content"
@@ -3304,7 +3678,7 @@ async fn reserve_staging_binding(
     let binding = ConsolidationStagingBinding {
         id: binding_id,
         schema_version: CONSOLIDATION_STAGING_SCHEMA.into(),
-        proposal_id: proposal.id.clone(),
+        proposal_id: proposal_id.into(),
         candidate_id: candidate_id.into(),
     };
     session
@@ -3312,7 +3686,7 @@ async fn reserve_staging_binding(
         .await?;
     // Without an edge revocation cleanup could never reach the binding.
     session
-        .put_edge(ctx, ARTIFACT_KIND, &binding.id, ARTIFACT_KIND, &proposal.id)
+        .put_edge(ctx, ARTIFACT_KIND, &binding.id, ARTIFACT_KIND, proposal_id)
         .await?;
     session
         .audit(ctx, "monitoring.consolidation.stage.reserve", &binding.id)
@@ -4301,5 +4675,54 @@ mod tests {
         for episode in ["redacted-cycle", "some-scope", "development-episode-1"] {
             episode_refusal(&store, &ctx, episode).await.unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod proposal_lineage_read_tests {
+    use super::*;
+    #[tokio::test]
+    async fn version_lineage_keeps_legacy_sources_out_of_current_selection() {
+        // Complete content controls only; neither raw DTO receives a claim,
+        // source permission, approval or execution authority from this fixture.
+        let (current_bundle,legacy_bundle)=crate::compiler::current_carrier_content_controls::content_bundles();
+        let claim="lineage-claim";
+        let terminal="lineage-terminal";
+        let old_id=consolidation_proposal_id(claim);
+        let new_id=current_consolidation_proposal_id(claim,&current_bundle.digest,terminal).unwrap();
+        assert_ne!(old_id,new_id);
+        assert_eq!(new_id,current_consolidation_proposal_id(claim,&current_bundle.digest,terminal).unwrap());
+        let legacy=ConsolidationProposal {
+            id:old_id.clone(),schema_version:CONSOLIDATION_PROPOSAL_SCHEMA.into(),claim_id:claim.into(),scope_id:"scope".into(),
+            cycle_ids:vec!["first".into(),"second".into()],pairs_digest:hash(b"complete pairing data"),
+            parent_skill_digest:skill_snapshot_digest(&legacy_bundle.skill).unwrap(),parent_bundle_digest:legacy_bundle.parent_digest.clone(),
+            candidate_skill_digest:skill_snapshot_digest(&legacy_bundle.skill).unwrap(),candidate_bundle_digest:legacy_bundle.digest.clone(),candidate_bundle:legacy_bundle,
+            selection_digest:hash(b"complete selection data"),terminal_fact_id:terminal.into(),sources:vec![],provenance:EnvironmentEvidenceScope::ProgramFixture,
+            environment_digest:hash(b"complete environment data"),revoke_watermark:0,
+        };
+        let current=CurrentConsolidationProposal {
+            id:new_id.clone(),schema_version:CONSOLIDATION_PROPOSAL_SCHEMA_V2.into(),claim_id:legacy.claim_id.clone(),scope_id:legacy.scope_id.clone(),
+            cycle_ids:legacy.cycle_ids.clone(),pairs_digest:legacy.pairs_digest.clone(),parent_skill_digest:legacy.parent_skill_digest.clone(),parent_bundle_digest:current_bundle.parent_digest.clone(),
+            candidate_skill_digest:skill_snapshot_digest(&current_bundle.skill).unwrap(),candidate_bundle_digest:current_bundle.digest.clone(),candidate_bundle:current_bundle,
+            selection_digest:legacy.selection_digest.clone(),terminal_fact_id:terminal.into(),sources:vec![],provenance:EnvironmentEvidenceScope::ProgramFixture,
+            environment_digest:legacy.environment_digest.clone(),revoke_watermark:0,
+        };
+        let directory=tempfile::tempdir().unwrap();let store=Store::open(&directory.path().join("lineage.sqlite3")).await.unwrap();
+        let admin=Context::new("n","admin",Role::Admin).unwrap();
+        let old_bytes=serde_json::to_vec(&legacy).unwrap();
+        let mut session=store.session().await.unwrap();
+        session.put(&admin,"artifact",&old_id,admin.actor(),&legacy).await.unwrap();
+        session.put(&admin,"artifact",&new_id,admin.actor(),&current).await.unwrap();
+        let before=session.list::<serde_json::Value>(&admin,"artifact").await.unwrap();
+        assert_eq!(load_current_proposal(&mut session,&admin,&new_id).await.unwrap().id,new_id);
+        assert!(matches!(load_current_proposal(&mut session,&admin,&old_id).await,
+            Err(Error::Conflict(message)) if message=="source_legacy: consolidation proposal is not Current input"));
+        session.commit().await.unwrap();let audit=store.verify_audit(&admin).await.unwrap();
+        assert!(matches!(MonitoringCoordinator::stage_current_consolidation_candidate(&admin,&store,&old_id,"candidate").await,
+            Err(Error::Conflict(message)) if message=="source_legacy: consolidation proposal is not Current input"));
+        let mut session=store.session().await.unwrap();
+        assert_eq!(session.list::<serde_json::Value>(&admin,"artifact").await.unwrap(),before);
+        assert_eq!(serde_json::to_vec(&session.need::<ConsolidationProposal>(&admin,"artifact",&old_id).await.unwrap()).unwrap(),old_bytes);
+        session.commit().await.unwrap();assert_eq!(store.verify_audit(&admin).await.unwrap(),audit);store.close().await;
     }
 }
