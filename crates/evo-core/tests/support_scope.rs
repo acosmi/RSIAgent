@@ -410,9 +410,10 @@ const EXPECTED_RELATIONS: &[(&str, &str, &str)] = &[
     ),
 ];
 /// V080.d "旧记录被改写": SHA-256 of the canonical JSON (keys sorted, no insignificant whitespace,
-/// UTF-8; evo_core::canonical_fingerprint) without plan_recheck of each of the 93 historical
-/// records retained from the v4.3 index binding (base a389c4e3). The 45 records added by AG-182
-/// are pinned by the next index pull request, after the merge of PR #200 is backfilled.
+/// UTF-8; evo_core::canonical_fingerprint) without plan_recheck of all 138 records: the 93
+/// historical records retained from the v4.3 index binding (base a389c4e3) and the 45 records
+/// added by AG-182 (PR #200), pinned by AG-200 after the merge of PR #200 (02a135aa) was
+/// backfilled into its 33 records.
 const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
     (
         "E00.controller_acceptance",
@@ -423,12 +424,24 @@ const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
         "ff982495a71a566a1a2f30c43a74ebce147321b32a65979fcc6ea9c9bfd229fa",
     ),
     (
+        "E00.ag182_rerun_controller_acceptance",
+        "ff8adb183d2bb8270d680fbcd6b01f096944b787f425a9b7cbe8d957a35b6a59",
+    ),
+    (
         "E01.controller_acceptance",
         "074a9cd7508f9ba3a13f2bc5f0894740ae57c8593ecc7d411c9e9d64d3990501",
     ),
     (
         "E01.ag057_explicit_sample_registration",
         "1661bc81322d2817fcf025437d354b083a2e5b9fa83db9c07ab3a4a24b9b9bfe",
+    ),
+    (
+        "E01.ag144_feasibility_approval_alignment_v43",
+        "3d3f37831720573ad7de398fe3bf7a8c69ca4be3dff4727e2e6201438c5e8078",
+    ),
+    (
+        "E01.ag182_rerun_controller_acceptance",
+        "23d263f89c080b38eca2bb506058793448780de6c3ca903e15ae33c177c52eaa",
     ),
     (
         "E02.controller_acceptance",
@@ -455,6 +468,22 @@ const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
         "4a6d22bd80043575aabd11caeff4dd92028912bd6ce033cb3116a49f4d64efde",
     ),
     (
+        "E02.ag136_management_registry_single_source_v43",
+        "2559f07520e1d6c1bbd8805e3356cae41688e85c245a7016fe510502cf6766e7",
+    ),
+    (
+        "E02.ag182_rerun_ag092_local_scoped_acceptance",
+        "cab188530425235d566fe1d64b4971fdb0e7cd630a7845b516cbd38e53f7159d",
+    ),
+    (
+        "E02.ag182_rerun_ag093_local_scoped_acceptance",
+        "f13839e456363cbf0e3f8c48d6cb35e2152be19d5e45d0b21f1acd6b7c2037c7",
+    ),
+    (
+        "E02.ag182_rerun_controller_acceptance",
+        "8e716d2c64888a520fe992a393c31cc8df64e540c1b554b76ad111dddb9076f3",
+    ),
+    (
         "E03.controller_acceptance",
         "724c6e819805aaff53c31acf981b14f4ed45c66cbf30e879388ba30c095250ca",
     ),
@@ -465,6 +494,10 @@ const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
     (
         "E03.ag079_local_scoped_acceptance",
         "0d6187cdd07d2302d608afb46d8c0dcec7d9ba718f69098cb6e32d51c63d641a",
+    ),
+    (
+        "E03.ag182_rerun_controller_acceptance",
+        "0d61b603b9de44bbb348331aa09a445382af8ac9bae67eb8f6cf57619887ace8",
     ),
     (
         "E04.controller_acceptance",
@@ -481,6 +514,22 @@ const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
     (
         "E04.ag121_v43_redacted_bound_request_identity",
         "e8e3528768d23ab3fdb673a819cb981345f12794e0d8280fb09d1624f93d0cbd",
+    ),
+    (
+        "E04.ag143_external_sampling_projection_v43",
+        "a9cb2fe2b95f1b1c3cd3a980beee9e57bdbbdd990256c22a16c02b7c3e15bc6d",
+    ),
+    (
+        "E04.ag134_root_budget_cancellation_v43",
+        "7930cb43067589856a17e70db2560fe12a7c84ff72455dae114947acd5859912",
+    ),
+    (
+        "E04.ag182_rerun_ag077_local_scoped_acceptance",
+        "c13bda7a9c27925f8448dfb6220328ce5ea1121b6eb2c7232c71ba0011b20e9f",
+    ),
+    (
+        "E04.ag182_rerun_controller_acceptance",
+        "ebca59d1d54f7b3ab778198a36015bc6d7875d18ff05063afbfa60948daea712",
     ),
     (
         "E05.controller_acceptance",
@@ -527,12 +576,60 @@ const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
         "1db33e283844a4f0f2b852ef99e1c58b772a2dea0805d65e1beeb7e87486cecb",
     ),
     (
+        "E05.ag137_evaluator_control_authentication",
+        "08131d590c228486bbed331162892cac9b0b7dfca9d72acc561c048c9bd25eb5",
+    ),
+    (
+        "E05.ag120_one_execution_receipt_per_call",
+        "8c4a67f78c641ba7fe694400e7ab543256f926be705a4cf72938cb9f39f00e2b",
+    ),
+    (
+        "E05.ag122_ga18_bound_cycle_validation",
+        "afe565d3d31dbfb7673985b9ca69dbd8966910c43c85359b9846eda3c10680e0",
+    ),
+    (
+        "E05.ag182_rerun_ag083_partition_admission_rejection_atomicity",
+        "8170f3e50d9a4d5a4bfe7286b55d75216858a92cf8c9b8f23206ca421fce74ed",
+    ),
+    (
+        "E05.ag182_rerun_ag087_local_scoped_acceptance",
+        "89f58763843d61d1838d1f44661ea548e44b9f70a5856d83bb9a414488ab6b74",
+    ),
+    (
+        "E05.ag182_rerun_ag088_local_scoped_acceptance",
+        "bbfe46fe78042708fb504984b2e72da8ec8f553b963f6bbc175ef00043ae00ae",
+    ),
+    (
+        "E05.ag182_rerun_ag089_local_scoped_acceptance",
+        "08bfe321465a193366d43aab54d1e3be2e7a9629f3a47dfbfcee0dbc68959368",
+    ),
+    (
+        "E05.ag182_rerun_ag090_local_scoped_acceptance",
+        "b73e1c420dbfb6a4316d97b64d72d89df7c0edada237fe166c4dd2220399253c",
+    ),
+    (
+        "E05.ag182_rerun_ag091_local_scoped_acceptance",
+        "6fa5c9ad08f8f38ce686cfa3ed6de341f436438f75bf132acb7d8a1daa0618a8",
+    ),
+    (
+        "E05.ag182_rerun_controller_acceptance",
+        "634f91847f89d8ba23f5f459508e0282d11c54b3e613dc4fb6ee85e55d28ad0c",
+    ),
+    (
         "E06.ag084_local_scoped_acceptance",
         "15f35447ee36c450ad8fa9bd3f95dd4e587ff2b758bd1591e9b88abf43eb3cdb",
     ),
     (
         "E06.ag116_edit_compiled_produce_review_v42",
         "74dc866a916baa251ba3283b6318403ae416564798946bb7a7e9cdfe7c99f5ba",
+    ),
+    (
+        "E06.f01_builtin_generation_strategy_authority",
+        "bfe72fbcf7e57974143375e97fee3a75c29c06b80f4e8abd3b86a15058391546",
+    ),
+    (
+        "E06.ag182_rerun_ag084_local_scoped_acceptance",
+        "e00b4966b14b40419c6de57ed34850bca1fe7eefe632593be6519a92e83f726e",
     ),
     (
         "E07.controller_acceptance",
@@ -557,6 +654,10 @@ const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
     (
         "E07.ag108_candidate_review",
         "ad759df1c7f9182e866d8f1ccaf0cf9dfc0ce3b72faedf9c0889c4b3ffa19123",
+    ),
+    (
+        "E07.ag182_rerun_controller_acceptance",
+        "ff3ec07197b51da4996c73772a0bfb994c70ed80ec5b35255383ec6085d0fdd7",
     ),
     (
         "E08.controller_acceptance",
@@ -623,6 +724,18 @@ const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
         "e105db3dc22aa5e1eefbdf18fae36b01fadca3858e5f06c2e1aa1ceb5b1066a5",
     ),
     (
+        "E08.ag182_replay_v3_economic_cleanup",
+        "1735efd723fd789edd5b6213c384b662b5dff785871ec1817e244cacb39c3a65",
+    ),
+    (
+        "E08.ag182_rerun_ag075_local_scoped_acceptance",
+        "c803b3dd8caff0f85438e2b7f7f8b057ef8e3ef4c2233fec6c205e206788e109",
+    ),
+    (
+        "E08.ag182_rerun_controller_acceptance",
+        "f61df7ebb6b9fec080628b87c764e10cf146fea1cd67f1252ad22aa2b295e6ac",
+    ),
+    (
         "E09.controller_acceptance",
         "f5ce8f536ed777d9534b2514867708d8b7ea8718be0e07c7184a262a7035c617",
     ),
@@ -659,12 +772,44 @@ const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
         "0132841ac9a6043c5d32db733a7a9b8aff8270762fde2acba30c63043c656398",
     ),
     (
+        "E09.ag182_replay_v3_legal_prefix",
+        "f000dc8d18848f0dfb750867c506b677e9cee9633d718035757a6cb2098e54e9",
+    ),
+    (
+        "E09.ag182_rerun_controller_acceptance",
+        "a82beb8d2ba5c8397814bcfa5453837426d036a97cfde51f0eca087f2b950694",
+    ),
+    (
         "E10.ag032_replay_redacted_reads",
         "a957960111997b98119c09151e57e4e949a35a6e8d312d2b6f373a09f9d4104b",
     ),
     (
+        "E10.ag147_replay_lineage_versioning_v43",
+        "56d997331600edc5aef4684ad7d8c9f755c1e05f8923b10d09f400650de64926",
+    ),
+    (
+        "E10.ag182_replay_v3_controller_acceptance",
+        "2f397f805e25dac7652fd1d0f7c43ca4f7d3aec593829cd15d334ca322e153ef",
+    ),
+    (
+        "E10.ag182_replay_v3_management_controller_acceptance",
+        "62031e625060284ba7ab39c6664a4bed4a2e9618f393c61a1be7f4ff3e4da5b4",
+    ),
+    (
+        "E10.ag182_replay_v3_episode_recovery",
+        "74bcbff491e88f189a6003659aaaf53518abcf3bb4e815b021ca287689f67e8c",
+    ),
+    (
+        "E10.ag182_replay_v3_fairness_waits_legal_set",
+        "d3290a8a1260c958b39d88fe3d6d67c091bbfb6be5cd11381bcd20f20776f27f",
+    ),
+    (
         "E11.controller_acceptance",
         "da5e5ea97acd78efeded949a10a9548a1617972bf576851777e94d1815ba8678",
+    ),
+    (
+        "E11.ag182_rerun_controller_acceptance",
+        "581d88b20c959aca7127d22ffb7ac5283bf60ebb405675004f24c9decb258aa0",
     ),
     (
         "E12.controller_acceptance",
@@ -677,6 +822,10 @@ const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
     (
         "E12.ag050_curriculum_priority",
         "178dcb3f3445b5ce93b6f6dbb421aaceb7bf4886dfe2906f1ce748fda4b1956e",
+    ),
+    (
+        "E12.ag182_rerun_controller_acceptance",
+        "a10c6776facc52c80de4e41e6a20245baa89054f2b7aec723de2f8ef6b137fb2",
     ),
     (
         "E13.ag022_consolidation_closure",
@@ -713,6 +862,14 @@ const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
     (
         "E16.1.ag070_local_scoped_acceptance",
         "f593c9ee97df37e97c455d4e70b0c1feafe6bd31911375f64327a6cb740d0eaf",
+    ),
+    (
+        "E16.1.ag182_rerun_ag070_local_scoped_acceptance",
+        "0afe71a49608966752a01b14404eb88617d01d72b0029033675c680dca851450",
+    ),
+    (
+        "E16.1.ag182_rerun_ag076_local_scoped_acceptance",
+        "8001653350fbfcbf248cb026112892c01b318c2a8accc124871bbc187db6d778",
     ),
     (
         "E16.2.durable_staging_publish_controller_acceptance",
@@ -775,8 +932,32 @@ const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
         "3505db766eb5baa3ca918da282110c07c64a448942776484451bdb409cb32349",
     ),
     (
+        "E16.5.ag150_readonly_dependency_api_v43",
+        "0d71ec6742bc4ae73065efb0e635f8e866a049c2a50bf9a1053241f8d063235c",
+    ),
+    (
+        "E16.5.ag153_shared_prepare_contract_v43",
+        "666c76b37ca7689a77c286e29be410f492aa4277caf15d4db518e3a9cf25b83f",
+    ),
+    (
         "E16.6.ag086_local_scoped_acceptance",
         "a55a8e65cb303d4c683a356ce7ccb3922c7480ed1041722775506b5880c8c537",
+    ),
+    (
+        "E16.6.ag114_evidence_identity_ownership",
+        "70b124f58240ea0b25b0ac9cc573531f70359883aef1e50858cc60ae80cb8f8a",
+    ),
+    (
+        "E16.6.ag182_v45_project_license_metadata",
+        "56eb362a529ab381aca9035c2361df5097abba5e3c08df0dc2226dadf15f6ee7",
+    ),
+    (
+        "E16.6.ag182_rerun_ag086_local_scoped_acceptance",
+        "415850c541a618837ccc08f8973558f9223aceff92f917931a452935120b887e",
+    ),
+    (
+        "E16.6.ag182_plan_v45_index_binding",
+        "3fe7f10b44b56128e6f19a6955def29b91be3493271112169d89437c50d38cc2",
     ),
     (
         "E17.disabled_rejection_controller_acceptance",
@@ -1004,6 +1185,14 @@ const WITHDRAWN_KEYS: &[&str] = &["clause", "id", "owner_task", "status", "withd
 const WITHDRAWN_STATUSES: &[&str] = &["pending_recheck", "superseded", "replaced_by_binding"];
 /// Missing-evidence register (plan §18.10 "本地缺失的证据路径", v4.5 Q-50).
 const MISSING_REGISTER_PATH: &str = "reports/evidence-missing.json";
+/// Reviewed SHA-256 of the register file itself (AG-200, review S-1), pinned here and in the Python
+/// checker: the manifest pointer, this constant and the file must agree, so an edited entry (an
+/// expected identity included) cannot pass by refreshing the pointer alone. Kept on one line.
+#[rustfmt::skip]
+const EXPECTED_MISSING_REGISTER_SHA256: &str = "b843e3f9692c5ba18ce9148278b3267584222461406fdccc17162ed84c115337";
+/// The local evidence store (the absolute directory holding out/, normally the primary checkout)
+/// for the test of the real manifest; without it out/ evidence paths are not judged (AG-200).
+const EVIDENCE_ROOT_ENV: &str = "RSIA_SUPPORT_SCOPE_EVIDENCE_ROOT";
 const MISSING_SCHEMA_VERSION: &str = "rsia.evidence_missing.v1";
 const EVIDENCE_PATH_FIELDS: &[&str] = &["input_ref", "log_path", "record_source"];
 /// The untracked local evidence store of the primary checkout (.gitignore /out/); a clone or
@@ -1167,14 +1356,142 @@ const EXECUTION_SCOPES: &[&str] = &["workspace", "single_target"];
 /// `execution.command` must be what was run, not the declared single-target command copied again.
 const DECLARED_COMMAND_PREFIX: &str = "cargo test --locked --offline";
 const PRODUCTION_CONSUMER_VALUES: &[&str] = &["wired", "none_library_only"];
+/// Closed key sets of rsia.support_scope.v2, shared with the Python checker (AG-200, review R-05):
+/// an unknown key cannot carry a claim; presence is checked by the field rules themselves.
+const SCHEMA_VERSION: &str = "rsia.support_scope.v2";
+const ROOT_KEYS: &[&str] = &[
+    "schema_version",
+    "plan_version",
+    "plan_sha256",
+    "plan_lineage",
+    "derived_index_notice",
+    "field_semantics",
+    "declaration",
+    "not_full_route_complete",
+    "legacy_equivalence_unverified",
+    "dimensions",
+    "blocked",
+    "explicitly_out_of_scope_until_revised",
+    "optional_disabled",
+    "overall_remaining",
+    "e_scopes",
+    "traceability",
+    "trace_index_coverage",
+    "project_license",
+    "withdrawn_records",
+    "evidence_missing_register",
+];
+const DIMENSION_KEYS: &[&str] = &["engineering", "host", "model", "effect", "deploy"];
+const COVERAGE_KEYS: &[&str] = &["purpose", "ranges"];
+const SCOPE_KEYS: &[&str] = &[
+    "title",
+    "status",
+    "status_reason",
+    "implementation_files",
+    "scenarios",
+    "verified_subscopes",
+    "remaining",
+    "completion_evidence_refs",
+];
+const EVIDENCE_KEYS: &[&str] = &[
+    "id",
+    "description",
+    "plan_version",
+    "plan_sha256",
+    "plan_recheck",
+    "source_sha",
+    "pr",
+    "merged_sha",
+    "pr_state",
+    "test_entry",
+    "command",
+    "input_digest",
+    "exit_code",
+    "log_path",
+    "actual_result",
+    "scope",
+    "risk",
+    "rollback",
+    "record_source",
+    "input_ref",
+    "execution",
+    "production_consumer",
+    "supersedes",
+    "completes",
+    "note",
+];
+const TRACEABILITY_KEYS: &[&str] = &[
+    "b_commitments",
+    "u_commitments",
+    "k_commitments",
+    "so_sources",
+    "v_scenarios",
+    "hs_borrowings",
+    "hsf_sources",
+];
+const COMMITMENT_KEYS: &[&str] = &[
+    "id",
+    "specification_status",
+    "sections",
+    "sources",
+    "e_tasks",
+    "v_scenarios",
+    "implementation_status",
+    "verification_status",
+    "effect_status",
+    "local_artifacts",
+    "related_evidence_refs",
+    "remaining",
+    "completion_evidence_refs",
+];
+const SO_SOURCE_KEYS: &[&str] = &[
+    "id",
+    "repository",
+    "commit",
+    "path",
+    "blob_sha",
+    "read_range",
+    "e_tasks",
+    "license",
+    "license_status",
+    "verification_status",
+    "local_use",
+    "verification_evidence_refs",
+    "completion_evidence_refs",
+];
+const LOCAL_USE_KEYS: &[&str] = &["mode", "artifacts"];
+const V_SCENARIO_KEYS: &[&str] = &[
+    "id",
+    "specification_status",
+    "e_tasks",
+    "status",
+    "verification_status",
+    "effect_status",
+    "related_evidence_refs",
+    "remaining",
+    "completion_evidence_refs",
+];
+/// Optional record-level pull request state; merged requires merged_sha, any other state requires
+/// it to be null (the Python checker's PR_STATES).
+const PR_STATES: &[&str] = &["draft", "open", "closed", "merged"];
+/// Parent/child progress order (the Python checker's STATUS_RANK): blocked and in_progress share a
+/// level; explicitly_out_of_scope has no rank and neither constrains nor is constrained.
+const STATUS_RANK: &[(&str, u8)] = &[
+    ("planned", 0),
+    ("blocked", 1),
+    ("in_progress", 1),
+    ("implemented_not_verified", 2),
+    ("verified", 3),
+];
 
-/// The reviewed V080.d pins shared by both checkers: withdrawn tuples, relation pairs, historical
-/// record digests and missing-register triples.
+/// The reviewed V080.d pins shared by both checkers: withdrawn tuples, relation pairs, record
+/// digests, missing-register triples and the register file SHA-256.
 struct ReviewedPins {
     withdrawn: BTreeMap<String, (u64, String, String, String)>,
     relations: BTreeSet<(String, String, String)>,
     records: BTreeMap<String, String>,
     missing: BTreeSet<(String, String, String)>,
+    register_sha256: String,
 }
 
 impl ReviewedPins {
@@ -1206,6 +1523,7 @@ impl ReviewedPins {
                 .iter()
                 .map(|(id, field, path)| (id.to_string(), field.to_string(), path.to_string()))
                 .collect(),
+            register_sha256: EXPECTED_MISSING_REGISTER_SHA256.to_string(),
         }
     }
 }
@@ -1758,7 +2076,7 @@ fn expected_merge_for_pr(pr: u64) -> Result<Option<&'static str>, String> {
         197 => Some("a730b9a9935bee7a41e8a47e86f329b99012566b"),
         198 => Some("e012bba09cb662e9c01d61b52124a709106f75b8"),
         199 => Some("a389c4e32e315ff516eba996a0a3dd40faadba0f"),
-        200 => None,
+        200 => Some("02a135aa918fce5dd2ea0c1c8eafc287318f10d2"),
         _ => return Err(format!("no reviewed merge status for PR {pr}")),
     })
 }
@@ -1895,6 +2213,7 @@ fn validate_evidence_record(
 ) -> Result<String, String> {
     let id = nonempty_string(&record["id"], &format!("{task} evidence id"))?;
     validate_evidence_namespace(id, task)?;
+    known_keys(record, EVIDENCE_KEYS, &format!("{task} evidence {id}"))?;
     nonempty_string(&record["description"], &format!("{id} description"))?;
     let version = nonempty_string(&record["plan_version"], &format!("{id} plan_version"))?;
     let digest = nonempty_string(&record["plan_sha256"], &format!("{id} plan_sha256"))?;
@@ -1997,25 +2316,39 @@ fn validate_evidence_record(
         .ok_or_else(|| format!("{id} has an invalid pull request URL"))?
         .parse::<u64>()
         .map_err(|_| format!("{id} has an invalid pull request number"))?;
-    if !record["merged_sha"].is_null() && record["merged_sha"] == record["source_sha"] {
+    let merged = &record["merged_sha"];
+    if !merged.is_null() && !merged.as_str().is_some_and(|text| is_lower_hex(text, 40)) {
+        return Err(format!("{id} merged_sha must be null or lowercase 40-hex"));
+    }
+    if !merged.is_null() && *merged == record["source_sha"] {
         return Err(format!(
             "{id} merged_sha must differ from its own source_sha"
         ));
     }
-    let expected_merge = expected_merge_for_pr(pr_number)?;
-    match expected_merge {
-        Some(expected) => {
-            lower_hex(&record["merged_sha"], 40, &format!("{id} merged_sha"))?;
-            if record["merged_sha"] != expected {
-                return Err(format!(
-                    "{id} merged_sha differs from the reviewed PR merge"
-                ));
-            }
-        }
-        None if !record["merged_sha"].is_null() => {
-            return Err(format!("{id} records a merge for an unmerged PR"));
-        }
-        None => {}
+    // pr_state (Python parity, AG-200): merged requires merged_sha, any other state requires it to
+    // be null; an absent or null pr_state asserts no state. The reviewed merge table is compared in
+    // validate_e_scopes after every record, as in the Python checker.
+    let pr_state = match record.get("pr_state") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|state| PR_STATES.contains(state))
+                .ok_or_else(|| {
+                    format!("{id}: pr_state must be one of {PR_STATES:?}, got {value}")
+                })?,
+        ),
+    };
+    if pr_state == Some("merged") && merged.is_null() {
+        return Err(format!("{id}: pr_state is 'merged' but merged_sha is null"));
+    }
+    if let Some(state) = pr_state
+        && state != "merged"
+        && let Some(sha) = merged.as_str()
+    {
+        return Err(format!(
+            "{id}: merged_sha {sha} is set but the record's pr_state is '{state}', not 'merged'"
+        ));
     }
     lower_hex(&record["input_digest"], 64, &format!("{id} input_digest"))?;
     if record["exit_code"].as_i64() != Some(0) {
@@ -2050,8 +2383,93 @@ fn validate_evidence_record(
     Ok(id.to_string())
 }
 
+/// Run and merge claims of the records seen so far (Python parity, AG-200): one test run supports
+/// one record, a run belongs to one E task, and the merge facts agree across records.
+#[derive(Default)]
+struct EvidenceClaims {
+    logs: BTreeMap<String, (String, String)>,
+    runs: BTreeMap<(String, String), (String, String)>,
+    pr_merges: BTreeMap<u64, (Value, String)>,
+    merge_owners: BTreeMap<String, (u64, String)>,
+    source_owners: BTreeMap<String, (u64, String)>,
+}
+
+impl EvidenceClaims {
+    fn claim(&mut self, id: &str, task: &str, record: &Value) -> Result<(), String> {
+        let log = record["log_path"].as_str().unwrap_or_default();
+        if let Some((owner, owner_task)) = self.logs.get(log) {
+            return Err(format!(
+                "{id}: log_path '{log}' duplicates evidence {owner} of task {owner_task}; one test run may support only one evidence record"
+            ));
+        }
+        self.logs
+            .insert(log.to_string(), (id.to_string(), task.to_string()));
+        let source = record["source_sha"].as_str().unwrap_or_default();
+        let entry = record["test_entry"].as_str().unwrap_or_default();
+        let (run_owner, run_task) = self
+            .runs
+            .entry((source.to_string(), entry.to_string()))
+            .or_insert_with(|| (id.to_string(), task.to_string()));
+        if run_task.as_str() != task {
+            return Err(format!(
+                "{id}: the same test run ({entry} at source_sha {source}) is already claimed by {run_owner} of task {run_task}; evidence sets may not be duplicated across tasks"
+            ));
+        }
+        let number = pull_request_number(&record["pr"], &format!("{id} pr"))?;
+        let merged = &record["merged_sha"];
+        let (known, known_id) = self
+            .pr_merges
+            .entry(number)
+            .or_insert_with(|| (merged.clone(), id.to_string()));
+        if *known != *merged {
+            return Err(format!(
+                "{id}: PR #{number} carries merged_sha {merged} here but {known} in {known_id}; one PR cannot be both merged and unmerged or merged twice"
+            ));
+        }
+        if let Some(sha) = merged.as_str() {
+            let (claimed, claimed_id) = self
+                .merge_owners
+                .entry(sha.to_string())
+                .or_insert_with(|| (number, id.to_string()));
+            if *claimed != number {
+                return Err(format!(
+                    "{id}: merged_sha {sha} is already recorded as the merge commit of PR #{claimed} ({claimed_id}); one merge commit cannot also merge PR #{number}"
+                ));
+            }
+            if let Some((other, other_id)) = self.source_owners.get(sha)
+                && *other != number
+            {
+                return Err(format!(
+                    "{id}: merged_sha {sha} is the source_sha of PR #{other} ({other_id}), not a merge of PR #{number}"
+                ));
+            }
+        }
+        if let Some((other, other_id)) = self.merge_owners.get(source)
+            && *other != number
+        {
+            return Err(format!(
+                "{id}: source_sha {source} is recorded as the merge commit of PR #{other} ({other_id})"
+            ));
+        }
+        self.source_owners
+            .entry(source.to_string())
+            .or_insert_with(|| (number, id.to_string()));
+        Ok(())
+    }
+}
+
+fn status_rank(entry: &Value) -> Option<u8> {
+    let status = entry["status"].as_str()?;
+    STATUS_RANK
+        .iter()
+        .find(|(known, _)| *known == status)
+        .map(|(_, rank)| *rank)
+}
+
 fn validate_e_scopes(value: &Value, root: &Path) -> Result<BTreeMap<String, String>, String> {
-    let object = value.as_object().ok_or("e_scopes must be an object")?;
+    let object = value["e_scopes"]
+        .as_object()
+        .ok_or("e_scopes must be an object")?;
     let actual: BTreeSet<String> = object.keys().cloned().collect();
     let expected = expected_e_ids();
     if actual != expected {
@@ -2061,10 +2479,33 @@ fn validate_e_scopes(value: &Value, root: &Path) -> Result<BTreeMap<String, Stri
             actual.difference(&expected).collect::<Vec<_>>()
         ));
     }
+    // A parent scope may not outrank its weakest child (Python parity, AG-200).
+    for (child, entry) in object {
+        if let Some((parent, _)) = child.rsplit_once('.')
+            && let Some(parent_entry) = object.get(parent)
+            && let (Some(parent_rank), Some(child_rank)) =
+                (status_rank(parent_entry), status_rank(entry))
+            && parent_rank > child_rank
+        {
+            return Err(format!(
+                "{parent}: status '{}' is stronger than sub-package {child} status '{}'; a parent scope may not outrank its weakest child",
+                parent_entry["status"].as_str().unwrap_or_default(),
+                entry["status"].as_str().unwrap_or_default()
+            ));
+        }
+    }
+    let optional = string_set(&value["optional_disabled"], "optional_disabled")?;
+    let out_of_scope = string_set(
+        &value["explicitly_out_of_scope_until_revised"],
+        "explicitly_out_of_scope_until_revised",
+    )?;
     let expected_scenarios = expected_e_scenarios();
     let mut evidence_ids = BTreeMap::new();
+    let mut claims = EvidenceClaims::default();
+    let mut merge_facts = Vec::new();
     let packages = workspace_packages(root)?;
     for (task, entry) in object {
+        known_keys(entry, SCOPE_KEYS, &format!("{task} scope entry"))?;
         nonempty_string(&entry["title"], &format!("{task} title"))?;
         let status = nonempty_string(&entry["status"], &format!("{task} status"))?;
         if !ALLOWED_STATUSES.contains(&status) {
@@ -2079,8 +2520,14 @@ fn validate_e_scopes(value: &Value, root: &Path) -> Result<BTreeMap<String, Stri
                 "{task} non-planned scope needs implementation_files"
             ));
         }
+        let mut declared = BTreeSet::new();
         for file in files {
             let file = nonempty_string(file, &format!("{task} implementation file"))?;
+            if !declared.insert(file) {
+                return Err(format!(
+                    "{task}: implementation_files must be a duplicate-free string array"
+                ));
+            }
             validate_repo_file(root, file, &format!("{task} implementation file"))?;
         }
         let actual_scenarios = string_set(&entry["scenarios"], &format!("{task} scenarios"))?;
@@ -2115,10 +2562,68 @@ fn validate_e_scopes(value: &Value, root: &Path) -> Result<BTreeMap<String, Stri
         if status == "verified" && evidence.is_empty() {
             return Err(format!("{task} verified status lacks execution evidence"));
         }
+        // Scope-level rules of the Python checker (AG-200).
+        if status == "planned" && !evidence.is_empty() {
+            let ids: Vec<&str> = evidence
+                .iter()
+                .filter_map(|record| record["id"].as_str())
+                .collect();
+            return Err(format!(
+                "{task}: status 'planned' is incompatible with verified evidence records {ids:?}; a planned scope has nothing verified"
+            ));
+        }
+        if status != "verified"
+            && entry
+                .get("completion_evidence_refs")
+                .is_some_and(|refs| !refs.is_null())
+        {
+            return Err(format!(
+                "{task}: completion_evidence_refs claims completion but status is '{status}'"
+            ));
+        }
+        if status == "verified" && optional.contains(task.as_str()) {
+            return Err(format!(
+                "{task}: optional scope is listed in optional_disabled and no enablement is recorded; status 'verified' is not allowed"
+            ));
+        }
+        if status == "explicitly_out_of_scope" && !out_of_scope.contains(task.as_str()) {
+            return Err(format!(
+                "{task}: status 'explicitly_out_of_scope' is not declared in explicitly_out_of_scope_until_revised"
+            ));
+        }
+        let mut owned = BTreeSet::new();
         for record in evidence {
             let id = validate_evidence_record(record, task, root, files, &packages)?;
             if evidence_ids.insert(id.clone(), task.clone()).is_some() {
                 return Err(format!("duplicate evidence id {id}"));
+            }
+            claims.claim(&id, task, record)?;
+            let pr = pull_request_number(&record["pr"], &format!("{id} pr"))?;
+            merge_facts.push((id.clone(), pr, record["merged_sha"].clone()));
+            owned.insert(id);
+        }
+        if status == "verified" {
+            let completion = string_set(
+                &entry["completion_evidence_refs"],
+                &format!("{task} completion evidence refs"),
+            )?;
+            if completion.is_empty() || !completion.is_subset(&owned) {
+                return Err(format!(
+                    "{task}: verified status lacks explicit task completion evidence"
+                ));
+            }
+        }
+    }
+    // The reviewed merge facts are compared after every record was seen, as in the Python checker.
+    for (id, pr, merged) in merge_facts {
+        match expected_merge_for_pr(pr).map_err(|error| format!("{id}: {error}"))? {
+            Some(expected) if merged == expected => {}
+            None if merged.is_null() => {}
+            None => return Err(format!("{id} records a merge for an unmerged PR")),
+            Some(_) => {
+                return Err(format!(
+                    "{id} merged_sha differs from the reviewed PR merge"
+                ));
             }
         }
     }
@@ -2288,6 +2793,7 @@ fn validate_commitments(
         let entry = by_id
             .get(expected.id)
             .ok_or_else(|| format!("missing commitment {}", expected.id))?;
+        known_keys(entry, COMMITMENT_KEYS, expected.id)?;
         if entry["specification_status"] != "included" || entry["effect_status"] != "not_claimed" {
             return Err(format!(
                 "{} conflates specification or effect status",
@@ -2299,6 +2805,21 @@ fn validate_commitments(
             if !ALLOWED_STATUSES.contains(&status) {
                 return Err(format!("{} has invalid {field}", expected.id));
             }
+        }
+        // The two tracking axes agree (Python parity, AG-200 rework R8-1).
+        let implementation = entry["implementation_status"].as_str().unwrap_or_default();
+        let verification = entry["verification_status"].as_str().unwrap_or_default();
+        if implementation == "planned" && verification != "planned" {
+            return Err(format!(
+                "{}: planned implementation has incompatible verification",
+                expected.id
+            ));
+        }
+        if verification == "verified" && matches!(implementation, "planned" | "blocked") {
+            return Err(format!(
+                "{}: verified commitment has incompatible implementation status",
+                expected.id
+            ));
         }
         if entry["implementation_status"] != expected_commitment_implementation_status(expected.id)
         {
@@ -2346,6 +2867,16 @@ fn validate_commitments(
         if artifacts.is_empty() {
             return Err(format!("{} has no local consumer/artifact", expected.id));
         }
+        let mut seen = BTreeSet::new();
+        if artifacts
+            .iter()
+            .any(|artifact| !seen.insert(artifact.to_string()))
+        {
+            return Err(format!(
+                "{}: local artifacts are absent or duplicated",
+                expected.id
+            ));
+        }
         for artifact in artifacts {
             let artifact = nonempty_string(artifact, "local artifact")?;
             validate_repo_file(root, artifact, &format!("{} local artifact", expected.id))?;
@@ -2356,6 +2887,23 @@ fn validate_commitments(
             &tasks,
             evidence_ids,
         )?;
+        // A verified commitment names completion evidence among its refs (Python parity, AG-200).
+        if entry["verification_status"] == "verified" {
+            let refs = string_set(
+                &entry["related_evidence_refs"],
+                &format!("{} related_evidence_refs", expected.id),
+            )?;
+            let completion = string_set(
+                &entry["completion_evidence_refs"],
+                &format!("{} completion evidence refs", expected.id),
+            )?;
+            if refs.is_empty() || completion.is_empty() || !completion.is_subset(&refs) {
+                return Err(format!(
+                    "{}: verified commitment lacks completion evidence",
+                    expected.id
+                ));
+            }
+        }
         nonempty_string(&entry["remaining"], &format!("{} remaining", expected.id))?;
     }
     Ok(())
@@ -2531,6 +3079,27 @@ fn validate_so_sources(
         let entry = by_id
             .get(expected.id)
             .ok_or_else(|| format!("missing {}", expected.id))?;
+        known_keys(entry, SO_SOURCE_KEYS, expected.id)?;
+        // A verified source names completion evidence among its refs (Python parity, AG-200); the
+        // pin below additionally keeps every source at reference_pins_only.
+        if entry["verification_status"] == "verified" {
+            let refs = match entry.get("verification_evidence_refs") {
+                Some(refs) => {
+                    string_set(refs, &format!("{} verification_evidence_refs", expected.id))?
+                }
+                None => BTreeSet::new(),
+            };
+            let completion = string_set(
+                &entry["completion_evidence_refs"],
+                &format!("{} completion evidence refs", expected.id),
+            )?;
+            if completion.is_empty() || !completion.is_subset(&refs) {
+                return Err(format!(
+                    "{}: verified source status lacks completion evidence",
+                    expected.id
+                ));
+            }
+        }
         if entry["repository"] != SKILLOPT_REPO
             || entry["commit"] != SKILLOPT_COMMIT
             || entry["path"] != expected.path
@@ -2566,11 +3135,26 @@ fn validate_so_sources(
                 expected.id
             ));
         }
+        known_keys(
+            &entry["local_use"],
+            LOCAL_USE_KEYS,
+            &format!("{} local_use", expected.id),
+        )?;
         let artifacts = entry["local_use"]["artifacts"]
             .as_array()
             .ok_or_else(|| format!("{} local artifacts missing", expected.id))?;
         if artifacts.is_empty() {
             return Err(format!("{} has no explicit local landing", expected.id));
+        }
+        let mut seen = BTreeSet::new();
+        if artifacts
+            .iter()
+            .any(|artifact| !seen.insert(artifact.to_string()))
+        {
+            return Err(format!(
+                "{}: local landing is absent or duplicated",
+                expected.id
+            ));
         }
         for artifact in artifacts {
             validate_repo_file(
@@ -2620,6 +3204,7 @@ fn validate_v_scenarios(
     }
     for (id, expected_tasks) in &expected {
         let entry = by_id[id.as_str()];
+        known_keys(entry, V_SCENARIO_KEYS, id)?;
         if entry["specification_status"] != "included" || entry["effect_status"] != "not_claimed" {
             return Err(format!("{id} conflates specification or effect status"));
         }
@@ -2628,6 +3213,17 @@ fn validate_v_scenarios(
             if !ALLOWED_STATUSES.contains(&status) {
                 return Err(format!("{id} has unknown {field}"));
             }
+        }
+        // The two status axes agree (Python parity, AG-200).
+        let status = entry["status"].as_str().unwrap_or_default();
+        let verification = entry["verification_status"].as_str().unwrap_or_default();
+        if status == "planned" && verification != "planned" {
+            return Err(format!(
+                "{id}: planned scenario has incompatible verification status"
+            ));
+        }
+        if (status == "verified") != (verification == "verified") {
+            return Err(format!("{id}: verified status axes disagree"));
         }
         let tasks = string_set(&entry["e_tasks"], &format!("{id} e_tasks"))?;
         if &tasks != expected_tasks {
@@ -2641,7 +3237,35 @@ fn validate_v_scenarios(
             &tasks,
             evidence_ids,
         )?;
-        nonempty_string(&entry["remaining"], &format!("{id} remaining"))?;
+        // A verified scenario names completion evidence among its refs and retains no unfinished
+        // scope; any other scenario states its remaining scope (Python parity, AG-200 and R8-1).
+        if status == "verified" {
+            let refs = string_set(
+                &entry["related_evidence_refs"],
+                &format!("{id} evidence refs"),
+            )?;
+            let completion = string_set(
+                &entry["completion_evidence_refs"],
+                &format!("{id} completion evidence refs"),
+            )?;
+            let unfinished = match &entry["remaining"] {
+                Value::Null => false,
+                Value::String(text) => !text.is_empty(),
+                Value::Array(items) => !items.is_empty(),
+                _ => true,
+            };
+            if refs.is_empty()
+                || completion.is_empty()
+                || !completion.is_subset(&refs)
+                || unfinished
+            {
+                return Err(format!(
+                    "{id}: verified scenario lacks completion evidence or retains unfinished scope"
+                ));
+            }
+        } else {
+            nonempty_string(&entry["remaining"], &format!("{id} remaining"))?;
+        }
     }
     Ok(actual_ids)
 }
@@ -2656,6 +3280,13 @@ fn validate_trace_index_coverage(value: &Value) -> Result<(), String> {
             .collect()
     {
         return Err("trace index coverage must be recorded separately for E00 and E16.6".into());
+    }
+    for task in ["E00", "E16.6"] {
+        known_keys(
+            &object[task],
+            COVERAGE_KEYS,
+            &format!("{task} trace_index_coverage"),
+        )?;
     }
     // V080 (E00/E16.6) tracks V001–V123, HS01–HS08, HSF01–HSF16 and HSP01 (plan §18.11, Q-50).
     if object["E00"]["purpose"] != "index_consistency_only_not_scenario_execution"
@@ -2771,6 +3402,24 @@ fn expected_field_semantics() -> Vec<(&'static str, String)> {
             "record_pins",
             "both checkers pin the reviewed supersedes and completes pairs (new record id to old record id) and, for every historical record retained from the previous index binding, the SHA-256 of its canonical JSON (keys sorted, no insignificant whitespace, UTF-8) without plan_recheck; a missing, extra or rewritten pin fails; the records added by an index pull request are pinned by the next index pull request, after the merge of the adding pull request is backfilled".to_string(),
         ),
+        // Appended by AG-200 (fail-closed evidence judgment, Rust evidence-store input, register file
+        // pin, merge facts); the thirteen definitions above are unchanged.
+        (
+            "evidence_judgment",
+            "top-level key of the Python checker report, with evidence_unjudged: judged when every evidence path was judged and none failed (with --evidence-root, out/ paths are judged in the local evidence store it names, the directory holding out/, normally the primary checkout); not_performed_structure_only when --structure-only is given, which counts the absent out/ evidence paths, registered or not, in evidence_unjudged without judging them; not_performed when the check stopped before every path was judged, in particular when neither option is given and an out/ evidence path is unjudged, which fails the check (fail closed); evidence_unjudged counts the unjudged paths as they are met, so a check that stops early reports the count reached; --structure-only and --evidence-root are mutually exclusive; the Rust test judges out/ evidence paths only when the environment variable RSIA_SUPPORT_SCOPE_EVIDENCE_ROOT names that store and otherwise reports that the evidence judgment was not performed".to_string(),
+        ),
+        (
+            "evidence_missing_register_pin",
+            "both checkers pin the missing-evidence register file itself: evidence_missing_register.path must be reports/evidence-missing.json and evidence_missing_register.sha256 must equal both the reviewed register SHA-256 constant of each checker and the SHA-256 of the file, so no register entry (including an expected identity, an unknown marker or a missing window) changes without changing both checkers; the reviewed (record_id, field, path) triples stay pinned as well".to_string(),
+        ),
+        (
+            "pr_state",
+            "optional record-level pull request state: draft, open, closed or merged; merged requires a merged_sha and every other state requires merged_sha to be null; an absent pr_state asserts no state".to_string(),
+        ),
+        (
+            "merged_sha",
+            "record-level merge commit of the record's pull request, null only while that pull request is unmerged: it must equal the reviewed merge fact of the pull request in the Rust table expected_merge_for_pr (which the Python checker reads), differ from the record's own source_sha, agree across every record of the same pull request, and be neither the merge commit of another pull request nor the source_sha of a record of another pull request; a record added by an index pull request carries null until the next index pull request backfills that merge (with pr_state merged); it remains a manifest assertion whose git ancestry neither checker verifies".to_string(),
+        ),
     ]
 }
 
@@ -2796,6 +3445,35 @@ fn validate_field_semantics(value: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Rejects keys outside a closed set, as the Python checker's known_keys does (AG-200).
+fn known_keys<'a>(
+    value: &'a Value,
+    allowed: &[&str],
+    what: &str,
+) -> Result<&'a serde_json::Map<String, Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{what} must be an object"))?;
+    let unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !allowed.contains(key))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "{what}: unknown key(s) {unknown:?} are not part of the {SCHEMA_VERSION} schema and cannot carry claims"
+        ));
+    }
+    Ok(object)
+}
+
+fn is_lower_hex(text: &str, len: usize) -> bool {
+    text.len() == len
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn exact_keys(
@@ -2833,9 +3511,13 @@ fn valid_owner_task(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("AG-") else {
         return false;
     };
-    let (digits, suffix) = rest.split_at(rest.len().min(3));
-    digits.len() == 3
-        && digits.bytes().all(|byte| byte.is_ascii_digit())
+    // `get` refuses a split inside a multi-byte character, so non-ASCII digits are rejected
+    // instead of panicking (AG-200).
+    let Some(digits) = rest.get(..3) else {
+        return false;
+    };
+    let suffix = &rest[3..];
+    digits.bytes().all(|byte| byte.is_ascii_digit())
         && (suffix.is_empty()
             || (suffix.len() == 1 && suffix.bytes().all(|b| b.is_ascii_lowercase())))
 }
@@ -3052,13 +3734,16 @@ fn evidence_file_present(root: &Path, relative: &str, field: &str) -> Result<boo
     Ok(true)
 }
 
-/// plan §18.10 (v4.5 Q-50): the missing-evidence register is pinned by path and SHA-256, names
-/// real record fields, and decides the three local outcomes this checkout can judge.
+/// plan §18.10 (v4.5 Q-50): the missing-evidence register is pinned by path and SHA-256 (the file
+/// SHA-256 also by a reviewed constant, AG-200), names real record fields, and decides the three
+/// local outcomes. `evidence_root` names the local evidence store holding out/; with it every out/
+/// evidence path is judged there, without it an out/ path is only judged when present in `root`.
 fn validate_missing_register(
     value: &Value,
     root: &Path,
     records: &BTreeMap<String, (String, Value)>,
     pins: &ReviewedPins,
+    evidence_root: Option<&Path>,
 ) -> Result<(), String> {
     let pointer = value["evidence_missing_register"]
         .as_object()
@@ -3075,6 +3760,13 @@ fn validate_missing_register(
         ));
     }
     lower_hex(&pointer["sha256"], 64, "evidence_missing_register.sha256")?;
+    if pointer["sha256"] != pins.register_sha256.as_str() {
+        return Err(format!(
+            "evidence_missing_register.sha256 {} is not the reviewed register SHA-256 pinned in both checkers ({}); a register entry cannot change without both checkers",
+            pointer["sha256"].as_str().unwrap_or_default(),
+            pins.register_sha256
+        ));
+    }
     validate_repo_file(root, MISSING_REGISTER_PATH, "missing-evidence register")?;
     let bytes = std::fs::read(root.join(MISSING_REGISTER_PATH))
         .map_err(|error| format!("cannot read the missing-evidence register: {error}"))?;
@@ -3201,16 +3893,33 @@ fn validate_missing_register(
     for (id, (_, record)) in records {
         for field in EVIDENCE_PATH_FIELDS {
             let path = nonempty_string(&record[*field], &format!("{id} {field}"))?;
-            let present = evidence_file_present(root, path, &format!("{id} {field}"))?;
-            match (present, registered.get(&(id.clone(), field.to_string()))) {
-                (true, Some((size, digest))) => {
+            let in_store = path.split('/').next() == Some(LOCAL_EVIDENCE_STORE);
+            // out/ paths are judged in the local evidence store when one is supplied (AG-200).
+            let base = match evidence_root {
+                Some(store) if in_store => store,
+                _ => root,
+            };
+            let identity = registered.get(&(id.clone(), field.to_string()));
+            if evidence_file_present(base, path, &format!("{id} {field}"))? {
+                let read = || {
+                    std::fs::read(base.join(path))
+                        .map_err(|error| format!("cannot read {id} {field}: {error}"))
+                };
+                // A present input manifest must match the record's input_digest (Python parity).
+                if *field == "input_ref"
+                    && record["input_digest"] != evo_core::hash(&read()?).as_str()
+                {
+                    return Err(format!(
+                        "{id}: local input manifest SHA-256 mismatch: {path} differs from the record's input_digest"
+                    ));
+                }
+                if let Some((size, digest)) = identity {
                     let Some(digest) = digest else {
                         return Err(format!(
                             "{id} {field} is registered missing with unknown identity and has reappeared; it must be verified through another binding and registered as a new record"
                         ));
                     };
-                    let body = std::fs::read(root.join(path))
-                        .map_err(|error| format!("cannot read {id} {field}: {error}"))?;
+                    let body = read()?;
                     if evo_core::hash(&body) != *digest
                         || size.is_some_and(|size| size != body.len() as u64)
                     {
@@ -3219,12 +3928,10 @@ fn validate_missing_register(
                         ));
                     }
                 }
-                (false, None) if path.split('/').next() != Some(LOCAL_EVIDENCE_STORE) => {
-                    return Err(format!(
-                        "{id} {field} {path} is missing and not listed in the missing-evidence register"
-                    ));
-                }
-                _ => {}
+            } else if identity.is_none() && (!in_store || evidence_root.is_some()) {
+                return Err(format!(
+                    "{id} {field} {path} is missing and not listed in the missing-evidence register"
+                ));
             }
         }
     }
@@ -3401,6 +4108,18 @@ fn validate_manifest(value: &Value, root: &Path) -> Result<(), String> {
 }
 
 fn validate_manifest_with(value: &Value, root: &Path, pins: &ReviewedPins) -> Result<(), String> {
+    validate_manifest_with_evidence(value, root, pins, None)
+}
+
+/// The whole manifest check; `evidence_root` (the local evidence store holding out/) is supplied
+/// only by the test of the real manifest, from RSIA_SUPPORT_SCOPE_EVIDENCE_ROOT (AG-200), so the
+/// synthetic out/ paths of fixture records are never judged against a real store.
+fn validate_manifest_with_evidence(
+    value: &Value,
+    root: &Path,
+    pins: &ReviewedPins,
+    evidence_root: Option<&Path>,
+) -> Result<(), String> {
     if value["schema_version"] != "rsia.support_scope.v2"
         || value["plan_version"] != PLAN_VERSION
         || value["plan_sha256"] != PLAN_SHA
@@ -3409,9 +4128,11 @@ fn validate_manifest_with(value: &Value, root: &Path, pins: &ReviewedPins) -> Re
             "support index top level is not bound to the current plan {PLAN_VERSION}"
         ));
     }
+    known_keys(value, ROOT_KEYS, "manifest root")?;
     validate_project_license(value, root)?;
     validate_plan_lineage(&value["plan_lineage"])?;
     validate_field_semantics(&value["field_semantics"])?;
+    known_keys(&value["dimensions"], DIMENSION_KEYS, "dimensions")?;
     if value["declaration"] != "subset_only"
         || value["not_full_route_complete"] != true
         || value["legacy_equivalence_unverified"] != true
@@ -3424,7 +4145,8 @@ fn validate_manifest_with(value: &Value, root: &Path, pins: &ReviewedPins) -> Re
         return Err("E17 and E18 must remain explicitly disabled".into());
     }
     validate_trace_index_coverage(&value["trace_index_coverage"])?;
-    let evidence_ids = validate_e_scopes(&value["e_scopes"], root)?;
+    let evidence_ids = validate_e_scopes(value, root)?;
+    known_keys(&value["traceability"], TRACEABILITY_KEYS, "traceability")?;
     let e_ids = expected_e_ids();
     let so_ids = validate_so_sources(
         &value["traceability"]["so_sources"],
@@ -3462,17 +4184,44 @@ fn validate_manifest_with(value: &Value, root: &Path, pins: &ReviewedPins) -> Re
     )?;
     let records = collect_records(&value["e_scopes"]);
     validate_withdrawn_records(&value["withdrawn_records"], &records, pins)?;
-    validate_missing_register(value, root, &records, pins)?;
+    validate_missing_register(value, root, &records, pins, evidence_root)?;
     validate_hsf_sources(&value["traceability"]["hsf_sources"])?;
     validate_hs_borrowings(&value["traceability"]["hs_borrowings"], &evidence_ids)?;
     validate_record_pins(&records, pins)
+}
+
+/// The local evidence store for the test of the real manifest (plan §18.10, AG-200): the absolute
+/// directory holding out/, read from RSIA_SUPPORT_SCOPE_EVIDENCE_ROOT; a set but unusable value
+/// fails instead of silently skipping the judgment.
+fn evidence_root_from_env() -> Option<PathBuf> {
+    let store = PathBuf::from(std::env::var_os(EVIDENCE_ROOT_ENV)?);
+    assert!(
+        store.is_absolute() && store.is_dir(),
+        "{EVIDENCE_ROOT_ENV} must name an existing absolute directory, got {}",
+        store.display()
+    );
+    Some(store)
 }
 
 #[test]
 fn support_scope_is_a_complete_but_non_normative_plan_derivative() {
     let root = repo_root();
     let value = load_manifest(&root);
-    validate_manifest(&value, &root).unwrap_or_else(|error| panic!("{error}"));
+    let evidence_root = evidence_root_from_env();
+    match &evidence_root {
+        Some(store) => eprintln!(
+            "evidence judged against the local evidence store {}",
+            store.display()
+        ),
+        None => eprintln!("evidence judgment not performed (set {EVIDENCE_ROOT_ENV})"),
+    }
+    validate_manifest_with_evidence(
+        &value,
+        &root,
+        &ReviewedPins::reviewed(),
+        evidence_root.as_deref(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(value["e_scopes"].as_object().unwrap().len(), 25);
     assert!(
         value["e_scopes"]
@@ -3534,9 +4283,13 @@ fn historical_records_keep_lineage_digests_but_top_level_must_be_current() {
     let mut outside = load_manifest(&root);
     outside["e_scopes"]["E01"]["verified_subscopes"][0]["plan_sha256"] =
         Value::String("a".repeat(64));
+    let error =
+        validate_manifest(&outside, &root).expect_err("a digest outside the lineage was accepted");
     assert!(
-        validate_manifest(&outside, &root).is_err(),
-        "a digest outside the lineage was accepted"
+        error.contains(
+            "E01.controller_acceptance plan_sha256 is not the registered digest of plan v4.1"
+        ),
+        "{error}"
     );
 
     let mut unknown_version = load_manifest(&root);
@@ -3602,54 +4355,89 @@ fn rejects_pending_or_unknown_plan_recheck_markers() {
         let mut downgraded = load_manifest(&root);
         let record = &mut downgraded["e_scopes"][task]["verified_subscopes"][0];
         assert_eq!(record["plan_recheck"], PLAN_RECHECKED);
+        let id = record["id"].as_str().unwrap().to_string();
+        let version = record["plan_version"].as_str().unwrap().to_string();
         record["plan_recheck"] = Value::String("not_affected".into());
-        assert!(
-            validate_manifest(&downgraded, &root).is_err(),
-            "{task}: a v4.1 record of a touched task without a recheck was accepted"
+        let not_rechecked = format!(
+            "{id} belongs to {task}, which the v4.5 revision touches, but was not rechecked"
         );
+        let error = validate_manifest(&downgraded, &root)
+            .expect_err("a record of a touched task without a recheck was accepted");
+        assert!(error.contains(&not_rechecked), "{task}: {error}");
+        let position = |wanted: &str| {
+            PLAN_LINEAGE
+                .iter()
+                .position(|(known, _, _)| *known == wanted)
+        };
         for previous in ["rechecked_v4.2", "rechecked_v4.3", "rechecked_v4.4"] {
             let mut previous_recheck = load_manifest(&root);
             previous_recheck["e_scopes"][task]["verified_subscopes"][0]["plan_recheck"] =
                 Value::String(previous.into());
-            assert!(
-                validate_manifest(&previous_recheck, &root).is_err(),
-                "{task}: the previous-plan marker {previous} was accepted in place of a v4.5 recheck"
-            );
+            let expected = if previous == "rechecked_v4.4" {
+                format!("{id} plan_recheck {previous} is not a registered marker")
+            } else if position(&previous["rechecked_".len()..]) <= position(&version) {
+                format!(
+                    "{id} plan_recheck {previous} does not name a plan later than the record's own plan_version {version}"
+                )
+            } else {
+                not_rechecked.clone()
+            };
+            let error = validate_manifest(&previous_recheck, &root)
+                .expect_err("a previous-plan marker was accepted in place of a v4.5 recheck");
+            assert!(error.contains(&expected), "{task} {previous}: {error}");
         }
         let mut missing = load_manifest(&root);
         missing["e_scopes"][task]["verified_subscopes"][0]
             .as_object_mut()
             .unwrap()
             .remove("plan_recheck");
-        assert!(
-            validate_manifest(&missing, &root).is_err(),
-            "{task}: a v4.1 record of a touched task with no marker was accepted"
-        );
+        let error = validate_manifest(&missing, &root)
+            .expect_err("a record of a touched task with no marker was accepted");
+        assert!(error.contains(&not_rechecked), "{task}: {error}");
     }
 }
 
 #[test]
 fn rejects_missing_or_unregistered_plan_lineage() {
     let root = repo_root();
+    let lineage_error =
+        |value: &Value| validate_manifest(value, &root).expect_err("a wrong lineage");
     let mut missing = load_manifest(&root);
     missing.as_object_mut().unwrap().remove("plan_lineage");
-    assert!(validate_manifest(&missing, &root).is_err());
+    let error = lineage_error(&missing);
+    assert!(error.contains("plan_lineage must be an array"), "{error}");
 
     let mut reversed = load_manifest(&root);
     reversed["plan_lineage"].as_array_mut().unwrap().reverse();
-    assert!(validate_manifest(&reversed, &root).is_err());
+    let error = lineage_error(&reversed);
+    assert!(
+        error.contains("plan_lineage entry for v4.1 differs from the registered lineage"),
+        "{error}"
+    );
 
     let mut truncated = load_manifest(&root);
     truncated["plan_lineage"].as_array_mut().unwrap().remove(0);
-    assert!(validate_manifest(&truncated, &root).is_err());
+    let error = lineage_error(&truncated);
+    assert!(
+        error.contains("plan_lineage must list exactly the 5 registered plan versions"),
+        "{error}"
+    );
 
     let mut wrong_digest = load_manifest(&root);
     wrong_digest["plan_lineage"][1]["sha256"] = Value::String(PLAN_LINEAGE[0].2.into());
-    assert!(validate_manifest(&wrong_digest, &root).is_err());
+    let error = lineage_error(&wrong_digest);
+    assert!(
+        error.contains("plan_lineage entry for v4.2 differs from the registered lineage"),
+        "{error}"
+    );
 
     let mut extra_key = load_manifest(&root);
     extra_key["plan_lineage"][1]["effect"] = Value::String("improved".into());
-    assert!(validate_manifest(&extra_key, &root).is_err());
+    let error = lineage_error(&extra_key);
+    assert!(
+        error.contains("plan_lineage entry for v4.2 carries unknown or missing keys"),
+        "{error}"
+    );
 
     let mut extended = load_manifest(&root);
     extended["plan_lineage"]
@@ -3660,16 +4448,21 @@ fn rejects_missing_or_unregistered_plan_lineage() {
             "file": "future.md",
             "sha256": "b".repeat(64),
         }));
-    assert!(validate_manifest(&extended, &root).is_err());
+    let error = lineage_error(&extended);
+    assert!(
+        error.contains("plan_lineage must list exactly the 5 registered plan versions"),
+        "{error}"
+    );
 
     let mut without_v44 = load_manifest(&root);
     without_v44["plan_lineage"]
         .as_array_mut()
         .unwrap()
         .remove(3);
+    let error = lineage_error(&without_v44);
     assert!(
-        validate_manifest(&without_v44, &root).is_err(),
-        "a lineage skipping the never-bound v4.4 was accepted"
+        error.contains("plan_lineage must list exactly the 5 registered plan versions"),
+        "a lineage skipping the never-bound v4.4 was accepted: {error}"
     );
 }
 
@@ -3711,13 +4504,23 @@ fn v43_scenarios_are_registered_without_execution_credit_and_reject_tampering() 
         serde_json::json!("verified");
     unexecuted["traceability"]["v_scenarios"][119]["related_evidence_refs"] = serde_json::json!([]);
     unexecuted["traceability"]["v_scenarios"][119]["remaining"] = serde_json::json!("");
-    assert!(validate_manifest(&unexecuted, &root).is_err());
+    assert_eq!(unexecuted["traceability"]["v_scenarios"][119]["id"], "V120");
+    // A verified scenario must name its completion evidence (as in the Python checker).
+    let error = validate_manifest(&unexecuted, &root).expect_err("an unexecuted verified V120");
+    assert!(
+        error.contains("V120 completion evidence refs must be an array"),
+        "{error}"
+    );
     let mut missing = baseline.clone();
     missing["traceability"]["v_scenarios"]
         .as_array_mut()
         .unwrap()
         .pop();
-    assert!(validate_manifest(&missing, &root).is_err());
+    let error = validate_manifest(&missing, &root).expect_err("a missing V123");
+    assert!(
+        error.contains("V001-V123 exact set is incomplete"),
+        "{error}"
+    );
     let mut duplicate = baseline.clone();
     let last = duplicate["traceability"]["v_scenarios"]
         .as_array()
@@ -3729,10 +4532,15 @@ fn v43_scenarios_are_registered_without_execution_credit_and_reject_tampering() 
         .as_array_mut()
         .unwrap()
         .push(last);
-    assert!(validate_manifest(&duplicate, &root).is_err());
+    let error = validate_manifest(&duplicate, &root).expect_err("a duplicated V123");
+    assert!(error.contains("duplicate V id V123"), "{error}");
     let mut wrong_owner = baseline;
     wrong_owner["traceability"]["v_scenarios"][119]["e_tasks"] = serde_json::json!(["E17"]);
-    assert!(validate_manifest(&wrong_owner, &root).is_err());
+    let error = validate_manifest(&wrong_owner, &root).expect_err("a wrong V120 owner");
+    assert!(
+        error.contains("V120 E responsibility mapping differs from plan v4.5"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -3745,7 +4553,11 @@ fn e09_scenarios_include_the_v097_ablation_obligation() {
         .as_array_mut()
         .unwrap()
         .retain(|item| item.as_str() != Some("V097"));
-    assert!(validate_manifest(&without_scenario, &root).is_err());
+    let error = validate_manifest(&without_scenario, &root).expect_err("E09 without V097");
+    assert!(
+        error.contains("E09 scenario responsibility differs from plan v4.5"),
+        "{error}"
+    );
 
     let mut without_task = load_manifest(&root);
     let v097 = without_task["traceability"]["v_scenarios"]
@@ -3758,7 +4570,11 @@ fn e09_scenarios_include_the_v097_ablation_obligation() {
         .as_array_mut()
         .unwrap()
         .retain(|item| item.as_str() != Some("E09"));
-    assert!(validate_manifest(&without_task, &root).is_err());
+    let error = validate_manifest(&without_task, &root).expect_err("V097 without E09");
+    assert!(
+        error.contains("V097 E responsibility mapping differs from plan v4.5"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -3767,9 +4583,12 @@ fn rejects_missing_e16_parent_and_optional_extensions() {
     for missing in ["E16", "E17", "E18"] {
         let mut value = load_manifest(&root);
         value["e_scopes"].as_object_mut().unwrap().remove(missing);
+        let error = validate_manifest(&value, &root).expect_err("a missing scope was accepted");
         assert!(
-            validate_manifest(&value, &root).is_err(),
-            "missing {missing} was accepted"
+            error.contains(&format!(
+                "e_scopes exact set mismatch: missing=[\"{missing}\"] extra=[]"
+            )),
+            "{missing}: {error}"
         );
     }
 }
@@ -3779,7 +4598,11 @@ fn rejects_unknown_status_and_verified_without_execution_evidence() {
     let root = repo_root();
     let mut unknown = load_manifest(&root);
     unknown["e_scopes"]["E17"]["status"] = Value::String("verified_optional".into());
-    assert!(validate_manifest(&unknown, &root).is_err());
+    let error = validate_manifest(&unknown, &root).expect_err("an unknown status");
+    assert!(
+        error.contains("E17 has unknown status verified_optional"),
+        "{error}"
+    );
 
     let mut unsupported_verified = load_manifest(&root);
     assert!(
@@ -3790,7 +4613,12 @@ fn rejects_unknown_status_and_verified_without_execution_evidence() {
     );
     unsupported_verified["e_scopes"]["E15"]["status"] = Value::String("verified".into());
     unsupported_verified["e_scopes"]["E15"]["remaining"] = Value::Array(vec![]);
-    assert!(validate_manifest(&unsupported_verified, &root).is_err());
+    let error = validate_manifest(&unsupported_verified, &root)
+        .expect_err("a verified scope without evidence");
+    assert!(
+        error.contains("E15 verified status lacks execution evidence"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -3802,9 +4630,12 @@ fn rejects_verified_record_missing_input_or_actual_result() {
             .as_object_mut()
             .unwrap()
             .remove(field);
+        let error = validate_manifest(&value, &root).expect_err("a record missing a field");
         assert!(
-            validate_manifest(&value, &root).is_err(),
-            "missing {field} was accepted"
+            error.contains(&format!(
+                "E01.controller_acceptance {field} must be a non-empty string"
+            )),
+            "missing {field} was accepted: {error}"
         );
     }
 }
@@ -3814,12 +4645,20 @@ fn rejects_failed_execution_and_wrong_per_pr_merge_sha() {
     let root = repo_root();
     let mut failed = load_manifest(&root);
     failed["e_scopes"]["E01"]["verified_subscopes"][0]["exit_code"] = serde_json::json!(101);
-    assert!(validate_manifest(&failed, &root).is_err());
+    let error = validate_manifest(&failed, &root).expect_err("a failed execution");
+    assert!(
+        error.contains("E01.controller_acceptance verified execution must have exit_code 0"),
+        "{error}"
+    );
 
     let mut wrong_merge = load_manifest(&root);
     wrong_merge["e_scopes"]["E03"]["verified_subscopes"][0]["merged_sha"] =
         Value::String("59afd1663a0d5f5212077dd92beaaf7920cde0ff".into());
-    assert!(validate_manifest(&wrong_merge, &root).is_err());
+    let error = validate_manifest(&wrong_merge, &root).expect_err("a wrong per-PR merge");
+    assert!(
+        error.contains("E03.controller_acceptance merged_sha differs from the reviewed PR merge"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -3829,14 +4668,19 @@ fn rejects_well_formed_but_wrong_so_pin_and_mapping() {
         let mut value = load_manifest(&root);
         value["traceability"]["so_sources"][0][field] =
             Value::String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        let error = validate_manifest(&value, &root).expect_err("a wrong SO pin");
         assert!(
-            validate_manifest(&value, &root).is_err(),
-            "wrong SO {field} was accepted"
+            error.contains("SO01 pin/provenance differs from plan v4.5"),
+            "wrong SO {field} was accepted: {error}"
         );
     }
     let mut mapping = load_manifest(&root);
     mapping["traceability"]["so_sources"][0]["e_tasks"] = serde_json::json!(["E99"]);
-    assert!(validate_manifest(&mapping, &root).is_err());
+    let error = validate_manifest(&mapping, &root).expect_err("a wrong SO mapping");
+    assert!(
+        error.contains("SO01 task mapping differs from plan v4.5"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -3844,18 +4688,27 @@ fn rejects_broken_commitment_and_v_trace_links() {
     let root = repo_root();
     let mut b = load_manifest(&root);
     b["traceability"]["b_commitments"][0]["e_tasks"] = serde_json::json!(["E18"]);
-    assert!(validate_manifest(&b, &root).is_err());
+    let error = validate_manifest(&b, &root).expect_err("a broken B01 chain");
+    assert!(
+        error.contains("B01 trace chain differs from plan v4.5"),
+        "{error}"
+    );
 
     let mut v = load_manifest(&root);
     v["traceability"]["v_scenarios"][0]["e_tasks"] = serde_json::json!(["E18"]);
-    assert!(validate_manifest(&v, &root).is_err());
+    let error = validate_manifest(&v, &root).expect_err("a broken V001 mapping");
+    assert!(
+        error.contains("V001 E responsibility mapping differs from plan v4.5"),
+        "{error}"
+    );
 
     let mut hidden_gap = load_manifest(&root);
     hidden_gap["traceability"]["k_commitments"][4]["implementation_status"] =
         Value::String("implemented_not_verified".into());
+    let error = validate_manifest(&hidden_gap, &root).expect_err("a hidden K05 gap");
     assert!(
-        validate_manifest(&hidden_gap, &root).is_err(),
-        "K05 cannot hide its missing consolidation consumer as implementation-complete"
+        error.contains("K05 implementation status hides a known consumer gap or completed subset"),
+        "K05 cannot hide its missing consolidation consumer as implementation-complete: {error}"
     );
 }
 
@@ -3867,17 +4720,31 @@ fn rejects_fake_target_extra_command_and_path_escape() {
         Value::String("crates/evo-core/tests/not_real.rs".into());
     fake["e_scopes"]["E01"]["verified_subscopes"][0]["command"] =
         Value::String("cargo test --locked --offline -p evo-core --test not_real".into());
-    assert!(validate_manifest(&fake, &root).is_err());
+    let error = validate_manifest(&fake, &root).expect_err("a fake test target");
+    assert!(
+        error.contains(
+            "E01.controller_acceptance test_entry does not exist: crates/evo-core/tests/not_real.rs"
+        ),
+        "{error}"
+    );
 
     let mut extra = load_manifest(&root);
     extra["e_scopes"]["E01"]["verified_subscopes"][0]["command"] = Value::String(
         "cargo test --locked --offline -p evo-core --test evaluation_v41 && echo pass".into(),
     );
-    assert!(validate_manifest(&extra, &root).is_err());
+    let error = validate_manifest(&extra, &root).expect_err("an extra shell command");
+    assert!(
+        error.contains("command must use the finite cargo test grammar"),
+        "{error}"
+    );
 
     let mut escape = load_manifest(&root);
     escape["e_scopes"]["E01"]["implementation_files"][0] = Value::String("../outside.rs".into());
-    assert!(validate_manifest(&escape, &root).is_err());
+    let error = validate_manifest(&escape, &root).expect_err("an escaping implementation file");
+    assert!(
+        error.contains("E01 implementation file contains traversal or non-normal components"),
+        "{error}"
+    );
 }
 
 #[cfg(unix)]
@@ -3920,9 +4787,11 @@ fn planned_scope_can_omit_files_only_with_explicit_remaining_reason() {
     let mut started = load_manifest(&root);
     assert_eq!(started["e_scopes"]["E18"]["status"], "in_progress");
     started["e_scopes"]["E18"]["implementation_files"] = Value::Array(vec![]);
+    let error = validate_manifest(&started, &root)
+        .expect_err("a started scope without implementation files was accepted");
     assert!(
-        validate_manifest(&started, &root).is_err(),
-        "a started scope without implementation files was accepted"
+        error.contains("E18 non-planned scope needs implementation_files"),
+        "{error}"
     );
 }
 
@@ -3948,7 +4817,7 @@ fn field_semantics_must_be_present_and_equal_the_pinned_text() {
     let baseline = load_manifest(&root);
     validate_manifest(&baseline, &root).unwrap();
     let pinned = expected_field_semantics();
-    assert_eq!(pinned.len(), 13);
+    assert_eq!(pinned.len(), 17);
     assert_eq!(
         baseline["field_semantics"].as_object().unwrap().len(),
         pinned.len()
@@ -3970,7 +4839,11 @@ fn field_semantics_must_be_present_and_equal_the_pinned_text() {
     ] {
         let mut value = load_manifest(&root);
         value["field_semantics"] = replacement;
-        assert!(validate_manifest(&value, &root).is_err());
+        let error = validate_manifest(&value, &root).expect_err("a non-object field_semantics");
+        assert!(
+            error.contains("field_semantics must be an object stating what command, exit_code, log_path, execution and production_consumer mean"),
+            "{error}"
+        );
     }
 
     for (key, _) in &pinned {
@@ -3979,9 +4852,13 @@ fn field_semantics_must_be_present_and_equal_the_pinned_text() {
             .as_object_mut()
             .unwrap()
             .remove(*key);
+        let error = validate_manifest(&dropped, &root)
+            .expect_err("field_semantics without a definition was accepted");
         assert!(
-            validate_manifest(&dropped, &root).is_err(),
-            "field_semantics without {key} was accepted"
+            error.contains(&format!(
+                "field_semantics keys differ: missing=[\"{key}\"] extra=[]"
+            )),
+            "{key}: {error}"
         );
         for replacement in [
             Value::Null,
@@ -4001,7 +4878,11 @@ fn field_semantics_must_be_present_and_equal_the_pinned_text() {
 
     let mut extended = load_manifest(&root);
     extended["field_semantics"]["effect"] = Value::String("improved".into());
-    assert!(validate_manifest(&extended, &root).is_err());
+    let error = validate_manifest(&extended, &root).expect_err("an extended field_semantics");
+    assert!(
+        error.contains("field_semantics keys differ: missing=[] extra=[\"effect\"]"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4032,7 +4913,14 @@ fn execution_is_required_above_pr_141_and_optional_up_to_it() {
     let mut malformed = well_formed_execution();
     malformed["exit_code"] = Value::String("0".into());
     let record = serde_json::json!({ "execution": malformed });
-    assert!(validate_execution("X.record", &record, 141).is_err());
+    let error = validate_execution("X.record", &record, 141)
+        .expect_err("a malformed execution on an older record");
+    assert!(
+        error.contains(
+            "X.record execution exit_code must be the integer exit code of the executed command"
+        ),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4085,13 +4973,21 @@ fn execution_rejects_malformed_objects() {
     ] {
         let mut execution = well_formed_execution();
         execution["command"] = invalid;
-        assert!(execution_result(execution).is_err());
+        let error = execution_result(execution).expect_err("an empty execution command");
+        assert!(
+            error.contains("X.record execution command must be a non-empty string"),
+            "{error}"
+        );
     }
 
     for invalid in [serde_json::json!(""), Value::Null, serde_json::json!(7)] {
         let mut execution = well_formed_execution();
         execution["evidence"] = invalid;
-        assert!(execution_result(execution).is_err());
+        let error = execution_result(execution).expect_err("an empty execution evidence");
+        assert!(
+            error.contains("X.record execution evidence must be a non-empty string"),
+            "{error}"
+        );
     }
 }
 
@@ -4217,8 +5113,14 @@ fn project_license_rejects_unreviewed_or_malformed_manifest_binding() {
     let root = repo_root();
     let value = load_manifest(&root);
     validate_project_license(&value, &root).unwrap();
+    let mut null = value.clone();
+    null["project_license"] = Value::Null;
+    let error = validate_manifest(&null, &root).expect_err("a null project_license");
+    assert!(
+        error.contains("project_license must be an object"),
+        "{error}"
+    );
     for replacement in [
-        Value::Null,
         serde_json::json!({"status":"MIT","path":"LICENSE","sha256":"164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb"}),
         serde_json::json!({"status":"source_available_personal_noncommercial_free","path":"../LICENSE","sha256":"164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb"}),
         serde_json::json!({"status":"source_available_personal_noncommercial_free","path":"LICENSE","sha256":true}),
@@ -4226,19 +5128,33 @@ fn project_license_rejects_unreviewed_or_malformed_manifest_binding() {
     ] {
         let mut changed = value.clone();
         changed["project_license"] = replacement;
-        assert!(validate_manifest(&changed, &root).is_err());
+        let error = validate_manifest(&changed, &root).expect_err("an unreviewed license binding");
+        assert!(
+            error.contains("project_license must bind the reviewed license text"),
+            "{error}"
+        );
     }
 }
 
 #[test]
 fn project_license_raw_json_rejects_duplicates_at_every_depth() {
-    for raw in [
-        r#"{"project_license":{},"project_license":{}}"#,
-        r#"{"project_license":{"status":"MIT","status":"source_available_personal_noncommercial_free"}}"#,
-        r#"[{"sha256":"a","sha256":"b"}]"#,
-        r#"{"valid":true} {"trailing":true}"#,
+    for (raw, expected) in [
+        (
+            r#"{"project_license":{},"project_license":{}}"#,
+            "duplicate JSON key: project_license",
+        ),
+        (
+            r#"{"project_license":{"status":"MIT","status":"source_available_personal_noncommercial_free"}}"#,
+            "duplicate JSON key: status",
+        ),
+        (
+            r#"[{"sha256":"a","sha256":"b"}]"#,
+            "duplicate JSON key: sha256",
+        ),
+        (r#"{"valid":true} {"trailing":true}"#, "trailing characters"),
     ] {
-        assert!(load_json_strict(raw).is_err(), "accepted: {raw}");
+        let error = load_json_strict(raw).expect_err("accepted ambiguous JSON");
+        assert!(error.contains(expected), "{raw}: {error}");
     }
     assert_eq!(
         load_json_strict(r#"{"scalars":[true,null,-1,2,0.5,"text"]}"#).unwrap(),
@@ -4269,16 +5185,29 @@ fn support_evidence_namespace_uses_the_longest_registered_task() {
     ] {
         validate_evidence_namespace(id, task).unwrap();
     }
-    for (id, task) in [
-        ("E16.5.borrowed", "E16"),
-        ("E01.borrowed", "E02"),
-        ("E160.borrowed", "E16"),
-        ("E01.bad/name", "E01"),
-        ("E01.é", "E01"),
+    for (id, task, expected) in [
+        (
+            "E16.5.borrowed",
+            "E16",
+            "E16 evidence id E16.5.borrowed is not namespaced under its own task",
+        ),
+        (
+            "E01.borrowed",
+            "E02",
+            "E02 evidence id E01.borrowed is not namespaced under its own task",
+        ),
+        (
+            "E160.borrowed",
+            "E16",
+            "E16 evidence id E160.borrowed is not namespaced under its own task",
+        ),
+        ("E01.bad/name", "E01", "E01 evidence id is invalid"),
+        ("E01.é", "E01", "E01 evidence id is invalid"),
     ] {
+        let error = validate_evidence_namespace(id, task).expect_err("a foreign or invalid id");
         assert!(
-            validate_evidence_namespace(id, task).is_err(),
-            "accepted {id} for {task}"
+            error.contains(expected),
+            "accepted {id} for {task}: {error}"
         );
     }
 }
@@ -4336,7 +5265,7 @@ fn support_evidence_refs_require_unique_known_owners_and_allow_empty_so() {
         entry["verification_evidence_refs"] = serde_json::json!([]);
     }
     validate_manifest(&value, &root).unwrap();
-    let owners = validate_e_scopes(&value["e_scopes"], &root).unwrap();
+    let owners = validate_e_scopes(&value, &root).unwrap();
     let tasks = split_set("E01");
     validate_evidence_refs(
         &serde_json::json!(["E01.controller_acceptance"]),
@@ -4345,11 +5274,19 @@ fn support_evidence_refs_require_unique_known_owners_and_allow_empty_so() {
         &owners,
     )
     .unwrap();
-    for bad in [
-        serde_json::json!(["E01.missing"]),
-        serde_json::json!(["E01.controller_acceptance", "E01.controller_acceptance"]),
+    for (bad, expected) in [
+        (
+            serde_json::json!(["E01.missing"]),
+            "refs references unknown evidence E01.missing",
+        ),
+        (
+            serde_json::json!(["E01.controller_acceptance", "E01.controller_acceptance"]),
+            "refs contains duplicate E01.controller_acceptance",
+        ),
     ] {
-        assert!(validate_evidence_refs(&bad, "refs", &tasks, &owners).is_err());
+        let error =
+            validate_evidence_refs(&bad, "refs", &tasks, &owners).expect_err("a wrong ref set");
+        assert!(error.contains(expected), "{error}");
     }
 }
 
@@ -4521,26 +5458,53 @@ fn workspace_mapping_rejects_duplicate_ambiguous_or_escaping_metadata() {
         "[\"components/*\"]",
     ] {
         fixture.write("Cargo.toml", &format!("[workspace]\nmembers = {members}\n"));
+        let error = workspace_packages(&fixture.root).expect_err("ambiguous workspace members");
         assert!(
-            workspace_packages(&fixture.root).is_err(),
-            "accepted {members}"
+            error.contains("read-only workspace package check failed"),
+            "accepted {members}: {error}"
         );
     }
-    for raw in [
-        r#"{}"#,
-        r#"[]"#,
-        r#"{"evo-core":1}"#,
-        r#"{"evo-core":"components/one","evo-core":"components/one"}"#,
-        r#"{"evo-core":"components/one","other":"components/one"}"#,
-        r#"{"evo-core":"../outside"}"#,
-        r#"{"evo-core":"/outside"}"#,
-        r#"{"evo-core":"components//one"}"#,
-        r#"{"unknown":null}"#,
+    for (raw, expected) in [
+        (
+            r#"{}"#,
+            "workspace package metadata must be a nonempty object",
+        ),
+        (
+            r#"[]"#,
+            "workspace package metadata must be a nonempty object",
+        ),
+        (
+            r#"{"evo-core":1}"#,
+            "workspace member must be a non-empty string",
+        ),
+        (
+            r#"{"evo-core":"components/one","evo-core":"components/one"}"#,
+            "duplicate JSON key: evo-core",
+        ),
+        (
+            r#"{"evo-core":"components/one","other":"components/one"}"#,
+            "workspace package metadata has a duplicate member/package",
+        ),
+        (
+            r#"{"evo-core":"../outside"}"#,
+            "workspace package metadata has a non-normal member",
+        ),
+        (
+            r#"{"evo-core":"/outside"}"#,
+            "workspace package metadata has a non-normal member",
+        ),
+        (
+            r#"{"evo-core":"components//one"}"#,
+            "workspace package metadata has a non-normal member",
+        ),
+        (
+            r#"{"unknown":null}"#,
+            "workspace member must be a non-empty string",
+        ),
     ] {
-        assert!(
-            decode_workspace_packages(raw, &fixture.root).is_err(),
-            "accepted {raw}"
-        );
+        let error =
+            decode_workspace_packages(raw, &fixture.root).expect_err("ambiguous package metadata");
+        assert!(error.contains(expected), "accepted {raw}: {error}");
     }
 }
 
@@ -4874,11 +5838,27 @@ fn withdrawn_tuples_relation_pairs_and_historical_records_are_pinned() {
             .count(),
         25
     );
-    assert_eq!(pins.records.len(), 93);
+    // AG-200 pins every current record: the 93 retained historical records and the 45 records added
+    // by AG-182 (12 backfills and the 33 PR #200 records carrying the backfilled merge 02a135aa).
+    assert_eq!(pins.records.len(), 138);
+    assert_eq!(
+        pins.records.keys().collect::<BTreeSet<_>>(),
+        records.keys().collect::<BTreeSet<_>>()
+    );
     for (id, digest) in &pins.records {
         assert_eq!(record_digest(&records[id].1).unwrap(), *digest, "{id}");
     }
-    assert_eq!(records.len() - pins.records.len(), 45);
+    let added = records
+        .values()
+        .filter(|(_, record)| {
+            let pr = pull_request_number(&record["pr"], "pr").unwrap();
+            [
+                178, 180, 187, 188, 189, 191, 192, 194, 195, 197, 198, 199, 200,
+            ]
+            .contains(&pr)
+        })
+        .count();
+    assert_eq!(added, 45);
     assert_eq!(
         record_digest(&serde_json::json!({"b": 1, "a": "§", "plan_recheck": "x"})).unwrap(),
         evo_core::hash("{\"a\":\"§\",\"b\":1}".as_bytes())
@@ -5004,11 +5984,16 @@ fn withdrawn_records_are_the_reviewed_list_and_never_revive() {
 
     let mut duplicated = baseline.clone();
     let first = duplicated["withdrawn_records"][0].clone();
+    let first_id = first["id"].as_str().unwrap().to_string();
     duplicated["withdrawn_records"]
         .as_array_mut()
         .unwrap()
         .push(first);
-    assert!(validate_manifest(&duplicated, &root).is_err());
+    let error = validate_manifest(&duplicated, &root).expect_err("a duplicated withdrawn entry");
+    assert!(
+        error.contains(&format!("withdrawn_records lists {first_id} twice")),
+        "{error}"
+    );
 
     for (field, invalid, expected) in [
         (
@@ -5051,13 +6036,21 @@ fn withdrawn_records_are_the_reviewed_list_and_never_revive() {
     let mut extra_key = baseline.clone();
     withdrawn_entry_mut(&mut extra_key, "E05.ag052_versioned_batch_verdicts")["verdict"] =
         Value::String("improved".into());
-    assert!(validate_manifest(&extra_key, &root).is_err());
+    let error = validate_manifest(&extra_key, &root).expect_err("an extra withdrawn key");
+    assert!(
+        error.contains("withdrawn_records entry keys differ: missing=[] extra=[\"verdict\"]"),
+        "{error}"
+    );
     let mut missing_key = baseline;
     withdrawn_entry_mut(&mut missing_key, "E05.ag052_versioned_batch_verdicts")
         .as_object_mut()
         .unwrap()
         .remove("owner_task");
-    assert!(validate_manifest(&missing_key, &root).is_err());
+    let error = validate_manifest(&missing_key, &root).expect_err("a missing withdrawn key");
+    assert!(
+        error.contains("withdrawn_records entry keys differ: missing=[\"owner_task\"] extra=[]"),
+        "{error}"
+    );
 }
 
 /// A synthetic re-verification of the withdrawn E05.ag101 record (same task, own identity, bound
@@ -5256,6 +6249,100 @@ fn pinned(value: &Value, register: &[u8]) -> Value {
     value
 }
 
+/// Reviewed pins whose register SHA-256 is re-pinned to `register`, as a reviewed register update of
+/// both checkers would do, so that a test isolates the rule it is about (AG-200).
+fn register_pins(register: &[u8]) -> ReviewedPins {
+    let mut pins = ReviewedPins::reviewed();
+    pins.register_sha256 = evo_core::hash(register);
+    pins
+}
+
+/// A synthetic local evidence store (a temporary directory holding out/) for the evidence-root
+/// judgment (AG-200); the real out/ is neither read nor written by these tests.
+struct EvidenceStoreFixture {
+    root: PathBuf,
+}
+
+impl EvidenceStoreFixture {
+    fn new() -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rsia-support-evidence-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        Self { root }
+    }
+
+    fn write(&self, relative: &str, body: &[u8]) {
+        let path = self.root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn remove(&self, relative: &str) {
+        std::fs::remove_file(self.root.join(relative)).unwrap();
+    }
+}
+
+impl Drop for EvidenceStoreFixture {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.root).unwrap();
+    }
+}
+
+fn fixture_evidence(path: &str) -> Vec<u8> {
+    format!("fixture evidence {path}\n").into_bytes()
+}
+
+/// Verified records by id with their owning task, as `collect_records` returns them.
+type RecordMap = BTreeMap<String, (String, Value)>;
+/// (record id, evidence field, path) of an evidence path written into a synthetic store.
+type StorePath = (String, String, String);
+
+/// Fills `store` with every out/ evidence path that is not registered missing; each unregistered
+/// input_ref gets fixture bytes and its records the matching input_digest (registered inputs keep
+/// their pinned digest). Returns the records to judge and the unregistered out/ triples.
+fn complete_store(
+    records: &RecordMap,
+    register: &Value,
+    store: &EvidenceStoreFixture,
+) -> (RecordMap, Vec<StorePath>) {
+    let registered: BTreeSet<(String, String)> = register["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["record_id"].as_str().unwrap().to_string(),
+                entry["field"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let mut judged = records.clone();
+    let mut written = Vec::new();
+    for (id, (_, record)) in judged.iter_mut() {
+        for field in EVIDENCE_PATH_FIELDS {
+            let path = record[*field].as_str().unwrap().to_string();
+            if path.split('/').next() != Some(LOCAL_EVIDENCE_STORE)
+                || registered.contains(&(id.clone(), field.to_string()))
+            {
+                continue;
+            }
+            let body = fixture_evidence(&path);
+            store.write(&path, &body);
+            if *field == "input_ref" {
+                record["input_digest"] = Value::String(evo_core::hash(&body));
+            }
+            written.push((id.clone(), field.to_string(), path));
+        }
+    }
+    (judged, written)
+}
+
 #[test]
 fn missing_evidence_register_is_pinned_and_decides_local_outcomes() {
     let root = repo_root();
@@ -5266,23 +6353,42 @@ fn missing_evidence_register_is_pinned_and_decides_local_outcomes() {
     let entries = register["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 42);
     let reviewed = ReviewedPins::reviewed();
+    assert_eq!(evo_core::hash(&original), EXPECTED_MISSING_REGISTER_SHA256);
+    assert_eq!(
+        baseline["evidence_missing_register"]["sha256"],
+        EXPECTED_MISSING_REGISTER_SHA256
+    );
     let healthy = RegisterFixture::new(&original);
-    validate_missing_register(&baseline, &healthy.root, &records, &reviewed).unwrap();
+    validate_missing_register(&baseline, &healthy.root, &records, &reviewed, None).unwrap();
 
     // Probe c: dropping a registered path changes the pinned register.
     let mut dropped: Value = register.clone();
     dropped["entries"].as_array_mut().unwrap().remove(0);
     let dropped_bytes = serde_json::to_vec_pretty(&dropped).unwrap();
     let fixture = RegisterFixture::new(&dropped_bytes);
-    let error = validate_missing_register(&baseline, &fixture.root, &records, &reviewed)
+    let error = validate_missing_register(&baseline, &fixture.root, &records, &reviewed, None)
         .expect_err("an unpinned register edit");
     assert!(error.contains("SHA-256 differs"), "{error}");
-    // Probe c2: the same drop with a re-pinned register SHA-256 fails on the reviewed triples.
+    // Probe c2: the same drop with a refreshed pointer fails on the reviewed register SHA-256
+    // (AG-200), and re-pinned in both checkers still on the reviewed triples.
     let error = validate_missing_register(
         &pinned(&baseline, &dropped_bytes),
         &fixture.root,
         &records,
         &reviewed,
+        None,
+    )
+    .expect_err("a refreshed pointer");
+    assert!(
+        error.contains("is not the reviewed register SHA-256 pinned in both checkers"),
+        "{error}"
+    );
+    let error = validate_missing_register(
+        &pinned(&baseline, &dropped_bytes),
+        &fixture.root,
+        &records,
+        &register_pins(&dropped_bytes),
+        None,
     )
     .expect_err("a dropped triple");
     assert!(
@@ -5316,6 +6422,19 @@ fn missing_evidence_register_is_pinned_and_decides_local_outcomes() {
         &fixture.root,
         &records,
         &reviewed,
+        None,
+    )
+    .expect_err("a refreshed pointer");
+    assert!(
+        error.contains("is not the reviewed register SHA-256 pinned in both checkers"),
+        "{error}"
+    );
+    let error = validate_missing_register(
+        &pinned(&baseline, &swapped_bytes),
+        &fixture.root,
+        &records,
+        &register_pins(&swapped_bytes),
+        None,
     )
     .expect_err("a swapped triple");
     assert!(
@@ -5334,7 +6453,7 @@ fn missing_evidence_register_is_pinned_and_decides_local_outcomes() {
         unknown["path"].as_str().unwrap(),
         b"restored from somewhere\n",
     );
-    let error = validate_missing_register(&baseline, &fixture.root, &records, &reviewed)
+    let error = validate_missing_register(&baseline, &fixture.root, &records, &reviewed, None)
         .expect_err("an unknown-identity path reappeared");
     assert!(error.contains("unknown identity"), "{error}");
     let known = entries
@@ -5343,7 +6462,7 @@ fn missing_evidence_register_is_pinned_and_decides_local_outcomes() {
         .unwrap();
     let fixture = RegisterFixture::new(&original);
     fixture.write(known["path"].as_str().unwrap(), b"different bytes\n");
-    let error = validate_missing_register(&baseline, &fixture.root, &records, &reviewed)
+    let error = validate_missing_register(&baseline, &fixture.root, &records, &reviewed, None)
         .expect_err("a mismatched path reappeared");
     assert!(error.contains("different bytes or SHA-256"), "{error}");
     let body = b"exactly the registered bytes\n";
@@ -5357,11 +6476,96 @@ fn missing_evidence_register_is_pinned_and_decides_local_outcomes() {
     let matching_bytes = serde_json::to_vec_pretty(&matching).unwrap();
     let fixture = RegisterFixture::new(&matching_bytes);
     fixture.write(known["path"].as_str().unwrap(), body);
-    validate_missing_register(
+    // Rewriting the registered identity and refreshing the pointer fails on the reviewed register
+    // SHA-256 (AG-200, review S-1); only a reviewed register update re-pinned in both checkers lets
+    // the restored path pass.
+    let error = validate_missing_register(
         &pinned(&baseline, &matching_bytes),
         &fixture.root,
         &records,
         &reviewed,
+        None,
+    )
+    .expect_err("a rewritten identity with a refreshed pointer");
+    assert!(
+        error.contains("is not the reviewed register SHA-256 pinned in both checkers"),
+        "{error}"
+    );
+    validate_missing_register(
+        &pinned(&baseline, &matching_bytes),
+        &fixture.root,
+        &records,
+        &register_pins(&matching_bytes),
+        None,
+    )
+    .unwrap();
+    // Probe c4: an unknown identity replaced by a forged SHA-256 and size, the forged file restored,
+    // the pointer refreshed; re-pinned as a reviewed register it would pass, so the constant decides.
+    let forged_body = b"forged evidence\n";
+    let mut forged: Value = register.clone();
+    let mut forged_path = String::new();
+    for entry in forged["entries"].as_array_mut().unwrap() {
+        if entry["expected_sha256"] == "unknown" && entry["expected_bytes"] == "unknown" {
+            entry["expected_sha256"] = Value::String(evo_core::hash(forged_body));
+            entry["expected_bytes"] = serde_json::json!(forged_body.len());
+            entry.as_object_mut().unwrap().remove("unknown_reason");
+            forged_path = entry["path"].as_str().unwrap().to_string();
+            break;
+        }
+    }
+    let forged_bytes = serde_json::to_vec_pretty(&forged).unwrap();
+    let fixture = RegisterFixture::new(&forged_bytes);
+    fixture.write(&forged_path, forged_body);
+    let error = validate_missing_register(
+        &pinned(&baseline, &forged_bytes),
+        &fixture.root,
+        &records,
+        &reviewed,
+        None,
+    )
+    .expect_err("a forged identity (probe c4)");
+    assert!(
+        error.contains("is not the reviewed register SHA-256 pinned in both checkers"),
+        "{error}"
+    );
+    validate_missing_register(
+        &pinned(&baseline, &forged_bytes),
+        &fixture.root,
+        &records,
+        &register_pins(&forged_bytes),
+        None,
+    )
+    .unwrap();
+    // Probe c5: a known identity downgraded to unknown (with a reason), the pointer refreshed.
+    let mut downgraded: Value = register.clone();
+    for entry in downgraded["entries"].as_array_mut().unwrap() {
+        if entry["expected_sha256"] != "unknown" && entry["expected_bytes"] != "unknown" {
+            entry["expected_sha256"] = serde_json::json!("unknown");
+            entry["expected_bytes"] = serde_json::json!("unknown");
+            entry["unknown_reason"] = serde_json::json!("probe c5");
+            break;
+        }
+    }
+    let downgraded_bytes = serde_json::to_vec_pretty(&downgraded).unwrap();
+    let fixture = RegisterFixture::new(&downgraded_bytes);
+    let error = validate_missing_register(
+        &pinned(&baseline, &downgraded_bytes),
+        &fixture.root,
+        &records,
+        &reviewed,
+        None,
+    )
+    .expect_err("a downgraded identity (probe c5)");
+    assert!(
+        error.contains("is not the reviewed register SHA-256 pinned in both checkers"),
+        "{error}"
+    );
+    validate_missing_register(
+        &pinned(&baseline, &downgraded_bytes),
+        &fixture.root,
+        &records,
+        &register_pins(&downgraded_bytes),
+        None,
     )
     .unwrap();
 
@@ -5375,6 +6579,7 @@ fn missing_evidence_register_is_pinned_and_decides_local_outcomes() {
         &healthy.root,
         &collect_records(&untracked["e_scopes"]),
         &reviewed,
+        None,
     )
     .expect_err("an unregistered missing tracked path");
     assert!(
@@ -5462,14 +6667,15 @@ fn missing_evidence_register_is_pinned_and_decides_local_outcomes() {
             &pinned(&baseline, &bytes),
             &fixture.root,
             &records,
-            &reviewed,
+            &register_pins(&bytes),
+            None,
         )
         .expect_err("a structural register defect");
         assert!(error.contains(label), "{label}: {error}");
     }
     let mut moved = baseline.clone();
     moved["evidence_missing_register"]["path"] = Value::String("reports/other.json".into());
-    let error = validate_missing_register(&moved, &healthy.root, &records, &reviewed)
+    let error = validate_missing_register(&moved, &healthy.root, &records, &reviewed, None)
         .expect_err("a moved register");
     assert!(
         error.contains("evidence_missing_register.path must be"),
@@ -5480,7 +6686,201 @@ fn missing_evidence_register_is_pinned_and_decides_local_outcomes() {
         .as_object_mut()
         .unwrap()
         .remove("evidence_missing_register");
-    assert!(validate_manifest(&unpinned, &root).is_err());
+    let error = validate_manifest(&unpinned, &root).expect_err("an unpinned register");
+    assert!(
+        error.contains("evidence_missing_register must be an object"),
+        "{error}"
+    );
+}
+
+#[test]
+fn missing_evidence_register_judges_out_paths_against_an_evidence_store() {
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let original = register_bytes(&root);
+    let register: Value = load_json_strict(std::str::from_utf8(&original).unwrap()).unwrap();
+    let reviewed = ReviewedPins::reviewed();
+    let checkout = RegisterFixture::new(&original);
+    let store = EvidenceStoreFixture::new();
+    let (records, written) =
+        complete_store(&collect_records(&baseline["e_scopes"]), &register, &store);
+    assert!(!written.is_empty());
+    // A complete store: every unregistered out/ path present, the 42 registered paths absent.
+    validate_missing_register(
+        &baseline,
+        &checkout.root,
+        &records,
+        &reviewed,
+        Some(store.root.as_path()),
+    )
+    .unwrap();
+
+    // An absent out/ path outside the register fails once the store is supplied; without the store
+    // it is not judged.
+    let (_, _, victim) = &written[0];
+    store.remove(victim);
+    let error = validate_missing_register(
+        &baseline,
+        &checkout.root,
+        &records,
+        &reviewed,
+        Some(store.root.as_path()),
+    )
+    .expect_err("an unregistered missing out/ path");
+    assert!(
+        error.contains(victim.as_str())
+            && error.contains("is missing and not listed in the missing-evidence register"),
+        "{error}"
+    );
+    validate_missing_register(&baseline, &checkout.root, &records, &reviewed, None).unwrap();
+    store.write(victim, &fixture_evidence(victim));
+
+    // A registered path reappearing in the store: an unknown identity always fails, a known one must
+    // match; the checkout alone does not see either.
+    let entries = register["entries"].as_array().unwrap();
+    let unknown = entries
+        .iter()
+        .find(|entry| entry["expected_sha256"] == "unknown")
+        .unwrap()["path"]
+        .as_str()
+        .unwrap();
+    store.write(unknown, b"restored from somewhere\n");
+    let error = validate_missing_register(
+        &baseline,
+        &checkout.root,
+        &records,
+        &reviewed,
+        Some(store.root.as_path()),
+    )
+    .expect_err("an unknown-identity path reappeared in the store");
+    assert!(error.contains("unknown identity"), "{error}");
+    validate_missing_register(&baseline, &checkout.root, &records, &reviewed, None).unwrap();
+    store.remove(unknown);
+    let known = entries
+        .iter()
+        .find(|entry| entry["expected_sha256"] != "unknown" && entry["field"] == "log_path")
+        .unwrap()["path"]
+        .as_str()
+        .unwrap();
+    store.write(known, b"different bytes\n");
+    let error = validate_missing_register(
+        &baseline,
+        &checkout.root,
+        &records,
+        &reviewed,
+        Some(store.root.as_path()),
+    )
+    .expect_err("a mismatched path reappeared in the store");
+    assert!(error.contains("different bytes or SHA-256"), "{error}");
+    store.remove(known);
+
+    // A present unregistered input manifest must match its record's input_digest (Python parity).
+    let (_, _, input) = written
+        .iter()
+        .find(|(_, field, _)| field == "input_ref")
+        .unwrap();
+    store.write(input, b"tampered input manifest\n");
+    let error = validate_missing_register(
+        &baseline,
+        &checkout.root,
+        &records,
+        &reviewed,
+        Some(store.root.as_path()),
+    )
+    .expect_err("a tampered input manifest");
+    assert!(
+        error.contains("local input manifest SHA-256 mismatch"),
+        "{error}"
+    );
+    store.write(input, &fixture_evidence(input));
+    validate_missing_register(
+        &baseline,
+        &checkout.root,
+        &records,
+        &reviewed,
+        Some(store.root.as_path()),
+    )
+    .unwrap();
+
+    // Probe c3 against the store (one evidence file deleted and registered in place of another
+    // entry, the count unchanged): the refreshed pointer fails on the reviewed register SHA-256,
+    // re-pinned on the reviewed triples, and with every pin refreshed the dropped entry is an
+    // unregistered missing out/ path that the store judgment rejects.
+    let (record_id, field, path) = written
+        .iter()
+        .find(|(_, _, path)| written.iter().filter(|(_, _, other)| other == path).count() == 1)
+        .unwrap()
+        .clone();
+    store.remove(&path);
+    let mut swapped = register.clone();
+    let dropped = swapped["entries"].as_array_mut().unwrap().remove(0);
+    swapped["entries"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "path": path,
+            "record_id": record_id,
+            "field": field,
+            "expected_bytes": "unknown",
+            "expected_sha256": "unknown",
+            "unknown_reason": "store probe",
+            "missing_window": "unknown",
+            "group": "store_probe",
+        }));
+    assert_eq!(swapped["entries"].as_array().unwrap().len(), 42);
+    let swapped_bytes = serde_json::to_vec_pretty(&swapped).unwrap();
+    let swapped_checkout = RegisterFixture::new(&swapped_bytes);
+    let manifest = pinned(&baseline, &swapped_bytes);
+    let error = validate_missing_register(
+        &manifest,
+        &swapped_checkout.root,
+        &records,
+        &reviewed,
+        Some(store.root.as_path()),
+    )
+    .expect_err("a refreshed pointer");
+    assert!(
+        error.contains("is not the reviewed register SHA-256 pinned in both checkers"),
+        "{error}"
+    );
+    let mut all_repinned = register_pins(&swapped_bytes);
+    let error = validate_missing_register(
+        &manifest,
+        &swapped_checkout.root,
+        &records,
+        &all_repinned,
+        Some(store.root.as_path()),
+    )
+    .expect_err("a swapped triple");
+    assert!(
+        error.contains("missing-evidence register entries differ from the reviewed register"),
+        "{error}"
+    );
+    all_repinned.missing = swapped["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["record_id"].as_str().unwrap().to_string(),
+                entry["field"].as_str().unwrap().to_string(),
+                entry["path"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let error = validate_missing_register(
+        &manifest,
+        &swapped_checkout.root,
+        &records,
+        &all_repinned,
+        Some(store.root.as_path()),
+    )
+    .expect_err("the dropped entry is an unregistered missing path");
+    assert!(
+        error.contains(dropped["path"].as_str().unwrap())
+            && error.contains("is missing and not listed in the missing-evidence register"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -5502,57 +6902,127 @@ fn harness2_borrowings_and_sources_match_the_plan_tables() {
             .len(),
         8
     );
-    for (index, field, invalid) in [
-        (0, "commit", serde_json::json!("a".repeat(40))),
-        (0, "tree", serde_json::json!("b".repeat(40))),
-        (3, "blob_sha", serde_json::json!("c".repeat(40))),
-        (3, "path", serde_json::json!("harness2/core/other.py")),
-        (1, "license", serde_json::json!("MIT")),
+    let pin = "fixed Harness² source pin differs from plan §16.8";
+    for (index, field, invalid, expected) in [
+        (
+            0,
+            "commit",
+            serde_json::json!("a".repeat(40)),
+            format!("HSF01 {pin}"),
+        ),
+        (
+            0,
+            "tree",
+            serde_json::json!("b".repeat(40)),
+            format!("HSF01 {pin}"),
+        ),
+        (
+            3,
+            "blob_sha",
+            serde_json::json!("c".repeat(40)),
+            format!("HSF04 {pin}"),
+        ),
+        (
+            3,
+            "path",
+            serde_json::json!("harness2/core/other.py"),
+            format!("HSF04 {pin}"),
+        ),
+        (
+            1,
+            "license",
+            serde_json::json!("MIT"),
+            format!("HSF02 {pin}"),
+        ),
         (
             1,
             "repository",
             serde_json::json!("https://github.com/google/harness2"),
+            format!("HSF02 {pin}"),
         ),
-        (2, "read_range", serde_json::json!("全文")),
-        (2, "e_tasks", serde_json::json!(["E00"])),
-        (16, "blob_sha", serde_json::json!("d".repeat(40))),
+        (
+            2,
+            "read_range",
+            serde_json::json!("全文"),
+            format!("HSF03 {pin}"),
+        ),
+        (
+            2,
+            "e_tasks",
+            serde_json::json!(["E00"]),
+            "HSF03 E mapping differs from the V123 responsibility".to_string(),
+        ),
+        (
+            16,
+            "blob_sha",
+            serde_json::json!("d".repeat(40)),
+            format!("HSP01 {pin}"),
+        ),
     ] {
         let mut value = baseline.clone();
         value["traceability"]["hsf_sources"][index][field] = invalid;
-        assert!(
-            validate_manifest(&value, &root).is_err(),
-            "HSF {index} {field}"
-        );
+        let error = validate_manifest(&value, &root).expect_err("a wrong Harness² source");
+        assert!(error.contains(&expected), "HSF {index} {field}: {error}");
     }
     let mut missing = baseline.clone();
     missing["traceability"]["hsf_sources"]
         .as_array_mut()
         .unwrap()
         .pop();
-    assert!(validate_manifest(&missing, &root).is_err());
-    for (index, field, invalid) in [
-        (0, "section", serde_json::json!("§6.7.5")),
-        (0, "hsf_refs", serde_json::json!(["HSF04"])),
-        (2, "e_tasks", serde_json::json!(["E09"])),
-        (6, "v_scenarios", serde_json::json!(["V052"])),
-        (4, "adoption", serde_json::json!("adopted")),
-        (4, "implementation_status", serde_json::json!("planned")),
-        (0, "verification_status", serde_json::json!("verified")),
-        (0, "effect_status", serde_json::json!("improved")),
-        (0, "remaining", serde_json::json!("")),
+    let error = validate_manifest(&missing, &root).expect_err("a missing HSP01");
+    assert!(
+        error.contains("hsf_sources must be exactly HSF01–HSF16 and HSP01"),
+        "{error}"
+    );
+    let chain = "borrowing trace chain differs from plan §2.9";
+    for (index, field, invalid, expected) in [
+        (0, "section", serde_json::json!("§6.7.5"), format!("HS01 {chain}")),
+        (0, "hsf_refs", serde_json::json!(["HSF04"]), format!("HS01 {chain}")),
+        (2, "e_tasks", serde_json::json!(["E09"]), format!("HS03 {chain}")),
+        (6, "v_scenarios", serde_json::json!(["V052"]), format!("HS07 {chain}")),
+        (4, "adoption", serde_json::json!("adopted"), format!("HS05 {chain}")),
+        (
+            4,
+            "implementation_status",
+            serde_json::json!("planned"),
+            "HS05 is registered only (plan §2.9, v4.5 Q-44) and is not implemented in this version"
+                .to_string(),
+        ),
+        (
+            0,
+            "verification_status",
+            serde_json::json!("verified"),
+            "HS01 tracking axes overstate the borrowing".to_string(),
+        ),
+        (
+            0,
+            "effect_status",
+            serde_json::json!("improved"),
+            "HS01 conflates specification or effect status".to_string(),
+        ),
+        (
+            0,
+            "remaining",
+            serde_json::json!(""),
+            "HS01 remaining must be a non-empty string".to_string(),
+        ),
         (
             0,
             "related_evidence_refs",
             serde_json::json!(["E01.controller_acceptance"]),
+            "HS01 related_evidence_refs references evidence E01.controller_acceptance owned by unrelated task E01".to_string(),
         ),
-        (0, "benefit", serde_json::json!("improved")),
+        (
+            0,
+            "benefit",
+            serde_json::json!("improved"),
+            "HS01 keys differ: missing=[] extra=[\"benefit\"]".to_string(),
+        ),
     ] {
         let mut value = baseline.clone();
         value["traceability"]["hs_borrowings"][index][field] = invalid;
-        assert!(
-            validate_manifest(&value, &root).is_err(),
-            "HS {index} {field}"
-        );
+        let error = validate_manifest(&value, &root).expect_err("a wrong Harness² borrowing");
+        assert!(error.contains(&expected), "HS {index} {field}: {error}");
     }
 }
 
@@ -5604,7 +7074,11 @@ fn v121_to_v123_and_v048_follow_the_v45_responsibility_table() {
         .as_array_mut()
         .unwrap()
         .push(Value::String("E06".into()));
-    assert!(validate_manifest(&v081, &root).is_err());
+    let error = validate_manifest(&v081, &root).expect_err("E06 carrying V081");
+    assert!(
+        error.contains("V081 E responsibility mapping differs from plan v4.5"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -5621,7 +7095,11 @@ fn stage8_gate_scripts_are_registered_execution_runners() {
     ] {
         let mut execution = well_formed_execution();
         execution["runner"] = Value::String(runner.into());
-        assert!(execution_result(execution).is_err(), "{runner}");
+        let error = execution_result(execution).expect_err("an unregistered gate runner");
+        assert!(
+            error.contains("X.record execution runner must be one of"),
+            "{runner}: {error}"
+        );
     }
 }
 
@@ -5629,17 +7107,727 @@ fn stage8_gate_scripts_are_registered_execution_runners() {
 fn trace_index_coverage_spans_v123_and_the_harness2_ranges() {
     let root = repo_root();
     let baseline = load_manifest(&root);
-    for (task, range) in [
-        ("E16.6", "V001–V123"),
-        ("E16.6", "HSP01"),
-        ("E00", "V087–V123"),
-        ("E00", "HSF01–HSF16"),
+    for (task, range, expected) in [
+        (
+            "E16.6",
+            "V001–V123",
+            "E16.6 complete index responsibility differs from plan v4.5",
+        ),
+        (
+            "E16.6",
+            "HSP01",
+            "E16.6 complete index responsibility differs from plan v4.5",
+        ),
+        (
+            "E00",
+            "V087–V123",
+            "E00 trace-only responsibility differs from plan v4.5",
+        ),
+        (
+            "E00",
+            "HSF01–HSF16",
+            "E00 trace-only responsibility differs from plan v4.5",
+        ),
     ] {
         let mut value = baseline.clone();
         value["trace_index_coverage"][task]["ranges"]
             .as_array_mut()
             .unwrap()
             .retain(|item| item != range);
-        assert!(validate_manifest(&value, &root).is_err(), "{task} {range}");
+        let error = validate_manifest(&value, &root).expect_err("a shrunken coverage range");
+        assert!(error.contains(expected), "{task} {range}: {error}");
+    }
+}
+
+/// A fresh evidence identity for a reviewed pull request (the Python tests' _fresh_record): its own
+/// id, the current plan binding, source commit and local artifacts; pr_state dropped.
+fn fresh_record(base: &Value, task: &str, name: &str, stem: &str) -> Value {
+    let id = format!("{task}.{name}");
+    let mut record = base.clone();
+    let object = record.as_object_mut().unwrap();
+    object.remove("pr_state");
+    for (key, value) in [
+        ("id", Value::String(id.clone())),
+        ("plan_version", Value::String(PLAN_VERSION.into())),
+        ("plan_sha256", Value::String(PLAN_SHA.into())),
+        ("plan_recheck", Value::String("not_affected".into())),
+        (
+            "source_sha",
+            Value::String(evo_core::hash(id.as_bytes())[..40].to_string()),
+        ),
+        ("log_path", Value::String(format!("out/fixture/{stem}.log"))),
+        (
+            "input_ref",
+            Value::String(format!("out/fixture/{stem}-input.json")),
+        ),
+        (
+            "input_digest",
+            Value::String(evo_core::hash(stem.as_bytes())),
+        ),
+        (
+            "record_source",
+            Value::String(format!("out/fixture/{stem}-acceptance.json")),
+        ),
+        ("execution", well_formed_execution()),
+    ] {
+        object.insert(key.to_string(), value);
+    }
+    record
+}
+
+/// A labelled manifest edit with the error text it must produce.
+type ManifestMutation = (&'static str, String, Box<dyn Fn(&mut Value)>);
+
+#[test]
+fn rejects_unknown_keys_in_every_closed_object() {
+    // R1 §Q4 items 1-3 (Python EVIDENCE/SCOPE/DIMENSION/COVERAGE/COMMITMENT/SO_SOURCE/LOCAL_USE/
+    // V_SCENARIO, ROOT and TRACEABILITY key sets).
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    validate_manifest(&baseline, &root).unwrap();
+    let record = baseline["e_scopes"]["E13"]["verified_subscopes"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cases: Vec<ManifestMutation> = vec![
+        (
+            "scope entry",
+            "E13 scope entry: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| value["e_scopes"]["E13"]["effect"] = "improved".into()),
+        ),
+        (
+            "evidence record",
+            format!("E13 evidence {record}: unknown key(s) [\"verdict\"]"),
+            Box::new(|value: &mut Value| {
+                value["e_scopes"]["E13"]["verified_subscopes"][0]["verdict"] = "improved".into()
+            }),
+        ),
+        (
+            "v_scenario",
+            "V001: unknown key(s) [\"benefit\"]".into(),
+            Box::new(|value: &mut Value| {
+                value["traceability"]["v_scenarios"][0]["benefit"] = "improved".into()
+            }),
+        ),
+        (
+            "commitment",
+            "B01: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| {
+                value["traceability"]["b_commitments"][0]["effect"] = "improved".into()
+            }),
+        ),
+        (
+            "so_source",
+            "SO01: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| {
+                value["traceability"]["so_sources"][0]["effect"] = "improved".into()
+            }),
+        ),
+        (
+            "local_use",
+            "SO01 local_use: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| {
+                value["traceability"]["so_sources"][0]["local_use"]["effect"] = "improved".into()
+            }),
+        ),
+        (
+            "traceability",
+            "traceability: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| value["traceability"]["effect"] = "improved".into()),
+        ),
+        (
+            "trace_index_coverage",
+            "E00 trace_index_coverage: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| {
+                value["trace_index_coverage"]["E00"]["effect"] = "improved".into()
+            }),
+        ),
+        (
+            "dimensions",
+            "dimensions: unknown key(s) [\"benefit\"]".into(),
+            Box::new(|value: &mut Value| value["dimensions"]["benefit"] = "improved".into()),
+        ),
+        (
+            "root",
+            "manifest root: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| value["effect"] = "improved".into()),
+        ),
+    ];
+    for (name, expected, mutate) in cases {
+        let mut value = baseline.clone();
+        mutate(&mut value);
+        let error = validate_manifest(&value, &root).expect_err("an unknown key carrying a claim");
+        assert!(
+            error.contains(&expected)
+                && error.contains(
+                    "are not part of the rsia.support_scope.v2 schema and cannot carry claims"
+                ),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn rejects_duplicated_runs_and_inconsistent_merge_facts_across_records() {
+    // R1 §Q4 items 4-5 (Python log_path uniqueness, cross-task run ownership and merge facts).
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let e13 = baseline["e_scopes"]["E13"]["verified_subscopes"][0].clone();
+    let e13_id = e13["id"].as_str().unwrap().to_string();
+    assert_eq!(e13["pr"], "https://github.com/acosmi/RSIAgent/pull/70");
+    let e13_merge = e13["merged_sha"].as_str().unwrap().to_string();
+    let e13_source = e13["source_sha"].as_str().unwrap().to_string();
+    // One test run (log_path) supports one record: E13's evidence borrowed under E15.
+    let mut borrowed = e13.clone();
+    borrowed["id"] = Value::String("E15.controller_acceptance".into());
+    borrowed["plan_recheck"] = Value::String(V43_RECHECKED.into());
+    for (log, expected) in [
+        (
+            None,
+            format!(
+                "E15.controller_acceptance: log_path '{}' duplicates evidence {e13_id} of task E13; one test run may support only one evidence record",
+                e13["log_path"].as_str().unwrap()
+            ),
+        ),
+        (
+            Some("out/fixture/e15-rerun.log"),
+            format!(
+                "E15.controller_acceptance: the same test run ({} at source_sha {e13_source}) is already claimed by {e13_id} of task E13; evidence sets may not be duplicated across tasks",
+                e13["test_entry"].as_str().unwrap()
+            ),
+        ),
+    ] {
+        let mut value = baseline.clone();
+        value["e_scopes"]["E15"]["status"] = Value::String("in_progress".into());
+        let mut record = borrowed.clone();
+        if let Some(log) = log {
+            record["log_path"] = Value::String(log.into());
+        }
+        value["e_scopes"]["E15"]["verified_subscopes"]
+            .as_array_mut()
+            .unwrap()
+            .push(record);
+        let error = validate_manifest(&value, &root).expect_err("evidence borrowed across tasks");
+        assert!(error.contains(&expected), "{error}");
+    }
+    // Merge facts agree across records (E13 of PR #70 and E16.4.ag066 of PR #111).
+    let id = "E16.4.ag066_local_stdio_harness";
+    assert_eq!(
+        baseline["e_scopes"]["E16.4"]["verified_subscopes"][0]["id"],
+        id
+    );
+    for (field, forged, expected) in [
+        (
+            "merged_sha",
+            e13_merge.clone(),
+            format!(
+                "{id}: merged_sha {e13_merge} is already recorded as the merge commit of PR #70 ({e13_id}); one merge commit cannot also merge PR #111"
+            ),
+        ),
+        (
+            "merged_sha",
+            e13_source.clone(),
+            format!(
+                "{id}: merged_sha {e13_source} is the source_sha of PR #70 ({e13_id}), not a merge of PR #111"
+            ),
+        ),
+        (
+            "source_sha",
+            e13_merge.clone(),
+            format!(
+                "{id}: source_sha {e13_merge} is recorded as the merge commit of PR #70 ({e13_id})"
+            ),
+        ),
+    ] {
+        let mut value = baseline.clone();
+        value["e_scopes"]["E16.4"]["verified_subscopes"][0][field] = Value::String(forged);
+        let error = validate_manifest(&value, &root).expect_err("an inconsistent merge fact");
+        assert!(error.contains(&expected), "{field}: {error}");
+    }
+    let mut sibling = fresh_record(
+        &baseline["e_scopes"]["E16.4"]["verified_subscopes"][0],
+        "E16.4",
+        "second_controller_acceptance",
+        "e164-second",
+    );
+    sibling["merged_sha"] = Value::Null;
+    let mut value = baseline.clone();
+    value["e_scopes"]["E16.4"]["verified_subscopes"]
+        .as_array_mut()
+        .unwrap()
+        .push(sibling);
+    let error = validate_manifest(&value, &root).expect_err("a PR both merged and unmerged");
+    assert!(
+        error.contains("E16.4.second_controller_acceptance: PR #111 carries merged_sha null here but \"200c43bc19368ff52b064e67eb1b14e35f096d39\" in E16.4.ag066_local_stdio_harness"),
+        "{error}"
+    );
+}
+
+#[test]
+fn pr_state_agrees_with_merged_sha() {
+    // R1 §Q4 item 7 (Python PR_STATES: merged requires merged_sha, any other state forbids it).
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let id = "E16.4.ag066_local_stdio_harness";
+    let merge = "200c43bc19368ff52b064e67eb1b14e35f096d39";
+    assert_eq!(
+        baseline["e_scopes"]["E16.4"]["verified_subscopes"][0]["id"],
+        id
+    );
+    assert_eq!(
+        baseline["e_scopes"]["E16.4"]["verified_subscopes"][0]["merged_sha"],
+        merge
+    );
+    let outside =
+        format!("{id}: pr_state must be one of [\"draft\", \"open\", \"closed\", \"merged\"]");
+    for (state, merged, expected) in [
+        (
+            serde_json::json!("pending"),
+            serde_json::json!(merge),
+            outside.clone(),
+        ),
+        (
+            serde_json::json!(["merged"]),
+            serde_json::json!(merge),
+            outside.clone(),
+        ),
+        (serde_json::json!(7), serde_json::json!(merge), outside),
+        (
+            serde_json::json!("draft"),
+            serde_json::json!(merge),
+            format!(
+                "{id}: merged_sha {merge} is set but the record's pr_state is 'draft', not 'merged'"
+            ),
+        ),
+        (
+            serde_json::json!("closed"),
+            serde_json::json!(merge),
+            format!(
+                "{id}: merged_sha {merge} is set but the record's pr_state is 'closed', not 'merged'"
+            ),
+        ),
+        (
+            serde_json::json!("merged"),
+            Value::Null,
+            format!("{id}: pr_state is 'merged' but merged_sha is null"),
+        ),
+        (
+            serde_json::json!("merged"),
+            serde_json::json!("2e209dc"),
+            format!("{id} merged_sha must be null or lowercase 40-hex"),
+        ),
+    ] {
+        let mut value = baseline.clone();
+        let record = &mut value["e_scopes"]["E16.4"]["verified_subscopes"][0];
+        record["pr_state"] = state;
+        record["merged_sha"] = merged;
+        let error =
+            validate_manifest(&value, &root).expect_err("a pr_state disagreeing with merged_sha");
+        assert!(error.contains(&expected), "{error}");
+    }
+    // An absent or null pr_state asserts no state; the record digest covers it, so only a re-pinned
+    // fixture is valid.
+    for state in [None, Some(Value::Null)] {
+        let mut value = baseline.clone();
+        let record = value["e_scopes"]["E16.4"]["verified_subscopes"][0]
+            .as_object_mut()
+            .unwrap();
+        match state {
+            None => {
+                record.remove("pr_state");
+            }
+            Some(state) => {
+                record.insert("pr_state".into(), state);
+            }
+        }
+        let error = validate_manifest(&value, &root).expect_err("a rewritten historical record");
+        assert!(
+            error.contains(&format!(
+                "{id} historical record differs from its pinned digest"
+            )),
+            "{error}"
+        );
+        validate_manifest_with(&value, &root, &repinned(&value)).unwrap();
+    }
+    // A non-merged state without merged_sha passes the state rule; the reviewed merge fact decides.
+    let mut draft = baseline;
+    draft["e_scopes"]["E16.4"]["verified_subscopes"][0]["pr_state"] = serde_json::json!("draft");
+    draft["e_scopes"]["E16.4"]["verified_subscopes"][0]["merged_sha"] = Value::Null;
+    let error = validate_manifest(&draft, &root).expect_err("an unmerged claim for a merged PR");
+    assert!(
+        error.contains(&format!(
+            "{id} merged_sha differs from the reviewed PR merge"
+        )),
+        "{error}"
+    );
+}
+
+#[test]
+fn completion_evidence_refs_follow_the_status() {
+    // R1 §Q4 item 8 (Python completion_evidence_refs of scopes, SO sources, V scenarios and B/U/K).
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let e13_id = baseline["e_scopes"]["E13"]["verified_subscopes"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut claimed = baseline.clone();
+    claimed["e_scopes"]["E03"]["completion_evidence_refs"] =
+        serde_json::json!(["E03.controller_acceptance"]);
+    let error =
+        validate_manifest(&claimed, &root).expect_err("completion claimed by a started scope");
+    assert!(
+        error.contains(
+            "E03: completion_evidence_refs claims completion but status is 'in_progress'"
+        ),
+        "{error}"
+    );
+    let verified_e13 = |completion: Value| {
+        let mut value = baseline.clone();
+        value["e_scopes"]["E13"]["status"] = Value::String("verified".into());
+        value["e_scopes"]["E13"]["remaining"] = serde_json::json!([]);
+        value["e_scopes"]["E13"]["completion_evidence_refs"] = completion;
+        value
+    };
+    for completion in [
+        serde_json::json!([]),
+        serde_json::json!(["E01.controller_acceptance"]),
+    ] {
+        let error = validate_manifest(&verified_e13(completion), &root)
+            .expect_err("a verified scope without its own completion evidence");
+        assert!(
+            error.contains("E13: verified status lacks explicit task completion evidence"),
+            "{error}"
+        );
+    }
+    validate_manifest(&verified_e13(serde_json::json!([e13_id])), &root).unwrap();
+    for (refs, completion, remaining) in [
+        (
+            serde_json::json!([]),
+            serde_json::json!([]),
+            serde_json::json!(""),
+        ),
+        (
+            serde_json::json!(["E02.controller_acceptance"]),
+            serde_json::json!(["E02.controller_acceptance"]),
+            serde_json::json!("unfinished"),
+        ),
+        (
+            serde_json::json!(["E02.controller_acceptance"]),
+            serde_json::json!([]),
+            serde_json::json!(""),
+        ),
+    ] {
+        let mut value = baseline.clone();
+        let entry = &mut value["traceability"]["v_scenarios"][119];
+        assert_eq!(entry["id"], "V120");
+        entry["status"] = Value::String("verified".into());
+        entry["verification_status"] = Value::String("verified".into());
+        entry["related_evidence_refs"] = refs;
+        entry["completion_evidence_refs"] = completion;
+        entry["remaining"] = remaining;
+        let error =
+            validate_manifest(&value, &root).expect_err("a verified scenario without completion");
+        assert!(
+            error.contains(
+                "V120: verified scenario lacks completion evidence or retains unfinished scope"
+            ),
+            "{error}"
+        );
+    }
+    let mut commitment = baseline.clone();
+    commitment["traceability"]["b_commitments"][0]["verification_status"] =
+        Value::String("verified".into());
+    commitment["traceability"]["b_commitments"][0]["completion_evidence_refs"] =
+        serde_json::json!([]);
+    let error = validate_manifest(&commitment, &root)
+        .expect_err("a verified commitment without completion");
+    assert!(
+        error.contains("B01: verified commitment lacks completion evidence"),
+        "{error}"
+    );
+    commitment["traceability"]["b_commitments"][0]["completion_evidence_refs"] =
+        serde_json::json!(["E02.controller_acceptance"]);
+    validate_manifest(&commitment, &root).unwrap();
+    let mut source = baseline;
+    source["traceability"]["so_sources"][0]["verification_status"] =
+        Value::String("verified".into());
+    source["traceability"]["so_sources"][0]["completion_evidence_refs"] = serde_json::json!([]);
+    let error =
+        validate_manifest(&source, &root).expect_err("a verified source without completion");
+    assert!(
+        error.contains("SO01: verified source status lacks completion evidence"),
+        "{error}"
+    );
+}
+
+#[test]
+fn scope_and_scenario_status_rules_match_the_python_checker() {
+    // R1 §Q4 item 10 (Python scope-level rules, STATUS_RANK, implementation_files and the V axes).
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let fresh = fresh_record(
+        &baseline["e_scopes"]["E13"]["verified_subscopes"][0],
+        "E15",
+        "controller_acceptance",
+        "e15",
+    );
+    let cases: Vec<ManifestMutation> = vec![
+        (
+            "planned scope with records",
+            "E15: status 'planned' is incompatible with verified evidence records [\"E15.controller_acceptance\"]; a planned scope has nothing verified".into(),
+            Box::new(move |value: &mut Value| {
+                value["e_scopes"]["E15"]["verified_subscopes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(fresh.clone())
+            }),
+        ),
+        (
+            "verified optional scope",
+            "E17: optional scope is listed in optional_disabled and no enablement is recorded; status 'verified' is not allowed".into(),
+            Box::new(|value: &mut Value| {
+                value["e_scopes"]["E17"]["status"] = "verified".into();
+                value["e_scopes"]["E17"]["remaining"] = serde_json::json!([]);
+            }),
+        ),
+        (
+            "undeclared out-of-scope status",
+            "E14: status 'explicitly_out_of_scope' is not declared in explicitly_out_of_scope_until_revised".into(),
+            Box::new(|value: &mut Value| {
+                value["e_scopes"]["E14"]["status"] = "explicitly_out_of_scope".into()
+            }),
+        ),
+        (
+            "parent outranking a child",
+            "E16: status 'implemented_not_verified' is stronger than sub-package E16.1 status 'in_progress'; a parent scope may not outrank its weakest child".into(),
+            Box::new(|value: &mut Value| {
+                value["e_scopes"]["E16"]["status"] = "implemented_not_verified".into()
+            }),
+        ),
+        (
+            "duplicated implementation file",
+            "E03: implementation_files must be a duplicate-free string array".into(),
+            Box::new(|value: &mut Value| {
+                let first = value["e_scopes"]["E03"]["implementation_files"][0].clone();
+                value["e_scopes"]["E03"]["implementation_files"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(first);
+            }),
+        ),
+        (
+            "planned scenario with another verification status",
+            "V001: planned scenario has incompatible verification status".into(),
+            Box::new(|value: &mut Value| {
+                value["traceability"]["v_scenarios"][0]["status"] = "planned".into()
+            }),
+        ),
+        (
+            "verified status on one axis only",
+            "V001: verified status axes disagree".into(),
+            Box::new(|value: &mut Value| {
+                value["traceability"]["v_scenarios"][0]["status"] = "verified".into()
+            }),
+        ),
+    ];
+    for (name, expected, mutate) in cases {
+        let mut value = baseline.clone();
+        mutate(&mut value);
+        let error = validate_manifest(&value, &root).expect_err("a status rule violation");
+        assert!(error.contains(&expected), "{name}: {error}");
+    }
+    // A declared out-of-scope status passes the rule.
+    let mut declared = baseline;
+    declared["e_scopes"]["E14"]["status"] = "explicitly_out_of_scope".into();
+    declared["explicitly_out_of_scope_until_revised"] = serde_json::json!(["E14"]);
+    validate_manifest(&declared, &root).unwrap();
+}
+
+#[test]
+fn non_ascii_digits_are_rejected_like_the_python_checker() {
+    // R1 §Q4 item 9: this checker accepts only ASCII digits; the Python checker now uses [0-9].
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    // Escaped so that no editor or review tool can normalize them to ASCII digits.
+    let owner_task = "AG-\u{661}\u{669}\u{662}";
+    let pr_url = "https://github.com/acosmi/RSIAgent/pull/\u{663}\u{660}";
+    let window_after = "\u{ff12}\u{ff10}\u{ff12}\u{ff16}-10-14T11:54:14Z";
+    for text in [owner_task, pr_url, window_after] {
+        assert!(
+            text.chars()
+                .any(|character| character.is_numeric() && !character.is_ascii_digit()),
+            "{text}"
+        );
+    }
+    let mut owner = baseline.clone();
+    withdrawn_entry_mut(&mut owner, "E05.ag052_versioned_batch_verdicts")["owner_task"] =
+        Value::String(owner_task.into());
+    let error = validate_manifest(&owner, &root).expect_err("a non-ASCII owner task");
+    assert!(
+        error.contains("E05.ag052_versioned_batch_verdicts owner_task must be a registered task number such as AG-187"),
+        "{error}"
+    );
+    let mut pr = baseline.clone();
+    pr["e_scopes"]["E01"]["verified_subscopes"][0]["pr"] = Value::String(pr_url.into());
+    let error = validate_manifest(&pr, &root).expect_err("a non-ASCII pull request number");
+    assert!(
+        error.contains("E01.controller_acceptance has an invalid pull request URL"),
+        "{error}"
+    );
+    let original = register_bytes(&root);
+    let mut register: Value = load_json_strict(std::str::from_utf8(&original).unwrap()).unwrap();
+    register["entries"][0]["missing_window"] =
+        serde_json::json!({"after": window_after, "before": "unknown"});
+    let bytes = serde_json::to_vec_pretty(&register).unwrap();
+    let fixture = RegisterFixture::new(&bytes);
+    let error = validate_missing_register(
+        &pinned(&baseline, &bytes),
+        &fixture.root,
+        &collect_records(&baseline["e_scopes"]),
+        &register_pins(&bytes),
+        None,
+    )
+    .expect_err("a non-ASCII missing window");
+    assert!(error.contains("missing_window is malformed"), "{error}");
+}
+
+fn commitment_position(value: &Value, group: &str, id: &str) -> usize {
+    value["traceability"][group]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|entry| entry["id"] == id)
+        .unwrap()
+}
+
+#[test]
+fn commitment_axes_and_artifact_lists_match_the_python_checker() {
+    // AG-200 rework R8-1 (review F-01): the four Python rules that the R1 §Q4 list missed.
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    validate_manifest(&baseline, &root).unwrap();
+    let b09 = commitment_position(&baseline, "b_commitments", "B09");
+    let k06 = commitment_position(&baseline, "k_commitments", "K06");
+    for (group, index) in [("b_commitments", b09), ("k_commitments", k06)] {
+        let entry = &baseline["traceability"][group][index];
+        assert_eq!(entry["implementation_status"], "planned");
+        assert_eq!(entry["verification_status"], "planned");
+    }
+    let cases: Vec<ManifestMutation> = vec![
+        (
+            "planned implementation with a later verification",
+            "B09: planned implementation has incompatible verification".into(),
+            Box::new(move |value: &mut Value| {
+                value["traceability"]["b_commitments"][b09]["verification_status"] =
+                    "implemented_not_verified".into()
+            }),
+        ),
+        (
+            "planned implementation claimed verified",
+            "K06: planned implementation has incompatible verification".into(),
+            Box::new(move |value: &mut Value| {
+                value["traceability"]["k_commitments"][k06]["verification_status"] =
+                    "verified".into()
+            }),
+        ),
+        (
+            "verified commitment with a blocked implementation",
+            "B01: verified commitment has incompatible implementation status".into(),
+            Box::new(|value: &mut Value| {
+                let entry = &mut value["traceability"]["b_commitments"][0];
+                entry["implementation_status"] = "blocked".into();
+                entry["verification_status"] = "verified".into();
+            }),
+        ),
+        (
+            "duplicated commitment artifact",
+            "B01: local artifacts are absent or duplicated".into(),
+            Box::new(|value: &mut Value| {
+                let artifacts = &mut value["traceability"]["b_commitments"][0]["local_artifacts"];
+                let first = artifacts[0].clone();
+                artifacts.as_array_mut().unwrap().push(first);
+            }),
+        ),
+        (
+            "duplicated SO local landing",
+            "SO01: local landing is absent or duplicated".into(),
+            Box::new(|value: &mut Value| {
+                let artifacts =
+                    &mut value["traceability"]["so_sources"][0]["local_use"]["artifacts"];
+                let first = artifacts[0].clone();
+                artifacts.as_array_mut().unwrap().push(first);
+            }),
+        ),
+    ];
+    for (name, expected, mutate) in cases {
+        let mut value = baseline.clone();
+        mutate(&mut value);
+        let error =
+            validate_manifest(&value, &root).expect_err("a commitment or artifact rule violation");
+        assert!(error.contains(&expected), "{name}: {error}");
+    }
+}
+
+#[test]
+fn v_scenario_remaining_follows_the_status_like_the_python_checker() {
+    // AG-200 rework R8-1 (review F-02): a scenario that is not verified states its remaining scope;
+    // a verified one names its completion evidence and retains none.
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let verified_v120 = |remaining: Option<Value>| {
+        let mut value = baseline.clone();
+        let entry = &mut value["traceability"]["v_scenarios"][119];
+        assert_eq!(entry["id"], "V120");
+        entry["status"] = "verified".into();
+        entry["verification_status"] = "verified".into();
+        entry["related_evidence_refs"] = serde_json::json!(["E02.controller_acceptance"]);
+        entry["completion_evidence_refs"] = serde_json::json!(["E02.controller_acceptance"]);
+        match remaining {
+            Some(remaining) => entry["remaining"] = remaining,
+            None => {
+                entry.as_object_mut().unwrap().remove("remaining");
+            }
+        }
+        value
+    };
+    for remaining in [
+        Some(serde_json::json!("")),
+        Some(serde_json::json!([])),
+        Some(Value::Null),
+        None,
+    ] {
+        validate_manifest(&verified_v120(remaining), &root).unwrap();
+    }
+    for remaining in [
+        serde_json::json!("still unfinished"),
+        serde_json::json!(["unfinished"]),
+    ] {
+        let error = validate_manifest(&verified_v120(Some(remaining)), &root)
+            .expect_err("a verified scenario that retains remaining scope");
+        assert!(
+            error.contains(
+                "V120: verified scenario lacks completion evidence or retains unfinished scope"
+            ),
+            "{error}"
+        );
+    }
+    for remaining in [Some(serde_json::json!("")), Some(Value::Null), None] {
+        let mut value = baseline.clone();
+        let entry = &mut value["traceability"]["v_scenarios"][0];
+        assert_eq!(entry["id"], "V001");
+        assert_ne!(entry["status"], "verified");
+        match remaining {
+            Some(remaining) => entry["remaining"] = remaining,
+            None => {
+                entry.as_object_mut().unwrap().remove("remaining");
+            }
+        }
+        let error = validate_manifest(&value, &root)
+            .expect_err("a scenario that is not verified without remaining scope");
+        assert!(
+            error.contains("V001 remaining must be a non-empty string"),
+            "{error}"
+        );
     }
 }
