@@ -575,6 +575,116 @@ pub struct Pair {
     pub candidate_units: u64,
     pub critical: bool,
 }
+/// Current integer-score DTO. Decoding or hashing this value grants no source,
+/// execution, independent-sample, budget or Formal authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundPairV2 {
+    pub domain: String,
+    pub schema_version: String,
+    pub task: evaluation::TaskIdentity,
+    pub task_hash: String,
+    pub task_material_utf8: String,
+    pub baseline_score_micros: u32,
+    pub candidate_score_micros: u32,
+    pub baseline_metered_micros: u64,
+    pub candidate_metered_micros: u64,
+    pub cost_basis: String,
+    pub currency: String,
+    pub baseline_pricing_version: String,
+    pub candidate_pricing_version: String,
+    pub critical: bool,
+}
+impl BoundPairV2 {
+    pub const DOMAIN: &'static str = "rsia.bound_pair";
+    pub const SCHEMA: &'static str = "rsia.bound_pair.v2";
+    pub const COST_BASIS: &'static str = "metered";
+    pub fn from_development_material(
+        task_id: &str,
+        family_id: &str,
+        material_utf8: String,
+        scores: (u32, u32),
+        metered_micros: (u64, u64),
+        currency: String,
+        pricing_versions: (String, String),
+    ) -> Result<Self> {
+        let task = evaluation::TaskIdentity::from_bytes(
+            task_id,
+            material_utf8.as_bytes(),
+            family_id,
+            evaluation::DataUse::Development,
+        )?;
+        let out = Self {
+            domain: Self::DOMAIN.into(),
+            schema_version: Self::SCHEMA.into(),
+            task_hash: task.raw_hash.clone(),
+            task,
+            task_material_utf8: material_utf8,
+            baseline_score_micros: scores.0,
+            candidate_score_micros: scores.1,
+            baseline_metered_micros: metered_micros.0,
+            candidate_metered_micros: metered_micros.1,
+            cost_basis: Self::COST_BASIS.into(),
+            currency,
+            baseline_pricing_version: pricing_versions.0,
+            candidate_pricing_version: pricing_versions.1,
+            critical: false,
+        };
+        out.validate_against_raw(out.task_material_utf8.as_bytes())?;
+        Ok(out)
+    }
+    pub fn validate_against_raw(&self, expected_raw: &[u8]) -> Result<()> {
+        if self.domain != Self::DOMAIN
+            || self.schema_version != Self::SCHEMA
+            || self.cost_basis != Self::COST_BASIS
+            || self.task.data_use != evaluation::DataUse::Development
+            || self.task_material_utf8.as_bytes() != expected_raw
+        {
+            return Err(Error::Conflict("bound pair wire/source mismatch".into()));
+        }
+        let actual = evaluation::TaskIdentity::from_bytes(
+            &self.task.task_id,
+            expected_raw,
+            &self.task.family_id,
+            evaluation::DataUse::Development,
+        )?;
+        if fingerprint(&actual)? != fingerprint(&self.task)? || self.task_hash != actual.raw_hash {
+            return Err(Error::Conflict(
+                "bound pair task identity differs from raw source".into(),
+            ));
+        }
+        identifier(&self.currency)?;
+        text(
+            &self.baseline_pricing_version,
+            "baseline_pricing_version",
+            128,
+        )?;
+        text(
+            &self.candidate_pricing_version,
+            "candidate_pricing_version",
+            128,
+        )?;
+        evaluation::q_from_micros(self.baseline_score_micros)?;
+        evaluation::q_from_micros(self.candidate_score_micros)?;
+        Ok(())
+    }
+    /// Arithmetic projection only. The caller must independently reload the
+    /// source/receipt closure; this method cannot authorize a Formal evaluation.
+    /// Pair.units here means metered currency micros, not generic/full-episode
+    /// units or billing confirmation. A zero baseline proves no monetary saving.
+    pub fn to_legacy_pair(&self, expected_raw: &[u8]) -> Result<Pair> {
+        self.validate_against_raw(expected_raw)?;
+        Ok(Pair {
+            task_hash: self.task_hash.clone(),
+            baseline: evaluation::q_from_micros(self.baseline_score_micros)?,
+            candidate: evaluation::q_from_micros(self.candidate_score_micros)?,
+            baseline_units: self.baseline_metered_micros,
+            candidate_units: self.candidate_metered_micros,
+            critical: self.critical,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationInput {
