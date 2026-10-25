@@ -643,6 +643,15 @@ async fn assert_issue_refused_without_candidate(fixture: &Fixture) {
     ));
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Envelope<T> {
+    schema_version: String,
+    id: String,
+    record_kind: String,
+    payload: T,
+}
+
 fn physical_id(kind: &str, id: &str) -> String {
     format!("e05-{}", fingerprint(&(kind, id)).unwrap())
 }

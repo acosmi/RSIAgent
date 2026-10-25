@@ -4759,9 +4759,84 @@ pub(crate) async fn capture_independent_grade(
 // Read-only facts: this value grants no principal/session authority and is
 // constructed only by the same receipt, capture, graph and cost validators used
 // by issuance below. No current-process authentication is inferred from it.
+// Only the data needed by complete-history checks. It cannot be deserialized,
+// supplied by callers, or used as an owned/principal authority. The general
+// Current resolver and ReadVerifiedInputs retain their Current-only contract.
+struct CompleteAuthorityInputs {
+    profile: FrozenCompilerProfile,
+    binding: ReadCompilerBinding,
+    baseline_bundle: crate::compiler::ReadBundle,
+}
+
+async fn complete_authority_inputs_in_session(
+    s: &mut Session,
+    ctx: &Context,
+    ticket: &crate::streaming_evaluator::ReadEvaluationTicket,
+    candidate: &crate::release_store::ReadCandidate,
+) -> Result<CompleteAuthorityInputs> {
+    use crate::streaming_evaluator::ReadEvaluationTicket;
+    let skill = SkillPatch {
+        content: evo_core::contract::PatchOp::ResetToBaseline,
+        applicability: evo_core::contract::PatchOp::ResetToBaseline,
+        counterexample: evo_core::contract::PatchOp::ResetToBaseline,
+        required_capabilities: evo_core::contract::PatchOp::ResetToBaseline,
+        dependencies: evo_core::contract::PatchOp::ResetToBaseline,
+    };
+    let improver = ImproverPatch {
+        instruction: evo_core::contract::PatchOp::ResetToBaseline,
+        max_candidates: evo_core::contract::PatchOp::ResetToBaseline,
+        max_rounds: evo_core::contract::PatchOp::ResetToBaseline,
+    };
+    match (ticket.schema_version.as_str(), candidate.is_current()) {
+        (ReadEvaluationTicket::SCHEMA_V3, true) => {
+            let inputs = resolve_read_bundle_in_session(
+                s,
+                ctx,
+                &candidate.bundle,
+                &candidate.environment_digest,
+                candidate.revoke_watermark,
+                Purpose::Development,
+            )
+            .await?;
+            Ok(CompleteAuthorityInputs {
+                profile: inputs.profile.clone(),
+                binding: inputs.binding.clone(),
+                baseline_bundle: inputs.compile(&skill, &improver)?,
+            })
+        }
+        (ReadEvaluationTicket::SCHEMA, false) => {
+            // Exact old DTO and old production resolver; this result remains
+            // local to historical preflight and grants no new consumption.
+            let bundle: ResolvedBundle = serde_json::from_value(
+                serde_json::to_value(&candidate.bundle).map_err(|_| Error::Internal)?,
+            )
+            .map_err(|_| Error::Internal)?;
+            let inputs = resolve_bundle_in_session(
+                s,
+                ctx,
+                &bundle,
+                &candidate.environment_digest,
+                candidate.revoke_watermark,
+                Purpose::Development,
+            )
+            .await?;
+            let baseline_bundle =
+                crate::compiler::ReadBundle::from_legacy(inputs.compile(&skill, &improver)?)?;
+            Ok(CompleteAuthorityInputs {
+                profile: inputs.profile,
+                binding: ReadCompilerBinding::from_legacy(inputs.binding)?,
+                baseline_bundle,
+            })
+        }
+        _ => Err(Error::Conflict(
+            "ticket/candidate versions do not form a supported pair".into(),
+        )),
+    }
+}
+
 struct CompleteAuthorityMaterial {
     candidate: crate::release_store::ReadCandidate,
-    inputs: ReadVerifiedInputs,
+    inputs: CompleteAuthorityInputs,
     host: RegisteredFormalHost,
     set: RegisteredPrincipalSet,
     seal: evo_storage::budget::SealedRootBudgetEvidence,
@@ -4772,7 +4847,8 @@ struct CompleteAuthorityMaterial {
 }
 
 pub(crate) async fn preflight_complete_authority_in_session(
-    s: &mut Session, ctx: &Context,
+    s: &mut Session,
+    ctx: &Context,
     ticket: &crate::streaming_evaluator::ReadEvaluationTicket,
     control: &crate::streaming_evaluator::RegisteredEvaluationControl,
 ) -> Result<()> {
@@ -4794,15 +4870,7 @@ async fn complete_authority_material_in_session(
     }
     let candidate: crate::release_store::ReadCandidate =
         s.need(ctx, "artifact", &ticket.candidate_digest).await?;
-    let inputs = resolve_read_bundle_in_session(
-        s,
-        ctx,
-        &candidate.bundle,
-        &candidate.environment_digest.clone(),
-        candidate.revoke_watermark,
-        Purpose::Development,
-    )
-    .await?;
+    let inputs = complete_authority_inputs_in_session(s, ctx, ticket, &candidate).await?;
     let host: RegisteredFormalHost = attested_read(
         s,
         ctx,
@@ -4901,20 +4969,7 @@ async fn complete_authority_material_in_session(
                 if receipt.side == crate::streaming_evaluator::ExecutionSide::Candidate {
                     candidate.bundle.clone()
                 } else {
-                    inputs.compile(
-                        &SkillPatch {
-                            content: evo_core::contract::PatchOp::ResetToBaseline,
-                            applicability: evo_core::contract::PatchOp::ResetToBaseline,
-                            counterexample: evo_core::contract::PatchOp::ResetToBaseline,
-                            required_capabilities: evo_core::contract::PatchOp::ResetToBaseline,
-                            dependencies: evo_core::contract::PatchOp::ResetToBaseline,
-                        },
-                        &ImproverPatch {
-                            instruction: evo_core::contract::PatchOp::ResetToBaseline,
-                            max_candidates: evo_core::contract::PatchOp::ResetToBaseline,
-                            max_rounds: evo_core::contract::PatchOp::ResetToBaseline,
-                        },
-                    )?
+                    inputs.baseline_bundle.clone()
                 };
             let projection = crate::compiler::projection_for_read_bundle(
                 &applied_bundle,
@@ -5029,11 +5084,21 @@ async fn complete_authority_material_in_session(
         // a currently running registered grader.
         for receipt_id in [candidate_receipt_id, baseline_receipt_id] {
             let receipt: crate::streaming_evaluator::ExecutionReceiptV2 =
-                crate::streaming_evaluator::need_record(s, ctx, "execution_receipt_v2", receipt_id).await?;
-            let call = s.budget_call(ctx, &control.billing_scope, &receipt.budget_call_id).await?.ok_or(Error::NotFound)?;
-            let capture_id = format!("formal-capture-{}", &hash(call.dispatch_id.as_ref().ok_or(Error::NotFound)?.as_bytes())[..32]);
-            let capture: FormalProviderCaptureRecord = attested_read(s, ctx, "artifact", &capture_id, Role::Host).await?;
-            if capture.host_pid == grade.grader_pid { return Err(Error::Forbidden); }
+                crate::streaming_evaluator::need_record(s, ctx, "execution_receipt_v2", receipt_id)
+                    .await?;
+            let call = s
+                .budget_call(ctx, &control.billing_scope, &receipt.budget_call_id)
+                .await?
+                .ok_or(Error::NotFound)?;
+            let capture_id = format!(
+                "formal-capture-{}",
+                &hash(call.dispatch_id.as_ref().ok_or(Error::NotFound)?.as_bytes())[..32]
+            );
+            let capture: FormalProviderCaptureRecord =
+                attested_read(s, ctx, "artifact", &capture_id, Role::Host).await?;
+            if capture.host_pid == grade.grader_pid {
+                return Err(Error::Forbidden);
+            }
         }
         grader_captures.push(TypedContentRef {
             kind: "artifact".into(),
@@ -5050,7 +5115,17 @@ async fn complete_authority_material_in_session(
             )?,
         ));
     }
-    Ok(CompleteAuthorityMaterial { candidate, inputs, host, set, seal, cost, provider_captures, grader_captures, roots })
+    Ok(CompleteAuthorityMaterial {
+        candidate,
+        inputs,
+        host,
+        set,
+        seal,
+        cost,
+        provider_captures,
+        grader_captures,
+        roots,
+    })
 }
 
 pub(crate) async fn issue_complete_authority_in_session(
@@ -5066,13 +5141,25 @@ pub(crate) async fn issue_complete_authority_in_session(
     {
         return Err(Error::Forbidden);
     }
-    let CompleteAuthorityMaterial { candidate, inputs, host, set, seal, cost, provider_captures, grader_captures, roots: mut capture_roots } =
-        complete_authority_material_in_session(s, ctx, ticket, control).await?;
+    let CompleteAuthorityMaterial {
+        candidate,
+        inputs,
+        host,
+        set,
+        seal,
+        cost,
+        provider_captures,
+        grader_captures,
+        roots: mut capture_roots,
+    } = complete_authority_material_in_session(s, ctx, ticket, control).await?;
     candidate.current()?;
     let observed = process_principal(ctx, &host, &set, Role::Evaluator)?;
     for r in &provider_captures {
-        let capture: FormalProviderCaptureRecord = attested_read(s, ctx, &r.kind, &r.id, Role::Host).await?;
-        if capture.host_pid == observed.pid { return Err(Error::Forbidden); }
+        let capture: FormalProviderCaptureRecord =
+            attested_read(s, ctx, &r.kind, &r.id, Role::Host).await?;
+        if capture.host_pid == observed.pid {
+            return Err(Error::Forbidden);
+        }
     }
     let report_storage_id =
         crate::streaming_evaluator::storage_id("formal_evaluation_v2", &ticket.id)?;

@@ -639,6 +639,13 @@ async fn assert_issue_refused_without_candidate(fixture: &Fixture) {
     ));
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DeferredPair {
+    target: String,
+    candidate: String,
+    baseline: String,
+}
+
 async fn execute(
     fixture: &Fixture,
     target: &str,
@@ -952,13 +959,13 @@ async fn world(fixture: &Fixture, _bound: bool, phase: &str) -> World {
         .await
         .unwrap();
     let sources = vec![
-            load_stored_source(&mut session, &fixture.evaluator, "S1")
-                .await
-                .unwrap(),
-            load_stored_source(&mut session, &fixture.evaluator, "S2")
-                .await
-                .unwrap(),
-        ];
+        load_stored_source(&mut session, &fixture.evaluator, "S1")
+            .await
+            .unwrap(),
+        load_stored_source(&mut session, &fixture.evaluator, "S2")
+            .await
+            .unwrap(),
+    ];
     let watermark = session.watermark(&fixture.evaluator).await.unwrap();
     let commit = session.commit().await;
     let group = fixture

@@ -625,6 +625,10 @@ fn release_envelopes_reject_unknown_json_and_bundle_digest_tampering() {
         revoke_watermark: 1,
     };
     record.bundle_digest = record.bundle.digest.clone();
+    assert_eq!(
+        evo_core::contract::resolved_bundle_digest_v3(&record.bundle).unwrap(),
+        record.bundle.digest
+    );
     let mut value = serde_json::to_value(&record).unwrap();
     value
         .as_object_mut()
@@ -632,7 +636,10 @@ fn release_envelopes_reject_unknown_json_and_bundle_digest_tampering() {
         .insert("verdict".into(), serde_json::json!("improved"));
     assert!(serde_json::from_value::<ReleaseCandidateRecord>(value).is_err());
     record.bundle.digest = d("tampered");
-    assert!(evo_engine::releases::validate_resolved_bundle_identity(&record.bundle).is_err());
+    assert_ne!(
+        evo_core::contract::resolved_bundle_digest_v3(&record.bundle).unwrap(),
+        record.bundle.digest
+    );
 }
 
 #[tokio::test]

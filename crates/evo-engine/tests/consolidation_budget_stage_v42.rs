@@ -1857,7 +1857,12 @@ impl Injected {
             fingerprint(&request.request).unwrap(),
             fingerprint(&self.world.seen.lock().unwrap()[0]).unwrap()
         );
-        let redispatched = self.world.broker.dispatch_bound(request).await.unwrap();
+        let redispatched = self
+            .world
+            .broker
+            .dispatch_compiler_bound(request)
+            .await
+            .unwrap();
         assert_eq!(
             self.world.provider_calls(),
             1,
@@ -2093,13 +2098,16 @@ async fn a_bound_development_environment_remains_a_scalar_with_real_content_edge
     let journal = world.fixture.journal();
     let (fact, inputs) = environment_preparation(&world, "environment-positive").await;
     let root = world.root().await;
-    journal.commit_bound(fact.clone(), &inputs).await.unwrap();
+    journal
+        .commit_source_bound(fact.clone(), &inputs)
+        .await
+        .unwrap();
     let stored = journal.reload(&fact.artifact_id).await.unwrap();
     assert_eq!(fingerprint(&stored).unwrap(), fingerprint(&fact).unwrap());
     assert_eq!(
         fingerprint(
             &journal
-                .lookup_bound(&fact.artifact_id, &inputs)
+                .lookup_source_bound(&fact.artifact_id, &inputs)
                 .await
                 .unwrap()
                 .unwrap()
@@ -2155,7 +2163,10 @@ async fn a_bound_development_environment_remains_a_scalar_with_real_content_edge
         .unwrap();
     assert_eq!(fingerprint(&cached).unwrap(), fingerprint(&fact).unwrap());
     session.commit().await.unwrap();
-    journal.commit_bound(fact.clone(), &inputs).await.unwrap();
+    journal
+        .commit_source_bound(fact.clone(), &inputs)
+        .await
+        .unwrap();
     assert_eq!(
         fingerprint(&journal.reload(&fact.artifact_id).await.unwrap()).unwrap(),
         fingerprint(&fact).unwrap()
@@ -2248,7 +2259,7 @@ async fn invalid_environment_preparations_leave_no_partial_journal_or_dispatch()
         let rejected = if case == "missing-binding" {
             journal.commit(fact.clone()).await
         } else {
-            journal.commit_bound(fact.clone(), &inputs).await
+            journal.commit_source_bound(fact.clone(), &inputs).await
         };
         assert!(
             matches!(

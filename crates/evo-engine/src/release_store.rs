@@ -567,16 +567,23 @@ impl ReleaseStore {
             return Err(Error::Forbidden);
         }
         validate_read_candidate_sources(&mut session, ctx, &candidate).await?;
-        let read = crate::streaming_evaluator::read_verified_formal_report_in_session(ctx, &mut session, report_id).await?;
+        let read = crate::streaming_evaluator::read_verified_formal_report_in_session(
+            ctx,
+            &mut session,
+            report_id,
+        )
+        .await?;
         // A historical report first retains all original negative diagnostics.
         // Healthy legacy material then refuses every new approval before DML.
         validate_read_verified_report_identity(&candidate, read.historical_view())?;
         validate_read_approval_actor(ctx, &candidate, read.historical_view())?;
         if !candidate.is_current() {
-            return Err(Error::Conflict("source_legacy: formal report is not Current input".into()));
+            return Err(Error::Conflict(
+                "source_legacy: formal report is not Current input".into(),
+            ));
         }
         candidate.current()?;
-        let view=read.current_view()?.clone();
+        let view = read.current_view()?.clone();
         let pointer = load_pointer(&mut session, ctx, &candidate.profile_id).await?;
         let release_id = format!(
             "release-{}",

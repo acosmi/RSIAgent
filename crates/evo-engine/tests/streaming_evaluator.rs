@@ -22,8 +22,8 @@ use evo_engine::dispatch::{
 };
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::release_store::{
-    CurrentStageBundleRequest as StageBundleRequest, ReleaseCandidateRecord, ReleaseStore,
-    TypedSourceRef,
+    CurrentReleaseCandidateRecord as ReleaseCandidateRecord,
+    CurrentStageBundleRequest as StageBundleRequest, ReleaseStore, TypedSourceRef,
 };
 use evo_engine::streaming_evaluator::{
     EvaluationEvidenceScope, ExecutionReceiptRequest, ExecutionReceiptV2, ExecutionSide,

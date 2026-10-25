@@ -668,11 +668,13 @@ fn assert_current_defaults(record: &HostSurfaceRecordV2, depth: usize) {
     }));
 }
 
+type ObjectDependencyImage = (String, String, Vec<(String, String)>);
+
 #[derive(Debug, PartialEq, Eq)]
 struct CurrentImage {
     artifacts: Vec<Value>,
     runs: Vec<Value>,
-    edges: Vec<(String, String, Vec<(String, String)>)>,
+    edges: Vec<ObjectDependencyImage>,
     counts: (u64, u64, usize),
     facts: evo_storage::lifecycle::ControlPlaneFacts,
     files: BTreeMap<String, (bool, Vec<u8>)>,

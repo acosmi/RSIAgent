@@ -1845,7 +1845,7 @@ async fn current_fact_source_preflight_precedes_first_dml() {
     use evo_engine::model::CurrentCompilerInputUse;
     use evo_engine::optimization::{StageDependency, StoreOptimizationJournal as ActualJournal};
     fn sql_image(path: &std::path::Path) -> serde_json::Value {
-        let script=r#"
+        let script = r#"
 import json,sqlite3,sys
 con=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
 quote=lambda name:'"'+name.replace('"','""')+'"'
@@ -1855,8 +1855,16 @@ for (name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' OR
     image[name]=[[{'blob':x.hex()} if isinstance(x,bytes) else x for x in row] for row in con.execute('SELECT * FROM '+quote(name)+' ORDER BY '+','.join(str(i+1) for i in range(len(columns))))]
 con.close();print(json.dumps(image,sort_keys=True))
 "#;
-        let output=std::process::Command::new("python3").args(["-B","-c",script]).arg(path).output().unwrap();
-        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+        let output = std::process::Command::new("python3")
+            .args(["-B", "-c", script])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         serde_json::from_slice(&output.stdout).unwrap()
     }
     async fn fixture() -> (tempfile::TempDir, Store, Context, CurrentCompilerInputUse) {
@@ -1962,7 +1970,7 @@ con.close();print(json.dumps(image,sort_keys=True))
                 .unwrap();
             session.commit().await.unwrap();
             let audit = store.verify_audit(&worker).await.unwrap();
-            let before_sql=sql_image(&directory.path().join("preflight.sqlite3"));
+            let before_sql = sql_image(&directory.path().join("preflight.sqlite3"));
             let invalid = if fault == "environment" {
                 fact(vec![StageDependency {
                     kind: "environment".into(),
@@ -2005,7 +2013,10 @@ con.close();print(json.dumps(image,sort_keys=True))
             );
             session.commit().await.unwrap();
             assert_eq!(store.verify_audit(&worker).await.unwrap(), audit);
-            assert_eq!(sql_image(&directory.path().join("preflight.sqlite3")),before_sql);
+            assert_eq!(
+                sql_image(&directory.path().join("preflight.sqlite3")),
+                before_sql
+            );
             store.close().await;
         }
     }

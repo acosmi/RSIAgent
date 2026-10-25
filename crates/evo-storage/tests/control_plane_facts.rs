@@ -897,7 +897,12 @@ async fn current_host_restore_precision_fault_is_zero_write() {
             "source-mismatch",
             source.original_utf8.replace("0.1", "0.2"),
         ),
-        ("source-resource", source.original_utf8.replace("0.1", &("[".repeat(257)+"0"+&"]".repeat(257)))),
+        (
+            "source-resource",
+            source
+                .original_utf8
+                .replace("0.1", &("[".repeat(257) + "0" + &"]".repeat(257))),
+        ),
     ] {
         let mut changed = body.clone();
         changed["source"]["original_utf8"] = json!(original);
@@ -918,9 +923,14 @@ async fn current_host_restore_precision_fault_is_zero_write() {
         let before = snapshot(dir.path());
         let expected = if name == "source-resource" {
             "object n/artifact/host-current has an unreadable body: reviewed host JSON resource limit: depth"
-        } else { "object n/artifact/host-current has an unreadable body: invalid reviewed host source/default" };
-        assert!(matches!(read_control_plane_facts(&path).await,
-            Err(evo_core::Error::Invalid(message)) if message == expected), "{name}");
+        } else {
+            "object n/artifact/host-current has an unreadable body: invalid reviewed host source/default"
+        };
+        assert!(
+            matches!(read_control_plane_facts(&path).await,
+            Err(evo_core::Error::Invalid(message)) if message == expected),
+            "{name}"
+        );
         assert_eq!(snapshot(dir.path()), before, "{name}");
         let after = compiler_cleanup_bodies(&path).await;
         assert_eq!(after["host-current"], damaged, "{name}");

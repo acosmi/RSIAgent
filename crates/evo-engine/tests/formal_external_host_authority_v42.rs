@@ -12,9 +12,9 @@ use evo_core::contract::{
     SkillSnapshot, compile_bundle,
 };
 use evo_core::evaluation::{
-    ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec,
-    FormalExperimentPlanV41, FormalStatisticalUnit, Money, OptimizationBudgetPlan,
-    OptimizerComparisonContract, ProfileKind, Verdict,
+    ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec, FormalExperimentPlanV41,
+    FormalStatisticalUnit, Money, OptimizationBudgetPlan, OptimizerComparisonContract, ProfileKind,
+    Verdict,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::holdout::{
@@ -26,27 +26,23 @@ use evo_core::sequential::{AlphaAllocation, FormalClaimKind, ResearchFamilyAlpha
 use evo_core::{Context, Error, Role, Strategy, fingerprint, hash};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::formal_authority::{
-    CONTROL_PRINCIPAL_ACTION_SCHEMA, FormalAuthorityIssuer,
-    FormalOperatorCommand, FormalRegistry, FrozenCompilerProfile,
-    IndependentGradeCapture, IssuedFormalAuthority, METER_SCHEMA, PRINCIPAL_ACTION_SCHEMA,
-    PRINCIPALS_SCHEMA, RegisteredFormalHost, RegisteredPrincipal,
+    CONTROL_PRINCIPAL_ACTION_SCHEMA, FormalAuthorityIssuer, FormalOperatorCommand, FormalRegistry,
+    FrozenCompilerProfile, IndependentGradeCapture, IssuedFormalAuthority, METER_SCHEMA,
+    PRINCIPAL_ACTION_SCHEMA, PRINCIPALS_SCHEMA, RegisteredFormalHost, RegisteredPrincipal,
     RegisteredPrincipalSet, RegisteredResourceInstrumentation, TypedContentClosure,
     TypedContentEdge, TypedContentRef, content_digest, read_typed_closure,
 };
-use evo_engine::release_store::{
-    ReleaseCandidateRecord, ReleaseStore,
-};
+use evo_engine::release_store::{ReleaseCandidateRecord, ReleaseStore};
 use evo_engine::streaming_evaluator::{
-    AnchorEvidenceStatus, CostEvidenceScope, DependencyEvidenceStatus,
-    EvaluationEvidenceScope, ReadEvaluationTicket as EvaluationTicketV2, ExecutionSide,
-    FixedGraderMethod, FixedGraderSpec, FrozenOracleEntry, IndependentEvaluationControl,
-    IndependentGraderReceiptV2, IssueTicketRequest, ProtectedHoldoutRecord, ProtectedInputRef,
+    AnchorEvidenceStatus, CostEvidenceScope, DependencyEvidenceStatus, EvaluationEvidenceScope,
+    ExecutionSide, FixedGraderMethod, FixedGraderSpec, FrozenOracleEntry,
+    IndependentEvaluationControl, IndependentGraderReceiptV2, IssueTicketRequest,
+    ProtectedHoldoutRecord, ProtectedInputRef, ReadEvaluationTicket as EvaluationTicketV2,
     RegisteredEvaluationControl, StartExecutionRequest, TargetState, TicketLifecycle,
     VerifiedReportVariant, verified_report_view_in_session,
 };
 use evo_storage::budget::{
-    BudgetCallFence, BudgetCallReservation, BudgetStage,
-    RootBudgetAuthorization, UsageCharge,
+    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization, UsageCharge,
 };
 use evo_storage::{Session, Store};
 use serde::Serialize;
@@ -67,7 +63,6 @@ const TICKET: &str = "ticket-ag095";
 const CONTROL_ID: &str = "control-ag095";
 const HOLDOUT_ID: &str = "holdout-ag095";
 const ATTEMPT: &str = "attempt-1";
-const MANDATORY: &str = "fixture-mandatory-context";
 const GRADER_KEY: &str = "RSIA_AG095_GRADER_CREDENTIAL";
 const GRADER_SECRET: &str = "ag095-grader-private-fixture-credential-32-bytes";
 /// The fixed-sample empirical-Bernstein radius at alpha 0.04 needs 20 clusters
@@ -353,44 +348,106 @@ fn spawn_grader_command(fx: &IngressFx, command: Value) -> std::process::Child {
 
 async fn finalize(db: &Path) -> Result<Value, String> {
     let store = Store::open(db).await.unwrap();
-    let result = IndependentEvaluationControl::finalize_complete(&ctx(Role::Evaluator, GRADER), &store, TICKET, evo_core::now().unwrap()).await;
+    let result = IndependentEvaluationControl::finalize_complete(
+        &ctx(Role::Evaluator, GRADER),
+        &store,
+        TICKET,
+        evo_core::now().unwrap(),
+    )
+    .await;
     store.close().await;
-    result.map(|formal| serde_json::to_value(formal).unwrap()).map_err(|error| match error { Error::Forbidden => "forbidden".into(), Error::Conflict(_) => "conflict".into(), other => panic!("unexpected finalization error: {other:?}") })
+    result
+        .map(|formal| serde_json::to_value(formal).unwrap())
+        .map_err(|error| match error {
+            Error::Forbidden => "forbidden".into(),
+            Error::Conflict(_) => "conflict".into(),
+            other => panic!("unexpected finalization error: {other:?}"),
+        })
 }
 
 async fn historical_fixture(phase: &str) -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("history.sqlite3");
     Store::open(&db).await.unwrap().close().await;
-    let metadata = trusted_compiler_inputs::restore_legacy_external_history(&db, phase).await.unwrap();
+    let metadata = trusted_compiler_inputs::restore_legacy_external_history(&db, phase)
+        .await
+        .unwrap();
     let store = Store::open(&db).await.unwrap();
     let mut session = store.session().await.unwrap();
     let grader = ctx(Role::Evaluator, GRADER);
-    let host = session.need(&grader, "artifact", metadata["host_id"].as_str().unwrap()).await.unwrap();
-    let candidate = session.need(&grader, "artifact", metadata["candidate_id"].as_str().unwrap()).await.unwrap();
-    drop(session); store.close().await;
-    Fx { _db_dir: dir, db, host, set: serde_json::from_value(metadata["principal_set"].clone()).unwrap(), candidate, graded: serde_json::from_value(metadata["graded"].clone()).unwrap(), producer_outputs: metadata["outputs"].clone() }
+    let host = session
+        .need(&grader, "artifact", metadata["host_id"].as_str().unwrap())
+        .await
+        .unwrap();
+    let candidate = session
+        .need(
+            &grader,
+            "artifact",
+            metadata["candidate_id"].as_str().unwrap(),
+        )
+        .await
+        .unwrap();
+    drop(session);
+    store.close().await;
+    Fx {
+        _db_dir: dir,
+        db,
+        host,
+        set: serde_json::from_value(metadata["principal_set"].clone()).unwrap(),
+        candidate,
+        graded: serde_json::from_value(metadata["graded"].clone()).unwrap(),
+        producer_outputs: metadata["outputs"].clone(),
+    }
 }
 
 async fn historical_formal(fx: &Fx) -> Value {
     assert_eq!(fx.producer_outputs["formal"]["variant"], "complete_batch");
     let store = Store::open(&fx.db).await.unwrap();
     let mut session = store.session().await.unwrap();
-    let row: Value = session.need(&ctx(Role::Evaluator, GRADER), "artifact", &storage_id(FORMAL_KIND,TICKET)).await.unwrap();
-    drop(session); store.close().await;
+    let row: Value = session
+        .need(
+            &ctx(Role::Evaluator, GRADER),
+            "artifact",
+            &storage_id(FORMAL_KIND, TICKET),
+        )
+        .await
+        .unwrap();
+    drop(session);
+    store.close().await;
     row["payload"].clone()
 }
 
-async fn historical_view(reader: &Context, store: &Store) -> evo_engine::streaming_evaluator::VerifiedFormalReportView {
+async fn historical_view(
+    reader: &Context,
+    store: &Store,
+) -> evo_engine::streaming_evaluator::VerifiedFormalReportView {
     let mut session = store.session().await.unwrap();
-    let history = evo_engine::streaming_evaluator::read_verified_formal_report_in_session(reader,&mut session,TICKET).await.unwrap();
-    assert_eq!(history.state(), evo_storage::PersistentContractState::Legacy);
-    assert!(matches!(history.current_view(), Err(Error::Conflict(message)) if message == "source_legacy: formal report is not Current input"));
+    let history = evo_engine::streaming_evaluator::read_verified_formal_report_in_session(
+        reader,
+        &mut session,
+        TICKET,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        history.state(),
+        evo_storage::PersistentContractState::Legacy
+    );
+    assert!(
+        matches!(history.current_view(), Err(Error::Conflict(message)) if message == "source_legacy: formal report is not Current input")
+    );
     let original = history.historical_view().clone();
     drop(session);
-    let current = IndependentEvaluationControl::verified_report_view(reader,store,TICKET).await.unwrap();
+    let current = IndependentEvaluationControl::verified_report_view(reader, store, TICKET)
+        .await
+        .unwrap();
     assert!(!current.promotion_eligible);
-    assert!(current.ineligibility_reasons.iter().any(|reason| reason == "source_legacy"));
+    assert!(
+        current
+            .ineligibility_reasons
+            .iter()
+            .any(|reason| reason == "source_legacy")
+    );
     original
 }
 
@@ -444,7 +501,14 @@ async fn assert_issue_refused_before_stage(
     assert!(matches!(status, Err(Error::NotFound)), "{status:?}");
 }
 
-struct IngressFx { _db_dir: tempfile::TempDir, db: PathBuf, _workspace: tempfile::TempDir, workspace: PathBuf, host: RegisteredFormalHost, set: RegisteredPrincipalSet }
+struct IngressFx {
+    _db_dir: tempfile::TempDir,
+    db: PathBuf,
+    _workspace: tempfile::TempDir,
+    workspace: PathBuf,
+    host: RegisteredFormalHost,
+    set: RegisteredPrincipalSet,
+}
 
 // This producer stops before staging. It creates no candidate, ticket, model
 // dispatch or issued report; the reachable RegisterControl ingress still runs.
@@ -614,8 +678,7 @@ async fn prepare_control_ingress(order: TicketOrder) -> Option<IngressFx> {
             .unwrap();
     }
     let mut s = store.session().await.unwrap();
-    s
-        .bump_watermark(&host_ctx, &d("ag095-initial-watermark"))
+    s.bump_watermark(&host_ctx, &d("ag095-initial-watermark"))
         .await
         .unwrap();
     s.commit().await.unwrap();
@@ -868,13 +931,31 @@ async fn prepare_control_ingress(order: TicketOrder) -> Option<IngressFx> {
         )
         .await;
     }
-    principal_action(&mut s, &host, &set, Role::Evaluator, "artifact", &control_storage_id, content_digest(&control).unwrap(), "register_control").await;
-    s.commit().await.unwrap(); store.close().await;
-    Some(IngressFx { _db_dir: db_dir, db, _workspace: workspace_dir, workspace, host, set })
+    principal_action(
+        &mut s,
+        &host,
+        &set,
+        Role::Evaluator,
+        "artifact",
+        &control_storage_id,
+        content_digest(&control).unwrap(),
+        "register_control",
+    )
+    .await;
+    s.commit().await.unwrap();
+    store.close().await;
+    Some(IngressFx {
+        _db_dir: db_dir,
+        db,
+        _workspace: workspace_dir,
+        workspace,
+        host,
+        set,
+    })
 }
 
 async fn prepare_in(order: TicketOrder) -> Fx {
-    assert!(matches!(order,TicketOrder::StagedBeforeIssue));
+    assert!(matches!(order, TicketOrder::StagedBeforeIssue));
     historical_fixture("P").await
 }
 
@@ -1493,7 +1574,11 @@ async fn bound_ticket_complete_batch_issues_authority_through_attachment_cycles(
     // attachment edges make cyclic; read it in-process before finalization.
     let direct = ticket_closure(&fx.db).await;
     let formal = historical_formal(&fx).await;
-    println!("AG109_T1 ticket_closure={:?} parent_historical_formal={:?}", direct.as_ref().map(|closure| closure.nodes.len()), formal["variant"]);
+    println!(
+        "AG109_T1 ticket_closure={:?} parent_historical_formal={:?}",
+        direct.as_ref().map(|closure| closure.nodes.len()),
+        formal["variant"]
+    );
     let direct = direct.unwrap_or_else(|error| panic!("bound ticket closure refused: {error:?}"));
     assert_eq!(formal["variant"], "complete_batch");
     assert_eq!(formal["evidence_scope"], "registered_external_host");
@@ -2357,7 +2442,11 @@ async fn ag122_unit_matcher_preserves_roles_lifecycle_and_opaque_refusals() {
         .await
         .unwrap();
     let sources = vec!["S1".to_string(), "S2".to_string()];
-    for id in &sources { store_trace_authority(&store, &host, &source(id)).await.unwrap(); }
+    for id in &sources {
+        store_trace_authority(&store, &host, &source(id))
+            .await
+            .unwrap();
+    }
     let reserved = store
         .reserve_budget_call_with_sources(
             &host,
@@ -2740,80 +2829,224 @@ async fn legacy_bound_history_rechecks_all_pins_and_never_grants_current_use() {
     let grader = ctx(Role::Evaluator, GRADER);
     let host = ctx(Role::Host, HOST);
     let before = catalog(&prepared.db);
-    let ticket = IndependentEvaluationControl::status(&grader, &store, TICKET).await.unwrap().ticket;
+    let ticket = IndependentEvaluationControl::status(&grader, &store, TICKET)
+        .await
+        .unwrap()
+        .ticket;
     assert_eq!(ticket.schema_version, EvaluationTicketV2::SCHEMA);
     assert!(ticket.source_plan_binding.is_none());
     assert!(ticket.candidate_dependency_binding.is_some());
     let mut session = store.session().await.unwrap();
-    let call = session.budget_calls_for_group(&grader, BILLING, TICKET).await.unwrap().remove(0);
+    let call = session
+        .budget_calls_for_group(&grader, BILLING, TICKET)
+        .await
+        .unwrap()
+        .remove(0);
     drop(session);
-    let result = IndependentEvaluationControl::start_execution(&host, &store, StartExecutionRequest {
-        ticket_id: TICKET.into(), target_id: ticket.targets[0].target_id.clone(), side: ExecutionSide::Candidate,
-        fence: BudgetCallFence { billing_scope: BILLING.into(), call_id: call.call_id, actual_input_digest: call.actual_input_digest, lease_token: call.lease_token, lease_epoch: call.lease_epoch, now: evo_core::now().unwrap() },
-    }).await;
-    assert!(matches!(result,Err(Error::Conflict(message)) if message == "legacy evaluation ticket is not Current input"));
-    let result = IndependentEvaluationControl::finalize_complete(&grader, &store, TICKET, evo_core::now().unwrap()).await;
-    assert!(matches!(result,Err(Error::Conflict(message)) if message == "legacy evaluation ticket is not Current input"));
-    assert_eq!(catalog(&prepared.db),before);
+    let result = IndependentEvaluationControl::start_execution(
+        &host,
+        &store,
+        StartExecutionRequest {
+            ticket_id: TICKET.into(),
+            target_id: ticket.targets[0].target_id.clone(),
+            side: ExecutionSide::Candidate,
+            fence: BudgetCallFence {
+                billing_scope: BILLING.into(),
+                call_id: call.call_id,
+                actual_input_digest: call.actual_input_digest,
+                lease_token: call.lease_token,
+                lease_epoch: call.lease_epoch,
+                now: evo_core::now().unwrap(),
+            },
+        },
+    )
+    .await;
+    assert!(
+        matches!(result,Err(Error::Conflict(message)) if message == "legacy evaluation ticket is not Current input")
+    );
+    let result = IndependentEvaluationControl::finalize_complete(
+        &grader,
+        &store,
+        TICKET,
+        evo_core::now().unwrap(),
+    )
+    .await;
+    assert!(
+        matches!(result,Err(Error::Conflict(message)) if message == "legacy evaluation ticket is not Current input")
+    );
+    assert_eq!(catalog(&prepared.db), before);
     store.close().await;
     // Each independently valid binding pin keeps its original mismatch error.
-    for field in ["namespace", "bundle_digest", "parent_digest", "profile_id", "environment_digest", "proposer_actor", "revoke_watermark_seq", "revoke_watermark_digest", "candidate_record_digest", "nodes", "sources"] {
+    for field in [
+        "namespace",
+        "bundle_digest",
+        "parent_digest",
+        "profile_id",
+        "environment_digest",
+        "proposer_actor",
+        "revoke_watermark_seq",
+        "revoke_watermark_digest",
+        "candidate_record_digest",
+        "nodes",
+        "sources",
+    ] {
         let (_dir, db) = copy_database(&prepared);
         let store = Store::open(&db).await.unwrap();
         let mut session = store.session().await.unwrap();
-        let physical = storage_id(TICKET_KIND,TICKET);
-        let mut envelope: Value = session.need(&grader,"artifact",&physical).await.unwrap();
+        let physical = storage_id(TICKET_KIND, TICKET);
+        let mut envelope: Value = session.need(&grader, "artifact", &physical).await.unwrap();
         let binding = &mut envelope["payload"]["candidate_dependency_binding"];
         match field {
-            "namespace" | "profile_id" | "proposer_actor" => binding[field] = json!("other-identity"),
-            "revoke_watermark_seq" => binding[field] = json!(binding[field].as_i64().unwrap()+1),
+            "namespace" | "profile_id" | "proposer_actor" => {
+                binding[field] = json!("other-identity")
+            }
+            "revoke_watermark_seq" => binding[field] = json!(binding[field].as_i64().unwrap() + 1),
             "candidate_record_digest" => {
                 binding[field] = json!(d("changed-pin"));
-                let node = binding["nodes"].as_array_mut().unwrap().iter_mut().find(|node| node["id"]==prepared.candidate.id).unwrap();
+                let node = binding["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|node| node["id"] == prepared.candidate.id)
+                    .unwrap();
                 node["content_digest"] = json!(d("changed-pin"));
             }
             "nodes" => binding[field][0]["outgoing_edge_digest"] = json!(d("changed-pin")),
             "sources" => binding[field][0]["content_digest"] = json!(d("changed-pin")),
             _ => binding[field] = json!(d("changed-pin")),
         }
-        session.put(&grader,"artifact",&physical,GRADER,&envelope).await.unwrap();
+        session
+            .put(&grader, "artifact", &physical, GRADER, &envelope)
+            .await
+            .unwrap();
         session.commit().await.unwrap();
-        let before=catalog(&db);
-        let result=IndependentEvaluationControl::status(&grader,&store,TICKET).await;
-        assert!(matches!(result,Err(Error::Conflict(message)) if message == "formal_candidate_dependency_binding_changed"),"binding {field}");
-        assert_eq!(catalog(&db),before);
+        let before = catalog(&db);
+        let result = IndependentEvaluationControl::status(&grader, &store, TICKET).await;
+        assert!(
+            matches!(result,Err(Error::Conflict(message)) if message == "formal_candidate_dependency_binding_changed"),
+            "binding {field}"
+        );
+        assert_eq!(catalog(&db), before);
         store.close().await;
     }
     // Each single pin fault reaches the original complete candidate fingerprint
     // guard; the healthy Legacy branch above is essential to this protection.
-    for field in ["environment_digest", "parent_digest", "proposer_actor", "sources"] {
+    for field in [
+        "environment_digest",
+        "parent_digest",
+        "proposer_actor",
+        "sources",
+    ] {
         let (_dir, db) = copy_database(&prepared);
         let store = Store::open(&db).await.unwrap();
         let mut session = store.session().await.unwrap();
-        let mut candidate: Value = session.need(&grader,"artifact",&prepared.candidate.id).await.unwrap();
-        if field == "sources" { candidate[field].as_array_mut().unwrap().pop(); }
-        else if field == "proposer_actor" { candidate[field]=json!("other-proposer"); }
-        else { candidate[field]=json!(d("changed-original-pin")); }
-        session.put(&ctx(Role::Worker,PROPOSER),"artifact",&prepared.candidate.id,PROPOSER,&candidate).await.unwrap();
+        let mut candidate: Value = session
+            .need(&grader, "artifact", &prepared.candidate.id)
+            .await
+            .unwrap();
+        if field == "sources" {
+            candidate[field].as_array_mut().unwrap().pop();
+        } else if field == "proposer_actor" {
+            candidate[field] = json!("other-proposer");
+        } else {
+            candidate[field] = json!(d("changed-original-pin"));
+        }
+        session
+            .put(
+                &ctx(Role::Worker, PROPOSER),
+                "artifact",
+                &prepared.candidate.id,
+                PROPOSER,
+                &candidate,
+            )
+            .await
+            .unwrap();
         session.commit().await.unwrap();
-        let before=catalog(&db);
-        let result=IndependentEvaluationControl::status(&grader,&store,TICKET).await;
-        assert!(matches!(result,Err(Error::Conflict(message)) if message == "formal_candidate_dependency_binding_changed"),"{field}");
-        assert_eq!(catalog(&db),before);
+        let before = catalog(&db);
+        let result = IndependentEvaluationControl::status(&grader, &store, TICKET).await;
+        assert!(
+            matches!(result,Err(Error::Conflict(message)) if message == "formal_candidate_dependency_binding_changed"),
+            "{field}"
+        );
+        assert_eq!(catalog(&db), before);
         store.close().await;
     }
-    let finished=historical_fixture("F").await;
-    let store=Store::open(&finished.db).await.unwrap();
-    let before=catalog(&finished.db);
-    let view=historical_view(&ctx(Role::Admin,ADMIN),&store).await;
+    {
+        let (_dir, db) = copy_database(&prepared);
+        let store = Store::open(&db).await.unwrap();
+        let mut session = store.session().await.unwrap();
+        let id = format!("formal-cost-{TICKET}");
+        let mut cost: Value = session.need(&grader, "artifact", &id).await.unwrap();
+        cost["measurements"]["cpu_nanoseconds"] = json!(2);
+        put_witnessed(&mut session, Role::Host, HOST, "artifact", &id, &cost).await;
+        session.commit().await.unwrap();
+        let before = catalog(&db);
+        let result = IndependentEvaluationControl::finalize_complete(
+            &grader,
+            &store,
+            TICKET,
+            evo_core::now().unwrap(),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Forbidden)), "{result:?}");
+        assert_eq!(catalog(&db), before);
+        store.close().await;
+    }
+    let finished = historical_fixture("F").await;
+    let store = Store::open(&finished.db).await.unwrap();
+    let before = catalog(&finished.db);
+    let status = IndependentEvaluationControl::status(&grader, &store, TICKET)
+        .await
+        .unwrap();
+    assert_eq!(status.ticket.lifecycle, TicketLifecycle::CompleteBatch);
+    let authority = FormalAuthorityIssuer::revalidate(
+        &ctx(Role::Admin, ADMIN),
+        &store,
+        TICKET,
+        &finished.candidate.id,
+    )
+    .await
+    .unwrap();
+    let mut session = store.session().await.unwrap();
+    let seal = session
+        .sealed_root_budget_evidence(&ctx(Role::Admin, ADMIN), BILLING)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(authority.root_seal_digest, fingerprint(&seal).unwrap());
+    // Preserve the actual parent's original typed root seal independently from
+    // the explicitly derived locator-dependent template and its current pins.
+    assert_eq!(
+        finished.producer_outputs["authority"]["root_seal_digest"],
+        "dac0623abafb6700d5570e4ab751a1ad04b08f892b29af0a53d3625903b2ed28"
+    );
+    assert_ne!(
+        authority.root_seal_digest,
+        finished.producer_outputs["authority"]["root_seal_digest"]
+            .as_str()
+            .unwrap()
+    );
+    drop(session);
+    let view = historical_view(&ctx(Role::Admin, ADMIN), &store).await;
     assert!(view.promotion_eligible);
-    assert_eq!(finished.producer_outputs["view_admin"]["promotion_eligible"],true);
-    let result=ReleaseStore::approve_verified(&ctx(Role::Admin,ADMIN),&store,&finished.candidate.id,TICKET).await;
-    assert!(matches!(result,Err(Error::Conflict(message)) if message == "source_legacy: formal report is not Current input"));
-    assert_eq!(catalog(&finished.db),before);
+    assert_eq!(
+        finished.producer_outputs["view_admin"]["promotion_eligible"],
+        true
+    );
+    let result = ReleaseStore::approve_verified(
+        &ctx(Role::Admin, ADMIN),
+        &store,
+        &finished.candidate.id,
+        TICKET,
+    )
+    .await;
+    assert!(
+        matches!(result,Err(Error::Conflict(message)) if message == "source_legacy: formal report is not Current input")
+    );
+    assert_eq!(catalog(&finished.db), before);
     store.close().await;
     // Exact edges remain part of all historical readers, including approval.
-    let (_dir,db)=copy_database(&finished);
-    add_artifact_edge(&db,&storage_id(FORMAL_KIND,TICKET),&finished.host.id).await;
-    assert_reads_refused(&db,&finished.candidate.id,EDGES_DIFFER).await;
+    let (_dir, db) = copy_database(&finished);
+    add_artifact_edge(&db, &storage_id(FORMAL_KIND, TICKET), &finished.host.id).await;
+    assert_reads_refused(&db, &finished.candidate.id, EDGES_DIFFER).await;
 }
