@@ -16,6 +16,10 @@
 //! backup agree on every protected fact, compared on the parsed body); only the set
 //! of facts grew, by one schema that covers all four record kinds.
 //!
+//! AG-178: `build_blocked_report` now writes a v2 report (a fifth record kind of the
+//! same envelope) and a v1 report stays in a store as legacy history; the history
+//! below holds both, and the envelope's schema still selects every kind.
+//!
 //! Every case that involves a restore starts from a real `Store::backup` and a real
 //! run of `scripts/restore_backup.py`; the gate cases run the real `StartupGate`
 //! against the directory the script produced. The records are written by the
@@ -86,6 +90,9 @@ const EXPERIMENT_KIND: &str = "replay_economic_experiment_v1";
 const JOB_KIND: &str = "replay_economic_job_v1";
 const COST_KIND: &str = "replay_economic_cost_receipt_v1";
 const REPORT_KIND: &str = "replay_economic_report_v1";
+/// The report kind `build_blocked_report` writes since AG-178; a v1 report stays in a
+/// store as legacy history, a record of the same envelope.
+const REPORT_V2_KIND: &str = "replay_economic_report_v2";
 /// The schema of the job payload; `replay_experiment.rs` writes it as a literal.
 const JOB_SCHEMA: &str = "rsia.replay_economic_job.v1";
 
@@ -726,24 +733,69 @@ enum Step {
     Start,
     /// `record_budget_cost`: a cost receipt of 20 micros; the job indexes it.
     Cost,
-    /// `build_blocked_report`: the report; the job names it.
+    /// `build_blocked_report`: the report (v2 since AG-178); the job names it.
     Report,
+    /// The v1 report of the same job, as the coordinator wrote it before AG-178: the
+    /// legacy record a store of that version holds. The coordinator no longer writes
+    /// v1, so this one record is stored as that version stored it.
+    LegacyReport,
     /// `cancel`: the job changes in place and nothing is added.
     Cancel,
 }
 
 impl Step {
     /// The order the steps can be taken in; a cancelled job takes no report.
-    const ALL: [Step; 5] = [
+    const ALL: [Step; 6] = [
         Step::Register,
         Step::Start,
         Step::Cost,
         Step::Report,
+        Step::LegacyReport,
         Step::Cancel,
     ];
     /// What an experiment that runs to its report leaves behind: one record of each
-    /// of the four kinds.
-    const HISTORY: [Step; 4] = [Step::Register, Step::Start, Step::Cost, Step::Report];
+    /// of the five kinds.
+    const HISTORY: [Step; 5] = [
+        Step::Register,
+        Step::Start,
+        Step::Cost,
+        Step::Report,
+        Step::LegacyReport,
+    ];
+}
+
+/// The envelope `replay_experiment.rs` stores a record in, field for field.
+#[derive(serde::Serialize)]
+struct StoredEnvelope<'a, T> {
+    schema_version: &'a str,
+    id: &'a str,
+    record_kind: &'a str,
+    payload: &'a T,
+}
+
+/// The v1 report the coordinator wrote before AG-178 for the job the v2 `report`
+/// was built from: the same fields without the cluster rows and statistics, under
+/// the v1 schema and the v1 id of the same input.
+fn legacy_v1_report(report: &ReplayEconomicReportV2) -> ReplayEconomicReportV1 {
+    let lineage = replay_economic_report_lineage(&report.id).unwrap();
+    assert_eq!(lineage[0].schema_version, REPORT_SCHEMA);
+    ReplayEconomicReportV1 {
+        schema_version: REPORT_SCHEMA.into(),
+        id: lineage[0].report_id.clone(),
+        experiment_id: report.experiment_id.clone(),
+        experiment_digest: report.experiment_digest.clone(),
+        paired_ticket_id: report.paired_ticket_id.clone(),
+        paired_ticket_digest: report.paired_ticket_digest.clone(),
+        paired_receipt_closure_digest: report.paired_receipt_closure_digest.clone(),
+        completed_paired_tasks: report.completed_paired_tasks,
+        paired_units: report.paired_units.clone(),
+        latency: report.latency.clone(),
+        quality_outcome: report.quality_outcome,
+        cost_receipt_ids: report.cost_receipt_ids.clone(),
+        economics: report.economics.clone(),
+        terminal: report.terminal,
+        reasons: report.reasons.clone(),
+    }
 }
 
 /// What one step wrote, as the gate names objects (`ns/kind/id`): the objects that
@@ -883,6 +935,7 @@ struct Scenario {
     manifest_bytes: Vec<u8>,
     experiment: ReplayEconomicExperimentV1,
     job_id: Option<String>,
+    report: Option<ReplayEconomicReportV2>,
 }
 
 impl Scenario {
@@ -907,6 +960,7 @@ impl Scenario {
             manifest_bytes: Vec::new(),
             experiment,
             job_id: None,
+            report: None,
         }
     }
 
@@ -1004,9 +1058,37 @@ impl Scenario {
                 .await
                 .unwrap();
                 assert_eq!(report.terminal, EconomicReportTerminal::BlockedSupport);
-                Stepped {
-                    new: vec![key(REPORT_KIND, &report.id)],
+                assert_eq!(report.schema_version, REPORT_SCHEMA_V2);
+                let stepped = Stepped {
+                    new: vec![key(REPORT_V2_KIND, &report.id)],
                     changed: vec![key(JOB_KIND, &job_id)],
+                };
+                self.report = Some(report);
+                stepped
+            }
+            Step::LegacyReport => {
+                let legacy = legacy_v1_report(self.report.as_ref().expect("the report was built"));
+                let id = economic_id(REPORT_KIND, &legacy.id);
+                let mut session = store.session().await.unwrap();
+                session
+                    .put(
+                        &admin(),
+                        "artifact",
+                        &id,
+                        evaluator.actor(),
+                        &StoredEnvelope {
+                            schema_version: ENVELOPE_SCHEMA,
+                            id: &id,
+                            record_kind: REPORT_KIND,
+                            payload: &legacy,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                session.commit().await.unwrap();
+                Stepped {
+                    new: vec![key(REPORT_KIND, &legacy.id)],
+                    changed: vec![],
                 }
             }
             Step::Cancel => {
@@ -1029,7 +1111,7 @@ impl Scenario {
         stepped
     }
 
-    /// The whole history an experiment leaves: the four steps of [`Step::HISTORY`].
+    /// The whole history an experiment leaves: the five steps of [`Step::HISTORY`].
     async fn run_history(&mut self) {
         for step in Step::HISTORY {
             self.step(step).await;
@@ -1288,6 +1370,7 @@ fn the_economic_envelope_is_listed_once_in_rust_and_once_in_the_restore_script()
         EXPERIMENT_SCHEMA,
         COST_RECEIPT_SCHEMA,
         REPORT_SCHEMA,
+        REPORT_SCHEMA_V2,
     ] {
         assert!(!rust.contains(schema), "{schema} is listed");
         assert!(!script_set.contains(schema), "{schema} is in the script");
@@ -1295,7 +1378,7 @@ fn the_economic_envelope_is_listed_once_in_rust_and_once_in_the_restore_script()
 }
 
 /// Both implementations select a record by the envelope's `schema_version` alone, so
-/// the four record kinds are all in the selection, and a database holding them yields
+/// the five record kinds are all in the selection, and a database holding them yields
 /// the same selection from the script and from the Rust reader. Records of other
 /// schemas that look like them are in neither.
 #[tokio::test]
@@ -1309,10 +1392,16 @@ async fn the_script_and_the_reader_select_every_record_kind_of_the_economic_enve
     let records = economic_objects(&scenario.live);
     assert_eq!(
         record_kinds(&records),
-        BTreeSet::from([EXPERIMENT_KIND, JOB_KIND, COST_KIND, REPORT_KIND]),
-        "one record of each of the four kinds: {records:#?}"
+        BTreeSet::from([
+            EXPERIMENT_KIND,
+            JOB_KIND,
+            COST_KIND,
+            REPORT_KIND,
+            REPORT_V2_KIND
+        ]),
+        "one record of each of the five kinds: {records:#?}"
     );
-    assert_eq!(records.len(), 4);
+    assert_eq!(records.len(), 5);
     let economic: BTreeSet<String> = records.keys().cloned().collect();
     let look_alike_keys: BTreeSet<String> = look_alikes()
         .iter()
@@ -1361,10 +1450,16 @@ async fn a_backup_older_than_the_anchor_on_the_economic_history_is_isolated() {
     let records = economic_objects(&scenario.live);
     assert_eq!(
         record_kinds(&records),
-        BTreeSet::from([EXPERIMENT_KIND, JOB_KIND, COST_KIND, REPORT_KIND]),
-        "one record of each of the four kinds: {records:#?}"
+        BTreeSet::from([
+            EXPERIMENT_KIND,
+            JOB_KIND,
+            COST_KIND,
+            REPORT_KIND,
+            REPORT_V2_KIND
+        ]),
+        "one record of each of the five kinds: {records:#?}"
     );
-    assert_eq!(records.len(), 4);
+    assert_eq!(records.len(), 5);
     let receipts: Vec<&Value> = records
         .values()
         .filter(|body| body["record_kind"] == COST_KIND)
@@ -1390,7 +1485,7 @@ async fn a_backup_older_than_the_anchor_on_the_economic_history_is_isolated() {
         "an experiment, its job, its cost receipt and its report only on the anchor",
     );
 
-    // What the script compared: it selects all four records on the anchor and none
+    // What the script compared: it selects all five records on the anchor and none
     // in the backup, so they are what the two sides disagree on.
     let economic: BTreeSet<String> = records.keys().cloned().collect();
     let on_anchor = script_selection(&scenario.live);
@@ -1512,7 +1607,7 @@ async fn an_equal_economic_history_restores_and_the_gate_admits_the_directory() 
     // the restored directory hold the same records byte for byte, and each of the
     // three really has them as protected facts.
     let anchor = economic_objects(&scenario.live);
-    assert_eq!(anchor.len(), 4, "{anchor:#?}");
+    assert_eq!(anchor.len(), 5, "{anchor:#?}");
     assert_eq!(economic_objects(&scenario.backup_database()), anchor);
     assert_eq!(economic_objects(&restored.data()), anchor);
     let economic: BTreeSet<(String, String, String)> = anchor
@@ -1559,10 +1654,10 @@ async fn a_record_the_cleanup_kept_still_isolates_a_backup_that_predates_it() {
     scenario.take_backup().await;
     scenario.run_history().await;
     let before = economic_objects(&scenario.live);
-    assert_eq!(before.len(), 4, "{before:#?}");
+    assert_eq!(before.len(), 5, "{before:#?}");
 
     // the source of the experiment's selection is revoked on the anchor and the
-    // cleanup runs to its end; the four records are exactly as they were
+    // cleanup runs to its end; the five records are exactly as they were
     let revocation = scenario.revoke_and_clean(REVOKED_RUN).await;
     assert_eq!(
         economic_objects(&scenario.live),
@@ -1598,9 +1693,9 @@ async fn a_backup_holding_the_history_restores_through_a_later_revocation_of_its
         .unwrap();
     assert_eq!(decision.posture(), RecoveryPosture::RestoredVerified);
 
-    // not vacuous: the four records are on every side, equal, and protected
+    // not vacuous: the five records are on every side, equal, and protected
     let anchor = economic_objects(&scenario.live);
-    assert_eq!(anchor.len(), 4, "{anchor:#?}");
+    assert_eq!(anchor.len(), 5, "{anchor:#?}");
     assert_eq!(economic_objects(&restored.data()), anchor);
     let protected: BTreeSet<String> = read_control_plane_facts(&restored.data())
         .await

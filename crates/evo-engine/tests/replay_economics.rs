@@ -1,3 +1,4 @@
+use evo_core::evaluation::Verdict;
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
 use evo_core::replay::*;
@@ -1825,4 +1826,394 @@ async fn invalid_derived_current_edges_preserve_the_real_parent_audit_and_all_re
         "historical/current/economic reads changed objects, dependency edges, audit or other database facts"
     );
     store.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// AG-178: report v2 is written, v1 reports are legacy history (plan §5.1.1, V104)
+// ---------------------------------------------------------------------------
+
+/// The stored row of the blocked v1 report in the actual Parent history above
+/// (`economic_record_rows.blocked_report`), byte for byte: a real record the
+/// coordinator wrote before AG-178.
+const PARENT_V1_BLOCKED_REPORT_ROW: &str = r#"{"schema_version":"rsia.replay_economic_artifact_envelope.v1","id":"e11-7c0c436b0e54d2101378ed4de239b743adf79259e692686e57a23d59ad46bdef","record_kind":"replay_economic_report_v1","payload":{"schema_version":"rsia.replay_economic_report.v1","id":"replay-economic-report-deddffc2e36f640df68c9e67","experiment_id":"economic-exp-1","experiment_digest":"724b27e8d4cbc060484fe07313a08e476031c67558c2a0cf25719b93ab7b2fe6","paired_ticket_id":"paired-ticket","paired_ticket_digest":"1a708645fe31616bac1b9f93d5c5e2f13dafc8f3b855bca6195a7835c4b3e91a","paired_receipt_closure_digest":null,"completed_paired_tasks":0,"paired_units":[],"latency":null,"quality_outcome":"zero_or_inconclusive","cost_receipt_ids":[],"economics":{"status":"blocked","reasons":["no_cost_receipts"]},"terminal":"blocked_support","reasons":["e05_paired_ticket_not_found","real_provider_and_independent_runner_unavailable"]}}"#;
+const PARENT_V1_BLOCKED_REPORT_ROW_SHA256: &str =
+    "9b857f8a4d0b2310e0f59c6e4ce72602ea8c089f1666988789c68b3b299701e2";
+const ECONOMIC_ENVELOPE_SCHEMA: &str = "rsia.replay_economic_artifact_envelope.v1";
+const LEGACY_REPORT_KIND: &str = "replay_economic_report_v1";
+const CURRENT_REPORT_KIND: &str = "replay_economic_report_v2";
+
+/// The envelope `replay_experiment.rs` stores an economic record in, field for field.
+#[derive(serde::Serialize)]
+struct StoredEnvelope<'a, T> {
+    schema_version: &'a str,
+    id: &'a str,
+    record_kind: &'a str,
+    payload: &'a T,
+}
+
+fn economic_storage_id(record_kind: &str, id: &str) -> String {
+    format!("e11-{}", fingerprint(&(record_kind, id)).unwrap())
+}
+
+/// Stores `payload` as `replay_experiment.rs` stores a record of `record_kind`.
+async fn put_economic_record<T: serde::Serialize>(
+    store: &Store,
+    admin: &Context,
+    record_kind: &str,
+    id: &str,
+    owner: &str,
+    payload: &T,
+) {
+    let storage_id = economic_storage_id(record_kind, id);
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            admin,
+            "artifact",
+            &storage_id,
+            owner,
+            &StoredEnvelope {
+                schema_version: ECONOMIC_ENVELOPE_SCHEMA,
+                id: &storage_id,
+                record_kind,
+                payload,
+            },
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+}
+
+/// Revokes the first source run of the selection world of the actual Parent history
+/// and runs the cleanup until it stops.
+async fn clean_the_selection_source(
+    store: &Store,
+    admin: &Context,
+    metadata: &serde_json::Value,
+) -> evo_storage::lifecycle::CleanupStatus {
+    use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
+    let world_id = metadata["selection"]["member_reports"][0]["world_id"]
+        .as_str()
+        .unwrap();
+    let world =
+        evo_storage::replay::load_live_replay_world(admin, store, world_id, Purpose::Development)
+            .await
+            .unwrap();
+    let mut status = LifecycleStore::begin_revoke(
+        admin,
+        store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: world.manifest.source_closure[0].source_id.clone(),
+        },
+        "selection source revoked",
+        evo_core::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    for _ in 0..256 {
+        if matches!(status.state, CleanupState::Complete | CleanupState::Failed) {
+            break;
+        }
+        status =
+            LifecycleStore::cleanup_step(admin, store, &status.job_id, 8, evo_core::now().unwrap())
+                .await
+                .unwrap();
+    }
+    status
+}
+
+fn lineage_of(
+    view: &evo_engine::replay_experiment::ReplayEconomicReportAuditView,
+) -> Vec<(&str, &str, bool)> {
+    view.report_lineage
+        .iter()
+        .map(|entry| {
+            (
+                entry.schema_version.as_str(),
+                entry.report_id.as_str(),
+                entry.exists,
+            )
+        })
+        .collect()
+}
+
+/// V104.a/b on a real old record: the golden v1 row is statically readable (the v1
+/// wire is unchanged, the v1 judge is kept), reads as legacy with its lineage, its
+/// id is the one the v1 formula derives from its job and a v2 report of that job
+/// gets another, and a revocation cleanup that reaches it completes and keeps it.
+#[tokio::test]
+async fn actual_parent_v1_report_golden_bytes_read_as_legacy_and_the_cleanup_keeps_them() {
+    let (_dir, store, admin, evaluator, metadata) = actual_m33_history_copy().await;
+    assert_eq!(
+        hash(PARENT_V1_BLOCKED_REPORT_ROW.as_bytes()),
+        PARENT_V1_BLOCKED_REPORT_ROW_SHA256
+    );
+    let row = &metadata["economic_record_rows"]["blocked_report"];
+    assert_eq!(
+        row["body_utf8"].as_str(),
+        Some(PARENT_V1_BLOCKED_REPORT_ROW)
+    );
+    let physical_id = row["physical_id"].as_str().unwrap();
+    let mut session = store.session().await.unwrap();
+    assert_eq!(
+        session
+            .object_row(&admin, "artifact", physical_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        PARENT_V1_BLOCKED_REPORT_ROW
+    );
+    session.commit().await.unwrap();
+
+    let stored: serde_json::Value = serde_json::from_str(PARENT_V1_BLOCKED_REPORT_ROW).unwrap();
+    let legacy: ReplayEconomicReportV1 = serde_json::from_value(stored["payload"].clone()).unwrap();
+    assert_eq!(legacy.schema_version, REPORT_SCHEMA);
+    assert_eq!(
+        serde_json::to_string(&StoredEnvelope {
+            schema_version: ECONOMIC_ENVELOPE_SCHEMA,
+            id: physical_id,
+            record_kind: LEGACY_REPORT_KIND,
+            payload: &legacy,
+        })
+        .unwrap(),
+        PARENT_V1_BLOCKED_REPORT_ROW,
+        "the v1 wire changed"
+    );
+    assert_eq!(
+        physical_id,
+        economic_storage_id(LEGACY_REPORT_KIND, &legacy.id)
+    );
+    assert!(serde_json::from_value::<ReplayEconomicReportV2>(stored["payload"].clone()).is_err());
+    let experiment: ReplayEconomicExperimentV1 =
+        serde_json::from_value(metadata["experiment"].clone()).unwrap();
+    legacy.validate_against(&experiment).unwrap();
+
+    let mut snapshot: evo_engine::replay_experiment::ReplayEconomicJobV1 =
+        serde_json::from_value(metadata["blocked_job"].clone()).unwrap();
+    assert_eq!(snapshot.report_id.as_deref(), Some(legacy.id.as_str()));
+    snapshot.report_id = None;
+    let input = fingerprint(&snapshot).unwrap();
+    assert_eq!(
+        replay_economic_report_id(REPORT_SCHEMA, &input).unwrap(),
+        legacy.id
+    );
+    let successor = replay_economic_report_id(REPORT_SCHEMA_V2, &input).unwrap();
+    assert_ne!(successor, legacy.id);
+
+    for caller in [&evaluator, &admin] {
+        let read = PersistentReplayEconomicCoordinator::query_report(caller, &store, &legacy.id)
+            .await
+            .unwrap();
+        assert_eq!(read.report_state, ReplayRecordState::Legacy);
+        assert_eq!(read.report_schema_version, REPORT_SCHEMA);
+        assert!(read.source_legacy);
+        assert_eq!(read.raw_payload, metadata["blocked_report"]);
+        assert_eq!(
+            lineage_of(&read),
+            [
+                (REPORT_SCHEMA, legacy.id.as_str(), true),
+                (REPORT_SCHEMA_V2, successor.as_str(), false),
+            ]
+        );
+    }
+    original_m33_rows_unchanged(&store, &admin, &metadata).await;
+
+    // The same revocation on an untouched copy, for the number of nodes it visits.
+    let (_baseline_dir, baseline_store, baseline_admin, _, baseline_metadata) =
+        actual_m33_history_copy().await;
+    let baseline =
+        clean_the_selection_source(&baseline_store, &baseline_admin, &baseline_metadata).await;
+    assert_eq!(
+        baseline.state,
+        evo_storage::lifecycle::CleanupState::Complete,
+        "{baseline:?}"
+    );
+    baseline_store.close().await;
+    // An edge to the experiment makes the cleanup reach the v1 report.
+    let experiment_row = metadata["economic_record_rows"]["experiment"]["physical_id"]
+        .as_str()
+        .unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .put_edge(&admin, "artifact", physical_id, "artifact", experiment_row)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let cleaned = clean_the_selection_source(&store, &admin, &metadata).await;
+    assert_eq!(
+        cleaned.state,
+        evo_storage::lifecycle::CleanupState::Complete,
+        "{cleaned:?}"
+    );
+    assert_eq!(cleaned.last_error, None);
+    assert_eq!(cleaned.processed_nodes, baseline.processed_nodes + 1);
+    let mut session = store.session().await.unwrap();
+    assert_eq!(
+        session
+            .object_row(&admin, "artifact", physical_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        PARENT_V1_BLOCKED_REPORT_ROW,
+        "the cleanup kept the v1 report as it was"
+    );
+    session.commit().await.unwrap();
+    assert!(matches!(
+        PersistentReplayEconomicCoordinator::query_report(&evaluator, &store, &legacy.id).await,
+        Err(Error::Conflict(_))
+    ));
+    store.close().await;
+}
+
+/// V104.b/c over a current selection: a v1 report reads as legacy because of its own
+/// version (the selection is current) and is never handed out as the job's report;
+/// a new report is v2, under a new id of the same input, and reads as current.
+#[tokio::test]
+async fn a_v1_report_reads_legacy_over_a_current_selection_and_new_reports_are_v2() {
+    let (_directory, store, admin, evaluator, experiment) = setup().await;
+    let job = PersistentReplayEconomicCoordinator::start(
+        &evaluator,
+        &store,
+        &experiment.id,
+        "legacy-key",
+        1,
+    )
+    .await
+    .unwrap();
+    // The report the coordinator built for this job before AG-178.
+    let input = fingerprint(&job).unwrap();
+    let legacy = ReplayEconomicReportV1 {
+        schema_version: REPORT_SCHEMA.into(),
+        id: replay_economic_report_id(REPORT_SCHEMA, &input).unwrap(),
+        experiment_id: experiment.id.clone(),
+        experiment_digest: experiment.digest().unwrap(),
+        paired_ticket_id: experiment.paired_ticket_id.clone(),
+        paired_ticket_digest: experiment.paired_ticket_digest.clone(),
+        paired_receipt_closure_digest: None,
+        completed_paired_tasks: 0,
+        paired_units: vec![],
+        latency: None,
+        quality_outcome: PairedQualityOutcome::ZeroOrInconclusive,
+        cost_receipt_ids: vec![],
+        economics: EconomicComputation::Blocked {
+            reasons: vec!["no_cost_receipts".into()],
+        },
+        terminal: EconomicReportTerminal::BlockedSupport,
+        reasons: job.blocked_reasons.clone(),
+    };
+    legacy.validate_against(&experiment).unwrap();
+    let mut indexed = job.clone();
+    indexed.report_id = Some(legacy.id.clone());
+    put_economic_record(
+        &store,
+        &admin,
+        LEGACY_REPORT_KIND,
+        &legacy.id,
+        evaluator.actor(),
+        &legacy,
+    )
+    .await;
+    put_economic_record(
+        &store,
+        &admin,
+        "replay_economic_job_v1",
+        &job.id,
+        evaluator.actor(),
+        &indexed,
+    )
+    .await;
+
+    let successor = replay_economic_report_id(REPORT_SCHEMA_V2, &input).unwrap();
+    let read = PersistentReplayEconomicCoordinator::query_report(&evaluator, &store, &legacy.id)
+        .await
+        .unwrap();
+    assert!(
+        !read.replay_read_view.source_legacy,
+        "the selection is current"
+    );
+    assert!(read.source_legacy, "the v1 report itself is legacy");
+    assert_eq!(read.report_state, ReplayRecordState::Legacy);
+    assert_eq!(read.report_schema_version, REPORT_SCHEMA);
+    assert_eq!(read.raw_payload, serde_json::to_value(&legacy).unwrap());
+    assert_eq!(
+        lineage_of(&read),
+        [
+            (REPORT_SCHEMA, legacy.id.as_str(), true),
+            (REPORT_SCHEMA_V2, successor.as_str(), false),
+        ]
+    );
+    assert!(matches!(
+        PersistentReplayEconomicCoordinator::build_blocked_report(&evaluator, &store, &job.id, 10)
+            .await,
+        Err(Error::Invalid(reason)) if reason == "legacy_economic_report_not_consumable"
+    ));
+
+    let fresh = PersistentReplayEconomicCoordinator::start(
+        &evaluator,
+        &store,
+        &experiment.id,
+        "current-key",
+        1,
+    )
+    .await
+    .unwrap();
+    let fresh_input = fingerprint(&fresh).unwrap();
+    let report = PersistentReplayEconomicCoordinator::build_blocked_report(
+        &evaluator, &store, &fresh.id, 10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.schema_version, REPORT_SCHEMA_V2);
+    assert_eq!(
+        report.id,
+        replay_economic_report_id(REPORT_SCHEMA_V2, &fresh_input).unwrap()
+    );
+    let predecessor = replay_economic_report_id(REPORT_SCHEMA, &fresh_input).unwrap();
+    assert_ne!(report.id, predecessor);
+    assert!(report.cluster_rows.is_empty());
+    let statistics = &report.quality_statistics;
+    assert_eq!(statistics.stats_version, "rsia.empirical_bernstein.v2");
+    assert_eq!(statistics.verdict, Verdict::Invalid);
+    assert_eq!(statistics.reasons, ["n<2"]);
+    assert_eq!(statistics.alpha_i, "0.05");
+    assert_eq!((statistics.lcb_micros, statistics.ucb_micros), (None, None));
+    assert_eq!(report.terminal, EconomicReportTerminal::BlockedSupport);
+    report.validate_against(&experiment).unwrap();
+    let current = PersistentReplayEconomicCoordinator::query_report(&evaluator, &store, &report.id)
+        .await
+        .unwrap();
+    assert_eq!(current.report_state, ReplayRecordState::CurrentVerified);
+    assert!(!current.source_legacy);
+    assert_eq!(current.report_schema_version, REPORT_SCHEMA_V2);
+    assert_eq!(current.raw_payload, serde_json::to_value(&report).unwrap());
+    assert_eq!(
+        lineage_of(&current),
+        [
+            (REPORT_SCHEMA, predecessor.as_str(), false),
+            (REPORT_SCHEMA_V2, report.id.as_str(), true),
+        ]
+    );
+    let mut session = store.session().await.unwrap();
+    assert!(
+        session
+            .object_row(
+                &admin,
+                "artifact",
+                &economic_storage_id(CURRENT_REPORT_KIND, &report.id)
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
+    session.commit().await.unwrap();
+    assert_eq!(
+        PersistentReplayEconomicCoordinator::status(&evaluator, &store, &fresh.id)
+            .await
+            .unwrap()
+            .report_id,
+        Some(report.id.clone())
+    );
 }

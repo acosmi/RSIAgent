@@ -54,6 +54,9 @@ const EXPERIMENT_KIND: &str = "replay_economic_experiment_v1";
 const JOB_KIND: &str = "replay_economic_job_v1";
 const COST_KIND: &str = "replay_economic_cost_receipt_v1";
 const REPORT_KIND: &str = "replay_economic_report_v1";
+/// The report kind `build_blocked_report` writes since AG-178; a v1 report stays
+/// in a store as legacy history and is kept like the other kinds.
+const REPORT_V2_KIND: &str = "replay_economic_report_v2";
 /// The run of the Select world: revoking it reaches the whole chain.
 const REVOKED_RUN: &str = "run-select";
 
@@ -710,6 +713,40 @@ async fn write_raw_job(fx: &Fx, job: &ReplayEconomicJobV1) -> Value {
     body
 }
 
+/// The envelope `replay_experiment.rs` stores a record in, field for field.
+#[derive(serde::Serialize)]
+struct StoredEnvelope<'a, T> {
+    schema_version: &'a str,
+    id: &'a str,
+    record_kind: &'a str,
+    payload: &'a T,
+}
+
+/// The v1 report the coordinator wrote before AG-178 for the job the v2 `report`
+/// was built from: the same fields without the cluster rows and statistics, under
+/// the v1 schema and the v1 id of the same input.
+fn legacy_v1_report(report: &ReplayEconomicReportV2) -> ReplayEconomicReportV1 {
+    let lineage = replay_economic_report_lineage(&report.id).unwrap();
+    assert_eq!(lineage[0].schema_version, REPORT_SCHEMA);
+    ReplayEconomicReportV1 {
+        schema_version: REPORT_SCHEMA.into(),
+        id: lineage[0].report_id.clone(),
+        experiment_id: report.experiment_id.clone(),
+        experiment_digest: report.experiment_digest.clone(),
+        paired_ticket_id: report.paired_ticket_id.clone(),
+        paired_ticket_digest: report.paired_ticket_digest.clone(),
+        paired_receipt_closure_digest: report.paired_receipt_closure_digest.clone(),
+        completed_paired_tasks: report.completed_paired_tasks,
+        paired_units: report.paired_units.clone(),
+        latency: report.latency.clone(),
+        quality_outcome: report.quality_outcome,
+        cost_receipt_ids: report.cost_receipt_ids.clone(),
+        economics: report.economics.clone(),
+        terminal: report.terminal,
+        reasons: report.reasons.clone(),
+    }
+}
+
 /// What a refused job write must leave as it found it: the economic records, the
 /// artifacts, the edges over the experiment and the audit chain.
 async fn written(fx: &Fx) -> (BTreeMap<String, Value>, u64, Vec<(String, String)>, usize) {
@@ -741,13 +778,14 @@ struct History {
     fx: Fx,
     job: ReplayEconomicJobV1,
     receipt: CostComponentReceiptV1,
-    /// The four economic records as they are before any revocation.
+    /// The five economic records as they are before any revocation.
     before: BTreeMap<String, Value>,
 }
 
 /// The experiment of `setup`, a started job, one finalized budget call recorded as
-/// a cost receipt (a real amount) and the blocked report built over them: one
-/// record of each of the four kinds.
+/// a cost receipt (a real amount), the blocked report built over them (v2) and the
+/// v1 report a store of the version before AG-178 holds for the same job: one
+/// record of each of the five kinds.
 async fn history() -> History {
     let fx = setup().await;
     fx.store
@@ -831,13 +869,39 @@ async fn history() -> History {
     .await
     .unwrap();
     assert_eq!(report.terminal, EconomicReportTerminal::BlockedSupport);
+    assert_eq!(report.schema_version, REPORT_SCHEMA_V2);
+    let legacy = legacy_v1_report(&report);
+    let legacy_row = economic_id(REPORT_KIND, &legacy.id);
+    let mut session = fx.store.session().await.unwrap();
+    session
+        .put(
+            &fx.admin,
+            "artifact",
+            &legacy_row,
+            fx.evaluator.actor(),
+            &StoredEnvelope {
+                schema_version: ENVELOPE_SCHEMA,
+                id: &legacy_row,
+                record_kind: REPORT_KIND,
+                payload: &legacy,
+            },
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
     let before = economic_records(&fx.store, &fx.admin).await;
     assert_eq!(
         record_kinds(&before),
-        BTreeSet::from([EXPERIMENT_KIND, JOB_KIND, COST_KIND, REPORT_KIND]),
-        "one record of each of the four kinds: {before:#?}"
+        BTreeSet::from([
+            EXPERIMENT_KIND,
+            JOB_KIND,
+            COST_KIND,
+            REPORT_KIND,
+            REPORT_V2_KIND
+        ]),
+        "one record of each of the five kinds: {before:#?}"
     );
-    assert_eq!(before.len(), 4);
+    assert_eq!(before.len(), 5);
     History {
         fx,
         job,
@@ -885,7 +949,7 @@ async fn assert_the_chain(history: &History) {
 /// Revoking the run of the selection world reaches run -> world -> pool and report
 /// -> experiment -> job. The job used to fail at the experiment
 /// (`blocked_unknown_scope:artifact:rsia.replay_economic_artifact_envelope.v1:
-/// replay_economic_experiment_v1`). It completes, the four economic records are as
+/// replay_economic_experiment_v1`). It completes, the five economic records are as
 /// they were, and what the experiment selected is redacted as before.
 #[tokio::test]
 async fn revoking_a_run_cleans_through_the_economic_experiment_and_keeps_its_history() {
@@ -916,7 +980,7 @@ async fn revoking_a_run_cleans_through_the_economic_experiment_and_keeps_its_his
         // the job. (The receipt and the economic report have no edge.)
         assert_eq!(status.processed_nodes, 8, "limit {limit}: {status:?}");
 
-        // History and money: the four records are exactly as they were.
+        // History and money: the five records are exactly as they were.
         assert_eq!(
             economic_records(&fx.store, &fx.admin).await,
             history.before,
@@ -951,11 +1015,11 @@ async fn revoking_a_run_cleans_through_the_economic_experiment_and_keeps_its_his
     }
 }
 
-/// The cost receipt and the economic report have no dependency edge today, so the
-/// closure of a revoked run never visits them and the first test cannot tell
-/// whether they are classified. Linking them to the experiment, as a change that
-/// gives them an edge would, makes the cleanup reach every one of the four kinds:
-/// each is kept as it was.
+/// The cost receipt and the economic reports (v1 and v2) have no dependency edge
+/// today, so the closure of a revoked run never visits them and the first test
+/// cannot tell whether they are classified. Linking them to the experiment, as a
+/// change that gives them an edge would, makes the cleanup reach every one of the
+/// five kinds: each is kept as it was.
 #[tokio::test]
 async fn each_listed_record_kind_is_kept_when_the_cleanup_reaches_it() {
     let history = history().await;
@@ -964,10 +1028,15 @@ async fn each_listed_record_kind_is_kept_when_the_cleanup_reaches_it() {
     let unlinked: Vec<&String> = history
         .before
         .iter()
-        .filter(|(_, body)| matches!(body["record_kind"].as_str(), Some(COST_KIND | REPORT_KIND)))
+        .filter(|(_, body)| {
+            matches!(
+                body["record_kind"].as_str(),
+                Some(COST_KIND | REPORT_KIND | REPORT_V2_KIND)
+            )
+        })
         .map(|(id, _)| id)
         .collect();
-    assert_eq!(unlinked.len(), 2, "{:?}", history.before.keys());
+    assert_eq!(unlinked.len(), 3, "{:?}", history.before.keys());
     let mut session = fx.store.session().await.unwrap();
     for id in unlinked {
         session
@@ -981,8 +1050,8 @@ async fn each_listed_record_kind_is_kept_when_the_cleanup_reaches_it() {
     let (status, _) = drive(&fx.store, &fx.admin, status, 1, 0).await;
     assert_eq!(status.state, CleanupState::Complete, "{status:?}");
     assert_eq!(status.last_error, None);
-    // The eight nodes of the chain and the two records linked to the experiment.
-    assert_eq!(status.processed_nodes, 10, "{status:?}");
+    // The eight nodes of the chain and the three records linked to the experiment.
+    assert_eq!(status.processed_nodes, 11, "{status:?}");
     assert_eq!(economic_records(&fx.store, &fx.admin).await, history.before);
 }
 
@@ -1592,7 +1661,7 @@ async fn jobs_written_while_the_cleanup_runs_are_found_by_the_recheck_and_kept()
 // 5. What the preserved records hold
 // ---------------------------------------------------------------------------
 
-/// The classification keeps the four record kinds whole, so they must hold nothing
+/// The classification keeps the five record kinds whole, so they must hold nothing
 /// that came from a source. Every string in them is an identifier or a digest
 /// (the alphabet of `evo_core::identifier`), except the reason strings, which are
 /// either generated by the coordinator from a fixed vocabulary or typed by the
@@ -1691,6 +1760,18 @@ async fn the_preserved_records_hold_identifiers_digests_and_reason_strings_only(
         "reservation is neither released nor final usage",
         "budget call state cannot prove final cost",
     ];
+    // The reasons `evaluation::empirical_bernstein` gives a bound it cannot define,
+    // which a v2 report records with its statistics (AG-178).
+    const STATISTICS_REASON_PATH: &str = "/payload/quality_statistics/reasons/*";
+    const STATISTICS_REASONS: [&str; 7] = [
+        "alpha_i out of range",
+        "n<2",
+        "non-finite or out-of-range cluster observation",
+        "weights must sum to a positive finite value",
+        "variance not defined",
+        "log term invalid",
+        "radius not finite",
+    ];
     // Generated from a receipt id, a component name or an error of the E05 read.
     const GENERATED_PREFIXES: [&str; 5] = [
         "e05_paired_ticket_unavailable: ",
@@ -1721,7 +1802,13 @@ async fn the_preserved_records_hold_identifiers_digests_and_reason_strings_only(
     let records = economic_records(&fx.store, &fx.admin).await;
     assert_eq!(
         record_kinds(&records),
-        BTreeSet::from([EXPERIMENT_KIND, JOB_KIND, COST_KIND, REPORT_KIND])
+        BTreeSet::from([
+            EXPERIMENT_KIND,
+            JOB_KIND,
+            COST_KIND,
+            REPORT_KIND,
+            REPORT_V2_KIND
+        ])
     );
     let mut free_text = BTreeSet::new();
     for body in records.values() {
@@ -1731,13 +1818,16 @@ async fn the_preserved_records_hold_identifiers_digests_and_reason_strings_only(
             if identifier_like(&text) {
                 continue;
             }
-            let allowed = REASON_PATHS.contains(&path.as_str())
+            let allowed = (REASON_PATHS.contains(&path.as_str())
                 && (GENERATED.contains(&text.as_str())
                     || GENERATED_PREFIXES
                         .iter()
                         .any(|prefix| text.starts_with(prefix))
                     || text == typed_note
-                    || text == typed_cancel);
+                    || text == typed_cancel))
+                || (path == STATISTICS_REASON_PATH
+                    && body["record_kind"] == REPORT_V2_KIND
+                    && STATISTICS_REASONS.contains(&text.as_str()));
             assert!(
                 allowed,
                 "{} {path}: {text:?} is free text outside the reason strings",
@@ -1750,4 +1840,5 @@ async fn the_preserved_records_hold_identifiers_digests_and_reason_strings_only(
     let paths: BTreeSet<_> = free_text.iter().map(|(_, path)| path.as_str()).collect();
     assert!(paths.contains("/payload/cancel_reason"), "{free_text:?}");
     assert!(paths.contains("/payload/reason"), "{free_text:?}");
+    assert!(paths.contains(STATISTICS_REASON_PATH), "{free_text:?}");
 }

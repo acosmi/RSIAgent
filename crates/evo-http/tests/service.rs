@@ -1662,6 +1662,28 @@ async fn ag147_history_get_error(
 
 #[tokio::test]
 async fn actual_parent_http_reads_preserve_old_job_and_economic_payloads_and_roles() {
+    use evo_engine::replay_experiment::PersistentReplayEconomicCoordinator;
+    /// AG-178 (plan §6.1.2, Q-53): the economic report GET was a read-only HTTP
+    /// entry outside the registered operation table, so it is closed. Every caller,
+    /// with or without a token, gets the router's 404 and no report.
+    async fn assert_economic_report_route_closed(
+        client: &reqwest::Client,
+        url: &str,
+        token: Option<&str>,
+    ) {
+        let request = client.get(url);
+        let request = match token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        };
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{url} {token:?}");
+        let body = response.text().await.unwrap();
+        assert!(
+            !body.contains("raw_payload") && !body.contains("replay-economic-report"),
+            "{body}"
+        );
+    }
     let (_directory, store, metadata, state) = ag147_parent_history_http_state().await;
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let audit_before = store.verify_audit(&admin).await.unwrap();
@@ -1725,17 +1747,32 @@ async fn actual_parent_http_reads_preserve_old_job_and_economic_payloads_and_rol
         .unwrap();
     assert_eq!(forged.status(), StatusCode::FORBIDDEN);
 
+    // The facts the closed route served are read in the library, through
+    // `query_report`, with the same roles.
     for name in ["blocked_report", "cancelled_report"] {
         let report_id = metadata[name]["id"].as_str().unwrap();
         let url = format!("{base}/v1/manage/replay/economic-reports/{report_id}");
-        assert_eq!(
-            client.get(&url).send().await.unwrap().status(),
-            StatusCode::UNAUTHORIZED
-        );
-        for token in [ADMIN_TOKEN, EVALUATOR_TOKEN] {
-            let response = client.get(&url).bearer_auth(token).send().await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let body: Value = response.json().await.unwrap();
+        assert_economic_report_route_closed(&client, &url, None).await;
+        for token in [
+            ADMIN_TOKEN,
+            EVALUATOR_TOKEN,
+            AGENT_A_TOKEN,
+            HOST_TOKEN,
+            AG147_HISTORY_WORKER_TOKEN,
+            "history-other-eval-0123456789",
+            "history-other-admin-0123456789",
+        ] {
+            assert_economic_report_route_closed(&client, &url, Some(token)).await;
+        }
+        for caller in [
+            Context::new("n", "admin", Role::Admin).unwrap(),
+            Context::new("n", "evaluator", Role::Evaluator).unwrap(),
+        ] {
+            let view =
+                PersistentReplayEconomicCoordinator::query_report(&caller, &store, report_id)
+                    .await
+                    .unwrap();
+            let body = serde_json::to_value(&view).unwrap();
             assert_eq!(body["raw_payload"], metadata[name]);
             assert_eq!(body["source_legacy"], true);
             assert_eq!(body["replay_read_view"]["record"]["state"], "legacy");
@@ -1744,33 +1781,26 @@ async fn actual_parent_http_reads_preserve_old_job_and_economic_payloads_and_rol
                 metadata["selection"]
             );
         }
-        for token in [
-            AGENT_A_TOKEN,
-            HOST_TOKEN,
-            AG147_HISTORY_WORKER_TOKEN,
-            "history-other-eval-0123456789",
+        for caller in [
+            Context::new("n", "agent-a", Role::Agent).unwrap(),
+            Context::new("n", "fixture-host", Role::Host).unwrap(),
+            Context::new("n", "worker", Role::Worker).unwrap(),
+            Context::new("n", "other-evaluator", Role::Evaluator).unwrap(),
         ] {
-            assert_eq!(
-                client
-                    .get(&url)
-                    .bearer_auth(token)
-                    .send()
-                    .await
-                    .unwrap()
-                    .status(),
-                StatusCode::FORBIDDEN
-            );
+            assert!(matches!(
+                PersistentReplayEconomicCoordinator::query_report(&caller, &store, report_id).await,
+                Err(evo_core::Error::Forbidden)
+            ));
         }
-        assert_eq!(
-            client
-                .get(&url)
-                .bearer_auth("history-other-admin-0123456789")
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::NOT_FOUND
-        );
+        assert!(matches!(
+            PersistentReplayEconomicCoordinator::query_report(
+                &Context::new("other", "admin", Role::Admin).unwrap(),
+                &store,
+                report_id,
+            )
+            .await,
+            Err(evo_core::Error::NotFound)
+        ));
     }
     assert_eq!(metadata["cancelled_job"]["state"], "cancelled");
     assert_eq!(metadata["cancelled_report"]["terminal"], "usage_uncertain");
@@ -1820,7 +1850,19 @@ async fn actual_parent_http_reads_preserve_old_job_and_economic_payloads_and_rol
 
 #[tokio::test]
 async fn actual_parent_http_source_cleanup_refuses_private_input_and_economic_reads_keeps_facts() {
+    use evo_engine::replay_experiment::PersistentReplayEconomicCoordinator;
     use evo_storage::lifecycle::{CleanupState, LifecycleStore, RevokeTombstone, TypedObjectRef};
+    /// AG-178 (plan §6.1.2, Q-53): the economic report GET is closed; the router
+    /// answers 404 with no report, before and after the cleanup.
+    async fn assert_economic_report_route_closed(client: &reqwest::Client, url: &str, token: &str) {
+        let response = client.get(url).bearer_auth(token).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{url}");
+        let body = response.text().await.unwrap();
+        assert!(
+            !body.contains("raw_payload") && !body.contains("replay-economic-report"),
+            "{body}"
+        );
+    }
 
     let (_directory, store, metadata, state) = ag147_parent_history_http_state().await;
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
@@ -1853,15 +1895,18 @@ async fn actual_parent_http_source_cleanup_refuses_private_input_and_economic_re
         .as_str()
         .unwrap();
     let job_url = format!("{base}/v1/manage/jobs/{job_id}");
-    let report_urls: Vec<_> = ["blocked_report", "cancelled_report"]
+    let report_ids: Vec<&str> = ["blocked_report", "cancelled_report"]
         .into_iter()
-        .map(|key| {
-            format!(
-                "{base}/v1/manage/replay/economic-reports/{}",
-                metadata[key]["id"].as_str().unwrap()
-            )
-        })
+        .map(|key| metadata[key]["id"].as_str().unwrap())
         .collect();
+    let report_urls: Vec<_> = report_ids
+        .iter()
+        .map(|id| format!("{base}/v1/manage/replay/economic-reports/{id}"))
+        .collect();
+    let readers = [
+        Context::new("n", "admin", Role::Admin).unwrap(),
+        Context::new("n", "evaluator", Role::Evaluator).unwrap(),
+    ];
     assert_eq!(
         client
             .get(&job_url)
@@ -1872,13 +1917,16 @@ async fn actual_parent_http_source_cleanup_refuses_private_input_and_economic_re
             .status(),
         StatusCode::OK
     );
-    for url in &report_urls {
+    for (id, url) in report_ids.iter().zip(&report_urls) {
         for token in [ADMIN_TOKEN, EVALUATOR_TOKEN] {
-            let response = client.get(url).bearer_auth(token).send().await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(
-                response.json::<Value>().await.unwrap()["source_legacy"],
-                true
+            assert_economic_report_route_closed(&client, url, token).await;
+        }
+        for reader in &readers {
+            assert!(
+                PersistentReplayEconomicCoordinator::query_report(reader, &store, id)
+                    .await
+                    .unwrap()
+                    .source_legacy
             );
         }
     }
@@ -1925,9 +1973,17 @@ async fn actual_parent_http_source_cleanup_refuses_private_input_and_economic_re
         "conflict",
     )
     .await;
-    for url in &report_urls {
+    // The library read names the moved source watermark as a Conflict, as the
+    // closed route did with 409/conflict; the route stays closed.
+    for (id, url) in report_ids.iter().zip(&report_urls) {
         for token in [ADMIN_TOKEN, EVALUATOR_TOKEN] {
-            ag147_history_get_error(&client, url, token, StatusCode::CONFLICT, "conflict").await;
+            assert_economic_report_route_closed(&client, url, token).await;
+        }
+        for reader in &readers {
+            assert!(matches!(
+                PersistentReplayEconomicCoordinator::query_report(reader, &store, id).await,
+                Err(evo_core::Error::Conflict(_))
+            ));
         }
     }
     let mut session = store.session().await.unwrap();

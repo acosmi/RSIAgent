@@ -3211,7 +3211,8 @@ async fn cleanup_node_content(
             "replay_economic_experiment_v1"
             | "replay_economic_job_v1"
             | "replay_economic_cost_receipt_v1"
-            | "replay_economic_report_v1",
+            | "replay_economic_report_v1"
+            | "replay_economic_report_v2",
         ) => true,
         ("evaluation", "", _) => value.as_object().is_some_and(|m| {
             m.len() == 3

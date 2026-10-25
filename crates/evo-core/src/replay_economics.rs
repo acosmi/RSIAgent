@@ -1,11 +1,16 @@
 //! Contracts for a paired online economic comparison of fixed vs replay-selected exploration.
+use crate::evaluation::{ClusterObservation, STATS_BERNSTEIN_V2, Verdict, empirical_bernstein};
 use crate::{Error, Result, fingerprint, identifier, text};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const EXPERIMENT_SCHEMA: &str = "rsia.replay_economic_experiment.v1";
 pub const COST_RECEIPT_SCHEMA: &str = "rsia.replay_economic_cost_receipt.v1";
 pub const REPORT_SCHEMA: &str = "rsia.replay_economic_report.v1";
+/// Schema of the economic report whose paired quality claim is judged by the
+/// cluster bounds of plan §3.4 (AG-178; the v4.5 §19.5 defect is the per-task mean
+/// of v1). Reports of [`REPORT_SCHEMA`] stay readable as legacy history (§5.1.1).
+pub const REPORT_SCHEMA_V2: &str = "rsia.replay_economic_report.v2";
 pub const REPLAY_SELECTION_RULE_V1: &str = "rsia.pareto_attainment.v2";
 
 fn digest(value: &str, name: &str) -> Result<()> {
@@ -1066,7 +1071,459 @@ impl ReplayEconomicReportV1 {
     }
 }
 
-pub fn economic_report_is_not_formal(_: &ReplayEconomicReportV1) -> Result<()> {
+/// Id prefixes of the two report versions. A report id is the prefix of its version
+/// and the first 24 hex digits of the digest of the job snapshot it was built from,
+/// so the version takes part in the id and every version's id of one input can be
+/// derived from any one of them (plan §5.1.1 items 1 and 5).
+pub const REPORT_ID_PREFIX_V1: &str = "replay-economic-report-";
+pub const REPORT_ID_PREFIX_V2: &str = "replay-economic-report-v2-";
+/// Every independent cluster has the same weight: the bound of plan §3.4 is used
+/// with equal weights per statistical unit, fixed in advance.
+pub const EQUAL_CLUSTER_WEIGHT: u32 = 1;
+/// alpha_i of the empirical-Bernstein bounds of a v2 report.
+///
+/// Plan v4.5 §3.4 (L413) has alpha_i allocated in one place by the independent
+/// experiment plan; `ReplayEconomicExperimentV1` carries no alpha field, so AG-178
+/// registers this named constant instead. [`e11_report_quality_v2`] is its only use
+/// and every v2 report records the value it was computed with. Allocation by the
+/// registered experiment plan is not implemented.
+pub const E11_REPORT_ALPHA_I: f64 = 0.05;
+
+/// One row of the closed table of economic report versions (plan §5.1.1 item 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EconomicReportVersion {
+    pub schema_version: &'static str,
+    pub id_prefix: &'static str,
+    pub introduced_change: &'static str,
+    /// The judge the version was written with is kept, for static reads.
+    pub retains_judge: bool,
+    /// Only the current version is consumable; every other row reads as legacy.
+    pub current: bool,
+}
+
+pub const ECONOMIC_REPORT_VERSIONS: &[EconomicReportVersion] = &[
+    EconomicReportVersion {
+        schema_version: REPORT_SCHEMA,
+        id_prefix: REPORT_ID_PREFIX_V1,
+        introduced_change: "paired quality judged by the per-task mean (plan v4.5 §19.5 defect)",
+        retains_judge: true,
+        current: false,
+    },
+    EconomicReportVersion {
+        schema_version: REPORT_SCHEMA_V2,
+        id_prefix: REPORT_ID_PREFIX_V2,
+        introduced_change: "paired quality judged by empirical-Bernstein v2 bounds over clusters",
+        retains_judge: true,
+        current: true,
+    },
+];
+
+pub fn economic_report_version(schema_version: &str) -> Result<&'static EconomicReportVersion> {
+    ECONOMIC_REPORT_VERSIONS
+        .iter()
+        .find(|row| row.schema_version == schema_version)
+        .ok_or_else(|| Error::Invalid("economic report version outside the static table".into()))
+}
+
+/// The id the report of one input (the digest of the job snapshot it is built from)
+/// has under one report version.
+pub fn replay_economic_report_id(schema_version: &str, input_digest: &str) -> Result<String> {
+    let version = economic_report_version(schema_version)?;
+    digest(input_digest, "economic report input digest")?;
+    Ok(format!("{}{}", version.id_prefix, &input_digest[..24]))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EconomicReportLineageId {
+    pub schema_version: String,
+    pub report_id: String,
+}
+
+/// Every version's id of the input `report_id` was derived from, in table order
+/// (predecessor first); `None` for an id no version of the table derives.
+pub fn replay_economic_report_lineage(report_id: &str) -> Option<Vec<EconomicReportLineageId>> {
+    let key = report_id
+        .strip_prefix(REPORT_ID_PREFIX_V2)
+        .or_else(|| report_id.strip_prefix(REPORT_ID_PREFIX_V1))?;
+    if key.len() != 24
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Some(
+        ECONOMIC_REPORT_VERSIONS
+            .iter()
+            .map(|version| EconomicReportLineageId {
+                schema_version: version.schema_version.into(),
+                report_id: format!("{}{key}", version.id_prefix),
+            })
+            .collect(),
+    )
+}
+
+/// One independent cluster of a v2 report: its paired units aggregated first
+/// (plan §3.4), as the cluster mean of `replay_selected - fixed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EconomicClusterRowV2 {
+    pub cluster_id: String,
+    pub unit_count: u32,
+    /// Mean paired difference in score micros, rounded toward negative infinity.
+    /// It is exact for a cluster of one unit, and in a report that passes
+    /// [`ReplayEconomicReportV2::validate_against`] every cluster has exactly one:
+    /// the registered manifest gives each task its own cluster, and that judge
+    /// refuses a repeated unit ordinal or unit id.
+    pub mean_delta_micros: i64,
+    pub weight: u32,
+}
+
+/// The cluster rows of `units`, sorted by cluster id. Every unit needs both scores.
+pub fn economic_cluster_rows_v2(
+    units: &[ReplayEconomicUnitReceiptV1],
+) -> Result<Vec<EconomicClusterRowV2>> {
+    let mut clusters: BTreeMap<&str, (u32, i64)> = BTreeMap::new();
+    for unit in units {
+        identifier(&unit.cluster_id)?;
+        let (Some(fixed), Some(replay)) =
+            (unit.fixed_score_micros, unit.replay_selected_score_micros)
+        else {
+            return Err(Error::Invalid(
+                "cluster aggregation requires both paired scores".into(),
+            ));
+        };
+        let (count, total) = clusters.entry(unit.cluster_id.as_str()).or_insert((0, 0));
+        *count = count.checked_add(1).ok_or(Error::Budget)?;
+        *total = total
+            .checked_add(i64::from(replay) - i64::from(fixed))
+            .ok_or(Error::Budget)?;
+    }
+    Ok(clusters
+        .into_iter()
+        .map(|(cluster_id, (count, total))| EconomicClusterRowV2 {
+            cluster_id: cluster_id.into(),
+            unit_count: count,
+            mean_delta_micros: total.div_euclid(i64::from(count)),
+            weight: EQUAL_CLUSTER_WEIGHT,
+        })
+        .collect())
+}
+
+/// The empirical-Bernstein v2 summary of a v2 report's cluster rows. The statistic
+/// values are finite decimal strings (plan §5.1: no JSON floats); the two bound
+/// endpoints are also kept in score micros, rounded away from a claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EconomicQualityStatisticsV2 {
+    pub stats_version: String,
+    /// `inconclusive` when the bounds are defined; `invalid` when they are not
+    /// (fewer than two clusters, an observation outside [-1, 1], ...).
+    pub verdict: Verdict,
+    pub n: u32,
+    pub mean: String,
+    pub variance: String,
+    pub radius: String,
+    pub lcb: String,
+    pub alpha_i: String,
+    /// floor(LCB x 1e6), never above the bound; `None` when the verdict is invalid.
+    pub lcb_micros: Option<i64>,
+    /// ceil(min(mean + radius, 1) x 1e6), never below the bound; `None` when invalid.
+    pub ucb_micros: Option<i64>,
+    pub reasons: Vec<String>,
+}
+
+/// Normalizes each cluster mean to d = micros / 1e6 and runs the read-only
+/// `evaluation::empirical_bernstein` over the clusters. A d outside [-1, 1], or
+/// fewer than two clusters, yields its `invalid` summary: no bound, no claim.
+pub fn economic_quality_statistics_v2(
+    rows: &[EconomicClusterRowV2],
+    alpha_i: f64,
+) -> Result<EconomicQualityStatisticsV2> {
+    let mut observations = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.unit_count == 0 || row.weight != EQUAL_CLUSTER_WEIGHT {
+            return Err(Error::Invalid(
+                "cluster row requires units and the equal cluster weight".into(),
+            ));
+        }
+        observations.push(ClusterObservation {
+            cluster_id: row.cluster_id.clone(),
+            d: row.mean_delta_micros as f64 / 1_000_000.0,
+            weight: f64::from(row.weight),
+        });
+    }
+    let report = empirical_bernstein(&observations, alpha_i)?;
+    if report.stats_version != STATS_BERNSTEIN_V2 {
+        return Err(Error::Invalid(
+            "economic report requires the empirical-Bernstein v2 statistic".into(),
+        ));
+    }
+    let bounded = report.verdict != Verdict::Invalid;
+    let lcb_micros = if bounded {
+        Some(bound_micros(report.lcb, f64::floor)?)
+    } else {
+        None
+    };
+    let ucb_micros = if bounded {
+        Some(bound_micros(
+            (report.mean + report.radius).min(1.0),
+            f64::ceil,
+        )?)
+    } else {
+        None
+    };
+    Ok(EconomicQualityStatisticsV2 {
+        stats_version: report.stats_version,
+        verdict: report.verdict,
+        n: u32::try_from(report.n)
+            .map_err(|_| Error::Invalid("too many economic clusters".into()))?,
+        mean: finite_decimal(report.mean)?,
+        variance: finite_decimal(report.variance)?,
+        radius: finite_decimal(report.radius)?,
+        lcb: finite_decimal(report.lcb)?,
+        alpha_i: finite_decimal(report.alpha_i)?,
+        lcb_micros,
+        ucb_micros,
+        reasons: report.reasons,
+    })
+}
+
+/// Cluster rows and statistics of the paired units of a v2 report: the one place
+/// [`E11_REPORT_ALPHA_I`] is used.
+pub fn e11_report_quality_v2(
+    units: &[ReplayEconomicUnitReceiptV1],
+) -> Result<(Vec<EconomicClusterRowV2>, EconomicQualityStatisticsV2)> {
+    let rows = economic_cluster_rows_v2(units)?;
+    let statistics = economic_quality_statistics_v2(&rows, E11_REPORT_ALPHA_I)?;
+    Ok((rows, statistics))
+}
+
+fn bound_micros(value: f64, round: fn(f64) -> f64) -> Result<i64> {
+    let micros = round(value * 1_000_000.0);
+    if !micros.is_finite() || micros.abs() > 1_000_000.0 {
+        return Err(Error::Invalid(
+            "statistic bound outside the score range".into(),
+        ));
+    }
+    Ok(micros as i64)
+}
+
+fn finite_decimal(value: f64) -> Result<String> {
+    if !value.is_finite() {
+        return Err(Error::Invalid("non-finite economic statistic".into()));
+    }
+    let mut rendered = format!("{value:.17}");
+    while rendered.contains('.') && rendered.ends_with('0') {
+        rendered.pop();
+    }
+    if rendered.ends_with('.') {
+        rendered.pop();
+    }
+    if rendered == "-0" {
+        rendered = "0".into();
+    }
+    Ok(rendered)
+}
+
+/// The economic report whose paired quality claim is judged by the bounds over
+/// independent clusters (plan §3.4; v4.5 §19.5). It holds the fields of v1, plus
+/// the cluster rows and the statistics, both recomputed from the embedded units by
+/// [`Self::validate_against`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayEconomicReportV2 {
+    pub schema_version: String,
+    pub id: String,
+    pub experiment_id: String,
+    pub experiment_digest: String,
+    pub paired_ticket_id: String,
+    pub paired_ticket_digest: String,
+    pub paired_receipt_closure_digest: Option<String>,
+    pub completed_paired_tasks: u32,
+    pub paired_units: Vec<ReplayEconomicUnitReceiptV1>,
+    pub cluster_rows: Vec<EconomicClusterRowV2>,
+    pub quality_statistics: EconomicQualityStatisticsV2,
+    pub latency: Option<ArmLatencySummaryV1>,
+    pub quality_outcome: PairedQualityOutcome,
+    pub cost_receipt_ids: Vec<String>,
+    pub economics: EconomicComputation,
+    pub terminal: EconomicReportTerminal,
+    pub reasons: Vec<String>,
+}
+
+impl ReplayEconomicReportV2 {
+    /// The checks of v1, except that a passing quality claim needs the cluster LCB
+    /// (in micros) to reach `min_gain_micros` / `-noninferiority_margin_micros`, and a
+    /// negative one (critical capabilities kept) needs the cluster UCB below
+    /// `-noninferiority_margin_micros` (plan §3.4 Q-57: a low LCB is no regression).
+    /// Without a defined bound no such claim holds.
+    ///
+    /// Two checks v1 does not make: a schema other than v2 gets an error of its
+    /// own, apart from a report that differs from its experiment (plan §5.1.1
+    /// item 3); and each planned task has at most one unit, so a repeated unit
+    /// ordinal or unit id is a conflict and every cluster row holds exactly one
+    /// unit (plan §3.4: independence that is not shown fails closed).
+    pub fn validate_against(&self, experiment: &ReplayEconomicExperimentV1) -> Result<()> {
+        if self.schema_version != REPORT_SCHEMA_V2 {
+            return Err(Error::Conflict(
+                "economic report schema_version is not the v2 report schema".into(),
+            ));
+        }
+        experiment.validate()?;
+        if self.experiment_id != experiment.id
+            || self.experiment_digest != experiment.digest()?
+            || self.paired_ticket_id != experiment.paired_ticket_id
+            || self.paired_ticket_digest != experiment.paired_ticket_digest
+            || self.completed_paired_tasks > experiment.tasks.len() as u32
+        {
+            return Err(Error::Conflict(
+                "economic report differs from preregistered paired experiment".into(),
+            ));
+        }
+        identifier(&self.id)?;
+        let mut receipt_ids = BTreeSet::new();
+        for receipt_id in &self.cost_receipt_ids {
+            identifier(receipt_id)?;
+            if !receipt_ids.insert(receipt_id.as_str()) {
+                return Err(Error::Invalid("duplicate report cost receipt".into()));
+            }
+        }
+        for reason in &self.reasons {
+            text(reason, "economic report reason", 512)?;
+        }
+        if let Some(receipts) = &self.paired_receipt_closure_digest {
+            digest(receipts, "paired_receipt_closure_digest")?;
+        }
+        if self.completed_paired_tasks != self.paired_units.len() as u32 {
+            return Err(Error::Conflict(
+                "paired report count differs from embedded unit receipts".into(),
+            ));
+        }
+        for unit in &self.paired_units {
+            unit.validate_against(experiment)?;
+        }
+        // One unit per planned task. A repeated ordinal would be merged into the
+        // cluster of its task and stand in for a task without a unit.
+        let mut ordinals = BTreeSet::new();
+        let mut unit_ids = BTreeSet::new();
+        for unit in &self.paired_units {
+            if !ordinals.insert(unit.ordinal) {
+                return Err(Error::Conflict(
+                    "paired unit ordinal repeats in the economic report".into(),
+                ));
+            }
+            if !unit_ids.insert(unit.id.as_str()) {
+                return Err(Error::Conflict(
+                    "paired unit id repeats in the economic report".into(),
+                ));
+            }
+        }
+        if self.paired_units.is_empty() {
+            if self.latency.is_some() {
+                return Err(Error::Invalid(
+                    "blocked report cannot invent latency quantiles".into(),
+                ));
+            }
+        } else if self.latency.as_ref() != Some(&summarize_unit_latencies(&self.paired_units)?) {
+            return Err(Error::Conflict(
+                "reported latency quantiles differ from paired units".into(),
+            ));
+        }
+        let (cluster_rows, statistics) = e11_report_quality_v2(&self.paired_units)?;
+        if cluster_rows != self.cluster_rows || statistics != self.quality_statistics {
+            return Err(Error::Conflict(
+                "economic report cluster statistics differ from paired units".into(),
+            ));
+        }
+        let critical_preserved = self
+            .paired_units
+            .iter()
+            .all(|unit| unit.critical_capabilities_preserved == Some(true));
+        let min_gain = i64::from(experiment.min_gain_micros);
+        let margin = i64::from(experiment.noninferiority_margin_micros);
+        match self.quality_outcome {
+            PairedQualityOutcome::PassedGain
+                if !critical_preserved
+                    || statistics.lcb_micros.is_none_or(|bound| bound < min_gain) =>
+            {
+                return Err(Error::Conflict(
+                    "quality-gain outcome differs from the cluster LCB or critical gates".into(),
+                ));
+            }
+            PairedQualityOutcome::PassedNoninferior
+                if !critical_preserved
+                    || statistics.lcb_micros.is_none_or(|bound| bound < -margin) =>
+            {
+                return Err(Error::Conflict(
+                    "noninferiority outcome differs from the cluster LCB or critical gates".into(),
+                ));
+            }
+            PairedQualityOutcome::Negative
+                if critical_preserved
+                    && statistics.ucb_micros.is_none_or(|bound| bound >= -margin) =>
+            {
+                return Err(Error::Conflict(
+                    "negative outcome differs from the cluster UCB and critical gates".into(),
+                ));
+            }
+            _ => {}
+        }
+        let expected = match (
+            experiment.primary_claim,
+            &self.quality_outcome,
+            &self.economics,
+        ) {
+            (
+                EconomicClaim::QualityGain,
+                PairedQualityOutcome::PassedGain,
+                EconomicComputation::Complete { .. },
+            ) if self.completed_paired_tasks == experiment.tasks.len() as u32
+                && self.paired_receipt_closure_digest.is_some() =>
+            {
+                EconomicReportTerminal::CompletePositive
+            }
+            (
+                EconomicClaim::NoninferiorSavings,
+                PairedQualityOutcome::PassedNoninferior,
+                EconomicComputation::Complete {
+                    marginal_saving_per_task_micros,
+                    ..
+                },
+            ) if *marginal_saving_per_task_micros > 0
+                && self.completed_paired_tasks == experiment.tasks.len() as u32
+                && self.paired_receipt_closure_digest.is_some() =>
+            {
+                EconomicReportTerminal::CompletePositive
+            }
+            (_, PairedQualityOutcome::ZeroOrInconclusive, EconomicComputation::Complete { .. }) => {
+                EconomicReportTerminal::CompleteZeroOrInconclusive
+            }
+            (_, PairedQualityOutcome::Negative, EconomicComputation::Complete { .. }) => {
+                EconomicReportTerminal::CompleteNegative
+            }
+            (_, PairedQualityOutcome::EarlyRejected, _) => EconomicReportTerminal::EarlyRejected,
+            (_, PairedQualityOutcome::Invalid, _) => EconomicReportTerminal::Invalid,
+            (_, _, EconomicComputation::UsageUncertain { .. }) => {
+                EconomicReportTerminal::UsageUncertain
+            }
+            _ => EconomicReportTerminal::BlockedSupport,
+        };
+        if self.terminal != expected {
+            return Err(Error::Conflict(
+                "economic report terminal overstates its evidence".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// An economic report of either version.
+pub trait EconomicReportRecord {}
+impl EconomicReportRecord for ReplayEconomicReportV1 {}
+impl EconomicReportRecord for ReplayEconomicReportV2 {}
+
+pub fn economic_report_is_not_formal<R: EconomicReportRecord>(_: &R) -> Result<()> {
     Err(Error::Invalid(
         "ReplayEconomicReport cannot become FormalEvaluation or approval evidence".into(),
     ))
