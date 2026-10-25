@@ -228,12 +228,22 @@ fn noninferiority_has_healthy_and_infeasible_sides_with_a_pending_equality() {
     let mut input = fixture.input();
     input.effect_hypothesis = 0.0;
     input.resources.expected_cost_ratio = Declared(0.8);
-    let pending = assess_plan_feasibility_v1(&input).unwrap();
+    let equality = assess_plan_feasibility_v1(&input).unwrap();
     assert_eq!(
-        pending.fixed.as_ref().unwrap().hypothesized_lcb,
+        equality.fixed.as_ref().unwrap().hypothesized_lcb,
         fixture.snapshot.noninferior_bound,
     );
-    descriptive(&pending, FeasibilityReason::NoninferiorityEqualityPending);
+    assert_eq!(
+        equality.disposition,
+        PlanFeasibilityDisposition::NumericallyCompatible
+    );
+    assert!(equality.fixed.as_ref().unwrap().statistical_pass);
+    assert!(equality.reasons.is_empty());
+    assert!(
+        !equality
+            .reasons
+            .contains(&FeasibilityReason::NoninferiorityEqualityPending)
+    );
     let rows: Vec<_> = (0..2000)
         .map(|i| ClusterObservation {
             cluster_id: format!("e{i}"),
@@ -982,4 +992,124 @@ fn strict_lcb_boundary_is_not_replaced_by_a_rounded_mde_comparison() {
             .unwrap()
             .statistical_pass
     );
+    let final_rows: Vec<_> = rows
+        .iter()
+        .map(|row| ClusterObservation {
+            cluster_id: row.cluster_id.clone(),
+            d: 0.125,
+            weight: 1.0,
+        })
+        .collect();
+    let report = empirical_bernstein(&final_rows, 0.05).unwrap();
+    assert_eq!(report.lcb.to_bits(), fixture.snapshot.min_effect.to_bits());
+    let mut frozen = fixture.snapshot.clone();
+    frozen.frozen = true;
+    frozen.frozen_at = Some(1);
+    frozen.candidate_digest = Some("candidate".into());
+    let decision = decide(&frozen, report, 1.0, 1.0, true).unwrap();
+    assert_eq!(decision.verdict, Verdict::Inconclusive);
+    assert!(decision.reasons.contains(&"gain_not_demonstrated".into()));
+}
+
+fn check_noninferiority_equality_boundary(n: usize, max_n: u32, tighter_required_n: Option<u32>) {
+    let rows: Vec<_> = (0..n)
+        .map(|index| ClusterObservation {
+            cluster_id: format!("equality-{index}"),
+            d: 0.0,
+            weight: 1.0,
+        })
+        .collect();
+    let report = empirical_bernstein(&rows, 0.05).unwrap();
+    let boundary = -report.radius;
+    assert_eq!(report.lcb.to_bits(), boundary.to_bits());
+    let wider = f64::from_bits(boundary.to_bits() + 1);
+    let tighter = f64::from_bits(boundary.to_bits() - 1);
+    assert!(wider < boundary && boundary < tighter);
+
+    // The adjacent-f64 positive and negative controls precede exact equality.
+    for (bound, statistical_pass, disposition, required_n, verdict) in [
+        (
+            wider,
+            true,
+            PlanFeasibilityDisposition::NumericallyCompatible,
+            Some(n as u32),
+            Verdict::Noninferior,
+        ),
+        (
+            tighter,
+            false,
+            PlanFeasibilityDisposition::DescriptiveOnly,
+            tighter_required_n,
+            Verdict::Inconclusive,
+        ),
+        (
+            boundary,
+            true,
+            PlanFeasibilityDisposition::NumericallyCompatible,
+            Some(n as u32),
+            Verdict::Noninferior,
+        ),
+    ] {
+        let mut fixture = Fixture::fixed(n);
+        fixture.snapshot.profile = ProfileKind::NoninferiorSavings;
+        fixture.snapshot.noninferior_bound = bound;
+        fixture.snapshot.monetary_budget.amount = "5".into();
+        fixture.total = 5_000_000;
+        let mut input = fixture.input();
+        input.max_n = max_n;
+        input.effect_hypothesis = 0.0;
+        input.resources.expected_cost_ratio = Declared(0.8);
+        let assessment = assess_plan_feasibility_v1(&input).unwrap();
+        assert_eq!(assessment.disposition, disposition);
+        let fixed = assessment.fixed.as_ref().unwrap();
+        assert_eq!(fixed.assessed_n, n as u32);
+        assert_eq!(fixed.statistical_pass, statistical_pass);
+        assert_eq!(fixed.required_fixed_n, required_n);
+        assert_eq!(fixed.radius.to_bits(), report.radius.to_bits());
+        assert_eq!(fixed.hypothesized_lcb.to_bits(), boundary.to_bits());
+        assert!(
+            !assessment
+                .reasons
+                .contains(&FeasibilityReason::NoninferiorityEqualityPending)
+        );
+        if statistical_pass {
+            assert!(assessment.reasons.is_empty());
+        } else {
+            descriptive(&assessment, FeasibilityReason::PlannedNTooSmall);
+            assert_eq!(
+                assessment
+                    .reasons
+                    .contains(&FeasibilityReason::RequiredFixedNNotFound),
+                required_n.is_none()
+            );
+        }
+
+        fixture.snapshot.frozen = true;
+        fixture.snapshot.frozen_at = Some(1);
+        fixture.snapshot.candidate_digest = Some("candidate".into());
+        let decision = decide(
+            &fixture.snapshot,
+            empirical_bernstein(&rows, 0.05).unwrap(),
+            0.8,
+            1.0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(decision.verdict, verdict);
+        if verdict == Verdict::Inconclusive {
+            assert_eq!(decision.reasons, ["noninferiority_not_demonstrated"]);
+        } else {
+            assert!(decision.reasons.is_empty());
+        }
+    }
+}
+
+#[test]
+fn noninferiority_fixed_lcb_equality_matches_approval() {
+    check_noninferiority_equality_boundary(2000, 100_000, Some(2001));
+}
+
+#[test]
+fn noninferiority_required_n_includes_equal_search_cap() {
+    check_noninferiority_equality_boundary(1000, 1000, None);
 }

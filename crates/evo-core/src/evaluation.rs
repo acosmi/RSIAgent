@@ -1513,6 +1513,10 @@ pub fn assess_plan_feasibility_v1(
         ProfileKind::QualityGain => snapshot.min_effect,
         ProfileKind::NoninferiorSavings => snapshot.noninferior_bound,
     };
+    let meets_threshold = |lcb: f64| match snapshot.profile {
+        ProfileKind::QualityGain => lcb > threshold,
+        ProfileKind::NoninferiorSavings => lcb >= threshold,
+    };
     let fixed = match input.variance_upper {
         Unavailable => {
             reasons.push(Reason::VarianceUnavailable);
@@ -1521,12 +1525,12 @@ pub fn assess_plan_feasibility_v1(
         Declared(variance) => {
             let radius = paired_bernstein_radius_v2(snapshot.n_planned, variance, alpha_i)?;
             let hypothesized_lcb = (input.effect_hypothesis - radius).max(-1.0);
-            let statistical_pass = hypothesized_lcb > threshold;
+            let statistical_pass = meets_threshold(hypothesized_lcb);
             let mut required_fixed_n = None;
             for assessed_n in 2..=input.max_n {
                 let candidate_radius =
                     paired_bernstein_radius_v2(assessed_n as usize, variance, alpha_i)?;
-                if (input.effect_hypothesis - candidate_radius).max(-1.0) > threshold {
+                if meets_threshold((input.effect_hypothesis - candidate_radius).max(-1.0)) {
                     required_fixed_n = Some(assessed_n);
                     break;
                 }
@@ -1536,10 +1540,6 @@ pub fn assess_plan_feasibility_v1(
             }
             if !statistical_pass {
                 reasons.push(Reason::PlannedNTooSmall);
-            }
-            if snapshot.profile == ProfileKind::NoninferiorSavings && hypothesized_lcb == threshold
-            {
-                reasons.push(Reason::NoninferiorityEqualityPending);
             }
             Some(FixedFeasibilityProjection {
                 assessed_n: n,
