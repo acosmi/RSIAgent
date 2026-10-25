@@ -4565,3 +4565,41 @@ V110/V113/V116与其余新增场景族仍 planned；related_evidence_refs 仅导
 
 - 两套检查器各钉常量 `EXPECTED_MISSING_REGISTER_SHA256` = `b843e3f9692c5ba18ce9148278b3267584222461406fdccc17162ed84c115337`（reports/evidence-missing.json 现行字节，24,047 字节，本卡未改该文件），要求 manifest 指针 sha256 == 常量 == 文件实际 SHA-256；Python 另钉清单路径（`--known-missing` 非 `reports/evidence-missing.json` 即拒绝，与 Rust 对齐）；三元组钉扎保留。原“改身份并刷新指针即通过”的用例改为拒绝向（探针 c4：unknown 改伪造 SHA 并放回伪造文件；c5：已知身份改 unknown），仅当两侧常量同时重钉（模拟经审查的清单更新）时通过。W0 裁决：不移除 rechecked_v4.2（§18.10 L3142 明文保留历史值）。
 - field_semantics 追加 4 条（两套检查器与派生索引三处逐字一致，既有 13 条原文不变，共 17 条）：`evidence_judgment`（judged / not_performed_structure_only / not_performed、`--structure-only` 与缺省失败关闭、Rust 的 `RSIA_SUPPORT_SCOPE_EVIDENCE_ROOT`）、`evidence_missing_register_pin`（清单文件 SHA-256 与路径钉死）、`pr_state`、`merged_sha`。
+
+### (c) Python 独有检查移植到 Rust 与错误子串（提交二）
+
+以 R1 侦察 §Q4 清单为准逐项移植；每项两侧各有断言错误子串的拒绝用例（Python 原缺的拒绝用例一并补齐）。
+
+| R1 §Q4 | 检查 | Rust 落点（crates/evo-core/tests/support_scope.rs） | Python 拒绝用例 | Rust 拒绝用例 |
+|---|---|---|---|---|
+| 1–3 | 闭合键集：manifest root、dimensions、trace_index_coverage、scope 条目、证据记录、traceability、B/U/K、SO、local_use、V | `known_keys` + ROOT_KEYS 等十个常量（与 Python 同集） | `test_rejects_unknown_keys_asserting_effect_or_verdict`（十处） | `rejects_unknown_keys_in_every_closed_object`（同十处） |
+| 4 | log_path 全局唯一 | `EvidenceClaims::claim` | `test_rejects_evidence_duplicated_or_borrowed_from_another_task` | `rejects_duplicated_runs_and_inconsistent_merge_facts_across_records` |
+| 5 | 跨任务同一运行 (source_sha, test_entry)；同 PR 同 merged_sha；一个合并提交只合并一个 PR；merged_sha 不是他 PR 的 source_sha，source_sha 不是他 PR 的合并提交 | `EvidenceClaims::claim`；合并事实表比对移到全部记录之后（与 Python 同序） | 同上 + `test_rejects_merged_sha_inconsistent_with_manifest_merge_facts` + `RustParityRejectionTests.test_source_sha_recorded_as_another_prs_merge_commit_is_rejected` | 同上 |
+| 6 | 现存 input_ref 比 input_digest | `validate_missing_register`（提交一，有无证据根均适用） | `test_missing_input_is_needs_verification_but_wrong_hash_is_error` | `missing_evidence_register_judges_out_paths_against_an_evidence_store` |
+| 7 | pr_state ∈ {draft, open, closed, merged}；merged ⇔ merged_sha 非空 | `validate_evidence_record` | `test_rejects_merged_sha_inconsistent_with_manifest_merge_facts` + `RustParityRejectionTests.test_rejects_pr_state_outside_the_registered_set` | `pr_state_agrees_with_merged_sha` |
+| 8 | completion_evidence_refs：非 verified 的 scope 不得带；verified scope ⊆ 自有记录；SO/V/B/U/K 的 verified 须有 completion ⊆ refs（V 另须无未完成范围） | `validate_e_scopes`、`validate_so_sources`、`validate_v_scenarios`、`validate_commitments` | `RustParityRejectionTests.test_completion_evidence_refs_follow_the_status` | `completion_evidence_refs_follow_the_status` |
+| 9 | withdrawn_records 键闭合与 status（两侧原已等价）；数字只收 ASCII | Python `PR_RE`/`OWNER_TASK_RE`/`ISO_UTC` 的 `\d` 改 `[0-9]`；Rust `valid_owner_task` 遇多字节字符不再 panic | `test_withdrawn_records_are_the_reviewed_list_and_ids_never_revive` + `RustParityRejectionTests.test_non_ascii_digits_are_rejected_like_the_rust_checker` | `withdrawn_records_are_the_reviewed_list_and_never_revive` + `non_ascii_digits_are_rejected_like_the_python_checker` |
+| 10 | planned 不得带记录；optional_disabled 不得 verified；explicitly_out_of_scope 须登记；父子状态秩；implementation_files 去重；V 两轴一致 | `validate_e_scopes`（STATUS_RANK）、`validate_v_scenarios` | `ControllerFalseAcceptanceTests`（planned、父子秩、optional）+ `RustParityRejectionTests.test_scope_and_scenario_status_rules` | `scope_and_scenario_status_rules_match_the_python_checker` |
+
+- R1 §3.4 列出的 54 处裸 `is_err()`（27 个测试）全部改为 `expect_err` + 错误子串断言；文件中 `is_err()` 剩余 0 处（W0 static_check 的单行启发式计数亦为 0）。
+- 同时修正：Python 对非字符串 pr_state 不再抛未捕获 TypeError；Rust 对非 ASCII owner_task 不再 panic（`str::split_at` 落在多字节字符内）。
+- 未移植与残留（如实登记，均非本卡清单项）：R1 §Q4 未列的三项 Python 独有检查仍只在 Python：SO `local_use.artifacts` 去重、B/U/K `local_artifacts` 去重、B/U/K 四轴（planned 实现须 planned 验证；verified 不得配 planned/blocked 实现）。Rust 独有且更严的规则保持不变：B/U/K 的 implementation_status 逐条钉死、SO 的 license_status/verification_status/local_use.mode 钉死、V 与 B/U/K 的 remaining 恒须非空（因此 verified 的 V 场景在 Rust 侧不可能通过，而 Python 要求 verified 场景 remaining 为空；现无 verified V）。Python 的 scope/V/B/U/K status 若为不可哈希值仍会抛未捕获 TypeError（退出 1 带回溯，本卡只修了 pr_state）。
+
+### 探针与验收（W0）
+
+- W0 验收脚本 qa/claude-r8-prep/ag200-accept/probes.py（实施者未运行；它会对 reports/*.json 做 checkout）：AG-182 的 13 个（a、b、c、c2、c3、d、e、f1、f2、g1、h1、k1、r1）+ a1（缺省无参须失败）、a2（`--structure-only` 须通过且标注）、c4、c5、j1、j2、k4、k5、m1、m2。对应单测：a1/a2 → `FailClosedEvidenceJudgmentTests`；c4/c5 → Python `test_register_file_sha256_is_pinned_in_both_checkers`、Rust `missing_evidence_register_is_pinned_and_decides_local_outcomes`；j1/j2 → Python `test_registered_missing_paths_are_listed_and_reappearance_is_checked`、Rust `missing_evidence_register_judges_out_paths_against_an_evidence_store`；k4/k5/m2 → 138 条摘要钉扎；m1 → 合并事实表、跨记录合并事实与摘要钉扎。
+- W0 静态核对 qa/claude-r8-prep/ag200-accept/static_check.py（只读，实施者已跑）：PROBLEMS 0；rust is_err-only assert lines 0；两侧 EXPECTED_RECORD_DIGESTS 各 138 条，与按记录独立重算一致；清单文件 SHA-256 == 指针 == 两侧常量；33 条 PR #200 记录只有 merged_sha/pr_state 变化，其余 105 条逐字节不变。
+
+### 自测（实施者，head 为提交二）
+
+- `cargom fmt --all -- --check`：退出 0（提交一、提交二各一次）。
+- `cargom clippy --workspace --all-targets --locked -- -D warnings`：退出 0（提交一、提交二各一次；首轮在提交二上报出提交一新增的测试辅助函数 type_complexity，已在提交一内改用类型别名后两处重跑）。
+- `cargom test --locked -p evo-core --test support_scope`：基线 43；提交一 44 过 / 0 败（未设变量，测试输出 `evidence judgment not performed (set RSIA_SUPPORT_SCOPE_EVIDENCE_ROOT)`）与 44 过 / 0 败（`RSIA_SUPPORT_SCOPE_EVIDENCE_ROOT=<主检出>`）；提交二 50 过 / 0 败（两种方式各一次；新增 1 + 6 个测试）。
+- `python3 -m unittest scripts.test_check_support_scope`：基线 106；提交一 112 OK；提交二 117 OK（新增 6 + 5 个测试）。
+- 检查器三模式（提交二，`--repo-root . --manifest reports/support-scope.json --source-of-truth <v4.5 真源>`）：缺省退出 1，errors 仅 `evidence store not supplied: 282 out/ evidence paths unjudged; …`；`--structure-only` 退出 0，not_performed_structure_only，evidence_unjudged 282；`--evidence-root <主检出>` 退出 0，errors []，evidence_missing 42，evidence_unjudged 0，judged；两旗同用退出 2；报告 14 键。
+- `python3 scripts/check_build_inputs.py` 0、`python3 scripts/check_dependency_register.py` 0、`python3 -B scripts/non_rust_delivery.py` 0（提交二的干净检出）。
+- 未跑：全量 workspace 测试（卡未要求，W0 十一门覆盖）、`cargom build -p rsia` 与 smoke_cli/smoke_workspace、W0 的 probes.py。
+
+### 不可声明项
+
+GPT/Claude 二次验收；完整 V071/V080/V116；E16.6 关闭；任何效果；“CI 环境已判定 out/ 证据”（CI 无 out/，只做结构检查，报告与测试输出如实标注）。本卡不新增验证记录，状态最高 implemented_not_verified。

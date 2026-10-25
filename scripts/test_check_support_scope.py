@@ -1847,6 +1847,112 @@ class FailClosedEvidenceJudgmentTests(unittest.TestCase):
         self.assertEqual(set(payload), self.REPORT_KEYS)
 
 
+class RustParityRejectionTests(unittest.TestCase):
+    """AG-200 (review R-05): each Python check ported to the Rust test also has a Python rejection case asserting its error text
+    (R1 §Q4); the Rust counterparts are in crates/evo-core/tests/support_scope.rs."""
+
+    def _errors(self, manifest: dict) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            report = _structure_check(repo.root)
+        self.assertFalse(report.structure_valid, "manipulated manifest must be rejected")
+        return report.errors
+
+    def _assert_valid(self, manifest: dict) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            report = _structure_check(repo.root)
+        self.assertTrue(report.structure_valid, report.errors)
+
+    def test_source_sha_recorded_as_another_prs_merge_commit_is_rejected(self):
+        manifest = _valid_manifest_dict()
+        e13 = manifest["e_scopes"]["E13"]["verified_subscopes"][0]
+        record = manifest["e_scopes"]["E16.4"]["verified_subscopes"][0]
+        self.assertEqual((e13["pr"].rsplit("/", 1)[1], record["pr"].rsplit("/", 1)[1]), ("70", "111"))
+        record["source_sha"] = e13["merged_sha"]
+        self.assertIn(f"{record['id']}: source_sha {e13['merged_sha']} is recorded as the merge commit of PR #70 ({e13['id']})", self._errors(manifest)[0])
+
+    def test_rejects_pr_state_outside_the_registered_set(self):
+        for value in ("pending", "MERGED", 7, ["merged"], {"state": "merged"}):
+            with self.subTest(value=value):
+                manifest = _valid_manifest_dict()
+                record = manifest["e_scopes"]["E16.4"]["verified_subscopes"][0]
+                record["pr_state"] = value
+                self.assertIn(f"{record['id']}: pr_state must be one of ['closed', 'draft', 'merged', 'open']", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        record = manifest["e_scopes"]["E16.4"]["verified_subscopes"][0]
+        record["pr_state"] = "closed"
+        self.assertIn(f"{record['id']}: merged_sha {record['merged_sha']} is set but the record's pr_state is 'closed', not 'merged'", self._errors(manifest)[0])
+
+    def test_completion_evidence_refs_follow_the_status(self):
+        manifest = _valid_manifest_dict()
+        manifest["e_scopes"]["E03"]["completion_evidence_refs"] = ["E03.controller_acceptance"]
+        self.assertIn("E03: completion_evidence_refs claims completion but status is 'in_progress'", self._errors(manifest)[0])
+        for completion in ([], ["E01.controller_acceptance"]):
+            with self.subTest(scope_completion=completion):
+                manifest = _valid_manifest_dict()
+                scope = manifest["e_scopes"]["E13"]
+                scope.update({"status": "verified", "remaining": [], "completion_evidence_refs": completion})
+                self.assertIn("E13: verified status lacks explicit task completion evidence", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        scope = manifest["e_scopes"]["E13"]
+        scope.update({"status": "verified", "remaining": [], "completion_evidence_refs": [scope["verified_subscopes"][0]["id"]]})
+        self._assert_valid(manifest)
+        for refs, completion, remaining in (([], [], ""), (["E02.controller_acceptance"], ["E02.controller_acceptance"], "unfinished"), (["E02.controller_acceptance"], [], "")):
+            with self.subTest(refs=refs, completion=completion, remaining=remaining):
+                manifest = _valid_manifest_dict()
+                entry = manifest["traceability"]["v_scenarios"][119]
+                self.assertEqual(entry["id"], "V120")
+                entry.update({"status": "verified", "verification_status": "verified", "related_evidence_refs": refs, "completion_evidence_refs": completion, "remaining": remaining})
+                self.assertIn("V120: verified scenario lacks completion evidence or retains unfinished scope", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        manifest["traceability"]["b_commitments"][0].update({"verification_status": "verified", "completion_evidence_refs": []})
+        self.assertIn("B01: verified commitment lacks completion evidence", self._errors(manifest)[0])
+        manifest["traceability"]["b_commitments"][0]["completion_evidence_refs"] = ["E02.controller_acceptance"]
+        self._assert_valid(manifest)
+        manifest = _valid_manifest_dict()
+        manifest["traceability"]["so_sources"][0].update({"verification_status": "verified", "completion_evidence_refs": []})
+        self.assertIn("SO01: verified source status lacks completion evidence", self._errors(manifest)[0])
+
+    def test_scope_and_scenario_status_rules(self):
+        manifest = _valid_manifest_dict()
+        manifest["e_scopes"]["E14"]["status"] = "explicitly_out_of_scope"
+        self.assertIn("E14: status 'explicitly_out_of_scope' is not declared in explicitly_out_of_scope_until_revised", self._errors(manifest)[0])
+        manifest["explicitly_out_of_scope_until_revised"] = ["E14"]
+        self._assert_valid(manifest)
+        manifest = _valid_manifest_dict()
+        files = manifest["e_scopes"]["E03"]["implementation_files"]
+        files.append(files[0])
+        self.assertIn("E03: implementation_files must be a duplicate-free string array", self._errors(manifest)[0])
+        for status, expected in (("planned", "V001: planned scenario has incompatible verification status"), ("verified", "V001: verified status axes disagree")):
+            with self.subTest(status=status):
+                manifest = _valid_manifest_dict()
+                manifest["traceability"]["v_scenarios"][0]["status"] = status
+                self.assertIn(expected, self._errors(manifest)[0])
+
+    def test_non_ascii_digits_are_rejected_like_the_rust_checker(self):
+        """R1 §Q4.9: \\d accepted other Unicode digits; every pattern now uses [0-9]."""
+        manifest = _valid_manifest_dict()
+        entry = next(entry for entry in manifest["withdrawn_records"] if entry["id"] == "E05.ag052_versioned_batch_verdicts")
+        entry["owner_task"] = "AG-\u0661\u0669\u0662"
+        self.assertIn("E05.ag052_versioned_batch_verdicts: owner_task must be a registered task number such as AG-187", self._errors(manifest)[0])
+        manifest = _valid_manifest_dict()
+        manifest["e_scopes"]["E01"]["verified_subscopes"][0]["pr"] = "https://github.com/acosmi/RSIAgent/pull/\u0663\u0660"
+        self.assertIn("E01.controller_acceptance: PR URL is invalid", self._errors(manifest)[0])
+        self.assertIsNone(css.ISO_UTC.fullmatch("\uff12\uff10\uff12\uff16-10-14T11:54:14Z"))
+        register = json.loads((REAL_ROOT / css.DEFAULT_KNOWN_MISSING).read_text(encoding="utf-8"))
+        register["entries"][0]["missing_window"] = {"after": "\uff12\uff10\uff12\uff16-10-14T11:54:14Z", "before": "unknown"}
+        raw = (json.dumps(register, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        manifest = _valid_manifest_dict()
+        manifest["evidence_missing_register"]["sha256"] = hashlib.sha256(raw).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(css, "EXPECTED_MISSING_REGISTER_SHA256", hashlib.sha256(raw).hexdigest()):
+            repo = FixtureRepo(Path(tmp), manifest)
+            (repo.root / css.DEFAULT_KNOWN_MISSING).write_bytes(raw)
+            report = _structure_check(repo.root)
+        self.assertFalse(report.structure_valid)
+        self.assertIn("missing-evidence entry 0: missing_window.after must be an ISO-8601 UTC timestamp or 'unknown'", report.errors[0])
+
+
 class PathSafetyTests(unittest.TestCase):
     def test_rejects_dot_dot_path_escape(self):
         with tempfile.TemporaryDirectory() as tmp:

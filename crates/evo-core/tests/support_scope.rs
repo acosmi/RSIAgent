@@ -1356,6 +1356,133 @@ const EXECUTION_SCOPES: &[&str] = &["workspace", "single_target"];
 /// `execution.command` must be what was run, not the declared single-target command copied again.
 const DECLARED_COMMAND_PREFIX: &str = "cargo test --locked --offline";
 const PRODUCTION_CONSUMER_VALUES: &[&str] = &["wired", "none_library_only"];
+/// Closed key sets of rsia.support_scope.v2, shared with the Python checker (AG-200, review R-05):
+/// an unknown key cannot carry a claim; presence is checked by the field rules themselves.
+const SCHEMA_VERSION: &str = "rsia.support_scope.v2";
+const ROOT_KEYS: &[&str] = &[
+    "schema_version",
+    "plan_version",
+    "plan_sha256",
+    "plan_lineage",
+    "derived_index_notice",
+    "field_semantics",
+    "declaration",
+    "not_full_route_complete",
+    "legacy_equivalence_unverified",
+    "dimensions",
+    "blocked",
+    "explicitly_out_of_scope_until_revised",
+    "optional_disabled",
+    "overall_remaining",
+    "e_scopes",
+    "traceability",
+    "trace_index_coverage",
+    "project_license",
+    "withdrawn_records",
+    "evidence_missing_register",
+];
+const DIMENSION_KEYS: &[&str] = &["engineering", "host", "model", "effect", "deploy"];
+const COVERAGE_KEYS: &[&str] = &["purpose", "ranges"];
+const SCOPE_KEYS: &[&str] = &[
+    "title",
+    "status",
+    "status_reason",
+    "implementation_files",
+    "scenarios",
+    "verified_subscopes",
+    "remaining",
+    "completion_evidence_refs",
+];
+const EVIDENCE_KEYS: &[&str] = &[
+    "id",
+    "description",
+    "plan_version",
+    "plan_sha256",
+    "plan_recheck",
+    "source_sha",
+    "pr",
+    "merged_sha",
+    "pr_state",
+    "test_entry",
+    "command",
+    "input_digest",
+    "exit_code",
+    "log_path",
+    "actual_result",
+    "scope",
+    "risk",
+    "rollback",
+    "record_source",
+    "input_ref",
+    "execution",
+    "production_consumer",
+    "supersedes",
+    "completes",
+    "note",
+];
+const TRACEABILITY_KEYS: &[&str] = &[
+    "b_commitments",
+    "u_commitments",
+    "k_commitments",
+    "so_sources",
+    "v_scenarios",
+    "hs_borrowings",
+    "hsf_sources",
+];
+const COMMITMENT_KEYS: &[&str] = &[
+    "id",
+    "specification_status",
+    "sections",
+    "sources",
+    "e_tasks",
+    "v_scenarios",
+    "implementation_status",
+    "verification_status",
+    "effect_status",
+    "local_artifacts",
+    "related_evidence_refs",
+    "remaining",
+    "completion_evidence_refs",
+];
+const SO_SOURCE_KEYS: &[&str] = &[
+    "id",
+    "repository",
+    "commit",
+    "path",
+    "blob_sha",
+    "read_range",
+    "e_tasks",
+    "license",
+    "license_status",
+    "verification_status",
+    "local_use",
+    "verification_evidence_refs",
+    "completion_evidence_refs",
+];
+const LOCAL_USE_KEYS: &[&str] = &["mode", "artifacts"];
+const V_SCENARIO_KEYS: &[&str] = &[
+    "id",
+    "specification_status",
+    "e_tasks",
+    "status",
+    "verification_status",
+    "effect_status",
+    "related_evidence_refs",
+    "remaining",
+    "completion_evidence_refs",
+];
+/// Optional record-level pull request state; merged requires merged_sha, any other state requires
+/// it to be null (the Python checker's PR_STATES).
+const PR_STATES: &[&str] = &["draft", "open", "closed", "merged"];
+/// Parent/child progress order (the Python checker's STATUS_RANK): blocked and in_progress share a
+/// level; explicitly_out_of_scope has no rank and neither constrains nor is constrained.
+const STATUS_RANK: &[(&str, u8)] = &[
+    ("planned", 0),
+    ("blocked", 1),
+    ("in_progress", 1),
+    ("implemented_not_verified", 2),
+    ("verified", 3),
+];
 
 /// The reviewed V080.d pins shared by both checkers: withdrawn tuples, relation pairs, record
 /// digests, missing-register triples and the register file SHA-256.
@@ -2086,6 +2213,7 @@ fn validate_evidence_record(
 ) -> Result<String, String> {
     let id = nonempty_string(&record["id"], &format!("{task} evidence id"))?;
     validate_evidence_namespace(id, task)?;
+    known_keys(record, EVIDENCE_KEYS, &format!("{task} evidence {id}"))?;
     nonempty_string(&record["description"], &format!("{id} description"))?;
     let version = nonempty_string(&record["plan_version"], &format!("{id} plan_version"))?;
     let digest = nonempty_string(&record["plan_sha256"], &format!("{id} plan_sha256"))?;
@@ -2188,25 +2316,39 @@ fn validate_evidence_record(
         .ok_or_else(|| format!("{id} has an invalid pull request URL"))?
         .parse::<u64>()
         .map_err(|_| format!("{id} has an invalid pull request number"))?;
-    if !record["merged_sha"].is_null() && record["merged_sha"] == record["source_sha"] {
+    let merged = &record["merged_sha"];
+    if !merged.is_null() && !merged.as_str().is_some_and(|text| is_lower_hex(text, 40)) {
+        return Err(format!("{id} merged_sha must be null or lowercase 40-hex"));
+    }
+    if !merged.is_null() && *merged == record["source_sha"] {
         return Err(format!(
             "{id} merged_sha must differ from its own source_sha"
         ));
     }
-    let expected_merge = expected_merge_for_pr(pr_number)?;
-    match expected_merge {
-        Some(expected) => {
-            lower_hex(&record["merged_sha"], 40, &format!("{id} merged_sha"))?;
-            if record["merged_sha"] != expected {
-                return Err(format!(
-                    "{id} merged_sha differs from the reviewed PR merge"
-                ));
-            }
-        }
-        None if !record["merged_sha"].is_null() => {
-            return Err(format!("{id} records a merge for an unmerged PR"));
-        }
-        None => {}
+    // pr_state (Python parity, AG-200): merged requires merged_sha, any other state requires it to
+    // be null; an absent or null pr_state asserts no state. The reviewed merge table is compared in
+    // validate_e_scopes after every record, as in the Python checker.
+    let pr_state = match record.get("pr_state") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|state| PR_STATES.contains(state))
+                .ok_or_else(|| {
+                    format!("{id}: pr_state must be one of {PR_STATES:?}, got {value}")
+                })?,
+        ),
+    };
+    if pr_state == Some("merged") && merged.is_null() {
+        return Err(format!("{id}: pr_state is 'merged' but merged_sha is null"));
+    }
+    if let Some(state) = pr_state
+        && state != "merged"
+        && let Some(sha) = merged.as_str()
+    {
+        return Err(format!(
+            "{id}: merged_sha {sha} is set but the record's pr_state is '{state}', not 'merged'"
+        ));
     }
     lower_hex(&record["input_digest"], 64, &format!("{id} input_digest"))?;
     if record["exit_code"].as_i64() != Some(0) {
@@ -2241,8 +2383,93 @@ fn validate_evidence_record(
     Ok(id.to_string())
 }
 
+/// Run and merge claims of the records seen so far (Python parity, AG-200): one test run supports
+/// one record, a run belongs to one E task, and the merge facts agree across records.
+#[derive(Default)]
+struct EvidenceClaims {
+    logs: BTreeMap<String, (String, String)>,
+    runs: BTreeMap<(String, String), (String, String)>,
+    pr_merges: BTreeMap<u64, (Value, String)>,
+    merge_owners: BTreeMap<String, (u64, String)>,
+    source_owners: BTreeMap<String, (u64, String)>,
+}
+
+impl EvidenceClaims {
+    fn claim(&mut self, id: &str, task: &str, record: &Value) -> Result<(), String> {
+        let log = record["log_path"].as_str().unwrap_or_default();
+        if let Some((owner, owner_task)) = self.logs.get(log) {
+            return Err(format!(
+                "{id}: log_path '{log}' duplicates evidence {owner} of task {owner_task}; one test run may support only one evidence record"
+            ));
+        }
+        self.logs
+            .insert(log.to_string(), (id.to_string(), task.to_string()));
+        let source = record["source_sha"].as_str().unwrap_or_default();
+        let entry = record["test_entry"].as_str().unwrap_or_default();
+        let (run_owner, run_task) = self
+            .runs
+            .entry((source.to_string(), entry.to_string()))
+            .or_insert_with(|| (id.to_string(), task.to_string()));
+        if run_task.as_str() != task {
+            return Err(format!(
+                "{id}: the same test run ({entry} at source_sha {source}) is already claimed by {run_owner} of task {run_task}; evidence sets may not be duplicated across tasks"
+            ));
+        }
+        let number = pull_request_number(&record["pr"], &format!("{id} pr"))?;
+        let merged = &record["merged_sha"];
+        let (known, known_id) = self
+            .pr_merges
+            .entry(number)
+            .or_insert_with(|| (merged.clone(), id.to_string()));
+        if *known != *merged {
+            return Err(format!(
+                "{id}: PR #{number} carries merged_sha {merged} here but {known} in {known_id}; one PR cannot be both merged and unmerged or merged twice"
+            ));
+        }
+        if let Some(sha) = merged.as_str() {
+            let (claimed, claimed_id) = self
+                .merge_owners
+                .entry(sha.to_string())
+                .or_insert_with(|| (number, id.to_string()));
+            if *claimed != number {
+                return Err(format!(
+                    "{id}: merged_sha {sha} is already recorded as the merge commit of PR #{claimed} ({claimed_id}); one merge commit cannot also merge PR #{number}"
+                ));
+            }
+            if let Some((other, other_id)) = self.source_owners.get(sha)
+                && *other != number
+            {
+                return Err(format!(
+                    "{id}: merged_sha {sha} is the source_sha of PR #{other} ({other_id}), not a merge of PR #{number}"
+                ));
+            }
+        }
+        if let Some((other, other_id)) = self.merge_owners.get(source)
+            && *other != number
+        {
+            return Err(format!(
+                "{id}: source_sha {source} is recorded as the merge commit of PR #{other} ({other_id})"
+            ));
+        }
+        self.source_owners
+            .entry(source.to_string())
+            .or_insert_with(|| (number, id.to_string()));
+        Ok(())
+    }
+}
+
+fn status_rank(entry: &Value) -> Option<u8> {
+    let status = entry["status"].as_str()?;
+    STATUS_RANK
+        .iter()
+        .find(|(known, _)| *known == status)
+        .map(|(_, rank)| *rank)
+}
+
 fn validate_e_scopes(value: &Value, root: &Path) -> Result<BTreeMap<String, String>, String> {
-    let object = value.as_object().ok_or("e_scopes must be an object")?;
+    let object = value["e_scopes"]
+        .as_object()
+        .ok_or("e_scopes must be an object")?;
     let actual: BTreeSet<String> = object.keys().cloned().collect();
     let expected = expected_e_ids();
     if actual != expected {
@@ -2252,10 +2479,33 @@ fn validate_e_scopes(value: &Value, root: &Path) -> Result<BTreeMap<String, Stri
             actual.difference(&expected).collect::<Vec<_>>()
         ));
     }
+    // A parent scope may not outrank its weakest child (Python parity, AG-200).
+    for (child, entry) in object {
+        if let Some((parent, _)) = child.rsplit_once('.')
+            && let Some(parent_entry) = object.get(parent)
+            && let (Some(parent_rank), Some(child_rank)) =
+                (status_rank(parent_entry), status_rank(entry))
+            && parent_rank > child_rank
+        {
+            return Err(format!(
+                "{parent}: status '{}' is stronger than sub-package {child} status '{}'; a parent scope may not outrank its weakest child",
+                parent_entry["status"].as_str().unwrap_or_default(),
+                entry["status"].as_str().unwrap_or_default()
+            ));
+        }
+    }
+    let optional = string_set(&value["optional_disabled"], "optional_disabled")?;
+    let out_of_scope = string_set(
+        &value["explicitly_out_of_scope_until_revised"],
+        "explicitly_out_of_scope_until_revised",
+    )?;
     let expected_scenarios = expected_e_scenarios();
     let mut evidence_ids = BTreeMap::new();
+    let mut claims = EvidenceClaims::default();
+    let mut merge_facts = Vec::new();
     let packages = workspace_packages(root)?;
     for (task, entry) in object {
+        known_keys(entry, SCOPE_KEYS, &format!("{task} scope entry"))?;
         nonempty_string(&entry["title"], &format!("{task} title"))?;
         let status = nonempty_string(&entry["status"], &format!("{task} status"))?;
         if !ALLOWED_STATUSES.contains(&status) {
@@ -2270,8 +2520,14 @@ fn validate_e_scopes(value: &Value, root: &Path) -> Result<BTreeMap<String, Stri
                 "{task} non-planned scope needs implementation_files"
             ));
         }
+        let mut declared = BTreeSet::new();
         for file in files {
             let file = nonempty_string(file, &format!("{task} implementation file"))?;
+            if !declared.insert(file) {
+                return Err(format!(
+                    "{task}: implementation_files must be a duplicate-free string array"
+                ));
+            }
             validate_repo_file(root, file, &format!("{task} implementation file"))?;
         }
         let actual_scenarios = string_set(&entry["scenarios"], &format!("{task} scenarios"))?;
@@ -2306,10 +2562,68 @@ fn validate_e_scopes(value: &Value, root: &Path) -> Result<BTreeMap<String, Stri
         if status == "verified" && evidence.is_empty() {
             return Err(format!("{task} verified status lacks execution evidence"));
         }
+        // Scope-level rules of the Python checker (AG-200).
+        if status == "planned" && !evidence.is_empty() {
+            let ids: Vec<&str> = evidence
+                .iter()
+                .filter_map(|record| record["id"].as_str())
+                .collect();
+            return Err(format!(
+                "{task}: status 'planned' is incompatible with verified evidence records {ids:?}; a planned scope has nothing verified"
+            ));
+        }
+        if status != "verified"
+            && entry
+                .get("completion_evidence_refs")
+                .is_some_and(|refs| !refs.is_null())
+        {
+            return Err(format!(
+                "{task}: completion_evidence_refs claims completion but status is '{status}'"
+            ));
+        }
+        if status == "verified" && optional.contains(task.as_str()) {
+            return Err(format!(
+                "{task}: optional scope is listed in optional_disabled and no enablement is recorded; status 'verified' is not allowed"
+            ));
+        }
+        if status == "explicitly_out_of_scope" && !out_of_scope.contains(task.as_str()) {
+            return Err(format!(
+                "{task}: status 'explicitly_out_of_scope' is not declared in explicitly_out_of_scope_until_revised"
+            ));
+        }
+        let mut owned = BTreeSet::new();
         for record in evidence {
             let id = validate_evidence_record(record, task, root, files, &packages)?;
             if evidence_ids.insert(id.clone(), task.clone()).is_some() {
                 return Err(format!("duplicate evidence id {id}"));
+            }
+            claims.claim(&id, task, record)?;
+            let pr = pull_request_number(&record["pr"], &format!("{id} pr"))?;
+            merge_facts.push((id.clone(), pr, record["merged_sha"].clone()));
+            owned.insert(id);
+        }
+        if status == "verified" {
+            let completion = string_set(
+                &entry["completion_evidence_refs"],
+                &format!("{task} completion evidence refs"),
+            )?;
+            if completion.is_empty() || !completion.is_subset(&owned) {
+                return Err(format!(
+                    "{task}: verified status lacks explicit task completion evidence"
+                ));
+            }
+        }
+    }
+    // The reviewed merge facts are compared after every record was seen, as in the Python checker.
+    for (id, pr, merged) in merge_facts {
+        match expected_merge_for_pr(pr).map_err(|error| format!("{id}: {error}"))? {
+            Some(expected) if merged == expected => {}
+            None if merged.is_null() => {}
+            None => return Err(format!("{id} records a merge for an unmerged PR")),
+            Some(_) => {
+                return Err(format!(
+                    "{id} merged_sha differs from the reviewed PR merge"
+                ));
             }
         }
     }
@@ -2479,6 +2793,7 @@ fn validate_commitments(
         let entry = by_id
             .get(expected.id)
             .ok_or_else(|| format!("missing commitment {}", expected.id))?;
+        known_keys(entry, COMMITMENT_KEYS, expected.id)?;
         if entry["specification_status"] != "included" || entry["effect_status"] != "not_claimed" {
             return Err(format!(
                 "{} conflates specification or effect status",
@@ -2547,6 +2862,23 @@ fn validate_commitments(
             &tasks,
             evidence_ids,
         )?;
+        // A verified commitment names completion evidence among its refs (Python parity, AG-200).
+        if entry["verification_status"] == "verified" {
+            let refs = string_set(
+                &entry["related_evidence_refs"],
+                &format!("{} related_evidence_refs", expected.id),
+            )?;
+            let completion = string_set(
+                &entry["completion_evidence_refs"],
+                &format!("{} completion evidence refs", expected.id),
+            )?;
+            if refs.is_empty() || completion.is_empty() || !completion.is_subset(&refs) {
+                return Err(format!(
+                    "{}: verified commitment lacks completion evidence",
+                    expected.id
+                ));
+            }
+        }
         nonempty_string(&entry["remaining"], &format!("{} remaining", expected.id))?;
     }
     Ok(())
@@ -2722,6 +3054,27 @@ fn validate_so_sources(
         let entry = by_id
             .get(expected.id)
             .ok_or_else(|| format!("missing {}", expected.id))?;
+        known_keys(entry, SO_SOURCE_KEYS, expected.id)?;
+        // A verified source names completion evidence among its refs (Python parity, AG-200); the
+        // pin below additionally keeps every source at reference_pins_only.
+        if entry["verification_status"] == "verified" {
+            let refs = match entry.get("verification_evidence_refs") {
+                Some(refs) => {
+                    string_set(refs, &format!("{} verification_evidence_refs", expected.id))?
+                }
+                None => BTreeSet::new(),
+            };
+            let completion = string_set(
+                &entry["completion_evidence_refs"],
+                &format!("{} completion evidence refs", expected.id),
+            )?;
+            if completion.is_empty() || !completion.is_subset(&refs) {
+                return Err(format!(
+                    "{}: verified source status lacks completion evidence",
+                    expected.id
+                ));
+            }
+        }
         if entry["repository"] != SKILLOPT_REPO
             || entry["commit"] != SKILLOPT_COMMIT
             || entry["path"] != expected.path
@@ -2757,6 +3110,11 @@ fn validate_so_sources(
                 expected.id
             ));
         }
+        known_keys(
+            &entry["local_use"],
+            LOCAL_USE_KEYS,
+            &format!("{} local_use", expected.id),
+        )?;
         let artifacts = entry["local_use"]["artifacts"]
             .as_array()
             .ok_or_else(|| format!("{} local artifacts missing", expected.id))?;
@@ -2811,6 +3169,7 @@ fn validate_v_scenarios(
     }
     for (id, expected_tasks) in &expected {
         let entry = by_id[id.as_str()];
+        known_keys(entry, V_SCENARIO_KEYS, id)?;
         if entry["specification_status"] != "included" || entry["effect_status"] != "not_claimed" {
             return Err(format!("{id} conflates specification or effect status"));
         }
@@ -2819,6 +3178,17 @@ fn validate_v_scenarios(
             if !ALLOWED_STATUSES.contains(&status) {
                 return Err(format!("{id} has unknown {field}"));
             }
+        }
+        // The two status axes agree (Python parity, AG-200).
+        let status = entry["status"].as_str().unwrap_or_default();
+        let verification = entry["verification_status"].as_str().unwrap_or_default();
+        if status == "planned" && verification != "planned" {
+            return Err(format!(
+                "{id}: planned scenario has incompatible verification status"
+            ));
+        }
+        if (status == "verified") != (verification == "verified") {
+            return Err(format!("{id}: verified status axes disagree"));
         }
         let tasks = string_set(&entry["e_tasks"], &format!("{id} e_tasks"))?;
         if &tasks != expected_tasks {
@@ -2832,6 +3202,33 @@ fn validate_v_scenarios(
             &tasks,
             evidence_ids,
         )?;
+        // A verified scenario names completion evidence among its refs and retains no unfinished
+        // scope (Python parity, AG-200); the remaining rule below keeps this checker stricter.
+        if status == "verified" {
+            let refs = string_set(
+                &entry["related_evidence_refs"],
+                &format!("{id} evidence refs"),
+            )?;
+            let completion = string_set(
+                &entry["completion_evidence_refs"],
+                &format!("{id} completion evidence refs"),
+            )?;
+            let unfinished = match &entry["remaining"] {
+                Value::Null => false,
+                Value::String(text) => !text.is_empty(),
+                Value::Array(items) => !items.is_empty(),
+                _ => true,
+            };
+            if refs.is_empty()
+                || completion.is_empty()
+                || !completion.is_subset(&refs)
+                || unfinished
+            {
+                return Err(format!(
+                    "{id}: verified scenario lacks completion evidence or retains unfinished scope"
+                ));
+            }
+        }
         nonempty_string(&entry["remaining"], &format!("{id} remaining"))?;
     }
     Ok(actual_ids)
@@ -2847,6 +3244,13 @@ fn validate_trace_index_coverage(value: &Value) -> Result<(), String> {
             .collect()
     {
         return Err("trace index coverage must be recorded separately for E00 and E16.6".into());
+    }
+    for task in ["E00", "E16.6"] {
+        known_keys(
+            &object[task],
+            COVERAGE_KEYS,
+            &format!("{task} trace_index_coverage"),
+        )?;
     }
     // V080 (E00/E16.6) tracks V001–V123, HS01–HS08, HSF01–HSF16 and HSP01 (plan §18.11, Q-50).
     if object["E00"]["purpose"] != "index_consistency_only_not_scenario_execution"
@@ -3007,6 +3411,35 @@ fn validate_field_semantics(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Rejects keys outside a closed set, as the Python checker's known_keys does (AG-200).
+fn known_keys<'a>(
+    value: &'a Value,
+    allowed: &[&str],
+    what: &str,
+) -> Result<&'a serde_json::Map<String, Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{what} must be an object"))?;
+    let unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !allowed.contains(key))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "{what}: unknown key(s) {unknown:?} are not part of the {SCHEMA_VERSION} schema and cannot carry claims"
+        ));
+    }
+    Ok(object)
+}
+
+fn is_lower_hex(text: &str, len: usize) -> bool {
+    text.len() == len
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn exact_keys(
     object: &serde_json::Map<String, Value>,
     required: &[&str],
@@ -3042,9 +3475,13 @@ fn valid_owner_task(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("AG-") else {
         return false;
     };
-    let (digits, suffix) = rest.split_at(rest.len().min(3));
-    digits.len() == 3
-        && digits.bytes().all(|byte| byte.is_ascii_digit())
+    // `get` refuses a split inside a multi-byte character, so non-ASCII digits are rejected
+    // instead of panicking (AG-200).
+    let Some(digits) = rest.get(..3) else {
+        return false;
+    };
+    let suffix = &rest[3..];
+    digits.bytes().all(|byte| byte.is_ascii_digit())
         && (suffix.is_empty()
             || (suffix.len() == 1 && suffix.bytes().all(|b| b.is_ascii_lowercase())))
 }
@@ -3655,9 +4092,11 @@ fn validate_manifest_with_evidence(
             "support index top level is not bound to the current plan {PLAN_VERSION}"
         ));
     }
+    known_keys(value, ROOT_KEYS, "manifest root")?;
     validate_project_license(value, root)?;
     validate_plan_lineage(&value["plan_lineage"])?;
     validate_field_semantics(&value["field_semantics"])?;
+    known_keys(&value["dimensions"], DIMENSION_KEYS, "dimensions")?;
     if value["declaration"] != "subset_only"
         || value["not_full_route_complete"] != true
         || value["legacy_equivalence_unverified"] != true
@@ -3670,7 +4109,8 @@ fn validate_manifest_with_evidence(
         return Err("E17 and E18 must remain explicitly disabled".into());
     }
     validate_trace_index_coverage(&value["trace_index_coverage"])?;
-    let evidence_ids = validate_e_scopes(&value["e_scopes"], root)?;
+    let evidence_ids = validate_e_scopes(value, root)?;
+    known_keys(&value["traceability"], TRACEABILITY_KEYS, "traceability")?;
     let e_ids = expected_e_ids();
     let so_ids = validate_so_sources(
         &value["traceability"]["so_sources"],
@@ -3807,9 +4247,13 @@ fn historical_records_keep_lineage_digests_but_top_level_must_be_current() {
     let mut outside = load_manifest(&root);
     outside["e_scopes"]["E01"]["verified_subscopes"][0]["plan_sha256"] =
         Value::String("a".repeat(64));
+    let error =
+        validate_manifest(&outside, &root).expect_err("a digest outside the lineage was accepted");
     assert!(
-        validate_manifest(&outside, &root).is_err(),
-        "a digest outside the lineage was accepted"
+        error.contains(
+            "E01.controller_acceptance plan_sha256 is not the registered digest of plan v4.1"
+        ),
+        "{error}"
     );
 
     let mut unknown_version = load_manifest(&root);
@@ -3875,54 +4319,89 @@ fn rejects_pending_or_unknown_plan_recheck_markers() {
         let mut downgraded = load_manifest(&root);
         let record = &mut downgraded["e_scopes"][task]["verified_subscopes"][0];
         assert_eq!(record["plan_recheck"], PLAN_RECHECKED);
+        let id = record["id"].as_str().unwrap().to_string();
+        let version = record["plan_version"].as_str().unwrap().to_string();
         record["plan_recheck"] = Value::String("not_affected".into());
-        assert!(
-            validate_manifest(&downgraded, &root).is_err(),
-            "{task}: a v4.1 record of a touched task without a recheck was accepted"
+        let not_rechecked = format!(
+            "{id} belongs to {task}, which the v4.5 revision touches, but was not rechecked"
         );
+        let error = validate_manifest(&downgraded, &root)
+            .expect_err("a record of a touched task without a recheck was accepted");
+        assert!(error.contains(&not_rechecked), "{task}: {error}");
+        let position = |wanted: &str| {
+            PLAN_LINEAGE
+                .iter()
+                .position(|(known, _, _)| *known == wanted)
+        };
         for previous in ["rechecked_v4.2", "rechecked_v4.3", "rechecked_v4.4"] {
             let mut previous_recheck = load_manifest(&root);
             previous_recheck["e_scopes"][task]["verified_subscopes"][0]["plan_recheck"] =
                 Value::String(previous.into());
-            assert!(
-                validate_manifest(&previous_recheck, &root).is_err(),
-                "{task}: the previous-plan marker {previous} was accepted in place of a v4.5 recheck"
-            );
+            let expected = if previous == "rechecked_v4.4" {
+                format!("{id} plan_recheck {previous} is not a registered marker")
+            } else if position(&previous["rechecked_".len()..]) <= position(&version) {
+                format!(
+                    "{id} plan_recheck {previous} does not name a plan later than the record's own plan_version {version}"
+                )
+            } else {
+                not_rechecked.clone()
+            };
+            let error = validate_manifest(&previous_recheck, &root)
+                .expect_err("a previous-plan marker was accepted in place of a v4.5 recheck");
+            assert!(error.contains(&expected), "{task} {previous}: {error}");
         }
         let mut missing = load_manifest(&root);
         missing["e_scopes"][task]["verified_subscopes"][0]
             .as_object_mut()
             .unwrap()
             .remove("plan_recheck");
-        assert!(
-            validate_manifest(&missing, &root).is_err(),
-            "{task}: a v4.1 record of a touched task with no marker was accepted"
-        );
+        let error = validate_manifest(&missing, &root)
+            .expect_err("a record of a touched task with no marker was accepted");
+        assert!(error.contains(&not_rechecked), "{task}: {error}");
     }
 }
 
 #[test]
 fn rejects_missing_or_unregistered_plan_lineage() {
     let root = repo_root();
+    let lineage_error =
+        |value: &Value| validate_manifest(value, &root).expect_err("a wrong lineage");
     let mut missing = load_manifest(&root);
     missing.as_object_mut().unwrap().remove("plan_lineage");
-    assert!(validate_manifest(&missing, &root).is_err());
+    let error = lineage_error(&missing);
+    assert!(error.contains("plan_lineage must be an array"), "{error}");
 
     let mut reversed = load_manifest(&root);
     reversed["plan_lineage"].as_array_mut().unwrap().reverse();
-    assert!(validate_manifest(&reversed, &root).is_err());
+    let error = lineage_error(&reversed);
+    assert!(
+        error.contains("plan_lineage entry for v4.1 differs from the registered lineage"),
+        "{error}"
+    );
 
     let mut truncated = load_manifest(&root);
     truncated["plan_lineage"].as_array_mut().unwrap().remove(0);
-    assert!(validate_manifest(&truncated, &root).is_err());
+    let error = lineage_error(&truncated);
+    assert!(
+        error.contains("plan_lineage must list exactly the 5 registered plan versions"),
+        "{error}"
+    );
 
     let mut wrong_digest = load_manifest(&root);
     wrong_digest["plan_lineage"][1]["sha256"] = Value::String(PLAN_LINEAGE[0].2.into());
-    assert!(validate_manifest(&wrong_digest, &root).is_err());
+    let error = lineage_error(&wrong_digest);
+    assert!(
+        error.contains("plan_lineage entry for v4.2 differs from the registered lineage"),
+        "{error}"
+    );
 
     let mut extra_key = load_manifest(&root);
     extra_key["plan_lineage"][1]["effect"] = Value::String("improved".into());
-    assert!(validate_manifest(&extra_key, &root).is_err());
+    let error = lineage_error(&extra_key);
+    assert!(
+        error.contains("plan_lineage entry for v4.2 carries unknown or missing keys"),
+        "{error}"
+    );
 
     let mut extended = load_manifest(&root);
     extended["plan_lineage"]
@@ -3933,16 +4412,21 @@ fn rejects_missing_or_unregistered_plan_lineage() {
             "file": "future.md",
             "sha256": "b".repeat(64),
         }));
-    assert!(validate_manifest(&extended, &root).is_err());
+    let error = lineage_error(&extended);
+    assert!(
+        error.contains("plan_lineage must list exactly the 5 registered plan versions"),
+        "{error}"
+    );
 
     let mut without_v44 = load_manifest(&root);
     without_v44["plan_lineage"]
         .as_array_mut()
         .unwrap()
         .remove(3);
+    let error = lineage_error(&without_v44);
     assert!(
-        validate_manifest(&without_v44, &root).is_err(),
-        "a lineage skipping the never-bound v4.4 was accepted"
+        error.contains("plan_lineage must list exactly the 5 registered plan versions"),
+        "a lineage skipping the never-bound v4.4 was accepted: {error}"
     );
 }
 
@@ -3984,13 +4468,23 @@ fn v43_scenarios_are_registered_without_execution_credit_and_reject_tampering() 
         serde_json::json!("verified");
     unexecuted["traceability"]["v_scenarios"][119]["related_evidence_refs"] = serde_json::json!([]);
     unexecuted["traceability"]["v_scenarios"][119]["remaining"] = serde_json::json!("");
-    assert!(validate_manifest(&unexecuted, &root).is_err());
+    assert_eq!(unexecuted["traceability"]["v_scenarios"][119]["id"], "V120");
+    // A verified scenario must name its completion evidence (as in the Python checker).
+    let error = validate_manifest(&unexecuted, &root).expect_err("an unexecuted verified V120");
+    assert!(
+        error.contains("V120 completion evidence refs must be an array"),
+        "{error}"
+    );
     let mut missing = baseline.clone();
     missing["traceability"]["v_scenarios"]
         .as_array_mut()
         .unwrap()
         .pop();
-    assert!(validate_manifest(&missing, &root).is_err());
+    let error = validate_manifest(&missing, &root).expect_err("a missing V123");
+    assert!(
+        error.contains("V001-V123 exact set is incomplete"),
+        "{error}"
+    );
     let mut duplicate = baseline.clone();
     let last = duplicate["traceability"]["v_scenarios"]
         .as_array()
@@ -4002,10 +4496,15 @@ fn v43_scenarios_are_registered_without_execution_credit_and_reject_tampering() 
         .as_array_mut()
         .unwrap()
         .push(last);
-    assert!(validate_manifest(&duplicate, &root).is_err());
+    let error = validate_manifest(&duplicate, &root).expect_err("a duplicated V123");
+    assert!(error.contains("duplicate V id V123"), "{error}");
     let mut wrong_owner = baseline;
     wrong_owner["traceability"]["v_scenarios"][119]["e_tasks"] = serde_json::json!(["E17"]);
-    assert!(validate_manifest(&wrong_owner, &root).is_err());
+    let error = validate_manifest(&wrong_owner, &root).expect_err("a wrong V120 owner");
+    assert!(
+        error.contains("V120 E responsibility mapping differs from plan v4.5"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4018,7 +4517,11 @@ fn e09_scenarios_include_the_v097_ablation_obligation() {
         .as_array_mut()
         .unwrap()
         .retain(|item| item.as_str() != Some("V097"));
-    assert!(validate_manifest(&without_scenario, &root).is_err());
+    let error = validate_manifest(&without_scenario, &root).expect_err("E09 without V097");
+    assert!(
+        error.contains("E09 scenario responsibility differs from plan v4.5"),
+        "{error}"
+    );
 
     let mut without_task = load_manifest(&root);
     let v097 = without_task["traceability"]["v_scenarios"]
@@ -4031,7 +4534,11 @@ fn e09_scenarios_include_the_v097_ablation_obligation() {
         .as_array_mut()
         .unwrap()
         .retain(|item| item.as_str() != Some("E09"));
-    assert!(validate_manifest(&without_task, &root).is_err());
+    let error = validate_manifest(&without_task, &root).expect_err("V097 without E09");
+    assert!(
+        error.contains("V097 E responsibility mapping differs from plan v4.5"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4040,9 +4547,12 @@ fn rejects_missing_e16_parent_and_optional_extensions() {
     for missing in ["E16", "E17", "E18"] {
         let mut value = load_manifest(&root);
         value["e_scopes"].as_object_mut().unwrap().remove(missing);
+        let error = validate_manifest(&value, &root).expect_err("a missing scope was accepted");
         assert!(
-            validate_manifest(&value, &root).is_err(),
-            "missing {missing} was accepted"
+            error.contains(&format!(
+                "e_scopes exact set mismatch: missing=[\"{missing}\"] extra=[]"
+            )),
+            "{missing}: {error}"
         );
     }
 }
@@ -4052,7 +4562,11 @@ fn rejects_unknown_status_and_verified_without_execution_evidence() {
     let root = repo_root();
     let mut unknown = load_manifest(&root);
     unknown["e_scopes"]["E17"]["status"] = Value::String("verified_optional".into());
-    assert!(validate_manifest(&unknown, &root).is_err());
+    let error = validate_manifest(&unknown, &root).expect_err("an unknown status");
+    assert!(
+        error.contains("E17 has unknown status verified_optional"),
+        "{error}"
+    );
 
     let mut unsupported_verified = load_manifest(&root);
     assert!(
@@ -4063,7 +4577,12 @@ fn rejects_unknown_status_and_verified_without_execution_evidence() {
     );
     unsupported_verified["e_scopes"]["E15"]["status"] = Value::String("verified".into());
     unsupported_verified["e_scopes"]["E15"]["remaining"] = Value::Array(vec![]);
-    assert!(validate_manifest(&unsupported_verified, &root).is_err());
+    let error = validate_manifest(&unsupported_verified, &root)
+        .expect_err("a verified scope without evidence");
+    assert!(
+        error.contains("E15 verified status lacks execution evidence"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4075,9 +4594,12 @@ fn rejects_verified_record_missing_input_or_actual_result() {
             .as_object_mut()
             .unwrap()
             .remove(field);
+        let error = validate_manifest(&value, &root).expect_err("a record missing a field");
         assert!(
-            validate_manifest(&value, &root).is_err(),
-            "missing {field} was accepted"
+            error.contains(&format!(
+                "E01.controller_acceptance {field} must be a non-empty string"
+            )),
+            "missing {field} was accepted: {error}"
         );
     }
 }
@@ -4087,12 +4609,20 @@ fn rejects_failed_execution_and_wrong_per_pr_merge_sha() {
     let root = repo_root();
     let mut failed = load_manifest(&root);
     failed["e_scopes"]["E01"]["verified_subscopes"][0]["exit_code"] = serde_json::json!(101);
-    assert!(validate_manifest(&failed, &root).is_err());
+    let error = validate_manifest(&failed, &root).expect_err("a failed execution");
+    assert!(
+        error.contains("E01.controller_acceptance verified execution must have exit_code 0"),
+        "{error}"
+    );
 
     let mut wrong_merge = load_manifest(&root);
     wrong_merge["e_scopes"]["E03"]["verified_subscopes"][0]["merged_sha"] =
         Value::String("59afd1663a0d5f5212077dd92beaaf7920cde0ff".into());
-    assert!(validate_manifest(&wrong_merge, &root).is_err());
+    let error = validate_manifest(&wrong_merge, &root).expect_err("a wrong per-PR merge");
+    assert!(
+        error.contains("E03.controller_acceptance merged_sha differs from the reviewed PR merge"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4102,14 +4632,19 @@ fn rejects_well_formed_but_wrong_so_pin_and_mapping() {
         let mut value = load_manifest(&root);
         value["traceability"]["so_sources"][0][field] =
             Value::String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        let error = validate_manifest(&value, &root).expect_err("a wrong SO pin");
         assert!(
-            validate_manifest(&value, &root).is_err(),
-            "wrong SO {field} was accepted"
+            error.contains("SO01 pin/provenance differs from plan v4.5"),
+            "wrong SO {field} was accepted: {error}"
         );
     }
     let mut mapping = load_manifest(&root);
     mapping["traceability"]["so_sources"][0]["e_tasks"] = serde_json::json!(["E99"]);
-    assert!(validate_manifest(&mapping, &root).is_err());
+    let error = validate_manifest(&mapping, &root).expect_err("a wrong SO mapping");
+    assert!(
+        error.contains("SO01 task mapping differs from plan v4.5"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4117,18 +4652,27 @@ fn rejects_broken_commitment_and_v_trace_links() {
     let root = repo_root();
     let mut b = load_manifest(&root);
     b["traceability"]["b_commitments"][0]["e_tasks"] = serde_json::json!(["E18"]);
-    assert!(validate_manifest(&b, &root).is_err());
+    let error = validate_manifest(&b, &root).expect_err("a broken B01 chain");
+    assert!(
+        error.contains("B01 trace chain differs from plan v4.5"),
+        "{error}"
+    );
 
     let mut v = load_manifest(&root);
     v["traceability"]["v_scenarios"][0]["e_tasks"] = serde_json::json!(["E18"]);
-    assert!(validate_manifest(&v, &root).is_err());
+    let error = validate_manifest(&v, &root).expect_err("a broken V001 mapping");
+    assert!(
+        error.contains("V001 E responsibility mapping differs from plan v4.5"),
+        "{error}"
+    );
 
     let mut hidden_gap = load_manifest(&root);
     hidden_gap["traceability"]["k_commitments"][4]["implementation_status"] =
         Value::String("implemented_not_verified".into());
+    let error = validate_manifest(&hidden_gap, &root).expect_err("a hidden K05 gap");
     assert!(
-        validate_manifest(&hidden_gap, &root).is_err(),
-        "K05 cannot hide its missing consolidation consumer as implementation-complete"
+        error.contains("K05 implementation status hides a known consumer gap or completed subset"),
+        "K05 cannot hide its missing consolidation consumer as implementation-complete: {error}"
     );
 }
 
@@ -4140,17 +4684,31 @@ fn rejects_fake_target_extra_command_and_path_escape() {
         Value::String("crates/evo-core/tests/not_real.rs".into());
     fake["e_scopes"]["E01"]["verified_subscopes"][0]["command"] =
         Value::String("cargo test --locked --offline -p evo-core --test not_real".into());
-    assert!(validate_manifest(&fake, &root).is_err());
+    let error = validate_manifest(&fake, &root).expect_err("a fake test target");
+    assert!(
+        error.contains(
+            "E01.controller_acceptance test_entry does not exist: crates/evo-core/tests/not_real.rs"
+        ),
+        "{error}"
+    );
 
     let mut extra = load_manifest(&root);
     extra["e_scopes"]["E01"]["verified_subscopes"][0]["command"] = Value::String(
         "cargo test --locked --offline -p evo-core --test evaluation_v41 && echo pass".into(),
     );
-    assert!(validate_manifest(&extra, &root).is_err());
+    let error = validate_manifest(&extra, &root).expect_err("an extra shell command");
+    assert!(
+        error.contains("command must use the finite cargo test grammar"),
+        "{error}"
+    );
 
     let mut escape = load_manifest(&root);
     escape["e_scopes"]["E01"]["implementation_files"][0] = Value::String("../outside.rs".into());
-    assert!(validate_manifest(&escape, &root).is_err());
+    let error = validate_manifest(&escape, &root).expect_err("an escaping implementation file");
+    assert!(
+        error.contains("E01 implementation file contains traversal or non-normal components"),
+        "{error}"
+    );
 }
 
 #[cfg(unix)]
@@ -4193,9 +4751,11 @@ fn planned_scope_can_omit_files_only_with_explicit_remaining_reason() {
     let mut started = load_manifest(&root);
     assert_eq!(started["e_scopes"]["E18"]["status"], "in_progress");
     started["e_scopes"]["E18"]["implementation_files"] = Value::Array(vec![]);
+    let error = validate_manifest(&started, &root)
+        .expect_err("a started scope without implementation files was accepted");
     assert!(
-        validate_manifest(&started, &root).is_err(),
-        "a started scope without implementation files was accepted"
+        error.contains("E18 non-planned scope needs implementation_files"),
+        "{error}"
     );
 }
 
@@ -4243,7 +4803,11 @@ fn field_semantics_must_be_present_and_equal_the_pinned_text() {
     ] {
         let mut value = load_manifest(&root);
         value["field_semantics"] = replacement;
-        assert!(validate_manifest(&value, &root).is_err());
+        let error = validate_manifest(&value, &root).expect_err("a non-object field_semantics");
+        assert!(
+            error.contains("field_semantics must be an object stating what command, exit_code, log_path, execution and production_consumer mean"),
+            "{error}"
+        );
     }
 
     for (key, _) in &pinned {
@@ -4252,9 +4816,13 @@ fn field_semantics_must_be_present_and_equal_the_pinned_text() {
             .as_object_mut()
             .unwrap()
             .remove(*key);
+        let error = validate_manifest(&dropped, &root)
+            .expect_err("field_semantics without a definition was accepted");
         assert!(
-            validate_manifest(&dropped, &root).is_err(),
-            "field_semantics without {key} was accepted"
+            error.contains(&format!(
+                "field_semantics keys differ: missing=[\"{key}\"] extra=[]"
+            )),
+            "{key}: {error}"
         );
         for replacement in [
             Value::Null,
@@ -4274,7 +4842,11 @@ fn field_semantics_must_be_present_and_equal_the_pinned_text() {
 
     let mut extended = load_manifest(&root);
     extended["field_semantics"]["effect"] = Value::String("improved".into());
-    assert!(validate_manifest(&extended, &root).is_err());
+    let error = validate_manifest(&extended, &root).expect_err("an extended field_semantics");
+    assert!(
+        error.contains("field_semantics keys differ: missing=[] extra=[\"effect\"]"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4305,7 +4877,14 @@ fn execution_is_required_above_pr_141_and_optional_up_to_it() {
     let mut malformed = well_formed_execution();
     malformed["exit_code"] = Value::String("0".into());
     let record = serde_json::json!({ "execution": malformed });
-    assert!(validate_execution("X.record", &record, 141).is_err());
+    let error = validate_execution("X.record", &record, 141)
+        .expect_err("a malformed execution on an older record");
+    assert!(
+        error.contains(
+            "X.record execution exit_code must be the integer exit code of the executed command"
+        ),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4358,13 +4937,21 @@ fn execution_rejects_malformed_objects() {
     ] {
         let mut execution = well_formed_execution();
         execution["command"] = invalid;
-        assert!(execution_result(execution).is_err());
+        let error = execution_result(execution).expect_err("an empty execution command");
+        assert!(
+            error.contains("X.record execution command must be a non-empty string"),
+            "{error}"
+        );
     }
 
     for invalid in [serde_json::json!(""), Value::Null, serde_json::json!(7)] {
         let mut execution = well_formed_execution();
         execution["evidence"] = invalid;
-        assert!(execution_result(execution).is_err());
+        let error = execution_result(execution).expect_err("an empty execution evidence");
+        assert!(
+            error.contains("X.record execution evidence must be a non-empty string"),
+            "{error}"
+        );
     }
 }
 
@@ -4490,8 +5077,14 @@ fn project_license_rejects_unreviewed_or_malformed_manifest_binding() {
     let root = repo_root();
     let value = load_manifest(&root);
     validate_project_license(&value, &root).unwrap();
+    let mut null = value.clone();
+    null["project_license"] = Value::Null;
+    let error = validate_manifest(&null, &root).expect_err("a null project_license");
+    assert!(
+        error.contains("project_license must be an object"),
+        "{error}"
+    );
     for replacement in [
-        Value::Null,
         serde_json::json!({"status":"MIT","path":"LICENSE","sha256":"164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb"}),
         serde_json::json!({"status":"source_available_personal_noncommercial_free","path":"../LICENSE","sha256":"164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb"}),
         serde_json::json!({"status":"source_available_personal_noncommercial_free","path":"LICENSE","sha256":true}),
@@ -4499,19 +5092,33 @@ fn project_license_rejects_unreviewed_or_malformed_manifest_binding() {
     ] {
         let mut changed = value.clone();
         changed["project_license"] = replacement;
-        assert!(validate_manifest(&changed, &root).is_err());
+        let error = validate_manifest(&changed, &root).expect_err("an unreviewed license binding");
+        assert!(
+            error.contains("project_license must bind the reviewed license text"),
+            "{error}"
+        );
     }
 }
 
 #[test]
 fn project_license_raw_json_rejects_duplicates_at_every_depth() {
-    for raw in [
-        r#"{"project_license":{},"project_license":{}}"#,
-        r#"{"project_license":{"status":"MIT","status":"source_available_personal_noncommercial_free"}}"#,
-        r#"[{"sha256":"a","sha256":"b"}]"#,
-        r#"{"valid":true} {"trailing":true}"#,
+    for (raw, expected) in [
+        (
+            r#"{"project_license":{},"project_license":{}}"#,
+            "duplicate JSON key: project_license",
+        ),
+        (
+            r#"{"project_license":{"status":"MIT","status":"source_available_personal_noncommercial_free"}}"#,
+            "duplicate JSON key: status",
+        ),
+        (
+            r#"[{"sha256":"a","sha256":"b"}]"#,
+            "duplicate JSON key: sha256",
+        ),
+        (r#"{"valid":true} {"trailing":true}"#, "trailing characters"),
     ] {
-        assert!(load_json_strict(raw).is_err(), "accepted: {raw}");
+        let error = load_json_strict(raw).expect_err("accepted ambiguous JSON");
+        assert!(error.contains(expected), "{raw}: {error}");
     }
     assert_eq!(
         load_json_strict(r#"{"scalars":[true,null,-1,2,0.5,"text"]}"#).unwrap(),
@@ -4542,16 +5149,29 @@ fn support_evidence_namespace_uses_the_longest_registered_task() {
     ] {
         validate_evidence_namespace(id, task).unwrap();
     }
-    for (id, task) in [
-        ("E16.5.borrowed", "E16"),
-        ("E01.borrowed", "E02"),
-        ("E160.borrowed", "E16"),
-        ("E01.bad/name", "E01"),
-        ("E01.é", "E01"),
+    for (id, task, expected) in [
+        (
+            "E16.5.borrowed",
+            "E16",
+            "E16 evidence id E16.5.borrowed is not namespaced under its own task",
+        ),
+        (
+            "E01.borrowed",
+            "E02",
+            "E02 evidence id E01.borrowed is not namespaced under its own task",
+        ),
+        (
+            "E160.borrowed",
+            "E16",
+            "E16 evidence id E160.borrowed is not namespaced under its own task",
+        ),
+        ("E01.bad/name", "E01", "E01 evidence id is invalid"),
+        ("E01.é", "E01", "E01 evidence id is invalid"),
     ] {
+        let error = validate_evidence_namespace(id, task).expect_err("a foreign or invalid id");
         assert!(
-            validate_evidence_namespace(id, task).is_err(),
-            "accepted {id} for {task}"
+            error.contains(expected),
+            "accepted {id} for {task}: {error}"
         );
     }
 }
@@ -4609,7 +5229,7 @@ fn support_evidence_refs_require_unique_known_owners_and_allow_empty_so() {
         entry["verification_evidence_refs"] = serde_json::json!([]);
     }
     validate_manifest(&value, &root).unwrap();
-    let owners = validate_e_scopes(&value["e_scopes"], &root).unwrap();
+    let owners = validate_e_scopes(&value, &root).unwrap();
     let tasks = split_set("E01");
     validate_evidence_refs(
         &serde_json::json!(["E01.controller_acceptance"]),
@@ -4618,11 +5238,19 @@ fn support_evidence_refs_require_unique_known_owners_and_allow_empty_so() {
         &owners,
     )
     .unwrap();
-    for bad in [
-        serde_json::json!(["E01.missing"]),
-        serde_json::json!(["E01.controller_acceptance", "E01.controller_acceptance"]),
+    for (bad, expected) in [
+        (
+            serde_json::json!(["E01.missing"]),
+            "refs references unknown evidence E01.missing",
+        ),
+        (
+            serde_json::json!(["E01.controller_acceptance", "E01.controller_acceptance"]),
+            "refs contains duplicate E01.controller_acceptance",
+        ),
     ] {
-        assert!(validate_evidence_refs(&bad, "refs", &tasks, &owners).is_err());
+        let error =
+            validate_evidence_refs(&bad, "refs", &tasks, &owners).expect_err("a wrong ref set");
+        assert!(error.contains(expected), "{error}");
     }
 }
 
@@ -4794,26 +5422,53 @@ fn workspace_mapping_rejects_duplicate_ambiguous_or_escaping_metadata() {
         "[\"components/*\"]",
     ] {
         fixture.write("Cargo.toml", &format!("[workspace]\nmembers = {members}\n"));
+        let error = workspace_packages(&fixture.root).expect_err("ambiguous workspace members");
         assert!(
-            workspace_packages(&fixture.root).is_err(),
-            "accepted {members}"
+            error.contains("read-only workspace package check failed"),
+            "accepted {members}: {error}"
         );
     }
-    for raw in [
-        r#"{}"#,
-        r#"[]"#,
-        r#"{"evo-core":1}"#,
-        r#"{"evo-core":"components/one","evo-core":"components/one"}"#,
-        r#"{"evo-core":"components/one","other":"components/one"}"#,
-        r#"{"evo-core":"../outside"}"#,
-        r#"{"evo-core":"/outside"}"#,
-        r#"{"evo-core":"components//one"}"#,
-        r#"{"unknown":null}"#,
+    for (raw, expected) in [
+        (
+            r#"{}"#,
+            "workspace package metadata must be a nonempty object",
+        ),
+        (
+            r#"[]"#,
+            "workspace package metadata must be a nonempty object",
+        ),
+        (
+            r#"{"evo-core":1}"#,
+            "workspace member must be a non-empty string",
+        ),
+        (
+            r#"{"evo-core":"components/one","evo-core":"components/one"}"#,
+            "duplicate JSON key: evo-core",
+        ),
+        (
+            r#"{"evo-core":"components/one","other":"components/one"}"#,
+            "workspace package metadata has a duplicate member/package",
+        ),
+        (
+            r#"{"evo-core":"../outside"}"#,
+            "workspace package metadata has a non-normal member",
+        ),
+        (
+            r#"{"evo-core":"/outside"}"#,
+            "workspace package metadata has a non-normal member",
+        ),
+        (
+            r#"{"evo-core":"components//one"}"#,
+            "workspace package metadata has a non-normal member",
+        ),
+        (
+            r#"{"unknown":null}"#,
+            "workspace member must be a non-empty string",
+        ),
     ] {
-        assert!(
-            decode_workspace_packages(raw, &fixture.root).is_err(),
-            "accepted {raw}"
-        );
+        let error =
+            decode_workspace_packages(raw, &fixture.root).expect_err("ambiguous package metadata");
+        assert!(error.contains(expected), "accepted {raw}: {error}");
     }
 }
 
@@ -5293,11 +5948,16 @@ fn withdrawn_records_are_the_reviewed_list_and_never_revive() {
 
     let mut duplicated = baseline.clone();
     let first = duplicated["withdrawn_records"][0].clone();
+    let first_id = first["id"].as_str().unwrap().to_string();
     duplicated["withdrawn_records"]
         .as_array_mut()
         .unwrap()
         .push(first);
-    assert!(validate_manifest(&duplicated, &root).is_err());
+    let error = validate_manifest(&duplicated, &root).expect_err("a duplicated withdrawn entry");
+    assert!(
+        error.contains(&format!("withdrawn_records lists {first_id} twice")),
+        "{error}"
+    );
 
     for (field, invalid, expected) in [
         (
@@ -5340,13 +6000,21 @@ fn withdrawn_records_are_the_reviewed_list_and_never_revive() {
     let mut extra_key = baseline.clone();
     withdrawn_entry_mut(&mut extra_key, "E05.ag052_versioned_batch_verdicts")["verdict"] =
         Value::String("improved".into());
-    assert!(validate_manifest(&extra_key, &root).is_err());
+    let error = validate_manifest(&extra_key, &root).expect_err("an extra withdrawn key");
+    assert!(
+        error.contains("withdrawn_records entry keys differ: missing=[] extra=[\"verdict\"]"),
+        "{error}"
+    );
     let mut missing_key = baseline;
     withdrawn_entry_mut(&mut missing_key, "E05.ag052_versioned_batch_verdicts")
         .as_object_mut()
         .unwrap()
         .remove("owner_task");
-    assert!(validate_manifest(&missing_key, &root).is_err());
+    let error = validate_manifest(&missing_key, &root).expect_err("a missing withdrawn key");
+    assert!(
+        error.contains("withdrawn_records entry keys differ: missing=[\"owner_task\"] extra=[]"),
+        "{error}"
+    );
 }
 
 /// A synthetic re-verification of the withdrawn E05.ag101 record (same task, own identity, bound
@@ -5982,7 +6650,11 @@ fn missing_evidence_register_is_pinned_and_decides_local_outcomes() {
         .as_object_mut()
         .unwrap()
         .remove("evidence_missing_register");
-    assert!(validate_manifest(&unpinned, &root).is_err());
+    let error = validate_manifest(&unpinned, &root).expect_err("an unpinned register");
+    assert!(
+        error.contains("evidence_missing_register must be an object"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -6194,57 +6866,127 @@ fn harness2_borrowings_and_sources_match_the_plan_tables() {
             .len(),
         8
     );
-    for (index, field, invalid) in [
-        (0, "commit", serde_json::json!("a".repeat(40))),
-        (0, "tree", serde_json::json!("b".repeat(40))),
-        (3, "blob_sha", serde_json::json!("c".repeat(40))),
-        (3, "path", serde_json::json!("harness2/core/other.py")),
-        (1, "license", serde_json::json!("MIT")),
+    let pin = "fixed Harness² source pin differs from plan §16.8";
+    for (index, field, invalid, expected) in [
+        (
+            0,
+            "commit",
+            serde_json::json!("a".repeat(40)),
+            format!("HSF01 {pin}"),
+        ),
+        (
+            0,
+            "tree",
+            serde_json::json!("b".repeat(40)),
+            format!("HSF01 {pin}"),
+        ),
+        (
+            3,
+            "blob_sha",
+            serde_json::json!("c".repeat(40)),
+            format!("HSF04 {pin}"),
+        ),
+        (
+            3,
+            "path",
+            serde_json::json!("harness2/core/other.py"),
+            format!("HSF04 {pin}"),
+        ),
+        (
+            1,
+            "license",
+            serde_json::json!("MIT"),
+            format!("HSF02 {pin}"),
+        ),
         (
             1,
             "repository",
             serde_json::json!("https://github.com/google/harness2"),
+            format!("HSF02 {pin}"),
         ),
-        (2, "read_range", serde_json::json!("全文")),
-        (2, "e_tasks", serde_json::json!(["E00"])),
-        (16, "blob_sha", serde_json::json!("d".repeat(40))),
+        (
+            2,
+            "read_range",
+            serde_json::json!("全文"),
+            format!("HSF03 {pin}"),
+        ),
+        (
+            2,
+            "e_tasks",
+            serde_json::json!(["E00"]),
+            "HSF03 E mapping differs from the V123 responsibility".to_string(),
+        ),
+        (
+            16,
+            "blob_sha",
+            serde_json::json!("d".repeat(40)),
+            format!("HSP01 {pin}"),
+        ),
     ] {
         let mut value = baseline.clone();
         value["traceability"]["hsf_sources"][index][field] = invalid;
-        assert!(
-            validate_manifest(&value, &root).is_err(),
-            "HSF {index} {field}"
-        );
+        let error = validate_manifest(&value, &root).expect_err("a wrong Harness² source");
+        assert!(error.contains(&expected), "HSF {index} {field}: {error}");
     }
     let mut missing = baseline.clone();
     missing["traceability"]["hsf_sources"]
         .as_array_mut()
         .unwrap()
         .pop();
-    assert!(validate_manifest(&missing, &root).is_err());
-    for (index, field, invalid) in [
-        (0, "section", serde_json::json!("§6.7.5")),
-        (0, "hsf_refs", serde_json::json!(["HSF04"])),
-        (2, "e_tasks", serde_json::json!(["E09"])),
-        (6, "v_scenarios", serde_json::json!(["V052"])),
-        (4, "adoption", serde_json::json!("adopted")),
-        (4, "implementation_status", serde_json::json!("planned")),
-        (0, "verification_status", serde_json::json!("verified")),
-        (0, "effect_status", serde_json::json!("improved")),
-        (0, "remaining", serde_json::json!("")),
+    let error = validate_manifest(&missing, &root).expect_err("a missing HSP01");
+    assert!(
+        error.contains("hsf_sources must be exactly HSF01–HSF16 and HSP01"),
+        "{error}"
+    );
+    let chain = "borrowing trace chain differs from plan §2.9";
+    for (index, field, invalid, expected) in [
+        (0, "section", serde_json::json!("§6.7.5"), format!("HS01 {chain}")),
+        (0, "hsf_refs", serde_json::json!(["HSF04"]), format!("HS01 {chain}")),
+        (2, "e_tasks", serde_json::json!(["E09"]), format!("HS03 {chain}")),
+        (6, "v_scenarios", serde_json::json!(["V052"]), format!("HS07 {chain}")),
+        (4, "adoption", serde_json::json!("adopted"), format!("HS05 {chain}")),
+        (
+            4,
+            "implementation_status",
+            serde_json::json!("planned"),
+            "HS05 is registered only (plan §2.9, v4.5 Q-44) and is not implemented in this version"
+                .to_string(),
+        ),
+        (
+            0,
+            "verification_status",
+            serde_json::json!("verified"),
+            "HS01 tracking axes overstate the borrowing".to_string(),
+        ),
+        (
+            0,
+            "effect_status",
+            serde_json::json!("improved"),
+            "HS01 conflates specification or effect status".to_string(),
+        ),
+        (
+            0,
+            "remaining",
+            serde_json::json!(""),
+            "HS01 remaining must be a non-empty string".to_string(),
+        ),
         (
             0,
             "related_evidence_refs",
             serde_json::json!(["E01.controller_acceptance"]),
+            "HS01 related_evidence_refs references evidence E01.controller_acceptance owned by unrelated task E01".to_string(),
         ),
-        (0, "benefit", serde_json::json!("improved")),
+        (
+            0,
+            "benefit",
+            serde_json::json!("improved"),
+            "HS01 keys differ: missing=[] extra=[\"benefit\"]".to_string(),
+        ),
     ] {
         let mut value = baseline.clone();
         value["traceability"]["hs_borrowings"][index][field] = invalid;
-        assert!(
-            validate_manifest(&value, &root).is_err(),
-            "HS {index} {field}"
-        );
+        let error = validate_manifest(&value, &root).expect_err("a wrong Harness² borrowing");
+        assert!(error.contains(&expected), "HS {index} {field}: {error}");
     }
 }
 
@@ -6296,7 +7038,11 @@ fn v121_to_v123_and_v048_follow_the_v45_responsibility_table() {
         .as_array_mut()
         .unwrap()
         .push(Value::String("E06".into()));
-    assert!(validate_manifest(&v081, &root).is_err());
+    let error = validate_manifest(&v081, &root).expect_err("E06 carrying V081");
+    assert!(
+        error.contains("V081 E responsibility mapping differs from plan v4.5"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -6313,7 +7059,11 @@ fn stage8_gate_scripts_are_registered_execution_runners() {
     ] {
         let mut execution = well_formed_execution();
         execution["runner"] = Value::String(runner.into());
-        assert!(execution_result(execution).is_err(), "{runner}");
+        let error = execution_result(execution).expect_err("an unregistered gate runner");
+        assert!(
+            error.contains("X.record execution runner must be one of"),
+            "{runner}: {error}"
+        );
     }
 }
 
@@ -6321,17 +7071,577 @@ fn stage8_gate_scripts_are_registered_execution_runners() {
 fn trace_index_coverage_spans_v123_and_the_harness2_ranges() {
     let root = repo_root();
     let baseline = load_manifest(&root);
-    for (task, range) in [
-        ("E16.6", "V001–V123"),
-        ("E16.6", "HSP01"),
-        ("E00", "V087–V123"),
-        ("E00", "HSF01–HSF16"),
+    for (task, range, expected) in [
+        (
+            "E16.6",
+            "V001–V123",
+            "E16.6 complete index responsibility differs from plan v4.5",
+        ),
+        (
+            "E16.6",
+            "HSP01",
+            "E16.6 complete index responsibility differs from plan v4.5",
+        ),
+        (
+            "E00",
+            "V087–V123",
+            "E00 trace-only responsibility differs from plan v4.5",
+        ),
+        (
+            "E00",
+            "HSF01–HSF16",
+            "E00 trace-only responsibility differs from plan v4.5",
+        ),
     ] {
         let mut value = baseline.clone();
         value["trace_index_coverage"][task]["ranges"]
             .as_array_mut()
             .unwrap()
             .retain(|item| item != range);
-        assert!(validate_manifest(&value, &root).is_err(), "{task} {range}");
+        let error = validate_manifest(&value, &root).expect_err("a shrunken coverage range");
+        assert!(error.contains(expected), "{task} {range}: {error}");
     }
+}
+
+/// A fresh evidence identity for a reviewed pull request (the Python tests' _fresh_record): its own
+/// id, the current plan binding, source commit and local artifacts; pr_state dropped.
+fn fresh_record(base: &Value, task: &str, name: &str, stem: &str) -> Value {
+    let id = format!("{task}.{name}");
+    let mut record = base.clone();
+    let object = record.as_object_mut().unwrap();
+    object.remove("pr_state");
+    for (key, value) in [
+        ("id", Value::String(id.clone())),
+        ("plan_version", Value::String(PLAN_VERSION.into())),
+        ("plan_sha256", Value::String(PLAN_SHA.into())),
+        ("plan_recheck", Value::String("not_affected".into())),
+        (
+            "source_sha",
+            Value::String(evo_core::hash(id.as_bytes())[..40].to_string()),
+        ),
+        ("log_path", Value::String(format!("out/fixture/{stem}.log"))),
+        (
+            "input_ref",
+            Value::String(format!("out/fixture/{stem}-input.json")),
+        ),
+        (
+            "input_digest",
+            Value::String(evo_core::hash(stem.as_bytes())),
+        ),
+        (
+            "record_source",
+            Value::String(format!("out/fixture/{stem}-acceptance.json")),
+        ),
+        ("execution", well_formed_execution()),
+    ] {
+        object.insert(key.to_string(), value);
+    }
+    record
+}
+
+/// A labelled manifest edit with the error text it must produce.
+type ManifestMutation = (&'static str, String, Box<dyn Fn(&mut Value)>);
+
+#[test]
+fn rejects_unknown_keys_in_every_closed_object() {
+    // R1 §Q4 items 1-3 (Python EVIDENCE/SCOPE/DIMENSION/COVERAGE/COMMITMENT/SO_SOURCE/LOCAL_USE/
+    // V_SCENARIO, ROOT and TRACEABILITY key sets).
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    validate_manifest(&baseline, &root).unwrap();
+    let record = baseline["e_scopes"]["E13"]["verified_subscopes"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cases: Vec<ManifestMutation> = vec![
+        (
+            "scope entry",
+            "E13 scope entry: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| value["e_scopes"]["E13"]["effect"] = "improved".into()),
+        ),
+        (
+            "evidence record",
+            format!("E13 evidence {record}: unknown key(s) [\"verdict\"]"),
+            Box::new(|value: &mut Value| {
+                value["e_scopes"]["E13"]["verified_subscopes"][0]["verdict"] = "improved".into()
+            }),
+        ),
+        (
+            "v_scenario",
+            "V001: unknown key(s) [\"benefit\"]".into(),
+            Box::new(|value: &mut Value| {
+                value["traceability"]["v_scenarios"][0]["benefit"] = "improved".into()
+            }),
+        ),
+        (
+            "commitment",
+            "B01: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| {
+                value["traceability"]["b_commitments"][0]["effect"] = "improved".into()
+            }),
+        ),
+        (
+            "so_source",
+            "SO01: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| {
+                value["traceability"]["so_sources"][0]["effect"] = "improved".into()
+            }),
+        ),
+        (
+            "local_use",
+            "SO01 local_use: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| {
+                value["traceability"]["so_sources"][0]["local_use"]["effect"] = "improved".into()
+            }),
+        ),
+        (
+            "traceability",
+            "traceability: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| value["traceability"]["effect"] = "improved".into()),
+        ),
+        (
+            "trace_index_coverage",
+            "E00 trace_index_coverage: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| {
+                value["trace_index_coverage"]["E00"]["effect"] = "improved".into()
+            }),
+        ),
+        (
+            "dimensions",
+            "dimensions: unknown key(s) [\"benefit\"]".into(),
+            Box::new(|value: &mut Value| value["dimensions"]["benefit"] = "improved".into()),
+        ),
+        (
+            "root",
+            "manifest root: unknown key(s) [\"effect\"]".into(),
+            Box::new(|value: &mut Value| value["effect"] = "improved".into()),
+        ),
+    ];
+    for (name, expected, mutate) in cases {
+        let mut value = baseline.clone();
+        mutate(&mut value);
+        let error = validate_manifest(&value, &root).expect_err("an unknown key carrying a claim");
+        assert!(
+            error.contains(&expected)
+                && error.contains(
+                    "are not part of the rsia.support_scope.v2 schema and cannot carry claims"
+                ),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn rejects_duplicated_runs_and_inconsistent_merge_facts_across_records() {
+    // R1 §Q4 items 4-5 (Python log_path uniqueness, cross-task run ownership and merge facts).
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let e13 = baseline["e_scopes"]["E13"]["verified_subscopes"][0].clone();
+    let e13_id = e13["id"].as_str().unwrap().to_string();
+    assert_eq!(e13["pr"], "https://github.com/acosmi/RSIAgent/pull/70");
+    let e13_merge = e13["merged_sha"].as_str().unwrap().to_string();
+    let e13_source = e13["source_sha"].as_str().unwrap().to_string();
+    // One test run (log_path) supports one record: E13's evidence borrowed under E15.
+    let mut borrowed = e13.clone();
+    borrowed["id"] = Value::String("E15.controller_acceptance".into());
+    borrowed["plan_recheck"] = Value::String(V43_RECHECKED.into());
+    for (log, expected) in [
+        (
+            None,
+            format!(
+                "E15.controller_acceptance: log_path '{}' duplicates evidence {e13_id} of task E13; one test run may support only one evidence record",
+                e13["log_path"].as_str().unwrap()
+            ),
+        ),
+        (
+            Some("out/fixture/e15-rerun.log"),
+            format!(
+                "E15.controller_acceptance: the same test run ({} at source_sha {e13_source}) is already claimed by {e13_id} of task E13; evidence sets may not be duplicated across tasks",
+                e13["test_entry"].as_str().unwrap()
+            ),
+        ),
+    ] {
+        let mut value = baseline.clone();
+        value["e_scopes"]["E15"]["status"] = Value::String("in_progress".into());
+        let mut record = borrowed.clone();
+        if let Some(log) = log {
+            record["log_path"] = Value::String(log.into());
+        }
+        value["e_scopes"]["E15"]["verified_subscopes"]
+            .as_array_mut()
+            .unwrap()
+            .push(record);
+        let error = validate_manifest(&value, &root).expect_err("evidence borrowed across tasks");
+        assert!(error.contains(&expected), "{error}");
+    }
+    // Merge facts agree across records (E13 of PR #70 and E16.4.ag066 of PR #111).
+    let id = "E16.4.ag066_local_stdio_harness";
+    assert_eq!(
+        baseline["e_scopes"]["E16.4"]["verified_subscopes"][0]["id"],
+        id
+    );
+    for (field, forged, expected) in [
+        (
+            "merged_sha",
+            e13_merge.clone(),
+            format!(
+                "{id}: merged_sha {e13_merge} is already recorded as the merge commit of PR #70 ({e13_id}); one merge commit cannot also merge PR #111"
+            ),
+        ),
+        (
+            "merged_sha",
+            e13_source.clone(),
+            format!(
+                "{id}: merged_sha {e13_source} is the source_sha of PR #70 ({e13_id}), not a merge of PR #111"
+            ),
+        ),
+        (
+            "source_sha",
+            e13_merge.clone(),
+            format!(
+                "{id}: source_sha {e13_merge} is recorded as the merge commit of PR #70 ({e13_id})"
+            ),
+        ),
+    ] {
+        let mut value = baseline.clone();
+        value["e_scopes"]["E16.4"]["verified_subscopes"][0][field] = Value::String(forged);
+        let error = validate_manifest(&value, &root).expect_err("an inconsistent merge fact");
+        assert!(error.contains(&expected), "{field}: {error}");
+    }
+    let mut sibling = fresh_record(
+        &baseline["e_scopes"]["E16.4"]["verified_subscopes"][0],
+        "E16.4",
+        "second_controller_acceptance",
+        "e164-second",
+    );
+    sibling["merged_sha"] = Value::Null;
+    let mut value = baseline.clone();
+    value["e_scopes"]["E16.4"]["verified_subscopes"]
+        .as_array_mut()
+        .unwrap()
+        .push(sibling);
+    let error = validate_manifest(&value, &root).expect_err("a PR both merged and unmerged");
+    assert!(
+        error.contains("E16.4.second_controller_acceptance: PR #111 carries merged_sha null here but \"200c43bc19368ff52b064e67eb1b14e35f096d39\" in E16.4.ag066_local_stdio_harness"),
+        "{error}"
+    );
+}
+
+#[test]
+fn pr_state_agrees_with_merged_sha() {
+    // R1 §Q4 item 7 (Python PR_STATES: merged requires merged_sha, any other state forbids it).
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let id = "E16.4.ag066_local_stdio_harness";
+    let merge = "200c43bc19368ff52b064e67eb1b14e35f096d39";
+    assert_eq!(
+        baseline["e_scopes"]["E16.4"]["verified_subscopes"][0]["id"],
+        id
+    );
+    assert_eq!(
+        baseline["e_scopes"]["E16.4"]["verified_subscopes"][0]["merged_sha"],
+        merge
+    );
+    let outside =
+        format!("{id}: pr_state must be one of [\"draft\", \"open\", \"closed\", \"merged\"]");
+    for (state, merged, expected) in [
+        (
+            serde_json::json!("pending"),
+            serde_json::json!(merge),
+            outside.clone(),
+        ),
+        (
+            serde_json::json!(["merged"]),
+            serde_json::json!(merge),
+            outside.clone(),
+        ),
+        (serde_json::json!(7), serde_json::json!(merge), outside),
+        (
+            serde_json::json!("draft"),
+            serde_json::json!(merge),
+            format!(
+                "{id}: merged_sha {merge} is set but the record's pr_state is 'draft', not 'merged'"
+            ),
+        ),
+        (
+            serde_json::json!("closed"),
+            serde_json::json!(merge),
+            format!(
+                "{id}: merged_sha {merge} is set but the record's pr_state is 'closed', not 'merged'"
+            ),
+        ),
+        (
+            serde_json::json!("merged"),
+            Value::Null,
+            format!("{id}: pr_state is 'merged' but merged_sha is null"),
+        ),
+        (
+            serde_json::json!("merged"),
+            serde_json::json!("2e209dc"),
+            format!("{id} merged_sha must be null or lowercase 40-hex"),
+        ),
+    ] {
+        let mut value = baseline.clone();
+        let record = &mut value["e_scopes"]["E16.4"]["verified_subscopes"][0];
+        record["pr_state"] = state;
+        record["merged_sha"] = merged;
+        let error =
+            validate_manifest(&value, &root).expect_err("a pr_state disagreeing with merged_sha");
+        assert!(error.contains(&expected), "{error}");
+    }
+    // An absent or null pr_state asserts no state; the record digest covers it, so only a re-pinned
+    // fixture is valid.
+    for state in [None, Some(Value::Null)] {
+        let mut value = baseline.clone();
+        let record = value["e_scopes"]["E16.4"]["verified_subscopes"][0]
+            .as_object_mut()
+            .unwrap();
+        match state {
+            None => {
+                record.remove("pr_state");
+            }
+            Some(state) => {
+                record.insert("pr_state".into(), state);
+            }
+        }
+        let error = validate_manifest(&value, &root).expect_err("a rewritten historical record");
+        assert!(
+            error.contains(&format!(
+                "{id} historical record differs from its pinned digest"
+            )),
+            "{error}"
+        );
+        validate_manifest_with(&value, &root, &repinned(&value)).unwrap();
+    }
+    // A non-merged state without merged_sha passes the state rule; the reviewed merge fact decides.
+    let mut draft = baseline;
+    draft["e_scopes"]["E16.4"]["verified_subscopes"][0]["pr_state"] = serde_json::json!("draft");
+    draft["e_scopes"]["E16.4"]["verified_subscopes"][0]["merged_sha"] = Value::Null;
+    let error = validate_manifest(&draft, &root).expect_err("an unmerged claim for a merged PR");
+    assert!(
+        error.contains(&format!(
+            "{id} merged_sha differs from the reviewed PR merge"
+        )),
+        "{error}"
+    );
+}
+
+#[test]
+fn completion_evidence_refs_follow_the_status() {
+    // R1 §Q4 item 8 (Python completion_evidence_refs of scopes, SO sources, V scenarios and B/U/K).
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let e13_id = baseline["e_scopes"]["E13"]["verified_subscopes"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut claimed = baseline.clone();
+    claimed["e_scopes"]["E03"]["completion_evidence_refs"] =
+        serde_json::json!(["E03.controller_acceptance"]);
+    let error =
+        validate_manifest(&claimed, &root).expect_err("completion claimed by a started scope");
+    assert!(
+        error.contains(
+            "E03: completion_evidence_refs claims completion but status is 'in_progress'"
+        ),
+        "{error}"
+    );
+    let verified_e13 = |completion: Value| {
+        let mut value = baseline.clone();
+        value["e_scopes"]["E13"]["status"] = Value::String("verified".into());
+        value["e_scopes"]["E13"]["remaining"] = serde_json::json!([]);
+        value["e_scopes"]["E13"]["completion_evidence_refs"] = completion;
+        value
+    };
+    for completion in [
+        serde_json::json!([]),
+        serde_json::json!(["E01.controller_acceptance"]),
+    ] {
+        let error = validate_manifest(&verified_e13(completion), &root)
+            .expect_err("a verified scope without its own completion evidence");
+        assert!(
+            error.contains("E13: verified status lacks explicit task completion evidence"),
+            "{error}"
+        );
+    }
+    validate_manifest(&verified_e13(serde_json::json!([e13_id])), &root).unwrap();
+    for (refs, completion, remaining) in [
+        (
+            serde_json::json!([]),
+            serde_json::json!([]),
+            serde_json::json!(""),
+        ),
+        (
+            serde_json::json!(["E02.controller_acceptance"]),
+            serde_json::json!(["E02.controller_acceptance"]),
+            serde_json::json!("unfinished"),
+        ),
+        (
+            serde_json::json!(["E02.controller_acceptance"]),
+            serde_json::json!([]),
+            serde_json::json!(""),
+        ),
+    ] {
+        let mut value = baseline.clone();
+        let entry = &mut value["traceability"]["v_scenarios"][119];
+        assert_eq!(entry["id"], "V120");
+        entry["status"] = Value::String("verified".into());
+        entry["verification_status"] = Value::String("verified".into());
+        entry["related_evidence_refs"] = refs;
+        entry["completion_evidence_refs"] = completion;
+        entry["remaining"] = remaining;
+        let error =
+            validate_manifest(&value, &root).expect_err("a verified scenario without completion");
+        assert!(
+            error.contains(
+                "V120: verified scenario lacks completion evidence or retains unfinished scope"
+            ),
+            "{error}"
+        );
+    }
+    let mut commitment = baseline.clone();
+    commitment["traceability"]["b_commitments"][0]["verification_status"] =
+        Value::String("verified".into());
+    commitment["traceability"]["b_commitments"][0]["completion_evidence_refs"] =
+        serde_json::json!([]);
+    let error = validate_manifest(&commitment, &root)
+        .expect_err("a verified commitment without completion");
+    assert!(
+        error.contains("B01: verified commitment lacks completion evidence"),
+        "{error}"
+    );
+    commitment["traceability"]["b_commitments"][0]["completion_evidence_refs"] =
+        serde_json::json!(["E02.controller_acceptance"]);
+    validate_manifest(&commitment, &root).unwrap();
+    let mut source = baseline;
+    source["traceability"]["so_sources"][0]["verification_status"] =
+        Value::String("verified".into());
+    source["traceability"]["so_sources"][0]["completion_evidence_refs"] = serde_json::json!([]);
+    let error =
+        validate_manifest(&source, &root).expect_err("a verified source without completion");
+    assert!(
+        error.contains("SO01: verified source status lacks completion evidence"),
+        "{error}"
+    );
+}
+
+#[test]
+fn scope_and_scenario_status_rules_match_the_python_checker() {
+    // R1 §Q4 item 10 (Python scope-level rules, STATUS_RANK, implementation_files and the V axes).
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let fresh = fresh_record(
+        &baseline["e_scopes"]["E13"]["verified_subscopes"][0],
+        "E15",
+        "controller_acceptance",
+        "e15",
+    );
+    let cases: Vec<ManifestMutation> = vec![
+        (
+            "planned scope with records",
+            "E15: status 'planned' is incompatible with verified evidence records [\"E15.controller_acceptance\"]; a planned scope has nothing verified".into(),
+            Box::new(move |value: &mut Value| {
+                value["e_scopes"]["E15"]["verified_subscopes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(fresh.clone())
+            }),
+        ),
+        (
+            "verified optional scope",
+            "E17: optional scope is listed in optional_disabled and no enablement is recorded; status 'verified' is not allowed".into(),
+            Box::new(|value: &mut Value| {
+                value["e_scopes"]["E17"]["status"] = "verified".into();
+                value["e_scopes"]["E17"]["remaining"] = serde_json::json!([]);
+            }),
+        ),
+        (
+            "undeclared out-of-scope status",
+            "E14: status 'explicitly_out_of_scope' is not declared in explicitly_out_of_scope_until_revised".into(),
+            Box::new(|value: &mut Value| {
+                value["e_scopes"]["E14"]["status"] = "explicitly_out_of_scope".into()
+            }),
+        ),
+        (
+            "parent outranking a child",
+            "E16: status 'implemented_not_verified' is stronger than sub-package E16.1 status 'in_progress'; a parent scope may not outrank its weakest child".into(),
+            Box::new(|value: &mut Value| {
+                value["e_scopes"]["E16"]["status"] = "implemented_not_verified".into()
+            }),
+        ),
+        (
+            "duplicated implementation file",
+            "E03: implementation_files must be a duplicate-free string array".into(),
+            Box::new(|value: &mut Value| {
+                let first = value["e_scopes"]["E03"]["implementation_files"][0].clone();
+                value["e_scopes"]["E03"]["implementation_files"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(first);
+            }),
+        ),
+        (
+            "planned scenario with another verification status",
+            "V001: planned scenario has incompatible verification status".into(),
+            Box::new(|value: &mut Value| {
+                value["traceability"]["v_scenarios"][0]["status"] = "planned".into()
+            }),
+        ),
+        (
+            "verified status on one axis only",
+            "V001: verified status axes disagree".into(),
+            Box::new(|value: &mut Value| {
+                value["traceability"]["v_scenarios"][0]["status"] = "verified".into()
+            }),
+        ),
+    ];
+    for (name, expected, mutate) in cases {
+        let mut value = baseline.clone();
+        mutate(&mut value);
+        let error = validate_manifest(&value, &root).expect_err("a status rule violation");
+        assert!(error.contains(&expected), "{name}: {error}");
+    }
+    // A declared out-of-scope status passes the rule.
+    let mut declared = baseline;
+    declared["e_scopes"]["E14"]["status"] = "explicitly_out_of_scope".into();
+    declared["explicitly_out_of_scope_until_revised"] = serde_json::json!(["E14"]);
+    validate_manifest(&declared, &root).unwrap();
+}
+
+#[test]
+fn non_ascii_digits_are_rejected_like_the_python_checker() {
+    // R1 §Q4 item 9: this checker accepts only ASCII digits; the Python checker now uses [0-9].
+    let root = repo_root();
+    let baseline = load_manifest(&root);
+    let mut owner = baseline.clone();
+    withdrawn_entry_mut(&mut owner, "E05.ag052_versioned_batch_verdicts")["owner_task"] =
+        Value::String("AG-١٩٢".into());
+    let error = validate_manifest(&owner, &root).expect_err("a non-ASCII owner task");
+    assert!(
+        error.contains("E05.ag052_versioned_batch_verdicts owner_task must be a registered task number such as AG-187"),
+        "{error}"
+    );
+    let mut pr = baseline.clone();
+    pr["e_scopes"]["E01"]["verified_subscopes"][0]["pr"] =
+        Value::String("https://github.com/acosmi/RSIAgent/pull/٣٠".into());
+    let error = validate_manifest(&pr, &root).expect_err("a non-ASCII pull request number");
+    assert!(
+        error.contains("E01.controller_acceptance has an invalid pull request URL"),
+        "{error}"
+    );
+    let original = register_bytes(&root);
+    let mut register: Value = load_json_strict(std::str::from_utf8(&original).unwrap()).unwrap();
+    register["entries"][0]["missing_window"] =
+        serde_json::json!({"after": "２０２６-10-14T11:54:14Z", "before": "unknown"});
+    let bytes = serde_json::to_vec_pretty(&register).unwrap();
+    let fixture = RegisterFixture::new(&bytes);
+    let error = validate_missing_register(
+        &pinned(&baseline, &bytes),
+        &fixture.root,
+        &collect_records(&baseline["e_scopes"]),
+        &register_pins(&bytes),
+        None,
+    )
+    .expect_err("a non-ASCII missing window");
+    assert!(error.contains("missing_window is malformed"), "{error}");
 }

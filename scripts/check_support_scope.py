@@ -61,7 +61,8 @@ SKILLOPT_REPO = "https://github.com/microsoft/SkillOpt.git"
 SKILLOPT_COMMIT = "79124b37e9a6371e13b753f8bcd7adb1e493ade1"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-PR_RE = re.compile(r"^https://github\.com/acosmi/RSIAgent/pull/(\d+)$")
+# Digits are ASCII [0-9] in every pattern: the regex digit class also matches other Unicode digits, which the Rust checker rejects.
+PR_RE = re.compile(r"^https://github\.com/acosmi/RSIAgent/pull/([0-9]+)$")
 IDENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # Progress order used for the parent/child gate rule. blocked and in_progress are the same level
 # ("started, unfinished"); explicitly_out_of_scope has no rank and neither constrains nor is constrained.
@@ -203,7 +204,7 @@ V_SCENARIO_COUNT = 123
 # fails; ids never return to verified_subscopes.
 WITHDRAWN_KEYS = {"id", "withdrawn_in_pr", "clause", "owner_task", "status"}
 WITHDRAWN_STATUSES = {"pending_recheck", "superseded", "replaced_by_binding"}
-OWNER_TASK_RE = re.compile(r"^AG-\d{3}[a-z]?$")
+OWNER_TASK_RE = re.compile(r"^AG-[0-9]{3}[a-z]?$")
 EXPECTED_WITHDRAWN = {
     # withdrawn by PR #165 (AG-124, v4.3 recheck) and PR #169 (AG-128, E04.ag054 correction)
     "E10.controller_acceptance": (165, "§7.4.2–§7.4.3", "AG-182", "superseded"),
@@ -470,7 +471,7 @@ EXPECTED_MISSING_TRIPLES = {
 }
 EVIDENCE_PATH_FIELDS = ("input_ref", "log_path", "record_source")
 UNKNOWN = "unknown"
-ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+ISO_UTC = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 # The local evidence store is the untracked out/ tree of the primary checkout (.gitignore /out/). A clone or worktree
 # does not carry it, so the absence of an out/ path is only judged when --evidence-root names the directory holding
 # that tree; a present path, and any path outside out/, is always checked. An absent out/ path that cannot be judged
@@ -1030,7 +1031,7 @@ def validate_evidence(record: Any, task: str, repo_root: Path, packages: dict[st
     if merged is not None and merged == source_sha:
         raise CheckerError(f"{identifier}: merged_sha must differ from its own source_sha")
     pr_state = record.get("pr_state")
-    if pr_state is not None and pr_state not in PR_STATES:
+    if pr_state is not None and (not isinstance(pr_state, str) or pr_state not in PR_STATES):
         raise CheckerError(f"{identifier}: pr_state must be one of {sorted(PR_STATES)}")
     if pr_state == "merged" and merged is None:
         raise CheckerError(f"{identifier}: pr_state is 'merged' but merged_sha is null")
