@@ -4,7 +4,7 @@
 mod trusted_compiler_inputs;
 
 use evo_core::contract::{
-    CompileParts, HostCapabilities, ImproverPatch, Profile, ResolvedBundle, ResolvedBundleV3,
+    CompileParts, HostCapabilities, ImproverPatch, Profile, ResolvedBundleV3,
     SkillPatch, SkillSnapshot, compile_bundle,
 };
 use evo_core::evaluation::{
@@ -35,11 +35,10 @@ use evo_engine::evidence::{
 use evo_engine::optimization::{
     DevelopmentManifest, DevelopmentRunRequest, DevelopmentSelection, DevelopmentSelectionDecision,
     DevelopmentTask, OptimizationJournal, OptimizationJournalStage, StageDependency, StageFact,
-    StageFactKind, StepTerminalClass, StoreOptimizationJournal, edit_compiled_input_digest,
+    StageFactKind, StepTerminalClass, StoreOptimizationJournal,
 };
 use evo_engine::release_store::{
-    CurrentReleaseCandidateRecord, CurrentStageBundleRequest, ReleaseCandidateRecord, ReleaseStore,
-    StageBundleRequest, TypedSourceRef,
+    CurrentReleaseCandidateRecord, CurrentStageBundleRequest, ReleaseStore, TypedSourceRef,
 };
 use evo_engine::review::{
     ReviewDetail, ReviewGap, ReviewKind, ReviewPayload, ReviewRequest, ReviewResponse,
@@ -108,7 +107,7 @@ fn source(id: &str, body: &str) -> StoredTraceAuthority {
         excerpt_end: body.len(),
     }
 }
-struct MaterialFixture<Candidate = ReleaseCandidateRecord> {
+struct MaterialFixture<Candidate = CurrentReleaseCandidateRecord> {
     _dir: tempfile::TempDir,
     db_path: PathBuf,
     store: Store,
@@ -122,125 +121,6 @@ struct MaterialFixture<Candidate = ReleaseCandidateRecord> {
     caps: HostCapabilities,
     sources: Vec<StoredTraceAuthority>,
     candidate: Candidate,
-}
-async fn material_fixture(parent: SkillSnapshot) -> MaterialFixture {
-    let baseline = SkillSnapshot {
-        content: "Safe baseline rule".into(),
-        applicability: "Safe baseline applies".into(),
-        counterexample: "Safe baseline counterexample".into(),
-        required_capabilities: parent.required_capabilities.clone(),
-        dependencies: parent.dependencies.clone(),
-    };
-    material_fixture_with_inputs(parent, baseline, Strategy::default(), Strategy::default()).await
-}
-async fn material_fixture_with_inputs(
-    parent: SkillSnapshot,
-    baseline: SkillSnapshot,
-    parent_strategy: Strategy,
-    baseline_strategy: Strategy,
-) -> MaterialFixture {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("stored-review.sqlite3");
-    let store = Store::open(&db_path).await.unwrap();
-    let admin = ctx("admin", Role::Admin);
-    let host = ctx("host", Role::Host);
-    let sources = vec![
-        source("source-one", "first trusted source"),
-        source("source-two", "unselected trusted support"),
-    ];
-    for authority in &sources {
-        store_trace_authority(&store, &host, authority)
-            .await
-            .unwrap();
-    }
-    // Search-parent dependency labels are real trusted content reads under the
-    // new compiler contract, including the oversized projection control.
-    for id in &parent.dependencies {
-        store_trace_authority(&store, &host, &source(id, "registered compiler dependency"))
-            .await
-            .unwrap();
-    }
-    let mut session = store.session().await.unwrap();
-    assert_eq!(
-        session
-            .bump_watermark(&admin, &d("watermark-one"))
-            .await
-            .unwrap(),
-        1
-    );
-    session.commit().await.unwrap();
-    let profile = Profile {
-        id: "review-profile".into(),
-        evolution_enabled: true,
-        parent_digest: d("declared-parent"),
-        baseline_digest: d("declared-baseline"),
-    };
-    let caps = HostCapabilities {
-        available: parent.required_capabilities.iter().cloned().collect(),
-        granted: parent.required_capabilities.iter().cloned().collect(),
-    };
-    let bundle = trusted_compiler_inputs::bundle(
-        CompileParts {
-            profile: &profile,
-            parent: &parent,
-            baseline: &baseline,
-            parent_strategy: &parent_strategy,
-            baseline_strategy: &baseline_strategy,
-            skill_patch: &SkillPatch::default(),
-            improver_patch: &ImproverPatch::default(),
-            caps: &caps,
-            revoked: &BTreeSet::new(),
-        },
-        NS,
-        &d("environment"),
-    )
-    .unwrap();
-    let profile = Profile {
-        id: bundle.profile_id.clone(),
-        evolution_enabled: true,
-        parent_digest: bundle.parent_digest.clone(),
-        baseline_digest: bundle.baseline_digest.clone(),
-    };
-    trusted_compiler_inputs::install_bundle(&store, &bundle)
-        .await
-        .unwrap();
-    let proposer = ctx("proposer", Role::Worker);
-    let candidate = ReleaseStore::stage_bundle(
-        &proposer,
-        &store,
-        StageBundleRequest {
-            candidate_id: "stored-candidate".into(),
-            environment_digest: d("environment"),
-            bundle,
-            proposer_actor: proposer.actor().into(),
-            sources: sources
-                .iter()
-                .map(|s| TypedSourceRef {
-                    kind: "run".into(),
-                    id: s.record.id.clone(),
-                    content_digest: s.trace.source_digest.clone(),
-                })
-                .collect(),
-            revoke_watermark: 1,
-        },
-    )
-    .await
-    .unwrap();
-    MaterialFixture {
-        _dir: dir,
-        db_path,
-        store,
-        admin,
-        host,
-        profile,
-        parent,
-        baseline,
-        parent_strategy,
-        baseline_strategy,
-        caps,
-        sources,
-        candidate,
-    }
 }
 // Current health is the existing ProgramFixture/EmptyRoot diagnostic only.
 // The unchanged old helpers retain legacy wire without Current authority.
@@ -461,8 +341,8 @@ print(json.dumps(out,sort_keys=True,separators=(',',':')))
 }
 
 struct EditFixture<
-    Bundle = ResolvedBundle,
-    Binding = evo_engine::formal_authority::FormalCompilerInputBinding,
+    Bundle = ResolvedBundleV3,
+    Binding = evo_engine::formal_authority::CurrentFormalCompilerInputBinding,
 > {
     prepared: StageFact,
     compiled: StageFact,
@@ -527,271 +407,6 @@ fn fact(
     }
     .seal()
     .unwrap()
-}
-async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> EditFixture {
-    let incumbent = trusted_compiler_inputs::bundle(
-        CompileParts {
-            profile: &fixture.profile,
-            parent: &fixture.parent,
-            baseline: &fixture.baseline,
-            parent_strategy: &fixture.parent_strategy,
-            baseline_strategy: &fixture.baseline_strategy,
-            skill_patch: &SkillPatch::default(),
-            improver_patch: &ImproverPatch::default(),
-            caps: &fixture.caps,
-            revoked: &BTreeSet::new(),
-        },
-        NS,
-        &d("environment"),
-    )
-    .unwrap();
-    trusted_compiler_inputs::install_bundle(&fixture.store, &incumbent)
-        .await
-        .unwrap();
-    let profile = Profile {
-        id: incumbent.profile_id.clone(),
-        evolution_enabled: true,
-        parent_digest: incumbent.parent_digest.clone(),
-        baseline_digest: incumbent.baseline_digest.clone(),
-    };
-    let compiler_request = evo_engine::formal_authority::CompilerInputRequest {
-        profile: profile.clone(),
-        search_parent: fixture.parent.clone(),
-        baseline: fixture.baseline.clone(),
-        search_parent_strategy: fixture.parent_strategy.clone(),
-        expected_parent_strategy_digest: None,
-        baseline_strategy: fixture.baseline_strategy.clone(),
-        capabilities: fixture.caps.clone(),
-        environment_digest: d("environment"),
-        purpose: Purpose::Development,
-        revoke_watermark: 1,
-    };
-    let mut session = fixture.store.session().await.unwrap();
-    let verified = evo_engine::formal_authority::resolve_compiler_inputs(
-        &mut session,
-        &fixture.admin,
-        &compiler_request,
-    )
-    .await
-    .unwrap();
-    let compiler_use = evo_engine::model::CompilerInputUse::new(
-        compiler_request.clone(),
-        verified.binding().clone(),
-    );
-    session.commit().await.unwrap();
-    let source_refs: Vec<_> = fixture
-        .sources
-        .iter()
-        .map(|s| EvidenceRef {
-            id: s.record.id.clone(),
-            digest: s.trace.source_digest.clone(),
-        })
-        .collect();
-    let selection = SourceSelection {
-        roots: vec![],
-        run_ids: fixture
-            .sources
-            .iter()
-            .map(|s| s.record.id.clone())
-            .collect(),
-        purpose: Purpose::Development,
-        allow_model_excerpts: true,
-    };
-    let evidence = ingest_trusted_run_records(
-        &selection,
-        &fixture
-            .sources
-            .iter()
-            .map(|s| s.record.clone())
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
-    let grant_id = format!("optgrant-{}", fingerprint(&selection).unwrap());
-    let mut session = fixture.store.session().await.unwrap();
-    session
-        .put(
-            &fixture.admin,
-            "artifact",
-            &grant_id,
-            fixture.admin.actor(),
-            &selection,
-        )
-        .await
-        .unwrap();
-    for source in &fixture.sources {
-        session
-            .put_edge(
-                &fixture.admin,
-                "artifact",
-                &grant_id,
-                "run",
-                &source.record.id,
-            )
-            .await
-            .unwrap();
-    }
-    session.commit().await.unwrap();
-    let trusted = TrustedEditContext::new(
-        NS,
-        &profile.id,
-        "skill-review",
-        "v1",
-        &profile.parent_digest,
-        &profile.baseline_digest,
-        &fixture.parent,
-        source_refs.clone(),
-    )
-    .unwrap();
-    let template = SkillEditBatch {
-        schema_version: SKILL_EDIT_SCHEMA.into(),
-        compiler_version: SKILL_EDIT_COMPILER_VERSION.into(),
-        namespace: NS.into(),
-        profile_id: profile.id.clone(),
-        skill_id: "skill-review".into(),
-        skill_version: "v1".into(),
-        input_digest: skill_snapshot_digest(&fixture.parent).unwrap(),
-        approved_parent_digest: profile.parent_digest.clone(),
-        safe_baseline_digest: profile.baseline_digest.clone(),
-        evidence: EvidenceClosure {
-            support: vec![],
-            counterexamples: vec![],
-            dependencies: vec![],
-        },
-        edits: vec![],
-    };
-    let context = ModelRequestContext {
-        request_id: "review-request".into(),
-        namespace: NS.into(),
-        purpose: Purpose::Development,
-        stage: ModelStage::ReflectFailure,
-        episode_id: "review-episode".into(),
-        step: 1,
-        attempt: 1,
-        parent_skill_digest: template.input_digest.clone(),
-        bundle_digest: incumbent.digest.clone(),
-        source_closure: source_refs.clone(),
-        model_digest: d("model"),
-        tools_digest: d("tools"),
-        rules_digest: d("rules"),
-        sampling_digest: d("sampling"),
-        revoke_watermark: 1,
-        max_suggestions: 4,
-    };
-    let development = DevelopmentRunRequest {
-        request_id: "development-original".into(),
-        namespace: NS.into(),
-        purpose: Purpose::Development,
-        episode_id: context.episode_id.clone(),
-        step: 1,
-        attempt: 1,
-        manifest: DevelopmentManifest::build(
-            "dev-manifest",
-            vec![DevelopmentTask {
-                id: "dev-task".into(),
-                parent_family: "dev-family".into(),
-                input_digest: d("dev-input"),
-            }],
-        )
-        .unwrap(),
-        parent_bundle_digest: context.bundle_digest.clone(),
-        candidate_bundle_digest: d("candidate-placeholder"),
-        environment_digest: d("environment"),
-        grader_digest: d("grader"),
-        rules_digest: d("rules"),
-        tools_digest: d("tools"),
-        revoke_watermark: 1,
-        idempotency_key: "dev-idempotency".into(),
-    };
-    let mut prepared_payload = json!({"evidence":evidence,"selection":selection,
-        "bindings":fixture.sources.iter().map(|s| (&s.record.id,&s.trace.source_digest,&s.record.parent_family)).collect::<Vec<_>>(),
-        "traces":fixture.sources.iter().map(|s| s.trace.clone()).collect::<Vec<_>>(),"context":context,"parent":fixture.parent,
-        "trusted_edit_context":format!("{trusted:?}"),"edit_template":template,"protected_ranges":"[]","profile":profile,
-        "baseline":fixture.baseline,"parent_strategy":fixture.parent_strategy,"baseline_strategy":fixture.baseline_strategy,
-        "improver":ImproverPatch::default(),"caps":fixture.caps,"revoked":BTreeSet::<String>::new(),"development":development,"allow_rank":false});
-    let input_digest = fingerprint(&(
-        fingerprint(&prepared_payload).unwrap(),
-        &compiler_use.binding,
-    ))
-    .unwrap();
-    prepared_payload["compiler_request"] = serde_json::to_value(&compiler_request).unwrap();
-    prepared_payload["compiler_binding"] = serde_json::to_value(&compiler_use.binding).unwrap();
-    let prepared = fact(
-        StageFactKind::StepPrepared,
-        OptimizationJournalStage::Merge,
-        input_digest,
-        dependencies(fixture, &grant_id, None),
-        prepared_payload,
-    );
-    let journal = StoreOptimizationJournal::new(
-        fixture.store.clone(),
-        fixture.admin.clone(),
-        fixture.admin.actor(),
-    )
-    .unwrap();
-    journal
-        .commit_bound(prepared.clone(), &compiler_use)
-        .await
-        .unwrap();
-    let prepared = journal
-        .lookup_bound(&prepared.artifact_id, &compiler_use)
-        .await
-        .unwrap()
-        .unwrap();
-    let selected: Vec<_> = (0..edits.len())
-        .map(|i| format!("suggestion-{i}"))
-        .collect();
-    let mut input = selected.clone();
-    input.push("unselected-suggestion".into());
-    let merged = MergeRecord {
-        input_suggestion_ids: input,
-        selected_suggestion_ids: selected,
-        read_dependencies: source_refs.clone(),
-        evidence: EvidenceClosure {
-            support: vec![source_refs[0].clone()],
-            counterexamples: vec![source_refs[1].clone()],
-            dependencies: source_refs,
-        },
-        edits,
-    };
-    let mut batch = template.clone();
-    batch.evidence = merged.evidence.clone();
-    batch.edits = merged.edits.clone();
-    // The existing compiler runs in fixture setup, never inside review.
-    let compiled = compile_skill_edit_batch(&fixture.parent, &trusted, &batch, &[]).unwrap();
-    let bundle = verified
-        .compile_search_edit(&compiled.output, &ImproverPatch::default())
-        .unwrap();
-    let payload = json!({"output":compiled.output,"patch":compiled.patch,"report":compiled.report,"bundle":bundle,"merge":merged,"compiler_request":compiler_request,"compiler_binding":compiler_use.binding});
-    // AG-108 (plan §5.1 L455, §5.2 L459): the digest of an EditCompiled fact is the
-    // one shared rule that binds the compiled batch to its compiler binding, as the
-    // producer writes it. This fixture used to hand-roll the bare `fingerprint(&batch)`
-    // that no production fact carries (plan §18.4 L2156: corrected, with independent
-    // coverage in the AG-108 tests below).
-    let compiled = fact(
-        StageFactKind::EditCompiled,
-        OptimizationJournalStage::EditCompile,
-        edit_compiled_input_digest(&batch, Some(&compiler_use.binding)).unwrap(),
-        dependencies(fixture, &grant_id, Some(&prepared.artifact_id)),
-        payload,
-    );
-    journal
-        .commit_bound(compiled.clone(), &compiler_use)
-        .await
-        .unwrap();
-    let compiled = journal
-        .lookup_bound(&compiled.artifact_id, &compiler_use)
-        .await
-        .unwrap()
-        .unwrap();
-    EditFixture {
-        prepared,
-        compiled,
-        template,
-        context,
-        development,
-        bundle,
-        binding: compiler_use.binding.clone(),
-    }
 }
 async fn seed_current_edit(
     fixture: &MaterialFixture<CurrentReleaseCandidateRecord>,
@@ -1893,6 +1508,13 @@ async fn support_limit_refuses_the_whole_recipe_without_truncation() {
 // and facts stored before compiler bindings existed keep the bare-batch algorithm.
 
 /// One content edit at the head of the parent's `content` ("ab" -> "new").
+fn edit_compiled_input_digest(
+    batch: &SkillEditBatch,
+    binding: Option<&evo_engine::formal_authority::CurrentFormalCompilerInputBinding>,
+) -> evo_core::Result<String> {
+    match binding { Some(binding) => fingerprint(&(batch, binding)), None => fingerprint(batch) }
+}
+
 fn head_replace(parent: &SkillSnapshot) -> Vec<SkillTextEdit> {
     vec![edit(
         parent,
@@ -1948,8 +1570,8 @@ async fn a_production_edit_compiled_fact_reviews_to_an_exact_diff_under_the_one_
     // Before AG-108 review compared the bare batch while the producer digests
     // (batch, compiler binding), so every production EditCompiled came back as
     // material_invalid with no payload and no diff.
-    let fixture = material_fixture(parent()).await;
-    let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+    let fixture = material_fixture_current(parent()).await;
+    let stored = seed_current_edit(&fixture, head_replace(&fixture.parent)).await;
     let batch = stored_batch(&stored.template, &stored.compiled);
     // The producer's formula, spelled out here independently of the shared rule.
     let producer = fingerprint(&(&batch, &stored.binding)).unwrap();
@@ -2025,8 +1647,8 @@ async fn edit_compiled_facts_stored_before_compiler_bindings_keep_the_old_digest
     // Guard case (plan §5.1 L453), green before and after AG-108: a fact stored
     // without compiler_* payload keys digests the bare batch, keeps that old
     // algorithm and interpretation, and still reviews to a complete exact diff.
-    let fixture = material_fixture(parent()).await;
-    let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+    let fixture = material_fixture_current(parent()).await;
+    let stored = seed_current_edit(&fixture, head_replace(&fixture.parent)).await;
     let (prepared, compiled) = pre_binding_facts(&fixture, &stored);
     assert!(compiled.payload.get("compiler_request").is_none());
     assert!(compiled.payload.get("compiler_binding").is_none());
@@ -2062,8 +1684,8 @@ async fn edit_compiled_facts_stored_before_compiler_bindings_keep_the_old_digest
 
 #[tokio::test]
 async fn edit_compiled_changed_after_its_digest_is_refused_by_the_digest_alone() {
-    let fixture = material_fixture(parent()).await;
-    let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+    let fixture = material_fixture_current(parent()).await;
+    let stored = seed_current_edit(&fixture, head_replace(&fixture.parent)).await;
     // A change every other review check accepts: the anchor "ab" occurs exactly
     // once in the parent field and covers the edited span, and the applied
     // report carries no anchor. Only the digest can notice it.
@@ -2119,8 +1741,8 @@ async fn an_edit_compiled_is_never_accepted_under_the_other_shapes_digest_rule()
     // One rule per shape (plan §5.2 L459) and no cross acceptance: a fact that
     // carries the compiler keys must hold the bound digest, a fact without them
     // the bare-batch digest.
-    let fixture = material_fixture(parent()).await;
-    let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+    let fixture = material_fixture_current(parent()).await;
+    let stored = seed_current_edit(&fixture, head_replace(&fixture.parent)).await;
     let batch = stored_batch(&stored.template, &stored.compiled);
 
     // Compiler keys present, bare-batch digest: exactly what review accepted
@@ -2171,8 +1793,8 @@ async fn an_edit_compiled_with_only_one_compiler_key_is_refused_whichever_rule_s
     // StepPrepared, and validate_compiled keeps the same (Some, Some) / (None, None)
     // match that read_prepared uses, so it could not pick a rule either.
     for dropped in ["compiler_request", "compiler_binding"] {
-        let fixture = material_fixture(parent()).await;
-        let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+        let fixture = material_fixture_current(parent()).await;
+        let stored = seed_current_edit(&fixture, head_replace(&fixture.parent)).await;
         let mut mixed = stored.compiled.clone();
         assert!(
             mixed
@@ -2237,290 +1859,6 @@ struct FormalFixture {
     evaluator: Context,
     worker: Context,
     ticket_id: String,
-}
-
-// Retained v1 setup is static audit source, never Current healthy authority.
-// A real historical Store seed is still required before claiming this branch.
-#[allow(dead_code)]
-async fn formal_fixture_legacy(n: u32, sequential: bool) -> FormalFixture {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("e05.sqlite3");
-    let store = Store::open(&db_path).await.unwrap();
-    let admin = Context::new(NS, "admin", Role::Admin).unwrap();
-    let evaluator = Context::new(NS, "evaluator", Role::Evaluator).unwrap();
-    let worker = Context::new(NS, "executor", Role::Worker).unwrap();
-    store
-        .authorize_root_budget(
-            &admin,
-            &RootBudgetAuthorization {
-                root_budget_id: "root-1".into(),
-                billing_scope: "billing-1".into(),
-                allowed_namespaces: vec![NS.into(), "other".into()],
-                currency: "USD".into(),
-                pricing_version: "pricing-v1".into(),
-                payment_subject: "fixture-only".into(),
-                authorization_receipt_digest: d("admin-budget-receipt"),
-                per_call_cap_micros: 100,
-                total_limit_micros: 1_000,
-                created_at: 1,
-            },
-        )
-        .await
-        .unwrap();
-
-    let mut v1 = ExperimentPlan::first_low_risk("formal-e05", 60).unwrap();
-    v1.n_planned = n as usize;
-    v1.monetary_budget = money("0.001");
-    v1.frozen = true;
-    v1.frozen_at = Some(1);
-    v1.validate().unwrap();
-
-    let alpha = ResearchFamilyAlphaPlan::new(
-        "family-e05",
-        "0.05",
-        vec![
-            AlphaAllocation {
-                claim_id: "fixed-gain".into(),
-                attempt_id: "attempt-1".into(),
-                kind: FormalClaimKind::FixedSampleGain,
-                alpha: "0.04".into(),
-            },
-            AlphaAllocation {
-                claim_id: "early-reject".into(),
-                attempt_id: "attempt-1".into(),
-                kind: FormalClaimKind::SequentialReject,
-                alpha: "0.01".into(),
-            },
-        ],
-    )
-    .unwrap();
-    let anchors = AnchorCoverageMatrix::new(
-        "quality-gain",
-        "anchors-v1",
-        vec![CriticalCapabilityCoverage {
-            capability_id: "safety".into(),
-            anchor_ids: vec!["anchor-1".into()],
-        }],
-    )
-    .unwrap();
-    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "payer", "USD").unwrap();
-    budget.root_total = money("0.001");
-    budget.admin_authorization_receipt_digest = Some(d("admin-budget-receipt"));
-    for stage in &mut budget.stages {
-        stage.per_call_limit.pricing_version = "pricing-v1".into();
-        stage.experiment_total.pricing_version = "pricing-v1".into();
-    }
-    budget.validate().unwrap();
-    let comparison = OptimizerComparisonContract::new(
-        optimizer(FixedOptimizerArm::CSimple, "simple"),
-        optimizer(FixedOptimizerArm::CSkillopt, "skillopt"),
-        FixedOptimizerArm::CSkillopt,
-    )
-    .unwrap();
-    assert!(v1.conditions.contains(&ControlCondition::FixedImproverC));
-    let formal = FormalExperimentPlanV41::new(
-        &v1,
-        d("preregistration"),
-        &alpha,
-        &comparison,
-        &budget,
-        anchors.digest().unwrap(),
-        d("sampling"),
-        d("common-mean"),
-        FormalStatisticalUnit::IndependentTaskCluster,
-        n,
-    )
-    .unwrap();
-    let ordered_clusters: Vec<_> = (0..n).map(|index| format!("cluster-{index}")).collect();
-    let early = sequential.then(|| {
-        EarlyStopPlan::new(
-            v1.digest().unwrap(),
-            &alpha,
-            "early-reject",
-            "attempt-1",
-            ProfileKind::QualityGain,
-            n,
-            ordered_clusters.clone(),
-            d("common-mean"),
-            d("sampling"),
-            anchors.digest().unwrap(),
-            20_000,
-            10_000,
-            10_000,
-        )
-        .unwrap()
-    });
-    let grader = FixedGraderSpec {
-        schema_version: FixedGraderSpec::SCHEMA.into(),
-        version: "exact-json-v1".into(),
-        method: FixedGraderMethod::ExactJsonAnswerV1,
-    };
-    let control = RegisteredEvaluationControl {
-        schema_version: RegisteredEvaluationControl::SCHEMA.into(),
-        id: "control-1".into(),
-        v1_plan_snapshot: v1.clone(),
-        formal_plan: formal,
-        alpha_plan: alpha.clone(),
-        optimizer_comparison: comparison,
-        optimization_budget: budget,
-        early_stop_plan: early.clone(),
-        anchor_matrix: anchors.clone(),
-        attempt_id: "attempt-1".into(),
-        fixed_sample_claim_id: "fixed-gain".into(),
-        billing_scope: "billing-1".into(),
-        executor_actor: "executor".into(),
-        evaluator_actor: "evaluator".into(),
-        proposer_actor: "proposer".into(),
-        approver_actor: "approver".into(),
-        oracle_digest: d("oracle-version"),
-        grader_digest: evo_core::fingerprint(&grader).unwrap(),
-        fixed_grader: grader,
-        evidence_scope: EvaluationEvidenceScope::ProgramFixture,
-        created_at_unix_seconds: 2,
-    };
-    IndependentEvaluationControl::register_control(&evaluator, &store, control.clone())
-        .await
-        .unwrap();
-
-    // The candidate the ticket binds: a real, registered software candidate
-    // with the frozen pair identity, staged before the ticket (L288).
-    let candidate =
-        trusted_compiler_inputs::software_candidate(NS, &d("environment"), "candidate-bundle");
-    let pair = FrozenCandidatePair::new(
-        v1.digest().unwrap(),
-        d("candidate"),
-        candidate.parent_digest.clone(),
-        3,
-    )
-    .unwrap();
-    let sequential_mode = match &early {
-        Some(plan) => SequentialMode::RejectOnly {
-            early_stop_plan_digest: plan.digest().unwrap(),
-        },
-        None => SequentialMode::Disabled,
-    };
-    let manifest = HoldoutManifest::issue_after_candidates_frozen(
-        &pair,
-        "family-e05",
-        alpha.digest().unwrap(),
-        sequential_mode,
-        "epoch-1",
-        "slice-1",
-        ordered_clusters.clone(),
-        ordered_clusters
-            .iter()
-            .map(|id| d(&format!("source-{id}")))
-            .collect(),
-        "sampler-v1",
-        d("oracle-version"),
-        anchors.digest().unwrap(),
-        evo_core::fingerprint(&FixedGraderSpec {
-            schema_version: FixedGraderSpec::SCHEMA.into(),
-            version: "exact-json-v1".into(),
-            method: FixedGraderMethod::ExactJsonAnswerV1,
-        })
-        .unwrap(),
-        d("environment"),
-        d("private-seed"),
-        4,
-    )
-    .unwrap();
-    let rotating_inputs: Vec<_> = ordered_clusters
-        .iter()
-        .enumerate()
-        .map(|(index, cluster)| ProtectedInputRef {
-            target_id: format!("r{index}"),
-            cluster_or_anchor_id: cluster.clone(),
-            input_artifact_id: format!("input-r{index}"),
-            input_digest: d(&format!("input-r{index}")),
-        })
-        .collect();
-    let anchor_inputs = vec![ProtectedInputRef {
-        target_id: "a0".into(),
-        cluster_or_anchor_id: "anchor-1".into(),
-        input_artifact_id: "input-a0".into(),
-        input_digest: d("input-a0"),
-    }];
-    let oracle_entries: Vec<_> = rotating_inputs
-        .iter()
-        .chain(anchor_inputs.iter())
-        .map(|input| FrozenOracleEntry {
-            target_id: input.target_id.clone(),
-            expected_answer_json: json!("ok").to_string(),
-        })
-        .collect();
-    let holdout = ProtectedHoldoutRecord {
-        schema_version: ProtectedHoldoutRecord::SCHEMA.into(),
-        id: "holdout-1".into(),
-        registration_id: "control-1".into(),
-        pair,
-        manifest,
-        candidate_bundle_digest: candidate.digest.clone(),
-        baseline_bundle_digest: d("baseline-bundle"),
-        rotating_inputs,
-        anchor_inputs,
-        oracle_payload_digest: evo_core::fingerprint(&oracle_entries).unwrap(),
-        oracle_entries,
-    };
-    IndependentEvaluationControl::register_holdout(&evaluator, &store, holdout.clone())
-        .await
-        .unwrap();
-    // True-source order (L288): the candidate is staged, then the ticket is
-    // issued and binds it (AG-100 issues no ticket without a candidate record).
-    let host = ctx("host", Role::Host);
-    let authority = source("formal-fixture-source", "formal fixture development source");
-    store_trace_authority(&store, &host, &authority)
-        .await
-        .unwrap();
-    let mut session = store.session().await.unwrap();
-    let watermark = session
-        .bump_watermark(&admin, &d("formal-fixture-watermark"))
-        .await
-        .unwrap();
-    session.commit().await.unwrap();
-    trusted_compiler_inputs::install_bundle(&store, &candidate)
-        .await
-        .unwrap();
-    let proposer = ctx("proposer", Role::Worker);
-    ReleaseStore::stage_bundle(
-        &proposer,
-        &store,
-        StageBundleRequest {
-            candidate_id: holdout.pair.candidate_digest.clone(),
-            bundle: candidate,
-            environment_digest: holdout.manifest.environment_digest.clone(),
-            proposer_actor: proposer.actor().into(),
-            sources: vec![TypedSourceRef {
-                kind: "run".into(),
-                id: authority.record.id,
-                content_digest: authority.trace.source_digest,
-            }],
-            revoke_watermark: watermark as u64,
-        },
-    )
-    .await
-    .unwrap();
-    let ticket = IndependentEvaluationControl::issue_ticket(
-        &evaluator,
-        &store,
-        IssueTicketRequest {
-            ticket_id: "ticket-1".into(),
-            registration_id: "control-1".into(),
-            holdout_id: "holdout-1".into(),
-            issued_at_unix_seconds: 5,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(ticket.candidate_dependency_binding.is_some());
-    FormalFixture {
-        _dir: dir,
-        db_path,
-        store,
-        evaluator,
-        worker,
-        ticket_id: ticket.id,
-    }
 }
 
 async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {

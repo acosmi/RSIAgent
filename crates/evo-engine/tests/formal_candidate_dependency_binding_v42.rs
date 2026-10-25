@@ -827,14 +827,7 @@ print(result.rowcount)
 /// AG-100's refusal of an issue that has no candidate record to bind.
 const CANDIDATE_RECORD_MISSING: &str = "formal_candidate_record_missing_at_issue";
 
-/// The stored ticket row, serialized in the product envelope's field order.
-#[derive(Serialize)]
-struct TicketEnvelope {
-    schema_version: String,
-    id: String,
-    record_kind: String,
-    payload: EvaluationTicketV2,
-}
+
 
 /// The stored outgoing edges of the ticket.
 async fn ticket_edges(fx: &Fixture) -> Vec<(String, String)> {
