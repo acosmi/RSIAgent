@@ -128,23 +128,33 @@ def _run_cli(args: list[str]) -> tuple[int, dict]:
         code = css.main(args)
     return code, json.loads(output.getvalue())
 
+def _structure_check(repo_root: Path, manifest_rel: str = "reports/support-scope.json", source_of_truth: Path | None = None) -> css.CheckReport:
+    """A fixture checkout carries no local evidence store, so structural tests state --structure-only explicitly (AG-200: the
+    default mode fails closed on unjudged out/ evidence paths and is exercised by FailClosedEvidenceJudgmentTests)."""
+    return css.run_check(repo_root, manifest_rel, source_of_truth, structure_only=True)
+
+def _out_path_count(manifest: dict) -> int:
+    """Evidence path references (input_ref, log_path, record_source) inside the local evidence store out/."""
+    return sum(1 for scope in manifest["e_scopes"].values() for record in scope["verified_subscopes"] for field in css.EVIDENCE_PATH_FIELDS if css.in_local_evidence_store(record[field]))
+
 class ValidManifestTests(unittest.TestCase):
     def test_valid_manifest_passes_structurally_and_exits_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp))
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
             self.assertTrue(report.structure_valid, report.errors)
-            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--structure-only"])
             self.assertEqual(code, 0)
             self.assertTrue(payload["structure_valid"])
             self.assertFalse(payload["plan_binding_available"])
             self.assertFalse(payload["input_binding_available"])
             self.assertEqual(payload["input_binding_scope"], "local_input_manifest_hashes_only")
+            self.assertEqual(payload["evidence_judgment"], "not_performed_structure_only")
 
     def test_missing_source_of_truth_is_reported_as_unverified_not_silently_ok(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp))
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
             self.assertTrue(report.structure_valid)
             self.assertFalse(report.plan_binding_available)
             self.assertFalse(report.input_binding_available)
@@ -169,8 +179,10 @@ class ValidManifestTests(unittest.TestCase):
             repo.write_manifest(repo.manifest)
             lineage = copy.deepcopy(css.PLAN_LINEAGE)
             lineage[css.PLAN_VERSION]["sha256"] = digest
-            with mock.patch.object(css, "PLAN_SHA256", digest), mock.patch.object(css, "PLAN_LINEAGE", lineage):
-                report = css.run_check(repo.root, "reports/support-scope.json", plan)
+            # The records verified against the current plan are digest-pinned since AG-200; the fixture re-binds them to the fixture
+            # plan bytes, so the V080.d tables are re-pinned to isolate the plan binding.
+            with mock.patch.object(css, "PLAN_SHA256", digest), mock.patch.object(css, "PLAN_LINEAGE", lineage), _repinned(repo.manifest):
+                report = _structure_check(repo.root, source_of_truth=plan)
             self.assertTrue(report.structure_valid, report.errors)
             self.assertTrue(report.plan_binding_available)
             self.assertFalse(report.input_binding_available)
@@ -184,7 +196,7 @@ class ValidManifestTests(unittest.TestCase):
             repo = FixtureRepo(Path(tmp))
             plan = Path(tmp) / "plan.md"
             plan.write_text("wrong plan\n", encoding="utf-8")
-            report = css.run_check(repo.root, "reports/support-scope.json", plan)
+            report = _structure_check(repo.root, source_of_truth=plan)
             self.assertFalse(report.structure_valid)
             self.assertTrue(any("source-of-truth SHA-256 mismatch" in item for item in report.errors))
 
@@ -197,7 +209,7 @@ class ValidManifestTests(unittest.TestCase):
                 "crates/evo-engine/src/compiler.rs"
             )
             repo = FixtureRepo(Path(tmp), manifest)
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
             self.assertTrue(report.structure_valid, report.errors)
 
     def test_new_scoped_evidence_refs_and_compatible_status_progress_are_allowed(self):
@@ -233,7 +245,7 @@ class ValidManifestTests(unittest.TestCase):
             path = repo.root / new_record["input_ref"]
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(input_bytes)
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
             self.assertTrue(report.structure_valid, report.errors)
 
 class RejectionTests(unittest.TestCase):
@@ -244,7 +256,7 @@ class RejectionTests(unittest.TestCase):
             repo = FixtureRepo(Path(tmp), manifest)
             # Fixture creation wrote the declared fake; remove it to retain the original protection semantic.
             (repo.root / "scripts/never_written.py").unlink()
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
             self.assertFalse(report.structure_valid)
             self.assertTrue(any("implementation_files differ" in item or "does not exist" in item for item in report.errors))
 
@@ -256,7 +268,7 @@ class RejectionTests(unittest.TestCase):
             record["command"] = "cargo test --locked --offline -p evo-core --test never_written"
             repo = FixtureRepo(Path(tmp), manifest)
             (repo.root / record["test_entry"]).unlink()
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_test_command_target_not_listed_in_test_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -264,28 +276,28 @@ class RejectionTests(unittest.TestCase):
             manifest["e_scopes"]["E01"]["verified_subscopes"][0]["command"] = "cargo test --locked --offline -p evo-core --test other"
             repo = FixtureRepo(Path(tmp), manifest)
             _write(repo.root / "crates/evo-core/tests/other.rs")
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_duplicate_id_in_a_commitment_set(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = _valid_manifest_dict()
             manifest["traceability"]["b_commitments"][-1] = copy.deepcopy(manifest["traceability"]["b_commitments"][0])
             repo = FixtureRepo(Path(tmp), manifest)
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_id_set_with_correct_length_but_wrong_members(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = _valid_manifest_dict()
             manifest["traceability"]["b_commitments"][-1]["id"] = "B11"
             repo = FixtureRepo(Path(tmp), manifest)
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_so_source_with_illegal_hash_format(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = _valid_manifest_dict()
             manifest["traceability"]["so_sources"][0]["commit"] = "not-a-real-sha"
             repo = FixtureRepo(Path(tmp), manifest)
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_verified_status_with_no_test_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -293,7 +305,7 @@ class RejectionTests(unittest.TestCase):
             manifest["e_scopes"]["E17"]["status"] = "verified"
             manifest["e_scopes"]["E17"]["remaining"] = []
             repo = FixtureRepo(Path(tmp), manifest)
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
         with tempfile.TemporaryDirectory() as tmp:
             manifest = _valid_manifest_dict()
@@ -301,7 +313,7 @@ class RejectionTests(unittest.TestCase):
             manifest["e_scopes"]["E03"]["remaining"] = []
             repo = FixtureRepo(Path(tmp), manifest)
             self.assertFalse(
-                css.run_check(repo.root, "reports/support-scope.json", None).structure_valid,
+                _structure_check(repo.root).structure_valid,
                 "an existing scoped record must not automatically verify the whole E task",
             )
 
@@ -310,7 +322,7 @@ class RejectionTests(unittest.TestCase):
             repo = FixtureRepo(Path(tmp))
             self.assertEqual(repo.manifest["e_scopes"]["E15"]["status"], "planned")
             self.assertEqual(repo.manifest["e_scopes"]["E15"]["verified_subscopes"], [])
-            self.assertTrue(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertTrue(_structure_check(repo.root).structure_valid)
 
     def test_rejects_missing_e16_parent_e17_or_e18(self):
         for missing in ("E16", "E17", "E18"):
@@ -318,7 +330,7 @@ class RejectionTests(unittest.TestCase):
                 manifest = _valid_manifest_dict()
                 del manifest["e_scopes"][missing]
                 repo = FixtureRepo(Path(tmp), manifest)
-                self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+                self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_well_formed_but_wrong_so_commit_and_blob(self):
         for field in ("commit", "blob_sha"):
@@ -326,21 +338,21 @@ class RejectionTests(unittest.TestCase):
                 manifest = _valid_manifest_dict()
                 manifest["traceability"]["so_sources"][0][field] = "a" * 40
                 repo = FixtureRepo(Path(tmp), manifest)
-                self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+                self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_nonexistent_e99_trace_reference(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = _valid_manifest_dict()
             manifest["traceability"]["so_sources"][0]["e_tasks"] = ["E99"]
             repo = FixtureRepo(Path(tmp), manifest)
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_unknown_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = _valid_manifest_dict()
             manifest["e_scopes"]["E01"]["status"] = "verified_subset"
             repo = FixtureRepo(Path(tmp), manifest)
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_command_with_extra_shell_tokens_or_multiple_targets(self):
         commands = [
@@ -352,7 +364,7 @@ class RejectionTests(unittest.TestCase):
                 manifest = _valid_manifest_dict()
                 manifest["e_scopes"]["E01"]["verified_subscopes"][0]["command"] = command
                 repo = FixtureRepo(Path(tmp), manifest)
-                self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+                self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_duplicate_json_object_key(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -360,28 +372,30 @@ class RejectionTests(unittest.TestCase):
             raw = (repo.root / "reports/support-scope.json").read_text(encoding="utf-8")
             raw = raw.replace('{\n  "schema_version"', '{\n  "schema_version": "rsia.support_scope.v2",\n  "schema_version"', 1)
             (repo.root / "reports/support-scope.json").write_text(raw, encoding="utf-8")
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
             self.assertFalse(report.structure_valid)
             self.assertTrue(any("duplicate JSON object key" in item for item in report.errors))
 
     def test_missing_input_is_needs_verification_but_wrong_hash_is_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp))
-            missing = css.run_check(repo.root, "reports/support-scope.json", None)
+            missing = _structure_check(repo.root)
             self.assertTrue(missing.structure_valid)
             self.assertFalse(missing.input_binding_available)
+            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid, "the default mode fails closed on the absent inputs")
             first = repo.manifest["e_scopes"]["E00"]["verified_subscopes"][0]
             _write(repo.root / first["input_ref"], "wrong bytes")
-            mismatch = css.run_check(repo.root, "reports/support-scope.json", None)
-            self.assertFalse(mismatch.structure_valid)
-            self.assertTrue(any("input manifest SHA-256 mismatch" in item for item in mismatch.errors))
+            # The digest mismatch is reported first in the structure-only and in the fail-closed default mode alike.
+            for mismatch in (_structure_check(repo.root), css.run_check(repo.root, "reports/support-scope.json", None)):
+                self.assertFalse(mismatch.structure_valid)
+                self.assertIn("input manifest SHA-256 mismatch", mismatch.errors[0])
 
     def test_rejects_nonzero_verified_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = _valid_manifest_dict()
             manifest["e_scopes"]["E01"]["verified_subscopes"][0]["exit_code"] = 101
             repo = FixtureRepo(Path(tmp), manifest)
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_boolean_and_float_zero_exit_codes(self):
         for value in (False, 0.0):
@@ -392,9 +406,7 @@ class RejectionTests(unittest.TestCase):
                 ] = value
                 repo = FixtureRepo(Path(tmp), manifest)
                 self.assertFalse(
-                    css.run_check(
-                        repo.root, "reports/support-scope.json", None
-                    ).structure_valid
+                    _structure_check(repo.root).structure_valid
                 )
 
     def test_rejects_range_or_trace_chain_disconnect(self):
@@ -402,12 +414,12 @@ class RejectionTests(unittest.TestCase):
             manifest = _valid_manifest_dict()
             manifest["trace_index_coverage"]["E16.6"]["ranges"].remove("V001–V123")
             repo = FixtureRepo(Path(tmp), manifest)
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
         with tempfile.TemporaryDirectory() as tmp:
             manifest = _valid_manifest_dict()
             manifest["traceability"]["k_commitments"][4]["e_tasks"] = ["E18"]
             repo = FixtureRepo(Path(tmp), manifest)
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
 class ControllerFalseAcceptanceTests(unittest.TestCase):
     """One rejection per false acceptance reproduced by the controller (2026-09-30), plus legitimate counterparts."""
@@ -415,14 +427,14 @@ class ControllerFalseAcceptanceTests(unittest.TestCase):
     def _errors(self, manifest: dict) -> list[str]:
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp), manifest)
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
         self.assertFalse(report.structure_valid, "manipulated manifest must be rejected")
         return report.errors
 
     def _assert_valid(self, manifest: dict) -> css.CheckReport:
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp), manifest)
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
         self.assertTrue(report.structure_valid, report.errors)
         return report
 
@@ -713,14 +725,14 @@ class PlanLineageTests(unittest.TestCase):
     def _errors(self, manifest: dict) -> list[str]:
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp), manifest)
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
         self.assertFalse(report.structure_valid, "manipulated manifest must be rejected")
         return report.errors
 
     def _assert_valid(self, manifest: dict) -> css.CheckReport:
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp), manifest)
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
         self.assertTrue(report.structure_valid, report.errors)
         return report
 
@@ -894,14 +906,14 @@ class HonestMachineFieldTests(unittest.TestCase):
     def _errors(self, manifest: dict) -> list[str]:
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp), manifest)
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
         self.assertFalse(report.structure_valid, "manipulated manifest must be rejected")
         return report.errors
 
     def _assert_valid(self, manifest: dict) -> css.CheckReport:
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp), manifest)
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
         self.assertTrue(report.structure_valid, report.errors)
         return report
 
@@ -924,7 +936,7 @@ class HonestMachineFieldTests(unittest.TestCase):
     def test_real_manifest_declares_the_pinned_field_semantics(self):
         semantics = _valid_manifest_dict()["field_semantics"]
         self.assertEqual(semantics, css.FIELD_SEMANTICS)
-        self.assertEqual(set(semantics), {"command", "exit_code", "log_path", "execution", "production_consumer", "execution_runners", "supersedes", "completes", "note", "withdrawn_records", "evidence_missing_register", "plan_recheck", "record_pins"})
+        self.assertEqual(set(semantics), {"command", "exit_code", "log_path", "execution", "production_consumer", "execution_runners", "supersedes", "completes", "note", "withdrawn_records", "evidence_missing_register", "plan_recheck", "record_pins", "evidence_judgment", "evidence_missing_register_pin", "pr_state", "merged_sha"})
         self.assertEqual(semantics["command"], self.CARD_COMMAND)
         self.assertEqual(semantics["exit_code"], self.CARD_EXIT_CODE)
         self.assertEqual(semantics["log_path"], self.CARD_LOG_PATH)
@@ -944,7 +956,7 @@ class HonestMachineFieldTests(unittest.TestCase):
         del manifest["field_semantics"]
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp), manifest)
-            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--structure-only"])
         self.assertEqual(code, 1)
         self.assertFalse(payload["structure_valid"])
         self.assertIn("field_semantics", payload["errors"][0])
@@ -1162,10 +1174,13 @@ class V45RebindTests(unittest.TestCase):
     """AG-182 (plan §18.10 machine form and §18.11, v4.5 Q-50; §2.9/§16.8; §13.5): every new field and structure has a
     rejection branch, and the missing-evidence register decides the three local outcomes."""
 
-    def _report(self, manifest: dict, evidence: dict[str, bytes] | None = None, *, store: bool = False, register: bytes | None = None, repo_files: dict[str, bytes] | None = None, repin: bool = False) -> css.CheckReport:
+    def _report(self, manifest: dict, evidence: dict[str, bytes] | None = None, *, store: bool = False, register: bytes | None = None, repo_files: dict[str, bytes] | None = None, repin: bool = False, repin_register: bool = False, default_mode: bool = False) -> css.CheckReport:
         """evidence goes into a separate --evidence-root store (used only when store=True); repo_files into the checkout;
-        repin re-pins the V080.d tables to a fixture that deliberately rewrites historical records (_complete_store)."""
-        with tempfile.TemporaryDirectory() as tmp, (_repinned(manifest) if repin else contextlib.nullcontext()):
+        repin re-pins the V080.d tables to a fixture that deliberately rewrites historical records (_complete_store);
+        repin_register treats the supplied register bytes as reviewed (both checkers pin the register SHA-256, AG-200);
+        without a store the run states --structure-only unless default_mode exercises the fail-closed default."""
+        reviewed_register = hashlib.sha256(register).hexdigest() if register is not None and repin_register else css.EXPECTED_MISSING_REGISTER_SHA256
+        with tempfile.TemporaryDirectory() as tmp, (_repinned(manifest) if repin else contextlib.nullcontext()), mock.patch.object(css, "EXPECTED_MISSING_REGISTER_SHA256", reviewed_register):
             repo = FixtureRepo(Path(tmp) / "checkout", manifest)
             if register is not None:
                 (repo.root / css.DEFAULT_KNOWN_MISSING).write_bytes(register)
@@ -1175,7 +1190,7 @@ class V45RebindTests(unittest.TestCase):
                     path = base / rel
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(body)
-            return css.run_check(repo.root, "reports/support-scope.json", None, None, (Path(tmp) / "evidence-store") if store else None)
+            return css.run_check(repo.root, "reports/support-scope.json", None, None, (Path(tmp) / "evidence-store") if store else None, structure_only=not store and not default_mode)
 
     def _errors(self, manifest: dict, **kwargs) -> list[str]:
         report = self._report(manifest, **kwargs)
@@ -1285,6 +1300,8 @@ class V45RebindTests(unittest.TestCase):
         current = [r for r in records if r["plan_version"] == css.PLAN_VERSION]
         self.assertEqual(len(current), 33)
         self.assertTrue(all(r["plan_recheck"] == "not_affected" and r["pr"].endswith("/pull/200") for r in current))
+        # AG-200 backfilled the merge of PR #200 (02a135aa, merged 2026-10-25T04:39:38Z) into its 33 records.
+        self.assertTrue(all((r["merged_sha"], r["pr_state"]) == ("02a135aa918fce5dd2ea0c1c8eafc287318f10d2", "merged") for r in current))
         backfills = [r for r in records if r["pr"].rsplit("/", 1)[1] in {"178", "180", "187", "188", "189", "191", "192", "194", "195", "197", "198", "199"}]
         self.assertEqual(len(backfills), 12)
         self.assertTrue(all((r["plan_version"], r["plan_sha256"], r["plan_recheck"]) == ("v4.3", css.PLAN_LINEAGE["v4.3"]["sha256"], "rechecked_v4.5") for r in backfills))
@@ -1324,11 +1341,13 @@ class V45RebindTests(unittest.TestCase):
         self.assertEqual(pairs, css.EXPECTED_RELATIONS)
         self.assertEqual(sorted(kind for kind, _, _ in css.EXPECTED_RELATIONS).count("supersedes"), 7)
         self.assertEqual(sorted(kind for kind, _, _ in css.EXPECTED_RELATIONS).count("completes"), 25)
-        self.assertEqual(len(css.EXPECTED_RECORD_DIGESTS), 93)
+        # AG-200 pins every current record: the 93 retained historical records and the 45 records added by AG-182 (12 backfills
+        # and the 33 PR #200 records, which carry the backfilled merge 02a135aa).
+        self.assertEqual(len(css.EXPECTED_RECORD_DIGESTS), 138)
+        self.assertEqual(set(css.EXPECTED_RECORD_DIGESTS), set(records))
         self.assertEqual({i: css.record_digest(records[i]) for i in css.EXPECTED_RECORD_DIGESTS}, css.EXPECTED_RECORD_DIGESTS)
-        new = set(records) - set(css.EXPECTED_RECORD_DIGESTS)
-        self.assertEqual(len(new), 45)
-        self.assertTrue(all(records[i]["pr"].rsplit("/", 1)[1] in {"178", "180", "187", "188", "189", "191", "192", "194", "195", "197", "198", "199", "200"} for i in new))
+        added = {i for i in records if records[i]["pr"].rsplit("/", 1)[1] in {"178", "180", "187", "188", "189", "191", "192", "194", "195", "197", "198", "199", "200"}}
+        self.assertEqual(len(added), 45)
         # The digest is the canonical JSON without plan_recheck: a recheck marker change is judged by the recheck rule only.
         self.assertEqual(css.record_digest({"b": 1, "a": "§", "plan_recheck": "x"}), hashlib.sha256('{"a":"§","b":1}'.encode()).hexdigest())
         # Probe g1 and siblings: a reviewed withdrawn tuple cannot be rewritten field by field.
@@ -1358,7 +1377,7 @@ class V45RebindTests(unittest.TestCase):
         # A pinned historical record that silently leaves the index fails (choose one nothing else references).
         manifest = _valid_manifest_dict()
         text = json.dumps(manifest, ensure_ascii=False)
-        quiet = next(i for i in css.EXPECTED_RECORD_DIGESTS if text.count(json.dumps(i)) == 1 and not any(entry["record_id"] == i for entry in self._register()["entries"]))
+        quiet = next(i for i in css.EXPECTED_RECORD_DIGESTS if text.count(json.dumps(i)) == 1 and not any(entry["record_id"] == i for entry in self._register()["entries"]) and not ({"supersedes", "completes"} & set(self._record(manifest, i))))
         scope = manifest["e_scopes"][css.task_of(quiet)]
         scope["verified_subscopes"] = [r for r in scope["verified_subscopes"] if r["id"] != quiet]
         if not scope["verified_subscopes"]:
@@ -1479,6 +1498,7 @@ class V45RebindTests(unittest.TestCase):
         store = self._complete_store(manifest, register)
         report = self._valid(manifest, evidence=store, store=True, repin=True)
         self.assertTrue(report.evidence_store_checked)
+        self.assertEqual((report.evidence_judgment, report.evidence_unjudged), ("judged", 0))
         self.assertEqual(len(report.evidence_missing), 42)
         self.assertEqual(report.evidence_registered_not_checked, [])
         self.assertIn("E00.controller_acceptance log_path out/implementation-v4.1-20260919/controller-e00-directed-test.log", report.evidence_missing)
@@ -1486,40 +1506,53 @@ class V45RebindTests(unittest.TestCase):
         victim = next(rel for rel in sorted(store) if "/inputs/" not in rel)
         errors = self._errors(manifest, evidence={rel: body for rel, body in store.items() if rel != victim}, store=True, repin=True)
         self.assertIn(f"{victim!r} is missing locally and is not listed in the missing-evidence register", errors[0])
-        # Without --evidence-root the same absences are reported, not judged; registered paths are registered, not checked (R-12).
+        # With --structure-only and no --evidence-root the same absences are reported, not judged; registered paths are registered,
+        # not checked (R-12); without either option the check fails closed on them (AG-200).
         report = self._valid(_valid_manifest_dict())
         self.assertFalse(report.evidence_store_checked)
+        unjudged = _out_path_count(_valid_manifest_dict())
+        self.assertEqual((report.evidence_judgment, report.evidence_unjudged), ("not_performed_structure_only", unjudged))
+        errors = self._errors(_valid_manifest_dict(), default_mode=True)
+        self.assertEqual(errors, [f"evidence store not supplied: {unjudged} out/ evidence paths unjudged; pass --evidence-root <primary checkout> or --structure-only"])
         self.assertTrue(any("local evidence store not supplied (--evidence-root)" in item and "42 registered path(s) are listed as registered, not checked" in item for item in report.needs_verification))
         self.assertEqual(report.evidence_missing, [])
         self.assertEqual(len(report.evidence_registered_not_checked), 42)
         self.assertIn("E00.controller_acceptance log_path out/implementation-v4.1-20260919/controller-e00-directed-test.log", report.evidence_registered_not_checked)
         self.assertEqual(report.to_dict()["evidence_registered_not_checked"], report.evidence_registered_not_checked)
-        # A tracked (non out/) evidence path is always checked (on a record that is not digest-pinned).
+        # A tracked (non out/) evidence path is always checked, and in the default mode before the fail-closed verdict. The record is
+        # digest-pinned since AG-200, so the V080.d tables are re-pinned to isolate the location rule.
         manifest = _valid_manifest_dict()
         self._record(manifest, "E01.ag182_rerun_controller_acceptance")["record_source"] = "docs/never_written.md"
-        with tempfile.TemporaryDirectory() as tmp:
+        with _repinned(manifest), tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp), manifest)
             (repo.root / "docs/never_written.md").unlink()
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
-        self.assertFalse(report.structure_valid)
-        self.assertIn("E01.ag182_rerun_controller_acceptance: record_source 'docs/never_written.md' is missing locally and is not listed in the missing-evidence register", report.errors[0])
+            reports = (_structure_check(repo.root), css.run_check(repo.root, "reports/support-scope.json", None))
+        for report in reports:
+            self.assertFalse(report.structure_valid)
+            self.assertIn("E01.ag182_rerun_controller_acceptance: record_source 'docs/never_written.md' is missing locally and is not listed in the missing-evidence register", report.errors[0])
 
     def test_registered_missing_paths_are_listed_and_reappearance_is_checked(self):
         register = self._register()
         unknown = next(entry for entry in register["entries"] if entry["expected_sha256"] == "unknown")
         self.assertTrue(unknown["unknown_reason"])
-        for files, kwargs in (({unknown["path"]: b"recovered elsewhere\n"}, {"repo_files": {unknown["path"]: b"recovered elsewhere\n"}}),):
-            errors = self._errors(_valid_manifest_dict(), **kwargs)
-            self.assertIn("is registered missing with unknown identity and has reappeared", errors[0])
+        # A reappearance is judged before the fail-closed verdict of the default mode (AG-200), so both modes report it first.
+        for default_mode in (False, True):
+            with self.subTest(default_mode=default_mode):
+                errors = self._errors(_valid_manifest_dict(), repo_files={unknown["path"]: b"recovered elsewhere\n"}, default_mode=default_mode)
+                self.assertIn("is registered missing with unknown identity and has reappeared", errors[0])
         # The same reappearance inside a supplied evidence store fails as well.
         manifest = _valid_manifest_dict()
         store = self._complete_store(manifest, register)
         store[unknown["path"]] = b"recovered elsewhere\n"
         self.assertIn("unknown identity", self._errors(manifest, evidence=store, store=True, repin=True)[0])
         known = next(entry for entry in register["entries"] if entry["expected_sha256"] != "unknown" and entry["field"] == "log_path")
-        errors = self._errors(_valid_manifest_dict(), repo_files={known["path"]: b"different bytes\n"})
-        self.assertIn("has reappeared with bytes or SHA-256 that differ from the register", errors[0])
-        # A path reappearing with exactly the registered identity passes and is flagged for removal.
+        for default_mode in (False, True):
+            with self.subTest(default_mode=default_mode):
+                errors = self._errors(_valid_manifest_dict(), repo_files={known["path"]: b"different bytes\n"}, default_mode=default_mode)
+                self.assertIn("has reappeared with bytes or SHA-256 that differ from the register", errors[0])
+        # Rewriting a registered identity to match a restored file and refreshing the pointer fails on the reviewed register SHA-256
+        # (AG-200, review S-1). Only a reviewed register update, re-pinned in both checkers, lets a path reappear with exactly the
+        # registered identity; it then passes and is flagged for removal.
         body = b"exactly the registered bytes\n"
         manifest = _valid_manifest_dict()
         changed = copy.deepcopy(register)
@@ -1527,7 +1560,8 @@ class V45RebindTests(unittest.TestCase):
             if entry["path"] == known["path"]:
                 entry["expected_sha256"], entry["expected_bytes"] = hashlib.sha256(body).hexdigest(), len(body)
         raw = self._pin(manifest, changed)
-        report = self._valid(manifest, repo_files={known["path"]: body}, register=raw)
+        self.assertIn("is not the reviewed register SHA-256 pinned in both checkers", self._errors(manifest, repo_files={known["path"]: body}, register=raw)[0])
+        report = self._valid(manifest, repo_files={known["path"]: body}, register=raw, repin_register=True)
         self.assertTrue(any("has reappeared with its registered identity" in item for item in report.needs_verification))
         self.assertNotIn(f"{known['record_id']} log_path {known['path']}", report.evidence_registered_not_checked)
         self.assertEqual(report.evidence_missing, [])
@@ -1543,7 +1577,8 @@ class V45RebindTests(unittest.TestCase):
         dropped = copy.deepcopy(register)
         gone = dropped["entries"].pop(0)
         raw = self._pin(manifest, dropped)
-        self.assertIn(f"missing-evidence register entries differ from the reviewed register: missing=[{(gone['record_id'], gone['field'], gone['path'])!r}] extra=[]", self._errors(manifest, register=raw)[0])
+        self.assertIn("is not the reviewed register SHA-256 pinned in both checkers", self._errors(manifest, register=raw)[0])
+        self.assertIn(f"missing-evidence register entries differ from the reviewed register: missing=[{(gone['record_id'], gone['field'], gone['path'])!r}] extra=[]", self._errors(manifest, register=raw, repin_register=True)[0])
         # Probe c3: drop one entry and register another real path, keeping 42 entries and a re-pinned SHA-256.
         manifest = _valid_manifest_dict()
         swapped = copy.deepcopy(register)
@@ -1554,7 +1589,8 @@ class V45RebindTests(unittest.TestCase):
         raw = self._pin(manifest, swapped)
         for store in (False, True):
             with self.subTest(store=store):
-                errors = self._errors(manifest, register=raw, store=store)
+                self.assertIn("is not the reviewed register SHA-256 pinned in both checkers", self._errors(manifest, register=raw, store=store)[0])
+                errors = self._errors(manifest, register=raw, store=store, repin_register=True)
                 self.assertIn("missing-evidence register entries differ from the reviewed register", errors[0])
                 self.assertIn(f"extra=[('E01.ag182_rerun_controller_acceptance', 'log_path', {other['log_path']!r})]", errors[0])
 
@@ -1584,7 +1620,7 @@ class V45RebindTests(unittest.TestCase):
                 changed = copy.deepcopy(register)
                 mutate(changed)
                 raw = self._pin(manifest, changed)
-                self.assertIn(expected, self._errors(manifest, register=raw)[0])
+                self.assertIn(expected, self._errors(manifest, register=raw, repin_register=True)[0])
         manifest = _valid_manifest_dict()
         manifest["evidence_missing_register"]["path"] = "reports/other.json"
         self.assertIn("differs from the register in use", self._errors(manifest)[0])
@@ -1593,9 +1629,51 @@ class V45RebindTests(unittest.TestCase):
         self.assertIn("evidence_missing_register", self._errors(manifest)[0])
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp))
-            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--known-missing", "reports/other.json"])
+            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--known-missing", "reports/other.json", "--structure-only"])
         self.assertEqual(code, 1)
         self.assertIn("differs from the register in use", payload["errors"][0])
+
+    def test_register_file_sha256_is_pinned_in_both_checkers(self):
+        """AG-200 (review S-1, probes c4/c5): the manifest pointer, the reviewed constant and the register file agree, so an edited
+        identity with a refreshed pointer fails; the register path is pinned as in the Rust checker."""
+        raw = (REAL_ROOT / css.DEFAULT_KNOWN_MISSING).read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), css.EXPECTED_MISSING_REGISTER_SHA256)
+        self.assertEqual(css.EXPECTED_MISSING_REGISTER_SHA256, "b843e3f9692c5ba18ce9148278b3267584222461406fdccc17162ed84c115337")
+        self.assertEqual(_valid_manifest_dict()["evidence_missing_register"], {"path": css.DEFAULT_KNOWN_MISSING, "sha256": css.EXPECTED_MISSING_REGISTER_SHA256})
+        register = self._register()
+        expected = "is not the reviewed register SHA-256 pinned in both checkers"
+        # Probe c4: an unknown identity replaced by a forged SHA-256 and size, the forged file restored, the pointer refreshed.
+        forged_body = b"forged evidence\n"
+        forged = copy.deepcopy(register)
+        target = next(entry for entry in forged["entries"] if entry["expected_sha256"] == "unknown" and entry["expected_bytes"] == "unknown")
+        target.update({"expected_sha256": hashlib.sha256(forged_body).hexdigest(), "expected_bytes": len(forged_body)})
+        del target["unknown_reason"]
+        for store in (False, True):
+            with self.subTest(probe="c4", store=store):
+                manifest = _valid_manifest_dict()
+                raw_forged = self._pin(manifest, forged)
+                files = {target["path"]: forged_body}
+                errors = self._errors(manifest, evidence=files if store else None, store=store, register=raw_forged, repo_files=None if store else files)
+                self.assertIn(expected, errors[0])
+                # Re-pinned as a reviewed register, the forged identity would be accepted: the constant is what rejects it.
+                self._valid(manifest, evidence=files if store else None, store=False, register=raw_forged, repo_files=files, repin_register=True)
+        # Probe c5: a known identity downgraded to unknown (with a reason), the pointer refreshed.
+        downgraded = copy.deepcopy(register)
+        known = next(entry for entry in downgraded["entries"] if _identity_known(entry))
+        known.update({"expected_sha256": "unknown", "expected_bytes": "unknown", "unknown_reason": "probe c5"})
+        manifest = _valid_manifest_dict()
+        raw_down = self._pin(manifest, downgraded)
+        self.assertIn(expected, self._errors(manifest, register=raw_down)[0])
+        self._valid(manifest, register=raw_down, repin_register=True)
+        # The register path is pinned: a consistent pointer, option and copy under another path fail.
+        manifest = _valid_manifest_dict()
+        manifest["evidence_missing_register"]["path"] = "reports/other.json"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            (repo.root / "reports/other.json").write_bytes(raw)
+            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--known-missing", "reports/other.json", "--structure-only"])
+        self.assertEqual(code, 1)
+        self.assertIn("missing-evidence register 'reports/other.json' is not the reviewed register 'reports/evidence-missing.json'; its path is pinned in both checkers", payload["errors"][0])
 
     def test_harness2_borrowings_and_sources_follow_the_plan_tables(self):
         manifest = _valid_manifest_dict()
@@ -1673,7 +1751,7 @@ class V45RebindTests(unittest.TestCase):
             code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--evidence-root", str(Path(tmp) / "absent")])
             self.assertEqual(code, 1)
             self.assertIn("evidence root does not exist", payload["errors"][0])
-            for extra in (["--known-missing", "reports/evidence-missing.json"], ["--evidence-root", tmp]):
+            for extra in (["--known-missing", "reports/evidence-missing.json"], ["--evidence-root", tmp], ["--structure-only"]):
                 for mode in ("--workspace-packages-only", "--project-license-metadata-only"):
                     with self.subTest(mode=mode, extra=extra), self.assertRaises(SystemExit) as caught:
                         css.main(["--repo-root", str(repo.root), mode] + extra)
@@ -1684,20 +1762,105 @@ def _identity_known(entry: dict) -> bool:
     return entry["expected_sha256"] != "unknown" and entry["expected_bytes"] != "unknown"
 
 
+class FailClosedEvidenceJudgmentTests(unittest.TestCase):
+    """AG-200 (plan §18.10 "本地缺失的证据路径", V080.d): without the local evidence store the checker fails closed unless
+    --structure-only states that only the structure was checked; --evidence-root judges every out/ evidence path; the report
+    states which judgment was made (evidence_judgment, evidence_unjudged)."""
+
+    REPORT_KEYS = {
+        "structure_valid", "plan_binding_available", "input_binding_available", "input_binding_scope", "needs_verification", "errors",
+        "plan_version", "plan_sha256", "evidence_store_checked", "evidence_missing", "evidence_registered_not_checked", "evidence_judgment",
+        "evidence_unjudged", "disclaimer",
+    }
+
+    def test_default_mode_fails_closed_on_unjudged_out_paths(self):
+        manifest = _valid_manifest_dict()
+        unjudged = _out_path_count(manifest)
+        self.assertGreater(unjudged, 42)
+        expected = f"evidence store not supplied: {unjudged} out/ evidence paths unjudged; pass --evidence-root <primary checkout> or --structure-only"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+        self.assertFalse(report.structure_valid)
+        self.assertEqual(report.errors, [expected])
+        self.assertEqual((report.evidence_judgment, report.evidence_unjudged, report.evidence_store_checked), ("not_performed", unjudged, False))
+        self.assertEqual(len(report.evidence_registered_not_checked), 42, "registered paths count as unjudged without the store")
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["errors"], [expected])
+        self.assertEqual(set(payload), self.REPORT_KEYS)
+
+    def test_default_mode_reports_a_structural_defect_before_the_fail_closed_verdict(self):
+        manifest = _valid_manifest_dict()
+        del manifest["field_semantics"]
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+        self.assertEqual(code, 1)
+        self.assertEqual(len(payload["errors"]), 1)
+        self.assertIn("field_semantics: must be an object", payload["errors"][0])
+        self.assertEqual(payload["evidence_judgment"], "not_performed")
+
+    def test_structure_only_passes_and_states_that_the_judgment_was_not_performed(self):
+        manifest = _valid_manifest_dict()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp), manifest)
+            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--structure-only"])
+        self.assertEqual(code, 0, payload["errors"])
+        self.assertTrue(payload["structure_valid"])
+        self.assertEqual(payload["errors"], [])
+        self.assertEqual(payload["evidence_judgment"], "not_performed_structure_only")
+        self.assertEqual(payload["evidence_unjudged"], _out_path_count(manifest))
+        self.assertFalse(payload["evidence_store_checked"])
+        self.assertEqual(len(payload["evidence_registered_not_checked"]), 42)
+        self.assertEqual(payload["evidence_missing"], [])
+        self.assertEqual(set(payload), self.REPORT_KEYS)
+
+    def test_structure_only_and_evidence_root_are_mutually_exclusive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp))
+            for order in (["--structure-only", "--evidence-root", tmp], ["--evidence-root", tmp, "--structure-only"]):
+                with self.subTest(order=order), self.assertRaises(SystemExit) as caught, contextlib.redirect_stderr(io.StringIO()):
+                    css.main(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"] + order)
+                self.assertEqual(caught.exception.code, 2)
+            report = css.run_check(repo.root, "reports/support-scope.json", None, None, Path(tmp), structure_only=True)
+        self.assertFalse(report.structure_valid)
+        self.assertIn("--structure-only and --evidence-root are mutually exclusive", report.errors[0])
+        self.assertEqual(report.evidence_judgment, "not_performed_structure_only")
+
+    def test_evidence_root_judges_every_out_path(self):
+        manifest = _valid_manifest_dict()
+        register = json.loads((REAL_ROOT / css.DEFAULT_KNOWN_MISSING).read_text(encoding="utf-8"))
+        store = V45RebindTests._complete_store(manifest, register)
+        with _repinned(manifest), tempfile.TemporaryDirectory() as tmp:
+            repo = FixtureRepo(Path(tmp) / "checkout", manifest)
+            evidence = Path(tmp) / "evidence-store"
+            for rel, body in store.items():
+                _write(evidence / rel)
+                (evidence / rel).write_bytes(body)
+            code, payload = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--evidence-root", str(evidence)])
+        self.assertEqual(code, 0, payload["errors"])
+        self.assertEqual(payload["errors"], [])
+        self.assertEqual((payload["evidence_judgment"], payload["evidence_unjudged"], payload["evidence_store_checked"]), ("judged", 0, True))
+        self.assertEqual(len(payload["evidence_missing"]), 42)
+        self.assertEqual(payload["evidence_registered_not_checked"], [])
+        self.assertEqual(set(payload), self.REPORT_KEYS)
+
+
 class PathSafetyTests(unittest.TestCase):
     def test_rejects_dot_dot_path_escape(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = _valid_manifest_dict()
             manifest["e_scopes"]["E00"]["implementation_files"][0] = "../../etc/passwd"
             repo = FixtureRepo(Path(tmp), manifest)
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_absolute_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = _valid_manifest_dict()
             manifest["e_scopes"]["E00"]["implementation_files"][0] = "/etc/passwd"
             repo = FixtureRepo(Path(tmp), manifest)
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
     @unittest.skipUnless(hasattr(Path, "symlink_to"), "symlink unsupported")
     def test_rejects_symlink_component(self):
@@ -1706,7 +1869,7 @@ class PathSafetyTests(unittest.TestCase):
             target = repo.root / "scripts/smoke_workspace.py"
             target.unlink()
             target.symlink_to(repo.root / "scripts/inventory_baseline_tests.py")
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_directory_symlink_even_when_target_stays_inside_repo(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1722,12 +1885,12 @@ class PathSafetyTests(unittest.TestCase):
             manifest = repo.manifest
             manifest["e_scopes"]["E00"]["implementation_files"][0] = "scripts-link/smoke_workspace.py"
             repo.write_manifest(manifest)
-            self.assertFalse(css.run_check(repo.root, "reports/support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root).structure_valid)
 
     def test_rejects_manifest_path_itself_escaping_repo_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp))
-            self.assertFalse(css.run_check(repo.root, "../support-scope.json", None).structure_valid)
+            self.assertFalse(_structure_check(repo.root, "../support-scope.json").structure_valid)
 
 
 
@@ -1874,7 +2037,7 @@ class ProjectLicenseTests(unittest.TestCase):
 
 class RealRepositoryTests(unittest.TestCase):
     def test_real_manifest_report(self):
-        code, payload = _run_cli(["--repo-root", str(REAL_ROOT), "--manifest", "reports/support-scope.json"])
+        code, payload = _run_cli(["--repo-root", str(REAL_ROOT), "--manifest", "reports/support-scope.json", "--structure-only"])
         print(f"[real] exit={code} structure={payload.get('structure_valid')} plan={payload.get('plan_binding_available')} input={payload.get('input_binding_available')} errors={payload.get('errors')}", file=sys.stderr)
         self.assertEqual(code, 0)
         self.assertTrue(payload["structure_valid"])
@@ -1882,18 +2045,22 @@ class RealRepositoryTests(unittest.TestCase):
         self.assertFalse(payload["input_binding_available"])
         self.assertEqual((payload["plan_version"], payload["plan_sha256"]), (css.PLAN_VERSION, css.PLAN_SHA256))
         self.assertFalse(payload["evidence_store_checked"])
+        self.assertEqual(payload["evidence_judgment"], "not_performed_structure_only")
+        self.assertGreater(payload["evidence_unjudged"], 0)
 
 
 class IndexOwnershipAndMergeFactsTests(unittest.TestCase):
     def _report(self, manifest: dict) -> css.CheckReport:
         with tempfile.TemporaryDirectory() as tmp:
             repo = FixtureRepo(Path(tmp), manifest)
-            return css.run_check(repo.root, "reports/support-scope.json", None)
+            return _structure_check(repo.root)
 
     def test_runtime_reads_the_single_reviewed_rust_table(self):
         facts = css.reviewed_merge_facts(REAL_ROOT)
         self.assertEqual(len(facts), 132)
-        self.assertIsNone(facts[200])  # the AG-182 rebind PR itself, unmerged when its records were registered
+        # The AG-182 rebind PR, unmerged when its records were registered; AG-200 backfilled its merge.
+        self.assertEqual(facts[200], "02a135aa918fce5dd2ea0c1c8eafc287318f10d2")
+        self.assertNotIn(None, facts.values())
         records = [record for scope in _valid_manifest_dict()["e_scopes"].values() for record in scope["verified_subscopes"]]
         self.assertEqual(len(records), 138)
         for record in records:
@@ -1919,12 +2086,12 @@ class IndexOwnershipAndMergeFactsTests(unittest.TestCase):
             for label, source in cases.items():
                 with self.subTest(case=label):
                     path.write_text(source, encoding="utf-8")
-                    code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+                    code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--structure-only"])
                     self.assertEqual(code, 1)
                     self.assertFalse(report["structure_valid"])
                     self.assertTrue(any("reviewed merge facts" in error for error in report["errors"]), report)
             path.unlink()
-            code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+            code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--structure-only"])
             self.assertEqual(code, 1)
             self.assertFalse(report["structure_valid"])
 
@@ -1958,12 +2125,12 @@ class IndexOwnershipAndMergeFactsTests(unittest.TestCase):
             path = repo.root / "crates/evo-core/tests/support_scope.rs"
             original = path.read_text(encoding="utf-8")
             path.write_text(original.replace('        _ => return Err(format!("no reviewed merge status for PR {pr}")),', '        999 => None,\n        _ => return Err(format!("no reviewed merge status for PR {pr}")),', 1), encoding="utf-8")
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
             self.assertTrue(report.structure_valid, report.errors)
             record["merged_sha"] = "b" * 40
             record["pr_state"] = "merged"
             repo.write_manifest(manifest)
-            report = css.run_check(repo.root, "reports/support-scope.json", None)
+            report = _structure_check(repo.root)
             self.assertFalse(report.structure_valid)
             self.assertIn("differs from the reviewed PR merge", report.errors[0])
 
@@ -2032,7 +2199,7 @@ class SharedWorkspaceAndRawFunctionTests(unittest.TestCase):
             ):
                 with self.subTest(case=label):
                     path.write_text(source, encoding="utf-8")
-                    code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+                    code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--structure-only"])
                     self.assertEqual(code, 1)
                     self.assertFalse(report["structure_valid"])
                     self.assertTrue(any("reviewed merge facts" in error for error in report["errors"]), report)
@@ -2093,7 +2260,7 @@ class CompleteFactFunctionDeclarationTests(unittest.TestCase):
             ):
                 with self.subTest(prefix=prefix):
                     path.write_text(original.replace(declaration, prefix + declaration, 1), encoding="utf-8")
-                    code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+                    code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--structure-only"])
                     self.assertEqual(code, 1)
                     self.assertFalse(report["structure_valid"])
                     self.assertTrue(any("ordinary private synchronous function" in error for error in report["errors"]), report)
@@ -2128,7 +2295,7 @@ class FactFunctionTokenTreeTests(unittest.TestCase):
             for index, source in enumerate(cases):
                 with self.subTest(case=index):
                     path.write_text(source, encoding="utf-8")
-                    code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json"])
+                    code, report = _run_cli(["--repo-root", str(repo.root), "--manifest", "reports/support-scope.json", "--structure-only"])
                     self.assertEqual(code, 1)
                     self.assertFalse(report["structure_valid"])
                     self.assertTrue(any("top-level Rust function" in error or "delimiters" in error for error in report["errors"]), report)

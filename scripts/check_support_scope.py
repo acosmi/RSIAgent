@@ -2,8 +2,11 @@
 """Read-only validator for the frozen rsia.support_scope.v2 derivative.
 
 The checker never executes manifest commands, starts subprocesses, accesses the
-network, or writes repository files. Exit 0 means structure only; it is not an
-acceptance, effect, license, host, deployment, or merge decision.
+network, or writes repository files. Exit 0 means structure plus, unless
+--structure-only is given, the local evidence judgment; it is not an acceptance,
+effect, license, host, deployment, or merge decision. Without --evidence-root the
+check fails closed once an out/ evidence path is unjudged, unless --structure-only
+states that only the structure was checked.
 """
 from __future__ import annotations
 
@@ -129,6 +132,34 @@ FIELD_SEMANTICS = {
         "missing, extra or rewritten pin fails; the records added by an index pull request are pinned by the next index pull request, after the merge "
         "of the adding pull request is backfilled"
     ),
+    # Appended by AG-200 (fail-closed evidence judgment, Rust evidence-store input, register file pin, merge facts); the thirteen
+    # definitions above are unchanged.
+    "evidence_judgment": (
+        "top-level key of the Python checker report, with evidence_unjudged: judged when every evidence path was judged and none failed (with "
+        "--evidence-root, out/ paths are judged in the local evidence store it names, the directory holding out/, normally the primary checkout); "
+        "not_performed_structure_only when --structure-only is given, which counts the absent out/ evidence paths, registered or not, in "
+        "evidence_unjudged without judging them; not_performed when the check stopped before every path was judged, in particular when neither "
+        "option is given and an out/ evidence path is unjudged, which fails the check (fail closed); --structure-only and --evidence-root are "
+        "mutually exclusive; the Rust test judges out/ evidence paths only when the environment variable RSIA_SUPPORT_SCOPE_EVIDENCE_ROOT names "
+        "that store and otherwise reports that the evidence judgment was not performed"
+    ),
+    "evidence_missing_register_pin": (
+        "both checkers pin the missing-evidence register file itself: evidence_missing_register.path must be reports/evidence-missing.json and "
+        "evidence_missing_register.sha256 must equal both the reviewed register SHA-256 constant of each checker and the SHA-256 of the file, so "
+        "no register entry (including an expected identity, an unknown marker or a missing window) changes without changing both checkers; the "
+        "reviewed (record_id, field, path) triples stay pinned as well"
+    ),
+    "pr_state": (
+        "optional record-level pull request state: draft, open, closed or merged; merged requires a merged_sha and every other state requires "
+        "merged_sha to be null; an absent pr_state asserts no state"
+    ),
+    "merged_sha": (
+        "record-level merge commit of the record's pull request, null only while that pull request is unmerged: it must equal the reviewed merge "
+        "fact of the pull request in the Rust table expected_merge_for_pr (which the Python checker reads), differ from the record's own "
+        "source_sha, agree across every record of the same pull request, and be neither the merge commit of another pull request nor the "
+        "source_sha of a record of another pull request; a record added by an index pull request carries null until the next index pull request "
+        "backfills that merge (with pr_state merged); it remains a manifest assertion whose git ancestry neither checker verifies"
+    ),
 }
 EXECUTION_KEYS = {"runner", "command", "scope", "exit_code", "evidence"}
 EXECUTION_RUNNERS = {"ctrl_verify.sh", "ctrl_verify_v43.sh", "ctrl_verify_v45.sh", "codex_task", "other"}
@@ -237,27 +268,39 @@ EXPECTED_RELATIONS = {
     ("completes", "E16.1.ag182_rerun_ag076_local_scoped_acceptance", "E16.1.ag076_local_scoped_acceptance"),
     ("completes", "E16.6.ag182_rerun_ag086_local_scoped_acceptance", "E16.6.ag086_local_scoped_acceptance"),
 }
-# V080.d "旧记录被改写": SHA-256 of the canonical JSON (keys sorted, no insignificant whitespace, UTF-8) without plan_recheck of each of
-# the 93 historical records retained from the v4.3 index binding (base a389c4e3). The 45 records added by AG-182 are pinned by the
-# next index pull request, after the merge of PR #200 is backfilled (FIELD_SEMANTICS["record_pins"]).
+# V080.d "旧记录被改写": SHA-256 of the canonical JSON (keys sorted, no insignificant whitespace, UTF-8) without plan_recheck of all 138
+# records: the 93 historical records retained from the v4.3 index binding (base a389c4e3) and the 45 records added by AG-182 (PR #200),
+# pinned by AG-200 after the merge of PR #200 (02a135aa) was backfilled into its 33 records (FIELD_SEMANTICS["record_pins"]).
 EXPECTED_RECORD_DIGESTS = {
     "E00.controller_acceptance": "1d8594a791d51459e7272f8c97bc17df016df597bd85b696ce2b2379313ee80a",
     "E00.ag099_step_future_default_test_stack": "ff982495a71a566a1a2f30c43a74ebce147321b32a65979fcc6ea9c9bfd229fa",
+    "E00.ag182_rerun_controller_acceptance": "ff8adb183d2bb8270d680fbcd6b01f096944b787f425a9b7cbe8d957a35b6a59",
     "E01.controller_acceptance": "074a9cd7508f9ba3a13f2bc5f0894740ae57c8593ecc7d411c9e9d64d3990501",
     "E01.ag057_explicit_sample_registration": "1661bc81322d2817fcf025437d354b083a2e5b9fa83db9c07ab3a4a24b9b9bfe",
+    "E01.ag144_feasibility_approval_alignment_v43": "3d3f37831720573ad7de398fe3bf7a8c69ca4be3dff4727e2e6201438c5e8078",
+    "E01.ag182_rerun_controller_acceptance": "23d263f89c080b38eca2bb506058793448780de6c3ca903e15ae33c177c52eaa",
     "E02.controller_acceptance": "e394666658305fca71b0c7d631aa1b323dea92fd8cd555845ee74165640704c1",
     "E02.ag055_v1_wire_goldens": "906e3945c9b4fd329f7e99bee4f8300e886fc6571363fd22bd9acfab5ad5215a",
     "E02.ag065_host_surface_name_coverage": "c17b10748a3d1938f470192799bb72ca377bb117ea013c642b5d878120a40199",
     "E02.ag092_local_scoped_acceptance": "29bde3c9b96dc0ed4209cae7fce85ccb53aada9374ef38073eaa65ad51176c5c",
     "E02.ag093_local_scoped_acceptance": "2847402ce6df60554ac63bc9c6e557194b768c56f53f7eae2111c60fea2c86e6",
     "E02.ag126_v43_host_surface_duplicates": "4a6d22bd80043575aabd11caeff4dd92028912bd6ce033cb3116a49f4d64efde",
+    "E02.ag136_management_registry_single_source_v43": "2559f07520e1d6c1bbd8805e3356cae41688e85c245a7016fe510502cf6766e7",
+    "E02.ag182_rerun_ag092_local_scoped_acceptance": "cab188530425235d566fe1d64b4971fdb0e7cd630a7845b516cbd38e53f7159d",
+    "E02.ag182_rerun_ag093_local_scoped_acceptance": "f13839e456363cbf0e3f8c48d6cb35e2152be19d5e45d0b21f1acd6b7c2037c7",
+    "E02.ag182_rerun_controller_acceptance": "8e716d2c64888a520fe992a393c31cc8df64e540c1b554b76ad111dddb9076f3",
     "E03.controller_acceptance": "724c6e819805aaff53c31acf981b14f4ed45c66cbf30e879388ba30c095250ca",
     "E03.ag016_development_receipts": "2291dcc8302da2ddb57e19d0cadf992f145853d612c72e25497185201d90f916",
     "E03.ag079_local_scoped_acceptance": "0d6187cdd07d2302d608afb46d8c0dcec7d9ba718f69098cb6e32d51c63d641a",
+    "E03.ag182_rerun_controller_acceptance": "0d61b603b9de44bbb348331aa09a445382af8ac9bae67eb8f6cf57619887ace8",
     "E04.controller_acceptance": "f49955f820927e62185e48ed3e36e6daf97a1b518b21b7ec2b65662ce3bb9cbb",
     "E04.ag082_local_scoped_acceptance": "4f3bfad1a3766ec3f05185061823c5162c31e22b49406caf38c427302e19f976",
     "E04.ag077_local_scoped_acceptance": "5544b5435969d00c5edb1dc62fdb738e0b2d16ef16f86bb40160150e4bb446ed",
     "E04.ag121_v43_redacted_bound_request_identity": "e8e3528768d23ab3fdb673a819cb981345f12794e0d8280fb09d1624f93d0cbd",
+    "E04.ag143_external_sampling_projection_v43": "a9cb2fe2b95f1b1c3cd3a980beee9e57bdbbdd990256c22a16c02b7c3e15bc6d",
+    "E04.ag134_root_budget_cancellation_v43": "7930cb43067589856a17e70db2560fe12a7c84ff72455dae114947acd5859912",
+    "E04.ag182_rerun_ag077_local_scoped_acceptance": "c13bda7a9c27925f8448dfb6220328ce5ea1121b6eb2c7232c71ba0011b20e9f",
+    "E04.ag182_rerun_controller_acceptance": "ebca59d1d54f7b3ab778198a36015bc6d7875d18ff05063afbfa60948daea712",
     "E05.controller_acceptance": "561829b705c81d4754ede69684bb680c264411f28b7ccbca92c9c70d3b1a1c3a",
     "E05.ag083_partition_admission_rejection_atomicity": "a583638461b587598d2d1de13848710ef6e0268dde1685b91d95b3fa26278125",
     "E05.ag087_local_scoped_acceptance": "a826a4fd3234faaa99bcc00b54907549131ed911e9a2c226ba23b17fc3098c67",
@@ -269,14 +312,27 @@ EXPECTED_RECORD_DIGESTS = {
     "E05.ag109_external_host_authority_bound_ticket": "4254c96216040460b6f65594e7343a24416901afbdd079c4055bb781f3a37e5c",
     "E05.ag100_formal_candidate_dependency_binding_v42": "fb3d5e5739db8d1160bcae324927994183fd9daefccae406c0bd8587176b392d",
     "E05.ag118_late_receipts_after_final_report_v42": "1db33e283844a4f0f2b852ef99e1c58b772a2dea0805d65e1beeb7e87486cecb",
+    "E05.ag137_evaluator_control_authentication": "08131d590c228486bbed331162892cac9b0b7dfca9d72acc561c048c9bd25eb5",
+    "E05.ag120_one_execution_receipt_per_call": "8c4a67f78c641ba7fe694400e7ab543256f926be705a4cf72938cb9f39f00e2b",
+    "E05.ag122_ga18_bound_cycle_validation": "afe565d3d31dbfb7673985b9ca69dbd8966910c43c85359b9846eda3c10680e0",
+    "E05.ag182_rerun_ag083_partition_admission_rejection_atomicity": "8170f3e50d9a4d5a4bfe7286b55d75216858a92cf8c9b8f23206ca421fce74ed",
+    "E05.ag182_rerun_ag087_local_scoped_acceptance": "89f58763843d61d1838d1f44661ea548e44b9f70a5856d83bb9a414488ab6b74",
+    "E05.ag182_rerun_ag088_local_scoped_acceptance": "bbfe46fe78042708fb504984b2e72da8ec8f553b963f6bbc175ef00043ae00ae",
+    "E05.ag182_rerun_ag089_local_scoped_acceptance": "08bfe321465a193366d43aab54d1e3be2e7a9629f3a47dfbfcee0dbc68959368",
+    "E05.ag182_rerun_ag090_local_scoped_acceptance": "b73e1c420dbfb6a4316d97b64d72d89df7c0edada237fe166c4dd2220399253c",
+    "E05.ag182_rerun_ag091_local_scoped_acceptance": "6fa5c9ad08f8f38ce686cfa3ed6de341f436438f75bf132acb7d8a1daa0618a8",
+    "E05.ag182_rerun_controller_acceptance": "634f91847f89d8ba23f5f459508e0282d11c54b3e613dc4fb6ee85e55d28ad0c",
     "E06.ag084_local_scoped_acceptance": "15f35447ee36c450ad8fa9bd3f95dd4e587ff2b758bd1591e9b88abf43eb3cdb",
     "E06.ag116_edit_compiled_produce_review_v42": "74dc866a916baa251ba3283b6318403ae416564798946bb7a7e9cdfe7c99f5ba",
+    "E06.f01_builtin_generation_strategy_authority": "bfe72fbcf7e57974143375e97fee3a75c29c06b80f4e8abd3b86a15058391546",
+    "E06.ag182_rerun_ag084_local_scoped_acceptance": "e00b4966b14b40419c6de57ed34850bca1fe7eefe632593be6519a92e83f726e",
     "E07.controller_acceptance": "ac6314300943f30c0e27913b978be822f9387d553006e5d6e16f62b60d517f41",
     "E07.ag015_curriculum_step_consumer": "6e61f463ac09aa20e2c5d993d2c6d74d093093370955cc78f52ae46b938601d8",
     "E07.ag017_exploration_start_consumer": "aebd4d7fc8c56b3f39da0759083899fe36203a1044a39a9e22ae1bc343be2e54",
     "E07.ag027_management_cleanup_closure": "6af732292546dcb863e8c1a0c155de4a127109711d262b21a9b68524d2b496f9",
     "E07.ag044_submit_upstream_gate": "c673295669527dfd97da6fe6f46ee4ab02f7500a6afac11c40eb98f6027ec39e",
     "E07.ag108_candidate_review": "ad759df1c7f9182e866d8f1ccaf0cf9dfc0ce3b72faedf9c0889c4b3ffa19123",
+    "E07.ag182_rerun_controller_acceptance": "ff3ec07197b51da4996c73772a0bfb994c70ed80ec5b35255383ec6085d0fdd7",
     "E08.controller_acceptance": "c62759622bb999c43cb7ebf7bb40f67360e3a7b6421fe2caeddad1338e544991",
     "E08.ag036_revocation_source_collision": "fae74423b0845f16d88ae3378495089a087a2639230ae1f7ceab97f21ed5d122",
     "E08.ag035_cleanup_fixpoint": "2204561a86ab1cb38dc2b99844e229bfd063bb564e416f77e5be21e6b8ffdf25",
@@ -293,6 +349,9 @@ EXPECTED_RECORD_DIGESTS = {
     "E08.ag106_budget_startup_recovery_v42": "32f8e7825843418114547ad3f3d95fdc8872afa5663d6dd8ae3eed2ba9549744",
     "E08.ag104_restore_prefix_migration_upgrade_v42": "755f4769045cf640f44ad391eddb152e7a2c561c65b94e0aa51363115fe8a02a",
     "E08.ag117_formal_call_revoke_cleanup_v42": "e105db3dc22aa5e1eefbdf18fae36b01fadca3858e5f06c2e1aa1ceb5b1066a5",
+    "E08.ag182_replay_v3_economic_cleanup": "1735efd723fd789edd5b6213c384b662b5dff785871ec1817e244cacb39c3a65",
+    "E08.ag182_rerun_ag075_local_scoped_acceptance": "c803b3dd8caff0f85438e2b7f7f8b057ef8e3ef4c2233fec6c205e206788e109",
+    "E08.ag182_rerun_controller_acceptance": "f61df7ebb6b9fec080628b87c764e10cf146fea1cd67f1252ad22aa2b295e6ac",
     "E09.controller_acceptance": "f5ce8f536ed777d9534b2514867708d8b7ea8718be0e07c7184a262a7035c617",
     "E09.ag021_skill_group_jobs": "12c6f148b56305cd068652cecaa4bea1b9f5cb98fcc0540d680b8f8084c575bb",
     "E09.ag024_exploration_cleanup_edges": "7076ba1d4f789db61481c97e527aa1e50c4801db91d7b1b9416e86f8fc52fe60",
@@ -302,11 +361,20 @@ EXPECTED_RECORD_DIGESTS = {
     "E09.ag041_postpaid_convergence": "384514f590f119120bbcab247d565328f27484cefe7d77df7fd0e1c308b82cc2",
     "E09.ag048_terminal_classes": "7c21051db6efae69f59f43de82fd099c9950cfd39c1267709c0fbbfef70b3f5c",
     "E09.ag103_fairness_waits_legal_set_v42": "0132841ac9a6043c5d32db733a7a9b8aff8270762fde2acba30c63043c656398",
+    "E09.ag182_replay_v3_legal_prefix": "f000dc8d18848f0dfb750867c506b677e9cee9633d718035757a6cb2098e54e9",
+    "E09.ag182_rerun_controller_acceptance": "a82beb8d2ba5c8397814bcfa5453837426d036a97cfde51f0eca087f2b950694",
     "E10.ag032_replay_redacted_reads": "a957960111997b98119c09151e57e4e949a35a6e8d312d2b6f373a09f9d4104b",
+    "E10.ag147_replay_lineage_versioning_v43": "56d997331600edc5aef4684ad7d8c9f755c1e05f8923b10d09f400650de64926",
+    "E10.ag182_replay_v3_controller_acceptance": "2f397f805e25dac7652fd1d0f7c43ca4f7d3aec593829cd15d334ca322e153ef",
+    "E10.ag182_replay_v3_management_controller_acceptance": "62031e625060284ba7ab39c6664a4bed4a2e9618f393c61a1be7f4ff3e4da5b4",
+    "E10.ag182_replay_v3_episode_recovery": "74bcbff491e88f189a6003659aaaf53518abcf3bb4e815b021ca287689f67e8c",
+    "E10.ag182_replay_v3_fairness_waits_legal_set": "d3290a8a1260c958b39d88fe3d6d67c091bbfb6be5cd11381bcd20f20776f27f",
     "E11.controller_acceptance": "da5e5ea97acd78efeded949a10a9548a1617972bf576851777e94d1815ba8678",
+    "E11.ag182_rerun_controller_acceptance": "581d88b20c959aca7127d22ffb7ac5283bf60ebb405675004f24c9decb258aa0",
     "E12.controller_acceptance": "86e83f3766896892230f8e092d2941223b7dfa00f3c87657ca3544b4377358a6",
     "E12.ag025_curriculum_cleanup": "e7848f07c68cc83acd4b5aa491db6a624b2e904dd52922c329920f99dbb64683",
     "E12.ag050_curriculum_priority": "178dcb3f3445b5ce93b6f6dbb421aaceb7bf4886dfe2906f1ce748fda4b1956e",
+    "E12.ag182_rerun_controller_acceptance": "a10c6776facc52c80de4e41e6a20245baa89054f2b7aec723de2f8ef6b137fb2",
     "E13.ag022_consolidation_closure": "7a7440e4247874584b1b0177ec063175fad1b5f59fa0054c7469d383086f6a4d",
     "E13.ag030_consolidation_budget_stage": "36b9fc48a26ea31f0a4e12b779938232ce01b1e8602a7f231d87cc9b919e81e4",
     "E13.ag031_bounded_terminal_category": "77481ced5879ebab6c1fad3223385f6346eb3bcc38b5347446f4f26687564c27",
@@ -316,6 +384,8 @@ EXPECTED_RECORD_DIGESTS = {
     "E14.ag058_current_description_boundaries": "968ace7f370ef39e775d0ae4bcb225e3a20bc27046b1c25077f208ac49212289",
     "E16.1.ag076_local_scoped_acceptance": "1db84fb47a4dd266efe79ff2d6cd62f7b300a3ea2526e307bc70adaf5a94bd12",
     "E16.1.ag070_local_scoped_acceptance": "f593c9ee97df37e97c455d4e70b0c1feafe6bd31911375f64327a6cb740d0eaf",
+    "E16.1.ag182_rerun_ag070_local_scoped_acceptance": "0afe71a49608966752a01b14404eb88617d01d72b0029033675c680dca851450",
+    "E16.1.ag182_rerun_ag076_local_scoped_acceptance": "8001653350fbfcbf248cb026112892c01b318c2a8accc124871bbc187db6d778",
     "E16.2.durable_staging_publish_controller_acceptance": "adcb1f3a66b3a675cd4aa3e31a2c49c4e734f83042422740093650a24d3f4413",
     "E16.2.ag071_known_marker_utf8_blocking": "21554a03c30f5e2c6124aa7a9abf0ad598df1f736f144a4cc3ded4e42be539b8",
     "E16.2.ag085_utf8_privacy_boundary_regressions": "2cef286c6f53f1fa34318b4cca3b559676d2a369e46038557239ea997062f70b",
@@ -331,7 +401,13 @@ EXPECTED_RECORD_DIGESTS = {
     "E16.5.ag125_v43_single_writer": "bc602ffe5639d5aaa0db5e54629a0237c30fd2dbba2d0957ff99a18ec4283d1f",
     "E16.5.ag129_v43_system_clock_conversion": "a9f3d6efb7173b6ca5bb1bd64946a1919212aeb90213076fc9f92d680af842f9",
     "E16.5.ag129_v43_broker_first_clock_refusal": "3505db766eb5baa3ca918da282110c07c64a448942776484451bdb409cb32349",
+    "E16.5.ag150_readonly_dependency_api_v43": "0d71ec6742bc4ae73065efb0e635f8e866a049c2a50bf9a1053241f8d063235c",
+    "E16.5.ag153_shared_prepare_contract_v43": "666c76b37ca7689a77c286e29be410f492aa4277caf15d4db518e3a9cf25b83f",
     "E16.6.ag086_local_scoped_acceptance": "a55a8e65cb303d4c683a356ce7ccb3922c7480ed1041722775506b5880c8c537",
+    "E16.6.ag114_evidence_identity_ownership": "70b124f58240ea0b25b0ac9cc573531f70359883aef1e50858cc60ae80cb8f8a",
+    "E16.6.ag182_v45_project_license_metadata": "56eb362a529ab381aca9035c2361df5097abba5e3c08df0dc2226dadf15f6ee7",
+    "E16.6.ag182_rerun_ag086_local_scoped_acceptance": "415850c541a618837ccc08f8973558f9223aceff92f917931a452935120b887e",
+    "E16.6.ag182_plan_v45_index_binding": "3fe7f10b44b56128e6f19a6955def29b91be3493271112169d89437c50d38cc2",
     "E17.disabled_rejection_controller_acceptance": "6046a7d9fe6f644c02b88ad8b52ccd2a25aa16078563031332fb1e15c9084442",
     "E18.disabled_rejection_controller_acceptance": "75279240c222bbd5e5a65656afa30f7cb0b186253f95ec496d3b27f04acee0a1",
 }
@@ -343,6 +419,9 @@ MISSING_SCHEMA_VERSION = "rsia.evidence_missing.v1"
 MISSING_REGISTER_KEYS = {"schema_version", "basis", "entries"}
 MISSING_ENTRY_KEYS = {"path", "record_id", "field", "expected_bytes", "expected_sha256", "unknown_reason", "missing_window", "group"}
 MISSING_WINDOW_KEYS = {"after", "before"}
+# Reviewed SHA-256 of the register file itself (AG-200, review S-1), pinned here and in the Rust test: the manifest pointer, this constant
+# and the file must agree, so an edited entry (an expected identity included) cannot pass by refreshing the pointer alone.
+EXPECTED_MISSING_REGISTER_SHA256 = "b843e3f9692c5ba18ce9148278b3267584222461406fdccc17162ed84c115337"
 # Reviewed (record_id, field, path) entries of the register (42), pinned here and in the Rust test so that removing one entry
 # and registering another (same count, re-pinned SHA-256) fails in both checkers.
 EXPECTED_MISSING_TRIPLES = {
@@ -394,7 +473,8 @@ UNKNOWN = "unknown"
 ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 # The local evidence store is the untracked out/ tree of the primary checkout (.gitignore /out/). A clone or worktree
 # does not carry it, so the absence of an out/ path is only judged when --evidence-root names the directory holding
-# that tree; a present path, and any path outside out/, is always checked.
+# that tree; a present path, and any path outside out/, is always checked. An absent out/ path that cannot be judged
+# fails the check (fail closed, AG-200) unless --structure-only states that only the structure is checked.
 LOCAL_EVIDENCE_STORE = "out"
 
 # Harness² borrowings HS01–HS08 (plan §2.9 table) and fixed sources HSF01–HSF16/HSP01 (plan §16.8 table).
@@ -1135,8 +1215,15 @@ def validate_missing_register(manifest: dict[str, Any], repo_root: Path, rel: st
         raise CheckerError("evidence_missing_register must contain exactly path and sha256")
     if pointer["path"] != rel:
         raise CheckerError(f"evidence_missing_register.path {pointer['path']!r} differs from the register in use ({rel!r}, --known-missing)")
+    if rel != DEFAULT_KNOWN_MISSING:
+        raise CheckerError(f"missing-evidence register {rel!r} is not the reviewed register {DEFAULT_KNOWN_MISSING!r}; its path is pinned in both checkers")
     if not isinstance(pointer["sha256"], str) or not HEX64.fullmatch(pointer["sha256"]):
         raise CheckerError("evidence_missing_register.sha256 must be lowercase SHA-256")
+    if pointer["sha256"] != EXPECTED_MISSING_REGISTER_SHA256:
+        raise CheckerError(
+            f"evidence_missing_register.sha256 {pointer['sha256']} is not the reviewed register SHA-256 pinned in both checkers "
+            f"({EXPECTED_MISSING_REGISTER_SHA256}); a register entry cannot change without both checkers"
+        )
     path = inspect_relative(repo_root, rel, "missing-evidence register", True)
     if sha256_of_file(path) != pointer["sha256"]:
         raise CheckerError(f"missing-evidence register {rel} SHA-256 differs from evidence_missing_register.sha256; the register cannot change without the manifest pin")
@@ -1516,6 +1603,8 @@ class CheckReport:
     evidence_store_checked: bool = False
     evidence_missing: list[str] = field(default_factory=list)
     evidence_registered_not_checked: list[str] = field(default_factory=list)
+    evidence_judgment: str = "not_performed"
+    evidence_unjudged: int = 0
     def fail(self, message: str) -> None:
         self.structure_valid = False
         self.errors.append(message)
@@ -1532,7 +1621,9 @@ class CheckReport:
             "evidence_store_checked": self.evidence_store_checked,
             "evidence_missing": self.evidence_missing,
             "evidence_registered_not_checked": self.evidence_registered_not_checked,
-            "disclaimer": "exit 0 proves only the frozen derivative's local structure. Commands were parsed, never executed; Git ancestry, logs, licenses, hosts, effects, and deployment were not automatically authenticated.",
+            "evidence_judgment": self.evidence_judgment,
+            "evidence_unjudged": self.evidence_unjudged,
+            "disclaimer": "exit 0 proves only the frozen derivative's local structure and, when evidence_judgment is judged, the local presence or registered absence of its evidence paths. Commands were parsed, never executed; Git ancestry, logs, licenses, hosts, effects, and deployment were not automatically authenticated.",
         }
 
 def validate_external_plan(path: Path) -> str:
@@ -1546,12 +1637,14 @@ def validate_external_plan(path: Path) -> str:
 def in_local_evidence_store(rel: str) -> bool:
     return rel.split("/", 1)[0] == LOCAL_EVIDENCE_STORE
 
-def check_local_evidence(report: CheckReport, evidence: list[dict[str, Any]], register: dict[tuple[str, str], dict[str, Any]], register_rel: str, repo_root: Path, evidence_root: Path | None) -> bool:
+def check_local_evidence(report: CheckReport, evidence: list[dict[str, Any]], register: dict[tuple[str, str], dict[str, Any]], register_rel: str, repo_root: Path, evidence_root: Path | None, structure_only: bool = False) -> bool:
     """plan §18.10 (v4.5 Q-50): three outcomes per evidence path. A missing path listed in the register is reported in
     evidence_missing, or in evidence_registered_not_checked when it lies in out/ and the evidence store is not supplied (its
     absence was not checked); a missing path outside the register fails (for out/ paths only when the evidence store is supplied);
     a registered path that reappears fails unless the registered SHA-256 (and bytes, when registered) match, and always
-    fails when its identity was registered as unknown. Returns whether every input manifest is present and matching."""
+    fails when its identity was registered as unknown. Every absent out/ path left unjudged (registered or not) is counted in
+    evidence_unjudged; after every path has been examined, a nonzero count fails the check (fail closed, AG-200) unless
+    structure_only states that only the structure is checked. Returns whether every input manifest is present and matching."""
     store_checked = evidence_root is not None
     all_inputs = bool(evidence)
     unjudged = 0
@@ -1585,15 +1678,26 @@ def check_local_evidence(report: CheckReport, evidence: list[dict[str, Any]], re
                 report.needs_verification.append(f"{identifier}: local {label} is unavailable")
             else:
                 raise CheckerError(f"{identifier}: {field_name} {rel!r} is missing locally and is not listed in the missing-evidence register {register_rel}")
+    report.evidence_unjudged = unjudged + len(report.evidence_registered_not_checked)
     if not store_checked:
         report.needs_verification.append(
             f"local evidence store not supplied (--evidence-root): {unjudged} absent {LOCAL_EVIDENCE_STORE}/ evidence path(s) were reported, not judged against "
             f"the missing-evidence register, and {len(report.evidence_registered_not_checked)} registered path(s) are listed as registered, not checked"
         )
+    # Raised only after every path was examined, so a digest mismatch or a reappearance above is reported first.
+    if report.evidence_unjudged and not structure_only:
+        raise CheckerError(
+            f"evidence store not supplied: {report.evidence_unjudged} {LOCAL_EVIDENCE_STORE}/ evidence paths unjudged; "
+            "pass --evidence-root <primary checkout> or --structure-only"
+        )
     return all_inputs
 
-def run_check(repo_root: Path, manifest_rel: str, source_of_truth: Path | None, known_missing: str | None = None, evidence_root: Path | None = None) -> CheckReport:
+def run_check(repo_root: Path, manifest_rel: str, source_of_truth: Path | None, known_missing: str | None = None, evidence_root: Path | None = None, structure_only: bool = False) -> CheckReport:
     report = CheckReport()
+    report.evidence_judgment = "not_performed_structure_only" if structure_only else "not_performed"
+    if structure_only and evidence_root is not None:
+        report.fail("--structure-only and --evidence-root are mutually exclusive: the local evidence judgment is either performed against the store or explicitly skipped")
+        return report
     if not repo_root.is_dir():
         report.fail(f"repo root does not exist or is not a directory: {repo_root}")
         return report
@@ -1617,7 +1721,9 @@ def run_check(repo_root: Path, manifest_rel: str, source_of_truth: Path | None, 
         report.plan_version = manifest.get("plan_version") if isinstance(manifest, dict) else None
         report.plan_sha256 = manifest.get("plan_sha256") if isinstance(manifest, dict) else None
         evidence, register = _validate_manifest(manifest, repo_root, register_rel)
-        report.input_binding_available = check_local_evidence(report, evidence, register, register_rel, repo_root, evidence_root)
+        report.input_binding_available = check_local_evidence(report, evidence, register, register_rel, repo_root, evidence_root, structure_only)
+        if not structure_only:
+            report.evidence_judgment = "judged"
         for record in evidence:
             if record["merged_sha"] is not None:
                 number = PR_RE.fullmatch(record["pr"]).group(1)
@@ -1639,14 +1745,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-license-metadata-only", action="store_true")
     parser.add_argument("--workspace-packages-only", action="store_true")
     parser.add_argument("--source-of-truth", type=Path)
-    parser.add_argument("--known-missing", help=f"missing-evidence register relative to --repo-root (default {DEFAULT_KNOWN_MISSING}); must equal evidence_missing_register.path")
-    parser.add_argument("--evidence-root", type=Path, help="directory that holds the local evidence store out/ (normally the primary checkout); without it, absent out/ evidence paths are reported but not judged")
+    parser.add_argument("--known-missing", help=f"missing-evidence register relative to --repo-root (default {DEFAULT_KNOWN_MISSING}, the only reviewed register); must equal evidence_missing_register.path")
+    judgment = parser.add_mutually_exclusive_group()
+    judgment.add_argument("--evidence-root", type=Path, help="directory that holds the local evidence store out/ (normally the primary checkout); every out/ evidence path is judged against it")
+    judgment.add_argument(
+        "--structure-only",
+        action="store_true",
+        help="check the structure only: absent out/ evidence paths are counted in evidence_unjudged and reported, not judged (evidence_judgment "
+        "not_performed_structure_only); without this option or --evidence-root the check fails closed when an out/ evidence path is unjudged",
+    )
     return parser
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    manifest_only = (args.known_missing, args.evidence_root)
+    manifest_only = (args.known_missing, args.evidence_root, True if args.structure_only else None)
     if args.workspace_packages_only:
         if args.project_license_metadata_only or args.manifest is not None or args.source_of_truth is not None or any(item is not None for item in manifest_only):
             parser.error("workspace-packages-only accepts only --repo-root")
@@ -1670,7 +1783,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.manifest is None:
         parser.error("--manifest is required unless metadata-only is selected")
     evidence_root = args.evidence_root.absolute() if args.evidence_root is not None else None
-    report = run_check(args.repo_root.absolute(), args.manifest, args.source_of_truth, args.known_missing, evidence_root)
+    report = run_check(args.repo_root.absolute(), args.manifest, args.source_of_truth, args.known_missing, evidence_root, args.structure_only)
     print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
     return 0 if report.structure_valid else 1
 
