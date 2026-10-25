@@ -356,6 +356,160 @@ impl ExperimentPlan {
     }
 }
 
+pub const PLAN_SCHEMA_V2: &str = "rsia.experiment_plan.v2";
+
+/// Content data only. A decoded value, including its id, grants no candidate
+/// source, role, approval, independent-sample or execution authority. The
+/// engine must reload and authenticate the complete candidate in its existing
+/// same-Session resolver before calling `verify_candidate_content`.
+///
+/// The inner v1 configuration is a complete frozen, *unbound* snapshot. It is
+/// never exposed as a bound v1 replacement for this complete v2 wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExperimentPlanV2 {
+    pub schema_version: String,
+    pub id: String,
+    pub frozen_configuration: ExperimentPlan,
+    pub candidate_locator: String,
+    pub candidate_record_digest: String,
+    pub candidate_record_utf8: String,
+}
+
+#[derive(Serialize)]
+struct ExperimentPlanIdentityV2<'a> {
+    schema_version: &'static str,
+    frozen_configuration: &'a ExperimentPlan,
+    candidate_locator: &'a str,
+    candidate_record_digest: &'a str,
+}
+
+impl ExperimentPlanV2 {
+    /// Serializes the supplied complete typed record once, using exactly the
+    /// bytes hashed by `fingerprint`. In particular, no intermediate Value or
+    /// bundle-only projection may replace that original. This pure data API
+    /// cannot establish that the caller supplied an authenticated candidate.
+    pub fn from_typed_candidate<T: Serialize>(
+        frozen_configuration: &ExperimentPlan,
+        candidate_locator: &str,
+        complete_candidate_record: &T,
+    ) -> Result<Self> {
+        Self::validate_configuration(frozen_configuration)?;
+        identifier(candidate_locator)?;
+        let candidate_record_utf8 = Self::typed_candidate_utf8(complete_candidate_record)?;
+        let candidate_record_digest = crate::hash(candidate_record_utf8.as_bytes());
+        let mut plan = Self {
+            schema_version: PLAN_SCHEMA_V2.into(),
+            id: String::new(),
+            frozen_configuration: frozen_configuration.clone(),
+            candidate_locator: candidate_locator.into(),
+            candidate_record_digest,
+            candidate_record_utf8,
+        };
+        plan.id = plan.expected_id()?;
+        Ok(plan)
+    }
+
+    fn validate_configuration(configuration: &ExperimentPlan) -> Result<()> {
+        configuration.validate()?;
+        if !configuration.frozen || configuration.candidate_digest.is_some() {
+            return Err(Error::Conflict(
+                "v2 requires a frozen unbound configuration".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn typed_candidate_utf8<T: Serialize>(record: &T) -> Result<String> {
+        let raw = serde_json::to_vec(record).map_err(|_| Error::Internal)?;
+        if raw.first() != Some(&b'{') || raw.last() != Some(&b'}') {
+            return Err(Error::Invalid(
+                "candidate record must serialize as a JSON object".into(),
+            ));
+        }
+        String::from_utf8(raw).map_err(|_| Error::Internal)
+    }
+
+    fn expected_id(&self) -> Result<String> {
+        Ok(format!(
+            "experiment-plan-v2-{}",
+            fingerprint(&ExperimentPlanIdentityV2 {
+                schema_version: PLAN_SCHEMA_V2,
+                frozen_configuration: &self.frozen_configuration,
+                candidate_locator: &self.candidate_locator,
+                candidate_record_digest: &self.candidate_record_digest,
+            })?
+        ))
+    }
+
+    fn validate_content_binding(&self) -> Result<()> {
+        if self.schema_version != PLAN_SCHEMA_V2 {
+            return Err(Error::Invalid(
+                "unsupported experiment plan v2 schema".into(),
+            ));
+        }
+        Self::validate_configuration(&self.frozen_configuration)?;
+        identifier(&self.candidate_locator)?;
+        if self.candidate_record_digest.len() != 64
+            || !self
+                .candidate_record_digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Error::Invalid("invalid candidate record digest".into()));
+        }
+        if crate::hash(self.candidate_record_utf8.as_bytes()) != self.candidate_record_digest {
+            return Err(Error::Conflict(
+                "experiment plan stored candidate digest mismatch".into(),
+            ));
+        }
+        if self.id != self.expected_id()? {
+            return Err(Error::Conflict(
+                "experiment plan v2 identity mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Rechecks both the independently loaded locator and every byte of the
+    /// actual complete typed record. Deserialize and self-consistent hashes
+    /// alone cannot satisfy this check against a different actual original.
+    /// The result remains content equality, not a source/permission proof.
+    pub fn verify_candidate_content<T: Serialize>(
+        &self,
+        actual_candidate_locator: &str,
+        actual_complete_candidate_record: &T,
+    ) -> Result<()> {
+        self.validate_content_binding()?;
+        identifier(actual_candidate_locator)?;
+        if self.candidate_locator != actual_candidate_locator {
+            return Err(Error::Conflict(
+                "experiment plan candidate locator mismatch".into(),
+            ));
+        }
+        let actual_utf8 = Self::typed_candidate_utf8(actual_complete_candidate_record)?;
+        if self.candidate_record_utf8.as_bytes() != actual_utf8.as_bytes()
+            || self.candidate_record_digest != crate::hash(actual_utf8.as_bytes())
+        {
+            return Err(Error::Conflict(
+                "experiment plan candidate content mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Full v2 fingerprint after the actual record comparison; never a v1
+    /// projection. Existing workflow gates still have to run independently.
+    pub fn digest_against<T: Serialize>(
+        &self,
+        actual_candidate_locator: &str,
+        actual_complete_candidate_record: &T,
+    ) -> Result<String> {
+        self.verify_candidate_content(actual_candidate_locator, actual_complete_candidate_record)?;
+        fingerprint(self)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterObservation {

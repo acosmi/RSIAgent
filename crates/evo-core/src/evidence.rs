@@ -241,6 +241,21 @@ impl EvidenceMember {
     }
 }
 
+/// New byte-binding check only. The historical member/set validators retain
+/// their identifier-only contract; the caller establishes source authority.
+pub fn verify_evidence_member_content_v3(
+    member: &EvidenceMember,
+    actual_bytes: &[u8],
+) -> Result<()> {
+    member.validate()?;
+    import_material_digest(&member.content_digest)
+        .map_err(|_| Error::Invalid("invalid evidence SHA-256 digest".into()))?;
+    if member.content_digest != crate::hash(actual_bytes) {
+        return Err(Error::Conflict("evidence_content_digest_mismatch".into()));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceSet {
@@ -340,6 +355,19 @@ impl EvidenceLocator {
         }
         Ok(excerpt)
     }
+}
+
+/// New strict-format check before the existing byte/range extractor. Historical
+/// `build` and `verify_and_extract` error ordering remains unchanged.
+pub fn verify_evidence_locator_content_v3<'a>(
+    locator: &EvidenceLocator,
+    actual_bytes: &'a [u8],
+) -> Result<&'a [u8]> {
+    for digest in [&locator.source_digest, &locator.excerpt_digest] {
+        import_material_digest(digest)
+            .map_err(|_| Error::Invalid("invalid evidence SHA-256 digest".into()))?;
+    }
+    locator.verify_and_extract(actual_bytes)
 }
 
 /// Aggregate summary of forensic history across sources (§5.6, §6.3).
@@ -764,6 +792,146 @@ mod tests {
             execution_attestation: att,
             purpose: Purpose::Generation,
         }
+    }
+
+    #[test]
+    fn old_member_and_set_keep_identifier_only_content_values() {
+        let member = member(
+            "run1",
+            TaskOrigin::TrustedRun,
+            ExecutionAttestation::TrustedHost,
+        );
+        member.validate().unwrap();
+        assert_eq!(member.content_digest, "run1d");
+        let set = EvidenceSet::build(
+            "legacy-set",
+            vec![member.clone()],
+            SourceCoverage::default(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(set.members[0].content_digest, "run1d");
+        let before = serde_json::to_vec(&set).unwrap();
+        assert!(verify_evidence_member_content_v3(&member, b"unbound body").is_err());
+        assert_eq!(serde_json::to_vec(&set).unwrap(), before);
+    }
+
+    #[test]
+    fn old_locator_retains_source_then_range_then_excerpt_error_order() {
+        let raw = b"actual evidence";
+        let mut locator =
+            EvidenceLocator::build("source", "source-name", 0, 100, 0, "excerpt-name").unwrap();
+        assert!(
+            matches!(locator.verify_and_extract(raw), Err(Error::Conflict(message)) if message == "source_changed")
+        );
+        locator.source_digest = crate::hash(raw);
+        assert!(
+            matches!(locator.verify_and_extract(raw), Err(Error::Invalid(message)) if message == "offset out of bounds")
+        );
+        locator.byte_end = 6;
+        assert!(
+            matches!(locator.verify_and_extract(raw), Err(Error::Conflict(message)) if message == "excerpt_digest_mismatch")
+        );
+        locator.excerpt_digest = crate::hash(b"actual");
+        assert_eq!(locator.verify_and_extract(raw).unwrap(), b"actual");
+        assert!(
+            matches!(EvidenceLocator::build("source", "s", 2, 1, 0, "e"),
+            Err(Error::Invalid(message)) if message == "invalid byte range")
+        );
+    }
+
+    #[test]
+    fn member_checks_actual_bytes_and_preserves_legal_wire() {
+        let raw = b"actual evidence\r\n";
+        let member = EvidenceMember {
+            source_id: "run-raw".into(),
+            content_digest: "f1aeb0ed7c71e897b463876cf96f46ab71583530ddf633c0e69f21336eba83c8"
+                .into(),
+            task_origin: TaskOrigin::TrustedRun,
+            execution_attestation: ExecutionAttestation::TrustedHost,
+            purpose: Purpose::Development,
+        };
+        verify_evidence_member_content_v3(&member, raw).unwrap();
+        assert_eq!(
+            serde_json::to_string(&member).unwrap(),
+            r#"{"source_id":"run-raw","content_digest":"f1aeb0ed7c71e897b463876cf96f46ab71583530ddf633c0e69f21336eba83c8","task_origin":"trusted_run","execution_attestation":"trusted_host","purpose":"development"}"#
+        );
+        for wrong_raw in [
+            b"other actual evidence\r\n".as_slice(),
+            b"actual evidence\n".as_slice(),
+        ] {
+            assert!(matches!(
+                verify_evidence_member_content_v3(&member, wrong_raw),
+                Err(Error::Conflict(message)) if message == "evidence_content_digest_mismatch"
+            ));
+        }
+        let mut malformed = member.clone();
+        malformed.content_digest = "readable_content_name".into();
+        assert!(matches!(
+            verify_evidence_member_content_v3(&malformed, raw),
+            Err(Error::Invalid(_))
+        ));
+        malformed.content_digest = crate::hash(b"other actual evidence\r\n");
+        assert!(matches!(
+            verify_evidence_member_content_v3(&malformed, raw),
+            Err(Error::Conflict(message)) if message == "evidence_content_digest_mismatch"
+        ));
+        // Historical bytes remain readable data, without a current content proof.
+        let historical = serde_json::to_string(&member).unwrap().replace(
+            "f1aeb0ed7c71e897b463876cf96f46ab71583530ddf633c0e69f21336eba83c8",
+            "readable_content_name",
+        );
+        let historical: EvidenceMember = serde_json::from_str(&historical).unwrap();
+        assert!(matches!(
+            verify_evidence_member_content_v3(&historical, raw),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn locator_keeps_source_excerpt_and_range_guards() {
+        let raw = b"actual evidence\r\n";
+        let locator =
+            EvidenceLocator::build("run-raw", crate::hash(raw), 0, 6, 0, crate::hash(b"actual"))
+                .unwrap();
+        assert_eq!(
+            verify_evidence_locator_content_v3(&locator, raw).unwrap(),
+            b"actual"
+        );
+        let mut changed = locator.clone();
+        changed.source_digest = crate::hash(b"other actual evidence\r\n");
+        assert!(matches!(
+            verify_evidence_locator_content_v3(&changed, raw),
+            Err(Error::Conflict(message)) if message == "source_changed"
+        ));
+        changed = locator.clone();
+        changed.excerpt_digest = crate::hash(b"other");
+        assert!(matches!(
+            verify_evidence_locator_content_v3(&changed, raw),
+            Err(Error::Conflict(message)) if message == "excerpt_digest_mismatch"
+        ));
+        changed = locator.clone();
+        changed.byte_end = raw.len() + 1;
+        assert!(matches!(
+            verify_evidence_locator_content_v3(&changed, raw),
+            Err(Error::Invalid(message)) if message == "offset out of bounds"
+        ));
+        for source_fault in [true, false] {
+            changed = locator.clone();
+            if source_fault {
+                changed.source_digest = "readable_source".into();
+            } else {
+                changed.excerpt_digest = "readable_excerpt".into();
+            }
+            assert!(matches!(
+                verify_evidence_locator_content_v3(&changed, raw),
+                Err(Error::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            EvidenceLocator::build("run-raw", crate::hash(raw), 7, 6, 0, crate::hash(b"")),
+            Err(Error::Invalid(message)) if message == "invalid byte range"
+        ));
     }
 
     #[test]
