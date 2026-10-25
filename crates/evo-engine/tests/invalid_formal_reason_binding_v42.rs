@@ -595,16 +595,17 @@ async fn request_ticket(fixture: &Fixture) -> evo_core::Result<EvaluationTicketV
         },
     )
     .await
-    .map(|ticket| {
+    .inspect(|ticket| {
         let _ = fixture.resolved_ticket_id.set(ticket.id.clone());
-        ticket
     })
 }
 
 async fn issue(fixture: &Fixture, bound: bool) {
     if !bound {
         assert_issue_refused_without_candidate(fixture).await;
-        trusted_compiler_inputs::assert_frozen_issuer_static_read("invalid-control-current").await.unwrap();
+        trusted_compiler_inputs::assert_frozen_issuer_static_read("invalid-control-current")
+            .await
+            .unwrap();
     }
     stage_candidate(fixture).await;
     let ticket = request_ticket(fixture).await.unwrap();
@@ -1236,6 +1237,14 @@ async fn old_identity_refusal_precedes_new_reason_guard() {
 
 #[tokio::test]
 async fn absent_binding_keeps_v1_bytes_fingerprints_and_legacy_invalid_reads() {
-    trusted_compiler_inputs::assert_frozen_issuer_static_read("invalid-control-v1").await.unwrap();
-    single_reasons_case("legacy-matrix-migrated-current", RegisteredEvaluationControl::SCHEMA_V1, false, json!([])).await;
+    trusted_compiler_inputs::assert_frozen_issuer_static_read("invalid-control-v1")
+        .await
+        .unwrap();
+    single_reasons_case(
+        "legacy-matrix-migrated-current",
+        RegisteredEvaluationControl::SCHEMA_V1,
+        false,
+        json!([]),
+    )
+    .await;
 }

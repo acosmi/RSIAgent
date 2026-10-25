@@ -674,9 +674,8 @@ fn request_ticket(fixture: &Fixture) -> Boxed<'_, evo_core::Result<EvaluationTic
             },
         )
         .await
-        .map(|ticket| {
+        .inspect(|ticket| {
             let _ = fixture.resolved_ticket_id.set(ticket.id.clone());
-            ticket
         })
     })
 }
@@ -685,7 +684,9 @@ fn issue(fixture: &Fixture, bound: bool) -> Boxed<'_, ()> {
     Box::pin(async move {
         if !bound {
             assert_issue_refused_without_candidate(fixture).await;
-            trusted_compiler_inputs::assert_frozen_issuer_static_read("late-final-legacy").await.unwrap();
+            trusted_compiler_inputs::assert_frozen_issuer_static_read("late-final-legacy")
+                .await
+                .unwrap();
         }
         stage_candidate(fixture).await;
         let ticket = request_ticket(fixture).await.unwrap();
@@ -712,6 +713,15 @@ fn assert_issue_refused_without_candidate(fixture: &Fixture) -> Boxed<'_, ()> {
             "a refused issue wrote state"
         );
     })
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Envelope<T> {
+    schema_version: String,
+    id: String,
+    record_kind: String,
+    payload: T,
 }
 
 fn physical_id(kind: &str, id: &str) -> String {
@@ -763,7 +773,8 @@ fn reach_final_report(fixture: &Fixture, endpoint: Endpoint) -> Boxed<'_, Scored
                     json!({"answer": "ok"}).to_string()
                 };
                 let unscored = ScoredPair {
-                    ticket_id: fixture.ticket_id().into(),                    target: "r1".into(),
+                    ticket_id: fixture.ticket_id().into(),
+                    target: "r1".into(),
                     candidate: execute_raw(
                         fixture,
                         "r1",
@@ -1173,7 +1184,8 @@ fn start_pending(fixture: &Fixture, now: i64) -> Boxed<'_, Pending> {
         .await
         .unwrap();
         Pending {
-            ticket_id: fixture.ticket_id().into(),            dispatch_id: decision.call.dispatch_id.unwrap(),
+            ticket_id: fixture.ticket_id().into(),
+            dispatch_id: decision.call.dispatch_id.unwrap(),
             request_digest: task.request_digest,
         }
     })
@@ -1256,7 +1268,8 @@ fn reach_report_with_unreceipted_call(
                 }
                 // Pay and close the stopping pair before taking the pending slot.
                 let stopping = ScoredPair {
-                    ticket_id: fixture.ticket_id().into(),                    target: "r12".into(),
+                    ticket_id: fixture.ticket_id().into(),
+                    target: "r12".into(),
                     candidate: execute(fixture, "r12", ExecutionSide::Candidate, "wrong", 28).await,
                     baseline: execute(fixture, "r12", ExecutionSide::Baseline, "ok", 29).await,
                 };
@@ -1321,8 +1334,13 @@ fn assert_late_execution_shape(
     let ticket: EvaluationTicketV2 = serde_json::from_value(observed.ticket.clone()).unwrap();
     let formal: Option<FormalEvaluationV2> =
         serde_json::from_value(observed.formal.clone()).unwrap();
-    assert_eq!(ticket.candidate_dependency_binding.is_some(), ticket.source_plan_binding.is_some());
-    if bound { assert!(ticket.source_plan_binding.is_some()); }
+    assert_eq!(
+        ticket.candidate_dependency_binding.is_some(),
+        ticket.source_plan_binding.is_some()
+    );
+    if bound {
+        assert!(ticket.source_plan_binding.is_some());
+    }
     assert!(ticket.late_execution_receipt_ids.is_empty());
     assert!(ticket.late_grader_receipt_ids.is_empty());
     let variant = match (endpoint, &formal) {
@@ -1989,7 +2007,10 @@ fn ag120_head_final_pending() -> Boxed<'static, (Fixture, Pending, String)> {
         let f = fixture(false).await;
         // Actual parent V2 issuer, dispatch, invalidation and reconciliation
         // facts. No new legacy execution is started by this head fixture.
-        let frozen = trusted_compiler_inputs::restore_frozen_issuer_rows(&f.db_path, "late-final-inflight").await.unwrap();
+        let frozen =
+            trusted_compiler_inputs::restore_frozen_issuer_rows(&f.db_path, "late-final-inflight")
+                .await
+                .unwrap();
         let _ = f.resolved_ticket_id.set(TICKET_ID.into());
         let facts = &frozen["pending_and_anchor"];
         let pending = Pending {
@@ -2006,7 +2027,10 @@ fn ag120_head_final_pending() -> Boxed<'static, (Fixture, Pending, String)> {
         let calls = observed.calls.as_array().unwrap();
         assert_eq!(calls.len(), 3);
         assert!(calls.iter().all(|call| call["state"] == "finalized"));
-        let anchor = facts["anchor_candidate_execution_receipt_id"].as_str().unwrap().to_owned();
+        let anchor = facts["anchor_candidate_execution_receipt_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         (f, pending, anchor)
     })
 }
@@ -2185,16 +2209,45 @@ async fn ag120_head_actual_old_wire_and_valid_new_producer_stay_field_exact() {
     let pending = start_pending(&f, 160).await;
     let mut request = late_execution_request(&pending);
     request.issued_at_unix_seconds = 161;
+    let task = IndependentEvaluationControl::broker_task(
+        &f.worker,
+        &f.store,
+        f.ticket_id(),
+        "r58",
+        ExecutionSide::Candidate,
+    )
+    .await
+    .unwrap();
+    let ticket = IndependentEvaluationControl::status(&f.evaluator, &f.store, f.ticket_id())
+        .await
+        .unwrap()
+        .ticket;
+    assert_eq!(ticket.schema_version, "rsia.evaluation_ticket.v3");
+    assert_ne!(ticket.id, old.ticket_id);
+    let expected = json!({
+        "schema_version":"rsia.execution_receipt.v2", "receipt_id": request.receipt_id,
+        "ticket_id":ticket.id, "target_id":"r58", "side":"candidate",
+        "request_digest":task.request_digest, "bundle_digest":task.bundle_digest,
+        "environment_digest":task.environment_digest, "output_digest":hash(request.output_utf8.as_bytes()),
+        "output_artifact_id":request.output_artifact_id, "budget_call_id":request.budget_call_id,
+        "executor_actor":f.worker.actor(), "latency_micros":request.latency_micros,
+        "issued_at_unix_seconds":request.issued_at_unix_seconds,
+    });
     let actual = Box::pin(IndependentEvaluationControl::record_execution_receipt(
         &f.worker, &f.store, request,
     ))
     .await
-    .expect("legal new input must preserve old v2 complete wire");
+    .expect("legal Current producer binds its own complete request pins");
+    assert_eq!(serde_json::to_value(&actual).unwrap(), expected);
+    assert_eq!(actual.bundle_digest, ticket.candidate_bundle_digest);
+    assert_eq!(actual.environment_digest, ticket.environment_digest);
+    let roundtrip: ExecutionReceiptV2 =
+        serde_json::from_slice(&serde_json::to_vec(&actual).unwrap()).unwrap();
     assert_eq!(
-        serde_json::to_value(&actual).unwrap(),
-        serde_json::to_value(&old).unwrap()
+        fingerprint(&actual).unwrap(),
+        fingerprint(&roundtrip).unwrap()
     );
-    assert_eq!(
+    assert_ne!(
         fingerprint(&actual).unwrap(),
         AG120_ACTUAL_OLD_M32_RECEIPT_FINGERPRINT
     );

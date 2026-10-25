@@ -54,7 +54,7 @@ use evo_engine::release_store::{
 };
 use evo_engine::streaming_evaluator::{
     AnchorEvidenceStatus, BrokerTaskView, CostEvidenceScope, DependencyEvidenceStatus,
-    EvaluationEvidenceScope, EvaluationTicketV2, ExecutionReceiptRequest, ExecutionSide,
+    EvaluationEvidenceScope, ReadEvaluationTicket as EvaluationTicketV2, ExecutionReceiptRequest, ExecutionSide,
     FixedGraderMethod, FixedGraderSpec, FrozenOracleEntry, IndependentEvaluationControl,
     IndependentGraderReceiptV2, IssueTicketRequest, ProtectedHoldoutRecord, ProtectedInputRef,
     RegisteredEvaluationControl, StartExecutionRequest, TargetState, TicketLifecycle,
@@ -3125,12 +3125,22 @@ async fn owned_authority_refused_connection_drains_after_caller_cancellation() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let result = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "owned_authority_refused_connection_drains_after_caller_cancellation", "--nocapture"])
+            .args([
+                "--exact",
+                "owned_authority_refused_connection_drains_after_caller_cancellation",
+                "--nocapture",
+            ])
             .env(CHILD, "1")
             .env(GRADER_KEY, GRADER_SECRET)
             .current_dir(directory.path())
-            .output().unwrap();
-        assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
         assert!(String::from_utf8_lossy(&result.stdout).contains("OWNED_REFUSED_DRAIN_COMPLETE"));
         return;
     }
@@ -3141,29 +3151,62 @@ async fn owned_authority_refused_connection_drains_after_caller_cancellation() {
     let grader_uid = std::fs::metadata(&workspace).unwrap().uid();
     let mut other = (10_001_u32..).filter(|uid| *uid != grader_uid);
     let base = trusted_compiler_inputs::inputs(
-        NS, "owned-refusal", SkillSnapshot::empty(), Strategy::default(),
-        HostCapabilities { available: BTreeSet::new(), granted: BTreeSet::new() }, &d("owned environment"));
+        NS,
+        "owned-refusal",
+        SkillSnapshot::empty(),
+        Strategy::default(),
+        HostCapabilities {
+            available: BTreeSet::new(),
+            granted: BTreeSet::new(),
+        },
+        &d("owned environment"),
+    );
     let set = RegisteredPrincipalSet {
-        id: format!("formal-principals-{}", base.host.id), schema_version: PRINCIPALS_SCHEMA.into(),
-        namespace: NS.into(), host_registration_id: base.host.id.clone(), version: 1,
-        host: principal(other.next().unwrap(), HOST, "owned-host-configured-secret-over-32-bytes"),
+        id: format!("formal-principals-{}", base.host.id),
+        schema_version: PRINCIPALS_SCHEMA.into(),
+        namespace: NS.into(),
+        host_registration_id: base.host.id.clone(),
+        version: 1,
+        host: principal(
+            other.next().unwrap(),
+            HOST,
+            "owned-host-configured-secret-over-32-bytes",
+        ),
         grader: principal(grader_uid, GRADER, GRADER_SECRET),
-        administrator: principal(other.next().unwrap(), ADMIN, "owned-admin-configured-secret-over-32-bytes"),
-        worker: principal(other.next().unwrap(), PROPOSER, "owned-worker-configured-secret-over-32-bytes"),
+        administrator: principal(
+            other.next().unwrap(),
+            ADMIN,
+            "owned-admin-configured-secret-over-32-bytes",
+        ),
+        worker: principal(
+            other.next().unwrap(),
+            PROPOSER,
+            "owned-worker-configured-secret-over-32-bytes",
+        ),
     };
     let mut host = base.host;
-    host.host_uid = set.host.uid; host.grader_uid = grader_uid; host.administrator_uid = set.administrator.uid;
+    host.host_uid = set.host.uid;
+    host.grader_uid = grader_uid;
+    host.administrator_uid = set.administrator.uid;
     host.grader_workspace = workspace.to_str().unwrap().into();
     host.grader_code_digest = hash(&std::fs::read(std::env::current_exe().unwrap()).unwrap());
     host.grader_credential_environment_key = GRADER_KEY.into();
-    host.host_principal = set.host.principal.clone(); host.grader_principal = set.grader.principal.clone();
-    host.administrator_principal = set.administrator.principal.clone(); host.worker_principal = set.worker.principal.clone();
+    host.host_principal = set.host.principal.clone();
+    host.grader_principal = set.grader.principal.clone();
+    host.administrator_principal = set.administrator.principal.clone();
+    host.worker_principal = set.worker.principal.clone();
     host.credential_binding_digest = set.binding_digest().unwrap();
     set.validate(&host).unwrap();
     let database = workspace.join("data").join("authority.sqlite3");
     let socket = workspace.join("s");
     // Dropping the calling future cancels its wait, not the owned finite run.
-    let mut call = Box::pin(PrincipalAuthorityService::serve_owned(database.clone(), host, set, socket.clone(), 1));
+    let mut call = Box::pin(PrincipalAuthorityService::serve_owned(
+        database.clone(),
+        host,
+        set,
+        socket.clone(),
+        1,
+    ));
     tokio::select! {
         result = &mut call => panic!("owner ended before accepting its connection: {result:?}"),
         () = async {
@@ -3175,33 +3218,53 @@ async fn owned_authority_refused_connection_drains_after_caller_cancellation() {
         } => {}
     }
     drop(call);
-    assert_eq!(DataDirectoryLock::acquire(&database).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        DataDirectoryLock::acquire(&database).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
     let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
     let envelope = serde_json::to_vec(&json!({
         "credential":"owned-admin-configured-secret-over-32-bytes",
         "command":{"operation":"bootstrap"}
-    })).unwrap();
+    }))
+    .unwrap();
     stream.write_u32(envelope.len() as u32).await.unwrap();
     stream.write_all(&envelope).await.unwrap();
     // Authentication fails before any operator response or product write.
     let mut response = Vec::new();
-    tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_to_end(&mut response)).await.unwrap().unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_to_end(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(response.is_empty());
     drop(stream);
     let guard = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match DataDirectoryLock::acquire(&database) {
                 Ok(guard) => break guard,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await
+                }
                 Err(error) => panic!("unexpected directory guard error: {error}"),
             }
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert!(!socket.exists());
     let store = Store::open(&database).await.unwrap();
     let admin = ctx(Role::Admin, ADMIN);
     let mut session = store.session().await.unwrap();
-    assert!(session.list::<Value>(&admin, "artifact").await.unwrap().is_empty());
+    assert!(
+        session
+            .list::<Value>(&admin, "artifact")
+            .await
+            .unwrap()
+            .is_empty()
+    );
     session.commit().await.unwrap();
     assert_eq!(store.verify_audit(&admin).await.unwrap(), 0);
     store.close().await;

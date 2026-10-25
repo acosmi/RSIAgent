@@ -466,7 +466,9 @@ impl World {
 
     /// The real `dispatch_bound` of a fresh broker over the same store.
     async fn replay(&self, bound: &impl serde::Serialize) -> Result<ModelResponse> {
-        self.broker().dispatch_compiler_bound(read_bound(bound)).await
+        self.broker()
+            .dispatch_compiler_bound(read_bound(bound))
+            .await
     }
 
     async fn replay_current(&self, bound: &CurrentBoundModelRequest) -> Result<ModelResponse> {
@@ -937,7 +939,7 @@ async fn authority_change_replay_closes_the_settled_call_then_refuses_unchanged(
     let expected = current_refusal(&world.store, &bound).await;
     assert_conflict(&expected, AUTHORITY_CHANGED);
     let settled = world.call(&bound).await;
-    assert_settled_open(&settled);
+    assert_current_settled_open(&settled);
     let before = world.snapshot();
     assert_same_error(world.replay(&bound).await, &expected);
     let after = world.snapshot();
@@ -992,7 +994,7 @@ async fn source_revocation_replay_closes_the_settled_call_then_refuses_unchanged
     let expected = current_refusal(&world.store, &bound).await;
     assert_conflict(&expected, BINDING_MISMATCH);
     let settled = world.call(&bound).await;
-    assert_settled_open(&settled);
+    assert_current_settled_open(&settled);
     let before = world.snapshot();
     assert_same_error(world.replay(&bound).await, &expected);
     let after = world.snapshot();
@@ -1236,15 +1238,40 @@ async fn historical_v1_closes_its_paid_record_but_cannot_authorize_new_dispatch(
 async fn current_model_preimage_refusal_preserves_dispatched_accounting() {
     let world = World::new().await;
     let inputs = current_compiler_use(&world.store, 1).await;
-    let bound = current_bound_request("source-model-preimage", 1, &RUNS, "software fixture", &inputs);
+    let bound = current_bound_request(
+        "source-model-preimage",
+        1,
+        &RUNS,
+        "software fixture",
+        &inputs,
+    );
     let completed = settle_open(&world, &bound).await;
     let settled = world.call(&bound).await;
-    assert_settled_open(&settled);
-    let fixture = trusted_compiler_inputs::inputs(NAMESPACE, PROFILE, parent_skill(), Strategy::default(), no_capabilities(), &hash(b"environment"));
+    assert_current_settled_open(&settled);
+    let fixture = trusted_compiler_inputs::inputs(
+        NAMESPACE,
+        PROFILE,
+        parent_skill(),
+        Strategy::default(),
+        no_capabilities(),
+        &hash(b"environment"),
+    );
     let mut session = world.store.session().await.unwrap();
-    let mut provider: Value = session.need(&admin(), "artifact", &fixture.provider.id).await.unwrap();
+    let mut provider: Value = session
+        .need(&admin(), "artifact", &fixture.provider.id)
+        .await
+        .unwrap();
     provider["provider_model"] = json!("another-legal-model");
-    session.put(&admin(), "artifact", &fixture.provider.id, admin().actor(), &provider).await.unwrap();
+    session
+        .put(
+            &admin(),
+            "artifact",
+            &fixture.provider.id,
+            admin().actor(),
+            &provider,
+        )
+        .await
+        .unwrap();
     session.commit().await.unwrap();
     let expected = current_refusal(&world.store, &bound).await;
     assert!(matches!(expected, Error::Forbidden));
@@ -1261,5 +1288,9 @@ async fn current_model_preimage_refusal_preserves_dispatched_accounting() {
     assert_eq!(closed_events(&after, &bound.request.request_id), 1);
     assert_same_error(world.replay_current(&bound).await, &expected);
     assert_eq!(world.snapshot(), after);
-    world.broker().verify_receipt(&bound.request, receipt(&completed)).await.unwrap();
+    world
+        .broker()
+        .verify_receipt(&bound.request, receipt(&completed))
+        .await
+        .unwrap();
 }

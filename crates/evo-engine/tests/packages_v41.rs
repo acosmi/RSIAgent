@@ -36,7 +36,9 @@ use evo_engine::packages::{
     package_dependency_ref_id, preview_package_diff, privacy_block, reject_member, reject_package,
     scan_privacy, validate_manifest,
 };
-use evo_engine::release_store::{ReleaseStore, CurrentStageBundleRequest as StageBundleRequest, TypedSourceRef};
+use evo_engine::release_store::{
+    CurrentStageBundleRequest as StageBundleRequest, ReleaseStore, TypedSourceRef,
+};
 use evo_storage::Store;
 use evo_storage::lifecycle::{CleanupState, CleanupStatus, LifecycleStore, TypedObjectRef};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2375,37 +2377,195 @@ async fn twenty_first_staged_package_is_refused_and_aborted_or_failed_records_do
     assert_eq!(staged_package_usage(&store, &admin).await.0, 20);
 }
 
+fn handoff_full_image(directory: &Path) -> serde_json::Value {
+    let script = r#"
+import hashlib,json,sqlite3,sys
+from pathlib import Path
+root=Path(sys.argv[1]);con=sqlite3.connect('file:'+str(root/'packages.sqlite3')+'?mode=ro',uri=True)
+quote=lambda name:'"'+name.replace('"','""')+'"'
+cell=lambda value:{'blob':value.hex()} if isinstance(value,bytes) else value
+image={name:[[cell(x) for x in row] for row in con.execute('SELECT * FROM '+quote(name)+' ORDER BY '+','.join(str(i+1) for i in range(len(con.execute('PRAGMA table_info('+quote(name)+')').fetchall()))))] for (name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()}
+con.close()
+files={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file() and not p.name.startswith('packages.sqlite3')}
+print(json.dumps({'tables':image,'files':files},sort_keys=True))
+"#;
+    let result = std::process::Command::new("python3")
+        .args(["-B", "-c", script])
+        .arg(directory)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    serde_json::from_slice(&result.stdout).unwrap()
+}
+
 #[tokio::test]
 async fn current_handoff_binds_real_candidate_and_does_not_grant_release() {
-    let (_directory, store, admin, _ordinary_sources) = persistent_store().await;
-    let host = Context::new("n", "host", Role::Host).unwrap();
-    let proposer = Context::new("n", "proposer", Role::Worker).unwrap();
-    let authority = trusted_authority("current-handoff-source", "actual trusted handoff source");
-    store_trace_authority(&store, &host, &authority).await.unwrap();
-    let source = E16SourceRef { kind: "run".into(), id: authority.record.id.clone(), digest: fingerprint(&serde_json::to_value(&authority).unwrap()).unwrap() };
-    let bundle = candidate_bundle("actual Current handoff material");
-    trusted_compiler_inputs::install_bundle_current_sources(&store, &bundle).await.unwrap();
-    let (manifest, files, binding) = candidate_material_package(&bundle);
-    let mut request = persistent_stage_request("current-handoff-material", manifest, files, vec![source]);
-    request.candidate_material = Some(binding);
-    let staged = PersistentPackageStore::stage_package(&admin, &store, request).await.unwrap();
-    let candidate = ReleaseStore::stage_current_bundle(&proposer, &store, StageBundleRequest {
-        candidate_id: "current-handoff-candidate".into(), environment_digest: hash(b"environment"),
-        proposer_actor: proposer.actor().into(), bundle,
-        sources: vec![TypedSourceRef { kind: "run".into(), id: authority.record.id.clone(), content_digest: authority.trace.source_digest.clone() }], revoke_watermark: 1,
-    }).await.unwrap();
-    let handed_off = PersistentPackageStore::record_candidate_handoff(&admin, &store, &staged.id, &candidate.id).await.unwrap();
-    assert_eq!(handed_off.payload.candidate_ref.as_deref(), Some(candidate.id.as_str()));
+    async fn setup() -> (
+        tempfile::TempDir,
+        Store,
+        Context,
+        String,
+        evo_engine::release_store::CurrentReleaseCandidateRecord,
+    ) {
+        let (directory, store, admin, _ordinary_sources) = persistent_store().await;
+        let host = Context::new("n", "host", Role::Host).unwrap();
+        let proposer = Context::new("n", "proposer", Role::Worker).unwrap();
+        let authority =
+            trusted_authority("current-handoff-source", "actual trusted handoff source");
+        store_trace_authority(&store, &host, &authority)
+            .await
+            .unwrap();
+        let source = E16SourceRef {
+            kind: "run".into(),
+            id: authority.record.id.clone(),
+            digest: fingerprint(&serde_json::to_value(&authority).unwrap()).unwrap(),
+        };
+        let bundle = candidate_bundle("actual Current handoff material");
+        trusted_compiler_inputs::install_bundle_current_sources(&store, &bundle)
+            .await
+            .unwrap();
+        let (manifest, files, binding) = candidate_material_package(&bundle);
+        let mut request =
+            persistent_stage_request("current-handoff-material", manifest, files, vec![source]);
+        request.candidate_material = Some(binding);
+        let staged = PersistentPackageStore::stage_package(&admin, &store, request)
+            .await
+            .unwrap();
+        let candidate = ReleaseStore::stage_current_bundle(
+            &proposer,
+            &store,
+            StageBundleRequest {
+                candidate_id: "current-handoff-candidate".into(),
+                environment_digest: hash(b"environment"),
+                proposer_actor: proposer.actor().into(),
+                bundle,
+                sources: vec![TypedSourceRef {
+                    kind: "run".into(),
+                    id: authority.record.id.clone(),
+                    content_digest: authority.trace.source_digest.clone(),
+                }],
+                revoke_watermark: 1,
+            },
+        )
+        .await
+        .unwrap();
+        (directory, store, admin, staged.id, candidate)
+    }
+    let (directory, store, admin, staged, candidate) = setup().await;
+    let handed_off =
+        PersistentPackageStore::record_candidate_handoff(&admin, &store, &staged, &candidate.id)
+            .await
+            .unwrap();
+    assert_eq!(
+        handed_off.payload.candidate_ref.as_deref(),
+        Some(candidate.id.as_str())
+    );
     assert_eq!(handed_off.payload.state, StagedAssetState::Staged);
     let mut session = store.session().await.unwrap();
-    assert!(session.list::<serde_json::Value>(&admin, "release").await.unwrap().is_empty());
-    assert!(session.list::<serde_json::Value>(&admin, "pointer").await.unwrap().is_empty());
-    let candidate_wire: serde_json::Value = session.need(&admin, "artifact", &candidate.id).await.unwrap();
+    assert!(
+        session
+            .list::<serde_json::Value>(&admin, "release")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        session
+            .list::<serde_json::Value>(&admin, "pointer")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let candidate_wire: serde_json::Value = session
+        .need(&admin, "artifact", &candidate.id)
+        .await
+        .unwrap();
     assert_eq!(candidate_wire, serde_json::to_value(&candidate).unwrap());
     session.commit().await.unwrap();
-    let audit = store.verify_audit(&admin).await.unwrap();
-    assert!(matches!(PersistentPackageStore::record_candidate_handoff(&admin, &store, &staged.id, "missing-current-candidate").await, Err(Error::NotFound)));
-    assert_eq!(store.verify_audit(&admin).await.unwrap(), audit);
-    assert_eq!(PersistentPackageStore::read_staged(&admin, &store, &staged.id).await.unwrap().payload.candidate_ref, handed_off.payload.candidate_ref);
     store.close().await;
+    let store = Store::open(&directory.path().join("packages.sqlite3"))
+        .await
+        .unwrap();
+    let before = handoff_full_image(directory.path());
+    let repeated =
+        PersistentPackageStore::record_candidate_handoff(&admin, &store, &staged, &candidate.id)
+            .await
+            .unwrap();
+    assert_eq!(
+        repeated.payload.candidate_ref,
+        handed_off.payload.candidate_ref
+    );
+    assert_eq!(handoff_full_image(directory.path()), before);
+    assert!(matches!(
+        PersistentPackageStore::record_candidate_handoff(
+            &admin,
+            &store,
+            &staged,
+            "missing-current-candidate"
+        )
+        .await,
+        Err(Error::NotFound)
+    ));
+    assert_eq!(handoff_full_image(directory.path()), before);
+    store.close().await;
+    for replay in [false, true] {
+        for fault in ["missing-bundle", "profile-preimage"] {
+            let (directory, store, admin, staged, candidate) = setup().await;
+            if replay {
+                PersistentPackageStore::record_candidate_handoff(
+                    &admin,
+                    &store,
+                    &staged,
+                    &candidate.id,
+                )
+                .await
+                .unwrap();
+            }
+            let mut session = store.session().await.unwrap();
+            let bundle_id = format!("formal-bundle-{}", candidate.bundle_digest);
+            if fault == "missing-bundle" {
+                session
+                    .delete(&admin, "artifact", &bundle_id)
+                    .await
+                    .unwrap();
+            } else {
+                let record: serde_json::Value =
+                    session.need(&admin, "artifact", &bundle_id).await.unwrap();
+                let profile_id = record["binding"]["profile_registration_id"]
+                    .as_str()
+                    .unwrap();
+                let mut profile: serde_json::Value =
+                    session.need(&admin, "artifact", profile_id).await.unwrap();
+                profile["authorized_by"] = serde_json::json!("different-admin");
+                session
+                    .put(&admin, "artifact", profile_id, admin.actor(), &profile)
+                    .await
+                    .unwrap();
+            }
+            session.commit().await.unwrap();
+            let before = handoff_full_image(directory.path());
+            let rejected = PersistentPackageStore::record_candidate_handoff(
+                &admin,
+                &store,
+                &staged,
+                &candidate.id,
+            )
+            .await;
+            if fault == "missing-bundle" {
+                assert!(matches!(rejected, Err(Error::NotFound)), "{rejected:?}");
+            } else {
+                assert!(matches!(rejected, Err(Error::Forbidden)), "{rejected:?}");
+            }
+            assert_eq!(
+                handoff_full_image(directory.path()),
+                before,
+                "{fault}, replay={replay}"
+            );
+            store.close().await;
+        }
+    }
 }

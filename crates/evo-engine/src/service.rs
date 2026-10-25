@@ -755,44 +755,30 @@ fn project_current_skill_material(
 ) -> Result<Vec<Skill>> {
     crate::compiler::ReadBundle::from_current(bundle.clone())?.validate_identity()?;
     if expected_digest != Some(bundle.digest.as_str()) {
-        return Err(Error::Conflict("prepared projection bundle identity changed".into()));
+        return Err(Error::Conflict(
+            "prepared projection bundle identity changed".into(),
+        ));
     }
     let expected = if bundle.skill.content.is_empty() && bundle.skill.applicability.is_empty() {
         Vec::new()
-    } else { vec![bundle.skill.content.clone()] };
+    } else {
+        vec![bundle.skill.content.clone()]
+    };
     if instructions != expected {
-        return Err(Error::Conflict("prepared projection differs from the active bundle".into()));
+        return Err(Error::Conflict(
+            "prepared projection differs from the active bundle".into(),
+        ));
     }
-    if expected.is_empty() { return Ok(Vec::new()); }
+    if expected.is_empty() {
+        return Ok(Vec::new());
+    }
     Ok(vec![Skill {
-        id: candidate_id.into(), digest: hash(bundle.skill.content.as_bytes()),
-        content: bundle.skill.content, applicability: bundle.skill.applicability,
+        id: candidate_id.into(),
+        digest: hash(bundle.skill.content.as_bytes()),
+        content: bundle.skill.content,
+        applicability: bundle.skill.applicability,
         counterexample: bundle.skill.counterexample,
     }])
-}
-
-#[cfg(test)]
-mod current_projection_controls {
-    use super::*;
-    #[test]
-    fn current_bundle_projection_keeps_complete_v3_skill_material() {
-        let (bundle, _legacy) = crate::compiler::current_carrier_content_controls::content_bundles();
-        let wire = serde_json::to_vec(&bundle).unwrap();
-        let projected = project_current_skill_material("content-candidate", bundle.clone(), Some(&bundle.digest), &[bundle.skill.content.clone()]).unwrap();
-        assert_eq!(projected.len(), 1);
-        assert_eq!(projected[0].id, "content-candidate");
-        assert_eq!(projected[0].digest, hash(bundle.skill.content.as_bytes()));
-        assert_eq!(projected[0].content, bundle.skill.content);
-        assert_eq!(projected[0].applicability, bundle.skill.applicability);
-        assert_eq!(projected[0].counterexample, bundle.skill.counterexample);
-        assert_eq!(serde_json::to_vec(&bundle).unwrap(), wire);
-        assert!(matches!(project_current_skill_material("content-candidate", bundle.clone(), Some(&hash(b"another bundle")), &[bundle.skill.content.clone()]),
-            Err(Error::Conflict(reason)) if reason == "prepared projection bundle identity changed"));
-        assert!(matches!(project_current_skill_material("content-candidate", bundle.clone(), Some(&bundle.digest), &["changed projection".into()]),
-            Err(Error::Conflict(reason)) if reason == "prepared projection differs from the active bundle"));
-        let mut tampered = bundle.clone(); tampered.skill.counterexample.push_str(" changed");
-        assert!(project_current_skill_material("content-candidate", tampered, Some(&bundle.digest), &[bundle.skill.content.clone()]).is_err());
-    }
 }
 
 async fn owned_value<T>(
@@ -871,4 +857,48 @@ fn ensure_unique(values: &[String], message: &str) -> Result<()> {
         return Err(Error::Conflict(message.into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod current_projection_controls {
+    use super::*;
+    #[test]
+    fn current_bundle_projection_keeps_complete_v3_skill_material() {
+        let (bundle, _legacy) =
+            crate::compiler::current_carrier_content_controls::content_bundles();
+        let wire = serde_json::to_vec(&bundle).unwrap();
+        let projected = project_current_skill_material(
+            "content-candidate",
+            bundle.clone(),
+            Some(&bundle.digest),
+            std::slice::from_ref(&bundle.skill.content),
+        )
+        .unwrap();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].id, "content-candidate");
+        assert_eq!(projected[0].digest, hash(bundle.skill.content.as_bytes()));
+        assert_eq!(projected[0].content, bundle.skill.content);
+        assert_eq!(projected[0].applicability, bundle.skill.applicability);
+        assert_eq!(projected[0].counterexample, bundle.skill.counterexample);
+        assert_eq!(serde_json::to_vec(&bundle).unwrap(), wire);
+        assert!(
+            matches!(project_current_skill_material("content-candidate", bundle.clone(), Some(&hash(b"another bundle")), std::slice::from_ref(&bundle.skill.content)),
+            Err(Error::Conflict(reason)) if reason == "prepared projection bundle identity changed")
+        );
+        assert!(
+            matches!(project_current_skill_material("content-candidate", bundle.clone(), Some(&bundle.digest), &["changed projection".into()]),
+            Err(Error::Conflict(reason)) if reason == "prepared projection differs from the active bundle")
+        );
+        let mut tampered = bundle.clone();
+        tampered.skill.counterexample.push_str(" changed");
+        assert!(
+            project_current_skill_material(
+                "content-candidate",
+                tampered,
+                Some(&bundle.digest),
+                std::slice::from_ref(&bundle.skill.content)
+            )
+            .is_err()
+        );
+    }
 }

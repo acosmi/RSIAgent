@@ -4022,6 +4022,16 @@ async fn read_facts_from(connection: &mut sqlx::SqliteConnection) -> Result<Cont
                 )));
             }
         };
+        if schema.as_deref() == Some("rsia.host_surface_record.v2") {
+            identifier(&namespace)?;
+            if kind != "artifact"
+                || value.get("id").and_then(serde_json::Value::as_str) != Some(id.as_str())
+            {
+                return Err(Error::Invalid(format!(
+                    "object {namespace}/{kind}/{id} current host physical identity differs"
+                )));
+            }
+        }
         if kind == "tombstone" {
             tombstones.insert((namespace.clone(), id.clone()), value.clone());
         }

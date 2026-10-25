@@ -198,49 +198,134 @@ async fn current_empty_root_required_baselines_bind_loaded_preimages() {
     use evo_core::contract::{ImproverPatch, PatchOp, SkillPatch};
     use evo_engine::compiler::{compile_current_in_session, persist_current_authenticated_bundle};
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("current-baselines.sqlite3")).await.unwrap();
+    let store = Store::open(&dir.path().join("current-baselines.sqlite3"))
+        .await
+        .unwrap();
     let worker = Context::new("n", "worker", Role::Worker).unwrap();
-    let f = trusted_compiler_inputs::inputs("n", "required-baselines", SkillSnapshot::empty(), Strategy::default(),
-        HostCapabilities { available: Default::default(), granted: Default::default() }, &hash(b"environment"));
+    let f = trusted_compiler_inputs::inputs(
+        "n",
+        "required-baselines",
+        SkillSnapshot::empty(),
+        Strategy::default(),
+        HostCapabilities {
+            available: Default::default(),
+            granted: Default::default(),
+        },
+        &hash(b"environment"),
+    );
     trusted_compiler_inputs::install(&store, &f).await.unwrap();
-    let alternative = trusted_compiler_inputs::inputs("n", "other-required-baselines", SkillSnapshot::empty(), Strategy::default(),
-        HostCapabilities { available: Default::default(), granted: Default::default() }, &hash(b"other environment"));
-    trusted_compiler_inputs::install(&store, &alternative).await.unwrap();
+    let alternative = trusted_compiler_inputs::inputs(
+        "n",
+        "other-required-baselines",
+        SkillSnapshot::empty(),
+        Strategy::default(),
+        HostCapabilities {
+            available: Default::default(),
+            granted: Default::default(),
+        },
+        &hash(b"other environment"),
+    );
+    trusted_compiler_inputs::install(&store, &alternative)
+        .await
+        .unwrap();
     let request = CompilerInputRequest {
-        profile: f.profile.clone(), search_parent: f.root.skill.clone(), baseline: f.frozen.baseline_skill.clone(),
-        search_parent_strategy: f.root.strategy.clone(), expected_parent_strategy_digest: Some(fingerprint(&f.root.strategy).unwrap()),
-        baseline_strategy: f.frozen.baseline_strategy.clone(), capabilities: f.frozen.capabilities.clone(),
-        environment_digest: f.frozen.environment_digest.clone(), purpose: evo_core::evidence::Purpose::Development, revoke_watermark: 0,
+        profile: f.profile.clone(),
+        search_parent: f.root.skill.clone(),
+        baseline: f.frozen.baseline_skill.clone(),
+        search_parent_strategy: f.root.strategy.clone(),
+        expected_parent_strategy_digest: Some(fingerprint(&f.root.strategy).unwrap()),
+        baseline_strategy: f.frozen.baseline_strategy.clone(),
+        capabilities: f.frozen.capabilities.clone(),
+        environment_digest: f.frozen.environment_digest.clone(),
+        purpose: evo_core::evidence::Purpose::Development,
+        revoke_watermark: 0,
     };
     let mut session = store.session().await.unwrap();
     for patch in [
         ImproverPatch::default(),
-        ImproverPatch { instruction: PatchOp::Set { value: f.root.strategy.instruction.clone() },
-            max_candidates: PatchOp::Set { value: f.root.strategy.max_candidates }, max_rounds: PatchOp::Set { value: f.root.strategy.max_rounds } },
-        ImproverPatch { instruction: PatchOp::ResetToBaseline, max_candidates: PatchOp::ResetToBaseline, max_rounds: PatchOp::ResetToBaseline },
+        ImproverPatch {
+            instruction: PatchOp::Set {
+                value: f.root.strategy.instruction.clone(),
+            },
+            max_candidates: PatchOp::Set {
+                value: f.root.strategy.max_candidates,
+            },
+            max_rounds: PatchOp::Set {
+                value: f.root.strategy.max_rounds,
+            },
+        },
+        ImproverPatch {
+            instruction: PatchOp::ResetToBaseline,
+            max_candidates: PatchOp::ResetToBaseline,
+            max_rounds: PatchOp::ResetToBaseline,
+        },
     ] {
-        let bundle = compile_current_in_session(&mut session, &worker, &request, &SkillPatch::default(), &patch).await.unwrap();
+        let bundle = compile_current_in_session(
+            &mut session,
+            &worker,
+            &request,
+            &SkillPatch::default(),
+            &patch,
+        )
+        .await
+        .unwrap();
         assert_eq!(bundle.parent_digest, fingerprint(&f.root).unwrap());
         assert_eq!(bundle.baseline_digest, fingerprint(&f.frozen).unwrap());
-        persist_current_authenticated_bundle(&mut session, &worker, &request, &bundle).await.unwrap();
+        persist_current_authenticated_bundle(&mut session, &worker, &request, &bundle)
+            .await
+            .unwrap();
     }
-    let before = session.list::<serde_json::Value>(&worker, "artifact").await.unwrap();
+    let before = session
+        .list::<serde_json::Value>(&worker, "artifact")
+        .await
+        .unwrap();
     for parent in [true, false] {
         for bad in ["legacy-label".to_string(), " ".to_string(), "a".repeat(129)] {
             let mut changed = request.clone();
-            if parent { changed.profile.parent_digest = bad; } else { changed.profile.baseline_digest = bad; }
-            assert!(matches!(compile_current_in_session(&mut session, &worker, &changed, &SkillPatch::default(), &ImproverPatch::default()).await,
-                Err(evo_core::Error::Invalid(reason)) if reason == "expected lowercase SHA256"));
-            assert_eq!(session.list::<serde_json::Value>(&worker, "artifact").await.unwrap(), before);
+            if parent {
+                changed.profile.parent_digest = bad;
+            } else {
+                changed.profile.baseline_digest = bad;
+            }
+            assert!(
+                matches!(compile_current_in_session(&mut session, &worker, &changed, &SkillPatch::default(), &ImproverPatch::default()).await,
+                Err(evo_core::Error::Invalid(reason)) if reason == "expected lowercase SHA256")
+            );
+            assert_eq!(
+                session
+                    .list::<serde_json::Value>(&worker, "artifact")
+                    .await
+                    .unwrap(),
+                before
+            );
         }
     }
-    let mut wrong_baseline = request.clone(); wrong_baseline.profile.baseline_digest = fingerprint(&alternative.frozen).unwrap();
-    assert!(matches!(compile_current_in_session(&mut session, &worker, &wrong_baseline, &SkillPatch::default(), &ImproverPatch::default()).await,
-        Err(evo_core::Error::Conflict(reason)) if reason == "full P/B profile/environment/version/capability binding mismatch"));
-    let mut wrong_parent = request.clone(); wrong_parent.profile.parent_digest = fingerprint(&alternative.root).unwrap();
-    assert!(matches!(compile_current_in_session(&mut session, &worker, &wrong_parent, &SkillPatch::default(), &ImproverPatch::default()).await,
-        Err(evo_core::Error::Forbidden)));
-    assert_eq!(session.list::<serde_json::Value>(&worker, "artifact").await.unwrap(), before);
+    let mut wrong_baseline = request.clone();
+    wrong_baseline.profile.baseline_digest = fingerprint(&alternative.frozen).unwrap();
+    assert!(
+        matches!(compile_current_in_session(&mut session, &worker, &wrong_baseline, &SkillPatch::default(), &ImproverPatch::default()).await,
+        Err(evo_core::Error::Conflict(reason)) if reason == "full P/B profile/environment/version/capability binding mismatch")
+    );
+    let mut wrong_parent = request.clone();
+    wrong_parent.profile.parent_digest = fingerprint(&alternative.root).unwrap();
+    assert!(matches!(
+        compile_current_in_session(
+            &mut session,
+            &worker,
+            &wrong_parent,
+            &SkillPatch::default(),
+            &ImproverPatch::default()
+        )
+        .await,
+        Err(evo_core::Error::Forbidden)
+    ));
+    assert_eq!(
+        session
+            .list::<serde_json::Value>(&worker, "artifact")
+            .await
+            .unwrap(),
+        before
+    );
     session.commit().await.unwrap();
     store.close().await;
 }

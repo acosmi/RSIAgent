@@ -638,17 +638,30 @@ async fn issue(fx: &Fixture) -> evo_core::Result<EvaluationTicketV2> {
         },
     )
     .await
-    .map(|ticket| {
+    .inspect(|ticket| {
         let _ = fx.resolved_ticket_id.set(ticket.id.clone());
-        ticket
     })
+}
+
+async fn assert_issue_refused_without_candidate(fx: &Fixture) {
+    let before = catalog(fx).await;
+    assert!(
+        matches!(issue(fx).await, Err(Error::Conflict(reason)) if reason == "formal_candidate_record_missing_at_issue")
+    );
+    assert_eq!(catalog(fx).await, before);
+    assert!(matches!(
+        IndependentEvaluationControl::status(&fx.evaluator, &fx.store, fx.ticket_id()).await,
+        Err(Error::NotFound)
+    ));
 }
 
 async fn ready(n: u32, bound: bool) -> Fixture {
     let fx = prepared(n, bound).await;
     if !bound {
         assert_issue_refused_without_candidate(&fx).await;
-        trusted_compiler_inputs::assert_frozen_issuer_static_read("dependency-legacy").await.unwrap();
+        trusted_compiler_inputs::assert_frozen_issuer_static_read("dependency-legacy")
+            .await
+            .unwrap();
         stage(&fx).await;
     }
     issue(&fx).await.unwrap();
@@ -826,8 +839,6 @@ print(result.rowcount)
 
 /// AG-100's refusal of an issue that has no candidate record to bind.
 const CANDIDATE_RECORD_MISSING: &str = "formal_candidate_record_missing_at_issue";
-
-
 
 /// The stored outgoing edges of the ticket.
 async fn ticket_edges(fx: &Fixture) -> Vec<(String, String)> {
@@ -1567,12 +1578,22 @@ impl Serialize for LegacyTicket<'_> {
 }
 #[tokio::test]
 async fn legacy_absence_preserves_exact_parent_bytes_fingerprints_and_never_upgrades_later() {
-    trusted_compiler_inputs::assert_frozen_issuer_static_read("dependency-legacy").await.unwrap();
-    let frozen: Value = serde_json::from_str(include_str!("fixtures/ag135b_legacy_issuers.json")).unwrap();
-    let ticket = frozen["fixtures"]["dependency-legacy"]["tables"]["objects"]["rows"].as_array().unwrap().iter().find_map(|row| {
-        let body: Value = serde_json::from_str(row[4]["text"].as_str()?).ok()?;
-        (body["record_kind"] == "evaluation_ticket_v2").then(|| serde_json::from_value::<EvaluationTicketV2>(body["payload"].clone()).unwrap())
-    }).unwrap();
+    trusted_compiler_inputs::assert_frozen_issuer_static_read("dependency-legacy")
+        .await
+        .unwrap();
+    let frozen: Value =
+        serde_json::from_str(include_str!("fixtures/ag135b_legacy_issuers.json")).unwrap();
+    let ticket = frozen["fixtures"]["dependency-legacy"]["tables"]["objects"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|row| {
+            let body: Value = serde_json::from_str(row[4]["text"].as_str()?).ok()?;
+            (body["record_kind"] == "evaluation_ticket_v2").then(|| {
+                serde_json::from_value::<EvaluationTicketV2>(body["payload"].clone()).unwrap()
+            })
+        })
+        .unwrap();
     assert!(ticket.candidate_dependency_binding.is_none());
     assert!(ticket.source_plan_binding.is_none());
     let original = serde_json::to_vec(&LegacyTicket(&ticket)).unwrap();
@@ -1582,7 +1603,6 @@ async fn legacy_absence_preserves_exact_parent_bytes_fingerprints_and_never_upgr
     assert!(!wire.contains("candidate_dependency_binding"));
     assert!(!wire.contains("source_plan_binding"));
 }
-
 
 /// AG-100 T1 (L564, L1055/L1057). A ticket requested while no candidate
 /// record exists is refused under both control schemas before any write: the
@@ -1659,9 +1679,10 @@ async fn issue_after_the_candidate_is_staged_binds_it_for_every_control_schema()
 /// registered now.
 #[tokio::test]
 async fn persisted_legacy_ticket_is_read_unbound_and_served_as_stored() {
-    trusted_compiler_inputs::assert_frozen_issuer_static_read("dependency-legacy").await.unwrap();
+    trusted_compiler_inputs::assert_frozen_issuer_static_read("dependency-legacy")
+        .await
+        .unwrap();
 }
-
 
 #[tokio::test]
 async fn bounded_outgoing_api_orders_typed_ids_isolates_namespace_and_refuses_limit_plus_one() {

@@ -1996,34 +1996,83 @@ async fn current_bound_pair_reloads_task_control_grader_and_metered_receipts() {
     let request = fixture.request();
     let report = fixture.runner().run(request.clone()).await.unwrap();
     let (request_fact, observation) = fixture.commit_facts(&request, &report).await;
-    let healthy = verify_development_observation(&fixture.store, &fixture.admin, &request_fact, &observation).await.unwrap();
+    let healthy =
+        verify_development_observation(&fixture.store, &fixture.admin, &request_fact, &observation)
+            .await
+            .unwrap();
     assert_eq!(healthy.outcomes.len(), fixture.control.tasks.len());
     for result in &report.results {
-        let parent = load_execution_receipt(&fixture.store, &fixture.admin, &result.parent_execution_id).await.unwrap();
-        let candidate = load_execution_receipt(&fixture.store, &fixture.admin, &result.candidate_execution_id).await.unwrap();
+        let parent =
+            load_execution_receipt(&fixture.store, &fixture.admin, &result.parent_execution_id)
+                .await
+                .unwrap();
+        let candidate = load_execution_receipt(
+            &fixture.store,
+            &fixture.admin,
+            &result.candidate_execution_id,
+        )
+        .await
+        .unwrap();
         assert_eq!(parent.task_id, candidate.task_id);
         assert_eq!(parent.control_id, fixture.control.id);
         assert_eq!(candidate.control_id, fixture.control.id);
         assert_eq!(parent.side, DevelopmentSide::Parent);
         assert_eq!(candidate.side, DevelopmentSide::Candidate);
-        let grade = load_grader_receipt(&fixture.store, &fixture.admin, &grader_receipt_id(&request.request_id, &result.task_id).unwrap()).await.unwrap();
+        let grade = load_grader_receipt(
+            &fixture.store,
+            &fixture.admin,
+            &grader_receipt_id(&request.request_id, &result.task_id).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(fingerprint(&grade).unwrap(), result.grader_receipt_digest);
         for execution in [parent, candidate] {
-            let call = fixture.store.budget_call(&fixture.admin, SCOPE, &execution.budget_call_id).await.unwrap().unwrap();
+            let call = fixture
+                .store
+                .budget_call(&fixture.admin, SCOPE, &execution.budget_call_id)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(call.state, BudgetCallState::Finalized);
             assert_eq!(call.actual_cost_micros, Some(0));
             assert!(call.execution_closed);
-            assert_eq!(RegisteredExecutionSettlement::from_call(&call).unwrap().runner_digest, registered_runner_digest().unwrap());
+            assert_eq!(
+                RegisteredExecutionSettlement::from_call(&call)
+                    .unwrap()
+                    .runner_digest,
+                registered_runner_digest().unwrap()
+            );
         }
     }
-    let before_root = fixture.store.root_budget(&fixture.admin, SCOPE).await.unwrap().unwrap();
+    let before_root = fixture
+        .store
+        .root_budget(&fixture.admin, SCOPE)
+        .await
+        .unwrap()
+        .unwrap();
     let before_audit = fixture.store.verify_audit(&fixture.admin).await.unwrap();
     let mut changed = report.clone();
     changed.results[0].grader_receipt_digest = d("another legitimate-looking grader receipt");
     let honest = observed_fact(&request, &report, vec![]);
     let forged = observed_fact(&request, &changed, vec![]);
-    assert!(matches!(gate_with_forged_observation(&fixture, &request_fact, &honest, &forged).await, Err(Error::Conflict(_))));
-    assert_eq!(fixture.store.root_budget(&fixture.admin, SCOPE).await.unwrap().unwrap(), before_root);
-    assert_eq!(fixture.store.verify_audit(&fixture.admin).await.unwrap(), before_audit);
-    verify_development_observation(&fixture.store, &fixture.admin, &request_fact, &observation).await.unwrap();
+    assert!(matches!(
+        gate_with_forged_observation(&fixture, &request_fact, &honest, &forged).await,
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(
+        fixture
+            .store
+            .root_budget(&fixture.admin, SCOPE)
+            .await
+            .unwrap()
+            .unwrap(),
+        before_root
+    );
+    assert_eq!(
+        fixture.store.verify_audit(&fixture.admin).await.unwrap(),
+        before_audit
+    );
+    verify_development_observation(&fixture.store, &fixture.admin, &request_fact, &observation)
+        .await
+        .unwrap();
 }

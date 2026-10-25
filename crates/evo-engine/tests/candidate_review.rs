@@ -4,8 +4,8 @@
 mod trusted_compiler_inputs;
 
 use evo_core::contract::{
-    CompileParts, HostCapabilities, ImproverPatch, Profile, ResolvedBundleV3,
-    SkillPatch, SkillSnapshot, compile_bundle,
+    CompileParts, HostCapabilities, ImproverPatch, Profile, ResolvedBundleV3, SkillPatch,
+    SkillSnapshot, compile_bundle,
 };
 use evo_core::evaluation::{
     ControlCondition, ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec,
@@ -1512,7 +1512,10 @@ fn edit_compiled_input_digest(
     batch: &SkillEditBatch,
     binding: Option<&evo_engine::formal_authority::CurrentFormalCompilerInputBinding>,
 ) -> evo_core::Result<String> {
-    match binding { Some(binding) => fingerprint(&(batch, binding)), None => fingerprint(batch) }
+    match binding {
+        Some(binding) => fingerprint(&(batch, binding)),
+        None => fingerprint(batch),
+    }
 }
 
 fn head_replace(parent: &SkillSnapshot) -> Vec<SkillTextEdit> {

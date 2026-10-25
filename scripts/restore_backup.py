@@ -52,8 +52,8 @@ def read_json(raw):
     return finite_json(json.loads(raw, object_pairs_hook=unique_object,
         parse_constant=reject_nonstandard_number))
 
-def read_current_host_raw(raw):
-    """Only the new Host body has this raw-token gate; old facts keep read_json."""
+def read_host_json_tokens(raw):
+    """Bounded raw numeric/key gate, also applied to embedded source UTF-8."""
     if not isinstance(raw,str) or len(raw.encode("utf-8"))>262144:
         raise IsolationError("invalid current host raw JSON")
     def decimal_token(token):
@@ -95,11 +95,149 @@ def read_current_host_raw(raw):
             stack.extend((part,depth+1) for part in item.values())
         elif isinstance(item,list):
             stack.extend((part,depth+1) for part in item)
-    if not isinstance(value,dict) or value.get("schema_version")!="rsia.host_surface_record.v2":
-        raise IsolationError("invalid current host raw JSON")
     # Precision and resource checks above see the actual tokens before the
     # ordinary protected-facts representation receives any binary floats.
     return read_json(raw)
+
+HOST_SOURCE_FIELDS=("schema_version","source_kind","source_schema","extractor_version","original_utf8")
+HOST_DECLARATION_FIELDS=("name","value_type","enum_values","default")
+HOST_ITEM_FIELDS=("name","coverage","mapped_field","consumer","reason","renamed_from","test_ref","capability","value_type","enum_values","default")
+HOST_MANIFEST_FIELDS=("schema_version","host","host_version","adapter_version","source_kind","source_schema","extractor_version","source_envelope_digest","source_digest","items","retired")
+HOST_DIFF_FIELDS=("added","removed","renamed","type_changed","enum_changed","default_changed","mapping_changed","legacy_untyped")
+
+def host_json_wire(value):
+    # serde_json's finite number spelling for the registered typed wire. This
+    # does not replace any legacy canonicalization or protected-facts algorithm.
+    if isinstance(value,float):
+        spelling=repr(value)
+        if "e" in spelling:
+            mantissa,exponent=spelling.split("e")
+            exponent=int(exponent)
+            if -5<=exponent<16:
+                spelling=format(Decimal(spelling),"f")
+                if "." not in spelling: spelling+=".0"
+            else: spelling=mantissa.removesuffix(".0")+"e"+str(exponent)
+        return spelling
+    if isinstance(value,dict):
+        return "{"+",".join(json.dumps(k,ensure_ascii=False)+":"+host_json_wire(v) for k,v in value.items())+"}"
+    if isinstance(value,list): return "["+",".join(map(host_json_wire,value))+"]"
+    return json.dumps(value,ensure_ascii=False,separators=(",",":"),allow_nan=False)
+
+def host_digest(value):
+    return hashlib.sha256(host_json_wire(value).encode("utf-8")).hexdigest()
+
+def host_ordered(value,fields):
+    exact_object(value,fields,"current host DTO")
+    return {key:value[key] for key in fields}
+
+def host_default(value,kind,choices):
+    if not isinstance(value,dict) or value.get("kind") not in ("none","unknown","value"):
+        raise IsolationError("invalid current host default")
+    tag=value["kind"]
+    exact_object(value,("kind","value") if tag=="value" else ("kind",),"current host default")
+    if tag!="value": return {"kind":tag}
+    raw=value["value"]
+    valid={"bool":lambda:type(raw) is bool,"integer":lambda:type(raw) is int,
+        "string":lambda:isinstance(raw,str),"enum":lambda:isinstance(raw,str) and raw in choices,
+        "string_list":lambda:isinstance(raw,list) and all(isinstance(x,str) for x in raw),
+        "object":lambda:isinstance(raw,dict),"opaque":lambda:False}
+    if kind not in valid or not valid[kind](): raise IsolationError("invalid current host default type")
+    def sorted_value(v):
+        if isinstance(v,dict): return {k:sorted_value(v[k]) for k in sorted(v)}
+        if isinstance(v,list): return [sorted_value(x) for x in v]
+        return v
+    return {"kind":tag,"value":sorted_value(raw)}
+
+def host_identifier(value):
+    if not isinstance(value,str) or not 1<=len(value)<=128 or any(not(c.isascii() and (c.isalnum() or c in "-_.:")) for c in value):
+        raise IsolationError("invalid current host identifier")
+
+def host_text(value,limit):
+    if not isinstance(value,str) or not value.strip() or len(value)>limit:
+        raise IsolationError("invalid current host text")
+
+def validate_current_host_content(value,namespace,kind,identity):
+    host_ordered(value,("id","schema_version","manifest","manifest_digest","source","extracted","extracted_typed","predecessor_surface_id","upgrade_diff"))
+    host_identifier(namespace);host_identifier(value["id"])
+    if kind!="artifact" or value["id"]!=identity or value["schema_version"]!="rsia.host_surface_record.v2":
+        raise IsolationError("current host physical identity differs")
+    previous=value["predecessor_surface_id"]
+    if previous is not None:
+        host_identifier(previous)
+        if previous==identity: raise IsolationError("current host predecessor is itself")
+    source=host_ordered(value["source"],HOST_SOURCE_FIELDS)
+    if tuple(source[k] for k in HOST_SOURCE_FIELDS[:-1])!=("rsia.host_source_envelope.v1","reviewed_fixture","rsia.host_reviewed_declarations.v1","rsia.host_reviewed_declarations.extractor.v1"):
+        raise IsolationError("invalid current host source envelope")
+    original=read_host_json_tokens(source["original_utf8"])
+    host_ordered(original,("schema_version","host","host_version","declarations"))
+    host_identifier(original["host"]);host_text(original["host_version"],128)
+    if original["schema_version"]!=source["source_schema"] or not isinstance(original["declarations"],list) or not original["declarations"]:
+        raise IsolationError("invalid current host declarations")
+    declarations=[];names=[]
+    for raw in original["declarations"]:
+        declaration=host_ordered(raw,HOST_DECLARATION_FIELDS);name=declaration["name"];host_identifier(name)
+        ty=declaration["value_type"];choices=declaration["enum_values"]
+        if name in names or ty not in ("bool","integer","string","enum","string_list","object","opaque") or not isinstance(choices,list) or not all(isinstance(x,str) for x in choices):
+            raise IsolationError("invalid current host declarations")
+        if (ty=="enum" and (not choices or choices!=sorted(set(choices)))) or (ty!="enum" and choices):
+            raise IsolationError("invalid current host enum")
+        declaration["default"]=host_default(declaration["default"],ty,choices)
+        names.append(name);declarations.append(declaration)
+    if value["extracted"]!=names or value["extracted_typed"]!=declarations:
+        raise IsolationError("current host extraction differs from original")
+    manifest=host_ordered(value["manifest"],HOST_MANIFEST_FIELDS)
+    if (manifest["schema_version"]!="rsia.host_surface.v2" or manifest["host"]!=original["host"] or manifest["host_version"]!=original["host_version"]
+        or any(manifest[k]!=source[k] for k in ("source_kind","source_schema","extractor_version"))
+        or manifest["source_envelope_digest"]!=host_digest(source)
+        or manifest["source_digest"]!=hashlib.sha256(source["original_utf8"].encode("utf-8")).hexdigest()):
+        raise IsolationError("current host source identity differs")
+    host_text(manifest["adapter_version"],128)
+    if not isinstance(manifest["items"],list) or len(manifest["items"])!=len(declarations): raise IsolationError("current host item coverage differs")
+    consumers={**{f"skill.{x}":"compiler" for x in ("content","applicability","counterexample","required_capabilities","dependencies")},
+        **{f"improver.{x}":"worker" for x in ("instruction","max_candidates","max_rounds")},
+        **{f"improver.exploration_policy.{x}":"exploration.decide_elastic" for x in ("significant_gain_micros","stagnation_abs_gain_micros","stagnation_window","max_focus_actions","fairness_wait_rounds")},
+        "host.model":"runner","host.tools":"runner"}
+    mapped=set();items=[]
+    for raw,declaration in zip(manifest["items"],declarations):
+        item=host_ordered(raw,HOST_ITEM_FIELDS);host_text(item["reason"],512)
+        if any(item[k] is not None and not isinstance(item[k],str) for k in ("mapped_field","consumer","renamed_from","test_ref","capability")):
+            raise IsolationError("invalid current host optional field")
+        item["default"]=host_default(item["default"],item["value_type"],item["enum_values"])
+        if any(item[k]!=declaration[k] for k in HOST_DECLARATION_FIELDS): raise IsolationError("current host typed item differs")
+        if item["renamed_from"] is not None:host_identifier(item["renamed_from"])
+        if item["coverage"]=="supported":
+            field=item["mapped_field"]
+            if field not in consumers or field in mapped or item["consumer"]!=consumers[field] or item["value_type"]=="opaque" or item["default"]["kind"]=="unknown":
+                raise IsolationError("invalid current host supported mapping")
+            host_text(item["test_ref"],262144);host_identifier(item["capability"]);mapped.add(field)
+        elif item["coverage"] not in ("runtime_owned","unsupported") or item["mapped_field"] is not None:
+            raise IsolationError("invalid current host classification")
+        items.append(item)
+    retired=[];retired_names=set()
+    for raw in manifest["retired"]:
+        item=host_ordered(raw,("name","reason"));host_identifier(item["name"]);host_text(item["reason"],512)
+        if item["name"] in names or item["name"] in retired_names:raise IsolationError("invalid current host retired declaration")
+        retired.append(item);retired_names.add(item["name"])
+    manifest["items"]=items;manifest["retired"]=retired
+    if value["manifest_digest"]!=host_digest(manifest):raise IsolationError("current host manifest digest differs")
+    diff=host_ordered(value["upgrade_diff"],HOST_DIFF_FIELDS)
+    for key,values in diff.items():
+        if not isinstance(values,list):raise IsolationError("invalid current host upgrade diff")
+        if key=="renamed":
+            for entry in values:
+                host_ordered(entry,("from","to"));host_identifier(entry["from"]);host_identifier(entry["to"])
+        else:
+            for entry in values:host_identifier(entry)
+    if previous is None and diff!={key:sorted(names) if key=="added" else [] for key in HOST_DIFF_FIELDS}:
+        raise IsolationError("current host upgrade diff differs")
+
+def read_current_host_raw(raw,namespace,kind,identity):
+    try:
+        value=read_host_json_tokens(raw)
+        validate_current_host_content(value,namespace,kind,identity)
+        return value
+    except (IsolationError,ValueError,TypeError,KeyError,RecursionError,OverflowError) as error:
+        raise IsolationError("invalid current host raw JSON") from error
 
 def exact_object(value,keys,name):
     if not isinstance(value,dict) or set(value)!=set(keys):
@@ -339,7 +477,7 @@ def protected_facts(con,namespaces):
     facts=[]
     for ns,kind,id,body,current_host in con.execute("""
         SELECT namespace,kind,id,body,
-          CASE WHEN kind='artifact' AND json_valid(body) THEN EXISTS (
+          CASE WHEN json_valid(body) THEN EXISTS (
             SELECT 1 FROM json_each(objects.body) member
             WHERE member.key='schema_version' AND member.type='text'
               AND member.value='rsia.host_surface_record.v2'
@@ -347,7 +485,7 @@ def protected_facts(con,namespaces):
         FROM objects ORDER BY namespace,kind,id"""):
         if ns not in namespaces:
             continue
-        value=read_current_host_raw(body) if current_host else read_json(body)
+        value=read_current_host_raw(body,ns,kind,id) if current_host else read_json(body)
         schema=value.get("schema_version","")
         if kind in ("budget","reservation","evaluation","receipt") or schema in (
             "rsia.typed_artifact_envelope.v1","rsia.exploration_artifact_envelope.v1",

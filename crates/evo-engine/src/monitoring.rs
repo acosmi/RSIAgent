@@ -4685,44 +4685,112 @@ mod proposal_lineage_read_tests {
     async fn version_lineage_keeps_legacy_sources_out_of_current_selection() {
         // Complete content controls only; neither raw DTO receives a claim,
         // source permission, approval or execution authority from this fixture.
-        let (current_bundle,legacy_bundle)=crate::compiler::current_carrier_content_controls::content_bundles();
-        let claim="lineage-claim";
-        let terminal="lineage-terminal";
-        let old_id=consolidation_proposal_id(claim);
-        let new_id=current_consolidation_proposal_id(claim,&current_bundle.digest,terminal).unwrap();
-        assert_ne!(old_id,new_id);
-        assert_eq!(new_id,current_consolidation_proposal_id(claim,&current_bundle.digest,terminal).unwrap());
-        let legacy=ConsolidationProposal {
-            id:old_id.clone(),schema_version:CONSOLIDATION_PROPOSAL_SCHEMA.into(),claim_id:claim.into(),scope_id:"scope".into(),
-            cycle_ids:vec!["first".into(),"second".into()],pairs_digest:hash(b"complete pairing data"),
-            parent_skill_digest:skill_snapshot_digest(&legacy_bundle.skill).unwrap(),parent_bundle_digest:legacy_bundle.parent_digest.clone(),
-            candidate_skill_digest:skill_snapshot_digest(&legacy_bundle.skill).unwrap(),candidate_bundle_digest:legacy_bundle.digest.clone(),candidate_bundle:legacy_bundle,
-            selection_digest:hash(b"complete selection data"),terminal_fact_id:terminal.into(),sources:vec![],provenance:EnvironmentEvidenceScope::ProgramFixture,
-            environment_digest:hash(b"complete environment data"),revoke_watermark:0,
+        let (current_bundle, legacy_bundle) =
+            crate::compiler::current_carrier_content_controls::content_bundles();
+        let claim = "lineage-claim";
+        let terminal = "lineage-terminal";
+        let old_id = consolidation_proposal_id(claim);
+        let new_id =
+            current_consolidation_proposal_id(claim, &current_bundle.digest, terminal).unwrap();
+        assert_ne!(old_id, new_id);
+        assert_eq!(
+            new_id,
+            current_consolidation_proposal_id(claim, &current_bundle.digest, terminal).unwrap()
+        );
+        let legacy = ConsolidationProposal {
+            id: old_id.clone(),
+            schema_version: CONSOLIDATION_PROPOSAL_SCHEMA.into(),
+            claim_id: claim.into(),
+            scope_id: "scope".into(),
+            cycle_ids: vec!["first".into(), "second".into()],
+            pairs_digest: hash(b"complete pairing data"),
+            parent_skill_digest: skill_snapshot_digest(&legacy_bundle.skill).unwrap(),
+            parent_bundle_digest: legacy_bundle.parent_digest.clone(),
+            candidate_skill_digest: skill_snapshot_digest(&legacy_bundle.skill).unwrap(),
+            candidate_bundle_digest: legacy_bundle.digest.clone(),
+            candidate_bundle: legacy_bundle,
+            selection_digest: hash(b"complete selection data"),
+            terminal_fact_id: terminal.into(),
+            sources: vec![],
+            provenance: EnvironmentEvidenceScope::ProgramFixture,
+            environment_digest: hash(b"complete environment data"),
+            revoke_watermark: 0,
         };
-        let current=CurrentConsolidationProposal {
-            id:new_id.clone(),schema_version:CONSOLIDATION_PROPOSAL_SCHEMA_V2.into(),claim_id:legacy.claim_id.clone(),scope_id:legacy.scope_id.clone(),
-            cycle_ids:legacy.cycle_ids.clone(),pairs_digest:legacy.pairs_digest.clone(),parent_skill_digest:legacy.parent_skill_digest.clone(),parent_bundle_digest:current_bundle.parent_digest.clone(),
-            candidate_skill_digest:skill_snapshot_digest(&current_bundle.skill).unwrap(),candidate_bundle_digest:current_bundle.digest.clone(),candidate_bundle:current_bundle,
-            selection_digest:legacy.selection_digest.clone(),terminal_fact_id:terminal.into(),sources:vec![],provenance:EnvironmentEvidenceScope::ProgramFixture,
-            environment_digest:legacy.environment_digest.clone(),revoke_watermark:0,
+        let current = CurrentConsolidationProposal {
+            id: new_id.clone(),
+            schema_version: CONSOLIDATION_PROPOSAL_SCHEMA_V2.into(),
+            claim_id: legacy.claim_id.clone(),
+            scope_id: legacy.scope_id.clone(),
+            cycle_ids: legacy.cycle_ids.clone(),
+            pairs_digest: legacy.pairs_digest.clone(),
+            parent_skill_digest: legacy.parent_skill_digest.clone(),
+            parent_bundle_digest: current_bundle.parent_digest.clone(),
+            candidate_skill_digest: skill_snapshot_digest(&current_bundle.skill).unwrap(),
+            candidate_bundle_digest: current_bundle.digest.clone(),
+            candidate_bundle: current_bundle,
+            selection_digest: legacy.selection_digest.clone(),
+            terminal_fact_id: terminal.into(),
+            sources: vec![],
+            provenance: EnvironmentEvidenceScope::ProgramFixture,
+            environment_digest: legacy.environment_digest.clone(),
+            revoke_watermark: 0,
         };
-        let directory=tempfile::tempdir().unwrap();let store=Store::open(&directory.path().join("lineage.sqlite3")).await.unwrap();
-        let admin=Context::new("n","admin",Role::Admin).unwrap();
-        let old_bytes=serde_json::to_vec(&legacy).unwrap();
-        let mut session=store.session().await.unwrap();
-        session.put(&admin,"artifact",&old_id,admin.actor(),&legacy).await.unwrap();
-        session.put(&admin,"artifact",&new_id,admin.actor(),&current).await.unwrap();
-        let before=session.list::<serde_json::Value>(&admin,"artifact").await.unwrap();
-        assert_eq!(load_current_proposal(&mut session,&admin,&new_id).await.unwrap().id,new_id);
-        assert!(matches!(load_current_proposal(&mut session,&admin,&old_id).await,
-            Err(Error::Conflict(message)) if message=="source_legacy: consolidation proposal is not Current input"));
-        session.commit().await.unwrap();let audit=store.verify_audit(&admin).await.unwrap();
-        assert!(matches!(MonitoringCoordinator::stage_current_consolidation_candidate(&admin,&store,&old_id,"candidate").await,
-            Err(Error::Conflict(message)) if message=="source_legacy: consolidation proposal is not Current input"));
-        let mut session=store.session().await.unwrap();
-        assert_eq!(session.list::<serde_json::Value>(&admin,"artifact").await.unwrap(),before);
-        assert_eq!(serde_json::to_vec(&session.need::<ConsolidationProposal>(&admin,"artifact",&old_id).await.unwrap()).unwrap(),old_bytes);
-        session.commit().await.unwrap();assert_eq!(store.verify_audit(&admin).await.unwrap(),audit);store.close().await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("lineage.sqlite3"))
+            .await
+            .unwrap();
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        let old_bytes = serde_json::to_vec(&legacy).unwrap();
+        let mut session = store.session().await.unwrap();
+        session
+            .put(&admin, "artifact", &old_id, admin.actor(), &legacy)
+            .await
+            .unwrap();
+        session
+            .put(&admin, "artifact", &new_id, admin.actor(), &current)
+            .await
+            .unwrap();
+        let before = session
+            .list::<serde_json::Value>(&admin, "artifact")
+            .await
+            .unwrap();
+        assert_eq!(
+            load_current_proposal(&mut session, &admin, &new_id)
+                .await
+                .unwrap()
+                .id,
+            new_id
+        );
+        assert!(
+            matches!(load_current_proposal(&mut session,&admin,&old_id).await,
+            Err(Error::Conflict(message)) if message=="source_legacy: consolidation proposal is not Current input")
+        );
+        session.commit().await.unwrap();
+        let audit = store.verify_audit(&admin).await.unwrap();
+        assert!(
+            matches!(MonitoringCoordinator::stage_current_consolidation_candidate(&admin,&store,&old_id,"candidate").await,
+            Err(Error::Conflict(message)) if message=="source_legacy: consolidation proposal is not Current input")
+        );
+        let mut session = store.session().await.unwrap();
+        assert_eq!(
+            session
+                .list::<serde_json::Value>(&admin, "artifact")
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_vec(
+                &session
+                    .need::<ConsolidationProposal>(&admin, "artifact", &old_id)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            old_bytes
+        );
+        session.commit().await.unwrap();
+        assert_eq!(store.verify_audit(&admin).await.unwrap(), audit);
+        store.close().await;
     }
 }

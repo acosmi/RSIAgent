@@ -8721,14 +8721,13 @@ pub(crate) mod current_source_test_support {
             parent_digest: root.digest().unwrap(),
             baseline_digest: frozen.baseline_digest().unwrap(),
         };
-        let fixture = FixtureInputs {
+        FixtureInputs {
             host,
             provider,
             frozen,
             root,
             profile,
-        };
-        fixture
+        }
     }
 
     pub(crate) async fn diagnostic_fixture() -> (
@@ -8858,12 +8857,14 @@ pub(crate) mod current_source_test_support {
     }
 
     fn provider_content(f: &FixtureInputs) -> RegisteredExternalProviderV3 {
-        let parameters = RegisteredExternalProviderV2::from_configuration(
+        let mut parameters = RegisteredExternalProviderV2::from_configuration(
             f.provider.clone(),
             evo_core::model_protocol::ModelProtocolId::ChatCompletionsNonstreamV1,
             evo_core::model_protocol::SamplingProfileId::TemperatureZeroV1,
             30,
-        ).unwrap();
+        )
+        .unwrap();
+        parameters.id = format!("{}-v3-content", parameters.id);
         RegisteredExternalProviderV3::from_configuration(parameters).unwrap()
     }
 
@@ -8877,7 +8878,10 @@ pub(crate) mod current_source_test_support {
         };
         let wire = serde_json::to_vec(&command).unwrap();
         let loaded: FormalOperatorCommand = serde_json::from_slice(&wire).unwrap();
-        assert_eq!(loaded.authentication_digest().unwrap(), provider_v3_command_digest(&provider).unwrap());
+        assert_eq!(
+            loaded.authentication_digest().unwrap(),
+            provider_v3_command_digest(&provider).unwrap()
+        );
         let before = store.verify_audit(&admin).await.unwrap();
         let mut session = store.session().await.unwrap();
         let artifacts = session.list::<Value>(&admin, "artifact").await.unwrap();
@@ -8885,15 +8889,27 @@ pub(crate) mod current_source_test_support {
         // registration. Neither decoding it nor the V2 configuration API can
         // mint the private owned capability or authorize a new send.
         let registration = FrozenProviderRegistration::from_record(
-            ProviderRegistrationWire::SourceBound(Box::new(provider.clone())));
-        assert!(matches!(registration.sampling_authority().require_new_dispatch(),
-            Err(Error::Conflict(reason)) if reason == "current_provider_source_unavailable"));
-        assert!(matches!(registration.verified_sampling_in_session(&mut session, &worker).await,
-            Err(Error::NotFound)));
-        assert_eq!(session.list::<Value>(&admin, "artifact").await.unwrap(), artifacts);
+            ProviderRegistrationWire::SourceBound(Box::new(provider.clone())),
+        );
+        assert!(
+            matches!(registration.sampling_authority().require_new_dispatch(),
+            Err(Error::Conflict(reason)) if reason == "current_provider_source_unavailable")
+        );
+        assert!(matches!(
+            registration
+                .verified_sampling_in_session(&mut session, &worker)
+                .await,
+            Err(Error::NotFound)
+        ));
+        assert_eq!(
+            session.list::<Value>(&admin, "artifact").await.unwrap(),
+            artifacts
+        );
         session.commit().await.unwrap();
-        assert!(matches!(FormalRegistry::register_provider_current(&admin, &store, provider.parameters_v2()).await,
-            Err(Error::Conflict(reason)) if reason == "current_provider_source_unavailable"));
+        assert!(
+            matches!(FormalRegistry::register_provider_current(&admin, &store, provider.parameters_v2()).await,
+            Err(Error::Conflict(reason)) if reason == "current_provider_source_unavailable")
+        );
         assert_eq!(store.verify_audit(&admin).await.unwrap(), before);
         store.close().await;
     }
@@ -8903,26 +8919,48 @@ pub(crate) mod current_source_test_support {
         let (_directory, store, worker, f, _request) = diagnostic_fixture().await;
         let current = provider_content(&f);
         let derived = current.derive_and_check_source(&worker).unwrap();
-        assert_eq!(serde_json::to_vec(&derived).unwrap(), serde_json::to_vec(&current).unwrap());
-        assert_eq!(current.model_digest, evo_core::canonical_fingerprint(&current.model_identity_material).unwrap());
-        for field in ["endpoint", "provider_model", "pricing_version", "model_digest", "transport_code_digest", "sampling_digest"] {
+        assert_eq!(
+            serde_json::to_vec(&derived).unwrap(),
+            serde_json::to_vec(&current).unwrap()
+        );
+        assert_eq!(
+            current.model_digest,
+            evo_core::canonical_fingerprint(&current.model_identity_material).unwrap()
+        );
+        for field in [
+            "endpoint",
+            "provider_model",
+            "pricing_version",
+            "model_digest",
+            "transport_code_digest",
+            "sampling_digest",
+        ] {
             let mut wire = serde_json::to_value(&current).unwrap();
-            wire[field] = if field == "endpoint" { serde_json::json!("https://other.fixture.invalid/v1/chat/completions") }
-                else if field.ends_with("digest") { serde_json::json!(hash(b"another content")) }
-                else { serde_json::json!("another-value") };
+            wire[field] = if field == "endpoint" {
+                serde_json::json!("https://other.fixture.invalid/v1/chat/completions")
+            } else if field.ends_with("digest") {
+                serde_json::json!(hash(b"another content"))
+            } else {
+                serde_json::json!("another-value")
+            };
             let changed: RegisteredExternalProviderV3 = serde_json::from_value(wire).unwrap();
             let refusal = changed.derive_and_check_source(&worker);
             if field == "sampling_digest" {
                 assert!(matches!(refusal, Err(Error::Forbidden)), "{field}");
             } else {
-                assert!(matches!(refusal, Err(Error::Conflict(reason))
-                    if reason == "provider source material does not recompute"), "{field}");
+                assert!(
+                    matches!(refusal, Err(Error::Conflict(reason))
+                    if reason == "provider source material does not recompute"),
+                    "{field}"
+                );
             }
         }
         let mut material_changed = current.clone();
         material_changed.model_identity_material.max_output_tokens += 1;
-        assert!(matches!(material_changed.derive_and_check_source(&worker), Err(Error::Conflict(reason))
-            if reason == "provider source material does not recompute"));
+        assert!(
+            matches!(material_changed.derive_and_check_source(&worker), Err(Error::Conflict(reason))
+            if reason == "provider source material does not recompute")
+        );
         // Changing the original configuration rederives a different complete
         // identity, but still supplies content only, never dispatch authority.
         let mut parameters = current.parameters_v2();
@@ -8932,5 +8970,4 @@ pub(crate) mod current_source_test_support {
         another.derive_and_check_source(&worker).unwrap();
         store.close().await;
     }
-
 }

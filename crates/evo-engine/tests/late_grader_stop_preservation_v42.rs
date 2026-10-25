@@ -591,16 +591,17 @@ async fn request_ticket(fixture: &Fixture) -> evo_core::Result<EvaluationTicketV
         },
     )
     .await
-    .map(|ticket| {
+    .inspect(|ticket| {
         let _ = fixture.resolved_ticket_id.set(ticket.id.clone());
-        ticket
     })
 }
 
 async fn issue(fixture: &Fixture, bound: bool) {
     if !bound {
         assert_issue_refused_without_candidate(fixture).await;
-        trusted_compiler_inputs::assert_frozen_issuer_static_read("late-stop-legacy").await.unwrap();
+        trusted_compiler_inputs::assert_frozen_issuer_static_read("late-stop-legacy")
+            .await
+            .unwrap();
     }
     stage_candidate(fixture).await;
     let ticket = request_ticket(fixture).await.unwrap();
@@ -950,18 +951,14 @@ async fn world(fixture: &Fixture, _bound: bool, phase: &str) -> World {
         )
         .await
         .unwrap();
-    let sources = if true {
-        vec![
+    let sources = vec![
             load_stored_source(&mut session, &fixture.evaluator, "S1")
                 .await
                 .unwrap(),
             load_stored_source(&mut session, &fixture.evaluator, "S2")
                 .await
                 .unwrap(),
-        ]
-    } else {
-        Vec::new()
-    };
+        ];
     let watermark = session.watermark(&fixture.evaluator).await.unwrap();
     let commit = session.commit().await;
     let group = fixture

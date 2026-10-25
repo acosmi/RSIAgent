@@ -693,7 +693,7 @@ fn release_bundle() -> evo_core::contract::ResolvedBundleV3 {
 
 async fn stage_fixture_candidate(
     fixture: &Fixture,
-) -> evo_engine::release_store::ReleaseCandidateRecord {
+) -> evo_engine::release_store::CurrentReleaseCandidateRecord {
     let host = Context::new("n", "host", Role::Host).unwrap();
     let proposer = Context::new("n", "proposer", Role::Worker).unwrap();
     trusted_compiler_inputs::install_bundle_current_sources(&fixture.store, &release_bundle())

@@ -3013,6 +3013,56 @@ impl Session {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentHostRestoreContent {
+    id: String,
+    schema_version: String,
+    manifest: evo_core::contract::HostSurfaceManifestV2,
+    manifest_digest: String,
+    source: evo_core::contract::ReviewedHostSourceEnvelopeV1,
+    extracted: Vec<String>,
+    extracted_typed: Vec<evo_core::contract::HostSurfaceDeclarationV2>,
+    predecessor_surface_id: Option<String>,
+    upgrade_diff: evo_core::contract::HostSurfaceUpgradeDiffV2,
+}
+fn validate_current_host_restore_content(value: &Value) -> Result<()> {
+    let record: CurrentHostRestoreContent =
+        serde_json::from_value(value.clone()).map_err(internal)?;
+    identifier(&record.id)?;
+    if record.schema_version != "rsia.host_surface_record.v2"
+        || record.predecessor_surface_id.as_deref() == Some(record.id.as_str())
+        || record.manifest_digest != fingerprint(&record.manifest)?
+    {
+        return Err(Error::Invalid(
+            "invalid reviewed host source/default".into(),
+        ));
+    }
+    if let Some(previous) = &record.predecessor_surface_id {
+        identifier(previous)?;
+    }
+    // The source string is still the original UTF-8. This parser checks its
+    // numeric tokens, decoded duplicate keys and limits before typed values.
+    evo_core::contract::validate_host_surface_v2_source(
+        &record.manifest,
+        &record.source,
+        &record.extracted,
+        &record.extracted_typed,
+    )?;
+    if record.predecessor_surface_id.is_none()
+        && fingerprint(&record.upgrade_diff)?
+            != fingerprint(&evo_core::contract::host_surface_upgrade_diff_v2(
+                &record.manifest,
+                None,
+            )?)?
+    {
+        return Err(Error::Invalid(
+            "invalid reviewed host source/default".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Data dispatch for the one current host-record wire, never authorization.
 /// The marker is read with the body by each caller's fixed SQL selector.
 pub(crate) fn current_host_surface_object_value(
@@ -3020,7 +3070,11 @@ pub(crate) fn current_host_surface_object_value(
     current_host_surface: i64,
 ) -> Result<Option<Value>> {
     match current_host_surface {
-        1 => evo_core::contract::decode_host_surface_record_v2_json(body).map(Some),
+        1 => {
+            let value = evo_core::contract::decode_host_surface_record_v2_json(body)?;
+            validate_current_host_restore_content(&value)?;
+            Ok(Some(value))
+        }
         0 => Ok(None),
         _ => Err(Error::Internal),
     }

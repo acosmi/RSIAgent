@@ -1838,3 +1838,175 @@ async fn legacy_run_is_explicitly_unsupported_and_never_overwritten() {
     );
     session.commit().await.unwrap();
 }
+
+#[tokio::test]
+async fn current_fact_source_preflight_precedes_first_dml() {
+    use evo_engine::formal_authority::{CompilerInputRequest, resolve_current_compiler_inputs};
+    use evo_engine::model::CurrentCompilerInputUse;
+    use evo_engine::optimization::{StageDependency, StoreOptimizationJournal as ActualJournal};
+    fn sql_image(path: &std::path::Path) -> serde_json::Value {
+        let script=r#"
+import json,sqlite3,sys
+con=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+quote=lambda name:'"'+name.replace('"','""')+'"'
+image={}
+for (name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+    columns=con.execute('PRAGMA table_info('+quote(name)+')').fetchall()
+    image[name]=[[{'blob':x.hex()} if isinstance(x,bytes) else x for x in row] for row in con.execute('SELECT * FROM '+quote(name)+' ORDER BY '+','.join(str(i+1) for i in range(len(columns))))]
+con.close();print(json.dumps(image,sort_keys=True))
+"#;
+        let output=std::process::Command::new("python3").args(["-B","-c",script]).arg(path).output().unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+    async fn fixture() -> (tempfile::TempDir, Store, Context, CurrentCompilerInputUse) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("preflight.sqlite3"))
+            .await
+            .unwrap();
+        let worker = Context::new("n", "worker", Role::Worker).unwrap();
+        let f = trusted_compiler_inputs::inputs(
+            "n",
+            "first-dml",
+            SkillSnapshot::empty(),
+            Strategy::default(),
+            HostCapabilities {
+                available: Default::default(),
+                granted: Default::default(),
+            },
+            &hash(b"environment"),
+        );
+        trusted_compiler_inputs::install(&store, &f).await.unwrap();
+        let mut session = store.session().await.unwrap();
+        session
+            .bump_watermark(&worker, &hash(b"current source watermark"))
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let request = CompilerInputRequest {
+            profile: f.profile,
+            search_parent: f.root.skill,
+            baseline: f.frozen.baseline_skill,
+            search_parent_strategy: f.root.strategy,
+            expected_parent_strategy_digest: None,
+            baseline_strategy: f.frozen.baseline_strategy,
+            capabilities: f.frozen.capabilities,
+            environment_digest: f.frozen.environment_digest,
+            purpose: Purpose::Development,
+            revoke_watermark: 1,
+        };
+        let mut session = store.session().await.unwrap();
+        let actual = resolve_current_compiler_inputs(&mut session, &worker, &request)
+            .await
+            .unwrap();
+        let inputs = CurrentCompilerInputUse::new(request, actual.binding().clone());
+        inputs.verify_current(&mut session, &worker).await.unwrap();
+        session.commit().await.unwrap();
+        (directory, store, worker, inputs)
+    }
+    fn fact(dependencies: Vec<StageDependency>) -> StageFact {
+        StageFact {
+            schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+            artifact_id: String::new(),
+            namespace: "n".into(),
+            episode_id: "first-dml-episode".into(),
+            step: 1,
+            attempt: 1,
+            stage: OptimizationJournalStage::ReflectFailure,
+            kind: StageFactKind::StepPrepared,
+            request_id: "first-dml-request".into(),
+            input_digest: hash(b"complete input"),
+            output_digest: None,
+            dependencies,
+            payload: serde_json::json!({"software_control":"metadata"}),
+        }
+        .seal()
+        .unwrap()
+    }
+    for claim in [true, false] {
+        let (_directory, store, worker, inputs) = fixture().await;
+        let journal = ActualJournal::new(store.clone(), worker.clone(), worker.actor()).unwrap();
+        if claim {
+            assert!(
+                journal
+                    .claim_source_bound(fact(vec![]), &inputs)
+                    .await
+                    .unwrap()
+            );
+        } else {
+            journal
+                .commit_source_bound(fact(vec![]), &inputs)
+                .await
+                .unwrap();
+        }
+        store.close().await;
+        for fault in ["environment", "watermark"] {
+            let (directory, store, worker, inputs) = fixture().await;
+            let journal =
+                ActualJournal::new(store.clone(), worker.clone(), worker.actor()).unwrap();
+            let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"CREATE TRIGGER ag135b_first_dml BEFORE INSERT ON objects BEGIN SELECT RAISE(FAIL,'AG135B_FIRST_DML_SENTINEL'); END\"); c.commit(); c.close()";
+            let result = std::process::Command::new("python3")
+                .args(["-B", "-c", script])
+                .arg(directory.path().join("preflight.sqlite3"))
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let mut session = store.session().await.unwrap();
+            let before = session
+                .list::<serde_json::Value>(&worker, "artifact")
+                .await
+                .unwrap();
+            session.commit().await.unwrap();
+            let audit = store.verify_audit(&worker).await.unwrap();
+            let before_sql=sql_image(&directory.path().join("preflight.sqlite3"));
+            let invalid = if fault == "environment" {
+                fact(vec![StageDependency {
+                    kind: "environment".into(),
+                    id: hash(b"environment"),
+                }])
+            } else {
+                fact(vec![StageDependency {
+                    kind: "revoke_watermark".into(),
+                    id: "2".into(),
+                }])
+            };
+            let rejected = if claim {
+                journal
+                    .claim_source_bound(invalid, &inputs)
+                    .await
+                    .map(|_| ())
+            } else {
+                journal.commit_source_bound(invalid, &inputs).await
+            };
+            let expected = if fault == "environment" {
+                "environment dependency requires one development request"
+            } else {
+                "source revoke watermark changed"
+            };
+            assert!(matches!(rejected,Err(Error::Conflict(message)) if message==expected));
+            let mut session = store.session().await.unwrap();
+            assert_eq!(
+                session
+                    .list::<serde_json::Value>(&worker, "artifact")
+                    .await
+                    .unwrap(),
+                before
+            );
+            assert!(
+                session
+                    .get::<serde_json::Value>(&worker, "artifact", &inputs.artifact_id().unwrap())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            session.commit().await.unwrap();
+            assert_eq!(store.verify_audit(&worker).await.unwrap(), audit);
+            assert_eq!(sql_image(&directory.path().join("preflight.sqlite3")),before_sql);
+            store.close().await;
+        }
+    }
+}

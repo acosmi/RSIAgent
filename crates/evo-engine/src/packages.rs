@@ -1773,6 +1773,19 @@ impl PersistentPackageStore {
             ));
         }
         candidate.bundle.validate_identity()?;
+        let authenticated = crate::compiler::verify_current_bundle_in_session(
+            &mut session,
+            ctx,
+            &candidate.bundle_digest,
+            &candidate.environment_digest,
+            watermark,
+        )
+        .await?;
+        if fingerprint(&authenticated.bundle)? != fingerprint(&candidate.current()?.bundle)? {
+            return Err(Error::Conflict(
+                "handoff authenticated bundle differs from candidate".into(),
+            ));
+        }
         if fingerprint(&candidate.bundle.skill)? != fingerprint(&staged_skill)?
             || fingerprint(&candidate.bundle.improver)? != fingerprint(&staged_strategy)?
         {

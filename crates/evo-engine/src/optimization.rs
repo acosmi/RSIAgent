@@ -1140,31 +1140,52 @@ impl StoreOptimizationJournal {
     }
 }
 
-async fn attach_fact_compiler_use(
+async fn prepare_fact_compiler_use(
     s: &mut Session,
     ctx: &Context,
     fact: &mut StageFact,
     inputs: &crate::model::CurrentCompilerInputUse,
 ) -> Result<()> {
     let id = inputs.artifact_id()?;
-    if let Some(old) = s.get::<serde_json::Value>(ctx, "artifact", &id).await? {
-        if crate::formal_authority::content_digest(&old)?
+    if let Some(old) = s.get::<serde_json::Value>(ctx, "artifact", &id).await?
+        && crate::formal_authority::content_digest(&old)?
             != crate::formal_authority::content_digest(inputs)?
-        {
-            return Err(Error::Conflict("compiler use was changed".into()));
-        }
-    } else {
-        s.put(ctx, "artifact", &id, ctx.actor(), inputs).await?;
-        for node in &inputs.binding.closure.nodes {
-            s.put_edge(ctx, "artifact", &id, &node.kind, &node.id)
-                .await?;
-        }
+    {
+        return Err(Error::Conflict("compiler use was changed".into()));
     }
     fact.dependencies.push(dependency("artifact", id));
     fact.dependencies
         .sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
     fact.dependencies
         .dedup_by(|a, b| a.kind == b.kind && a.id == b.id);
+    Ok(())
+}
+async fn persist_fact_current_material(
+    s: &mut Session,
+    ctx: &Context,
+    fact: &StageFact,
+    inputs: Option<&crate::model::CurrentCompilerInputUse>,
+) -> Result<()> {
+    if let Some(inputs) = inputs {
+        let id = inputs.artifact_id()?;
+        if s.get::<serde_json::Value>(ctx, "artifact", &id)
+            .await?
+            .is_none()
+        {
+            s.put(ctx, "artifact", &id, ctx.actor(), inputs).await?;
+            for node in &inputs.binding.closure.nodes {
+                s.put_edge(ctx, "artifact", &id, &node.kind, &node.id)
+                    .await?;
+            }
+        }
+    }
+    if fact.kind == StageFactKind::EditCompiled {
+        let request = serde_json::from_value(fact.payload["compiler_request"].clone())
+            .map_err(|_| Error::Forbidden)?;
+        let bundle =
+            serde_json::from_value(fact.payload["bundle"].clone()).map_err(|_| Error::Internal)?;
+        persist_authenticated_bundle_boxed(s, ctx, &request, &bundle).await?;
+    }
     Ok(())
 }
 async fn verify_fact_compiler_use(
@@ -1252,7 +1273,7 @@ impl StoreOptimizationJournal {
         let mut session = self.store.session().await?;
         if let Some(inputs) = inputs {
             verify_compiler_use_boxed(inputs, &mut session, &self.context).await?;
-            attach_fact_compiler_use(&mut session, &self.context, &mut fact, inputs).await?;
+            prepare_fact_compiler_use(&mut session, &self.context, &mut fact, inputs).await?;
         }
         validate_live_fact(&mut session, &self.context, &fact, inputs).await?;
         if let Some(old) = session
@@ -1263,6 +1284,7 @@ impl StoreOptimizationJournal {
             if fingerprint(&old)? != fingerprint(&fact)? {
                 return Err(Error::Conflict("prepared claim differs".into()));
             }
+            persist_fact_current_material(&mut session, &self.context, &fact, inputs).await?;
             session.commit().await?;
             return Ok(false);
         }
@@ -1279,6 +1301,7 @@ impl StoreOptimizationJournal {
         {
             return Err(Error::Conflict("prepared subject missing".into()));
         }
+        persist_fact_current_material(&mut session, &self.context, &fact, inputs).await?;
         session
             .put(
                 &self.context,
@@ -1413,7 +1436,7 @@ impl StoreOptimizationJournal {
             }
             // Only a reverified Current use can be created here. The revoked
             // branch above commits the redacted observation without its raw use.
-            attach_fact_compiler_use(&mut session, &self.context, &mut fact, inputs).await?;
+            prepare_fact_compiler_use(&mut session, &self.context, &mut fact, inputs).await?;
         }
         validate_live_fact(&mut session, &self.context, &fact, inputs).await?;
         if session
@@ -1429,6 +1452,7 @@ impl StoreOptimizationJournal {
             if fingerprint(&old)? != fingerprint(&fact)? {
                 return Err(Error::Conflict("cached stage payload differs".into()));
             }
+            persist_fact_current_material(&mut session, &self.context, &fact, inputs).await?;
             session.commit().await?;
             return Ok(());
         }
@@ -1440,6 +1464,7 @@ impl StoreOptimizationJournal {
             if fingerprint(&old)? != fingerprint(&fact)? {
                 return Err(Error::Conflict("immutable stage differs".into()));
             }
+            persist_fact_current_material(&mut session, &self.context, &fact, inputs).await?;
             session.commit().await?;
             return Ok(());
         }
@@ -1455,6 +1480,7 @@ impl StoreOptimizationJournal {
         {
             return self.commit_redacted(session, &fact).await;
         }
+        persist_fact_current_material(&mut session, &self.context, &fact, inputs).await?;
         session
             .put(
                 &self.context,
@@ -3691,6 +3717,29 @@ async fn validate_live_fact_unboxed(
             ));
         }
     }
+    for dependency in &fact.dependencies {
+        if !matches!(
+            dependency.kind.as_str(),
+            "artifact"
+                | "run"
+                | "release"
+                | "formal_parent"
+                | "pointer"
+                | "receipt"
+                | "bundle"
+                | "environment"
+                | "revoke_watermark"
+                | "execution"
+                | "grader"
+                | "model_receipt"
+        ) {
+            return Err(Error::Conflict("unsupported stage dependency kind".into()));
+        }
+    }
+    if let Some(value) = fact.payload.get("compiler_binding") {
+        let _: crate::formal_authority::CurrentFormalCompilerInputBinding =
+            serde_json::from_value(value.clone()).map_err(|_| Error::Forbidden)?;
+    }
     if fact.kind == StageFactKind::StepPrepared && fact.payload.get("compiler_request").is_some() {
         let request: crate::formal_authority::CompilerInputRequest =
             serde_json::from_value(fact.payload["compiler_request"].clone())
@@ -3734,7 +3783,10 @@ async fn validate_live_fact_unboxed(
                 "edit fact compiler binding changed before commit".into(),
             ));
         }
-        persist_authenticated_bundle_boxed(session, context, &request, &bundle).await?;
+        Box::pin(crate::compiler::preflight_current_authenticated_bundle(
+            session, context, &request, &bundle,
+        ))
+        .await?;
     }
     // Raw late receipts preserve billing/audit truth; every consumer still checks their watermark.
     // What such a receipt holds of a revoked source's answer is not kept: `commit` stores

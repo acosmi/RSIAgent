@@ -623,16 +623,17 @@ async fn request_ticket(fixture: &Fixture) -> evo_core::Result<EvaluationTicketV
         },
     )
     .await
-    .map(|ticket| {
+    .inspect(|ticket| {
         let _ = fixture.resolved_ticket_id.set(ticket.id.clone());
-        ticket
     })
 }
 
 async fn issue(fixture: &Fixture, bound: bool) {
     if !bound {
         assert_issue_refused_without_candidate(fixture).await;
-        trusted_compiler_inputs::assert_frozen_issuer_static_read("early-legacy").await.unwrap();
+        trusted_compiler_inputs::assert_frozen_issuer_static_read("early-legacy")
+            .await
+            .unwrap();
     }
     stage_candidate(fixture).await;
     let ticket = request_ticket(fixture).await.unwrap();
@@ -1459,8 +1460,16 @@ async fn critical_anchor_k0_keeps_empty_prefix_with_enabled_or_disabled_statisti
 
 #[tokio::test]
 async fn absent_candidate_binding_preserves_legacy_early_report_interpretation() {
-    trusted_compiler_inputs::assert_frozen_issuer_static_read("early-legacy").await.unwrap();
-    single_report_field("legacy-matrix-migrated-current", RegisteredEvaluationControl::SCHEMA_V1, "ucb", json!("0")).await;
+    trusted_compiler_inputs::assert_frozen_issuer_static_read("early-legacy")
+        .await
+        .unwrap();
+    single_report_field(
+        "legacy-matrix-migrated-current",
+        RegisteredEvaluationControl::SCHEMA_V1,
+        "ucb",
+        json!("0"),
+    )
+    .await;
 }
 
 #[tokio::test]

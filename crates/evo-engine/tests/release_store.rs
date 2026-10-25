@@ -11,9 +11,10 @@ use evo_core::optimization::{OptimizationTrace, TraceOutcome};
 use evo_core::{Context, Error, Role, Strategy, hash};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::release_store::{
-    AppliedRequestMaterial, HostSurfaceRecord, HostSurfaceRecordV2, PersistentRelease,
-    PersistentReleaseState, PrepareRunRequest, CurrentReleaseCandidateRecord as ReleaseCandidateRecord, ReleaseStore,
-    RunApplicationSnapshot, CurrentStageBundleRequest as StageBundleRequest, TrustedHostExecutionEvidence, TypedSourceRef,
+    AppliedRequestMaterial, CurrentReleaseCandidateRecord as ReleaseCandidateRecord,
+    CurrentStageBundleRequest as StageBundleRequest, HostSurfaceRecord, HostSurfaceRecordV2,
+    PersistentRelease, PersistentReleaseState, PrepareRunRequest, ReleaseStore,
+    RunApplicationSnapshot, TrustedHostExecutionEvidence, TypedSourceRef,
 };
 use evo_storage::Store;
 use std::collections::BTreeSet;
@@ -1160,25 +1161,78 @@ async fn legacy_baseline_reload_and_replay_cannot_authorize_new_applied_request(
 async fn current_diagnostic_stage_and_unapproved_rollback_bind_exact_history() {
     let (_directory, store) = database().await;
     let (_host, proposer, sources) = setup_sources(&store, "n").await;
-    let request = StageBundleRequest { candidate_id: "current-diagnostic-history".into(),
-        bundle: bundle("p1", "complete Current diagnostic candidate"), environment_digest: system("p1").digest().unwrap(),
-        proposer_actor: proposer.actor().into(), sources, revoke_watermark: 1 };
-    let staged = ReleaseStore::stage_current_bundle(&proposer, &store, request.clone()).await.unwrap();
+    let request = StageBundleRequest {
+        candidate_id: "current-diagnostic-history".into(),
+        bundle: bundle("p1", "complete Current diagnostic candidate"),
+        environment_digest: system("p1").digest().unwrap(),
+        proposer_actor: proposer.actor().into(),
+        sources,
+        revoke_watermark: 1,
+    };
+    let staged = ReleaseStore::stage_current_bundle(&proposer, &store, request.clone())
+        .await
+        .unwrap();
     let mut session = store.session().await.unwrap();
-    let loaded: evo_engine::release_store::ReadCandidate = session.need(&proposer, "artifact", &staged.id).await.unwrap();
-    assert_eq!(serde_json::to_vec(&loaded).unwrap(), serde_json::to_vec(&staged).unwrap());
-    let original = session.list::<serde_json::Value>(&proposer, "artifact").await.unwrap();
+    let loaded: evo_engine::release_store::ReadCandidate = session
+        .need(&proposer, "artifact", &staged.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&loaded).unwrap(),
+        serde_json::to_vec(&staged).unwrap()
+    );
+    let original = session
+        .list::<serde_json::Value>(&proposer, "artifact")
+        .await
+        .unwrap();
     session.commit().await.unwrap();
     let audit = store.verify_audit(&proposer).await.unwrap();
-    assert_eq!(serde_json::to_vec(&ReleaseStore::stage_current_bundle(&proposer, &store, request).await.unwrap()).unwrap(), serde_json::to_vec(&staged).unwrap());
+    assert_eq!(
+        serde_json::to_vec(
+            &ReleaseStore::stage_current_bundle(&proposer, &store, request)
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_vec(&staged).unwrap()
+    );
     let approver = ctx("n", "approver", Role::Admin);
-    assert!(matches!(ReleaseStore::approve_verified(&approver, &store, &staged.id, "missing-authenticated-report").await, Err(Error::NotFound)));
-    assert!(matches!(ReleaseStore::rollback(&approver, &store, "p1", "unapproved-history", 0, &staged.environment_digest).await,
-        Err(Error::Conflict(reason)) if reason == "profile has no active release"));
+    assert!(matches!(
+        ReleaseStore::approve_verified(
+            &approver,
+            &store,
+            &staged.id,
+            "missing-authenticated-report"
+        )
+        .await,
+        Err(Error::NotFound)
+    ));
+    assert!(
+        matches!(ReleaseStore::rollback(&approver, &store, "p1", "unapproved-history", 0, &staged.environment_digest).await,
+        Err(Error::Conflict(reason)) if reason == "profile has no active release")
+    );
     let mut session = store.session().await.unwrap();
-    assert_eq!(session.list::<serde_json::Value>(&proposer, "artifact").await.unwrap(), original);
-    assert!(session.list::<serde_json::Value>(&proposer, "release").await.unwrap().is_empty());
-    assert!(session.list::<serde_json::Value>(&proposer, "pointer").await.unwrap().is_empty());
+    assert_eq!(
+        session
+            .list::<serde_json::Value>(&proposer, "artifact")
+            .await
+            .unwrap(),
+        original
+    );
+    assert!(
+        session
+            .list::<serde_json::Value>(&proposer, "release")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        session
+            .list::<serde_json::Value>(&proposer, "pointer")
+            .await
+            .unwrap()
+            .is_empty()
+    );
     session.commit().await.unwrap();
     assert_eq!(store.verify_audit(&proposer).await.unwrap(), audit);
     store.close().await;

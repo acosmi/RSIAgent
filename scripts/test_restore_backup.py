@@ -623,12 +623,25 @@ class RestoreTests(unittest.TestCase):
 
     def test_current_host_raw_precision_refusal_preserves_old_restore_bytes(self):
         scenario=Scenario(self,CURRENT)
-        # Raw decoder controls only. These records do not establish Host authority.
+        # Complete reviewed source/manifest/extraction, with the exact typed
+        # field order that the Rust producer fingerprints. This grants no role.
+        declaration={"name":"option","value_type":"object","enum_values":[],"default":{"kind":"value","value":{"decimal":0.1}}}
+        original=json.dumps({"schema_version":"rsia.host_reviewed_declarations.v1","host":"restore-host","host_version":"1","declarations":[declaration]},separators=(",",":"))
+        source={"schema_version":"rsia.host_source_envelope.v1","source_kind":"reviewed_fixture","source_schema":"rsia.host_reviewed_declarations.v1","extractor_version":"rsia.host_reviewed_declarations.extractor.v1","original_utf8":original}
+        encoded=lambda v:json.dumps(v,ensure_ascii=False,separators=(",",":"))
+        digest=lambda v:sha256_text(encoded(v))
+        item={"name":"option","coverage":"unsupported","mapped_field":None,"consumer":None,"reason":"restore content control","renamed_from":None,"test_ref":None,"capability":None,
+            "value_type":"object","enum_values":[],"default":declaration["default"]}
+        manifest={"schema_version":"rsia.host_surface.v2","host":"restore-host","host_version":"1","adapter_version":"1","source_kind":"reviewed_fixture",
+            "source_schema":source["source_schema"],"extractor_version":source["extractor_version"],"source_envelope_digest":digest(source),"source_digest":sha256_text(original),"items":[item],"retired":[]}
+        body={"id":"host-new","schema_version":"rsia.host_surface_record.v2","manifest":manifest,"manifest_digest":digest(manifest),"source":source,
+            "extracted":["option"],"extracted_typed":[declaration],"predecessor_surface_id":None,
+            "upgrade_diff":{key:["option"] if key=="added" else [] for key in ("added","removed","renamed","type_changed","enum_changed","default_changed","mapping_changed","legacy_untyped")}}
+        current=encoded(body)
         legacy='{"id":"host-old","schema_version":"rsia.host_surface_record.v1","default":{"kind":"value","value":0.100000000000000001}}'
-        current='{"id":"host-new","schema_version":"rsia.host_surface_record.v2","default":{"kind":"value","value":0.1}}'
         con=connect(scenario.history)
-        for identity,body in (("host-old",legacy),("host-new",current)):
-            con.execute("INSERT INTO objects(namespace,kind,id,owner,body) VALUES('legacy-a','artifact',?,'admin',?)",(identity,body))
+        for identity,raw in (("host-old",legacy),("host-new",current)):
+            con.execute("INSERT INTO objects(namespace,kind,id,owner,body) VALUES('legacy-a','artifact',?,'admin',?)",(identity,raw))
         con.close()
         anchor=scenario.anchor()
         backup=scenario.backup("healthy-host-raw")
@@ -639,17 +652,31 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(con.execute("SELECT body FROM objects WHERE id='host-new'").fetchone()[0],current)
         con.close()
         before_anchor=database_image(anchor)
-        damaged=current.replace("0.1}","0.100000000000000001}")
-        self.assertNotEqual(damaged,current)
-        con=connect(scenario.history)
-        con.execute("UPDATE objects SET body=? WHERE id='host-new'",(damaged,))
-        con.close()
-        changed=scenario.backup("precision-host")
-        before_backup=database_image(changed / "rsia.sqlite3")
-        dest,result=scenario.restore(changed,anchor,"refused-host-restore")
-        self.assert_isolated(scenario,dest,result,"invalid current host raw JSON")
-        self.assertEqual(database_image(anchor),before_anchor)
-        self.assertEqual(database_image(changed / "rsia.sqlite3"),before_backup)
+        escaped_duplicate=original.replace('"decimal":0.1','"decimal":0.1,"\\u0064ecimal":0.1')
+        with self.assertRaisesRegex(restore.IsolationError,"duplicate JSON object key"):
+            restore.read_host_json_tokens(escaped_duplicate)
+        faults={"outer-precision":current.replace('"decimal":0.1','"decimal":0.100000000000000001',1)}
+        for fault,raw_source in {
+            "source-precision":original.replace("0.1","0.100000000000000001"),
+            "source-escaped-key":original.replace('"decimal":0.1','"decimal":0.1,"\\u0064ecimal":0.1'),
+            "source-mismatch":original.replace("0.1","0.2"),
+            "source-resource":original.replace("0.1","["*257+"0"+"]"*257),
+        }.items():
+            changed=json.loads(current);changed["source"]["original_utf8"]=raw_source;faults[fault]=encoded(changed)
+        wrong=json.loads(current);wrong["id"]="another-physical-id"
+        with self.assertRaisesRegex(restore.IsolationError,"invalid current host raw JSON"):
+            restore.read_current_host_raw(encoded(wrong),"legacy-a","artifact","host-new")
+        for fault,damaged in faults.items():
+            with self.subTest(fault=fault):
+                self.assertNotEqual(damaged,current)
+                con=connect(scenario.history)
+                con.execute("UPDATE objects SET body=? WHERE id='host-new'",(damaged,));con.close()
+                changed=scenario.backup("damaged-host-"+fault)
+                before_backup=database_image(changed / "rsia.sqlite3")
+                dest,result=scenario.restore(changed,anchor,"refused-host-"+fault)
+                self.assert_isolated(scenario,dest,result,"invalid current host raw JSON")
+                self.assertEqual(database_image(anchor),before_anchor)
+                self.assertEqual(database_image(changed / "rsia.sqlite3"),before_backup)
 
 
 if __name__ == "__main__":

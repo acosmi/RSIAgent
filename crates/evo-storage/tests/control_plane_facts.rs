@@ -878,29 +878,53 @@ async fn current_host_restore_precision_fault_is_zero_write() {
     session.commit().await.unwrap();
     store.close().await;
     read_control_plane_facts(&path).await.unwrap();
-    let damaged = raw.replacen("\"decimal\":0.1", "\"decimal\":0.100000000000000001", 1);
-    assert_ne!(damaged, raw);
-    let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
-        .filename(&path)
-        .create_if_missing(false)
-        .disable_statement_logging()
-        .connect()
-        .await
-        .unwrap();
-    sqlx::query(
-        "UPDATE objects SET body=? WHERE namespace='n' AND kind='artifact' AND id='host-current'",
-    )
-    .bind(&damaged)
-    .execute(&mut connection)
-    .await
-    .unwrap();
-    connection.close().await.unwrap();
-    let before = snapshot(dir.path());
-    assert!(matches!(read_control_plane_facts(&path).await,
-        Err(evo_core::Error::Invalid(message)) if message=="object n/artifact/host-current has an unreadable body: invalid reviewed host source/default"));
-    assert_eq!(snapshot(dir.path()), before);
-    let after = compiler_cleanup_bodies(&path).await;
-    assert_eq!(after["host-current"], damaged);
+    let mut faults = vec![(
+        "outer",
+        raw.replacen("\"decimal\":0.1", "\"decimal\":0.100000000000000001", 1),
+    )];
+    for (name, original) in [
+        (
+            "source-precision",
+            source.original_utf8.replace("0.1", "0.100000000000000001"),
+        ),
+        (
+            "source-duplicate",
+            source
+                .original_utf8
+                .replace("\"decimal\":0.1", "\"decimal\":0.1,\"\\u0064ecimal\":0.1"),
+        ),
+        (
+            "source-mismatch",
+            source.original_utf8.replace("0.1", "0.2"),
+        ),
+        ("source-resource", source.original_utf8.replace("0.1", &("[".repeat(257)+"0"+&"]".repeat(257)))),
+    ] {
+        let mut changed = body.clone();
+        changed["source"]["original_utf8"] = json!(original);
+        faults.push((name, serde_json::to_string(&changed).unwrap()));
+    }
+    for (name, damaged) in faults {
+        assert_ne!(damaged, raw, "{name}");
+        let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(false)
+            .disable_statement_logging()
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objects SET body=? WHERE namespace='n' AND kind='artifact' AND id='host-current'")
+            .bind(&damaged).execute(&mut connection).await.unwrap();
+        connection.close().await.unwrap();
+        let before = snapshot(dir.path());
+        let expected = if name == "source-resource" {
+            "object n/artifact/host-current has an unreadable body: reviewed host JSON resource limit: depth"
+        } else { "object n/artifact/host-current has an unreadable body: invalid reviewed host source/default" };
+        assert!(matches!(read_control_plane_facts(&path).await,
+            Err(evo_core::Error::Invalid(message)) if message == expected), "{name}");
+        assert_eq!(snapshot(dir.path()), before, "{name}");
+        let after = compiler_cleanup_bodies(&path).await;
+        assert_eq!(after["host-current"], damaged, "{name}");
+    }
 }
 
 #[test]
