@@ -1170,8 +1170,11 @@ pub fn replay_economic_report_lineage(report_id: &str) -> Option<Vec<EconomicRep
 pub struct EconomicClusterRowV2 {
     pub cluster_id: String,
     pub unit_count: u32,
-    /// Mean paired difference in score micros, rounded toward negative infinity
-    /// (exact for a cluster of one unit, which is what a registered manifest has).
+    /// Mean paired difference in score micros, rounded toward negative infinity.
+    /// It is exact for a cluster of one unit, and in a report that passes
+    /// [`ReplayEconomicReportV2::validate_against`] every cluster has exactly one:
+    /// the registered manifest gives each task its own cluster, and that judge
+    /// refuses a repeated unit ordinal or unit id.
     pub mean_delta_micros: i64,
     pub weight: u32,
 }
@@ -1355,10 +1358,20 @@ impl ReplayEconomicReportV2 {
     /// negative one (critical capabilities kept) needs the cluster UCB below
     /// `-noninferiority_margin_micros` (plan §3.4 Q-57: a low LCB is no regression).
     /// Without a defined bound no such claim holds.
+    ///
+    /// Two checks v1 does not make: a schema other than v2 gets an error of its
+    /// own, apart from a report that differs from its experiment (plan §5.1.1
+    /// item 3); and each planned task has at most one unit, so a repeated unit
+    /// ordinal or unit id is a conflict and every cluster row holds exactly one
+    /// unit (plan §3.4: independence that is not shown fails closed).
     pub fn validate_against(&self, experiment: &ReplayEconomicExperimentV1) -> Result<()> {
+        if self.schema_version != REPORT_SCHEMA_V2 {
+            return Err(Error::Conflict(
+                "economic report schema_version is not the v2 report schema".into(),
+            ));
+        }
         experiment.validate()?;
-        if self.schema_version != REPORT_SCHEMA_V2
-            || self.experiment_id != experiment.id
+        if self.experiment_id != experiment.id
             || self.experiment_digest != experiment.digest()?
             || self.paired_ticket_id != experiment.paired_ticket_id
             || self.paired_ticket_digest != experiment.paired_ticket_digest
@@ -1389,6 +1402,22 @@ impl ReplayEconomicReportV2 {
         }
         for unit in &self.paired_units {
             unit.validate_against(experiment)?;
+        }
+        // One unit per planned task. A repeated ordinal would be merged into the
+        // cluster of its task and stand in for a task without a unit.
+        let mut ordinals = BTreeSet::new();
+        let mut unit_ids = BTreeSet::new();
+        for unit in &self.paired_units {
+            if !ordinals.insert(unit.ordinal) {
+                return Err(Error::Conflict(
+                    "paired unit ordinal repeats in the economic report".into(),
+                ));
+            }
+            if !unit_ids.insert(unit.id.as_str()) {
+                return Err(Error::Conflict(
+                    "paired unit id repeats in the economic report".into(),
+                ));
+            }
         }
         if self.paired_units.is_empty() {
             if self.latency.is_some() {

@@ -842,7 +842,132 @@ fn report_versions_get_distinct_ids_and_a_derivable_lineage() {
     relabelled.schema_version = REPORT_SCHEMA.into();
     assert_eq!(
         conflict(relabelled.validate_against(&experiment)),
-        "economic report differs from preregistered paired experiment"
+        "economic report schema_version is not the v2 report schema"
     );
     assert!(economic_report_is_not_formal(&relabelled).is_err());
+}
+
+/// Review I-2 (plan §3.4: the bound needs independent clusters, and independence
+/// that is not shown fails closed). Unit 400 replaced by a copy of unit 1: the copy
+/// would be merged into cluster-1 as its second unit, task 400 would have no unit,
+/// and the count of 400 units would still claim the complete experiment. The v2
+/// judge refuses the repeat instead of judging the merged clusters.
+#[test]
+fn a_repeated_unit_is_refused_not_merged_into_its_cluster() {
+    let experiment = experiment_with_tasks(400, EconomicClaim::QualityGain);
+    let honest = units_with_deltas(&experiment, &[100_000; 400]);
+    v2_report(
+        &experiment,
+        honest.clone(),
+        PairedQualityOutcome::PassedGain,
+        EconomicReportTerminal::CompletePositive,
+    )
+    .validate_against(&experiment)
+    .unwrap();
+
+    let mut repeated = honest;
+    repeated[399] = repeated[0].clone();
+    let report = v2_report(
+        &experiment,
+        repeated,
+        PairedQualityOutcome::PassedGain,
+        EconomicReportTerminal::CompletePositive,
+    );
+    // The rows these units give: 399 clusters, cluster-1 with two units and none
+    // for task 400, under a count of 400 completed tasks, with a bound that would
+    // still reach the gain.
+    assert_eq!(report.completed_paired_tasks, 400);
+    assert_eq!(report.quality_statistics.n, 399);
+    assert_eq!(report.cluster_rows.len(), 399);
+    assert!(report.cluster_rows.contains(&row("cluster-1", 2, 100_000)));
+    assert!(
+        !report
+            .cluster_rows
+            .iter()
+            .any(|cluster| cluster.cluster_id == "cluster-400")
+    );
+    assert!(report.quality_statistics.lcb_micros.unwrap() >= i64::from(experiment.min_gain_micros));
+    assert_eq!(
+        conflict(report.validate_against(&experiment)),
+        "paired unit ordinal repeats in the economic report"
+    );
+}
+
+/// Each repeat has an error of its own: the ordinal of unit 1 under a fresh unit id
+/// (unit ids are free identifiers, not derived from the unit), and the id of unit 1
+/// on unit 400 (no cluster is merged, but one id names two units).
+#[test]
+fn a_repeated_ordinal_and_a_repeated_unit_id_are_told_apart() {
+    let experiment = experiment_with_tasks(400, EconomicClaim::QualityGain);
+    let units = units_with_deltas(&experiment, &[100_000; 400]);
+    let mut same_ordinal = units.clone();
+    same_ordinal[399] = ReplayEconomicUnitReceiptV1 {
+        id: "unit-1-again".into(),
+        ..units[0].clone()
+    };
+    let ids: std::collections::BTreeSet<&str> =
+        same_ordinal.iter().map(|unit| unit.id.as_str()).collect();
+    assert_eq!(ids.len(), 400);
+    assert_eq!(
+        conflict(
+            v2_report(
+                &experiment,
+                same_ordinal,
+                PairedQualityOutcome::PassedGain,
+                EconomicReportTerminal::CompletePositive,
+            )
+            .validate_against(&experiment)
+        ),
+        "paired unit ordinal repeats in the economic report"
+    );
+
+    let mut same_id = units;
+    same_id[399].id = same_id[0].id.clone();
+    let report = v2_report(
+        &experiment,
+        same_id,
+        PairedQualityOutcome::PassedGain,
+        EconomicReportTerminal::CompletePositive,
+    );
+    assert_eq!(report.cluster_rows.len(), 400);
+    assert!(
+        report
+            .cluster_rows
+            .iter()
+            .all(|cluster| cluster.unit_count == 1)
+    );
+    assert_eq!(
+        conflict(report.validate_against(&experiment)),
+        "paired unit id repeats in the economic report"
+    );
+}
+
+/// Review S-6 (plan §5.1.1 item 3: different causes do not share one error). A
+/// report under a schema other than v2 is refused for its schema, with an error
+/// apart from the one of a report that differs from its preregistered experiment.
+#[test]
+fn a_schema_other_than_v2_has_its_own_error() {
+    let experiment = experiment_with_tasks(2, EconomicClaim::QualityGain);
+    let report = v2_report(
+        &experiment,
+        units_with_deltas(&experiment, &[0, 0]),
+        PairedQualityOutcome::ZeroOrInconclusive,
+        EconomicReportTerminal::CompleteZeroOrInconclusive,
+    );
+    report.validate_against(&experiment).unwrap();
+    for schema in ["rsia.replay_economic_report.v9", REPORT_SCHEMA] {
+        let mut relabelled = report.clone();
+        relabelled.schema_version = schema.into();
+        assert_eq!(
+            conflict(relabelled.validate_against(&experiment)),
+            "economic report schema_version is not the v2 report schema",
+            "{schema}"
+        );
+    }
+    let mut elsewhere = report;
+    elsewhere.experiment_id = "economic-exp-2".into();
+    assert_eq!(
+        conflict(elsewhere.validate_against(&experiment)),
+        "economic report differs from preregistered paired experiment"
+    );
 }
