@@ -1068,3 +1068,37 @@ pub async fn assert_frozen_issuer_static_read(key: &str) -> Result<()> {
     store.close().await;
     Ok(())
 }
+
+// Explicitly derived portable legacy templates. The source snapshot hashes,
+// field locator rules and derived table hashes are part of the fixture. These
+// rows carry historical software facts; they never authenticate a new writer.
+pub async fn restore_legacy_external_history(path: &std::path::Path, phase: &str) -> Result<serde_json::Value> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("../fixtures/ag135b_legacy_external_host.json")).map_err(|_| Error::Internal)?;
+    let dataset = fixture["datasets"].get(phase).ok_or(Error::NotFound)?.clone();
+    if evo_core::canonical_fingerprint(&dataset["tables"])? != dataset["derived_tables_sha256"].as_str().ok_or(Error::Internal)? {
+        return Err(Error::Conflict("portable legacy table digest differs".into()));
+    }
+    let script = r#"
+import json,sqlite3,sys
+snapshot=json.load(sys.stdin)
+con=sqlite3.connect(sys.argv[1])
+con.execute('PRAGMA foreign_keys=OFF')
+con.execute('BEGIN IMMEDIATE')
+quote=lambda name:'"'+name.replace('"','""')+'"'
+for table in snapshot['tables']:con.execute('DELETE FROM '+quote(table))
+for table,data in snapshot['tables'].items():
+    sql='INSERT INTO '+quote(table)+'('+','.join(map(quote,data['columns']))+') VALUES('+','.join('?' for _ in data['columns'])+')'
+    con.executemany(sql,data['rows'])
+con.commit()
+assert con.execute('PRAGMA integrity_check').fetchall()==[('ok',)]
+assert con.execute('PRAGMA foreign_key_check').fetchall()==[]
+con.close()
+"#;
+    let mut child = Command::new("python3").args(["-B", "-c", script]).arg(path).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|_| Error::Internal)?;
+    child.stdin.take().ok_or(Error::Internal)?.write_all(&serde_json::to_vec(&dataset).map_err(|_| Error::Internal)?).map_err(|_| Error::Internal)?;
+    let result = child.wait_with_output().map_err(|_| Error::Internal)?;
+    if !result.status.success() { return Err(Error::Conflict(format!("portable legacy import failed: {}", String::from_utf8_lossy(&result.stderr)))); }
+    Ok(dataset["metadata"].clone())
+}

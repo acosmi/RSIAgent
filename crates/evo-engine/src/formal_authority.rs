@@ -4756,13 +4756,36 @@ pub(crate) async fn capture_independent_grade(
     .await?;
     Ok(())
 }
-pub(crate) async fn issue_complete_authority_in_session(
+// Read-only facts: this value grants no principal/session authority and is
+// constructed only by the same receipt, capture, graph and cost validators used
+// by issuance below. No current-process authentication is inferred from it.
+struct CompleteAuthorityMaterial {
+    candidate: crate::release_store::ReadCandidate,
+    inputs: ReadVerifiedInputs,
+    host: RegisteredFormalHost,
+    set: RegisteredPrincipalSet,
+    seal: evo_storage::budget::SealedRootBudgetEvidence,
+    cost: EpisodeCostRecord,
+    provider_captures: Vec<TypedContentRef>,
+    grader_captures: Vec<TypedContentRef>,
+    roots: Vec<(String, String)>,
+}
+
+pub(crate) async fn preflight_complete_authority_in_session(
+    s: &mut Session, ctx: &Context,
+    ticket: &crate::streaming_evaluator::ReadEvaluationTicket,
+    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
+) -> Result<()> {
+    complete_authority_material_in_session(s, ctx, ticket, control).await?;
+    Ok(())
+}
+
+async fn complete_authority_material_in_session(
     s: &mut Session,
     ctx: &Context,
     ticket: &crate::streaming_evaluator::ReadEvaluationTicket,
     control: &crate::streaming_evaluator::RegisteredEvaluationControl,
-    formal: &crate::streaming_evaluator::FormalEvaluationV2,
-) -> Result<()> {
+) -> Result<CompleteAuthorityMaterial> {
     ctx.require(&[Role::Evaluator])?;
     if control.evidence_scope
         != crate::streaming_evaluator::EvaluationEvidenceScope::RegisteredExternalHost
@@ -4771,7 +4794,6 @@ pub(crate) async fn issue_complete_authority_in_session(
     }
     let candidate: crate::release_store::ReadCandidate =
         s.need(ctx, "artifact", &ticket.candidate_digest).await?;
-    candidate.current()?;
     let inputs = resolve_read_bundle_in_session(
         s,
         ctx,
@@ -4791,26 +4813,6 @@ pub(crate) async fn issue_complete_authority_in_session(
     .await?;
     host.validate(ctx)?;
     let set = verify_read_candidate_principals(s, ctx, &host.id, &candidate, control).await?;
-    process_principal(ctx, &host, &set, Role::Evaluator)?;
-    let report_storage_id =
-        crate::streaming_evaluator::storage_id("formal_evaluation_v2", &ticket.id)?;
-    record_grader_action(
-        s,
-        ctx,
-        &host,
-        "artifact",
-        &report_storage_id,
-        formal,
-        "issue_report",
-    )
-    .await?;
-    let report_principal_action_id =
-        principal_action_id("artifact", &report_storage_id, Role::Evaluator)?;
-    let observed = crate::executor::observe_registered_process(
-        host.grader_uid,
-        &host.grader_code_digest,
-        &host.grader_workspace,
-    )?;
     let seal = s
         .sealed_root_budget_evidence(ctx, &control.billing_scope)
         .await?
@@ -4853,31 +4855,7 @@ pub(crate) async fn issue_complete_authority_in_session(
         &cost.measurement_sources,
     )
     .await?;
-    let mut roots = vec![
-        ("artifact".into(), candidate.id.clone()),
-        ("artifact".into(), cost.id.clone()),
-        (
-            "artifact".into(),
-            crate::streaming_evaluator::storage_id("formal_evaluation_v2", &ticket.id)?,
-        ),
-        (
-            "artifact".into(),
-            crate::streaming_evaluator::storage_id("evaluation_ticket_v2", &ticket.id)?,
-        ),
-        (
-            "artifact".into(),
-            crate::streaming_evaluator::storage_id(
-                "registered_evaluation_control_v41",
-                &ticket.registration_id,
-            )?,
-        ),
-        (
-            "artifact".into(),
-            crate::streaming_evaluator::storage_id("protected_holdout_v41", &ticket.holdout_id)?,
-        ),
-        ("artifact".into(), set.id.clone()),
-        ("artifact".into(), report_principal_action_id.clone()),
-    ];
+    let mut roots = Vec::new();
     for target in &ticket.targets {
         let crate::streaming_evaluator::TargetState::Completed {
             candidate_receipt_id,
@@ -4980,7 +4958,6 @@ pub(crate) async fn issue_complete_authority_in_session(
                     )?)?
                 || capture.host_registration_id != host.id
                 || capture.host_uid != host.host_uid
-                || capture.host_pid == observed.pid
                 || capture.host_principal != host.host_principal
                 || capture.host_code_digest != host.code_digest
                 || capture.host_workspace != host.host_workspace
@@ -5047,6 +5024,17 @@ pub(crate) async fn issue_complete_authority_in_session(
         {
             return Err(Error::Forbidden);
         }
+        // The original independent grader capture is a persisted fact. A read
+        // checks that fact against both provider processes, without impersonating
+        // a currently running registered grader.
+        for receipt_id in [candidate_receipt_id, baseline_receipt_id] {
+            let receipt: crate::streaming_evaluator::ExecutionReceiptV2 =
+                crate::streaming_evaluator::need_record(s, ctx, "execution_receipt_v2", receipt_id).await?;
+            let call = s.budget_call(ctx, &control.billing_scope, &receipt.budget_call_id).await?.ok_or(Error::NotFound)?;
+            let capture_id = format!("formal-capture-{}", &hash(call.dispatch_id.as_ref().ok_or(Error::NotFound)?.as_bytes())[..32]);
+            let capture: FormalProviderCaptureRecord = attested_read(s, ctx, "artifact", &capture_id, Role::Host).await?;
+            if capture.host_pid == grade.grader_pid { return Err(Error::Forbidden); }
+        }
         grader_captures.push(TypedContentRef {
             kind: "artifact".into(),
             id: grade_id.clone(),
@@ -5062,6 +5050,70 @@ pub(crate) async fn issue_complete_authority_in_session(
             )?,
         ));
     }
+    Ok(CompleteAuthorityMaterial { candidate, inputs, host, set, seal, cost, provider_captures, grader_captures, roots })
+}
+
+pub(crate) async fn issue_complete_authority_in_session(
+    s: &mut Session,
+    ctx: &Context,
+    ticket: &crate::streaming_evaluator::ReadEvaluationTicket,
+    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
+    formal: &crate::streaming_evaluator::FormalEvaluationV2,
+) -> Result<()> {
+    ctx.require(&[Role::Evaluator])?;
+    if control.evidence_scope
+        != crate::streaming_evaluator::EvaluationEvidenceScope::RegisteredExternalHost
+    {
+        return Err(Error::Forbidden);
+    }
+    let CompleteAuthorityMaterial { candidate, inputs, host, set, seal, cost, provider_captures, grader_captures, roots: mut capture_roots } =
+        complete_authority_material_in_session(s, ctx, ticket, control).await?;
+    candidate.current()?;
+    let observed = process_principal(ctx, &host, &set, Role::Evaluator)?;
+    for r in &provider_captures {
+        let capture: FormalProviderCaptureRecord = attested_read(s, ctx, &r.kind, &r.id, Role::Host).await?;
+        if capture.host_pid == observed.pid { return Err(Error::Forbidden); }
+    }
+    let report_storage_id =
+        crate::streaming_evaluator::storage_id("formal_evaluation_v2", &ticket.id)?;
+    record_grader_action(
+        s,
+        ctx,
+        &host,
+        "artifact",
+        &report_storage_id,
+        formal,
+        "issue_report",
+    )
+    .await?;
+    let report_principal_action_id =
+        principal_action_id("artifact", &report_storage_id, Role::Evaluator)?;
+    let mut roots = vec![
+        ("artifact".into(), candidate.id.clone()),
+        ("artifact".into(), cost.id.clone()),
+        (
+            "artifact".into(),
+            crate::streaming_evaluator::storage_id("formal_evaluation_v2", &ticket.id)?,
+        ),
+        (
+            "artifact".into(),
+            crate::streaming_evaluator::storage_id("evaluation_ticket_v2", &ticket.id)?,
+        ),
+        (
+            "artifact".into(),
+            crate::streaming_evaluator::storage_id(
+                "registered_evaluation_control_v41",
+                &ticket.registration_id,
+            )?,
+        ),
+        (
+            "artifact".into(),
+            crate::streaming_evaluator::storage_id("protected_holdout_v41", &ticket.holdout_id)?,
+        ),
+        ("artifact".into(), set.id.clone()),
+        ("artifact".into(), report_principal_action_id.clone()),
+    ];
+    roots.append(&mut capture_roots);
     let closure = read_typed_closure(s, ctx, &roots).await?;
     let record = ReadIssuedAuthority::from_parts(ReadIssuedAuthorityView {
         id: format!("formal-authority-{}", ticket.id),

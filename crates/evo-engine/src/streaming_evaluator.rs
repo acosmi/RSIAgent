@@ -1434,6 +1434,34 @@ pub struct VerifiedFormalReportView {
     pub ineligibility_reasons: Vec<String>,
 }
 
+/// Read-only provenance of the original report; no stored wire or authority
+/// capability is constructed by this carrier. Original legacy bytes remain in
+/// `VerifiedFormalReportView`, with a separate explicit consumption decision.
+#[derive(Debug, Clone)]
+pub struct VerifiedFormalReportReadV1 {
+    state: evo_storage::PersistentContractState,
+    original: VerifiedFormalReportView,
+}
+impl VerifiedFormalReportReadV1 {
+    pub const SCHEMA: &'static str = "rsia.verified_formal_report_read.v1";
+    pub fn state(&self) -> evo_storage::PersistentContractState { self.state }
+    pub fn historical_view(&self) -> &VerifiedFormalReportView { &self.original }
+    pub fn current_view(&self) -> Result<&VerifiedFormalReportView> {
+        if self.state != evo_storage::PersistentContractState::CurrentVerified {
+            return Err(Error::Conflict("source_legacy: formal report is not Current input".into()));
+        }
+        Ok(&self.original)
+    }
+    fn public_projection(&self) -> VerifiedFormalReportView {
+        let mut view = self.original.clone();
+        if self.state == evo_storage::PersistentContractState::Legacy {
+            view.promotion_eligible = false;
+            view.ineligibility_reasons.push("source_legacy".into());
+        }
+        view
+    }
+}
+
 /// Live-use gate shared by original start_execution and the registered bridge.
 /// Historical ticket-only views deliberately do not call this new-use gate.
 pub(crate) async fn live_task_candidate_in_session(
@@ -2670,7 +2698,6 @@ impl IndependentEvaluationControl {
                 "registered control digest differs from the frozen ticket".into(),
             ));
         }
-        ticket.require_current_new_use()?;
         let mut calls = Vec::new();
         let mut execution_content_pins = BTreeMap::new();
         let mut candidate_cost = 0i128;
@@ -2838,6 +2865,13 @@ impl IndependentEvaluationControl {
                 return Err(Error::Conflict(STATISTICS_CHANGED.into()));
             }
         }
+        if control.evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
+            crate::formal_authority::preflight_complete_authority_in_session(
+                &mut session, ctx, &latest, &latest_control,
+            ).await?;
+        }
+        // History retains its strict diagnostics. It cannot reach the first DML.
+        latest.require_current_new_use()?;
         session
             .stop_dispatch_group(
                 ctx,
@@ -3112,10 +3146,10 @@ impl IndependentEvaluationControl {
                 ..
             })
         ) {
-            let candidate = session
+            let candidate: ReadCandidate = session
                 .need(ctx, "artifact", &ticket.candidate_digest)
                 .await?;
-            crate::formal_authority::verify_issued_authority(
+            crate::formal_authority::verify_read_issued_authority(
                 &mut session,
                 ctx,
                 ticket_id,
@@ -3145,7 +3179,7 @@ pub async fn verified_report_view_in_session(
     report_id: &str,
 ) -> Result<VerifiedFormalReportView> {
     ctx.require(&[Role::Evaluator, Role::Admin])?;
-    verified_report_view_core(ctx, session, report_id).await
+    Ok(read_verified_formal_report_core(ctx, session, report_id).await?.public_projection())
 }
 
 pub(crate) async fn verified_report_view_for_host_in_session(
@@ -3154,14 +3188,21 @@ pub(crate) async fn verified_report_view_for_host_in_session(
     report_id: &str,
 ) -> Result<VerifiedFormalReportView> {
     ctx.require(&[Role::Host])?;
-    verified_report_view_core(ctx, session, report_id).await
+    Ok(read_verified_formal_report_core(ctx, session, report_id).await?.public_projection())
 }
 
-async fn verified_report_view_core(
+pub async fn read_verified_formal_report_in_session(
+    ctx: &Context, session: &mut Session, report_id: &str,
+) -> Result<VerifiedFormalReportReadV1> {
+    ctx.require(&[Role::Evaluator,Role::Admin])?;
+    read_verified_formal_report_core(ctx,session,report_id).await
+}
+
+async fn read_verified_formal_report_core(
     ctx: &Context,
     session: &mut Session,
     report_id: &str,
-) -> Result<VerifiedFormalReportView> {
+) -> Result<VerifiedFormalReportReadV1> {
     identifier(report_id)?;
     let ticket: ReadEvaluationTicket = need_record(session, ctx, TICKET_KIND, report_id).await?;
     let formal: FormalEvaluationV2 = need_record(session, ctx, FORMAL_KIND, report_id).await?;
@@ -3277,7 +3318,10 @@ async fn verified_report_view_core(
                 .retain(|reason| reason == "formal_verdict_not_approvable");
         }
     }
-    Ok(view)
+    let state=if ticket.schema_version == ReadEvaluationTicket::SCHEMA {
+        evo_storage::PersistentContractState::Legacy
+    } else { evo_storage::PersistentContractState::CurrentVerified };
+    Ok(VerifiedFormalReportReadV1 { state, original:view })
 }
 
 async fn validate_status_closure(
@@ -5424,6 +5468,14 @@ async fn bind_candidate_record_in_session(
         return Ok(None);
     };
     candidate.current()?;
+    Ok(Some(rebuild_candidate_binding_in_session(session,ctx,control,holdout,candidate).await?))
+}
+
+async fn rebuild_candidate_binding_in_session(
+    session: &mut Session, ctx: &Context, control: &RegisteredEvaluationControl,
+    holdout: &ProtectedHoldoutRecord, candidate: ReadCandidate,
+) -> Result<(ReadCandidate, FormalCandidateDependencyBinding)> {
+    candidate.validate_content()?;
     candidate_matches_frozen(&candidate, control, holdout)?;
     // Tombstones are checked before watermark/body/edge traversal, including
     // begin_revoke where the source body and all dependent objects still exist.
@@ -5472,7 +5524,14 @@ async fn bind_candidate_record_in_session(
         .await?,
     };
     binding.validate()?;
-    Ok(Some((candidate, binding)))
+    Ok((candidate, binding))
+}
+
+fn validate_ticket_candidate_versions(ticket: &ReadEvaluationTicket, candidate: &ReadCandidate) -> Result<()> {
+    match (ticket.schema_version.as_str(),candidate.is_current()) {
+        (ReadEvaluationTicket::SCHEMA,false)|(ReadEvaluationTicket::SCHEMA_V3,true) => Ok(()),
+        _ => Err(Error::Conflict("ticket/candidate versions do not form a supported pair".into())),
+    }
 }
 
 async fn validate_candidate_binding_in_session(
@@ -5492,6 +5551,7 @@ async fn validate_candidate_binding_in_session(
     if fingerprint(&candidate)? != binding.candidate_record_digest {
         return Err(Error::Conflict(CANDIDATE_CHANGED.into()));
     }
+    validate_ticket_candidate_versions(ticket, &candidate)?;
     for source in &binding.sources {
         if judge_dependency(ctx, session, &source.kind, &source.id)
             .await?
@@ -5509,9 +5569,7 @@ async fn validate_candidate_binding_in_session(
     {
         return Err(Error::Conflict(CANDIDATE_CHANGED.into()));
     }
-    let current = bind_candidate_record_in_session(session, ctx, control, holdout)
-        .await?
-        .ok_or_else(|| Error::Conflict(CANDIDATE_CHANGED.into()))?;
+    let current = rebuild_candidate_binding_in_session(session, ctx, control, holdout, candidate).await?;
     if &current.1 != binding {
         return Err(Error::Conflict(CANDIDATE_CHANGED.into()));
     }
@@ -7457,6 +7515,7 @@ async fn ga18_candidate_binding(
             .clone(),
     )
     .map_err(|_| ga18_cycle_error())?;
+    validate_ticket_candidate_versions(ticket,&candidate).map_err(|_|ga18_cycle_error())?;
     candidate_matches_frozen(&candidate, control, holdout)?;
     validate_read_candidate_in_session(session, ctx, &candidate).await?;
     let watermark = session.watermark(ctx).await?.ok_or_else(ga18_cycle_error)?;
