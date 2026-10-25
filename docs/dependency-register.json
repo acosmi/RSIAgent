@@ -126,6 +126,35 @@
       "version": "4.6.7"
     },
     {
+      "alternative": "zip crate (lenient defaults, fast release churn); miniz_oxide backend (license expression not on the allowlist); hand-written inflate (codec risk).",
+      "checksum": "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb",
+      "consumers": [
+        {
+          "alias": "flate2",
+          "declaration": {
+            "default-features": false,
+            "features": [
+              "zlib-rs"
+            ],
+            "version": "=1.1.10"
+          },
+          "default_features": false,
+          "features": [
+            "zlib-rs"
+          ],
+          "kind": "regular",
+          "manifest": "crates/evo-engine/Cargo.toml",
+          "target": null,
+          "workspace_declaration": null
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "flate2",
+      "purpose": "Bounded raw-DEFLATE decoding and CRC-32 for the restricted ZIP package reader (E16.2 / V066 ZIP sub-scenarios); this registration alone wires no ingress.",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.1.10"
+    },
+    {
       "alternative": "Use reviewed platform lock adapters preserving lock ownership and contention behavior.",
       "checksum": "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213",
       "consumers": [
@@ -1198,12 +1227,12 @@
     }
   ],
   "inputs": {
-    "cargo_lock_sha256": "87daf3d622f60c12135dc8856d95c4690ee06ae8854a561988d846878657d7b0",
+    "cargo_lock_sha256": "13df38fc85826bd279bac426ca5086eb99e1e9861d158f209359bff6d6e86435",
     "manifests": {
       "Cargo.toml": "b509c760a653938dcb00fed78a4ead63c43aa7b6bd1537f4e6dd0fb3e5c45f61",
       "apps/rsia/Cargo.toml": "f7a01045b14b22b99d6f1b0d442013ff836392a159226613f8fa21674935bc46",
       "crates/evo-core/Cargo.toml": "1e53067bdd36e742e729d53b757c090df1ee30b599da58627dcfd1f471fad371",
-      "crates/evo-engine/Cargo.toml": "bac362631f8bd675c3b323b0a847f152a6d090a5039f148e3e4ae0e77eea225f",
+      "crates/evo-engine/Cargo.toml": "f113680f8179d1b8089df666e6d6aa8b4034cab65575e340ee153b8c9afd7d73",
       "crates/evo-http/Cargo.toml": "d75104c7dc6eb959f820df2c40e5d470166fe003fc2d4cdd3086bf90f463dc68",
       "crates/evo-mcp/Cargo.toml": "733aa65f247ea23431aa5da8accf0f7cd02144d4dd3be7d5282b0caf9614d0bf",
       "crates/evo-storage/Cargo.toml": "ae3380bbfef2ff9b6f215d1d182e39c6c931f45b838b2126e3f5de3f7a89e7b7"
@@ -1426,7 +1455,7 @@
       "version": "0.2.0"
     }
   ],
-  "inventory_sha256": "124767c45a982453be8c66d09567a10ac662000e3820d0d78d342dd3433b3805",
+  "inventory_sha256": "9fee59d3c32f0cc9f69fde949e83f1a38d2d9243a5e85bf14fb4d7c8c2cdc95c",
   "legacy_license_exceptions": {
     "Apache-2.0/MIT": [
       {
