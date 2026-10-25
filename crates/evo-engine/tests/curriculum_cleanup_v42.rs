@@ -1735,3 +1735,130 @@ async fn the_curriculum_cleanup_is_paged_and_resumes_after_a_restart() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// AG-170 (I10): the v3 learner-state payload and the v2 selection payload keep
+// their record kinds, so the cleanup redacts them like their predecessors
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_v3_learner_state_and_a_v2_selection_are_redacted_and_read_back_as_conflict() {
+    let chain = Chain::build().await;
+    let fixture = &chain.fixture;
+    let ctx = &fixture.admin;
+    // Since AG-170 a runner-verified report bound to a real cycle makes the
+    // proposal eligible, so the v2 selection is produced through the public
+    // API (unlike the forged v1 selection of `Chain::build`).
+    let registered = RegisteredPureFunctionProfileV1::clamp_i64();
+    let offline = check_target_outputs(
+        &registered,
+        &chain.proposal,
+        ClampOutput { clamped: -1 },
+        ClampOutput { clamped: -1 },
+    )
+    .unwrap();
+    let report = evo_engine::curriculum_profiles::runner_verified_report(
+        &registered,
+        &chain.proposal,
+        &offline,
+        &chain.facts[0].0,
+        &chain.facts[0].1,
+    )
+    .unwrap();
+    let verified_id = chain
+        .coordinator
+        .record_validity_report(STATE_ID, report)
+        .await
+        .unwrap();
+    let decision = chain
+        .coordinator
+        .select_next_task(
+            STATE_ID,
+            &[evo_engine::curriculum::CurriculumTaskCandidateV1 {
+                id: "candidate-task-v2".into(),
+                parent_family: "family-a".into(),
+                coverage_bucket_id: None,
+                stable_choice_seq: 1,
+                proposal_id: chain.proposal.id.clone(),
+                validity_report_id: verified_id.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    let state_storage = curriculum_state_storage_id(STATE_ID).unwrap();
+    let selection_storage = storage_id(SELECTION_KIND, &decision.id);
+    let verified_storage = storage_id(VALIDITY_KIND, &verified_id);
+    let before = curriculum_bodies(&fixture.store, ctx).await;
+    assert_eq!(before[&state_storage]["record_kind"], STATE_KIND);
+    assert_eq!(
+        before[&state_storage]["payload"]["schema_version"],
+        "rsia.learner_state.v3"
+    );
+    assert_eq!(before[&selection_storage]["record_kind"], SELECTION_KIND);
+    assert_eq!(
+        before[&selection_storage]["payload"]["schema_version"],
+        "rsia.curriculum_selection.v2"
+    );
+    assert_eq!(
+        before[&verified_storage]["payload"]["status"],
+        "runner_verified"
+    );
+
+    let status = revoke_and_clean(fixture, "run-a").await;
+    assert_eq!(status.state, CleanupState::Complete, "{status:?}");
+    assert_eq!(status.last_error, None);
+    let after = curriculum_bodies(&fixture.store, ctx).await;
+    assert_redacted_envelope(&after[&state_storage], &state_storage, STATE_KIND);
+    assert_redacted_envelope(
+        &after[&selection_storage],
+        &selection_storage,
+        SELECTION_KIND,
+    );
+    assert_redacted_envelope(&after[&verified_storage], &verified_storage, VALIDITY_KIND);
+    let redacted_text = after
+        .values()
+        .filter(|value| value["schema_version"] == REDACTED)
+        .map(Value::to_string)
+        .collect::<String>();
+    for needle in [
+        "rsia.learner_state.v3",
+        "rsia.curriculum_selection.v2",
+        "failure_records",
+        "retest_priority_marks",
+        "frozen_state_choice_task_id",
+        "candidate-task-v2",
+        "offline_output_digest",
+        "family-a",
+    ] {
+        assert!(
+            !redacted_text.contains(needle),
+            "{needle} survived redaction"
+        );
+    }
+    // The redacted v3 learner state reads back as a Conflict that names the
+    // redaction, on the selection path and on the cycle path alike.
+    for result in [
+        chain
+            .coordinator
+            .select_next_task(STATE_ID, &[])
+            .await
+            .map(|_| ()),
+        chain
+            .coordinator
+            .record_cycle(DevelopmentCycleReceiptV1 {
+                schema_version: "rsia.development_cycle_receipt.v1".into(),
+                id: "cycle-3".into(),
+                state_id: STATE_ID.into(),
+                development_request_fact_id: chain.facts[1].0.clone(),
+                development_observed_fact_id: chain.facts[1].1.clone(),
+            })
+            .await
+            .map(|_| ()),
+    ] {
+        assert!(
+            matches!(&result, Err(Error::Conflict(message))
+                if message.contains("redacted") && message.contains(STATE_KIND)),
+            "{result:?}"
+        );
+    }
+}
