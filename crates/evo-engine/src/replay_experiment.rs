@@ -49,8 +49,9 @@ use evo_core::replay::{OBJECTIVE_V2, ReplayTerminal, WorldPartition};
 use evo_core::replay_economics::{
     COST_RECEIPT_SCHEMA, ComponentBillingSourceV1, CostComponentKind, CostComponentReceiptV1,
     CostScope, CostSourceKind, EconomicComputation, EconomicReportTerminal, MeasurementState,
-    PairedQualityOutcome, REPORT_SCHEMA, ReplayEconomicExperimentV1, ReplayEconomicReportV1,
-    compute_economics,
+    PairedQualityOutcome, REPORT_SCHEMA, REPORT_SCHEMA_V2, ReplayEconomicExperimentV1,
+    ReplayEconomicReportV1, ReplayEconomicReportV2, compute_economics, e11_report_quality_v2,
+    replay_economic_report_id, replay_economic_report_lineage,
 };
 use evo_core::{Context, Role, identifier};
 use evo_storage::budget::BudgetCallState;
@@ -60,7 +61,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 const EXPERIMENT_KIND: &str = "replay_economic_experiment_v1";
 const JOB_KIND: &str = "replay_economic_job_v1";
 const COST_KIND: &str = "replay_economic_cost_receipt_v1";
+/// Legacy v1 reports (plan §5.1.1): read and cleaned, never written again.
 const REPORT_KIND: &str = "replay_economic_report_v1";
+/// The current report kind (AG-178): cluster aggregation and the LCB judgment.
+const REPORT_KIND_V2: &str = "replay_economic_report_v2";
 const ENVELOPE_SCHEMA: &str = "rsia.replay_economic_artifact_envelope.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -576,7 +580,7 @@ impl PersistentReplayEconomicCoordinator {
         store: &Store,
         job_id: &str,
         projected_tasks: u64,
-    ) -> Result<ReplayEconomicReportV1> {
+    ) -> Result<ReplayEconomicReportV2> {
         ctx.require(&[Role::Evaluator])?;
         let (job, experiment) = load_job_experiment(ctx, store, job_id).await?;
         if job.state == ReplayEconomicJobState::Cancelled {
@@ -587,11 +591,25 @@ impl PersistentReplayEconomicCoordinator {
         verify_experiment_sources(&mut session, ctx, &experiment).await?;
         load_live_selection_in_session(&mut session, ctx, &experiment).await?;
         if let Some(report_id) = &job.report_id {
-            let existing: ReplayEconomicReportV1 =
-                need_record(&mut session, ctx, REPORT_KIND, report_id).await?;
-            existing.validate_against(&experiment)?;
-            session.commit().await?;
-            return Ok(existing);
+            if let Some(existing) =
+                get_record::<ReplayEconomicReportV2>(&mut session, ctx, REPORT_KIND_V2, report_id)
+                    .await?
+            {
+                existing.validate_against(&experiment)?;
+                session.commit().await?;
+                return Ok(existing);
+            }
+            // A v1 report is legacy history: `query_report` reads it, but it is
+            // never handed out as the job's current report nor rebuilt in place
+            // (plan §5.1.1 items 2-4).
+            return Err(
+                match get_record::<serde_json::Value>(&mut session, ctx, REPORT_KIND, report_id)
+                    .await?
+                {
+                    Some(_) => Error::Invalid("legacy_economic_report_not_consumable".into()),
+                    None => Error::NotFound,
+                },
+            );
         }
         let mut receipts: Vec<CostComponentReceiptV1> =
             Vec::with_capacity(job.cost_receipt_ids.len());
@@ -633,9 +651,10 @@ impl PersistentReplayEconomicCoordinator {
         } else {
             EconomicReportTerminal::BlockedSupport
         };
-        let report = ReplayEconomicReportV1 {
-            schema_version: REPORT_SCHEMA.into(),
-            id: format!("replay-economic-report-{}", &fingerprint(&job)?[..24]),
+        let (cluster_rows, quality_statistics) = e11_report_quality_v2(&[])?;
+        let report = ReplayEconomicReportV2 {
+            schema_version: REPORT_SCHEMA_V2.into(),
+            id: replay_economic_report_id(REPORT_SCHEMA_V2, &fingerprint(&job)?)?,
             experiment_id: experiment.id.clone(),
             experiment_digest: experiment.digest()?,
             paired_ticket_id: experiment.paired_ticket_id.clone(),
@@ -643,6 +662,8 @@ impl PersistentReplayEconomicCoordinator {
             paired_receipt_closure_digest: None,
             completed_paired_tasks: 0,
             paired_units: vec![],
+            cluster_rows,
+            quality_statistics,
             latency: None,
             quality_outcome: PairedQualityOutcome::ZeroOrInconclusive,
             cost_receipt_ids: job.cost_receipt_ids.clone(),
@@ -685,7 +706,8 @@ impl PersistentReplayEconomicCoordinator {
             ));
         }
         if let Some(existing) =
-            get_record::<ReplayEconomicReportV1>(&mut session, ctx, REPORT_KIND, &report.id).await?
+            get_record::<ReplayEconomicReportV2>(&mut session, ctx, REPORT_KIND_V2, &report.id)
+                .await?
         {
             if fingerprint(&existing)? != fingerprint(&report)? {
                 return Err(Error::Conflict(
@@ -696,7 +718,7 @@ impl PersistentReplayEconomicCoordinator {
             put_record(
                 &mut session,
                 ctx,
-                REPORT_KIND,
+                REPORT_KIND_V2,
                 &report.id,
                 ctx.actor(),
                 &report,
@@ -1061,14 +1083,128 @@ mod tests {
 
 /// Read-only wrapper; the original economic report and all paid receipts remain
 /// byte-for-byte persistent history. A retired selection is disclosed as Legacy,
-/// never reinterpreted as a new registration or selection authorization.
+/// never reinterpreted as a new registration or selection authorization. A v1
+/// report is itself a historical version (AG-178; plan §5.1.1): `report_state` is
+/// Legacy and `source_legacy` is set, whatever the state of its selection.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplayEconomicReportAuditView {
     pub raw_payload: serde_json::Value,
     pub source_legacy: bool,
     pub replay_read_view: crate::replay::ReplayReportAuditView,
     pub lineage: Vec<evo_storage::replay::ReplayLineageEntry>,
+    pub report_schema_version: String,
+    pub report_state: evo_core::replay::ReplayRecordState,
+    /// Every version's id of the report's input, predecessor first (plan §5.1.1
+    /// item 5); empty for an id no version derives.
+    pub report_lineage: Vec<ReplayEconomicReportLineageEntry>,
 }
+
+/// One derivable id of an economic report's input, and whether a report of that
+/// version is stored under it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayEconomicReportLineageEntry {
+    pub schema_version: String,
+    pub report_id: String,
+    pub exists: bool,
+}
+
+/// A stored economic report of either version.
+enum StoredEconomicReport {
+    Current(Box<ReplayEconomicReportV2>),
+    Legacy(Box<ReplayEconomicReportV1>),
+}
+
+impl StoredEconomicReport {
+    fn id(&self) -> &str {
+        match self {
+            Self::Current(report) => &report.id,
+            Self::Legacy(report) => &report.id,
+        }
+    }
+
+    fn experiment_id(&self) -> &str {
+        match self {
+            Self::Current(report) => &report.experiment_id,
+            Self::Legacy(report) => &report.experiment_id,
+        }
+    }
+
+    fn schema_version(&self) -> &str {
+        match self {
+            Self::Current(report) => &report.schema_version,
+            Self::Legacy(report) => &report.schema_version,
+        }
+    }
+
+    fn state(&self) -> evo_core::replay::ReplayRecordState {
+        match self {
+            Self::Current(_) => evo_core::replay::ReplayRecordState::CurrentVerified,
+            Self::Legacy(_) => evo_core::replay::ReplayRecordState::Legacy,
+        }
+    }
+
+    /// v2 is checked by the current judge; v1 by the judge it was written with,
+    /// kept for static reads only (its result never makes the report current).
+    fn validate_against(&self, experiment: &ReplayEconomicExperimentV1) -> Result<()> {
+        match self {
+            Self::Current(report) => report.validate_against(experiment),
+            Self::Legacy(report) => report.validate_against(experiment),
+        }
+    }
+
+    fn raw_payload(&self) -> Result<serde_json::Value> {
+        let value = match self {
+            Self::Current(report) => serde_json::to_value(report.as_ref()),
+            Self::Legacy(report) => serde_json::to_value(report.as_ref()),
+        };
+        value.map_err(|_| Error::Internal)
+    }
+}
+
+async fn load_economic_report(
+    session: &mut Session,
+    ctx: &Context,
+    report_id: &str,
+) -> Result<StoredEconomicReport> {
+    let current =
+        get_record::<ReplayEconomicReportV2>(session, ctx, REPORT_KIND_V2, report_id).await?;
+    let legacy = get_record::<ReplayEconomicReportV1>(session, ctx, REPORT_KIND, report_id).await?;
+    match (current, legacy) {
+        (Some(current), None) => Ok(StoredEconomicReport::Current(Box::new(current))),
+        (None, Some(legacy)) => Ok(StoredEconomicReport::Legacy(Box::new(legacy))),
+        (Some(_), Some(_)) => Err(Error::Invalid("economic_report_identity_invalid".into())),
+        (None, None) => Err(Error::NotFound),
+    }
+}
+
+async fn economic_report_lineage_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    report_id: &str,
+) -> Result<Vec<ReplayEconomicReportLineageEntry>> {
+    let Some(ids) = replay_economic_report_lineage(report_id) else {
+        return Ok(Vec::new());
+    };
+    let mut entries = Vec::with_capacity(ids.len());
+    for id in ids {
+        let record_kind = match id.schema_version.as_str() {
+            REPORT_SCHEMA => REPORT_KIND,
+            REPORT_SCHEMA_V2 => REPORT_KIND_V2,
+            _ => return Err(Error::Internal),
+        };
+        let exists = session
+            .object_row(ctx, "artifact", &storage_id(record_kind, &id.report_id)?)
+            .await?
+            .is_some();
+        entries.push(ReplayEconomicReportLineageEntry {
+            schema_version: id.schema_version,
+            report_id: id.report_id,
+            exists,
+        });
+    }
+    Ok(entries)
+}
+
 impl PersistentReplayEconomicCoordinator {
     pub async fn query_report(
         ctx: &Context,
@@ -1078,14 +1214,13 @@ impl PersistentReplayEconomicCoordinator {
         ctx.require(&[Role::Evaluator, Role::Admin])?;
         identifier(report_id)?;
         let mut session = store.session().await?;
-        let report: ReplayEconomicReportV1 =
-            need_record(&mut session, ctx, REPORT_KIND, report_id).await?;
+        let report = load_economic_report(&mut session, ctx, report_id).await?;
         let experiment: ReplayEconomicExperimentV1 =
-            need_record(&mut session, ctx, EXPERIMENT_KIND, &report.experiment_id).await?;
+            need_record(&mut session, ctx, EXPERIMENT_KIND, report.experiment_id()).await?;
         if ctx.role() == Role::Evaluator && experiment.evaluator_actor != ctx.actor() {
             return Err(Error::Forbidden);
         }
-        if report.id != report_id {
+        if report.id() != report_id {
             return Err(Error::Invalid("economic_report_identity_invalid".into()));
         }
         report.validate_against(&experiment)?;
@@ -1137,11 +1272,17 @@ impl PersistentReplayEconomicCoordinator {
                 "economic report selection history differs".into(),
             ));
         }
+        let report_lineage =
+            economic_report_lineage_in_session(&mut session, ctx, report_id).await?;
         let result = ReplayEconomicReportAuditView {
-            raw_payload: serde_json::to_value(&report).map_err(|_| Error::Internal)?,
-            source_legacy: read.source_legacy,
+            raw_payload: report.raw_payload()?,
+            source_legacy: report.state() == evo_core::replay::ReplayRecordState::Legacy
+                || read.source_legacy,
             lineage: read.lineage.clone(),
             replay_read_view: read,
+            report_schema_version: report.schema_version().into(),
+            report_state: report.state(),
+            report_lineage,
         };
         session.commit().await?;
         Ok(result)
