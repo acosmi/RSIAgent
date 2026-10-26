@@ -584,14 +584,18 @@ impl Fixture {
             .await
             .unwrap();
         let control = control();
-        let candidate = crate::trusted_compiler_inputs::software_candidate(
-            NAMESPACE,
+        let candidate = crate::trusted_compiler_inputs::software_candidate_current(
+            &store,
+            &executor,
             &control.environment_digest,
             "candidate-bundle",
-        );
-        crate::trusted_compiler_inputs::persist_bundle(
+            1,
+        )
+        .await
+        .unwrap();
+        crate::trusted_compiler_inputs::persist_bundle_current(
             &store,
-            NAMESPACE,
+            &executor,
             &candidate,
             &control.environment_digest,
             1,
@@ -640,7 +644,7 @@ impl Fixture {
             attempt: 1,
             manifest: self.control.manifest().unwrap(),
             parent_bundle_digest: d("parent-bundle"),
-            candidate_bundle_digest: crate::trusted_compiler_inputs::software_candidate(
+            candidate_bundle_digest: trusted_compiler_inputs::software_candidate_content_current(
                 NAMESPACE,
                 &self.control.environment_digest,
                 "candidate-bundle",

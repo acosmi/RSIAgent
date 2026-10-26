@@ -18,7 +18,7 @@
 //! staging, drift, registration, binding, attempt set, probe job, schedule receipt,
 //! management job), wrapped in the envelope `curriculum.rs` persists for the two
 //! curriculum records (that type is private), and shaped after the engine's record
-//! otherwise (the proposal, whose bundle is abbreviated, and the private input).
+//! otherwise (the legacy proposal, whose bundle is abbreviated, and the private input).
 //! The restore script and the gate read only `kind`, `id`, the top-level
 //! `schema_version` and the body as a whole, so nothing else about a fixture
 //! matters to them.
@@ -37,7 +37,12 @@
 //!   account for a spend or bind an idempotency key are preserved by the cleanup
 //!   and stay visible (the run record case below).
 
+#[path = "support/trusted_compiler_inputs.rs"]
+mod trusted_compiler_inputs;
+
+use evo_core::contract::SkillSnapshot;
 use evo_core::curriculum::{ProbeJobV1, ProbeTerminal, ProposalAttemptOutcome};
+use evo_core::skill_edit::skill_snapshot_digest;
 use evo_core::strategy::PracticePlan;
 use evo_core::{Context, Job, JobState, Role, fingerprint, hash};
 use evo_engine::curriculum::{
@@ -45,12 +50,12 @@ use evo_engine::curriculum::{
 };
 use evo_engine::dispatch::{ManagementJob, ManagementJobState};
 use evo_engine::monitoring::{
-    CONSOLIDATION_CLAIM_SCHEMA, CONSOLIDATION_PROPOSAL_SCHEMA, CONSOLIDATION_RUN_SCHEMA,
-    CONSOLIDATION_SCOPE_SCHEMA, CONSOLIDATION_STAGING_SCHEMA, ConsolidationClaim,
-    ConsolidationClaimState, ConsolidationRunOutcome, ConsolidationRunRecord, ConsolidationScope,
-    ConsolidationScopeIndex, ConsolidationStagingBinding, ENVIRONMENT_DRIFT_SCHEMA,
-    ENVIRONMENT_IDENTITY_SCHEMA, EnvironmentDriftRecord, EnvironmentEvidenceScope,
-    EnvironmentIdentityRecord, MonitoringCoordinator, SourceDependency,
+    CONSOLIDATION_CLAIM_SCHEMA, CONSOLIDATION_PROPOSAL_SCHEMA, CONSOLIDATION_PROPOSAL_SCHEMA_V2,
+    CONSOLIDATION_RUN_SCHEMA, CONSOLIDATION_SCOPE_SCHEMA, CONSOLIDATION_STAGING_SCHEMA,
+    ConsolidationClaim, ConsolidationClaimState, ConsolidationRunOutcome, ConsolidationRunRecord,
+    ConsolidationScope, ConsolidationScopeIndex, ConsolidationStagingBinding,
+    ENVIRONMENT_DRIFT_SCHEMA, ENVIRONMENT_IDENTITY_SCHEMA, EnvironmentDriftRecord,
+    EnvironmentEvidenceScope, EnvironmentIdentityRecord, MonitoringCoordinator, SourceDependency,
 };
 use evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA;
 use evo_engine::practice::{
@@ -90,7 +95,7 @@ const REDACTED: &str = "rsia.redacted.v1";
 const CURRICULUM_ENVELOPE_SCHEMA: &str = "rsia.curriculum_artifact_envelope.v1";
 const PRIVATE_INPUT_SCHEMA: &str = "rsia.management_private_input.v1";
 /// AG-051 added the replay-economic envelope to the same list; its own cases are in
-/// `restore_economic_v42.rs`. The ten schemas this file covers are unchanged.
+/// `restore_economic_v42.rs`. This file covers eleven action schemas.
 const ECONOMIC_ENVELOPE_SCHEMA: &str = "rsia.replay_economic_artifact_envelope.v1";
 
 fn d(label: &str) -> String {
@@ -225,6 +230,57 @@ fn proposal_fact() -> Fact {
             "environment_digest": d("environment"),
             "revoke_watermark": 1,
         }),
+    )
+}
+
+/// Complete v2 body for schema selection and backup/anchor snapshots only.
+/// It registers no issuer, approval, ordinary P or authority for a new run.
+fn current_proposal_fact() -> Fact {
+    let environment_digest = d("environment");
+    let candidate = trusted_compiler_inputs::software_candidate_content_current(
+        NS,
+        &environment_digest,
+        "restore proposal v2 complete snapshot",
+    );
+    let claim = claim_id();
+    let terminal_fact_id = "restore-v2-terminal-fact";
+    let id = format!(
+        "consolidation-proposal-v2-{}",
+        fingerprint(&(
+            CONSOLIDATION_PROPOSAL_SCHEMA_V2,
+            &claim,
+            &candidate.digest,
+            terminal_fact_id,
+        ))
+        .unwrap()
+    );
+    let candidate_bundle_digest = candidate.digest.clone();
+    Fact::new(
+        "consolidation proposal v2 complete snapshot",
+        "artifact",
+        id.clone(),
+        &evo_engine::monitoring::CurrentConsolidationProposal {
+            id,
+            schema_version: CONSOLIDATION_PROPOSAL_SCHEMA_V2.into(),
+            claim_id: claim,
+            scope_id: SCOPE_ID.into(),
+            cycle_ids: vec!["cycle-1".into(), "cycle-2".into()],
+            pairs_digest: d("restore-current-pairs-snapshot"),
+            parent_skill_digest: skill_snapshot_digest(&SkillSnapshot::empty()).unwrap(),
+            parent_bundle_digest: candidate.parent_digest.clone(),
+            candidate_skill_digest: skill_snapshot_digest(&candidate.skill).unwrap(),
+            candidate_bundle: candidate,
+            candidate_bundle_digest,
+            selection_digest: d("restore-current-selection-snapshot"),
+            terminal_fact_id: terminal_fact_id.into(),
+            sources: vec![SourceDependency {
+                id: SOURCE_RUN.into(),
+                content_digest: d("source"),
+            }],
+            provenance: EnvironmentEvidenceScope::ProgramFixture,
+            environment_digest,
+            revoke_watermark: 1,
+        },
     )
 }
 
@@ -506,7 +562,7 @@ fn stage_fact() -> Fact {
     )
 }
 
-/// One fact of every class this change protects (ten schemas, eleven facts: the
+/// One fact of every class this change protects (eleven schemas, twelve facts: the
 /// curriculum envelope twice, for its two record kinds that carry scheduling
 /// idempotency and quota facts).
 fn every_class() -> Vec<Fact> {
@@ -522,6 +578,7 @@ fn every_class() -> Vec<Fact> {
         probe_job_fact(false),
         schedule_receipt_fact(),
         job_fact(ManagementJobState::Queued),
+        current_proposal_fact(),
     ]
 }
 
@@ -1008,6 +1065,7 @@ fn engine_action_schemas() -> BTreeSet<String> {
         CONSOLIDATION_RUN_SCHEMA,
         CONSOLIDATION_STAGING_SCHEMA,
         CONSOLIDATION_PROPOSAL_SCHEMA,
+        CONSOLIDATION_PROPOSAL_SCHEMA_V2,
         ENVIRONMENT_DRIFT_SCHEMA,
         PRACTICE_REGISTRATION_SCHEMA,
         PRACTICE_REGISTRATION_BINDING_SCHEMA,
@@ -1023,7 +1081,7 @@ fn engine_action_schemas() -> BTreeSet<String> {
 #[test]
 fn the_action_schemas_are_listed_once_in_rust_and_in_the_restore_script() {
     let expected = engine_action_schemas();
-    assert_eq!(expected.len(), 10, "ten distinct schemas");
+    assert_eq!(expected.len(), 11, "eleven distinct schemas");
     let listed: BTreeSet<String> = PROTECTED_ACTION_SCHEMA_VERSIONS
         .iter()
         .map(|schema| (*schema).to_owned())
@@ -1033,7 +1091,7 @@ fn the_action_schemas_are_listed_once_in_rust_and_in_the_restore_script() {
         listed.len(),
         "a schema is listed twice"
     );
-    // the list is the ten schemas of this round plus the economic envelope (AG-051)
+    // the list is the eleven schemas of this round plus the economic envelope (AG-051)
     let without_economic: BTreeSet<String> = listed
         .iter()
         .filter(|schema| schema.as_str() != ECONOMIC_ENVELOPE_SCHEMA)
@@ -1196,7 +1254,7 @@ async fn the_script_and_the_reader_select_the_same_objects_in_a_database_holding
     let from_script: BTreeSet<String> = script_selection(&scenario.live).into_iter().collect();
     assert_eq!(from_rust, all_keys, "the Rust reader's selection");
     assert_eq!(from_script, all_keys, "the script's selection");
-    // the eleven fixtures are all in it, under both kinds
+    // the twelve fixtures are all in it, under both kinds
     assert!(protected_keys.iter().all(|key| from_rust.contains(key)));
     assert!(from_rust.iter().any(|key| key.starts_with("n/job/")));
     assert!(!from_rust.iter().any(|key| key.contains("legacy-job")));

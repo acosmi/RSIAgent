@@ -589,7 +589,7 @@ mod curriculum_fx {
             attempt: 1,
             manifest: control.manifest().unwrap(),
             parent_bundle_digest: d("parent-bundle"),
-            candidate_bundle_digest: crate::trusted_compiler_inputs::software_candidate(
+            candidate_bundle_digest: trusted_compiler_inputs::software_candidate_content_current(
                 NAMESPACE,
                 &control.environment_digest,
                 "candidate-bundle",
@@ -653,14 +653,18 @@ mod curriculum_fx {
                 .await
                 .unwrap();
             let control = control();
-            let candidate = crate::trusted_compiler_inputs::software_candidate(
-                NAMESPACE,
+            let candidate = crate::trusted_compiler_inputs::software_candidate_current(
+                &store,
+                &executor,
                 &control.environment_digest,
                 "candidate-bundle",
-            );
-            crate::trusted_compiler_inputs::persist_bundle(
+                1,
+            )
+            .await
+            .unwrap();
+            crate::trusted_compiler_inputs::persist_bundle_current(
                 &store,
-                NAMESPACE,
+                &executor,
                 &candidate,
                 &control.environment_digest,
                 1,
@@ -749,19 +753,21 @@ mod curriculum_fx {
             .seal()
             .unwrap();
             let observed_fact = observed_fact(request, report, extras);
-            let inputs = crate::trusted_compiler_inputs::bundle_use(
+            let inputs = crate::trusted_compiler_inputs::bundle_use_current(
                 &self.store,
-                NAMESPACE,
+                &self.admin,
                 &request.candidate_bundle_digest,
+                &request.environment_digest,
+                request.revoke_watermark,
             )
             .await
             .unwrap();
             journal
-                .commit_bound(request_fact.clone(), &inputs)
+                .commit_source_bound(request_fact.clone(), &inputs)
                 .await
                 .unwrap();
             journal
-                .commit_bound(observed_fact.clone(), &inputs)
+                .commit_source_bound(observed_fact.clone(), &inputs)
                 .await
                 .unwrap();
             (request_fact.artifact_id, observed_fact.artifact_id)
