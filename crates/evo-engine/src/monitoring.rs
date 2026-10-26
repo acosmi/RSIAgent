@@ -2854,7 +2854,7 @@ async fn historical_consolidation_input_matches(
             compiler_request,
             binding.current()?.clone(),
         );
-        let digest = optimization_bound_request_digest(request, &actual)?;
+        let digest = optimization_bound_request_digest(request, &actual);
         (
             crate::model::ReadCompilerInputUse::from_current(actual)?,
             digest,
@@ -2864,7 +2864,7 @@ async fn historical_consolidation_input_matches(
             compiler_request,
             binding.legacy().ok_or(Error::Forbidden)?.clone(),
         );
-        let digest = historical_optimization_bound_request_digest(request, &actual)?;
+        let digest = historical_optimization_bound_request_digest(request, &actual);
         (
             crate::model::ReadCompilerInputUse::from_legacy(actual)?,
             digest,
@@ -2888,6 +2888,17 @@ async fn historical_consolidation_input_matches(
             "historical consolidation compiler input differs".into(),
         ));
     }
+    if fingerprint(&request.compiler_input_request())? != fingerprint(&inputs.request)? {
+        return Err(Error::Conflict(
+            if terminal.outcome == ConsolidationRunOutcome::Revoked {
+                "revoked consolidation input differs"
+            } else {
+                "completed consolidation input differs"
+            }
+            .into(),
+        ));
+    }
+    let expected_digest = expected_digest?;
     if expected_digest != input_digest {
         return Err(Error::Conflict(
             if terminal.outcome == ConsolidationRunOutcome::Revoked {

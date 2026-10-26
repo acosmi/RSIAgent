@@ -957,7 +957,9 @@ impl<'de> Deserialize<'de> for ReadEvaluationTicket {
             EvaluationTicketWire::Current(value)
                 if value.schema_version == EvaluationTicketV3::SCHEMA =>
             {
-                value.into()
+                let current: Self = value.into();
+                current.validate().map_err(D::Error::custom)?;
+                current
             }
             EvaluationTicketWire::Legacy(value)
                 if value.schema_version == EvaluationTicketV2::SCHEMA =>
@@ -2350,6 +2352,22 @@ impl IndependentEvaluationControl {
         store: &Store,
         request: GraderReceiptRequest,
     ) -> Result<IndependentGraderReceiptV2> {
+        Self::record_grader_receipt_boxed(ctx, store, request).await
+    }
+
+    fn record_grader_receipt_boxed<'a>(
+        ctx: &'a Context,
+        store: &'a Store,
+        request: GraderReceiptRequest,
+    ) -> crate::optimization::StepFuture<'a, IndependentGraderReceiptV2> {
+        Box::pin(Self::record_grader_receipt_unboxed(ctx, store, request))
+    }
+
+    async fn record_grader_receipt_unboxed(
+        ctx: &Context,
+        store: &Store,
+        request: GraderReceiptRequest,
+    ) -> Result<IndependentGraderReceiptV2> {
         ctx.require(&[Role::Evaluator])?;
         valid_time(request.issued_at_unix_seconds)?;
         let mut session = store.session().await?;
@@ -3345,7 +3363,20 @@ async fn read_verified_formal_report_core(
     })
 }
 
-async fn validate_status_closure(
+// Keep the same validation body and borrowed Session on the caller's task.
+// The box owns only the future; the original caller still owns the Session.
+fn validate_status_closure<'a>(
+    session: &'a mut Session,
+    ctx: &'a Context,
+    ticket: &'a ReadEvaluationTicket,
+    formal: Option<&'a FormalEvaluationV2>,
+) -> crate::optimization::StepFuture<'a, ()> {
+    Box::pin(validate_status_closure_unboxed(
+        session, ctx, ticket, formal,
+    ))
+}
+
+async fn validate_status_closure_unboxed(
     session: &mut Session,
     ctx: &Context,
     ticket: &ReadEvaluationTicket,

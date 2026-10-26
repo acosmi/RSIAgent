@@ -610,8 +610,56 @@ async fn cached_active_run_requires_live_report_source_and_snapshot_records() {
     );
 }
 
-#[test]
-fn release_envelopes_reject_unknown_json_and_bundle_digest_tampering() {
+// Full logical SQL image, including all source, dependency, audit and budget
+// tables. This observer deliberately does not use the validator under test.
+fn release_sql_image(directory: &std::path::Path) -> serde_json::Value {
+    let script = r#"
+import json,sqlite3,struct,sys
+con=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+con.text_factory=bytes
+quote=lambda value:'"'+value.replace('"','""')+'"'
+def cell(storage,value):
+    storage=storage.decode('ascii')
+    if storage in ('text','blob'):
+        assert isinstance(value,bytes)
+        return [storage,value.hex()]
+    if storage=='integer':
+        assert isinstance(value,int)
+        return [storage,str(value)]
+    if storage=='real':
+        assert isinstance(value,float)
+        return [storage,struct.pack('>d',value).hex()]
+    assert storage=='null' and value is None
+    return [storage,None]
+image={}
+for (raw_name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
+    name=raw_name.decode('utf-8')
+    table=quote(name)
+    columns=[row[1].decode('utf-8') for row in con.execute('PRAGMA table_xinfo('+table+')')]
+    assert columns
+    expressions=','.join('typeof('+quote(column)+'),'+quote(column) for column in columns)
+    rows=[]
+    for row in con.execute('SELECT '+expressions+' FROM '+table):
+        rows.append([cell(row[2*i],row[2*i+1]) for i in range(len(columns))])
+    image[name]={'columns':columns,'rows':sorted(rows,key=lambda row:json.dumps(row,separators=(',',':')))}
+con.close()
+print(json.dumps(image,sort_keys=True,separators=(',',':')))
+"#;
+    let output = std::process::Command::new("python3")
+        .args(["-B", "-c", script])
+        .arg(directory.join("e06.sqlite3"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn release_envelopes_reject_unknown_json_and_bundle_digest_tampering() {
     let mut record = ReleaseCandidateRecord {
         id: "candidate-1".into(),
         schema_version: "rsia.release_candidate.v2".into(),
@@ -640,6 +688,44 @@ fn release_envelopes_reject_unknown_json_and_bundle_digest_tampering() {
         evo_core::contract::resolved_bundle_digest_v3(&record.bundle).unwrap(),
         record.bundle.digest
     );
+    // Retain the original V2 algorithm's real rejection independently of the
+    // Current consumer. A legacy DTO alone grants no new execution authority.
+    let mut legacy = trusted_compiler_inputs::software_candidate("n", &d("environment"), "rule");
+    evo_engine::releases::validate_resolved_bundle_identity(&legacy).unwrap();
+    legacy.digest = d("tampered");
+    assert!(matches!(
+        evo_engine::releases::validate_resolved_bundle_identity(&legacy),
+        Err(Error::Conflict(ref m)) if m == "resolved bundle digest does not match its complete content"
+    ));
+
+    let (directory, store) = database().await;
+    let (_, proposer, sources) = setup_sources(&store, "n").await;
+    let request = StageBundleRequest {
+        candidate_id: "healthy-envelope-candidate".into(),
+        bundle: bundle("p1", "rule"),
+        environment_digest: system("p1").digest().unwrap(),
+        proposer_actor: proposer.actor().into(),
+        sources,
+        revoke_watermark: 1,
+    };
+    let staged = ReleaseStore::stage_current_bundle(&proposer, &store, request.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&staged.bundle).unwrap(),
+        serde_json::to_vec(&request.bundle).unwrap()
+    );
+    let mut bad = request;
+    bad.candidate_id = "tampered-envelope-candidate".into();
+    bad.bundle.digest = d("tampered");
+    let before = release_sql_image(directory.path());
+    let refused = ReleaseStore::stage_current_bundle(&proposer, &store, bad).await;
+    assert!(
+        matches!(refused, Err(Error::Conflict(ref m)) if m == "Current resolved bundle identity differs"),
+        "{refused:?}"
+    );
+    assert_eq!(release_sql_image(directory.path()), before);
+    store.close().await;
 }
 
 #[tokio::test]
@@ -1193,7 +1279,10 @@ async fn current_diagnostic_stage_and_unapproved_rollback_bind_exact_history() {
         .await
         .unwrap();
     session.commit().await.unwrap();
-    let audit = store.verify_audit(&proposer).await.unwrap();
+    let audit = store
+        .verify_audit(&ctx("n", "admin", Role::Admin))
+        .await
+        .unwrap();
     assert_eq!(
         serde_json::to_vec(
             &ReleaseStore::stage_current_bundle(&proposer, &store, request)
@@ -1241,6 +1330,12 @@ async fn current_diagnostic_stage_and_unapproved_rollback_bind_exact_history() {
             .is_empty()
     );
     session.commit().await.unwrap();
-    assert_eq!(store.verify_audit(&proposer).await.unwrap(), audit);
+    assert_eq!(
+        store
+            .verify_audit(&ctx("n", "admin", Role::Admin))
+            .await
+            .unwrap(),
+        audit
+    );
     store.close().await;
 }

@@ -1969,7 +1969,17 @@ con.close();print(json.dumps(image,sort_keys=True))
                 .await
                 .unwrap();
             session.commit().await.unwrap();
-            let audit = store.verify_audit(&worker).await.unwrap();
+            let audit = store
+                .verify_audit(
+                    &evo_core::Context::new(
+                        worker.namespace(),
+                        "fixture-admin",
+                        evo_core::Role::Admin,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
             let before_sql = sql_image(&directory.path().join("preflight.sqlite3"));
             let invalid = if fault == "environment" {
                 fact(vec![StageDependency {
@@ -2012,7 +2022,20 @@ con.close();print(json.dumps(image,sort_keys=True))
                     .is_none()
             );
             session.commit().await.unwrap();
-            assert_eq!(store.verify_audit(&worker).await.unwrap(), audit);
+            assert_eq!(
+                store
+                    .verify_audit(
+                        &evo_core::Context::new(
+                            worker.namespace(),
+                            "fixture-admin",
+                            evo_core::Role::Admin
+                        )
+                        .unwrap()
+                    )
+                    .await
+                    .unwrap(),
+                audit
+            );
             assert_eq!(
                 sql_image(&directory.path().join("preflight.sqlite3")),
                 before_sql

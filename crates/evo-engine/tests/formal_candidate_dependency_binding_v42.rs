@@ -871,8 +871,12 @@ async fn bound_software_positive_pins_full_candidate_sources_and_real_fact_slice
         "rsia.formal_candidate_dependency_binding.v1"
     );
     // Compare native typed fingerprints, not Value's reordered map serialization.
-    let typed: evo_engine::release_store::ReleaseCandidateRecord =
+    let typed: evo_engine::release_store::CurrentReleaseCandidateRecord =
         serde_json::from_value(candidate).unwrap();
+    assert_eq!(
+        typed.schema_version,
+        evo_engine::release_store::RELEASE_CANDIDATE_SCHEMA_V2
+    );
     assert_eq!(
         binding.candidate_record_digest,
         fingerprint(&typed).unwrap()
@@ -1259,6 +1263,53 @@ async fn complete_direct_source_edges_cannot_be_missing_at_issue() {
     assert_eq!(catalog(&fx).await, before);
 }
 
+async fn expected_current_candidate_nodes(fx: &Fixture) -> BTreeSet<(String, String)> {
+    let candidate_id = &fx.holdout.pair.candidate_digest;
+    let compiler_id = format!(
+        "compiler-binding-{}",
+        fingerprint(&(candidate_id, &fx.holdout.candidate_bundle_digest)).unwrap()
+    );
+    let mut session = fx.store.session().await.unwrap();
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StoredCompilerBinding {
+        id: String,
+        schema_version: String,
+        candidate_id: String,
+        binding: evo_engine::formal_authority::CurrentFormalCompilerInputBinding,
+    }
+    let compiler: StoredCompilerBinding = session
+        .need(&fx.evaluator, "artifact", &compiler_id)
+        .await
+        .unwrap();
+    assert_eq!(compiler.id, compiler_id);
+    assert_eq!(
+        compiler.schema_version,
+        evo_engine::release_store::STORED_BINDING_SCHEMA_V2
+    );
+    assert_eq!(compiler.candidate_id, *candidate_id);
+    session.commit().await.unwrap();
+    let mut nodes = compiler
+        .binding
+        .closure
+        .nodes
+        .into_iter()
+        .map(|node| (node.kind, node.id))
+        .collect::<BTreeSet<_>>();
+    nodes.extend([
+        ("artifact".into(), candidate_id.clone()),
+        ("artifact".into(), compiler_id),
+        (
+            "artifact".into(),
+            format!("formal-bundle-{}", fx.holdout.candidate_bundle_digest),
+        ),
+        ("run".into(), "S1".into()),
+        ("run".into(), "S2".into()),
+        ("run".into(), "S3".into()),
+    ]);
+    nodes
+}
+
 #[tokio::test]
 async fn canonical_extra_source_edges_are_included_and_revoked_even_when_not_direct_refs() {
     let fx = prepared(2, true).await;
@@ -1274,10 +1325,19 @@ async fn canonical_extra_source_edges_are_included_and_revoked_even_when_not_dir
         "S3",
     )
     .await;
+    let expected_nodes = expected_current_candidate_nodes(&fx).await;
     let ticket = issue(&fx).await.unwrap();
     let binding = ticket.candidate_dependency_binding.unwrap();
     assert_eq!(binding.sources.len(), 2);
-    assert_eq!(binding.nodes.len(), 11);
+    assert_eq!(binding.nodes.len(), expected_nodes.len());
+    assert_eq!(
+        binding
+            .nodes
+            .iter()
+            .map(|n| (n.kind.clone(), n.id.clone()))
+            .collect::<BTreeSet<_>>(),
+        expected_nodes
+    );
     assert!(
         binding
             .nodes
@@ -1303,9 +1363,18 @@ async fn cycles_and_diamonds_deduplicate_complete_typed_closure() {
     for (from, to) in [("S1", "S3"), ("S2", "S3"), ("S3", "S1")] {
         add_edge(&fx, "run", from, "run", to).await;
     }
+    let expected_nodes = expected_current_candidate_nodes(&fx).await;
     let ticket = issue(&fx).await.unwrap();
     let binding = ticket.candidate_dependency_binding.unwrap();
-    assert_eq!(binding.nodes.len(), 11);
+    assert_eq!(binding.nodes.len(), expected_nodes.len());
+    assert_eq!(
+        binding
+            .nodes
+            .iter()
+            .map(|n| (n.kind.clone(), n.id.clone()))
+            .collect::<BTreeSet<_>>(),
+        expected_nodes
+    );
     assert_eq!(
         binding
             .nodes
@@ -1313,14 +1382,14 @@ async fn cycles_and_diamonds_deduplicate_complete_typed_closure() {
             .map(|node| (&node.kind, &node.id))
             .collect::<BTreeSet<_>>()
             .len(),
-        11
+        expected_nodes.len()
     );
     let root = binding
         .nodes
         .iter()
         .find(|node| node.id == fx.holdout.pair.candidate_digest)
         .unwrap();
-    assert_eq!(root.outgoing_edge_count, 3);
+    assert_eq!(root.outgoing_edge_count, 4);
     assert_eq!(
         root.outgoing_edge_digest,
         fingerprint(&vec![
@@ -1334,6 +1403,10 @@ async fn cycles_and_diamonds_deduplicate_complete_typed_closure() {
                     ))
                     .unwrap()
                 )
+            ),
+            (
+                "artifact".to_string(),
+                format!("formal-bundle-{}", fx.holdout.candidate_bundle_digest)
             ),
             ("run".to_string(), "S1".to_string()),
             ("run".to_string(), "S2".to_string()),
@@ -1778,15 +1851,50 @@ async fn overall_typed_node_bound_accepts_exact_ten_thousand_and_refuses_one_mor
     // Direct own-database adversarial graph seeding exercises closure capacity
     // independently of the separate normal-ingestion MVP run count. Every node
     // is still a real, fully valid StoredTraceAuthority; no placeholder is proof.
-    // The seven compiler authorization nodes occupy real closure capacity.
-    for extra in [9984, 9985] {
+    // Count the real Current authorization graph independently in the owned
+    // SQLite fixture, then fill precisely to 10000 or 10001 total typed nodes.
+    for total in [10_000, 10_001] {
         let fx = prepared(2, true).await;
         let template = serde_json::to_string(&source("graph-template")).unwrap();
-        own_sqlite(
+        let alpha_ids: Vec<_> = fx
+            .control
+            .alpha_plan
+            .allocations
+            .iter()
+            .filter(|allocation| allocation.attempt_id == fx.control.attempt_id)
+            .map(|allocation| {
+                sid(
+                    "alpha_claim_reservation_v1",
+                    &format!(
+                        "{}:{}",
+                        fx.control.alpha_plan.research_family_id, allocation.claim_id
+                    ),
+                )
+            })
+            .collect();
+        let holdout_id = sid("protected_holdout_v41", &fx.holdout.id);
+        let planning = own_sqlite(
             &fx,
             r#"
 import sqlite3,sys,json,copy
-con=sqlite3.connect(sys.argv[1]);template=json.loads(sys.argv[2]);count=int(sys.argv[3])
+con=sqlite3.connect(sys.argv[1]);template=json.loads(sys.argv[2]);total=int(sys.argv[3])
+candidate=sys.argv[4];holdout=sys.argv[5];alpha_ids=json.loads(sys.argv[6])
+roots=[('artifact',candidate),('artifact',holdout)]
+assert len(set(roots))==2
+assert len(alpha_ids)==len(set(alpha_ids))
+def closure(roots):
+    values=','.join('(?,?)' for _ in roots)
+    query="WITH RECURSIVE closure(kind,id) AS (VALUES "+values+" UNION SELECT d.dst_kind,d.dst_id FROM dependencies d JOIN closure p ON d.namespace='n' AND d.src_kind=p.kind AND d.src_id=p.id) SELECT kind,id FROM closure ORDER BY kind,id"
+    return set(con.execute(query,[part for root in roots for part in root]))
+prior_keys=set(con.execute("SELECT kind,id FROM objects WHERE namespace='n'"))
+prior=closure(roots);candidate_prior=closure([roots[0]])
+assert prior <= prior_keys
+assert not {('artifact',id) for id in alpha_ids} & prior_keys
+for (body,) in con.execute("SELECT body FROM objects WHERE namespace='n'"):
+    assert json.loads(body).get('record_kind') not in ('evaluation_ticket_v2','evaluation_ticket_issue_receipt_v1','alpha_claim_reservation_v1')
+C=len(prior);B=len(candidate_prior);A=len(alpha_ids)
+count=total-C-2-A
+assert count>0
 for i in range(count):
     doc=copy.deepcopy(template);node=f'node-{i:05}'
     doc['record']['id']=node;doc['trace']['run_id']=node
@@ -1795,14 +1903,68 @@ for i in range(count):
     con.execute('INSERT INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id) VALUES(?,?,?,?,?)',('n','run',previous,'run',node))
 # A second root-to-last edge forms a lawful diamond without adding nodes.
 con.execute('INSERT INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id) VALUES(?,?,?,?,?)',('n','run','S2','run',f'node-{count-1:05}'))
+assert len(closure(roots))==C+count
+assert len(closure(roots))+2+A==total
 con.commit()
+print(json.dumps({'C':C,'B':B,'A':A,'extra':count,'total':total,'prior_keys':sorted(prior_keys)},separators=(',',':')))
+con.close()
 "#,
-            &[&template, &extra.to_string()],
+            &[
+                &template,
+                &total.to_string(),
+                &fx.holdout.pair.candidate_digest,
+                &holdout_id,
+                &serde_json::to_string(&alpha_ids).unwrap(),
+            ],
+        );
+        let planning: Value = serde_json::from_str(&planning).unwrap();
+        println!(
+            "current-capacity-inputs C={} B={} A={} extra={} total={}",
+            planning["C"], planning["B"], planning["A"], planning["extra"], planning["total"]
         );
         let before = catalog(&fx).await;
         let result = issue(&fx).await;
-        if extra == 9984 {
+        if total == 10_000 {
             let ticket = result.unwrap();
+            let mut new_ids = vec![
+                sid("evaluation_ticket_v2", &ticket.id),
+                sid("evaluation_ticket_issue_receipt_v1", &ticket.id),
+            ];
+            new_ids.extend(alpha_ids.clone());
+            assert_eq!(
+                new_ids.iter().collect::<BTreeSet<_>>().len(),
+                2 + alpha_ids.len()
+            );
+            for id in &new_ids {
+                assert!(
+                    !planning["prior_keys"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(["artifact", id]))
+                );
+            }
+            // This SQL traversal reads the actual issued ticket's complete
+            // physical closure, independently of the collector under test.
+            let issued_count = own_sqlite(
+                &fx,
+                r#"
+import json,sqlite3,sys
+con=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+root=sys.argv[2];new_ids=json.loads(sys.argv[3])
+query="WITH RECURSIVE closure(kind,id) AS (VALUES ('artifact',?) UNION SELECT d.dst_kind,d.dst_id FROM dependencies d JOIN closure p ON d.namespace='n' AND d.src_kind=p.kind AND d.src_id=p.id) SELECT kind,id FROM closure"
+nodes=set(con.execute(query,(root,)))
+for id in new_ids:
+    assert ('artifact',id) in nodes
+    assert con.execute("SELECT 1 FROM objects WHERE namespace='n' AND kind='artifact' AND id=?",(id,)).fetchone()==(1,)
+print(len(nodes))
+con.close()
+"#,
+                &[
+                    &sid("evaluation_ticket_v2", &ticket.id),
+                    &serde_json::to_string(&new_ids).unwrap(),
+                ],
+            );
+            assert_eq!(issued_count.trim(), "10000");
             assert_eq!(
                 ticket
                     .candidate_dependency_binding

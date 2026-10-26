@@ -2527,6 +2527,7 @@ async fn current_handoff_binds_real_candidate_and_does_not_grant_release() {
             }
             let mut session = store.session().await.unwrap();
             let bundle_id = format!("formal-bundle-{}", candidate.bundle_digest);
+            let mut reauthorize = None;
             if fault == "missing-bundle" {
                 session
                     .delete(&admin, "artifact", &bundle_id)
@@ -2538,15 +2539,37 @@ async fn current_handoff_binds_real_candidate_and_does_not_grant_release() {
                 let profile_id = record["binding"]["profile_registration_id"]
                     .as_str()
                     .unwrap();
-                let mut profile: serde_json::Value =
+                let mut profile: evo_engine::formal_authority::FrozenCompilerProfile =
                     session.need(&admin, "artifact", profile_id).await.unwrap();
-                profile["authorized_by"] = serde_json::json!("different-admin");
+                profile.authorized_by = "different-admin".into();
                 session
                     .put(&admin, "artifact", profile_id, admin.actor(), &profile)
                     .await
                     .unwrap();
+                reauthorize = Some(profile);
             }
             session.commit().await.unwrap();
+            if let Some(profile) = reauthorize {
+                let changed_admin =
+                    Context::new(admin.namespace(), "different-admin", Role::Admin).unwrap();
+                evo_engine::formal_authority::FormalRegistry::freeze_profile(
+                    &changed_admin,
+                    &store,
+                    profile.clone(),
+                )
+                .await
+                .unwrap();
+                let mut session = store.session().await.unwrap();
+                let closure = evo_engine::formal_authority::read_typed_closure(
+                    &mut session,
+                    &admin,
+                    &[("artifact".into(), profile.id.clone())],
+                )
+                .await
+                .unwrap();
+                assert!(closure.nodes.iter().any(|node| node.id == profile.id));
+                session.commit().await.unwrap();
+            }
             let before = handoff_full_image(directory.path());
             let rejected = PersistentPackageStore::record_candidate_handoff(
                 &admin,
@@ -2558,7 +2581,10 @@ async fn current_handoff_binds_real_candidate_and_does_not_grant_release() {
             if fault == "missing-bundle" {
                 assert!(matches!(rejected, Err(Error::NotFound)), "{rejected:?}");
             } else {
-                assert!(matches!(rejected, Err(Error::Forbidden)), "{rejected:?}");
+                assert!(
+                    matches!(rejected, Err(Error::Conflict(ref message)) if message == "full P/B profile/environment/version/capability binding mismatch"),
+                    "{rejected:?}"
+                );
             }
             assert_eq!(
                 handoff_full_image(directory.path()),

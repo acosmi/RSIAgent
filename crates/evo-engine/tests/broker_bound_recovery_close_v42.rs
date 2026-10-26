@@ -1257,11 +1257,11 @@ async fn current_model_preimage_refusal_preserves_dispatched_accounting() {
         &hash(b"environment"),
     );
     let mut session = world.store.session().await.unwrap();
-    let mut provider: Value = session
+    let mut provider: evo_engine::formal_authority::RegisteredExternalProvider = session
         .need(&admin(), "artifact", &fixture.provider.id)
         .await
         .unwrap();
-    provider["provider_model"] = json!("another-legal-model");
+    provider.provider_model = "another-legal-model".into();
     session
         .put(
             &admin(),
@@ -1273,8 +1273,28 @@ async fn current_model_preimage_refusal_preserves_dispatched_accounting() {
         .await
         .unwrap();
     session.commit().await.unwrap();
+    // Re-register the exact changed diagnostic configuration through its real
+    // Admin producer. The content witness is healthy; the frozen host/model
+    // binding, rather than a missing witness, must refuse the continuation.
+    evo_engine::formal_authority::FormalRegistry::register_provider(
+        &admin(),
+        &world.store,
+        provider.clone(),
+    )
+    .await
+    .unwrap();
+    let mut session = world.store.session().await.unwrap();
+    let closure = evo_engine::formal_authority::read_typed_closure(
+        &mut session,
+        &admin(),
+        &[("artifact".into(), provider.id.clone())],
+    )
+    .await
+    .unwrap();
+    assert!(closure.nodes.iter().any(|n| n.id == provider.id));
+    session.commit().await.unwrap();
     let expected = current_refusal(&world.store, &bound).await;
-    assert!(matches!(expected, Error::Forbidden));
+    assert_conflict(&expected, AUTHORITY_CHANGED);
     let before = world.snapshot();
     assert_same_error(world.replay_current(&bound).await, &expected);
     let after = world.snapshot();

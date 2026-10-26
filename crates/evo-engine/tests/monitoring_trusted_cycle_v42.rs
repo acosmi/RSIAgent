@@ -242,6 +242,7 @@ fn build_request(
     request_id: &str,
     episode_id: &str,
     step: u32,
+    candidate_bundle_digest: &str,
 ) -> DevelopmentRunRequest {
     DevelopmentRunRequest {
         request_id: request_id.into(),
@@ -252,12 +253,7 @@ fn build_request(
         attempt: 1,
         manifest: control.manifest().unwrap(),
         parent_bundle_digest: d("parent-bundle"),
-        candidate_bundle_digest: trusted_compiler_inputs::software_candidate(
-            TENANT,
-            &control.environment_digest,
-            &format!("candidate-bundle-{request_id}"),
-        )
-        .digest,
+        candidate_bundle_digest: candidate_bundle_digest.into(),
         environment_digest: control.environment_digest.clone(),
         grader_digest: control.grader_digest.clone(),
         rules_digest: control.rules_digest.clone(),
@@ -587,27 +583,23 @@ impl Fixture {
     /// Runs the real registered runner for cycle `n` and journals the request and
     /// observation facts the way the E03 step and its recovery journal would.
     async fn stage_trusted(&self, n: u32) -> Staged {
+        let candidate = trusted_compiler_inputs::software_candidate_current(
+            &self.store,
+            &self.worker,
+            &self.control.environment_digest,
+            &format!("candidate-bundle-dev-request-{n}"),
+            1,
+        )
+        .await
+        .unwrap();
         let request = build_request(
             &self.control,
             &format!("dev-request-{n}"),
             &format!("cycle-episode-{n}"),
             n,
-        );
-        let candidate = trusted_compiler_inputs::software_candidate(
-            TENANT,
-            &self.control.environment_digest,
-            &format!("candidate-bundle-{}", request.request_id),
+            &candidate.digest,
         );
         assert_eq!(candidate.digest, request.candidate_bundle_digest);
-        trusted_compiler_inputs::persist_bundle(
-            &self.store,
-            TENANT,
-            &candidate,
-            &self.control.environment_digest,
-            request.revoke_watermark,
-        )
-        .await
-        .unwrap();
         let report = self.runner().run(request.clone()).await.unwrap();
         assert_eq!(
             report.provenance,
@@ -616,19 +608,21 @@ impl Fixture {
         let journal = self.journal();
         let request_fact = request_fact(&request);
         let observed = observed_fact(&request, &report, true);
-        let inputs = trusted_compiler_inputs::bundle_use(
+        let inputs = trusted_compiler_inputs::bundle_use_current(
             &self.store,
-            TENANT,
+            &self.worker,
             &request.candidate_bundle_digest,
+            &request.environment_digest,
+            request.revoke_watermark,
         )
         .await
         .unwrap();
         journal
-            .commit_bound(request_fact.clone(), &inputs)
+            .commit_source_bound(request_fact.clone(), &inputs)
             .await
             .unwrap();
         journal
-            .commit_bound(observed.clone(), &inputs)
+            .commit_source_bound(observed.clone(), &inputs)
             .await
             .unwrap();
         Staged {

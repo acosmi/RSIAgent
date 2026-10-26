@@ -3326,7 +3326,7 @@ mod consolidation {
             let admin = context("admin", Role::Admin);
             let host = context("host", Role::Host);
             let worker = context("worker", Role::Worker);
-            ReleaseStore::register_host_surface(
+            trusted_compiler_inputs::register_fixture_host_surface(
                 &admin,
                 &store,
                 "surface",
@@ -3890,6 +3890,19 @@ mod consolidation {
             self.dispatch(request.request).await
         }
 
+        // This deterministic port accepts the complete Current carrier while
+        // retaining the same fixture responses, receipts and original failures.
+        async fn dispatch_compiler_bound(
+            &self,
+            request: evo_engine::model::ReadBoundModelRequest,
+        ) -> Result<ModelResponse> {
+            request.validate()?;
+            if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+                return Err(Error::Forbidden);
+            }
+            self.dispatch(request.request.clone()).await
+        }
+
         async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
             match &self.script {
                 Script::Edits => {
@@ -4306,7 +4319,10 @@ async fn bound_cache_and_dispatch_claim_observe_admin_pointer_change_without_run
     .unwrap();
     assert_eq!(legacy.schema_version, "rsia.bound_model_request.v1");
     let legacy_fact = repair_dispatch_fact(&legacy);
-    assert_ne!(legacy_fact.artifact_id, fact.artifact_id);
+    // The business fact's identity does not encode the separate compiler-use
+    // carrier. Equal keys still confer no legacy authority: both old ports must
+    // refuse before the first Current claim on that same key.
+    assert_eq!(legacy_fact.artifact_id, fact.artifact_id);
     assert!(matches!(
         journal
             .claim_bound(legacy_fact.clone(), &legacy_inputs)

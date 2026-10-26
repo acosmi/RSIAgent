@@ -262,9 +262,52 @@ async fn new_run_rejects_legacy_rename_to_classified_name_without_writing() {
     assert_new_run_rejects_legacy_fixture(&["model", "model", "theme"], "instruction").await;
 }
 
+async fn restore_actual_registration_prefix(
+    directory: &Path,
+    store: Store,
+    body: &str,
+    audit: &[(i64, &str, &str, &str, &str)],
+) -> Store {
+    store.close().await;
+    let path = directory.join("name-coverage.sqlite3");
+    let script = r#"
+import json,sqlite3,sys
+payload=json.loads(sys.argv[2])
+con=sqlite3.connect(sys.argv[1])
+body=payload['body']
+con.execute("INSERT INTO objects(namespace,kind,id,owner,body,revision) VALUES('name-coverage','artifact',?,'trusted-actor',?,1)",(json.loads(body)['id'],body))
+con.executemany('INSERT INTO audit(seq,namespace,payload,previous_hash,digest) VALUES(?,?,?,?,?)',payload['audit'])
+con.commit()
+assert con.execute('PRAGMA integrity_check').fetchall()==[('ok',)]
+con.close()
+"#;
+    let result = std::process::Command::new("python3")
+        .args(["-B", "-c", script])
+        .arg(&path)
+        .arg(serde_json::to_string(&json!({"body":body,"audit":audit})).unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Store::open(&path).await.unwrap()
+}
+
 #[tokio::test]
 async fn complete_registration_is_idempotent_and_changed_content_conflicts() {
-    let (_dir, store) = database().await;
+    let (dir, store) = database().await;
+    // This is the actual successful registration prefix of the frozen parent
+    // run, before its later prepare events; it creates no new v1 authority.
+    let store = restore_actual_registration_prefix(
+        dir.path(),
+        store,
+        ACTUAL_LEGACY_HOST,
+        &ACTUAL_LEGACY_AUDIT[..2],
+    )
+    .await;
+    assert_eq!(counts(&store).await, (1, 0, 2));
     let admin = context(Role::Admin);
     let manifest = surface();
     let extracted = names(&["theme", "instruction", "model"]);
@@ -311,7 +354,15 @@ async fn complete_registration_is_idempotent_and_changed_content_conflicts() {
 
 #[tokio::test]
 async fn complete_duplicate_names_keep_registration_behavior() {
-    let (_dir, store) = database().await;
+    let (dir, store) = database().await;
+    let store = restore_actual_registration_prefix(
+        dir.path(),
+        store,
+        ACTUAL_DUPLICATE_HOST,
+        &ACTUAL_DUPLICATE_AUDIT,
+    )
+    .await;
+    assert_eq!(counts(&store).await, (1, 0, 2));
     let mut manifest = surface();
     manifest.items.push(manifest.items[0].clone());
     let expected_digest = fingerprint(&manifest).unwrap();
@@ -325,8 +376,57 @@ async fn complete_duplicate_names_keep_registration_behavior() {
     .await
     .unwrap();
     assert_eq!(record.manifest_digest, expected_digest);
+    assert_eq!(
+        expected_digest,
+        "f3ef985779cf420b9b8aa9c6e77704933c67ce671efe670958d19e48b231eee3"
+    );
+    assert_eq!(
+        serde_json::to_string(&record).unwrap(),
+        ACTUAL_DUPLICATE_HOST
+    );
     assert_eq!(counts(&store).await, (1, 0, 2));
+    assert_fixture_unchanged(
+        &store,
+        &serde_json::from_str(ACTUAL_DUPLICATE_HOST).unwrap(),
+    )
+    .await;
+    let before = counts(&store).await;
+    let mut fresh = record.clone();
+    fresh.id = "new-duplicate-v1".into();
+    let refused = ReleaseStore::register_host_surface(
+        &context(Role::Admin),
+        &store,
+        &fresh.id,
+        fresh.manifest,
+        fresh.extracted,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(Error::Conflict(ref m)) if m == "new v1 host surface registration lacks original source; use source-bound registration")
+    );
+    assert_eq!(counts(&store).await, before);
 }
+
+// Actual base-800 successful duplicate registration prefix. Record SHA-256:
+// 99473dba6e1aa58309aa11b89dde2f69a307de4c3827625e62793c1a2be59a5b.
+// Its four items, owner and two original audit events are retained byte for byte.
+const ACTUAL_DUPLICATE_HOST: &str = r#"{"id":"surface-name-coverage","schema_version":"rsia.host_surface_record.v1","manifest":{"schema_version":"rsia.host_surface.v1","host":"reference","host_version":"0.1.0","adapter_version":"0.1.0","source_digest":"reference_host_surface_v1","items":[{"name":"instruction","coverage":"supported","mapped_field":"skill.content","consumer":"compiler","reason":"run-level instruction projection"},{"name":"model","coverage":"runtime_owned","mapped_field":null,"consumer":null,"reason":"model identity is host-declared"},{"name":"theme","coverage":"unsupported","mapped_field":null,"consumer":null,"reason":"UI theme is out of scope"},{"name":"instruction","coverage":"supported","mapped_field":"skill.content","consumer":"compiler","reason":"run-level instruction projection"}]},"manifest_digest":"f3ef985779cf420b9b8aa9c6e77704933c67ce671efe670958d19e48b231eee3","extracted":["instruction","model","theme","model"]}"#;
+const ACTUAL_DUPLICATE_AUDIT: [(i64, &str, &str, &str, &str); 2] = [
+    (
+        1,
+        "name-coverage",
+        r#"{"actor":"trusted-actor","entity":"be4bf1c6b626e1591b84b8d8df2410abf288f1b07dc48fac727acff670e58e79","operation":"formal.admin.content.v1.f9e65bfa18da6cccfa157fb8caf97aa67cf67ff6cf96906026dc7bd9b6bfa160","role":"admin","timestamp":1792966038}"#,
+        "",
+        "2942a91e56c22bfef270da2b29a203cc597a89c88f379f590ce7c4be84cd1e18",
+    ),
+    (
+        2,
+        "name-coverage",
+        r#"{"actor":"trusted-actor","entity":"surface-name-coverage","operation":"host_surface.register","role":"admin","timestamp":1792966038}"#,
+        "2942a91e56c22bfef270da2b29a203cc597a89c88f379f590ce7c4be84cd1e18",
+        "c7069a2677c733a967747c74e712ebd2721193652d11052cfa91b01783a5f487",
+    ),
+];
 
 // Actual frozen parent-producer bytes. Only objects and their original audit
 // chain are needed here; migration/FTS internals are created by Store::open.
@@ -672,24 +772,34 @@ type ObjectDependencyImage = (String, String, Vec<(String, String)>);
 
 #[derive(Debug, PartialEq, Eq)]
 struct CurrentImage {
-    artifacts: Vec<Value>,
-    runs: Vec<Value>,
+    artifacts: Result<Vec<Value>, String>,
+    runs: Result<Vec<Value>, String>,
     edges: Vec<ObjectDependencyImage>,
+    raw_sql: Value,
     counts: (u64, u64, usize),
-    facts: evo_storage::lifecycle::ControlPlaneFacts,
+    facts: Result<evo_storage::lifecycle::ControlPlaneFacts, String>,
     files: BTreeMap<String, (bool, Vec<u8>)>,
 }
 
-// This fixture owns only the named database family: no second Store, SQL
-// connection, cleanup or global serialization is introduced. Unexpected files,
-// directories and symlinks fail the observation instead of being ignored.
+// This fixture owns only the named database family. Its existing read-only SQL
+// observer preserves every row even when a damaged Current body is refused by
+// the typed reader. Unexpected files, directories and symlinks still fail.
 async fn current_image(store: &Store, dir: &Path) -> CurrentImage {
     let admin = context(Role::Admin);
     let mut session = store.session().await.unwrap();
-    let artifacts: Vec<Value> = session.list(&admin, "artifact").await.unwrap();
-    let runs: Vec<Value> = session.list(&admin, "run").await.unwrap();
+    let artifacts: Result<Vec<Value>, String> = session
+        .list(&admin, "artifact")
+        .await
+        .map_err(|error| error.to_string());
+    let runs: Result<Vec<Value>, String> = session
+        .list(&admin, "run")
+        .await
+        .map_err(|error| error.to_string());
     let mut edges = Vec::new();
     for (kind, values) in [("artifact", &artifacts), ("run", &runs)] {
+        let Ok(values) = values else {
+            continue;
+        };
         for body in values {
             let id = body["id"].as_str().expect("fixture object id");
             edges.push((
@@ -707,7 +817,8 @@ async fn current_image(store: &Store, dir: &Path) -> CurrentImage {
     let facts =
         evo_storage::lifecycle::read_control_plane_facts(&dir.join("name-coverage.sqlite3"))
             .await
-            .unwrap();
+            .map_err(|error| error.to_string());
+    let raw_sql = raw_logical_image(&dir.join("name-coverage.sqlite3")).await;
     let mut files = BTreeMap::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let entry = entry.unwrap();
@@ -734,6 +845,7 @@ async fn current_image(store: &Store, dir: &Path) -> CurrentImage {
         artifacts,
         runs,
         edges,
+        raw_sql,
         counts,
         facts,
         files,
@@ -1041,8 +1153,13 @@ async fn current_source_typed_identity_and_authentication_faults_hit_their_exact
                 "invalid reviewed host source/default"
             }
             "manifest_digest" => {
+                evo_engine::release_store::validate_host_record_v2_source(&record).unwrap();
                 record.manifest_digest = hash(b"single deliberately wrong stored manifest digest");
-                "current host surface identity/source differs"
+                assert_conflict(
+                    evo_engine::release_store::validate_host_record_v2_source(&record),
+                    "current host surface identity/source differs",
+                );
+                "invalid reviewed host source/default"
             }
             "witness" => {
                 // A locally valid classification change with the real digest
@@ -1080,6 +1197,13 @@ async fn current_source_typed_identity_and_authentication_faults_hit_their_exact
         }
         session.commit().await.unwrap();
         let prior = current_image(&store, dir.path()).await;
+        if matches!(fault, "source" | "typed_default" | "manifest_digest") {
+            assert_eq!(
+                prior.artifacts.as_ref().unwrap_err(),
+                &Error::Invalid(expected.into()).to_string(),
+                "{fault} typed observation must retain the exact refusal"
+            );
+        }
         let mut fresh = request();
         fresh.run_id = "new-current-run-after-single-fault".into();
         let result = ReleaseStore::prepare_run(&context(Role::Host), &store, fresh).await;
@@ -1088,7 +1212,10 @@ async fn current_source_typed_identity_and_authentication_faults_hit_their_exact
                 matches!(result, Err(Error::NotFound)),
                 "{fault}: {result:?}"
             );
-        } else if matches!(fault, "source" | "typed_default" | "schema") {
+        } else if matches!(
+            fault,
+            "source" | "typed_default" | "manifest_digest" | "schema"
+        ) {
             assert_invalid(result, expected);
         } else {
             assert_conflict(result, expected);
@@ -1105,7 +1232,10 @@ async fn current_source_typed_identity_and_authentication_faults_hit_their_exact
                 matches!(result, Err(Error::NotFound)),
                 "{fault}: {result:?}"
             );
-        } else if matches!(fault, "source" | "typed_default" | "schema") {
+        } else if matches!(
+            fault,
+            "source" | "typed_default" | "manifest_digest" | "schema"
+        ) {
             assert_invalid(result, expected);
         } else {
             assert_conflict(result, expected);
@@ -1202,24 +1332,89 @@ async fn current_predecessor_is_a_real_same_host_record_and_foreign_or_self_inpu
 }
 
 // Observe exact logical rows without deserializing a deliberately damaged body.
-async fn raw_logical_image(path: &Path) -> Vec<(String, Vec<String>)> {
+type RawDatabaseFamily = BTreeMap<String, (std::fs::Permissions, Vec<u8>)>;
+
+// The fixture has no concurrent business writer. Capture the main database and
+// every existing WAL/SHM member together; no SQLite client opens the source here.
+fn capture_raw_database_family(path: &Path) -> RawDatabaseFamily {
+    let mut files = BTreeMap::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let member = std::path::PathBuf::from(name);
+        let metadata = match std::fs::symlink_metadata(&member) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => {
+                continue;
+            }
+            Err(error) => panic!("cannot capture database family member {member:?}: {error}"),
+        };
+        assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+        let bytes = std::fs::read(&member).unwrap();
+        let after = std::fs::symlink_metadata(&member).unwrap();
+        assert!(after.is_file() && !after.file_type().is_symlink());
+        assert_eq!(metadata.permissions(), after.permissions());
+        assert_eq!(metadata.len(), bytes.len() as u64);
+        assert_eq!(after.len(), bytes.len() as u64);
+        let name = member.file_name().unwrap().to_str().unwrap().to_owned();
+        assert!(
+            files
+                .insert(name, (metadata.permissions(), bytes))
+                .is_none()
+        );
+    }
+    files
+}
+
+async fn raw_logical_image(path: &Path) -> Value {
+    let captured = capture_raw_database_family(path);
+    let private = tempfile::tempdir().unwrap();
+    for (name, (permissions, bytes)) in &captured {
+        let copy = private.path().join(name);
+        std::fs::write(&copy, bytes).unwrap();
+        std::fs::set_permissions(&copy, permissions.clone()).unwrap();
+    }
+    assert_eq!(
+        capture_raw_database_family(path),
+        captured,
+        "copying the private observation changed the source database family"
+    );
+    let copy_path = private.path().join(path.file_name().unwrap());
     let script = r#"
-import json,sqlite3,sys
+import json,sqlite3,struct,sys
 con=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+con.text_factory=bytes
 quote=lambda value:'"'+value.replace('"','""')+'"'
-result=[]
-for (name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
+def cell(storage,value):
+    storage=storage.decode('ascii')
+    if storage in ('text','blob'):
+        assert isinstance(value,bytes)
+        return [storage,value.hex()]
+    if storage=='integer':
+        assert isinstance(value,int)
+        return [storage,str(value)]
+    if storage=='real':
+        assert isinstance(value,float)
+        return [storage,struct.pack('>d',value).hex()]
+    assert storage=='null' and value is None
+    return [storage,None]
+image={}
+for (raw_name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
+    name=raw_name.decode('utf-8')
     table=quote(name)
-    columns=[row[1] for row in con.execute('PRAGMA table_info('+table+')')]
-    expressions=','.join('quote('+quote(column)+')' for column in columns)
-    rows=sorted(row[0] for row in con.execute('SELECT json_array('+expressions+') FROM '+table))
-    result.append((name,rows))
+    columns=[row[1].decode('utf-8') for row in con.execute('PRAGMA table_xinfo('+table+')')]
+    assert columns
+    expressions=','.join('typeof('+quote(column)+'),'+quote(column) for column in columns)
+    rows=[]
+    for row in con.execute('SELECT '+expressions+' FROM '+table):
+        rows.append([cell(row[2*i],row[2*i+1]) for i in range(len(columns))])
+    image[name]={'columns':columns,'rows':sorted(rows,key=lambda row:json.dumps(row,separators=(',',':')))}
 con.close()
-print(json.dumps(result,ensure_ascii=False,separators=(',',':')))
+print(json.dumps(image,sort_keys=True,separators=(',',':')))
 "#;
     let result = std::process::Command::new("python3")
         .args(["-B", "-c", script])
-        .arg(path)
+        .arg(&copy_path)
         .output()
         .unwrap();
     assert!(
@@ -1227,7 +1422,14 @@ print(json.dumps(result,ensure_ascii=False,separators=(',',':')))
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    serde_json::from_slice(&result.stdout).unwrap()
+    assert_eq!(
+        capture_raw_database_family(path),
+        captured,
+        "observing the private copy changed the source database family"
+    );
+    let image = serde_json::from_slice(&result.stdout).unwrap();
+    private.close().unwrap();
+    image
 }
 fn write_raw_host_body(path: &Path, body: &str) {
     let script = "import sqlite3,sys; con=sqlite3.connect(sys.argv[1]); con.execute(\"UPDATE objects SET body=? WHERE namespace='name-coverage' AND kind='artifact' AND id='surface-name-coverage'\",(sys.argv[2],)); con.commit(); con.close()";
@@ -1261,7 +1463,14 @@ async fn raw_host_registration_precision_fault_is_zero_write() {
     .unwrap();
     assert_eq!(same.source.original_utf8, healthy.original_utf8);
     let before = raw_logical_image(&dir.path().join("name-coverage.sqlite3")).await;
-    let damaged = raw.replacen("0.1", "0.100000000000000001", 1);
+    let token = "\"decimal\":0.1";
+    assert_eq!(healthy.original_utf8.matches(token).count(), 1);
+    let mut damaged_source = healthy.clone();
+    damaged_source.original_utf8 =
+        healthy
+            .original_utf8
+            .replacen(token, "\"decimal\":0.100000000000000001", 1);
+    let damaged = serde_json::to_string(&damaged_source).unwrap();
     assert_ne!(damaged, raw);
     assert_invalid(
         evo_engine::hosts::register_reviewed_host_surface_json(

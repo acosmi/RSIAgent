@@ -102,14 +102,29 @@ async fn state(store: &Store) -> (u64, u64, usize, usize) {
     )
 }
 
-async fn raw_surface(store: &Store) -> Value {
-    let mut s = store.session().await.unwrap();
-    let raw = s
-        .raw_object(&ctx(Role::Admin), "artifact", SURFACE_ID)
-        .await
+// Observe original SQL bytes independently of the production typed reader:
+// malformed Current labels must still be observable after that reader refuses.
+async fn raw_surface(directory: &std::path::Path) -> Value {
+    let script = r#"
+import sqlite3,sys
+c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+row=c.execute("SELECT body FROM objects WHERE namespace='duplicates-v43' AND kind='artifact' AND id=?",(sys.argv[2],)).fetchone()
+assert row is not None
+sys.stdout.write(row[0])
+c.close()
+"#;
+    let output = std::process::Command::new("python3")
+        .args(["-B", "-c", script])
+        .arg(directory.join("surface.sqlite3"))
+        .arg(SURFACE_ID)
+        .output()
         .unwrap();
-    s.commit().await.unwrap();
-    raw
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 // Model an authenticated old component record through the existing local
@@ -249,7 +264,7 @@ async fn assert_fresh_legacy_refused(store: &Store) {
     assert!(matches!(
         ReleaseStore::prepare_run(&ctx(Role::Host), store, fresh).await,
         Err(Error::Invalid(message))
-            if message == "current prepare requires a source-bound host surface v2"
+            if message == "conflicting host surface items for name instruction"
     ));
     assert_eq!(state(store).await, before);
 }
@@ -322,7 +337,7 @@ async fn disk_legacy_conflict_is_readable_but_cannot_prepare_a_new_run() {
     assert_conflict(ReleaseStore::prepare_run(&ctx(Role::Host), &store, request()).await);
     assert_fresh_legacy_refused(&store).await;
     assert_eq!(state(&store).await, before);
-    assert_eq!(raw_surface(&store).await, raw);
+    assert_eq!(raw_surface(dir.path()).await, raw);
     store.close().await;
 }
 
@@ -349,7 +364,7 @@ async fn unknown_or_v2_record_schema_cannot_be_typed_read_or_prepared() {
             Err(Error::Internal)
         ));
         assert_eq!(state(&store).await, before);
-        assert_eq!(raw_surface(&store).await, raw);
+        assert_eq!(raw_surface(_dir.path()).await, raw);
         store.close().await;
     }
 }
@@ -452,7 +467,7 @@ async fn existing_prepare_and_reload_revalidate_authenticated_legacy_surface() {
             assert_conflict(repeated);
         }
         assert_eq!(state(&store).await, before);
-        assert_eq!(raw_surface(&store).await, raw);
+        assert_eq!(raw_surface(_dir.path()).await, raw);
         store.close().await;
     }
 }

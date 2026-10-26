@@ -1113,7 +1113,7 @@ async fn put_artifact(store: &Store, ctx: &Context, id: &str, body: &Value) {
 }
 
 async fn release_candidates(store: &Store, ctx: &Context) -> usize {
-    artifacts_with_schema(store, ctx, "rsia.release_candidate.v1")
+    artifacts_with_schema(store, ctx, "rsia.release_candidate.v2")
         .await
         .len()
 }
@@ -2184,7 +2184,24 @@ async fn a_terminal_fact_that_does_not_hold_the_candidate_writes_no_proposal() {
             fact.payload["status"] = json!("rejected");
         }),
         ("another bundle", |fact| {
-            fact.payload["bundle"]["digest"] = json!(d("another bundle"));
+            let mut bundle: evo_core::contract::ResolvedBundleV3 =
+                serde_json::from_value(fact.payload["bundle"].clone()).unwrap();
+            // Keep the intrinsic Current identity healthy so the terminal/full
+            // candidate comparison, not a malformed digest, rejects this wire.
+            bundle.skill.content = "another complete terminal bundle".into();
+            for origin in &mut bundle.origins {
+                if origin.field == "skill.content" {
+                    origin.value_digest = fingerprint(&bundle.skill.content).unwrap();
+                }
+            }
+            bundle.digest = evo_core::contract::resolved_bundle_digest_v3(&bundle).unwrap();
+            assert_eq!(
+                evo_core::contract::resolved_bundle_digest_v3(&bundle).unwrap(),
+                bundle.digest
+            );
+            bundle.skill.validate().unwrap();
+            evo_core::Validate::validate(&bundle.improver).unwrap();
+            fact.payload["bundle"] = serde_json::to_value(bundle).unwrap();
         }),
         ("another selection", |fact| {
             fact.payload["selection"]["candidate_total_micros"] = json!(1);
@@ -2200,8 +2217,13 @@ async fn a_terminal_fact_that_does_not_hold_the_candidate_writes_no_proposal() {
             forge,
         };
         let refused = run.run_with(&run.claim, &run.model, &forged, 1, true).await;
+        let expected = if name == "another bundle" {
+            "terminal candidate full bundle differs"
+        } else {
+            "optimization terminal fact does not hold this candidate"
+        };
         assert!(
-            matches!(&refused, Err(Error::Conflict(message)) if message.contains("terminal fact")),
+            matches!(&refused, Err(Error::Conflict(message)) if message == expected),
             "{name}: {refused:?}"
         );
         assert_no_proposal(&run).await;
@@ -2327,7 +2349,7 @@ async fn staging_writes_only_a_release_candidate_and_is_idempotent_and_conflict_
         serde_json::to_value(candidate).unwrap()
     );
     assert_eq!(
-        artifacts_with_schema(&fixture.store, &fixture.worker, "rsia.release_candidate.v1")
+        artifacts_with_schema(&fixture.store, &fixture.worker, "rsia.release_candidate.v2")
             .await
             .len(),
         1
@@ -2374,7 +2396,7 @@ async fn staging_writes_only_a_release_candidate_and_is_idempotent_and_conflict_
         second_proposal.candidate_bundle_digest
     );
     assert_eq!(
-        artifacts_with_schema(&fixture.store, &fixture.worker, "rsia.release_candidate.v1")
+        artifacts_with_schema(&fixture.store, &fixture.worker, "rsia.release_candidate.v2")
             .await
             .len(),
         2
@@ -2855,7 +2877,7 @@ async fn an_environment_drift_makes_the_proposal_unstageable() {
         .await;
     assert!(matches!(refused, Err(Error::Conflict(_))), "{refused:?}");
     assert_eq!(
-        artifacts_with_schema(&fixture.store, &fixture.worker, "rsia.release_candidate.v1")
+        artifacts_with_schema(&fixture.store, &fixture.worker, "rsia.release_candidate.v2")
             .await
             .len(),
         0
@@ -3003,7 +3025,7 @@ async fn revoking_a_source_cleans_the_monitoring_closure_to_complete() {
         &staged.candidate.id,
     )
     .await;
-    assert_redacted(&candidate_body, "rsia.release_candidate.v1");
+    assert_redacted(&candidate_body, "rsia.release_candidate.v2");
     // The binding that reserved the candidate id is part of the closure too.
     let binding_body = value(
         &fixture.store,

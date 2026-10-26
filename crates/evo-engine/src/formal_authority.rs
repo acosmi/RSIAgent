@@ -8953,6 +8953,8 @@ pub(crate) mod current_source_test_support {
         .await
         .unwrap();
         let before = session.list::<Value>(&worker, "artifact").await.unwrap();
+        // An unendorsed edit is a separate content-witness refusal control.
+        // The authenticated original/projection mismatch is exercised below.
         let mut changed = f.root.clone();
         changed.authorized_by = "another-admin".into();
         session
@@ -8969,7 +8971,8 @@ pub(crate) mod current_source_test_support {
                 &ImproverPatch::default()
             )
             .await,
-            Err(Error::Forbidden)
+            Err(Error::Conflict(ref message))
+                if message == "missing authenticated content authorization; quarantine"
         ));
         assert_eq!(
             session.list::<Value>(&worker, "artifact").await.unwrap(),
@@ -8990,6 +8993,55 @@ pub(crate) mod current_source_test_support {
         assert_eq!(
             serde_json::to_vec(&restored.bundle).unwrap(),
             serde_json::to_vec(&bundle).unwrap()
+        );
+        session.commit().await.unwrap();
+
+        // Keep the content-authentication gate healthy through the existing
+        // Admin producer. Reauthorizing this changed root does not authorize an
+        // old request's parent digest to refer to that different original body.
+        let another_admin = Context::new(worker.namespace(), "another-admin", Role::Admin).unwrap();
+        let mut session = store.session().await.unwrap();
+        session
+            .put(
+                &another_admin,
+                "artifact",
+                &changed.id,
+                another_admin.actor(),
+                &changed,
+            )
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let changed_digest =
+            FormalRegistry::authorize_empty_root(&another_admin, &store, changed.clone())
+                .await
+                .unwrap();
+        assert_ne!(changed_digest, request.profile.parent_digest);
+        let mut session = store.session().await.unwrap();
+        let authenticated: EmptyRootAuthorization =
+            attested_read(&mut session, &worker, "artifact", &changed.id, Role::Admin)
+                .await
+                .unwrap();
+        assert_eq!(
+            fingerprint(&authenticated).unwrap(),
+            fingerprint(&changed).unwrap()
+        );
+        let after_authorization = session.list::<Value>(&worker, "artifact").await.unwrap();
+        let refused = crate::compiler::compile_current_in_session(
+            &mut session,
+            &worker,
+            &request,
+            &SkillPatch::default(),
+            &ImproverPatch::default(),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(Error::Conflict(ref message)) if message == "empty root digest mismatch"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            session.list::<Value>(&worker, "artifact").await.unwrap(),
+            after_authorization
         );
         session.commit().await.unwrap();
         store.close().await;

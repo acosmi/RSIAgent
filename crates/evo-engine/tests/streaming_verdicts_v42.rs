@@ -752,7 +752,7 @@ async fn stage_fixture_candidate(
 async fn assert_release_forbidden(fixture: &Fixture) {
     let approver = Context::new("n", "approver", Role::Admin).unwrap();
     let mut session = fixture.store.session().await.unwrap();
-    let candidate: evo_engine::release_store::ReleaseCandidateRecord = session
+    let candidate: evo_engine::release_store::CurrentReleaseCandidateRecord = session
         .need(&approver, "artifact", &d("candidate"))
         .await
         .unwrap();

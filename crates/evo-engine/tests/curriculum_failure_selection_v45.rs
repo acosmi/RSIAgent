@@ -202,6 +202,7 @@ fn build_request(
     control: &DevelopmentControlV1,
     request_id: &str,
     episode_id: &str,
+    candidate_bundle_digest: &str,
 ) -> DevelopmentRunRequest {
     DevelopmentRunRequest {
         request_id: request_id.into(),
@@ -212,12 +213,7 @@ fn build_request(
         attempt: 1,
         manifest: control.manifest().unwrap(),
         parent_bundle_digest: d("parent-bundle"),
-        candidate_bundle_digest: trusted_compiler_inputs::software_candidate(
-            NAMESPACE,
-            &control.environment_digest,
-            "candidate-bundle",
-        )
-        .digest,
+        candidate_bundle_digest: candidate_bundle_digest.into(),
         environment_digest: control.environment_digest.clone(),
         grader_digest: control.grader_digest.clone(),
         rules_digest: control.rules_digest.clone(),
@@ -228,6 +224,7 @@ fn build_request(
 }
 
 struct Fixture {
+    candidate_digest: String,
     _dir: tempfile::TempDir,
     store: Store,
     admin: Context,
@@ -253,7 +250,7 @@ impl Fixture {
         }
         let mut session = store.session().await.unwrap();
         session
-            .bump_watermark(&admin, "initial-watermark")
+            .bump_watermark(&admin, &d("initial-watermark"))
             .await
             .unwrap();
         session.commit().await.unwrap();
@@ -276,16 +273,11 @@ impl Fixture {
             .await
             .unwrap();
         let control = control();
-        let candidate = trusted_compiler_inputs::software_candidate(
-            NAMESPACE,
+        let candidate = trusted_compiler_inputs::software_candidate_current(
+            &store,
+            &executor,
             &control.environment_digest,
             "candidate-bundle",
-        );
-        trusted_compiler_inputs::persist_bundle(
-            &store,
-            NAMESPACE,
-            &candidate,
-            &control.environment_digest,
             1,
         )
         .await
@@ -294,6 +286,7 @@ impl Fixture {
             .await
             .unwrap();
         Self {
+            candidate_digest: candidate.digest,
             _dir: dir,
             store,
             admin,
@@ -408,19 +401,21 @@ impl Fixture {
         }
         .seal()
         .unwrap();
-        let inputs = trusted_compiler_inputs::bundle_use(
+        let inputs = trusted_compiler_inputs::bundle_use_current(
             &self.store,
-            NAMESPACE,
+            &self.admin,
             &request.candidate_bundle_digest,
+            &request.environment_digest,
+            request.revoke_watermark,
         )
         .await
         .unwrap();
         journal
-            .commit_bound(request_fact.clone(), &inputs)
+            .commit_source_bound(request_fact.clone(), &inputs)
             .await
             .unwrap();
         journal
-            .commit_bound(observed_fact.clone(), &inputs)
+            .commit_source_bound(observed_fact.clone(), &inputs)
             .await
             .unwrap();
         (request_fact.artifact_id, observed_fact.artifact_id)
@@ -554,6 +549,7 @@ async fn real_cycle(
         &fixture.control,
         &format!("dev-request-{n}"),
         &format!("episode-{n}"),
+        &fixture.candidate_digest,
     );
     let report = fixture.runner().run(request.clone()).await.unwrap();
     let (request_fact_id, observed_fact_id) = fixture.commit_facts(&request, &report).await;

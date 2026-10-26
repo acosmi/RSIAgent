@@ -1665,9 +1665,23 @@ async fn an_ordinary_e03_step_keeps_its_reflection_and_ranking_ledger_stages() {
             )
             .await
             .unwrap();
-        assert!(
-            matches!(outcome, OptimizationStepOutcome::Candidate { .. }),
-            "{base:?}: {outcome:?}"
+        let OptimizationStepOutcome::CurrentCandidate {
+            edit,
+            bundle,
+            selection,
+        } = &outcome
+        else {
+            panic!("{base:?}: {outcome:?}");
+        };
+        assert_eq!(bundle.schema_version, evo_core::contract::BUNDLE_SCHEMA_V3);
+        assert_eq!(
+            serde_json::to_vec(&bundle.skill).unwrap(),
+            serde_json::to_vec(&edit.output).unwrap()
+        );
+        assert_eq!(selection.candidate_bundle_digest, bundle.digest);
+        assert_eq!(
+            selection.decision,
+            evo_engine::optimization::DevelopmentSelectionDecision::AcceptCandidate
         );
         assert_eq!(world.provider_calls(), 3, "{base:?}");
         let mut stages: Vec<_> = world
@@ -1720,9 +1734,23 @@ async fn an_ordinary_step_cannot_use_the_consolidate_stage() {
         .ordinary("e03-episode", Shape::at(ModelStage::ReflectFailure))
         .await
         .unwrap();
-    assert!(
-        matches!(outcome, OptimizationStepOutcome::Candidate { .. }),
-        "{outcome:?}"
+    let OptimizationStepOutcome::CurrentCandidate {
+        edit,
+        bundle,
+        selection,
+    } = &outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(bundle.schema_version, evo_core::contract::BUNDLE_SCHEMA_V3);
+    assert_eq!(
+        serde_json::to_vec(&bundle.skill).unwrap(),
+        serde_json::to_vec(&edit.output).unwrap()
+    );
+    assert_eq!(selection.candidate_bundle_digest, bundle.digest);
+    assert_eq!(
+        selection.decision,
+        evo_engine::optimization::DevelopmentSelectionDecision::AcceptCandidate
     );
 }
 
