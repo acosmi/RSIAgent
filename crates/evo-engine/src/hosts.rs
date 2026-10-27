@@ -270,7 +270,14 @@ mod tests {
             .iter()
             .map(|item| item.name.clone())
             .collect();
-        assert!(detect_surface_drift(&manifest, &extracted).is_ok());
+        manifest
+            .validate_frozen_v1_against_extraction(&extracted)
+            .unwrap();
+        assert!(matches!(
+            detect_surface_drift(&manifest, &extracted),
+            Err(Error::Invalid(message))
+                if message == "supported item consumer differs from field contract"
+        ));
         assert!(manifest.host_version.starts_with("unverified-"));
     }
 }
