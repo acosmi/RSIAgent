@@ -805,6 +805,11 @@ impl ReleaseStore {
         };
         validate_host_record_v2_source(&record)?;
         validate_host_surface_v2_predecessor(&record, predecessor.as_ref())?;
+        // The stored record repeats the source and both typed projections.
+        // Bound its actual persisted wire before the first DML, using the
+        // reader's raw gate; per-source/default limits alone are insufficient.
+        let raw = serde_json::to_string(&record).map_err(|_| Error::Internal)?;
+        evo_core::contract::decode_host_surface_record_v2_json(&raw)?;
         if let Some(existing) = session
             .get::<serde_json::Value>(ctx, "artifact", id)
             .await?

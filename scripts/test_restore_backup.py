@@ -11,12 +11,14 @@ crates/evo-storage/tests/restore_prefix_upgrade_v42.rs proves the upgraded
 database equal to `Store::open` on ledgers the real sqlx migrator wrote.
 """
 
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -677,6 +679,510 @@ class RestoreTests(unittest.TestCase):
                 self.assert_isolated(scenario,dest,result,"invalid current host raw JSON")
                 self.assertEqual(database_image(anchor),before_anchor)
                 self.assertEqual(database_image(changed / "rsia.sqlite3"),before_backup)
+
+
+def _host_database_family(path):
+    path=Path(path)
+    family={}
+    for suffix in ("","-wal","-shm"):
+        member=Path(str(path)+suffix)
+        if not member.exists():
+            assert suffix
+            continue
+        assert member.is_file() and not member.is_symlink()
+        family[suffix]=(member.stat().st_mode,member.read_bytes())
+    return family
+
+
+def _host_private_database_image(path):
+    # Opening a read-only WAL database can update SHM. Observe a complete
+    # private family copy and prove the original bytes/permissions unchanged.
+    path=Path(path);before=_host_database_family(path)
+    with tempfile.TemporaryDirectory(prefix="host-raw-observer-") as private:
+        copy=Path(private)/path.name
+        for suffix,(mode,raw) in before.items():
+            member=Path(str(copy)+suffix);member.write_bytes(raw);member.chmod(mode)
+        image=database_image(copy)
+    assert _host_database_family(path)==before
+    return image,before
+
+
+@contextmanager
+def _host_anchor_read_observer(test,path):
+    """Attribute this closed-Store fixture's WAL setup, then restore its cold image."""
+    path=Path(path);cold_family=_host_database_family(path)
+    test.assertEqual(set(cold_family),{""},"existing anchor WAL/SHM must remain untouched")
+    cold=_host_private_database_image(path)
+    test.assertEqual(cold[1],cold_family)
+    diagnostic={"cold":{suffix:{"mode":mode,"bytes":len(raw),"sha256":hashlib.sha256(raw).hexdigest()}
+        for suffix,(mode,raw) in cold_family.items()}}
+    observer=sqlite3.connect(path.resolve().as_uri()+"?mode=rw",uri=True,isolation_level=None)
+    try:
+        observer.execute("PRAGMA query_only=ON")
+        observer.execute("BEGIN")
+        observer.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        warm=_host_private_database_image(path)
+        diagnostic["warm"]={suffix:{"mode":mode,"bytes":len(raw),"sha256":hashlib.sha256(raw).hexdigest()}
+            for suffix,(mode,raw) in warm[1].items()}
+        test.assertEqual(warm[0],cold[0],"observer setup changed the complete logical image")
+        test.assertEqual(warm[1][""],cold_family[""],"observer setup changed main DB bytes/permissions")
+        try:
+            yield warm,diagnostic
+        finally:
+            test.assertEqual(_host_private_database_image(path),warm,
+                "CLI changed the complete warm anchor image: "+repr(diagnostic))
+    finally:
+        observer.close()
+        closed=_host_private_database_image(path)
+        diagnostic["closed"]={suffix:{"mode":mode,"bytes":len(raw),"sha256":hashlib.sha256(raw).hexdigest()}
+            for suffix,(mode,raw) in closed[1].items()}
+        test.assertEqual(closed,cold,"observer close did not restore the cold full family: "+repr(diagnostic))
+
+
+def _host_backup_image(path):
+    image={}
+    for member in sorted(Path(path).rglob("*")):
+        assert not member.is_symlink()
+        image[str(member.relative_to(path))]=(member.is_dir(),member.stat().st_mode,None if member.is_dir() else member.read_bytes())
+    return image
+
+
+def _host_rewrite_backup(backup,identity,wire):
+    database=backup/"rsia.sqlite3"
+    con=connect(database)
+    try:
+        changed=con.execute("UPDATE objects SET body=? WHERE namespace='name-coverage' AND kind='artifact' AND id=?",(wire,identity))
+        assert changed.rowcount==1
+    finally:
+        con.close()
+    manifest_path=backup/"backup-manifest.json"
+    manifest=json.loads(manifest_path.read_text())
+    raw=database.read_bytes()
+    manifest["database"]["sha256"]=hashlib.sha256(raw).hexdigest()
+    manifest["database"]["bytes"]=len(raw)
+    manifest_path.write_text(json.dumps(manifest,indent=2)+"\n")
+
+
+# Actual Rust producer bytes, including all six exported fields.
+RUST_CURRENT_HOST_MARKER_BYTES = b'{"manifest_wire":"{\\"schema_version\\":\\"rsia.host_surface.v2\\",\\"host\\":\\"reference\\",\\"host_version\\":\\"0.1.0\\",\\"adapter_version\\":\\"r8-9\\",\\"source_kind\\":\\"reviewed_fixture\\",\\"source_schema\\":\\"rsia.host_reviewed_declarations.v1\\",\\"extractor_version\\":\\"rsia.host_reviewed_declarations.extractor.v1\\",\\"source_envelope_digest\\":\\"0ccd87b4fc71dd55c8cdfa719712d6beb2cbd62f278df453cfdfb1a7eae9e137\\",\\"source_digest\\":\\"c156ec7bdc91a14c3e4b35dad968ccfe48dfc81ce9d75bcf2145abb231d482f5\\",\\"items\\":[{\\"name\\":\\"enabled\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"bool\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":true}},{\\"name\\":\\"disabled\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"bool\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":false}},{\\"name\\":\\"count\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"integer\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":1}},{\\"name\\":\\"mode\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"enum\\",\\"enum_values\\":[\\"a\\",\\"b\\"],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":\\"b\\"}},{\\"name\\":\\"reserved\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"object\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":{\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":null},\\"kind\\":\\"value\\",\\"value\\":null}}},{\\"name\\":\\"numbers\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"object\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":{\\"exponent_high\\":1e+16,\\"exponent_low\\":1e-6,\\"fixed_high\\":1000000000000000.0,\\"fixed_low\\":0.00001,\\"flags\\":[true,false,{\\"on\\":true}],\\"fraction\\":0.1,\\"large_int\\":1e+21,\\"negative_zero\\":-0.0,\\"one\\":1.0,\\"zero\\":-0.0}}},{\\"name\\":\\"boundary\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"string\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":\\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\"}},{\\"name\\":\\"compact_numbers\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"object\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":{\\"n\\":[1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16]}}},{\\"name\\":\\"raw_zeros\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"object\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":{\\"zero_0\\":0.0,\\"zero_1\\":-0.0,\\"zero_10\\":0.0,\\"zero_11\\":-0.0,\\"zero_2\\":0.0,\\"zero_3\\":-0.0,\\"zero_4\\":0.0,\\"zero_5\\":-0.0,\\"zero_6\\":0.0,\\"zero_7\\":-0.0,\\"zero_8\\":0.0,\\"zero_9\\":-0.0}}}],\\"retired\\":[]}","number_wires":[{"bits":"0000000000000000","wire":"0.0"},{"bits":"0000000000000001","wire":"5e-324"},{"bits":"0000000000000002","wire":"1e-323"},{"bits":"000fffffffffffff","wire":"2.225073858507201e-308"},{"bits":"0010000000000000","wire":"2.2250738585072014e-308"},{"bits":"0010000000000001","wire":"2.225073858507202e-308"},{"bits":"3eb0c6f7a0b5ed8c","wire":"9.999999999999997e-7"},{"bits":"3eb0c6f7a0b5ed8d","wire":"1e-6"},{"bits":"3eb0c6f7a0b5ed8e","wire":"1.0000000000000002e-6"},{"bits":"3ee4f8b588e368f0","wire":"9.999999999999999e-6"},{"bits":"3ee4f8b588e368f1","wire":"0.00001"},{"bits":"3ee4f8b588e368f2","wire":"0.000010000000000000003"},{"bits":"3fb9999999999999","wire":"0.09999999999999999"},{"bits":"3fb999999999999a","wire":"0.1"},{"bits":"3fb999999999999b","wire":"0.10000000000000002"},{"bits":"3feb0e7009b61cdf","wire":"0.84551240822557"},{"bits":"3feb0e7009b61ce0","wire":"0.8455124082255701"},{"bits":"3feb0e7009b61ce1","wire":"0.8455124082255702"},{"bits":"3fefffffffffffff","wire":"0.9999999999999999"},{"bits":"3ff0000000000000","wire":"1.0"},{"bits":"3ff0000000000001","wire":"1.0000000000000002"},{"bits":"3ff0000000000002","wire":"1.0000000000000004"},{"bits":"3ff3c0ca428c59fa","wire":"1.2345678901234565"},{"bits":"3ff3c0ca428c59fb","wire":"1.2345678901234567"},{"bits":"3ff3c0ca428c59fc","wire":"1.234567890123457"},{"bits":"4003ffffffffffff","wire":"2.4999999999999996"},{"bits":"4004000000000000","wire":"2.5"},{"bits":"4004000000000001","wire":"2.5000000000000004"},{"bits":"430c6bf52633ffff","wire":"999999999999999.9"},{"bits":"430c6bf526340000","wire":"1000000000000000.0"},{"bits":"430c6bf526340001","wire":"1000000000000000.1"},{"bits":"4341c37937e07fff","wire":"9999999999999998.0"},{"bits":"4341c37937e08000","wire":"1e+16"},{"bits":"4341c37937e08001","wire":"1.0000000000000002e+16"},{"bits":"444b1ae4d6e2ef4f","wire":"9.999999999999999e+20"},{"bits":"444b1ae4d6e2ef50","wire":"1e+21"},{"bits":"444b1ae4d6e2ef51","wire":"1.0000000000000001e+21"},{"bits":"44b52d02c7e14af5","wire":"9.999999999999997e+22"},{"bits":"44b52d02c7e14af6","wire":"1e+23"},{"bits":"44b52d02c7e14af7","wire":"1.0000000000000001e+23"},{"bits":"7feffffffffffffe","wire":"1.7976931348623155e+308"},{"bits":"7fefffffffffffff","wire":"1.7976931348623157e+308"},{"bits":"8000000000000000","wire":"-0.0"},{"bits":"8000000000000001","wire":"-5e-324"},{"bits":"8000000000000002","wire":"-1e-323"},{"bits":"800fffffffffffff","wire":"-2.225073858507201e-308"},{"bits":"8010000000000000","wire":"-2.2250738585072014e-308"},{"bits":"8010000000000001","wire":"-2.225073858507202e-308"},{"bits":"beb0c6f7a0b5ed8c","wire":"-9.999999999999997e-7"},{"bits":"beb0c6f7a0b5ed8d","wire":"-1e-6"},{"bits":"beb0c6f7a0b5ed8e","wire":"-1.0000000000000002e-6"},{"bits":"bee4f8b588e368f0","wire":"-9.999999999999999e-6"},{"bits":"bee4f8b588e368f1","wire":"-0.00001"},{"bits":"bee4f8b588e368f2","wire":"-0.000010000000000000003"},{"bits":"bfb9999999999999","wire":"-0.09999999999999999"},{"bits":"bfb999999999999a","wire":"-0.1"},{"bits":"bfb999999999999b","wire":"-0.10000000000000002"},{"bits":"bfeb0e7009b61cdf","wire":"-0.84551240822557"},{"bits":"bfeb0e7009b61ce0","wire":"-0.8455124082255701"},{"bits":"bfeb0e7009b61ce1","wire":"-0.8455124082255702"},{"bits":"bfefffffffffffff","wire":"-0.9999999999999999"},{"bits":"bff0000000000000","wire":"-1.0"},{"bits":"bff0000000000001","wire":"-1.0000000000000002"},{"bits":"bff0000000000002","wire":"-1.0000000000000004"},{"bits":"bff3c0ca428c59fa","wire":"-1.2345678901234565"},{"bits":"bff3c0ca428c59fb","wire":"-1.2345678901234567"},{"bits":"bff3c0ca428c59fc","wire":"-1.234567890123457"},{"bits":"c003ffffffffffff","wire":"-2.4999999999999996"},{"bits":"c004000000000000","wire":"-2.5"},{"bits":"c004000000000001","wire":"-2.5000000000000004"},{"bits":"c30c6bf52633ffff","wire":"-999999999999999.9"},{"bits":"c30c6bf526340000","wire":"-1000000000000000.0"},{"bits":"c30c6bf526340001","wire":"-1000000000000000.1"},{"bits":"c341c37937e07fff","wire":"-9999999999999998.0"},{"bits":"c341c37937e08000","wire":"-1e+16"},{"bits":"c341c37937e08001","wire":"-1.0000000000000002e+16"},{"bits":"c44b1ae4d6e2ef4f","wire":"-9.999999999999999e+20"},{"bits":"c44b1ae4d6e2ef50","wire":"-1e+21"},{"bits":"c44b1ae4d6e2ef51","wire":"-1.0000000000000001e+21"},{"bits":"c4b52d02c7e14af5","wire":"-9.999999999999997e+22"},{"bits":"c4b52d02c7e14af6","wire":"-1e+23"},{"bits":"c4b52d02c7e14af7","wire":"-1.0000000000000001e+23"},{"bits":"ffeffffffffffffe","wire":"-1.7976931348623155e+308"},{"bits":"ffefffffffffffff","wire":"-1.7976931348623157e+308"}],"raw_token_faults":["0e9223372036854775808","0e-9223372036854775809","0e00000000000000000009223372036854775808","0.0e-9223372036854775808","-0.0e-9223372036854775808","10e9223372036854775807","1e-1000000000000000000","1e1000000000000000000","0.100000000000000001","00e1","0e+","0.e1"],"raw_zero_tokens":["0e1000000000000000000","-0e1000000000000000000","0e-1000000000000000000","-0e-1000000000000000000","0e9223372036854775807","-0e9223372036854775807","0e-9223372036854775808","-0e-9223372036854775808","0e+00000000000000000009223372036854775807","-0e-00000000000000000009223372036854775808","0.0e9223372036854775807","-0.0e-9223372036854775807"],"record_wire":"{\\"id\\":\\"surface-name-coverage\\",\\"schema_version\\":\\"rsia.host_surface_record.v2\\",\\"manifest\\":{\\"schema_version\\":\\"rsia.host_surface.v2\\",\\"host\\":\\"reference\\",\\"host_version\\":\\"0.1.0\\",\\"adapter_version\\":\\"r8-9\\",\\"source_kind\\":\\"reviewed_fixture\\",\\"source_schema\\":\\"rsia.host_reviewed_declarations.v1\\",\\"extractor_version\\":\\"rsia.host_reviewed_declarations.extractor.v1\\",\\"source_envelope_digest\\":\\"0ccd87b4fc71dd55c8cdfa719712d6beb2cbd62f278df453cfdfb1a7eae9e137\\",\\"source_digest\\":\\"c156ec7bdc91a14c3e4b35dad968ccfe48dfc81ce9d75bcf2145abb231d482f5\\",\\"items\\":[{\\"name\\":\\"enabled\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"bool\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":true}},{\\"name\\":\\"disabled\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"bool\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":false}},{\\"name\\":\\"count\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"integer\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":1}},{\\"name\\":\\"mode\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"enum\\",\\"enum_values\\":[\\"a\\",\\"b\\"],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":\\"b\\"}},{\\"name\\":\\"reserved\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"object\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":{\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":null},\\"kind\\":\\"value\\",\\"value\\":null}}},{\\"name\\":\\"numbers\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"object\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":{\\"exponent_high\\":1e+16,\\"exponent_low\\":1e-6,\\"fixed_high\\":1000000000000000.0,\\"fixed_low\\":0.00001,\\"flags\\":[true,false,{\\"on\\":true}],\\"fraction\\":0.1,\\"large_int\\":1e+21,\\"negative_zero\\":-0.0,\\"one\\":1.0,\\"zero\\":-0.0}}},{\\"name\\":\\"boundary\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"string\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":\\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\"}},{\\"name\\":\\"compact_numbers\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"object\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":{\\"n\\":[1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16]}}},{\\"name\\":\\"raw_zeros\\",\\"coverage\\":\\"unsupported\\",\\"mapped_field\\":null,\\"consumer\\":null,\\"reason\\":\\"unmapped reviewed software fixture\\",\\"renamed_from\\":null,\\"test_ref\\":null,\\"capability\\":null,\\"value_type\\":\\"object\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":{\\"zero_0\\":0.0,\\"zero_1\\":-0.0,\\"zero_10\\":0.0,\\"zero_11\\":-0.0,\\"zero_2\\":0.0,\\"zero_3\\":-0.0,\\"zero_4\\":0.0,\\"zero_5\\":-0.0,\\"zero_6\\":0.0,\\"zero_7\\":-0.0,\\"zero_8\\":0.0,\\"zero_9\\":-0.0}}}],\\"retired\\":[]},\\"manifest_digest\\":\\"c46ac130d4771e559c428b29d4f15ee68f89c951d3e1bfdd97eff02388d24b52\\",\\"source\\":{\\"schema_version\\":\\"rsia.host_source_envelope.v1\\",\\"source_kind\\":\\"reviewed_fixture\\",\\"source_schema\\":\\"rsia.host_reviewed_declarations.v1\\",\\"extractor_version\\":\\"rsia.host_reviewed_declarations.extractor.v1\\",\\"original_utf8\\":\\"{\\\\\\"declarations\\\\\\":[{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":true},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"enabled\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"bool\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":false},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"disabled\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"bool\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":1},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"count\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"integer\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":\\\\\\"b\\\\\\"},\\\\\\"enum_values\\\\\\":[\\\\\\"a\\\\\\",\\\\\\"b\\\\\\"],\\\\\\"name\\\\\\":\\\\\\"mode\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"enum\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":null},\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":null}},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"reserved\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"object\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":{\\\\\\"exponent_high\\\\\\":1e+16,\\\\\\"exponent_low\\\\\\":1e-6,\\\\\\"fixed_high\\\\\\":1000000000000000.0,\\\\\\"fixed_low\\\\\\":0.00001,\\\\\\"flags\\\\\\":[true,false,{\\\\\\"on\\\\\\":true}],\\\\\\"fraction\\\\\\":0.1,\\\\\\"large_int\\\\\\":1000000000000000000000,\\\\\\"negative_zero\\\\\\":-0,\\\\\\"one\\\\\\":1.0,\\\\\\"zero\\\\\\":-0.0}},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"numbers\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"object\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":\\\\\\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\\\\\"},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"boundary\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"string\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":{\\\\\\"n\\\\\\":[1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16]}},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"compact_numbers\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"object\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":{\\\\\\"zero_0\\\\\\":0e1000000000000000000,\\\\\\"zero_1\\\\\\":-0e1000000000000000000,\\\\\\"zero_10\\\\\\":0.0e9223372036854775807,\\\\\\"zero_11\\\\\\":-0.0e-9223372036854775807,\\\\\\"zero_2\\\\\\":0e-1000000000000000000,\\\\\\"zero_3\\\\\\":-0e-1000000000000000000,\\\\\\"zero_4\\\\\\":0e9223372036854775807,\\\\\\"zero_5\\\\\\":-0e9223372036854775807,\\\\\\"zero_6\\\\\\":0e-9223372036854775808,\\\\\\"zero_7\\\\\\":-0e-9223372036854775808,\\\\\\"zero_8\\\\\\":0e+00000000000000000009223372036854775807,\\\\\\"zero_9\\\\\\":-0e-00000000000000000009223372036854775808}},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"raw_zeros\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"object\\\\\\"}],\\\\\\"host\\\\\\":\\\\\\"reference\\\\\\",\\\\\\"host_version\\\\\\":\\\\\\"0.1.0\\\\\\",\\\\\\"schema_version\\\\\\":\\\\\\"rsia.host_reviewed_declarations.v1\\\\\\"}\\"},\\"extracted\\":[\\"enabled\\",\\"disabled\\",\\"count\\",\\"mode\\",\\"reserved\\",\\"numbers\\",\\"boundary\\",\\"compact_numbers\\",\\"raw_zeros\\"],\\"extracted_typed\\":[{\\"name\\":\\"enabled\\",\\"value_type\\":\\"bool\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":true}},{\\"name\\":\\"disabled\\",\\"value_type\\":\\"bool\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":false}},{\\"name\\":\\"count\\",\\"value_type\\":\\"integer\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":1}},{\\"name\\":\\"mode\\",\\"value_type\\":\\"enum\\",\\"enum_values\\":[\\"a\\",\\"b\\"],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":\\"b\\"}},{\\"name\\":\\"reserved\\",\\"value_type\\":\\"object\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":{\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":null},\\"kind\\":\\"value\\",\\"value\\":null}}},{\\"name\\":\\"numbers\\",\\"value_type\\":\\"object\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":{\\"exponent_high\\":1e+16,\\"exponent_low\\":1e-6,\\"fixed_high\\":1000000000000000.0,\\"fixed_low\\":0.00001,\\"flags\\":[true,false,{\\"on\\":true}],\\"fraction\\":0.1,\\"large_int\\":1e+21,\\"negative_zero\\":-0.0,\\"one\\":1.0,\\"zero\\":-0.0}}},{\\"name\\":\\"boundary\\",\\"value_type\\":\\"string\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":\\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\"}},{\\"name\\":\\"compact_numbers\\",\\"value_type\\":\\"object\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":{\\"n\\":[1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16]}}},{\\"name\\":\\"raw_zeros\\",\\"value_type\\":\\"object\\",\\"enum_values\\":[],\\"default\\":{\\"kind\\":\\"value\\",\\"value\\":{\\"zero_0\\":0.0,\\"zero_1\\":-0.0,\\"zero_10\\":0.0,\\"zero_11\\":-0.0,\\"zero_2\\":0.0,\\"zero_3\\":-0.0,\\"zero_4\\":0.0,\\"zero_5\\":-0.0,\\"zero_6\\":0.0,\\"zero_7\\":-0.0,\\"zero_8\\":0.0,\\"zero_9\\":-0.0}}}],\\"predecessor_surface_id\\":null,\\"upgrade_diff\\":{\\"added\\":[\\"boundary\\",\\"compact_numbers\\",\\"count\\",\\"disabled\\",\\"enabled\\",\\"mode\\",\\"numbers\\",\\"raw_zeros\\",\\"reserved\\"],\\"removed\\":[],\\"renamed\\":[],\\"type_changed\\":[],\\"enum_changed\\":[],\\"default_changed\\":[],\\"mapping_changed\\":[],\\"legacy_untyped\\":[]}}","source_wire":"{\\"schema_version\\":\\"rsia.host_source_envelope.v1\\",\\"source_kind\\":\\"reviewed_fixture\\",\\"source_schema\\":\\"rsia.host_reviewed_declarations.v1\\",\\"extractor_version\\":\\"rsia.host_reviewed_declarations.extractor.v1\\",\\"original_utf8\\":\\"{\\\\\\"declarations\\\\\\":[{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":true},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"enabled\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"bool\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":false},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"disabled\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"bool\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":1},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"count\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"integer\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":\\\\\\"b\\\\\\"},\\\\\\"enum_values\\\\\\":[\\\\\\"a\\\\\\",\\\\\\"b\\\\\\"],\\\\\\"name\\\\\\":\\\\\\"mode\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"enum\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":null},\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":null}},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"reserved\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"object\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":{\\\\\\"exponent_high\\\\\\":1e+16,\\\\\\"exponent_low\\\\\\":1e-6,\\\\\\"fixed_high\\\\\\":1000000000000000.0,\\\\\\"fixed_low\\\\\\":0.00001,\\\\\\"flags\\\\\\":[true,false,{\\\\\\"on\\\\\\":true}],\\\\\\"fraction\\\\\\":0.1,\\\\\\"large_int\\\\\\":1000000000000000000000,\\\\\\"negative_zero\\\\\\":-0,\\\\\\"one\\\\\\":1.0,\\\\\\"zero\\\\\\":-0.0}},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"numbers\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"object\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":\\\\\\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\\\\\"},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"boundary\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"string\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":{\\\\\\"n\\\\\\":[1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16,1e+16]}},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"compact_numbers\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"object\\\\\\"},{\\\\\\"default\\\\\\":{\\\\\\"kind\\\\\\":\\\\\\"value\\\\\\",\\\\\\"value\\\\\\":{\\\\\\"zero_0\\\\\\":0e1000000000000000000,\\\\\\"zero_1\\\\\\":-0e1000000000000000000,\\\\\\"zero_10\\\\\\":0.0e9223372036854775807,\\\\\\"zero_11\\\\\\":-0.0e-9223372036854775807,\\\\\\"zero_2\\\\\\":0e-1000000000000000000,\\\\\\"zero_3\\\\\\":-0e-1000000000000000000,\\\\\\"zero_4\\\\\\":0e9223372036854775807,\\\\\\"zero_5\\\\\\":-0e9223372036854775807,\\\\\\"zero_6\\\\\\":0e-9223372036854775808,\\\\\\"zero_7\\\\\\":-0e-9223372036854775808,\\\\\\"zero_8\\\\\\":0e+00000000000000000009223372036854775807,\\\\\\"zero_9\\\\\\":-0e-00000000000000000009223372036854775808}},\\\\\\"enum_values\\\\\\":[],\\\\\\"name\\\\\\":\\\\\\"raw_zeros\\\\\\",\\\\\\"value_type\\\\\\":\\\\\\"object\\\\\\"}],\\\\\\"host\\\\\\":\\\\\\"reference\\\\\\",\\\\\\"host_version\\\\\\":\\\\\\"0.1.0\\\\\\",\\\\\\"schema_version\\\\\\":\\\\\\"rsia.host_reviewed_declarations.v1\\\\\\"}\\"}"}'
+
+
+def _rust_current_host_restore_matrix(payload):
+    """Consume this test run's real Rust producer/backup; never mint its digest.
+
+    The Rust integration test owns every supplied path and closes the Store
+    first. Stage B will also call this helper from a single Python top-level
+    test with independently checked Rust raw constants.
+    """
+    test=RestoreTests()
+    backup=Path(payload["backup"]);anchor=Path(payload["anchor"])
+    identity=payload["identity"];wire=payload["record_wire"]
+    manifest=json.loads((backup/"backup-manifest.json").read_text())
+    test.assertTrue(manifest["watermarks"])
+    test.assertIn("name-coverage",{mark["namespace"] for mark in manifest["watermarks"]})
+    for entry in payload["number_wires"]:
+        number=struct.unpack(">d",bytes.fromhex(entry["bits"]))[0]
+        test.assertEqual(restore.host_json_wire(number),entry["wire"],entry["bits"])
+    current=restore.read_current_host_raw(wire,"name-coverage","artifact",identity)
+    if payload["typed_matrix"]:
+        actual=json.loads(RUST_CURRENT_HOST_MARKER_BYTES)
+        test.assertEqual(wire,actual["record_wire"])
+        test.assertEqual(payload["number_wires"],actual["number_wires"])
+        test.assertEqual(payload["raw_token_faults"],actual["raw_token_faults"])
+        test.assertEqual(restore.host_json_wire(restore.host_ordered(current["source"],restore.HOST_SOURCE_FIELDS)),actual["source_wire"])
+        test.assertEqual(restore.host_json_wire(restore.host_ordered(current["manifest"],restore.HOST_MANIFEST_FIELDS)),actual["manifest_wire"])
+        for index,token in enumerate(actual["raw_zero_tokens"]):
+            test.assertEqual(current["source"]["original_utf8"].count('"zero_'+str(index)+'":'+token),1)
+    with _host_anchor_read_observer(test,anchor) as (anchor_image,observer):
+        backup_image=_host_private_database_image(backup/"rsia.sqlite3")
+        backup_files=_host_backup_image(backup)
+        con=restore.readonly(backup/"rsia.sqlite3")
+        try:
+            test.assertEqual(con.execute("SELECT body FROM objects WHERE namespace='name-coverage' AND kind='artifact' AND id=?",(identity,)).fetchone(),(wire,))
+        finally:
+            con.close()
+        test.assertEqual(_host_private_database_image(backup/"rsia.sqlite3"),backup_image)
+        scenario=Scenario.__new__(Scenario);scenario.base=backup.parent
+        dest,result=scenario.restore(backup,anchor,"rust-host-restored")
+        test.assert_restored(dest,result,0,"none")
+        test.assertEqual(_host_private_database_image(dest/"rsia.sqlite3")[0],backup_image[0])
+        test.assertEqual(_host_private_database_image(anchor),anchor_image)
+        test.assertEqual(_host_private_database_image(backup/"rsia.sqlite3"),backup_image)
+        test.assertEqual(_host_backup_image(backup),backup_files)
+        original=json.loads(wire)
+        faults=[];equivalents=[]
+        if payload["typed_matrix"]:
+            def changed(): return json.loads(wire)
+            def declarations(body): return {item["name"]:item for item in body["extracted_typed"]}
+            for name,replacement in (("enabled",1),("disabled",0)):
+                body=changed();declarations(body)[name]["default"]["value"]=replacement
+                faults.append((name+"-as-number",restore.host_json_wire(body)))
+            for position,replacement in ((0,1),(1,0)):
+                body=changed();declarations(body)["numbers"]["default"]["value"]["flags"][position]=replacement
+                faults.append(("nested-bool-"+str(position),restore.host_json_wire(body)))
+            body=changed();declarations(body)["numbers"]["default"]["value"]["flags"][2]["on"]=1
+            faults.append(("object-bool-as-number",restore.host_json_wire(body)))
+            for key,replacement in (("one",True),("zero",False)):
+                body=changed();declarations(body)["numbers"]["default"]["value"][key]=replacement
+                faults.append(("number-as-bool-"+key,restore.host_json_wire(body)))
+            body=changed();declarations(body)["count"]["default"]["value"]=1.0
+            faults.append(("integer-as-float",restore.host_json_wire(body)))
+            body=changed();declarations(body)["enabled"]["default"]["value"]=None
+            faults.append(("real-default-null",restore.host_json_wire(body)))
+            body=changed();declarations(body)["enabled"]["extra"]=None
+            faults.append(("extra-typed-key",restore.host_json_wire(body)))
+            body=changed();declarations(body)["enabled"].pop("enum_values")
+            faults.append(("missing-typed-key",restore.host_json_wire(body)))
+            body=changed();declarations(body)["enabled"]["value_type"]="integer"
+            faults.append(("wrong-typed-type",restore.host_json_wire(body)))
+            body=changed();declarations(body)["mode"]["enum_values"].append("c")
+            faults.append(("wrong-typed-enum",restore.host_json_wire(body)))
+            body=changed();declarations(body)["boundary"]["default"]["value"]+="x"
+            faults.append(("default-4097",restore.host_json_wire(body)))
+            body=changed();declarations(body)["compact_numbers"]["default"]["value"]["n"].append(1e16)
+            faults.append(("numeric-default-4097",restore.host_json_wire(body)))
+            for name,replacement in (("source-precision",'"fraction":0.100000000000000001'),("source-duplicate",'"fraction":0.1,"\\u0066raction":0.1')):
+                body=changed();raw=body["source"]["original_utf8"]
+                body["source"]["original_utf8"]=raw.replace('"fraction":0.1',replacement,1)
+                test.assertNotEqual(body["source"]["original_utf8"],raw)
+                faults.append((name,restore.host_json_wire(body)))
+            faults.append(("outer-precision",wire.replace('"fraction":0.1','"fraction":0.100000000000000001',1)))
+            for index,token in enumerate(payload.get("raw_token_faults",[])):
+                body=changed();raw=body["source"]["original_utf8"]
+                body["source"]["original_utf8"]=raw.replace('"zero_0":0e1000000000000000000','"zero_0":'+token,1)
+                test.assertNotEqual(body["source"]["original_utf8"],raw)
+                with test.assertRaisesRegex(restore.IsolationError,"^invalid current host raw JSON$"):
+                    restore.read_host_json_tokens(body["source"]["original_utf8"])
+                for field in ("manifest","manifest_digest","extracted","extracted_typed"):
+                    test.assertEqual(restore.host_json_wire(body[field]),restore.host_json_wire(original[field]))
+                faults.append(("raw-token-"+str(index),restore.host_json_wire(body)))
+            body=changed();number_default=declarations(body)["numbers"]["default"]["value"]
+            number_default["one"]=1;number_default["zero"]=0.0
+            declarations(body)["numbers"]["default"]["value"]={key:number_default[key] for key in reversed(number_default)}
+            equivalents.append(("number-value-and-object-order",restore.host_json_wire(body)))
+        if payload["resource_fault"] is not None:
+            faults.append(("final-record-resource",payload["resource_fault"]))
+        equivalent_destinations=[]
+        for name,raw in equivalents:
+            body=json.loads(raw)
+            for field in ("source","manifest","manifest_digest"):
+                test.assertEqual(restore.host_json_wire(body[field]),restore.host_json_wire(original[field]))
+            copy=backup.parent/("equivalent-"+name);shutil.copytree(backup,copy)
+            _host_rewrite_backup(copy,identity,raw)
+            before=_host_private_database_image(copy/"rsia.sqlite3")
+            before_files=_host_backup_image(copy)
+            equivalent,result=scenario.restore(copy,anchor,"restored-"+name)
+            test.assert_restored(equivalent,result,0,"none")
+            test.assertEqual(_host_private_database_image(equivalent/"rsia.sqlite3")[0],before[0])
+            test.assertEqual(_host_private_database_image(copy/"rsia.sqlite3"),before)
+            test.assertEqual(_host_backup_image(copy),before_files)
+            test.assertEqual(_host_private_database_image(anchor),anchor_image)
+            equivalent_destinations.append(str(equivalent))
+        for name,raw in faults:
+            test.assertNotEqual(raw,wire,name)
+            if name not in ("source-precision","source-duplicate","outer-precision","final-record-resource") and not name.startswith("raw-token-"):
+                body=json.loads(raw)
+                for field in ("source","manifest","manifest_digest"):
+                    test.assertEqual(restore.host_json_wire(body[field]),restore.host_json_wire(original[field]),name)
+            copy=backup.parent/("damaged-"+name);shutil.copytree(backup,copy)
+            _host_rewrite_backup(copy,identity,raw)
+            before=_host_private_database_image(copy/"rsia.sqlite3")
+            before_files=_host_backup_image(copy)
+            refused,result=scenario.restore(copy,anchor,"refused-"+name)
+            test.assert_isolated(scenario,refused,result,"invalid current host raw JSON")
+            test.assertEqual(_host_private_database_image(copy/"rsia.sqlite3"),before)
+            test.assertEqual(_host_backup_image(copy),before_files)
+            test.assertEqual(_host_private_database_image(anchor),anchor_image)
+            test.assertEqual(_host_private_database_image(backup/"rsia.sqlite3"),backup_image)
+            test.assertEqual(_host_backup_image(backup),backup_files)
+    return {"restored":str(dest),"equivalents":equivalent_destinations,"isolated":len(faults),"anchor_observer":observer}
+
+
+def _rust_current_host_text_restore_matrix(payload):
+    """Separate content-only text cases from the original canonical/run matrix.
+
+    Every healthy row and malformed row's derived digests come from the actual
+    Rust producer/typed serializer in this test run, never a Python auth factory.
+    """
+    test=RestoreTests()
+    backup=Path(payload["backup"]);anchor=Path(payload["anchor"])
+    records=payload["records"];faults=payload["faults"]
+    test.assertTrue(records);test.assertTrue(faults)
+    test.assertEqual(len(records),30);test.assertEqual(len(faults),162)
+    manifest=json.loads((backup/"backup-manifest.json").read_text())
+    test.assertIn("name-coverage",{row["namespace"] for row in manifest["watermarks"]})
+    with _host_anchor_read_observer(test,anchor) as (anchor_image,observer):
+        backup_image=_host_private_database_image(backup/"rsia.sqlite3")
+        backup_files=_host_backup_image(backup)
+        con=restore.readonly(backup/"rsia.sqlite3")
+        try:
+            for row in records:
+                wire=row["wire"];identity=row["id"]
+                restore.read_current_host_raw(wire,"name-coverage","artifact",identity)
+                test.assertEqual(con.execute("SELECT body FROM objects WHERE namespace='name-coverage' AND kind='artifact' AND id=?",(identity,)).fetchone(),(wire,))
+        finally:
+            con.close()
+        scenario=Scenario.__new__(Scenario);scenario.base=backup.parent
+        dest,result=scenario.restore(backup,anchor,"text-content-restored")
+        test.assert_restored(dest,result,0,"none")
+        test.assertEqual(_host_private_database_image(dest/"rsia.sqlite3")[0],backup_image[0])
+        test.assertEqual(_host_private_database_image(anchor),anchor_image)
+        test.assertEqual(_host_private_database_image(backup/"rsia.sqlite3"),backup_image)
+        test.assertEqual(_host_backup_image(backup),backup_files)
+        originals={row["id"]:json.loads(row["wire"]) for row in records}
+        original_wires={row["id"]:row["wire"] for row in records}
+        text_count=0;shape_count=0
+        for index,fault in enumerate(faults):
+            wire=fault["wire"];identity=fault["id"];body=json.loads(wire);original=originals[identity]
+            test.assertNotEqual(wire,restore.host_json_wire(original),fault["name"])
+            for field in ("id","schema_version","extracted","extracted_typed","predecessor_surface_id","upgrade_diff"):
+                test.assertEqual(restore.host_json_wire(body[field]),restore.host_json_wire(original[field]),fault["name"])
+            if fault["field"]=="retired_shape":
+                shape_count+=1
+                test.assertIn(fault["shape"],("object","string"))
+                replacement='"retired":{}' if fault["shape"]=="object" else '"retired":""'
+                expected={} if fault["shape"]=="object" else ""
+                test.assertIs(type(body["manifest"]["retired"]),type(expected))
+                test.assertEqual(body["manifest"]["retired"],expected)
+                test.assertEqual(original["manifest"]["retired"],[])
+                test.assertIsNone(original["predecessor_surface_id"])
+                test.assertEqual(original["extracted"],["old-setting"])
+                test.assertEqual(original_wires[identity].count('"retired":[]'),1)
+                test.assertEqual(wire,original_wires[identity].replace('"retired":[]',replacement,1))
+                test.assertEqual(body["manifest_digest"],original["manifest_digest"])
+                test.assertEqual(restore.host_digest(restore.host_ordered(original["manifest"],restore.HOST_MANIFEST_FIELDS)),original["manifest_digest"])
+                for field in ("source_digest","source_envelope_digest"):
+                    test.assertEqual(body["manifest"][field],original["manifest"][field])
+                repaired=json.loads(wire);repaired["manifest"]["retired"]=[]
+                test.assertEqual(repaired,original)
+            else:
+                text_count+=1
+                # Explicitly prove the target text is reached with consistent hashes;
+                # a stale manifest/source digest cannot masquerade as a text refusal.
+                source=restore.host_ordered(body["source"],restore.HOST_SOURCE_FIELDS)
+                ordered=restore.host_ordered(body["manifest"],restore.HOST_MANIFEST_FIELDS)
+                test.assertEqual(body["manifest_digest"],restore.host_digest(ordered),fault["name"])
+                test.assertEqual(ordered["source_envelope_digest"],restore.host_digest(source),fault["name"])
+                test.assertEqual(ordered["source_digest"],sha256_text(source["original_utf8"]),fault["name"])
+                if fault["field"]!="host_version":
+                    test.assertEqual(restore.host_json_wire(body["source"]),restore.host_json_wire(original["source"]),fault["name"])
+                else:
+                    before=json.loads(original["source"]["original_utf8"])
+                    after=json.loads(source["original_utf8"])
+                    test.assertNotEqual(after["host_version"],before["host_version"])
+                    test.assertEqual(after["host_version"],ordered["host_version"])
+                    after.pop("host_version");before.pop("host_version")
+                    test.assertEqual(after,before)
+            with test.assertRaisesRegex(restore.IsolationError,"^invalid current host raw JSON$"):
+                restore.read_current_host_raw(wire,"name-coverage","artifact",identity)
+            copy=backup.parent/("text-damaged-"+str(index));shutil.copytree(backup,copy)
+            _host_rewrite_backup(copy,identity,wire)
+            before=_host_private_database_image(copy/"rsia.sqlite3");before_files=_host_backup_image(copy)
+            refused,result=scenario.restore(copy,anchor,"text-refused-"+str(index))
+            test.assert_isolated(scenario,refused,result,"invalid current host raw JSON")
+            test.assertEqual(_host_private_database_image(copy/"rsia.sqlite3"),before)
+            test.assertEqual(_host_backup_image(copy),before_files)
+            test.assertEqual(_host_private_database_image(anchor),anchor_image)
+            test.assertEqual(_host_private_database_image(backup/"rsia.sqlite3"),backup_image)
+            test.assertEqual(_host_backup_image(backup),backup_files)
+        test.assertEqual(text_count,160);test.assertEqual(shape_count,2)
+    return {"restored":str(dest),"accepted":len(records),"isolated":len(faults),"text_isolated":text_count,"shape_isolated":shape_count,"anchor_observer":observer}
+
+
+def _rust_current_host_number_admission_matrix(payload):
+    """Compare pinned raw admission and restore this run's real number rows."""
+    test=RestoreTests()
+    raw_accepted=0;raw_refused=0
+    for row in payload["raw_cases"]:
+        raw='{"schema_version":"rsia.host_surface_record.v2","n":'+row["token"]+'}'
+        if row["accepted"]:
+            number=restore.read_host_json_tokens(raw)["n"]
+            test.assertIs(type(number),float if row["number_kind"]=="float" else int)
+            test.assertEqual(restore.host_json_wire(number),row["number_wire"],row["token"])
+            raw_accepted+=1
+        else:
+            with test.assertRaisesRegex(restore.IsolationError,"^invalid current host raw JSON$"):
+                restore.read_host_json_tokens(raw)
+            raw_refused+=1
+    test.assertEqual(raw_accepted,12);test.assertEqual(raw_refused,9)
+    records=payload["records"];variants=payload["variants"]
+    test.assertEqual(len(records),2)
+    test.assertEqual([(row["field"],row["old_token"],row["new_token"],row["accepted"]) for row in variants],
+        [("safe","1","1.0",True),("n","8000000000000004","8000000000000004.0",False)])
+    backup=Path(payload["backup"]);anchor=Path(payload["anchor"])
+    manifest=json.loads((backup/"backup-manifest.json").read_text())
+    test.assertIn("name-coverage",{row["namespace"] for row in manifest["watermarks"]})
+    with _host_anchor_read_observer(test,anchor) as (anchor_image,observer):
+        backup_image=_host_private_database_image(backup/"rsia.sqlite3")
+        backup_files=_host_backup_image(backup)
+        con=restore.readonly(backup/"rsia.sqlite3")
+        try:
+            for row in records:
+                restore.read_current_host_raw(row["wire"],"name-coverage","artifact",row["id"])
+                test.assertEqual(con.execute("SELECT body FROM objects WHERE namespace='name-coverage' AND kind='artifact' AND id=?",(row["id"],)).fetchone(),(row["wire"],))
+        finally:
+            con.close()
+        scenario=Scenario.__new__(Scenario);scenario.base=backup.parent
+        dest,result=scenario.restore(backup,anchor,"number-content-restored")
+        test.assert_restored(dest,result,0,"none")
+        test.assertEqual(_host_private_database_image(dest/"rsia.sqlite3")[0],backup_image[0])
+        test.assertEqual(_host_private_database_image(anchor),anchor_image)
+        test.assertEqual(_host_private_database_image(backup/"rsia.sqlite3"),backup_image)
+        test.assertEqual(_host_backup_image(backup),backup_files)
+        original_wire=records[0]["wire"];original=json.loads(original_wire)
+        typed_wire=payload["typed_wire"]
+        test.assertEqual(json.loads(typed_wire),original["extracted_typed"])
+        target='"extracted_typed":'+typed_wire
+        test.assertEqual(original_wire.count(target),1)
+        test.assertIs(type(original["extracted_typed"][0]["default"]["value"]["n"]),int)
+        test.assertEqual(original["extracted_typed"][0]["default"]["value"]["n"],8000000000000004)
+        test.assertEqual(original["manifest_digest"],restore.host_digest(restore.host_ordered(original["manifest"],restore.HOST_MANIFEST_FIELDS)))
+        test.assertEqual(original["manifest"]["source_digest"],sha256_text(original["source"]["original_utf8"]))
+        test.assertEqual(original["manifest"]["source_envelope_digest"],restore.host_digest(restore.host_ordered(original["source"],restore.HOST_SOURCE_FIELDS)))
+        equivalent=None;equivalent_count=0;isolated=0
+        for index,row in enumerate(variants):
+            identity=row["id"];wire=row["wire"]
+            test.assertEqual(identity,records[0]["id"])
+            old='"'+row["field"]+'":'+row["old_token"]
+            new='"'+row["field"]+'":'+row["new_token"]
+            test.assertEqual(typed_wire.count(old),1)
+            changed=typed_wire.replace(old,new,1)
+            test.assertEqual(wire,original_wire.replace(target,'"extracted_typed":'+changed,1))
+            body=json.loads(wire)
+            for field in ("id","schema_version","source","manifest","manifest_digest","extracted","predecessor_surface_id","upgrade_diff"):
+                test.assertEqual(body[field],original[field])
+            test.assertIs(type(body["extracted_typed"][0]["default"]["value"][row["field"]]),float)
+            if row["accepted"]:
+                restore.read_current_host_raw(wire,"name-coverage","artifact",identity)
+            else:
+                with test.assertRaisesRegex(restore.IsolationError,"^invalid current host raw JSON$"):
+                    restore.read_current_host_raw(wire,"name-coverage","artifact",identity)
+            copy=backup.parent/("number-variant-"+str(index));shutil.copytree(backup,copy)
+            _host_rewrite_backup(copy,identity,wire)
+            before=_host_private_database_image(copy/"rsia.sqlite3");before_files=_host_backup_image(copy)
+            restored,result=scenario.restore(copy,anchor,"number-result-"+str(index))
+            if row["accepted"]:
+                test.assert_restored(restored,result,0,"none")
+                test.assertEqual(_host_private_database_image(restored/"rsia.sqlite3")[0],before[0])
+                equivalent=str(restored)
+                equivalent_count+=1
+            else:
+                test.assert_isolated(scenario,restored,result,"invalid current host raw JSON")
+                isolated+=1
+            test.assertEqual(_host_private_database_image(copy/"rsia.sqlite3"),before)
+            test.assertEqual(_host_backup_image(copy),before_files)
+            test.assertEqual(_host_private_database_image(anchor),anchor_image)
+            test.assertEqual(_host_private_database_image(backup/"rsia.sqlite3"),backup_image)
+            test.assertEqual(_host_backup_image(backup),backup_files)
+        test.assertIsNotNone(equivalent);test.assertEqual(equivalent_count,1);test.assertEqual(isolated,1)
+    return {"restored":str(dest),"accepted":len(records),"equivalent":equivalent,
+        "equivalent_count":equivalent_count,"isolated":isolated,"raw_accepted":raw_accepted,"raw_refused":raw_refused,"anchor_observer":observer}
+
+
+class RustCurrentHostWireTests(unittest.TestCase):
+    def test_rust_current_host_wire_defaults_restore_and_typed_faults_isolate(self):
+        actual=json.loads(RUST_CURRENT_HOST_MARKER_BYTES)
+        self.assertEqual(set(actual),{"record_wire","source_wire","manifest_wire","number_wires","raw_zero_tokens","raw_token_faults"})
+        record=json.loads(actual["record_wire"])
+        scenario=Scenario(self,CURRENT)
+        con=connect(scenario.history)
+        try:
+            # This fixture watermark binds its local anchor/backup, never a run grant.
+            con.execute("INSERT INTO revoke_watermark VALUES(?,?,?)",
+                ("name-coverage",1,sha256_text("static-rust-current-host-anchor-1")))
+            con.execute("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,?,?,?,?)",
+                ("name-coverage","artifact",record["id"],"trusted-actor",actual["record_wire"]))
+        finally:
+            con.close()
+        anchor=scenario.anchor("static-rust-live")
+        backup=scenario.backup("static-rust-backup")
+        response=_rust_current_host_restore_matrix({
+            "backup":str(backup),"anchor":str(anchor),"identity":record["id"],
+            "record_wire":actual["record_wire"],"number_wires":actual["number_wires"],
+            "raw_token_faults":actual["raw_token_faults"],"typed_matrix":True,"resource_fault":None,
+        })
+        self.assertEqual(response["isolated"],30)
+        self.assertEqual(len(response["equivalents"]),1)
+        self.assertTrue(Path(response["restored"]).is_dir())
+        self.assertTrue(Path(response["equivalents"][0]).is_dir())
+
+    def test_root_host_upgrade_metadata_without_predecessor_isolated(self):
+        actual=json.loads(RUST_CURRENT_HOST_MARKER_BYTES)
+        wire=actual["record_wire"];manifest_wire=actual["manifest_wire"]
+        record=json.loads(wire)
+        self.assertIsNone(record["predecessor_surface_id"])
+        self.assertEqual(record["manifest"]["retired"],[])
+        self.assertTrue(all(item["renamed_from"] is None for item in record["manifest"]["items"]))
+        self.assertEqual(record["manifest"]["items"][0]["name"],"enabled")
+        self.assertEqual(json.loads(manifest_wire),record["manifest"])
+        self.assertEqual(wire.count(manifest_wire),1)
+        self.assertEqual(manifest_wire.count('"retired":[]'),1)
+        self.assertEqual(manifest_wire.count('"renamed_from":null'),9)
+        self.assertEqual(record["manifest_digest"],sha256_text(manifest_wire))
+        digest_token='"manifest_digest":"'+record["manifest_digest"]+'"'
+        self.assertEqual(wire.count(digest_token),1)
+        self.assertEqual(wire.count(actual["source_wire"]),1)
+        scenario=Scenario(self,CURRENT)
+        con=connect(scenario.history)
+        try:
+            con.execute("INSERT INTO revoke_watermark VALUES(?,?,?)",
+                ("name-coverage",1,sha256_text("root-rust-current-host-anchor-1")))
+            con.execute("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,?,?,?,?)",
+                ("name-coverage","artifact",record["id"],"trusted-actor",wire))
+        finally:
+            con.close()
+        anchor=scenario.anchor("root-host-live")
+        backup=scenario.backup("root-host-backup")
+        checks=RestoreTests()
+        with _host_anchor_read_observer(self,anchor) as (anchor_image,observer):
+            backup_image=_host_private_database_image(backup/"rsia.sqlite3")
+            backup_files=_host_backup_image(backup)
+            dest,result=scenario.restore(backup,anchor,"root-host-restored")
+            checks.assert_restored(dest,result,0,"none")
+            self.assertEqual(_host_private_database_image(dest/"rsia.sqlite3")[0],backup_image[0])
+            self.assertEqual(_host_private_database_image(anchor),anchor_image)
+            self.assertEqual(_host_private_database_image(backup/"rsia.sqlite3"),backup_image)
+            self.assertEqual(_host_backup_image(backup),backup_files)
+            for name,old,new in (
+                ("retired",'"retired":[]','"retired":[{"name":"ghost","reason":"retired"}]'),
+                ("renamed-from",'"renamed_from":null','"renamed_from":"ghost"'),
+            ):
+                with self.subTest(fault=name):
+                    changed_manifest=manifest_wire.replace(old,new,1)
+                    self.assertEqual(changed_manifest.replace(new,old,1),manifest_wire)
+                    changed_digest=sha256_text(changed_manifest)
+                    changed_token='"manifest_digest":"'+changed_digest+'"'
+                    damaged=wire.replace(manifest_wire,changed_manifest,1).replace(digest_token,changed_token,1)
+                    self.assertNotEqual(damaged,wire)
+                    self.assertEqual(damaged.replace(changed_manifest,manifest_wire,1).replace(changed_token,digest_token,1),wire)
+                    body=json.loads(damaged)
+                    self.assertEqual(body["manifest_digest"],restore.host_digest(
+                        restore.host_ordered(body["manifest"],restore.HOST_MANIFEST_FIELDS)))
+                    self.assertEqual(damaged.count(actual["source_wire"]),1)
+                    for field in ("id","schema_version","source","extracted","extracted_typed","predecessor_surface_id","upgrade_diff"):
+                        self.assertEqual(body[field],record[field],name)
+                    repaired=json.loads(changed_manifest)
+                    if name=="retired":
+                        self.assertEqual(repaired["retired"],[{"name":"ghost","reason":"retired"}])
+                        repaired["retired"]=[]
+                    else:
+                        self.assertEqual(repaired["items"][0]["renamed_from"],"ghost")
+                        repaired["items"][0]["renamed_from"]=None
+                    self.assertEqual(repaired,record["manifest"])
+                    copy=scenario.base/("root-damaged-"+name);shutil.copytree(backup,copy)
+                    _host_rewrite_backup(copy,record["id"],damaged)
+                    before=_host_private_database_image(copy/"rsia.sqlite3")
+                    before_files=_host_backup_image(copy)
+                    refused,result=scenario.restore(copy,anchor,"root-refused-"+name)
+                    self.assertEqual(_host_private_database_image(copy/"rsia.sqlite3"),before)
+                    self.assertEqual(_host_backup_image(copy),before_files)
+                    self.assertEqual(_host_private_database_image(anchor),anchor_image)
+                    self.assertEqual(_host_private_database_image(backup/"rsia.sqlite3"),backup_image)
+                    self.assertEqual(_host_backup_image(backup),backup_files)
+                    with self.assertRaisesRegex(restore.IsolationError,"^invalid current host raw JSON$",
+                        msg=f"CLI rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"):
+                        restore.read_current_host_raw(damaged,"name-coverage","artifact",record["id"])
+                    checks.assert_isolated(scenario,refused,result,"invalid current host raw JSON")
 
 
 if __name__ == "__main__":

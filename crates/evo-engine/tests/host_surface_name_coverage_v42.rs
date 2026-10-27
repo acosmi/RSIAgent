@@ -1526,3 +1526,1471 @@ async fn raw_host_prepare_precision_fault_is_zero_write() {
 async fn raw_host_reload_precision_fault_is_zero_write() {
     raw_host_reader_precision_control(true).await;
 }
+
+fn r9_declaration(name: &str, kind: &str, value: Value) -> Value {
+    json!({
+        "name":name,
+        "value_type":kind,
+        "enum_values":if kind == "enum" { vec!["a", "b"] } else { Vec::new() },
+        "default":{"kind":"value","value":value},
+    })
+}
+
+fn r9_source(declarations: Vec<Value>) -> ReviewedHostSourceEnvelopeV1 {
+    ReviewedHostSourceEnvelopeV1 {
+        schema_version: "rsia.host_source_envelope.v1".into(),
+        source_kind: "reviewed_fixture".into(),
+        source_schema: "rsia.host_reviewed_declarations.v1".into(),
+        extractor_version: "rsia.host_reviewed_declarations.extractor.v1".into(),
+        original_utf8: serde_json::to_string(&json!({
+            "schema_version":"rsia.host_reviewed_declarations.v1",
+            "host":"reference","host_version":"0.1.0","declarations":declarations,
+        }))
+        .unwrap(),
+    }
+}
+
+fn r9_registration(source: &ReviewedHostSourceEnvelopeV1) -> HostSurfaceRegistrationV2 {
+    HostSurfaceRegistrationV2 {
+        adapter_version: "r8-9".into(),
+        classifications: extract_reviewed_host_source(source)
+            .unwrap()
+            .declarations
+            .into_iter()
+            .map(|declaration| HostSurfaceClassificationV2 {
+                name: declaration.name,
+                coverage: SurfaceCoverage::Unsupported,
+                mapped_field: None,
+                consumer: None,
+                reason: "unmapped reviewed software fixture".into(),
+                renamed_from: None,
+                test_ref: None,
+                capability: None,
+            })
+            .collect(),
+        retired: Vec::new(),
+    }
+}
+
+// Data-only preview for independent final-wire counting. The real writer below
+// must produce these bytes; this helper creates no witness or authority.
+fn r9_candidate(
+    source: &ReviewedHostSourceEnvelopeV1,
+    registration: &HostSurfaceRegistrationV2,
+) -> HostSurfaceRecordV2 {
+    let (manifest, extracted_typed) =
+        evo_core::contract::host_surface_v2_from_source(source, registration).unwrap();
+    let upgrade_diff = evo_core::contract::host_surface_upgrade_diff_v2(&manifest, None).unwrap();
+    HostSurfaceRecordV2 {
+        id: SURFACE_ID.into(),
+        schema_version: HOST_SURFACE_RECORD_SCHEMA_V2.into(),
+        manifest_digest: fingerprint(&manifest).unwrap(),
+        source: source.clone(),
+        extracted: extracted_typed
+            .iter()
+            .map(|item| item.name.clone())
+            .collect(),
+        extracted_typed,
+        manifest,
+        predecessor_surface_id: None,
+        upgrade_diff,
+    }
+}
+
+// Count the actual serde wire independently of the bounded decoder. Strings
+// (including embedded source UTF-8) are scalars; keys are not value nodes.
+fn r9_raw_resources(raw: &str) -> (usize, usize, usize) {
+    let bytes = raw.as_bytes();
+    let (mut pos, mut nodes, mut depth, mut maximum) = (0, 0, 0_usize, 0);
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'{' | b'[' => {
+                nodes += 1;
+                depth += 1;
+                maximum = maximum.max(depth);
+                pos += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1).unwrap();
+                pos += 1;
+            }
+            b'"' => {
+                pos += 1;
+                while bytes[pos] != b'"' {
+                    if bytes[pos] == b'\\' {
+                        pos += 1;
+                    }
+                    pos += 1;
+                }
+                pos += 1;
+                let mut next = pos;
+                while bytes.get(next).is_some_and(u8::is_ascii_whitespace) {
+                    next += 1;
+                }
+                if bytes.get(next) != Some(&b':') {
+                    nodes += 1;
+                }
+            }
+            b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => {
+                nodes += 1;
+                while pos < bytes.len()
+                    && !matches!(bytes[pos], b',' | b'}' | b']')
+                    && !bytes[pos].is_ascii_whitespace()
+                {
+                    pos += 1;
+                }
+            }
+            b',' | b':' | b' ' | b'\r' | b'\n' | b'\t' => pos += 1,
+            value => panic!("unexpected generated JSON byte {value}"),
+        }
+    }
+    assert_eq!(depth, 0);
+    (raw.len(), nodes, maximum)
+}
+
+async fn r9_healthy_chain(
+    source: ReviewedHostSourceEnvelopeV1,
+    registration: HostSurfaceRegistrationV2,
+) -> (tempfile::TempDir, Store, HostSurfaceRecordV2) {
+    let (dir, store) = database().await;
+    let admin = context(Role::Admin);
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, &hash(b"r8-9 actual backup namespace"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let expected = serde_json::to_string(&r9_candidate(&source, &registration)).unwrap();
+    let record = ReleaseStore::register_host_surface_from_source(
+        &admin,
+        &store,
+        SURFACE_ID,
+        source.clone(),
+        registration.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(serde_json::to_string(&record).unwrap(), expected);
+    assert_eq!(record.source.original_utf8, source.original_utf8);
+    store.close().await;
+    let store = Store::open(&dir.path().join("name-coverage.sqlite3"))
+        .await
+        .unwrap();
+    let mut session = store.session().await.unwrap();
+    let loaded: HostSurfaceRecordV2 = session.need(&admin, "artifact", SURFACE_ID).await.unwrap();
+    let listed: Vec<HostSurfaceRecordV2> = session.list(&admin, "artifact").await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(serde_json::to_string(&loaded).unwrap(), expected);
+    assert_eq!(serde_json::to_string(&listed[0]).unwrap(), expected);
+    session.commit().await.unwrap();
+    let before = current_image(&store, dir.path()).await;
+    let repeat = ReleaseStore::register_host_surface_from_source(
+        &admin,
+        &store,
+        SURFACE_ID,
+        source,
+        registration,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(serde_json::to_string(&repeat).unwrap(), expected);
+    assert_eq!(current_image(&store, dir.path()).await, before);
+    let host = context(Role::Host);
+    let prepared = ReleaseStore::prepare_run(&host, &store, request())
+        .await
+        .unwrap();
+    assert_eq!(prepared.host_surface_digest, record.manifest_digest);
+    let prepared = serde_json::to_value(&prepared).unwrap();
+    let read = ReleaseStore::read_run_snapshot(&host, &store, RUN_ID)
+        .await
+        .unwrap();
+    assert_eq!(serde_json::to_value(&read).unwrap(), prepared);
+    let live = ReleaseStore::validate_run_snapshot_live(&host, &store, RUN_ID)
+        .await
+        .unwrap();
+    assert_eq!(serde_json::to_value(&live).unwrap(), prepared);
+    let before = current_image(&store, dir.path()).await;
+    let replay = ReleaseStore::prepare_run(&host, &store, request())
+        .await
+        .unwrap();
+    assert_eq!(serde_json::to_value(&replay).unwrap(), prepared);
+    assert_eq!(current_image(&store, dir.path()).await, before);
+    (dir, store, record)
+}
+
+async fn r9_restore_chain(
+    store: &Store,
+    dir: &Path,
+    record: &HostSurfaceRecordV2,
+    number_wires: Value,
+    typed_matrix: bool,
+    resource_fault: Option<&str>,
+) {
+    let private = tempfile::tempdir().unwrap();
+    let backup = private.path().join("actual-rust-backup");
+    store.backup(&backup).await.unwrap();
+    store.close().await;
+    let anchor = dir.join("name-coverage.sqlite3");
+    let before = capture_raw_database_family(&anchor);
+    let payload = private.path().join("actual-rust-host-input.json");
+    std::fs::write(
+        &payload,
+        serde_json::to_vec(&json!({
+            "backup":backup,"anchor":anchor,"identity":record.id,
+            "record_wire":serde_json::to_string(record).unwrap(),
+            "number_wires":number_wires,"typed_matrix":typed_matrix,
+            "raw_token_faults":if typed_matrix { r9_invalid_number_tokens() } else { Vec::new() },
+            "resource_fault":resource_fault,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let script = "import json,sys; from scripts.test_restore_backup import _rust_current_host_restore_matrix; print(json.dumps(_rust_current_host_restore_matrix(json.load(open(sys.argv[1],encoding='utf-8')))))";
+    let output = std::process::Command::new("python3")
+        .args(["-B", "-c", script])
+        .arg(&payload)
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Python restore bridge failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(capture_raw_database_family(&anchor), before);
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let restored_path = Path::new(response["restored"].as_str().unwrap()).join("rsia.sqlite3");
+    let restored = Store::open(&restored_path).await.unwrap();
+    let admin = context(Role::Admin);
+    let mut session = restored.session().await.unwrap();
+    let loaded: HostSurfaceRecordV2 = session.need(&admin, "artifact", SURFACE_ID).await.unwrap();
+    assert_eq!(
+        serde_json::to_string(&loaded).unwrap(),
+        serde_json::to_string(record).unwrap()
+    );
+    let artifacts: Vec<Value> = session.list(&admin, "artifact").await.unwrap();
+    assert!(artifacts.iter().any(|value| value["id"] == SURFACE_ID));
+    session.commit().await.unwrap();
+    let live = ReleaseStore::validate_run_snapshot_live(&context(Role::Host), &restored, RUN_ID)
+        .await
+        .unwrap();
+    assert_eq!(live.host_surface_digest, record.manifest_digest);
+    ReleaseStore::read_run_snapshot(&context(Role::Host), &restored, RUN_ID)
+        .await
+        .unwrap();
+    restored.close().await;
+    for destination in response["equivalents"].as_array().unwrap() {
+        let restored = Store::open(&Path::new(destination.as_str().unwrap()).join("rsia.sqlite3"))
+            .await
+            .unwrap();
+        let mut session = restored.session().await.unwrap();
+        let loaded: HostSurfaceRecordV2 =
+            session.need(&admin, "artifact", SURFACE_ID).await.unwrap();
+        evo_engine::release_store::validate_host_record_v2_source(&loaded).unwrap();
+        session.commit().await.unwrap();
+        // Semantic content equality is not a replacement Admin witness for a
+        // changed wire. Only the untouched actual producer above earns live use.
+        restored.close().await;
+    }
+    assert_eq!(
+        response["isolated"].as_u64().unwrap() > 0,
+        typed_matrix || resource_fault.is_some()
+    );
+}
+
+fn r9_legal_zero_tokens() -> Vec<&'static str> {
+    vec![
+        "0e1000000000000000000",
+        "-0e1000000000000000000",
+        "0e-1000000000000000000",
+        "-0e-1000000000000000000",
+        "0e9223372036854775807",
+        "-0e9223372036854775807",
+        "0e-9223372036854775808",
+        "-0e-9223372036854775808",
+        "0e+00000000000000000009223372036854775807",
+        "-0e-00000000000000000009223372036854775808",
+        "0.0e9223372036854775807",
+        "-0.0e-9223372036854775807",
+    ]
+}
+
+fn r9_invalid_number_tokens() -> Vec<&'static str> {
+    vec![
+        "0e9223372036854775808",
+        "0e-9223372036854775809",
+        "0e00000000000000000009223372036854775808",
+        "0.0e-9223372036854775808",
+        "-0.0e-9223372036854775808",
+        "10e9223372036854775807",
+        "1e-1000000000000000000",
+        "1e1000000000000000000",
+        "0.100000000000000001",
+        "00e1",
+        "0e+",
+        "0.e1",
+    ]
+}
+
+#[tokio::test]
+async fn current_host_number_object_and_typed_defaults_survive_cross_language_restore() {
+    let zero_tokens = r9_legal_zero_tokens();
+    let zeros = zero_tokens
+        .iter()
+        .enumerate()
+        .map(|(index, _)| (format!("zero_{index}"), json!(0.0)))
+        .collect();
+    let declarations = vec![
+        r9_declaration("enabled", "bool", json!(true)),
+        r9_declaration("disabled", "bool", json!(false)),
+        r9_declaration("count", "integer", json!(1)),
+        r9_declaration("mode", "enum", json!("b")),
+        r9_declaration(
+            "reserved",
+            "object",
+            json!({"kind":"value","value":null,"default":{"kind":"value","value":null}}),
+        ),
+        r9_declaration(
+            "numbers",
+            "object",
+            json!({
+                "fixed_high":1e15,"exponent_high":1e16,"fixed_low":1e-5,"exponent_low":1e-6,
+                "large_int":1e21,"negative_zero":-0.0,"fraction":0.1,"one":1.0,"zero":-0.0,
+                "flags":[true,false,{"on":true}],
+            }),
+        ),
+        r9_declaration("boundary", "string", json!("x".repeat(4094))),
+        r9_declaration("compact_numbers", "object", json!({"n":vec![1e16;817]})),
+        r9_declaration("raw_zeros", "object", Value::Object(zeros)),
+    ];
+    let mut source = r9_source(declarations);
+    source.original_utf8 = source
+        .original_utf8
+        .replace(
+            "\"large_int\":1e+21",
+            "\"large_int\":1000000000000000000000",
+        )
+        .replace("\"negative_zero\":-0.0", "\"negative_zero\":-0");
+    assert!(source.original_utf8.contains("1000000000000000000000"));
+    assert!(source.original_utf8.contains("\"negative_zero\":-0,"));
+    for (index, token) in zero_tokens.iter().enumerate() {
+        let old = format!("\"zero_{index}\":0.0");
+        let original = format!("\"zero_{index}\":{token}");
+        assert!(source.original_utf8.contains(&old));
+        source.original_utf8 = source.original_utf8.replacen(&old, &original, 1);
+        assert!(source.original_utf8.contains(&original));
+    }
+    let registration = r9_registration(&source);
+    let (dir, store, record) = r9_healthy_chain(source, registration.clone()).await;
+    for (index, token) in r9_invalid_number_tokens().iter().enumerate() {
+        let mut damaged = record.source.clone();
+        let old = format!("\"zero_0\":{}", zero_tokens[0]);
+        let replacement = format!("\"zero_0\":{token}");
+        damaged.original_utf8 = damaged.original_utf8.replacen(&old, &replacement, 1);
+        assert_ne!(damaged.original_utf8, record.source.original_utf8);
+        let before = current_image(&store, dir.path()).await;
+        let result = ReleaseStore::register_host_surface_from_source(
+            &context(Role::Admin),
+            &store,
+            &format!("raw-token-fault-{index}"),
+            damaged,
+            registration.clone(),
+            None,
+        )
+        .await;
+        assert_invalid(result, "invalid reviewed host source/default");
+        assert_eq!(current_image(&store, dir.path()).await, before);
+    }
+    let seeds = [
+        0.0_f64,
+        1.0,
+        0.1,
+        2.5,
+        1e15,
+        1e16,
+        1e-5,
+        1e-6,
+        1e21,
+        1e23,
+        1.0000000000000002,
+        1.2345678901234567,
+        0.8455124082255701,
+        f64::MIN_POSITIVE,
+        f64::MAX,
+        f64::from_bits(1),
+    ];
+    let mut bits = BTreeSet::new();
+    for seed in seeds {
+        for sign in [0, 1_u64 << 63] {
+            let value = seed.to_bits() ^ sign;
+            for candidate in [value.wrapping_sub(1), value, value.wrapping_add(1)] {
+                if f64::from_bits(candidate).is_finite() {
+                    bits.insert(candidate);
+                }
+            }
+        }
+    }
+    let number_wires = Value::Array(
+        bits.into_iter()
+            .map(|bits| {
+                json!({
+                    "bits":format!("{bits:016x}"),
+                    "wire":serde_json::to_string(&f64::from_bits(bits)).unwrap(),
+                })
+            })
+            .collect(),
+    );
+    // This one marker exports only this actual software producer's material.
+    // The controller captures stdout; no QA/local path or authority is embedded.
+    println!(
+        "AG135B_R8_9_ACTUAL_PRODUCER_V1 {}",
+        serde_json::to_string(&json!({
+            "record_wire":serde_json::to_string(&record).unwrap(),
+            "source_wire":serde_json::to_string(&record.source).unwrap(),
+            "manifest_wire":serde_json::to_string(&record.manifest).unwrap(),
+            "number_wires":number_wires,
+            "raw_zero_tokens":zero_tokens,
+            "raw_token_faults":r9_invalid_number_tokens(),
+        }))
+        .unwrap()
+    );
+    r9_restore_chain(&store, dir.path(), &record, number_wires, true, None).await;
+    r10_text_matrix().await;
+    r11_number_admission_matrix().await;
+}
+
+fn r9_byte_case(target: usize) -> (ReviewedHostSourceEnvelopeV1, HostSurfaceRegistrationV2) {
+    let make = |size| {
+        r9_source(
+            (0..64)
+                .map(|index| {
+                    r9_declaration(
+                        &format!("field-{index:02}"),
+                        "string",
+                        json!("x".repeat(size)),
+                    )
+                })
+                .collect(),
+        )
+    };
+    let (mut low, mut high) = (0_usize, 3000_usize);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        let source = make(middle);
+        let registration = r9_registration(&source);
+        let raw = serde_json::to_string(&r9_candidate(&source, &registration)).unwrap();
+        if raw.len() <= target {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let source = make(low);
+    let mut registration = r9_registration(&source);
+    let raw = serde_json::to_string(&r9_candidate(&source, &registration)).unwrap();
+    registration.classifications[0]
+        .reason
+        .push_str(&"x".repeat(target - raw.len()));
+    assert!(registration.classifications[0].reason.len() <= 512);
+    let raw = serde_json::to_string(&r9_candidate(&source, &registration)).unwrap();
+    assert_eq!(raw.len(), target);
+    (source, registration)
+}
+
+fn r9_node_case(target: usize) -> (ReviewedHostSourceEnvelopeV1, HostSurfaceRegistrationV2) {
+    // Changing the declaration parity permits adjacent complete-record node
+    // counts even though each default is repeated twice in the final record.
+    let count = if target & 1 == 0 { 16 } else { 17 };
+    let make = |extra: usize| {
+        r9_source(
+            (0..count)
+                .map(|index| {
+                    let size = extra / count + usize::from(index < extra % count);
+                    r9_declaration(
+                        &format!("field-{index:02}"),
+                        "object",
+                        json!({"values":vec![0;size]}),
+                    )
+                })
+                .collect(),
+        )
+    };
+    let source = make(0);
+    let registration = r9_registration(&source);
+    let raw = serde_json::to_string(&r9_candidate(&source, &registration)).unwrap();
+    let baseline = r9_raw_resources(&raw).1;
+    assert_eq!((target - baseline) % 2, 0);
+    let source = make((target - baseline) / 2);
+    let registration = r9_registration(&source);
+    let raw = serde_json::to_string(&r9_candidate(&source, &registration)).unwrap();
+    assert_eq!(r9_raw_resources(&raw).1, target);
+    (source, registration)
+}
+
+fn r9_depth_case(target: usize) -> (ReviewedHostSourceEnvelopeV1, HostSurfaceRegistrationV2) {
+    let mut nested = Value::Null;
+    for _ in 0..target - 6 {
+        nested = Value::Array(vec![nested]);
+    }
+    let source = r9_source(vec![r9_declaration(
+        "nested",
+        "object",
+        json!({"nested":nested}),
+    )]);
+    let registration = r9_registration(&source);
+    let raw = serde_json::to_string(&r9_candidate(&source, &registration)).unwrap();
+    assert_eq!(r9_raw_resources(&raw).2, target);
+    (source, registration)
+}
+
+fn r9_install_first_dml_sentinel(path: &Path) {
+    let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"CREATE TRIGGER r8_9_first_dml BEFORE INSERT ON objects BEGIN SELECT RAISE(FAIL,'AG135B_R8_9_FIRST_DML'); END\"); c.commit(); c.close()";
+    let output = std::process::Command::new("python3")
+        .args(["-B", "-c", script])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn current_host_final_record_resource_amplification_is_zero_write() {
+    for dimension in ["UTF-8 bytes", "nodes", "depth"] {
+        let make = |outside| match dimension {
+            "UTF-8 bytes" => r9_byte_case(262_144 + usize::from(outside)),
+            "nodes" => r9_node_case(32_768 + usize::from(outside)),
+            "depth" => r9_depth_case(256 + usize::from(outside)),
+            _ => unreachable!(),
+        };
+        let (source, registration) = make(false);
+        let legal = r9_candidate(&source, &registration);
+        let raw = serde_json::to_string(&legal).unwrap();
+        let inside = r9_raw_resources(&raw);
+        assert!(inside.0 <= 262_144 && inside.1 <= 32_768 && inside.2 <= 256);
+        evo_core::contract::decode_host_surface_record_v2_json(&raw).unwrap();
+        let (dir, store, record) = r9_healthy_chain(source, registration).await;
+        assert_eq!(serde_json::to_string(&record).unwrap(), raw);
+        let (source, registration) = make(true);
+        let source_resources = r9_raw_resources(&source.original_utf8);
+        assert!(
+            source_resources.0 <= 262_144
+                && source_resources.1 <= 32_768
+                && source_resources.2 <= 256
+        );
+        // This full producer extraction proves every default remains valid;
+        // only the final repeated record exceeds its separate resource cap.
+        extract_reviewed_host_source(&source).unwrap();
+        let illegal = r9_candidate(&source, &registration);
+        let damaged = serde_json::to_string(&illegal).unwrap();
+        let outside = r9_raw_resources(&damaged);
+        match dimension {
+            "UTF-8 bytes" => {
+                assert!(outside.0 == 262_145 && outside.1 <= 32_768 && outside.2 <= 256);
+            }
+            "nodes" => assert!(outside.0 <= 262_144 && outside.1 == 32_769 && outside.2 <= 256),
+            "depth" => assert!(outside.0 <= 262_144 && outside.1 <= 32_768 && outside.2 == 257),
+            _ => unreachable!(),
+        }
+        let expected = format!("reviewed host JSON resource limit: {dimension}");
+        assert_invalid(
+            evo_core::contract::decode_host_surface_record_v2_json(&damaged),
+            &expected,
+        );
+        r9_restore_chain(
+            &store,
+            dir.path(),
+            &record,
+            json!([]),
+            false,
+            Some(&damaged),
+        )
+        .await;
+
+        let (refused_dir, refused_store) = database().await;
+        let admin = context(Role::Admin);
+        let control_source = r9_source(vec![r9_declaration("healthy", "bool", json!(true))]);
+        let control_registration = r9_registration(&control_source);
+        ReleaseStore::register_host_surface_from_source(
+            &admin,
+            &refused_store,
+            "resource-healthy-control",
+            control_source,
+            control_registration,
+            None,
+        )
+        .await
+        .unwrap();
+        r9_install_first_dml_sentinel(&refused_dir.path().join("name-coverage.sqlite3"));
+        let before = current_image(&refused_store, refused_dir.path()).await;
+        let result = ReleaseStore::register_host_surface_from_source(
+            &admin,
+            &refused_store,
+            SURFACE_ID,
+            source,
+            registration,
+            None,
+        )
+        .await;
+        assert_invalid(result, &expected);
+        assert_eq!(
+            current_image(&refused_store, refused_dir.path()).await,
+            before
+        );
+        refused_store.close().await;
+    }
+}
+
+const R10_WHITE_SPACE: &str = "\u{0009}\u{000a}\u{000b}\u{000c}\u{000d}\u{0020}\u{0085}\u{00a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+const R10_PREDECESSOR: &str = "r10-text-predecessor";
+
+#[derive(Clone, Copy, Debug)]
+enum R10TextField {
+    HostVersion,
+    AdapterVersion,
+    Reason,
+    RetiredReason,
+    TestRef,
+}
+
+impl R10TextField {
+    fn name(self) -> &'static str {
+        match self {
+            Self::HostVersion => "host_version",
+            Self::AdapterVersion => "adapter_version",
+            Self::Reason => "reason",
+            Self::RetiredReason => "retired_reason",
+            Self::TestRef => "test_ref",
+        }
+    }
+    fn limit(self) -> usize {
+        match self {
+            Self::HostVersion | Self::AdapterVersion => 128,
+            Self::Reason | Self::RetiredReason => 512,
+            Self::TestRef => panic!("test_ref has no independent byte cap"),
+        }
+    }
+    fn expected(self) -> &'static str {
+        match self {
+            Self::HostVersion => "host_version: expected nonempty text <= 128 bytes",
+            Self::AdapterVersion => "adapter_version: expected nonempty text <= 128 bytes",
+            Self::Reason => "reason: expected nonempty text <= 512 bytes",
+            Self::RetiredReason => "retired reason: expected nonempty text <= 512 bytes",
+            Self::TestRef => "invalid reviewed host source/default",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct R10TextInputs {
+    source: ReviewedHostSourceEnvelopeV1,
+    registration: HostSurfaceRegistrationV2,
+}
+
+struct R10TextFault {
+    name: String,
+    field: R10TextField,
+    value: Option<String>,
+}
+
+fn r10_replace_source_version(source: &mut ReviewedHostSourceEnvelopeV1, value: &str) {
+    // All variants start from the genuine simple text source below. Use the
+    // real JSON string serializer, including NUL/C0 escapes, for this one token.
+    let old = "\"host_version\":\"0.1.0\"";
+    let replacement = format!("\"host_version\":{}", serde_json::to_string(value).unwrap());
+    assert!(source.original_utf8.contains(old));
+    source.original_utf8 = source.original_utf8.replacen(old, &replacement, 1);
+}
+
+fn r10_text_inputs() -> R10TextInputs {
+    let source = r9_source(vec![r9_declaration(
+        "new-setting",
+        "string",
+        json!("reviewed software content"),
+    )]);
+    let mut registration = r9_registration(&source);
+    let item = &mut registration.classifications[0];
+    item.coverage = SurfaceCoverage::Supported;
+    item.mapped_field = Some("skill.content".into());
+    item.consumer = Some("compiler".into());
+    item.capability = Some("r10-text-content".into());
+    item.test_ref = Some("tests/r10/text-contract".into());
+    registration.retired = vec![evo_core::contract::RetiredHostSurfaceV2 {
+        name: "old-setting".into(),
+        reason: "retired reviewed software field".into(),
+    }];
+    R10TextInputs {
+        source,
+        registration,
+    }
+}
+
+fn r10_set_input(inputs: &mut R10TextInputs, field: R10TextField, value: Option<&str>) {
+    match field {
+        R10TextField::HostVersion => {
+            r10_replace_source_version(&mut inputs.source, value.unwrap());
+        }
+        R10TextField::AdapterVersion => {
+            inputs.registration.adapter_version = value.unwrap().into();
+        }
+        R10TextField::Reason => {
+            inputs.registration.classifications[0].reason = value.unwrap().into();
+        }
+        R10TextField::RetiredReason => {
+            inputs.registration.retired[0].reason = value.unwrap().into();
+        }
+        R10TextField::TestRef => {
+            inputs.registration.classifications[0].test_ref = value.map(str::to_owned);
+        }
+    }
+}
+
+fn r10_positive_text_inputs() -> Vec<(String, R10TextInputs)> {
+    let base = r10_text_inputs();
+    let fields = [
+        R10TextField::HostVersion,
+        R10TextField::AdapterVersion,
+        R10TextField::Reason,
+        R10TextField::RetiredReason,
+    ];
+    let mut cases = vec![("base".into(), base.clone())];
+    for field in fields {
+        let limit = field.limit();
+        for (label, value) in [
+            ("ascii-bound", "x".repeat(limit)),
+            (
+                "utf8-bound",
+                "汉".repeat(limit / 3) + &"a".repeat(limit % 3),
+            ),
+        ] {
+            assert_eq!(value.len(), limit);
+            let mut inputs = base.clone();
+            r10_set_input(&mut inputs, field, Some(&value));
+            cases.push((format!("{}-{label}", field.name()), inputs));
+        }
+    }
+    for separator in ['\u{001c}', '\u{001d}', '\u{001e}', '\u{001f}'] {
+        for (label, value) in [
+            ("single", separator.to_string()),
+            (
+                "padded",
+                format!("{R10_WHITE_SPACE}{separator}{R10_WHITE_SPACE}"),
+            ),
+        ] {
+            assert!(value.len() <= 128);
+            let mut inputs = base.clone();
+            for field in fields {
+                r10_set_input(&mut inputs, field, Some(&value));
+            }
+            cases.push((format!("c0-{:04x}-{label}", u32::from(separator)), inputs));
+        }
+    }
+    let mut references = vec!["t\0".into(), "\0".into(), "r".repeat(513), "汉".repeat(171)];
+    for separator in ['\u{001c}', '\u{001d}', '\u{001e}', '\u{001f}'] {
+        references.push(separator.to_string());
+        references.push(format!("{R10_WHITE_SPACE}{separator}{R10_WHITE_SPACE}"));
+    }
+    for (index, reference) in references.into_iter().enumerate() {
+        let mut inputs = base.clone();
+        r10_set_input(&mut inputs, R10TextField::TestRef, Some(&reference));
+        cases.push((format!("reference-{index:02}"), inputs));
+    }
+    assert_eq!(cases.len(), 29);
+    cases
+}
+
+fn r10_text_faults() -> Vec<R10TextFault> {
+    let mut cases = Vec::new();
+    for field in [
+        R10TextField::HostVersion,
+        R10TextField::AdapterVersion,
+        R10TextField::Reason,
+        R10TextField::RetiredReason,
+    ] {
+        let mut values = vec![
+            ("ascii-over".into(), "x".repeat(field.limit() + 1)),
+            ("utf8-over".into(), "汉".repeat(field.limit() / 3 + 1)),
+            ("empty".into(), String::new()),
+            ("nul-only".into(), "\0".into()),
+            ("nul-first".into(), "\0x".into()),
+            ("nul-middle".into(), "x\0y".into()),
+            ("nul-last".into(), "x\0".into()),
+            ("all-white".into(), R10_WHITE_SPACE.into()),
+        ];
+        for character in R10_WHITE_SPACE.chars() {
+            values.push((
+                format!("white-{:04x}", u32::from(character)),
+                character.to_string(),
+            ));
+        }
+        assert_eq!(values.len(), 33);
+        for (label, value) in values {
+            cases.push(R10TextFault {
+                name: format!("{}-{label}", field.name()),
+                field,
+                value: Some(value),
+            });
+        }
+    }
+    let mut references = vec![None, Some(String::new()), Some(R10_WHITE_SPACE.into())];
+    references.extend(R10_WHITE_SPACE.chars().map(|value| Some(value.to_string())));
+    assert_eq!(references.len(), 28);
+    for (index, value) in references.into_iter().enumerate() {
+        cases.push(R10TextFault {
+            name: format!("test-ref-empty-{index:02}"),
+            field: R10TextField::TestRef,
+            value,
+        });
+    }
+    assert_eq!(cases.len(), 160);
+    cases
+}
+
+async fn r10_open_text_store() -> (tempfile::TempDir, Store, HostSurfaceRecordV2) {
+    let (dir, store) = database().await;
+    let admin = context(Role::Admin);
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, &hash(b"r10 actual text fixture namespace"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let source = r9_source(vec![r9_declaration("old-setting", "string", json!("old"))]);
+    let registration = r9_registration(&source);
+    let previous = ReleaseStore::register_host_surface_from_source(
+        &admin,
+        &store,
+        R10_PREDECESSOR,
+        source,
+        registration,
+        None,
+    )
+    .await
+    .unwrap();
+    (dir, store, previous)
+}
+
+fn r10_bad_text_record(base: &HostSurfaceRecordV2, fault: &R10TextFault) -> HostSurfaceRecordV2 {
+    let mut record = base.clone();
+    match fault.field {
+        R10TextField::HostVersion => {
+            let value = fault.value.as_deref().unwrap();
+            r10_replace_source_version(&mut record.source, value);
+            record.manifest.host_version = value.into();
+            record.manifest.source_digest = hash(record.source.original_utf8.as_bytes());
+            record.manifest.source_envelope_digest = fingerprint(&record.source).unwrap();
+        }
+        R10TextField::AdapterVersion => {
+            record.manifest.adapter_version = fault.value.clone().unwrap();
+        }
+        R10TextField::Reason => {
+            record.manifest.items[0].reason = fault.value.clone().unwrap();
+        }
+        R10TextField::RetiredReason => {
+            record.manifest.retired[0].reason = fault.value.clone().unwrap();
+        }
+        R10TextField::TestRef => {
+            record.manifest.items[0].test_ref = fault.value.clone();
+        }
+    }
+    record.manifest_digest = fingerprint(&record.manifest).unwrap();
+    assert_eq!(
+        record.manifest_digest,
+        fingerprint(&record.manifest).unwrap()
+    );
+    assert_eq!(
+        record.manifest.source_envelope_digest,
+        fingerprint(&record.source).unwrap()
+    );
+    assert_eq!(
+        record.manifest.source_digest,
+        hash(record.source.original_utf8.as_bytes())
+    );
+    assert_eq!(record.extracted, base.extracted);
+    assert_eq!(
+        fingerprint(&record.extracted_typed).unwrap(),
+        fingerprint(&base.extracted_typed).unwrap()
+    );
+    assert_eq!(record.predecessor_surface_id, base.predecessor_surface_id);
+    assert_eq!(record.upgrade_diff, base.upgrade_diff);
+    let raw = serde_json::to_string(&record).unwrap();
+    evo_core::contract::decode_host_surface_record_v2_json(&raw).unwrap();
+    assert_invalid(
+        evo_engine::release_store::validate_host_record_v2_source(&record),
+        fault.field.expected(),
+    );
+    record
+}
+
+async fn r10_writer_text_faults(inputs: &R10TextInputs, faults: &[R10TextFault]) {
+    let (dir, store, previous) = r10_open_text_store().await;
+    let admin = context(Role::Admin);
+    ReleaseStore::register_host_surface_from_source(
+        &admin,
+        &store,
+        "r10-writer-healthy",
+        inputs.source.clone(),
+        inputs.registration.clone(),
+        Some(previous.id),
+    )
+    .await
+    .unwrap();
+    r9_install_first_dml_sentinel(&dir.path().join("name-coverage.sqlite3"));
+    let before = current_image(&store, dir.path()).await;
+    for (index, fault) in faults.iter().enumerate() {
+        // Mutate healthy inputs only. Invalid host_version never goes through
+        // r9_registration/r9_candidate, whose healthy-only extraction unwraps.
+        let mut damaged = inputs.clone();
+        r10_set_input(&mut damaged, fault.field, fault.value.as_deref());
+        let result = ReleaseStore::register_host_surface_from_source(
+            &admin,
+            &store,
+            &format!("r10-rejected-{index}"),
+            damaged.source,
+            damaged.registration,
+            Some(R10_PREDECESSOR.into()),
+        )
+        .await;
+        assert_invalid(result, fault.field.expected());
+        assert_eq!(
+            current_image(&store, dir.path()).await,
+            before,
+            "{} writer changed the full database image",
+            fault.name
+        );
+    }
+    store.close().await;
+}
+
+async fn r10_restore_text_content(
+    store: &Store,
+    dir: &Path,
+    records: &[HostSurfaceRecordV2],
+    faults: Vec<Value>,
+) {
+    let private = tempfile::tempdir().unwrap();
+    let backup = private.path().join("text-content-backup");
+    store.backup(&backup).await.unwrap();
+    store.close().await;
+    let anchor = dir.join("name-coverage.sqlite3");
+    let before = capture_raw_database_family(&anchor);
+    let payload = private.path().join("text-content-input.json");
+    let rows = records
+        .iter()
+        .map(|record| json!({"id":record.id,"wire":serde_json::to_string(record).unwrap()}))
+        .collect::<Vec<_>>();
+    let fault_count = faults.len();
+    std::fs::write(
+        &payload,
+        serde_json::to_vec(&json!({
+            "backup":backup,"anchor":anchor,"records":rows,"faults":faults,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let script = "import json,sys; from scripts.test_restore_backup import _rust_current_host_text_restore_matrix; print(json.dumps(_rust_current_host_text_restore_matrix(json.load(open(sys.argv[1],encoding='utf-8')))))";
+    let output = std::process::Command::new("python3")
+        .args(["-B", "-c", script])
+        .arg(&payload)
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "text content bridge failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(capture_raw_database_family(&anchor), before);
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["accepted"].as_u64(), Some(records.len() as u64));
+    assert_eq!(response["isolated"].as_u64(), Some(fault_count as u64));
+    assert_eq!(fault_count, 162);
+    assert_eq!(response["text_isolated"].as_u64(), Some(160));
+    assert_eq!(response["shape_isolated"].as_u64(), Some(2));
+    let path = Path::new(response["restored"].as_str().unwrap()).join("rsia.sqlite3");
+    let restored = Store::open(&path).await.unwrap();
+    let admin = context(Role::Admin);
+    let mut session = restored.session().await.unwrap();
+    let listed: Vec<HostSurfaceRecordV2> = session.list(&admin, "artifact").await.unwrap();
+    assert_eq!(listed.len(), records.len());
+    for record in records {
+        let loaded: HostSurfaceRecordV2 =
+            session.need(&admin, "artifact", &record.id).await.unwrap();
+        assert_eq!(
+            serde_json::to_string(&loaded).unwrap(),
+            serde_json::to_string(record).unwrap()
+        );
+        evo_engine::release_store::validate_host_record_v2_source(&loaded).unwrap();
+    }
+    session.commit().await.unwrap();
+    // This independent text fixture has no run snapshot. Its supported test_ref
+    // values prove content acceptance only, never real behavior/live authority.
+    restored.close().await;
+}
+
+async fn r10_text_matrix() {
+    assert_eq!(R10_WHITE_SPACE.chars().count(), 25);
+    for character in R10_WHITE_SPACE.chars() {
+        assert!(character.is_whitespace());
+    }
+    for character in ['\u{001c}', '\u{001d}', '\u{001e}', '\u{001f}'] {
+        assert!(!character.is_whitespace());
+    }
+    let (dir, store, previous) = r10_open_text_store().await;
+    let admin = context(Role::Admin);
+    let mut records = vec![previous];
+    let mut replays = Vec::new();
+    let mut baseline = None;
+    for (name, inputs) in r10_positive_text_inputs() {
+        let id = format!("r10-text-{name}");
+        let record = ReleaseStore::register_host_surface_from_source(
+            &admin,
+            &store,
+            &id,
+            inputs.source.clone(),
+            inputs.registration.clone(),
+            Some(R10_PREDECESSOR.into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            record.predecessor_surface_id.as_deref(),
+            Some(R10_PREDECESSOR)
+        );
+        assert_eq!(record.upgrade_diff.added, names(&["new-setting"]));
+        assert_eq!(record.upgrade_diff.removed, names(&["old-setting"]));
+        if name == "base" {
+            baseline = Some(record.clone());
+        }
+        replays.push((inputs, id));
+        records.push(record);
+    }
+    assert_eq!(records.len(), 30); // 29 successors and their actual predecessor.
+    store.close().await;
+    let store = Store::open(&dir.path().join("name-coverage.sqlite3"))
+        .await
+        .unwrap();
+    let mut session = store.session().await.unwrap();
+    let listed: Vec<HostSurfaceRecordV2> = session.list(&admin, "artifact").await.unwrap();
+    assert_eq!(listed.len(), records.len());
+    for record in &records {
+        let loaded: HostSurfaceRecordV2 =
+            session.need(&admin, "artifact", &record.id).await.unwrap();
+        assert_eq!(
+            serde_json::to_string(&loaded).unwrap(),
+            serde_json::to_string(record).unwrap()
+        );
+        evo_engine::release_store::validate_host_record_v2_source(&loaded).unwrap();
+    }
+    session.commit().await.unwrap();
+    let before = current_image(&store, dir.path()).await;
+    for (inputs, id) in replays {
+        let repeat = ReleaseStore::register_host_surface_from_source(
+            &admin,
+            &store,
+            &id,
+            inputs.source,
+            inputs.registration,
+            Some(R10_PREDECESSOR.into()),
+        )
+        .await
+        .unwrap();
+        let original = records.iter().find(|record| record.id == id).unwrap();
+        assert_eq!(
+            serde_json::to_string(&repeat).unwrap(),
+            serde_json::to_string(original).unwrap()
+        );
+    }
+    assert_eq!(current_image(&store, dir.path()).await, before);
+    let baseline = baseline.unwrap();
+    let faults = r10_text_faults();
+    let mut bad_wires = Vec::new();
+    for fault in &faults {
+        let damaged = r10_bad_text_record(&baseline, fault);
+        bad_wires.push(json!({
+            "name":fault.name,"field":fault.field.name(),"id":damaged.id,
+            "wire":serde_json::to_string(&damaged).unwrap(),
+        }));
+    }
+    assert_eq!(bad_wires.len(), 160);
+    let previous = &records[0];
+    assert_eq!(previous.extracted, names(&["old-setting"]));
+    assert!(previous.predecessor_surface_id.is_none());
+    assert!(previous.manifest.retired.is_empty());
+    assert_eq!(
+        serde_json::to_value(&previous.extracted_typed[0].default).unwrap(),
+        json!({"kind":"value","value":"old"})
+    );
+    let original = serde_json::to_string(previous).unwrap();
+    assert_eq!(original.matches("\"retired\":[]").count(), 1);
+    let healthy = evo_core::contract::decode_host_surface_record_v2_json(&original).unwrap();
+    serde_json::from_value::<HostSurfaceRecordV2>(healthy.clone()).unwrap();
+    for (shape, replacement, expected) in [
+        (
+            "object",
+            "\"retired\":{}",
+            "invalid type: map, expected a sequence",
+        ),
+        (
+            "string",
+            "\"retired\":\"\"",
+            "invalid type: string \"\", expected a sequence",
+        ),
+    ] {
+        let wire = original.replacen("\"retired\":[]", replacement, 1);
+        assert_eq!(wire.len(), original.len());
+        let mut decoded = evo_core::contract::decode_host_surface_record_v2_json(&wire).unwrap();
+        let error = serde_json::from_value::<HostSurfaceRecordV2>(decoded.clone()).unwrap_err();
+        assert_eq!(error.classify(), serde_json::error::Category::Data);
+        assert_eq!(error.to_string(), expected);
+        let error = serde_json::from_value::<evo_core::contract::HostSurfaceManifestV2>(
+            decoded["manifest"].clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error.classify(), serde_json::error::Category::Data);
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(decoded["manifest_digest"], healthy["manifest_digest"]);
+        for field in ["source_digest", "source_envelope_digest"] {
+            assert_eq!(decoded["manifest"][field], healthy["manifest"][field]);
+        }
+        decoded["manifest"]["retired"] = json!([]);
+        assert_eq!(decoded, healthy);
+        bad_wires.push(json!({
+            "name":format!("retired-empty-{shape}"),"field":"retired_shape","shape":shape,
+            "id":previous.id,"wire":wire,
+        }));
+    }
+    assert_eq!(bad_wires.len(), 162);
+    {
+        let (root_dir, root_store) = database().await;
+        let source = previous.source.clone();
+        let registration = r9_registration(&source);
+        let root = ReleaseStore::register_host_surface_from_source(
+            &admin,
+            &root_store,
+            SURFACE_ID,
+            source.clone(),
+            registration.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(root.predecessor_surface_id.is_none());
+        assert!(root.manifest.retired.is_empty());
+        assert!(root.manifest.items[0].renamed_from.is_none());
+        let root_wire = serde_json::to_string(&root).unwrap();
+        let path = root_dir.path().join("name-coverage.sqlite3");
+        r9_install_first_dml_sentinel(&path);
+        let before = current_image(&root_store, root_dir.path()).await;
+        let mut semantic_wires = Vec::new();
+        for retired in [true, false] {
+            let mut changed_registration = registration.clone();
+            let mut damaged = root.clone();
+            if retired {
+                changed_registration.retired = vec![evo_core::contract::RetiredHostSurfaceV2 {
+                    name: "ghost".into(),
+                    reason: "retired".into(),
+                }];
+                damaged.manifest.retired = changed_registration.retired.clone();
+            } else {
+                changed_registration.classifications[0].renamed_from = Some("ghost".into());
+                damaged.manifest.items[0].renamed_from = Some("ghost".into());
+            }
+            damaged.manifest_digest = fingerprint(&damaged.manifest).unwrap();
+            let wire = serde_json::to_string(&damaged).unwrap();
+            evo_core::contract::decode_host_surface_record_v2_json(&wire).unwrap();
+            let mut repaired = damaged.clone();
+            if retired {
+                repaired.manifest.retired.clear();
+            } else {
+                repaired.manifest.items[0].renamed_from = None;
+            }
+            repaired.manifest_digest = root.manifest_digest.clone();
+            assert_eq!(serde_json::to_string(&repaired).unwrap(), root_wire);
+            assert_invalid(
+                ReleaseStore::register_host_surface_from_source(
+                    &admin,
+                    &root_store,
+                    SURFACE_ID,
+                    source.clone(),
+                    changed_registration,
+                    None,
+                )
+                .await,
+                "invalid reviewed host source/default",
+            );
+            assert_eq!(current_image(&root_store, root_dir.path()).await, before);
+            semantic_wires.push(wire);
+        }
+        assert_eq!(semantic_wires.len(), 2);
+        root_store.close().await;
+        for wire in semantic_wires {
+            write_raw_host_body(&path, &wire);
+            let cold = capture_raw_database_family(&path);
+            let cold_logical = raw_logical_image(&path).await;
+            let reader = Store::open(&path).await.unwrap();
+            let warm = current_image(&reader, root_dir.path()).await;
+            assert_eq!(warm.raw_sql, cold_logical);
+            let mut session = reader.session().await.unwrap();
+            assert_invalid(
+                session
+                    .need::<HostSurfaceRecordV2>(&admin, "artifact", SURFACE_ID)
+                    .await,
+                "invalid reviewed host source/default",
+            );
+            assert_invalid(
+                session
+                    .list::<HostSurfaceRecordV2>(&admin, "artifact")
+                    .await,
+                "invalid reviewed host source/default",
+            );
+            session.commit().await.unwrap();
+            assert_eq!(current_image(&reader, root_dir.path()).await, warm);
+            reader.close().await;
+            assert_eq!(capture_raw_database_family(&path), cold);
+            assert_eq!(raw_logical_image(&path).await, cold_logical);
+        }
+    }
+    r10_writer_text_faults(&r10_text_inputs(), &faults).await;
+    r10_restore_text_content(&store, dir.path(), &records, bad_wires).await;
+}
+
+async fn r11_number_admission_matrix() {
+    let mut raw_cases = Vec::new();
+    let mut raw_accepted = 0;
+    let mut raw_refused = 0;
+    for (token, accepted) in [
+        ("1", true),
+        ("1.0", true),
+        ("8000000000000004", true),
+        ("18446744073709551615", true),
+        ("-9223372036854775808", true),
+        ("-0", true),
+        ("-0.0", true),
+        ("1000000000000000000000", true),
+        ("0e2147483648", true),
+        ("-0e-2147483649", true),
+        ("1.000000000000000000000000000000000000", true),
+        ("5e-324", true),
+        ("8000000000000004.0", false),
+        ("51.248178375505404", false),
+        ("18446744073709551616", false),
+        ("-9223372036854775809", false),
+        ("1e2147483648", false),
+        ("1e-2147483649", false),
+        ("1.000000000000000000000000000000000001", false),
+        ("1e-400", false),
+        ("1e309", false),
+    ] {
+        let raw = format!("{{\"schema_version\":\"rsia.host_surface_record.v2\",\"n\":{token}}}");
+        let result = evo_core::contract::decode_host_surface_record_v2_json(&raw);
+        if accepted {
+            let decoded = result.unwrap();
+            raw_accepted += 1;
+            raw_cases.push(json!({
+                "token":token,"accepted":true,
+                "number_kind":if decoded["n"].is_f64() { "float" } else { "integer" },
+                "number_wire":serde_json::to_string(&decoded["n"]).unwrap(),
+            }));
+        } else {
+            assert_invalid(result, "invalid reviewed host source/default");
+            raw_refused += 1;
+            raw_cases.push(json!({"token":token,"accepted":false}));
+        }
+    }
+    assert_eq!(raw_accepted, 12);
+    assert_eq!(raw_refused, 9);
+    let observed: serde_json::Number = serde_json::from_str("8000000000000004.0").unwrap();
+    assert_eq!(
+        serde_json::to_string(&observed).unwrap(),
+        "8000000000000003.0"
+    );
+
+    let (dir, store) = database().await;
+    let admin = context(Role::Admin);
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, &hash(b"r11 actual number admission namespace"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let mut records = Vec::new();
+    let mut replays = Vec::new();
+    for (id, value) in [
+        (
+            "r11-number-integer",
+            json!({"n":8000000000000004_i64,"safe":1_i64}),
+        ),
+        ("r11-number-float", json!({"n":1.0_f64})),
+    ] {
+        let source = r9_source(vec![r9_declaration("numbers", "object", value)]);
+        let registration = r9_registration(&source);
+        let record = ReleaseStore::register_host_surface_from_source(
+            &admin,
+            &store,
+            id,
+            source.clone(),
+            registration.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        replays.push((id, source, registration));
+        records.push(record);
+    }
+    assert_eq!(records.len(), 2);
+    store.close().await;
+    let store = Store::open(&dir.path().join("name-coverage.sqlite3"))
+        .await
+        .unwrap();
+    let mut session = store.session().await.unwrap();
+    let listed: Vec<HostSurfaceRecordV2> = session.list(&admin, "artifact").await.unwrap();
+    assert_eq!(listed.len(), 2);
+    for record in &records {
+        let loaded: HostSurfaceRecordV2 =
+            session.need(&admin, "artifact", &record.id).await.unwrap();
+        assert_eq!(
+            serde_json::to_string(&loaded).unwrap(),
+            serde_json::to_string(record).unwrap()
+        );
+        evo_engine::release_store::validate_host_record_v2_source(&loaded).unwrap();
+    }
+    session.commit().await.unwrap();
+    let before = current_image(&store, dir.path()).await;
+    for (id, source, registration) in replays {
+        let repeat = ReleaseStore::register_host_surface_from_source(
+            &admin,
+            &store,
+            id,
+            source,
+            registration,
+            None,
+        )
+        .await
+        .unwrap();
+        let original = records.iter().find(|record| record.id == id).unwrap();
+        assert_eq!(
+            serde_json::to_string(&repeat).unwrap(),
+            serde_json::to_string(original).unwrap()
+        );
+    }
+    assert_eq!(current_image(&store, dir.path()).await, before);
+
+    let record = &records[0];
+    let original = serde_json::to_string(record).unwrap();
+    let typed = serde_json::to_string(&record.extracted_typed).unwrap();
+    let target = format!("\"extracted_typed\":{typed}");
+    assert_eq!(original.matches(&target).count(), 1);
+    let mut variants = Vec::new();
+    let mut equivalent = None;
+    for (field, old, new, accepted) in [
+        ("safe", "1", "1.0", true),
+        ("n", "8000000000000004", "8000000000000004.0", false),
+    ] {
+        let token = format!("\"{field}\":{old}");
+        assert_eq!(typed.matches(&token).count(), 1);
+        let changed = typed.replacen(&token, &format!("\"{field}\":{new}"), 1);
+        let replacement = format!("\"extracted_typed\":{changed}");
+        let wire = original.replacen(&target, &replacement, 1);
+        assert_ne!(wire, original);
+        assert_eq!(wire.replacen(&replacement, &target, 1), original);
+        for (field, value) in [
+            ("source", serde_json::to_string(&record.source).unwrap()),
+            ("manifest", serde_json::to_string(&record.manifest).unwrap()),
+            (
+                "manifest_digest",
+                serde_json::to_string(&record.manifest_digest).unwrap(),
+            ),
+        ] {
+            assert!(wire.contains(&format!("\"{field}\":{value}")));
+        }
+        let result = evo_core::contract::decode_host_surface_record_v2_json(&wire);
+        if accepted {
+            let decoded: HostSurfaceRecordV2 = serde_json::from_value(result.unwrap()).unwrap();
+            evo_engine::release_store::validate_host_record_v2_source(&decoded).unwrap();
+            equivalent = Some(decoded);
+        } else {
+            assert_invalid(result, "invalid reviewed host source/default");
+        }
+        variants.push(json!({
+            "id":record.id,"field":field,"old_token":old,"new_token":new,
+            "accepted":accepted,"wire":wire,
+        }));
+    }
+    let equivalent = equivalent.unwrap();
+    assert_eq!(variants.len(), 2);
+    let private = tempfile::tempdir().unwrap();
+    let backup = private.path().join("number-admission-backup");
+    store.backup(&backup).await.unwrap();
+    store.close().await;
+    let anchor = dir.path().join("name-coverage.sqlite3");
+    let before = capture_raw_database_family(&anchor);
+    let rows = records
+        .iter()
+        .map(|record| json!({"id":record.id,"wire":serde_json::to_string(record).unwrap()}))
+        .collect::<Vec<_>>();
+    let payload = private.path().join("number-admission-input.json");
+    std::fs::write(
+        &payload,
+        serde_json::to_vec(&json!({
+            "backup":backup,"anchor":anchor,"records":rows,
+            "variants":variants,"raw_cases":raw_cases,"typed_wire":typed,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let script = "import json,sys; from scripts.test_restore_backup import _rust_current_host_number_admission_matrix; print(json.dumps(_rust_current_host_number_admission_matrix(json.load(open(sys.argv[1],encoding='utf-8')))))";
+    let output = std::process::Command::new("python3")
+        .args(["-B", "-c", script])
+        .arg(&payload)
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "number admission bridge failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(capture_raw_database_family(&anchor), before);
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    for (field, count) in [
+        ("accepted", 2),
+        ("equivalent_count", 1),
+        ("isolated", 1),
+        ("raw_accepted", 12),
+        ("raw_refused", 9),
+    ] {
+        assert_eq!(response[field].as_u64(), Some(count));
+    }
+    for (field, changed) in [("restored", false), ("equivalent", true)] {
+        let path = Path::new(response[field].as_str().unwrap()).join("rsia.sqlite3");
+        let restored = Store::open(&path).await.unwrap();
+        let mut session = restored.session().await.unwrap();
+        let listed: Vec<HostSurfaceRecordV2> = session.list(&admin, "artifact").await.unwrap();
+        assert_eq!(listed.len(), 2);
+        for record in &records {
+            let loaded: HostSurfaceRecordV2 =
+                session.need(&admin, "artifact", &record.id).await.unwrap();
+            let expected = if changed && record.id == equivalent.id {
+                &equivalent
+            } else {
+                record
+            };
+            assert_eq!(
+                serde_json::to_string(&loaded).unwrap(),
+                serde_json::to_string(expected).unwrap()
+            );
+            evo_engine::release_store::validate_host_record_v2_source(&loaded).unwrap();
+        }
+        session.commit().await.unwrap();
+        restored.close().await;
+    }
+}

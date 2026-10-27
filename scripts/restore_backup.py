@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import sqlite3
 import stat
@@ -52,52 +53,112 @@ def read_json(raw):
     return finite_json(json.loads(raw, object_pairs_hook=unique_object,
         parse_constant=reject_nonstandard_number))
 
+def host_decimal_parts(token):
+    # Match reviewed_decimal's order without Decimal's host exponent range:
+    # grammar, i64 exponent, checked fraction subtraction, zero, trailing zeros.
+    parsed=re.fullmatch(r"(-?)(0|[1-9][0-9]*)(?:\.([0-9]+))?(?:[eE]([+-]?)([0-9]+))?",token)
+    if parsed is None: raise IsolationError("invalid current host raw JSON")
+    negative,whole,fraction,exponent_sign,exponent_digits=parsed.groups()
+    digits=(exponent_digits or "0").lstrip("0") or "0"
+    limit="9223372036854775808" if exponent_sign=="-" else "9223372036854775807"
+    if len(digits)>len(limit) or (len(digits)==len(limit) and digits>limit):
+        raise IsolationError("invalid current host raw JSON")
+    # Only at most 19 significant exponent digits reach int(), even if the
+    # original legal exponent has many leading zeros.
+    exponent=int(digits)*(-1 if exponent_sign=="-" else 1)
+    fraction=fraction or ""
+    exponent-=len(fraction)
+    if not -(1<<63)<=exponent<=(1<<63)-1:
+        raise IsolationError("invalid current host raw JSON")
+    coefficient=(whole+fraction).lstrip("0")
+    if not coefficient: return (False,"0",0)
+    trimmed=coefficient.rstrip("0")
+    exponent+=len(coefficient)-len(trimmed)
+    if not -(1<<63)<=exponent<=(1<<63)-1:
+        raise IsolationError("invalid current host raw JSON")
+    return (negative=="-",trimmed,exponent)
+
+HOST_POW10=tuple(float(10**exponent) for exponent in range(309))
+
 def read_host_json_tokens(raw):
     """Bounded raw numeric/key gate, also applied to embedded source UTF-8."""
     if not isinstance(raw,str) or len(raw.encode("utf-8"))>262144:
         raise IsolationError("invalid current host raw JSON")
     def decimal_token(token):
         try:
-            exact=Decimal(token)
-            rounded=float(token)
-            if not math.isfinite(rounded) or Decimal(str(rounded))!=exact:
+            exact=host_decimal_parts(token)
+            # The validated original digits follow serde_json's default
+            # u64 accumulator, then binary64 cast and decimal scaling. Keeping
+            # fractional trailing zeros here matters before the precision gate.
+            mantissa,_,explicit_digits=token.removeprefix("-").lower().partition("e")
+            whole,_,fraction=mantissa.partition(".")
+            significand=0;exponent=0
+            for offset,character in enumerate(whole):
+                updated=significand*10+ord(character)-ord("0")
+                if updated>(1<<64)-1:
+                    exponent=len(whole)-offset
+                    break
+                significand=updated
+            for character in fraction:
+                updated=significand*10+ord(character)-ord("0")
+                if updated>(1<<64)-1: break
+                significand=updated;exponent-=1
+            explicit=0;exponent_overflow=False
+            negative_exponent=explicit_digits.startswith("-")
+            for character in explicit_digits.lstrip("+-"):
+                explicit=explicit*10+ord(character)-ord("0")
+                if explicit>(1<<31)-1:
+                    exponent_overflow=True
+                    break
+            if exponent_overflow:
+                if significand and not negative_exponent:
+                    raise IsolationError("invalid current host raw JSON")
+                rounded=0.0
+            else:
+                exponent=max(-(1<<31),min((1<<31)-1,
+                    exponent+(-explicit if negative_exponent else explicit)))
+                rounded=float(significand)
+                while True:
+                    if -308<=exponent<=308:
+                        rounded=rounded*HOST_POW10[exponent] if exponent>=0 else rounded/HOST_POW10[-exponent]
+                        break
+                    if rounded==0.0: break
+                    if exponent>=0:
+                        raise IsolationError("invalid current host raw JSON")
+                    rounded/=HOST_POW10[308];exponent+=308
+            if token.startswith("-"): rounded=-rounded
+            if not math.isfinite(rounded) or host_decimal_parts(host_json_wire(rounded))!=exact:
                 raise IsolationError("invalid current host raw JSON")
-            return exact
+            return rounded
         except (InvalidOperation,ValueError,OverflowError) as error:
             raise IsolationError("invalid current host raw JSON") from error
     def integer_token(token):
-        value=int(token)
-        if value<-(1<<63) or value>(1<<64)-1:
-            raise IsolationError("invalid current host raw JSON")
-        return value
+        # serde_json keeps i64/u64, but negative zero and integer overflow
+        # become Float. The same exact decimal roundtrip gate still applies.
+        digits=token.removeprefix("-")
+        limit="9223372036854775808" if token.startswith("-") else "18446744073709551615"
+        bounded=len(digits)<len(limit) or (len(digits)==len(limit) and digits<=limit)
+        return int(token) if bounded and token!="-0" else decimal_token(token)
     try:
         value=json.loads(raw,object_pairs_hook=unique_object,parse_float=decimal_token,
             parse_int=integer_token,parse_constant=reject_nonstandard_number)
     except (ValueError,RecursionError) as error:
         raise IsolationError("invalid current host raw JSON") from error
     nodes=0
-    stack=[(value,1)]
+    stack=[(value,0)]
     while stack:
         item,depth=stack.pop()
         nodes+=1
-        if nodes>32768 or depth>256:
+        if nodes>32768:
             raise IsolationError("invalid current host raw JSON")
-        if isinstance(item,dict):
-            if item.get("kind")=="value" and "value" in item:
-                def numbers(child):
-                    if isinstance(child,Decimal): return float(child)
-                    if isinstance(child,dict): return {key:numbers(part) for key,part in child.items()}
-                    if isinstance(child,list): return [numbers(part) for part in child]
-                    return child
-                canonical=json.dumps(numbers(item["value"]),sort_keys=True,ensure_ascii=False,separators=(",",":"))
-                if item["value"] is None or len(canonical.encode("utf-8"))>4096:
-                    raise IsolationError("invalid current host raw JSON")
-            stack.extend((part,depth+1) for part in item.values())
-        elif isinstance(item,list):
-            stack.extend((part,depth+1) for part in item)
+        if isinstance(item,(dict,list)):
+            if depth>=256:
+                raise IsolationError("invalid current host raw JSON")
+            children=item.values() if isinstance(item,dict) else item
+            stack.extend((part,depth+1) for part in children)
     # Precision and resource checks above see the actual tokens before the
     # ordinary protected-facts representation receives any binary floats.
-    return read_json(raw)
+    return value
 
 HOST_SOURCE_FIELDS=("schema_version","source_kind","source_schema","extractor_version","original_utf8")
 HOST_DECLARATION_FIELDS=("name","value_type","enum_values","default")
@@ -109,6 +170,7 @@ def host_json_wire(value):
     # serde_json's finite number spelling for the registered typed wire. This
     # does not replace any legacy canonicalization or protected-facts algorithm.
     if isinstance(value,float):
+        if not math.isfinite(value): raise IsolationError("non-finite current host number")
         spelling=repr(value)
         if "e" in spelling:
             mantissa,exponent=spelling.split("e")
@@ -116,7 +178,7 @@ def host_json_wire(value):
             if -5<=exponent<16:
                 spelling=format(Decimal(spelling),"f")
                 if "." not in spelling: spelling+=".0"
-            else: spelling=mantissa.removesuffix(".0")+"e"+str(exponent)
+            else: spelling=mantissa.removesuffix(".0")+"e"+format(exponent,"+d")
         return spelling
     if isinstance(value,dict):
         return "{"+",".join(json.dumps(k,ensure_ascii=False)+":"+host_json_wire(v) for k,v in value.items())+"}"
@@ -130,6 +192,49 @@ def host_ordered(value,fields):
     exact_object(value,fields,"current host DTO")
     return {key:value[key] for key in fields}
 
+def host_number_comparison(value):
+    # ReviewedDecimal's coefficient/exponent form, without Decimal.normalize's
+    # context-dependent rounding. This is value/budget data, never digest wire.
+    sign,digits,exponent=Decimal(host_json_wire(value)).as_tuple()
+    coefficient="".join(map(str,digits)).lstrip("0")
+    if not coefficient: return "0"
+    trimmed=coefficient.rstrip("0")
+    exponent+=len(coefficient)-len(trimmed)
+    return ("-" if sign else "")+trimmed+("e"+str(exponent) if exponent else "")
+
+def host_default_size(value):
+    size=0;pending=[value]
+    while pending:
+        part=pending.pop()
+        if isinstance(part,dict):
+            size+=2+max(0,len(part)-1)
+            size+=sum(len(json.dumps(key,ensure_ascii=False).encode("utf-8"))+1 for key in part)
+            pending.extend(part.values())
+        elif isinstance(part,list):
+            size+=2+max(0,len(part)-1);pending.extend(part)
+        elif type(part) in (int,float): size+=len(host_number_comparison(part))
+        else: size+=len(json.dumps(part,ensure_ascii=False,separators=(",",":"),allow_nan=False).encode("utf-8"))
+        if size>4096: raise IsolationError("invalid current host default size")
+    return size
+
+def host_same_value(left,right):
+    # Mirrors ReviewedSemanticValueV1, rather than bool/int Python equality or
+    # serde Number's integer/float variant equality. Object order is irrelevant.
+    pending=[(left,right)]
+    while pending:
+        a,b=pending.pop()
+        if type(a) in (int,float) and type(b) in (int,float):
+            if host_number_comparison(a)!=host_number_comparison(b): return False
+        elif type(a) is not type(b): return False
+        elif isinstance(a,dict):
+            if set(a)!=set(b): return False
+            pending.extend((a[key],b[key]) for key in a)
+        elif isinstance(a,list):
+            if len(a)!=len(b): return False
+            pending.extend(zip(a,b))
+        elif a!=b: return False
+    return True
+
 def host_default(value,kind,choices):
     if not isinstance(value,dict) or value.get("kind") not in ("none","unknown","value"):
         raise IsolationError("invalid current host default")
@@ -137,11 +242,12 @@ def host_default(value,kind,choices):
     exact_object(value,("kind","value") if tag=="value" else ("kind",),"current host default")
     if tag!="value": return {"kind":tag}
     raw=value["value"]
-    valid={"bool":lambda:type(raw) is bool,"integer":lambda:type(raw) is int,
+    valid={"bool":lambda:type(raw) is bool,"integer":lambda:type(raw) is int and -(1<<63)<=raw<=(1<<64)-1,
         "string":lambda:isinstance(raw,str),"enum":lambda:isinstance(raw,str) and raw in choices,
         "string_list":lambda:isinstance(raw,list) and all(isinstance(x,str) for x in raw),
         "object":lambda:isinstance(raw,dict),"opaque":lambda:False}
     if kind not in valid or not valid[kind](): raise IsolationError("invalid current host default type")
+    host_default_size(raw)
     def sorted_value(v):
         if isinstance(v,dict): return {k:sorted_value(v[k]) for k in sorted(v)}
         if isinstance(v,list): return [sorted_value(x) for x in v]
@@ -152,9 +258,28 @@ def host_identifier(value):
     if not isinstance(value,str) or not 1<=len(value)<=128 or any(not(c.isascii() and (c.isalnum() or c in "-_.:")) for c in value):
         raise IsolationError("invalid current host identifier")
 
-def host_text(value,limit):
-    if not isinstance(value,str) or not value.strip() or len(value)>limit:
+HOST_RUST_WHITE_SPACE="\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+
+def host_nonempty_text(value):
+    # Rust trim uses Unicode White_Space, excluding Python's C0 separators.
+    if not isinstance(value,str) or not any(character not in HOST_RUST_WHITE_SPACE for character in value):
         raise IsolationError("invalid current host text")
+
+def host_text(value,limit):
+    host_nonempty_text(value)
+    if len(value.encode("utf-8"))>limit or "\u0000" in value:
+        raise IsolationError("invalid current host text")
+
+def host_declaration(raw):
+    declaration=host_ordered(raw,HOST_DECLARATION_FIELDS)
+    host_identifier(declaration["name"])
+    ty=declaration["value_type"];choices=declaration["enum_values"]
+    if ty not in ("bool","integer","string","enum","string_list","object","opaque") or not isinstance(choices,list) or not all(isinstance(x,str) for x in choices):
+        raise IsolationError("invalid current host declarations")
+    if (ty=="enum" and (not choices or choices!=sorted(set(choices)))) or (ty!="enum" and choices):
+        raise IsolationError("invalid current host enum")
+    declaration["default"]=host_default(declaration["default"],ty,choices)
+    return declaration
 
 def validate_current_host_content(value,namespace,kind,identity):
     host_ordered(value,("id","schema_version","manifest","manifest_digest","source","extracted","extracted_typed","predecessor_surface_id","upgrade_diff"))
@@ -175,15 +300,13 @@ def validate_current_host_content(value,namespace,kind,identity):
         raise IsolationError("invalid current host declarations")
     declarations=[];names=[]
     for raw in original["declarations"]:
-        declaration=host_ordered(raw,HOST_DECLARATION_FIELDS);name=declaration["name"];host_identifier(name)
-        ty=declaration["value_type"];choices=declaration["enum_values"]
-        if name in names or ty not in ("bool","integer","string","enum","string_list","object","opaque") or not isinstance(choices,list) or not all(isinstance(x,str) for x in choices):
+        declaration=host_declaration(raw);name=declaration["name"]
+        if name in names:
             raise IsolationError("invalid current host declarations")
-        if (ty=="enum" and (not choices or choices!=sorted(set(choices)))) or (ty!="enum" and choices):
-            raise IsolationError("invalid current host enum")
-        declaration["default"]=host_default(declaration["default"],ty,choices)
         names.append(name);declarations.append(declaration)
-    if value["extracted"]!=names or value["extracted_typed"]!=declarations:
+    if not isinstance(value["extracted_typed"],list): raise IsolationError("invalid current host typed extraction")
+    typed=[host_declaration(raw) for raw in value["extracted_typed"]]
+    if not host_same_value(value["extracted"],names) or not host_same_value(typed,declarations):
         raise IsolationError("current host extraction differs from original")
     manifest=host_ordered(value["manifest"],HOST_MANIFEST_FIELDS)
     if (manifest["schema_version"]!="rsia.host_surface.v2" or manifest["host"]!=original["host"] or manifest["host_version"]!=original["host_version"]
@@ -202,17 +325,19 @@ def validate_current_host_content(value,namespace,kind,identity):
         item=host_ordered(raw,HOST_ITEM_FIELDS);host_text(item["reason"],512)
         if any(item[k] is not None and not isinstance(item[k],str) for k in ("mapped_field","consumer","renamed_from","test_ref","capability")):
             raise IsolationError("invalid current host optional field")
-        item["default"]=host_default(item["default"],item["value_type"],item["enum_values"])
-        if any(item[k]!=declaration[k] for k in HOST_DECLARATION_FIELDS): raise IsolationError("current host typed item differs")
+        item_declaration=host_declaration({key:item[key] for key in HOST_DECLARATION_FIELDS})
+        item["default"]=item_declaration["default"]
+        if not host_same_value(item_declaration,declaration): raise IsolationError("current host typed item differs")
         if item["renamed_from"] is not None:host_identifier(item["renamed_from"])
         if item["coverage"]=="supported":
             field=item["mapped_field"]
             if field not in consumers or field in mapped or item["consumer"]!=consumers[field] or item["value_type"]=="opaque" or item["default"]["kind"]=="unknown":
                 raise IsolationError("invalid current host supported mapping")
-            host_text(item["test_ref"],262144);host_identifier(item["capability"]);mapped.add(field)
+            host_nonempty_text(item["test_ref"]);host_identifier(item["capability"]);mapped.add(field)
         elif item["coverage"] not in ("runtime_owned","unsupported") or item["mapped_field"] is not None:
             raise IsolationError("invalid current host classification")
         items.append(item)
+    if not isinstance(manifest["retired"],list): raise IsolationError("invalid current host retired declarations")
     retired=[];retired_names=set()
     for raw in manifest["retired"]:
         item=host_ordered(raw,("name","reason"));host_identifier(item["name"]);host_text(item["reason"],512)
@@ -228,7 +353,8 @@ def validate_current_host_content(value,namespace,kind,identity):
                 host_ordered(entry,("from","to"));host_identifier(entry["from"]);host_identifier(entry["to"])
         else:
             for entry in values:host_identifier(entry)
-    if previous is None and diff!={key:sorted(names) if key=="added" else [] for key in HOST_DIFF_FIELDS}:
+    if previous is None and (retired or any(item["renamed_from"] is not None for item in items)
+        or diff!={key:sorted(names) if key=="added" else [] for key in HOST_DIFF_FIELDS}):
         raise IsolationError("current host upgrade diff differs")
 
 def read_current_host_raw(raw,namespace,kind,identity):
