@@ -723,7 +723,7 @@ impl ReleaseStore {
                 "unverified host surface candidate cannot be registered as supported".into(),
             ));
         }
-        manifest.validate_against_extraction(&extracted)?;
+        manifest.validate_frozen_v1_against_extraction(&extracted)?;
         let record = HostSurfaceRecord {
             id: id.into(),
             schema_version: HOST_SURFACE_RECORD_SCHEMA.into(),
@@ -1039,7 +1039,7 @@ impl ReleaseStore {
                     .await?;
                 surface
                     .manifest
-                    .validate_against_extraction(&surface.extracted)?;
+                    .validate_frozen_v1_against_extraction(&surface.extracted)?;
                 if surface.manifest_digest != snapshot.host_surface_digest
                     || surface.manifest_digest != fingerprint(&surface.manifest)?
                 {
@@ -1919,7 +1919,7 @@ pub(crate) async fn validate_host_surface_v2_live_in_session(
                 }
                 record
                     .manifest
-                    .validate_against_extraction(&record.extracted)?;
+                    .validate_frozen_v1_against_extraction(&record.extracted)?;
                 require_body_witness(session, ctx, "artifact", &cursor, &record, Role::Admin)
                     .await?;
                 predecessor = Some(StoredHostSurfacePredecessorV2::Legacy(Box::new(record)));
@@ -1984,7 +1984,7 @@ async fn load_host_surface_predecessor_v2(
             }
             record
                 .manifest
-                .validate_against_extraction(&record.extracted)?;
+                .validate_frozen_v1_against_extraction(&record.extracted)?;
             require_body_witness(session, ctx, "artifact", id, &record, Role::Admin).await?;
             Ok(StoredHostSurfacePredecessorV2::Legacy(Box::new(record)))
         }

@@ -37,7 +37,14 @@ fn structural_surface_checks_do_not_change_blocked_support() {
         .iter()
         .map(|item| item.name.clone())
         .collect();
-    assert!(detect_surface_drift(&manifest, &fields).is_ok());
+    manifest
+        .validate_frozen_v1_against_extraction(&fields)
+        .unwrap();
+    assert!(matches!(
+        detect_surface_drift(&manifest, &fields),
+        Err(Error::Invalid(message))
+            if message == "supported item consumer differs from field contract"
+    ));
     assert!(manifest.host_version.starts_with("unverified-"));
 
     let mut drifted = fields.clone();
@@ -64,7 +71,14 @@ fn checked_in_claude_fixture_is_only_an_untrusted_structural_fixture() {
         .iter()
         .map(|item| item.name.clone())
         .collect();
-    assert!(manifest.validate_against_extraction(&extracted).is_ok());
+    manifest
+        .validate_frozen_v1_against_extraction(&extracted)
+        .unwrap();
+    assert!(matches!(
+        manifest.validate_against_extraction(&extracted),
+        Err(Error::Invalid(message))
+            if message == "supported item consumer differs from field contract"
+    ));
     assert!(claude_code_support(None).is_err());
 }
 
