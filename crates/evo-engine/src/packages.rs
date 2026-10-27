@@ -148,6 +148,29 @@ pub struct PackageMember {
 }
 
 pub fn reject_member(m: &PackageMember) -> Result<()> {
+    const FORMAT_RANGES: [(u32, u32); 21] = [
+        (0x00ad, 0x00ad),
+        (0x0600, 0x0605),
+        (0x061c, 0x061c),
+        (0x06dd, 0x06dd),
+        (0x070f, 0x070f),
+        (0x0890, 0x0891),
+        (0x08e2, 0x08e2),
+        (0x180e, 0x180e),
+        (0x200b, 0x200f),
+        (0x202a, 0x202e),
+        (0x2060, 0x2064),
+        (0x2066, 0x206f),
+        (0xfeff, 0xfeff),
+        (0xfff9, 0xfffb),
+        (0x110bd, 0x110bd),
+        (0x110cd, 0x110cd),
+        (0x13430, 0x1343f),
+        (0x1bca0, 0x1bca3),
+        (0x1d173, 0x1d17a),
+        (0xe0001, 0xe0001),
+        (0xe0020, 0xe007f),
+    ];
     if m.path.trim().is_empty() {
         return Err(Error::Invalid("empty path".into()));
     }
@@ -158,6 +181,17 @@ pub fn reject_member(m: &PackageMember) -> Result<()> {
     // Check for drive letters like C: or device prefixes
     if m.path.contains(':') {
         return Err(Error::Invalid("device or drive prefix in path".into()));
+    }
+    if m.path.contains('\\') {
+        return Err(Error::Invalid("path traversal".into()));
+    }
+    if m.path.chars().any(|c| {
+        (c.is_control() && c != '\0')
+            || FORMAT_RANGES
+                .iter()
+                .any(|&(first, last)| (first..=last).contains(&(c as u32)))
+    }) {
+        return Err(Error::Invalid("control or format character in path".into()));
     }
 
     let mut norm = String::new();
@@ -206,7 +240,7 @@ pub fn reject_member(m: &PackageMember) -> Result<()> {
             m.size, MAX_FILE
         )));
     }
-    if m.compressed > 0 && m.size / m.compressed.max(1) > MAX_ZIP_RATIO {
+    if u128::from(m.size) > u128::from(MAX_ZIP_RATIO) * u128::from(m.compressed) {
         return Err(Error::Invalid(format!(
             "zip bomb ratio: {} / {} > max {}",
             m.size, m.compressed, MAX_ZIP_RATIO
@@ -230,7 +264,17 @@ pub fn reject_package(members: &[PackageMember]) -> Result<()> {
     let mut seen = BTreeSet::new();
     for m in members {
         reject_member(m)?;
-        if !seen.insert(&m.path) {
+        let folded = m.path.to_lowercase();
+        if !seen.insert(folded.clone())
+            || seen.iter().any(|other| {
+                folded
+                    .strip_prefix(other.as_str())
+                    .is_some_and(|tail| tail.starts_with('/'))
+                    || other
+                        .strip_prefix(folded.as_str())
+                        .is_some_and(|tail| tail.starts_with('/'))
+            })
+        {
             return Err(Error::Invalid(format!("duplicate path: {}", m.path)));
         }
         total = total.saturating_add(m.size);
