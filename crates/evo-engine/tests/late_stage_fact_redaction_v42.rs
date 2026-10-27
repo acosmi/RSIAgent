@@ -532,6 +532,20 @@ impl ModelPort for MarkerModel {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.0.fetch_add(1, Ordering::SeqCst);
         let output = suggestions_output(&request)?;
@@ -736,6 +750,20 @@ impl<M: ModelPort> ModelPort for InFlightModel<M> {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let first = {
             let mut requests = self.requests.lock().unwrap();
@@ -820,6 +848,53 @@ impl RecordingJournal {
 
 #[async_trait]
 impl OptimizationJournal for RecordingJournal {
+    async fn current_compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::CurrentVerifiedCompilerInputs> {
+        self.inner.current_compiler_inputs(request).await
+    }
+
+    async fn commit_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<()> {
+        let mut fact = fact;
+        fact.dependencies
+            .push(dep("artifact", &inputs.artifact_id()?));
+        fact.dependencies
+            .sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+        fact.dependencies
+            .dedup_by(|a, b| a.kind == b.kind && a.id == b.id);
+        self.given.lock().unwrap().push(fact.clone());
+        self.inner.commit_source_bound(fact, inputs).await
+    }
+
+    async fn claim_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<bool> {
+        let mut fact = fact;
+        fact.dependencies
+            .push(dep("artifact", &inputs.artifact_id()?));
+        fact.dependencies
+            .sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+        fact.dependencies
+            .dedup_by(|a, b| a.kind == b.kind && a.id == b.id);
+        self.given.lock().unwrap().push(fact.clone());
+        self.inner.claim_source_bound(fact, inputs).await
+    }
+
+    async fn lookup_source_bound(
+        &self,
+        artifact_id: &str,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        self.inner.lookup_source_bound(artifact_id, inputs).await
+    }
+
     async fn commit_bound(
         &self,
         fact: StageFact,
@@ -1857,7 +1932,10 @@ async fn a_step_over_live_sources_stores_every_fact_as_committed() {
     let (late, requests) = run_step(InFlight::Nothing, "episode-e").await;
     assert_eq!(requests.len(), 2, "two reflection calls");
     assert!(
-        matches!(&late.result, Ok(OptimizationStepOutcome::Candidate { .. })),
+        matches!(
+            &late.result,
+            Ok(OptimizationStepOutcome::CurrentCandidate { .. })
+        ),
         "{:?}",
         late.result
     );
@@ -2000,13 +2078,19 @@ async fn a_replay_that_reads_a_redacted_stage_fact_ends_with_the_named_conflict(
     // from the books, without a dispatch.
     let (live, _) = run_step(InFlight::Nothing, "episode-r1").await;
     assert!(
-        matches!(&live.result, Ok(OptimizationStepOutcome::Candidate { .. })),
+        matches!(
+            &live.result,
+            Ok(OptimizationStepOutcome::CurrentCandidate { .. })
+        ),
         "{:?}",
         live.result
     );
     let (control, calls) = live.replay("episode-r1").await;
     assert!(
-        matches!(&control, Ok(OptimizationStepOutcome::Candidate { .. })),
+        matches!(
+            &control,
+            Ok(OptimizationStepOutcome::CurrentCandidate { .. })
+        ),
         "{control:?}"
     );
     assert_eq!(calls, 0);

@@ -23,7 +23,9 @@ use evo_core::sequential::{
 };
 use evo_core::{Context, Error, Role, Strategy, fingerprint, hash};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
-use evo_engine::release_store::{ReleaseStore, StageBundleRequest, TypedSourceRef};
+use evo_engine::release_store::{
+    CurrentStageBundleRequest as StageBundleRequest, ReleaseStore, TypedSourceRef,
+};
 use evo_engine::streaming_evaluator::{
     AnchorEvidenceStatus, CostEvidenceScope, DependencyEvidenceStatus, EvaluationEvidenceScope,
     EvaluationTargetKind, ExecutionReceiptRequest, ExecutionSide, FixedGraderMethod,
@@ -80,7 +82,7 @@ fn optimizer(arm: FixedOptimizerArm, label: &str) -> FixedOptimizerSpec {
     }
 }
 
-fn bundle() -> evo_core::contract::ResolvedBundle {
+fn bundle() -> evo_core::contract::ResolvedBundleV3 {
     let profile = Profile {
         id: "statistics-profile".into(),
         evolution_enabled: true,
@@ -94,7 +96,7 @@ fn bundle() -> evo_core::contract::ResolvedBundle {
         required_capabilities: vec![],
         dependencies: vec![],
     };
-    trusted_compiler_inputs::bundle(
+    trusted_compiler_inputs::bundle_content_current(
         CompileParts {
             profile: &profile,
             parent: &parent,
@@ -124,6 +126,15 @@ struct Fixture {
     worker: Context,
     control: RegisteredEvaluationControl,
     holdout: ProtectedHoldoutRecord,
+    resolved_ticket_id: std::sync::OnceLock<String>,
+}
+impl Fixture {
+    fn ticket_id(&self) -> &str {
+        self.resolved_ticket_id
+            .get()
+            .map(String::as_str)
+            .unwrap_or(TICKET_ID)
+    }
 }
 
 // ROOT can provide a fresh existing parent directory for future authorized
@@ -372,6 +383,7 @@ async fn fixture(case: &str, schema: &str, sequential: bool) -> Fixture {
         .await
         .unwrap();
     Fixture {
+        resolved_ticket_id: std::sync::OnceLock::new(),
         _temporary: temporary,
         db_path,
         artifacts,
@@ -427,10 +439,10 @@ async fn stage_candidate(fixture: &Fixture) {
         .await
         .unwrap();
     session.commit().await.unwrap();
-    trusted_compiler_inputs::install_bundle(&fixture.store, &bundle())
+    trusted_compiler_inputs::install_bundle_current_sources(&fixture.store, &bundle())
         .await
         .unwrap();
-    ReleaseStore::stage_bundle(
+    ReleaseStore::stage_current_bundle(
         &proposer,
         &fixture.store,
         StageBundleRequest {
@@ -456,7 +468,7 @@ async fn execute(
     let task = IndependentEvaluationControl::broker_task(
         &fixture.worker,
         &fixture.store,
-        TICKET_ID,
+        fixture.ticket_id(),
         target,
         side,
     )
@@ -472,7 +484,7 @@ async fn execute(
             &BudgetCallReservation {
                 billing_scope: BILLING_SCOPE.into(),
                 call_id: call_id.clone(),
-                dispatch_group_id: TICKET_ID.into(),
+                dispatch_group_id: fixture.ticket_id().into(),
                 stage: BudgetStage::TaskExecution,
                 actual_input_digest: task.request_digest.clone(),
                 request_artifact: None,
@@ -496,7 +508,7 @@ async fn execute(
         &fixture.worker,
         &fixture.store,
         StartExecutionRequest {
-            ticket_id: TICKET_ID.into(),
+            ticket_id: fixture.ticket_id().into(),
             target_id: target.into(),
             side,
             fence: fence.clone(),
@@ -510,7 +522,7 @@ async fn execute(
         &fixture.store,
         ExecutionReceiptRequest {
             receipt_id: receipt_id.clone(),
-            ticket_id: TICKET_ID.into(),
+            ticket_id: fixture.ticket_id().into(),
             target_id: target.into(),
             side,
             request_digest: task.request_digest,
@@ -574,7 +586,7 @@ async fn grade(fixture: &Fixture, target: &str, baseline_answer: &str, ordinal: 
         &fixture.store,
         GraderReceiptRequest {
             receipt_id: format!("grader-{ordinal}"),
-            ticket_id: TICKET_ID.into(),
+            ticket_id: fixture.ticket_id().into(),
             target_id: target.into(),
             candidate_execution_receipt_id: candidate,
             baseline_execution_receipt_id: baseline,
@@ -601,6 +613,7 @@ async fn complete(fixture: &Fixture, sequential: bool) -> FormalEvaluationV2 {
     )
     .await
     .unwrap();
+    fixture.resolved_ticket_id.set(issued.id.clone()).unwrap();
     assert!(issued.candidate_dependency_binding.is_some());
     if sequential {
         // The anchor completes first; rotating callbacks arrive in reverse order.
@@ -618,7 +631,7 @@ async fn complete(fixture: &Fixture, sequential: bool) -> FormalEvaluationV2 {
     IndependentEvaluationControl::finalize_complete(
         &fixture.evaluator,
         &fixture.store,
-        TICKET_ID,
+        fixture.ticket_id(),
         5_000,
     )
     .await
@@ -642,17 +655,22 @@ struct ReadResults {
 }
 
 async fn read_every_entry(fixture: &Fixture, phase: &str) -> ReadResults {
-    let status =
-        IndependentEvaluationControl::status(&fixture.evaluator, &fixture.store, TICKET_ID).await;
+    let status = IndependentEvaluationControl::status(
+        &fixture.evaluator,
+        &fixture.store,
+        fixture.ticket_id(),
+    )
+    .await;
     let view = IndependentEvaluationControl::verified_report_view(
         &fixture.evaluator,
         &fixture.store,
-        TICKET_ID,
+        fixture.ticket_id(),
     )
     .await;
     let mut session = fixture.store.session().await.unwrap();
     let same_session =
-        verified_report_view_in_session(&fixture.evaluator, &mut session, TICKET_ID).await;
+        verified_report_view_in_session(&fixture.evaluator, &mut session, fixture.ticket_id())
+            .await;
     let watermark = session.watermark(&fixture.evaluator).await.unwrap();
     drop(session);
     let observed = json!({
@@ -961,7 +979,7 @@ async fn single_mean_case(case: &str, schema: &str, sequential: bool, verdict: V
     assert_eq!(closed_positive.watermark, positive.watermark);
     let mut session = fixture.store.session().await.unwrap();
     let calls = session
-        .budget_calls_for_group(&fixture.worker, BILLING_SCOPE, TICKET_ID)
+        .budget_calls_for_group(&fixture.worker, BILLING_SCOPE, fixture.ticket_id())
         .await
         .unwrap();
     assert_eq!(calls.len(), 2 * (N as usize + 1));
@@ -987,7 +1005,10 @@ async fn single_mean_case(case: &str, schema: &str, sequential: bool, verdict: V
             .sum::<i64>(),
         15 * i64::from(N + 1),
     );
-    let physical_id = format!("e05-{}", fingerprint(&(FORMAL_KIND, TICKET_ID)).unwrap());
+    let physical_id = format!(
+        "e05-{}",
+        fingerprint(&(FORMAL_KIND, fixture.ticket_id())).unwrap()
+    );
     let original: FormalEnvelope = session
         .need(&fixture.evaluator, "artifact", &physical_id)
         .await

@@ -992,7 +992,7 @@ impl PersistentCoordinator {
     ) -> Result<CoordinatorStepResult> {
         if let Some(journal) = journal {
             journal
-                .compiler_inputs(&request.compiler_input_request())
+                .current_compiler_inputs(&request.compiler_input_request())
                 .await?;
         }
         {
@@ -2056,6 +2056,18 @@ fn candidate_material(
     })
 }
 
+fn current_candidate_material(
+    edit: &CompiledSkillEdit,
+    bundle: &evo_core::contract::ResolvedBundleV3,
+    selection: &DevelopmentSelection,
+) -> Option<CandidateMaterial> {
+    Some(CandidateMaterial {
+        skill_digest: skill_snapshot_digest(&edit.output).ok()?,
+        bundle_digest: bundle.digest.clone(),
+        selection_digest: fingerprint(selection).ok()?,
+    })
+}
+
 /// The verdict a candidate ends up with once its material is known. A verdict that
 /// saw the candidate (every verdict but an unanswered gate) names it, so without its
 /// material it is `Unmaterialized`, the uncertain path; one that keeps nothing keeps
@@ -2101,6 +2113,41 @@ async fn settlement_for(
             .await;
             let (verdict, material) =
                 materialize(verdict, candidate_material(&edit, &bundle, &selection));
+            let (status, evidence, class) = verdict.observed();
+            let (skill_digest, bundle_digest, selection_digest) = match material {
+                Some(material) => (
+                    Some(material.skill_digest),
+                    Some(material.bundle_digest),
+                    Some(material.selection_digest),
+                ),
+                None => (None, None, None),
+            };
+            Settlement {
+                status,
+                evidence,
+                skill_digest,
+                bundle_digest,
+                selection_digest,
+                class,
+            }
+        }
+        Ok(OptimizationStepOutcome::CurrentCandidate {
+            edit,
+            bundle,
+            selection,
+        }) => {
+            let verdict = judge_candidate_evidence(
+                session,
+                ctx,
+                request_fact_id,
+                observed_fact_id,
+                task_count,
+            )
+            .await;
+            let (verdict, material) = materialize(
+                verdict,
+                current_candidate_material(&edit, &bundle, &selection),
+            );
             let (status, evidence, class) = verdict.observed();
             let (skill_digest, bundle_digest, selection_digest) = match material {
                 Some(material) => (
@@ -3978,6 +4025,94 @@ mod tests {
         }
     }
 
+    // Complete compiled content for projection only: no registered producer,
+    // Host, paid execution or approved-source authority is constructed here.
+    fn current_resolved_bundle() -> evo_core::contract::ResolvedBundleV3 {
+        use evo_core::contract::{
+            CompilePartsV3, EmptyRootContentV1, FrozenCompilerProfileContentV1, HostCapabilities,
+            ImproverPatch, ParentContentV3, PatchOp, Profile, ProfileContentProofV3, SkillPatch,
+            SkillSnapshot, SystemSnapshot, compile_bundle_v3, replay_resolved_bundle_v3,
+        };
+        use evo_core::{Strategy, fingerprint, hash};
+        use std::collections::BTreeSet;
+        let snapshot = SystemSnapshot {
+            schema_version: "rsia.system_snapshot.v1".into(),
+            profile_id: "projection-profile".into(),
+            host_id: "reference".into(),
+            host_version: "0.1.0".into(),
+            model_id: "development-model".into(),
+            tools: vec![],
+            mandatory_context_digest: hash(b"Complete projection context original.\n"),
+        };
+        let baseline = FrozenCompilerProfileContentV1 {
+            id: "projection-profile-registration".into(),
+            schema_version: "rsia.frozen_compiler_profile.v1".into(),
+            namespace: "projection-data".into(),
+            profile_id: snapshot.profile_id.clone(),
+            version: 1,
+            host_registration_id: "projection-host-registration".into(),
+            provider_registration_id: "projection-provider-registration".into(),
+            resource_instrumentation_id: None,
+            environment_digest: snapshot.digest().unwrap(),
+            system_snapshot: snapshot,
+            capabilities: HostCapabilities {
+                available: BTreeSet::new(),
+                granted: BTreeSet::new(),
+            },
+            baseline_skill: SkillSnapshot::empty(),
+            baseline_strategy: Strategy::default(),
+            dependencies: vec![],
+            purpose: evo_core::evidence::Purpose::Development,
+            application_order: vec!["mandatory_context".into(), "skill".into(), "task".into()],
+            authorized_by: "projection-data-operator".into(),
+        };
+        let root = EmptyRootContentV1 {
+            id: "projection-empty-root".into(),
+            schema_version: "rsia.empty_root_authorization.v1".into(),
+            namespace: baseline.namespace.clone(),
+            profile_registration_id: baseline.id.clone(),
+            profile_digest: fingerprint(&baseline).unwrap(),
+            host_registration_id: baseline.host_registration_id.clone(),
+            skill: SkillSnapshot::empty(),
+            strategy: Strategy {
+                schema_version: "evo.strategy.v1".into(),
+                instruction:
+                    "Preserve the unchanged host baseline; no evolution instruction is applied."
+                        .into(),
+                max_candidates: 1,
+                max_rounds: 1,
+                require_counterexample: true,
+            },
+            authorized_by: "projection-data-operator".into(),
+        };
+        let proof = ProfileContentProofV3::from_content(
+            Profile {
+                id: baseline.profile_id.clone(),
+                evolution_enabled: true,
+                parent_digest: fingerprint(&root).unwrap(),
+                baseline_digest: fingerprint(&baseline).unwrap(),
+            },
+            ParentContentV3::EmptyRoot(root),
+            baseline,
+        )
+        .unwrap();
+        let patch = SkillPatch {
+            content: PatchOp::Set {
+                value: "完整 Current 候选内容；保留 typed V3 全像。".into(),
+            },
+            ..SkillPatch::default()
+        };
+        let bundle = compile_bundle_v3(CompilePartsV3 {
+            content: &proof,
+            skill_patch: &patch,
+            improver_patch: &ImproverPatch::default(),
+            revoked: &BTreeSet::new(),
+        })
+        .unwrap();
+        replay_resolved_bundle_v3(&bundle, &proof, &BTreeSet::new()).unwrap();
+        bundle
+    }
+
     fn development_selection() -> DevelopmentSelection {
         DevelopmentSelection {
             request_id: "dev-1".into(),
@@ -4010,6 +4145,47 @@ mod tests {
         let invalid = skill(&"x".repeat(16 * 1024 + 1));
         assert!(skill_snapshot_digest(&invalid).is_err());
         assert!(candidate_material(&compiled_edit(invalid), &bundle, &selection).is_none());
+    }
+
+    #[test]
+    fn current_candidate_material_uses_complete_v3_and_keeps_uncertain_mapping() {
+        let bundle = current_resolved_bundle();
+        let output = bundle.skill.clone();
+        let mut selection = development_selection();
+        selection.parent_bundle_digest = bundle.parent_digest.clone();
+        selection.candidate_bundle_digest = bundle.digest.clone();
+        let mut edit = compiled_edit(output.clone());
+        edit.report.output_digest = skill_snapshot_digest(&output).unwrap();
+        let material = current_candidate_material(&edit, &bundle, &selection)
+            .expect("complete Current data has its projection digests");
+        assert_eq!(
+            material.skill_digest,
+            skill_snapshot_digest(&output).unwrap()
+        );
+        assert_eq!(material.bundle_digest, bundle.digest);
+        assert_eq!(material.selection_digest, fingerprint(&selection).unwrap());
+        // Complete data is not an observation: an unanswered gate keeps no candidate.
+        let (unverified, named) = materialize(CandidateVerdict::Unverified, Some(material));
+        assert!(named.is_none());
+        assert!(matches!(
+            unverified.observed().0,
+            ObservedStatus::UsageUncertain
+        ));
+
+        edit.output.content = "x".repeat(16 * 1024 + 1);
+        let missing = current_candidate_material(&edit, &bundle, &selection);
+        assert!(missing.is_none());
+        let (verdict, named) = materialize(
+            CandidateVerdict::Trusted {
+                quality_micros: 750_000,
+            },
+            missing,
+        );
+        assert!(named.is_none());
+        let (status, evidence, class) = verdict.observed();
+        assert!(matches!(status, ObservedStatus::UsageUncertain));
+        assert_eq!(evidence, ExplorationEvidenceV1::NotObserved);
+        assert_eq!(class.code(), "candidate_material_unavailable");
     }
 
     #[test]

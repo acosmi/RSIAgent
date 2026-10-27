@@ -343,7 +343,22 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         }
         let dispatch_id = decision.call.dispatch_id.ok_or(Error::Internal)?;
         let started = std::time::Instant::now();
-        let captured = match self.transport.execute_formal(&request, &dispatch_id).await {
+        let captured = match async {
+            let admitted = RegisteredDispatch {
+                dispatch_id: dispatch_id.clone(),
+                request_digest: fingerprint(&request)?,
+                formal: true,
+                consumed: std::sync::atomic::AtomicBool::new(false),
+            };
+            REGISTERED_DISPATCH
+                .scope(
+                    admitted,
+                    self.transport.execute_formal(&request, &dispatch_id),
+                )
+                .await
+        }
+        .await
+        {
             Ok(value) => value,
             Err(error) => {
                 self.store
@@ -870,11 +885,17 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
         };
         if let Some(existing) = existing {
             if existing.request_artifact.as_ref().is_some_and(|artifact| {
-                artifact.schema_version == BOUND_REQUEST_ARTIFACT_SCHEMA
-                    || (artifact.schema_version == REDACTED_ARTIFACT_SCHEMA
-                        && redacted_request_identity(artifact).is_none_or(|identity| {
-                            identity.original_schema == BOUND_REQUEST_ARTIFACT_SCHEMA
-                        }))
+                matches!(
+                    artifact.schema_version.as_str(),
+                    BOUND_REQUEST_ARTIFACT_SCHEMA | crate::model::CURRENT_BOUND_MODEL_SCHEMA
+                ) || (artifact.schema_version == REDACTED_ARTIFACT_SCHEMA
+                    && redacted_request_identity(artifact).is_none_or(|identity| {
+                        matches!(
+                            identity.original_schema.as_str(),
+                            BOUND_REQUEST_ARTIFACT_SCHEMA
+                                | crate::model::CURRENT_BOUND_MODEL_SCHEMA
+                        )
+                    }))
             }) {
                 return Err(Error::Forbidden);
             }
@@ -997,6 +1018,13 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
         &self,
         bound: crate::model::BoundModelRequest,
     ) -> Result<ModelResponse> {
+        self.dispatch_compiler_bound(crate::model::ReadBoundModelRequest::from_legacy(bound)?)
+            .await
+    }
+    async fn dispatch_compiler_bound(
+        &self,
+        bound: crate::model::ReadBoundModelRequest,
+    ) -> Result<ModelResponse> {
         bound.validate()?;
         let request = bound.request.clone();
         let ctx = self.broker_context(&request.namespace)?;
@@ -1004,12 +1032,30 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
         let lease_until = now
             .checked_add(self.config.lease_seconds)
             .ok_or(Error::Budget)?;
-        let artifact = BudgetArtifact::from_serializable("rsia.bound_model_request.v1", &bound)?;
+        let artifact = BudgetArtifact::from_serializable(bound.schema_version.clone(), &bound)?;
         // Accounting before content (plan §11, §6.6, E04): a same-key replay of a
         // settled call records its lost close before the checks below, which may
         // refuse it; their refusal and its return value are unchanged.
         self.close_settled_bound_execution(&ctx, &request, &artifact, now)
             .await?;
+        // A malformed redaction has no qualified request identity. Refuse that
+        // read before content authority; a valid same-key paid replay was
+        // already closed above. Typed access refusals retain their original
+        // later priority, while database errors still propagate.
+        if let Ok(Some(call)) = self
+            .store
+            .budget_call_typed(&ctx, &self.config.billing_scope, &request.request_id)
+            .await?
+            && call.request_artifact.as_ref().is_some_and(|stored| {
+                stored.schema_version == REDACTED_ARTIFACT_SCHEMA
+                    && redacted_request_identity(stored).is_none()
+            })
+        {
+            return Ok(pre_dispatch_refusal(
+                &request,
+                &BudgetPreDispatchRefusal::CallIdReused,
+            ));
+        }
         let mut session = self.store.session().await?;
         bound.verify_current(&mut session, &ctx).await?;
         if let Some(cap) = self.transport.formal_capability() {
@@ -1212,7 +1258,19 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         provenance: ModelExecutionProvenance,
     ) -> Result<ModelResponse> {
         let dispatch_id = decision.call.dispatch_id.clone().ok_or(Error::Internal)?;
-        let completion = match self.transport.execute(&request, &dispatch_id).await {
+        let completion = match async {
+            let admitted = RegisteredDispatch {
+                dispatch_id: dispatch_id.clone(),
+                request_digest: fingerprint(&request)?,
+                formal: false,
+                consumed: std::sync::atomic::AtomicBool::new(false),
+            };
+            REGISTERED_DISPATCH
+                .scope(admitted, self.transport.execute(&request, &dispatch_id))
+                .await
+        }
+        .await
+        {
             Ok(completion) => completion,
             Err(_) => {
                 let failure_fence = BudgetCallFence {
@@ -2073,4 +2131,50 @@ mod pre_dispatch_tests {
             20
         );
     }
+}
+
+// Private task-local scope of the two original, already-committed dispatch
+// decisions. It grants no budget and cannot be serialized or caller-constructed.
+struct RegisteredDispatch {
+    dispatch_id: String,
+    request_digest: String,
+    formal: bool,
+    consumed: std::sync::atomic::AtomicBool,
+}
+tokio::task_local! {
+    static REGISTERED_DISPATCH: RegisteredDispatch;
+}
+pub(crate) fn require_registered_model_dispatch(
+    request: &ModelRequest,
+    dispatch_id: &str,
+) -> Result<()> {
+    require_registered_dispatch(fingerprint(request)?, dispatch_id, false)
+}
+pub(crate) fn require_registered_formal_dispatch(
+    request: &crate::model::FormalTaskRequest,
+    dispatch_id: &str,
+) -> Result<()> {
+    require_registered_dispatch(fingerprint(request)?, dispatch_id, true)
+}
+fn require_registered_dispatch(digest: String, dispatch_id: &str, formal: bool) -> Result<()> {
+    REGISTERED_DISPATCH
+        .try_with(|admission| {
+            if admission.dispatch_id != dispatch_id
+                || admission.request_digest != digest
+                || admission.formal != formal
+            {
+                return Err(Error::Forbidden);
+            }
+            admission
+                .consumed
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .map_err(|_| Error::Conflict("registered dispatch already consumed".into()))?;
+            Ok(())
+        })
+        .map_err(|_| Error::Forbidden)?
 }

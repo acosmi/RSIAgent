@@ -3,12 +3,11 @@
 //! and replay/self-report artifacts cannot mint a formal evaluation.
 use crate::evidence::load_stored_source;
 use crate::release_store::{
-    RELEASE_CANDIDATE_SCHEMA, ReleaseCandidateRecord, TypedSourceRef,
-    validate_candidate_read_in_session,
+    RELEASE_CANDIDATE_SCHEMA, ReadCandidate, TypedSourceRef, validate_read_candidate_in_session,
 };
 use crate::revocation_gate::{MAX_UPSTREAM_CLOSURE_NODES, judge_dependency};
 use evo_core::evaluation::{
-    BernsteinReport, ClusterObservation, ExperimentPlan, FormalExperimentPlanV41,
+    BernsteinReport, ClusterObservation, ExperimentPlan, ExperimentPlanV2, FormalExperimentPlanV41,
     OptimizationBudgetPlan, OptimizerComparisonContract, ProfileKind, Verdict, decide,
     empirical_bernstein, parse_decimal,
 };
@@ -495,6 +494,39 @@ pub enum TicketLifecycle {
     Invalid,
 }
 
+/// A reference to the complete plan rebuilt from authenticated same-Session
+/// inputs. No candidate raw body is retained in a historical ticket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TicketSourcePlanBinding {
+    pub schema_version: String,
+    pub namespace: String,
+    pub logical_ticket_id: String,
+    pub plan_id: String,
+    pub plan_digest: String,
+    pub candidate_record_digest: String,
+}
+
+impl TicketSourcePlanBinding {
+    const SCHEMA: &'static str = "rsia.evaluation_ticket_source_plan_binding.v1";
+
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != Self::SCHEMA {
+            return Err(Error::Invalid(
+                "unsupported ticket source-plan binding schema".into(),
+            ));
+        }
+        for value in [&self.namespace, &self.logical_ticket_id, &self.plan_id] {
+            identifier(value)?;
+        }
+        digest(&self.plan_digest, "source plan_digest")?;
+        digest(
+            &self.candidate_record_digest,
+            "source candidate_record_digest",
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationTicketV2 {
@@ -581,6 +613,453 @@ impl EvaluationTicketV2 {
         }
         if let Some(binding) = &self.candidate_dependency_binding {
             binding.validate()?;
+        }
+        valid_time(self.issued_at_unix_seconds)?;
+        if self.targets.is_empty() || self.next_sequence == 0 {
+            return Err(Error::Invalid("ticket has no planned targets".into()));
+        }
+        let mut ids = BTreeSet::new();
+        for target in &self.targets {
+            identifier(&target.target_id)?;
+            identifier(&target.input_artifact_id)?;
+            digest(&target.input_digest, "target input_digest")?;
+            if !ids.insert(&target.target_id) {
+                return Err(Error::Invalid("duplicate ticket target".into()));
+            }
+            match &target.state {
+                TargetState::Running {
+                    candidate,
+                    baseline,
+                }
+                | TargetState::RunningUsageUnknown {
+                    candidate,
+                    baseline,
+                }
+                | TargetState::CancelledAfterDispatch {
+                    candidate,
+                    baseline,
+                } => {
+                    for slot in [candidate, baseline].into_iter().flatten() {
+                        slot.validate()?;
+                    }
+                }
+                TargetState::Completed {
+                    candidate_score_micros,
+                    baseline_score_micros,
+                    candidate_receipt_id,
+                    baseline_receipt_id,
+                    grader_receipt_id,
+                    completion_sequence,
+                    ..
+                } => {
+                    if *candidate_score_micros > 1_000_000
+                        || *baseline_score_micros > 1_000_000
+                        || *completion_sequence == 0
+                    {
+                        return Err(Error::Invalid("invalid completed target state".into()));
+                    }
+                    for receipt_id in [candidate_receipt_id, baseline_receipt_id, grader_receipt_id]
+                    {
+                        identifier(receipt_id)?;
+                    }
+                }
+                TargetState::NotDispatched { released_call_ids } => {
+                    for call_id in released_call_ids {
+                        identifier(call_id)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for call_id in &self.unattributed_budget_call_ids {
+            identifier(call_id)?;
+        }
+        if let Some(stop_digest) = &self.stop_member_terminal_digest {
+            digest(stop_digest, "stop_member_terminal_digest")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationTicketV3 {
+    pub schema_version: String,
+    pub id: String,
+    pub registration_id: String,
+    pub registration_digest: String,
+    pub holdout_id: String,
+    pub manifest_digest: String,
+    pub v1_plan_snapshot_digest: String,
+    pub bound_v1_plan_digest: String,
+    pub formal_plan_digest: String,
+    pub profile: evo_core::evaluation::ProfileKind,
+    pub n_planned: u32,
+    pub research_family_id: String,
+    pub alpha_plan_digest: String,
+    pub candidate_digest: String,
+    pub baseline_digest: String,
+    pub candidate_bundle_digest: String,
+    pub baseline_bundle_digest: String,
+    pub environment_digest: String,
+    pub proposer_actor: String,
+    pub evaluator_actor: String,
+    pub executor_actor: String,
+    pub approver_actor: String,
+    pub issue_receipt_digest: String,
+    pub evidence_scope: EvaluationEvidenceScope,
+    pub attempt_id: String,
+    pub targets: Vec<EvaluationTarget>,
+    pub lifecycle: TicketLifecycle,
+    pub next_sequence: u64,
+    pub pending_certificate: Option<EarlyStopCertificate>,
+    pub stop_member_terminal_digest: Option<String>,
+    pub late_execution_receipt_ids: Vec<String>,
+    pub late_grader_receipt_ids: Vec<String>,
+    pub unattributed_budget_call_ids: Vec<String>,
+    pub invalid_reasons: Vec<String>,
+    pub issued_at_unix_seconds: i64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_candidate_binding"
+    )]
+    pub candidate_dependency_binding: Option<FormalCandidateDependencyBinding>,
+    pub source_plan_binding: TicketSourcePlanBinding,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadEvaluationTicket {
+    pub schema_version: String,
+    pub id: String,
+    pub registration_id: String,
+    pub registration_digest: String,
+    pub holdout_id: String,
+    pub manifest_digest: String,
+    pub v1_plan_snapshot_digest: String,
+    pub bound_v1_plan_digest: String,
+    pub formal_plan_digest: String,
+    pub profile: evo_core::evaluation::ProfileKind,
+    pub n_planned: u32,
+    pub research_family_id: String,
+    pub alpha_plan_digest: String,
+    pub candidate_digest: String,
+    pub baseline_digest: String,
+    pub candidate_bundle_digest: String,
+    pub baseline_bundle_digest: String,
+    pub environment_digest: String,
+    pub proposer_actor: String,
+    pub evaluator_actor: String,
+    pub executor_actor: String,
+    pub approver_actor: String,
+    pub issue_receipt_digest: String,
+    pub evidence_scope: EvaluationEvidenceScope,
+    pub attempt_id: String,
+    pub targets: Vec<EvaluationTarget>,
+    pub lifecycle: TicketLifecycle,
+    pub next_sequence: u64,
+    pub pending_certificate: Option<EarlyStopCertificate>,
+    pub stop_member_terminal_digest: Option<String>,
+    pub late_execution_receipt_ids: Vec<String>,
+    pub late_grader_receipt_ids: Vec<String>,
+    pub unattributed_budget_call_ids: Vec<String>,
+    pub invalid_reasons: Vec<String>,
+    pub issued_at_unix_seconds: i64,
+    pub candidate_dependency_binding: Option<FormalCandidateDependencyBinding>,
+    pub source_plan_binding: Option<TicketSourcePlanBinding>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EvaluationTicketWire {
+    Current(EvaluationTicketV3),
+    Legacy(EvaluationTicketV2),
+}
+impl From<EvaluationTicketV2> for ReadEvaluationTicket {
+    fn from(value: EvaluationTicketV2) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            id: value.id,
+            registration_id: value.registration_id,
+            registration_digest: value.registration_digest,
+            holdout_id: value.holdout_id,
+            manifest_digest: value.manifest_digest,
+            v1_plan_snapshot_digest: value.v1_plan_snapshot_digest,
+            bound_v1_plan_digest: value.bound_v1_plan_digest,
+            formal_plan_digest: value.formal_plan_digest,
+            profile: value.profile,
+            n_planned: value.n_planned,
+            research_family_id: value.research_family_id,
+            alpha_plan_digest: value.alpha_plan_digest,
+            candidate_digest: value.candidate_digest,
+            baseline_digest: value.baseline_digest,
+            candidate_bundle_digest: value.candidate_bundle_digest,
+            baseline_bundle_digest: value.baseline_bundle_digest,
+            environment_digest: value.environment_digest,
+            proposer_actor: value.proposer_actor,
+            evaluator_actor: value.evaluator_actor,
+            executor_actor: value.executor_actor,
+            approver_actor: value.approver_actor,
+            issue_receipt_digest: value.issue_receipt_digest,
+            evidence_scope: value.evidence_scope,
+            attempt_id: value.attempt_id,
+            targets: value.targets,
+            lifecycle: value.lifecycle,
+            next_sequence: value.next_sequence,
+            pending_certificate: value.pending_certificate,
+            stop_member_terminal_digest: value.stop_member_terminal_digest,
+            late_execution_receipt_ids: value.late_execution_receipt_ids,
+            late_grader_receipt_ids: value.late_grader_receipt_ids,
+            unattributed_budget_call_ids: value.unattributed_budget_call_ids,
+            invalid_reasons: value.invalid_reasons,
+            issued_at_unix_seconds: value.issued_at_unix_seconds,
+            candidate_dependency_binding: value.candidate_dependency_binding,
+            source_plan_binding: None,
+        }
+    }
+}
+impl From<EvaluationTicketV3> for ReadEvaluationTicket {
+    fn from(value: EvaluationTicketV3) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            id: value.id,
+            registration_id: value.registration_id,
+            registration_digest: value.registration_digest,
+            holdout_id: value.holdout_id,
+            manifest_digest: value.manifest_digest,
+            v1_plan_snapshot_digest: value.v1_plan_snapshot_digest,
+            bound_v1_plan_digest: value.bound_v1_plan_digest,
+            formal_plan_digest: value.formal_plan_digest,
+            profile: value.profile,
+            n_planned: value.n_planned,
+            research_family_id: value.research_family_id,
+            alpha_plan_digest: value.alpha_plan_digest,
+            candidate_digest: value.candidate_digest,
+            baseline_digest: value.baseline_digest,
+            candidate_bundle_digest: value.candidate_bundle_digest,
+            baseline_bundle_digest: value.baseline_bundle_digest,
+            environment_digest: value.environment_digest,
+            proposer_actor: value.proposer_actor,
+            evaluator_actor: value.evaluator_actor,
+            executor_actor: value.executor_actor,
+            approver_actor: value.approver_actor,
+            issue_receipt_digest: value.issue_receipt_digest,
+            evidence_scope: value.evidence_scope,
+            attempt_id: value.attempt_id,
+            targets: value.targets,
+            lifecycle: value.lifecycle,
+            next_sequence: value.next_sequence,
+            pending_certificate: value.pending_certificate,
+            stop_member_terminal_digest: value.stop_member_terminal_digest,
+            late_execution_receipt_ids: value.late_execution_receipt_ids,
+            late_grader_receipt_ids: value.late_grader_receipt_ids,
+            unattributed_budget_call_ids: value.unattributed_budget_call_ids,
+            invalid_reasons: value.invalid_reasons,
+            issued_at_unix_seconds: value.issued_at_unix_seconds,
+            candidate_dependency_binding: value.candidate_dependency_binding,
+            source_plan_binding: Some(value.source_plan_binding),
+        }
+    }
+}
+impl Serialize for ReadEvaluationTicket {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.validate_source_plan_binding_shape()
+            .map_err(serde::ser::Error::custom)?;
+        match &self.source_plan_binding {
+            Some(source) => EvaluationTicketV3 {
+                schema_version: self.schema_version.clone(),
+                id: self.id.clone(),
+                registration_id: self.registration_id.clone(),
+                registration_digest: self.registration_digest.clone(),
+                holdout_id: self.holdout_id.clone(),
+                manifest_digest: self.manifest_digest.clone(),
+                v1_plan_snapshot_digest: self.v1_plan_snapshot_digest.clone(),
+                bound_v1_plan_digest: self.bound_v1_plan_digest.clone(),
+                formal_plan_digest: self.formal_plan_digest.clone(),
+                profile: self.profile,
+                n_planned: self.n_planned,
+                research_family_id: self.research_family_id.clone(),
+                alpha_plan_digest: self.alpha_plan_digest.clone(),
+                candidate_digest: self.candidate_digest.clone(),
+                baseline_digest: self.baseline_digest.clone(),
+                candidate_bundle_digest: self.candidate_bundle_digest.clone(),
+                baseline_bundle_digest: self.baseline_bundle_digest.clone(),
+                environment_digest: self.environment_digest.clone(),
+                proposer_actor: self.proposer_actor.clone(),
+                evaluator_actor: self.evaluator_actor.clone(),
+                executor_actor: self.executor_actor.clone(),
+                approver_actor: self.approver_actor.clone(),
+                issue_receipt_digest: self.issue_receipt_digest.clone(),
+                evidence_scope: self.evidence_scope,
+                attempt_id: self.attempt_id.clone(),
+                targets: self.targets.clone(),
+                lifecycle: self.lifecycle,
+                next_sequence: self.next_sequence,
+                pending_certificate: self.pending_certificate.clone(),
+                stop_member_terminal_digest: self.stop_member_terminal_digest.clone(),
+                late_execution_receipt_ids: self.late_execution_receipt_ids.clone(),
+                late_grader_receipt_ids: self.late_grader_receipt_ids.clone(),
+                unattributed_budget_call_ids: self.unattributed_budget_call_ids.clone(),
+                invalid_reasons: self.invalid_reasons.clone(),
+                issued_at_unix_seconds: self.issued_at_unix_seconds,
+                candidate_dependency_binding: self.candidate_dependency_binding.clone(),
+                source_plan_binding: source.clone(),
+            }
+            .serialize(serializer),
+            None => EvaluationTicketV2 {
+                schema_version: self.schema_version.clone(),
+                id: self.id.clone(),
+                registration_id: self.registration_id.clone(),
+                registration_digest: self.registration_digest.clone(),
+                holdout_id: self.holdout_id.clone(),
+                manifest_digest: self.manifest_digest.clone(),
+                v1_plan_snapshot_digest: self.v1_plan_snapshot_digest.clone(),
+                bound_v1_plan_digest: self.bound_v1_plan_digest.clone(),
+                formal_plan_digest: self.formal_plan_digest.clone(),
+                profile: self.profile,
+                n_planned: self.n_planned,
+                research_family_id: self.research_family_id.clone(),
+                alpha_plan_digest: self.alpha_plan_digest.clone(),
+                candidate_digest: self.candidate_digest.clone(),
+                baseline_digest: self.baseline_digest.clone(),
+                candidate_bundle_digest: self.candidate_bundle_digest.clone(),
+                baseline_bundle_digest: self.baseline_bundle_digest.clone(),
+                environment_digest: self.environment_digest.clone(),
+                proposer_actor: self.proposer_actor.clone(),
+                evaluator_actor: self.evaluator_actor.clone(),
+                executor_actor: self.executor_actor.clone(),
+                approver_actor: self.approver_actor.clone(),
+                issue_receipt_digest: self.issue_receipt_digest.clone(),
+                evidence_scope: self.evidence_scope,
+                attempt_id: self.attempt_id.clone(),
+                targets: self.targets.clone(),
+                lifecycle: self.lifecycle,
+                next_sequence: self.next_sequence,
+                pending_certificate: self.pending_certificate.clone(),
+                stop_member_terminal_digest: self.stop_member_terminal_digest.clone(),
+                late_execution_receipt_ids: self.late_execution_receipt_ids.clone(),
+                late_grader_receipt_ids: self.late_grader_receipt_ids.clone(),
+                unattributed_budget_call_ids: self.unattributed_budget_call_ids.clone(),
+                invalid_reasons: self.invalid_reasons.clone(),
+                issued_at_unix_seconds: self.issued_at_unix_seconds,
+                candidate_dependency_binding: self.candidate_dependency_binding.clone(),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for ReadEvaluationTicket {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let ticket: Self = match EvaluationTicketWire::deserialize(deserializer)? {
+            EvaluationTicketWire::Current(value)
+                if value.schema_version == EvaluationTicketV3::SCHEMA =>
+            {
+                let current: Self = value.into();
+                current.validate().map_err(D::Error::custom)?;
+                current
+            }
+            EvaluationTicketWire::Legacy(value)
+                if value.schema_version == EvaluationTicketV2::SCHEMA =>
+            {
+                value.validate().map_err(D::Error::custom)?;
+                value.into()
+            }
+            _ => {
+                return Err(D::Error::custom(
+                    "evaluation ticket wire/schema version mismatch",
+                ));
+            }
+        };
+        ticket
+            .validate_source_plan_binding_shape()
+            .map_err(D::Error::custom)?;
+        Ok(ticket)
+    }
+}
+impl EvaluationTicketV3 {
+    pub const SCHEMA: &'static str = "rsia.evaluation_ticket.v3";
+}
+
+impl ReadEvaluationTicket {
+    pub const SCHEMA: &'static str = "rsia.evaluation_ticket.v2";
+    pub const SCHEMA_V3: &'static str = "rsia.evaluation_ticket.v3";
+
+    fn supports_schema(schema: &str) -> bool {
+        matches!(schema, Self::SCHEMA | Self::SCHEMA_V3)
+    }
+
+    fn require_current_new_use(&self) -> Result<()> {
+        self.validate()?;
+        if self.schema_version != EvaluationTicketV3::SCHEMA {
+            return Err(Error::Conflict(
+                "legacy evaluation ticket is not Current input".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_source_plan_binding_shape(&self) -> Result<()> {
+        match (self.schema_version.as_str(), &self.source_plan_binding) {
+            (Self::SCHEMA, None) => Ok(()),
+            (Self::SCHEMA_V3, Some(binding)) => binding.validate(),
+            (Self::SCHEMA, Some(_)) => Err(Error::Invalid(
+                "v2 ticket cannot carry a source-plan binding".into(),
+            )),
+            (Self::SCHEMA_V3, None) => Err(Error::Invalid(
+                "v3 ticket requires a source-plan binding".into(),
+            )),
+            _ => Err(Error::Invalid(
+                "unsupported evaluation-ticket schema".into(),
+            )),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.validate_source_plan_binding_shape()?;
+        for value in [
+            &self.id,
+            &self.registration_id,
+            &self.holdout_id,
+            &self.research_family_id,
+            &self.proposer_actor,
+            &self.evaluator_actor,
+            &self.executor_actor,
+            &self.approver_actor,
+            &self.attempt_id,
+        ] {
+            identifier(value)?;
+        }
+        for (value, name) in [
+            (&self.registration_digest, "registration_digest"),
+            (&self.manifest_digest, "manifest_digest"),
+            (&self.v1_plan_snapshot_digest, "v1_plan_snapshot_digest"),
+            (&self.bound_v1_plan_digest, "bound_v1_plan_digest"),
+            (&self.formal_plan_digest, "formal_plan_digest"),
+            (&self.alpha_plan_digest, "alpha_plan_digest"),
+            (&self.candidate_digest, "candidate_digest"),
+            (&self.baseline_digest, "baseline_digest"),
+            (&self.candidate_bundle_digest, "candidate_bundle_digest"),
+            (&self.baseline_bundle_digest, "baseline_bundle_digest"),
+            (&self.environment_digest, "environment_digest"),
+            (&self.issue_receipt_digest, "issue_receipt_digest"),
+        ] {
+            digest(value, name)?;
+        }
+        if let Some(binding) = &self.candidate_dependency_binding {
+            binding.validate()?;
+        }
+        if let Some(plan) = &self.source_plan_binding {
+            let candidate = self.candidate_dependency_binding.as_ref().ok_or_else(|| {
+                Error::Invalid("v3 ticket requires candidate dependency binding".into())
+            })?;
+            if plan.candidate_record_digest != candidate.candidate_record_digest {
+                return Err(Error::Conflict(
+                    "ticket source-plan candidate digest mismatch".into(),
+                ));
+            }
         }
         valid_time(self.issued_at_unix_seconds)?;
         if self.targets.is_empty() || self.next_sequence == 0 {
@@ -899,7 +1378,7 @@ pub struct IssueTicketRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamingEvaluationStatus {
-    pub ticket: EvaluationTicketV2,
+    pub ticket: ReadEvaluationTicket,
     pub formal: Option<FormalEvaluationV2>,
 }
 
@@ -957,22 +1436,57 @@ pub struct VerifiedFormalReportView {
     pub ineligibility_reasons: Vec<String>,
 }
 
+/// Read-only provenance of the original report; no stored wire or authority
+/// capability is constructed by this carrier. Original legacy bytes remain in
+/// `VerifiedFormalReportView`, with a separate explicit consumption decision.
+#[derive(Debug, Clone)]
+pub struct VerifiedFormalReportReadV1 {
+    state: evo_storage::PersistentContractState,
+    original: VerifiedFormalReportView,
+}
+impl VerifiedFormalReportReadV1 {
+    pub const SCHEMA: &'static str = "rsia.verified_formal_report_read.v1";
+    pub fn state(&self) -> evo_storage::PersistentContractState {
+        self.state
+    }
+    pub fn historical_view(&self) -> &VerifiedFormalReportView {
+        &self.original
+    }
+    pub fn current_view(&self) -> Result<&VerifiedFormalReportView> {
+        if self.state != evo_storage::PersistentContractState::CurrentVerified {
+            return Err(Error::Conflict(
+                "source_legacy: formal report is not Current input".into(),
+            ));
+        }
+        Ok(&self.original)
+    }
+    fn public_projection(&self) -> VerifiedFormalReportView {
+        let mut view = self.original.clone();
+        if self.state == evo_storage::PersistentContractState::Legacy {
+            view.promotion_eligible = false;
+            view.ineligibility_reasons.push("source_legacy".into());
+        }
+        view
+    }
+}
+
 /// Live-use gate shared by original start_execution and the registered bridge.
 /// Historical ticket-only views deliberately do not call this new-use gate.
 pub(crate) async fn live_task_candidate_in_session(
     ctx: &Context,
     session: &mut Session,
     task: &BrokerTaskView,
-) -> Result<(crate::release_store::ReleaseCandidateRecord, String)> {
-    let ticket: EvaluationTicketV2 =
+) -> Result<(crate::release_store::ReadCandidate, String)> {
+    let ticket: ReadEvaluationTicket =
         need_record(session, ctx, TICKET_KIND, &task.ticket_id).await?;
     let expected = broker_view(&ticket, &task.target_id, task.side)?;
     if fingerprint(&expected)? != fingerprint(task)? {
         return Err(Error::Conflict("task differs from frozen ticket".into()));
     }
-    let candidate: crate::release_store::ReleaseCandidateRecord = session
+    let candidate: crate::release_store::ReadCandidate = session
         .need(ctx, "artifact", &ticket.candidate_digest)
         .await?;
+    candidate.current()?;
     if candidate.bundle_digest != ticket.candidate_bundle_digest
         || candidate.parent_digest != ticket.baseline_digest
         || candidate.environment_digest != ticket.environment_digest
@@ -982,7 +1496,7 @@ pub(crate) async fn live_task_candidate_in_session(
             "actual candidate differs from frozen task".into(),
         ));
     }
-    crate::formal_authority::resolve_bundle_in_session(
+    crate::formal_authority::resolve_read_bundle_in_session(
         session,
         ctx,
         &candidate.bundle,
@@ -1017,7 +1531,7 @@ pub(crate) async fn live_task_candidate_in_session(
     let control: RegisteredEvaluationControl =
         need_record(session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
     if control.evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
-        let inputs = crate::formal_authority::resolve_bundle_in_session(
+        let inputs = crate::formal_authority::resolve_read_bundle_in_session(
             session,
             ctx,
             &candidate.bundle,
@@ -1026,7 +1540,7 @@ pub(crate) async fn live_task_candidate_in_session(
             evo_core::evidence::Purpose::Development,
         )
         .await?;
-        crate::formal_authority::verify_candidate_principals_from_binding(
+        crate::formal_authority::verify_read_candidate_principals_from_binding(
             session,
             ctx,
             inputs.binding(),
@@ -1190,7 +1704,7 @@ impl IndependentEvaluationControl {
         ctx: &Context,
         store: &Store,
         request: IssueTicketRequest,
-    ) -> Result<EvaluationTicketV2> {
+    ) -> Result<ReadEvaluationTicket> {
         ctx.require(&[Role::Evaluator])?;
         identifier(&request.ticket_id)?;
         identifier(&request.registration_id)?;
@@ -1238,8 +1752,25 @@ impl IndependentEvaluationControl {
                 "registration facts changed during ticket issue".into(),
             ));
         }
-        let candidate_dependency_binding =
-            bind_candidate_in_session(&mut session, ctx, &control, &holdout).await?;
+        let Some((candidate, candidate_binding)) =
+            bind_candidate_record_in_session(&mut session, ctx, &control, &holdout).await?
+        else {
+            return Err(Error::Conflict(CANDIDATE_RECORD_MISSING.into()));
+        };
+        let source_plan_binding = source_plan_binding_from_candidate(
+            ctx.namespace(),
+            &request.ticket_id,
+            &control,
+            &candidate,
+        )?;
+        let ticket_id = source_bound_ticket_id(
+            ctx.namespace(),
+            &control,
+            &holdout,
+            &source_plan_binding,
+            request.issued_at_unix_seconds,
+        )?;
+        let candidate_dependency_binding = Some(candidate_binding);
         // Every issued ticket binds its frozen candidate (L564). Without a
         // candidate record there is nothing to bind: the issue is refused here,
         // before its first write and under every control schema, instead of
@@ -1274,7 +1805,7 @@ impl IndependentEvaluationControl {
                 ));
             }
         }
-        if get_record::<EvaluationTicketV2>(&mut session, ctx, TICKET_KIND, &request.ticket_id)
+        if get_record::<ReadEvaluationTicket>(&mut session, ctx, TICKET_KIND, &ticket_id)
             .await?
             .is_some()
         {
@@ -1295,7 +1826,7 @@ impl IndependentEvaluationControl {
                 control.v1_plan_snapshot.query_limit,
             )?,
         };
-        ledger.reserve(request.ticket_id.clone(), &holdout.manifest)?;
+        ledger.reserve(ticket_id.clone(), &holdout.manifest)?;
         let claim_allocations: Vec<_> = control
             .alpha_plan
             .allocations
@@ -1323,7 +1854,7 @@ impl IndependentEvaluationControl {
                 research_family_id: control.alpha_plan.research_family_id.clone(),
                 claim_id: allocation.claim_id.clone(),
                 attempt_id: allocation.attempt_id.clone(),
-                ticket_id: request.ticket_id.clone(),
+                ticket_id: ticket_id.clone(),
             };
             put_record(
                 &mut session,
@@ -1339,7 +1870,7 @@ impl IndependentEvaluationControl {
         let manifest_digest = holdout.manifest.digest()?;
         let issue_receipt = TicketIssueReceipt {
             schema_version: "rsia.evaluation_ticket_issue_receipt.v1".into(),
-            ticket_id: request.ticket_id.clone(),
+            ticket_id: ticket_id.clone(),
             registration_digest: registration_digest.clone(),
             manifest_digest: manifest_digest.clone(),
             evaluator_actor: ctx.actor().into(),
@@ -1369,9 +1900,9 @@ impl IndependentEvaluationControl {
             input_digest: input.input_digest.clone(),
             state: TargetState::Planned,
         });
-        let ticket = EvaluationTicketV2 {
-            schema_version: EvaluationTicketV2::SCHEMA.into(),
-            id: request.ticket_id.clone(),
+        let ticket = ReadEvaluationTicket {
+            schema_version: ReadEvaluationTicket::SCHEMA_V3.into(),
+            id: ticket_id.clone(),
             registration_id: control.id.clone(),
             registration_digest,
             holdout_id: holdout.id.clone(),
@@ -1406,6 +1937,7 @@ impl IndependentEvaluationControl {
             invalid_reasons: Vec::new(),
             issued_at_unix_seconds: request.issued_at_unix_seconds,
             candidate_dependency_binding,
+            source_plan_binding: Some(source_plan_binding),
         };
         ticket.validate()?;
         put_record(
@@ -1421,7 +1953,7 @@ impl IndependentEvaluationControl {
             &mut session,
             ctx,
             TICKET_RECEIPT_KIND,
-            &request.ticket_id,
+            &ticket_id,
             ctx.actor(),
             &issue_receipt,
         )
@@ -1430,7 +1962,7 @@ impl IndependentEvaluationControl {
             &mut session,
             ctx,
             TICKET_KIND,
-            &request.ticket_id,
+            &ticket_id,
             ctx.actor(),
             &ticket,
         )
@@ -1439,7 +1971,7 @@ impl IndependentEvaluationControl {
             .put_edge(
                 ctx,
                 "artifact",
-                &storage_id(TICKET_KIND, &request.ticket_id)?,
+                &storage_id(TICKET_KIND, &ticket_id)?,
                 "artifact",
                 &storage_id(HOLDOUT_KIND, &holdout.id)?,
             )
@@ -1455,7 +1987,7 @@ impl IndependentEvaluationControl {
             .await?;
         }
         session
-            .audit(ctx, "issue_evaluation_ticket", &request.ticket_id)
+            .audit(ctx, "issue_evaluation_ticket", &ticket_id)
             .await?;
         session.commit().await?;
         Ok(ticket)
@@ -1470,7 +2002,7 @@ impl IndependentEvaluationControl {
     ) -> Result<BrokerTaskView> {
         ctx.require(&[Role::Worker, Role::Host])?;
         let mut session = store.session().await?;
-        let ticket: EvaluationTicketV2 =
+        let ticket: ReadEvaluationTicket =
             need_record(&mut session, ctx, TICKET_KIND, ticket_id).await?;
         if ticket.executor_actor != ctx.actor()
             || matches!(
@@ -1497,7 +2029,7 @@ impl IndependentEvaluationControl {
     ) -> Result<BudgetDispatchDecision> {
         ctx.require(&[Role::Worker, Role::Host])?;
         let mut session = store.session().await?;
-        let mut ticket: EvaluationTicketV2 =
+        let mut ticket: ReadEvaluationTicket =
             need_record(&mut session, ctx, TICKET_KIND, &request.ticket_id).await?;
         let control: RegisteredEvaluationControl =
             need_record(&mut session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
@@ -1505,6 +2037,7 @@ impl IndependentEvaluationControl {
             return Err(Error::Forbidden);
         }
         validate_status_closure(&mut session, ctx, &ticket, None).await?;
+        ticket.require_current_new_use()?;
         let view = broker_view(&ticket, &request.target_id, request.side)?;
         live_task_candidate_in_session(ctx, &mut session, &view).await?;
         if request.fence.billing_scope != control.billing_scope
@@ -1591,7 +2124,8 @@ impl IndependentEvaluationControl {
             ));
         }
         valid_time(request.issued_at_unix_seconds)?;
-        let ticket: EvaluationTicketV2 = load(store, ctx, TICKET_KIND, &request.ticket_id).await?;
+        let ticket: ReadEvaluationTicket =
+            load(store, ctx, TICKET_KIND, &request.ticket_id).await?;
         if ticket.executor_actor != ctx.actor() {
             return Err(Error::Forbidden);
         }
@@ -1661,7 +2195,7 @@ impl IndependentEvaluationControl {
             issued_at_unix_seconds: request.issued_at_unix_seconds,
         };
         let mut session = store.session().await?;
-        let mut latest: EvaluationTicketV2 =
+        let mut latest: ReadEvaluationTicket =
             need_record(&mut session, ctx, TICKET_KIND, &request.ticket_id).await?;
         if !is_stopping(latest.lifecycle) {
             validate_status_closure(&mut session, ctx, &latest, None).await?;
@@ -1818,10 +2352,26 @@ impl IndependentEvaluationControl {
         store: &Store,
         request: GraderReceiptRequest,
     ) -> Result<IndependentGraderReceiptV2> {
+        Self::record_grader_receipt_boxed(ctx, store, request).await
+    }
+
+    fn record_grader_receipt_boxed<'a>(
+        ctx: &'a Context,
+        store: &'a Store,
+        request: GraderReceiptRequest,
+    ) -> crate::optimization::StepFuture<'a, IndependentGraderReceiptV2> {
+        Box::pin(Self::record_grader_receipt_unboxed(ctx, store, request))
+    }
+
+    async fn record_grader_receipt_unboxed(
+        ctx: &Context,
+        store: &Store,
+        request: GraderReceiptRequest,
+    ) -> Result<IndependentGraderReceiptV2> {
         ctx.require(&[Role::Evaluator])?;
         valid_time(request.issued_at_unix_seconds)?;
         let mut session = store.session().await?;
-        let mut ticket: EvaluationTicketV2 =
+        let mut ticket: ReadEvaluationTicket =
             need_record(&mut session, ctx, TICKET_KIND, &request.ticket_id).await?;
         let control: RegisteredEvaluationControl =
             need_record(&mut session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
@@ -2156,7 +2706,7 @@ impl IndependentEvaluationControl {
     ) -> Result<FormalEvaluationV2> {
         ctx.require(&[Role::Evaluator])?;
         valid_time(now)?;
-        let ticket: EvaluationTicketV2 = load(store, ctx, TICKET_KIND, ticket_id).await?;
+        let ticket: ReadEvaluationTicket = load(store, ctx, TICKET_KIND, ticket_id).await?;
         let control: RegisteredEvaluationControl =
             load(store, ctx, CONTROL_KIND, &ticket.registration_id).await?;
         if ticket.evaluator_actor != ctx.actor()
@@ -2267,7 +2817,7 @@ impl IndependentEvaluationControl {
         };
         let resource_evidence_digest = fingerprint(&resource_evidence)?;
         let mut session = store.session().await?;
-        let mut latest: EvaluationTicketV2 =
+        let mut latest: ReadEvaluationTicket =
             need_record(&mut session, ctx, TICKET_KIND, ticket_id).await?;
         if latest.lifecycle != TicketLifecycle::ReadyForFinal
             || fingerprint(&latest)? != fingerprint(&ticket)?
@@ -2339,6 +2889,17 @@ impl IndependentEvaluationControl {
                 return Err(Error::Conflict(STATISTICS_CHANGED.into()));
             }
         }
+        if control.evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
+            crate::formal_authority::preflight_complete_authority_in_session(
+                &mut session,
+                ctx,
+                &latest,
+                &latest_control,
+            )
+            .await?;
+        }
+        // History retains its strict diagnostics. It cannot reach the first DML.
+        latest.require_current_new_use()?;
         session
             .stop_dispatch_group(
                 ctx,
@@ -2470,7 +3031,7 @@ impl IndependentEvaluationControl {
         identifier(reason)?;
         valid_time(now)?;
         let mut session = store.session().await?;
-        let mut ticket: EvaluationTicketV2 =
+        let mut ticket: ReadEvaluationTicket =
             need_record(&mut session, ctx, TICKET_KIND, ticket_id).await?;
         let control: RegisteredEvaluationControl =
             need_record(&mut session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
@@ -2491,7 +3052,7 @@ impl IndependentEvaluationControl {
     ) -> Result<StreamingEvaluationStatus> {
         ctx.require(&[Role::Evaluator])?;
         valid_time(now_unix_seconds)?;
-        let ticket: EvaluationTicketV2 = load(store, ctx, TICKET_KIND, ticket_id).await?;
+        let ticket: ReadEvaluationTicket = load(store, ctx, TICKET_KIND, ticket_id).await?;
         if ticket.evaluator_actor != ctx.actor() {
             return Err(Error::Forbidden);
         }
@@ -2535,7 +3096,7 @@ impl IndependentEvaluationControl {
             }
         }
         let mut session = store.session().await?;
-        let mut latest: EvaluationTicketV2 =
+        let mut latest: ReadEvaluationTicket =
             need_record(&mut session, ctx, TICKET_KIND, ticket_id).await?;
         if latest.lifecycle != TicketLifecycle::Draining {
             return Err(Error::Conflict(
@@ -2601,7 +3162,7 @@ impl IndependentEvaluationControl {
     ) -> Result<StreamingEvaluationStatus> {
         ctx.require(&[Role::Evaluator, Role::Admin])?;
         let mut session = store.session().await?;
-        let ticket: EvaluationTicketV2 =
+        let ticket: ReadEvaluationTicket =
             need_record(&mut session, ctx, TICKET_KIND, ticket_id).await?;
         let formal =
             get_record::<FormalEvaluationV2>(&mut session, ctx, FORMAL_KIND, ticket_id).await?;
@@ -2613,10 +3174,10 @@ impl IndependentEvaluationControl {
                 ..
             })
         ) {
-            let candidate = session
+            let candidate: ReadCandidate = session
                 .need(ctx, "artifact", &ticket.candidate_digest)
                 .await?;
-            crate::formal_authority::verify_issued_authority(
+            crate::formal_authority::verify_read_issued_authority(
                 &mut session,
                 ctx,
                 ticket_id,
@@ -2646,7 +3207,9 @@ pub async fn verified_report_view_in_session(
     report_id: &str,
 ) -> Result<VerifiedFormalReportView> {
     ctx.require(&[Role::Evaluator, Role::Admin])?;
-    verified_report_view_core(ctx, session, report_id).await
+    Ok(read_verified_formal_report_core(ctx, session, report_id)
+        .await?
+        .public_projection())
 }
 
 pub(crate) async fn verified_report_view_for_host_in_session(
@@ -2655,16 +3218,27 @@ pub(crate) async fn verified_report_view_for_host_in_session(
     report_id: &str,
 ) -> Result<VerifiedFormalReportView> {
     ctx.require(&[Role::Host])?;
-    verified_report_view_core(ctx, session, report_id).await
+    Ok(read_verified_formal_report_core(ctx, session, report_id)
+        .await?
+        .public_projection())
 }
 
-async fn verified_report_view_core(
+pub async fn read_verified_formal_report_in_session(
     ctx: &Context,
     session: &mut Session,
     report_id: &str,
-) -> Result<VerifiedFormalReportView> {
+) -> Result<VerifiedFormalReportReadV1> {
+    ctx.require(&[Role::Evaluator, Role::Admin])?;
+    read_verified_formal_report_core(ctx, session, report_id).await
+}
+
+async fn read_verified_formal_report_core(
+    ctx: &Context,
+    session: &mut Session,
+    report_id: &str,
+) -> Result<VerifiedFormalReportReadV1> {
     identifier(report_id)?;
-    let ticket: EvaluationTicketV2 = need_record(session, ctx, TICKET_KIND, report_id).await?;
+    let ticket: ReadEvaluationTicket = need_record(session, ctx, TICKET_KIND, report_id).await?;
     let formal: FormalEvaluationV2 = need_record(session, ctx, FORMAL_KIND, report_id).await?;
     validate_status_closure(session, ctx, &ticket, Some(&formal)).await?;
     let revoke_watermark = session.watermark(ctx).await?;
@@ -2761,10 +3335,10 @@ async fn verified_report_view_core(
         view.ineligibility_reasons
             .retain(|reason| reason != "program_fixture_not_production_authority");
         if variant == VerifiedReportVariant::CompleteBatch {
-            let candidate: crate::release_store::ReleaseCandidateRecord = session
+            let candidate: crate::release_store::ReadCandidate = session
                 .need(ctx, "artifact", &ticket.candidate_digest)
                 .await?;
-            let authority = crate::formal_authority::verify_issued_authority(
+            let authority = crate::formal_authority::verify_read_issued_authority(
                 session, ctx, report_id, &candidate,
             )
             .await?;
@@ -2778,13 +3352,34 @@ async fn verified_report_view_core(
                 .retain(|reason| reason == "formal_verdict_not_approvable");
         }
     }
-    Ok(view)
+    let state = if ticket.schema_version == ReadEvaluationTicket::SCHEMA {
+        evo_storage::PersistentContractState::Legacy
+    } else {
+        evo_storage::PersistentContractState::CurrentVerified
+    };
+    Ok(VerifiedFormalReportReadV1 {
+        state,
+        original: view,
+    })
 }
 
-async fn validate_status_closure(
+// Keep the same validation body and borrowed Session on the caller's task.
+// The box owns only the future; the original caller still owns the Session.
+fn validate_status_closure<'a>(
+    session: &'a mut Session,
+    ctx: &'a Context,
+    ticket: &'a ReadEvaluationTicket,
+    formal: Option<&'a FormalEvaluationV2>,
+) -> crate::optimization::StepFuture<'a, ()> {
+    Box::pin(validate_status_closure_unboxed(
+        session, ctx, ticket, formal,
+    ))
+}
+
+async fn validate_status_closure_unboxed(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     formal: Option<&FormalEvaluationV2>,
 ) -> Result<()> {
     ticket.validate()?;
@@ -3127,12 +3722,16 @@ async fn validate_status_closure(
 }
 
 fn derive_complete_report(
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     control: &RegisteredEvaluationControl,
     rows: &[ClusterObservation],
     cost_ratio: f64,
     p95_ratio: f64,
 ) -> Result<BernsteinReport> {
+    // This is only the unchanged numeric configuration calculation. The full
+    // v3 source pin is authenticated in the same-Session complete/status gates
+    // before a report can be written; this legacy digest cannot replace it.
+    ticket.validate()?;
     let alpha = control.alpha_plan.allocation(
         &control.fixed_sample_claim_id,
         &control.attempt_id,
@@ -3160,11 +3759,13 @@ fn derive_complete_report(
 async fn recompute_bound_complete_report_in_session(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     control: &RegisteredEvaluationControl,
     holdout: &ProtectedHoldoutRecord,
     calls: &[BudgetCallRecord],
 ) -> Result<BernsteinReportWire> {
+    ticket.validate()?;
+    validate_candidate_binding_in_session(session, ctx, ticket, control, holdout).await?;
     let changed = || Error::Conflict(STATISTICS_CHANGED.into());
     let planned_n = usize::try_from(ticket.n_planned).map_err(|_| changed())?;
     if ticket.candidate_dependency_binding.is_none()
@@ -3351,7 +3952,7 @@ async fn recompute_bound_complete_report_in_session(
 async fn validate_completed_target_evidence(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     control: &RegisteredEvaluationControl,
     holdout: &ProtectedHoldoutRecord,
     target: &EvaluationTarget,
@@ -3452,7 +4053,7 @@ const EARLY_CERTIFICATE_CHANGED: &str = "formal_early_stop_certificate_changed";
 async fn validate_bound_early_certificate_in_session(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     control: &RegisteredEvaluationControl,
     holdout: &ProtectedHoldoutRecord,
     certificate: &EarlyStopCertificate,
@@ -3467,6 +4068,7 @@ async fn validate_bound_early_certificate_in_session(
     ticket.validate()?;
     control.validate()?;
     holdout.validate_against(control)?;
+    validate_candidate_binding_in_session(session, ctx, ticket, control, holdout).await?;
     let pending = ticket.pending_certificate.as_ref().ok_or_else(changed)?;
     let mut bound_plan = control.v1_plan_snapshot.clone();
     bound_plan.bind_candidate(ticket.candidate_digest.clone())?;
@@ -3840,7 +4442,7 @@ async fn validate_bound_early_certificate_in_session(
     Ok(())
 }
 
-fn anchor_evidence_digest(ticket: &EvaluationTicketV2) -> Result<String> {
+fn anchor_evidence_digest(ticket: &ReadEvaluationTicket) -> Result<String> {
     fingerprint(
         &ticket
             .targets
@@ -3900,8 +4502,9 @@ pub(crate) fn validate_content_envelope(id: &str, body: &Value) -> Result<()> {
             (v.id, v.schema_version)
         }
         TICKET_KIND => {
-            let v: EvaluationTicketV2 =
+            let v: ReadEvaluationTicket =
                 serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
+            v.validate()?;
             (v.id, v.schema_version)
         }
         FORMAL_KIND => {
@@ -3967,7 +4570,7 @@ pub(crate) fn validate_content_envelope(id: &str, body: &Value) -> Result<()> {
             RegisteredEvaluationControl::SCHEMA | RegisteredEvaluationControl::SCHEMA_V1
         ),
         HOLDOUT_KIND => schema == ProtectedHoldoutRecord::SCHEMA,
-        TICKET_KIND => schema == EvaluationTicketV2::SCHEMA,
+        TICKET_KIND => ReadEvaluationTicket::supports_schema(&schema),
         EXECUTION_RECEIPT_KIND => schema == "rsia.execution_receipt.v2",
         GRADER_RECEIPT_KIND => schema == "rsia.independent_grader_receipt.v2",
         OUTPUT_KIND => schema == "rsia.execution_output.v1",
@@ -3992,6 +4595,23 @@ async fn get_record<T: DeserializeOwned>(
     id: &str,
 ) -> Result<Option<T>> {
     let storage_id = storage_id(record_kind, id)?;
+    if record_kind == TICKET_KIND {
+        // Decode the stored ticket directly: a Value round-trip would erase
+        // duplicate source_plan_binding keys before the strict wire sees them.
+        let envelope: Option<TypedArtifactEnvelope<T>> =
+            session.get(ctx, "artifact", &storage_id).await?;
+        return match envelope {
+            Some(envelope)
+                if envelope.schema_version == ENVELOPE_SCHEMA
+                    && envelope.id == storage_id
+                    && envelope.record_kind == record_kind =>
+            {
+                Ok(Some(envelope.payload))
+            }
+            Some(_) => Err(Error::Conflict("typed artifact envelope mismatch".into())),
+            None => Ok(None),
+        };
+    }
     let raw = session.get::<Value>(ctx, "artifact", &storage_id).await?;
     if let Some(body) = &raw {
         if !body.is_object() || !body.get("payload").is_some_and(Value::is_object) {
@@ -4145,7 +4765,10 @@ fn validate_node_shape(nodes: &[FormalDependencyNode]) -> Result<()> {
         }
         match (&node.record_kind, node.schema_version.as_str()) {
             (None, "rsia.optimization.source.v1") if node.kind == "run" => {}
-            (None, RELEASE_CANDIDATE_SCHEMA) if node.kind == "artifact" => {}
+            (
+                None,
+                RELEASE_CANDIDATE_SCHEMA | crate::release_store::RELEASE_CANDIDATE_SCHEMA_V2,
+            ) if node.kind == "artifact" => {}
             (None, schema)
                 if crate::formal_authority::compiler_dependency_schema(&node.kind, schema) => {}
             (Some(kind), ENVELOPE_SCHEMA)
@@ -4222,7 +4845,10 @@ impl FormalCandidateDependencyBinding {
         if !self.nodes.iter().any(|node| {
             node.kind == "artifact"
                 && node.id == self.candidate_id
-                && node.schema_version == RELEASE_CANDIDATE_SCHEMA
+                && matches!(
+                    node.schema_version.as_str(),
+                    RELEASE_CANDIDATE_SCHEMA | crate::release_store::RELEASE_CANDIDATE_SCHEMA_V2
+                )
                 && node.content_digest == self.candidate_record_digest
         }) || self.sources.iter().any(|source| {
             !self
@@ -4297,7 +4923,7 @@ fn dependency_record_schema(kind: &str) -> Option<&'static str> {
     match kind {
         CONTROL_KIND => Some(RegisteredEvaluationControl::SCHEMA),
         HOLDOUT_KIND => Some(ProtectedHoldoutRecord::SCHEMA),
-        TICKET_KIND => Some(EvaluationTicketV2::SCHEMA),
+        TICKET_KIND => Some(ReadEvaluationTicket::SCHEMA),
         TICKET_RECEIPT_KIND => Some("rsia.evaluation_ticket_issue_receipt.v1"),
         ALPHA_USE_KIND => Some("rsia.alpha_claim_reservation.v1"),
         EXECUTION_RECEIPT_KIND => Some("rsia.execution_receipt.v2"),
@@ -4497,14 +5123,17 @@ async fn dependency_node_identity(
     if kind != "artifact" {
         return Err(Error::Invalid("unsupported formal dependency kind".into()));
     }
-    if schema == RELEASE_CANDIDATE_SCHEMA {
-        let candidate: ReleaseCandidateRecord = session.need(ctx, kind, id).await?;
+    if matches!(
+        schema,
+        RELEASE_CANDIDATE_SCHEMA | crate::release_store::RELEASE_CANDIDATE_SCHEMA_V2
+    ) {
+        let candidate: ReadCandidate = session.need(ctx, kind, id).await?;
         if candidate.id != id {
             return Err(Error::Conflict(
                 "candidate physical identity differs".into(),
             ));
         }
-        validate_candidate_read_in_session(session, ctx, &candidate).await?;
+        validate_read_candidate_in_session(session, ctx, &candidate).await?;
         return Ok((schema.into(), None, id.into(), fingerprint(&candidate)?));
     }
     if schema != ENVELOPE_SCHEMA {
@@ -4522,6 +5151,7 @@ async fn dependency_node_identity(
     if actual_schema != Some(expected_schema)
         && !(record_kind == CONTROL_KIND
             && actual_schema == Some(RegisteredEvaluationControl::SCHEMA_V1))
+        && !(record_kind == TICKET_KIND && actual_schema == Some(ReadEvaluationTicket::SCHEMA_V3))
     {
         return Err(Error::Invalid(
             "unsupported formal dependency inner schema".into(),
@@ -4582,11 +5212,17 @@ async fn dependency_node_identity(
             .await?
         }
         TICKET_KIND => {
-            let ticket: EvaluationTicketV2 =
+            let ticket: ReadEvaluationTicket =
                 need_record(session, ctx, TICKET_KIND, &logical_id).await?;
             ticket.validate()?;
-            typed_node_fingerprint::<EvaluationTicketV2>(session, ctx, id, record_kind, &logical_id)
-                .await?
+            typed_node_fingerprint::<ReadEvaluationTicket>(
+                session,
+                ctx,
+                id,
+                record_kind,
+                &logical_id,
+            )
+            .await?
         }
         TICKET_RECEIPT_KIND => {
             typed_node_fingerprint::<TicketIssueReceipt>(session, ctx, id, record_kind, &logical_id)
@@ -4738,7 +5374,7 @@ async fn collect_dependency_nodes(
 }
 
 fn candidate_matches_frozen(
-    candidate: &ReleaseCandidateRecord,
+    candidate: &ReadCandidate,
     control: &RegisteredEvaluationControl,
     holdout: &ProtectedHoldoutRecord,
 ) -> Result<()> {
@@ -4755,20 +5391,148 @@ fn candidate_matches_frozen(
     Ok(())
 }
 
-async fn bind_candidate_in_session(
+#[derive(Serialize)]
+struct TicketIdentityV3<'a> {
+    domain: &'static str,
+    schema_version: &'static str,
+    namespace: &'a str,
+    logical_ticket_id: &'a str,
+    registration_id: &'a str,
+    registration_digest: String,
+    holdout_id: &'a str,
+    holdout_record_digest: String,
+    manifest_digest: String,
+    source_plan_binding: &'a TicketSourcePlanBinding,
+    evaluator_actor: &'a str,
+    issued_at_unix_seconds: i64,
+}
+
+impl TicketIdentityV3<'_> {
+    fn content_id(&self) -> Result<String> {
+        Ok(format!("evaluation-ticket-v3-{}", fingerprint(self)?))
+    }
+}
+
+fn source_bound_ticket_id(
+    namespace: &str,
+    control: &RegisteredEvaluationControl,
+    holdout: &ProtectedHoldoutRecord,
+    binding: &TicketSourcePlanBinding,
+    issued_at_unix_seconds: i64,
+) -> Result<String> {
+    binding.validate()?;
+    if binding.namespace != namespace {
+        return Err(Error::Conflict(
+            "ticket source-plan namespace mismatch".into(),
+        ));
+    }
+    TicketIdentityV3 {
+        domain: "rsia.evaluation_ticket.identity.v3",
+        schema_version: ReadEvaluationTicket::SCHEMA_V3,
+        namespace,
+        logical_ticket_id: &binding.logical_ticket_id,
+        registration_id: &control.id,
+        registration_digest: control.digest()?,
+        holdout_id: &holdout.id,
+        holdout_record_digest: fingerprint(holdout)?,
+        manifest_digest: holdout.manifest.digest()?,
+        source_plan_binding: binding,
+        evaluator_actor: &control.evaluator_actor,
+        issued_at_unix_seconds,
+    }
+    .content_id()
+}
+
+// The only production callers have just authenticated this complete loaded
+// ReadCandidate through bind_candidate_record_in_session. This helper performs
+// content math, not source authorization, and retains no raw candidate bytes.
+fn source_plan_binding_from_candidate(
+    namespace: &str,
+    logical_ticket_id: &str,
+    control: &RegisteredEvaluationControl,
+    candidate: &ReadCandidate,
+) -> Result<TicketSourcePlanBinding> {
+    candidate.current()?;
+    let plan = ExperimentPlanV2::from_typed_candidate(
+        &control.v1_plan_snapshot,
+        &candidate.id,
+        candidate,
+    )?;
+    let plan_digest = plan.digest_against(&candidate.id, candidate)?;
+    let binding = TicketSourcePlanBinding {
+        schema_version: TicketSourcePlanBinding::SCHEMA.into(),
+        namespace: namespace.into(),
+        logical_ticket_id: logical_ticket_id.into(),
+        plan_id: plan.id,
+        plan_digest,
+        candidate_record_digest: plan.candidate_record_digest,
+    };
+    binding.validate()?;
+    Ok(binding)
+}
+
+fn validate_source_plan_binding_from_candidate(
+    namespace: &str,
+    ticket: &ReadEvaluationTicket,
+    control: &RegisteredEvaluationControl,
+    holdout: &ProtectedHoldoutRecord,
+    candidate: &ReadCandidate,
+) -> Result<()> {
+    ticket.validate_source_plan_binding_shape()?;
+    let Some(stored) = &ticket.source_plan_binding else {
+        return Ok(()); // The old v2 byte interpretation remains historical.
+    };
+    let actual = source_plan_binding_from_candidate(
+        namespace,
+        &stored.logical_ticket_id,
+        control,
+        candidate,
+    )?;
+    if stored != &actual
+        || ticket.id
+            != source_bound_ticket_id(
+                namespace,
+                control,
+                holdout,
+                &actual,
+                ticket.issued_at_unix_seconds,
+            )?
+    {
+        return Err(Error::Conflict(
+            "ticket source-plan original changed".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn bind_candidate_record_in_session(
     session: &mut Session,
     ctx: &Context,
     control: &RegisteredEvaluationControl,
     holdout: &ProtectedHoldoutRecord,
-) -> Result<Option<FormalCandidateDependencyBinding>> {
+) -> Result<Option<(ReadCandidate, FormalCandidateDependencyBinding)>> {
     // Presence is decided once at issue, never by a subsequent read of an old
     // unbound ticket. A malformed present candidate cannot become legacy None.
     let Some(candidate) = session
-        .get::<ReleaseCandidateRecord>(ctx, "artifact", &holdout.pair.candidate_digest)
+        .get::<ReadCandidate>(ctx, "artifact", &holdout.pair.candidate_digest)
         .await?
     else {
         return Ok(None);
     };
+    candidate.current()?;
+    Ok(Some(
+        rebuild_candidate_binding_in_session(session, ctx, control, holdout, candidate).await?,
+    ))
+}
+
+async fn rebuild_candidate_binding_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    control: &RegisteredEvaluationControl,
+    holdout: &ProtectedHoldoutRecord,
+    candidate: ReadCandidate,
+) -> Result<(ReadCandidate, FormalCandidateDependencyBinding)> {
+    candidate.validate_content()?;
     candidate_matches_frozen(&candidate, control, holdout)?;
     // Tombstones are checked before watermark/body/edge traversal, including
     // begin_revoke where the source body and all dependent objects still exist.
@@ -4780,7 +5544,7 @@ async fn bind_candidate_in_session(
             return Err(Error::Forbidden);
         }
     }
-    validate_candidate_read_in_session(session, ctx, &candidate).await?;
+    validate_read_candidate_in_session(session, ctx, &candidate).await?;
     let watermark = session
         .watermark(ctx)
         .await?
@@ -4809,17 +5573,33 @@ async fn bind_candidate_in_session(
         sources: candidate.sources.clone(),
         revoke_watermark_seq: watermark.0,
         revoke_watermark_digest: watermark.1,
-        nodes: collect_dependency_nodes(session, ctx, vec![("artifact".into(), candidate.id)])
-            .await?,
+        nodes: collect_dependency_nodes(
+            session,
+            ctx,
+            vec![("artifact".into(), candidate.id.clone())],
+        )
+        .await?,
     };
     binding.validate()?;
-    Ok(Some(binding))
+    Ok((candidate, binding))
+}
+
+fn validate_ticket_candidate_versions(
+    ticket: &ReadEvaluationTicket,
+    candidate: &ReadCandidate,
+) -> Result<()> {
+    match (ticket.schema_version.as_str(), candidate.is_current()) {
+        (ReadEvaluationTicket::SCHEMA, false) | (ReadEvaluationTicket::SCHEMA_V3, true) => Ok(()),
+        _ => Err(Error::Conflict(
+            "ticket/candidate versions do not form a supported pair".into(),
+        )),
+    }
 }
 
 async fn validate_candidate_binding_in_session(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     control: &RegisteredEvaluationControl,
     holdout: &ProtectedHoldoutRecord,
 ) -> Result<()> {
@@ -4827,13 +5607,13 @@ async fn validate_candidate_binding_in_session(
         return Ok(());
     };
     binding.validate()?;
-    let candidate: ReleaseCandidateRecord =
-        session.need(ctx, "artifact", &binding.candidate_id).await?;
+    let candidate: ReadCandidate = session.need(ctx, "artifact", &binding.candidate_id).await?;
     // Full immutable pin FIRST: stripping S2 while keeping its edges, watermark
     // and bundle cannot silently change the frozen source set or its authority.
     if fingerprint(&candidate)? != binding.candidate_record_digest {
         return Err(Error::Conflict(CANDIDATE_CHANGED.into()));
     }
+    validate_ticket_candidate_versions(ticket, &candidate)?;
     for source in &binding.sources {
         if judge_dependency(ctx, session, &source.kind, &source.id)
             .await?
@@ -4851,10 +5631,18 @@ async fn validate_candidate_binding_in_session(
     {
         return Err(Error::Conflict(CANDIDATE_CHANGED.into()));
     }
-    let current = bind_candidate_in_session(session, ctx, control, holdout).await?;
-    if current.as_ref() != Some(binding) {
+    let current =
+        rebuild_candidate_binding_in_session(session, ctx, control, holdout, candidate).await?;
+    if &current.1 != binding {
         return Err(Error::Conflict(CANDIDATE_CHANGED.into()));
     }
+    validate_source_plan_binding_from_candidate(
+        ctx.namespace(),
+        ticket,
+        control,
+        holdout,
+        &current.0,
+    )?;
     Ok(())
 }
 
@@ -4884,7 +5672,7 @@ fn artifact_edge(kind: &str, logical_id: &str) -> Result<(String, String)> {
 async fn bound_complete_report_edges(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     control: &RegisteredEvaluationControl,
 ) -> Result<Vec<(String, String)>> {
     let mut edges = vec![
@@ -4942,7 +5730,7 @@ async fn require_exact_fact_edges(
 async fn required_ticket_edges(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     control: &RegisteredEvaluationControl,
 ) -> Result<Vec<(String, String)>> {
     let mut edges = vec![
@@ -5013,7 +5801,7 @@ async fn required_ticket_edges(
 async fn validate_bound_fact_edges(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     control: &RegisteredEvaluationControl,
 ) -> Result<()> {
     if ticket.candidate_dependency_binding.is_none() {
@@ -5097,7 +5885,7 @@ async fn validate_bound_fact_edges(
 async fn bind_stored_facts_in_session(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
 ) -> Result<Option<FormalStoredDependencyBinding>> {
     let Some(candidate) = &ticket.candidate_dependency_binding else {
         return Ok(None);
@@ -5255,7 +6043,7 @@ fn historical_typed_payload<T: DeserializeOwned>(
 }
 
 fn validate_execution_history_binding(
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     receipt: &ExecutionReceiptV2,
 ) -> Result<()> {
     let target = ticket
@@ -5284,7 +6072,7 @@ fn validate_execution_history_binding(
 
 fn execution_call_matches(
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     receipt: &ExecutionReceiptV2,
     call: &BudgetCallRecord,
 ) -> bool {
@@ -5319,7 +6107,7 @@ async fn execution_receipt_billing_scope(
         )
         .await?
         .ok_or_else(execution_receipt_history_conflict)?;
-    let ticket: EvaluationTicketV2 =
+    let ticket: ReadEvaluationTicket =
         historical_typed_payload(&row, TICKET_KIND, &receipt.ticket_id)?;
     ticket
         .validate()
@@ -5395,7 +6183,7 @@ async fn execution_receipt_billing_scope(
 async fn require_unreceipted_execution_call(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     receipt: &ExecutionReceiptV2,
 ) -> Result<()> {
     validate_execution_history_binding(ticket, receipt)?;
@@ -5403,7 +6191,7 @@ async fn require_unreceipted_execution_call(
         .object_row(ctx, "artifact", &storage_id(TICKET_KIND, &ticket.id)?)
         .await?
         .ok_or_else(execution_receipt_history_conflict)?;
-    let stored_ticket: EvaluationTicketV2 =
+    let stored_ticket: ReadEvaluationTicket =
         historical_typed_payload(&ticket_row, TICKET_KIND, &ticket.id)?;
     if ticket_row.owner != ticket.evaluator_actor
         || stored_ticket.id != ticket.id
@@ -5515,7 +6303,7 @@ async fn require_unreceipted_execution_call(
 async fn control_billing_scope(
     store: &Store,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
 ) -> Result<String> {
     let control: RegisteredEvaluationControl =
         load(store, ctx, CONTROL_KIND, &ticket.registration_id).await?;
@@ -5738,7 +6526,7 @@ fn parse_strict_json(value: &str) -> Result<StrictJsonValue> {
 }
 
 fn request_digest(
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     target: &EvaluationTarget,
     side: ExecutionSide,
     bundle_digest: &str,
@@ -5757,7 +6545,7 @@ fn request_digest(
 }
 
 fn broker_view(
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     target_id: &str,
     side: ExecutionSide,
 ) -> Result<BrokerTaskView> {
@@ -5921,7 +6709,7 @@ fn set_running_receipt(
 }
 
 fn validate_execution_pair(
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     target_id: &str,
     candidate: &ExecutionReceiptV2,
     baseline: &ExecutionReceiptV2,
@@ -5989,7 +6777,7 @@ async fn audit_late_grading_error(
 /// report. Any CompleteBatch or Invalid target qualifies; for EarlyStopped
 /// only a target the stop had already scored, as the AG-091 path keeps a
 /// later result for an unscored target on the ticket and re-derives its report.
-fn late_grading_after_final_report(ticket: &EvaluationTicketV2, target_id: &str) -> Result<bool> {
+fn late_grading_after_final_report(ticket: &ReadEvaluationTicket, target_id: &str) -> Result<bool> {
     Ok(match ticket.lifecycle {
         TicketLifecycle::CompleteBatch | TicketLifecycle::Invalid => true,
         TicketLifecycle::EarlyStopped => matches!(
@@ -6000,14 +6788,14 @@ fn late_grading_after_final_report(ticket: &EvaluationTicketV2, target_id: &str)
     })
 }
 
-fn rotating_complete(ticket: &EvaluationTicketV2) -> bool {
+fn rotating_complete(ticket: &ReadEvaluationTicket) -> bool {
     ticket.targets.iter().all(|target| {
         !matches!(target.kind, EvaluationTargetKind::Rotating { .. })
             || matches!(target.state, TargetState::Completed { .. })
     })
 }
 
-fn anchors_passed(ticket: &EvaluationTicketV2) -> bool {
+fn anchors_passed(ticket: &ReadEvaluationTicket) -> bool {
     ticket
         .targets
         .iter()
@@ -6021,7 +6809,7 @@ fn anchors_passed(ticket: &EvaluationTicketV2) -> bool {
 }
 
 fn rebuild_stream(
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     plan: &EarlyStopPlan,
     alpha: &ResearchFamilyAlphaPlan,
 ) -> Result<(EarlyStopDecision, SequentialRejectOnly)> {
@@ -6062,7 +6850,7 @@ fn rebuild_stream(
 async fn mark_exposure_dispatched_if_needed(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     at_unix_seconds: i64,
 ) -> Result<()> {
     let at_unix_ms = at_unix_seconds
@@ -6097,7 +6885,7 @@ async fn mark_exposure_dispatched_if_needed(
 async fn mark_feedback_used_if_needed(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     at_unix_seconds: i64,
 ) -> Result<()> {
     let at_unix_ms = at_unix_seconds
@@ -6136,7 +6924,7 @@ async fn mark_feedback_used_if_needed(
 async fn settle_exposure_money(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     usage_uncertain: bool,
 ) -> Result<()> {
     let mut ledger: ExposureLedger =
@@ -6197,7 +6985,7 @@ async fn close_execution_slots(
     session: &mut Session,
     ctx: &Context,
     control: &RegisteredEvaluationControl,
-    ticket: &mut EvaluationTicketV2,
+    ticket: &mut ReadEvaluationTicket,
     reason: &str,
     now: i64,
 ) -> Result<bool> {
@@ -6382,7 +7170,7 @@ async fn stop_ticket(
     session: &mut Session,
     ctx: &Context,
     control: &RegisteredEvaluationControl,
-    ticket: &mut EvaluationTicketV2,
+    ticket: &mut ReadEvaluationTicket,
     decision: EarlyStopDecision,
     issuer: &IndependentGraderReceiptV2,
     now: i64,
@@ -6453,7 +7241,7 @@ async fn invalidate_in_session(
     session: &mut Session,
     ctx: &Context,
     control: &RegisteredEvaluationControl,
-    ticket: &mut EvaluationTicketV2,
+    ticket: &mut ReadEvaluationTicket,
     reason: &str,
     now: i64,
 ) -> Result<FormalEvaluationV2> {
@@ -6489,7 +7277,7 @@ async fn load_slice_id(session: &mut Session, ctx: &Context, holdout_id: &str) -
 async fn maybe_store_early_formal(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
 ) -> Result<()> {
     if ticket.lifecycle == TicketLifecycle::EarlyStopped {
         let certificate = ticket
@@ -6702,8 +7490,13 @@ fn ga18_node_identity(
     if crate::formal_authority::compiler_dependency_schema(kind, schema) {
         return Ok((schema.into(), None, id.into(), fingerprint(value)?));
     }
-    if kind == "artifact" && schema == RELEASE_CANDIDATE_SCHEMA {
-        let candidate: ReleaseCandidateRecord =
+    if kind == "artifact"
+        && matches!(
+            schema,
+            RELEASE_CANDIDATE_SCHEMA | crate::release_store::RELEASE_CANDIDATE_SCHEMA_V2
+        )
+    {
+        let candidate: ReadCandidate =
             serde_json::from_value(value.clone()).map_err(|_| ga18_cycle_error())?;
         return Ok((schema.into(), None, id.into(), fingerprint(&candidate)?));
     }
@@ -6719,6 +7512,7 @@ fn ga18_node_identity(
     if actual_schema != Some(expected_schema)
         && !(record_kind == CONTROL_KIND
             && actual_schema == Some(RegisteredEvaluationControl::SCHEMA_V1))
+        && !(record_kind == TICKET_KIND && actual_schema == Some(EvaluationTicketV3::SCHEMA))
     {
         return Err(ga18_cycle_error());
     }
@@ -6745,7 +7539,7 @@ fn ga18_node_identity(
     let content = match record_kind {
         CONTROL_KIND => typed::<RegisteredEvaluationControl>(value)?,
         HOLDOUT_KIND => typed::<ProtectedHoldoutRecord>(value)?,
-        TICKET_KIND => typed::<EvaluationTicketV2>(value)?,
+        TICKET_KIND => typed::<ReadEvaluationTicket>(value)?,
         TICKET_RECEIPT_KIND => typed::<TicketIssueReceipt>(value)?,
         ALPHA_USE_KIND => typed::<AlphaClaimReservation>(value)?,
         EXECUTION_RECEIPT_KIND => typed::<ExecutionReceiptV2>(value)?,
@@ -6765,7 +7559,7 @@ fn ga18_node_identity(
 async fn ga18_candidate_binding(
     session: &mut Session,
     ctx: &Context,
-    ticket: &EvaluationTicketV2,
+    ticket: &ReadEvaluationTicket,
     control: &RegisteredEvaluationControl,
     holdout: &ProtectedHoldoutRecord,
     bodies: &BTreeMap<Ga18Key, Value>,
@@ -6777,15 +7571,16 @@ async fn ga18_candidate_binding(
         .ok_or_else(ga18_cycle_error)?;
     binding.validate()?;
     let candidate_key = ("artifact".into(), ticket.candidate_digest.clone());
-    let candidate: ReleaseCandidateRecord = serde_json::from_value(
+    let candidate: ReadCandidate = serde_json::from_value(
         bodies
             .get(&candidate_key)
             .ok_or_else(ga18_cycle_error)?
             .clone(),
     )
     .map_err(|_| ga18_cycle_error())?;
+    validate_ticket_candidate_versions(ticket, &candidate).map_err(|_| ga18_cycle_error())?;
     candidate_matches_frozen(&candidate, control, holdout)?;
-    validate_candidate_read_in_session(session, ctx, &candidate).await?;
+    validate_read_candidate_in_session(session, ctx, &candidate).await?;
     let watermark = session.watermark(ctx).await?.ok_or_else(ga18_cycle_error)?;
     let direct = outgoing.get(&candidate_key).cloned().unwrap_or_default();
     for source in &candidate.sources {
@@ -6853,7 +7648,7 @@ async fn ga18_execution(
     ctx: &Context,
     bodies: &BTreeMap<Ga18Key, Value>,
     outgoing: &BTreeMap<Ga18Key, Vec<Ga18Key>>,
-    binding: (&EvaluationTicketV2, &RegisteredEvaluationControl),
+    binding: (&ReadEvaluationTicket, &RegisteredEvaluationControl),
     id: &str,
     side: ExecutionSide,
 ) -> Result<ExecutionReceiptV2> {
@@ -6962,7 +7757,7 @@ pub(crate) async fn ga18_qualified_cycle_edges(
             .as_str()
             .ok_or_else(ga18_cycle_error)?
             .to_owned();
-        let ticket: EvaluationTicketV2 =
+        let ticket: ReadEvaluationTicket =
             ga18_owned_record(session, ctx, bodies, TICKET_KIND, &ticket_id, &evaluator).await?;
         ticket.validate()?;
         let control: RegisteredEvaluationControl = ga18_owned_record(
@@ -7281,5 +8076,206 @@ mod complete_verdict_tests {
             postprocess_complete_report("unknown", ProfileKind::QualityGain, report),
             Err(Error::Invalid(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod source_plan_ticket_tests {
+    use super::*;
+
+    // Wire/identity data controls only. These do not construct an authenticated
+    // external host, source, Owner, approval, or same-Session business fixture.
+    const LEGACY_V2: &str = concat!(
+        "{\"schema_version\":\"rsia.evaluation_ticket.v2\",\"id\":\"legacy-ticket\",",
+        "\"registration_id\":\"registration\",\"registration_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+        "\"holdout_id\":\"holdout\",\"manifest_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+        "\"v1_plan_snapshot_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+        "\"bound_v1_plan_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+        "\"formal_plan_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+        "\"profile\":\"quality_gain\",\"n_planned\":2,\"research_family_id\":\"family\",",
+        "\"alpha_plan_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+        "\"candidate_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+        "\"baseline_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+        "\"candidate_bundle_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+        "\"baseline_bundle_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+        "\"environment_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+        "\"proposer_actor\":\"proposer\",\"evaluator_actor\":\"evaluator\",\"executor_actor\":\"executor\",\"approver_actor\":\"approver\",",
+        "\"issue_receipt_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+        "\"evidence_scope\":\"program_fixture\",\"attempt_id\":\"attempt\",",
+        "\"targets\":[{\"target_id\":\"target\",\"kind\":{\"kind\":\"rotating\",\"cluster_id\":\"cluster\"},",
+        "\"input_artifact_id\":\"input\",\"input_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"state\":{\"state\":\"planned\"}}],",
+        "\"lifecycle\":\"reserved\",\"next_sequence\":1,\"pending_certificate\":null,\"stop_member_terminal_digest\":null,",
+        "\"late_execution_receipt_ids\":[],\"late_grader_receipt_ids\":[],\"unattributed_budget_call_ids\":[],\"invalid_reasons\":[],\"issued_at_unix_seconds\":1}"
+    );
+
+    fn current_wire_data() -> ReadEvaluationTicket {
+        let mut ticket: ReadEvaluationTicket = serde_json::from_str(LEGACY_V2).unwrap();
+        let candidate_digest = hash(b"Complete candidate content data original.");
+        let source_id = "source-run".to_string();
+        let empty_edges = fingerprint(&Vec::<(String, String)>::new()).unwrap();
+        let source = TypedSourceRef {
+            kind: "run".into(),
+            id: source_id.clone(),
+            content_digest: hash(b"Complete source raw data original."),
+        };
+        ticket.candidate_dependency_binding = Some(FormalCandidateDependencyBinding {
+            schema_version: CANDIDATE_BINDING_SCHEMA.into(),
+            namespace: "ns".into(),
+            candidate_id: ticket.candidate_digest.clone(),
+            candidate_record_digest: candidate_digest.clone(),
+            bundle_digest: ticket.candidate_bundle_digest.clone(),
+            parent_digest: ticket.baseline_digest.clone(),
+            profile_id: "profile".into(),
+            environment_digest: ticket.environment_digest.clone(),
+            proposer_actor: ticket.proposer_actor.clone(),
+            sources: vec![source.clone()],
+            revoke_watermark_seq: 0,
+            revoke_watermark_digest: hash(b"Complete watermark data original."),
+            nodes: vec![
+                FormalDependencyNode {
+                    kind: "artifact".into(),
+                    id: ticket.candidate_digest.clone(),
+                    schema_version: crate::release_store::RELEASE_CANDIDATE_SCHEMA_V2.into(),
+                    record_kind: None,
+                    logical_id: ticket.candidate_digest.clone(),
+                    content_digest: candidate_digest.clone(),
+                    outgoing_edge_digest: fingerprint(&vec![("run", &source_id)]).unwrap(),
+                    outgoing_edge_count: 1,
+                },
+                FormalDependencyNode {
+                    kind: "run".into(),
+                    id: source_id.clone(),
+                    schema_version: "rsia.optimization.source.v1".into(),
+                    record_kind: None,
+                    logical_id: source_id,
+                    content_digest: source.content_digest,
+                    outgoing_edge_digest: empty_edges,
+                    outgoing_edge_count: 0,
+                },
+            ],
+        });
+        ticket.schema_version = ReadEvaluationTicket::SCHEMA_V3.into();
+        ticket.source_plan_binding = Some(TicketSourcePlanBinding {
+            schema_version: TicketSourcePlanBinding::SCHEMA.into(),
+            namespace: "ns".into(),
+            logical_ticket_id: "logical-ticket".into(),
+            plan_id: "plan-content-identity".into(),
+            plan_digest: hash(b"Complete frozen plan content data original."),
+            candidate_record_digest: candidate_digest,
+        });
+        ticket
+    }
+
+    #[test]
+    fn legacy_v2_ticket_keeps_exact_wire_without_a_source_plan_field() {
+        let ticket: ReadEvaluationTicket = serde_json::from_str(LEGACY_V2).unwrap();
+        ticket.validate().unwrap();
+        assert!(ticket.source_plan_binding.is_none());
+        assert_eq!(serde_json::to_string(&ticket).unwrap(), LEGACY_V2);
+    }
+
+    #[test]
+    fn source_plan_wire_rejects_null_missing_duplicate_and_version_mismatch() {
+        let ticket = current_wire_data();
+        ticket.validate().unwrap();
+        let raw = serde_json::to_string(&ticket).unwrap();
+        serde_json::from_str::<ReadEvaluationTicket>(&raw)
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert!(!raw.contains("candidate_record_utf8"));
+        let mut value = serde_json::to_value(&ticket).unwrap();
+        value["source_plan_binding"] = Value::Null;
+        assert!(serde_json::from_value::<ReadEvaluationTicket>(value).is_err());
+        let mut missing = serde_json::to_value(&ticket).unwrap();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("source_plan_binding");
+        assert!(serde_json::from_value::<ReadEvaluationTicket>(missing).is_err());
+        let mut wrong_version = serde_json::to_value(&ticket).unwrap();
+        wrong_version["schema_version"] = serde_json::json!(EvaluationTicketV2::SCHEMA);
+        assert!(serde_json::from_value::<ReadEvaluationTicket>(wrong_version).is_err());
+        let duplicate = format!(
+            "{},\"source_plan_binding\":{}}}",
+            raw.strip_suffix('}').unwrap(),
+            serde_json::to_string(ticket.source_plan_binding.as_ref().unwrap()).unwrap(),
+        );
+        assert!(serde_json::from_str::<ReadEvaluationTicket>(&duplicate).is_err());
+        let mut missing_candidate = ticket.clone();
+        missing_candidate.candidate_dependency_binding = None;
+        assert!(
+            matches!(missing_candidate.validate(), Err(Error::Invalid(message))
+            if message == "v3 ticket requires candidate dependency binding")
+        );
+    }
+
+    #[test]
+    fn another_legal_candidate_pin_cannot_replace_the_bound_record_pin() {
+        let ticket = current_wire_data();
+        ticket.validate().unwrap();
+        let original = serde_json::to_vec(&ticket).unwrap();
+        let mut changed = ticket.clone();
+        changed
+            .source_plan_binding
+            .as_mut()
+            .unwrap()
+            .candidate_record_digest = hash(b"Another complete candidate content data original.");
+        changed
+            .source_plan_binding
+            .as_ref()
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert!(matches!(changed.validate(), Err(Error::Conflict(message))
+            if message == "ticket source-plan candidate digest mismatch"));
+        assert_eq!(serde_json::to_vec(&ticket).unwrap(), original);
+    }
+
+    #[test]
+    fn v3_identity_includes_frozen_input_pins_and_issuance_facts() {
+        let ticket = current_wire_data();
+        ticket.validate().unwrap();
+        let binding = ticket.source_plan_binding.as_ref().unwrap();
+        fn make_identity(
+            binding: &TicketSourcePlanBinding,
+            holdout_record_digest: String,
+        ) -> TicketIdentityV3<'_> {
+            TicketIdentityV3 {
+                domain: "rsia.evaluation_ticket.identity.v3",
+                schema_version: ReadEvaluationTicket::SCHEMA_V3,
+                namespace: "ns",
+                logical_ticket_id: "logical-ticket",
+                registration_id: "registration",
+                registration_digest: hash(b"Complete frozen registration data original."),
+                holdout_id: "holdout",
+                holdout_record_digest,
+                manifest_digest: hash(b"Complete frozen manifest data original."),
+                source_plan_binding: binding,
+                evaluator_actor: "evaluator",
+                issued_at_unix_seconds: 1,
+            }
+        }
+        let original = make_identity(binding, hash(b"Complete frozen holdout data A."));
+        let id = original.content_id().unwrap();
+        assert_eq!(original.content_id().unwrap(), id);
+        identifier(&id).unwrap();
+        assert!(id.starts_with("evaluation-ticket-v3-"));
+        let changed_holdout = make_identity(binding, hash(b"Complete frozen holdout data B."));
+        assert_ne!(changed_holdout.content_id().unwrap(), id);
+        let mut changed_binding = binding.clone();
+        changed_binding.plan_digest = hash(b"Another complete frozen plan content data original.");
+        changed_binding.validate().unwrap();
+        let changed_plan = make_identity(&changed_binding, original.holdout_record_digest.clone())
+            .content_id()
+            .unwrap();
+        assert_ne!(changed_plan, id);
+        changed_binding.plan_id = "another-valid-plan-content-identity".into();
+        let changed_plan_id =
+            make_identity(&changed_binding, original.holdout_record_digest.clone());
+        assert_ne!(changed_plan_id.content_id().unwrap(), changed_plan);
+        let mut later = make_identity(binding, original.holdout_record_digest.clone());
+        later.issued_at_unix_seconds = 2;
+        assert_ne!(later.content_id().unwrap(), id);
     }
 }

@@ -15,7 +15,7 @@ CHAR_START = re.compile("'(?:\\\\(?:u\\{[0-9a-fA-F]+\\}|x[0-9a-fA-F]{2}|.)|[^'\\
 SITES = {
     ("apps/rsia/src/main.rs", "bootstrap"): 1,
     ("crates/evo-engine/src/bin/formal_local_host.rs", "run"): 1,
-    ("crates/evo-engine/src/bin/formal_local_host.rs", "authority"): 1,
+    ("crates/evo-engine/src/formal_authority.rs", "serve_owned"): 1,
 }
 
 
@@ -145,12 +145,48 @@ def check_tree(root: Path) -> list[str]:
                     errors.append(f"{relative}:{owner[0]}: missing admission")
                 if not re.search(r"\bstore\s*\.\s*close\s*\(\s*\)\s*\.\s*await", body[offset:]):
                     errors.append(f"{relative}:{owner[0]}: missing close before guard release")
-                if owner[0] == "authority":
-                    socket = re.search(r"UnixListener\s*::\s*bind\s*\(", body)
-                    if socket is not None and (gate is None or socket.start() < gate.start()):
-                        errors.append(f"{relative}: authority socket precedes shared gate/lock")
+            if relative == "crates/evo-engine/src/formal_authority.rs" and owner[0] == "serve_owned":
+                normalized = re.sub(r"\s+", "", body)
+                gate = normalized.find("let(data_lock,gate)=crate::data_directory_lock::mount_gate(&database,None).await")
+                opening = normalized.find("letstore=Store::open(&database).await?;")
+                owned = normalized.find("letowner=OwnedPrincipalAuthority{service,store,_data_lock:data_lock,")
+                admission = normalized.find("gate.admit()")
+                serving = normalized.find("owner.serve(&socket,connections).await")
+                close = normalized.find("owner.store.close().await;")
+                release = normalized.find("drop(owner);")
+                if min(gate,opening,owned,admission,serving,close,release)<0 or not gate<opening<owned<admission<serving<close<release:
+                    errors.append(f"{relative}: owned gate/open/admit/serve/close/guard order differs")
+                if gate>=0 and normalized[:gate].count("{")-normalized[:gate].count("}")!=2:
+                    errors.append(f"{relative}: owned guard must live in its spawned owner scope")
+                if len(re.findall(r"\bdata_lock\b",body))!=2 or len(re.findall(r"\bowner\b",body))!=4:
+                    errors.append(f"{relative}: owned guard or Store escapes reviewed lifetime")
+                if opening>=0 and close>=0 and ("return" in normalized[opening:close] or "UnixListener::bind(" in normalized):
+                    errors.append(f"{relative}: owned open can escape close or socket precedes admission")
+                if "tokio::spawn(asyncmove{" not in normalized or "connections==0||connections>64" not in normalized:
+                    errors.append(f"{relative}: owned authority must detach one finite drain")
+                if "letresult=async{gate.admit()" not in normalized or "}.await;owner.store.close().await;drop(owner);result" not in normalized:
+                    errors.append(f"{relative}: every owned serve result must close Store before guard release")
     for site, expected in counts.items():
         if expected != SITES[site]: errors.append(f"{site}: expected {SITES[site]} open, found {expected}")
+    formal = contents.get("crates/evo-engine/src/formal_authority.rs", "")
+    binary = contents.get("crates/evo-engine/src/bin/formal_local_host.rs", "")
+    authorities = [binary[start:end] for name,start,end in functions(binary) if name=="authority"]
+    expected_authority="{evo_engine::formal_authority::PrincipalAuthorityService::serve_owned(std::path::PathBuf::from(database),host,principals,std::path::PathBuf::from(socket),connections).await}"
+    if len(authorities)!=1 or re.sub(r"\s+","",authorities[0]).replace(",)",")")!=expected_authority:
+        errors.append("formal host authority must only call the unique owned entry")
+    signature=re.search(r"pub\s+async\s+fn\s+serve_owned\s*\(([^{}]*)\)\s*->\s*Result<Value>\s*\{",formal)
+    expected_parameters="database:std::path::PathBuf,host:RegisteredFormalHost,principals:RegisteredPrincipalSet,socket:std::path::PathBuf,connections:u16"
+    if signature is None or re.sub(r"\s+","",signature[1]).rstrip(",")!=expected_parameters:
+        errors.append("owned entry cannot accept an external Store, guard or authority flag")
+    if sum(len(re.findall(r"\bserve_owned\s*\(",code)) for code in contents.values())!=2:
+        errors.append("owned authority must have only its definition and one production caller")
+    owned_serve = [formal[start:end] for name,start,end in functions(formal) if name=="serve" and "UnixListener" in formal[start:end]]
+    if len(owned_serve)!=1:
+        errors.append("owned authority must have one finite socket drain")
+    else:
+        normalized = re.sub(r"\s+","",owned_serve[0])
+        if "for_in0..connections{" not in normalized or "listener.accept()" not in normalized or "drop(listener);" not in normalized or "remove_file(path)" not in normalized:
+            errors.append("owned socket drain must remain finite and close its listener")
     cli = contents.get("apps/rsia/src/main.rs", "")
     mounts = re.findall(r"mount_gate\s*\(\s*&data[^;]*;\s*let\s+\(\s*service\s*,\s*prepare_config\s*\)\s*=\s*bootstrap\s*\(\s*&data", cli)
     if len(mounts) != 2: errors.append("CLI serve/stdio must both mount before bootstrap")

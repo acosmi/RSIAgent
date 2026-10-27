@@ -34,13 +34,14 @@ use evo_engine::model::{
     ModelExecutionProvenance, ModelExecutionReceipt, ModelPort, ModelResponse,
 };
 use evo_engine::monitoring::{
-    CONSOLIDATION_PROPOSAL_SCHEMA, CONSOLIDATION_STAGING_SCHEMA, ClaimOutcome,
-    CompleteDevelopmentCycleRequest, ConsolidationClaim, ConsolidationClaimState,
-    ConsolidationDevRunner, ConsolidationModelPort, ConsolidationProposal, ConsolidationRunOutcome,
-    ConsolidationRunRecord, ConsolidationStagingBinding, DEVELOPMENT_CYCLE_SCHEMA,
+    CONSOLIDATION_PROPOSAL_SCHEMA_V2 as CONSOLIDATION_PROPOSAL_SCHEMA,
+    CONSOLIDATION_STAGING_SCHEMA, ClaimOutcome, CompleteDevelopmentCycleRequest,
+    ConsolidationClaim, ConsolidationClaimState, ConsolidationDevRunner, ConsolidationModelPort,
+    ConsolidationRunOutcome, ConsolidationRunRecord, ConsolidationStagingBinding,
+    CurrentConsolidationProposal as ConsolidationProposal, DEVELOPMENT_CYCLE_SCHEMA,
     DevelopmentCycleRecord, ENVIRONMENT_DRIFT_SCHEMA, EnvironmentEvidenceScope,
     MonitoringCoordinator, RecordEnvironmentRequest, RecordedEnvironment,
-    StagedConsolidationCandidate,
+    StagedCurrentConsolidationCandidate as StagedConsolidationCandidate,
 };
 use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
@@ -49,7 +50,8 @@ use evo_engine::optimization::{
     OptimizationStepRequest, PairedTaskResult, StageDependency, StageFact, StageFactKind,
 };
 use evo_engine::release_store::{
-    PrepareRunRequest, ReleaseCandidateRecord, ReleaseStore, StageBundleRequest,
+    CurrentReleaseCandidateRecord as ReleaseCandidateRecord,
+    CurrentStageBundleRequest as StageBundleRequest, PrepareRunRequest, ReleaseStore,
     TrustedHostExecutionEvidence, TypedSourceRef,
 };
 use evo_storage::Store;
@@ -209,7 +211,7 @@ impl Fixture {
         let admin = context("admin", Role::Admin);
         let host = context("host", Role::Host);
         let worker = context("worker", Role::Worker);
-        ReleaseStore::register_host_surface(
+        trusted_compiler_inputs::register_fixture_host_surface(
             &admin,
             &store,
             "surface",
@@ -545,6 +547,20 @@ impl ModelPort for EditingModelPort {
     ) -> evo_core::Result<evo_engine::model::ModelResponse> {
         request.validate()?;
         self.dispatch(request.request).await
+    }
+
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
     }
 
     async fn dispatch(&self, request: ModelRequest) -> evo_core::Result<ModelResponse> {
@@ -1017,11 +1033,19 @@ impl Run {
 
     async fn proposal_of(&self, claim: &ConsolidationClaim) -> ConsolidationProposal {
         let mut session = self.fixture.store.session().await.unwrap();
+        let run: ConsolidationRunRecord = session
+            .need(
+                &self.fixture.worker,
+                "artifact",
+                &format!("consolidation-run-{}", claim.id),
+            )
+            .await
+            .unwrap();
         let proposal = session
             .need(
                 &self.fixture.worker,
                 "artifact",
-                &format!("consolidation-proposal-{}", claim.id),
+                run.proposal_id.as_deref().unwrap(),
             )
             .await
             .unwrap();
@@ -1035,7 +1059,7 @@ impl Run {
         proposal: &ConsolidationProposal,
         candidate_id: &str,
     ) -> Result<StagedConsolidationCandidate, Error> {
-        MonitoringCoordinator::stage_consolidation_candidate(
+        MonitoringCoordinator::stage_current_consolidation_candidate(
             ctx,
             &self.fixture.store,
             &proposal.id,
@@ -1089,7 +1113,7 @@ async fn put_artifact(store: &Store, ctx: &Context, id: &str, body: &Value) {
 }
 
 async fn release_candidates(store: &Store, ctx: &Context) -> usize {
-    artifacts_with_schema(store, ctx, "rsia.release_candidate.v1")
+    artifacts_with_schema(store, ctx, "rsia.release_candidate.v2")
         .await
         .len()
 }
@@ -1185,6 +1209,20 @@ impl ModelPort for RevokingModelPort {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> evo_core::Result<ModelResponse> {
         if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
             return Err(Error::Conflict(
@@ -1244,6 +1282,40 @@ struct FailingJournal {
 
 #[async_trait]
 impl OptimizationJournal for FailingJournal {
+    async fn current_compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::CurrentVerifiedCompilerInputs> {
+        self.inner.current_compiler_inputs(request).await
+    }
+
+    async fn commit_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> evo_core::Result<()> {
+        if self.commits.fetch_add(1, Ordering::SeqCst) == self.fail_on_commit {
+            return Err(Error::NotFound);
+        }
+        self.inner.commit_source_bound(fact, inputs).await
+    }
+
+    async fn claim_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> evo_core::Result<bool> {
+        self.inner.claim_source_bound(fact, inputs).await
+    }
+
+    async fn lookup_source_bound(
+        &self,
+        artifact_id: &str,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> evo_core::Result<Option<StageFact>> {
+        self.inner.lookup_source_bound(artifact_id, inputs).await
+    }
+
     async fn commit_bound(
         &self,
         fact: StageFact,
@@ -1323,6 +1395,59 @@ struct ForgedTerminalJournal {
 
 #[async_trait]
 impl OptimizationJournal for ForgedTerminalJournal {
+    async fn current_compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::CurrentVerifiedCompilerInputs> {
+        self.inner.current_compiler_inputs(request).await
+    }
+
+    async fn commit_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> evo_core::Result<()> {
+        self.inner.commit_source_bound(fact.clone(), inputs).await?;
+        if fact.kind == StageFactKind::StepCompleted && fact.payload["status"] == "candidate" {
+            let mut session = self.store.session().await?;
+            let original: StageFact = session
+                .need(&self.context, "artifact", &fact.artifact_id)
+                .await?;
+            *self.original.lock().unwrap() = Some(original.clone());
+            let mut stored = original;
+            (self.forge)(&mut stored);
+            stored.output_digest = None;
+            stored = stored.seal()?;
+            session
+                .put(
+                    &self.context,
+                    "artifact",
+                    &stored.artifact_id,
+                    self.context.actor(),
+                    &stored,
+                )
+                .await?;
+            session.commit().await?;
+        }
+        Ok(())
+    }
+
+    async fn claim_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> evo_core::Result<bool> {
+        self.inner.claim_source_bound(fact, inputs).await
+    }
+
+    async fn lookup_source_bound(
+        &self,
+        artifact_id: &str,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> evo_core::Result<Option<StageFact>> {
+        self.inner.lookup_source_bound(artifact_id, inputs).await
+    }
+
     async fn commit_bound(
         &self,
         fact: StageFact,
@@ -1731,7 +1856,16 @@ async fn a_candidate_outcome_freezes_a_proposal_with_its_fields_and_edges() {
 
     assert_eq!(
         proposal.id,
-        format!("consolidation-proposal-{}", run.claim.id)
+        format!(
+            "consolidation-proposal-v2-{}",
+            fingerprint(&(
+                CONSOLIDATION_PROPOSAL_SCHEMA,
+                &run.claim.id,
+                &proposal.candidate_bundle_digest,
+                &proposal.terminal_fact_id
+            ))
+            .unwrap()
+        )
     );
     assert_eq!(proposal.schema_version, CONSOLIDATION_PROPOSAL_SCHEMA);
     assert_eq!(proposal.claim_id, run.claim.id);
@@ -2050,7 +2184,24 @@ async fn a_terminal_fact_that_does_not_hold_the_candidate_writes_no_proposal() {
             fact.payload["status"] = json!("rejected");
         }),
         ("another bundle", |fact| {
-            fact.payload["bundle"]["digest"] = json!(d("another bundle"));
+            let mut bundle: evo_core::contract::ResolvedBundleV3 =
+                serde_json::from_value(fact.payload["bundle"].clone()).unwrap();
+            // Keep the intrinsic Current identity healthy so the terminal/full
+            // candidate comparison, not a malformed digest, rejects this wire.
+            bundle.skill.content = "another complete terminal bundle".into();
+            for origin in &mut bundle.origins {
+                if origin.field == "skill.content" {
+                    origin.value_digest = fingerprint(&bundle.skill.content).unwrap();
+                }
+            }
+            bundle.digest = evo_core::contract::resolved_bundle_digest_v3(&bundle).unwrap();
+            assert_eq!(
+                evo_core::contract::resolved_bundle_digest_v3(&bundle).unwrap(),
+                bundle.digest
+            );
+            bundle.skill.validate().unwrap();
+            evo_core::Validate::validate(&bundle.improver).unwrap();
+            fact.payload["bundle"] = serde_json::to_value(bundle).unwrap();
         }),
         ("another selection", |fact| {
             fact.payload["selection"]["candidate_total_micros"] = json!(1);
@@ -2066,8 +2217,13 @@ async fn a_terminal_fact_that_does_not_hold_the_candidate_writes_no_proposal() {
             forge,
         };
         let refused = run.run_with(&run.claim, &run.model, &forged, 1, true).await;
+        let expected = if name == "another bundle" {
+            "terminal candidate full bundle differs"
+        } else {
+            "optimization terminal fact does not hold this candidate"
+        };
         assert!(
-            matches!(&refused, Err(Error::Conflict(message)) if message.contains("terminal fact")),
+            matches!(&refused, Err(Error::Conflict(message)) if message == expected),
             "{name}: {refused:?}"
         );
         assert_no_proposal(&run).await;
@@ -2193,7 +2349,7 @@ async fn staging_writes_only_a_release_candidate_and_is_idempotent_and_conflict_
         serde_json::to_value(candidate).unwrap()
     );
     assert_eq!(
-        artifacts_with_schema(&fixture.store, &fixture.worker, "rsia.release_candidate.v1")
+        artifacts_with_schema(&fixture.store, &fixture.worker, "rsia.release_candidate.v2")
             .await
             .len(),
         1
@@ -2240,7 +2396,7 @@ async fn staging_writes_only_a_release_candidate_and_is_idempotent_and_conflict_
         second_proposal.candidate_bundle_digest
     );
     assert_eq!(
-        artifacts_with_schema(&fixture.store, &fixture.worker, "rsia.release_candidate.v1")
+        artifacts_with_schema(&fixture.store, &fixture.worker, "rsia.release_candidate.v2")
             .await
             .len(),
         2
@@ -2421,7 +2577,7 @@ async fn a_proposal_is_staged_as_at_most_one_candidate() {
     // The reservation is a stored fact, not memory: the answers survive a restart.
     fixture.store.close().await;
     let reopened = Store::open(&fixture.database).await.unwrap();
-    let after_restart = MonitoringCoordinator::stage_consolidation_candidate(
+    let after_restart = MonitoringCoordinator::stage_current_consolidation_candidate(
         &fixture.worker,
         &reopened,
         &proposal.id,
@@ -2432,7 +2588,7 @@ async fn a_proposal_is_staged_as_at_most_one_candidate() {
         matches!(&after_restart, Err(Error::Conflict(message)) if message.contains("candidate-1")),
         "{after_restart:?}"
     );
-    let repeated = MonitoringCoordinator::stage_consolidation_candidate(
+    let repeated = MonitoringCoordinator::stage_current_consolidation_candidate(
         &fixture.worker,
         &reopened,
         &proposal.id,
@@ -2464,13 +2620,13 @@ async fn two_concurrent_stagings_of_one_proposal_leave_exactly_one_candidate() {
     let proposal = run.proposal().await;
 
     let (left, right) = tokio::join!(
-        MonitoringCoordinator::stage_consolidation_candidate(
+        MonitoringCoordinator::stage_current_consolidation_candidate(
             &fixture.worker,
             &fixture.store,
             &proposal.id,
             "candidate-left"
         ),
-        MonitoringCoordinator::stage_consolidation_candidate(
+        MonitoringCoordinator::stage_current_consolidation_candidate(
             &fixture.worker,
             &fixture.store,
             &proposal.id,
@@ -2491,13 +2647,13 @@ async fn two_concurrent_stagings_of_one_proposal_leave_exactly_one_candidate() {
 
     // The same id from two callers at once is one staging, twice.
     let (first, second) = tokio::join!(
-        MonitoringCoordinator::stage_consolidation_candidate(
+        MonitoringCoordinator::stage_current_consolidation_candidate(
             &fixture.worker,
             &fixture.store,
             &proposal.id,
             winner
         ),
-        MonitoringCoordinator::stage_consolidation_candidate(
+        MonitoringCoordinator::stage_current_consolidation_candidate(
             &fixture.worker,
             &fixture.store,
             &proposal.id,
@@ -2584,7 +2740,7 @@ async fn a_candidate_staged_outside_the_bridge_keeps_the_reservation_of_its_prop
     let proposal = run.proposal().await;
 
     // The same bundle, environment and sources staged directly by another proposer.
-    ReleaseStore::stage_bundle(
+    ReleaseStore::stage_current_bundle(
         &fixture.admin,
         &fixture.store,
         StageBundleRequest {
@@ -2721,7 +2877,7 @@ async fn an_environment_drift_makes_the_proposal_unstageable() {
         .await;
     assert!(matches!(refused, Err(Error::Conflict(_))), "{refused:?}");
     assert_eq!(
-        artifacts_with_schema(&fixture.store, &fixture.worker, "rsia.release_candidate.v1")
+        artifacts_with_schema(&fixture.store, &fixture.worker, "rsia.release_candidate.v2")
             .await
             .len(),
         0
@@ -2869,7 +3025,7 @@ async fn revoking_a_source_cleans_the_monitoring_closure_to_complete() {
         &staged.candidate.id,
     )
     .await;
-    assert_redacted(&candidate_body, "rsia.release_candidate.v1");
+    assert_redacted(&candidate_body, "rsia.release_candidate.v2");
     // The binding that reserved the candidate id is part of the closure too.
     let binding_body = value(
         &fixture.store,

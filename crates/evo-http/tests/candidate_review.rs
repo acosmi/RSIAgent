@@ -1,8 +1,7 @@
 //! The first two tests are the actual existing-API parent positive control and
 //! route semantic red. Their original parent run is separately preserved.
 use evo_core::contract::{
-    CapabilityLevel, CompileParts, HostCapabilities, ImproverPatch, Profile, SkillSnapshot,
-    SystemSnapshot, compile_bundle,
+    CapabilityLevel, HostCapabilities, ImproverPatch, Profile, SkillSnapshot, SystemSnapshot,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::management_registry::REVIEW_ROUTE;
@@ -15,7 +14,8 @@ use evo_engine::formal_authority::{
     empty_root_strategy,
 };
 use evo_engine::release_store::{
-    ReleaseCandidateRecord, ReleaseStore, StageBundleRequest, TypedSourceRef,
+    CurrentReleaseCandidateRecord as ReleaseCandidateRecord,
+    CurrentStageBundleRequest as StageBundleRequest, ReleaseStore, TypedSourceRef,
 };
 use evo_engine::service::{HostPrepareConfig, HostService};
 use evo_http::{AuthIdentity, AuthRegistry, HttpState, router};
@@ -75,7 +75,7 @@ async fn registered_review_bundle(
     snapshot: &SystemSnapshot,
     parent: &SkillSnapshot,
     capabilities: &HostCapabilities,
-) -> evo_core::contract::ResolvedBundle {
+) -> evo_core::contract::ResolvedBundleV3 {
     let profile_id = snapshot.profile_id.as_str();
     let environment = snapshot.digest().unwrap();
     let scope = evo_core::fingerprint(&(namespace, snapshot, capabilities)).unwrap();
@@ -174,28 +174,49 @@ async fn registered_review_bundle(
         .await
         .unwrap();
     let strategy = Strategy::default();
-    compile_bundle(CompileParts {
-        profile: &profile,
-        parent: &root.skill,
-        baseline: &frozen.baseline_skill,
-        parent_strategy: &root.strategy,
-        baseline_strategy: &frozen.baseline_strategy,
-        skill_patch: &evo_core::contract::rebase_skill_patch(&root.skill, parent).unwrap(),
-        improver_patch: &ImproverPatch {
-            instruction: evo_core::contract::PatchOp::Set {
-                value: strategy.instruction,
-            },
-            max_candidates: evo_core::contract::PatchOp::Set {
-                value: strategy.max_candidates,
-            },
-            max_rounds: evo_core::contract::PatchOp::Set {
-                value: strategy.max_rounds,
-            },
+    let worker = Context::new(namespace, "proposer", Role::Worker).unwrap();
+    let mut session = store.session().await.unwrap();
+    let watermark = session
+        .watermark(&worker)
+        .await
+        .unwrap()
+        .map(|row| row.0 as u64)
+        .unwrap_or(0);
+    let request = evo_engine::formal_authority::CompilerInputRequest {
+        profile,
+        search_parent: root.skill.clone(),
+        baseline: frozen.baseline_skill.clone(),
+        search_parent_strategy: root.strategy.clone(),
+        expected_parent_strategy_digest: Some(fingerprint(&root.strategy).unwrap()),
+        baseline_strategy: frozen.baseline_strategy.clone(),
+        capabilities: frozen.capabilities.clone(),
+        environment_digest: frozen.environment_digest.clone(),
+        purpose: Purpose::Development,
+        revoke_watermark: watermark,
+    };
+    let patch = evo_core::contract::rebase_skill_patch(&root.skill, parent).unwrap();
+    let improver = ImproverPatch {
+        instruction: evo_core::contract::PatchOp::Set {
+            value: strategy.instruction,
         },
-        caps: &frozen.capabilities,
-        revoked: &BTreeSet::new(),
-    })
-    .unwrap()
+        max_candidates: evo_core::contract::PatchOp::Set {
+            value: strategy.max_candidates,
+        },
+        max_rounds: evo_core::contract::PatchOp::Set {
+            value: strategy.max_rounds,
+        },
+    };
+    let bundle = Box::pin(evo_engine::compiler::compile_current_in_session(
+        &mut session,
+        &worker,
+        &request,
+        &patch,
+        &improver,
+    ))
+    .await
+    .unwrap();
+    session.commit().await.unwrap();
+    bundle
 }
 
 async fn fixture() -> (tempfile::TempDir, HttpState) {
@@ -247,7 +268,7 @@ async fn fixture() -> (tempfile::TempDir, HttpState) {
     };
     let bundle =
         registered_review_bundle(&store, NAMESPACE, &system_snapshot, &parent, &caps).await;
-    let staged = ReleaseStore::stage_bundle(
+    let staged = ReleaseStore::stage_current_bundle(
         &proposer,
         &store,
         StageBundleRequest {

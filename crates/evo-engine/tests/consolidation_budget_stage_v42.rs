@@ -43,7 +43,8 @@ use evo_engine::evidence::{
     store_trace_authority,
 };
 use evo_engine::model::{
-    BoundModelRequest, CompilerInputUse, ModelExecutionProvenance, ModelPort, ModelResponse,
+    BoundModelRequest, CurrentCompilerInputUse as CompilerInputUse, ModelExecutionProvenance,
+    ModelPort, ModelResponse, ReadBoundModelRequest,
 };
 use evo_engine::monitoring::{
     ClaimOutcome, CompleteDevelopmentCycleRequest, ConsolidationClaim, ConsolidationClaimState,
@@ -536,7 +537,7 @@ impl Fixture {
         let admin = context("admin", Role::Admin);
         let host = context("host", Role::Host);
         let worker = context("worker", Role::Worker);
-        ReleaseStore::register_host_surface(
+        trusted_compiler_inputs::register_fixture_host_surface(
             &admin,
             &store,
             "surface",
@@ -1338,7 +1339,7 @@ impl ModelTransport for ScriptedTransport {
 /// it to the same broker without replacing its compiler authority.
 struct RecordingModelPort<'a> {
     broker: &'a PersistentModelBroker<ScriptedTransport>,
-    bound: &'a Mutex<Vec<BoundModelRequest>>,
+    bound: &'a Mutex<Vec<ReadBoundModelRequest>>,
 }
 
 #[async_trait]
@@ -1348,8 +1349,16 @@ impl ModelPort for RecordingModelPort<'_> {
     }
 
     async fn dispatch_bound(&self, request: BoundModelRequest) -> Result<ModelResponse> {
-        self.bound.lock().unwrap().push(request.clone());
+        let read = serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        self.bound.lock().unwrap().push(read);
         self.broker.dispatch_bound(request).await
+    }
+    async fn dispatch_compiler_bound(
+        &self,
+        request: ReadBoundModelRequest,
+    ) -> Result<ModelResponse> {
+        self.bound.lock().unwrap().push(request.clone());
+        self.broker.dispatch_compiler_bound(request).await
     }
 }
 
@@ -1371,7 +1380,7 @@ struct World {
     /// The requests those calls carried.
     seen: Arc<Mutex<Vec<ModelRequest>>>,
     /// Complete incoming requests, before the broker dispatches the provider.
-    bound: Mutex<Vec<BoundModelRequest>>,
+    bound: Mutex<Vec<ReadBoundModelRequest>>,
 }
 
 impl World {
@@ -1656,9 +1665,23 @@ async fn an_ordinary_e03_step_keeps_its_reflection_and_ranking_ledger_stages() {
             )
             .await
             .unwrap();
-        assert!(
-            matches!(outcome, OptimizationStepOutcome::Candidate { .. }),
-            "{base:?}: {outcome:?}"
+        let OptimizationStepOutcome::CurrentCandidate {
+            edit,
+            bundle,
+            selection,
+        } = &outcome
+        else {
+            panic!("{base:?}: {outcome:?}");
+        };
+        assert_eq!(bundle.schema_version, evo_core::contract::BUNDLE_SCHEMA_V3);
+        assert_eq!(
+            serde_json::to_vec(&bundle.skill).unwrap(),
+            serde_json::to_vec(&edit.output).unwrap()
+        );
+        assert_eq!(selection.candidate_bundle_digest, bundle.digest);
+        assert_eq!(
+            selection.decision,
+            evo_engine::optimization::DevelopmentSelectionDecision::AcceptCandidate
         );
         assert_eq!(world.provider_calls(), 3, "{base:?}");
         let mut stages: Vec<_> = world
@@ -1711,9 +1734,23 @@ async fn an_ordinary_step_cannot_use_the_consolidate_stage() {
         .ordinary("e03-episode", Shape::at(ModelStage::ReflectFailure))
         .await
         .unwrap();
-    assert!(
-        matches!(outcome, OptimizationStepOutcome::Candidate { .. }),
-        "{outcome:?}"
+    let OptimizationStepOutcome::CurrentCandidate {
+        edit,
+        bundle,
+        selection,
+    } = &outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(bundle.schema_version, evo_core::contract::BUNDLE_SCHEMA_V3);
+    assert_eq!(
+        serde_json::to_vec(&bundle.skill).unwrap(),
+        serde_json::to_vec(&edit.output).unwrap()
+    );
+    assert_eq!(selection.candidate_bundle_digest, bundle.digest);
+    assert_eq!(
+        selection.decision,
+        evo_engine::optimization::DevelopmentSelectionDecision::AcceptCandidate
     );
 }
 
@@ -1848,7 +1885,12 @@ impl Injected {
             fingerprint(&request.request).unwrap(),
             fingerprint(&self.world.seen.lock().unwrap()[0]).unwrap()
         );
-        let redispatched = self.world.broker.dispatch_bound(request).await.unwrap();
+        let redispatched = self
+            .world
+            .broker
+            .dispatch_compiler_bound(request)
+            .await
+            .unwrap();
         assert_eq!(
             self.world.provider_calls(),
             1,
@@ -2013,7 +2055,10 @@ async fn environment_preparation(world: &World, episode: &str) -> (StageFact, Co
         Shape::at(ModelStage::ReflectFailure),
     );
     let compiler_request = step.compiler_input_request();
-    let verified = journal.compiler_inputs(&compiler_request).await.unwrap();
+    let verified = journal
+        .current_compiler_inputs(&compiler_request)
+        .await
+        .unwrap();
     let inputs = CompilerInputUse::new(compiler_request, verified.binding().clone());
     let request = step.development_request.clone();
     let mut dependencies = vec![
@@ -2081,13 +2126,16 @@ async fn a_bound_development_environment_remains_a_scalar_with_real_content_edge
     let journal = world.fixture.journal();
     let (fact, inputs) = environment_preparation(&world, "environment-positive").await;
     let root = world.root().await;
-    journal.commit_bound(fact.clone(), &inputs).await.unwrap();
+    journal
+        .commit_source_bound(fact.clone(), &inputs)
+        .await
+        .unwrap();
     let stored = journal.reload(&fact.artifact_id).await.unwrap();
     assert_eq!(fingerprint(&stored).unwrap(), fingerprint(&fact).unwrap());
     assert_eq!(
         fingerprint(
             &journal
-                .lookup_bound(&fact.artifact_id, &inputs)
+                .lookup_source_bound(&fact.artifact_id, &inputs)
                 .await
                 .unwrap()
                 .unwrap()
@@ -2143,7 +2191,10 @@ async fn a_bound_development_environment_remains_a_scalar_with_real_content_edge
         .unwrap();
     assert_eq!(fingerprint(&cached).unwrap(), fingerprint(&fact).unwrap());
     session.commit().await.unwrap();
-    journal.commit_bound(fact.clone(), &inputs).await.unwrap();
+    journal
+        .commit_source_bound(fact.clone(), &inputs)
+        .await
+        .unwrap();
     assert_eq!(
         fingerprint(&journal.reload(&fact.artifact_id).await.unwrap()).unwrap(),
         fingerprint(&fact).unwrap()
@@ -2236,7 +2287,7 @@ async fn invalid_environment_preparations_leave_no_partial_journal_or_dispatch()
         let rejected = if case == "missing-binding" {
             journal.commit(fact.clone()).await
         } else {
-            journal.commit_bound(fact.clone(), &inputs).await
+            journal.commit_source_bound(fact.clone(), &inputs).await
         };
         assert!(
             matches!(

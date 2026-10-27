@@ -2294,15 +2294,23 @@ impl Session {
         id: &str,
     ) -> Result<Option<T>> {
         identifier(id)?;
-        let body: Option<String> =
-            sqlx::query_scalar("SELECT body FROM objects WHERE namespace=? AND kind=? AND id=?")
-                .bind(ctx.namespace())
-                .bind(kind)
-                .bind(id)
-                .fetch_optional(&mut *self.tx)
-                .await
-                .map_err(internal)?;
-        body.map(|b| serde_json::from_str(&b).map_err(internal))
+        // The exact marker and original body come from this one namespace/kind/id
+        // read. json_each sees every top-level member, including duplicate versions.
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT body, CASE WHEN objects.kind='artifact' AND EXISTS (
+                 SELECT 1 FROM json_each(objects.body) AS member
+                 WHERE member.key='schema_version' AND member.type='text'
+                   AND member.value='rsia.host_surface_record.v2'
+             ) THEN 1 ELSE 0 END
+             FROM objects WHERE namespace=? AND kind=? AND id=?",
+        )
+        .bind(ctx.namespace())
+        .bind(kind)
+        .bind(id)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        row.map(|(body, current_host_surface)| decode_object_row_body(&body, current_host_surface))
             .transpose()
     }
     pub async fn need<T: DeserializeOwned>(
@@ -2314,8 +2322,14 @@ impl Session {
         self.get(ctx, kind, id).await?.ok_or(Error::NotFound)
     }
     pub async fn list<T: DeserializeOwned>(&mut self, ctx: &Context, kind: &str) -> Result<Vec<T>> {
-        let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT body FROM objects WHERE namespace=? AND kind=? ORDER BY rowid LIMIT 10001",
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT body, CASE WHEN objects.kind='artifact' AND json_valid(objects.body)
+             THEN EXISTS (
+                 SELECT 1 FROM json_each(objects.body) AS member
+                 WHERE member.key='schema_version' AND member.type='text'
+                   AND member.value='rsia.host_surface_record.v2'
+             ) ELSE 0 END
+             FROM objects WHERE namespace=? AND kind=? ORDER BY rowid LIMIT 10001",
         )
         .bind(ctx.namespace())
         .bind(kind)
@@ -2326,7 +2340,7 @@ impl Session {
             return Err(Error::Conflict("scope collection exceeds bounded scan; archive or add paginated query before continuing".into()));
         }
         rows.into_iter()
-            .map(|r| serde_json::from_str(&r).map_err(internal))
+            .map(|(body, current_host_surface)| decode_object_row_body(&body, current_host_surface))
             .collect()
     }
 
@@ -2996,6 +3010,85 @@ impl Session {
     }
     pub async fn raw_object(&mut self, ctx: &Context, kind: &str, id: &str) -> Result<Value> {
         self.need(ctx, kind, id).await
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentHostRestoreContent {
+    id: String,
+    schema_version: String,
+    manifest: evo_core::contract::HostSurfaceManifestV2,
+    manifest_digest: String,
+    source: evo_core::contract::ReviewedHostSourceEnvelopeV1,
+    extracted: Vec<String>,
+    extracted_typed: Vec<evo_core::contract::HostSurfaceDeclarationV2>,
+    predecessor_surface_id: Option<String>,
+    upgrade_diff: evo_core::contract::HostSurfaceUpgradeDiffV2,
+}
+fn validate_current_host_restore_content(value: &Value) -> Result<()> {
+    let record: CurrentHostRestoreContent =
+        serde_json::from_value(value.clone()).map_err(internal)?;
+    identifier(&record.id)?;
+    if record.schema_version != "rsia.host_surface_record.v2"
+        || record.predecessor_surface_id.as_deref() == Some(record.id.as_str())
+        || record.manifest_digest != fingerprint(&record.manifest)?
+    {
+        return Err(Error::Invalid(
+            "invalid reviewed host source/default".into(),
+        ));
+    }
+    if let Some(previous) = &record.predecessor_surface_id {
+        identifier(previous)?;
+    }
+    // The source string is still the original UTF-8. This parser checks its
+    // numeric tokens, decoded duplicate keys and limits before typed values.
+    evo_core::contract::validate_host_surface_v2_source(
+        &record.manifest,
+        &record.source,
+        &record.extracted,
+        &record.extracted_typed,
+    )?;
+    if record.predecessor_surface_id.is_none()
+        && fingerprint(&record.upgrade_diff)?
+            != fingerprint(&evo_core::contract::host_surface_upgrade_diff_v2(
+                &record.manifest,
+                None,
+            )?)?
+    {
+        return Err(Error::Invalid(
+            "invalid reviewed host source/default".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Data dispatch for the one current host-record wire, never authorization.
+/// The marker is read with the body by each caller's fixed SQL selector.
+pub(crate) fn current_host_surface_object_value(
+    body: &str,
+    current_host_surface: i64,
+) -> Result<Option<Value>> {
+    match current_host_surface {
+        1 => {
+            let value = evo_core::contract::decode_host_surface_record_v2_json(body)?;
+            validate_current_host_restore_content(&value)?;
+            Ok(Some(value))
+        }
+        0 => Ok(None),
+        _ => Err(Error::Internal),
+    }
+}
+
+/// Ordinary object readers retain their original serde path for every other
+/// body. Recovery facts instead keep their existing strict legacy parser.
+pub(crate) fn decode_object_row_body<T: DeserializeOwned>(
+    body: &str,
+    current_host_surface: i64,
+) -> Result<T> {
+    match current_host_surface_object_value(body, current_host_surface)? {
+        Some(value) => serde_json::from_value(value).map_err(internal),
+        None => serde_json::from_str(body).map_err(internal),
     }
 }
 
@@ -3718,5 +3811,283 @@ mod tests {
         let got = t.get_world(&c, "w1").await.unwrap().unwrap();
         assert!(got.0);
         assert_eq!(got.1["k"], "v");
+    }
+}
+
+/// Reviewed wire history. These states classify data; they grant no source or
+/// execution authority. New consumers must additionally authenticate originals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistentContractState {
+    CurrentVerified,
+    Legacy,
+    Invalid,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct PersistentContractVersion {
+    pub schema: &'static str,
+    pub introduced_change: &'static str,
+    pub verifier_retained: bool,
+    pub current: bool,
+}
+macro_rules! contract_versions {
+    ($(($old:literal, $new:literal, $change:literal)),+ $(,)?) => {
+        pub const PERSISTENT_CONTRACT_VERSIONS: &[PersistentContractVersion] = &[
+            $(PersistentContractVersion { schema: $old, introduced_change: "frozen historical wire", verifier_retained: true, current: false },
+              PersistentContractVersion { schema: $new, introduced_change: $change, verifier_retained: true, current: true }),+
+        ];
+    };
+}
+contract_versions!(
+    (
+        "rsia.resolved_bundle.v2",
+        "rsia.resolved_bundle.v3",
+        "complete P/B original content"
+    ),
+    (
+        "rsia.authenticated_bundle.v1",
+        "rsia.authenticated_bundle.v2",
+        "complete Current bundle and originals"
+    ),
+    (
+        "rsia.formal_compiler_input_binding.v2",
+        "rsia.formal_compiler_input_binding.v3",
+        "typed Current input closure"
+    ),
+    (
+        "rsia.persisted_compiler_binding.v1",
+        "rsia.persisted_compiler_binding.v2",
+        "Current compiler binding"
+    ),
+    (
+        "rsia.release_candidate.v1",
+        "rsia.release_candidate.v2",
+        "complete Current bundle"
+    ),
+    (
+        "rsia.host_surface_record.v1",
+        "rsia.host_surface_record.v2",
+        "typed raw source and defaults"
+    ),
+    (
+        "rsia.run_application.v1",
+        "rsia.run_application.v2",
+        "frozen typed Host input"
+    ),
+    (
+        "rsia.bound_model_request.v1",
+        "rsia.bound_model_request.v2",
+        "Current compiler use"
+    ),
+    (
+        "rsia.optimization.compiler_use.v1",
+        "rsia.optimization.compiler_use.v2",
+        "Current input originals"
+    ),
+    (
+        "rsia.monitoring.consolidation_proposal.v1",
+        "rsia.monitoring.consolidation_proposal.v2",
+        "Current candidate and terminal identity"
+    ),
+    (
+        "rsia.registered_external_provider.v1",
+        "rsia.registered_external_provider.v3",
+        "owned source authority and exact model material"
+    ),
+    (
+        "rsia.issued_formal_authority.v2",
+        "rsia.issued_formal_authority.v3",
+        "Current candidate binding"
+    ),
+    (
+        "rsia.experiment_plan.v1",
+        "rsia.experiment_plan.v2",
+        "complete typed candidate pin"
+    ),
+    (
+        "rsia.evaluation_ticket.v2",
+        "rsia.evaluation_ticket.v3",
+        "source plan and issuance identity"
+    ),
+);
+pub fn persistent_contract_state(
+    schema: &str,
+    identity_matches: bool,
+) -> Result<PersistentContractState> {
+    if schema == "rsia.registered_external_provider.v2" {
+        return Ok(if identity_matches {
+            PersistentContractState::Legacy
+        } else {
+            PersistentContractState::Invalid
+        });
+    }
+    let version = PERSISTENT_CONTRACT_VERSIONS
+        .iter()
+        .find(|version| version.schema == schema)
+        .ok_or_else(|| Error::Invalid("unknown persistent contract version; isolate".into()))?;
+    Ok(if !identity_matches {
+        PersistentContractState::Invalid
+    } else if version.current {
+        PersistentContractState::CurrentVerified
+    } else {
+        PersistentContractState::Legacy
+    })
+}
+
+#[cfg(test)]
+mod current_host_raw_tests {
+    use super::*;
+    use evo_core::Role;
+    use evo_core::contract::{
+        HostSurfaceClassificationV2, HostSurfaceDeclarationV2, HostSurfaceManifestV2,
+        HostSurfaceRegistrationV2, HostSurfaceUpgradeDiffV2, ReviewedHostSourceEnvelopeV1,
+        SurfaceCoverage, host_surface_upgrade_diff_v2, host_surface_v2_from_source,
+    };
+    use serde::Deserialize;
+    use sqlx::Connection;
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HostRecordWire {
+        id: String,
+        schema_version: String,
+        manifest: HostSurfaceManifestV2,
+        manifest_digest: String,
+        source: ReviewedHostSourceEnvelopeV1,
+        extracted: Vec<String>,
+        extracted_typed: Vec<HostSurfaceDeclarationV2>,
+        predecessor_surface_id: Option<String>,
+        upgrade_diff: HostSurfaceUpgradeDiffV2,
+    }
+    fn complete_record() -> HostRecordWire {
+        let source = ReviewedHostSourceEnvelopeV1 {
+            schema_version: "rsia.host_source_envelope.v1".into(), source_kind: "reviewed_fixture".into(),
+            source_schema: "rsia.host_reviewed_declarations.v1".into(),
+            extractor_version: "rsia.host_reviewed_declarations.extractor.v1".into(),
+            original_utf8: r#"{"schema_version":"rsia.host_reviewed_declarations.v1","host":"reference","host_version":"1","declarations":[{"name":"option","value_type":"object","enum_values":[],"default":{"kind":"value","value":{"decimal":0.1}}}]}"#.into(),
+        };
+        let registration = HostSurfaceRegistrationV2 {
+            adapter_version: "1".into(),
+            retired: vec![],
+            classifications: vec![HostSurfaceClassificationV2 {
+                name: "option".into(),
+                coverage: SurfaceCoverage::Unsupported,
+                mapped_field: None,
+                consumer: None,
+                reason: "raw storage control only".into(),
+                renamed_from: None,
+                test_ref: None,
+                capability: None,
+            }],
+        };
+        let (manifest, extracted_typed) =
+            host_surface_v2_from_source(&source, &registration).unwrap();
+        HostRecordWire {
+            id: "host-record".into(),
+            schema_version: "rsia.host_surface_record.v2".into(),
+            manifest_digest: fingerprint(&manifest).unwrap(),
+            upgrade_diff: host_surface_upgrade_diff_v2(&manifest, None).unwrap(),
+            extracted: extracted_typed
+                .iter()
+                .map(|item| item.name.clone())
+                .collect(),
+            manifest,
+            source,
+            extracted_typed,
+            predecessor_surface_id: None,
+        }
+    }
+    #[tokio::test]
+    async fn current_host_raw_decoder_preserves_namespace_kind_id_and_exact_dto() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host-raw.sqlite3");
+        let store = Store::open(&path).await.unwrap();
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        let record = complete_record();
+        let raw = serde_json::to_string(&record).unwrap();
+        let mut session = store.session().await.unwrap();
+        session
+            .put(&admin, "artifact", &record.id, admin.actor(), &record)
+            .await
+            .unwrap();
+        let read: HostRecordWire = session.need(&admin, "artifact", &record.id).await.unwrap();
+        assert_eq!(serde_json::to_string(&read).unwrap(), raw);
+        let listed: Vec<HostRecordWire> = session.list(&admin, "artifact").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(serde_json::to_string(&listed[0]).unwrap(), raw);
+        assert_eq!(
+            session
+                .object_row(&admin, "artifact", &record.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            raw
+        );
+        let other = Context::new("other", "admin", Role::Admin).unwrap();
+        assert!(
+            session
+                .get::<HostRecordWire>(&other, "artifact", &record.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            session
+                .get::<HostRecordWire>(&admin, "run", &record.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            session
+                .get::<HostRecordWire>(&admin, "artifact", "other-id")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        session.commit().await.unwrap();
+        store.close().await;
+        let damaged = raw.replacen("\"decimal\":0.1", "\"decimal\":0.100000000000000001", 1);
+        assert_ne!(damaged, raw);
+        let mut connection = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(false)
+            .disable_statement_logging()
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objects SET body=? WHERE namespace='n' AND kind='artifact' AND id='host-record'")
+            .bind(&damaged).execute(&mut connection).await.unwrap();
+        connection.close().await.unwrap();
+        let store = Store::open(&path).await.unwrap();
+        let mut session = store.session().await.unwrap();
+        assert!(
+            matches!(session.get::<HostRecordWire>(&admin,"artifact",&record.id).await,
+            Err(Error::Invalid(message)) if message == "invalid reviewed host source/default")
+        );
+        assert!(
+            session
+                .get::<Value>(&other, "artifact", &record.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            session
+                .object_row(&admin, "artifact", &record.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            damaged
+        );
+        session.commit().await.unwrap();
+        store.close().await;
+        let mut unknown = serde_json::to_value(&record).unwrap();
+        unknown["unknown_field"] = serde_json::json!(true);
+        let unknown = serde_json::to_string(&unknown).unwrap();
+        assert!(matches!(
+            decode_object_row_body::<HostRecordWire>(&unknown, 1),
+            Err(Error::Internal)
+        ));
     }
 }

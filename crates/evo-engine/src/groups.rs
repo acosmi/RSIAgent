@@ -151,7 +151,7 @@ pub async fn run_skill_group_job(
     // Validate every group before the first group's model, runner or claim.
     for group in &groups {
         journal
-            .compiler_inputs(&group.request.compiler_input_request())
+            .current_compiler_inputs(&group.request.compiler_input_request())
             .await?;
     }
 
@@ -207,6 +207,16 @@ fn group_outcome(scope: GroupScope, result: Result<OptimizationStepOutcome>) -> 
     };
     match result {
         Ok(OptimizationStepOutcome::Candidate { edit, bundle, .. }) => {
+            match skill_snapshot_digest(&edit.output) {
+                Ok(candidate_skill_digest) => GroupOutcome {
+                    candidate_skill_digest: Some(candidate_skill_digest),
+                    candidate_bundle_digest: Some(bundle.digest),
+                    ..outcome(GroupOutcomeKind::Candidate, None)
+                },
+                Err(error) => failed(&error),
+            }
+        }
+        Ok(OptimizationStepOutcome::CurrentCandidate { edit, bundle, .. }) => {
             match skill_snapshot_digest(&edit.output) {
                 Ok(candidate_skill_digest) => GroupOutcome {
                     candidate_skill_digest: Some(candidate_skill_digest),
@@ -339,5 +349,226 @@ fn in_group(group_id: &str, error: Error) -> Error {
         Error::Invalid(message) => Error::Invalid(format!("skill group {group_id}: {message}")),
         Error::Conflict(message) => Error::Conflict(format!("skill group {group_id}: {message}")),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod current_candidate_tests {
+    use super::*;
+    use crate::optimization::{DevelopmentSelection, DevelopmentSelectionDecision};
+    use evo_core::skill_edit::{
+        CompiledSkillEdit, EditApplyReport, EditApplyStatus, EvidenceClosure,
+    };
+
+    // Complete compiled content for projection only: no registered producer,
+    // Host, paid execution or approved-source authority is constructed here.
+    fn current_bundle() -> evo_core::contract::ResolvedBundleV3 {
+        use evo_core::contract::{
+            CompilePartsV3, EmptyRootContentV1, FrozenCompilerProfileContentV1, HostCapabilities,
+            ImproverPatch, ParentContentV3, PatchOp, Profile, ProfileContentProofV3, SkillPatch,
+            SkillSnapshot, SystemSnapshot, compile_bundle_v3, replay_resolved_bundle_v3,
+        };
+        use evo_core::{Strategy, fingerprint, hash};
+        use std::collections::BTreeSet;
+        let snapshot = SystemSnapshot {
+            schema_version: "rsia.system_snapshot.v1".into(),
+            profile_id: "projection-profile".into(),
+            host_id: "reference".into(),
+            host_version: "0.1.0".into(),
+            model_id: "development-model".into(),
+            tools: vec![],
+            mandatory_context_digest: hash(b"Complete projection context original.\n"),
+        };
+        let baseline = FrozenCompilerProfileContentV1 {
+            id: "projection-profile-registration".into(),
+            schema_version: "rsia.frozen_compiler_profile.v1".into(),
+            namespace: "projection-data".into(),
+            profile_id: snapshot.profile_id.clone(),
+            version: 1,
+            host_registration_id: "projection-host-registration".into(),
+            provider_registration_id: "projection-provider-registration".into(),
+            resource_instrumentation_id: None,
+            environment_digest: snapshot.digest().unwrap(),
+            system_snapshot: snapshot,
+            capabilities: HostCapabilities {
+                available: BTreeSet::new(),
+                granted: BTreeSet::new(),
+            },
+            baseline_skill: SkillSnapshot::empty(),
+            baseline_strategy: Strategy::default(),
+            dependencies: vec![],
+            purpose: evo_core::evidence::Purpose::Development,
+            application_order: vec!["mandatory_context".into(), "skill".into(), "task".into()],
+            authorized_by: "projection-data-operator".into(),
+        };
+        let root = EmptyRootContentV1 {
+            id: "projection-empty-root".into(),
+            schema_version: "rsia.empty_root_authorization.v1".into(),
+            namespace: baseline.namespace.clone(),
+            profile_registration_id: baseline.id.clone(),
+            profile_digest: fingerprint(&baseline).unwrap(),
+            host_registration_id: baseline.host_registration_id.clone(),
+            skill: SkillSnapshot::empty(),
+            strategy: Strategy {
+                schema_version: "evo.strategy.v1".into(),
+                instruction:
+                    "Preserve the unchanged host baseline; no evolution instruction is applied."
+                        .into(),
+                max_candidates: 1,
+                max_rounds: 1,
+                require_counterexample: true,
+            },
+            authorized_by: "projection-data-operator".into(),
+        };
+        let proof = ProfileContentProofV3::from_content(
+            Profile {
+                id: baseline.profile_id.clone(),
+                evolution_enabled: true,
+                parent_digest: fingerprint(&root).unwrap(),
+                baseline_digest: fingerprint(&baseline).unwrap(),
+            },
+            ParentContentV3::EmptyRoot(root),
+            baseline,
+        )
+        .unwrap();
+        let patch = SkillPatch {
+            content: PatchOp::Set {
+                value: "完整 Current 候选内容；保留 typed V3 全像。".into(),
+            },
+            ..SkillPatch::default()
+        };
+        let bundle = compile_bundle_v3(CompilePartsV3 {
+            content: &proof,
+            skill_patch: &patch,
+            improver_patch: &ImproverPatch::default(),
+            revoked: &BTreeSet::new(),
+        })
+        .unwrap();
+        replay_resolved_bundle_v3(&bundle, &proof, &BTreeSet::new()).unwrap();
+        bundle
+    }
+
+    fn scope() -> GroupScope {
+        GroupScope {
+            group_id: "group".into(),
+            skill_id: "skill".into(),
+            skill_version: "v1".into(),
+            namespace: "projection-data".into(),
+            parent_digest: "parent".into(),
+            approved_parent_digest: "approved-parent".into(),
+            episode_id: "episode".into(),
+            request_id: "request".into(),
+        }
+    }
+
+    #[test]
+    fn current_candidate_projects_its_actual_skill_and_complete_bundle_digest() {
+        let bundle = current_bundle();
+        let expected_bundle = bundle.digest.clone();
+        let expected_skill = skill_snapshot_digest(&bundle.skill).unwrap();
+        let edit = CompiledSkillEdit {
+            output: bundle.skill.clone(),
+            patch: evo_core::contract::SkillPatch::default(),
+            report: EditApplyReport {
+                schema_version: evo_core::skill_edit::SKILL_EDIT_SCHEMA.into(),
+                compiler_version: evo_core::skill_edit::SKILL_EDIT_COMPILER_VERSION.into(),
+                namespace: "projection-data".into(),
+                profile_id: "projection-profile".into(),
+                skill_id: "skill".into(),
+                skill_version: "v1".into(),
+                status: EditApplyStatus::Applied,
+                input_digest: skill_snapshot_digest(&evo_core::contract::SkillSnapshot::empty())
+                    .unwrap(),
+                output_digest: expected_skill.clone(),
+                approved_parent_digest: bundle.parent_digest.clone(),
+                safe_baseline_digest: bundle.baseline_digest.clone(),
+                evidence: EvidenceClosure {
+                    support: vec![],
+                    counterexamples: vec![],
+                    dependencies: vec![],
+                },
+                changed_bytes: 0,
+                edits: vec![],
+            },
+        };
+        let selection = DevelopmentSelection {
+            request_id: "projection-development".into(),
+            manifest_digest: evo_core::hash(b"Complete projection manifest original."),
+            parent_bundle_digest: bundle.parent_digest.clone(),
+            candidate_bundle_digest: expected_bundle.clone(),
+            decision: DevelopmentSelectionDecision::AcceptCandidate,
+            parent_total_micros: 1,
+            candidate_total_micros: 2,
+            reason: "data projection only".into(),
+        };
+        let outcome = group_outcome(
+            scope(),
+            Ok(OptimizationStepOutcome::CurrentCandidate {
+                edit: Box::new(edit.clone()),
+                bundle: Box::new(bundle.clone()),
+                selection: selection.clone(),
+            }),
+        );
+        assert_eq!(outcome.kind, GroupOutcomeKind::Candidate);
+        assert_eq!(
+            outcome.candidate_skill_digest.as_deref(),
+            Some(expected_skill.as_str())
+        );
+        assert_eq!(
+            outcome.candidate_bundle_digest.as_deref(),
+            Some(expected_bundle.as_str())
+        );
+        assert!(outcome.terminal.is_none());
+
+        let mut invalid = edit;
+        invalid.output.content = "x".repeat(16 * 1024 + 1);
+        let refused = group_outcome(
+            scope(),
+            Ok(OptimizationStepOutcome::CurrentCandidate {
+                edit: Box::new(invalid),
+                bundle: Box::new(bundle),
+                selection,
+            }),
+        );
+        assert_eq!(refused.kind, GroupOutcomeKind::Failed);
+        assert!(refused.candidate_skill_digest.is_none());
+        assert!(refused.candidate_bundle_digest.is_none());
+        assert!(matches!(
+            refused.terminal,
+            Some(StepTerminalClass::StepError { .. })
+        ));
+    }
+
+    #[test]
+    fn current_projection_keeps_non_candidate_terminal_classes() {
+        for (step, kind, class) in [
+            (
+                OptimizationStepOutcome::NoChange {
+                    class: StepTerminalClass::NoEligibleReflectionBatch,
+                },
+                GroupOutcomeKind::NoChange,
+                StepTerminalClass::NoEligibleReflectionBatch,
+            ),
+            (
+                OptimizationStepOutcome::Rejected {
+                    class: StepTerminalClass::GrantUnavailable,
+                },
+                GroupOutcomeKind::Rejected,
+                StepTerminalClass::GrantUnavailable,
+            ),
+            (
+                OptimizationStepOutcome::Uncertain {
+                    class: StepTerminalClass::CancelledOrUncertain,
+                },
+                GroupOutcomeKind::Uncertain,
+                StepTerminalClass::CancelledOrUncertain,
+            ),
+        ] {
+            let actual = group_outcome(scope(), Ok(step));
+            assert_eq!(actual.kind, kind);
+            assert_eq!(actual.terminal, Some(class));
+            assert!(actual.candidate_skill_digest.is_none());
+            assert!(actual.candidate_bundle_digest.is_none());
+        }
     }
 }

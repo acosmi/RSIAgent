@@ -657,6 +657,20 @@ impl ModelPort for ScriptedModel {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let tag = match request.stage {
@@ -822,6 +836,66 @@ impl FaultyJournal {
 
 #[async_trait]
 impl OptimizationJournal for FaultyJournal {
+    async fn current_compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::CurrentVerifiedCompilerInputs> {
+        self.inner.current_compiler_inputs(request).await
+    }
+
+    async fn commit_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<()> {
+        match &self.fault {
+            JournalFault::FailOnce {
+                kind,
+                stage,
+                message,
+            } if fact.kind == *kind
+                && stage.is_none_or(|stage| stage == fact.stage)
+                && !self.tripped.swap(true, Ordering::SeqCst) =>
+            {
+                return Err(Error::Conflict(message.clone()));
+            }
+            JournalFault::Crash {
+                kind,
+                stage,
+                message,
+            } if (fact.kind == *kind && stage.is_none_or(|stage| stage == fact.stage))
+                || self.tripped.load(Ordering::SeqCst) =>
+            {
+                self.tripped.store(true, Ordering::SeqCst);
+                return Err(Error::Conflict(message.clone()));
+            }
+            _ => {}
+        }
+        self.inner.commit_source_bound(fact, inputs).await
+    }
+
+    async fn claim_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<bool> {
+        if let JournalFault::ClaimedElsewhere { stage } = &self.fault
+            && fact.kind == StageFactKind::DispatchPrepared
+            && fact.stage == *stage
+        {
+            return Ok(false);
+        }
+        self.inner.claim_source_bound(fact, inputs).await
+    }
+
+    async fn lookup_source_bound(
+        &self,
+        artifact_id: &str,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        self.inner.lookup_source_bound(artifact_id, inputs).await
+    }
+
     async fn commit_bound(
         &self,
         fact: StageFact,
@@ -1238,6 +1312,7 @@ fn class_of(outcome: &OptimizationStepOutcome) -> Option<StepTerminalClass> {
         | OptimizationStepOutcome::Rejected { class }
         | OptimizationStepOutcome::Uncertain { class } => Some(*class),
         OptimizationStepOutcome::Candidate { .. } => None,
+        OptimizationStepOutcome::CurrentCandidate { .. } => None,
     }
 }
 
@@ -1247,6 +1322,7 @@ fn kind_of(outcome: &OptimizationStepOutcome) -> Option<Kind> {
         OptimizationStepOutcome::Rejected { .. } => Some(Kind::Rejected),
         OptimizationStepOutcome::Uncertain { .. } => Some(Kind::Uncertain),
         OptimizationStepOutcome::Candidate { .. } => None,
+        OptimizationStepOutcome::CurrentCandidate { .. } => None,
     }
 }
 
@@ -2092,7 +2168,7 @@ async fn an_accepted_candidate_is_recorded_as_it_always_was() {
     let driven = Setup::default().drive().await;
     let outcome = driven.outcome.as_ref().unwrap();
     assert!(
-        matches!(outcome, OptimizationStepOutcome::Candidate { .. }),
+        matches!(outcome, OptimizationStepOutcome::CurrentCandidate { .. }),
         "{outcome:?}"
     );
     let facts = stage_facts(&driven.env.store).await;
@@ -2193,6 +2269,20 @@ impl ModelPort for WatermarkBumpingModel {
     ) -> evo_core::Result<evo_engine::model::ModelResponse> {
         request.validate()?;
         self.dispatch(request.request).await
+    }
+
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
     }
 
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
@@ -3236,7 +3326,7 @@ mod consolidation {
             let admin = context("admin", Role::Admin);
             let host = context("host", Role::Host);
             let worker = context("worker", Role::Worker);
-            ReleaseStore::register_host_surface(
+            trusted_compiler_inputs::register_fixture_host_surface(
                 &admin,
                 &store,
                 "surface",
@@ -3800,6 +3890,19 @@ mod consolidation {
             self.dispatch(request.request).await
         }
 
+        // This deterministic port accepts the complete Current carrier while
+        // retaining the same fixture responses, receipts and original failures.
+        async fn dispatch_compiler_bound(
+            &self,
+            request: evo_engine::model::ReadBoundModelRequest,
+        ) -> Result<ModelResponse> {
+            request.validate()?;
+            if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+                return Err(Error::Forbidden);
+            }
+            self.dispatch(request.request.clone()).await
+        }
+
         async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
             match &self.script {
                 Script::Edits => {
@@ -4078,6 +4181,58 @@ async fn repair_compiler_use(
     s.commit().await.unwrap();
     evo_engine::model::CompilerInputUse::new(request, verified.binding().clone())
 }
+// Current siblings authenticate in the supplied Store/Session. The original
+// v1 helpers remain the explicit refusal control below, not historical evidence.
+async fn repair_current_compiler_use(
+    store: &Store,
+    fixture: &Fixture,
+    tag: &str,
+) -> evo_engine::model::CurrentCompilerInputUse {
+    let request = fixture
+        .request("binding-world", 1, tag)
+        .compiler_input_request();
+    trusted_compiler_inputs::install_request(store, &request)
+        .await
+        .unwrap();
+    let mut s = store.session().await.unwrap();
+    let verified =
+        evo_engine::formal_authority::resolve_current_compiler_inputs(&mut s, &worker(), &request)
+            .await
+            .unwrap();
+    let inputs =
+        evo_engine::model::CurrentCompilerInputUse::new(request, verified.binding().clone());
+    inputs.verify_current(&mut s, &worker()).await.unwrap();
+    s.commit().await.unwrap();
+    inputs
+}
+fn repair_current_dispatch_fact(bound: &evo_engine::model::CurrentBoundModelRequest) -> StageFact {
+    StageFact {
+        schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+        artifact_id: String::new(),
+        namespace: bound.request.namespace.clone(),
+        episode_id: bound.request.episode_id.clone(),
+        step: bound.request.step,
+        attempt: bound.request.attempt,
+        stage: OptimizationJournalStage::ReflectFailure,
+        kind: StageFactKind::DispatchPrepared,
+        request_id: bound.request.request_id.clone(),
+        input_digest: fingerprint(bound).unwrap(),
+        output_digest: None,
+        dependencies: vec![],
+        payload: serde_json::to_value(bound).unwrap(),
+    }
+    .seal()
+    .unwrap()
+}
+fn repair_read_current_bound(
+    bound: &evo_engine::model::CurrentBoundModelRequest,
+) -> evo_engine::model::ReadBoundModelRequest {
+    let wire = serde_json::to_vec(bound).unwrap();
+    let read = serde_json::from_slice(&wire).unwrap();
+    assert_eq!(serde_json::to_vec(&read).unwrap(), wire);
+    read
+}
+
 fn repair_model_request(fixture: &Fixture, tag: &str) -> ModelRequest {
     ModelRequest::build(
         fixture.request("binding-world", 1, tag).model_context,
@@ -4144,8 +4299,8 @@ async fn bound_cache_and_dispatch_claim_observe_admin_pointer_change_without_run
 {
     let fixture = Fixture::new();
     let (_dir, _path, store) = seeded_store(fixture.outcomes).await;
-    let inputs = repair_compiler_use(&store, &fixture, "bound-cache").await;
-    let bound = evo_engine::model::BoundModelRequest::new(
+    let inputs = repair_current_compiler_use(&store, &fixture, "bound-cache").await;
+    let bound = evo_engine::model::CurrentBoundModelRequest::new(
         repair_model_request(&fixture, "bound-cache"),
         inputs.clone(),
     )
@@ -4153,12 +4308,57 @@ async fn bound_cache_and_dispatch_claim_observe_admin_pointer_change_without_run
     let journal =
         evo_engine::optimization::StoreOptimizationJournal::new(store.clone(), worker(), "worker")
             .unwrap();
-    let fact = repair_dispatch_fact(&bound);
-    assert!(journal.claim_bound(fact.clone(), &inputs).await.unwrap());
-    assert!(!journal.claim_bound(fact.clone(), &inputs).await.unwrap());
+    let fact = repair_current_dispatch_fact(&bound);
+    // The original newly constructed v1 wire is a refusal control. It is not
+    // relabelled as a historical producer or converted into Current authority.
+    let legacy_inputs = repair_compiler_use(&store, &fixture, "bound-cache").await;
+    let legacy = evo_engine::model::BoundModelRequest::new(
+        repair_model_request(&fixture, "bound-cache"),
+        legacy_inputs.clone(),
+    )
+    .unwrap();
+    assert_eq!(legacy.schema_version, "rsia.bound_model_request.v1");
+    let legacy_fact = repair_dispatch_fact(&legacy);
+    // The business fact's identity does not encode the separate compiler-use
+    // carrier. Equal keys still confer no legacy authority: both old ports must
+    // refuse before the first Current claim on that same key.
+    assert_eq!(legacy_fact.artifact_id, fact.artifact_id);
+    assert!(matches!(
+        journal
+            .claim_bound(legacy_fact.clone(), &legacy_inputs)
+            .await,
+        Err(Error::Forbidden)
+    ));
+    assert!(matches!(
+        journal
+            .lookup_bound(&legacy_fact.artifact_id, &legacy_inputs)
+            .await,
+        Err(Error::Forbidden)
+    ));
+    let mut legacy_check = store.session().await.unwrap();
+    assert!(
+        legacy_check
+            .get::<Value>(&worker(), "artifact", &legacy_fact.artifact_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    legacy_check.commit().await.unwrap();
     assert!(
         journal
-            .lookup_bound(&fact.artifact_id, &inputs)
+            .claim_source_bound(fact.clone(), &inputs)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !journal
+            .claim_source_bound(fact.clone(), &inputs)
+            .await
+            .unwrap()
+    );
+    assert!(
+        journal
+            .lookup_source_bound(&fact.artifact_id, &inputs)
             .await
             .unwrap()
             .is_some()
@@ -4169,7 +4369,7 @@ async fn bound_cache_and_dispatch_claim_observe_admin_pointer_change_without_run
     s.commit().await.unwrap();
     assert!(
         journal
-            .lookup_bound(&fact.artifact_id, &inputs)
+            .lookup_source_bound(&fact.artifact_id, &inputs)
             .await
             .is_err()
     );
@@ -4179,7 +4379,7 @@ async fn bound_cache_and_dispatch_claim_observe_admin_pointer_change_without_run
     let fresh_fact = fresh_fact.seal().unwrap();
     assert!(
         journal
-            .claim_bound(fresh_fact.clone(), &inputs)
+            .claim_source_bound(fresh_fact.clone(), &inputs)
             .await
             .is_err()
     );
@@ -4191,7 +4391,7 @@ async fn bound_cache_and_dispatch_claim_observe_admin_pointer_change_without_run
             .is_none()
     );
     s.commit().await.unwrap();
-    let current = repair_compiler_use(&store, &fixture, "bound-cache").await;
+    let current = repair_current_compiler_use(&store, &fixture, "bound-cache").await;
     assert_ne!(
         inputs.binding.binding_digest,
         current.binding.binding_digest
@@ -4274,8 +4474,8 @@ async fn bound_broker_cache_and_expired_refence_keep_exact_input_charge_and_no_r
     let fixture = Fixture::new();
     let (_dir, _path, store) = seeded_store(fixture.outcomes).await;
     repair_root(&store).await;
-    let inputs = repair_compiler_use(&store, &fixture, "bound-broker").await;
-    let bound = evo_engine::model::BoundModelRequest::new(
+    let inputs = repair_current_compiler_use(&store, &fixture, "bound-broker").await;
+    let bound = evo_engine::model::CurrentBoundModelRequest::new(
         repair_model_request(&fixture, "bound-broker"),
         inputs.clone(),
     )
@@ -4283,17 +4483,28 @@ async fn bound_broker_cache_and_expired_refence_keep_exact_input_charge_and_no_r
     let calls = std::sync::Arc::new(AtomicUsize::new(0));
     let broker = repair_broker(&store, calls.clone(), false);
     assert!(matches!(
-        broker.dispatch_bound(bound.clone()).await.unwrap(),
+        broker
+            .dispatch_compiler_bound(repair_read_current_bound(&bound))
+            .await
+            .unwrap(),
         ModelResponse::Completed { .. }
     ));
     assert!(matches!(
-        broker.dispatch_bound(bound.clone()).await.unwrap(),
+        broker
+            .dispatch_compiler_bound(repair_read_current_bound(&bound))
+            .await
+            .unwrap(),
         ModelResponse::Completed { .. }
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(broker.dispatch(bound.request.clone()).await.is_err());
     repair_move_pointer_epoch(&store, 1).await;
-    assert!(broker.dispatch_bound(bound.clone()).await.is_err());
+    assert!(
+        broker
+            .dispatch_compiler_bound(repair_read_current_bound(&bound))
+            .await
+            .is_err()
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let paid = store
         .budget_call(&host(), "binding-scope", &bound.request.request_id)
@@ -4302,18 +4513,22 @@ async fn bound_broker_cache_and_expired_refence_keep_exact_input_charge_and_no_r
         .unwrap();
     assert_eq!(paid.actual_cost_micros, Some(5));
     assert!(paid.execution_closed);
-    let current = repair_compiler_use(&store, &fixture, "bound-broker").await;
+    let current = repair_current_compiler_use(&store, &fixture, "bound-broker").await;
     let reused =
-        evo_engine::model::BoundModelRequest::new(bound.request.clone(), current.clone()).unwrap();
+        evo_engine::model::CurrentBoundModelRequest::new(bound.request.clone(), current.clone())
+            .unwrap();
     assert!(matches!(
-        broker.dispatch_bound(reused).await.unwrap(),
+        broker
+            .dispatch_compiler_bound(repair_read_current_bound(&reused))
+            .await
+            .unwrap(),
         ModelResponse::Rejected {
             dispatch: RejectedDispatch::NotDispatched,
             ..
         }
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    let next = evo_engine::model::BoundModelRequest::new(
+    let next = evo_engine::model::CurrentBoundModelRequest::new(
         repair_model_request(&fixture, "bound-refence"),
         current,
     )
@@ -4326,7 +4541,7 @@ async fn bound_broker_cache_and_expired_refence_keep_exact_input_charge_and_no_r
         actual_input_digest: next.request.cache_key_digest.clone(),
         request_artifact: Some(
             evo_storage::budget::BudgetArtifact::from_serializable(
-                "rsia.bound_model_request.v1",
+                evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA,
                 &next,
             )
             .unwrap(),
@@ -4345,7 +4560,10 @@ async fn bound_broker_cache_and_expired_refence_keep_exact_input_charge_and_no_r
         .await
         .unwrap();
     assert!(matches!(
-        broker.dispatch_bound(next.clone()).await.unwrap(),
+        broker
+            .dispatch_compiler_bound(repair_read_current_bound(&next))
+            .await
+            .unwrap(),
         ModelResponse::Completed { .. }
     ));
     let paid = store
@@ -4359,10 +4577,11 @@ async fn bound_broker_cache_and_expired_refence_keep_exact_input_charge_and_no_r
     let request_artifact = paid.request_artifact.unwrap();
     assert_eq!(
         request_artifact.schema_version,
-        "rsia.bound_model_request.v1"
+        evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA
     );
-    let persisted: evo_engine::model::BoundModelRequest =
+    let persisted: evo_engine::model::CurrentBoundModelRequest =
         serde_json::from_str(&request_artifact.body).unwrap();
+    persisted.validate().unwrap();
     assert_eq!(
         fingerprint(&persisted).unwrap(),
         fingerprint(&next).unwrap()
@@ -4374,8 +4593,8 @@ async fn bound_transport_outcome_unknown_is_preserved_and_never_automatically_re
     let fixture = Fixture::new();
     let (_dir, _path, store) = seeded_store(fixture.outcomes).await;
     repair_root(&store).await;
-    let inputs = repair_compiler_use(&store, &fixture, "bound-uncertain").await;
-    let bound = evo_engine::model::BoundModelRequest::new(
+    let inputs = repair_current_compiler_use(&store, &fixture, "bound-uncertain").await;
+    let bound = evo_engine::model::CurrentBoundModelRequest::new(
         repair_model_request(&fixture, "bound-uncertain"),
         inputs,
     )
@@ -4384,7 +4603,10 @@ async fn bound_transport_outcome_unknown_is_preserved_and_never_automatically_re
     let broker = repair_broker(&store, calls.clone(), true);
     for _ in 0..2 {
         assert!(matches!(
-            broker.dispatch_bound(bound.clone()).await.unwrap(),
+            broker
+                .dispatch_compiler_bound(repair_read_current_bound(&bound))
+                .await
+                .unwrap(),
             ModelResponse::Uncertain { .. }
         ));
     }

@@ -118,19 +118,27 @@ pub fn rollback(
     pointer: &mut ProfilePointer,
 ) -> Result<()> {
     ctx.require(&[Role::Admin])?;
-    identifier(previous_digest)?;
+    if previous_digest.len() != 64
+        || !previous_digest
+            .bytes()
+            .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+    {
+        return Err(Error::Invalid(
+            "rollback target digest must be 64 lowercase hexadecimal characters".into(),
+        ));
+    }
     if current.state == ReleaseState::Revoked && previous_digest == current.bundle_digest {
         return Err(Error::Conflict(
             "revoked content cannot be the rollback target".into(),
         ));
     }
-    pointer.active = Some(previous_digest.into());
-    pointer.epoch = pointer
-        .epoch
-        .checked_add(1)
-        .ok_or_else(|| Error::Conflict("pointer_epoch_overflow".into()))?;
-    current.state = ReleaseState::RolledBack;
-    Ok(())
+    // A digest string provides no approved-release or complete-bundle source.
+    // Actual rollback must use ReleaseStore::rollback, which reloads the
+    // authenticated prior release and candidate in its existing transaction.
+    let _ = pointer;
+    Err(Error::Conflict(
+        "rollback requires a stored approved release and its complete bundle source".into(),
+    ))
 }
 
 pub fn apply_receipt(ctx: &Context, release: &Release, receipt: &AppliedReceipt) -> Result<()> {
@@ -241,6 +249,39 @@ mod tests {
         };
         assert!(apply_receipt(&host, &rel, &receipt).is_err());
         assert!(side_effects_survive_rollback());
+    }
+
+    #[test]
+    fn raw_rollback_digest_cannot_change_a_pointer_without_approved_source() {
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        let mut release = Release {
+            id: "current".into(),
+            bundle_digest: evo_core::hash(b"current complete bundle"),
+            evaluation_id: "evaluation".into(),
+            parent_pointer: evo_core::hash(b"parent complete bundle"),
+            state: ReleaseState::Active,
+            approved_by: Some("admin".into()),
+        };
+        let mut pointer = ProfilePointer {
+            profile_id: "p1".into(),
+            active: Some(release.bundle_digest.clone()),
+            epoch: 7,
+        };
+        let before = serde_json::to_value((&release, &pointer)).unwrap();
+        let alleged_previous = evo_core::hash(b"unregistered complete bundle");
+        assert!(matches!(
+            rollback(&admin, &mut release, &alleged_previous, &mut pointer),
+            Err(Error::Conflict(message))
+                if message == "rollback requires a stored approved release and its complete bundle source"
+        ));
+        assert_eq!(serde_json::to_value((&release, &pointer)).unwrap(), before);
+        for malformed in ["previous-release", &"A".repeat(64), &"0".repeat(63)] {
+            assert!(matches!(
+                rollback(&admin, &mut release, malformed, &mut pointer),
+                Err(Error::Invalid(_))
+            ));
+            assert_eq!(serde_json::to_value((&release, &pointer)).unwrap(), before);
+        }
     }
 
     #[test]

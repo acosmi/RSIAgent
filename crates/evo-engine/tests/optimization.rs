@@ -82,6 +82,20 @@ impl ModelPort for FixtureModelPort {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let output = "[]".to_string();
         Ok(ModelResponse::Completed {
@@ -267,6 +281,20 @@ impl ModelPort for EditingFixtureModelPort {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         let source = request.source_closure[0].clone();
         let parent: SkillSnapshot = serde_json::from_str(
@@ -348,10 +376,79 @@ impl ModelPort for EditingFixtureModelPort {
 struct FixtureJournal {
     facts: Mutex<Vec<StageFact>>,
     recovery_facts: Mutex<Vec<StageFact>>,
+    // The test owns this Store for its whole lifetime; Current never borrows
+    // a resolver-created database or manufactures the request's watermark.
+    current_store: Option<(Store, Context)>,
+}
+
+impl FixtureJournal {
+    async fn verify_current_use(
+        &self,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<()> {
+        let (store, context) = self.current_store.as_ref().ok_or(Error::Forbidden)?;
+        let mut session = store.session().await?;
+        Box::pin(inputs.verify_current(&mut session, context)).await?;
+        session.commit().await
+    }
 }
 
 #[async_trait]
 impl OptimizationJournal for FixtureJournal {
+    async fn current_compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> Result<evo_engine::formal_authority::CurrentVerifiedCompilerInputs> {
+        let (store, context) = self.current_store.as_ref().ok_or(Error::Forbidden)?;
+        trusted_compiler_inputs::resolve_software_fixture_current(store, context, request).await
+    }
+
+    async fn commit_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<()> {
+        self.verify_current_use(inputs).await?;
+        let recovery = matches!(
+            fact.kind,
+            StageFactKind::StepPrepared
+                | StageFactKind::StepCompleted
+                | StageFactKind::DispatchPrepared
+                | StageFactKind::DispatchObserved
+        );
+        if recovery {
+            self.recovery_facts.lock().unwrap().push(fact);
+        } else {
+            self.facts.lock().unwrap().push(fact);
+        }
+        Ok(())
+    }
+
+    async fn claim_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<bool> {
+        self.commit_source_bound(fact, inputs).await?;
+        Ok(true)
+    }
+
+    async fn lookup_source_bound(
+        &self,
+        id: &str,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        self.verify_current_use(inputs).await?;
+        Ok(self
+            .facts
+            .lock()
+            .unwrap()
+            .iter()
+            .chain(self.recovery_facts.lock().unwrap().iter())
+            .find(|f| f.artifact_id == id)
+            .cloned())
+    }
+
     async fn commit_bound(
         &self,
         fact: StageFact,
@@ -555,7 +652,15 @@ async fn g1_step_requires_journal_and_reaches_development_candidate_without_acti
         granted: BTreeSet::new(),
     };
     let revoked = BTreeSet::new();
-    let journal = FixtureJournal::default();
+    let directory = tempfile::tempdir().unwrap();
+    let current_store = Store::open(&directory.path().join("fixture-journal.sqlite3"))
+        .await
+        .unwrap();
+    let current_context = Context::new("tenant", "worker", Role::Worker).unwrap();
+    let journal = FixtureJournal {
+        current_store: Some((current_store.clone(), current_context)),
+        ..FixtureJournal::default()
+    };
     let source_selection = SourceSelection {
         roots: vec![],
         run_ids: vec!["run-failure".into(), "run-success".into()],
@@ -618,6 +723,9 @@ async fn g1_step_requires_journal_and_reaches_development_candidate_without_acti
             allow_rank_call: false,
         })
     };
+    // Install the real source/grant closure and advance its own durable
+    // watermark once, using the original fixture producer and Clock.
+    seed_authority(&current_store, &make_request()).await;
     let missing = run_optimization_step(
         Some(&EditingFixtureModelPort),
         Some(&FixtureDevRunner),
@@ -655,13 +763,17 @@ async fn g1_step_requires_journal_and_reaches_development_candidate_without_acti
     )
     .await
     .unwrap();
-    assert!(matches!(outcome, OptimizationStepOutcome::Candidate { .. }));
+    assert!(matches!(
+        outcome,
+        OptimizationStepOutcome::CurrentCandidate { .. }
+    ));
     assert_eq!(journal.facts.lock().unwrap().len(), 8);
     exercise_sqlite_recovery(&make_request).await;
     exercise_rank_and_authority(&make_request).await;
     exercise_late_revocation(&make_request).await;
     exercise_terminal_outcomes(&make_request).await;
     exercise_missing_watermark(&make_request).await;
+    current_store.close().await;
 }
 
 #[tokio::test]
@@ -742,6 +854,20 @@ impl ModelPort for CountModel {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         EditingFixtureModelPort.dispatch(request).await
@@ -765,6 +891,45 @@ struct CrashJournal {
 }
 #[async_trait]
 impl OptimizationJournal for CrashJournal {
+    async fn current_compiler_inputs(
+        &self,
+        request: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> evo_core::Result<evo_engine::formal_authority::CurrentVerifiedCompilerInputs> {
+        self.inner.current_compiler_inputs(request).await
+    }
+
+    async fn commit_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<()> {
+        if (fact.kind == self.kind && fact.stage == self.stage)
+            || self.failed.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(Error::Conflict(
+                "fixture crash before durable commit".into(),
+            ));
+        }
+        self.inner.commit_source_bound(fact, inputs).await
+    }
+
+    async fn claim_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<bool> {
+        self.inner.claim_source_bound(fact, inputs).await
+    }
+
+    async fn lookup_source_bound(
+        &self,
+        id: &str,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        self.inner.lookup_source_bound(id, inputs).await
+    }
+
     async fn commit_bound(
         &self,
         fact: StageFact,
@@ -965,7 +1130,7 @@ async fn exercise_sqlite_recovery<'a>(make_request: impl Fn() -> OptimizationSte
         if expected_uncertain {
             assert!(matches!(outcome, OptimizationStepOutcome::Uncertain { .. }));
         } else {
-            let OptimizationStepOutcome::Candidate {
+            let OptimizationStepOutcome::CurrentCandidate {
                 edit,
                 bundle,
                 selection,
@@ -982,7 +1147,7 @@ async fn exercise_sqlite_recovery<'a>(make_request: impl Fn() -> OptimizationSte
             let recovered = run_optimization_step(None, None, Some(&journal), make_request())
                 .await
                 .unwrap();
-            let OptimizationStepOutcome::Candidate {
+            let OptimizationStepOutcome::CurrentCandidate {
                 edit: again,
                 bundle: again_bundle,
                 selection: again_selection,
@@ -1119,6 +1284,20 @@ impl ModelPort for RankingFixture {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         use std::sync::atomic::Ordering::SeqCst;
         if request.stage == ModelStage::Rank {
@@ -1198,7 +1377,10 @@ async fn exercise_rank_and_authority<'a>(make_request: impl Fn() -> Optimization
             assert!(matches!(outcome, OptimizationStepOutcome::Rejected { .. }));
             assert_eq!(runner.0.load(SeqCst), 0);
         } else {
-            assert!(matches!(outcome, OptimizationStepOutcome::Candidate { .. }));
+            assert!(matches!(
+                outcome,
+                OptimizationStepOutcome::CurrentCandidate { .. }
+            ));
             assert_eq!(runner.0.load(SeqCst), 1);
         }
         let mut request = make_request();
@@ -1219,7 +1401,7 @@ async fn exercise_rank_and_authority<'a>(make_request: impl Fn() -> Optimization
         if !invalid {
             assert!(matches!(
                 second_case,
-                OptimizationStepOutcome::Candidate { .. }
+                OptimizationStepOutcome::CurrentCandidate { .. }
             ));
         }
         assert_eq!(model.ranks.load(SeqCst), 2);
@@ -1362,6 +1544,20 @@ impl ModelPort for RevokingModel {
         self.dispatch(request.request).await
     }
 
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
+    }
+
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let response = EditingFixtureModelPort.dispatch(request).await?;
@@ -1435,6 +1631,20 @@ impl ModelPort for TerminalFixture {
     ) -> evo_core::Result<evo_engine::model::ModelResponse> {
         request.validate()?;
         self.dispatch(request.request).await
+    }
+
+    // Explicit software fixture support; the caller's real Current journal
+    // verifies authority. This adapter retains the original scripted response
+    // and Fixture provenance, and supplies no provider or OS authority.
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<evo_engine::model::ModelResponse> {
+        request.validate()?;
+        if request.schema_version != evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+            return Err(evo_core::Error::Forbidden);
+        }
+        self.dispatch(request.request.clone()).await
     }
 
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
@@ -1627,4 +1837,210 @@ async fn legacy_run_is_explicitly_unsupported_and_never_overwritten() {
         legacy
     );
     session.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn current_fact_source_preflight_precedes_first_dml() {
+    use evo_engine::formal_authority::{CompilerInputRequest, resolve_current_compiler_inputs};
+    use evo_engine::model::CurrentCompilerInputUse;
+    use evo_engine::optimization::{StageDependency, StoreOptimizationJournal as ActualJournal};
+    fn sql_image(path: &std::path::Path) -> serde_json::Value {
+        let script = r#"
+import json,sqlite3,sys
+con=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+quote=lambda name:'"'+name.replace('"','""')+'"'
+image={}
+for (name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+    columns=con.execute('PRAGMA table_info('+quote(name)+')').fetchall()
+    image[name]=[[{'blob':x.hex()} if isinstance(x,bytes) else x for x in row] for row in con.execute('SELECT * FROM '+quote(name)+' ORDER BY '+','.join(str(i+1) for i in range(len(columns))))]
+con.close();print(json.dumps(image,sort_keys=True))
+"#;
+        let output = std::process::Command::new("python3")
+            .args(["-B", "-c", script])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+    async fn fixture() -> (tempfile::TempDir, Store, Context, CurrentCompilerInputUse) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("preflight.sqlite3"))
+            .await
+            .unwrap();
+        let worker = Context::new("n", "worker", Role::Worker).unwrap();
+        let f = trusted_compiler_inputs::inputs(
+            "n",
+            "first-dml",
+            SkillSnapshot::empty(),
+            Strategy::default(),
+            HostCapabilities {
+                available: Default::default(),
+                granted: Default::default(),
+            },
+            &hash(b"environment"),
+        );
+        trusted_compiler_inputs::install(&store, &f).await.unwrap();
+        let mut session = store.session().await.unwrap();
+        session
+            .bump_watermark(&worker, &hash(b"current source watermark"))
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let request = CompilerInputRequest {
+            profile: f.profile,
+            search_parent: f.root.skill,
+            baseline: f.frozen.baseline_skill,
+            search_parent_strategy: f.root.strategy,
+            expected_parent_strategy_digest: None,
+            baseline_strategy: f.frozen.baseline_strategy,
+            capabilities: f.frozen.capabilities,
+            environment_digest: f.frozen.environment_digest,
+            purpose: Purpose::Development,
+            revoke_watermark: 1,
+        };
+        let mut session = store.session().await.unwrap();
+        let actual = resolve_current_compiler_inputs(&mut session, &worker, &request)
+            .await
+            .unwrap();
+        let inputs = CurrentCompilerInputUse::new(request, actual.binding().clone());
+        inputs.verify_current(&mut session, &worker).await.unwrap();
+        session.commit().await.unwrap();
+        (directory, store, worker, inputs)
+    }
+    fn fact(dependencies: Vec<StageDependency>) -> StageFact {
+        StageFact {
+            schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+            artifact_id: String::new(),
+            namespace: "n".into(),
+            episode_id: "first-dml-episode".into(),
+            step: 1,
+            attempt: 1,
+            stage: OptimizationJournalStage::ReflectFailure,
+            kind: StageFactKind::StepPrepared,
+            request_id: "first-dml-request".into(),
+            input_digest: hash(b"complete input"),
+            output_digest: None,
+            dependencies,
+            payload: serde_json::json!({"software_control":"metadata"}),
+        }
+        .seal()
+        .unwrap()
+    }
+    for claim in [true, false] {
+        let (_directory, store, worker, inputs) = fixture().await;
+        let journal = ActualJournal::new(store.clone(), worker.clone(), worker.actor()).unwrap();
+        if claim {
+            assert!(
+                journal
+                    .claim_source_bound(fact(vec![]), &inputs)
+                    .await
+                    .unwrap()
+            );
+        } else {
+            journal
+                .commit_source_bound(fact(vec![]), &inputs)
+                .await
+                .unwrap();
+        }
+        store.close().await;
+        for fault in ["environment", "watermark"] {
+            let (directory, store, worker, inputs) = fixture().await;
+            let journal =
+                ActualJournal::new(store.clone(), worker.clone(), worker.actor()).unwrap();
+            let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"CREATE TRIGGER ag135b_first_dml BEFORE INSERT ON objects BEGIN SELECT RAISE(FAIL,'AG135B_FIRST_DML_SENTINEL'); END\"); c.commit(); c.close()";
+            let result = std::process::Command::new("python3")
+                .args(["-B", "-c", script])
+                .arg(directory.path().join("preflight.sqlite3"))
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let mut session = store.session().await.unwrap();
+            let before = session
+                .list::<serde_json::Value>(&worker, "artifact")
+                .await
+                .unwrap();
+            session.commit().await.unwrap();
+            let audit = store
+                .verify_audit(
+                    &evo_core::Context::new(
+                        worker.namespace(),
+                        "fixture-admin",
+                        evo_core::Role::Admin,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let before_sql = sql_image(&directory.path().join("preflight.sqlite3"));
+            let invalid = if fault == "environment" {
+                fact(vec![StageDependency {
+                    kind: "environment".into(),
+                    id: hash(b"environment"),
+                }])
+            } else {
+                fact(vec![StageDependency {
+                    kind: "revoke_watermark".into(),
+                    id: "2".into(),
+                }])
+            };
+            let rejected = if claim {
+                journal
+                    .claim_source_bound(invalid, &inputs)
+                    .await
+                    .map(|_| ())
+            } else {
+                journal.commit_source_bound(invalid, &inputs).await
+            };
+            let expected = if fault == "environment" {
+                "environment dependency requires one development request"
+            } else {
+                "source revoke watermark changed"
+            };
+            assert!(matches!(rejected,Err(Error::Conflict(message)) if message==expected));
+            let mut session = store.session().await.unwrap();
+            assert_eq!(
+                session
+                    .list::<serde_json::Value>(&worker, "artifact")
+                    .await
+                    .unwrap(),
+                before
+            );
+            assert!(
+                session
+                    .get::<serde_json::Value>(&worker, "artifact", &inputs.artifact_id().unwrap())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            session.commit().await.unwrap();
+            assert_eq!(
+                store
+                    .verify_audit(
+                        &evo_core::Context::new(
+                            worker.namespace(),
+                            "fixture-admin",
+                            evo_core::Role::Admin
+                        )
+                        .unwrap()
+                    )
+                    .await
+                    .unwrap(),
+                audit
+            );
+            assert_eq!(
+                sql_image(&directory.path().join("preflight.sqlite3")),
+                before_sql
+            );
+            store.close().await;
+        }
+    }
 }

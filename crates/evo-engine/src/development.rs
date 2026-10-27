@@ -56,12 +56,12 @@ fn verify_development_bundle_inputs<'a>(
     s: &'a mut Session,
     ctx: &'a Context,
     request: &'a DevelopmentRunRequest,
-) -> StepFuture<'a, crate::compiler::AuthenticatedBundleRecord> {
+) -> StepFuture<'a, crate::compiler::CurrentAuthenticatedBundleRecord> {
     // The pure-function runner's parent label is an experimental comparison
     // identifier, not ordinary-P authority. Its candidate carries the full,
     // authenticated actual P/B pair; formal host pairs are separately replayed
     // against their registered projection in verify_formal_task_in_session.
-    Box::pin(crate::compiler::verify_bundle_in_session(
+    Box::pin(crate::compiler::verify_current_bundle_in_session(
         s,
         ctx,
         &request.candidate_bundle_digest,
@@ -301,6 +301,186 @@ impl DevelopmentTaskSpecV1 {
             input_digest: self.input_digest.clone(),
         }
     }
+}
+
+/// Original software-task content, excluding the task locator and family label.
+/// These bytes attest content only; source permission remains the existing
+/// same-Session control/source/receipt checks below.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskSourceMaterialV1 {
+    domain: String,
+    schema_version: String,
+    profile: RegisteredPureFunctionProfileV1,
+    target_source_body_utf8: String,
+    oracle_source_body_utf8: String,
+    profile_runner_source_body_utf8: String,
+    input_schema_utf8: String,
+    output_schema_utf8: String,
+    input: RegisteredTargetInputV1,
+    input_digest: String,
+    expected_answer_json: String,
+    fixed_grader: FixedGraderSpec,
+    execution_runner_contract_body_utf8: String,
+    environment_digest: String,
+    rules_digest: String,
+    tools_digest: String,
+}
+fn development_task_source_material(
+    c: &DevelopmentControlV1,
+    t: &DevelopmentTaskSpecV1,
+) -> Result<TaskSourceMaterialV1> {
+    c.validate()?;
+    t.validate()?;
+    if fingerprint(c.task(&t.task_id)?)? != fingerprint(t)? {
+        return Err(pair_source_changed());
+    }
+    let profile = RegisteredPureFunctionProfileV1::clamp_i64();
+    profile.validate()?;
+    let [
+        (target_id, target),
+        (oracle_id, oracle),
+        (runner_id, runner),
+    ] = crate::curriculum_profiles::registered_profile_source_bodies();
+    let input_schema_utf8 = "{value:i64,min:i64,max:i64}:domain+-1000000".to_owned();
+    let output_schema_utf8 = "{clamped:i64}".to_owned();
+    if target_id != profile.target_source_id
+        || oracle_id != profile.oracle_source_id
+        || runner_id != profile.runner_source_id
+        || fingerprint(&target)? != profile.target_digest
+        || fingerprint(&oracle)? != profile.oracle_digest
+        || fingerprint(&runner)? != profile.runner_digest
+        || hash(input_schema_utf8.as_bytes()) != profile.input_schema_digest
+        || hash(output_schema_utf8.as_bytes()) != profile.output_schema_digest
+        || t.profile_id != profile.profile_id
+        || t.target_id != profile.target_id
+        || c.target_digest != profile.target_digest
+        || c.oracle_digest != profile.oracle_digest
+        || c.runner_digest != registered_runner_digest()?
+    {
+        return Err(pair_source_changed());
+    }
+    let text = |v: &serde_json::Value| serde_json::to_string(v).map_err(|_| Error::Internal);
+    Ok(TaskSourceMaterialV1 {
+        domain: "rsia.development_task_source".into(),
+        schema_version: "rsia.development_task_source_material.v1".into(),
+        profile,
+        target_source_body_utf8: text(&target)?,
+        oracle_source_body_utf8: text(&oracle)?,
+        profile_runner_source_body_utf8: text(&runner)?,
+        input_schema_utf8,
+        output_schema_utf8,
+        input: t.input,
+        input_digest: t.input_digest.clone(),
+        expected_answer_json: t.expected_answer_json.clone(),
+        fixed_grader: c.fixed_grader.clone(),
+        execution_runner_contract_body_utf8: text(&registered_runner_contract_body())?,
+        environment_digest: c.environment_digest.clone(),
+        rules_digest: c.rules_digest.clone(),
+        tools_digest: c.tools_digest.clone(),
+    })
+}
+fn pair_source_changed() -> Error {
+    Error::Conflict("development pair raw source/score changed".into())
+}
+
+// Existing receipts retain Uncertain and all original diagnostic paths.
+// This optional numeric bridge requires measured execution costs; it never
+// substitutes zero or claims complete-episode/nonmonetary cost coverage.
+fn pair_metered_costs(p: &VerifiedPair) -> Result<(u64, u64, String, (String, String))> {
+    match (&p.parent.cost_state, &p.candidate.cost_state) {
+        (
+            DevelopmentCostState::Known {
+                micros: a,
+                currency: ac,
+                pricing_version: ap,
+            },
+            DevelopmentCostState::Known {
+                micros: b,
+                currency: bc,
+                pricing_version: bp,
+            },
+        ) if ac == bc => Ok((
+            u64::try_from(*a).map_err(|_| pair_source_changed())?,
+            u64::try_from(*b).map_err(|_| pair_source_changed())?,
+            ac.clone(),
+            (ap.clone(), bp.clone()),
+        )),
+        _ => Err(Error::Conflict(
+            "pair metered-cost comparison unavailable".into(),
+        )),
+    }
+}
+/// Private producer: reloads real source and recomputes both scores, using the
+/// caller's existing Session. It does not open Store, commit or mint authority.
+pub(crate) async fn rebuild_bound_development_pair_in_session(
+    ctx: &Context,
+    s: &mut Session,
+    control_id: &str,
+    request: &DevelopmentRunRequest,
+    task_id: &str,
+) -> Result<evo_core::BoundPairV2> {
+    validate_development_request(request)?;
+    let c = need_control(s, ctx, control_id).await?;
+    if c.evidence_scope != DevelopmentEvidenceScope::RegisteredPureFunctionExecution {
+        return Err(Error::Forbidden);
+    }
+    validate_control_request_binding(&c, request)?;
+    require_live_sources(s, ctx, &c.source_ids, request.revoke_watermark).await?;
+    verify_development_bundle_inputs(s, ctx, request).await?;
+    let t = registered_task(&c, request, task_id)?;
+    let parent_id = execution_receipt_id(&request.request_id, task_id, DevelopmentSide::Parent)?;
+    let candidate_id =
+        execution_receipt_id(&request.request_id, task_id, DevelopmentSide::Candidate)?;
+    let pair = verify_execution_pair(ctx, s, &c, request, t, &parent_id, &candidate_id).await?;
+    let grader_id = grader_receipt_id(&request.request_id, task_id)?;
+    let g: DevelopmentGraderReceiptV1 =
+        need_record(s, ctx, GRADER_RECEIPT_KIND, &grader_id).await?;
+    if g.schema_version != DEVELOPMENT_GRADER_RECEIPT_SCHEMA
+        || g.receipt_id != grader_id
+        || g.namespace != ctx.namespace()
+    {
+        return Err(pair_source_changed());
+    }
+    validate_grader_receipt_binding(&g, &c, request, t, &pair)?;
+    if let Some(id) = &g.scoring_budget_call_id {
+        let call = s
+            .budget_call(ctx, &c.billing_scope, id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        validate_scoring_call(ctx, &call, &c, request)?;
+    }
+    let material = development_task_source_material(&c, t)?;
+    let raw = serde_json::to_string(&material).map_err(|_| Error::Internal)?;
+    let (baseline, candidate, currency, pricing_versions) = pair_metered_costs(&pair)?;
+    evo_core::BoundPairV2::from_development_material(
+        &t.task_id,
+        &t.parent_family,
+        raw,
+        (pair.parent_score_micros, pair.candidate_score_micros),
+        (baseline, candidate),
+        currency,
+        pricing_versions,
+    )
+}
+/// New current-wire reader, not a replacement for any legacy reader.
+/// Its explicit loader coordinates are independently supplied by the existing
+/// controlled caller, not selected from the untrusted DTO's self-description.
+pub(crate) async fn read_bound_development_pair_in_session(
+    ctx: &Context,
+    s: &mut Session,
+    control_id: &str,
+    request: &DevelopmentRunRequest,
+    task_id: &str,
+    wire: &evo_core::BoundPairV2,
+) -> Result<evo_core::Pair> {
+    let actual =
+        rebuild_bound_development_pair_in_session(ctx, s, control_id, request, task_id).await?;
+    wire.validate_against_raw(actual.task_material_utf8.as_bytes())?;
+    if fingerprint(wire)? != fingerprint(&actual)? {
+        return Err(pair_source_changed());
+    }
+    wire.to_legacy_pair(actual.task_material_utf8.as_bytes())
 }
 
 fn registered_runner_contract_body() -> serde_json::Value {
@@ -1788,6 +1968,64 @@ pub(crate) async fn verify_observed_report_in_session(
                 "development report scores differ from the server-computed grader result".into(),
             ));
         }
+        // Bind the complete registered task content for every observed score.
+        // This is development software material, never Formal sample authority.
+        let material = development_task_source_material(&control, task)?;
+        let material_utf8 = serde_json::to_string(&material).map_err(|_| Error::Internal)?;
+        // A damaged Known amount is still corruption when the currencies are
+        // incomparable or the other side is Uncertain; it is not an optional
+        // mathematical projection failure.
+        for cost in [&pair.parent.cost_state, &pair.candidate.cost_state] {
+            if let DevelopmentCostState::Known { micros, .. } = cost {
+                u64::try_from(*micros).map_err(|_| pair_source_changed())?;
+            }
+        }
+        let comparable_costs = matches!(
+            (&pair.parent.cost_state, &pair.candidate.cost_state),
+            (DevelopmentCostState::Known { currency: parent, .. },
+             DevelopmentCostState::Known { currency: candidate, .. }) if parent == candidate
+        );
+        if comparable_costs {
+            let (baseline, candidate, currency, pricing_versions) = pair_metered_costs(&pair)?;
+            let expected = evo_core::BoundPairV2::from_development_material(
+                &task.task_id,
+                &task.parent_family,
+                material_utf8.clone(),
+                (pair.parent_score_micros, pair.candidate_score_micros),
+                (baseline, candidate),
+                currency,
+                pricing_versions,
+            )?;
+            // These entry points independently reload the original control,
+            // output/receipt/budget/grader closure in this same Session.
+            let bound = rebuild_bound_development_pair_in_session(
+                ctx,
+                session,
+                &control.id,
+                request,
+                &task.task_id,
+            )
+            .await?;
+            if fingerprint(&bound)? != fingerprint(&expected)? {
+                return Err(pair_source_changed());
+            }
+            let projected = read_bound_development_pair_in_session(
+                ctx,
+                session,
+                &control.id,
+                request,
+                &task.task_id,
+                &bound,
+            )
+            .await?;
+            let expected_projection = expected.to_legacy_pair(material_utf8.as_bytes())?;
+            if fingerprint(&projected)? != fingerprint(&expected_projection)? {
+                return Err(pair_source_changed());
+            }
+        }
+        // Uncertain or incomparable costs retain the original integer q,
+        // outputs and accounting facts. They never become numeric zero.
+        // Legitimate metered 0/0 likewise proves no monetary saving.
         for receipt in [&pair.parent, &pair.candidate] {
             execution_ids.insert(receipt.receipt_id.clone());
             call_ids.insert(receipt.budget_call_id.clone());
@@ -2171,7 +2409,7 @@ impl RegisteredDevelopmentRunner {
         fence: &BudgetCallFence,
         request: &DevelopmentRunRequest,
         source_ids: &[String],
-        reserved_inputs: &crate::compiler::AuthenticatedBundleRecord,
+        reserved_inputs: &crate::compiler::CurrentAuthenticatedBundleRecord,
     ) -> Result<BudgetDispatchDecision> {
         let mut session = self.store.session().await?;
         // A proven source revocation keeps the existing typed budget refusal and
@@ -2207,7 +2445,7 @@ impl RegisteredDevelopmentRunner {
                     "development original compiler request differs".into(),
                 ));
             }
-            let inputs = crate::model::CompilerInputUse::new(
+            let inputs = crate::model::CurrentCompilerInputUse::new(
                 reserved_inputs.input.clone(),
                 reserved_inputs.binding.clone(),
             );

@@ -4,7 +4,7 @@
 mod trusted_compiler_inputs;
 
 use evo_core::contract::{
-    CompileParts, HostCapabilities, ImproverPatch, Profile, ResolvedBundle, SkillPatch,
+    CompileParts, HostCapabilities, ImproverPatch, Profile, ResolvedBundleV3, SkillPatch,
     SkillSnapshot, compile_bundle,
 };
 use evo_core::evaluation::{
@@ -35,10 +35,10 @@ use evo_engine::evidence::{
 use evo_engine::optimization::{
     DevelopmentManifest, DevelopmentRunRequest, DevelopmentSelection, DevelopmentSelectionDecision,
     DevelopmentTask, OptimizationJournal, OptimizationJournalStage, StageDependency, StageFact,
-    StageFactKind, StepTerminalClass, StoreOptimizationJournal, edit_compiled_input_digest,
+    StageFactKind, StepTerminalClass, StoreOptimizationJournal,
 };
 use evo_engine::release_store::{
-    ReleaseCandidateRecord, ReleaseStore, StageBundleRequest, TypedSourceRef,
+    CurrentReleaseCandidateRecord, CurrentStageBundleRequest, ReleaseStore, TypedSourceRef,
 };
 use evo_engine::review::{
     ReviewDetail, ReviewGap, ReviewKind, ReviewPayload, ReviewRequest, ReviewResponse,
@@ -107,7 +107,7 @@ fn source(id: &str, body: &str) -> StoredTraceAuthority {
         excerpt_end: body.len(),
     }
 }
-struct MaterialFixture {
+struct MaterialFixture<Candidate = CurrentReleaseCandidateRecord> {
     _dir: tempfile::TempDir,
     db_path: PathBuf,
     store: Store,
@@ -120,9 +120,13 @@ struct MaterialFixture {
     baseline_strategy: Strategy,
     caps: HostCapabilities,
     sources: Vec<StoredTraceAuthority>,
-    candidate: ReleaseCandidateRecord,
+    candidate: Candidate,
 }
-async fn material_fixture(parent: SkillSnapshot) -> MaterialFixture {
+// Current health is the existing ProgramFixture/EmptyRoot diagnostic only.
+// The unchanged old helpers retain legacy wire without Current authority.
+async fn material_fixture_current(
+    parent: SkillSnapshot,
+) -> MaterialFixture<CurrentReleaseCandidateRecord> {
     let baseline = SkillSnapshot {
         content: "Safe baseline rule".into(),
         applicability: "Safe baseline applies".into(),
@@ -130,14 +134,15 @@ async fn material_fixture(parent: SkillSnapshot) -> MaterialFixture {
         required_capabilities: parent.required_capabilities.clone(),
         dependencies: parent.dependencies.clone(),
     };
-    material_fixture_with_inputs(parent, baseline, Strategy::default(), Strategy::default()).await
+    material_fixture_with_current_inputs(parent, baseline, Strategy::default(), Strategy::default())
+        .await
 }
-async fn material_fixture_with_inputs(
+async fn material_fixture_with_current_inputs(
     parent: SkillSnapshot,
     baseline: SkillSnapshot,
     parent_strategy: Strategy,
     baseline_strategy: Strategy,
-) -> MaterialFixture {
+) -> MaterialFixture<CurrentReleaseCandidateRecord> {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("stored-review.sqlite3");
     let store = Store::open(&db_path).await.unwrap();
@@ -178,7 +183,10 @@ async fn material_fixture_with_inputs(
         available: parent.required_capabilities.iter().cloned().collect(),
         granted: parent.required_capabilities.iter().cloned().collect(),
     };
-    let bundle = trusted_compiler_inputs::bundle(
+    let proposer = ctx("proposer", Role::Worker);
+    let bundle = trusted_compiler_inputs::bundle_current(
+        &store,
+        &proposer,
         CompileParts {
             profile: &profile,
             parent: &parent,
@@ -190,9 +198,10 @@ async fn material_fixture_with_inputs(
             caps: &caps,
             revoked: &BTreeSet::new(),
         },
-        NS,
         &d("environment"),
+        1,
     )
+    .await
     .unwrap();
     let profile = Profile {
         id: bundle.profile_id.clone(),
@@ -200,14 +209,19 @@ async fn material_fixture_with_inputs(
         parent_digest: bundle.parent_digest.clone(),
         baseline_digest: bundle.baseline_digest.clone(),
     };
-    trusted_compiler_inputs::install_bundle(&store, &bundle)
-        .await
-        .unwrap();
-    let proposer = ctx("proposer", Role::Worker);
-    let candidate = ReleaseStore::stage_bundle(
+    trusted_compiler_inputs::persist_bundle_current(
+        &store,
+        &proposer,
+        &bundle,
+        &d("environment"),
+        1,
+    )
+    .await
+    .unwrap();
+    let candidate = ReleaseStore::stage_current_bundle(
         &proposer,
         &store,
-        StageBundleRequest {
+        CurrentStageBundleRequest {
             candidate_id: "stored-candidate".into(),
             environment_digest: d("environment"),
             bundle,
@@ -241,8 +255,8 @@ async fn material_fixture_with_inputs(
         candidate,
     }
 }
-async fn review(
-    fixture: &MaterialFixture,
+async fn review<Candidate>(
+    fixture: &MaterialFixture<Candidate>,
     kind: ReviewKind,
     id: &str,
     detail: ReviewDetail,
@@ -326,18 +340,21 @@ print(json.dumps(out,sort_keys=True,separators=(',',':')))
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-struct EditFixture {
+struct EditFixture<
+    Bundle = ResolvedBundleV3,
+    Binding = evo_engine::formal_authority::CurrentFormalCompilerInputBinding,
+> {
     prepared: StageFact,
     compiled: StageFact,
     template: SkillEditBatch,
     context: ModelRequestContext,
     development: DevelopmentRunRequest,
-    bundle: ResolvedBundle,
+    bundle: Bundle,
     /// The compiler-input binding both facts were written under.
-    binding: evo_engine::formal_authority::FormalCompilerInputBinding,
+    binding: Binding,
 }
-fn dependencies(
-    fixture: &MaterialFixture,
+fn dependencies<Candidate>(
+    fixture: &MaterialFixture<Candidate>,
     grant: &str,
     prepared: Option<&str>,
 ) -> Vec<StageDependency> {
@@ -391,8 +408,14 @@ fn fact(
     .seal()
     .unwrap()
 }
-async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> EditFixture {
-    let incumbent = trusted_compiler_inputs::bundle(
+async fn seed_current_edit(
+    fixture: &MaterialFixture<CurrentReleaseCandidateRecord>,
+    edits: Vec<SkillTextEdit>,
+) -> EditFixture<ResolvedBundleV3, evo_engine::formal_authority::CurrentFormalCompilerInputBinding>
+{
+    let incumbent = trusted_compiler_inputs::bundle_current(
+        &fixture.store,
+        &fixture.admin,
         CompileParts {
             profile: &fixture.profile,
             parent: &fixture.parent,
@@ -404,13 +427,20 @@ async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> Edit
             caps: &fixture.caps,
             revoked: &BTreeSet::new(),
         },
-        NS,
         &d("environment"),
+        1,
     )
+    .await
     .unwrap();
-    trusted_compiler_inputs::install_bundle(&fixture.store, &incumbent)
-        .await
-        .unwrap();
+    trusted_compiler_inputs::persist_bundle_current(
+        &fixture.store,
+        &fixture.admin,
+        &incumbent,
+        &d("environment"),
+        1,
+    )
+    .await
+    .unwrap();
     let profile = Profile {
         id: incumbent.profile_id.clone(),
         evolution_enabled: true,
@@ -430,17 +460,21 @@ async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> Edit
         revoke_watermark: 1,
     };
     let mut session = fixture.store.session().await.unwrap();
-    let verified = evo_engine::formal_authority::resolve_compiler_inputs(
+    let verified = evo_engine::formal_authority::resolve_current_compiler_inputs(
         &mut session,
         &fixture.admin,
         &compiler_request,
     )
     .await
     .unwrap();
-    let compiler_use = evo_engine::model::CompilerInputUse::new(
+    let compiler_use = evo_engine::model::CurrentCompilerInputUse::new(
         compiler_request.clone(),
         verified.binding().clone(),
     );
+    compiler_use
+        .verify_current(&mut session, &fixture.admin)
+        .await
+        .unwrap();
     session.commit().await.unwrap();
     let source_refs: Vec<_> = fixture
         .sources
@@ -592,11 +626,11 @@ async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> Edit
     )
     .unwrap();
     journal
-        .commit_bound(prepared.clone(), &compiler_use)
+        .commit_source_bound(prepared.clone(), &compiler_use)
         .await
         .unwrap();
     let prepared = journal
-        .lookup_bound(&prepared.artifact_id, &compiler_use)
+        .lookup_source_bound(&prepared.artifact_id, &compiler_use)
         .await
         .unwrap()
         .unwrap();
@@ -624,25 +658,31 @@ async fn seed_edit(fixture: &MaterialFixture, edits: Vec<SkillTextEdit>) -> Edit
     let bundle = verified
         .compile_search_edit(&compiled.output, &ImproverPatch::default())
         .unwrap();
+    trusted_compiler_inputs::persist_bundle_current(
+        &fixture.store,
+        &fixture.admin,
+        &bundle,
+        &d("environment"),
+        1,
+    )
+    .await
+    .unwrap();
     let payload = json!({"output":compiled.output,"patch":compiled.patch,"report":compiled.report,"bundle":bundle,"merge":merged,"compiler_request":compiler_request,"compiler_binding":compiler_use.binding});
-    // AG-108 (plan §5.1 L455, §5.2 L459): the digest of an EditCompiled fact is the
-    // one shared rule that binds the compiled batch to its compiler binding, as the
-    // producer writes it. This fixture used to hand-roll the bare `fingerprint(&batch)`
-    // that no production fact carries (plan §18.4 L2156: corrected, with independent
-    // coverage in the AG-108 tests below).
+    // Current hashes the complete batch and Current binding independently.
+    // The legacy AG-108 helper and all its old algorithms remain unchanged.
     let compiled = fact(
         StageFactKind::EditCompiled,
         OptimizationJournalStage::EditCompile,
-        edit_compiled_input_digest(&batch, Some(&compiler_use.binding)).unwrap(),
+        fingerprint(&(&batch, &compiler_use.binding)).unwrap(),
         dependencies(fixture, &grant_id, Some(&prepared.artifact_id)),
         payload,
     );
     journal
-        .commit_bound(compiled.clone(), &compiler_use)
+        .commit_source_bound(compiled.clone(), &compiler_use)
         .await
         .unwrap();
     let compiled = journal
-        .lookup_bound(&compiled.artifact_id, &compiler_use)
+        .lookup_source_bound(&compiled.artifact_id, &compiler_use)
         .await
         .unwrap()
         .unwrap();
@@ -677,7 +717,7 @@ fn edit(
         operation,
     }
 }
-async fn replace_fact(fixture: &MaterialFixture, fact: &StageFact) {
+async fn replace_fact<Candidate>(fixture: &MaterialFixture<Candidate>, fact: &StageFact) {
     let mut session = fixture.store.session().await.unwrap();
     session
         .put(
@@ -708,7 +748,7 @@ async fn replace_fact(fixture: &MaterialFixture, fact: &StageFact) {
 async fn typed_candidate_is_exact_or_metadata_but_never_infers_history_formal_or_release() {
     let mut p = parent();
     p.content = "Cafe\u{301} 中文🙂".into();
-    let fixture = material_fixture(p).await;
+    let fixture = material_fixture_current(p).await;
     let before = catalog(&fixture.db_path);
     let metadata = review(
         &fixture,
@@ -756,7 +796,7 @@ async fn typed_candidate_is_exact_or_metadata_but_never_infers_history_formal_or
 
 #[tokio::test]
 async fn actual_ascii_unicode_insert_replace_delete_diff_is_complete_and_read_only() {
-    let fixture = material_fixture(parent()).await;
+    let fixture = material_fixture_current(parent()).await;
     let edits = vec![
         edit(
             &fixture.parent,
@@ -782,7 +822,7 @@ async fn actual_ascii_unicode_insert_replace_delete_diff_is_complete_and_read_on
             TextEditOperation::Delete,
         ),
     ];
-    let stored = seed_edit(&fixture, edits).await;
+    let stored = seed_current_edit(&fixture, edits).await;
     let before = catalog(&fixture.db_path);
     let metadata = review(
         &fixture,
@@ -830,8 +870,8 @@ async fn actual_ascii_unicode_insert_replace_delete_diff_is_complete_and_read_on
 
 #[tokio::test]
 async fn seven_real_variants_keep_terminal_classes_and_unverified_selection_unbound() {
-    let fixture = material_fixture(parent()).await;
-    let stored = seed_edit(
+    let fixture = material_fixture_current(parent()).await;
+    let stored = seed_current_edit(
         &fixture,
         vec![edit(
             &fixture.parent,
@@ -993,7 +1033,7 @@ async fn every_finite_privacy_class_masks_the_whole_field_and_derived_hashes() {
         ] {
             let mut skill = parent();
             skill.content = field;
-            let fixture = material_fixture(skill).await;
+            let fixture = material_fixture_current(skill).await;
             for detail in [ReviewDetail::Metadata, ReviewDetail::Exact] {
                 let response = review(
                     &fixture,
@@ -1020,8 +1060,8 @@ async fn every_finite_privacy_class_masks_the_whole_field_and_derived_hashes() {
     }
     let mut skill = parent();
     skill.content = "abc harmless text then ghp_fixture-secret".into();
-    let fixture = material_fixture(skill).await;
-    let stored = seed_edit(
+    let fixture = material_fixture_current(skill).await;
+    let stored = seed_current_edit(
         &fixture,
         vec![edit(
             &fixture.parent,
@@ -1051,8 +1091,8 @@ async fn every_finite_privacy_class_masks_the_whole_field_and_derived_hashes() {
 async fn a_masked_edit_fragment_cannot_leak_positions_or_aggregate_length() {
     let mut skill = parent();
     skill.content = "api".into();
-    let fixture = material_fixture(skill).await;
-    let stored = seed_edit(
+    let fixture = material_fixture_current(skill).await;
+    let stored = seed_current_edit(
         &fixture,
         vec![edit(
             &fixture.parent,
@@ -1093,8 +1133,8 @@ async fn scope_pb_span_digest_and_output_corruption_never_yield_a_complete_diff(
         "output",
         "schema",
     ] {
-        let fixture = material_fixture(parent()).await;
-        let stored = seed_edit(
+        let fixture = material_fixture_current(parent()).await;
+        let stored = seed_current_edit(
             &fixture,
             vec![edit(
                 &fixture.parent,
@@ -1130,8 +1170,7 @@ async fn scope_pb_span_digest_and_output_corruption_never_yield_a_complete_diff(
                     serde_json::from_value(candidate.payload["merge"]["edits"].clone()).unwrap();
                 // AG-108: re-digest under the production rule so this case still
                 // reaches the UTF-8 span check instead of a stale-digest refusal.
-                candidate.input_digest =
-                    edit_compiled_input_digest(&batch, Some(&stored.binding)).unwrap();
+                candidate.input_digest = fingerprint(&(&batch, &stored.binding)).unwrap();
             }
             "removed_digest" => {
                 candidate.payload["report"]["edits"][0]["removed_digest"] =
@@ -1167,7 +1206,7 @@ async fn scope_pb_span_digest_and_output_corruption_never_yield_a_complete_diff(
 
 #[tokio::test]
 async fn roles_namespaces_wrong_primary_and_hidden_kinds_are_unavailable() {
-    let fixture = material_fixture(parent()).await;
+    let fixture = material_fixture_current(parent()).await;
     let service = HostService::new(fixture.store.clone(), fixture.host.clone()).unwrap();
     for role in [Role::Agent, Role::Worker, Role::Host, Role::Evaluator] {
         let request = ReviewRequest {
@@ -1232,8 +1271,8 @@ async fn roles_namespaces_wrong_primary_and_hidden_kinds_are_unavailable() {
 
 #[tokio::test]
 async fn queued_unselected_source_change_occurs_after_first_full_read_and_before_fresh_read() {
-    let fixture = material_fixture(parent()).await;
-    let stored = seed_edit(
+    let fixture = material_fixture_current(parent()).await;
+    let stored = seed_current_edit(
         &fixture,
         vec![edit(
             &fixture.parent,
@@ -1312,7 +1351,7 @@ async fn queued_unselected_source_change_occurs_after_first_full_read_and_before
 
 #[tokio::test]
 async fn support_limit_refuses_the_whole_recipe_without_truncation() {
-    let fixture = material_fixture(parent()).await;
+    let fixture = material_fixture_current(parent()).await;
     let mut candidate = fixture.candidate.clone();
     candidate.sources = vec![candidate.sources[0].clone(); 129];
     let mut session = fixture.store.session().await.unwrap();
@@ -1339,7 +1378,7 @@ async fn support_limit_refuses_the_whole_recipe_without_truncation() {
     assert!(!response.diff_complete);
     let mut large = parent();
     large.content = "a".repeat(16 * 1024);
-    let fixture = material_fixture(large).await;
+    let fixture = material_fixture_current(large).await;
     let response = review(
         &fixture,
         ReviewKind::TypedCandidate,
@@ -1356,7 +1395,7 @@ async fn support_limit_refuses_the_whole_recipe_without_truncation() {
     );
     // The compiler already enforces this skill limit. Inject an independently
     // rehashed oversized stored record to exercise review's own finite limit.
-    let fixture = material_fixture(parent()).await;
+    let fixture = material_fixture_current(parent()).await;
     let mut oversized = fixture.candidate.clone();
     oversized.bundle.skill.content = "a".repeat(16 * 1024 + 1);
     for origin in &mut oversized.bundle.origins {
@@ -1418,7 +1457,7 @@ async fn support_limit_refuses_the_whole_recipe_without_truncation() {
         Err(evo_core::Error::Forbidden),
     ));
 
-    let fixture = material_fixture(parent()).await;
+    let fixture = material_fixture_current(parent()).await;
     let mut predecessor = None;
     for index in 0..32 {
         let deps = predecessor
@@ -1469,6 +1508,16 @@ async fn support_limit_refuses_the_whole_recipe_without_truncation() {
 // and facts stored before compiler bindings existed keep the bare-batch algorithm.
 
 /// One content edit at the head of the parent's `content` ("ab" -> "new").
+fn edit_compiled_input_digest(
+    batch: &SkillEditBatch,
+    binding: Option<&evo_engine::formal_authority::CurrentFormalCompilerInputBinding>,
+) -> evo_core::Result<String> {
+    match binding {
+        Some(binding) => fingerprint(&(batch, binding)),
+        None => fingerprint(batch),
+    }
+}
+
 fn head_replace(parent: &SkillSnapshot) -> Vec<SkillTextEdit> {
     vec![edit(
         parent,
@@ -1524,8 +1573,8 @@ async fn a_production_edit_compiled_fact_reviews_to_an_exact_diff_under_the_one_
     // Before AG-108 review compared the bare batch while the producer digests
     // (batch, compiler binding), so every production EditCompiled came back as
     // material_invalid with no payload and no diff.
-    let fixture = material_fixture(parent()).await;
-    let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+    let fixture = material_fixture_current(parent()).await;
+    let stored = seed_current_edit(&fixture, head_replace(&fixture.parent)).await;
     let batch = stored_batch(&stored.template, &stored.compiled);
     // The producer's formula, spelled out here independently of the shared rule.
     let producer = fingerprint(&(&batch, &stored.binding)).unwrap();
@@ -1601,8 +1650,8 @@ async fn edit_compiled_facts_stored_before_compiler_bindings_keep_the_old_digest
     // Guard case (plan §5.1 L453), green before and after AG-108: a fact stored
     // without compiler_* payload keys digests the bare batch, keeps that old
     // algorithm and interpretation, and still reviews to a complete exact diff.
-    let fixture = material_fixture(parent()).await;
-    let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+    let fixture = material_fixture_current(parent()).await;
+    let stored = seed_current_edit(&fixture, head_replace(&fixture.parent)).await;
     let (prepared, compiled) = pre_binding_facts(&fixture, &stored);
     assert!(compiled.payload.get("compiler_request").is_none());
     assert!(compiled.payload.get("compiler_binding").is_none());
@@ -1638,8 +1687,8 @@ async fn edit_compiled_facts_stored_before_compiler_bindings_keep_the_old_digest
 
 #[tokio::test]
 async fn edit_compiled_changed_after_its_digest_is_refused_by_the_digest_alone() {
-    let fixture = material_fixture(parent()).await;
-    let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+    let fixture = material_fixture_current(parent()).await;
+    let stored = seed_current_edit(&fixture, head_replace(&fixture.parent)).await;
     // A change every other review check accepts: the anchor "ab" occurs exactly
     // once in the parent field and covers the edited span, and the applied
     // report carries no anchor. Only the digest can notice it.
@@ -1695,8 +1744,8 @@ async fn an_edit_compiled_is_never_accepted_under_the_other_shapes_digest_rule()
     // One rule per shape (plan §5.2 L459) and no cross acceptance: a fact that
     // carries the compiler keys must hold the bound digest, a fact without them
     // the bare-batch digest.
-    let fixture = material_fixture(parent()).await;
-    let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+    let fixture = material_fixture_current(parent()).await;
+    let stored = seed_current_edit(&fixture, head_replace(&fixture.parent)).await;
     let batch = stored_batch(&stored.template, &stored.compiled);
 
     // Compiler keys present, bare-batch digest: exactly what review accepted
@@ -1747,8 +1796,8 @@ async fn an_edit_compiled_with_only_one_compiler_key_is_refused_whichever_rule_s
     // StepPrepared, and validate_compiled keeps the same (Some, Some) / (None, None)
     // match that read_prepared uses, so it could not pick a rule either.
     for dropped in ["compiler_request", "compiler_binding"] {
-        let fixture = material_fixture(parent()).await;
-        let stored = seed_edit(&fixture, head_replace(&fixture.parent)).await;
+        let fixture = material_fixture_current(parent()).await;
+        let stored = seed_current_edit(&fixture, head_replace(&fixture.parent)).await;
         let mut mixed = stored.compiled.clone();
         assert!(
             mixed
@@ -1955,10 +2004,29 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
         .await
         .unwrap();
 
-    // The candidate the ticket binds: a real, registered software candidate
-    // with the frozen pair identity, staged before the ticket (L288).
-    let candidate =
-        trusted_compiler_inputs::software_candidate(NS, &d("environment"), "candidate-bundle");
+    // ProgramFixture's real Current candidate remains a software diagnostic:
+    // it confers no external-host, provider, paid or promotion authority.
+    let host = ctx("host", Role::Host);
+    let authority = source("formal-fixture-source", "formal fixture development source");
+    store_trace_authority(&store, &host, &authority)
+        .await
+        .unwrap();
+    let mut session = store.session().await.unwrap();
+    let watermark = session
+        .bump_watermark(&admin, &d("formal-fixture-watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let proposer = ctx("proposer", Role::Worker);
+    let candidate = trusted_compiler_inputs::software_candidate_current(
+        &store,
+        &proposer,
+        &d("environment"),
+        "candidate-bundle",
+        watermark as u64,
+    )
+    .await
+    .unwrap();
     let pair = FrozenCandidatePair::new(
         v1.digest().unwrap(),
         d("candidate"),
@@ -2040,25 +2108,19 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
         .unwrap();
     // True-source order (L288): the candidate is staged, then the ticket is
     // issued and binds it (AG-100 issues no ticket without a candidate record).
-    let host = ctx("host", Role::Host);
-    let authority = source("formal-fixture-source", "formal fixture development source");
-    store_trace_authority(&store, &host, &authority)
-        .await
-        .unwrap();
-    let mut session = store.session().await.unwrap();
-    let watermark = session
-        .bump_watermark(&admin, &d("formal-fixture-watermark"))
-        .await
-        .unwrap();
-    session.commit().await.unwrap();
-    trusted_compiler_inputs::install_bundle(&store, &candidate)
-        .await
-        .unwrap();
-    let proposer = ctx("proposer", Role::Worker);
-    ReleaseStore::stage_bundle(
+    trusted_compiler_inputs::persist_bundle_current(
+        &store,
+        &proposer,
+        &candidate,
+        &d("environment"),
+        watermark as u64,
+    )
+    .await
+    .unwrap();
+    ReleaseStore::stage_current_bundle(
         &proposer,
         &store,
-        StageBundleRequest {
+        CurrentStageBundleRequest {
             candidate_id: holdout.pair.candidate_digest.clone(),
             bundle: candidate,
             environment_digest: holdout.manifest.environment_digest.clone(),
@@ -2379,7 +2441,9 @@ async fn existing_formal_complete_early_and_invalid_views_keep_every_limitation_
     }
 }
 
-async fn attach_budget_reference(fixture: &MaterialFixture) -> BudgetCallRef {
+async fn attach_budget_reference(
+    fixture: &MaterialFixture<CurrentReleaseCandidateRecord>,
+) -> BudgetCallRef {
     fixture
         .store
         .authorize_root_budget(
@@ -2450,7 +2514,7 @@ async fn budget_reference_requires_canonical_identity_real_edges_and_all_declare
         "missing_revoked_edge",
         "present_revoked_edge",
     ] {
-        let fixture = material_fixture(parent()).await;
+        let fixture = material_fixture_current(parent()).await;
         let mut reference = attach_budget_reference(&fixture).await;
         let before = catalog(&fixture.db_path);
         let control = review(

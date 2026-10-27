@@ -28,7 +28,9 @@ use evo_engine::dispatch::{
     ManagementResult,
 };
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
-use evo_engine::release_store::{ReleaseStore, StageBundleRequest, TypedSourceRef};
+use evo_engine::release_store::{
+    CurrentStageBundleRequest as StageBundleRequest, ReleaseStore, TypedSourceRef,
+};
 use evo_engine::streaming_evaluator::{
     EvaluationEvidenceScope, ExecutionReceiptRequest, ExecutionSide, FixedGraderMethod,
     FixedGraderSpec, FormalEvaluationV2, FrozenOracleEntry, GraderReceiptRequest,
@@ -84,6 +86,15 @@ struct Fixture {
     holdout: ProtectedHoldoutRecord,
     control: RegisteredEvaluationControl,
     candidate_cost: i64,
+    resolved_ticket_id: std::sync::OnceLock<String>,
+}
+impl Fixture {
+    fn ticket_id(&self) -> &str {
+        self.resolved_ticket_id
+            .get()
+            .map(String::as_str)
+            .unwrap_or(&self.ticket_id)
+    }
 }
 
 async fn unregistered_fixture(schema: &str, profile: ProfileKind, candidate_cost: i64) -> Fixture {
@@ -303,6 +314,7 @@ async fn unregistered_fixture(schema: &str, profile: ProfileKind, candidate_cost
         oracle_entries,
     };
     let fixture = Fixture {
+        resolved_ticket_id: std::sync::OnceLock::new(),
         _dir: dir,
         db_path,
         store,
@@ -327,7 +339,7 @@ async fn execute_output(
     let view = IndependentEvaluationControl::broker_task(
         &fixture.worker,
         &fixture.store,
-        &fixture.ticket_id,
+        fixture.ticket_id(),
         target_id,
         side,
     )
@@ -347,7 +359,7 @@ async fn execute_output(
             &BudgetCallReservation {
                 billing_scope: "billing-1".into(),
                 call_id: call_id.clone(),
-                dispatch_group_id: fixture.ticket_id.clone(),
+                dispatch_group_id: fixture.ticket_id().to_owned(),
                 stage: BudgetStage::TaskExecution,
                 actual_input_digest: view.request_digest.clone(),
                 request_artifact: None,
@@ -371,7 +383,7 @@ async fn execute_output(
         &fixture.worker,
         &fixture.store,
         StartExecutionRequest {
-            ticket_id: fixture.ticket_id.clone(),
+            ticket_id: fixture.ticket_id().to_owned(),
             target_id: target_id.into(),
             side,
             fence: fence.clone(),
@@ -385,7 +397,7 @@ async fn execute_output(
         &fixture.store,
         ExecutionReceiptRequest {
             receipt_id: receipt_id.clone(),
-            ticket_id: fixture.ticket_id.clone(),
+            ticket_id: fixture.ticket_id().to_owned(),
             target_id: target_id.into(),
             side,
             request_digest: view.request_digest,
@@ -480,7 +492,7 @@ async fn grade_target(
         &fixture.store,
         GraderReceiptRequest {
             receipt_id: receipt_id.clone(),
-            ticket_id: fixture.ticket_id.clone(),
+            ticket_id: fixture.ticket_id().to_owned(),
             target_id: target_id.into(),
             candidate_execution_receipt_id: candidate,
             baseline_execution_receipt_id: baseline,
@@ -513,7 +525,7 @@ async fn fixture(schema: &str, profile: ProfileKind, candidate_cost: i64) -> Fix
 }
 
 async fn issue(fixture: &Fixture) {
-    IndependentEvaluationControl::issue_ticket(
+    let ticket = IndependentEvaluationControl::issue_ticket(
         &fixture.evaluator,
         &fixture.store,
         IssueTicketRequest {
@@ -525,6 +537,7 @@ async fn issue(fixture: &Fixture) {
     )
     .await
     .unwrap();
+    fixture.resolved_ticket_id.set(ticket.id).unwrap();
 }
 
 fn storage_id(kind: &str, id: &str) -> String {
@@ -588,7 +601,7 @@ async fn finalize(fixture: &Fixture) -> FormalEvaluationV2 {
     IndependentEvaluationControl::finalize_complete(
         &fixture.evaluator,
         &fixture.store,
-        &fixture.ticket_id,
+        fixture.ticket_id(),
         1_000,
     )
     .await
@@ -611,7 +624,7 @@ async fn assert_readback(fixture: &Fixture, formal: &FormalEvaluationV2) {
     let status = IndependentEvaluationControl::status(
         &fixture.evaluator,
         &fixture.store,
-        &fixture.ticket_id,
+        fixture.ticket_id(),
     )
     .await
     .unwrap();
@@ -623,7 +636,7 @@ async fn assert_readback(fixture: &Fixture, formal: &FormalEvaluationV2) {
     let view = IndependentEvaluationControl::verified_report_view(
         &fixture.evaluator,
         &fixture.store,
-        &fixture.ticket_id,
+        fixture.ticket_id(),
     )
     .await
     .unwrap();
@@ -640,7 +653,7 @@ async fn assert_readback(fixture: &Fixture, formal: &FormalEvaluationV2) {
     }
 }
 
-fn release_bundle() -> evo_core::contract::ResolvedBundle {
+fn release_bundle() -> evo_core::contract::ResolvedBundleV3 {
     let profile = Profile {
         id: "p1".into(),
         evolution_enabled: true,
@@ -654,7 +667,7 @@ fn release_bundle() -> evo_core::contract::ResolvedBundle {
         required_capabilities: vec![],
         dependencies: vec![],
     };
-    trusted_compiler_inputs::bundle(
+    trusted_compiler_inputs::bundle_content_current(
         CompileParts {
             profile: &profile,
             parent: &parent,
@@ -677,10 +690,10 @@ fn release_bundle() -> evo_core::contract::ResolvedBundle {
 
 async fn stage_fixture_candidate(
     fixture: &Fixture,
-) -> evo_engine::release_store::ReleaseCandidateRecord {
+) -> evo_engine::release_store::CurrentReleaseCandidateRecord {
     let host = Context::new("n", "host", Role::Host).unwrap();
     let proposer = Context::new("n", "proposer", Role::Worker).unwrap();
-    trusted_compiler_inputs::install_bundle(&fixture.store, &release_bundle())
+    trusted_compiler_inputs::install_bundle_current_sources(&fixture.store, &release_bundle())
         .await
         .unwrap();
     let body = "trusted release source";
@@ -716,7 +729,7 @@ async fn stage_fixture_candidate(
         .await
         .unwrap();
     session.commit().await.unwrap();
-    ReleaseStore::stage_bundle(
+    ReleaseStore::stage_current_bundle(
         &proposer,
         &fixture.store,
         StageBundleRequest {
@@ -739,7 +752,7 @@ async fn stage_fixture_candidate(
 async fn assert_release_forbidden(fixture: &Fixture) {
     let approver = Context::new("n", "approver", Role::Admin).unwrap();
     let mut session = fixture.store.session().await.unwrap();
-    let candidate: evo_engine::release_store::ReleaseCandidateRecord = session
+    let candidate: evo_engine::release_store::CurrentReleaseCandidateRecord = session
         .need(&approver, "artifact", &d("candidate"))
         .await
         .unwrap();
@@ -747,7 +760,7 @@ async fn assert_release_forbidden(fixture: &Fixture) {
     let view = IndependentEvaluationControl::verified_report_view(
         &fixture.evaluator,
         &fixture.store,
-        &fixture.ticket_id,
+        fixture.ticket_id(),
     )
     .await
     .unwrap();
@@ -760,7 +773,7 @@ async fn assert_release_forbidden(fixture: &Fixture) {
             &approver,
             &fixture.store,
             &candidate.id,
-            &fixture.ticket_id,
+            fixture.ticket_id(),
         )
         .await,
         Err(Error::Forbidden)
@@ -835,7 +848,7 @@ async fn v1_control_keeps_the_exact_legacy_typed_bytes_and_digest() {
     let ticket = IndependentEvaluationControl::status(
         &fixture.evaluator,
         &fixture.store,
-        &fixture.ticket_id,
+        fixture.ticket_id(),
     )
     .await
     .unwrap()
@@ -1094,13 +1107,13 @@ async fn both_frozen_versions_survive_restart_without_changing_any_bound_digest(
         let issue_before = stored(
             &fixture,
             "evaluation_ticket_issue_receipt_v1",
-            &fixture.ticket_id,
+            fixture.ticket_id(),
         )
         .await;
         let ticket_before = IndependentEvaluationControl::status(
             &fixture.evaluator,
             &fixture.store,
-            &fixture.ticket_id,
+            fixture.ticket_id(),
         )
         .await
         .unwrap()
@@ -1126,7 +1139,7 @@ async fn both_frozen_versions_survive_restart_without_changing_any_bound_digest(
             stored(
                 &fixture,
                 "evaluation_ticket_issue_receipt_v1",
-                &fixture.ticket_id
+                fixture.ticket_id()
             )
             .await,
             issue_before
@@ -1134,7 +1147,7 @@ async fn both_frozen_versions_survive_restart_without_changing_any_bound_digest(
         let after = IndependentEvaluationControl::status(
             &fixture.evaluator,
             &fixture.store,
-            &fixture.ticket_id,
+            fixture.ticket_id(),
         )
         .await
         .unwrap()
@@ -1190,7 +1203,7 @@ async fn switching_a_frozen_control_version_is_rejected_before_formal_writes() {
         .await
         .unwrap();
         assert!(matches!(IndependentEvaluationControl::finalize_complete(
-            &fixture.evaluator, &fixture.store, &fixture.ticket_id, 1_000,
+            &fixture.evaluator, &fixture.store, fixture.ticket_id(), 1_000,
         ).await, Err(Error::Conflict(message)) if message.contains("control") && message.contains("digest")));
         let mut session = fixture.store.session().await.unwrap();
         assert!(
@@ -1198,7 +1211,7 @@ async fn switching_a_frozen_control_version_is_rejected_before_formal_writes() {
                 .get::<Value>(
                     &fixture.evaluator,
                     "artifact",
-                    &storage_id("formal_evaluation_v2", &fixture.ticket_id)
+                    &storage_id("formal_evaluation_v2", fixture.ticket_id())
                 )
                 .await
                 .unwrap()
@@ -1209,7 +1222,7 @@ async fn switching_a_frozen_control_version_is_rejected_before_formal_writes() {
                 .get::<Value>(
                     &fixture.evaluator,
                     "artifact",
-                    &storage_id("evaluation_resource_evidence_v1", &fixture.ticket_id)
+                    &storage_id("evaluation_resource_evidence_v1", fixture.ticket_id())
                 )
                 .await
                 .unwrap()
@@ -1219,7 +1232,7 @@ async fn switching_a_frozen_control_version_is_rejected_before_formal_writes() {
             .need(
                 &fixture.evaluator,
                 "artifact",
-                &storage_id("evaluation_ticket_v2", &fixture.ticket_id),
+                &storage_id("evaluation_ticket_v2", fixture.ticket_id()),
             )
             .await
             .unwrap();

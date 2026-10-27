@@ -53,10 +53,13 @@ use evo_engine::broker::{
 use evo_engine::evidence::{
     StoredRunRecord, StoredTraceAuthority, store_source_selection, store_trace_authority,
 };
-use evo_engine::formal_authority::{CompilerInputRequest, resolve_compiler_inputs};
+use evo_engine::formal_authority::{
+    CompilerInputRequest, resolve_compiler_inputs, resolve_current_compiler_inputs,
+};
 use evo_engine::model::{
-    BoundModelRequest, CompilerInputUse, ModelExecutionProvenance, ModelExecutionReceipt,
-    ModelPort, ModelRejectionKind, ModelResponse, RejectedDispatch,
+    BoundModelRequest, CompilerInputUse, CurrentBoundModelRequest, CurrentCompilerInputUse,
+    ModelExecutionProvenance, ModelExecutionReceipt, ModelPort, ModelRejectionKind, ModelResponse,
+    ReadBoundModelRequest, RejectedDispatch,
 };
 use evo_storage::Store;
 use evo_storage::budget::{
@@ -290,6 +293,54 @@ fn bound_request(
     .unwrap()
 }
 
+// Preserve the complete original wire. Authority still comes exclusively from
+// the real broker/resolver Session; this conversion is not an approval fixture.
+fn read_bound<T: serde::Serialize>(bound: &T) -> ReadBoundModelRequest {
+    let original = serde_json::to_vec(bound).expect("fixture bound wire serialization");
+    let read: ReadBoundModelRequest =
+        serde_json::from_slice(&original).expect("fixture exact supported bound wire");
+    assert_eq!(serde_json::to_vec(&read).unwrap(), original);
+    read
+}
+
+// Current health here means the existing ProgramFixture/EmptyRoot program
+// boundary only. No OS identity, provider source, grade or paid authority is minted.
+async fn current_compiler_use(store: &Store, watermark: u64) -> CurrentCompilerInputUse {
+    let request = compiler_request(watermark);
+    Box::pin(trusted_compiler_inputs::install_request(store, &request))
+        .await
+        .unwrap();
+    let mut session = store.session().await.unwrap();
+    let actual = Box::pin(resolve_current_compiler_inputs(
+        &mut session,
+        &worker(),
+        &request,
+    ))
+    .await
+    .unwrap();
+    let inputs = CurrentCompilerInputUse::new(request, actual.binding().clone());
+    inputs
+        .verify_current(&mut session, &worker())
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    inputs
+}
+
+fn current_bound_request(
+    tag: &str,
+    watermark: u64,
+    sources: &[&str],
+    content: &str,
+    inputs: &CurrentCompilerInputUse,
+) -> CurrentBoundModelRequest {
+    CurrentBoundModelRequest::new(
+        model_request(tag, watermark, sources, content),
+        inputs.clone(),
+    )
+    .expect("fixture complete Current request")
+}
+
 /// `repair_move_pointer_epoch`: a genuine scoped Admin audit of an empty software
 /// profile pointer. The bound compiler authority changes; the source watermark
 /// does not. It creates no Approved release, report, provider capture or history.
@@ -414,12 +465,21 @@ impl World {
     }
 
     /// The real `dispatch_bound` of a fresh broker over the same store.
-    async fn replay(&self, bound: &BoundModelRequest) -> Result<ModelResponse> {
-        let broker = self.broker();
-        broker.dispatch_bound(bound.clone()).await
+    async fn replay(&self, bound: &impl serde::Serialize) -> Result<ModelResponse> {
+        self.broker()
+            .dispatch_compiler_bound(read_bound(bound))
+            .await
     }
 
-    async fn call(&self, bound: &BoundModelRequest) -> BudgetCallRecord {
+    async fn replay_current(&self, bound: &CurrentBoundModelRequest) -> Result<ModelResponse> {
+        self.broker()
+            .dispatch_compiler_bound(read_bound(bound))
+            .await
+    }
+
+    async fn call(&self, bound: &impl serde::Serialize) -> BudgetCallRecord {
+        let read = read_bound(bound);
+        let bound = &read;
         self.store
             .budget_call(&host(), SCOPE, &bound.request.request_id)
             .await
@@ -453,7 +513,9 @@ impl World {
 /// commit leaves (shape of `broker_cache_revoke_v42::settle_open` with the manual
 /// bound reservation of `step_terminal_classes_v42`). No execution flag is written
 /// by SQL. Returns the persisted usable response.
-async fn settle_open(world: &World, bound: &BoundModelRequest) -> ModelResponse {
+async fn settle_open(world: &World, bound: &impl serde::Serialize) -> ModelResponse {
+    let read = read_bound(bound);
+    let bound = &read;
     let ctx = host();
     let request = &bound.request;
     let reservation = BudgetCallReservation {
@@ -463,7 +525,7 @@ async fn settle_open(world: &World, bound: &BoundModelRequest) -> ModelResponse 
         stage: BudgetStage::Reflection,
         actual_input_digest: request.cache_key_digest.clone(),
         request_artifact: Some(
-            BudgetArtifact::from_serializable("rsia.bound_model_request.v1", bound).unwrap(),
+            BudgetArtifact::from_serializable(bound.schema_version.clone(), bound).unwrap(),
         ),
         max_cost_micros: 20,
         lease_token: fingerprint(&("host", SCOPE, bound)).unwrap(),
@@ -565,14 +627,20 @@ async fn settle_open(world: &World, bound: &BoundModelRequest) -> ModelResponse 
         .await
         .unwrap();
     assert!(settlement.response_usable);
-    assert_settled_open(&settlement.call);
+    if bound.schema_version == evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA {
+        assert_current_settled_open(&settlement.call);
+    } else {
+        assert_settled_open(&settlement.call);
+    }
     assert_eq!(world.totals().await, (0, COST));
     completed
 }
 
 /// The error the bound request's own authority check returns now, read in a
 /// Session that is rolled back.
-async fn current_refusal(store: &Store, bound: &BoundModelRequest) -> Error {
+async fn current_refusal(store: &Store, bound: &impl serde::Serialize) -> Error {
+    let read = read_bound(bound);
+    let bound = &read;
     let mut s = store.session().await.unwrap();
     let error = Box::pin(bound.verify_current(&mut s, &host()))
         .await
@@ -585,15 +653,15 @@ async fn current_refusal(store: &Store, bound: &BoundModelRequest) -> Error {
 /// compiler authority current now. It reaches the root's concurrency gate only
 /// when every other call on the root has closed its execution.
 async fn next_call(world: &World, watermark: u64, sources: &[&str]) -> ModelResponse {
-    let inputs = compiler_use(&world.store, watermark).await;
-    let next = bound_request(
+    let inputs = current_compiler_use(&world.store, watermark).await;
+    let next = current_bound_request(
         "same-root-next",
         watermark,
         sources,
         "software fixture",
         &inputs,
     );
-    world.replay(&next).await.unwrap()
+    world.replay_current(&next).await.unwrap()
 }
 
 /// Runs the real revocation cleanup job to completion (shape of
@@ -633,6 +701,22 @@ fn assert_settled_open(call: &BudgetCallRecord) {
     assert_eq!(
         call.request_artifact.as_ref().unwrap().schema_version,
         "rsia.bound_model_request.v1"
+    );
+    assert!(call.dispatch_id.is_some());
+}
+
+fn assert_current_settled_open(call: &BudgetCallRecord) {
+    assert_eq!(call.state, BudgetCallState::Finalized);
+    assert_eq!(call.response_usable, Some(true));
+    assert_eq!(call.actual_cost_micros, Some(COST));
+    assert!(!call.execution_closed, "fixture execution was not open");
+    assert_eq!(
+        call.response_artifact.as_ref().unwrap().schema_version,
+        "rsia.model_response.artifact.v1"
+    );
+    assert_eq!(
+        call.request_artifact.as_ref().unwrap().schema_version,
+        evo_engine::model::CURRENT_BOUND_MODEL_SCHEMA
     );
     assert!(call.dispatch_id.is_some());
 }
@@ -848,14 +932,14 @@ fn assert_only_recovery_close(before: &Value, after: &Value, call: &BudgetCallRe
 #[tokio::test]
 async fn authority_change_replay_closes_the_settled_call_then_refuses_unchanged() {
     let world = World::new().await;
-    let inputs = compiler_use(&world.store, 1).await;
-    let bound = bound_request("authority-changed", 1, &RUNS, "software fixture", &inputs);
+    let inputs = current_compiler_use(&world.store, 1).await;
+    let bound = current_bound_request("authority-changed", 1, &RUNS, "software fixture", &inputs);
     let completed = settle_open(&world, &bound).await;
     repair_move_pointer_epoch(&world.store, 1).await;
     let expected = current_refusal(&world.store, &bound).await;
     assert_conflict(&expected, AUTHORITY_CHANGED);
     let settled = world.call(&bound).await;
-    assert_settled_open(&settled);
+    assert_current_settled_open(&settled);
     let before = world.snapshot();
     assert_same_error(world.replay(&bound).await, &expected);
     let after = world.snapshot();
@@ -890,8 +974,8 @@ async fn authority_change_replay_closes_the_settled_call_then_refuses_unchanged(
 #[tokio::test]
 async fn source_revocation_replay_closes_the_settled_call_then_refuses_unchanged() {
     let world = World::new().await;
-    let inputs = compiler_use(&world.store, 1).await;
-    let bound = bound_request("source-revoked", 1, &RUNS, "software fixture", &inputs);
+    let inputs = current_compiler_use(&world.store, 1).await;
+    let bound = current_bound_request("source-revoked", 1, &RUNS, "software fixture", &inputs);
     let completed = settle_open(&world, &bound).await;
     let status = LifecycleStore::begin_revoke(
         &admin(),
@@ -910,7 +994,7 @@ async fn source_revocation_replay_closes_the_settled_call_then_refuses_unchanged
     let expected = current_refusal(&world.store, &bound).await;
     assert_conflict(&expected, BINDING_MISMATCH);
     let settled = world.call(&bound).await;
-    assert_settled_open(&settled);
+    assert_current_settled_open(&settled);
     let before = world.snapshot();
     assert_same_error(world.replay(&bound).await, &expected);
     let after = world.snapshot();
@@ -944,8 +1028,8 @@ async fn source_revocation_replay_closes_the_settled_call_then_refuses_unchanged
 #[tokio::test]
 async fn redacted_replay_closes_the_settled_call_then_refuses_unchanged() {
     let world = World::new().await;
-    let inputs = compiler_use(&world.store, 1).await;
-    let bound = bound_request("source-redacted", 1, &RUNS, "software fixture", &inputs);
+    let inputs = current_compiler_use(&world.store, 1).await;
+    let bound = current_bound_request("source-redacted", 1, &RUNS, "software fixture", &inputs);
     let completed = settle_open(&world, &bound).await;
     let status = LifecycleStore::begin_revoke(
         &admin(),
@@ -1009,36 +1093,49 @@ async fn redacted_replay_closes_the_settled_call_then_refuses_unchanged() {
 #[tokio::test]
 async fn reused_call_id_with_other_input_or_binding_refuses_without_closing() {
     let world = World::new().await;
-    let inputs = compiler_use(&world.store, 1).await;
-    let original = bound_request("reused", 1, &RUNS, "software fixture", &inputs);
+    let legacy_inputs = current_compiler_use(&world.store, 1).await;
+    let legacy_other_input = current_bound_request(
+        "reused",
+        1,
+        &RUNS,
+        "another software fixture",
+        &legacy_inputs,
+    );
+    let inputs = current_compiler_use(&world.store, 1).await;
+    let original = current_bound_request("reused", 1, &RUNS, "software fixture", &inputs);
     settle_open(&world, &original).await;
     let settled = world.call(&original).await;
     // (a) Another input digest under the same call id; the authority is unchanged.
-    let other_input = bound_request("reused", 1, &RUNS, "another software fixture", &inputs);
+    let other_input =
+        current_bound_request("reused", 1, &RUNS, "another software fixture", &inputs);
     assert_eq!(other_input.request.request_id, original.request.request_id);
     assert_ne!(
         other_input.request.cache_key_digest,
         original.request.cache_key_digest
     );
     let before = world.snapshot();
-    assert_call_id_reused(world.replay(&other_input).await.unwrap());
+    assert_call_id_reused(world.replay_current(&other_input).await.unwrap());
     assert_eq!(world.snapshot(), before, "a reused call id wrote");
     // (b) The same input digest under another bound request artifact: the binding
     // that is current after an Admin moved the profile pointer.
     repair_move_pointer_epoch(&world.store, 1).await;
-    let current = compiler_use(&world.store, 1).await;
-    let other_binding = BoundModelRequest::new(original.request.clone(), current).unwrap();
+    let current = current_compiler_use(&world.store, 1).await;
+    let other_binding = CurrentBoundModelRequest::new(original.request.clone(), current).unwrap();
     assert_eq!(
         other_binding.request.cache_key_digest,
         original.request.cache_key_digest
     );
     let moved = world.snapshot();
-    assert_call_id_reused(world.replay(&other_binding).await.unwrap());
+    assert_call_id_reused(world.replay_current(&other_binding).await.unwrap());
     // (c) Another input digest under the stale binding: the authority check refuses
     // first, and nothing was closed before it.
     let expected = current_refusal(&world.store, &other_input).await;
     assert_conflict(&expected, AUTHORITY_CHANGED);
-    assert_same_error(world.replay(&other_input).await, &expected);
+    assert_same_error(world.replay_current(&other_input).await, &expected);
+    // Keep the original stale v1 negative wire in addition to Current health.
+    let legacy_expected = current_refusal(&world.store, &legacy_other_input).await;
+    assert_conflict(&legacy_expected, AUTHORITY_CHANGED);
+    assert_same_error(world.replay(&legacy_other_input).await, &legacy_expected);
     assert_eq!(world.snapshot(), moved, "a reused call id wrote");
     assert_eq!(world.call(&original).await, settled);
     assert_eq!(closed_events(&moved, &original.request.request_id), 0);
@@ -1051,8 +1148,8 @@ async fn reused_call_id_with_other_input_or_binding_refuses_without_closing() {
 #[tokio::test]
 async fn repeated_refused_replays_record_exactly_one_close() {
     let world = World::new().await;
-    let inputs = compiler_use(&world.store, 1).await;
-    let bound = bound_request("repeated", 1, &RUNS, "software fixture", &inputs);
+    let inputs = current_compiler_use(&world.store, 1).await;
+    let bound = current_bound_request("repeated", 1, &RUNS, "software fixture", &inputs);
     settle_open(&world, &bound).await;
     repair_move_pointer_epoch(&world.store, 1).await;
     let expected = current_refusal(&world.store, &bound).await;
@@ -1077,14 +1174,14 @@ async fn repeated_refused_replays_record_exactly_one_close() {
 #[tokio::test]
 async fn live_replay_returns_the_persisted_response_and_closes_once() {
     let world = World::new().await;
-    let inputs = compiler_use(&world.store, 1).await;
-    let bound = bound_request("live", 1, &RUNS, "software fixture", &inputs);
+    let inputs = current_compiler_use(&world.store, 1).await;
+    let bound = current_bound_request("live", 1, &RUNS, "software fixture", &inputs);
     let completed = settle_open(&world, &bound).await;
     let settled = world.call(&bound).await;
     let before = world.snapshot();
-    assert_same_response(&world.replay(&bound).await.unwrap(), &completed);
+    assert_same_response(&world.replay_current(&bound).await.unwrap(), &completed);
     let once = world.snapshot();
-    assert_same_response(&world.replay(&bound).await.unwrap(), &completed);
+    assert_same_response(&world.replay_current(&bound).await.unwrap(), &completed);
     assert_eq!(world.snapshot(), once, "a repeated replay wrote again");
     assert_only_recovery_close(&before, &once, &settled);
     assert_eq!(closed_events(&once, &bound.request.request_id), 1);
@@ -1095,4 +1192,125 @@ async fn live_replay_returns_the_persisted_response_and_closes_once() {
         .unwrap();
     assert_eq!(world.provider_calls(), 1);
     assert_eq!(world.totals().await, (0, COST));
+}
+
+#[tokio::test]
+async fn historical_v1_closes_its_paid_record_but_cannot_authorize_new_dispatch() {
+    let world = World::new().await;
+    let inputs = compiler_use(&world.store, 1).await;
+    let bound = bound_request("legacy-paid-reader", 1, &RUNS, "software fixture", &inputs);
+    let completed = settle_open(&world, &bound).await;
+    let call = world.call(&bound).await;
+    assert_eq!(
+        call.request_artifact.as_ref().unwrap().schema_version,
+        "rsia.bound_model_request.v1"
+    );
+    let before = world.snapshot();
+    assert_conflict(
+        &world.replay(&bound).await.unwrap_err(),
+        "legacy compiler use is not Current input",
+    );
+    let once = world.snapshot();
+    assert_only_recovery_close(&before, &once, &call);
+    assert_eq!(closed_events(&once, &bound.request.request_id), 1);
+    world
+        .broker()
+        .verify_receipt(&bound.request, receipt(&completed))
+        .await
+        .unwrap();
+    let new_legacy = bound_request("legacy-new-use", 1, &RUNS, "software fixture", &inputs);
+    assert_conflict(
+        &world.replay(&new_legacy).await.unwrap_err(),
+        "legacy compiler use is not Current input",
+    );
+    assert_eq!(world.snapshot(), once);
+    repair_move_pointer_epoch(&world.store, 1).await;
+    let moved = world.snapshot();
+    let expected = current_refusal(&world.store, &bound).await;
+    assert_conflict(&expected, AUTHORITY_CHANGED);
+    assert_same_error(world.replay(&bound).await, &expected);
+    assert_eq!(world.snapshot(), moved);
+    assert_eq!(world.provider_calls(), 1);
+    assert_eq!(world.totals().await, (0, COST));
+}
+
+#[tokio::test]
+async fn current_model_preimage_refusal_preserves_dispatched_accounting() {
+    let world = World::new().await;
+    let inputs = current_compiler_use(&world.store, 1).await;
+    let bound = current_bound_request(
+        "source-model-preimage",
+        1,
+        &RUNS,
+        "software fixture",
+        &inputs,
+    );
+    let completed = settle_open(&world, &bound).await;
+    let settled = world.call(&bound).await;
+    assert_current_settled_open(&settled);
+    let fixture = trusted_compiler_inputs::inputs(
+        NAMESPACE,
+        PROFILE,
+        parent_skill(),
+        Strategy::default(),
+        no_capabilities(),
+        &hash(b"environment"),
+    );
+    let mut session = world.store.session().await.unwrap();
+    let mut provider: evo_engine::formal_authority::RegisteredExternalProvider = session
+        .need(&admin(), "artifact", &fixture.provider.id)
+        .await
+        .unwrap();
+    provider.provider_model = "another-legal-model".into();
+    session
+        .put(
+            &admin(),
+            "artifact",
+            &fixture.provider.id,
+            admin().actor(),
+            &provider,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    // Re-register the exact changed diagnostic configuration through its real
+    // Admin producer. The content witness is healthy; the frozen host/model
+    // binding, rather than a missing witness, must refuse the continuation.
+    evo_engine::formal_authority::FormalRegistry::register_provider(
+        &admin(),
+        &world.store,
+        provider.clone(),
+    )
+    .await
+    .unwrap();
+    let mut session = world.store.session().await.unwrap();
+    let closure = evo_engine::formal_authority::read_typed_closure(
+        &mut session,
+        &admin(),
+        &[("artifact".into(), provider.id.clone())],
+    )
+    .await
+    .unwrap();
+    assert!(closure.nodes.iter().any(|n| n.id == provider.id));
+    session.commit().await.unwrap();
+    let expected = current_refusal(&world.store, &bound).await;
+    assert_conflict(&expected, AUTHORITY_CHANGED);
+    let before = world.snapshot();
+    assert_same_error(world.replay_current(&bound).await, &expected);
+    let after = world.snapshot();
+    assert_only_recovery_close(&before, &after, &settled);
+    assert_eq!(world.provider_calls(), 1);
+    assert_eq!(world.totals().await, (0, COST));
+    let closed = world.call(&bound).await;
+    assert_eq!(closed.actual_cost_micros, Some(COST));
+    assert_eq!(closed.response_artifact, settled.response_artifact);
+    assert_eq!(closed.usage_record_id, settled.usage_record_id);
+    assert_eq!(closed_events(&after, &bound.request.request_id), 1);
+    assert_same_error(world.replay_current(&bound).await, &expected);
+    assert_eq!(world.snapshot(), after);
+    world
+        .broker()
+        .verify_receipt(&bound.request, receipt(&completed))
+        .await
+        .unwrap();
 }

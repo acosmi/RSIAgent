@@ -102,6 +102,42 @@ pub fn detect_surface_drift(
     manifest.validate_against_extraction(extracted_fields)
 }
 
+/// Same finite family gate as the original v1 registration, without promoting
+/// reviewed software declarations into fixed-version/handshake/smoke support.
+pub(crate) fn validate_registerable_host_v2(host: &str, version: &str) -> Result<()> {
+    let host = host.to_ascii_lowercase();
+    let version = version.to_ascii_lowercase();
+    if version.starts_with("unverified-") || host == CLAUDE_CODE_TARGET || host.contains("claude") {
+        return Err(Error::Invalid(
+            "unverified host surface candidate cannot be registered as supported".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Exact envelope decoder; classification/role authority remains in the
+/// existing ReleaseStore/Session path, not in the source or this DTO parse.
+pub async fn register_reviewed_host_surface_json(
+    ctx: &Context,
+    store: &Store,
+    id: &str,
+    source_json: &str,
+    registration: evo_core::contract::HostSurfaceRegistrationV2,
+    predecessor_surface_id: Option<String>,
+) -> Result<crate::release_store::HostSurfaceRecordV2> {
+    ctx.require(&[Role::Admin])?;
+    let source = evo_core::contract::parse_reviewed_host_source_json(source_json)?.source;
+    ReleaseStore::register_host_surface_from_source(
+        ctx,
+        store,
+        id,
+        source,
+        registration,
+        predecessor_surface_id,
+    )
+    .await
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerifiedHostStage {

@@ -1,7 +1,7 @@
 //! HostService boundary and persistence tests.
 use evo_core::contract::{
-    CapabilityLevel, HostCapabilities, HostSurfaceManifest, SurfaceCoverage, SurfaceItem,
-    SystemSnapshot,
+    CapabilityLevel, HostCapabilities, HostSurfaceClassificationV2, HostSurfaceRegistrationV2,
+    ReviewedHostSourceEnvelopeV1, SurfaceCoverage, SystemSnapshot,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
@@ -55,29 +55,54 @@ async fn setup() -> (tempfile::TempDir, HostService, Context, HostPrepareConfig)
         .unwrap();
     let host = context("gateway-host", Role::Host);
     let admin = context("admin", Role::Admin);
-    let manifest = HostSurfaceManifest {
-        schema_version: "rsia.host_surface.v1".into(),
-        host: "reference-host".into(),
-        host_version: "1.0.0".into(),
-        adapter_version: "1.0.0".into(),
-        source_digest: digest("reference-surface-source"),
-        items: vec![SurfaceItem {
-            name: "model".into(),
-            coverage: SurfaceCoverage::Supported,
-            mapped_field: Some("host.model".into()),
-            consumer: Some("reference-host".into()),
-            reason: "fixed reference fixture".into(),
-        }],
+    // Local reviewed software data confers no supported/native-host authority.
+    // ToolOnly model identity remains runtime-owned; config capabilities are unchanged.
+    let source = ReviewedHostSourceEnvelopeV1 {
+        schema_version: "rsia.host_source_envelope.v1".into(),
+        source_kind: "reviewed_fixture".into(),
+        source_schema: "rsia.host_reviewed_declarations.v1".into(),
+        extractor_version: "rsia.host_reviewed_declarations.extractor.v1".into(),
+        original_utf8: concat!(
+            "{\"schema_version\":\"rsia.host_reviewed_declarations.v1\",",
+            "\"host\":\"reference-host\",\"host_version\":\"1.0.0\",\"declarations\":[",
+            "{\"name\":\"model\",\"value_type\":\"string\",\"enum_values\":[],",
+            "\"default\":{\"kind\":\"none\"}}]}"
+        )
+        .into(),
     };
-    ReleaseStore::register_host_surface(
+    let registration = HostSurfaceRegistrationV2 {
+        adapter_version: "1.0.0".into(),
+        classifications: vec![HostSurfaceClassificationV2 {
+            name: "model".into(),
+            coverage: SurfaceCoverage::RuntimeOwned,
+            mapped_field: None,
+            consumer: None,
+            reason: "model identity remains host-owned in this ToolOnly fixture".into(),
+            renamed_from: None,
+            test_ref: None,
+            capability: None,
+        }],
+        retired: vec![],
+    };
+    let record = ReleaseStore::register_host_surface_from_source(
         &admin,
         &store,
         "reference-surface",
-        manifest,
-        vec!["model".into()],
+        source.clone(),
+        registration,
+        None,
     )
     .await
     .unwrap();
+    assert_eq!(record.source.original_utf8, source.original_utf8);
+    assert_eq!(
+        record.manifest.source_digest,
+        hash(source.original_utf8.as_bytes())
+    );
+    assert_eq!(
+        record.manifest_digest,
+        evo_core::fingerprint(&record.manifest).unwrap()
+    );
     let service = HostService::new(store, host.clone()).unwrap();
     (dir, service, host, prepare_config())
 }
@@ -317,9 +342,9 @@ async fn zero_skill_and_tool_only_cannot_claim_use() {
                     instructions: snapshot.request_material.instructions.clone(),
                     tools: snapshot.request_material.tools.clone(),
                 },
-                environment_digest: snapshot.environment_digest,
-                host_surface_digest: snapshot.host_surface_digest,
-                host_capabilities_digest: snapshot.host_capabilities_digest,
+                environment_digest: snapshot.environment_digest.clone(),
+                host_surface_digest: snapshot.host_surface_digest.clone(),
+                host_capabilities_digest: snapshot.host_capabilities_digest.clone(),
                 offered: vec!["fake-skill".into()],
                 attached: vec!["fake-skill".into()],
                 used: vec!["fake-skill".into()],

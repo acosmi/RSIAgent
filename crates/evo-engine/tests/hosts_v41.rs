@@ -1,6 +1,7 @@
 //! E16.4 host authority tests. Structural fixtures never mint use or benefit.
 use evo_core::contract::{
-    AppliedReceipt, CapabilityLevel, HostCapabilities, HostSurfaceManifest, SurfaceCoverage,
+    AppliedReceipt, CapabilityLevel, HostCapabilities, HostSurfaceClassificationV2,
+    HostSurfaceManifest, HostSurfaceRegistrationV2, ReviewedHostSourceEnvelopeV1, SurfaceCoverage,
     SystemSnapshot,
 };
 use evo_core::{Context, Error, Role, hash};
@@ -176,22 +177,71 @@ async fn baseline_store() -> (tempfile::TempDir, Store, Context, String) {
     let store = Store::open(&dir.path().join("host.sqlite3")).await.unwrap();
     let admin = context("admin", Role::Admin);
     let host = context("gateway", Role::Host);
-    let mut manifest = unverified_claude_code_surface_candidate();
-    manifest.host = "reference-host".into();
-    manifest.host_version = "1.0.0-fixed-fixture".into();
-    for item in &mut manifest.items {
-        if item.coverage == SurfaceCoverage::Supported {
-            item.consumer = Some("reference-fixture".into());
-        }
-    }
-    let extracted = manifest
-        .items
+    // These software declarations preserve the seven structural names without
+    // promoting the unverified Claude candidate or granting native/tool use.
+    let fields = [
+        ("evo_prepare", SurfaceCoverage::RuntimeOwned),
+        ("evo_feedback", SurfaceCoverage::RuntimeOwned),
+        ("evo_propose", SurfaceCoverage::RuntimeOwned),
+        ("evo_inspect", SurfaceCoverage::RuntimeOwned),
+        ("shell_tool", SurfaceCoverage::Unsupported),
+        ("web_search", SurfaceCoverage::Unsupported),
+        ("model_selection", SurfaceCoverage::RuntimeOwned),
+    ];
+    let declarations: Vec<_> = fields
         .iter()
-        .map(|item| item.name.clone())
+        .map(|(name, _)| {
+            serde_json::json!({
+                "name":name,"value_type":"opaque","enum_values":[],"default":{"kind":"unknown"}
+            })
+        })
         .collect();
-    ReleaseStore::register_host_surface(&admin, &store, "surface", manifest, extracted)
-        .await
-        .unwrap();
+    let source = ReviewedHostSourceEnvelopeV1 {
+        schema_version: "rsia.host_source_envelope.v1".into(),
+        source_kind: "reviewed_fixture".into(),
+        source_schema: "rsia.host_reviewed_declarations.v1".into(),
+        extractor_version: "rsia.host_reviewed_declarations.extractor.v1".into(),
+        original_utf8: serde_json::to_string(&serde_json::json!({
+            "schema_version":"rsia.host_reviewed_declarations.v1",
+            "host":"reference-host","host_version":"1.0.0-fixed-fixture",
+            "declarations":declarations
+        }))
+        .unwrap(),
+    };
+    let registration = HostSurfaceRegistrationV2 {
+        adapter_version: "0.2.0".into(),
+        classifications: fields
+            .into_iter()
+            .map(|(name, coverage)| HostSurfaceClassificationV2 {
+                name: name.into(),
+                coverage,
+                mapped_field: None,
+                consumer: None,
+                reason:
+                    "ToolOnly software fixture; no verified native attachment or tool authority"
+                        .into(),
+                renamed_from: None,
+                test_ref: None,
+                capability: None,
+            })
+            .collect(),
+        retired: vec![],
+    };
+    let registered = ReleaseStore::register_host_surface_from_source(
+        &admin,
+        &store,
+        "surface",
+        source.clone(),
+        registration,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(registered.source.original_utf8, source.original_utf8);
+    assert_eq!(
+        registered.manifest.source_digest,
+        hash(source.original_utf8.as_bytes())
+    );
     let run_id = "run-authority".to_string();
     ReleaseStore::prepare_run(
         &host,
@@ -242,7 +292,7 @@ async fn caller_authored_used_and_benefit_cannot_mint_authority() {
             used: vec!["invented".into()],
             verified_benefit: vec!["invented".into()],
             bundle_digest: hash(b"invented-bundle"),
-            request_digest: snapshot.request_digest,
+            request_digest: snapshot.request_digest.clone(),
             capability_level: CapabilityLevel::Attached,
             truncated: false,
             attested_by: "self".into(),

@@ -1463,19 +1463,19 @@ fn ingest_selected_sources(
                 }
                 let excerpt = &raw_bytes[excerpt_start..excerpt_end];
                 let excerpt_digest = evo_core::hash(excerpt);
-                if let Ok(loc) = EvidenceLocator::build(
+                let loc = EvidenceLocator::build(
                     &member_id,
                     &content_digest,
                     excerpt_start,
                     excerpt_end,
                     ev.event_index,
                     &excerpt_digest,
-                ) {
-                    all_locators.push(loc);
-                    excerpt_bytes_used += excerpt.len();
-                    if excerpt_end < ev.byte_end {
-                        coverage.excerpt_truncated += 1;
-                    }
+                )?;
+                evo_core::evidence::verify_evidence_locator_content_v3(&loc, raw_bytes)?;
+                all_locators.push(loc);
+                excerpt_bytes_used += excerpt.len();
+                if excerpt_end < ev.byte_end {
+                    coverage.excerpt_truncated += 1;
                 }
             } else if selection.allow_model_excerpts
                 && ev.byte_end <= raw_bytes.len()
@@ -1492,13 +1492,15 @@ fn ingest_selected_sources(
             content_digest.clone(),
         ));
 
-        members.push(EvidenceMember {
+        let member = EvidenceMember {
             source_id: member_id,
             content_digest,
             task_origin: TaskOrigin::ImportedHistory,
             execution_attestation: ExecutionAttestation::UnverifiedImport,
             purpose: selection.purpose,
-        });
+        };
+        evo_core::evidence::verify_evidence_member_content_v3(&member, raw_bytes)?;
+        members.push(member);
     }
 
     let clusters = independent_clusters(&cluster_inputs);
@@ -2349,6 +2351,7 @@ impl PersistentImportService {
             },
         };
 
+        validate_import_evidence_sources(&result.payload, &selection, &source_records)?;
         let mut session = self.store.session().await?;
         validate_live_import_sources(&mut session, ctx, &selection, &source_records).await?;
         if let Some(existing) = session
@@ -2437,6 +2440,10 @@ impl PersistentImportService {
                 return Err(Error::Conflict("import result source mismatch".into()));
             }
         }
+        // Evaluator access is a summary-only historical view, not a byte proof.
+        if ctx.role() == Role::Admin {
+            validate_import_evidence_sources(&result.payload, &selection, &source_records)?;
+        }
         session.commit().await?;
         if ctx.role() == Role::Admin {
             for source in &source_records {
@@ -2454,6 +2461,7 @@ impl PersistentImportService {
                 if hash(&bytes) != source.payload.raw_digest {
                     return Err(Error::Conflict("source_changed".into()));
                 }
+                verify_import_evidence_bytes(&result.payload, &source.id, &bytes)?;
             }
         }
         let mut session = self.store.session().await?;
@@ -3289,6 +3297,90 @@ fn validate_source_record(ctx: &Context, record: &ImportSourceRecord) -> Result<
     Ok(())
 }
 
+// Content checks within the existing Admin writer/reader. Imported history
+// remains unverified; these checks never manufacture source permissions.
+fn validate_import_evidence_sources(
+    payload: &ImportResultPayload,
+    selection: &SourceSelectionRecord,
+    sources: &[ImportSourceRecord],
+) -> Result<()> {
+    let mut members = BTreeSet::new();
+    if let Some(set) = &payload.evidence_set {
+        let rebuilt = EvidenceSet::build(
+            set.id.clone(),
+            set.members.clone(),
+            set.coverage.clone(),
+            set.independent_clusters.clone(),
+        )?;
+        if fingerprint(&rebuilt)? != fingerprint(set)? {
+            return Err(Error::Conflict("import evidence identity mismatch".into()));
+        }
+        for member in &set.members {
+            let source = sources
+                .iter()
+                .find(|source| source.id == member.source_id)
+                .ok_or_else(|| Error::Conflict("import evidence source binding mismatch".into()))?;
+            if !members.insert(member.source_id.as_str())
+                || source.payload.status != ImportSourceReadStatus::Ready
+                || member.content_digest != source.payload.raw_digest
+                || member.purpose != selection.payload.purpose
+                || member.task_origin != TaskOrigin::ImportedHistory
+                || member.execution_attestation != ExecutionAttestation::UnverifiedImport
+            {
+                return Err(Error::Conflict(
+                    "import evidence source binding mismatch".into(),
+                ));
+            }
+        }
+    }
+    for locator in &payload.locators {
+        if !members.contains(locator.source_id.as_str()) {
+            return Err(Error::Conflict(
+                "import locator source binding mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_import_evidence_bytes(
+    payload: &ImportResultPayload,
+    source_id: &str,
+    raw: &[u8],
+) -> Result<()> {
+    if let Some(set) = &payload.evidence_set {
+        for member in set
+            .members
+            .iter()
+            .filter(|member| member.source_id == source_id)
+        {
+            evo_core::evidence::verify_evidence_member_content_v3(member, raw)?;
+        }
+    }
+    for locator in payload
+        .locators
+        .iter()
+        .filter(|locator| locator.source_id == source_id)
+    {
+        evo_core::evidence::verify_evidence_locator_content_v3(locator, raw)?;
+        let mut events = payload.event_records.iter().filter(|event| {
+            event.source_id == source_id && event.event_index == locator.event_index
+        });
+        let event = events
+            .next()
+            .ok_or_else(|| Error::Conflict("import locator event binding mismatch".into()))?;
+        if events.next().is_some()
+            || locator.byte_start != event.byte_start
+            || locator.byte_end > event.byte_end
+        {
+            return Err(Error::Conflict(
+                "import locator event binding mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_result_record(ctx: &Context, record: &ImportResultRecord) -> Result<()> {
     validate_envelope(ctx, record, IMPORT_RESULT_SCHEMA)?;
     if record.payload.generation_status != "blocked_external_generation_conditions_unavailable"
@@ -3425,6 +3517,20 @@ mod local_material_boundary_tests {
         ImportResultRecord,
         ImportMaterialReadRequest,
     ) {
+        fixture_with_excerpts(false).await
+    }
+
+    async fn fixture_with_excerpts(
+        allow_excerpts: bool,
+    ) -> (
+        tempfile::TempDir,
+        Store,
+        Context,
+        PersistentImportService,
+        SourceSelectionRecord,
+        ImportResultRecord,
+        ImportMaterialReadRequest,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let admin = Context::new("boundary-tenant", "admin", Role::Admin).unwrap();
         let store = Store::open(&directory.path().join("import.sqlite3"))
@@ -3448,9 +3554,13 @@ mod local_material_boundary_tests {
                     request_key: "boundary-registration".into(),
                     roots: vec![directory.path().to_string_lossy().into_owned()],
                     purpose: Purpose::Development,
-                    allow_model_excerpts: false,
-                    outbound_authorized: false,
-                    retention_scope: ImportRetentionScope::LocalPrivate,
+                    allow_model_excerpts: allow_excerpts,
+                    outbound_authorized: allow_excerpts,
+                    retention_scope: if allow_excerpts {
+                        ImportRetentionScope::LocalWithAuthorizedExcerpts
+                    } else {
+                        ImportRetentionScope::LocalPrivate
+                    },
                     sources: vec![ImportSourceSpec {
                         source_id: "incident.try1".into(),
                         path: path.to_string_lossy().into_owned(),
@@ -3470,6 +3580,98 @@ mod local_material_boundary_tests {
             }],
         };
         (directory, store, admin, service, selection, result, request)
+    }
+
+    #[tokio::test]
+    async fn live_reader_rejects_wrong_member_preimage_after_healthy_import() {
+        let (_directory, store, admin, service, _selection, result, _request) = fixture().await;
+        let healthy = service.load_live_result(&admin, &result.id).await.unwrap();
+        assert_eq!(
+            fingerprint(&healthy).unwrap(),
+            fingerprint(&result).unwrap()
+        );
+        let mut changed = result.clone();
+        changed.payload.evidence_set.as_mut().unwrap().members[0].content_digest =
+            hash(br#"{"role":"user","content":"another valid observation"}"#);
+        // Keep the set internally well-formed; only its source binding is wrong.
+        let set = changed.payload.evidence_set.as_mut().unwrap();
+        *set = EvidenceSet::build(
+            set.id.clone(),
+            set.members.clone(),
+            set.coverage.clone(),
+            set.independent_clusters.clone(),
+        )
+        .unwrap();
+        let mut session = store.session().await.unwrap();
+        session
+            .put(
+                &admin,
+                IMPORT_ARTIFACT_KIND,
+                &changed.id,
+                admin.actor(),
+                &changed,
+            )
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        assert!(matches!(
+            service.load_live_result(&admin, &result.id).await,
+            Err(Error::Conflict(message)) if message == "import evidence source binding mismatch"
+        ));
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn live_reader_keeps_locator_digest_and_range_failures_after_healthy_import() {
+        for fault in 0..4 {
+            let (_directory, store, admin, service, _selection, result, _request) =
+                fixture_with_excerpts(true).await;
+            let healthy = service.load_live_result(&admin, &result.id).await.unwrap();
+            assert_eq!(
+                fingerprint(&healthy).unwrap(),
+                fingerprint(&result).unwrap()
+            );
+            assert!(!result.payload.locators.is_empty());
+            let mut changed = result.clone();
+            let locator = &mut changed.payload.locators[0];
+            match fault {
+                0 => locator.source_digest = hash(br#"{"role":"user","content":"other"}"#),
+                1 => locator.excerpt_digest = hash(b"another actual excerpt"),
+                2 => locator.byte_end += 1,
+                3 => locator.excerpt_digest = "readable_excerpt".into(),
+                _ => unreachable!(),
+            }
+            let mut session = store.session().await.unwrap();
+            session
+                .put(
+                    &admin,
+                    IMPORT_ARTIFACT_KIND,
+                    &changed.id,
+                    admin.actor(),
+                    &changed,
+                )
+                .await
+                .unwrap();
+            session.commit().await.unwrap();
+            let error = service
+                .load_live_result(&admin, &result.id)
+                .await
+                .unwrap_err();
+            match fault {
+                0 => assert!(
+                    matches!(error, Error::Conflict(message) if message == "source_changed")
+                ),
+                1 => assert!(
+                    matches!(error, Error::Conflict(message) if message == "excerpt_digest_mismatch")
+                ),
+                2 => assert!(
+                    matches!(error, Error::Invalid(message) if message == "offset out of bounds")
+                ),
+                3 => assert!(matches!(error, Error::Invalid(_))),
+                _ => unreachable!(),
+            }
+            store.close().await;
+        }
     }
 
     #[tokio::test]

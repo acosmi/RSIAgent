@@ -32,7 +32,8 @@ mod trusted_compiler_inputs;
 
 use evo_core::contract::{
     CapabilityLevel, CompileParts, HostCapabilities, HostSurfaceManifest, ImproverPatch, Profile,
-    ResolvedBundle, SkillPatch, SkillSnapshot, SurfaceCoverage, SurfaceItem, SystemSnapshot,
+    ResolvedBundleV3 as ResolvedBundle, SkillPatch, SkillSnapshot, SurfaceCoverage, SurfaceItem,
+    SystemSnapshot,
 };
 use evo_core::curriculum::{
     AppliedLearnerAssetRef, CoverageBucketState, CurriculumControlProfileV1, FailureCycleOutcome,
@@ -70,8 +71,9 @@ use evo_engine::optimization::{
     StoreOptimizationJournal,
 };
 use evo_engine::release_store::{
-    PersistentRelease, PersistentReleaseState, PrepareRunRequest, ReleaseCandidateRecord,
-    ReleaseStore, StageBundleRequest, TrustedHostExecutionEvidence, TrustedHostExecutionReceipt,
+    CurrentReleaseCandidateRecord as ReleaseCandidateRecord,
+    CurrentStageBundleRequest as StageBundleRequest, PersistentRelease, PersistentReleaseState,
+    PrepareRunRequest, ReleaseStore, TrustedHostExecutionEvidence, TrustedHostExecutionReceipt,
     TypedSourceRef,
 };
 use evo_engine::streaming_evaluator::{FixedGraderMethod, FixedGraderSpec};
@@ -200,6 +202,7 @@ fn build_request(
     control: &DevelopmentControlV1,
     request_id: &str,
     episode_id: &str,
+    candidate_bundle_digest: &str,
 ) -> DevelopmentRunRequest {
     DevelopmentRunRequest {
         request_id: request_id.into(),
@@ -210,12 +213,7 @@ fn build_request(
         attempt: 1,
         manifest: control.manifest().unwrap(),
         parent_bundle_digest: d("parent-bundle"),
-        candidate_bundle_digest: trusted_compiler_inputs::software_candidate(
-            NAMESPACE,
-            &control.environment_digest,
-            "candidate-bundle",
-        )
-        .digest,
+        candidate_bundle_digest: candidate_bundle_digest.into(),
         environment_digest: control.environment_digest.clone(),
         grader_digest: control.grader_digest.clone(),
         rules_digest: control.rules_digest.clone(),
@@ -226,6 +224,7 @@ fn build_request(
 }
 
 struct Fixture {
+    candidate_digest: String,
     _dir: tempfile::TempDir,
     store: Store,
     admin: Context,
@@ -251,7 +250,7 @@ impl Fixture {
         }
         let mut session = store.session().await.unwrap();
         session
-            .bump_watermark(&admin, "initial-watermark")
+            .bump_watermark(&admin, &d("initial-watermark"))
             .await
             .unwrap();
         session.commit().await.unwrap();
@@ -274,16 +273,11 @@ impl Fixture {
             .await
             .unwrap();
         let control = control();
-        let candidate = trusted_compiler_inputs::software_candidate(
-            NAMESPACE,
+        let candidate = trusted_compiler_inputs::software_candidate_current(
+            &store,
+            &executor,
             &control.environment_digest,
             "candidate-bundle",
-        );
-        trusted_compiler_inputs::persist_bundle(
-            &store,
-            NAMESPACE,
-            &candidate,
-            &control.environment_digest,
             1,
         )
         .await
@@ -292,6 +286,7 @@ impl Fixture {
             .await
             .unwrap();
         Self {
+            candidate_digest: candidate.digest,
             _dir: dir,
             store,
             admin,
@@ -406,19 +401,21 @@ impl Fixture {
         }
         .seal()
         .unwrap();
-        let inputs = trusted_compiler_inputs::bundle_use(
+        let inputs = trusted_compiler_inputs::bundle_use_current(
             &self.store,
-            NAMESPACE,
+            &self.admin,
             &request.candidate_bundle_digest,
+            &request.environment_digest,
+            request.revoke_watermark,
         )
         .await
         .unwrap();
         journal
-            .commit_bound(request_fact.clone(), &inputs)
+            .commit_source_bound(request_fact.clone(), &inputs)
             .await
             .unwrap();
         journal
-            .commit_bound(observed_fact.clone(), &inputs)
+            .commit_source_bound(observed_fact.clone(), &inputs)
             .await
             .unwrap();
         (request_fact.artifact_id, observed_fact.artifact_id)
@@ -552,6 +549,7 @@ async fn real_cycle(
         &fixture.control,
         &format!("dev-request-{n}"),
         &format!("episode-{n}"),
+        &fixture.candidate_digest,
     );
     let report = fixture.runner().run(request.clone()).await.unwrap();
     let (request_fact_id, observed_fact_id) = fixture.commit_facts(&request, &report).await;
@@ -781,7 +779,7 @@ fn release_bundle(content: &str) -> ResolvedBundle {
         required_capabilities: vec![],
         dependencies: vec![],
     };
-    trusted_compiler_inputs::bundle(
+    trusted_compiler_inputs::bundle_content_current(
         CompileParts {
             profile: &profile,
             parent: &parent,
@@ -817,11 +815,11 @@ async fn stage_candidate(
     runs: &[&str],
 ) -> ReleaseCandidateRecord {
     let bundle = release_bundle("retest skill");
-    trusted_compiler_inputs::install_bundle(&fixture.store, &bundle)
+    trusted_compiler_inputs::install_bundle_current_sources(&fixture.store, &bundle)
         .await
         .unwrap();
     let proposer = Context::new(NAMESPACE, "proposer", Role::Worker).unwrap();
-    ReleaseStore::stage_bundle(
+    ReleaseStore::stage_current_bundle(
         &proposer,
         &fixture.store,
         StageBundleRequest {
@@ -1632,7 +1630,7 @@ async fn an_unapproved_candidate_or_a_missing_trusted_receipt_has_no_influence()
     // release, so the Host's run of that profile is a zero-skill baseline run
     // and its applied request carries no trusted applied receipt.
     stage_candidate(&fixture, "candidate-unapproved", &["run-b"]).await;
-    ReleaseStore::register_host_surface(
+    trusted_compiler_inputs::register_fixture_host_surface(
         &fixture.admin,
         &fixture.store,
         "surface-1",

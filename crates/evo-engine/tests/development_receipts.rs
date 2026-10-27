@@ -181,6 +181,7 @@ struct Fixture {
     executor: Context,
     grader: Context,
     control: DevelopmentControlV1,
+    candidate_bundle_digest: String,
 }
 
 impl Fixture {
@@ -226,14 +227,18 @@ impl Fixture {
             CONTROL_ID,
             DevelopmentEvidenceScope::RegisteredPureFunctionExecution,
         );
-        let candidate = trusted_compiler_inputs::software_candidate(
-            NAMESPACE,
+        let candidate = trusted_compiler_inputs::software_candidate_current(
+            &store,
+            &executor,
             &control.environment_digest,
             "registered development fixture",
-        );
-        trusted_compiler_inputs::persist_bundle(
+            1,
+        )
+        .await
+        .unwrap();
+        trusted_compiler_inputs::persist_bundle_current(
             &store,
-            NAMESPACE,
+            &executor,
             &candidate,
             &control.environment_digest,
             1,
@@ -260,6 +265,7 @@ impl Fixture {
             executor,
             grader,
             control,
+            candidate_bundle_digest: candidate.digest,
         }
     }
 
@@ -276,7 +282,9 @@ impl Fixture {
     }
 
     fn request(&self) -> DevelopmentRunRequest {
-        build_request(&self.control, "dev-request-1", "episode-1")
+        let mut request = build_request(&self.control, "dev-request-1", "episode-1");
+        request.candidate_bundle_digest = self.candidate_bundle_digest.clone();
+        request
     }
 
     /// Commits the request/observation pair the way the E03 step and its
@@ -286,9 +294,8 @@ impl Fixture {
         request: &DevelopmentRunRequest,
         report: &DevelopmentRunReport,
     ) -> (String, String) {
-        let mut session = self.store.session().await.unwrap();
-        let original = evo_engine::compiler::verify_bundle_in_session(
-            &mut session,
+        let inputs = trusted_compiler_inputs::bundle_use_current(
+            &self.store,
             &self.admin,
             &request.candidate_bundle_digest,
             &request.environment_digest,
@@ -296,8 +303,6 @@ impl Fixture {
         )
         .await
         .unwrap();
-        session.commit().await.unwrap();
-        let inputs = evo_engine::model::CompilerInputUse::new(original.input, original.binding);
         let journal =
             StoreOptimizationJournal::new(self.store.clone(), self.admin.clone(), "admin").unwrap();
         let extras = vec![
@@ -346,11 +351,11 @@ impl Fixture {
         .unwrap();
         let observed_fact = observed_fact(request, report, extras);
         journal
-            .commit_bound(request_fact.clone(), &inputs)
+            .commit_source_bound(request_fact.clone(), &inputs)
             .await
             .unwrap();
         journal
-            .commit_bound(observed_fact.clone(), &inputs)
+            .commit_source_bound(observed_fact.clone(), &inputs)
             .await
             .unwrap();
         (request_fact.artifact_id, observed_fact.artifact_id)
@@ -652,7 +657,8 @@ async fn receipts_from_a_different_control_are_a_conflict() {
         Arc::new(|| 100),
     )
     .unwrap();
-    let other_request = build_request(&other, "dev-request-2", "episode-2");
+    let mut other_request = build_request(&other, "dev-request-2", "episode-2");
+    other_request.candidate_bundle_digest = fixture.candidate_bundle_digest.clone();
     let other_report = other_runner.run(other_request.clone()).await.unwrap();
     // The same request id can never be re-executed under a different control.
     assert!(matches!(
@@ -1782,7 +1788,7 @@ async fn registered_runner_rechecks_the_reserved_bundle_before_dispatch_without_
         let fixture = Fixture::new().await;
         let request = fixture.request();
         let mut s = fixture.store.session().await.unwrap();
-        let original: evo_engine::compiler::AuthenticatedBundleRecord = s
+        let original: evo_engine::compiler::CurrentAuthenticatedBundleRecord = s
             .need(
                 &fixture.executor,
                 "artifact",
@@ -1982,4 +1988,91 @@ fn ag129_snapshot_preserves_nul_text_real_bits_and_storage_classes() {
             "lost logical SQLite value {expected}"
         );
     }
+}
+
+#[tokio::test]
+async fn current_bound_pair_reloads_task_control_grader_and_metered_receipts() {
+    let fixture = Fixture::new().await;
+    let request = fixture.request();
+    let report = fixture.runner().run(request.clone()).await.unwrap();
+    let (request_fact, observation) = fixture.commit_facts(&request, &report).await;
+    let healthy =
+        verify_development_observation(&fixture.store, &fixture.admin, &request_fact, &observation)
+            .await
+            .unwrap();
+    assert_eq!(healthy.outcomes.len(), fixture.control.tasks.len());
+    for result in &report.results {
+        let parent =
+            load_execution_receipt(&fixture.store, &fixture.admin, &result.parent_execution_id)
+                .await
+                .unwrap();
+        let candidate = load_execution_receipt(
+            &fixture.store,
+            &fixture.admin,
+            &result.candidate_execution_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(parent.task_id, candidate.task_id);
+        assert_eq!(parent.control_id, fixture.control.id);
+        assert_eq!(candidate.control_id, fixture.control.id);
+        assert_eq!(parent.side, DevelopmentSide::Parent);
+        assert_eq!(candidate.side, DevelopmentSide::Candidate);
+        let grade = load_grader_receipt(
+            &fixture.store,
+            &fixture.admin,
+            &grader_receipt_id(&request.request_id, &result.task_id).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fingerprint(&grade).unwrap(), result.grader_receipt_digest);
+        for execution in [parent, candidate] {
+            let call = fixture
+                .store
+                .budget_call(&fixture.admin, SCOPE, &execution.budget_call_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(call.state, BudgetCallState::Finalized);
+            assert_eq!(call.actual_cost_micros, Some(0));
+            assert!(call.execution_closed);
+            assert_eq!(
+                RegisteredExecutionSettlement::from_call(&call)
+                    .unwrap()
+                    .runner_digest,
+                registered_runner_digest().unwrap()
+            );
+        }
+    }
+    let before_root = fixture
+        .store
+        .root_budget(&fixture.admin, SCOPE)
+        .await
+        .unwrap()
+        .unwrap();
+    let before_audit = fixture.store.verify_audit(&fixture.admin).await.unwrap();
+    let mut changed = report.clone();
+    changed.results[0].grader_receipt_digest = d("another legitimate-looking grader receipt");
+    let honest = observed_fact(&request, &report, vec![]);
+    let forged = observed_fact(&request, &changed, vec![]);
+    assert!(matches!(
+        gate_with_forged_observation(&fixture, &request_fact, &honest, &forged).await,
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(
+        fixture
+            .store
+            .root_budget(&fixture.admin, SCOPE)
+            .await
+            .unwrap()
+            .unwrap(),
+        before_root
+    );
+    assert_eq!(
+        fixture.store.verify_audit(&fixture.admin).await.unwrap(),
+        before_audit
+    );
+    verify_development_observation(&fixture.store, &fixture.admin, &request_fact, &observation)
+        .await
+        .unwrap();
 }

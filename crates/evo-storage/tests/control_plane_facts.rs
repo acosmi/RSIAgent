@@ -6,8 +6,9 @@
 use evo_core::{Context, Role, hash};
 use evo_storage::Store;
 use evo_storage::lifecycle::{
-    ControlPlaneFacts, LifecycleStore, PROTECTED_OBJECT_KINDS, PROTECTED_SCHEMA_VERSIONS,
-    ROOT_BUDGET_TABLE_QUERY, TypedObjectRef, parse_strict_json, read_control_plane_facts,
+    ControlPlaneFacts, LifecycleStore, PROTECTED_ACTION_SCHEMA_VERSIONS, PROTECTED_OBJECT_KINDS,
+    PROTECTED_SCHEMA_VERSIONS, ROOT_BUDGET_TABLE_QUERY, TypedObjectRef, parse_strict_json,
+    read_control_plane_facts,
 };
 use serde_json::json;
 use sqlx::{ConnectOptions, Connection};
@@ -459,9 +460,527 @@ fn the_exported_selectors_are_the_restore_scripts() {
     // script source itself.
     assert_eq!(PROTECTED_OBJECT_KINDS.len(), 4);
     assert_eq!(PROTECTED_SCHEMA_VERSIONS.len(), 9);
+    assert_eq!(PROTECTED_ACTION_SCHEMA_VERSIONS.len(), 12);
     // E16 budget refs preserve the original source snapshots through recovery.
     assert!(PROTECTED_SCHEMA_VERSIONS.contains(&"rsia.budget_call_e16_ref.v1"));
     assert!(ROOT_BUDGET_TABLE_QUERY.contains("LIKE 'root_budget%'"));
     let facts: Option<ControlPlaneFacts> = None;
     assert!(facts.is_none());
+}
+
+#[tokio::test]
+async fn current_and_legacy_consolidation_bodies_remain_protected_and_cleanable() {
+    // These deliberately minimal claimed action records exercise conservative
+    // metadata protection and cleanup. They are not valid compiler/Current
+    // producer fixtures and confer no proposal or model authority.
+    let (_dir, store, path) = database().await;
+    let admin = ctx("n", "admin", Role::Admin);
+    put_run(&store, "n", "proposal-source").await;
+    let legacy = json!({
+        "schema_version": "rsia.monitoring.consolidation_proposal.v1",
+        "id": "proposal-legacy", "payload": "source-derived content"
+    });
+    let current = json!({
+        "schema_version": "rsia.monitoring.consolidation_proposal.v2",
+        "id": "proposal-current", "payload": "source-derived content"
+    });
+    let mut session = store.session().await.unwrap();
+    for value in [&legacy, &current] {
+        let id = value["id"].as_str().unwrap();
+        session
+            .put(&admin, "artifact", id, admin.actor(), value)
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", id, "run", "proposal-source")
+            .await
+            .unwrap();
+    }
+    session.commit().await.unwrap();
+    let status = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: "proposal-source".into(),
+        },
+        "remove source-derived proposal content",
+        evo_core::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    store.close().await;
+
+    let facts = read_control_plane_facts(&path).await.unwrap();
+    let legacy_key = (
+        "n".to_owned(),
+        "artifact".to_owned(),
+        "proposal-legacy".to_owned(),
+    );
+    let current_key = (
+        "n".to_owned(),
+        "artifact".to_owned(),
+        "proposal-current".to_owned(),
+    );
+    assert_eq!(facts.protected_objects[&legacy_key], legacy);
+    assert_eq!(facts.protected_objects[&current_key], current);
+
+    let changed = json!({
+        "schema_version": "rsia.monitoring.consolidation_proposal.v2",
+        "id": "proposal-current", "payload": "changed source-derived content"
+    });
+    // Only this test's released temporary database is modified; the reader
+    // must distinguish every field of the whole action record.
+    exec(&path, &format!(
+        "UPDATE objects SET body='{}' WHERE namespace='n' AND kind='artifact' AND id='proposal-current'",
+        serde_json::to_string(&changed).unwrap()
+    )).await;
+    let after = read_control_plane_facts(&path).await.unwrap();
+    assert_ne!(facts, after);
+    assert_eq!(after.protected_objects[&legacy_key], legacy);
+    assert_eq!(after.protected_objects[&current_key], changed);
+
+    let reopened = Store::open(&path).await.unwrap();
+    let mut result = status;
+    for _ in 0..20 {
+        if result.state == evo_storage::lifecycle::CleanupState::Complete {
+            break;
+        }
+        result = LifecycleStore::cleanup_step(
+            &admin,
+            &reopened,
+            &result.job_id,
+            16,
+            evo_core::now().unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(result.state, evo_storage::lifecycle::CleanupState::Complete);
+    let mut session = reopened.session().await.unwrap();
+    for id in ["proposal-legacy", "proposal-current"] {
+        let value: serde_json::Value = session.need(&admin, "artifact", id).await.unwrap();
+        assert_eq!(value["schema_version"], "rsia.redacted.v1");
+        assert_eq!(
+            value["original_schema"],
+            if id == "proposal-legacy" {
+                "rsia.monitoring.consolidation_proposal.v1"
+            } else {
+                "rsia.monitoring.consolidation_proposal.v2"
+            }
+        );
+        assert!(
+            !serde_json::to_string(&value)
+                .unwrap()
+                .contains("source-derived content")
+        );
+    }
+    session.commit().await.unwrap();
+    reopened.close().await;
+}
+
+// Read actual stored bytes only after this test's Store has released the file.
+async fn compiler_cleanup_bodies(path: &Path) -> BTreeMap<String, String> {
+    let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .disable_statement_logging()
+        .connect()
+        .await
+        .unwrap();
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id,body FROM objects WHERE namespace='n' AND kind='artifact' ORDER BY id",
+    )
+    .fetch_all(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+    rows.into_iter().collect()
+}
+
+#[tokio::test]
+async fn known_compiler_content_is_redacted_while_binding_metadata_and_facts_survive() {
+    // These are claimed-schema cleanup data, not valid Current producer,
+    // independent OS principal, dispatch, grading or paid-execution proofs.
+    let (_dir, store, path) = database().await;
+    let admin = ctx("n", "admin", Role::Admin);
+    put_run(&store, "n", "compiler-source").await;
+    let sentinel = "revoked original compiler source content";
+    let bundle = json!({"skill":{"content":sentinel},"improver":{"instruction":sentinel}});
+    let input = json!({
+        "search_parent":{"content":sentinel}, "baseline":{"content":sentinel},
+        "search_parent_strategy":{"instruction":sentinel},
+        "baseline_strategy":{"instruction":sentinel}
+    });
+    let content = [
+        json!({"id":"candidate-v1","schema_version":"rsia.release_candidate.v1","bundle":bundle.clone()}),
+        json!({"id":"candidate-v2","schema_version":"rsia.release_candidate.v2","bundle":bundle.clone()}),
+        json!({"id":"compiler-use-v1","schema_version":"rsia.optimization.compiler_use.v1","request":input.clone()}),
+        json!({"id":"compiler-use-v2","schema_version":"rsia.optimization.compiler_use.v2","request":input.clone()}),
+        json!({"id":"authenticated-v1","schema_version":"rsia.authenticated_bundle.v1","bundle":bundle.clone(),"input":input.clone()}),
+        json!({"id":"authenticated-v2","schema_version":"rsia.authenticated_bundle.v2","bundle":bundle.clone(),"input":input,
+            "original_baseline":{"baseline_skill":{"content":sentinel}},
+            "original_parent":{"skill":{"content":sentinel},"strategy":{"instruction":sentinel}}}),
+        // The original standalone v2 classifier remains supported unchanged.
+        json!({"id":"standalone-v2","schema_version":"rsia.resolved_bundle.v2","skill":{"content":sentinel}}),
+    ];
+    let digest = hash(b"x"); // The existing put_run fixture's actual body bytes.
+    let mut metadata = Vec::new();
+    let mut session = store.session().await.unwrap();
+    for value in &content {
+        let id = value["id"].as_str().unwrap();
+        session
+            .put(&admin, "artifact", id, admin.actor(), value)
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", id, "run", "compiler-source")
+            .await
+            .unwrap();
+    }
+    for (id, schema, binding_schema, candidate_id) in [
+        (
+            "binding-v1",
+            "rsia.persisted_compiler_binding.v1",
+            "rsia.formal_compiler_input_binding.v2",
+            "candidate-v1",
+        ),
+        (
+            "binding-v2",
+            "rsia.persisted_compiler_binding.v2",
+            "rsia.formal_compiler_input_binding.v3",
+            "candidate-v2",
+        ),
+    ] {
+        let value = json!({
+            "id":id,"schema_version":schema,"candidate_id":candidate_id,
+            "binding":{
+                "schema_version":binding_schema,"namespace":"n","profile_registration_id":"compiler-profile",
+                "profile_digest":digest,"parent_digest":digest,"baseline_digest":digest,
+                "parent_skill_digest":digest,"parent_strategy_digest":digest,
+                "search_parent_skill_digest":digest,"search_parent_strategy_digest":digest,
+                "baseline_skill_digest":digest,"baseline_strategy_digest":digest,
+                "environment_digest":digest,"capabilities_digest":digest,"purpose":"development",
+                "application_order":["mandatory_context","skill","task"],"watermark":[0,digest],
+                "live_profile_pointer_digest":null,
+                "closure":{"nodes":[{"kind":"run","id":"compiler-source",
+                    "schema_version":"rsia.optimization.source.v1","content_digest":digest}],
+                    "edges":[],"digest":digest},"binding_digest":digest
+            }
+        });
+        session
+            .put(&admin, "artifact", id, admin.actor(), &value)
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", id, "run", "compiler-source")
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", candidate_id, "artifact", id)
+            .await
+            .unwrap();
+        metadata.push(value);
+    }
+    session.commit().await.unwrap();
+    let mut status = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: "compiler-source".into(),
+        },
+        "remove compiler-derived source content",
+        evo_core::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    store.close().await;
+    let before = compiler_cleanup_bodies(&path).await;
+    let facts = read_control_plane_facts(&path).await.unwrap();
+    assert_eq!(facts.watermarks.len(), 1);
+    assert_eq!(facts.tombstones.len(), 1);
+    for value in &content {
+        assert!(before[value["id"].as_str().unwrap()].contains(sentinel));
+    }
+
+    let reopened = Store::open(&path).await.unwrap();
+    for _ in 0..20 {
+        if matches!(
+            status.state,
+            evo_storage::lifecycle::CleanupState::Complete
+                | evo_storage::lifecycle::CleanupState::Failed
+        ) {
+            break;
+        }
+        status = LifecycleStore::cleanup_step(
+            &admin,
+            &reopened,
+            &status.job_id,
+            16,
+            evo_core::now().unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        status.state,
+        evo_storage::lifecycle::CleanupState::Complete,
+        "{:?}",
+        status.last_error
+    );
+    reopened.close().await;
+    let after = compiler_cleanup_bodies(&path).await;
+    for value in &content {
+        let id = value["id"].as_str().unwrap();
+        let redacted: serde_json::Value = serde_json::from_str(&after[id]).unwrap();
+        assert_eq!(redacted["schema_version"], "rsia.redacted.v1");
+        assert_eq!(redacted["original_schema"], value["schema_version"]);
+        assert_eq!(redacted["original_digest"], hash(before[id].as_bytes()));
+        assert!(!after[id].contains(sentinel));
+    }
+    for value in &metadata {
+        let id = value["id"].as_str().unwrap();
+        assert_eq!(after[id], before[id]);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&after[id]).unwrap(),
+            *value
+        );
+    }
+    assert_eq!(read_control_plane_facts(&path).await.unwrap(), facts);
+}
+
+#[tokio::test]
+async fn future_compiler_record_versions_fail_closed_without_rewriting_their_bodies() {
+    // Every unknown version gets an independent real Store and source closure;
+    // claiming a familiar schema family grants neither cleanup nor authority.
+    for schema in [
+        "rsia.release_candidate.v3",
+        "rsia.optimization.compiler_use.v3",
+        "rsia.authenticated_bundle.v3",
+        "rsia.persisted_compiler_binding.v3",
+        // No standalone v3 writer was registered by this implementation.
+        "rsia.resolved_bundle.v3",
+    ] {
+        let (_dir, store, path) = database().await;
+        let admin = ctx("n", "admin", Role::Admin);
+        put_run(&store, "n", "future-source").await;
+        let claimed = json!({"id":"future-record","schema_version":schema,
+            "payload":"unknown-version source content must not be silently handled"});
+        let mut session = store.session().await.unwrap();
+        session
+            .put(&admin, "artifact", "future-record", admin.actor(), &claimed)
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", "future-record", "run", "future-source")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let mut status = LifecycleStore::begin_revoke(
+            &admin,
+            &store,
+            TypedObjectRef {
+                kind: "run".into(),
+                id: "future-source".into(),
+            },
+            "unknown compiler record cleanup boundary",
+            evo_core::now().unwrap(),
+        )
+        .await
+        .unwrap();
+        store.close().await;
+        let before = compiler_cleanup_bodies(&path).await;
+        let facts = read_control_plane_facts(&path).await.unwrap();
+        let reopened = Store::open(&path).await.unwrap();
+        for _ in 0..20 {
+            if matches!(
+                status.state,
+                evo_storage::lifecycle::CleanupState::Complete
+                    | evo_storage::lifecycle::CleanupState::Failed
+            ) {
+                break;
+            }
+            status = LifecycleStore::cleanup_step(
+                &admin,
+                &reopened,
+                &status.job_id,
+                16,
+                evo_core::now().unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            status.state,
+            evo_storage::lifecycle::CleanupState::Failed,
+            "{schema}"
+        );
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some(format!("blocked_unknown_scope:artifact:{schema}:").as_str())
+        );
+        reopened.close().await;
+        let after = compiler_cleanup_bodies(&path).await;
+        assert_eq!(after["future-record"], before["future-record"], "{schema}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&after["future-record"]).unwrap(),
+            claimed
+        );
+        assert_eq!(read_control_plane_facts(&path).await.unwrap(), facts);
+    }
+}
+
+#[tokio::test]
+async fn current_host_restore_precision_fault_is_zero_write() {
+    use evo_core::contract::{
+        HostSurfaceClassificationV2, HostSurfaceRegistrationV2, ReviewedHostSourceEnvelopeV1,
+        SurfaceCoverage, host_surface_upgrade_diff_v2, host_surface_v2_from_source,
+    };
+    let (dir, store, path) = database().await;
+    let admin = ctx("n", "admin", Role::Admin);
+    let source=ReviewedHostSourceEnvelopeV1 {
+        schema_version:"rsia.host_source_envelope.v1".into(),source_kind:"reviewed_fixture".into(),
+        source_schema:"rsia.host_reviewed_declarations.v1".into(),
+        extractor_version:"rsia.host_reviewed_declarations.extractor.v1".into(),
+        original_utf8:r#"{"schema_version":"rsia.host_reviewed_declarations.v1","host":"reference","host_version":"1","declarations":[{"name":"option","value_type":"object","enum_values":[],"default":{"kind":"value","value":{"decimal":0.1}}}]}"#.into(),
+    };
+    let registration = HostSurfaceRegistrationV2 {
+        adapter_version: "1".into(),
+        retired: vec![],
+        classifications: vec![HostSurfaceClassificationV2 {
+            name: "option".into(),
+            coverage: SurfaceCoverage::Unsupported,
+            mapped_field: None,
+            consumer: None,
+            reason: "restore raw data control".into(),
+            renamed_from: None,
+            test_ref: None,
+            capability: None,
+        }],
+    };
+    let (manifest, typed) = host_surface_v2_from_source(&source, &registration).unwrap();
+    let body = json!({"id":"host-current","schema_version":"rsia.host_surface_record.v2",
+        "manifest_digest":evo_core::fingerprint(&manifest).unwrap(),
+        "upgrade_diff":host_surface_upgrade_diff_v2(&manifest,None).unwrap(),
+        "manifest":manifest,"source":source,"extracted":["option"],"extracted_typed":typed,"predecessor_surface_id":null});
+    let raw = serde_json::to_string(&body).unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin, "artifact", "host-current", admin.actor(), &body)
+        .await
+        .unwrap();
+    session
+        .bump_watermark(&admin, &hash(b"raw restore watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    store.close().await;
+    read_control_plane_facts(&path).await.unwrap();
+    let mut faults = vec![(
+        "outer",
+        raw.replacen("\"decimal\":0.1", "\"decimal\":0.100000000000000001", 1),
+    )];
+    for (name, original) in [
+        (
+            "source-precision",
+            source.original_utf8.replace("0.1", "0.100000000000000001"),
+        ),
+        (
+            "source-duplicate",
+            source
+                .original_utf8
+                .replace("\"decimal\":0.1", "\"decimal\":0.1,\"\\u0064ecimal\":0.1"),
+        ),
+        (
+            "source-mismatch",
+            source.original_utf8.replace("0.1", "0.2"),
+        ),
+        (
+            "source-resource",
+            source
+                .original_utf8
+                .replace("0.1", &("[".repeat(257) + "0" + &"]".repeat(257))),
+        ),
+    ] {
+        let mut changed = body.clone();
+        changed["source"]["original_utf8"] = json!(original);
+        faults.push((name, serde_json::to_string(&changed).unwrap()));
+    }
+    for (name, damaged) in faults {
+        assert_ne!(damaged, raw, "{name}");
+        let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(false)
+            .disable_statement_logging()
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objects SET body=? WHERE namespace='n' AND kind='artifact' AND id='host-current'")
+            .bind(&damaged).execute(&mut connection).await.unwrap();
+        connection.close().await.unwrap();
+        let before = snapshot(dir.path());
+        let expected = if name == "source-resource" {
+            "object n/artifact/host-current has an unreadable body: reviewed host JSON resource limit: depth"
+        } else {
+            "object n/artifact/host-current has an unreadable body: invalid reviewed host source/default"
+        };
+        assert!(
+            matches!(read_control_plane_facts(&path).await,
+            Err(evo_core::Error::Invalid(message)) if message == expected),
+            "{name}"
+        );
+        assert_eq!(snapshot(dir.path()), before, "{name}");
+        let after = compiler_cleanup_bodies(&path).await;
+        assert_eq!(after["host-current"], damaged, "{name}");
+    }
+}
+
+#[test]
+fn current_version_table_classifies_legacy_invalid_unknown_and_lineage() {
+    use evo_storage::{
+        PERSISTENT_CONTRACT_VERSIONS, PersistentContractState, persistent_contract_state,
+    };
+    let mut schemas = std::collections::BTreeSet::new();
+    for version in PERSISTENT_CONTRACT_VERSIONS {
+        assert!(
+            schemas.insert(version.schema),
+            "duplicate version descriptor"
+        );
+        assert!(!version.introduced_change.is_empty());
+        assert!(version.verifier_retained);
+        assert_eq!(
+            persistent_contract_state(version.schema, true).unwrap(),
+            if version.current {
+                PersistentContractState::CurrentVerified
+            } else {
+                PersistentContractState::Legacy
+            }
+        );
+        assert_eq!(
+            persistent_contract_state(version.schema, false).unwrap(),
+            PersistentContractState::Invalid
+        );
+        // The version is part of the content identity. These software IDs are
+        // data controls; a consumer still reloads each actual producer source.
+        let input = hash(b"same original input bytes");
+        let identity = evo_core::fingerprint(&(version.schema, &input)).unwrap();
+        assert_eq!(
+            identity,
+            evo_core::fingerprint(&(version.schema, &input)).unwrap()
+        );
+        assert_ne!(
+            identity,
+            evo_core::fingerprint(&("unknown-version", &input)).unwrap()
+        );
+    }
+    assert_eq!(
+        persistent_contract_state("rsia.registered_external_provider.v2", true).unwrap(),
+        PersistentContractState::Legacy
+    );
+    assert!(
+        matches!(persistent_contract_state("rsia.release_candidate.v99",true),
+        Err(evo_core::Error::Invalid(message)) if message=="unknown persistent contract version; isolate")
+    );
 }
