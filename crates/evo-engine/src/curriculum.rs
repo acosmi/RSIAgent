@@ -1995,7 +1995,8 @@ async fn proposal_has_quarantine(
 /// release in state `active` or `superseded`. A release record that is
 /// missing or does not decode as a persistent release is a `Conflict`; a
 /// rolled-back, revoked or never-activated release is simply not live. Only
-/// the release's identity and state are used, never its formal evaluation.
+/// the latest Admin witness of the complete stored body authorizes its use;
+/// ranking uses only identity and state, never its formal evaluation.
 async fn live_asset_releases(
     session: &mut Session,
     context: &Context,
@@ -2023,10 +2024,20 @@ async fn live_asset_releases(
             .get::<serde_json::Value>(context, "release", &release_id)
             .await?
             .ok_or_else(unreadable)?;
-        let release: PersistentRelease = serde_json::from_value(body).map_err(|_| unreadable())?;
+        let release: PersistentRelease =
+            serde_json::from_value(body.clone()).map_err(|_| unreadable())?;
         if release.schema_version != PERSISTENT_RELEASE_SCHEMA || release.id != release_id {
             return Err(unreadable());
         }
+        crate::formal_authority::require_content_witness(
+            session,
+            context,
+            "release",
+            &release_id,
+            &body,
+            Role::Admin,
+        )
+        .await?;
         if matches!(
             release.state,
             PersistentReleaseState::Active | PersistentReleaseState::Superseded

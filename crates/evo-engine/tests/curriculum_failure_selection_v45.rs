@@ -65,6 +65,7 @@ use evo_engine::dispatch::{
     ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
 };
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
+use evo_engine::formal_authority::content_digest;
 use evo_engine::optimization::{
     DevRunner, DevelopmentRunReport, DevelopmentRunRequest, OPTIMIZATION_STAGE_FACT_SCHEMA,
     OptimizationJournal, OptimizationJournalStage, StageDependency, StageFact, StageFactKind,
@@ -837,15 +838,14 @@ async fn stage_candidate(
 
 /// Writes the release record a retest mark names. A release can only be
 /// approved and activated through the formal operator channel (see the module
-/// note), so the record is written directly; selection reads back only its
-/// identity and state. The formal fields carry values that must never appear
-/// in a selection record.
-async fn put_release(
-    fixture: &Fixture,
+/// note), so the record is written directly with a real Admin full-body audit
+/// witness. This still does not assemble the full approval/application chain.
+/// The formal fields must never appear in a selection record.
+fn release_body(
     release_id: &str,
     candidate: &ReleaseCandidateRecord,
     state: PersistentReleaseState,
-) {
+) -> Value {
     let release = PersistentRelease {
         id: release_id.into(),
         schema_version: "rsia.persistent_release.v1".into(),
@@ -864,12 +864,145 @@ async fn put_release(
         expected_pointer_epoch: 0,
         state,
     };
+    serde_json::to_value(release).unwrap()
+}
+
+async fn put_release(
+    fixture: &Fixture,
+    release_id: &str,
+    candidate: &ReleaseCandidateRecord,
+    state: PersistentReleaseState,
+) {
+    let body = release_body(release_id, candidate, state);
     let mut session = fixture.store.session().await.unwrap();
     session
-        .put(&fixture.admin, "release", release_id, "admin", &release)
+        .put(&fixture.admin, "release", release_id, "admin", &body)
+        .await
+        .unwrap();
+    let raw_digest = content_digest(&body).unwrap();
+    let operation = format!(
+        "formal.admin.content.v1.{}",
+        fingerprint(&(fixture.admin.namespace(), "release", release_id)).unwrap()
+    );
+    let entity =
+        fingerprint(&(fixture.admin.namespace(), "release", release_id, raw_digest)).unwrap();
+    session
+        .audit(&fixture.admin, &operation, &entity)
         .await
         .unwrap();
     session.commit().await.unwrap();
+}
+
+async fn write_raw_release(fixture: &Fixture, body: &Value) {
+    let mut session = fixture.store.session().await.unwrap();
+    session
+        .put(
+            &fixture.admin,
+            "release",
+            body["id"].as_str().unwrap(),
+            "admin",
+            body,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+}
+
+async fn witness_release_body(fixture: &Fixture, context: &Context, body: &Value) {
+    let release_id = body["id"].as_str().unwrap();
+    let raw_digest = content_digest(body).unwrap();
+    let operation = format!(
+        "formal.admin.content.v1.{}",
+        fingerprint(&(context.namespace(), "release", release_id)).unwrap()
+    );
+    let entity = fingerprint(&(context.namespace(), "release", release_id, raw_digest)).unwrap();
+    let mut session = fixture.store.session().await.unwrap();
+    session.audit(context, &operation, &entity).await.unwrap();
+    session.commit().await.unwrap();
+}
+
+/// Enumerates every fixture object in the business kinds this path can read
+/// or write, including selection and cycle envelopes under `artifact`. The
+/// public row pages, decoded reads, complete outgoing edges and verified audit
+/// count make zero-write refusals observable without claiming physical-page
+/// equality or bypassing storage through SQL.
+async fn selection_snapshot(fixture: &Fixture) -> Value {
+    let mut session = fixture.store.session().await.unwrap();
+    let mut objects = Vec::new();
+    let mut counts = Vec::new();
+    for kind in ["artifact", "release", "run", "receipt"] {
+        let count = session
+            .namespace_object_count(&fixture.admin, kind)
+            .await
+            .unwrap();
+        let mut after = None;
+        let mut found = 0;
+        loop {
+            let page = session
+                .object_rows_page(&fixture.admin, kind, after)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            for row in page {
+                after = Some(row.rowid);
+                found += 1;
+                let read: Option<Value> = session.get(&fixture.admin, kind, &row.id).await.unwrap();
+                let raw = session
+                    .raw_object(&fixture.admin, kind, &row.id)
+                    .await
+                    .unwrap();
+                assert_eq!(read.as_ref(), Some(&raw));
+                let edges = session
+                    .outgoing_edges_bounded(&fixture.admin, kind, &row.id, 10_000)
+                    .await
+                    .unwrap();
+                objects.push(json!({"kind": kind, "rowid": row.rowid, "id": row.id, "owner": row.owner, "body": row.body, "raw": raw, "edges": edges}));
+            }
+        }
+        assert_eq!(found, count);
+        counts.push(json!([kind, count]));
+    }
+    session.commit().await.unwrap();
+    let audit = fixture.store.verify_audit(&fixture.admin).await.unwrap();
+    json!({"objects": objects, "counts": counts, "audit": audit})
+}
+
+async fn release_selection_case() -> (
+    Fixture,
+    PersistentCurriculumCoordinator,
+    Vec<CurriculumTaskCandidateV1>,
+    ReleaseCandidateRecord,
+) {
+    let fixture = Fixture::new().await;
+    let coordinator = curriculum(&fixture, None, &[]).await;
+    let facts = real_cycle(&fixture, &coordinator, 1).await;
+    let candidates = eligible_candidates(
+        &coordinator,
+        &facts,
+        &[
+            ("task-a", "family-a", 1, None),
+            ("task-b", "family-b", 7, None),
+        ],
+    )
+    .await;
+    plant_failures(&fixture, "planted-cycle-1", &["family-b"]).await;
+    let candidate = stage_candidate(&fixture, "candidate-ab", &["run-a", "run-b"]).await;
+    plant_applied_asset(&fixture, "release-ab", &candidate).await;
+    let worker = PersistentCurriculumCoordinator::new(
+        fixture.store.clone(),
+        fixture.executor.clone(),
+        fixture.executor.actor(),
+    )
+    .unwrap();
+    (fixture, worker, candidates, candidate)
+}
+
+fn assert_content_quarantine(result: Result<TaskSelectionDecisionV2, Error>) {
+    assert!(
+        matches!(result, Err(Error::Conflict(message)) if message == "missing authenticated content authorization; quarantine")
+    );
 }
 
 async fn resolve_families(
@@ -940,7 +1073,7 @@ fn find_record<'a>(state: &'a Value, family: &str) -> &'a Value {
 async fn record_cycle_writes_the_v3_wire_and_clean_passes_create_no_records() {
     let fixture = Fixture::new().await;
     let coordinator = curriculum(&fixture, None, &[]).await;
-    real_cycle(&fixture, &coordinator, 1).await;
+    let facts = real_cycle(&fixture, &coordinator, 1).await;
     let state = load_state(&fixture).await;
     // The registered pure-function pairs are verified passes, so no failure
     // record appears and the v3 cluster list stays empty.
@@ -958,6 +1091,24 @@ async fn record_cycle_writes_the_v3_wire_and_clean_passes_create_no_records() {
     );
     assert_eq!(body["payload"]["failure_records"], json!([]));
     assert_eq!(body["payload"]["retest_priority_marks"], json!([]));
+    // An identical receipt replays before failure reduction and performs no
+    // state, cycle-receipt, selection, dependency or audit writes.
+    let before = selection_snapshot(&fixture).await;
+    let replay = coordinator
+        .record_cycle(DevelopmentCycleReceiptV1 {
+            schema_version: "rsia.development_cycle_receipt.v1".into(),
+            id: "cycle-1".into(),
+            state_id: STATE_ID.into(),
+            development_request_fact_id: facts.0,
+            development_observed_fact_id: facts.1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(replay).unwrap(),
+        serde_json::to_value(state).unwrap()
+    );
+    assert_eq!(selection_snapshot(&fixture).await, before);
 }
 
 #[tokio::test]
@@ -1936,7 +2087,50 @@ async fn wait_terminal(
 async fn a_failure_gap_without_a_registered_bucket_ends_in_a_queryable_unsupported_scope_terminal()
 {
     let fixture = Fixture::new().await;
-    let coordinator = curriculum(&fixture, None, &["family-a"]).await;
+    let coordinator = curriculum(&fixture, None, &FAMILIES).await;
+    for cycle in 1..=3 {
+        real_cycle(&fixture, &coordinator, cycle).await;
+    }
+    let healthy = load_state(&fixture).await;
+    assert_eq!(healthy.completed_cycles.len(), 3);
+    assert!(
+        healthy
+            .coverage_buckets
+            .iter()
+            .all(|bucket| bucket.observed_independent_clusters
+                >= bucket.required_independent_clusters)
+    );
+    for cycle in &healthy.completed_cycles {
+        assert_eq!(
+            cycle
+                .cluster_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(FAMILIES)
+        );
+    }
+    let registered = RegisteredPureFunctionProfileV1::clamp_i64();
+    let PlateauSignalV1::NotTriggered { reasons } = evo_core::curriculum::detect_plateau_signal_v3(
+        &CurriculumControlProfileV1::offline_default(
+            PROFILE_ID,
+            d("task-space"),
+            registered.oracle_digest,
+            registered.runner_digest,
+        )
+        .unwrap(),
+        &healthy,
+    )
+    .unwrap() else {
+        panic!("five repeated families cannot provide the 10/30 plateau window");
+    };
+    for reason in [
+        "insufficient_cycle_clusters",
+        "cluster_reused_across_cycles",
+        "insufficient_unique_window_clusters",
+    ] {
+        assert!(reasons.iter().any(|actual| actual == reason), "{reasons:?}");
+    }
     // Only an orphan cluster (no registered task bucket) holds an active
     // absolute failure.
     plant_failures(&fixture, "planted-cycle-1", &["family-orphan"]).await;
@@ -2042,4 +2236,237 @@ async fn a_stored_v2_state_keeps_its_failure_clusters_as_legacy_diagnostics_acro
         })
         .unwrap()
     );
+}
+
+#[tokio::test]
+async fn worker_selection_requires_latest_admin_full_release_body_witness() {
+    for state in [
+        PersistentReleaseState::Active,
+        PersistentReleaseState::Superseded,
+        PersistentReleaseState::RolledBack,
+        PersistentReleaseState::Revoked,
+    ] {
+        let (fixture, worker, candidates, candidate) = release_selection_case().await;
+        let mut body = release_body("release-ab", &candidate, state);
+        body.as_object_mut()
+            .unwrap()
+            .remove("expected_parent_release_id");
+        let typed: PersistentRelease = serde_json::from_value(body.clone()).unwrap();
+        assert!(typed.expected_parent_release_id.is_none());
+        assert_ne!(
+            content_digest(&body).unwrap(),
+            content_digest(&typed).unwrap()
+        );
+        write_raw_release(&fixture, &body).await;
+        witness_release_body(&fixture, &fixture.admin, &body).await;
+        let decision = worker
+            .select_next_task(STATE_ID, &candidates)
+            .await
+            .unwrap();
+        let live = matches!(
+            state,
+            PersistentReleaseState::Active | PersistentReleaseState::Superseded
+        );
+        assert_eq!(
+            decision.priority_category == SelectionPriorityCategory::RetestDue,
+            live
+        );
+        assert_eq!(decision.consumed_asset.is_some(), live);
+
+        // Independent, otherwise identical input has no Admin content event.
+        let (fixture, worker, candidates, candidate) = release_selection_case().await;
+        let mut body = release_body("release-ab", &candidate, state);
+        body.as_object_mut()
+            .unwrap()
+            .remove("expected_parent_release_id");
+        write_raw_release(&fixture, &body).await;
+        assert!(
+            load_state(&fixture)
+                .await
+                .retest_priority_marks
+                .iter()
+                .any(|mark| !mark.consumed && mark.release_id == "release-ab")
+        );
+        let before = selection_snapshot(&fixture).await;
+        assert_content_quarantine(worker.select_next_task(STATE_ID, &candidates).await);
+        assert_eq!(selection_snapshot(&fixture).await, before, "{state:?}");
+    }
+}
+
+#[tokio::test]
+async fn release_body_tampering_is_rejected_before_selection_state_or_mark_writes() {
+    for state in [
+        PersistentReleaseState::Active,
+        PersistentReleaseState::Superseded,
+        PersistentReleaseState::RolledBack,
+        PersistentReleaseState::Revoked,
+    ] {
+        let (fixture, worker, candidates, candidate) = release_selection_case().await;
+        put_release(&fixture, "release-ab", &candidate, state).await;
+        let healthy = worker
+            .select_next_task(STATE_ID, &candidates)
+            .await
+            .unwrap();
+        let live = matches!(
+            state,
+            PersistentReleaseState::Active | PersistentReleaseState::Superseded
+        );
+        assert_eq!(healthy.consumed_asset.is_some(), live);
+        // Live selection consumed family-a only; family-b still names this
+        // release. Void selection also leaves its marks unconsumed.
+        assert!(
+            load_state(&fixture)
+                .await
+                .retest_priority_marks
+                .iter()
+                .any(|mark| mark.family == "family-b"
+                    && !mark.consumed
+                    && mark.release_id == "release-ab")
+        );
+        let mut body = release_body("release-ab", &candidate, state);
+        body["approved_by"] = json!("changed-legal-non-ranking-field");
+        let decoded: PersistentRelease = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(decoded.state, state);
+        write_raw_release(&fixture, &body).await;
+        let before = selection_snapshot(&fixture).await;
+        assert_content_quarantine(worker.select_next_task(STATE_ID, &candidates).await);
+        assert_eq!(selection_snapshot(&fixture).await, before, "{state:?}");
+    }
+}
+
+#[tokio::test]
+async fn stale_admin_and_worker_release_witnesses_cannot_restore_asset_influence() {
+    let (fixture, worker, candidates, candidate) = release_selection_case().await;
+    put_release(
+        &fixture,
+        "release-ab",
+        &candidate,
+        PersistentReleaseState::Active,
+    )
+    .await;
+    let old_a = release_body("release-ab", &candidate, PersistentReleaseState::Active);
+    put_release(
+        &fixture,
+        "release-ab",
+        &candidate,
+        PersistentReleaseState::Superseded,
+    )
+    .await;
+    let latest_b = release_body("release-ab", &candidate, PersistentReleaseState::Superseded);
+    assert_ne!(
+        content_digest(&old_a).unwrap(),
+        content_digest(&latest_b).unwrap()
+    );
+    // Restore A directly: the normal helper would issue a new Admin event.
+    write_raw_release(&fixture, &old_a).await;
+    let before = selection_snapshot(&fixture).await;
+    assert_content_quarantine(worker.select_next_task(STATE_ID, &candidates).await);
+    assert_eq!(selection_snapshot(&fixture).await, before);
+    // A real Worker can spell the Admin operation, but its actual audit role
+    // cannot replace or supersede the latest Admin witness of B.
+    witness_release_body(&fixture, &fixture.executor, &old_a).await;
+    let before = selection_snapshot(&fixture).await;
+    assert_content_quarantine(worker.select_next_task(STATE_ID, &candidates).await);
+    assert_eq!(selection_snapshot(&fixture).await, before);
+    assert!(
+        load_state(&fixture)
+            .await
+            .retest_priority_marks
+            .iter()
+            .any(|mark| !mark.consumed && mark.release_id == "release-ab")
+    );
+    write_raw_release(&fixture, &latest_b).await;
+    let healthy = worker
+        .select_next_task(STATE_ID, &candidates)
+        .await
+        .unwrap();
+    assert_eq!(
+        healthy.priority_category,
+        SelectionPriorityCategory::RetestDue
+    );
+    assert_eq!(healthy.consumed_asset.unwrap().release_id, "release-ab");
+}
+
+#[tokio::test]
+async fn witnessed_void_releases_remove_influence_without_formal_report_reads() {
+    for state in [
+        PersistentReleaseState::RolledBack,
+        PersistentReleaseState::Revoked,
+    ] {
+        let (fixture, worker, candidates, candidate) = release_selection_case().await;
+        put_release(
+            &fixture,
+            "release-ab",
+            &candidate,
+            PersistentReleaseState::Active,
+        )
+        .await;
+        let healthy = worker
+            .select_next_task(STATE_ID, &candidates)
+            .await
+            .unwrap();
+        assert_eq!(
+            healthy.priority_category,
+            SelectionPriorityCategory::RetestDue
+        );
+        assert_eq!(healthy.chosen_task_id, "task-a");
+        let before_void = load_state(&fixture).await;
+        assert_eq!(
+            before_void.failure_records[0].status,
+            FailureRecordStatus::RetestDue
+        );
+        assert!(
+            before_void
+                .retest_priority_marks
+                .iter()
+                .any(|mark| mark.family == "family-b" && !mark.consumed)
+        );
+        put_release(&fixture, "release-ab", &candidate, state).await;
+        let mut session = fixture.store.session().await.unwrap();
+        for kind in ["artifact", "receipt"] {
+            assert!(
+                session
+                    .get::<Value>(&fixture.admin, kind, "formal-report-must-not-leak")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        session.commit().await.unwrap();
+        // Success with an absent formal report proves this read path does not
+        // need that report, protected evaluation detail or a broker seed.
+        let decision = worker
+            .select_next_task(STATE_ID, &candidates)
+            .await
+            .unwrap();
+        assert_ne!(
+            decision.priority_category,
+            SelectionPriorityCategory::RetestDue
+        );
+        assert!(decision.consumed_asset.is_none());
+        let after = load_state(&fixture).await;
+        assert_eq!(after.failure_records[0].status, FailureRecordStatus::Active);
+        assert_eq!(after.failure_records[0].retest_release_id, None);
+        assert_eq!(
+            after.failure_records[0].transition_note.as_deref(),
+            Some("retest_void:release-ab")
+        );
+        assert!(
+            after
+                .retest_priority_marks
+                .iter()
+                .any(|mark| mark.family == "family-b" && !mark.consumed)
+        );
+        let wire = serde_json::to_string(&decision).unwrap();
+        for sentinel in [
+            "formal-report-must-not-leak",
+            d("formal-report-digest-must-not-leak").as_str(),
+            "formal-evaluator-must-not-leak",
+            "holdout",
+            "exposure",
+            "broker",
+        ] {
+            assert!(!wire.contains(sentinel), "{sentinel} leaked into {wire}");
+        }
+    }
 }

@@ -9,10 +9,11 @@
 
 use evo_core::curriculum::{
     AppliedLearnerAssetRef, CoverageBucketState, CurriculumControlProfileV1, DRIFT_NOTE,
-    FailureCycleOutcome, FailureRecordStatus, FailureRecordType, FailureResolutionV1,
-    LEGACY_V2_UNTYPED_NOTE, LearnerStateV2, LearnerStateV3, PlateauSignalV1,
-    UNSUPPORTED_SCOPE_REASON, apply_cycle_to_failure_records, detect_plateau_signal_v3,
-    failure_record_id, learner_skill_snapshot_after_asset, legacy_failure_record_id,
+    DevelopmentCycleObservation, FailureCycleOutcome, FailureRecordStatus, FailureRecordType,
+    FailureResolutionV1, LEGACY_V2_UNTYPED_NOTE, LearnerStateV2, LearnerStateV3,
+    MAX_FAILURE_RECORDS, PlateauSignalV1, UNSUPPORTED_SCOPE_REASON, apply_cycle_to_failure_records,
+    detect_plateau_signal_v3, failure_record_id, learner_skill_snapshot_after_asset,
+    legacy_failure_record_id,
 };
 use evo_core::{Error, hash};
 
@@ -130,6 +131,34 @@ fn record_of<'a>(
         .iter()
         .find(|record| record.cluster_id == cluster && record.cycle_id.as_deref() == Some(cycle))
         .unwrap_or_else(|| panic!("no record of {cluster} from {cycle}"))
+}
+
+fn plateau_cycle(n: usize) -> DevelopmentCycleObservation {
+    DevelopmentCycleObservation {
+        cycle_id: format!("window-cycle-{n}"),
+        environment_digest: d("env"),
+        grader_digest: d("grader"),
+        cluster_ids: (0..10).map(|i| format!("window-{n}-cluster-{i}")).collect(),
+        successful_clusters: 10,
+        paired_gain_micros: vec![0; 10],
+        source_artifact_ids: vec!["task-space-source".into()],
+    }
+}
+
+fn full_bucket_state() -> LearnerStateV3 {
+    let mut state = with_buckets(base_state(), &["family-a"]);
+    state.coverage_buckets[0].observed_independent_clusters = 1;
+    state.development_fact_ids = vec!["task-space-source".into()];
+    state
+}
+
+fn failure_state(count: usize) -> LearnerStateV3 {
+    let mut state = base_state();
+    let outcomes: Vec<_> = (0..count)
+        .map(|i| outcome(&format!("family-{i}"), false, -100, &format!("seed-{i}")))
+        .collect();
+    reduce(&mut state, "seed-cycle", &outcomes);
+    state
 }
 
 #[test]
@@ -705,20 +734,282 @@ fn unsupported_scope_keeps_only_registered_failure_clusters() {
         panic!("expected a failure gap for the registered cluster");
     };
     assert_eq!(failure_cluster_ids, vec!["family-a".to_string()]);
-    // With only orphan failures there is no executable direction: no
-    // failure gap, the unsupported-scope reason instead.
+    // An orphan cannot erase the registered coverage or cold-start entry.
     let mut orphan_only = with_buckets(base_state(), &["family-a"]);
     reduce(
         &mut orphan_only,
         "cycle-1",
         &[outcome("family-orphan", false, -100, "o1")],
     );
+    let PlateauSignalV1::CoverageGap {
+        authorized_bucket_ids,
+    } = detect_plateau_signal_v3(&profile(), &orphan_only).unwrap()
+    else {
+        panic!("expected the registered coverage gap");
+    };
+    assert_eq!(authorized_bucket_ids, vec!["family-a".to_string()]);
+    orphan_only.coverage_buckets[0].observed_independent_clusters = 1;
+    assert!(matches!(
+        detect_plateau_signal_v3(&profile(), &orphan_only).unwrap(),
+        PlateauSignalV1::ColdStart
+    ));
+    orphan_only.completed_cycles = (0..3).map(plateau_cycle).collect();
+    orphan_only.development_fact_ids = vec!["task-space-source".into()];
+    orphan_only.completed_cycles[0].successful_clusters = 0;
     let PlateauSignalV1::NotTriggered { reasons } =
         detect_plateau_signal_v3(&profile(), &orphan_only).unwrap()
     else {
-        panic!("expected NotTriggered for an orphan-only failure gap");
+        panic!("expected unsupported only after all other entries fail");
     };
     assert_eq!(reasons, vec![UNSUPPORTED_SCOPE_REASON.to_string()]);
+}
+
+#[test]
+fn orphan_failures_preserve_coverage_gap_entry() {
+    let mut state = with_buckets(base_state(), &["family-a"]);
+    let healthy =
+        serde_json::to_value(detect_plateau_signal_v3(&profile(), &state).unwrap()).unwrap();
+    assert_eq!(healthy["trigger"], "coverage_gap");
+    reduce(
+        &mut state,
+        "orphan-cycle",
+        &[outcome("orphan", false, -100, "orphan")],
+    );
+    assert_eq!(
+        serde_json::to_value(detect_plateau_signal_v3(&profile(), &state).unwrap()).unwrap(),
+        healthy
+    );
+    state.cooldown_remaining_cycles = 1;
+    assert_eq!(
+        serde_json::to_value(detect_plateau_signal_v3(&profile(), &state).unwrap()).unwrap(),
+        serde_json::json!({"trigger": "not_triggered", "reasons": ["cooldown"]})
+    );
+}
+
+#[test]
+fn orphan_failures_preserve_complete_plateau_entry() {
+    let mut state = full_bucket_state();
+    state.completed_cycles = (0..3).map(plateau_cycle).collect();
+    let healthy =
+        serde_json::to_value(detect_plateau_signal_v3(&profile(), &state).unwrap()).unwrap();
+    assert_eq!(healthy["trigger"], "plateau_probe");
+    assert_eq!(healthy["unique_cluster_ids"].as_array().unwrap().len(), 30);
+    assert_eq!(healthy["mean_gain_micros"], serde_json::json!([0, 0, 0]));
+    assert_eq!(healthy["sample_variance_micros_squared"], 0);
+    reduce(
+        &mut state,
+        "orphan-cycle",
+        &[outcome("outside-window", false, -100, "orphan")],
+    );
+    assert_eq!(
+        serde_json::to_value(detect_plateau_signal_v3(&profile(), &state).unwrap()).unwrap(),
+        healthy
+    );
+}
+
+#[test]
+fn orphan_failures_keep_cold_start_until_complete_window() {
+    for cycles in 0..3 {
+        let mut state = full_bucket_state();
+        state.completed_cycles = (0..cycles).map(plateau_cycle).collect();
+        assert!(matches!(
+            detect_plateau_signal_v3(&profile(), &state).unwrap(),
+            PlateauSignalV1::ColdStart
+        ));
+        reduce(
+            &mut state,
+            "orphan-cycle",
+            &[outcome("orphan", false, -100, "orphan")],
+        );
+        assert!(
+            matches!(
+                detect_plateau_signal_v3(&profile(), &state).unwrap(),
+                PlateauSignalV1::ColdStart
+            ),
+            "completed cycles: {cycles}"
+        );
+    }
+}
+
+#[test]
+fn orphan_failures_are_unsupported_only_after_all_other_entries_fail() {
+    for condition in ["gain", "success", "clusters"] {
+        let mut state = full_bucket_state();
+        state.completed_cycles = (0..3).map(plateau_cycle).collect();
+        let expected_reason = match condition {
+            "gain" => {
+                state.completed_cycles[0].paired_gain_micros.fill(100_000);
+                "mean_gain_not_plateau"
+            }
+            "success" => {
+                state.completed_cycles[0].successful_clusters = 0;
+                "success_rate_below_threshold"
+            }
+            _ => {
+                for cycle in &mut state.completed_cycles {
+                    cycle.cluster_ids = vec!["same-cluster".into()];
+                    cycle.paired_gain_micros = vec![0];
+                    cycle.successful_clusters = 1;
+                }
+                "insufficient_unique_window_clusters"
+            }
+        };
+        let PlateauSignalV1::NotTriggered { reasons } =
+            detect_plateau_signal_v3(&profile(), &state).unwrap()
+        else {
+            panic!("no coverage or plateau entry for {condition}");
+        };
+        assert!(reasons.iter().any(|reason| reason == expected_reason));
+        assert!(
+            !reasons
+                .iter()
+                .any(|reason| reason == UNSUPPORTED_SCOPE_REASON)
+        );
+        reduce(
+            &mut state,
+            "orphan-cycle",
+            &[outcome("orphan", false, -100, "orphan")],
+        );
+        let PlateauSignalV1::NotTriggered { reasons } =
+            detect_plateau_signal_v3(&profile(), &state).unwrap()
+        else {
+            panic!("expected unsupported for {condition}");
+        };
+        assert_eq!(reasons, vec![UNSUPPORTED_SCOPE_REASON.to_string()]);
+    }
+}
+
+#[test]
+fn failure_record_capacity_counts_new_absolute_and_regression_records_exactly() {
+    assert_eq!(MAX_FAILURE_RECORDS, 10_000);
+    let additions = [
+        outcome("new-absolute", false, -100, "new-absolute"),
+        outcome("new-regression", true, -100, "new-regression"),
+        outcome("clean-pass", true, 100, "clean-pass"),
+    ];
+    let mut state = failure_state(9_998);
+    reduce(&mut state, "new-cycle", &additions);
+    assert_eq!(state.failure_records.len(), 10_000);
+    assert_eq!(
+        state.failure_records[9_998].record_type,
+        Some(FailureRecordType::AbsoluteFailure)
+    );
+    assert_eq!(
+        state.failure_records[9_999].record_type,
+        Some(FailureRecordType::Regression)
+    );
+    let mut state = failure_state(9_999);
+    let before = state.failure_records.clone();
+    assert!(matches!(
+        apply_cycle_to_failure_records(&mut state.failure_records, "new-cycle", &d("env"), &d("grader"), &d("skill"), &additions),
+        Err(Error::Conflict(message)) if message == "learner failure records capacity exceeded: used=9999, additional=2, limit=10000"
+    ));
+    assert_eq!(state.failure_records, before);
+    reduce(
+        &mut state,
+        "clean-cycle",
+        &[outcome("clean-pass", true, 100, "clean-pass")],
+    );
+    assert_eq!(state.failure_records, before);
+}
+
+#[test]
+fn failure_record_capacity_refusal_preserves_drift_retest_and_resolution_state() {
+    let mut state = failure_state(10_000);
+    state.failure_records[0].environment_digest = d("old-env");
+    state.failure_records[1].status = FailureRecordStatus::RetestDue;
+    state.failure_records[1].retest_release_id = Some("release-1".into());
+    state.failure_records[1].transition_note = Some("retest_after:release-1".into());
+    let outcomes = [
+        outcome("family-0", true, 0, "drift"),
+        outcome("family-1", false, -100, "retest"),
+        outcome("family-2", true, 0, "resolve"),
+        outcome("new-regression", true, -100, "regression"),
+    ];
+    let before = state.failure_records.clone();
+    assert!(matches!(
+        apply_cycle_to_failure_records(&mut state.failure_records, "new-cycle", &d("env"), &d("grader"), &d("skill"), &outcomes),
+        Err(Error::Conflict(message)) if message == "learner failure records capacity exceeded: used=10000, additional=2, limit=10000"
+    ));
+    assert_eq!(state.failure_records, before);
+    // Existing boundary errors keep priority over the new capacity conflict.
+    for duplicate in [false, true] {
+        let mut invalid = outcomes.to_vec();
+        let expected = if duplicate {
+            invalid.push(invalid[0].clone());
+            "duplicate cluster in failure cycle outcomes"
+        } else {
+            invalid[0].task_id.clear();
+            "identifier: expected nonempty text <= 128 bytes"
+        };
+        assert!(matches!(
+            apply_cycle_to_failure_records(&mut state.failure_records, "new-cycle", &d("env"), &d("grader"), &d("skill"), &invalid),
+            Err(Error::Invalid(message)) if message == expected
+        ));
+        assert_eq!(state.failure_records, before);
+    }
+    state.failure_records[0].candidate_execution_id = None;
+    let invalid_before = state.failure_records.clone();
+    assert!(matches!(
+        apply_cycle_to_failure_records(&mut state.failure_records, "new-cycle", &d("env"), &d("grader"), &d("skill"), &outcomes),
+        Err(Error::Invalid(message)) if message == "a failure record is bound to its verified task, cycle and receipts"
+    ));
+    assert_eq!(state.failure_records, invalid_before);
+    state.failure_records = before;
+    state.failure_records[1] = state.failure_records[0].clone();
+    let duplicate_before = state.failure_records.clone();
+    assert!(matches!(
+        apply_cycle_to_failure_records(&mut state.failure_records, "new-cycle", &d("env"), &d("grader"), &d("skill"), &outcomes),
+        Err(Error::Invalid(message)) if message == "duplicate failure record"
+    ));
+    assert_eq!(state.failure_records, duplicate_before);
+}
+
+#[test]
+fn full_failure_record_vector_allows_non_appending_resolution() {
+    let mut state = failure_state(10_000);
+    let before = state.failure_records.clone();
+    reduce(
+        &mut state,
+        "resolve-cycle",
+        &[outcome("family-0", true, 0, "resolved")],
+    );
+    assert_eq!(state.failure_records.len(), 10_000);
+    let resolved = &state.failure_records[0];
+    let mut original = resolved.clone();
+    original.status = before[0].status;
+    original.resolution = None;
+    assert_eq!(original, before[0]);
+    assert_eq!(resolved.status, FailureRecordStatus::Resolved);
+    assert_eq!(
+        resolved.resolution.as_ref().unwrap().resolved_cycle_id,
+        "resolve-cycle"
+    );
+    assert_eq!(&state.failure_records[1..], &before[1..]);
+    let after_resolution = state.failure_records.clone();
+    assert!(matches!(
+        apply_cycle_to_failure_records(&mut state.failure_records, "append-cycle", &d("env"), &d("grader"), &d("skill"), &[outcome("new-family", false, -100, "new")]),
+        Err(Error::Conflict(message)) if message == "learner failure records capacity exceeded: used=10000, additional=1, limit=10000"
+    ));
+    assert_eq!(state.failure_records, after_resolution);
+}
+
+#[test]
+fn failure_cycle_repeat_conflict_preserves_full_failure_record_vector() {
+    let mut state = failure_state(10_000);
+    reduce(
+        &mut state,
+        "resolve-cycle",
+        &[outcome("family-0", true, 0, "resolved")],
+    );
+    for cycle in ["seed-cycle", "resolve-cycle"] {
+        let before = state.failure_records.clone();
+        assert!(matches!(
+            apply_cycle_to_failure_records(&mut state.failure_records, cycle, &d("env"), &d("grader"), &d("skill"), &[outcome("new-family", false, -100, "new")]),
+            Err(Error::Conflict(message)) if message == "development cycle already reduced into failure records"
+        ));
+        assert_eq!(state.failure_records, before);
+    }
 }
 
 #[test]
