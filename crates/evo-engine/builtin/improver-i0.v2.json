@@ -1,0 +1,1 @@
+{"schema_version":"rsia.improver_content.v2","mechanism":{"class":"exploration_policy","policy":{"schema_version":"rsia.elastic_priority.v1","significant_gain_micros":20000,"stagnation_abs_gain_micros":5000,"stagnation_window":2,"max_focus_actions":2,"fairness_wait_rounds":4}}}

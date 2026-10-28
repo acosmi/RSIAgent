@@ -1688,7 +1688,10 @@ impl PersistentPackageStore {
                     "staged manifest differs from registered digest".into(),
                 ));
             }
-        } else if envelope.payload.package_schema_version != "rsia.seed.reset.v1" {
+        } else if !matches!(
+            envelope.payload.package_schema_version.as_str(),
+            "rsia.seed.reset.v1" | "rsia.seed.update.v1"
+        ) {
             return Err(Error::Invalid(
                 "unsupported staged asset content schema".into(),
             ));

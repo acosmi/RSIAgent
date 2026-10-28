@@ -42,6 +42,7 @@ use crate::exploration::{
     ExplorationWorldV1, MechanismUsageRecordV1, PersistentCoordinator, RootOpportunity, WorldState,
     exploration_world_storage_id, get_record, need_record, put_record, storage_id,
 };
+use crate::seeds::{BUILTIN_I0_BYTES, BUILTIN_SEED_CATALOG_BYTES, validate_builtin_seed_catalog};
 use evo_core::contract::assert_candidate_may_write;
 use evo_core::improver::ImproverContentV2;
 use evo_core::{ArtifactKind, Context, Error, Result, Role, fingerprint, hash, identifier};
@@ -628,6 +629,17 @@ impl MetaTrialForkRequest {
     }
 }
 
+// The same pure production preflight is exercised with mismatched bytes by
+// the private unit test. Its inputs never become a caller-controlled catalog.
+fn preflight_i0(runtime: &ImproverContentV2, catalog: &[u8], raw: &[u8]) -> Result<()> {
+    let catalog = validate_builtin_seed_catalog(catalog, raw, include_bytes!("../../../LICENSE"))?;
+    let actual = serde_json::to_vec(runtime).map_err(|_| Error::Internal)?;
+    if actual != raw || runtime.content_digest()? != catalog.entries[0].content_sha256 {
+        return Err(Error::Invalid("seed_catalog_mismatch".into()));
+    }
+    Ok(())
+}
+
 /// Forks one S0 into two independent exploration streams. It is a namespace for
 /// the trusted fork; it carries no state.
 pub struct MetaTrialCoordinator;
@@ -662,6 +674,11 @@ impl MetaTrialCoordinator {
         request: MetaTrialForkRequest,
     ) -> Result<MetaTrialV1> {
         ctx.require(&[Role::Admin, Role::Worker])?;
+        preflight_i0(
+            &ImproverContentV2::builtin_default(),
+            BUILTIN_SEED_CATALOG_BYTES,
+            BUILTIN_I0_BYTES,
+        )?;
         let plan = request.plan(evo_core::now()?)?;
         store
             .root_budget(ctx, &plan.trial.billing_scope)
@@ -1090,6 +1107,62 @@ mod tests {
             ..ElasticPolicyV1::default()
         };
         content
+    }
+
+    #[tokio::test]
+    async fn i0_catalog_rejection_precedes_trial_world_or_budget_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("i0.sqlite3")).await.unwrap();
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        let healthy = ImproverContentV2::builtin_default();
+        preflight_i0(&healthy, BUILTIN_SEED_CATALOG_BYTES, BUILTIN_I0_BYTES).unwrap();
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(BUILTIN_SEED_CATALOG_BYTES).unwrap();
+        catalog["entries"][0]["content_sha256"] = serde_json::json!(hash(b"changed"));
+        let catalog = serde_json::to_vec(&catalog).unwrap();
+        for (runtime, bytes, raw) in [
+            (healthy.clone(), catalog.as_slice(), BUILTIN_I0_BYTES),
+            (
+                changed_content(),
+                BUILTIN_SEED_CATALOG_BYTES,
+                BUILTIN_I0_BYTES,
+            ),
+            (healthy, BUILTIN_SEED_CATALOG_BYTES, b"changed".as_slice()),
+        ] {
+            assert!(
+                matches!(preflight_i0(&runtime, bytes, raw), Err(Error::Invalid(message)) if message == "seed_catalog_mismatch")
+            );
+        }
+        // Exercise the real entry, then pin the placement of the pure preflight:
+        // the immutable compiled catalog cannot be injected through fork's API.
+        let source = include_str!("meta.rs");
+        let fork = source.split("    pub async fn fork(").nth(1).unwrap();
+        assert!(fork.find("ctx.require").unwrap() < fork.find("preflight_i0").unwrap());
+        assert!(fork.find("preflight_i0").unwrap() < fork.find("request.plan").unwrap());
+        assert!(fork.find("preflight_i0").unwrap() < fork.find(".root_budget").unwrap());
+        assert!(matches!(
+            MetaTrialCoordinator::fork(&admin, &store, request("i0-trial")).await,
+            Err(Error::Budget)
+        ));
+        let mut session = store.session().await.unwrap();
+        for kind in ["artifact", "budget", "reservation", "job"] {
+            assert!(
+                session
+                    .list::<serde_json::Value>(&admin, kind)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        session.commit().await.unwrap();
+        assert_eq!(store.verify_audit(&admin).await.unwrap(), 0);
+        assert!(
+            store
+                .root_budget(&admin, "scope-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

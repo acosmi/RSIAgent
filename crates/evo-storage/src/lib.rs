@@ -455,7 +455,7 @@ fn validate_registered_blob_field(schema: &str, field: &str) -> Result<()> {
     let valid = match schema {
         "rsia.e16.import_source.v1" => field == "raw_blob_digest",
         "rsia.e16.staged_asset.v1" => field == "content_blob_digest",
-        "rsia.e16.seed_install.v1" => matches!(
+        "rsia.e16.seed_install.v1" | "rsia.e16.seed_install.v2" => matches!(
             field,
             "baseline_blob_digest" | "local_blob_digest" | "upstream_blob_digest"
         ),
@@ -1523,7 +1523,7 @@ impl Store {
         let artifact: Value = session.need(ctx, "artifact", &artifact_id).await?;
         let state_field = if matches!(
             expected_schema.as_str(),
-            "rsia.e16.seed_install.v1" | "rsia.e16.import_source.v1"
+            "rsia.e16.seed_install.v1" | "rsia.e16.seed_install.v2" | "rsia.e16.import_source.v1"
         ) {
             "status"
         } else {

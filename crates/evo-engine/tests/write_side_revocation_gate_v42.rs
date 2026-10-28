@@ -71,7 +71,9 @@ use evo_engine::packages::{
     PackageEntry, PackageKind, PersistentPackageStore, RedactionReport, RedactionStatus,
     StagePackageRequest, StagedAssetState, package_dependency_ref_id,
 };
-use evo_engine::seeds::{InstallSeedRequest, PersistentSeedStore};
+use evo_engine::seeds::{
+    InstallCurrentSeedRequest, PersistentSeedStore, SeedIdentity, SeedUpstream,
+};
 use evo_storage::Store;
 use evo_storage::lifecycle::{
     CleanupState, CleanupStatus, LifecycleStore, REVOKE_TOMBSTONE_SCHEMA, RevokeTombstone,
@@ -486,15 +488,29 @@ mod e16_fx {
         key: &str,
         asset: &str,
         sources: Vec<E16SourceRef>,
-    ) -> InstallSeedRequest {
-        InstallSeedRequest {
+    ) -> InstallCurrentSeedRequest {
+        InstallCurrentSeedRequest {
             request_key: key.into(),
-            publisher: "org.rsia".into(),
-            asset_id: asset.into(),
-            kind: "skill".into(),
-            baseline_bytes: b"baseline seed".to_vec(),
-            local_bytes: b"local seed".to_vec(),
-            upstream_bytes: Some(b"upstream seed".to_vec()),
+            baseline_identity: Some(SeedIdentity {
+                publisher: "org.rsia".into(),
+                asset_id: asset.into(),
+                kind: "skill".into(),
+            }),
+            local_identity: Some(SeedIdentity {
+                publisher: "org.rsia".into(),
+                asset_id: asset.into(),
+                kind: "skill".into(),
+            }),
+            local_marked: true,
+            baseline_bytes: Some(b"baseline seed".to_vec()),
+            local_bytes: Some(b"local seed".to_vec()),
+            upstream: Some(SeedUpstream {
+                path: "seeds/upstream.txt".into(),
+                content_digest: hash(b"upstream seed"),
+                bytes: b"upstream seed".to_vec(),
+            }),
+            compiler_version: "compiler-v1".into(),
+            confirmed_bytes: None,
             environment_digest: environment(),
             source_refs: sources,
         }
@@ -597,12 +613,13 @@ async fn prepare(entry: Entry, name: &str) -> Setup {
             }
             Entry::ReadInstall => {
                 existing = Some(
-                    PersistentSeedStore::install(
+                    PersistentSeedStore::install_current(
                         &admin,
                         &fx.store,
                         install_request("existing-install", "existing-seed", sources),
                     )
                     .await
+                    .map(|comparison| comparison.install)
                     .unwrap()
                     .id,
                 );
@@ -633,12 +650,13 @@ async fn attempt(entry: Entry, setup: &Setup, namespace: &str) -> Result<(), Err
         }
         Entry::Install => {
             let sources = vec![source_ref(fx, &admin, kind, id).await];
-            PersistentSeedStore::install(
+            PersistentSeedStore::install_current(
                 &admin,
                 &fx.store,
                 install_request("case-install", "case-seed", sources),
             )
             .await
+            .map(|comparison| comparison.install)
             .map(|_| ())
         }
         Entry::ReadStaged => PersistentPackageStore::read_staged(
@@ -1392,7 +1410,7 @@ async fn derived_attempts(fx: &Fx, label: &str, derived: &str) -> Vec<String> {
             "{label}: stage over an unrelated live source: {error:?}"
         ));
     }
-    if let Err(error) = PersistentSeedStore::install(
+    if let Err(error) = PersistentSeedStore::install_current(
         &admin,
         &fx.store,
         install_request(
@@ -1402,6 +1420,7 @@ async fn derived_attempts(fx: &Fx, label: &str, derived: &str) -> Vec<String> {
         ),
     )
     .await
+    .map(|comparison| comparison.install)
     {
         problems.push(format!(
             "{label}: install over an unrelated live source: {error:?}"
@@ -1420,7 +1439,7 @@ async fn derived_attempts(fx: &Fx, label: &str, derived: &str) -> Vec<String> {
     )
     .await
     .map(|_| ());
-    let installed = PersistentSeedStore::install(
+    let installed = PersistentSeedStore::install_current(
         &admin,
         &fx.store,
         install_request(
@@ -1430,6 +1449,7 @@ async fn derived_attempts(fx: &Fx, label: &str, derived: &str) -> Vec<String> {
         ),
     )
     .await
+    .map(|comparison| comparison.install)
     .map(|_| ());
     for (writer, result) in [("stage", staged), ("install", installed)] {
         match result {
@@ -1476,12 +1496,13 @@ async fn a_staged_package_or_an_install_over_a_source_derived_from_a_revoked_run
     )
     .await
     .unwrap();
-    PersistentSeedStore::install(
+    PersistentSeedStore::install_current(
         &admin,
         &fx.store,
         install_request("live-install", "live-seed", vec![source]),
     )
     .await
+    .map(|comparison| comparison.install)
     .unwrap();
 
     let mut status = begin(&fx, &admin, "run", "run-r").await;
@@ -1545,12 +1566,13 @@ async fn existing_staged_packages_installs_and_exports_are_closed_over_a_revoked
     )
     .await
     .unwrap();
-    let installed = PersistentSeedStore::install(
+    let installed = PersistentSeedStore::install_current(
         &admin,
         &fx.store,
         install_request("ok-install", "ok-seed", vec![source.clone()]),
     )
     .await
+    .map(|comparison| comparison.install)
     .unwrap();
     let attempt_id = PersistentPackageStore::prepare_export(
         &admin,
@@ -1658,12 +1680,13 @@ async fn existing_staged_packages_installs_and_exports_are_closed_over_a_revoked
     );
     expect_forbidden(
         "install, the request of the existing install again",
-        PersistentSeedStore::install(
+        PersistentSeedStore::install_current(
             &admin,
             &fx.store,
             install_request("ok-install", "ok-seed", vec![source]),
         )
         .await
+        .map(|comparison| comparison.install)
         .map(|_| ()),
     );
     assert!(
@@ -1701,12 +1724,13 @@ async fn after_a_real_revocation_the_existing_package_and_install_are_closed_by_
     )
     .await
     .unwrap();
-    let installed = PersistentSeedStore::install(
+    let installed = PersistentSeedStore::install_current(
         &admin,
         &fx.store,
         install_request("real-install", "real-seed", vec![run]),
     )
     .await
+    .map(|comparison| comparison.install)
     .unwrap();
     let mut status = begin(&fx, &admin, "run", "run-r").await;
     let mut states: Vec<CleanupState> = Vec::new();
@@ -1841,12 +1865,13 @@ async fn an_e16_source_that_is_a_run_is_judged_by_its_own_kind() {
                 .unwrap()
                 .id
             } else {
-                PersistentSeedStore::install(
+                PersistentSeedStore::install_current(
                     &admin,
                     &fx.store,
                     install_request("run-ref-install", "run-ref-seed", vec![run]),
                 )
                 .await
+                .map(|comparison| comparison.install)
                 .unwrap()
                 .id
             };
@@ -2835,12 +2860,13 @@ async fn known_boundary_a_tombstone_of_the_other_kind_still_stops_a_new_stage_or
             )
             .await
             .map(|_| ()),
-            _ => PersistentSeedStore::install(
+            _ => PersistentSeedStore::install_current(
                 &admin,
                 &fx.store,
                 install_request("boundary-install", "boundary-seed", vec![source]),
             )
             .await
+            .map(|comparison| comparison.install)
             .map(|_| ()),
         };
         assert!(
@@ -2850,7 +2876,7 @@ async fn known_boundary_a_tombstone_of_the_other_kind_still_stops_a_new_stage_or
         let left = if entry == Entry::Stage {
             prepared_staged(&fx).await
         } else {
-            fx.artifacts_of(&admin, "rsia.e16.seed_install.v1")
+            fx.artifacts_of(&admin, "rsia.e16.seed_install.v2")
                 .await
                 .iter()
                 .filter(|body| body["payload"]["status"] == "prepared")
