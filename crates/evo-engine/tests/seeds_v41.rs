@@ -16,8 +16,9 @@
 use evo_core::{Context, Error, Role, fingerprint, hash};
 use evo_engine::packages::{E16SourceRef, PersistentPackageStore, StagedAssetState};
 use evo_engine::seeds::{
-    DiffCategory, E16_SEED_INSTALL_SCHEMA, InstallSeedRequest, PersistentSeedStore, SeedClass,
-    SeedInstallRecord, SeedStatus, SeedTriple, StagingSession, auto_activate, classify,
+    DiffCategory, E16_CURRENT_SEED_INSTALL_SCHEMA as E16_SEED_INSTALL_SCHEMA,
+    InstallCurrentSeedRequest, PersistentSeedStore, SeedClass, SeedIdentity, SeedInstallRecord,
+    SeedStatus, SeedTriple, SeedUpstream, StagingSession, auto_activate, classify,
     compute_three_way_diff, safe_reset_to_baseline,
 };
 use evo_storage::Store;
@@ -416,15 +417,29 @@ async fn seed_store() -> (tempfile::TempDir, Store, Context, Vec<E16SourceRef>) 
     )
 }
 
-fn install_request(key: &str, sources: Vec<E16SourceRef>) -> InstallSeedRequest {
-    InstallSeedRequest {
+fn install_request(key: &str, sources: Vec<E16SourceRef>) -> InstallCurrentSeedRequest {
+    InstallCurrentSeedRequest {
         request_key: key.into(),
-        publisher: "org.rsia".into(),
-        asset_id: "reasoning-seed".into(),
-        kind: "skill".into(),
-        baseline_bytes: b"baseline seed".to_vec(),
-        local_bytes: b"local seed".to_vec(),
-        upstream_bytes: Some(b"upstream seed".to_vec()),
+        baseline_identity: Some(SeedIdentity {
+            publisher: "org.rsia".into(),
+            asset_id: "reasoning-seed".into(),
+            kind: "skill".into(),
+        }),
+        local_identity: Some(SeedIdentity {
+            publisher: "org.rsia".into(),
+            asset_id: "reasoning-seed".into(),
+            kind: "skill".into(),
+        }),
+        local_marked: true,
+        baseline_bytes: Some(b"baseline seed".to_vec()),
+        local_bytes: Some(b"local seed".to_vec()),
+        upstream: Some(SeedUpstream {
+            path: "seeds/upstream.txt".into(),
+            content_digest: hash(b"upstream seed"),
+            bytes: b"upstream seed".to_vec(),
+        }),
+        compiler_version: "compiler-v1".into(),
+        confirmed_bytes: None,
         environment_digest: hash(b"environment"),
         source_refs: sources,
     }
@@ -433,31 +448,34 @@ fn install_request(key: &str, sources: Vec<E16SourceRef>) -> InstallSeedRequest 
 #[tokio::test]
 async fn persistent_seed_install_restart_identity_and_reset_staging() {
     let (directory, store, admin, sources) = seed_store().await;
-    let installed = PersistentSeedStore::install(
+    let installed = PersistentSeedStore::install_current(
         &admin,
         &store,
         install_request("install-key", sources.clone()),
     )
     .await
+    .map(|comparison| comparison.install)
     .unwrap();
     assert_eq!(installed.schema_version, E16_SEED_INSTALL_SCHEMA);
     assert_eq!(installed.payload.status, SeedStatus::Installed);
     assert_eq!(
-        PersistentSeedStore::install(
+        PersistentSeedStore::install_current(
             &admin,
             &store,
             install_request("install-key", sources.clone()),
         )
         .await
+        .map(|comparison| comparison.install)
         .unwrap()
         .id,
         installed.id
     );
     let mut changed = install_request("different-key", sources);
-    changed.baseline_bytes = b"different baseline".to_vec();
+    changed.baseline_bytes = Some(b"different baseline".to_vec());
     assert!(
-        PersistentSeedStore::install(&admin, &store, changed)
+        PersistentSeedStore::install_current(&admin, &store, changed)
             .await
+            .map(|comparison| comparison.install)
             .is_err()
     );
     let staged = PersistentSeedStore::stage_reset_to_baseline(
@@ -503,12 +521,13 @@ async fn persistent_seed_install_restart_identity_and_reset_staging() {
 #[tokio::test]
 async fn seed_reset_reads_current_watermark_sources_environment_and_permissions() {
     let (_directory, store, admin, sources) = seed_store().await;
-    let installed = PersistentSeedStore::install(
+    let installed = PersistentSeedStore::install_current(
         &admin,
         &store,
         install_request("install-key", sources.clone()),
     )
     .await
+    .map(|comparison| comparison.install)
     .unwrap();
     assert!(
         PersistentSeedStore::stage_reset_to_baseline(
@@ -545,9 +564,14 @@ async fn seed_reset_reads_current_watermark_sources_environment_and_permissions(
         .unwrap();
     session.commit().await.unwrap();
     assert!(
-        PersistentSeedStore::install(&admin, &store, install_request("install-key", sources),)
-            .await
-            .is_err()
+        PersistentSeedStore::install_current(
+            &admin,
+            &store,
+            install_request("install-key", sources),
+        )
+        .await
+        .map(|comparison| comparison.install)
+        .is_err()
     );
     assert!(
         PersistentSeedStore::stage_reset_to_baseline(
@@ -567,8 +591,9 @@ async fn seed_reset_reads_current_watermark_sources_environment_and_permissions(
 async fn prepared_seed_install_resumes_after_restart_without_unregistered_blobs() {
     let (directory, store, admin, sources) = seed_store().await;
     let request = install_request("prepared-restart", sources);
-    let installed = PersistentSeedStore::install(&admin, &store, request.clone())
+    let installed = PersistentSeedStore::install_current(&admin, &store, request.clone())
         .await
+        .map(|comparison| comparison.install)
         .unwrap();
     let mut interrupted = installed.clone();
     interrupted.payload.status = SeedStatus::Prepared;
@@ -589,8 +614,9 @@ async fn prepared_seed_install_resumes_after_restart_without_unregistered_blobs(
     let reopened = Store::open(&directory.path().join("seeds.sqlite3"))
         .await
         .unwrap();
-    let resumed = PersistentSeedStore::install(&admin, &reopened, request)
+    let resumed = PersistentSeedStore::install_current(&admin, &reopened, request)
         .await
+        .map(|comparison| comparison.install)
         .unwrap();
     assert_eq!(resumed.payload.status, SeedStatus::Installed);
     assert_eq!(
@@ -602,6 +628,23 @@ async fn prepared_seed_install_resumes_after_restart_without_unregistered_blobs(
         resumed.payload.upstream_digest,
         installed.payload.upstream_digest
     );
+    // Current restart reads bind all actual registered bytes, not only hashes
+    // copied from the envelope. Preserve the original successful recovery above.
+    let upstream_path = directory
+        .path()
+        .join("blobs")
+        .join(hash(b"n"))
+        .join(resumed.payload.upstream_blob_digest.as_ref().unwrap());
+    std::fs::write(&upstream_path, b"changed upstream bytes").unwrap();
+    assert!(
+        PersistentSeedStore::read_install(&admin, &reopened, &resumed.id)
+            .await
+            .is_err()
+    );
+    std::fs::write(&upstream_path, b"upstream seed").unwrap();
+    PersistentSeedStore::read_install(&admin, &reopened, &resumed.id)
+        .await
+        .unwrap();
 }
 
 // =========================================================================

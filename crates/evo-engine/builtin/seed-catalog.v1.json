@@ -1,0 +1,20 @@
+{
+  "schema_version": "rsia.builtin_seed_catalog.v1",
+  "entries": [
+    {
+      "publisher": "rsia.builtin",
+      "asset_id": "improver-i0",
+      "kind": "improver",
+      "version": 2,
+      "content_sha256": "7f79becfa89f0e951c0fafea209956938f7e9b28804ad6255cf30b65fc9d9c2a",
+      "path": "crates/evo-engine/builtin/improver-i0.v2.json",
+      "git_blob": "189d2461f1f8983386f774d1e6c8b5d50781ef47",
+      "license": {
+        "name": "Source-Available",
+        "path": "LICENSE",
+        "sha256": "164d42969d38c372e7cd85fe0daf749b6e8409fbd28afd36d1d2b098c5e9debb",
+        "git_blob": "64db287a4cbdecf401babab8559a1c5a7f22568a"
+      }
+    }
+  ]
+}

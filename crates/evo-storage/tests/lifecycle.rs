@@ -2260,3 +2260,425 @@ async fn f17_staged_and_prepared_staged_assets_keep_shared_import_blob_alive() {
     f17_revoke_import_and_check_blob("staged", true).await;
     f17_revoke_import_and_check_blob("prepared", true).await;
 }
+
+#[tokio::test]
+async fn seed_install_v2_registered_blobs_recover_and_share_liveness() {
+    let (dir, store) = database().await;
+    let admin = ctx("admin", Role::Admin);
+    let bytes = b"AG158-SHARED-SEED";
+    let digest = hash(bytes);
+    // Software run fixtures from the existing lifecycle helper, not execution
+    // or formal authority. Both new v2 producers bind their actual stored run.
+    for source in ["seed-source-a", "seed-source-b"] {
+        put_source(&store, source, "AG158-v2-source-software-fixture").await;
+    }
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, "seed-v2-watermark")
+        .await
+        .unwrap();
+    for (id, source) in [
+        ("seed-v2-a", "seed-source-a"),
+        ("seed-v2-b", "seed-source-b"),
+    ] {
+        let body: serde_json::Value = session.need(&admin, "run", source).await.unwrap();
+        let envelope = json!({
+            "schema_version":"rsia.e16.seed_install.v2", "id":id, "namespace":"n", "owner_actor":"admin", "request_key":id,
+            "input_digest":hash(id.as_bytes()), "created_at":1, "updated_at":1,
+            "source_refs":[{"kind":"run","id":source,"digest":fingerprint(&body).unwrap()}], "revoke_watermark":1,
+            "payload":{
+                "publisher":"org.rsia", "asset_id":id, "kind":"skill", "baseline_blob_digest":digest, "baseline_digest":digest,
+                "local_blob_digest":digest,"local_digest":digest,"upstream_blob_digest":digest,"upstream_digest":digest,
+                "environment_digest":hash(b"environment"),"status":"prepared","quarantine_reason":null,
+                "local_identity":{"publisher":"org.rsia","asset_id":id,"kind":"skill"},"local_marked":true,
+                "upstream_path":"upstream/seed.txt","compiler_version":"compiler-v1","catalog_version":null,"confirmed_content_digest":null
+            }
+        });
+        session
+            .put(&admin, "artifact", id, admin.actor(), &envelope)
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", id, "run", source)
+            .await
+            .unwrap();
+    }
+    session.commit().await.unwrap();
+    store.close().await;
+    let store = Store::open(&dir.path().join("rsia.sqlite3")).await.unwrap();
+    for id in ["seed-v2-a", "seed-v2-b"] {
+        for field in [
+            "baseline_blob_digest",
+            "local_blob_digest",
+            "upstream_blob_digest",
+        ] {
+            assert_eq!(
+                store
+                    .publish_registered_blob(
+                        &admin,
+                        id,
+                        "rsia.e16.seed_install.v2",
+                        field,
+                        bytes,
+                        1024
+                    )
+                    .await
+                    .unwrap(),
+                digest
+            );
+        }
+    }
+    assert_eq!(store.read_blob(&admin, &digest, 1024).await.unwrap(), bytes);
+    for (source, tick, survives) in [("seed-source-a", 2, true), ("seed-source-b", 30, false)] {
+        let mut cleanup = LifecycleStore::begin_revoke(
+            &admin,
+            &store,
+            TypedObjectRef {
+                kind: "run".into(),
+                id: source.into(),
+            },
+            "revoke seed source",
+            tick,
+        )
+        .await
+        .unwrap();
+        for now in tick + 1..tick + 20 {
+            cleanup = LifecycleStore::cleanup_step(&admin, &store, &cleanup.job_id, 16, now)
+                .await
+                .unwrap();
+            if cleanup.pending_nodes == 0 {
+                break;
+            }
+        }
+        assert_eq!(cleanup.state, CleanupState::Complete);
+        let read = store.read_blob(&admin, &digest, 1024).await;
+        if survives {
+            assert_eq!(read.unwrap(), bytes);
+        } else {
+            assert!(matches!(read, Err(evo_core::Error::NotFound)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn seed_install_v1_v2_cleanup_redacts_same_registered_content() {
+    let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+        "../../evo-engine/tests/fixtures/ag158_seed_install_v1.json"
+    ))
+    .unwrap();
+    let fixture = &fixtures["revocable_observation"];
+    let original = fixture["stored_envelope_body"].as_str().unwrap();
+    assert_eq!(
+        hash(original.as_bytes()),
+        fixture["stored_envelope_body_sha256"]
+    );
+    assert_eq!(fixture["source_is_execution_or_formal_proof"], false);
+    let (dir, store) = database().await;
+    let admin = Context::new(fixture["namespace"].as_str().unwrap(), "admin", Role::Admin).unwrap();
+    let host = Context::new(
+        admin.namespace(),
+        fixture["source_owner_actor"].as_str().unwrap(),
+        Role::Host,
+    )
+    .unwrap();
+    let observed = &fixture["envelope"];
+    let legacy_id = observed["id"].as_str().unwrap();
+    let legacy_source = fixture["source_refs"][0]["id"].as_str().unwrap();
+    assert_eq!(fixture["source_refs"][0]["kind"], "run");
+    assert_eq!(fixture["dependency_edges"], json!([["run", legacy_source]]));
+    let source: serde_json::Value =
+        serde_json::from_str(fixture["source_body"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        hash(fixture["source_body"].as_str().unwrap().as_bytes()),
+        fixture["source_body_sha256"]
+    );
+    // The v2 protocol fixture has its own live software run in the observed
+    // record's real namespace. Equal digests here are the same physical blobs.
+    let live_source = "ag158-current-live-run";
+    let live_body = json!({"id":live_source,"schema_version":"rsia.optimization.source.v1","body":"AG158-v2-software-source"});
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&host, "run", legacy_source, host.actor(), &source)
+        .await
+        .unwrap();
+    session
+        .put(&host, "run", live_source, host.actor(), &live_body)
+        .await
+        .unwrap();
+    session
+        .bump_watermark(&admin, "observed-legacy-watermark")
+        .await
+        .unwrap();
+    session
+        .put(
+            &admin,
+            "budget",
+            "retained-cost",
+            admin.actor(),
+            &json!({"id":"retained-cost","settled_micros":7}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .object_row(&admin, "run", legacy_source)
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        fixture["source_body"].as_str().unwrap()
+    );
+    session.commit().await.unwrap();
+    // Restore the untouched old TEXT in its original namespace, without a
+    // typed JSON projection or a different source/identity masquerading as it.
+    let connection = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        dir.path().join("rsia.sqlite3").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,'artifact',?,?,?)")
+        .bind(admin.namespace())
+        .bind(legacy_id)
+        .bind(admin.actor())
+        .bind(original)
+        .execute(&connection)
+        .await
+        .unwrap();
+    connection.close().await;
+    // New, explicitly synthetic storage protocol material; it is not a
+    // historical capture, a Current-verified comparison, or execution evidence.
+    let current = json!({
+        "schema_version":"rsia.e16.seed_install.v2", "id":"seed-v2-shared", "namespace":admin.namespace(),
+        "owner_actor":admin.actor(), "request_key":"seed-v2-shared", "input_digest":hash(b"AG158-v2-protocol-fixture"),
+        "created_at":1,"updated_at":1,"source_refs":[{"kind":"run","id":live_source,"digest":fingerprint(&live_body).unwrap()}],
+        "revoke_watermark":1,"payload":{
+            "publisher":"org.rsia","asset_id":"reasoning-seed","kind":"skill",
+            "baseline_blob_digest":observed["payload"]["baseline_blob_digest"],"baseline_digest":observed["payload"]["baseline_digest"],
+            "local_blob_digest":observed["payload"]["local_blob_digest"],"local_digest":observed["payload"]["local_digest"],
+            "upstream_blob_digest":observed["payload"]["upstream_blob_digest"],"upstream_digest":observed["payload"]["upstream_digest"],
+            "environment_digest":hash(b"environment"),"status":"prepared","quarantine_reason":null,
+            "local_identity":{"publisher":"org.rsia","asset_id":"reasoning-seed","kind":"skill"},"local_marked":true,
+            "upstream_path":"upstream/seed.txt","compiler_version":"compiler-v1","catalog_version":null,"confirmed_content_digest":null
+        }
+    });
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "artifact",
+            "seed-v2-shared",
+            admin.actor(),
+            &current,
+        )
+        .await
+        .unwrap();
+    session
+        .put_edge(&admin, "artifact", legacy_id, "run", legacy_source)
+        .await
+        .unwrap();
+    session
+        .put_edge(&admin, "artifact", "seed-v2-shared", "run", live_source)
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .object_row(&admin, "artifact", legacy_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        original
+    );
+    assert_eq!(
+        session
+            .dependents(&admin, "run", legacy_source)
+            .await
+            .unwrap(),
+        vec![("artifact".to_string(), legacy_id.to_string())]
+    );
+    session.commit().await.unwrap();
+    for (input, field) in [
+        ("baseline_bytes", "baseline_blob_digest"),
+        ("local_bytes", "local_blob_digest"),
+        ("upstream_bytes", "upstream_blob_digest"),
+    ] {
+        let bytes: Vec<u8> = serde_json::from_value(fixture["request"][input].clone()).unwrap();
+        assert_eq!(
+            store
+                .publish_registered_blob(
+                    &admin,
+                    "seed-v2-shared",
+                    "rsia.e16.seed_install.v2",
+                    field,
+                    &bytes,
+                    1024
+                )
+                .await
+                .unwrap(),
+            observed["payload"][field].as_str().unwrap()
+        );
+    }
+    for (source, tick, survives) in [(legacy_source, 2, true), (live_source, 30, false)] {
+        let mut cleanup = LifecycleStore::begin_revoke(
+            &admin,
+            &store,
+            TypedObjectRef {
+                kind: "run".into(),
+                id: source.into(),
+            },
+            "revoke legacy or current seed source",
+            tick,
+        )
+        .await
+        .unwrap();
+        for now in tick + 1..tick + 20 {
+            cleanup = LifecycleStore::cleanup_step(&admin, &store, &cleanup.job_id, 16, now)
+                .await
+                .unwrap();
+            if cleanup.pending_nodes == 0 {
+                break;
+            }
+        }
+        assert_eq!(cleanup.state, CleanupState::Complete);
+        let mut session = store.session().await.unwrap();
+        let redacted: serde_json::Value =
+            session.need(&admin, "artifact", legacy_id).await.unwrap();
+        assert_eq!(redacted["schema_version"], "rsia.redacted.v1");
+        assert_eq!(
+            redacted["original_digest"],
+            fixture["stored_envelope_body_sha256"]
+        );
+        assert_eq!(redacted["original_kind"], "seed_install");
+        assert!(redacted.get("payload").is_none());
+        // The frozen parent's normative redaction retains digest metadata.
+        assert_eq!(
+            redacted["metadata"]["payload"]["baseline_blob_digest"],
+            observed["payload"]["baseline_blob_digest"]
+        );
+        let other: serde_json::Value = session
+            .need(&admin, "artifact", "seed-v2-shared")
+            .await
+            .unwrap();
+        if survives {
+            assert_eq!(other["schema_version"], "rsia.e16.seed_install.v2");
+            assert_eq!(other["payload"]["status"], "prepared");
+        } else {
+            assert_eq!(other["schema_version"], "rsia.redacted.v1");
+            assert_eq!(other["original_schema"], "rsia.e16.seed_install.v2");
+            assert_eq!(other["original_kind"], "seed_install");
+            assert!(other.get("payload").is_none());
+            assert_eq!(
+                other["metadata"]["payload"]["baseline_blob_digest"],
+                observed["payload"]["baseline_blob_digest"]
+            );
+        }
+        let cost: serde_json::Value = session
+            .need(&admin, "budget", "retained-cost")
+            .await
+            .unwrap();
+        assert_eq!(cost["settled_micros"], 7);
+        let tombstone: serde_json::Value = session.need(&admin, "tombstone", source).await.unwrap();
+        assert_eq!(tombstone["source_kind"], "run");
+        session.commit().await.unwrap();
+        for (input, field) in [
+            ("baseline_bytes", "baseline_blob_digest"),
+            ("local_bytes", "local_blob_digest"),
+            ("upstream_bytes", "upstream_blob_digest"),
+        ] {
+            let read = store
+                .read_blob(&admin, observed["payload"][field].as_str().unwrap(), 1024)
+                .await;
+            if survives {
+                let bytes: Vec<u8> =
+                    serde_json::from_value(fixture["request"][input].clone()).unwrap();
+                assert_eq!(read.unwrap(), bytes);
+            } else {
+                assert!(matches!(read, Err(evo_core::Error::NotFound)));
+            }
+        }
+    }
+    // Separate, explicitly synthetic protocol fixtures mirror the existing F17
+    // import/shared-blob test: a strict import root and an independent software
+    // run-backed nonlive v2 record reference the same bytes in one namespace.
+    for status in ["staged", "quarantined", "unknown"] {
+        let (_dir, store) = database().await;
+        let admin = ctx("admin", Role::Admin);
+        put_source(&store, "nonlive-run", "AG158-nonlive-software-source").await;
+        let bytes = format!("nonlive-v2-{status}");
+        let digest = store.put_blob(&admin, bytes.as_bytes()).await.unwrap();
+        let root = format!("import-{status}");
+        let survivor = format!("nonlive-{status}");
+        let import = e16_import_envelope(
+            "rsia.e16.import_source.v1",
+            &root,
+            json!([{"kind":"blob","id":digest,"content_digest":digest}]),
+            json!({"status":"ready","raw_blob_digest":digest,"blob_published":true}),
+        );
+        let mut session = store.session().await.unwrap();
+        let source: serde_json::Value = session.need(&admin, "run", "nonlive-run").await.unwrap();
+        let nonlive = e16_import_envelope(
+            "rsia.e16.seed_install.v2",
+            &survivor,
+            json!([{"kind":"run","id":"nonlive-run","digest":fingerprint(&source).unwrap()}]),
+            json!({
+                "publisher":"org.rsia","asset_id":survivor,"kind":"skill",
+                "baseline_blob_digest":digest,"baseline_digest":digest,"local_blob_digest":digest,"local_digest":digest,
+                "upstream_blob_digest":digest,"upstream_digest":digest,"environment_digest":hash(b"environment"),
+                "status":status,"quarantine_reason":null,
+                "local_identity":{"publisher":"org.rsia","asset_id":survivor,"kind":"skill"},"local_marked":true,
+                "upstream_path":"upstream/seed.txt","compiler_version":"compiler-v1","catalog_version":null,"confirmed_content_digest":null
+            }),
+        );
+        session
+            .put(&admin, "artifact", &root, admin.actor(), &import)
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", &root, "blob", &digest)
+            .await
+            .unwrap();
+        session
+            .put(&admin, "artifact", &survivor, admin.actor(), &nonlive)
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", &survivor, "run", "nonlive-run")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let mut cleanup = LifecycleStore::begin_revoke(
+            &admin,
+            &store,
+            TypedObjectRef {
+                kind: "artifact".into(),
+                id: root.clone(),
+            },
+            "nonlive seed does not retain content",
+            40,
+        )
+        .await
+        .unwrap();
+        for tick in 41..60 {
+            cleanup = LifecycleStore::cleanup_step(&admin, &store, &cleanup.job_id, 16, tick)
+                .await
+                .unwrap();
+            if cleanup.pending_nodes == 0 {
+                break;
+            }
+        }
+        assert_eq!(cleanup.state, CleanupState::Complete);
+        assert!(matches!(
+            store.read_blob(&admin, &digest, 1024).await,
+            Err(evo_core::Error::NotFound)
+        ));
+        let mut session = store.session().await.unwrap();
+        let import: serde_json::Value = session.need(&admin, "artifact", &root).await.unwrap();
+        let remaining: serde_json::Value =
+            session.need(&admin, "artifact", &survivor).await.unwrap();
+        assert_eq!(import["schema_version"], "rsia.redacted.v1");
+        assert_eq!(remaining["schema_version"], "rsia.e16.seed_install.v2");
+        assert_eq!(remaining["payload"]["status"], status);
+        session.commit().await.unwrap();
+    }
+}

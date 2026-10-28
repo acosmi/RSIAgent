@@ -2172,7 +2172,7 @@ fn e16_schema_kind(schema: &str) -> Option<&'static str> {
         "rsia.e16.import_source.v1" => Some("import_source"),
         "rsia.e16.import_result.v1" => Some("import_result"),
         "rsia.e16.staged_asset.v1" => Some("staged_asset"),
-        "rsia.e16.seed_install.v1" => Some("seed_install"),
+        "rsia.e16.seed_install.v1" | "rsia.e16.seed_install.v2" => Some("seed_install"),
         "rsia.e16.export_attempt.v1" => Some("export_attempt"),
         "rsia.e16.delivery_audit.v1" => Some("delivery_audit"),
         "rsia.e16.export_attempt.v2" => Some("export_attempt"),
@@ -2606,7 +2606,7 @@ async fn remove_e16_blob_if_unreferenced(
          WHERE d.namespace=? AND d.dst_kind='blob' AND d.dst_id=?
          AND json_extract(o.body,'$.schema_version') IN (
            'rsia.e16.import_source.v1','rsia.e16.staged_asset.v1',
-           'rsia.e16.seed_install.v1','rsia.e16.export_attempt.v1',
+           'rsia.e16.seed_install.v1','rsia.e16.seed_install.v2','rsia.e16.export_attempt.v1',
            'rsia.e16.export_attempt.v2'
          )
          AND NOT EXISTS (
@@ -2659,7 +2659,7 @@ fn e16_blob_digest_fields(schema: &str) -> &'static [&'static str] {
     match schema {
         "rsia.e16.import_source.v1" => &["raw_blob_digest"],
         "rsia.e16.staged_asset.v1" => &["content_blob_digest"],
-        "rsia.e16.seed_install.v1" => &[
+        "rsia.e16.seed_install.v1" | "rsia.e16.seed_install.v2" => &[
             "baseline_blob_digest",
             "local_blob_digest",
             "upstream_blob_digest",
@@ -2696,7 +2696,9 @@ fn e16_record_keeps_blobs_alive(schema: &str, payload: &serde_json::Value) -> bo
     let (field, live): (&str, &[&str]) = match schema {
         "rsia.e16.import_source.v1" => ("status", &["prepared", "ready"]),
         "rsia.e16.staged_asset.v1" => ("state", &["prepared", "staged"]),
-        "rsia.e16.seed_install.v1" => ("status", &["prepared", "installed"]),
+        "rsia.e16.seed_install.v1" | "rsia.e16.seed_install.v2" => {
+            ("status", &["prepared", "installed"])
+        }
         "rsia.e16.export_attempt.v1" | "rsia.e16.export_attempt.v2" => {
             ("state", &["prepared", "completed"])
         }
@@ -2719,7 +2721,7 @@ async fn e16_payload_has_live_blob_reference(
          WHERE o.namespace=? AND o.kind='artifact'
          AND json_extract(o.body,'$.schema_version') IN (
            'rsia.e16.import_source.v1','rsia.e16.staged_asset.v1',
-           'rsia.e16.seed_install.v1','rsia.e16.export_attempt.v1',
+           'rsia.e16.seed_install.v1','rsia.e16.seed_install.v2','rsia.e16.export_attempt.v1',
            'rsia.e16.export_attempt.v2'
          )
          AND (
