@@ -2055,3 +2055,271 @@ async fn actual_parent_http_source_cleanup_refuses_private_input_and_economic_re
     assert!(task.await.unwrap_err().is_cancelled());
     store.close().await;
 }
+
+// A read-only SQLite snapshot retains every table, row identity and cell type.
+// Python's sqlite3 is already part of the repository's required test runtime.
+fn management_sql_snapshot(path: &std::path::Path) -> Vec<u8> {
+    let result = std::process::Command::new("python3")
+        .args(["-B", "-c", r#"
+import json, pathlib, sqlite3, struct, sys
+con = sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri() + '?mode=ro', uri=True)
+con.execute('BEGIN')
+def cell(v):
+    if v is None: return ['null']
+    if isinstance(v, int): return ['integer', str(v)]
+    if isinstance(v, float): return ['real', struct.pack('>d', v).hex()]
+    if isinstance(v, bytes): return ['blob', v.hex()]
+    return ['text', v.encode('utf-8').hex()]
+facts = []
+for name, ddl in con.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+    table = '"' + name.replace('"', '""') + '"'
+    columns = '*' if 'WITHOUT ROWID' in (ddl or '').upper() else 'rowid,*'
+    rows = [[cell(v) for v in row] for row in con.execute('SELECT ' + columns + ' FROM ' + table)]
+    rows.sort(key=lambda row: json.dumps(row, separators=(',', ':')))
+    facts.append([name, ddl, rows])
+print(json.dumps(facts, separators=(',', ':')))
+con.close()
+"#])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!result.stdout.is_empty());
+    result.stdout
+}
+
+#[tokio::test]
+async fn authenticated_management_submit_preserves_three_exact_fixed_codes() {
+    let (dir, state) = state(registry()).await;
+    let path = dir.path().join("http.sqlite3");
+    let before = management_sql_snapshot(&path);
+    let (base, server) = spawn(state).await;
+    let client = reqwest::Client::new();
+    for (name, code) in [
+        ("unknown.management", "unknown_management_operation"),
+        ("evo_prepare", "unknown_management_operation"),
+        ("release.rollback", "management_operation_plane_mismatch"),
+        ("restore", "management_operation_plane_mismatch"),
+        ("source.revoke", "management_operation_not_wired"),
+        (
+            "development.probe_compose.enable",
+            "management_operation_not_wired",
+        ),
+        (
+            "development.probe_compose.disable",
+            "management_operation_not_wired",
+        ),
+    ] {
+        let response = post(
+            &client,
+            &base,
+            &format!("/v1/manage/{name}"),
+            Some(ADMIN_TOKEN),
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error":{"code":code}})
+        );
+    }
+    assert_eq!(management_sql_snapshot(&path), before);
+    server.abort();
+}
+
+#[tokio::test]
+async fn management_code_mapping_preserves_auth_identity_and_strict_json_precedence() {
+    let (dir, state) = state(registry()).await;
+    let path = dir.path().join("http.sqlite3");
+    let before = management_sql_snapshot(&path);
+    let (base, server) = spawn(state).await;
+    let client = reqwest::Client::new();
+    for name in ["unknown.management", "release.rollback", "source.revoke"] {
+        let route = format!("/v1/manage/{name}");
+        let response = post(&client, &base, &route, None, json!({"actor":"forged"})).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error":{"code":"bearer_token_required"}})
+        );
+        let response = raw_post(&client, &base, &route, "invalid-token-0123456789", "{").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error":{"code":"invalid_bearer_token"}})
+        );
+        let response = client
+            .post(format!("{base}{route}"))
+            .bearer_auth(ADMIN_TOKEN)
+            .header("x-role", "Admin")
+            .body("{")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error":{"code":"identity_headers_forbidden"}})
+        );
+        for body in ["{", r#"{"x":{"a":1,"a":2}}"#] {
+            let response = raw_post(&client, &base, &route, ADMIN_TOKEN, body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.json::<Value>().await.unwrap(),
+                json!({"error":{"code":"invalid_management_payload"}})
+            );
+        }
+        let response = post(
+            &client,
+            &base,
+            &route,
+            Some(ADMIN_TOKEN),
+            json!({"role":"Admin"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error":{"code":"body_identity_forbidden"}})
+        );
+    }
+    // Ordinary Invalid remains private; only the three submit codes are exposed.
+    let response = post(&client, &base, "/v1/manage/meta.start", Some(ADMIN_TOKEN), json!({"schema_version":"rsia.management.meta_start.v1","request_key":"bad-shape","extra":true})).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error":{"code":"invalid_input"}})
+    );
+    let response = post(
+        &client,
+        &base,
+        "/v1/manage/evaluation.status",
+        Some(ADMIN_TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error":{"code":"forbidden"}})
+    );
+    assert_eq!(management_sql_snapshot(&path), before);
+    server.abort();
+}
+
+#[tokio::test]
+async fn registered_review_route_keeps_authorization_and_zero_write_boundary() {
+    let (dir, state) = state(registry()).await;
+    let path = dir.path().join("http.sqlite3");
+    let before = management_sql_snapshot(&path);
+    let (base, server) = spawn(state).await;
+    let client = reqwest::Client::new();
+    let route = evo_core::management_registry::REVIEW_ROUTE;
+    let request =
+        json!({"kind":"typed_candidate","id":"missing-review-record","detail":"metadata"});
+    for token in [ADMIN_TOKEN, AGENT_A_TOKEN, HOST_TOKEN, EVALUATOR_TOKEN] {
+        let response = post(&client, &base, route, Some(token), request.clone()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error":{"code":"review_unavailable"}})
+        );
+    }
+    let response = post(&client, &base, route, Some(ADMIN_TOKEN), json!({})).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error":{"code":"invalid_review_payload"}})
+    );
+    // Auth precedes review parsing, and the generic submit gate is not called.
+    let response = raw_post(&client, &base, route, AGENT_A_TOKEN, "{").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error":{"code":"review_unavailable"}})
+    );
+    assert_eq!(management_sql_snapshot(&path), before);
+    server.abort();
+}
+
+#[tokio::test]
+async fn dedicated_job_status_and_cancel_remain_live_without_new_jobs() {
+    let (dir, state) = state(registry()).await;
+    let (base, server) = spawn(state).await;
+    let client = reqwest::Client::new();
+    let request = json!({"schema_version":"rsia.management.meta_start.v1","request_key":"dedicated-http-health"});
+    let response = post(
+        &client,
+        &base,
+        "/v1/manage/meta.start",
+        Some(ADMIN_TOKEN),
+        request.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let queued: Value = response.json().await.unwrap();
+    let id = queued["id"].as_str().unwrap();
+    let done = wait_job(&client, &base, ADMIN_TOKEN, id).await;
+    assert_eq!(done["state"], "blocked");
+    assert_eq!(done["step"], "blocked_feature");
+    assert_eq!(done["error_code"], "meta.start_consumer_unavailable");
+    let path = dir.path().join("http.sqlite3");
+    let before = management_sql_snapshot(&path);
+    let response = post(
+        &client,
+        &base,
+        "/v1/manage/meta.start",
+        Some(ADMIN_TOKEN),
+        request,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap(), done);
+    let response = client
+        .get(format!("{base}/v1/manage/jobs/{id}"))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap(), done);
+    let response = post(
+        &client,
+        &base,
+        &format!("/v1/manage/jobs/{id}/cancel"),
+        Some(ADMIN_TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap(), done);
+    for name in ["job.status", "job.cancel"] {
+        let response = post(
+            &client,
+            &base,
+            &format!("/v1/manage/{name}"),
+            Some(ADMIN_TOKEN),
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error":{"code":"invalid_input"}})
+        );
+    }
+    let response = client
+        .get(format!("{base}/v1/manage/jobs/{id}"))
+        .bearer_auth(EVALUATOR_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(management_sql_snapshot(&path), before);
+    server.abort();
+}

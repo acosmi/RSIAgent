@@ -66,7 +66,7 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
         "exploration.start" | "replay.run" | "curriculum.step" | "meta.start" => {
             ctx.require(&[Role::Admin])
         }
-        _ => Err(Error::Invalid("unknown management operation".into())),
+        _ => Err(Error::Invalid("management_operation_not_wired".into())),
     }
 }
 
@@ -758,7 +758,17 @@ async fn persist_management(
     operation: &str,
     payload: Value,
 ) -> Result<ManagementJob> {
-    authorize(ctx, operation)?;
+    let entry = evo_core::management_registry::lookup(operation)
+        .ok_or_else(|| Error::Invalid("unknown_management_operation".into()))?;
+    if entry.plane != evo_core::management_registry::Plane::Dispatch {
+        return Err(Error::Invalid("management_operation_plane_mismatch".into()));
+    }
+    if entry.execution != evo_core::management_registry::ExecutionKind::AsyncJob {
+        return Err(Error::Invalid(
+            "management operation requires dedicated route".into(),
+        ));
+    }
+    required_management_role(ctx, operation)?;
     let request = parse_request(operation, payload)?;
     validate_request_authority(ctx, &request)?;
     identifier(request.request_key())?;

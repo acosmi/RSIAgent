@@ -345,16 +345,24 @@ async fn main() -> Result<()> {
                         .await?
                 }
                 _ => {
-                    if !evo_core::contract::admin_ops().contains(&operation.as_str()) {
+                    let entry = evo_core::management_registry::lookup(&operation);
+                    if entry.is_none_or(|entry| {
+                        entry.plane != evo_core::management_registry::Plane::Dispatch
+                    }) {
+                        let reason = if entry.is_none() {
+                            "unknown_management_operation"
+                        } else {
+                            "management_operation_plane_mismatch"
+                        };
                         eprintln!(
                             "{}",
                             serde_json::json!({
                                 "operation": operation,
                                 "status": "unsupported",
-                                "reason": "unknown_management_operation"
+                                "reason": reason
                             })
                         );
-                        bail!("unknown management operation");
+                        bail!("management operation refused: {reason}");
                     }
                     let path = request_file.context("--request-file is required")?;
                     let body = tokio::fs::read(path).await?;
