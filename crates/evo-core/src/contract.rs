@@ -801,6 +801,22 @@ pub struct HostSurfaceManifest {
 
 impl HostSurfaceManifest {
     pub fn validate_against_extraction(&self, extracted: &[String]) -> Result<()> {
+        self.validate_frozen_v1_against_extraction(extracted)?;
+        for item in &self.items {
+            if item.coverage == SurfaceCoverage::Supported {
+                let contract = field_contract(item.mapped_field.as_deref().unwrap_or(""))?;
+                if item.consumer.as_deref() != Some(contract.consumer) {
+                    return Err(Error::Invalid(
+                        "supported item consumer differs from field contract".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Frozen v1 guards for historical reads and lineage, without current-use authority.
+    pub fn validate_frozen_v1_against_extraction(&self, extracted: &[String]) -> Result<()> {
         if self.schema_version != SURFACE_SCHEMA {
             return Err(Error::Invalid("unsupported host surface schema".into()));
         }
