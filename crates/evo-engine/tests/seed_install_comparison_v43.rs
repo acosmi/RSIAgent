@@ -347,6 +347,17 @@ async fn upstream_newer_only_stages_and_replay_is_idempotent() {
     PersistentPackageStore::read_staged(&fx.admin, &fx.store, &staged.id)
         .await
         .unwrap();
+    let mut session = fx.store.session().await.unwrap();
+    let mut original_bodies = Vec::new();
+    for id in [&initial.id, &staged.id] {
+        let row = session
+            .object_row(&fx.admin, "artifact", id)
+            .await
+            .unwrap()
+            .unwrap();
+        original_bodies.push((id.clone(), row.body));
+    }
+    session.commit().await.unwrap();
     let before = fx.shape().await;
     let replay = PersistentSeedStore::install_current(&fx.admin, &fx.store, request)
         .await
@@ -359,6 +370,27 @@ async fn upstream_newer_only_stages_and_replay_is_idempotent() {
         matches!(PersistentSeedStore::install_current(&fx.admin, &fx.store, same_key).await, Err(Error::Conflict(message)) if message == "seed update request key changed")
     );
     assert_eq!(fx.shape().await, before);
+    for (local, upstream) in [("baseline", "baseline"), ("upstream", "upstream")] {
+        let before = fx.shape().await;
+        let same_key = fx.request("new-upstream", "baseline", local, upstream);
+        assert!(
+            matches!(PersistentSeedStore::install_current(&fx.admin, &fx.store, same_key).await, Err(Error::Conflict(message)) if message == "seed update request key changed")
+        );
+        assert_eq!(fx.shape().await, before);
+        let mut session = fx.store.session().await.unwrap();
+        for (id, body) in &original_bodies {
+            assert_eq!(
+                &session
+                    .object_row(&fx.admin, "artifact", id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .body,
+                body
+            );
+        }
+        session.commit().await.unwrap();
+    }
     fx.no_active().await;
 }
 

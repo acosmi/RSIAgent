@@ -764,15 +764,7 @@ impl PersistentSeedStore {
         if let Some(existing) = &existing {
             if existing.payload.status == SeedStatus::Installed {
                 session.commit().await?;
-                let verified = Self::read_install(ctx, store, &id).await?;
-                if stage_bytes.is_none() {
-                    return Ok(SeedInstallComparison {
-                        install: verified,
-                        class,
-                        diff,
-                        staged: None,
-                    });
-                }
+                Self::read_install(ctx, store, &id).await?;
                 session = store.session().await?;
                 if current_watermark(&mut session, ctx).await? != watermark {
                     return Err(Error::Conflict("seed install watermark advanced".into()));
@@ -810,35 +802,30 @@ impl PersistentSeedStore {
         } else {
             None
         };
-        let previous_stage = if let Some(expected) = &stage_input {
-            let previous = session
-                .get::<E16Envelope<StagedAssetPayload>>(ctx, "artifact", &stage_id)
-                .await?;
-            if let Some(previous) = &previous {
-                if previous.schema_version != E16_STAGED_ASSET_SCHEMA
-                    || previous.input_digest != *expected
-                    || previous.namespace != ctx.namespace()
-                    || previous.owner_actor != ctx.actor()
-                    || previous.revoke_watermark != watermark
-                    || previous.source_refs != stage_sources
-                {
-                    return Err(Error::Conflict("seed update request key changed".into()));
-                }
-            } else {
-                // The actual instance count and both Prepared registrations are
-                // in this one Session, before any installation/blob/audit write.
-                let usage: V41CapacityUsage =
-                    session.capacity_usage_v41(unix_now_secs()?).await?.into();
-                admit_field(
-                    CapacityField::StagedPackages,
-                    usage.staged_packages,
-                    &CapacityLimits::default(),
-                )?;
+        let previous_stage = session
+            .get::<E16Envelope<StagedAssetPayload>>(ctx, "artifact", &stage_id)
+            .await?;
+        if let Some(previous) = &previous_stage {
+            if previous.schema_version != E16_STAGED_ASSET_SCHEMA
+                || stage_input.as_ref() != Some(&previous.input_digest)
+                || previous.namespace != ctx.namespace()
+                || previous.owner_actor != ctx.actor()
+                || previous.revoke_watermark != watermark
+                || previous.source_refs != stage_sources
+            {
+                return Err(Error::Conflict("seed update request key changed".into()));
             }
-            previous
-        } else {
-            None
-        };
+        } else if stage_input.is_some() {
+            // The actual instance count and both Prepared registrations are
+            // in this one Session, before any installation/blob/audit write.
+            let usage: V41CapacityUsage =
+                session.capacity_usage_v41(unix_now_secs()?).await?.into();
+            admit_field(
+                CapacityField::StagedPackages,
+                usage.staged_packages,
+                &CapacityLimits::default(),
+            )?;
+        }
         let needs_publication = existing
             .as_ref()
             .is_none_or(|e| e.payload.status == SeedStatus::Prepared);
