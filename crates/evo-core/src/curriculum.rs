@@ -484,7 +484,7 @@ pub const LEGACY_V2_UNTYPED_NOTE: &str = "legacy_v2_untyped";
 /// grading drift (plan §8.1.1: 旧记录转diagnostic并注明漂移).
 pub const DRIFT_NOTE: &str = "environment_or_grader_drift";
 /// Reason of the v3 trigger when every active absolute failure lies outside
-/// the registered task space (plan §8.1.1: 不得触发failure_gap，返回unsupported_scope).
+/// the registered task space and no other entry applies (plan §8.1.1).
 pub const UNSUPPORTED_SCOPE_REASON: &str = "failure_cluster_outside_registered_task_space";
 /// Upper bound of the failure records one learner state carries.
 pub const MAX_FAILURE_RECORDS: usize = 10_000;
@@ -782,6 +782,8 @@ pub fn apply_cycle_to_failure_records(
             ));
         }
     }
+    let mut record_ids = std::collections::BTreeSet::new();
+    let mut duplicate_record = false;
     for record in records.iter() {
         record.validate()?;
         if record.cycle_id.as_deref() == Some(cycle_id)
@@ -794,6 +796,25 @@ pub fn apply_cycle_to_failure_records(
                 "development cycle already reduced into failure records".into(),
             ));
         }
+        duplicate_record |= !record_ids.insert(record.record_id.as_str());
+    }
+    if records.len() > MAX_FAILURE_RECORDS {
+        return Err(Error::Invalid(
+            "failure records exceed the supported bound".into(),
+        ));
+    }
+    if duplicate_record {
+        return Err(Error::Invalid("duplicate failure record".into()));
+    }
+    let used = records.len();
+    let additional = outcomes
+        .iter()
+        .filter(|outcome| !outcome.passed || outcome.paired_gain_micros < 0)
+        .count();
+    if !matches!(used.checked_add(additional), Some(total) if total <= MAX_FAILURE_RECORDS) {
+        return Err(Error::Conflict(format!(
+            "learner failure records capacity exceeded: used={used}, additional={additional}, limit={MAX_FAILURE_RECORDS}"
+        )));
     }
     for record in records.iter_mut() {
         if record.counts_as_open()
@@ -1313,12 +1334,12 @@ pub fn detect_plateau_signal(
 /// records constitute a failure gap, and only while they carry an executable
 /// improvement direction — the cluster is a registered task bucket of the
 /// authorized task space. Active clusters outside it are dropped from the
-/// gap; when every active cluster is outside it, the trigger is
-/// `NotTriggered { reasons: ["failure_cluster_outside_registered_task_space"] }`,
-/// which the probe scheduler ends in the `unsupported_scope` terminal instead
-/// of firing FailureGap. Regression, retest-due, resolved and diagnostic
-/// records never trigger `failure_gap`. Everything else matches the v2 window
-/// logic.
+/// gap. When every active cluster is outside it, coverage, plateau and legal
+/// cold-start entries remain available. Only when none applies does the
+/// trigger return `NotTriggered` with `UNSUPPORTED_SCOPE_REASON`, which the
+/// probe scheduler ends in `unsupported_scope`. Regression, retest-due,
+/// resolved and diagnostic records never trigger `failure_gap`. Everything
+/// else matches the v2 window logic.
 pub fn detect_plateau_signal_v3(
     profile: &CurriculumControlProfileV1,
     state: &LearnerStateV3,
@@ -1331,7 +1352,8 @@ pub fn detect_plateau_signal_v3(
         });
     }
     let active_clusters = state.active_absolute_failure_clusters();
-    if !active_clusters.is_empty() {
+    let has_active_failures = !active_clusters.is_empty();
+    if has_active_failures {
         let registered: std::collections::BTreeSet<&str> = state
             .coverage_buckets
             .iter()
@@ -1341,14 +1363,11 @@ pub fn detect_plateau_signal_v3(
             .into_iter()
             .filter(|cluster| registered.contains(cluster.as_str()))
             .collect();
-        if failure_cluster_ids.is_empty() {
-            return Ok(PlateauSignalV1::NotTriggered {
-                reasons: vec![UNSUPPORTED_SCOPE_REASON.into()],
+        if !failure_cluster_ids.is_empty() {
+            return Ok(PlateauSignalV1::FailureGap {
+                failure_cluster_ids,
             });
         }
-        return Ok(PlateauSignalV1::FailureGap {
-            failure_cluster_ids,
-        });
     }
     let gaps: Vec<_> = state
         .coverage_buckets
@@ -1387,7 +1406,13 @@ pub fn detect_plateau_signal_v3(
         last_trigger_window_digest: state.last_trigger_window_digest.clone(),
         cooldown_remaining_cycles: state.cooldown_remaining_cycles,
     };
-    detect_plateau_signal(profile, &legacy)
+    let signal = detect_plateau_signal(profile, &legacy)?;
+    if has_active_failures && matches!(signal, PlateauSignalV1::NotTriggered { .. }) {
+        return Ok(PlateauSignalV1::NotTriggered {
+            reasons: vec![UNSUPPORTED_SCOPE_REASON.into()],
+        });
+    }
+    Ok(signal)
 }
 
 fn sample_variance_micros_squared(values: &[(i128, i128)], threshold: u64) -> Result<(u64, bool)> {
