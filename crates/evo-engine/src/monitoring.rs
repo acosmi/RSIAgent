@@ -856,7 +856,14 @@ impl MonitoringCoordinator {
 
         let application_status = application_status(&snapshot, &application);
         let observation = DeploymentObservation {
-            id: format!("monitor-observation-{}", request.run_id),
+            id: format!(
+                "monitor-observation-env3-v1-{}",
+                evo_core::canonical_fingerprint(&(
+                    "rsia.monitoring.observation.env3.identity.v1",
+                    &request.run_id,
+                    &environment_id,
+                ))?
+            ),
             schema_version: DEPLOYMENT_OBSERVATION_SCHEMA.into(),
             run_id: request.run_id,
             environment_id,

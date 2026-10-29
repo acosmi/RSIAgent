@@ -3357,6 +3357,29 @@ async fn cleanup_node_content(
         ) => true,
         // E09 practice attempt sets carry source-derived scores and output digests.
         ("artifact", "rsia.practice_attempt_set.v1", _) => true,
+        // Service Run is bare content; exact keys and its declared type bound this case.
+        ("artifact", "", _)
+            if value.as_object().is_some_and(|m| {
+                m.len() == 9
+                    && [
+                        "id",
+                        "owner",
+                        "goal",
+                        "snapshot_id",
+                        "improver_version",
+                        "capabilities",
+                        "status",
+                        "source",
+                        "created_at",
+                    ]
+                    .iter()
+                    .all(|key| m.contains_key(*key))
+                    && serde_json::from_value::<evo_core::Run>(value.clone())
+                        .is_ok_and(|run| run.source == "trusted_host_snapshot")
+            }) =>
+        {
+            true
+        }
         // E03's persisted SourceSelection predates a schema field; exact fields define its shape.
         ("artifact", "", _) => value.as_object().is_some_and(|m| {
             m.len() == 4

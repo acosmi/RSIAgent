@@ -44,6 +44,9 @@ const OLD_BASELINE_AUTH: &str =
     include_str!("fixtures/ag168-legacy-authenticated-bundle-v2-baseline.raw.json");
 const OLD_RUN: &str = include_str!("fixtures/ag168-legacy-run-v2.raw.json");
 const OLD_ENV: &str = include_str!("fixtures/ag168-legacy-environment-v1.raw.json");
+// Actual 2ae ProgramFixture capture; old facts remain historical originals.
+const OLD_OBSERVATION: &str = r#"{"id":"monitor-observation-run-8ba326dc076d9698476f4754","schema_version":"rsia.monitoring.observation.v1","run_id":"run-8ba326dc076d9698476f4754","environment_id":"monitor-env-8507b0516247752c0b5453b37992b556","snapshot_id":"run-snapshot-run-8ba326dc076d9698476f4754","application_id":"host-application-run-8ba326dc076d9698476f4754","request_digest":"73f4cccdd28816083d8af2976fbc8e7816f9b6b34f8db63560f93b87e5f3918b","execution_receipt_id":null,"application_status":"not_selected","quality_status":"unknown"}"#;
+const OLD_APPLICATION: &str = r#"{"id":"host-application-run-8ba326dc076d9698476f4754","schema_version":"rsia.host_application.v1","run_id":"run-8ba326dc076d9698476f4754","release_id":null,"actual_request_digest":"73f4cccdd28816083d8af2976fbc8e7816f9b6b34f8db63560f93b87e5f3918b","execution_receipt_id":null,"receipt":null}"#;
 fn d(v: &str) -> String {
     hash(v.as_bytes())
 }
@@ -722,17 +725,16 @@ async fn run_v3_reload_application_and_idempotency_bind_full_request() {
         Err(Error::Conflict(_))
     ));
     assert_eq!(f.counts().await, before);
-    // Deliberately invalid alias, never a new authority or a historical upgrade.
+    // Synthetic duplicate-generation fault data, never a new Current authority.
+    let alias_id = format!("run-snapshot-{}", run.run_id);
+    let mut alias: Value = serde_json::from_str(OLD_RUN).unwrap();
+    alias["id"] = json!(&alias_id);
+    alias["run_id"] = json!(&run.run_id);
+    let alias: LoadedRunApplicationSnapshot = serde_json::from_value(alias).unwrap();
     let mut s = f.store.session().await.unwrap();
-    s.put(
-        &f.host,
-        "artifact",
-        &format!("run-snapshot-{}", run.run_id),
-        f.host.actor(),
-        &run,
-    )
-    .await
-    .unwrap();
+    s.put(&f.host, "artifact", &alias_id, f.host.actor(), &alias)
+        .await
+        .unwrap();
     s.commit().await.unwrap();
     assert!(
         matches!(f.service.read_run_snapshot(&f.host,&run.run_id).await,Err(Error::Conflict(message)) if message=="run id has both physical generations")
@@ -893,6 +895,11 @@ async fn environment_v3_context_change_cannot_reuse_identity() {
     .await
     .unwrap();
     assert_eq!(same.environment, first.environment);
+    assert_eq!(same.observation, first.observation);
+    // Each stored observation is a separate immutable fact.
+    let mut observations = vec![first.observation.clone()];
+    let mut observation_ids = BTreeSet::new();
+    assert!(observation_ids.insert(first.observation.id.clone()));
     let mut ids = BTreeSet::new();
     ids.insert(first.environment.id.clone());
     for field in 0..3 {
@@ -906,8 +913,14 @@ async fn environment_v3_context_change_cannot_reuse_identity() {
             .await
             .unwrap();
         assert!(ids.insert(changed.environment.id.clone()));
+        assert!(observation_ids.insert(changed.observation.id.clone()));
+        let mut expected_observation = first.observation.clone();
+        expected_observation.id = changed.observation.id.clone();
+        expected_observation.environment_id = changed.environment.id.clone();
+        assert_eq!(changed.observation, expected_observation);
+        observations.push(changed.observation);
     }
-    let (_, second_run) = f.environment("another-run-same-material").await;
+    let (another_run, second_run) = f.environment("another-run-same-material").await;
     assert_ne!(
         first.environment.identity_digest,
         second_run.environment.identity_digest
@@ -916,6 +929,16 @@ async fn environment_v3_context_change_cannot_reuse_identity() {
         first.environment.complete().unwrap().run_scope,
         second_run.environment.complete().unwrap().run_scope
     );
+    assert!(observation_ids.insert(second_run.observation.id.clone()));
+    let mut expected_observation = first.observation.clone();
+    expected_observation.id = second_run.observation.id.clone();
+    expected_observation.run_id = another_run.run_id.clone();
+    expected_observation.environment_id = second_run.environment.id.clone();
+    expected_observation.snapshot_id = another_run.id.clone();
+    expected_observation.application_id = format!("host-application-{}", another_run.run_id);
+    expected_observation.request_digest = another_run.request_digest.clone();
+    assert_eq!(second_run.observation, expected_observation);
+    observations.push(second_run.observation);
     let mut wrong = environment_request(&run.run_id);
     wrong.revoke_watermark = 2;
     let before = f.counts().await;
@@ -936,6 +959,31 @@ async fn environment_v3_context_change_cannot_reuse_identity() {
         .await
         .unwrap();
     assert_ne!(changed.environment.id, first.environment.id);
+    assert!(observation_ids.insert(changed.observation.id.clone()));
+    let mut expected_observation = first.observation.clone();
+    expected_observation.id = changed.observation.id.clone();
+    expected_observation.environment_id = changed.environment.id.clone();
+    assert_eq!(changed.observation, expected_observation);
+    observations.push(changed.observation);
+    let mut s = f.store.session().await.unwrap();
+    for observation in observations {
+        assert_eq!(
+            observation.id,
+            format!(
+                "monitor-observation-env3-v1-{}",
+                canonical_fingerprint(&(
+                    "rsia.monitoring.observation.env3.identity.v1",
+                    &observation.run_id,
+                    &observation.environment_id,
+                ))
+                .unwrap()
+            )
+        );
+        let stored: evo_engine::monitoring::DeploymentObservation =
+            s.need(&f.host, "artifact", &observation.id).await.unwrap();
+        assert_eq!(stored, observation);
+    }
+    s.commit().await.unwrap();
     f.store.close().await;
 }
 
@@ -1344,6 +1392,47 @@ async fn actual_historical_run2_env1_constants_remain_readable_cleanable_and_lin
     .unwrap();
     assert_eq!(identity, environment.identity_digest);
     assert_eq!(environment.id, format!("monitor-env-{}", &identity[..32]));
+    assert_eq!(
+        hash(OLD_OBSERVATION.as_bytes()),
+        "4a4a1bcfa746633edd8f549a29a62fdbb5a96f3e3c3f6f9a17d763fa1e8717e3"
+    );
+    let observation: evo_engine::monitoring::DeploymentObservation =
+        serde_json::from_str(OLD_OBSERVATION).unwrap();
+    let application: evo_engine::release_store::HostApplicationRecord =
+        serde_json::from_str(OLD_APPLICATION).unwrap();
+    assert_eq!(
+        serde_json::to_string(&observation).unwrap(),
+        OLD_OBSERVATION
+    );
+    assert_eq!(
+        serde_json::to_string(&application).unwrap(),
+        OLD_APPLICATION
+    );
+    assert_eq!(
+        fingerprint(&observation).unwrap(),
+        "4a4a1bcfa746633edd8f549a29a62fdbb5a96f3e3c3f6f9a17d763fa1e8717e3"
+    );
+    assert_eq!(observation.schema_version, "rsia.monitoring.observation.v1");
+    assert_eq!(
+        observation.id,
+        format!("monitor-observation-{}", run.run_id)
+    );
+    assert_eq!(observation.run_id, run.run_id);
+    assert_eq!(observation.environment_id, environment.id);
+    assert_eq!(observation.snapshot_id, run.id);
+    assert_eq!(observation.application_id, application.id);
+    assert_eq!(application.id, format!("host-application-{}", run.run_id));
+    assert_eq!(application.run_id, run.run_id);
+    assert_eq!(application.release_id, run.release_id);
+    assert_eq!(observation.request_digest, run.request_digest);
+    assert_eq!(
+        observation.request_digest,
+        application.actual_request_digest
+    );
+    assert_eq!(
+        observation.execution_receipt_id,
+        application.execution_receipt_id
+    );
 
     let host: LoadedRegisteredFormalHost = serde_json::from_str(OLD_HOST).unwrap();
     let profile: LoadedFrozenCompilerProfile = serde_json::from_str(OLD_PROFILE).unwrap();
@@ -1367,24 +1456,90 @@ async fn actual_historical_run2_env1_constants_remain_readable_cleanable_and_lin
     )
     .await
     .unwrap();
+    s.put(
+        &f.host,
+        "receipt",
+        &application.id,
+        f.host.actor(),
+        &application,
+    )
+    .await
+    .unwrap();
+    s.put(
+        &f.host,
+        "artifact",
+        &observation.id,
+        f.host.actor(),
+        &observation,
+    )
+    .await
+    .unwrap();
+    s.put_edge(&f.host, "receipt", &application.id, "artifact", &run.id)
+        .await
+        .unwrap();
+    s.put_edge(
+        &f.host,
+        "artifact",
+        &observation.id,
+        "artifact",
+        &environment.id,
+    )
+    .await
+    .unwrap();
+    s.put_edge(
+        &f.host,
+        "artifact",
+        &observation.id,
+        "receipt",
+        &application.id,
+    )
+    .await
+    .unwrap();
     s.put_edge(&f.host, "artifact", &run.id, "run", "software-source")
         .await
         .unwrap();
     s.put_edge(&f.host, "artifact", &environment.id, "artifact", &run.id)
         .await
         .unwrap();
+    let stored_observation: evo_engine::monitoring::DeploymentObservation =
+        s.need(&f.host, "artifact", &observation.id).await.unwrap();
+    let stored_application: evo_engine::release_store::HostApplicationRecord =
+        s.need(&f.host, "receipt", &application.id).await.unwrap();
+    assert_eq!(
+        serde_json::to_string(&stored_observation).unwrap(),
+        OLD_OBSERVATION
+    );
+    assert_eq!(
+        serde_json::to_string(&stored_application).unwrap(),
+        OLD_APPLICATION
+    );
+    assert_eq!(
+        fingerprint(&stored_observation).unwrap(),
+        fingerprint(&observation).unwrap()
+    );
     s.commit().await.unwrap();
     let status = revoke(&f, "software-source").await;
     assert_eq!(status.state, CleanupState::Complete);
     let mut s = f.store.session().await.unwrap();
     let old_run: Value = s.need(&f.admin, "artifact", &run.id).await.unwrap();
     let old_environment: Value = s.need(&f.admin, "artifact", &environment.id).await.unwrap();
+    let old_observation: Value = s.need(&f.admin, "artifact", &observation.id).await.unwrap();
     s.commit().await.unwrap();
     assert_eq!(old_run["schema_version"], "rsia.redacted.v1");
     assert_eq!(old_run["original_schema"], "rsia.run_application.v2");
     assert_eq!(
         old_environment["original_schema"],
         "rsia.monitoring.environment.v1"
+    );
+    assert_eq!(old_observation["id"], observation.id);
+    assert_eq!(old_observation["schema_version"], "rsia.redacted.v1");
+    assert_eq!(
+        old_observation["original_schema"],
+        "rsia.monitoring.observation.v1"
+    );
+    assert_eq!(
+        old_observation["original_digest"],
+        "4a4a1bcfa746633edd8f549a29a62fdbb5a96f3e3c3f6f9a17d763fa1e8717e3"
     );
     f.store.close().await;
 }
@@ -1466,7 +1621,11 @@ async fn complete_tool_original_redaction_drops_content_and_preserves_metadata()
         .unwrap()
         .unwrap();
     let status = revoke(&f, "software-source").await;
-    assert_eq!(status.state, CleanupState::Complete);
+    assert_eq!(
+        status.state,
+        CleanupState::Complete,
+        "cleanup status: {status:?}"
+    );
     let mut s = f.store.session().await.unwrap();
     let after: Value = s.need(&f.worker, "artifact", &terminal.id).await.unwrap();
     let raw: Value = s
@@ -1509,6 +1668,47 @@ async fn complete_tool_original_redaction_drops_content_and_preserves_metadata()
     assert_eq!(
         revoke(&f, "software-source").await.state,
         CleanupState::Failed
+    );
+    f.store.close().await;
+
+    // The exact service shape still refuses another source domain.
+    let f = Fixture::new().await;
+    let non_service = evo_core::Run {
+        id: "bare-non-service".into(),
+        owner: f.worker.actor().into(),
+        goal: "private content in an unknown bare record".into(),
+        snapshot_id: "not-a-service-snapshot".into(),
+        improver_version: "unavailable".into(),
+        capabilities: vec![],
+        status: "prepared".into(),
+        source: "another-source-domain".into(),
+        created_at: 100,
+    };
+    let mut s = f.store.session().await.unwrap();
+    s.put(
+        &f.worker,
+        "artifact",
+        &non_service.id,
+        f.worker.actor(),
+        &non_service,
+    )
+    .await
+    .unwrap();
+    s.put_edge(
+        &f.worker,
+        "artifact",
+        &non_service.id,
+        "run",
+        "software-source",
+    )
+    .await
+    .unwrap();
+    s.commit().await.unwrap();
+    let status = revoke(&f, "software-source").await;
+    assert_eq!(status.state, CleanupState::Failed, "{status:?}");
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some("blocked_unknown_scope:artifact::")
     );
     f.store.close().await;
 }
