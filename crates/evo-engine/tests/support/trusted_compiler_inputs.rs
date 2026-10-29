@@ -715,7 +715,7 @@ pub async fn bundle_use_current(
         watermark,
     ))
     .await?;
-    let inputs = CurrentCompilerInputUse::new(record.input, record.binding);
+    let inputs = CurrentCompilerInputUse::new(record.input.clone(), record.binding.clone());
     Box::pin(inputs.verify_current(&mut session, ctx)).await?;
     session.commit().await?;
     Ok(inputs)

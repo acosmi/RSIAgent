@@ -3146,7 +3146,7 @@ mod consolidation {
     use async_trait::async_trait;
     use evo_core::contract::{
         CapabilityLevel, HostCapabilities, HostSurfaceManifest, ImproverPatch, Profile,
-        SkillSnapshot, SurfaceCoverage, SurfaceItem, SystemSnapshot,
+        SkillSnapshot, SurfaceCoverage, SurfaceItem, SystemSnapshotV3,
     };
     use evo_core::evidence::{
         EvidenceSet, ExecutionAttestation, Purpose, SourceSelection, TaskOrigin,
@@ -3183,7 +3183,7 @@ mod consolidation {
         OptimizationStepRequest, PairedTaskResult, StageDependency, StageFact, StageFactKind,
     };
     use evo_engine::release_store::{
-        PrepareRunRequest, ReleaseStore, TrustedHostExecutionEvidence,
+        CompletePrepareRunRequest, ReleaseStore, TrustedHostExecutionEvidence,
     };
     use evo_storage::Store;
     use evo_storage::budget::{RootBudgetAuthorization, RootBudgetRecord};
@@ -3243,14 +3243,25 @@ mod consolidation {
         }
     }
 
-    fn system(model: &str) -> SystemSnapshot {
-        SystemSnapshot {
-            schema_version: "rsia.system_snapshot.v2".into(),
+    fn system(model: &str) -> SystemSnapshotV3 {
+        let source = evo_core::contract::ToolSourceV1 {
+            schema_version: evo_core::contract::TOOL_SOURCE_SCHEMA.into(),
+            domain: "mcp_protocol".into(),
+            producer_id: "rmcp.ToolRouter.list_all".into(),
+            producer_version: "rmcp-3.3.0".into(),
+            definitions: serde_json::from_str(include_str!(
+                "fixtures/ag168-actual-mcp-descriptors.json"
+            ))
+            .unwrap(),
+        };
+        SystemSnapshotV3 {
+            schema_version: "rsia.system_snapshot.v3".into(),
             profile_id: "profile".into(),
             host_id: "monitor-host".into(),
             host_version: "1.0.0".into(),
             model_id: model.into(),
-            tools: vec!["tool-a".into()],
+            tools: source.names().unwrap(),
+            tool_source: source,
             mandatory_context_digest: d("mandatory"),
         }
     }
@@ -3575,10 +3586,10 @@ mod consolidation {
         model: &str,
         task: &str,
     ) {
-        let snapshot = ReleaseStore::prepare_run(
+        let snapshot = ReleaseStore::prepare_complete_run(
             host,
             store,
-            PrepareRunRequest {
+            CompletePrepareRunRequest {
                 run_id: run_id.into(),
                 profile_id: "profile".into(),
                 system_snapshot: system(model),

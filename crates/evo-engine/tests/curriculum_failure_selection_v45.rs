@@ -1790,13 +1790,25 @@ async fn an_unapproved_candidate_or_a_missing_trusted_receipt_has_no_influence()
     )
     .await
     .unwrap();
-    let snapshot = ReleaseStore::prepare_run(
+    let old_system = release_system();
+    let source = evo_core::model_protocol::registered_chat_wire_v1_tool_source();
+    let complete_system = evo_core::contract::SystemSnapshotV3 {
+        schema_version: evo_core::contract::SYSTEM_SNAPSHOT_SCHEMA_V3.into(),
+        profile_id: old_system.profile_id,
+        host_id: old_system.host_id,
+        host_version: old_system.host_version,
+        model_id: old_system.model_id,
+        tools: source.names().unwrap(),
+        mandatory_context_digest: old_system.mandatory_context_digest,
+        tool_source: source,
+    };
+    let snapshot = ReleaseStore::prepare_complete_run(
         &fixture.host,
         &fixture.store,
-        PrepareRunRequest {
+        evo_engine::release_store::CompletePrepareRunRequest {
             run_id: "host-run-1".into(),
             profile_id: "p1".into(),
-            system_snapshot: release_system(),
+            system_snapshot: complete_system,
             host_surface_id: "surface-1".into(),
             host_capabilities: HostCapabilities {
                 available: BTreeSet::new(),

@@ -3304,6 +3304,7 @@ async fn cleanup_node_content(
         ("artifact", "rsia.release_candidate.v2", _) => true,
         ("artifact", "rsia.run_application.v1", _)
         | ("artifact", "rsia.run_application.v2", _)
+        | ("artifact", "rsia.run_application.v3", _)
         | ("receipt", "rsia.host_application.v1", _)
         | ("artifact", "rsia.host_execution_receipt.v1", _) => true,
         // Both historical and Current compiler-use/bundle records carry full
@@ -3313,7 +3314,10 @@ async fn cleanup_node_content(
             "rsia.optimization.compiler_use.v1"
             | "rsia.optimization.compiler_use.v2"
             | "rsia.authenticated_bundle.v1"
-            | "rsia.authenticated_bundle.v2",
+            | "rsia.authenticated_bundle.v2"
+            | "rsia.authenticated_bundle.v3"
+            | "rsia.registered_formal_host.v2"
+            | "rsia.frozen_compiler_profile.v2",
             _,
         ) => true,
         ("artifact", "rsia.resolved_bundle.v2", _) => true,
@@ -3325,6 +3329,7 @@ async fn cleanup_node_content(
         (
             "artifact",
             "rsia.monitoring.environment.v1"
+            | "rsia.monitoring.environment.v3"
             | "rsia.monitoring.observation.v1"
             | "rsia.monitoring.development_cycle.v1"
             | "rsia.monitoring.development_cycle.v2"

@@ -13,7 +13,13 @@ fn d(label: &str) -> String {
     hash(label.as_bytes())
 }
 
-async fn server() -> (tempfile::TempDir, McpHost) {
+async fn server() -> (
+    tempfile::TempDir,
+    McpHost,
+    HostService,
+    Context,
+    HostPrepareConfig,
+) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("mcp.sqlite3")).await.unwrap();
     let host = Context::new("tenant-a", "gateway-host", Role::Host).unwrap();
@@ -36,20 +42,20 @@ async fn server() -> (tempfile::TempDir, McpHost) {
             retired: vec![],
             classifications: vec![evo_core::contract::HostSurfaceClassificationV2 {
                 name: "model".into(),
-                coverage: SurfaceCoverage::Supported,
-                mapped_field: Some("host.model".into()),
-                consumer: Some("runner".into()),
-                reason: "fixed disabled-model software fixture".into(),
+                coverage: SurfaceCoverage::RuntimeOwned,
+                mapped_field: None,
+                consumer: None,
+                reason: "ToolOnly disabled-model fixture has no native model slot".into(),
                 renamed_from: None,
-                test_ref: Some("existing service integration assertions".into()),
-                capability: Some("fixture-model".into()),
+                test_ref: None,
+                capability: None,
             }],
         },
         None,
     )
     .await
     .unwrap();
-    let service = HostService::new(store, host).unwrap();
+    let service = HostService::new(store, host.clone()).unwrap();
     let caller = Context::new("tenant-a", "stdio-agent", Role::Agent).unwrap();
     let config = HostPrepareConfig {
         profile_id: "profile-a".into(),
@@ -70,7 +76,8 @@ async fn server() -> (tempfile::TempDir, McpHost) {
         evolution_enabled: true,
         capability_level: CapabilityLevel::ToolOnly,
     };
-    (dir, McpHost::new(service, caller, config).unwrap())
+    let server = McpHost::new(service.clone(), caller, config.clone()).unwrap();
+    (dir, server, service, host, config)
 }
 
 fn params(name: &'static str, value: Value) -> CallToolRequestParams {
@@ -79,7 +86,7 @@ fn params(name: &'static str, value: Value) -> CallToolRequestParams {
 
 #[tokio::test]
 async fn real_stdio_handshake_and_four_tool_calls() {
-    let (_dir, server) = server().await;
+    let (_dir, server, ..) = server().await;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
         let (reader, writer) = tokio::io::split(server_transport);
@@ -180,7 +187,7 @@ async fn real_stdio_handshake_and_four_tool_calls() {
 
 #[tokio::test]
 async fn raw_duplicate_key_is_rejected_before_dispatch_and_writes_nothing() {
-    let (_dir, first_server) = server().await;
+    let (_dir, first_server, ..) = server().await;
     let retry_server = first_server.clone();
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let first_task = tokio::spawn(async move {
@@ -237,4 +244,108 @@ async fn raw_duplicate_key_is_rejected_before_dispatch_and_writes_nothing() {
     assert_eq!(prepared.structured_content.unwrap()["run"]["goal"], "clean");
     client.cancel().await.unwrap();
     retry_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn same_router_advertisement_and_prepare_commit_the_same_complete_source() {
+    let (_dir, server, service, host, _) = server().await;
+    let complete_source = server.tool_source().clone();
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        let (reader, writer) = tokio::io::split(server_transport);
+        serve_strict(server, reader, writer).await.unwrap();
+    });
+    let client = ().serve(client_transport).await.unwrap();
+    let advertised = client
+        .list_tools(None)
+        .await
+        .unwrap()
+        .tools
+        .into_iter()
+        .map(|tool| serde_json::to_value(tool).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(advertised, complete_source.definitions);
+    assert_eq!(complete_source.domain, "mcp_protocol");
+    let prepared = client
+        .call_tool(params(
+            "evo_prepare",
+            json!({"request_key":"complete-router","goal":"same actual source","capabilities":[]}),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(prepared.is_error, Some(true));
+    let body = prepared.structured_content.unwrap();
+    let run = service
+        .read_run_snapshot(&host, body["run"]["id"].as_str().unwrap())
+        .await
+        .unwrap();
+    let original = run.current_v3().unwrap();
+    assert_eq!(original.system_snapshot.tool_source, complete_source);
+    assert_eq!(
+        original.system_snapshot.tools,
+        complete_source.names().unwrap()
+    );
+    assert_eq!(
+        original.environment_digest,
+        evo_core::canonical_fingerprint(&(
+            "rsia.tool_capability_environment.v3",
+            &original.system_snapshot,
+            &original.host_capabilities
+        ))
+        .unwrap()
+    );
+    assert_eq!(
+        original.request_digest,
+        evo_core::canonical_fingerprint(&(
+            "rsia.applied_request.v3",
+            &original.request_material,
+            &original.environment_digest,
+            &original.host_surface_digest,
+            evo_core::fingerprint(&original.host_capabilities).unwrap()
+        ))
+        .unwrap()
+    );
+    client.cancel().await.unwrap();
+    server_task.await.unwrap();
+    service.store().close().await;
+}
+
+#[tokio::test]
+async fn mcp_complete_source_mismatch_refuses_before_prepare_writes() {
+    let (_dir, server, service, host, legacy_config) = server().await;
+    let caller = Context::new("tenant-a", "stdio-agent", Role::Agent).unwrap();
+    let config = evo_core::prepare_contract::CompleteHostPrepareConfig::from_producer(
+        &legacy_config,
+        server.tool_source().clone(),
+    )
+    .unwrap();
+    let _healthy = McpHost::new_complete(service.clone(), caller.clone(), config.clone()).unwrap();
+    let mut session = service.store().session().await.unwrap();
+    let before = session
+        .namespace_object_count(&host, "artifact")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let audit_before = service.store().verify_audit(&host).await.unwrap();
+    let mut changed = config;
+    changed.system_snapshot.tool_source.definitions[0]["description"] =
+        json!("same name; a different complete definition");
+    changed.validate().unwrap();
+    assert!(
+        matches!(McpHost::new_complete(service.clone(), caller, changed), Err(evo_core::Error::Conflict(message)) if message == "MCP complete source differs from actual router")
+    );
+    let mut session = service.store().session().await.unwrap();
+    assert_eq!(
+        session
+            .namespace_object_count(&host, "artifact")
+            .await
+            .unwrap(),
+        before
+    );
+    session.commit().await.unwrap();
+    assert_eq!(
+        service.store().verify_audit(&host).await.unwrap(),
+        audit_before
+    );
+    service.store().close().await;
 }

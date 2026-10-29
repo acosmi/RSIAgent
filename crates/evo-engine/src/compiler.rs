@@ -132,8 +132,7 @@ pub fn projection_for_new_run(
     project_run(bundle, snapshot, evolution_enabled)
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 enum ReadBundleWire {
     Current(evo_core::contract::ResolvedBundleV3),
     Legacy(ResolvedBundle),
@@ -233,7 +232,20 @@ impl<'de> Deserialize<'de> for ReadBundle {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        let wire = ReadBundleWire::deserialize(deserializer)?;
+        let value = evo_core::contract::StrictJsonValue::deserialize(deserializer)?.0;
+        let wire = match value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(evo_core::contract::BUNDLE_SCHEMA_V3) => {
+                serde_json::from_value(value).map(ReadBundleWire::Current)
+            }
+            Some(evo_core::contract::BUNDLE_SCHEMA) => {
+                serde_json::from_value(value).map(ReadBundleWire::Legacy)
+            }
+            _ => return Err(serde::de::Error::custom("unsupported bundle schema")),
+        }
+        .map_err(serde::de::Error::custom)?;
         Self::from_wire(wire).map_err(serde::de::Error::custom)
     }
 }
@@ -297,6 +309,175 @@ pub struct CurrentAuthenticatedBundleRecord {
     pub original_baseline: crate::formal_authority::FrozenCompilerProfile,
     pub original_parent: crate::formal_authority::CurrentParentMaterial,
 }
+pub const AUTHENTICATED_BUNDLE_SCHEMA_V3: &str = "rsia.authenticated_bundle.v3";
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatedBundleRecordV3 {
+    pub id: String,
+    pub schema_version: String,
+    pub bundle: evo_core::contract::ResolvedBundleV3,
+    pub input: CompilerInputRequest,
+    pub binding: crate::formal_authority::CurrentFormalCompilerInputBinding,
+    pub original_baseline: crate::formal_authority::FrozenCompilerProfileV2,
+    pub original_parent: crate::formal_authority::CurrentParentMaterial,
+}
+#[derive(Debug, Clone)]
+pub struct AuthenticatedBundleView {
+    pub id: String,
+    pub schema_version: String,
+    pub bundle: evo_core::contract::ResolvedBundleV3,
+    pub input: CompilerInputRequest,
+    pub binding: crate::formal_authority::CurrentFormalCompilerInputBinding,
+    pub original_baseline: crate::formal_authority::LoadedFrozenCompilerProfile,
+    pub original_parent: crate::formal_authority::CurrentParentMaterial,
+}
+
+#[derive(Debug, Clone)]
+enum AuthenticatedBundleOriginal {
+    V2(CurrentAuthenticatedBundleRecord),
+    V3(AuthenticatedBundleRecordV3),
+}
+#[derive(Debug, Clone)]
+pub struct LoadedAuthenticatedBundleRecord {
+    original: AuthenticatedBundleOriginal,
+    view: AuthenticatedBundleView,
+}
+impl LoadedAuthenticatedBundleRecord {
+    fn from_original(original: AuthenticatedBundleOriginal) -> Self {
+        macro_rules! view {
+            ($value:expr) => {{
+                let value = $value;
+                AuthenticatedBundleView {
+                    id: value.id.clone(),
+                    schema_version: value.schema_version.clone(),
+                    bundle: value.bundle.clone(),
+                    input: value.input.clone(),
+                    binding: value.binding.clone(),
+                    original_baseline: value.original_baseline.clone().into(),
+                    original_parent: value.original_parent.clone(),
+                }
+            }};
+        }
+        let view = match &original {
+            AuthenticatedBundleOriginal::V2(v) => view!(v),
+            AuthenticatedBundleOriginal::V3(v) => view!(v),
+        };
+        Self { original, view }
+    }
+    pub fn v2(&self) -> Option<&CurrentAuthenticatedBundleRecord> {
+        match &self.original {
+            AuthenticatedBundleOriginal::V2(v) => Some(v),
+            _ => None,
+        }
+    }
+    pub fn v3(&self) -> Option<&AuthenticatedBundleRecordV3> {
+        match &self.original {
+            AuthenticatedBundleOriginal::V3(v) => Some(v),
+            _ => None,
+        }
+    }
+    pub fn validate_content_version(&self) -> Result<()> {
+        let expected = if self.v3().is_some() {
+            AUTHENTICATED_BUNDLE_SCHEMA_V3
+        } else {
+            AUTHENTICATED_BUNDLE_SCHEMA_V2
+        };
+        if self.schema_version != expected
+            || self.id != format!("formal-bundle-{}", self.bundle.digest)
+            || (self.v3().is_some() != self.original_baseline.complete().is_some())
+        {
+            return Err(Error::Conflict(
+                "authenticated original variant/version differs".into(),
+            ));
+        }
+        if let Some(v) = self.v3() {
+            let parent = match &v.original_parent {
+                crate::formal_authority::CurrentParentMaterial::EmptyRoot { root } => {
+                    evo_core::contract::ParentContentV3::EmptyRoot(
+                        crate::formal_authority::project_empty_root(root)?,
+                    )
+                }
+                crate::formal_authority::CurrentParentMaterial::ApprovedRelease {
+                    bundle, ..
+                } => evo_core::contract::ParentContentV3::CurrentBundle(bundle.clone()),
+            };
+            let baseline =
+                crate::formal_authority::project_complete_frozen_profile(&v.original_baseline)?;
+            let proof = evo_core::contract::CompleteProfileContentProofV3::from_content(
+                v.input.profile.clone(),
+                parent,
+                baseline,
+            )?;
+            evo_core::contract::replay_complete_resolved_bundle_v3(
+                &v.bundle,
+                &proof,
+                &std::collections::BTreeSet::new(),
+            )?;
+            if v.binding.schema_version != crate::formal_authority::CURRENT_BINDING_SCHEMA
+                || v.input.profile.baseline_digest != v.bundle.baseline_digest
+                || v.input.profile.parent_digest != v.bundle.parent_digest
+                || v.input.environment_digest != v.original_baseline.environment_digest
+                || fingerprint(&v.input.capabilities)?
+                    != fingerprint(&v.original_baseline.capabilities)?
+            {
+                return Err(Error::Conflict(
+                    "complete authenticated original input differs".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+impl From<CurrentAuthenticatedBundleRecord> for LoadedAuthenticatedBundleRecord {
+    fn from(v: CurrentAuthenticatedBundleRecord) -> Self {
+        Self::from_original(AuthenticatedBundleOriginal::V2(v))
+    }
+}
+impl From<AuthenticatedBundleRecordV3> for LoadedAuthenticatedBundleRecord {
+    fn from(v: AuthenticatedBundleRecordV3) -> Self {
+        Self::from_original(AuthenticatedBundleOriginal::V3(v))
+    }
+}
+impl std::ops::Deref for LoadedAuthenticatedBundleRecord {
+    type Target = AuthenticatedBundleView;
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+impl Serialize for LoadedAuthenticatedBundleRecord {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match &self.original {
+            AuthenticatedBundleOriginal::V2(v) => v.serialize(s),
+            AuthenticatedBundleOriginal::V3(v) => v.serialize(s),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for LoadedAuthenticatedBundleRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let value = evo_core::contract::StrictJsonValue::deserialize(d)?.0;
+        let record = match value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(AUTHENTICATED_BUNDLE_SCHEMA_V2) => {
+                serde_json::from_value::<CurrentAuthenticatedBundleRecord>(value).map(Self::from)
+            }
+            Some(AUTHENTICATED_BUNDLE_SCHEMA_V3) => {
+                serde_json::from_value::<AuthenticatedBundleRecordV3>(value).map(Self::from)
+            }
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "unsupported authenticated bundle schema",
+                ));
+            }
+        }
+        .map_err(serde::de::Error::custom)?;
+        record
+            .validate_content_version()
+            .map_err(serde::de::Error::custom)?;
+        Ok(record)
+    }
+}
 pub async fn compile_current_in_session(
     s: &mut Session,
     ctx: &Context,
@@ -342,17 +523,30 @@ async fn prepare_or_persist_current_bundle(
         crate::formal_authority::resolve_current_compiler_inputs(s, ctx, &output).await?;
     output_inputs.replay(bundle)?;
     let (original_baseline, original_parent) = output_inputs.original_material();
-    let record = CurrentAuthenticatedBundleRecord {
-        id: format!("formal-bundle-{}", bundle.digest),
-        schema_version: AUTHENTICATED_BUNDLE_SCHEMA_V2.into(),
-        bundle: bundle.clone(),
-        input: output,
-        binding: output_inputs.binding().clone(),
-        original_baseline,
-        original_parent,
+    let record = if original_baseline.complete().is_some() {
+        LoadedAuthenticatedBundleRecord::from(AuthenticatedBundleRecordV3 {
+            id: format!("formal-bundle-{}", bundle.digest),
+            schema_version: AUTHENTICATED_BUNDLE_SCHEMA_V3.into(),
+            bundle: bundle.clone(),
+            input: output,
+            binding: output_inputs.binding().clone(),
+            original_baseline: original_baseline.complete().ok_or(Error::Internal)?.clone(),
+            original_parent,
+        })
+    } else {
+        LoadedAuthenticatedBundleRecord::from(CurrentAuthenticatedBundleRecord {
+            id: format!("formal-bundle-{}", bundle.digest),
+            schema_version: AUTHENTICATED_BUNDLE_SCHEMA_V2.into(),
+            bundle: bundle.clone(),
+            input: output,
+            binding: output_inputs.binding().clone(),
+            original_baseline: original_baseline.legacy().ok_or(Error::Internal)?.clone(),
+            original_parent,
+        })
     };
+    record.validate_content_version()?;
     if let Some(old) = s
-        .get::<CurrentAuthenticatedBundleRecord>(ctx, "artifact", &record.id)
+        .get::<LoadedAuthenticatedBundleRecord>(ctx, "artifact", &record.id)
         .await?
     {
         if serde_json::to_vec(&old).map_err(|_| Error::Internal)?
@@ -377,7 +571,7 @@ pub async fn verify_current_bundle_in_session(
     bundle_digest: &str,
     environment: &str,
     watermark: u64,
-) -> Result<CurrentAuthenticatedBundleRecord> {
+) -> Result<LoadedAuthenticatedBundleRecord> {
     verify_current_bundle_in_session_inner(
         s,
         ctx,
@@ -395,11 +589,11 @@ pub(crate) async fn verify_current_bundle_in_session_inner(
     environment: &str,
     watermark: u64,
     visiting: &mut std::collections::BTreeSet<String>,
-) -> Result<CurrentAuthenticatedBundleRecord> {
+) -> Result<LoadedAuthenticatedBundleRecord> {
     let record =
         need_current_authenticated_record(s, ctx, &format!("formal-bundle-{bundle_digest}"))
             .await?;
-    if record.schema_version != AUTHENTICATED_BUNDLE_SCHEMA_V2
+    if record.validate_content_version().is_err()
         || record.bundle.schema_version != evo_core::contract::BUNDLE_SCHEMA_V3
         || record.bundle.compiler_version != evo_core::contract::BUNDLE_COMPILER_VERSION_V3
         || record.binding.schema_version != crate::formal_authority::CURRENT_BINDING_SCHEMA
@@ -443,7 +637,7 @@ pub(crate) async fn read_current_parent_bundle_in_session(
     environment: &str,
     watermark: u64,
     visiting: &mut std::collections::BTreeSet<String>,
-) -> Result<CurrentAuthenticatedBundleRecord> {
+) -> Result<LoadedAuthenticatedBundleRecord> {
     let key = format!("authenticated:{digest}");
     if !visiting.insert(key.clone()) {
         return Err(Error::Conflict("cyclic compiler parent lineage".into()));
@@ -451,7 +645,7 @@ pub(crate) async fn read_current_parent_bundle_in_session(
     let result = async {
         let record =
             need_current_authenticated_record(s, ctx, &format!("formal-bundle-{digest}")).await?;
-        if record.schema_version != AUTHENTICATED_BUNDLE_SCHEMA_V2
+        if record.validate_content_version().is_err()
             || record.bundle.schema_version != evo_core::contract::BUNDLE_SCHEMA_V3
             || record.bundle.compiler_version != evo_core::contract::BUNDLE_COMPILER_VERSION_V3
             || record.binding.schema_version != crate::formal_authority::CURRENT_BINDING_SCHEMA
@@ -475,17 +669,36 @@ pub(crate) async fn read_current_parent_bundle_in_session(
     result
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum AuthenticatedRecordRead {
-    Current(Box<CurrentAuthenticatedBundleRecord>),
+    Current(Box<LoadedAuthenticatedBundleRecord>),
     Legacy(Box<AuthenticatedBundleRecord>),
+}
+impl<'de> Deserialize<'de> for AuthenticatedRecordRead {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let value = evo_core::contract::StrictJsonValue::deserialize(d)?.0;
+        match value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(AUTHENTICATED_BUNDLE_SCHEMA_V2 | AUTHENTICATED_BUNDLE_SCHEMA_V3) => {
+                serde_json::from_value(value)
+                    .map(Self::Current)
+                    .map_err(serde::de::Error::custom)
+            }
+            Some("rsia.authenticated_bundle.v1") => serde_json::from_value(value)
+                .map(Self::Legacy)
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom(
+                "unsupported authenticated bundle schema",
+            )),
+        }
+    }
 }
 async fn need_current_authenticated_record(
     s: &mut Session,
     ctx: &Context,
     id: &str,
-) -> Result<CurrentAuthenticatedBundleRecord> {
+) -> Result<LoadedAuthenticatedBundleRecord> {
     match s
         .need::<AuthenticatedRecordRead>(ctx, "artifact", id)
         .await?
@@ -847,4 +1060,37 @@ pub(crate) mod current_carrier_content_controls {
             assert!(serde_json::from_value::<ReadBundle>(body).is_err());
         }
     }
+}
+
+pub(crate) fn projection_for_loaded_snapshot(
+    bundle: &ReadBundle,
+    snapshot: &evo_core::contract::LoadedSystemSnapshot,
+    evolution_enabled: bool,
+) -> Result<RunProjection> {
+    if let Some(old) = snapshot.legacy() {
+        return projection_for_read_bundle(bundle, old, evolution_enabled);
+    }
+    projection_for_complete_snapshot(
+        bundle,
+        snapshot.complete().ok_or(Error::Internal)?,
+        evolution_enabled,
+    )
+}
+pub fn projection_for_complete_snapshot(
+    bundle: &ReadBundle,
+    snapshot: &evo_core::contract::SystemSnapshotV3,
+    evolution_enabled: bool,
+) -> Result<RunProjection> {
+    snapshot.validate()?;
+    Ok(RunProjection {
+        bundle_digest: bundle.digest.clone(),
+        instructions: if !evolution_enabled
+            || (bundle.skill.content.is_empty() && bundle.skill.applicability.is_empty())
+        {
+            Vec::new()
+        } else {
+            vec![bundle.skill.content.clone()]
+        },
+        tools: snapshot.tools.clone(),
+    })
 }

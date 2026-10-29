@@ -259,7 +259,7 @@ pub struct ImproverPatch {
     pub max_rounds: PatchOp<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostCapabilities {
     pub available: BTreeSet<String>,
@@ -295,6 +295,335 @@ pub struct SystemSnapshot {
 impl SystemSnapshot {
     pub fn digest(&self) -> Result<String> {
         fingerprint(self)
+    }
+}
+
+pub const TOOL_SOURCE_SCHEMA: &str = "rsia.tool_source.v1";
+pub const SYSTEM_SNAPSHOT_SCHEMA_V3: &str = "rsia.system_snapshot.v3";
+
+/// Complete producer material. This is a content commitment, never a grant of
+/// host, OS-principal or provider authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolSourceV1 {
+    pub schema_version: String,
+    pub domain: String,
+    pub producer_id: String,
+    pub producer_version: String,
+    pub definitions: Vec<serde_json::Value>,
+}
+impl ToolSourceV1 {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != TOOL_SOURCE_SCHEMA {
+            return Err(Error::Invalid("unsupported tool source schema".into()));
+        }
+        match self.domain.as_str() {
+            "mcp_protocol" => {
+                if self.producer_id != "rmcp.ToolRouter.list_all"
+                    || self.producer_version != "rmcp-3.3.0"
+                    || self.definitions.len() != MODEL_TOOLS.len()
+                {
+                    return Err(Error::Conflict("MCP tool producer differs".into()));
+                }
+                let names = self.names()?;
+                let unique = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
+                if unique.len() != MODEL_TOOLS.len()
+                    || MODEL_TOOLS.iter().any(|name| !unique.contains(name))
+                {
+                    return Err(Error::Conflict("MCP tool set differs".into()));
+                }
+            }
+            "http_protocol" => {
+                if self.producer_id != "evo-http.typed_routes"
+                    || self.producer_version != "rsia.http_typed_routes.v1"
+                    || self.definitions.len() != MODEL_TOOLS.len()
+                {
+                    return Err(Error::Conflict("HTTP route producer differs".into()));
+                }
+                let names = self.names()?;
+                if names != MODEL_TOOLS.map(str::to_owned) {
+                    return Err(Error::Conflict("HTTP route order differs".into()));
+                }
+                for (definition, path) in self.definitions.iter().zip([
+                    "/v1/tools/prepare",
+                    "/v1/tools/feedback",
+                    "/v1/tools/propose",
+                    "/v1/tools/inspect",
+                ]) {
+                    if definition.get("path").and_then(serde_json::Value::as_str) != Some(path)
+                        || definition.get("method").and_then(serde_json::Value::as_str)
+                            != Some("POST")
+                        || !definition
+                            .get("input_schema")
+                            .is_some_and(serde_json::Value::is_object)
+                    {
+                        return Err(Error::Conflict("HTTP typed route differs".into()));
+                    }
+                }
+            }
+            "registered_chat_wire_v1_adapter" => {
+                if self.producer_id != "evo-engine.RegisteredExternalTransport"
+                    || self.producer_version != "rsia.chat_wire_v1.native_tool_contract.v1"
+                    || !self.definitions.is_empty()
+                {
+                    return Err(Error::Conflict(
+                        "registered adapter tool source differs".into(),
+                    ));
+                }
+            }
+            _ => return Err(Error::Invalid("unsupported tool source domain".into())),
+        }
+        for definition in &self.definitions {
+            if !definition.is_object()
+                || serde_json::to_vec(definition)
+                    .map_err(|_| Error::Internal)?
+                    .len()
+                    > V1_TOOL_DESCRIPTOR_MAX
+            {
+                return Err(Error::Invalid(
+                    "tool definition exceeds 2000-byte commitment".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+    pub fn names(&self) -> Result<Vec<String>> {
+        self.definitions
+            .iter()
+            .map(|definition| {
+                let name = definition
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| Error::Invalid("tool definition requires name".into()))?;
+                identifier(name)?;
+                Ok(name.to_owned())
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemSnapshotV3 {
+    pub schema_version: String,
+    pub profile_id: String,
+    pub host_id: String,
+    pub host_version: String,
+    pub model_id: String,
+    pub tools: Vec<String>,
+    pub mandatory_context_digest: String,
+    pub tool_source: ToolSourceV1,
+}
+impl SystemSnapshotV3 {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != SYSTEM_SNAPSHOT_SCHEMA_V3 {
+            return Err(Error::Invalid(
+                "unsupported complete snapshot schema".into(),
+            ));
+        }
+        for id in [&self.profile_id, &self.host_id, &self.model_id] {
+            identifier(id)?;
+        }
+        text(&self.host_version, "host_version", 128)?;
+        content_digest_format_v3(&self.mandatory_context_digest)?;
+        self.tool_source.validate()?;
+        if self.tools != self.tool_source.names()? {
+            return Err(Error::Conflict(
+                "snapshot ordered tool projection differs".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn digest(&self) -> Result<String> {
+        self.validate()?;
+        crate::canonical_fingerprint(&("rsia.system_snapshot.content.v3", self))
+    }
+    pub fn environment_digest(&self, capabilities: &HostCapabilities) -> Result<String> {
+        self.validate()?;
+        crate::canonical_fingerprint(&("rsia.tool_capability_environment.v3", self, capabilities))
+    }
+}
+
+/// A read-only common view has no serializer; the carrier always emits the
+/// complete original variant, including the entire nested tool source.
+#[derive(Debug, Clone)]
+pub struct SystemSnapshotView {
+    pub schema_version: String,
+    pub profile_id: String,
+    pub host_id: String,
+    pub host_version: String,
+    pub model_id: String,
+    pub tools: Vec<String>,
+    pub mandatory_context_digest: String,
+}
+#[derive(Debug, Clone)]
+pub enum SystemSnapshotOriginal {
+    Legacy(SystemSnapshot),
+    Complete(SystemSnapshotV3),
+}
+#[derive(Debug, Clone)]
+pub struct LoadedSystemSnapshot {
+    original: SystemSnapshotOriginal,
+    view: SystemSnapshotView,
+}
+impl LoadedSystemSnapshot {
+    fn from_original(original: SystemSnapshotOriginal) -> Self {
+        macro_rules! view {
+            ($s:expr) => {
+                SystemSnapshotView {
+                    schema_version: $s.schema_version.clone(),
+                    profile_id: $s.profile_id.clone(),
+                    host_id: $s.host_id.clone(),
+                    host_version: $s.host_version.clone(),
+                    model_id: $s.model_id.clone(),
+                    tools: $s.tools.clone(),
+                    mandatory_context_digest: $s.mandatory_context_digest.clone(),
+                }
+            };
+        }
+        let view = match &original {
+            SystemSnapshotOriginal::Legacy(s) => view!(s),
+            SystemSnapshotOriginal::Complete(s) => view!(s),
+        };
+        Self { original, view }
+    }
+    pub fn complete(&self) -> Option<&SystemSnapshotV3> {
+        match &self.original {
+            SystemSnapshotOriginal::Complete(s) => Some(s),
+            _ => None,
+        }
+    }
+    pub fn legacy(&self) -> Option<&SystemSnapshot> {
+        match &self.original {
+            SystemSnapshotOriginal::Legacy(s) => Some(s),
+            _ => None,
+        }
+    }
+    pub fn digest(&self) -> Result<String> {
+        match &self.original {
+            SystemSnapshotOriginal::Legacy(s) => s.digest(),
+            SystemSnapshotOriginal::Complete(s) => s.digest(),
+        }
+    }
+}
+impl From<SystemSnapshot> for LoadedSystemSnapshot {
+    fn from(s: SystemSnapshot) -> Self {
+        Self::from_original(SystemSnapshotOriginal::Legacy(s))
+    }
+}
+impl From<SystemSnapshotV3> for LoadedSystemSnapshot {
+    fn from(s: SystemSnapshotV3) -> Self {
+        Self::from_original(SystemSnapshotOriginal::Complete(s))
+    }
+}
+impl std::ops::Deref for LoadedSystemSnapshot {
+    type Target = SystemSnapshotView;
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+impl Serialize for LoadedSystemSnapshot {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match &self.original {
+            SystemSnapshotOriginal::Legacy(v) => v.serialize(s),
+            SystemSnapshotOriginal::Complete(v) => v.serialize(s),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for LoadedSystemSnapshot {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let value = StrictJsonValue::deserialize(d)?.0;
+        match value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("rsia.system_snapshot.v1" | "rsia.system_snapshot.v2") => {
+                serde_json::from_value::<SystemSnapshot>(value)
+                    .map(Self::from)
+                    .map_err(serde::de::Error::custom)
+            }
+            Some(SYSTEM_SNAPSHOT_SCHEMA_V3) => serde_json::from_value::<SystemSnapshotV3>(value)
+                .map(Self::from)
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom(
+                "unsupported system snapshot schema",
+            )),
+        }
+    }
+}
+
+/// Closed wire readers use this before schema dispatch. Its recursive visitor
+/// detects duplicate decoded keys before a Value can discard them.
+pub struct StrictJsonValue(pub serde_json::Value);
+impl<'de> Deserialize<'de> for StrictJsonValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct UniqueVisitor;
+        impl<'de> serde::de::Visitor<'de> for UniqueVisitor {
+            type Value = serde_json::Value;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("JSON with recursively unique decoded keys")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(serde_json::Value::Null)
+            }
+            fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                v: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(v.into())
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                Ok(v.into())
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                Ok(v.into())
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+                serde_json::Number::from_f64(v)
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(v.into())
+            }
+            fn visit_string<E: serde::de::Error>(
+                self,
+                v: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(v.into())
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(v) = seq.next_element::<StrictJsonValue>()? {
+                    values.push(v.0);
+                }
+                Ok(serde_json::Value::Array(values))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                use serde::de::Error as _;
+                let mut values = serde_json::Map::new();
+                while let Some(k) = map.next_key::<String>()? {
+                    if values.contains_key(&k) {
+                        return Err(A::Error::custom("duplicate decoded JSON key"));
+                    }
+                    values.insert(k, map.next_value::<StrictJsonValue>()?.0);
+                }
+                Ok(serde_json::Value::Object(values))
+            }
+        }
+        d.deserialize_any(UniqueVisitor).map(Self)
     }
 }
 
@@ -3536,6 +3865,26 @@ pub struct FrozenCompilerProfileContentV1 {
     pub authorized_by: String,
 }
 #[derive(Debug, Clone, Serialize)]
+pub struct FrozenCompilerProfileContentV2 {
+    pub id: String,
+    pub schema_version: String,
+    pub namespace: String,
+    pub profile_id: String,
+    pub version: u64,
+    pub host_registration_id: String,
+    pub provider_registration_id: String,
+    pub resource_instrumentation_id: Option<String>,
+    pub system_snapshot: SystemSnapshotV3,
+    pub capabilities: HostCapabilities,
+    pub environment_digest: String,
+    pub baseline_skill: SkillSnapshot,
+    pub baseline_strategy: Strategy,
+    pub dependencies: Vec<CompilerDependencyContentV1>,
+    pub purpose: crate::evidence::Purpose,
+    pub application_order: Vec<String>,
+    pub authorized_by: String,
+}
+#[derive(Debug, Clone, Serialize)]
 pub struct EmptyRootContentV1 {
     pub id: String,
     pub schema_version: String,
@@ -3683,6 +4032,143 @@ impl ProfileContentProofV3 {
             ParentContentV3::CurrentBundle(bundle) => (&bundle.skill, &bundle.improver),
         }
     }
+}
+/// Complete content proof only; successful construction authenticates no Store
+/// writer, live principal set, provider, budget, or release.
+#[derive(Debug, Clone)]
+pub struct CompleteProfileContentProofV3 {
+    profile: Profile,
+    parent: ParentContentV3,
+    baseline: FrozenCompilerProfileContentV2,
+}
+impl CompleteProfileContentProofV3 {
+    pub fn from_content(
+        profile: Profile,
+        parent: ParentContentV3,
+        baseline: FrozenCompilerProfileContentV2,
+    ) -> Result<Self> {
+        identifier(&profile.id)?;
+        content_digest_format_v3(&profile.parent_digest)?;
+        content_digest_format_v3(&profile.baseline_digest)?;
+        if baseline.schema_version != "rsia.frozen_compiler_profile.v2"
+            || baseline.profile_id != profile.id
+            || baseline.system_snapshot.profile_id != baseline.profile_id
+            || baseline.version == 0
+            || baseline.application_order != ["mandatory_context", "skill", "task"]
+        {
+            return Err(Error::Conflict(
+                "full frozen profile identity/order mismatch".into(),
+            ));
+        }
+        identifier(&baseline.id)?;
+        identifier(&baseline.profile_id)?;
+        baseline.system_snapshot.validate()?;
+        if baseline.environment_digest
+            != baseline
+                .system_snapshot
+                .environment_digest(&baseline.capabilities)?
+        {
+            return Err(Error::Conflict(
+                "complete profile environment differs".into(),
+            ));
+        }
+        baseline.baseline_skill.validate()?;
+        baseline.baseline_strategy.validate()?;
+        if fingerprint(&baseline.baseline_strategy)? != fingerprint(&Strategy::default())?
+            || !baseline
+                .capabilities
+                .allows(&baseline.baseline_skill.required_capabilities)
+        {
+            return Err(Error::Forbidden);
+        }
+        let baseline_digest = fingerprint(&baseline)?;
+        if baseline_digest != profile.baseline_digest {
+            return Err(Error::Conflict("baseline content digest mismatch".into()));
+        }
+        let parent_digest = match &parent {
+            ParentContentV3::EmptyRoot(root) => {
+                if root.schema_version != "rsia.empty_root_authorization.v1"
+                    || root.namespace != baseline.namespace
+                    || root.profile_registration_id != baseline.id
+                    || root.profile_digest != baseline_digest
+                    || root.host_registration_id != baseline.host_registration_id
+                    || fingerprint(&root.skill)? != fingerprint(&SkillSnapshot::empty())?
+                    || fingerprint(&root.strategy)?
+                        != fingerprint(&empty_root_strategy_content_v3())?
+                {
+                    return Err(Error::Conflict(
+                        "empty root complete content mismatch".into(),
+                    ));
+                }
+                fingerprint(root)?
+            }
+            ParentContentV3::CurrentBundle(bundle) => {
+                validate_current_bundle_content_v3(bundle)?;
+                if bundle.profile_id != profile.id {
+                    return Err(Error::Conflict("parent bundle profile mismatch".into()));
+                }
+                bundle.digest.clone()
+            }
+        };
+        if parent_digest != profile.parent_digest {
+            return Err(Error::Conflict("parent content digest mismatch".into()));
+        }
+        Ok(Self {
+            profile,
+            parent,
+            baseline,
+        })
+    }
+    pub fn profile(&self) -> &Profile {
+        &self.profile
+    }
+    pub fn baseline_content(&self) -> &FrozenCompilerProfileContentV2 {
+        &self.baseline
+    }
+    fn parent_values(&self) -> (&SkillSnapshot, &Strategy) {
+        match &self.parent {
+            ParentContentV3::EmptyRoot(root) => (&root.skill, &root.strategy),
+            ParentContentV3::CurrentBundle(bundle) => (&bundle.skill, &bundle.improver),
+        }
+    }
+}
+pub struct CompleteCompilePartsV3<'a> {
+    pub content: &'a CompleteProfileContentProofV3,
+    pub skill_patch: &'a SkillPatch,
+    pub improver_patch: &'a ImproverPatch,
+    pub revoked: &'a BTreeSet<String>,
+}
+pub fn compile_complete_bundle_v3(parts: CompleteCompilePartsV3<'_>) -> Result<ResolvedBundleV3> {
+    compile_bundle_content_v3(
+        BorrowedProfileContentV3::Complete(parts.content),
+        parts.skill_patch,
+        parts.improver_patch,
+        parts.revoked,
+    )
+}
+pub fn replay_complete_resolved_bundle_v3(
+    bundle: &ResolvedBundleV3,
+    proof: &CompleteProfileContentProofV3,
+    revoked: &BTreeSet<String>,
+) -> Result<()> {
+    validate_current_bundle_content_v3(bundle)?;
+    if bundle.profile_id != proof.profile.id
+        || bundle.parent_digest != proof.profile.parent_digest
+        || bundle.baseline_digest != proof.profile.baseline_digest
+    {
+        return Err(Error::Conflict("bundle P/B identity mismatch".into()));
+    }
+    let (skill_patch, improver_patch) = replay_patches_v3(bundle)?;
+    let rebuilt = compile_complete_bundle_v3(CompleteCompilePartsV3 {
+        content: proof,
+        skill_patch: &skill_patch,
+        improver_patch: &improver_patch,
+        revoked,
+    })?;
+    if fingerprint(&rebuilt)? != fingerprint(bundle)? {
+        return Err(Error::Conflict("complete bundle replay differs".into()));
+    }
+    Ok(())
 }
 const BUNDLE_FIELDS_V3: [&str; 8] = [
     "skill.content",
@@ -3839,15 +4325,15 @@ fn compile_leaf_v3<T: Clone + Serialize>(
     op: &PatchOp<T>,
     parent: &T,
     baseline: &T,
-    proof: &ProfileContentProofV3,
+    profile: &Profile,
     origins: &mut Vec<ValueOrigin>,
 ) -> Result<T> {
     let value = op.apply(parent, baseline);
     let value_json = serde_json::to_value(&value).map_err(|_| Error::Internal)?;
     validate_explicit_field_value_v3(field, &value_json)?;
     let (layer, source_digest) = match op {
-        PatchOp::Inherit => (OriginLayer::Parent, proof.profile.parent_digest.clone()),
-        PatchOp::ResetToBaseline => (OriginLayer::Baseline, proof.profile.baseline_digest.clone()),
+        PatchOp::Inherit => (OriginLayer::Parent, profile.parent_digest.clone()),
+        PatchOp::ResetToBaseline => (OriginLayer::Baseline, profile.baseline_digest.clone()),
         PatchOp::Set { .. } => (
             OriginLayer::Explicit,
             explicit_field_source_v3(field, &value)?,
@@ -3869,17 +4355,61 @@ pub struct CompilePartsV3<'a> {
     pub revoked: &'a BTreeSet<String>,
 }
 pub fn compile_bundle_v3(parts: CompilePartsV3<'_>) -> Result<ResolvedBundleV3> {
-    let proof = parts.content;
+    compile_bundle_content_v3(
+        BorrowedProfileContentV3::Legacy(parts.content),
+        parts.skill_patch,
+        parts.improver_patch,
+        parts.revoked,
+    )
+}
+enum BorrowedProfileContentV3<'a> {
+    Legacy(&'a ProfileContentProofV3),
+    Complete(&'a CompleteProfileContentProofV3),
+}
+impl BorrowedProfileContentV3<'_> {
+    fn profile(&self) -> &Profile {
+        match self {
+            Self::Legacy(p) => &p.profile,
+            Self::Complete(p) => &p.profile,
+        }
+    }
+    fn parent_values(&self) -> (&SkillSnapshot, &Strategy) {
+        match self {
+            Self::Legacy(p) => p.parent_values(),
+            Self::Complete(p) => p.parent_values(),
+        }
+    }
+    fn baseline(&self) -> (&SkillSnapshot, &Strategy, &HostCapabilities) {
+        match self {
+            Self::Legacy(p) => (
+                &p.baseline.baseline_skill,
+                &p.baseline.baseline_strategy,
+                &p.baseline.capabilities,
+            ),
+            Self::Complete(p) => (
+                &p.baseline.baseline_skill,
+                &p.baseline.baseline_strategy,
+                &p.baseline.capabilities,
+            ),
+        }
+    }
+}
+fn compile_bundle_content_v3(
+    proof: BorrowedProfileContentV3<'_>,
+    skill_patch: &SkillPatch,
+    improver_patch: &ImproverPatch,
+    revoked: &BTreeSet<String>,
+) -> Result<ResolvedBundleV3> {
+    let profile = proof.profile();
     let (p, ps) = proof.parent_values();
-    let b = &proof.baseline.baseline_skill;
-    let bs = &proof.baseline.baseline_strategy;
+    let (b, bs, capabilities) = proof.baseline();
     p.validate()?;
     ps.validate()?;
     b.validate()?;
     bs.validate()?;
     // Both original inputs are checked before any Set/Reset discards a reference.
     for dep in p.dependencies.iter().chain(&b.dependencies) {
-        if parts.revoked.contains(dep) {
+        if revoked.contains(dep) {
             return Err(Error::Conflict("dependency_revoked".into()));
         }
     }
@@ -3887,42 +4417,42 @@ pub fn compile_bundle_v3(parts: CompilePartsV3<'_>) -> Result<ResolvedBundleV3> 
     let skill = SkillSnapshot {
         content: compile_leaf_v3(
             "skill.content",
-            &parts.skill_patch.content,
+            &skill_patch.content,
             &p.content,
             &b.content,
-            proof,
+            profile,
             &mut origins,
         )?,
         applicability: compile_leaf_v3(
             "skill.applicability",
-            &parts.skill_patch.applicability,
+            &skill_patch.applicability,
             &p.applicability,
             &b.applicability,
-            proof,
+            profile,
             &mut origins,
         )?,
         counterexample: compile_leaf_v3(
             "skill.counterexample",
-            &parts.skill_patch.counterexample,
+            &skill_patch.counterexample,
             &p.counterexample,
             &b.counterexample,
-            proof,
+            profile,
             &mut origins,
         )?,
         required_capabilities: compile_leaf_v3(
             "skill.required_capabilities",
-            &parts.skill_patch.required_capabilities,
+            &skill_patch.required_capabilities,
             &p.required_capabilities,
             &b.required_capabilities,
-            proof,
+            profile,
             &mut origins,
         )?,
         dependencies: compile_leaf_v3(
             "skill.dependencies",
-            &parts.skill_patch.dependencies,
+            &skill_patch.dependencies,
             &p.dependencies,
             &b.dependencies,
-            proof,
+            profile,
             &mut origins,
         )?,
     };
@@ -3930,26 +4460,26 @@ pub fn compile_bundle_v3(parts: CompilePartsV3<'_>) -> Result<ResolvedBundleV3> 
         schema_version: ps.schema_version.clone(),
         instruction: compile_leaf_v3(
             "improver.instruction",
-            &parts.improver_patch.instruction,
+            &improver_patch.instruction,
             &ps.instruction,
             &bs.instruction,
-            proof,
+            profile,
             &mut origins,
         )?,
         max_candidates: compile_leaf_v3(
             "improver.max_candidates",
-            &parts.improver_patch.max_candidates,
+            &improver_patch.max_candidates,
             &ps.max_candidates,
             &bs.max_candidates,
-            proof,
+            profile,
             &mut origins,
         )?,
         max_rounds: compile_leaf_v3(
             "improver.max_rounds",
-            &parts.improver_patch.max_rounds,
+            &improver_patch.max_rounds,
             &ps.max_rounds,
             &bs.max_rounds,
-            proof,
+            profile,
             &mut origins,
         )?,
         require_counterexample: ps.require_counterexample,
@@ -3957,23 +4487,19 @@ pub fn compile_bundle_v3(parts: CompilePartsV3<'_>) -> Result<ResolvedBundleV3> 
     skill.validate()?;
     improver.validate()?;
     for dep in &skill.dependencies {
-        if parts.revoked.contains(dep) {
+        if revoked.contains(dep) {
             return Err(Error::Conflict("dependency_revoked".into()));
         }
     }
-    if !proof
-        .baseline
-        .capabilities
-        .allows(&skill.required_capabilities)
-    {
+    if !capabilities.allows(&skill.required_capabilities) {
         return Err(Error::Forbidden);
     }
     let mut bundle = ResolvedBundleV3 {
         schema_version: BUNDLE_SCHEMA_V3.into(),
         compiler_version: BUNDLE_COMPILER_VERSION_V3.into(),
-        profile_id: proof.profile.id.clone(),
-        parent_digest: proof.profile.parent_digest.clone(),
-        baseline_digest: proof.profile.baseline_digest.clone(),
+        profile_id: profile.id.clone(),
+        parent_digest: profile.parent_digest.clone(),
+        baseline_digest: profile.baseline_digest.clone(),
         skill,
         improver,
         origins,
