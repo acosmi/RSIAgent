@@ -167,8 +167,7 @@ impl HostService {
         request: evo_core::Prepare,
         config: &HostPrepareConfig,
     ) -> Result<Prepared> {
-        self.prepare_inner(caller, request, PrepareConfiguration::legacy(config))
-            .await
+        Box::pin(self.prepare_inner(caller, request, PrepareConfiguration::legacy(config))).await
     }
     pub async fn prepare_complete(
         &self,
@@ -176,8 +175,7 @@ impl HostService {
         request: evo_core::Prepare,
         config: &CompleteHostPrepareConfig,
     ) -> Result<Prepared> {
-        self.prepare_inner(caller, request, PrepareConfiguration::complete(config))
-            .await
+        Box::pin(self.prepare_inner(caller, request, PrepareConfiguration::complete(config))).await
     }
     async fn prepare_inner(
         &self,
