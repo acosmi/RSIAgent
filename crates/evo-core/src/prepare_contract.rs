@@ -73,6 +73,83 @@ pub struct PrepareOperation<'a> {
     pub config: &'a HostPrepareConfig,
 }
 
+/// Complete producer configuration. Legacy configuration/operation bytes above
+/// retain their original meaning and never synthesize a missing tool source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteHostPrepareConfig {
+    pub profile_id: String,
+    pub system_snapshot: crate::contract::SystemSnapshotV3,
+    pub host_surface_id: String,
+    pub host_capabilities: HostCapabilities,
+    pub evolution_enabled: bool,
+    pub capability_level: CapabilityLevel,
+}
+impl CompleteHostPrepareConfig {
+    pub fn validate(&self) -> Result<()> {
+        identifier(&self.profile_id)?;
+        identifier(&self.host_surface_id)?;
+        if self.system_snapshot.profile_id != self.profile_id {
+            return Err(Error::Conflict("system snapshot profile mismatch".into()));
+        }
+        self.system_snapshot.validate()?;
+        for capability in self
+            .host_capabilities
+            .available
+            .iter()
+            .chain(&self.host_capabilities.granted)
+        {
+            identifier(capability)?;
+        }
+        if !self
+            .host_capabilities
+            .granted
+            .is_subset(&self.host_capabilities.available)
+        {
+            return Err(Error::Conflict(
+                "granted capabilities must be available".into(),
+            ));
+        }
+        self.system_snapshot
+            .environment_digest(&self.host_capabilities)?;
+        Ok(())
+    }
+    /// Startup adapter only: source is supplied by the actual protocol producer,
+    /// never loaded from or written back into a historical configuration record.
+    pub fn from_producer(
+        legacy: &HostPrepareConfig,
+        source: crate::contract::ToolSourceV1,
+    ) -> Result<Self> {
+        legacy.validate()?;
+        let snapshot = &legacy.system_snapshot;
+        let complete = Self {
+            profile_id: legacy.profile_id.clone(),
+            system_snapshot: crate::contract::SystemSnapshotV3 {
+                schema_version: crate::contract::SYSTEM_SNAPSHOT_SCHEMA_V3.into(),
+                profile_id: snapshot.profile_id.clone(),
+                host_id: snapshot.host_id.clone(),
+                host_version: snapshot.host_version.clone(),
+                model_id: snapshot.model_id.clone(),
+                tools: source.names()?,
+                mandatory_context_digest: snapshot.mandatory_context_digest.clone(),
+                tool_source: source,
+            },
+            host_surface_id: legacy.host_surface_id.clone(),
+            host_capabilities: legacy.host_capabilities.clone(),
+            evolution_enabled: legacy.evolution_enabled,
+            capability_level: legacy.capability_level,
+        };
+        complete.validate()?;
+        Ok(complete)
+    }
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletePrepareOperation<'a> {
+    pub schema_version: &'static str,
+    pub request: &'a crate::Prepare,
+    pub config: &'a CompleteHostPrepareConfig,
+}
+
 fn ensure_unique(values: &[String], message: &str) -> Result<()> {
     let unique = values.iter().collect::<std::collections::BTreeSet<_>>();
     if unique.len() != values.len() {

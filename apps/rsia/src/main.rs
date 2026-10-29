@@ -6,7 +6,7 @@ use evo_core::contract::{
 };
 use evo_core::{Context, Role, hash};
 use evo_engine::data_directory_lock::DataDirectoryLock;
-use evo_engine::service::{HostPrepareConfig, HostService};
+use evo_engine::service::{CompleteHostPrepareConfig, HostPrepareConfig, HostService};
 use evo_engine::startup_gate::GateDecision;
 #[cfg(test)]
 use evo_engine::startup_gate::{DATA_LOCK_FILE, data_directory};
@@ -19,7 +19,28 @@ use std::{
 };
 
 const GATEWAY_HOST_ACTOR: &str = "reference-host-gateway";
-const REFERENCE_SURFACE_ID: &str = "reference-host-surface-v2-source-bound";
+#[derive(Debug, Clone, Copy)]
+enum StructuralProtocol {
+    Mcp,
+    Http,
+}
+impl StructuralProtocol {
+    fn host_id(self) -> &'static str {
+        match self {
+            Self::Mcp => "rsia-mcp-structural-gateway",
+            Self::Http => "rsia-http-structural-gateway",
+        }
+    }
+    fn surface_id(self) -> &'static str {
+        match self {
+            Self::Mcp => "rsia-mcp-structural-surface-v3",
+            Self::Http => "rsia-http-structural-surface-v3",
+        }
+    }
+}
+fn http_prepare_config(config: &HostPrepareConfig) -> evo_core::Result<CompleteHostPrepareConfig> {
+    CompleteHostPrepareConfig::from_producer(config, evo_http::typed_route_tool_source()?)
+}
 
 async fn review_client(
     kind: ReviewKindArgument,
@@ -226,10 +247,12 @@ async fn main() -> Result<()> {
             let admin_token = environment_token("RSIA_ADMIN_TOKEN")?;
             let evaluator_token = environment_token("RSIA_EVALUATOR_TOKEN")?;
             let (_data_lock, gate) = mount_gate(&data, trusted_revocations_db.as_deref()).await?;
-            let (service, prepare_config) = bootstrap(&data, &namespace).await?;
+            let (service, prepare_config) =
+                bootstrap(&data, &namespace, StructuralProtocol::Http).await?;
             let mounted_store = service.store().clone();
             let serving: Result<()> = async {
                 gate.admit()?;
+                let prepare_config = http_prepare_config(&prepare_config)?;
                 let mut entries = Vec::new();
                 if let Some(token) = auth_token {
                     entries.push((token, AuthIdentity::new(&namespace, &actor, Role::Agent)?));
@@ -302,7 +325,8 @@ async fn main() -> Result<()> {
             trusted_revocations_db,
         } => {
             let (_data_lock, gate) = mount_gate(&data, trusted_revocations_db.as_deref()).await?;
-            let (service, prepare_config) = bootstrap(&data, &namespace).await?;
+            let (service, prepare_config) =
+                bootstrap(&data, &namespace, StructuralProtocol::Mcp).await?;
             let mounted_store = service.store().clone();
             let serving: Result<()> = async {
                 gate.admit()?;
@@ -415,30 +439,35 @@ fn lock_directory(data: &Path) -> PathBuf {
     data_directory(data)
 }
 
-async fn bootstrap(data: &Path, namespace: &str) -> Result<(HostService, HostPrepareConfig)> {
+async fn bootstrap(
+    data: &Path,
+    namespace: &str,
+    protocol: StructuralProtocol,
+) -> Result<(HostService, HostPrepareConfig)> {
     let store = Store::open(data).await?;
     let initialized: Result<(HostService, HostPrepareConfig)> = async {
         let host = Context::new(namespace, GATEWAY_HOST_ACTOR, Role::Host)?;
         let admin = Context::new(namespace, "service-admin", Role::Admin)?;
+        let original = serde_json::json!({"schema_version":"rsia.host_reviewed_declarations.v1","host":protocol.host_id(),"host_version":"1.0.0","declarations":[{"name":"model","value_type":"string","enum_values":[],"default":{"kind":"value","value":"disabled"}}]});
         let source = ReviewedHostSourceEnvelopeV1 {
             schema_version: "rsia.host_source_envelope.v1".into(),
             source_kind: "reviewed_fixture".into(),
             source_schema: "rsia.host_reviewed_declarations.v1".into(),
             extractor_version: "rsia.host_reviewed_declarations.extractor.v1".into(),
-            original_utf8: r#"{"schema_version":"rsia.host_reviewed_declarations.v1","host":"reference-host","host_version":"1.0.0","declarations":[{"name":"model","value_type":"string","enum_values":[],"default":{"kind":"value","value":"disabled"}}]}"#.into(),
+            original_utf8: serde_json::to_string(&original)?,
         };
         let raw_source = serde_json::to_string(&source)?;
         evo_engine::hosts::register_reviewed_host_surface_json(
-            &admin, &store, REFERENCE_SURFACE_ID, &raw_source,
+            &admin, &store, protocol.surface_id(), &raw_source,
             HostSurfaceRegistrationV2 {
                 adapter_version: "1.0.0".into(),
                 classifications: vec![HostSurfaceClassificationV2 {
-                    name: "model".into(), coverage: SurfaceCoverage::Supported,
-                    mapped_field: Some("host.model".into()), consumer: Some("runner".into()),
-                    reason: "fixed disabled-model reference adapter".into(),
+                    name: "model".into(), coverage: SurfaceCoverage::RuntimeOwned,
+                    mapped_field: None, consumer: None,
+                    reason: "Structural ToolOnly gateway supplies protocol materials; model execution remains runtime-owned".into(),
                     renamed_from: None,
-                    test_ref: Some("scripts/smoke_cli.py".into()),
-                    capability: Some("fs_read".into()),
+                    test_ref: None,
+                    capability: None,
                 }],
                 retired: vec![],
             }, None,
@@ -448,13 +477,14 @@ async fn bootstrap(data: &Path, namespace: &str) -> Result<(HostService, HostPre
             system_snapshot: SystemSnapshot {
                 schema_version: "rsia.system_snapshot.v2".into(),
                 profile_id: "default".into(),
-                host_id: "reference-host".into(),
+                host_id: protocol.host_id().into(),
                 host_version: "1.0.0".into(),
                 model_id: "disabled".into(),
-                tools: vec!["read_config".into()],
+                // The actual protocol constructor supplies the complete definitions.
+                tools: vec![],
                 mandatory_context_digest: hash(b"reference-host-mandatory-context-v1"),
             },
-            host_surface_id: REFERENCE_SURFACE_ID.into(),
+            host_surface_id: protocol.surface_id().into(),
             host_capabilities: HostCapabilities {
                 available: ["fs_read".into()].into_iter().collect::<BTreeSet<_>>(),
                 granted: ["fs_read".into()].into_iter().collect::<BTreeSet<_>>(),
@@ -755,5 +785,150 @@ mod tests {
         assert_eq!(std::fs::read_dir(&restored).unwrap().count(), before);
         assert!(!restored.join(DATA_LOCK_FILE).exists());
         assert!(!restored.join(RESTORE_ADMISSION_FILE).exists());
+    }
+}
+
+#[cfg(test)]
+mod ag168_complete_binding_tests {
+    use super::*;
+    use evo_engine::release_store::HostSurfaceRecordV2;
+
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "rsia-ag168-bootstrap-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path.canonicalize().unwrap())
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_mcp_and_http_keep_distinct_structural_source_domains() {
+        let directory = Directory::new();
+        let data = directory.0.join("bootstrap.sqlite3");
+        let admin = Context::new("bootstrap-fixture", "service-admin", Role::Admin).unwrap();
+        let (http_service, http_startup) =
+            bootstrap(&data, "bootstrap-fixture", StructuralProtocol::Http)
+                .await
+                .unwrap();
+        let http = http_prepare_config(&http_startup).unwrap();
+        assert_eq!(http.system_snapshot.host_id, "rsia-http-structural-gateway");
+        assert_eq!(http.host_surface_id, "rsia-http-structural-surface-v3");
+        assert_eq!(
+            http.system_snapshot.tool_source,
+            evo_http::typed_route_tool_source().unwrap()
+        );
+        assert_eq!(http.system_snapshot.tool_source.domain, "http_protocol");
+        let mut session = http_service.store().session().await.unwrap();
+        let before: HostSurfaceRecordV2 = session
+            .need(&admin, "artifact", &http.host_surface_id)
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let original_http_surface = evo_core::fingerprint(&before).unwrap();
+        http_service.store().close().await;
+
+        let (mcp_service, mcp_startup) =
+            bootstrap(&data, "bootstrap-fixture", StructuralProtocol::Mcp)
+                .await
+                .unwrap();
+        let caller = Context::new("bootstrap-fixture", "stdio-agent", Role::Agent).unwrap();
+        let actual_mcp =
+            evo_mcp::McpHost::new(mcp_service.clone(), caller, mcp_startup.clone()).unwrap();
+        let mcp = CompleteHostPrepareConfig::from_producer(
+            &mcp_startup,
+            actual_mcp.tool_source().clone(),
+        )
+        .unwrap();
+        assert_eq!(mcp.system_snapshot.host_id, "rsia-mcp-structural-gateway");
+        assert_eq!(mcp.host_surface_id, "rsia-mcp-structural-surface-v3");
+        assert_eq!(mcp.system_snapshot.tool_source.domain, "mcp_protocol");
+        assert_eq!(
+            mcp.system_snapshot.tool_source.producer_id,
+            "rmcp.ToolRouter.list_all"
+        );
+        assert_ne!(
+            http.system_snapshot.tool_source,
+            mcp.system_snapshot.tool_source
+        );
+        assert_ne!(
+            http.system_snapshot
+                .environment_digest(&http.host_capabilities)
+                .unwrap(),
+            mcp.system_snapshot
+                .environment_digest(&mcp.host_capabilities)
+                .unwrap()
+        );
+        let mut session = mcp_service.store().session().await.unwrap();
+        for config in [&http, &mcp] {
+            config.validate().unwrap();
+            assert_eq!(config.system_snapshot.host_version, "1.0.0");
+            assert_eq!(config.system_snapshot.model_id, "disabled");
+            assert_eq!(
+                config.system_snapshot.tools,
+                config.system_snapshot.tool_source.names().unwrap()
+            );
+            assert_eq!(
+                config.system_snapshot.mandatory_context_digest,
+                hash(b"reference-host-mandatory-context-v1")
+            );
+            assert_eq!(
+                config.host_capabilities.available,
+                ["fs_read".into()].into_iter().collect::<BTreeSet<_>>()
+            );
+            assert_eq!(
+                config.host_capabilities.granted,
+                config.host_capabilities.available
+            );
+            assert_eq!(config.capability_level, CapabilityLevel::ToolOnly);
+            let surface: HostSurfaceRecordV2 = session
+                .need(&admin, "artifact", &config.host_surface_id)
+                .await
+                .unwrap();
+            let original: serde_json::Value =
+                serde_json::from_str(&surface.source.original_utf8).unwrap();
+            assert_eq!(original["host"], config.system_snapshot.host_id);
+            assert_eq!(
+                original["host_version"],
+                config.system_snapshot.host_version
+            );
+            assert_eq!(surface.manifest.host, config.system_snapshot.host_id);
+            assert_eq!(
+                surface.manifest.host_version,
+                config.system_snapshot.host_version
+            );
+            assert_eq!(surface.manifest.items.len(), 1);
+            let model = &surface.manifest.items[0];
+            assert_eq!(model.name, "model");
+            assert_eq!(model.coverage, SurfaceCoverage::RuntimeOwned);
+            assert!(model.mapped_field.is_none() && model.consumer.is_none());
+            assert!(model.capability.is_none() && model.test_ref.is_none());
+            assert!(!model.reason.is_empty());
+            assert!(!evo_core::contract::MODEL_TOOLS.contains(&model.name.as_str()));
+        }
+        let after: HostSurfaceRecordV2 = session
+            .need(&admin, "artifact", &http.host_surface_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            evo_core::fingerprint(&after).unwrap(),
+            original_http_surface
+        );
+        session.commit().await.unwrap();
+        assert_eq!(GATEWAY_HOST_ACTOR, "reference-host-gateway");
+        drop(actual_mcp);
+        mcp_service.store().close().await;
     }
 }

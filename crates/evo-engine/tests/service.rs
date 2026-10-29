@@ -1,7 +1,7 @@
 //! HostService boundary and persistence tests.
 use evo_core::contract::{
     CapabilityLevel, HostCapabilities, HostSurfaceClassificationV2, HostSurfaceRegistrationV2,
-    ReviewedHostSourceEnvelopeV1, SurfaceCoverage, SystemSnapshot,
+    ReviewedHostSourceEnvelopeV1, SurfaceCoverage,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
@@ -14,7 +14,7 @@ use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority};
 use evo_engine::release_store::{
     AppliedRequestMaterial, ReleaseStore, TrustedHostExecutionEvidence,
 };
-use evo_engine::service::{HostPrepareConfig, HostService};
+use evo_engine::service::{CompleteHostPrepareConfig, HostPrepareConfig, HostService};
 use evo_storage::Store;
 use serde_json::json;
 
@@ -26,16 +26,27 @@ fn digest(label: &str) -> String {
     hash(label.as_bytes())
 }
 
-fn prepare_config() -> HostPrepareConfig {
-    HostPrepareConfig {
+fn prepare_config() -> CompleteHostPrepareConfig {
+    let source = evo_core::contract::ToolSourceV1 {
+        schema_version: evo_core::contract::TOOL_SOURCE_SCHEMA.into(),
+        domain: "mcp_protocol".into(),
+        producer_id: "rmcp.ToolRouter.list_all".into(),
+        producer_version: "rmcp-3.3.0".into(),
+        definitions: serde_json::from_str(include_str!(
+            "fixtures/ag168-actual-mcp-descriptors.json"
+        ))
+        .unwrap(),
+    };
+    CompleteHostPrepareConfig {
         profile_id: "profile-a".into(),
-        system_snapshot: SystemSnapshot {
-            schema_version: "rsia.system_snapshot.v2".into(),
+        system_snapshot: evo_core::contract::SystemSnapshotV3 {
+            schema_version: "rsia.system_snapshot.v3".into(),
             profile_id: "profile-a".into(),
             host_id: "reference-host".into(),
             host_version: "1.0.0".into(),
             model_id: "disabled".into(),
-            tools: vec!["read_config".into()],
+            tools: source.names().unwrap(),
+            tool_source: source,
             mandatory_context_digest: digest("mandatory"),
         },
         host_surface_id: "reference-surface".into(),
@@ -48,7 +59,12 @@ fn prepare_config() -> HostPrepareConfig {
     }
 }
 
-async fn setup() -> (tempfile::TempDir, HostService, Context, HostPrepareConfig) {
+async fn setup() -> (
+    tempfile::TempDir,
+    HostService,
+    Context,
+    CompleteHostPrepareConfig,
+) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("service.sqlite3"))
         .await
@@ -117,10 +133,13 @@ async fn prepare_freezes_zero_skill_baseline_and_is_idempotent() {
         capabilities: vec!["fs_read".into()],
     };
     let first = service
-        .prepare(&agent, request.clone(), &config)
+        .prepare_complete(&agent, request.clone(), &config)
         .await
         .unwrap();
-    let second = service.prepare(&agent, request, &config).await.unwrap();
+    let second = service
+        .prepare_complete(&agent, request, &config)
+        .await
+        .unwrap();
     assert_eq!(first.run.id, second.run.id);
     assert!(first.skills.is_empty());
     assert!(
@@ -136,7 +155,7 @@ async fn prepare_freezes_zero_skill_baseline_and_is_idempotent() {
     .await
     .unwrap();
     assert!(snapshot.projection.instructions.is_empty());
-    assert_eq!(snapshot.projection.tools, vec!["read_config"]);
+    assert_eq!(snapshot.projection.tools, config.system_snapshot.tools);
     assert_eq!(
         snapshot.request_material.task_input_digest,
         digest("locate config precedence")
@@ -149,7 +168,7 @@ async fn same_key_different_body_and_cross_actor_reads_are_rejected() {
     let first = context("agent-a", Role::Agent);
     let second = context("agent-b", Role::Agent);
     let prepared = service
-        .prepare(
+        .prepare_complete(
             &first,
             Prepare {
                 request_key: "same-key".into(),
@@ -161,7 +180,7 @@ async fn same_key_different_body_and_cross_actor_reads_are_rejected() {
         .await
         .unwrap();
     let changed = service
-        .prepare(
+        .prepare_complete(
             &first,
             Prepare {
                 request_key: "same-key".into(),
@@ -191,7 +210,7 @@ async fn feedback_stays_unverified_and_proposal_stays_proposed() {
     let (_dir, service, _host, config) = setup().await;
     let agent = context("agent-a", Role::Agent);
     let prepared = service
-        .prepare(
+        .prepare_complete(
             &agent,
             Prepare {
                 request_key: "prepare-1".into(),
@@ -288,7 +307,7 @@ async fn zero_skill_and_tool_only_cannot_claim_use() {
     let (_dir, service, host, config) = setup().await;
     let agent = context("agent-a", Role::Agent);
     let prepared = service
-        .prepare(
+        .prepare_complete(
             &agent,
             Prepare {
                 request_key: "prepare-1".into(),
@@ -366,7 +385,7 @@ async fn cached_operations_revalidate_live_snapshot_after_deletion() {
         capabilities: vec![],
     };
     let prepared = service
-        .prepare(&agent, prepare.clone(), &config)
+        .prepare_complete(&agent, prepare.clone(), &config)
         .await
         .unwrap();
     let feedback = Feedback {
@@ -420,7 +439,7 @@ async fn cached_operations_revalidate_live_snapshot_after_deletion() {
     session.commit().await.unwrap();
 
     assert!(matches!(
-        service.prepare(&agent, prepare, &config).await,
+        service.prepare_complete(&agent, prepare, &config).await,
         Err(Error::NotFound)
     ));
     assert!(matches!(
@@ -445,7 +464,7 @@ async fn a_different_namespace_cannot_reuse_the_trusted_host() {
     let outsider = Context::new("tenant-b", "agent-a", Role::Agent).unwrap();
     assert!(matches!(
         service
-            .prepare(
+            .prepare_complete(
                 &outsider,
                 Prepare {
                     request_key: "prepare-1".into(),
@@ -572,7 +591,7 @@ async fn prepare_refuses_the_run_past_mvp_capacity_and_writes_nothing() {
 
     // 999 runs exist: the thousandth run is admitted.
     let admitted = service
-        .prepare(
+        .prepare_complete(
             &agent,
             prepare_request("run-1000", "last admitted run"),
             &config,
@@ -591,7 +610,7 @@ async fn prepare_refuses_the_run_past_mvp_capacity_and_writes_nothing() {
     // At the limit a new derivation is refused with the typed conflict.
     for _ in 0..2 {
         match service
-            .prepare(
+            .prepare_complete(
                 &agent,
                 prepare_request("run-1001", "one run too many"),
                 &config,
@@ -626,7 +645,7 @@ async fn prepare_refuses_the_run_past_mvp_capacity_and_writes_nothing() {
 
     // The idempotent replay of an admitted run is not a new derivation.
     let replay = service
-        .prepare(
+        .prepare_complete(
             &agent,
             prepare_request("run-1000", "last admitted run"),
             &config,
@@ -660,7 +679,7 @@ async fn prepare_run_capacity_cannot_be_split_across_namespaces() {
         .unwrap();
     session.commit().await.unwrap();
     match service
-        .prepare(
+        .prepare_complete(
             &agent,
             prepare_request("split-run", "run in another tenant"),
             &config,
@@ -705,7 +724,7 @@ async fn inflight_prepare_slots_refuse_the_sixth_prepare_and_release_on_every_pa
         other => panic!("expected the in-flight prepare conflict, got {other:?}"),
     }
     match service
-        .prepare(
+        .prepare_complete(
             &agent,
             prepare_request("inflight-1", "sixth prepare"),
             &config,
@@ -726,7 +745,7 @@ async fn inflight_prepare_slots_refuse_the_sixth_prepare_and_release_on_every_pa
     drop(guards.pop());
     assert_eq!(service.inflight_prepare(), MAX_PREPARE - 1);
     service
-        .prepare(
+        .prepare_complete(
             &agent,
             prepare_request("inflight-1", "sixth prepare"),
             &config,
@@ -739,7 +758,7 @@ async fn inflight_prepare_slots_refuse_the_sixth_prepare_and_release_on_every_pa
     // first session) releases it as well.
     assert!(matches!(
         service
-            .prepare(
+            .prepare_complete(
                 &agent,
                 prepare_request("inflight-1", "different goal"),
                 &config

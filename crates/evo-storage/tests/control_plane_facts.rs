@@ -758,7 +758,7 @@ async fn future_compiler_record_versions_fail_closed_without_rewriting_their_bod
     for schema in [
         "rsia.release_candidate.v3",
         "rsia.optimization.compiler_use.v3",
-        "rsia.authenticated_bundle.v3",
+        "rsia.authenticated_bundle.v4",
         "rsia.persisted_compiler_binding.v3",
         // No standalone v3 writer was registered by this implementation.
         "rsia.resolved_bundle.v3",

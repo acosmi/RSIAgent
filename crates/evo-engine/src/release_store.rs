@@ -11,9 +11,9 @@ use crate::streaming_evaluator::{
 use evo_core::contract::{
     AppliedReceipt, CapabilityLevel, HostCapabilities, HostSurfaceDeclarationV2,
     HostSurfaceManifest, HostSurfaceManifestV2, HostSurfacePredecessorV2,
-    HostSurfaceRegistrationV2, HostSurfaceUpgradeDiffV2, ResolvedBundle,
-    ReviewedHostSourceEnvelopeV1, RunProjection, SystemSnapshot, host_surface_upgrade_diff_v2,
-    host_surface_v2_allows_field, host_surface_v2_from_source,
+    HostSurfaceRegistrationV2, HostSurfaceUpgradeDiffV2, LoadedSystemSnapshot, ResolvedBundle,
+    ReviewedHostSourceEnvelopeV1, RunProjection, StrictJsonValue, SystemSnapshot, SystemSnapshotV3,
+    host_surface_upgrade_diff_v2, host_surface_v2_allows_field, host_surface_v2_from_source,
 };
 use evo_core::evaluation::Verdict;
 use evo_core::{Context, Error, Result, Role, Validate, fingerprint, identifier};
@@ -136,6 +136,7 @@ where
 
 pub const HOST_SURFACE_RECORD_SCHEMA_V2: &str = "rsia.host_surface_record.v2";
 pub const RUN_APPLICATION_SCHEMA_V2: &str = "rsia.run_application.v2";
+pub const RUN_APPLICATION_SCHEMA_V3: &str = "rsia.run_application.v3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -214,6 +215,29 @@ pub struct RunApplicationSnapshotV2 {
     pub evolution_enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunApplicationSnapshotV3 {
+    pub id: String,
+    pub schema_version: String,
+    pub run_id: String,
+    pub profile_id: String,
+    pub pointer_epoch: u64,
+    pub release_id: Option<String>,
+    pub bundle_digest: Option<String>,
+    pub environment_digest: String,
+    pub system_snapshot: SystemSnapshotV3,
+    pub host_surface_id: String,
+    pub host_surface_digest: String,
+    pub host_capabilities_digest: String,
+    pub host_capabilities: HostCapabilities,
+    pub projection: RunProjection,
+    pub request_material: AppliedRequestMaterial,
+    pub request_digest: String,
+    pub capability_level: CapabilityLevel,
+    pub evolution_enabled: bool,
+}
+
 fn deserialize_run_application_v2_schema<'de, D>(
     deserializer: D,
 ) -> std::result::Result<String, D::Error>
@@ -263,6 +287,62 @@ pub(crate) fn validate_run_application_v2_binding(record: &RunApplicationSnapsho
     Ok(())
 }
 
+pub fn complete_applied_request_digest(
+    material: &AppliedRequestMaterial,
+    environment: &str,
+    surface: &str,
+    capabilities: &HostCapabilities,
+) -> Result<String> {
+    evo_core::canonical_fingerprint(&(
+        "rsia.applied_request.v3",
+        material,
+        environment,
+        surface,
+        fingerprint(capabilities)?,
+    ))
+}
+pub fn validate_run_application_v3_binding(record: &RunApplicationSnapshotV3) -> Result<()> {
+    identifier(&record.run_id)?;
+    identifier(&record.profile_id)?;
+    identifier(&record.host_surface_id)?;
+    validate_digest(
+        &record.request_material.task_input_digest,
+        "task input digest",
+    )?;
+    let config = evo_core::prepare_contract::CompleteHostPrepareConfig {
+        profile_id: record.profile_id.clone(),
+        system_snapshot: record.system_snapshot.clone(),
+        host_surface_id: record.host_surface_id.clone(),
+        host_capabilities: record.host_capabilities.clone(),
+        evolution_enabled: record.evolution_enabled,
+        capability_level: record.capability_level,
+    };
+    config.validate()?;
+    if record.schema_version != RUN_APPLICATION_SCHEMA_V3
+        || record.id != format!("run-snapshot-v3-{}", record.run_id)
+        || record.host_capabilities_digest != fingerprint(&record.host_capabilities)?
+        || record.environment_digest
+            != record
+                .system_snapshot
+                .environment_digest(&record.host_capabilities)?
+        || record.request_digest
+            != complete_applied_request_digest(
+                &record.request_material,
+                &record.environment_digest,
+                &record.host_surface_digest,
+                &record.host_capabilities,
+            )?
+        || record.request_material.instructions != record.projection.instructions
+        || record.request_material.tools != record.projection.tools
+        || record.request_material.mandatory_context_digest
+            != record.system_snapshot.mandatory_context_digest
+    {
+        return Err(Error::Conflict(
+            "complete run source/capability binding differs".into(),
+        ));
+    }
+    Ok(())
+}
 /// Non-serializable, read-only field view. It cannot stand in for either wire.
 #[derive(Debug, Clone)]
 pub struct RunApplicationView {
@@ -274,7 +354,7 @@ pub struct RunApplicationView {
     pub release_id: Option<String>,
     pub bundle_digest: Option<String>,
     pub environment_digest: String,
-    pub system_snapshot: SystemSnapshot,
+    pub system_snapshot: LoadedSystemSnapshot,
     pub host_surface_id: String,
     pub host_surface_digest: String,
     pub host_capabilities_digest: String,
@@ -285,11 +365,12 @@ pub struct RunApplicationView {
     pub evolution_enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 enum RunApplicationWire {
     Legacy(RunApplicationSnapshot),
     Current(RunApplicationSnapshotV2),
+    Complete(RunApplicationSnapshotV3),
 }
 
 /// Wire and cached view are constructed together and never exposed mutably.
@@ -309,6 +390,7 @@ impl LoadedRunApplicationSnapshot {
                 ));
             }
             RunApplicationWire::Current(value) => validate_run_application_v2_binding(value)?,
+            RunApplicationWire::Complete(value) => validate_run_application_v3_binding(value)?,
             _ => {}
         }
         macro_rules! field_view {
@@ -323,7 +405,7 @@ impl LoadedRunApplicationSnapshot {
                     release_id: value.release_id.clone(),
                     bundle_digest: value.bundle_digest.clone(),
                     environment_digest: value.environment_digest.clone(),
-                    system_snapshot: value.system_snapshot.clone(),
+                    system_snapshot: value.system_snapshot.clone().into(),
                     host_surface_id: value.host_surface_id.clone(),
                     host_surface_digest: value.host_surface_digest.clone(),
                     host_capabilities_digest: value.host_capabilities_digest.clone(),
@@ -338,6 +420,7 @@ impl LoadedRunApplicationSnapshot {
         let view = match &wire {
             RunApplicationWire::Legacy(value) => field_view!(value),
             RunApplicationWire::Current(value) => field_view!(value),
+            RunApplicationWire::Complete(value) => field_view!(value),
         };
         Ok(Self { wire, view })
     }
@@ -345,6 +428,38 @@ impl LoadedRunApplicationSnapshot {
         match &self.wire {
             RunApplicationWire::Current(value) => Some(value),
             _ => None,
+        }
+    }
+    pub fn current_v3(&self) -> Option<&RunApplicationSnapshotV3> {
+        match &self.wire {
+            RunApplicationWire::Complete(value) => Some(value),
+            _ => None,
+        }
+    }
+    pub fn raw_capabilities(&self) -> Option<&HostCapabilities> {
+        match &self.wire {
+            RunApplicationWire::Current(v) => Some(&v.host_capabilities),
+            RunApplicationWire::Complete(v) => Some(&v.host_capabilities),
+            _ => None,
+        }
+    }
+    pub fn applied_request_digest(&self, material: &AppliedRequestMaterial) -> Result<String> {
+        match &self.wire {
+            RunApplicationWire::Complete(v) => complete_applied_request_digest(
+                material,
+                &v.environment_digest,
+                &v.host_surface_digest,
+                &v.host_capabilities,
+            ),
+            _ => fingerprint(material),
+        }
+    }
+    pub fn expected_environment_digest(&self) -> Result<String> {
+        match &self.wire {
+            RunApplicationWire::Complete(v) => {
+                v.system_snapshot.environment_digest(&v.host_capabilities)
+            }
+            _ => self.system_snapshot.digest(),
         }
     }
 }
@@ -369,7 +484,27 @@ impl<'de> Deserialize<'de> for LoadedRunApplicationSnapshot {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        let wire = RunApplicationWire::deserialize(deserializer)?;
+        let value = StrictJsonValue::deserialize(deserializer)?.0;
+        let wire = match value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(RUN_APPLICATION_SCHEMA) => {
+                serde_json::from_value(value).map(RunApplicationWire::Legacy)
+            }
+            Some(RUN_APPLICATION_SCHEMA_V2) => {
+                serde_json::from_value(value).map(RunApplicationWire::Current)
+            }
+            Some(RUN_APPLICATION_SCHEMA_V3) => {
+                serde_json::from_value(value).map(RunApplicationWire::Complete)
+            }
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "unsupported run application schema",
+                ));
+            }
+        }
+        .map_err(serde::de::Error::custom)?;
         Self::from_wire(wire).map_err(serde::de::Error::custom)
     }
 }
@@ -385,6 +520,27 @@ pub struct PrepareRunRequest {
     pub capability_level: CapabilityLevel,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompletePrepareRunRequest {
+    pub run_id: String,
+    pub profile_id: String,
+    pub system_snapshot: SystemSnapshotV3,
+    pub host_surface_id: String,
+    pub host_capabilities: HostCapabilities,
+    pub task_input_digest: String,
+    pub evolution_enabled: bool,
+    pub capability_level: CapabilityLevel,
+}
+struct PreparedRunMaterial {
+    run_id: String,
+    profile_id: String,
+    system_snapshot: LoadedSystemSnapshot,
+    host_surface_id: String,
+    host_capabilities: HostCapabilities,
+    task_input_digest: String,
+    evolution_enabled: bool,
+    capability_level: CapabilityLevel,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppliedRequestMaterial {
@@ -848,15 +1004,77 @@ impl ReleaseStore {
     ) -> Result<LoadedRunApplicationSnapshot> {
         ctx.require(&[Role::Host])?;
         validate_prepare_request(&request)?;
-        let snapshot_id = format!("run-snapshot-{}", request.run_id);
-        let requested_environment_digest = request.system_snapshot.digest()?;
+        Self::prepare_run_material(
+            ctx,
+            store,
+            PreparedRunMaterial {
+                run_id: request.run_id,
+                profile_id: request.profile_id,
+                system_snapshot: request.system_snapshot.into(),
+                host_surface_id: request.host_surface_id,
+                host_capabilities: request.host_capabilities,
+                task_input_digest: request.task_input_digest,
+                evolution_enabled: request.evolution_enabled,
+                capability_level: request.capability_level,
+            },
+        )
+        .await
+    }
+    pub async fn prepare_complete_run(
+        ctx: &Context,
+        store: &Store,
+        request: CompletePrepareRunRequest,
+    ) -> Result<LoadedRunApplicationSnapshot> {
+        ctx.require(&[Role::Host])?;
+        identifier(&request.run_id)?;
+        validate_digest(&request.task_input_digest, "task input digest")?;
+        evo_core::prepare_contract::CompleteHostPrepareConfig {
+            profile_id: request.profile_id.clone(),
+            system_snapshot: request.system_snapshot.clone(),
+            host_surface_id: request.host_surface_id.clone(),
+            host_capabilities: request.host_capabilities.clone(),
+            evolution_enabled: request.evolution_enabled,
+            capability_level: request.capability_level,
+        }
+        .validate()?;
+        Self::prepare_run_material(
+            ctx,
+            store,
+            PreparedRunMaterial {
+                run_id: request.run_id,
+                profile_id: request.profile_id,
+                system_snapshot: request.system_snapshot.into(),
+                host_surface_id: request.host_surface_id,
+                host_capabilities: request.host_capabilities,
+                task_input_digest: request.task_input_digest,
+                evolution_enabled: request.evolution_enabled,
+                capability_level: request.capability_level,
+            },
+        )
+        .await
+    }
+    async fn prepare_run_material(
+        ctx: &Context,
+        store: &Store,
+        request: PreparedRunMaterial,
+    ) -> Result<LoadedRunApplicationSnapshot> {
+        let complete = request.system_snapshot.complete();
+        let snapshot_id = if complete.is_some() {
+            format!("run-snapshot-v3-{}", request.run_id)
+        } else {
+            format!("run-snapshot-{}", request.run_id)
+        };
+        let requested_environment_digest = match complete {
+            Some(s) => s.environment_digest(&request.host_capabilities)?,
+            None => request.system_snapshot.digest()?,
+        };
         let requested_caps_digest = fingerprint(&request.host_capabilities)?;
         let mut session = store.session().await?;
-        if let Some(existing) = session
-            .get::<LoadedRunApplicationSnapshot>(ctx, "artifact", &snapshot_id)
-            .await?
+        if let Some(existing) =
+            load_run_original_in_session(&mut session, ctx, &request.run_id).await?
         {
-            if existing.profile_id != request.profile_id
+            if existing.id != snapshot_id
+                || existing.profile_id != request.profile_id
                 || existing.environment_digest != requested_environment_digest
                 || existing.host_surface_id != request.host_surface_id
                 || existing.host_capabilities_digest != requested_caps_digest
@@ -903,7 +1121,17 @@ impl ReleaseStore {
                 revalidate_current_release(&mut session, ctx, &release).await?;
                 let candidate: ReadCandidate =
                     session.need(ctx, "artifact", &release.candidate_id).await?;
-                let projection = project_read_run_surface_v2(
+                if let Some(complete) = request.system_snapshot.complete() {
+                    validate_versioned_release_snapshot_source(
+                        &mut session,
+                        ctx,
+                        &candidate,
+                        complete,
+                        &request.host_capabilities,
+                    )
+                    .await?;
+                }
+                let projection = project_read_run_surface(
                     &surface,
                     &request.host_capabilities,
                     &candidate.bundle,
@@ -911,10 +1139,18 @@ impl ReleaseStore {
                 )?;
                 (Some(release.id), Some(release.bundle_digest), projection)
             } else {
-                (None, None, baseline_projection(&request.system_snapshot))
+                (
+                    None,
+                    None,
+                    baseline_loaded_projection(&request.system_snapshot),
+                )
             }
         } else {
-            (None, None, baseline_projection(&request.system_snapshot))
+            (
+                None,
+                None,
+                baseline_loaded_projection(&request.system_snapshot),
+            )
         };
         let material = AppliedRequestMaterial {
             mandatory_context_digest: request.system_snapshot.mandatory_context_digest.clone(),
@@ -922,27 +1158,67 @@ impl ReleaseStore {
             instructions: projection.instructions.clone(),
             tools: projection.tools.clone(),
         };
-        let current = RunApplicationSnapshotV2 {
-            id: snapshot_id.clone(),
-            schema_version: RUN_APPLICATION_SCHEMA_V2.into(),
-            run_id: request.run_id,
-            profile_id: request.profile_id,
-            pointer_epoch: pointer.epoch,
-            release_id,
-            bundle_digest,
-            environment_digest,
-            system_snapshot: request.system_snapshot,
-            host_surface_id: surface.id,
-            host_surface_digest: surface.manifest_digest,
-            host_capabilities_digest: caps_digest,
-            host_capabilities: request.host_capabilities,
-            projection,
-            request_digest: fingerprint(&material)?,
-            request_material: material,
-            capability_level: request.capability_level,
-            evolution_enabled: request.evolution_enabled,
+        let request_digest = match request.system_snapshot.complete() {
+            Some(_) => complete_applied_request_digest(
+                &material,
+                &environment_digest,
+                &surface.manifest_digest,
+                &request.host_capabilities,
+            )?,
+            None => fingerprint(&material)?,
         };
-        let record = LoadedRunApplicationSnapshot::from_wire(RunApplicationWire::Current(current))?;
+        let wire = if request.system_snapshot.complete().is_some() {
+            RunApplicationWire::Complete(RunApplicationSnapshotV3 {
+                id: snapshot_id.clone(),
+                schema_version: RUN_APPLICATION_SCHEMA_V3.into(),
+                run_id: request.run_id,
+                profile_id: request.profile_id,
+                pointer_epoch: pointer.epoch,
+                release_id,
+                bundle_digest,
+                environment_digest,
+                system_snapshot: request
+                    .system_snapshot
+                    .complete()
+                    .ok_or(Error::Internal)?
+                    .clone(),
+                host_surface_id: surface.id,
+                host_surface_digest: surface.manifest_digest,
+                host_capabilities_digest: caps_digest,
+                host_capabilities: request.host_capabilities,
+                projection,
+                request_digest: request_digest.clone(),
+                request_material: material,
+                capability_level: request.capability_level,
+                evolution_enabled: request.evolution_enabled,
+            })
+        } else {
+            RunApplicationWire::Current(RunApplicationSnapshotV2 {
+                id: snapshot_id.clone(),
+                schema_version: RUN_APPLICATION_SCHEMA_V2.into(),
+                run_id: request.run_id,
+                profile_id: request.profile_id,
+                pointer_epoch: pointer.epoch,
+                release_id,
+                bundle_digest,
+                environment_digest,
+                system_snapshot: request
+                    .system_snapshot
+                    .legacy()
+                    .ok_or(Error::Internal)?
+                    .clone(),
+                host_surface_id: surface.id,
+                host_surface_digest: surface.manifest_digest,
+                host_capabilities_digest: caps_digest,
+                host_capabilities: request.host_capabilities,
+                projection,
+                request_digest: request_digest.clone(),
+                request_material: material,
+                capability_level: request.capability_level,
+                evolution_enabled: request.evolution_enabled,
+            })
+        };
+        let record = LoadedRunApplicationSnapshot::from_wire(wire)?;
         session
             .put(ctx, "artifact", &snapshot_id, ctx.actor(), &record)
             .await?;
@@ -1001,10 +1277,26 @@ impl ReleaseStore {
         run_id: &str,
     ) -> Result<LoadedRunApplicationSnapshot> {
         ctx.require(&[Role::Host, Role::Admin])?;
+        Self::validate_run_snapshot_source_in_session(ctx, session, run_id).await
+    }
+    pub(crate) async fn validate_environment_run_source_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        run_id: &str,
+    ) -> Result<LoadedRunApplicationSnapshot> {
+        ctx.require(&[Role::Host, Role::Admin, Role::Worker])?;
+        Self::validate_run_snapshot_source_in_session(ctx, session, run_id).await
+    }
+    async fn validate_run_snapshot_source_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        run_id: &str,
+    ) -> Result<LoadedRunApplicationSnapshot> {
         identifier(run_id)?;
-        let snapshot_id = format!("run-snapshot-{run_id}");
-        let snapshot: LoadedRunApplicationSnapshot =
-            session.need(ctx, "artifact", &snapshot_id).await?;
+        let snapshot = load_run_original_in_session(session, ctx, run_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        let snapshot_id = snapshot.id.clone();
         require_body_witness(
             session,
             ctx,
@@ -1017,8 +1309,9 @@ impl ReleaseStore {
         if snapshot.id != snapshot_id
             || snapshot.run_id != run_id
             || snapshot.system_snapshot.profile_id != snapshot.profile_id
-            || snapshot.environment_digest != snapshot.system_snapshot.digest()?
-            || snapshot.request_digest != fingerprint(&snapshot.request_material)?
+            || snapshot.environment_digest != snapshot.expected_environment_digest()?
+            || snapshot.request_digest
+                != snapshot.applied_request_digest(&snapshot.request_material)?
             || snapshot.request_material.instructions != snapshot.projection.instructions
             || snapshot.request_material.tools != snapshot.projection.tools
             || snapshot.request_material.mandatory_context_digest
@@ -1047,8 +1340,12 @@ impl ReleaseStore {
                 }
                 None
             }
-            RunApplicationWire::Current(current) => {
-                validate_run_application_v2_binding(current)?;
+            RunApplicationWire::Current(_) | RunApplicationWire::Complete(_) => {
+                match &snapshot.wire {
+                    RunApplicationWire::Current(v) => validate_run_application_v2_binding(v)?,
+                    RunApplicationWire::Complete(v) => validate_run_application_v3_binding(v)?,
+                    _ => unreachable!(),
+                }
                 let surface = validate_host_surface_v2_live_in_session(
                     session,
                     ctx,
@@ -1092,10 +1389,22 @@ impl ReleaseStore {
             } else {
                 revalidate_release(session, ctx, &release).await?;
             }
-            if let (Some(surface), Some(current)) = (&current_surface, snapshot.current_v2()) {
-                let projection = project_read_run_surface_v2(
+            if let Some(complete) = snapshot.current_v3() {
+                validate_versioned_release_snapshot_source(
+                    session,
+                    ctx,
+                    &candidate,
+                    &complete.system_snapshot,
+                    &complete.host_capabilities,
+                )
+                .await?;
+            }
+            if let (Some(surface), Some(capabilities)) =
+                (&current_surface, snapshot.raw_capabilities())
+            {
+                let projection = project_read_run_surface(
                     surface,
-                    &current.host_capabilities,
+                    capabilities,
                     &candidate.bundle,
                     &snapshot.system_snapshot,
                 )?;
@@ -1111,7 +1420,7 @@ impl ReleaseStore {
             ));
         } else if current_surface.is_some()
             && fingerprint(&snapshot.projection)?
-                != fingerprint(&baseline_projection(&snapshot.system_snapshot))?
+                != fingerprint(&baseline_loaded_projection(&snapshot.system_snapshot))?
         {
             return Err(Error::Conflict(
                 "current baseline projection changed".into(),
@@ -1134,13 +1443,14 @@ impl ReleaseStore {
         // Historical snapshots remain readable and replayable, but cannot
         // authorize a new application record, including zero-skill baselines
         // whose release_id is None.
-        if snapshot.current_v2().is_none() {
+        if snapshot.current_v3().is_none() {
             return Err(Error::Conflict(
                 "legacy run snapshot cannot authorize a new applied request".into(),
             ));
         }
         require_current_run_source(&mut session, ctx, &snapshot).await?;
-        let actual_request_digest = fingerprint(&evidence.actual_request_material)?;
+        let actual_request_digest =
+            snapshot.applied_request_digest(&evidence.actual_request_material)?;
         if actual_request_digest != snapshot.request_digest
             || evidence.actual_request_material != snapshot.request_material
             || evidence.environment_digest != snapshot.environment_digest
@@ -3103,16 +3413,16 @@ async fn revalidate_current_release(
     validate_read_verified_report_identity(&candidate, &view)?;
     validate_read_stored_release_identity(release, &candidate, &view)
 }
-fn project_read_run_surface_v2(
+fn project_read_run_surface(
     surface: &HostSurfaceRecordV2,
     capabilities: &HostCapabilities,
     bundle: &crate::compiler::ReadBundle,
-    snapshot: &SystemSnapshot,
+    snapshot: &LoadedSystemSnapshot,
 ) -> Result<RunProjection> {
     if !capabilities.allows(&bundle.skill.required_capabilities) {
         return Err(Error::Forbidden);
     }
-    let projection = crate::compiler::projection_for_read_bundle(bundle, snapshot, true)?;
+    let projection = crate::compiler::projection_for_loaded_snapshot(bundle, snapshot, true)?;
     // SystemSnapshot.tools is the unchanged host baseline. The only candidate
     // content emitted by the existing project_run is skill.content.
     if !projection.instructions.is_empty()
@@ -3131,6 +3441,82 @@ async fn require_current_run_source(
     if let Some(id) = &snapshot.release_id {
         let release: PersistentRelease = s.need(ctx, "release", id).await?;
         revalidate_current_release(s, ctx, &release).await?;
+    }
+    Ok(())
+}
+
+async fn load_run_original_in_session(
+    s: &mut Session,
+    ctx: &Context,
+    run_id: &str,
+) -> Result<Option<LoadedRunApplicationSnapshot>> {
+    let old_id = format!("run-snapshot-{run_id}");
+    let new_id = format!("run-snapshot-v3-{run_id}");
+    let old = s
+        .get::<LoadedRunApplicationSnapshot>(ctx, "artifact", &old_id)
+        .await?;
+    let new = s
+        .get::<LoadedRunApplicationSnapshot>(ctx, "artifact", &new_id)
+        .await?;
+    if old.is_some() && new.is_some() {
+        return Err(Error::Conflict(
+            "run id has both physical generations".into(),
+        ));
+    }
+    for (id, record) in [(&old_id, old.as_ref()), (&new_id, new.as_ref())] {
+        if let Some(record) = record
+            && (record.id != *id
+                || record.run_id != run_id
+                || (record.current_v3().is_some() != (id == &new_id)))
+        {
+            return Err(Error::Conflict("run physical key/version differs".into()));
+        }
+    }
+    Ok(new.or(old))
+}
+fn baseline_loaded_projection(snapshot: &LoadedSystemSnapshot) -> RunProjection {
+    if let Some(old) = snapshot.legacy() {
+        return baseline_projection(old);
+    }
+    RunProjection {
+        bundle_digest: String::new(),
+        instructions: Vec::new(),
+        tools: snapshot.tools.clone(),
+    }
+}
+
+async fn validate_versioned_release_snapshot_source(
+    session: &mut Session,
+    ctx: &Context,
+    candidate: &ReadCandidate,
+    snapshot: &SystemSnapshotV3,
+    capabilities: &HostCapabilities,
+) -> Result<()> {
+    let current = candidate.current()?;
+    let original = crate::compiler::verify_current_bundle_in_session(
+        session,
+        ctx,
+        &current.bundle.digest,
+        &current.environment_digest,
+        current.revoke_watermark,
+    )
+    .await?;
+    // Preserve the original software content verifier/meaning. This never
+    // supplies missing D to an old profile. A real new Host2 is separately
+    // required to use its complete Profile2/adapter/principal source gates.
+    let Some(complete) = original.v3() else {
+        return Ok(());
+    };
+    if serde_json::to_vec(&complete.original_baseline.system_snapshot)
+        .map_err(|_| Error::Internal)?
+        != serde_json::to_vec(snapshot).map_err(|_| Error::Internal)?
+        || fingerprint(&complete.original_baseline.capabilities)? != fingerprint(capabilities)?
+        || complete.original_baseline.environment_digest
+            != snapshot.environment_digest(capabilities)?
+    {
+        return Err(Error::Conflict(
+            "complete release source differs from actual run environment".into(),
+        ));
     }
     Ok(())
 }

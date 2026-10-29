@@ -56,7 +56,7 @@ fn verify_development_bundle_inputs<'a>(
     s: &'a mut Session,
     ctx: &'a Context,
     request: &'a DevelopmentRunRequest,
-) -> StepFuture<'a, crate::compiler::CurrentAuthenticatedBundleRecord> {
+) -> StepFuture<'a, crate::compiler::LoadedAuthenticatedBundleRecord> {
     // The pure-function runner's parent label is an experimental comparison
     // identifier, not ordinary-P authority. Its candidate carries the full,
     // authenticated actual P/B pair; formal host pairs are separately replayed
@@ -2409,7 +2409,7 @@ impl RegisteredDevelopmentRunner {
         fence: &BudgetCallFence,
         request: &DevelopmentRunRequest,
         source_ids: &[String],
-        reserved_inputs: &crate::compiler::CurrentAuthenticatedBundleRecord,
+        reserved_inputs: &crate::compiler::LoadedAuthenticatedBundleRecord,
     ) -> Result<BudgetDispatchDecision> {
         let mut session = self.store.session().await?;
         // A proven source revocation keeps the existing typed budget refusal and

@@ -10,13 +10,13 @@ use crate::capacity::{
 };
 use crate::evidence::{StoredTraceAuthority, load_stored_source, store_trace_authority};
 use crate::release_store::{
-    HostApplicationRecord, LoadedRunApplicationSnapshot as RunApplicationSnapshot,
-    PersistentRelease, PrepareRunRequest, ReadCandidate, ReleaseStore,
-    TrustedHostExecutionEvidence,
+    CompletePrepareRunRequest, HostApplicationRecord,
+    LoadedRunApplicationSnapshot as RunApplicationSnapshot, PersistentRelease, PrepareRunRequest,
+    ReadCandidate, ReleaseStore, TrustedHostExecutionEvidence,
 };
 use evo_core::contract::{AppliedReceipt, CapabilityLevel};
-pub use evo_core::prepare_contract::HostPrepareConfig;
-use evo_core::prepare_contract::PrepareOperation;
+pub use evo_core::prepare_contract::{CompleteHostPrepareConfig, HostPrepareConfig};
+use evo_core::prepare_contract::{CompletePrepareOperation, PrepareOperation};
 use evo_core::{
     Candidate, CandidateState, Context, EntityKind, Error, Feedback, FeedbackRecord, Improvement,
     Inspect, Job, Prepared, Proposal, Receipt, Release, Result, Role, Run, Skill, Validate,
@@ -167,6 +167,22 @@ impl HostService {
         request: evo_core::Prepare,
         config: &HostPrepareConfig,
     ) -> Result<Prepared> {
+        Box::pin(self.prepare_inner(caller, request, PrepareConfiguration::legacy(config))).await
+    }
+    pub async fn prepare_complete(
+        &self,
+        caller: &Context,
+        request: evo_core::Prepare,
+        config: &CompleteHostPrepareConfig,
+    ) -> Result<Prepared> {
+        Box::pin(self.prepare_inner(caller, request, PrepareConfiguration::complete(config))).await
+    }
+    async fn prepare_inner(
+        &self,
+        caller: &Context,
+        request: evo_core::Prepare,
+        config: PrepareConfiguration<'_>,
+    ) -> Result<Prepared> {
         self.authorize_model_caller(caller)?;
         request.validate()?;
         config.validate()?;
@@ -174,10 +190,7 @@ impl HostService {
         if !config.host_capabilities.allows(&request.capabilities) {
             return Err(Error::Forbidden);
         }
-        let operation = PrepareOperation {
-            request: &request,
-            config,
-        };
+        let operation = config.operation(&request);
         // Held until this function returns on any path.
         let _inflight = self.begin_inflight_prepare()?;
         {
@@ -186,12 +199,13 @@ impl HostService {
                 .cached::<Prepared, _>(caller, "service.prepare", &request.request_key, &operation)
                 .await?
             {
-                ReleaseStore::validate_run_snapshot_live_in_session(
+                let live = ReleaseStore::validate_run_snapshot_live_in_session(
                     &self.trusted_host,
                     &mut session,
                     &existing.run.id,
                 )
                 .await?;
+                config.matches(&live)?;
                 let run: Run = session
                     .need(caller, SERVICE_RUN_KIND, &existing.run.id)
                     .await?;
@@ -214,25 +228,51 @@ impl HostService {
             &[
                 caller.namespace(),
                 caller.actor(),
-                "prepare",
+                config.run_component(),
                 &request.request_key,
             ],
         );
-        let snapshot = ReleaseStore::prepare_run(
-            &self.trusted_host,
-            &self.store,
-            PrepareRunRequest {
-                run_id: run_id.clone(),
-                profile_id: config.profile_id.clone(),
-                system_snapshot: config.system_snapshot.clone(),
-                host_surface_id: config.host_surface_id.clone(),
-                host_capabilities: config.host_capabilities.clone(),
-                task_input_digest: hash(request.goal.as_bytes()),
-                evolution_enabled: config.evolution_enabled,
-                capability_level: config.capability_level,
-            },
-        )
-        .await?;
+        let snapshot = if config.system_snapshot.complete().is_some() {
+            ReleaseStore::prepare_complete_run(
+                &self.trusted_host,
+                &self.store,
+                CompletePrepareRunRequest {
+                    run_id: run_id.clone(),
+                    profile_id: config.profile_id.clone(),
+                    system_snapshot: config
+                        .system_snapshot
+                        .complete()
+                        .ok_or(Error::Internal)?
+                        .clone(),
+                    host_surface_id: config.host_surface_id.clone(),
+                    host_capabilities: config.host_capabilities.clone(),
+                    task_input_digest: hash(request.goal.as_bytes()),
+                    evolution_enabled: config.evolution_enabled,
+                    capability_level: config.capability_level,
+                },
+            )
+            .await?
+        } else {
+            ReleaseStore::prepare_run(
+                &self.trusted_host,
+                &self.store,
+                PrepareRunRequest {
+                    run_id: run_id.clone(),
+                    profile_id: config.profile_id.clone(),
+                    system_snapshot: config
+                        .system_snapshot
+                        .legacy()
+                        .ok_or(Error::Internal)?
+                        .clone(),
+                    host_surface_id: config.host_surface_id.clone(),
+                    host_capabilities: config.host_capabilities.clone(),
+                    task_input_digest: hash(request.goal.as_bytes()),
+                    evolution_enabled: config.evolution_enabled,
+                    capability_level: config.capability_level,
+                },
+            )
+            .await?
+        };
         let run = Run {
             id: run_id.clone(),
             owner: caller.actor().into(),
@@ -263,12 +303,13 @@ impl HostService {
             .cached::<Prepared, _>(caller, "service.prepare", &request.request_key, &operation)
             .await?
         {
-            ReleaseStore::validate_run_snapshot_live_in_session(
+            let live = ReleaseStore::validate_run_snapshot_live_in_session(
                 &self.trusted_host,
                 &mut session,
                 &existing.run.id,
             )
             .await?;
+            config.matches(&live)?;
             let run: Run = session
                 .need(caller, SERVICE_RUN_KIND, &existing.run.id)
                 .await?;
@@ -279,12 +320,13 @@ impl HostService {
             session.commit().await?;
             return Ok(existing);
         }
-        ReleaseStore::validate_run_snapshot_live_in_session(
+        let live = ReleaseStore::validate_run_snapshot_live_in_session(
             &self.trusted_host,
             &mut session,
             &run_id,
         )
         .await?;
+        config.matches(&live)?;
         if let Some(existing) = session
             .get::<Run>(caller, SERVICE_RUN_KIND, &run_id)
             .await?
@@ -632,7 +674,8 @@ impl HostService {
         let snapshot =
             ReleaseStore::validate_run_snapshot_live(&self.trusted_host, &self.store, run_id)
                 .await?;
-        let actual_request_digest = fingerprint(&evidence.actual_request_material)?;
+        let actual_request_digest =
+            snapshot.applied_request_digest(&evidence.actual_request_material)?;
         if actual_request_digest != snapshot.request_digest
             || evidence.actual_request_material != snapshot.request_material
             || evidence.environment_digest != snapshot.environment_digest
@@ -900,5 +943,104 @@ mod current_projection_controls {
             )
             .is_err()
         );
+    }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum PrepareOperationOriginal<'a> {
+    Legacy(PrepareOperation<'a>),
+    Complete(CompletePrepareOperation<'a>),
+}
+enum PrepareConfigOriginal<'a> {
+    Legacy(&'a HostPrepareConfig),
+    Complete(&'a CompleteHostPrepareConfig),
+}
+struct PrepareConfiguration<'a> {
+    original: PrepareConfigOriginal<'a>,
+    view: PrepareConfigurationView,
+}
+struct PrepareConfigurationView {
+    profile_id: String,
+    system_snapshot: evo_core::contract::LoadedSystemSnapshot,
+    host_surface_id: String,
+    host_capabilities: evo_core::contract::HostCapabilities,
+    evolution_enabled: bool,
+    capability_level: CapabilityLevel,
+}
+impl<'a> PrepareConfiguration<'a> {
+    fn legacy(c: &'a HostPrepareConfig) -> Self {
+        Self {
+            original: PrepareConfigOriginal::Legacy(c),
+            view: PrepareConfigurationView {
+                profile_id: c.profile_id.clone(),
+                system_snapshot: c.system_snapshot.clone().into(),
+                host_surface_id: c.host_surface_id.clone(),
+                host_capabilities: c.host_capabilities.clone(),
+                evolution_enabled: c.evolution_enabled,
+                capability_level: c.capability_level,
+            },
+        }
+    }
+    fn complete(c: &'a CompleteHostPrepareConfig) -> Self {
+        Self {
+            original: PrepareConfigOriginal::Complete(c),
+            view: PrepareConfigurationView {
+                profile_id: c.profile_id.clone(),
+                system_snapshot: c.system_snapshot.clone().into(),
+                host_surface_id: c.host_surface_id.clone(),
+                host_capabilities: c.host_capabilities.clone(),
+                evolution_enabled: c.evolution_enabled,
+                capability_level: c.capability_level,
+            },
+        }
+    }
+    fn validate(&self) -> Result<()> {
+        match self.original {
+            PrepareConfigOriginal::Legacy(c) => c.validate(),
+            PrepareConfigOriginal::Complete(c) => c.validate(),
+        }
+    }
+    fn operation<'b>(&'b self, r: &'b evo_core::Prepare) -> PrepareOperationOriginal<'b> {
+        match self.original {
+            PrepareConfigOriginal::Legacy(c) => {
+                PrepareOperationOriginal::Legacy(PrepareOperation {
+                    request: r,
+                    config: c,
+                })
+            }
+            PrepareConfigOriginal::Complete(c) => {
+                PrepareOperationOriginal::Complete(CompletePrepareOperation {
+                    schema_version: "rsia.prepare_operation.v3",
+                    request: r,
+                    config: c,
+                })
+            }
+        }
+    }
+    fn run_component(&self) -> &'static str {
+        match self.original {
+            PrepareConfigOriginal::Legacy(_) => "prepare",
+            PrepareConfigOriginal::Complete(_) => "prepare.v3",
+        }
+    }
+    fn matches(&self, run: &RunApplicationSnapshot) -> Result<()> {
+        if run.profile_id != self.profile_id
+            || run.host_surface_id != self.host_surface_id
+            || fingerprint(&run.system_snapshot)? != fingerprint(&self.system_snapshot)?
+            || run.host_capabilities_digest != fingerprint(&self.host_capabilities)?
+            || run.evolution_enabled != self.evolution_enabled
+            || run.capability_level != self.capability_level
+            || (self.system_snapshot.complete().is_some() != run.current_v3().is_some())
+        {
+            return Err(Error::Conflict("configured live run source differs".into()));
+        }
+        Ok(())
+    }
+}
+impl std::ops::Deref for PrepareConfiguration<'_> {
+    type Target = PrepareConfigurationView;
+    fn deref(&self) -> &Self::Target {
+        &self.view
     }
 }

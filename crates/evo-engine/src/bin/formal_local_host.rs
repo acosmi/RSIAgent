@@ -24,7 +24,7 @@ enum Command {
     /// The finite socket ingress authenticates Admin/Evaluator/Worker peers.
     Authority {
         database: String,
-        host: Box<evo_engine::formal_authority::RegisteredFormalHost>,
+        host: Box<evo_engine::formal_authority::LoadedRegisteredFormalHost>,
         principals: evo_engine::formal_authority::RegisteredPrincipalSet,
         socket: String,
         connections: u16,
@@ -317,7 +317,7 @@ async fn execute(ctx: &Context, store: &Store, command: Command) -> Result<serde
 
 async fn authority(
     database: String,
-    host: evo_engine::formal_authority::RegisteredFormalHost,
+    host: evo_engine::formal_authority::LoadedRegisteredFormalHost,
     principals: evo_engine::formal_authority::RegisteredPrincipalSet,
     socket: String,
     connections: u16,

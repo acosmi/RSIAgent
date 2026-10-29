@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const ENVIRONMENT_IDENTITY_SCHEMA: &str = "rsia.monitoring.environment.v1";
+pub const ENVIRONMENT_IDENTITY_SCHEMA_V3: &str = "rsia.monitoring.environment.v3";
 pub const DEPLOYMENT_OBSERVATION_SCHEMA: &str = "rsia.monitoring.observation.v1";
 /// Current cycle schema. `v1` kept a score-biased `pair_classes` list without task
 /// ids; it is refused when read (there is no production writer to migrate).
@@ -116,6 +117,213 @@ pub struct EnvironmentIdentityRecord {
     pub revoke_watermark: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentIdentityRecordV3 {
+    pub id: String,
+    pub schema_version: String,
+    pub identity_digest: String,
+    pub namespace: String,
+    pub evidence_scope: EnvironmentEvidenceScope,
+    pub profile_id: String,
+    pub release_id: Option<String>,
+    pub bundle_digest: Option<String>,
+    pub environment_digest: String,
+    pub model_identity: String,
+    pub ordered_tools: Vec<String>,
+    pub host_id: String,
+    pub host_version: String,
+    pub host_surface_digest: String,
+    pub host_capabilities_digest: String,
+    pub mandatory_context_digest: String,
+    pub development_manifest_digest: String,
+    pub grader_digest: String,
+    pub generation_strategy_digest: String,
+    pub revoke_watermark: u64,
+    pub run_scope: Option<String>,
+    pub system_snapshot: evo_core::contract::SystemSnapshotV3,
+    pub host_capabilities: evo_core::contract::HostCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentView {
+    pub id: String,
+    pub schema_version: String,
+    pub identity_digest: String,
+    pub namespace: String,
+    pub evidence_scope: EnvironmentEvidenceScope,
+    pub profile_id: String,
+    pub release_id: Option<String>,
+    pub bundle_digest: Option<String>,
+    pub environment_digest: String,
+    pub model_identity: String,
+    pub ordered_tools: Vec<String>,
+    pub host_id: String,
+    pub host_version: String,
+    pub host_surface_digest: String,
+    pub host_capabilities_digest: String,
+    pub mandatory_context_digest: String,
+    pub development_manifest_digest: String,
+    pub grader_digest: String,
+    pub generation_strategy_digest: String,
+    pub revoke_watermark: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EnvironmentOriginal {
+    Legacy(Box<EnvironmentIdentityRecord>),
+    Complete(Box<EnvironmentIdentityRecordV3>),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedEnvironment {
+    original: EnvironmentOriginal,
+    view: EnvironmentView,
+}
+impl LoadedEnvironment {
+    fn from_original(original: EnvironmentOriginal) -> Self {
+        macro_rules! view {
+            ($value:expr) => {{
+                let value = $value;
+                EnvironmentView {
+                    id: value.id.clone(),
+                    schema_version: value.schema_version.clone(),
+                    identity_digest: value.identity_digest.clone(),
+                    namespace: value.namespace.clone(),
+                    evidence_scope: value.evidence_scope,
+                    profile_id: value.profile_id.clone(),
+                    release_id: value.release_id.clone(),
+                    bundle_digest: value.bundle_digest.clone(),
+                    environment_digest: value.environment_digest.clone(),
+                    model_identity: value.model_identity.clone(),
+                    ordered_tools: value.ordered_tools.clone(),
+                    host_id: value.host_id.clone(),
+                    host_version: value.host_version.clone(),
+                    host_surface_digest: value.host_surface_digest.clone(),
+                    host_capabilities_digest: value.host_capabilities_digest.clone(),
+                    mandatory_context_digest: value.mandatory_context_digest.clone(),
+                    development_manifest_digest: value.development_manifest_digest.clone(),
+                    grader_digest: value.grader_digest.clone(),
+                    generation_strategy_digest: value.generation_strategy_digest.clone(),
+                    revoke_watermark: value.revoke_watermark,
+                }
+            }};
+        }
+        let view = match &original {
+            EnvironmentOriginal::Legacy(v) => view!(v),
+            EnvironmentOriginal::Complete(v) => view!(v),
+        };
+        Self { original, view }
+    }
+    pub fn complete(&self) -> Option<&EnvironmentIdentityRecordV3> {
+        match &self.original {
+            EnvironmentOriginal::Complete(v) => Some(v),
+            _ => None,
+        }
+    }
+    pub fn legacy(&self) -> Option<&EnvironmentIdentityRecord> {
+        match &self.original {
+            EnvironmentOriginal::Legacy(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+impl From<EnvironmentIdentityRecord> for LoadedEnvironment {
+    fn from(v: EnvironmentIdentityRecord) -> Self {
+        Self::from_original(EnvironmentOriginal::Legacy(Box::new(v)))
+    }
+}
+impl From<EnvironmentIdentityRecordV3> for LoadedEnvironment {
+    fn from(v: EnvironmentIdentityRecordV3) -> Self {
+        Self::from_original(EnvironmentOriginal::Complete(Box::new(v)))
+    }
+}
+impl std::ops::Deref for LoadedEnvironment {
+    type Target = EnvironmentView;
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+impl Serialize for LoadedEnvironment {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match &self.original {
+            EnvironmentOriginal::Legacy(v) => v.serialize(s),
+            EnvironmentOriginal::Complete(v) => v.serialize(s),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for LoadedEnvironment {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let value = evo_core::contract::StrictJsonValue::deserialize(d)?.0;
+        match value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(ENVIRONMENT_IDENTITY_SCHEMA) => {
+                serde_json::from_value::<EnvironmentIdentityRecord>(value)
+                    .map(Self::from)
+                    .map_err(serde::de::Error::custom)
+            }
+            Some(ENVIRONMENT_IDENTITY_SCHEMA_V3) => {
+                let v: EnvironmentIdentityRecordV3 =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                v.validate().map_err(serde::de::Error::custom)?;
+                Ok(Self::from(v))
+            }
+            _ => Err(serde::de::Error::custom("unsupported environment schema")),
+        }
+    }
+}
+impl EnvironmentIdentityRecordV3 {
+    pub fn recompute_identity(&self) -> Result<String> {
+        let mut original = serde_json::to_value(self).map_err(|_| Error::Internal)?;
+        let fields = original.as_object_mut().ok_or(Error::Internal)?;
+        fields.remove("id");
+        fields.remove("identity_digest");
+        evo_core::canonical_fingerprint(&("rsia.monitoring.environment.identity.v3", original))
+    }
+    pub fn validate(&self) -> Result<()> {
+        identifier(&self.profile_id)?;
+        self.system_snapshot.validate()?;
+        for (value, name) in [
+            (
+                &self.development_manifest_digest,
+                "development manifest digest",
+            ),
+            (&self.grader_digest, "grader digest"),
+            (
+                &self.generation_strategy_digest,
+                "generation strategy digest",
+            ),
+        ] {
+            validate_digest(value, name)?;
+        }
+        if self.schema_version != ENVIRONMENT_IDENTITY_SCHEMA_V3
+            || self.id != format!("monitor-env-v3-{}", self.identity_digest)
+            || self.identity_digest != self.recompute_identity()?
+            || self.profile_id != self.system_snapshot.profile_id
+            || self.model_identity != self.system_snapshot.model_id
+            || self.ordered_tools != self.system_snapshot.tools
+            || self.host_id != self.system_snapshot.host_id
+            || self.host_version != self.system_snapshot.host_version
+            || self.mandatory_context_digest != self.system_snapshot.mandatory_context_digest
+            || self.host_capabilities_digest != fingerprint(&self.host_capabilities)?
+            || self.environment_digest
+                != self
+                    .system_snapshot
+                    .environment_digest(&self.host_capabilities)?
+            || ((self.evidence_scope == EnvironmentEvidenceScope::ProgramFixture)
+                != self.run_scope.is_some())
+        {
+            return Err(Error::Conflict(
+                "complete environment original binding differs".into(),
+            ));
+        }
+        if let Some(run) = &self.run_scope {
+            identifier(run)?;
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentEvidenceScope {
@@ -165,7 +373,7 @@ pub struct RecordEnvironmentRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedEnvironment {
-    pub environment: EnvironmentIdentityRecord,
+    pub environment: LoadedEnvironment,
     pub observation: DeploymentObservation,
 }
 
@@ -579,29 +787,13 @@ impl MonitoringCoordinator {
         } else {
             EnvironmentEvidenceScope::ProgramFixture
         };
-        let uncertain_run_scope = (evidence_scope == EnvironmentEvidenceScope::ProgramFixture)
-            .then_some(request.run_id.as_str());
-        let identity_digest = fingerprint(&(
-            ctx.namespace(),
-            evidence_scope,
-            uncertain_run_scope,
-            &snapshot.profile_id,
-            &snapshot.release_id,
-            &snapshot.bundle_digest,
-            &snapshot.environment_digest,
-            &snapshot.system_snapshot,
-            &snapshot.host_surface_digest,
-            &snapshot.host_capabilities_digest,
-            &request.development_manifest_digest,
-            &request.grader_digest,
-            &request.generation_strategy_digest,
-            request.revoke_watermark,
-        ))?;
-        let environment_id = format!("monitor-env-{}", &identity_digest[..32]);
-        let environment = EnvironmentIdentityRecord {
-            id: environment_id.clone(),
-            schema_version: ENVIRONMENT_IDENTITY_SCHEMA.into(),
-            identity_digest,
+        let complete_run = snapshot.current_v3().ok_or_else(|| {
+            Error::Conflict("legacy run cannot create a current environment".into())
+        })?;
+        let mut complete_environment = EnvironmentIdentityRecordV3 {
+            id: String::new(),
+            schema_version: ENVIRONMENT_IDENTITY_SCHEMA_V3.into(),
+            identity_digest: String::new(),
             namespace: ctx.namespace().into(),
             evidence_scope,
             profile_id: snapshot.profile_id.clone(),
@@ -619,7 +811,17 @@ impl MonitoringCoordinator {
             grader_digest: request.grader_digest,
             generation_strategy_digest: request.generation_strategy_digest,
             revoke_watermark: request.revoke_watermark,
+            run_scope: (evidence_scope == EnvironmentEvidenceScope::ProgramFixture)
+                .then(|| request.run_id.clone()),
+            system_snapshot: complete_run.system_snapshot.clone(),
+            host_capabilities: complete_run.host_capabilities.clone(),
         };
+        complete_environment.identity_digest = complete_environment.recompute_identity()?;
+        complete_environment.id =
+            format!("monitor-env-v3-{}", complete_environment.identity_digest);
+        complete_environment.validate()?;
+        let environment_id = complete_environment.id.clone();
+        let environment = LoadedEnvironment::from(complete_environment);
         put_immutable(&mut session, ctx, &environment.id, &environment).await?;
         session
             .put_edge(
@@ -640,9 +842,28 @@ impl MonitoringCoordinator {
             )
             .await?;
 
+        if let Some(execution_id) = &application.execution_receipt_id {
+            session
+                .put_edge(
+                    ctx,
+                    ARTIFACT_KIND,
+                    &environment.id,
+                    ARTIFACT_KIND,
+                    execution_id,
+                )
+                .await?;
+        }
+
         let application_status = application_status(&snapshot, &application);
         let observation = DeploymentObservation {
-            id: format!("monitor-observation-{}", request.run_id),
+            id: format!(
+                "monitor-observation-env3-v1-{}",
+                evo_core::canonical_fingerprint(&(
+                    "rsia.monitoring.observation.env3.identity.v1",
+                    &request.run_id,
+                    &environment_id,
+                ))?
+            ),
             schema_version: DEPLOYMENT_OBSERVATION_SCHEMA.into(),
             run_id: request.run_id,
             environment_id,
@@ -739,10 +960,11 @@ impl MonitoringCoordinator {
         }
         validate_stored_sources(&mut session, ctx, &source_ids, request.revoke_watermark).await?;
         let sources = load_source_dependencies(&mut session, ctx, &source_ids).await?;
-        let environment: EnvironmentIdentityRecord = session
+        let environment: LoadedEnvironment = session
             .need(ctx, ARTIFACT_KIND, &request.environment_id)
             .await?;
         validate_environment_record(&environment)?;
+        validate_environment_live(&mut session, ctx, &environment).await?;
         if environment.namespace != ctx.namespace()
             || environment.profile_id != request.profile_id
             || environment.development_manifest_digest != request.development_manifest_digest
@@ -792,8 +1014,8 @@ impl MonitoringCoordinator {
             profile_id: request.profile_id,
             development_manifest_digest: request.development_manifest_digest,
             environment_id: environment.id.clone(),
-            environment_identity_digest: environment.identity_digest,
-            environment_digest: environment.environment_digest,
+            environment_identity_digest: environment.identity_digest.clone(),
+            environment_digest: environment.environment_digest.clone(),
             grader_digest: request.grader_digest,
             generation_strategy_digest: request.generation_strategy_digest,
             parent_skill_digest: request.parent_skill_digest,
@@ -976,6 +1198,18 @@ impl MonitoringCoordinator {
             let claim = load_live_claim(&mut session, ctx, claim_id).await?;
             session.commit().await?;
             return Ok(ClaimOutcome::AlreadyClaimed(claim));
+        }
+        let environment: LoadedEnvironment = session
+            .need(ctx, ARTIFACT_KIND, &index.scope.environment_id)
+            .await?;
+        validate_environment_record(&environment)?;
+        validate_environment_live(&mut session, ctx, &environment).await?;
+        if environment.identity_digest != index.scope.environment_identity_digest
+            || environment.environment_digest != index.scope.environment_digest
+        {
+            return Err(Error::Conflict(
+                "claim differs from current complete environment".into(),
+            ));
         }
         let start = usize::try_from((generation - 1) * 2)
             .map_err(|_| Error::Invalid("generation overflow".into()))?;
@@ -1697,14 +1931,16 @@ impl MonitoringCoordinator {
             return Err(Error::Invalid("drift reason must be 1..=512 bytes".into()));
         }
         let mut session = store.session().await?;
-        let previous: EnvironmentIdentityRecord = session
+        let previous: LoadedEnvironment = session
             .need(ctx, ARTIFACT_KIND, previous_environment_id)
             .await?;
-        let current: EnvironmentIdentityRecord = session
+        let current: LoadedEnvironment = session
             .need(ctx, ARTIFACT_KIND, current_environment_id)
             .await?;
         validate_environment_record(&previous)?;
         validate_environment_record(&current)?;
+        validate_environment_live(&mut session, ctx, &previous).await?;
+        validate_environment_live(&mut session, ctx, &current).await?;
         if previous.identity_digest == current.identity_digest {
             return Err(Error::Conflict("environment identity did not drift".into()));
         }
@@ -1723,8 +1959,8 @@ impl MonitoringCoordinator {
             schema_version: ENVIRONMENT_DRIFT_SCHEMA.into(),
             previous_environment_id: previous_environment_id.into(),
             current_environment_id: current_environment_id.into(),
-            previous_identity_digest: previous.identity_digest,
-            current_identity_digest: current.identity_digest,
+            previous_identity_digest: previous.identity_digest.clone(),
+            current_identity_digest: current.identity_digest.clone(),
             invalidated_scope_id: scope_id.into(),
             reason: reason.into(),
         };
@@ -1885,6 +2121,78 @@ impl DevRunner for RootBoundDevRunner<'_> {
     }
 }
 
+async fn validate_environment_live(
+    session: &mut Session,
+    ctx: &Context,
+    environment: &LoadedEnvironment,
+) -> Result<()> {
+    let original = environment
+        .complete()
+        .ok_or_else(|| Error::Conflict("legacy environment cannot authorize new use".into()))?;
+    original.validate()?;
+    if original.namespace != ctx.namespace() {
+        return Err(Error::Forbidden);
+    }
+    require_watermark(session, ctx, original.revoke_watermark).await?;
+    let edges = session
+        .outgoing_edges_bounded(ctx, ARTIFACT_KIND, &original.id, 10_000)
+        .await?;
+    let runs = edges
+        .iter()
+        .filter(|(kind, _)| kind == ARTIFACT_KIND)
+        .filter_map(|(_, id)| id.strip_prefix("run-snapshot-v3-"))
+        .collect::<Vec<_>>();
+    if runs.is_empty() {
+        return Err(Error::Conflict(
+            "environment lacks its actual run source".into(),
+        ));
+    }
+    for run_id in runs {
+        let snapshot =
+            ReleaseStore::validate_environment_run_source_in_session(ctx, session, run_id).await?;
+        let run = snapshot
+            .current_v3()
+            .ok_or_else(|| Error::Conflict("legacy environment run source".into()))?;
+        let application_id = format!("host-application-{run_id}");
+        if !edges.contains(&(RECEIPT_KIND.into(), application_id.clone())) {
+            return Err(Error::Conflict(
+                "environment lacks its application edge".into(),
+            ));
+        }
+        let application: HostApplicationRecord =
+            session.need(ctx, RECEIPT_KIND, &application_id).await?;
+        validate_host_application(session, ctx, &snapshot, &application).await?;
+        if let Some(execution_id) = &application.execution_receipt_id
+            && !edges.contains(&(ARTIFACT_KIND.into(), execution_id.clone()))
+        {
+            return Err(Error::Conflict(
+                "environment lacks its actual execution edge".into(),
+            ));
+        }
+        let scope = if application.execution_receipt_id.is_some() {
+            EnvironmentEvidenceScope::TrustedExecution
+        } else {
+            EnvironmentEvidenceScope::ProgramFixture
+        };
+        if original.profile_id != run.profile_id
+            || original.release_id != run.release_id
+            || original.bundle_digest != run.bundle_digest
+            || original.environment_digest != run.environment_digest
+            || original.system_snapshot != run.system_snapshot
+            || original.host_capabilities != run.host_capabilities
+            || original.host_surface_digest != run.host_surface_digest
+            || original.evidence_scope != scope
+            || original.run_scope
+                != (scope == EnvironmentEvidenceScope::ProgramFixture).then(|| run_id.to_owned())
+        {
+            return Err(Error::Conflict(
+                "environment differs from its complete live run/application".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn validate_host_application(
     session: &mut Session,
     ctx: &Context,
@@ -1900,6 +2208,15 @@ async fn validate_host_application(
             "stored Host application differs from the run snapshot".into(),
         ));
     }
+    crate::formal_authority::require_content_witness(
+        session,
+        ctx,
+        RECEIPT_KIND,
+        &application.id,
+        &serde_json::to_value(application).map_err(|_| Error::Internal)?,
+        Role::Host,
+    )
+    .await?;
     if let Some(receipt) = &application.receipt {
         receipt.validate()?;
         if receipt.request_digest != snapshot.request_digest
@@ -1913,6 +2230,15 @@ async fn validate_host_application(
     if let Some(execution_id) = &application.execution_receipt_id {
         let execution: TrustedHostExecutionReceipt =
             session.need(ctx, ARTIFACT_KIND, execution_id).await?;
+        crate::formal_authority::require_content_witness(
+            session,
+            ctx,
+            ARTIFACT_KIND,
+            execution_id,
+            &serde_json::to_value(&execution).map_err(|_| Error::Internal)?,
+            Role::Host,
+        )
+        .await?;
         if execution.run_id != snapshot.run_id
             || execution.request_digest != snapshot.request_digest
             || execution.environment_digest != snapshot.environment_digest
@@ -2140,7 +2466,7 @@ async fn validate_development_fact(
 fn validate_report_scope(
     report: &DevelopmentRunReport,
     request: &CompleteDevelopmentCycleRequest,
-    environment: &EnvironmentIdentityRecord,
+    environment: &EnvironmentView,
 ) -> Result<()> {
     identifier(&report.request_id)?;
     identifier(&report.execution_receipt_id)?;
@@ -2223,7 +2549,7 @@ async fn verify_trusted_development(
     fact: &StageFact,
     report: &DevelopmentRunReport,
     request: &CompleteDevelopmentCycleRequest,
-    environment: &EnvironmentIdentityRecord,
+    environment: &EnvironmentView,
 ) -> Result<()> {
     let request_fact_id = development_request_fact_id(fact)?;
     let view = verified_development_observation_in_session(
@@ -2244,7 +2570,7 @@ fn require_view_matches(
     fact: &StageFact,
     report: &DevelopmentRunReport,
     request: &CompleteDevelopmentCycleRequest,
-    environment: &EnvironmentIdentityRecord,
+    environment: &EnvironmentView,
 ) -> Result<()> {
     let same_tasks = view.outcomes.len() == report.results.len()
         && view
@@ -2755,14 +3081,13 @@ async fn load_source_dependencies(
     Ok(sources)
 }
 
-fn validate_environment_record(environment: &EnvironmentIdentityRecord) -> Result<()> {
-    if environment.schema_version != ENVIRONMENT_IDENTITY_SCHEMA {
-        return Err(Error::Invalid("unsupported environment schema".into()));
+fn validate_environment_record(environment: &LoadedEnvironment) -> Result<()> {
+    match environment.complete() {
+        Some(v) => v.validate(),
+        None => Err(Error::Conflict(
+            "legacy environment cannot authorize new use".into(),
+        )),
     }
-    identifier(&environment.id)?;
-    validate_digest(&environment.identity_digest, "environment identity digest")?;
-    validate_digest(&environment.environment_digest, "environment digest")?;
-    Ok(())
 }
 
 async fn put_immutable<T>(session: &mut Session, ctx: &Context, id: &str, value: &T) -> Result<()>
@@ -3013,7 +3338,7 @@ fn pairs_digest(cycles: &[DevelopmentCycleRecord]) -> Result<String> {
 /// A proposal is fixture-grade unless both the frozen environment and every
 /// backing cycle are free of fixture evidence.
 fn proposal_provenance(
-    environment: &EnvironmentIdentityRecord,
+    environment: &EnvironmentView,
     cycles: &[DevelopmentCycleRecord],
 ) -> EnvironmentEvidenceScope {
     if environment.evidence_scope == EnvironmentEvidenceScope::TrustedExecution
@@ -3030,7 +3355,7 @@ fn proposal_provenance(
 /// The frozen environment and the completed cycles behind a claim: what the
 /// derived fields of its proposal are recomputed from.
 struct ClaimEvidence {
-    environment: EnvironmentIdentityRecord,
+    environment: LoadedEnvironment,
     cycles: Vec<DevelopmentCycleRecord>,
 }
 
@@ -3040,10 +3365,11 @@ async fn load_claim_evidence(
     claim: &ConsolidationClaim,
     scope: &ConsolidationScope,
 ) -> Result<ClaimEvidence> {
-    let environment: EnvironmentIdentityRecord = session
+    let environment: LoadedEnvironment = session
         .need(ctx, ARTIFACT_KIND, &scope.environment_id)
         .await?;
     validate_environment_record(&environment)?;
+    validate_environment_live(session, ctx, &environment).await?;
     let mut cycles = Vec::with_capacity(claim.cycle_ids.len());
     for cycle_id in &claim.cycle_ids {
         let cycle = load_cycle(session, ctx, cycle_id).await?;
@@ -3960,8 +4286,8 @@ mod tests {
         ));
     }
 
-    fn environment(scope: EnvironmentEvidenceScope) -> EnvironmentIdentityRecord {
-        EnvironmentIdentityRecord {
+    fn environment(scope: EnvironmentEvidenceScope) -> EnvironmentView {
+        EnvironmentView {
             id: "environment".into(),
             schema_version: ENVIRONMENT_IDENTITY_SCHEMA.into(),
             identity_digest: "1".repeat(64),
@@ -4477,7 +4803,7 @@ mod tests {
         StageFact,
         DevelopmentRunReport,
         CompleteDevelopmentCycleRequest,
-        EnvironmentIdentityRecord,
+        EnvironmentView,
     ) {
         let environment = environment(EnvironmentEvidenceScope::ProgramFixture);
         let mut report = report(vec![
