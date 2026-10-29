@@ -1,10 +1,10 @@
-//! The single typed management-operation registry (plan v4.3 §6.1.2 L726–774,
-//! V100.a L2215).
+//! The single typed management-operation registry (plan v4.5 §6.1.2 L795–854,
+//! V100.a/e L2374–2382).
 //!
 //! One authoring constant (`MANAGEMENT_CATALOG`) registers every concrete
-//! operation name of the §6.1.2 table L738–L768 plus the one named action of
-//! the closed control family (`control.review`, cited per §4 L448, §6.5 L863
-//! and E06 L1617). All name projections — `all_names`, `dispatch_names`,
+//! operation name of the §6.1.2 table L811–L842 plus the one named action of
+//! the closed control family (`control.review`, cited per §4, §6.5 L945–947
+//! and E06 L1738–1752). All name projections — `all_names`, `dispatch_names`,
 //! `formal_names`, `offline_names`, the review name and its route — derive
 //! from that one catalog, so there is no second fact table that can drift.
 //!
@@ -13,7 +13,7 @@
 //! runtime consumes it: the existing seven dispatch handlers, the formal
 //! authority commands and the offline restore keep their own real guards.
 
-/// Execution plane of a registered operation (§6.1.2 plane notes L770–774).
+/// Execution plane of a registered operation (§6.1.2 plane notes L844–854).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Plane {
     /// `rsia serve` `/v1/manage/*` and `rsia manage`.
@@ -40,7 +40,7 @@ pub enum RoleRequirement {
     JobOwner,
     /// development.control.register: Admin who is neither executor nor grader.
     AdminNotExecutorOrGrader,
-    /// release.approve/canary/activate/rollback: Admin and the §4 L448
+    /// release.approve/canary/activate/rollback: Admin and the §4
     /// approval-subject separation.
     AdminWithApprovalSubjectSeparation,
     /// Formal-authority command fixed by the command to Host.
@@ -48,7 +48,7 @@ pub enum RoleRequirement {
     /// Formal-authority command fixed by the command to Evaluator.
     FixedFormalEvaluator,
     /// control.review: the Admin of this gateway's trusted namespace, per the
-    /// cited clauses (§4 L448, §6.5 L863, E06 L1617).
+    /// cited clauses (§4, §6.5 L945–947, E06 L1738–1752).
     TrustedGatewayAdmin,
     /// restore: the operating-system operator, offline.
     OperatingSystemOperator,
@@ -70,15 +70,15 @@ pub enum PaidPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ExecutionKind {
     /// Dispatch-plane async operation: submit persists and returns a job id
-    /// (§6.1.2 L728). Unimplemented names stay fail-closed at the dispatcher's
-    /// unknown-operation default.
+    /// (§6.1.2 L799). Registered names without a handler are refused before
+    /// payload parsing or persistence.
     AsyncJob,
     /// job.status/job.cancel: dedicated lifecycle routes over existing jobs
     /// (§6.1.1), never a new job.
     JobLifecycle,
     /// The one registered synchronous read-only control-plane view: reads
     /// existing governance facts and creates no job, private input, audit row,
-    /// budget call or model call (§6.1.2 L734, §6.5 L863, E06 L1617).
+    /// budget call or model call (§6.1.2 L804, §6.5 L945–947, E06 L1738–1752).
     SyncReadonlyView,
     /// Formal-authority command over its own channel (§4.2, E04/E05/E06).
     FormalCommand,
@@ -91,8 +91,8 @@ pub enum ExecutionKind {
 pub struct ManagementOperation {
     /// The exact operation name (`family.action`); the minimal code identifier.
     pub name: &'static str,
-    /// The §6.1.2 table row this name is registered under (L738–L768); the
-    /// 31 distinct rows are the 31 families.
+    /// The §6.1.2 table row this name is registered under (L811–L842); the
+    /// 32 distinct rows are the 32 families.
     pub table_line: u16,
     pub plane: Plane,
     pub role: RoleRequirement,
@@ -103,7 +103,7 @@ pub struct ManagementOperation {
     pub clause: &'static str,
 }
 
-/// The route prefix of the dispatch plane (§6.1.2 plane note L771).
+/// The route prefix of the dispatch plane (§6.1.2 plane note L845).
 pub const MANAGE_ROUTE_PREFIX: &str = "/v1/manage/";
 
 /// The one named action of the closed control family (family.action).
@@ -127,12 +127,12 @@ macro_rules! op {
 }
 
 /// The single authoring catalog: every concrete name of §6.1.2 table
-/// L738–L768 in table order, then the control family's one named action.
+/// L811–L842 in table order, then the control family's one named action.
 pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
-    // L738 experiment.register；evaluation.start/status
+    // L811 experiment.register；evaluation.start/status
     op!(
         "experiment.register",
-        738,
+        811,
         Dispatch,
         Evaluator,
         PaidPolicy::Never,
@@ -141,7 +141,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "evaluation.start",
-        738,
+        811,
         Dispatch,
         Evaluator,
         PaidPolicy::Never,
@@ -150,17 +150,17 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "evaluation.status",
-        738,
+        811,
         Dispatch,
         Evaluator,
         PaidPolicy::Never,
         AsyncJob,
         "E01/E05；§6.6"
     ),
-    // L739 exploration.start；replay.run；meta.start
+    // L812 exploration.start；replay.run；meta.start
     op!(
         "exploration.start",
-        739,
+        812,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -169,7 +169,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "replay.run",
-        739,
+        812,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -178,27 +178,27 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "meta.start",
-        739,
+        812,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E09/E10/E14；§6.1"
     ),
-    // L740 curriculum.step
+    // L813 curriculum.step
     op!(
         "curriculum.step",
-        740,
+        813,
         Dispatch,
         Admin,
         PaidPolicy::Conditional("提案生成为是（占§8课程额度）"),
         AsyncJob,
         "E12；§8.1"
     ),
-    // L741 job.status；job.cancel
+    // L814 job.status；job.cancel
     op!(
         "job.status",
-        741,
+        814,
         Dispatch,
         JobOwner,
         PaidPolicy::Never,
@@ -207,37 +207,37 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "job.cancel",
-        741,
+        814,
         Dispatch,
         JobOwner,
         PaidPolicy::Never,
         JobLifecycle,
         "§6.1.1"
     ),
-    // L742 exploration.step（每次推进一个节点）
+    // L815 exploration.step（每次推进一个节点）
     op!(
         "exploration.step",
-        742,
+        815,
         Dispatch,
         Admin,
         PaidPolicy::Always,
         AsyncJob,
         "E09；§7.1–§7.2.3"
     ),
-    // L743 optimization.step（G1单步内容优化）
+    // L816 optimization.step（G1单步内容优化）
     op!(
         "optimization.step",
-        743,
+        816,
         Dispatch,
         Admin,
         PaidPolicy::Always,
         AsyncJob,
         "E03/E07；§6.7"
     ),
-    // L744 practice.register/run；skill_group.run — run为是
+    // L817 practice.register/run；skill_group.run — run为是
     op!(
         "practice.register",
-        744,
+        817,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -246,7 +246,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "practice.run",
-        744,
+        817,
         Dispatch,
         Admin,
         PaidPolicy::Always,
@@ -255,27 +255,46 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "skill_group.run",
-        744,
+        817,
         Dispatch,
         Admin,
         PaidPolicy::Always,
         AsyncJob,
         "E09/E12；§7.7、§8.5"
     ),
-    // L745 development.control.register
+    // L818 development.control.register
     op!(
         "development.control.register",
-        745,
+        818,
         Dispatch,
         AdminNotExecutorOrGrader,
         PaidPolicy::Never,
         AsyncJob,
         "E03/E09"
     ),
-    // L746 consolidation.trigger；consolidation.run — trigger否、run是
+    // L819 development.probe_compose.enable/disable (registration only).
+    op!(
+        "development.probe_compose.enable",
+        819,
+        Dispatch,
+        Admin,
+        PaidPolicy::Never,
+        AsyncJob,
+        "E09；§6.7.5（v4.5补充，Q-46）"
+    ),
+    op!(
+        "development.probe_compose.disable",
+        819,
+        Dispatch,
+        Admin,
+        PaidPolicy::Never,
+        AsyncJob,
+        "E09；§6.7.5（v4.5补充，Q-46）"
+    ),
+    // L820 consolidation.trigger；consolidation.run — trigger否、run是
     op!(
         "consolidation.trigger",
-        746,
+        820,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -284,17 +303,17 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "consolidation.run",
-        746,
+        820,
         Dispatch,
         Admin,
         PaidPolicy::Always,
         AsyncJob,
         "E13；§11.5"
     ),
-    // L747 curriculum.register/record_cycle/proposal/select/record_applied_asset
+    // L821 curriculum.register/record_cycle/proposal/select/record_applied_asset
     op!(
         "curriculum.register",
-        747,
+        821,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -303,7 +322,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "curriculum.record_cycle",
-        747,
+        821,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -312,7 +331,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "curriculum.proposal",
-        747,
+        821,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -321,7 +340,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "curriculum.select",
-        747,
+        821,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -330,17 +349,17 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "curriculum.record_applied_asset",
-        747,
+        821,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E12；§8.1.1、§8.4.1"
     ),
-    // L748 monitoring.environment.record（Host/Admin）；monitoring.drift.record（Admin）
+    // L822 monitoring.environment.record（Host/Admin）；monitoring.drift.record（Admin）
     op!(
         "monitoring.environment.record",
-        748,
+        822,
         Dispatch,
         HostOrAdmin,
         PaidPolicy::Never,
@@ -349,17 +368,17 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "monitoring.drift.record",
-        748,
+        822,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E13"
     ),
-    // L749 source.revoke；cleanup.continue（清理另由启动流程续跑；失败重试仅Admin）
+    // L823 source.revoke；cleanup.continue（清理另由启动流程续跑；失败重试仅Admin）
     op!(
         "source.revoke",
-        749,
+        823,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -368,17 +387,17 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "cleanup.continue",
-        749,
+        823,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E08；§11.3.1"
     ),
-    // L750 budget.*（授权与记账）
+    // L824 budget.*（授权与记账）
     op!(
         "budget.root.authorize",
-        750,
+        824,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -387,7 +406,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "budget.stage_plan.bind",
-        750,
+        824,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -396,7 +415,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "budget.calls.list_open",
-        750,
+        824,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -405,27 +424,27 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "budget.call.reconcile",
-        750,
+        824,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E04；§3.5.1、§6.6"
     ),
-    // L751 host_surface.register（dispatch或启动流程）
+    // L825 host_surface.register（dispatch或启动流程）
     op!(
         "host_surface.register",
-        751,
+        825,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E02/E16.4；§5.5.1"
     ),
-    // L752 import.register/execute
+    // L826 import.register/execute
     op!(
         "import.register",
-        752,
+        826,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -434,17 +453,17 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "import.execute",
-        752,
+        826,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E16.1；§6.3"
     ),
-    // L753 asset.stage/abort/handoff；export.prepare/complete/abort；trace.export
+    // L827 asset.stage/abort/handoff；export.prepare/complete/abort；trace.export
     op!(
         "asset.stage",
-        753,
+        827,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -453,7 +472,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "asset.abort",
-        753,
+        827,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -462,7 +481,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "asset.handoff",
-        753,
+        827,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -471,7 +490,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "export.prepare",
-        753,
+        827,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -480,7 +499,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "export.complete",
-        753,
+        827,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -489,7 +508,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "export.abort",
-        753,
+        827,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -498,17 +517,17 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "trace.export",
-        753,
+        827,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E16.1/E16.2；§11.2–§11.2.1"
     ),
-    // L754 seed.install/reset_stage
+    // L828 seed.install/reset_stage
     op!(
         "seed.install",
-        754,
+        828,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -517,17 +536,17 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "seed.reset_stage",
-        754,
+        828,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E16.3；§11.1.1"
     ),
-    // L755 replay_economics.register/start/status/cancel — 否（执行时为是）
+    // L829 replay_economics.register/start/status/cancel — 否（执行时为是）
     op!(
         "replay_economics.register",
-        755,
+        829,
         Dispatch,
         Evaluator,
         PaidPolicy::Conditional("执行时为是"),
@@ -536,7 +555,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "replay_economics.start",
-        755,
+        829,
         Dispatch,
         Evaluator,
         PaidPolicy::Conditional("执行时为是"),
@@ -545,7 +564,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "replay_economics.status",
-        755,
+        829,
         Dispatch,
         Evaluator,
         PaidPolicy::Conditional("执行时为是"),
@@ -554,28 +573,28 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "replay_economics.cancel",
-        755,
+        829,
         Dispatch,
         Evaluator,
         PaidPolicy::Conditional("执行时为是"),
         AsyncJob,
         "E11"
     ),
-    // L756 backup.create
+    // L830 backup.create
     op!(
         "backup.create",
-        756,
+        830,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E08/E16.5"
     ),
-    // L757 正式权威平面：formal.host.bootstrap；formal.provider.register；
+    // L831 正式权威平面：formal.host.bootstrap；formal.provider.register；
     // formal.meter.register；evaluation.control.register（控制登记为Evaluator）
     op!(
         "formal.host.bootstrap",
-        757,
+        831,
         FormalAuthority,
         Admin,
         PaidPolicy::Never,
@@ -584,7 +603,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "formal.provider.register",
-        757,
+        831,
         FormalAuthority,
         Admin,
         PaidPolicy::Never,
@@ -593,7 +612,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "formal.meter.register",
-        757,
+        831,
         FormalAuthority,
         Admin,
         PaidPolicy::Never,
@@ -602,17 +621,17 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "evaluation.control.register",
-        757,
+        831,
         FormalAuthority,
         Evaluator,
         PaidPolicy::Never,
         FormalCommand,
         "E04/E05；§4.2"
     ),
-    // L758 正式权威平面：release.approve/canary/activate/rollback（§4批准主体分离）
+    // L832 正式权威平面：release.approve/canary/activate/rollback（§4批准主体分离）
     op!(
         "release.approve",
-        758,
+        832,
         FormalAuthority,
         AdminWithApprovalSubjectSeparation,
         PaidPolicy::Never,
@@ -621,7 +640,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "release.canary",
-        758,
+        832,
         FormalAuthority,
         AdminWithApprovalSubjectSeparation,
         PaidPolicy::Never,
@@ -630,7 +649,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "release.activate",
-        758,
+        832,
         FormalAuthority,
         AdminWithApprovalSubjectSeparation,
         PaidPolicy::Never,
@@ -639,17 +658,17 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "release.rollback",
-        758,
+        832,
         FormalAuthority,
         AdminWithApprovalSubjectSeparation,
         PaidPolicy::Never,
         FormalCommand,
         "E06；§6.2"
     ),
-    // L759 正式权威平面：formal.execute/grade/cost/capture_cost/finalize（按命令固定为Host或Evaluator）
+    // L833 正式权威平面：formal.execute/grade/cost/capture_cost/finalize（按命令固定为Host或Evaluator）
     op!(
         "formal.execute",
-        759,
+        833,
         FormalAuthority,
         FixedFormalHost,
         PaidPolicy::Always,
@@ -658,7 +677,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "formal.grade",
-        759,
+        833,
         FormalAuthority,
         FixedFormalEvaluator,
         PaidPolicy::Conditional("调用计价的外部grader时为是（formal_evaluation阶段）"),
@@ -667,7 +686,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "formal.cost",
-        759,
+        833,
         FormalAuthority,
         FixedFormalHost,
         PaidPolicy::Never,
@@ -676,7 +695,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "formal.capture_cost",
-        759,
+        833,
         FormalAuthority,
         FixedFormalHost,
         PaidPolicy::Never,
@@ -685,57 +704,57 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "formal.finalize",
-        759,
+        833,
         FormalAuthority,
         FixedFormalEvaluator,
         PaidPolicy::Never,
         FormalCommand,
         "E04/E05"
     ),
-    // L760 repair_template.register
+    // L834 repair_template.register
     op!(
         "repair_template.register",
-        760,
+        834,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E09；§7.2.3"
     ),
-    // L761 service.register（非正式用途的外部服务登记）
+    // L835 service.register（非正式用途的外部服务登记）
     op!(
         "service.register",
-        761,
+        835,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E04；§4.2"
     ),
-    // L762 direction_hint.register
+    // L836 direction_hint.register
     op!(
         "direction_hint.register",
-        762,
+        836,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E11；§9.1.1"
     ),
-    // L763 safe_baseline.register
+    // L837 safe_baseline.register
     op!(
         "safe_baseline.register",
-        763,
+        837,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E02；§5.3、§5.6"
     ),
-    // L764 routing.preference.decide；routing.capability.review；diagnostic.resolve
+    // L838 routing.preference.decide；routing.capability.review；diagnostic.resolve
     op!(
         "routing.preference.decide",
-        764,
+        838,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -744,7 +763,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "routing.capability.review",
-        764,
+        838,
         Dispatch,
         Admin,
         PaidPolicy::Never,
@@ -753,27 +772,27 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "diagnostic.resolve",
-        764,
+        838,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E03；§6.4"
     ),
-    // L765 emergency.stop（停用受影响能力）
+    // L839 emergency.stop（停用受影响能力）
     op!(
         "emergency.stop",
-        765,
+        839,
         Dispatch,
         Admin,
         PaidPolicy::Never,
         AsyncJob,
         "E06/E13；§3.3、§11"
     ),
-    // L766 ticket.void；holdout.epoch.close；anchor.version.register（独立评测负责人）
+    // L840 ticket.void；holdout.epoch.close；anchor.version.register（独立评测负责人）
     op!(
         "ticket.void",
-        766,
+        840,
         Dispatch,
         Evaluator,
         PaidPolicy::Never,
@@ -782,7 +801,7 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "holdout.epoch.close",
-        766,
+        840,
         Dispatch,
         Evaluator,
         PaidPolicy::Never,
@@ -791,27 +810,27 @@ pub const MANAGEMENT_CATALOG: &[ManagementOperation] = &[
     ),
     op!(
         "anchor.version.register",
-        766,
+        840,
         Dispatch,
         Evaluator,
         PaidPolicy::Never,
         AsyncJob,
         "E01/E05；§3.2.1–§3.2.3"
     ),
-    // L767 控制面登记与审阅（闭合族；本卡登记的唯一命名动作，按所引条款）
+    // L841 控制面登记与审阅（闭合族；本卡登记的唯一命名动作，按所引条款）
     op!(
         "control.review",
-        767,
+        841,
         Dispatch,
         TrustedGatewayAdmin,
         PaidPolicy::Never,
         SyncReadonlyView,
-        "§6.1.2 L734；§4 L448；§6.5 L863；E06 L1617"
+        "§6.1.2 L804；§4；§6.5 L945–947；E06 L1738–1752"
     ),
-    // L768 离线脚本：restore
+    // L842 离线脚本：restore
     op!(
         "restore",
-        768,
+        842,
         OfflineScript,
         OperatingSystemOperator,
         PaidPolicy::Never,
@@ -887,11 +906,11 @@ const fn project_all_names<const N: usize>() -> [&'static str; N] {
     out
 }
 
-/// Total registered concrete names: the 72 of the original table plus
+/// Total registered concrete names: the 74 of the current table plus
 /// `control.review`.
 pub const REGISTERED_COUNT: usize = MANAGEMENT_CATALOG.len();
 
-/// Distinct §6.1.2 table rows (the families); must be exactly 31.
+/// Distinct §6.1.2 table rows (the families); must be exactly 32.
 pub const FAMILY_COUNT: usize = {
     let mut seen: [u16; 64] = [0; 64];
     let mut n = 0;
@@ -920,9 +939,9 @@ const DISPATCH_COUNT: usize = count_plane(Plane::Dispatch);
 const FORMAL_COUNT: usize = count_plane(Plane::FormalAuthority);
 const OFFLINE_COUNT: usize = count_plane(Plane::OfflineScript);
 
-/// All 73 registered names in table order.
+/// All 75 registered names in table order.
 pub const ALL_NAMES: [&str; REGISTERED_COUNT] = project_all_names::<REGISTERED_COUNT>();
-/// The 59 dispatch-plane names (58 original + control.review); the projection
+/// The 61 dispatch-plane names (60 table names + control.review); the projection
 /// `contract::admin_ops` serves.
 pub const DISPATCH_NAMES: [&str; DISPATCH_COUNT] = project_plane::<DISPATCH_COUNT>(Plane::Dispatch);
 /// The 13 formal-authority-plane names.
@@ -934,11 +953,11 @@ pub const OFFLINE_NAMES: [&str; OFFLINE_COUNT] =
 
 // Fail closed at compile time if the catalog drifts from the §6.1.2 counts,
 // repeats a name, leaves a clause empty, or breaks the route derivation.
-const _: () = assert!(REGISTERED_COUNT == 73, "catalog must hold 72+1 names");
-const _: () = assert!(DISPATCH_COUNT == 59, "dispatch projection must be 59");
+const _: () = assert!(REGISTERED_COUNT == 75, "catalog must hold 74+1 names");
+const _: () = assert!(DISPATCH_COUNT == 61, "dispatch projection must be 61");
 const _: () = assert!(FORMAL_COUNT == 13, "formal projection must be 13");
 const _: () = assert!(OFFLINE_COUNT == 1, "offline projection must be 1");
-const _: () = assert!(FAMILY_COUNT == 31, "table rows must be 31 families");
+const _: () = assert!(FAMILY_COUNT == 32, "table rows must be 32 families");
 const _: () = assert!(names_unique(), "duplicate registered name");
 const _: () = assert!(clauses_cited(), "operation without a cited clause");
 const _: () = assert!(
@@ -969,7 +988,7 @@ const fn clauses_cited() -> bool {
     let mut i = 0;
     while i < MANAGEMENT_CATALOG.len() {
         let entry = &MANAGEMENT_CATALOG[i];
-        if entry.clause.is_empty() || entry.table_line < 738 || entry.table_line > 768 {
+        if entry.clause.is_empty() || entry.table_line < 811 || entry.table_line > 842 {
             return false;
         }
         i += 1;
@@ -985,7 +1004,7 @@ const fn review_entry_registered() -> bool {
             return matches!(entry.plane, Plane::Dispatch)
                 && matches!(entry.execution, ExecutionKind::SyncReadonlyView)
                 && matches!(entry.role, RoleRequirement::TrustedGatewayAdmin)
-                && entry.table_line == 767;
+                && entry.table_line == 841;
         }
         i += 1;
     }

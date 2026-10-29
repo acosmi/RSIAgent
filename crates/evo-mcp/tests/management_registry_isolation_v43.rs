@@ -1,7 +1,7 @@
 //! AG-136 MCP isolation controls (plan V100.a L2215, §6.1.2 L726).
 //!
 //! The actual MCP router must keep exposing exactly the four model tools, the
-//! full 73-name management catalog must be disjoint from them, and every
+//! full 75-name management catalog must be disjoint from them, and every
 //! registered management name must be rejected as a model tool while the four
 //! model tools stay accepted.
 use evo_core::contract::{MODEL_TOOLS, admin_ops};
@@ -25,12 +25,12 @@ fn actual_router_output_is_exactly_the_four_model_tools() {
     assert_eq!(model_tools(), &MODEL_TOOLS[..]);
 }
 
-/// C/V100.a: the management catalog (73) and the model tools never intersect;
+/// C/V100.a: the management catalog (75) and the model tools never intersect;
 /// management names never appear in any tool descriptor.
 #[test]
 fn management_catalog_is_disjoint_from_model_tools() {
     let all = management_registry::all_names();
-    assert_eq!(all.len(), 73);
+    assert_eq!(all.len(), 75);
     for &name in all {
         assert!(
             !MODEL_TOOLS.contains(&name),
@@ -89,7 +89,7 @@ fn reject_if_admin_refuses_all_73_registered_names_only() {
 #[test]
 fn admin_ops_is_the_dispatch_projection_and_excludes_formal_and_offline() {
     assert_eq!(admin_ops(), management_registry::dispatch_names());
-    assert_eq!(admin_ops().len(), 59);
+    assert_eq!(admin_ops().len(), 61);
     for &name in management_registry::formal_names()
         .iter()
         .chain(management_registry::offline_names().iter())

@@ -1,5 +1,5 @@
 //! AG-136 E acceptance: an independent transcription of the plan §6.1.2
-//! registration table (L738–L768, v4.3 `73dd00bf…`) cross-checked against the
+//! registration table (L811–L842, v4.5 `f6f9b1e4…`) cross-checked against the
 //! single-source registry. This fixture is acceptance input written from the
 //! truth table itself — it is not derived from `management_registry` and is
 //! never a second runtime fact source.
@@ -42,17 +42,17 @@ fn e(
     }
 }
 
-/// Independent transcription of L738–L768 plus the one named control action.
+/// Independent transcription of L811–L842 plus the one named control action.
 fn source_table() -> Vec<ExpectedOp> {
     use ExecutionKind as X;
     use PaidPolicy as P;
     use Plane as Pl;
     use RoleRequirement as R;
     vec![
-        // L738 | experiment.register；evaluation.start/status | dispatch | Evaluator | 否（占查询/alpha额度） | E01/E05；§6.6
+        // L811 | experiment.register；evaluation.start/status | dispatch | Evaluator | 否（占查询/alpha额度） | E01/E05；§6.6
         e(
             "experiment.register",
-            738,
+            811,
             Pl::Dispatch,
             R::Evaluator,
             P::Never,
@@ -61,7 +61,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "evaluation.start",
-            738,
+            811,
             Pl::Dispatch,
             R::Evaluator,
             P::Never,
@@ -70,17 +70,17 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "evaluation.status",
-            738,
+            811,
             Pl::Dispatch,
             R::Evaluator,
             P::Never,
             X::AsyncJob,
             "E01/E05；§6.6",
         ),
-        // L739 | exploration.start；replay.run；meta.start | dispatch | Admin | 否 | E09/E10/E14；§6.1
+        // L812 | exploration.start；replay.run；meta.start | dispatch | Admin | 否 | E09/E10/E14；§6.1
         e(
             "exploration.start",
-            739,
+            812,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -89,7 +89,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "replay.run",
-            739,
+            812,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -98,27 +98,27 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "meta.start",
-            739,
+            812,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E09/E10/E14；§6.1",
         ),
-        // L740 | curriculum.step | dispatch | Admin | 提案生成为是（占§8课程额度） | E12；§8.1
+        // L813 | curriculum.step | dispatch | Admin | 提案生成为是（占§8课程额度） | E12；§8.1
         e(
             "curriculum.step",
-            740,
+            813,
             Pl::Dispatch,
             R::Admin,
             P::Conditional("提案生成为是（占§8课程额度）"),
             X::AsyncJob,
             "E12；§8.1",
         ),
-        // L741 | job.status；job.cancel | dispatch | 作业属主 | 否 | §6.1.1
+        // L814 | job.status；job.cancel | dispatch | 作业属主 | 否 | §6.1.1
         e(
             "job.status",
-            741,
+            814,
             Pl::Dispatch,
             R::JobOwner,
             P::Never,
@@ -127,37 +127,37 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "job.cancel",
-            741,
+            814,
             Pl::Dispatch,
             R::JobOwner,
             P::Never,
             X::JobLifecycle,
             "§6.1.1",
         ),
-        // L742 | exploration.step | dispatch | Admin | 是 | E09；§7.1–§7.2.3
+        // L815 | exploration.step | dispatch | Admin | 是 | E09；§7.1–§7.2.3
         e(
             "exploration.step",
-            742,
+            815,
             Pl::Dispatch,
             R::Admin,
             P::Always,
             X::AsyncJob,
             "E09；§7.1–§7.2.3",
         ),
-        // L743 | optimization.step | dispatch | Admin | 是 | E03/E07；§6.7
+        // L816 | optimization.step | dispatch | Admin | 是 | E03/E07；§6.7
         e(
             "optimization.step",
-            743,
+            816,
             Pl::Dispatch,
             R::Admin,
             P::Always,
             X::AsyncJob,
             "E03/E07；§6.7",
         ),
-        // L744 | practice.register/run；skill_group.run | dispatch | Admin | run为是 | E09/E12；§7.7、§8.5
+        // L817 | practice.register/run；skill_group.run | dispatch | Admin | run为是 | E09/E12；§7.7、§8.5
         e(
             "practice.register",
-            744,
+            817,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -166,7 +166,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "practice.run",
-            744,
+            817,
             Pl::Dispatch,
             R::Admin,
             P::Always,
@@ -175,27 +175,46 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "skill_group.run",
-            744,
+            817,
             Pl::Dispatch,
             R::Admin,
             P::Always,
             X::AsyncJob,
             "E09/E12；§7.7、§8.5",
         ),
-        // L745 | development.control.register | dispatch | Admin（不得为executor或grader） | 否 | E03/E09
+        // L818 | development.control.register | dispatch | Admin（不得为executor或grader） | 否 | E03/E09
         e(
             "development.control.register",
-            745,
+            818,
             Pl::Dispatch,
             R::AdminNotExecutorOrGrader,
             P::Never,
             X::AsyncJob,
             "E03/E09",
         ),
-        // L746 | consolidation.trigger；consolidation.run | dispatch | Admin | trigger否、run是 | E13；§11.5
+        // L819 | development.probe_compose.enable/disable | dispatch | Admin | 否 | E09；§6.7.5
+        e(
+            "development.probe_compose.enable",
+            819,
+            Pl::Dispatch,
+            R::Admin,
+            P::Never,
+            X::AsyncJob,
+            "E09；§6.7.5（v4.5补充，Q-46）",
+        ),
+        e(
+            "development.probe_compose.disable",
+            819,
+            Pl::Dispatch,
+            R::Admin,
+            P::Never,
+            X::AsyncJob,
+            "E09；§6.7.5（v4.5补充，Q-46）",
+        ),
+        // L820 | consolidation.trigger；consolidation.run | dispatch | Admin | trigger否、run是 | E13；§11.5
         e(
             "consolidation.trigger",
-            746,
+            820,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -204,17 +223,17 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "consolidation.run",
-            746,
+            820,
             Pl::Dispatch,
             R::Admin,
             P::Always,
             X::AsyncJob,
             "E13；§11.5",
         ),
-        // L747 | curriculum.register/record_cycle/proposal/select/record_applied_asset | dispatch | Admin | 否 | E12；§8.1.1、§8.4.1
+        // L821 | curriculum.register/record_cycle/proposal/select/record_applied_asset | dispatch | Admin | 否 | E12；§8.1.1、§8.4.1
         e(
             "curriculum.register",
-            747,
+            821,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -223,7 +242,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "curriculum.record_cycle",
-            747,
+            821,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -232,7 +251,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "curriculum.proposal",
-            747,
+            821,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -241,7 +260,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "curriculum.select",
-            747,
+            821,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -250,17 +269,17 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "curriculum.record_applied_asset",
-            747,
+            821,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E12；§8.1.1、§8.4.1",
         ),
-        // L748 | monitoring.environment.record；monitoring.drift.record | dispatch | Host/Admin；Admin | 否 | E13
+        // L822 | monitoring.environment.record；monitoring.drift.record | dispatch | Host/Admin；Admin | 否 | E13
         e(
             "monitoring.environment.record",
-            748,
+            822,
             Pl::Dispatch,
             R::HostOrAdmin,
             P::Never,
@@ -269,17 +288,17 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "monitoring.drift.record",
-            748,
+            822,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E13",
         ),
-        // L749 | source.revoke；cleanup.continue | dispatch（清理另由启动流程续跑） | Admin（失败重试仅Admin） | 否 | E08；§11.3.1
+        // L823 | source.revoke；cleanup.continue | dispatch（清理另由启动流程续跑） | Admin（失败重试仅Admin） | 否 | E08；§11.3.1
         e(
             "source.revoke",
-            749,
+            823,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -288,17 +307,17 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "cleanup.continue",
-            749,
+            823,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E08；§11.3.1",
         ),
-        // L750 | budget.* | dispatch | Admin | 否（授权与记账） | E04；§3.5.1、§6.6
+        // L824 | budget.* | dispatch | Admin | 否（授权与记账） | E04；§3.5.1、§6.6
         e(
             "budget.root.authorize",
-            750,
+            824,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -307,7 +326,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "budget.stage_plan.bind",
-            750,
+            824,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -316,7 +335,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "budget.calls.list_open",
-            750,
+            824,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -325,27 +344,27 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "budget.call.reconcile",
-            750,
+            824,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E04；§3.5.1、§6.6",
         ),
-        // L751 | host_surface.register | dispatch或启动流程 | Admin | 否 | E02/E16.4；§5.5.1
+        // L825 | host_surface.register | dispatch或启动流程 | Admin | 否 | E02/E16.4；§5.5.1
         e(
             "host_surface.register",
-            751,
+            825,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E02/E16.4；§5.5.1",
         ),
-        // L752 | import.register/execute | dispatch | Admin | 否 | E16.1；§6.3
+        // L826 | import.register/execute | dispatch | Admin | 否 | E16.1；§6.3
         e(
             "import.register",
-            752,
+            826,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -354,17 +373,17 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "import.execute",
-            752,
+            826,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E16.1；§6.3",
         ),
-        // L753 | asset.stage/abort/handoff；export.prepare/complete/abort；trace.export | dispatch | Admin | 否 | E16.1/E16.2；§11.2–§11.2.1
+        // L827 | asset.stage/abort/handoff；export.prepare/complete/abort；trace.export | dispatch | Admin | 否 | E16.1/E16.2；§11.2–§11.2.1
         e(
             "asset.stage",
-            753,
+            827,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -373,7 +392,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "asset.abort",
-            753,
+            827,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -382,7 +401,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "asset.handoff",
-            753,
+            827,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -391,7 +410,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "export.prepare",
-            753,
+            827,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -400,7 +419,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "export.complete",
-            753,
+            827,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -409,7 +428,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "export.abort",
-            753,
+            827,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -418,17 +437,17 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "trace.export",
-            753,
+            827,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E16.1/E16.2；§11.2–§11.2.1",
         ),
-        // L754 | seed.install/reset_stage | dispatch | Admin | 否 | E16.3；§11.1.1
+        // L828 | seed.install/reset_stage | dispatch | Admin | 否 | E16.3；§11.1.1
         e(
             "seed.install",
-            754,
+            828,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -437,17 +456,17 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "seed.reset_stage",
-            754,
+            828,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E16.3；§11.1.1",
         ),
-        // L755 | replay_economics.register/start/status/cancel | dispatch | Evaluator | 否（执行时为是） | E11
+        // L829 | replay_economics.register/start/status/cancel | dispatch | Evaluator | 否（执行时为是） | E11
         e(
             "replay_economics.register",
-            755,
+            829,
             Pl::Dispatch,
             R::Evaluator,
             P::Conditional("执行时为是"),
@@ -456,7 +475,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "replay_economics.start",
-            755,
+            829,
             Pl::Dispatch,
             R::Evaluator,
             P::Conditional("执行时为是"),
@@ -465,7 +484,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "replay_economics.status",
-            755,
+            829,
             Pl::Dispatch,
             R::Evaluator,
             P::Conditional("执行时为是"),
@@ -474,27 +493,27 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "replay_economics.cancel",
-            755,
+            829,
             Pl::Dispatch,
             R::Evaluator,
             P::Conditional("执行时为是"),
             X::AsyncJob,
             "E11",
         ),
-        // L756 | backup.create | dispatch | Admin | 否 | E08/E16.5
+        // L830 | backup.create | dispatch | Admin | 否 | E08/E16.5
         e(
             "backup.create",
-            756,
+            830,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E08/E16.5",
         ),
-        // L757 | formal.host.bootstrap；formal.provider.register；formal.meter.register；evaluation.control.register | 正式权威平面 | Admin（控制登记为Evaluator） | 否 | E04/E05；§4.2
+        // L831 | formal.host.bootstrap；formal.provider.register；formal.meter.register；evaluation.control.register | 正式权威平面 | Admin（控制登记为Evaluator） | 否 | E04/E05；§4.2
         e(
             "formal.host.bootstrap",
-            757,
+            831,
             Pl::FormalAuthority,
             R::Admin,
             P::Never,
@@ -503,7 +522,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "formal.provider.register",
-            757,
+            831,
             Pl::FormalAuthority,
             R::Admin,
             P::Never,
@@ -512,7 +531,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "formal.meter.register",
-            757,
+            831,
             Pl::FormalAuthority,
             R::Admin,
             P::Never,
@@ -521,17 +540,17 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "evaluation.control.register",
-            757,
+            831,
             Pl::FormalAuthority,
             R::Evaluator,
             P::Never,
             X::FormalCommand,
             "E04/E05；§4.2",
         ),
-        // L758 | release.approve/canary/activate/rollback | 正式权威平面 | Admin，且符合§4批准主体分离 | 否 | E06；§6.2
+        // L832 | release.approve/canary/activate/rollback | 正式权威平面 | Admin，且符合§4批准主体分离 | 否 | E06；§6.2
         e(
             "release.approve",
-            758,
+            832,
             Pl::FormalAuthority,
             R::AdminWithApprovalSubjectSeparation,
             P::Never,
@@ -540,7 +559,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "release.canary",
-            758,
+            832,
             Pl::FormalAuthority,
             R::AdminWithApprovalSubjectSeparation,
             P::Never,
@@ -549,7 +568,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "release.activate",
-            758,
+            832,
             Pl::FormalAuthority,
             R::AdminWithApprovalSubjectSeparation,
             P::Never,
@@ -558,17 +577,17 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "release.rollback",
-            758,
+            832,
             Pl::FormalAuthority,
             R::AdminWithApprovalSubjectSeparation,
             P::Never,
             X::FormalCommand,
             "E06；§6.2",
         ),
-        // L759 | formal.execute/grade/cost/capture_cost/finalize | 正式权威平面 | 按命令固定为Host或Evaluator | execute为是；grade调用计价的外部grader时为是 | E04/E05
+        // L833 | formal.execute/grade/cost/capture_cost/finalize | 正式权威平面 | 按命令固定为Host或Evaluator | execute为是；grade调用计价的外部grader时为是 | E04/E05
         e(
             "formal.execute",
-            759,
+            833,
             Pl::FormalAuthority,
             R::FixedFormalHost,
             P::Always,
@@ -577,7 +596,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "formal.grade",
-            759,
+            833,
             Pl::FormalAuthority,
             R::FixedFormalEvaluator,
             P::Conditional("调用计价的外部grader时为是（formal_evaluation阶段）"),
@@ -586,7 +605,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "formal.cost",
-            759,
+            833,
             Pl::FormalAuthority,
             R::FixedFormalHost,
             P::Never,
@@ -595,7 +614,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "formal.capture_cost",
-            759,
+            833,
             Pl::FormalAuthority,
             R::FixedFormalHost,
             P::Never,
@@ -604,57 +623,57 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "formal.finalize",
-            759,
+            833,
             Pl::FormalAuthority,
             R::FixedFormalEvaluator,
             P::Never,
             X::FormalCommand,
             "E04/E05",
         ),
-        // L760 | repair_template.register | dispatch | Admin | 否 | E09；§7.2.3
+        // L834 | repair_template.register | dispatch | Admin | 否 | E09；§7.2.3
         e(
             "repair_template.register",
-            760,
+            834,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E09；§7.2.3",
         ),
-        // L761 | service.register | dispatch | Admin | 否 | E04；§4.2
+        // L835 | service.register | dispatch | Admin | 否 | E04；§4.2
         e(
             "service.register",
-            761,
+            835,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E04；§4.2",
         ),
-        // L762 | direction_hint.register | dispatch | Admin | 否 | E11；§9.1.1
+        // L836 | direction_hint.register | dispatch | Admin | 否 | E11；§9.1.1
         e(
             "direction_hint.register",
-            762,
+            836,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E11；§9.1.1",
         ),
-        // L763 | safe_baseline.register | dispatch | Admin | 否 | E02；§5.3、§5.6
+        // L837 | safe_baseline.register | dispatch | Admin | 否 | E02；§5.3、§5.6
         e(
             "safe_baseline.register",
-            763,
+            837,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E02；§5.3、§5.6",
         ),
-        // L764 | routing.preference.decide；routing.capability.review；diagnostic.resolve | dispatch | Admin | 否 | E03；§6.4
+        // L838 | routing.preference.decide；routing.capability.review；diagnostic.resolve | dispatch | Admin | 否 | E03；§6.4
         e(
             "routing.preference.decide",
-            764,
+            838,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -663,7 +682,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "routing.capability.review",
-            764,
+            838,
             Pl::Dispatch,
             R::Admin,
             P::Never,
@@ -672,27 +691,27 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "diagnostic.resolve",
-            764,
+            838,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E03；§6.4",
         ),
-        // L765 | emergency.stop | dispatch | Admin | 否 | E06/E13；§3.3、§11
+        // L839 | emergency.stop | dispatch | Admin | 否 | E06/E13；§3.3、§11
         e(
             "emergency.stop",
-            765,
+            839,
             Pl::Dispatch,
             R::Admin,
             P::Never,
             X::AsyncJob,
             "E06/E13；§3.3、§11",
         ),
-        // L766 | ticket.void；holdout.epoch.close；anchor.version.register | dispatch | Evaluator（独立评测负责人） | 否 | E01/E05；§3.2.1–§3.2.3
+        // L840 | ticket.void；holdout.epoch.close；anchor.version.register | dispatch | Evaluator（独立评测负责人） | 否 | E01/E05；§3.2.1–§3.2.3
         e(
             "ticket.void",
-            766,
+            840,
             Pl::Dispatch,
             R::Evaluator,
             P::Never,
@@ -701,7 +720,7 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "holdout.epoch.close",
-            766,
+            840,
             Pl::Dispatch,
             R::Evaluator,
             P::Never,
@@ -710,27 +729,27 @@ fn source_table() -> Vec<ExpectedOp> {
         ),
         e(
             "anchor.version.register",
-            766,
+            840,
             Pl::Dispatch,
             R::Evaluator,
             P::Never,
             X::AsyncJob,
             "E01/E05；§3.2.1–§3.2.3",
         ),
-        // L767 | 控制面登记与审阅（闭合族）| dispatch | 按所引条款 | 否 | §4 L448；§6.5 L863；E06 L1617
+        // L841 | 控制面登记与审阅（闭合族）| dispatch | 按所引条款 | 否 | §4；§6.5 L945–947；E06 L1738–1752
         e(
             "control.review",
-            767,
+            841,
             Pl::Dispatch,
             R::TrustedGatewayAdmin,
             P::Never,
             X::SyncReadonlyView,
-            "§6.1.2 L734；§4 L448；§6.5 L863；E06 L1617",
+            "§6.1.2 L804；§4；§6.5 L945–947；E06 L1738–1752",
         ),
-        // L768 | restore | 离线脚本 | 操作系统运维人员 | 否 | E08；V018
+        // L842 | restore | 离线脚本 | 操作系统运维人员 | 否 | E08；V018
         e(
             "restore",
-            768,
+            842,
             Pl::OfflineScript,
             R::OperatingSystemOperator,
             P::Never,
@@ -745,7 +764,7 @@ fn source_table() -> Vec<ExpectedOp> {
 #[test]
 fn registry_matches_the_independent_source_table_exactly() {
     let expected = source_table();
-    assert_eq!(expected.len(), 73, "fixture is 72+1");
+    assert_eq!(expected.len(), 75, "fixture is 74+1");
     assert_eq!(MANAGEMENT_CATALOG.len(), expected.len());
     for (actual, expected) in MANAGEMENT_CATALOG.iter().zip(&expected) {
         assert_eq!(actual.name, expected.name, "name/order drift");
@@ -759,11 +778,11 @@ fn registry_matches_the_independent_source_table_exactly() {
     }
 }
 
-/// The counts the card pins: 72+1 names over 31 families, 59/13/1 planes.
+/// The counts the card pins: 74+1 names over 32 families, 61/13/1 planes.
 #[test]
 fn counts_are_72_plus_1_over_31_families_and_59_13_1_planes() {
-    assert_eq!(all_names().len(), 73);
-    assert_eq!(dispatch_names().len(), 59);
+    assert_eq!(all_names().len(), 75);
+    assert_eq!(dispatch_names().len(), 61);
     assert_eq!(formal_names().len(), 13);
     assert_eq!(offline_names().len(), 1);
     assert_eq!(admin_ops(), dispatch_names());
@@ -771,18 +790,25 @@ fn counts_are_72_plus_1_over_31_families_and_59_13_1_planes() {
     // 72 original names + the single control.review.
     let original = all_names()
         .iter()
-        .filter(|name| **name != REVIEW_OPERATION)
+        .filter(|name| {
+            !matches!(
+                **name,
+                REVIEW_OPERATION
+                    | "development.probe_compose.enable"
+                    | "development.probe_compose.disable"
+            )
+        })
         .count();
     assert_eq!(original, 72);
 
-    // 31 distinct table rows = 31 families, exactly L738..=L768.
+    // 32 distinct table rows = 32 families, exactly L811..=L842.
     let mut lines: Vec<u16> = MANAGEMENT_CATALOG.iter().map(|op| op.table_line).collect();
     lines.sort_unstable();
     lines.dedup();
-    assert_eq!(lines.len(), 31);
-    assert_eq!(lines.first(), Some(&738));
-    assert_eq!(lines.last(), Some(&768));
-    let expected_lines: Vec<u16> = (738..=768).collect();
+    assert_eq!(lines.len(), 32);
+    assert_eq!(lines.first(), Some(&811));
+    assert_eq!(lines.last(), Some(&842));
+    let expected_lines: Vec<u16> = (811..=842).collect();
     assert_eq!(lines, expected_lines);
 
     // The projections partition the catalog and are duplicate-free.
@@ -800,11 +826,11 @@ fn counts_are_72_plus_1_over_31_families_and_59_13_1_planes() {
     all.dedup();
     assert_eq!(all.len(), before, "duplicate registered name");
 
-    // The closed control family (L767) registers exactly one action; it is
+    // The closed control family (L841) registers exactly one action; it is
     // not a wildcard for arbitrary control.* names.
     let control_family: Vec<_> = MANAGEMENT_CATALOG
         .iter()
-        .filter(|op| op.table_line == 767)
+        .filter(|op| op.table_line == 841)
         .collect();
     assert_eq!(control_family.len(), 1);
     assert_eq!(control_family[0].name, REVIEW_OPERATION);
@@ -832,7 +858,7 @@ fn review_projection_is_the_single_concat_derived_sync_view() {
     assert_eq!(review.execution, ExecutionKind::SyncReadonlyView);
     assert_eq!(review.role, RoleRequirement::TrustedGatewayAdmin);
     assert_eq!(review.paid, PaidPolicy::Never);
-    assert_eq!(review.table_line, 767);
+    assert_eq!(review.table_line, 841);
 
     let views = MANAGEMENT_CATALOG
         .iter()
@@ -871,7 +897,7 @@ fn conditional_paid_policies_are_not_flattened() {
     assert_eq!(paid("restore"), PaidPolicy::Never);
 }
 
-/// V100.a closure at the contract boundary: all 73 registered names are
+/// V100.a closure at the contract boundary: all 75 registered names are
 /// rejected as model tools, the four model tools are untouched and disjoint,
 /// and unknown names stay unknown.
 #[test]
@@ -918,5 +944,63 @@ fn off_table_names_are_unknown_to_the_registry() {
         "restore --force",
     ] {
         assert!(lookup(name).is_none(), "{name:?}");
+    }
+}
+
+#[test]
+fn probe_compose_pair_is_registered_without_enabling_or_changing_existing_metadata() {
+    let names = [
+        "development.probe_compose.enable",
+        "development.probe_compose.disable",
+    ];
+    for name in names {
+        let entry = lookup(name).unwrap();
+        assert_eq!(entry.table_line, 819);
+        assert_eq!(entry.plane, Plane::Dispatch);
+        assert_eq!(entry.role, RoleRequirement::Admin);
+        assert_eq!(entry.paid, PaidPolicy::Never);
+        assert_eq!(entry.execution, ExecutionKind::AsyncJob);
+        assert_eq!(entry.clause, "E09；§6.7.5（v4.5补充，Q-46）");
+        assert!(dispatch_names().contains(&name));
+        assert!(!MODEL_TOOLS.contains(&name));
+    }
+    let position = all_names()
+        .iter()
+        .position(|name| *name == names[0])
+        .unwrap();
+    assert_eq!(all_names()[position - 1], "development.control.register");
+    assert_eq!(all_names()[position + 1], names[1]);
+    assert_eq!(all_names()[position + 2], "consolidation.trigger");
+    let old_expected: Vec<_> = source_table()
+        .into_iter()
+        .filter(|entry| !names.contains(&entry.name))
+        .collect();
+    let old_actual: Vec<_> = MANAGEMENT_CATALOG
+        .iter()
+        .filter(|entry| !names.contains(&entry.name))
+        .collect();
+    assert_eq!(old_expected.len(), 73);
+    assert_eq!(old_actual.len(), old_expected.len());
+    for (actual, expected) in old_actual.iter().zip(old_expected) {
+        assert_eq!(
+            (
+                actual.name,
+                actual.table_line,
+                actual.plane,
+                actual.role,
+                actual.paid,
+                actual.execution,
+                actual.clause
+            ),
+            (
+                expected.name,
+                expected.line,
+                expected.plane,
+                expected.role,
+                expected.paid,
+                expected.execution,
+                expected.clause
+            )
+        );
     }
 }

@@ -310,7 +310,26 @@ async fn management(
     let caller = state.auth.authenticate(&headers)?;
     let body = parse_unique_value(&body, "invalid_management_payload")?;
     reject_body_identity(&body)?;
-    to_json(state.management.submit(&caller, &operation, body).await?)
+    let result = state
+        .management
+        .submit(&caller, &operation, body)
+        .await
+        .map_err(|error| match error {
+            Error::Invalid(message) if message == "unknown_management_operation" => {
+                HttpError::new(StatusCode::BAD_REQUEST, "unknown_management_operation")
+            }
+            Error::Invalid(message) if message == "management_operation_plane_mismatch" => {
+                HttpError::new(
+                    StatusCode::BAD_REQUEST,
+                    "management_operation_plane_mismatch",
+                )
+            }
+            Error::Invalid(message) if message == "management_operation_not_wired" => {
+                HttpError::new(StatusCode::BAD_REQUEST, "management_operation_not_wired")
+            }
+            error => error.into(),
+        })?;
+    to_json(result)
 }
 
 async fn management_status(
