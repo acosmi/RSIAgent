@@ -902,6 +902,39 @@ fn validate_historical_authenticated_input(
     Ok(())
 }
 
+pub(crate) fn projection_for_loaded_snapshot(
+    bundle: &ReadBundle,
+    snapshot: &evo_core::contract::LoadedSystemSnapshot,
+    evolution_enabled: bool,
+) -> Result<RunProjection> {
+    if let Some(old) = snapshot.legacy() {
+        return projection_for_read_bundle(bundle, old, evolution_enabled);
+    }
+    projection_for_complete_snapshot(
+        bundle,
+        snapshot.complete().ok_or(Error::Internal)?,
+        evolution_enabled,
+    )
+}
+pub fn projection_for_complete_snapshot(
+    bundle: &ReadBundle,
+    snapshot: &evo_core::contract::SystemSnapshotV3,
+    evolution_enabled: bool,
+) -> Result<RunProjection> {
+    snapshot.validate()?;
+    Ok(RunProjection {
+        bundle_digest: bundle.digest.clone(),
+        instructions: if !evolution_enabled
+            || (bundle.skill.content.is_empty() && bundle.skill.applicability.is_empty())
+        {
+            Vec::new()
+        } else {
+            vec![bundle.skill.content.clone()]
+        },
+        tools: snapshot.tools.clone(),
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod current_carrier_content_controls {
     use super::*;
@@ -1060,37 +1093,4 @@ pub(crate) mod current_carrier_content_controls {
             assert!(serde_json::from_value::<ReadBundle>(body).is_err());
         }
     }
-}
-
-pub(crate) fn projection_for_loaded_snapshot(
-    bundle: &ReadBundle,
-    snapshot: &evo_core::contract::LoadedSystemSnapshot,
-    evolution_enabled: bool,
-) -> Result<RunProjection> {
-    if let Some(old) = snapshot.legacy() {
-        return projection_for_read_bundle(bundle, old, evolution_enabled);
-    }
-    projection_for_complete_snapshot(
-        bundle,
-        snapshot.complete().ok_or(Error::Internal)?,
-        evolution_enabled,
-    )
-}
-pub fn projection_for_complete_snapshot(
-    bundle: &ReadBundle,
-    snapshot: &evo_core::contract::SystemSnapshotV3,
-    evolution_enabled: bool,
-) -> Result<RunProjection> {
-    snapshot.validate()?;
-    Ok(RunProjection {
-        bundle_digest: bundle.digest.clone(),
-        instructions: if !evolution_enabled
-            || (bundle.skill.content.is_empty() && bundle.skill.applicability.is_empty())
-        {
-            Vec::new()
-        } else {
-            vec![bundle.skill.content.clone()]
-        },
-        tools: snapshot.tools.clone(),
-    })
 }
