@@ -3321,3 +3321,6 @@ impl ControlledTaskProfileV1 {
         controlled_task_cluster_digest(&self.profile_id, task)
     }
 }
+
+pub mod config_precedence_generator;
+pub mod config_precedence_oracle;

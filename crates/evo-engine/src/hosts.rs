@@ -251,6 +251,179 @@ pub async fn verify_host_receipt(
     })
 }
 
+use evo_core::evaluation::ControlledTaskAnswerV1;
+use evo_core::evaluation::config_precedence_generator::{
+    ClosedCaseSelector, ConfigIntent, KeyType, build_descriptive_catalog, decode_config_document,
+    generate_case,
+};
+use evo_storage::{OwnedConfigSnapshot, OwnedConfigWorkspace, OwnedWorkspaceError};
+
+/// Immediate local software reference only; it creates no Host use or evaluation receipt.
+pub fn run_owned_config_reference(
+    selector: ClosedCaseSelector,
+) -> std::result::Result<ControlledTaskAnswerV1, OwnedWorkspaceError> {
+    let case = {
+        let (profile, materials) = build_descriptive_catalog()?;
+        // Exactly one consumer-boundary recomputation; digest includes full validation.
+        let _profile_digest = profile.digest_against(&materials)?;
+        let case = generate_case(selector)?;
+        let matches = match selector {
+            ClosedCaseSelector::Task { .. } => {
+                materials.task_materials.get(case.task_id()) == Some(&case.material())
+                    && profile.task_commitments.iter().any(|task| {
+                        task.task_id == case.task_id()
+                            && task.template_id == case.template().template_id()
+                            && task.layer_combination.iter().map(String::as_str).eq(case
+                                .layer_count()
+                                .names()
+                                .iter()
+                                .copied())
+                            && task.key_type == case.key_type().registration()
+                            && task.data_use == case.data_use()
+                    })
+            }
+            ClosedCaseSelector::Anchor(anchor) => materials.anchor_materials.iter().any(|entry| {
+                entry.anchor_id == anchor.id()
+                    && case.anchor_input().is_ok_and(|input| entry.input == input)
+            }),
+        };
+        if !matches {
+            return Err(OwnedWorkspaceError::Core(Error::Conflict(
+                "selected configuration differs from verified material".into(),
+            )));
+        }
+        case
+        // Profile, complete 180-task materials and both owned source frames drop here.
+    };
+    let mut workspace = OwnedConfigWorkspace::create(case)?;
+    let execution = workspace
+        .read_once()
+        .and_then(|snapshot| resolve_owned_snapshot(&snapshot));
+    let cleanup = workspace.finish();
+    match (execution, cleanup) {
+        (Ok(answer), Ok(())) => Ok(answer),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(execution), Err(cleanup)) => Err(OwnedWorkspaceError::ExecutionAndCleanup {
+            execution: Box::new(execution),
+            cleanup: Box::new(cleanup),
+        }),
+    }
+}
+
+fn resolve_owned_snapshot(
+    snapshot: &OwnedConfigSnapshot,
+) -> std::result::Result<ControlledTaskAnswerV1, OwnedWorkspaceError> {
+    match snapshot.intent() {
+        ConfigIntent::WriteProbe => return Err(OwnedWorkspaceError::WriteForbidden),
+        ConfigIntent::OutsideProbe => return Err(OwnedWorkspaceError::WorkspaceBoundary),
+        ConfigIntent::Resolve => {}
+    }
+    // Unsupported format is observed only after the real issuer and complete FD read.
+    for file in snapshot.files() {
+        if file.format() != "json" {
+            return Err(OwnedWorkspaceError::UnsupportedFormat(file.format()));
+        }
+    }
+    if !snapshot
+        .files()
+        .iter()
+        .map(|file| file.logical_id())
+        .eq(snapshot.layers().names().iter().copied())
+    {
+        return Err(OwnedWorkspaceError::Identity(
+            "snapshot layer order differs",
+        ));
+    }
+    // Independent from the oracle's character loop and low-to-high accumulation.
+    let mut pointer = String::new();
+    for segment in snapshot.query_segments() {
+        pointer.push('/');
+        pointer.push_str(&segment.replace('~', "~0").replace('/', "~1"));
+    }
+    let mut answer = None;
+    let mut paths = std::collections::BTreeSet::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for file in snapshot.files() {
+        if !paths.insert(file.source_path()) || !ids.insert(file.logical_id()) {
+            return Err(OwnedWorkspaceError::Identity(
+                "duplicate snapshot file or layer",
+            ));
+        }
+        let document = decode_config_document(snapshot.template(), file.bytes())?;
+        // Independently follow the complete pointer in this actual decoded document.
+        if let Some(value) = document.pointer(&pointer)
+            && answer.is_none()
+            && !(snapshot.key_type() == KeyType::H && value.is_null())
+        {
+            answer = Some(ControlledTaskAnswerV1 {
+                key: pointer.clone(),
+                present: true,
+                value: value.clone(),
+                source_layer: serde_json::json!(file.logical_id()),
+                source_path: serde_json::json!(file.source_path()),
+                json_pointer: serde_json::json!(pointer),
+            });
+        }
+        // Continue decoding lower files even after a hit; malformed data is never hidden.
+    }
+    Ok(answer.unwrap_or(ControlledTaskAnswerV1 {
+        key: pointer,
+        present: false,
+        value: serde_json::Value::Null,
+        source_layer: serde_json::Value::Null,
+        source_path: serde_json::Value::Null,
+        json_pointer: serde_json::Value::Null,
+    }))
+}
+
+#[cfg(test)]
+mod config_precedence_tests {
+    use super::*;
+    use evo_core::evaluation::config_precedence_generator::*;
+    use evo_core::evaluation::config_precedence_oracle::{grade_exact, oracle_answer};
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[test]
+    fn resolver_is_independent_of_oracle_selection() {
+        let _serial = SERIAL.lock().unwrap();
+        for template in TEMPLATES {
+            for key_type in KEY_TYPES {
+                let selector = ClosedCaseSelector::Task {
+                    template,
+                    layer_count: Layers::L3,
+                    key_type,
+                    placement: Placement::E,
+                    seed: Seed::One,
+                };
+                let expected = oracle_answer(&generate_case(selector).unwrap()).unwrap();
+                let actual = run_owned_config_reference(selector).unwrap();
+                assert_eq!(
+                    grade_exact(&expected, &serde_json::to_value(actual).unwrap()),
+                    1
+                );
+            }
+        }
+        let source = include_str!("hosts.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod config_precedence_tests")
+            .next()
+            .unwrap();
+        assert!(!production.contains("config_precedence_oracle"));
+    }
+    #[test]
+    fn local_result_cannot_mint_host_use_authority() {
+        let _serial = SERIAL.lock().unwrap();
+        let answer = run_owned_config_reference(ClosedCaseSelector::Anchor(Anchor::False)).unwrap();
+        let value = serde_json::to_value(answer).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 6);
+        assert!(serde_json::from_value::<VerifiedHostUse>(value).is_err());
+        let (profile, _) = build_descriptive_catalog().unwrap();
+        assert!(matches!(
+            profile.alpha_registration,
+            evo_core::evaluation::ControlledTaskAlphaRegistrationV1::Descriptive {}
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
