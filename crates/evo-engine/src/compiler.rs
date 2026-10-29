@@ -704,7 +704,7 @@ async fn need_current_authenticated_record(
         .await?
     {
         AuthenticatedRecordRead::Current(record) => {
-            if record.schema_version != AUTHENTICATED_BUNDLE_SCHEMA_V2 || record.id != id {
+            if record.validate_content_version().is_err() || record.id != id {
                 return Err(Error::Invalid(
                     "unsupported current authenticated record identity/schema".into(),
                 ));

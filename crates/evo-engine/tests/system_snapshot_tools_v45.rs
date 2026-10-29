@@ -1192,6 +1192,10 @@ async fn complete_formal_host_profile_and_final_command_are_bound() {
 #[test]
 fn complete_authenticated_baseline_and_parent_reload_keep_full_originals() {
     let content = complete_authenticated(source(), None);
+    assert!(content.v3().is_some());
+    assert!(content.v2().is_none());
+    let refused_by_current_loader = content.validate_content_version().is_err();
+    assert!(!refused_by_current_loader);
     content.validate_content_version().unwrap();
     let raw = serde_json::to_string(&content).unwrap();
     let loaded: LoadedAuthenticatedBundleRecord = serde_json::from_str(&raw).unwrap();
@@ -1235,6 +1239,18 @@ fn complete_authenticated_baseline_and_parent_reload_keep_full_originals() {
             "{key}"
         );
     }
+    let mut wrong_id = content.v3().unwrap().clone();
+    wrong_id.id = "formal-bundle-wrong".into();
+    assert!(matches!(
+        LoadedAuthenticatedBundleRecord::from(wrong_id).validate_content_version(),
+        Err(Error::Conflict(message)) if message == "authenticated original variant/version differs"
+    ));
+    let mut wrong_schema = content.v3().unwrap().clone();
+    wrong_schema.schema_version = "rsia.authenticated_bundle.v2".into();
+    assert!(matches!(
+        LoadedAuthenticatedBundleRecord::from(wrong_schema).validate_content_version(),
+        Err(Error::Conflict(message)) if message == "authenticated original variant/version differs"
+    ));
     // No Store persistence or legitimate new-Host2 authority is asserted here.
 }
 
@@ -1277,6 +1293,9 @@ fn complete_authenticated_loaded_original_fingerprint_keeps_nested_source() {
     let old: LoadedAuthenticatedBundleRecord = serde_json::from_str(OLD_AUTH).unwrap();
     assert_eq!(serde_json::to_string(&old).unwrap(), OLD_AUTH);
     assert!(old.v2().is_some());
+    assert!(old.v3().is_none());
+    let refused_by_current_loader = old.validate_content_version().is_err();
+    assert!(!refused_by_current_loader);
     // This is complete-wire/F evidence only; no Reserved/paid/4-UID dispatch is fabricated.
 }
 

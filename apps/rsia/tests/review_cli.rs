@@ -15,7 +15,7 @@ use evo_engine::release_store::{
     CurrentStageBundleRequest as StageBundleRequest, ReleaseStore, TypedSourceRef,
 };
 use evo_engine::review::{ReviewDetail, ReviewKind, ReviewRequest};
-use evo_engine::service::{HostPrepareConfig, HostService};
+use evo_engine::service::{CompleteHostPrepareConfig, HostPrepareConfig, HostService};
 use evo_http::{AuthIdentity, AuthRegistry, HttpState};
 use evo_storage::Store;
 use serde_json::{Value, json};
@@ -330,14 +330,18 @@ async fn fixture(scratch: &Scratch) -> HttpState {
     .unwrap();
     HttpState {
         service,
-        prepare_config: HostPrepareConfig {
-            profile_id: "cli-profile".into(),
-            system_snapshot: snapshot,
-            host_surface_id: "unused-review-surface".into(),
-            host_capabilities: caps,
-            evolution_enabled: true,
-            capability_level: CapabilityLevel::ToolOnly,
-        },
+        prepare_config: CompleteHostPrepareConfig::from_producer(
+            &HostPrepareConfig {
+                profile_id: "cli-profile".into(),
+                system_snapshot: snapshot,
+                host_surface_id: "unused-review-surface".into(),
+                host_capabilities: caps,
+                evolution_enabled: true,
+                capability_level: CapabilityLevel::ToolOnly,
+            },
+            evo_http::typed_route_tool_source().unwrap(),
+        )
+        .unwrap(),
         auth,
         management,
     }
