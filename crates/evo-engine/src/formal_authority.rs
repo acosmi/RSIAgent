@@ -3480,7 +3480,7 @@ impl FormalRegistry {
         store: &Store,
         profile: FrozenCompilerProfile,
     ) -> Result<()> {
-        Self::freeze_profile_original(ctx, store, profile.into()).await
+        Box::pin(Self::freeze_profile_original(ctx, store, profile.into())).await
     }
     pub async fn freeze_complete_profile(
         ctx: &Context,
@@ -4001,7 +4001,7 @@ pub async fn resolve_bundle_in_session(
             .improver
         }
     };
-    let verified = resolve_compiler_inputs(
+    let verified = Box::pin(resolve_compiler_inputs(
         s,
         ctx,
         &CompilerInputRequest {
@@ -4021,7 +4021,7 @@ pub async fn resolve_bundle_in_session(
             purpose,
             revoke_watermark: watermark,
         },
-    )
+    ))
     .await?;
     verified.replay(bundle)?;
     // Set dependencies are new reads and are checked after replay as well.
@@ -7428,7 +7428,7 @@ pub(crate) async fn resolve_current_compiler_inputs_inner(
     if !visiting.insert(key.clone()) {
         return Err(Error::Conflict("cyclic compiler parent lineage".into()));
     }
-    let result = async {
+    let result = Box::pin(async {
         ctx.require(&[Role::Worker, Role::Host, Role::Admin, Role::Evaluator])?;
         // Current labels are content commitments, including all-Set patches.
         // Validate their format before a lookup or a full-original mismatch.
@@ -7617,7 +7617,7 @@ pub(crate) async fn resolve_current_compiler_inputs_inner(
         };
         verified.content()?;
         Ok(verified)
-    }
+    })
     .await;
     visiting.remove(&key);
     result

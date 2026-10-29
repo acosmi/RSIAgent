@@ -2960,7 +2960,7 @@ async fn revoking_a_source_cleans_the_monitoring_closure_to_complete() {
         .put_edge(
             &fixture.admin,
             "artifact",
-            "run-snapshot-host-run-1",
+            &fixture.environment.observation.snapshot_id,
             "run",
             "source-1",
         )
