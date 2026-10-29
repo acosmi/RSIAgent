@@ -326,7 +326,8 @@ async fn mcp_complete_source_mismatch_refuses_before_prepare_writes() {
         .await
         .unwrap();
     session.commit().await.unwrap();
-    let audit_before = service.store().verify_audit(&host).await.unwrap();
+    let audit_admin = Context::new("tenant-a", "admin", Role::Admin).unwrap();
+    let audit_before = service.store().verify_audit(&audit_admin).await.unwrap();
     let mut changed = config;
     changed.system_snapshot.tool_source.definitions[0]["description"] =
         json!("same name; a different complete definition");
@@ -344,7 +345,7 @@ async fn mcp_complete_source_mismatch_refuses_before_prepare_writes() {
     );
     session.commit().await.unwrap();
     assert_eq!(
-        service.store().verify_audit(&host).await.unwrap(),
+        service.store().verify_audit(&audit_admin).await.unwrap(),
         audit_before
     );
     service.store().close().await;
