@@ -7409,7 +7409,13 @@ pub async fn resolve_current_compiler_inputs(
     ctx: &Context,
     request: &CompilerInputRequest,
 ) -> Result<CurrentVerifiedCompilerInputs> {
-    resolve_current_compiler_inputs_inner(s, ctx, request, &mut BTreeSet::new()).await
+    Box::pin(resolve_current_compiler_inputs_inner(
+        s,
+        ctx,
+        request,
+        &mut BTreeSet::new(),
+    ))
+    .await
 }
 
 pub(crate) async fn resolve_current_compiler_inputs_inner(
