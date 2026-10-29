@@ -4091,3 +4091,3228 @@ mod current_host_raw_tests {
         ));
     }
 }
+
+// A finite, ephemeral issuer. It does not modify Store/Session or grant a role.
+pub use owned_config_workspace::{OwnedConfigSnapshot, OwnedConfigWorkspace, OwnedWorkspaceError};
+mod owned_config_workspace {
+    use evo_core::evaluation::config_precedence_generator::{
+        ClosedCaseSelector, ConfigIntent, GeneratedConfigCase, KeyType, Layers, Template,
+    };
+    use std::{fmt, io};
+
+    #[derive(Debug)]
+    pub enum OwnedWorkspaceError {
+        Unsupported(&'static str),
+        Active,
+        Poisoned,
+        Capacity(&'static str),
+        Identity(&'static str),
+        OriginMismatch,
+        AlreadyRead,
+        WriteForbidden,
+        WorkspaceBoundary,
+        UnsupportedFormat(&'static str),
+        Core(evo_core::Error),
+        Io {
+            operation: &'static str,
+            source: io::Error,
+        },
+        Cleanup(Vec<OwnedWorkspaceError>),
+        ExecutionAndCleanup {
+            execution: Box<OwnedWorkspaceError>,
+            cleanup: Box<OwnedWorkspaceError>,
+        },
+    }
+    impl fmt::Display for OwnedWorkspaceError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "owned configuration workspace: {self:?}")
+        }
+    }
+    impl std::error::Error for OwnedWorkspaceError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Io { source, .. } => Some(source),
+                Self::Core(e) => Some(e),
+                Self::ExecutionAndCleanup { execution, .. } => Some(execution.as_ref()),
+                _ => None,
+            }
+        }
+    }
+    impl From<evo_core::Error> for OwnedWorkspaceError {
+        fn from(e: evo_core::Error) -> Self {
+            Self::Core(e)
+        }
+    }
+    type WsResult<T> = std::result::Result<T, OwnedWorkspaceError>;
+    #[derive(Debug)]
+    pub struct SnapshotFile {
+        logical_id: &'static str,
+        source_path: &'static str,
+        format: &'static str,
+        bytes: Vec<u8>,
+    }
+    impl SnapshotFile {
+        pub fn logical_id(&self) -> &'static str {
+            self.logical_id
+        }
+        pub fn source_path(&self) -> &'static str {
+            self.source_path
+        }
+        pub fn format(&self) -> &'static str {
+            self.format
+        }
+        pub fn bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+    #[derive(Debug)]
+    pub struct OwnedConfigSnapshot {
+        selector: ClosedCaseSelector,
+        template: Template,
+        layers: Layers,
+        key_type: KeyType,
+        query: Vec<&'static str>,
+        intent: ConfigIntent,
+        files: Vec<SnapshotFile>,
+    }
+    impl OwnedConfigSnapshot {
+        pub fn selector(&self) -> ClosedCaseSelector {
+            self.selector
+        }
+        pub fn template(&self) -> Template {
+            self.template
+        }
+        pub fn layers(&self) -> Layers {
+            self.layers
+        }
+        pub fn key_type(&self) -> KeyType {
+            self.key_type
+        }
+        pub fn query_segments(&self) -> &[&'static str] {
+            &self.query
+        }
+        pub fn intent(&self) -> ConfigIntent {
+            self.intent
+        }
+        pub fn files(&self) -> &[SnapshotFile] {
+            &self.files
+        }
+    }
+    pub struct OwnedConfigWorkspace {
+        #[cfg(unix)]
+        state: Option<State>,
+    }
+    // Keep the public opaque value from disclosing private directory names/FDs.
+    impl fmt::Debug for OwnedConfigWorkspace {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("OwnedConfigWorkspace")
+                .finish_non_exhaustive()
+        }
+    }
+    #[cfg(test)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Phase {
+        Parent,
+        Create,
+        Seal,
+        Execute,
+        Cleanup,
+    }
+    #[cfg(not(test))]
+    #[derive(Clone, Copy)]
+    enum Phase {
+        Parent,
+        Create,
+        Seal,
+        Execute,
+        Cleanup,
+    }
+    #[cfg(test)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct IoEvent {
+        phase: Phase,
+        operation: &'static str,
+        component: String,
+        parent: Option<(u64, u64)>,
+        fd: Option<(u64, u64)>,
+        offset: Option<u64>,
+        requested: usize,
+        bytes: Vec<u8>,
+        errno: Option<i32>,
+        completed: bool,
+        injected: bool,
+    }
+    #[cfg(test)]
+    #[derive(Debug, Clone, Copy)]
+    enum ReadFault {
+        Actual,
+        Interrupted,
+        EarlyEof,
+    }
+    #[cfg(test)]
+    std::thread_local! {
+        static IO_EVENTS:std::cell::RefCell<Vec<IoEvent>> = const { std::cell::RefCell::new(Vec::new()) };
+        static READ_FAULTS:std::cell::RefCell<std::collections::VecDeque<ReadFault>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    }
+    #[cfg(unix)]
+    use {
+        rustix::fs::{self as rfs, AtFlags, Mode, OFlags},
+        std::{
+            fs::File,
+            io::Write,
+            os::unix::fs::{FileExt, MetadataExt},
+            sync::atomic::{AtomicU8, AtomicU64, Ordering},
+        },
+    };
+    #[cfg(unix)]
+    static WORKSPACE_STATE: AtomicU8 = AtomicU8::new(0); // free, active, poisoned
+    #[cfg(unix)]
+    static ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+    #[cfg(unix)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Identity {
+        dev: u64,
+        ino: u64,
+        uid: u32,
+    }
+    #[cfg(unix)]
+    fn identity(m: &std::fs::Metadata) -> Identity {
+        Identity {
+            dev: m.dev(),
+            ino: m.ino(),
+            uid: m.uid(),
+        }
+    }
+    #[cfg(unix)]
+    fn io_error(operation: &'static str, source: impl Into<io::Error>) -> OwnedWorkspaceError {
+        OwnedWorkspaceError::Io {
+            operation,
+            source: source.into(),
+        }
+    }
+    #[cfg(unix)]
+    fn directory_flags() -> OFlags {
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+    }
+    #[cfg(unix)]
+    fn observed_open(
+        _phase: Phase,
+        parent: Option<&File>,
+        component: &str,
+        flags: OFlags,
+        mode: Mode,
+    ) -> WsResult<File> {
+        #[cfg(test)]
+        let parent_id = parent
+            .and_then(|p| p.metadata().ok())
+            .map(|m| (m.dev(), m.ino()));
+        #[cfg(test)]
+        IO_EVENTS.with(|events| {
+            events.borrow_mut().push(IoEvent {
+                phase: _phase,
+                operation: "open",
+                component: component.into(),
+                parent: parent_id,
+                fd: None,
+                offset: None,
+                requested: 0,
+                bytes: Vec::new(),
+                errno: None,
+                completed: false,
+                injected: false,
+            })
+        });
+        let opened = match parent {
+            Some(p) => rfs::openat(p, component, flags, mode),
+            None => rfs::open(component, flags, mode),
+        }
+        .map(File::from);
+        #[cfg(test)]
+        {
+            let (fd, errno) = match &opened {
+                Ok(f) => (f.metadata().ok().map(|m| (m.dev(), m.ino())), None),
+                Err(e) => (None, Some(e.raw_os_error())),
+            };
+            IO_EVENTS.with(|events| {
+                events.borrow_mut().push(IoEvent {
+                    phase: _phase,
+                    operation: "open",
+                    component: component.into(),
+                    parent: parent_id,
+                    fd,
+                    offset: None,
+                    requested: 0,
+                    bytes: Vec::new(),
+                    errno,
+                    completed: true,
+                    injected: false,
+                })
+            });
+        }
+        opened.map_err(|e| io_error("openat", e))
+    }
+    #[cfg(unix)]
+    fn observed_read(
+        _phase: Phase,
+        file: &File,
+        logical_id: &str,
+        buffer: &mut [u8],
+        offset: u64,
+    ) -> io::Result<usize> {
+        #[cfg(test)]
+        let fault = READ_FAULTS.with(|faults| faults.borrow_mut().pop_front());
+        #[cfg(test)]
+        let result = match fault {
+            Some(ReadFault::Interrupted) => Err(io::Error::from(rustix::io::Errno::INTR)),
+            Some(ReadFault::EarlyEof) => Ok(0),
+            Some(ReadFault::Actual) | None => file.read_at(buffer, offset),
+        };
+        #[cfg(not(test))]
+        let result = file.read_at(buffer, offset);
+        #[cfg(test)]
+        IO_EVENTS.with(|events| {
+            events.borrow_mut().push(IoEvent {
+                phase: _phase,
+                operation: "read",
+                component: logical_id.into(),
+                parent: None,
+                fd: file.metadata().ok().map(|m| (m.dev(), m.ino())),
+                offset: Some(offset),
+                requested: buffer.len(),
+                bytes: result
+                    .as_ref()
+                    .map(|n| buffer[..*n].to_vec())
+                    .unwrap_or_default(),
+                errno: result.as_ref().err().and_then(io::Error::raw_os_error),
+                completed: true,
+                injected: matches!(fault, Some(ReadFault::Interrupted | ReadFault::EarlyEof)),
+            })
+        });
+        #[cfg(not(test))]
+        let _ = logical_id;
+        result
+    }
+    #[cfg(test)]
+    #[derive(Debug, Clone)]
+    struct BufferSample {
+        phase: Phase,
+        logical_id: String,
+        expected_len: usize,
+        capacity: usize,
+        eof_slot: usize,
+    }
+    #[cfg(test)]
+    #[derive(Debug, Clone, Copy)]
+    struct MemorySample {
+        phase: Phase,
+        origin_case_heap_capacity: usize,
+        state_inline_bytes: usize,
+        directory_vector_capacity: usize,
+        member_vector_capacity: usize,
+        snapshot_vector_capacity: usize,
+        snapshot_bytes_capacity: usize,
+        query_vector_capacity: usize,
+    }
+    #[cfg(test)]
+    std::thread_local! {
+        static BUFFER_SAMPLES:std::cell::RefCell<Vec<BufferSample>> = const { std::cell::RefCell::new(Vec::new()) };
+        static MEMORY_SAMPLES:std::cell::RefCell<Vec<MemorySample>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    #[cfg(unix)]
+    fn bounded_read(
+        phase: Phase,
+        file: &File,
+        logical_id: &str,
+        expected: &[u8],
+    ) -> WsResult<Vec<u8>> {
+        let mut bytes = vec![0; expected.len()];
+        #[cfg(test)]
+        BUFFER_SAMPLES.with(|s| {
+            s.borrow_mut().push(BufferSample {
+                phase,
+                logical_id: logical_id.into(),
+                expected_len: expected.len(),
+                capacity: bytes.capacity(),
+                eof_slot: 1,
+            })
+        });
+        let (mut offset, mut interrupted) = (0usize, 0usize);
+        while offset < bytes.len() {
+            match observed_read(
+                phase,
+                file,
+                logical_id,
+                &mut bytes[offset..],
+                u64::try_from(offset).map_err(|_| OwnedWorkspaceError::Capacity("read offset"))?,
+            ) {
+                Ok(0) => return Err(OwnedWorkspaceError::Identity("truncated original fd")),
+                Ok(n) => {
+                    offset = offset
+                        .checked_add(n)
+                        .ok_or(OwnedWorkspaceError::Capacity("read count"))?
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted && interrupted < 8 => {
+                    interrupted += 1
+                }
+                Err(e) => return Err(io_error("read_at", e)),
+            }
+        }
+        let mut eof = [0u8; 1];
+        loop {
+            match observed_read(
+                phase,
+                file,
+                logical_id,
+                &mut eof,
+                u64::try_from(offset).map_err(|_| OwnedWorkspaceError::Capacity("EOF offset"))?,
+            ) {
+                Ok(0) => break,
+                Ok(_) => return Err(OwnedWorkspaceError::Identity("original fd grew")),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted && interrupted < 8 => {
+                    interrupted += 1
+                }
+                Err(e) => return Err(io_error("read_at EOF", e)),
+            }
+        }
+        if bytes != expected {
+            return Err(OwnedWorkspaceError::OriginMismatch);
+        }
+        Ok(bytes)
+    }
+    #[cfg(unix)]
+    fn next_root_name(uid: u32, pid: u32, counter: &AtomicU64) -> WsResult<String> {
+        let value = counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+            .map_err(|_| OwnedWorkspaceError::Capacity("root name counter exhausted"))?;
+        Ok(format!("rsia-ctw-v1-{uid}-{pid}-{value}"))
+    }
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct Directory {
+        fd: Option<File>,
+        parent: Option<usize>,
+        name: String,
+        identity: Option<Identity>,
+    }
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct Member {
+        parent: usize,
+        name: String,
+        identity: Option<Identity>,
+        read: Option<File>,
+        source: usize,
+    }
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct State {
+        case: GeneratedConfigCase,
+        parent: Option<File>,
+        directories: Vec<Directory>,
+        members: Vec<Member>,
+        read: bool,
+        uid: u32,
+        permit: Permit,
+    }
+    #[cfg(test)]
+    #[derive(Debug, Clone, Copy)]
+    struct FdSample {
+        phase: Phase,
+        directories: usize,
+        reads: usize,
+        writes: usize,
+        total: usize,
+    }
+    #[cfg(test)]
+    std::thread_local! { static FD_SAMPLES:std::cell::RefCell<Vec<FdSample>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    struct FileLayout<'a> {
+        logical_id: &'a str,
+        components: &'a [&'a str],
+        source_path: &'a str,
+        bytes: usize,
+    }
+    #[cfg(unix)]
+    #[derive(Debug, Clone, Copy)]
+    struct ResourceBudget {
+        payload: usize,
+        directories: usize,
+        readers: usize,
+        writers: usize,
+        peak: usize,
+    }
+    #[cfg(unix)]
+    fn preflight_layout(files: &[FileLayout<'_>]) -> WsResult<ResourceBudget> {
+        if files.is_empty() || files.len() > 16 {
+            return Err(OwnedWorkspaceError::Capacity("regular count"));
+        }
+        let mut bytes = 0usize;
+        let mut directories = 1usize;
+        let mut paths = std::collections::BTreeSet::new();
+        let mut logical = std::collections::BTreeSet::new();
+        for file in files {
+            let components = file.components;
+            if components.is_empty()
+                || components.len() > 4
+                || components.iter().any(|s| {
+                    s.is_empty() || matches!(*s, "." | "..") || s.contains(['/', '\\', '\0'])
+                })
+            {
+                return Err(OwnedWorkspaceError::WorkspaceBoundary);
+            }
+            if !logical.insert(file.logical_id) || !paths.insert(file.source_path) {
+                return Err(OwnedWorkspaceError::Identity("duplicate member"));
+            }
+            if components.join("/") != file.source_path {
+                return Err(OwnedWorkspaceError::OriginMismatch);
+            }
+            for prior in &paths {
+                if *prior != file.source_path
+                    && (prior.starts_with(&format!("{}/", file.source_path))
+                        || file.source_path.starts_with(&format!("{prior}/")))
+                {
+                    return Err(OwnedWorkspaceError::WorkspaceBoundary);
+                }
+            }
+            if file.bytes > 65_536 {
+                return Err(OwnedWorkspaceError::Capacity("file bytes"));
+            }
+            bytes = bytes
+                .checked_add(file.bytes)
+                .ok_or(OwnedWorkspaceError::Capacity("total bytes overflow"))?;
+            directories = directories
+                .checked_add(components.len() - 1)
+                .ok_or(OwnedWorkspaceError::Capacity("directory count overflow"))?;
+        }
+        let reads = files.len();
+        let dirs = directories
+            .checked_add(1)
+            .ok_or(OwnedWorkspaceError::Capacity("parent count overflow"))?;
+        let peak = dirs
+            .checked_add(reads)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(OwnedWorkspaceError::Capacity("FD count overflow"))?;
+        if bytes > 262_144 || dirs > 50 || peak > 72 {
+            return Err(OwnedWorkspaceError::Capacity("workspace preflight"));
+        }
+        Ok(ResourceBudget {
+            payload: bytes,
+            directories: dirs,
+            readers: reads,
+            writers: 1,
+            peak,
+        })
+    }
+    #[cfg(all(test, unix))]
+    #[derive(Debug)]
+    struct TestLayout {
+        logical_id: String,
+        components: Vec<String>,
+        source_path: String,
+        bytes: usize,
+    }
+    #[cfg(all(test, unix))]
+    #[derive(Debug, Clone, Copy)]
+    struct LayoutEvent {
+        members: usize,
+        injected: bool,
+    }
+    #[cfg(all(test, unix))]
+    std::thread_local! {
+        static H2_LAYOUT_OVERRIDE:std::cell::RefCell<Option<Vec<TestLayout>>> = const { std::cell::RefCell::new(None) };
+        static LAYOUT_EVENTS:std::cell::RefCell<Vec<LayoutEvent>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    #[cfg(unix)]
+    fn preflight(case: &GeneratedConfigCase) -> WsResult<ResourceBudget> {
+        let files: Vec<_> = case
+            .files()
+            .iter()
+            .map(|f| FileLayout {
+                logical_id: f.logical_id(),
+                components: f.components(),
+                source_path: f.source_path(),
+                bytes: f.raw_utf8().len(),
+            })
+            .collect();
+        #[cfg(test)]
+        if let Some(layout) = H2_LAYOUT_OVERRIDE.with(|input| input.borrow_mut().take()) {
+            // Negative-only fixture projection at the real preflight boundary.
+            // It cannot create a replacement case, State or executable workspace.
+            let components: Vec<Vec<&str>> = layout
+                .iter()
+                .map(|f| f.components.iter().map(String::as_str).collect())
+                .collect();
+            let injected: Vec<_> = layout
+                .iter()
+                .zip(&components)
+                .map(|(f, c)| FileLayout {
+                    logical_id: &f.logical_id,
+                    components: c,
+                    source_path: &f.source_path,
+                    bytes: f.bytes,
+                })
+                .collect();
+            LAYOUT_EVENTS.with(|events| {
+                events.borrow_mut().push(LayoutEvent {
+                    members: layout.len(),
+                    injected: true,
+                })
+            });
+            return match preflight_layout(&injected) {
+                Err(error) => Err(error),
+                Ok(_) => Err(OwnedWorkspaceError::Identity(
+                    "test layout override must be a rejection",
+                )),
+            };
+        }
+        #[cfg(test)]
+        LAYOUT_EVENTS.with(|events| {
+            events.borrow_mut().push(LayoutEvent {
+                members: files.len(),
+                injected: false,
+            })
+        });
+        preflight_layout(&files)
+    }
+    #[cfg(unix)]
+    fn check_ancestor(file: &File, uid: u32, parent: bool) -> WsResult<()> {
+        let m = file
+            .metadata()
+            .map_err(|e| io_error("ancestor metadata", e))?;
+        if !m.is_dir()
+            || (m.uid() != 0 && m.uid() != uid)
+            || ((m.mode() & 0o022) != 0 && !(m.uid() == 0 && (m.mode() & 0o1000) != 0))
+            || (parent && !(m.uid() == 0 && (m.mode() & 0o1000) != 0))
+        {
+            return Err(OwnedWorkspaceError::Identity(
+                "insecure fixed parent or ancestor",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    fn fixed_parent(uid: u32) -> WsResult<File> {
+        let mut current =
+            observed_open(Phase::Parent, None, "/", directory_flags(), Mode::empty())?;
+        #[cfg(test)]
+        FD_SAMPLES.with(|s| {
+            s.borrow_mut().push(FdSample {
+                phase: Phase::Parent,
+                directories: 1,
+                reads: 0,
+                writes: 0,
+                total: 1,
+            })
+        });
+        check_ancestor(&current, uid, false)?;
+        let components: &[&str] = if cfg!(target_os = "macos") {
+            &["private", "tmp"]
+        } else if cfg!(target_os = "linux") {
+            &["tmp"]
+        } else {
+            return Err(OwnedWorkspaceError::Unsupported("platform"));
+        };
+        for (index, component) in components.iter().enumerate() {
+            let next = observed_open(
+                Phase::Parent,
+                Some(&current),
+                component,
+                directory_flags(),
+                Mode::empty(),
+            )?;
+            #[cfg(test)]
+            FD_SAMPLES.with(|s| {
+                s.borrow_mut().push(FdSample {
+                    phase: Phase::Parent,
+                    directories: 2,
+                    reads: 0,
+                    writes: 0,
+                    total: 2,
+                })
+            });
+            check_ancestor(&next, uid, index + 1 == components.len())?;
+            current = next;
+        }
+        Ok(current)
+    }
+    #[cfg(unix)]
+    impl State {
+        fn sample(&self, _phase: Phase, writes: usize) -> WsResult<()> {
+            let dirs = usize::from(self.parent.is_some())
+                + self.directories.iter().filter(|d| d.fd.is_some()).count();
+            let reads = self.members.iter().filter(|m| m.read.is_some()).count();
+            #[cfg(test)]
+            MEMORY_SAMPLES.with(|s| {
+                s.borrow_mut().push(MemorySample {
+                    phase: _phase,
+                    origin_case_heap_capacity: self.case.heap_capacity_bytes(),
+                    state_inline_bytes: std::mem::size_of::<State>(),
+                    directory_vector_capacity: self.directories.capacity()
+                        * std::mem::size_of::<Directory>(),
+                    member_vector_capacity: self.members.capacity() * std::mem::size_of::<Member>(),
+                    snapshot_vector_capacity: 0,
+                    snapshot_bytes_capacity: 0,
+                    query_vector_capacity: 0,
+                })
+            });
+            let total = dirs
+                .checked_add(reads)
+                .and_then(|n| n.checked_add(writes))
+                .ok_or(OwnedWorkspaceError::Capacity("live FD count"))?;
+            #[cfg(test)]
+            FD_SAMPLES.with(|s| {
+                s.borrow_mut().push(FdSample {
+                    phase: _phase,
+                    directories: dirs,
+                    reads,
+                    writes,
+                    total,
+                })
+            });
+            if dirs > 50 || reads > 16 || writes > 1 || total > 72 {
+                return Err(OwnedWorkspaceError::Capacity("live FD peak"));
+            }
+            Ok(())
+        }
+        fn directory(&self, index: usize) -> WsResult<&File> {
+            self.directories
+                .get(index)
+                .and_then(|d| d.fd.as_ref())
+                .ok_or(OwnedWorkspaceError::Identity(
+                    "missing original directory fd",
+                ))
+        }
+        fn parent_fd(&self, parent: Option<usize>) -> WsResult<&File> {
+            match parent {
+                Some(i) => self.directory(i),
+                None => self
+                    .parent
+                    .as_ref()
+                    .ok_or(OwnedWorkspaceError::Identity("missing fixed parent fd")),
+            }
+        }
+        fn create_directory(&mut self, parent: Option<usize>, name: String) -> WsResult<usize> {
+            #[cfg(test)]
+            if parent.is_none() {
+                test_hook(HookPoint::RootMkdir, Some(self.parent_fd(parent)?), &name)?;
+            }
+            if let Err(error) = rfs::mkdirat(self.parent_fd(parent)?, name.as_str(), Mode::RWXU) {
+                // A non-EEXIST error never authorizes adoption. If absence cannot
+                // be proved, retain an unknown identity so cleanup poisons safely.
+                if parent.is_none() && error != rustix::io::Errno::EXIST {
+                    let absent = matches!(rfs::statat(self.parent_fd(parent)?,name.as_str(),AtFlags::SYMLINK_NOFOLLOW),Err(e) if e==rustix::io::Errno::NOENT);
+                    if !absent {
+                        self.directories.push(Directory {
+                            fd: None,
+                            parent,
+                            name,
+                            identity: None,
+                        });
+                    }
+                }
+                return Err(io_error("mkdirat", error));
+            }
+            let index = self.directories.len();
+            self.directories.push(Directory {
+                fd: None,
+                parent,
+                name,
+                identity: None,
+            });
+            let d = &self.directories[index];
+            let st = rfs::statat(
+                self.parent_fd(parent)?,
+                d.name.as_str(),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|e| io_error("created directory statat", e))?;
+            self.directories[index].identity = Some(stat_identity(&st));
+            let fd = observed_open(
+                Phase::Create,
+                Some(self.parent_fd(parent)?),
+                self.directories[index].name.as_str(),
+                directory_flags(),
+                Mode::empty(),
+            )?;
+            self.directories[index].fd = Some(fd);
+            self.sample(Phase::Create, 0)?;
+            let m = self
+                .directory(index)?
+                .metadata()
+                .map_err(|e| io_error("created directory metadata", e))?;
+            if !m.is_dir()
+                || m.uid() != self.uid
+                || m.mode() & 0o7777 != 0o700
+                || Some(identity(&m)) != self.directories[index].identity
+            {
+                return Err(OwnedWorkspaceError::Identity("created directory differs"));
+            }
+            Ok(index)
+        }
+    }
+    #[cfg(unix)]
+    fn check_regular(
+        file: &File,
+        original: Identity,
+        uid: u32,
+        len: usize,
+        mode: u32,
+    ) -> WsResult<()> {
+        let m = file
+            .metadata()
+            .map_err(|e| io_error("original file metadata", e))?;
+        if !m.is_file()
+            || identity(&m) != original
+            || m.uid() != uid
+            || m.nlink() != 1
+            || m.len()
+                != u64::try_from(len).map_err(|_| OwnedWorkspaceError::Capacity("file length"))?
+            || m.mode() & 0o7777 != mode
+        {
+            return Err(OwnedWorkspaceError::Identity(
+                "original regular identity/link/mode/length differs",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    fn write_original(file: &mut File, logical_id: &str, bytes: &[u8]) -> WsResult<()> {
+        let (mut offset, mut interrupted) = (0usize, 0usize);
+        while offset < bytes.len() {
+            let written = file.write(&bytes[offset..]);
+            #[cfg(test)]
+            IO_EVENTS.with(|events| {
+                events.borrow_mut().push(IoEvent {
+                    phase: Phase::Create,
+                    operation: "write",
+                    component: logical_id.into(),
+                    parent: None,
+                    fd: file.metadata().ok().map(|m| (m.dev(), m.ino())),
+                    offset: Some(offset as u64),
+                    requested: bytes.len() - offset,
+                    bytes: written
+                        .as_ref()
+                        .map(|n| bytes[offset..offset + *n].to_vec())
+                        .unwrap_or_default(),
+                    errno: written.as_ref().err().and_then(io::Error::raw_os_error),
+                    completed: true,
+                    injected: false,
+                })
+            });
+            match written {
+                Ok(0) => return Err(io_error("write", io::Error::from(io::ErrorKind::WriteZero))),
+                Ok(n) => {
+                    offset = offset
+                        .checked_add(n)
+                        .ok_or(OwnedWorkspaceError::Capacity("write count"))?
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted && interrupted < 8 => {
+                    interrupted += 1
+                }
+                Err(e) => return Err(io_error("write", e)),
+            }
+        }
+        #[cfg(not(test))]
+        let _ = logical_id;
+        file.sync_all().map_err(|e| io_error("file fsync", e))
+    }
+    #[cfg(unix)]
+    impl State {
+        fn populate(&mut self) -> WsResult<()> {
+            let pid = rustix::process::getpid().as_raw_nonzero().get() as u32;
+            let mut root = None;
+            for _ in 0..8 {
+                let name = next_root_name(self.uid, pid, &ROOT_COUNTER)?;
+                match self.create_directory(None, name) {
+                    Ok(index) => {
+                        root = Some(index);
+                        break;
+                    }
+                    Err(OwnedWorkspaceError::Io { source, .. })
+                        if source.raw_os_error()
+                            == Some(rustix::io::Errno::EXIST.raw_os_error()) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let root =
+                root.ok_or_else(|| io_error("mkdirat collisions", rustix::io::Errno::EXIST))?;
+            #[cfg(test)]
+            test_hook(HookPoint::RootCreated, Some(self.directory(root)?), "")?;
+            for source_index in 0..self.case.files().len() {
+                let components = self.case.files()[source_index].components();
+                let mut parent = root;
+                for component in &components[..components.len() - 1] {
+                    parent = match self
+                        .directories
+                        .iter()
+                        .position(|d| d.parent == Some(parent) && d.name == *component)
+                    {
+                        Some(index) => index,
+                        None => self.create_directory(Some(parent), (*component).into())?,
+                    };
+                }
+                let name = components[components.len() - 1];
+                #[cfg(test)]
+                test_hook(
+                    HookPoint::BeforeMemberCreate,
+                    Some(self.directory(parent)?),
+                    name,
+                )?;
+                let mut writer = observed_open(
+                    Phase::Create,
+                    Some(self.directory(parent)?),
+                    name,
+                    OFlags::WRONLY
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC,
+                    Mode::RUSR | Mode::WUSR,
+                )?;
+                let member = self.members.len();
+                self.members.push(Member {
+                    parent,
+                    name: name.into(),
+                    identity: None,
+                    read: None,
+                    source: source_index,
+                });
+                self.sample(Phase::Create, 1)?;
+                let m = writer
+                    .metadata()
+                    .map_err(|e| io_error("created regular metadata", e))?;
+                let original = identity(&m);
+                self.members[member].identity = Some(original);
+                if !m.is_file()
+                    || m.uid() != self.uid
+                    || m.nlink() != 1
+                    || m.mode() & 0o7777 != 0o600
+                {
+                    return Err(OwnedWorkspaceError::Identity("created regular differs"));
+                }
+                self.sample(Phase::Create, 1)?;
+                let source = &self.case.files()[source_index];
+                write_original(
+                    &mut writer,
+                    source.logical_id(),
+                    source.raw_utf8().as_bytes(),
+                )?;
+                #[cfg(test)]
+                test_hook(
+                    HookPoint::BeforePreopen,
+                    Some(self.directory(parent)?),
+                    name,
+                )?;
+                let reader = observed_open(
+                    Phase::Seal,
+                    Some(self.directory(parent)?),
+                    name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?;
+                self.members[member].read = Some(reader);
+                self.sample(Phase::Seal, 1)?;
+                #[cfg(test)]
+                test_hook(HookPoint::AfterPreopen, Some(self.directory(parent)?), name)?;
+                let reader = self.members[member]
+                    .read
+                    .as_ref()
+                    .ok_or(OwnedWorkspaceError::Identity("preopen missing"))?;
+                check_regular(&writer, original, self.uid, source.raw_utf8().len(), 0o600)?;
+                check_regular(reader, original, self.uid, source.raw_utf8().len(), 0o600)?;
+                let seal_bytes = bounded_read(
+                    Phase::Seal,
+                    reader,
+                    source.logical_id(),
+                    source.raw_utf8().as_bytes(),
+                )?;
+                check_regular(reader, original, self.uid, source.raw_utf8().len(), 0o600)?;
+                drop(seal_bytes);
+                rfs::fchmod(&writer, Mode::RUSR).map_err(|e| io_error("seal fchmod", e))?;
+                check_regular(&writer, original, self.uid, source.raw_utf8().len(), 0o400)?;
+                check_regular(reader, original, self.uid, source.raw_utf8().len(), 0o400)?;
+                drop(writer);
+                self.sample(Phase::Seal, 0)?;
+            }
+            Ok(())
+        }
+        fn snapshot(&mut self) -> WsResult<OwnedConfigSnapshot> {
+            if self.read {
+                return Err(OwnedWorkspaceError::AlreadyRead);
+            }
+            self.read = true;
+            let mut files = Vec::with_capacity(self.members.len());
+            for member in &self.members {
+                let source = &self.case.files()[member.source];
+                let file = member
+                    .read
+                    .as_ref()
+                    .ok_or(OwnedWorkspaceError::Identity("original read fd missing"))?;
+                let original = member
+                    .identity
+                    .ok_or(OwnedWorkspaceError::Identity("creation identity missing"))?;
+                check_regular(file, original, self.uid, source.raw_utf8().len(), 0o400)?;
+                let bytes = bounded_read(
+                    Phase::Execute,
+                    file,
+                    source.logical_id(),
+                    source.raw_utf8().as_bytes(),
+                )?;
+                check_regular(file, original, self.uid, source.raw_utf8().len(), 0o400)?;
+                files.push(SnapshotFile {
+                    logical_id: source.logical_id(),
+                    source_path: source.source_path(),
+                    format: source.format(),
+                    bytes,
+                });
+                #[cfg(test)]
+                MEMORY_SAMPLES.with(|s| {
+                    s.borrow_mut().push(MemorySample {
+                        phase: Phase::Execute,
+                        origin_case_heap_capacity: self.case.heap_capacity_bytes(),
+                        state_inline_bytes: std::mem::size_of::<State>(),
+                        directory_vector_capacity: self.directories.capacity()
+                            * std::mem::size_of::<Directory>(),
+                        member_vector_capacity: self.members.capacity()
+                            * std::mem::size_of::<Member>(),
+                        snapshot_vector_capacity: files.capacity()
+                            * std::mem::size_of::<SnapshotFile>(),
+                        snapshot_bytes_capacity: files.iter().map(|f| f.bytes.capacity()).sum(),
+                        query_vector_capacity: 0,
+                    })
+                });
+            }
+            self.sample(Phase::Execute, 0)?;
+            let query = self.case.query_segments().to_vec();
+            #[cfg(test)]
+            MEMORY_SAMPLES.with(|s| {
+                s.borrow_mut().push(MemorySample {
+                    phase: Phase::Execute,
+                    origin_case_heap_capacity: self.case.heap_capacity_bytes(),
+                    state_inline_bytes: std::mem::size_of::<State>(),
+                    directory_vector_capacity: self.directories.capacity()
+                        * std::mem::size_of::<Directory>(),
+                    member_vector_capacity: self.members.capacity() * std::mem::size_of::<Member>(),
+                    snapshot_vector_capacity: files.capacity()
+                        * std::mem::size_of::<SnapshotFile>(),
+                    snapshot_bytes_capacity: files.iter().map(|f| f.bytes.capacity()).sum(),
+                    query_vector_capacity: query.capacity() * std::mem::size_of::<&str>(),
+                })
+            });
+            Ok(OwnedConfigSnapshot {
+                selector: self.case.selector(),
+                template: self.case.template(),
+                layers: self.case.layer_count(),
+                key_type: self.case.key_type(),
+                query,
+                intent: self.case.intent(),
+                files,
+            })
+        }
+    }
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct Permit {
+        resolved: bool,
+    }
+    #[cfg(unix)]
+    impl Permit {
+        fn acquire() -> WsResult<Self> {
+            match WORKSPACE_STATE.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => Ok(Self { resolved: false }),
+                Err(2) => Err(OwnedWorkspaceError::Poisoned),
+                Err(_) => Err(OwnedWorkspaceError::Active),
+            }
+        }
+        fn resolve(&mut self, clean: bool) {
+            self.resolved = true;
+            WORKSPACE_STATE.store(if clean { 0 } else { 2 }, Ordering::SeqCst);
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            if !self.resolved {
+                WORKSPACE_STATE.store(2, Ordering::SeqCst);
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_cast)] // Stat field widths differ between macOS and Linux.
+    fn stat_identity(st: &rfs::Stat) -> Identity {
+        Identity {
+            dev: st.st_dev as u64,
+            ino: st.st_ino as u64,
+            uid: st.st_uid,
+        }
+    }
+    #[cfg(unix)]
+    fn remove_known(
+        parent: &File,
+        name: &str,
+        original: Option<Identity>,
+        directory: bool,
+    ) -> WsResult<()> {
+        let original = original.ok_or(OwnedWorkspaceError::Identity(
+            "cleanup lacks creation identity",
+        ))?;
+        let st = rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| io_error("cleanup statat", e))?;
+        let expected = if directory {
+            rfs::FileType::Directory
+        } else {
+            rfs::FileType::RegularFile
+        };
+        if stat_identity(&st) != original
+            || rfs::FileType::from_raw_mode(st.st_mode) != expected
+            || (!directory && st.st_nlink != 1)
+        {
+            return Err(OwnedWorkspaceError::Identity(
+                "cleanup member identity differs",
+            ));
+        }
+        let removed = rfs::unlinkat(
+            parent,
+            name,
+            if directory {
+                AtFlags::REMOVEDIR
+            } else {
+                AtFlags::empty()
+            },
+        );
+        #[cfg(test)]
+        IO_EVENTS.with(|events| {
+            events.borrow_mut().push(IoEvent {
+                phase: Phase::Cleanup,
+                operation: "unlink",
+                component: name.into(),
+                parent: parent.metadata().ok().map(|m| (m.dev(), m.ino())),
+                fd: Some((original.dev, original.ino)),
+                offset: None,
+                requested: 0,
+                bytes: Vec::new(),
+                errno: removed.as_ref().err().map(|e| e.raw_os_error()),
+                completed: true,
+                injected: false,
+            })
+        });
+        removed.map_err(|e| io_error("cleanup unlinkat", e))
+    }
+    #[cfg(unix)]
+    impl State {
+        fn cleanup(mut self) -> WsResult<()> {
+            for member in &mut self.members {
+                drop(member.read.take());
+            }
+            let mut failures = Vec::new();
+            if let Err(e) = self.sample(Phase::Cleanup, 0) {
+                failures.push(e);
+            }
+            for member in self.members.iter().rev() {
+                let result = self
+                    .directory(member.parent)
+                    .and_then(|p| remove_known(p, &member.name, member.identity, false));
+                if let Err(e) = result {
+                    failures.push(e);
+                }
+            }
+            for index in (0..self.directories.len()).rev() {
+                let directory = &self.directories[index];
+                let result = self
+                    .parent_fd(directory.parent)
+                    .and_then(|p| remove_known(p, &directory.name, directory.identity, true));
+                if let Err(e) = result {
+                    failures.push(e);
+                }
+                drop(self.directories[index].fd.take());
+                if let Err(e) = self.sample(Phase::Cleanup, 0) {
+                    failures.push(e);
+                }
+            }
+            self.members.clear();
+            self.directories.clear();
+            drop(self.parent.take());
+            if let Err(e) = self.sample(Phase::Cleanup, 0) {
+                failures.push(e);
+            }
+            self.permit.resolve(failures.is_empty());
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(OwnedWorkspaceError::Cleanup(failures))
+            }
+        }
+    }
+    #[cfg(unix)]
+    impl OwnedConfigWorkspace {
+        pub fn create(case: GeneratedConfigCase) -> WsResult<Self> {
+            if !cfg!(any(target_os = "macos", target_os = "linux")) {
+                return Err(OwnedWorkspaceError::Unsupported("platform"));
+            }
+            let uid = rustix::process::getuid().as_raw();
+            let effective = rustix::process::geteuid().as_raw();
+            #[cfg(test)]
+            let (uid, effective) = test_uids(uid, effective)?;
+            if uid == 0 || uid != effective {
+                return Err(OwnedWorkspaceError::Unsupported(
+                    "real/effective UID must match and be nonzero",
+                ));
+            }
+            let budget = preflight(&case)?;
+            if budget.payload > 262_144
+                || budget.directories > 50
+                || budget.readers > 16
+                || budget.writers > 1
+                || budget.peak > 72
+            {
+                return Err(OwnedWorkspaceError::Capacity("preflight budget differs"));
+            }
+            let mut permit = Permit::acquire()?;
+            let parent = match fixed_parent(uid) {
+                Ok(p) => p,
+                Err(e) => {
+                    permit.resolve(true);
+                    return Err(e);
+                }
+            };
+            let mut workspace = Self {
+                state: Some(State {
+                    case,
+                    parent: Some(parent),
+                    directories: Vec::with_capacity(49),
+                    members: Vec::with_capacity(16),
+                    read: false,
+                    uid,
+                    permit,
+                }),
+            };
+            let result = workspace
+                .state
+                .as_mut()
+                .ok_or(OwnedWorkspaceError::Identity("creation state missing"))?
+                .populate();
+            if let Err(execution) = result {
+                return match workspace.finish() {
+                    Ok(()) => Err(execution),
+                    Err(cleanup) => Err(OwnedWorkspaceError::ExecutionAndCleanup {
+                        execution: Box::new(execution),
+                        cleanup: Box::new(cleanup),
+                    }),
+                };
+            }
+            Ok(workspace)
+        }
+        pub fn read_once(&mut self) -> WsResult<OwnedConfigSnapshot> {
+            self.state
+                .as_mut()
+                .ok_or(OwnedWorkspaceError::Identity("workspace finished"))?
+                .snapshot()
+        }
+        pub fn finish(mut self) -> WsResult<()> {
+            match self.state.take() {
+                Some(state) => state.cleanup(),
+                None => Err(OwnedWorkspaceError::Identity("workspace already finished")),
+            }
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for OwnedConfigWorkspace {
+        fn drop(&mut self) {
+            if let Some(state) = self.state.take() {
+                let _ = state.cleanup();
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    impl OwnedConfigWorkspace {
+        pub fn create(_case: GeneratedConfigCase) -> WsResult<Self> {
+            Err(OwnedWorkspaceError::Unsupported("platform"))
+        }
+        pub fn read_once(&mut self) -> WsResult<OwnedConfigSnapshot> {
+            Err(OwnedWorkspaceError::Unsupported("platform"))
+        }
+        pub fn finish(self) -> WsResult<()> {
+            Err(OwnedWorkspaceError::Unsupported("platform"))
+        }
+    }
+    #[cfg(all(test, unix))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HookPoint {
+        UidPolicy,
+        RootMkdir,
+        RootCreated,
+        BeforeMemberCreate,
+        BeforePreopen,
+        AfterPreopen,
+    }
+    #[cfg(all(test, unix))]
+    #[derive(Debug)]
+    enum TestAction {
+        Uids { real: u32, effective: u32 },
+        MkdirError(rustix::io::Errno),
+        Panic,
+        Symlink(std::path::PathBuf),
+        Hardlink(std::path::PathBuf),
+        Fifo,
+    }
+    #[cfg(all(test, unix))]
+    #[derive(Debug, Clone)]
+    struct HookEvent {
+        point: HookPoint,
+        action: &'static str,
+        component: String,
+        errno: Option<i32>,
+    }
+    #[cfg(all(test, unix))]
+    #[derive(Debug, Clone)]
+    struct UidEvent {
+        actual_real: u32,
+        actual_effective: u32,
+        selected_real: u32,
+        selected_effective: u32,
+        injected: bool,
+    }
+    #[cfg(all(test, unix))]
+    std::thread_local! {
+        static H2_HOOKS:std::cell::RefCell<std::collections::VecDeque<(HookPoint,TestAction)>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+        static HOOK_EVENTS:std::cell::RefCell<Vec<HookEvent>> = const { std::cell::RefCell::new(Vec::new()) };
+        static UID_EVENTS:std::cell::RefCell<Vec<UidEvent>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    #[cfg(all(test, unix))]
+    fn take_hook(point: HookPoint) -> Option<TestAction> {
+        H2_HOOKS.with(|hooks| {
+            let mut hooks = hooks.borrow_mut();
+            if hooks.front().is_some_and(|(p, _)| *p == point) {
+                hooks.pop_front().map(|(_, a)| a)
+            } else {
+                None
+            }
+        })
+    }
+    #[cfg(all(test, unix))]
+    fn test_uids(real: u32, effective: u32) -> WsResult<(u32, u32)> {
+        let action = take_hook(HookPoint::UidPolicy);
+        let injected = action.is_some();
+        let selected = match action {
+            Some(TestAction::Uids { real, effective }) => (real, effective),
+            None => (real, effective),
+            _ => return Err(OwnedWorkspaceError::Identity("wrong UID hook action")),
+        };
+        UID_EVENTS.with(|events| {
+            events.borrow_mut().push(UidEvent {
+                actual_real: real,
+                actual_effective: effective,
+                selected_real: selected.0,
+                selected_effective: selected.1,
+                injected,
+            })
+        });
+        Ok(selected)
+    }
+    // Fixture mutations are deliberately separate from production open/read observations.
+    // No hook is public, and none replaces identity, origin, read or cleanup validation.
+    #[cfg(all(test, unix))]
+    fn fixture_fifo(parent: &File, name: &str) -> WsResult<()> {
+        #[cfg(target_os = "linux")]
+        {
+            rfs::mkfifoat(parent, name, Mode::RUSR | Mode::WUSR)
+                .map_err(|e| io_error("fixture injected mutation", e))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
+            let raw_path =
+                rfs::getpath(parent).map_err(|e| io_error("fixture parent getpath", e))?;
+            let parent_path =
+                std::path::Path::new(std::ffi::OsStr::from_bytes(raw_path.as_bytes()));
+            let root_path = parent_path.parent().ok_or(OwnedWorkspaceError::Identity(
+                "fixture parent lacks owned root",
+            ))?;
+            let fixed_path = root_path.parent().ok_or(OwnedWorkspaceError::Identity(
+                "fixture root lacks fixed parent",
+            ))?;
+            let root_name = root_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or(OwnedWorkspaceError::Identity("fixture root name"))?;
+            let directory = parent_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or(OwnedWorkspaceError::Identity("fixture member directory"))?;
+            let prefix = format!(
+                "rsia-ctw-v1-{}-{}-",
+                rustix::process::getuid().as_raw(),
+                std::process::id()
+            );
+            if !root_name
+                .strip_prefix(&prefix)
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                || !matches!(
+                    (directory, name),
+                    ("override", "config.json")
+                        | ("project", "config.json")
+                        | ("defaults", "base.json")
+                        | ("config", "unsupported.toml")
+                )
+            {
+                return Err(OwnedWorkspaceError::WorkspaceBoundary);
+            }
+            let parent_before = parent
+                .metadata()
+                .map_err(|e| io_error("fixture parent metadata", e))?;
+            let root_before = std::fs::symlink_metadata(root_path)
+                .map_err(|e| io_error("fixture root metadata", e))?;
+            let fixed = std::fs::symlink_metadata(fixed_path)
+                .map_err(|e| io_error("fixture fixed metadata", e))?;
+            let expected_fixed = std::fs::symlink_metadata("/private/tmp")
+                .map_err(|e| io_error("fixture expected fixed metadata", e))?;
+            let parent_id = (parent_before.dev(), parent_before.ino());
+            let root_id = (root_before.dev(), root_before.ino());
+            let fixed_id = (fixed.dev(), fixed.ino());
+            let uid = rustix::process::getuid().as_raw();
+            let linked = IO_EVENTS.with(|events| {
+                let events = events.borrow();
+                events.iter().any(|e| {
+                    e.phase == Phase::Create
+                        && e.operation == "open"
+                        && e.completed
+                        && e.component == root_name
+                        && e.fd == Some(root_id)
+                        && e.parent == Some(fixed_id)
+                }) && events.iter().any(|e| {
+                    e.phase == Phase::Create
+                        && e.operation == "open"
+                        && e.completed
+                        && e.component == directory
+                        && e.fd == Some(parent_id)
+                        && e.parent == Some(root_id)
+                })
+            });
+            let parent_at_path = std::fs::symlink_metadata(parent_path)
+                .map_err(|e| io_error("fixture path parent metadata", e))?;
+            if !linked
+                || !parent_before.is_dir()
+                || parent_before.uid() != uid
+                || !root_before.is_dir()
+                || root_before.uid() != uid
+                || !parent_at_path.is_dir()
+                || identity(&parent_at_path) != identity(&parent_before)
+                || fixed_id != (expected_fixed.dev(), expected_fixed.ino())
+                || fixed.uid() != 0
+                || fixed.mode() & 0o1000 == 0
+            {
+                return Err(OwnedWorkspaceError::Identity(
+                    "fixture FIFO parent is not this owned creation",
+                ));
+            }
+            let path = parent_path.join(name);
+            let argv = vec![
+                "/usr/bin/mkfifo".to_string(),
+                "-m".into(),
+                "600".into(),
+                path.to_string_lossy().into_owned(),
+            ];
+            let output = std::process::Command::new("/usr/bin/mkfifo")
+                .args(["-m", "600"])
+                .arg(&path)
+                .output();
+            let output = match output {
+                Ok(output) => output,
+                Err(source) => {
+                    println!(
+                        "RSIA_AG174B_H2_FIFO_FIXTURE {}",
+                        serde_json::json!({"argv":argv,"spawn_errno":source.raw_os_error(),"error":source.to_string(),"fixture_only":true})
+                    );
+                    return Err(io_error("fixture mkfifo spawn", source));
+                }
+            };
+            println!(
+                "RSIA_AG174B_H2_FIFO_FIXTURE {}",
+                serde_json::json!({"argv":argv,"status":format!("{:?}",output.status),"code":output.status.code(),"success":output.status.success(),"stdout":output.stdout,"stderr":output.stderr,"parent_before":parent_id,"root":root_id,"fixed_parent":fixed_id,"fixture_only":true,"production_execution_permission":false})
+            );
+            if !output.status.success() {
+                return Err(io_error(
+                    "fixture mkfifo exit",
+                    io::Error::other("fixed mkfifo failed; original status and streams recorded"),
+                ));
+            }
+            let fifo = std::fs::symlink_metadata(&path)
+                .map_err(|e| io_error("fixture FIFO metadata", e))?;
+            let parent_after = std::fs::symlink_metadata(parent_path)
+                .map_err(|e| io_error("fixture FIFO parent recheck", e))?;
+            let root_after = std::fs::symlink_metadata(root_path)
+                .map_err(|e| io_error("fixture FIFO root recheck", e))?;
+            println!(
+                "RSIA_AG174B_H2_FIFO_FIXTURE {}",
+                serde_json::json!({"path":path.to_string_lossy(),"dev":fifo.dev(),"ino":fifo.ino(),"uid":fifo.uid(),"mode":fifo.mode(),"nlink":fifo.nlink(),"is_fifo":fifo.file_type().is_fifo(),"parent_after":(parent_after.dev(),parent_after.ino()),"fixture_only":true})
+            );
+            if !fifo.file_type().is_fifo()
+                || fifo.uid() != uid
+                || !parent_after.is_dir()
+                || identity(&parent_after) != identity(&parent_before)
+                || !root_after.is_dir()
+                || identity(&root_after) != identity(&root_before)
+            {
+                return Err(OwnedWorkspaceError::Identity(
+                    "fixture FIFO or parent changed",
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (parent, name);
+            Err(OwnedWorkspaceError::Unsupported("fixture FIFO platform"))
+        }
+    }
+    #[cfg(all(test, unix))]
+    fn test_hook(point: HookPoint, parent: Option<&File>, name: &str) -> WsResult<()> {
+        let Some(action) = take_hook(point) else {
+            return Ok(());
+        };
+        let label = match &action {
+            TestAction::Uids { .. } => "uids",
+            TestAction::MkdirError(_) => "mkdir-error",
+            TestAction::Panic => "panic",
+            TestAction::Symlink(_) => "symlink",
+            TestAction::Hardlink(_) => "hardlink",
+            TestAction::Fifo => "fifo",
+        };
+        HOOK_EVENTS.with(|events| {
+            events.borrow_mut().push(HookEvent {
+                point,
+                action: label,
+                component: name.into(),
+                errno: None,
+            })
+        });
+        if matches!(action, TestAction::Panic) {
+            panic!("injected owned workspace creation unwind");
+        }
+        if let TestAction::MkdirError(errno) = action {
+            HOOK_EVENTS.with(|events| {
+                events.borrow_mut().push(HookEvent {
+                    point,
+                    action: label,
+                    component: name.into(),
+                    errno: Some(errno.raw_os_error()),
+                })
+            });
+            return Err(io_error("injected mkdirat", errno));
+        }
+        let parent = parent.ok_or(OwnedWorkspaceError::Identity(
+            "fixture hook lacks known parent",
+        ))?;
+        if matches!(point, HookPoint::BeforePreopen | HookPoint::AfterPreopen) {
+            rfs::renameat(parent, name, parent, "h2-displaced-original")
+                .map_err(|e| io_error("fixture rename original", e))?;
+        }
+        let result = match action {
+            TestAction::Symlink(target) => rfs::symlinkat(target.as_path(), parent, name)
+                .map_err(|e| io_error("fixture injected mutation", e)),
+            TestAction::Hardlink(target) => {
+                rfs::linkat(rfs::CWD, target.as_path(), parent, name, AtFlags::empty())
+                    .map_err(|e| io_error("fixture injected mutation", e))
+            }
+            TestAction::Fifo => fixture_fifo(parent, name),
+            _ => return Err(OwnedWorkspaceError::Identity("wrong fixture hook action")),
+        };
+        HOOK_EVENTS.with(|events| {
+            events.borrow_mut().push(HookEvent {
+                point,
+                action: label,
+                component: name.into(),
+                errno: result.as_ref().err().and_then(|e| match e {
+                    OwnedWorkspaceError::Io { source, .. } => source.raw_os_error(),
+                    _ => None,
+                }),
+            })
+        });
+        result
+    }
+    // BEGIN RSIA AG174B INDEPENDENT H2
+    // Independent controller-owned H2 assertions, mechanically inserted before H freeze.
+    #[cfg(test)]
+    #[cfg(unix)]
+    mod tests {
+        use super::*;
+        use evo_core::evaluation::config_precedence_generator::{Placement, Seed, generate_case};
+        use serde_json::{Value, json};
+        use std::{
+            collections::BTreeSet,
+            os::unix::fs::PermissionsExt,
+            path::{Path, PathBuf},
+            process::Command,
+            sync::Arc,
+        };
+
+        const CHILD: &str = "RSIA_AG174B_H2_CASE";
+        const SENTINEL: &[u8] = b"independent-h2-external-sentinel-never-product-input";
+        std::thread_local! { static FIXTURE_IO: std::cell::RefCell<Vec<Value>> = const { std::cell::RefCell::new(Vec::new()) }; }
+        fn selector() -> ClosedCaseSelector {
+            ClosedCaseSelector::Task {
+                template: Template::F,
+                layer_count: Layers::L3,
+                key_type: KeyType::B,
+                placement: Placement::E,
+                seed: Seed::Zero,
+            }
+        }
+        fn generated() -> GeneratedConfigCase {
+            generate_case(selector()).expect("independent closed input")
+        }
+        fn events() -> Vec<IoEvent> {
+            IO_EVENTS.with(|e| e.borrow().clone())
+        }
+        fn fixture(operation: &str, detail: Value) {
+            FIXTURE_IO.with(|v| {
+                v.borrow_mut()
+                    .push(json!({"operation":operation,"detail":detail}))
+            });
+        }
+        fn file_id(file: &File) -> (u64, u64) {
+            let m = file.metadata().expect("fixture metadata");
+            (m.dev(), m.ino())
+        }
+        fn report(case: &str, expected: Value) {
+            let io:Vec<_>=events().iter().map(|e|json!({"phase":format!("{:?}",e.phase),"operation":e.operation,"component":e.component,"parent":e.parent,"fd":e.fd,"offset":e.offset,"requested":e.requested,"bytes":e.bytes,"errno":e.errno,"completed":e.completed,"injected":e.injected})).collect();
+            let fd:Vec<_>=FD_SAMPLES.with(|s|s.borrow().iter().map(|s|json!({"phase":format!("{:?}",s.phase),"directories":s.directories,"reads":s.reads,"writes":s.writes,"total":s.total})).collect());
+            let buffers:Vec<_>=BUFFER_SAMPLES.with(|s|s.borrow().iter().map(|s|json!({"phase":format!("{:?}",s.phase),"logical_id":s.logical_id,"expected_len":s.expected_len,"capacity":s.capacity,"eof_slot":s.eof_slot})).collect());
+            let memory:Vec<_>=MEMORY_SAMPLES.with(|s|s.borrow().iter().map(|s|json!({"phase":format!("{:?}",s.phase),"origin_case_heap_capacity":s.origin_case_heap_capacity,"state_inline_bytes":s.state_inline_bytes,"directory_vector_capacity":s.directory_vector_capacity,"member_vector_capacity":s.member_vector_capacity,"snapshot_vector_capacity":s.snapshot_vector_capacity,"snapshot_bytes_capacity":s.snapshot_bytes_capacity,"query_vector_capacity":s.query_vector_capacity})).collect());
+            let hooks:Vec<_>=HOOK_EVENTS.with(|s|s.borrow().iter().map(|e|json!({"point":format!("{:?}",e.point),"action":e.action,"component":e.component,"errno":e.errno})).collect());
+            let uids:Vec<_>=UID_EVENTS.with(|s|s.borrow().iter().map(|e|json!({"actual_real":e.actual_real,"actual_effective":e.actual_effective,"selected_real":e.selected_real,"selected_effective":e.selected_effective,"injected":e.injected})).collect());
+            let layouts: Vec<_> = LAYOUT_EVENTS.with(|s| {
+                s.borrow()
+                    .iter()
+                    .map(|e| json!({"members":e.members,"injected":e.injected}))
+                    .collect()
+            });
+            let fixture_io = FIXTURE_IO.with(|s| s.borrow().clone());
+            println!(
+                "RSIA_AG174B_H2 {}",
+                json!({"case":case,"selector":{"template":"F","layer_count":3,"key_type":"B","placement":"E","seed":0},"expected":expected,"actual_uid":rustix::process::getuid().as_raw(),"actual_euid":rustix::process::geteuid().as_raw(),"actual_pid":std::process::id(),"production_io":io,"fd_samples":fd,"buffer_samples":buffers,"memory_samples":memory,"fixture_hook_events":hooks,"uid_events":uids,"layout_events":layouts,"fixture_io":fixture_io,"claim":"exact software case; injected actions explicitly identified; no close errno or global sandbox claim"})
+            );
+        }
+        fn isolated(name: &str, cases: &[&str], run: fn(&str)) {
+            let prefix = format!("{name}::");
+            if let Ok(value) = std::env::var(CHILD) {
+                let case = value
+                    .strip_prefix(&prefix)
+                    .expect("exact child test identity");
+                assert!(
+                    cases.contains(&case),
+                    "only explicitly selected subcase may execute"
+                );
+                run(case);
+                println!("RSIA_AG174B_H2_CHILD_FINISHED {value}");
+                return;
+            }
+            for case in cases {
+                let identity = format!("{name}::{case}");
+                let output =
+                    Command::new(std::env::current_exe().expect("actual fixed-H test binary"))
+                        .args(["--exact", name, "--nocapture"])
+                        .env(CHILD, &identity)
+                        .env_remove("RUST_MIN_STACK")
+                        .env_remove("RUST_TEST_THREADS")
+                        .output()
+                        .expect("launch exact current test binary");
+                let stdout = String::from_utf8(output.stdout).expect("child stdout UTF8");
+                let stderr = String::from_utf8(output.stderr).expect("child stderr UTF8");
+                println!(
+                    "RSIA_AG174B_H2_CHILD_RESULT {}",
+                    json!({"test":name,"case":case,"status":output.status.code(),"success":output.status.success(),"stdout":stdout,"stderr":stderr})
+                );
+                assert!(
+                    output.status.success(),
+                    "actual child failed: {identity}\n{stdout}\n{stderr}"
+                );
+                assert!(
+                    stdout.contains(&format!("RSIA_AG174B_H2_CHILD_FINISHED {identity}")),
+                    "complete assertion tail not reached"
+                );
+                assert!(
+                    stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                    "exact child must actually run one test"
+                );
+            }
+        }
+        fn expected_files(workspace: &OwnedConfigWorkspace) -> Vec<(String, Vec<u8>, (u64, u64))> {
+            let state = workspace.state.as_ref().expect("real created state");
+            state
+                .members
+                .iter()
+                .map(|m| {
+                    let source = &state.case.files()[m.source];
+                    let reader = m.read.as_ref().expect("real preopened reader");
+                    let id = m.identity.expect("real creation identity");
+                    assert_eq!(identity(&reader.metadata().unwrap()), id);
+                    (
+                        source.logical_id().into(),
+                        source.raw_utf8().as_bytes().to_vec(),
+                        (id.dev, id.ino),
+                    )
+                })
+                .collect()
+        }
+        fn assert_phase_reads(
+            rows: &[IoEvent],
+            phase: Phase,
+            expected: &[(String, Vec<u8>, (u64, u64))],
+        ) {
+            for (logical, origin, id) in expected {
+                let reads: Vec<_> = rows
+                    .iter()
+                    .filter(|e| {
+                        e.phase == phase && e.operation == "read" && e.component == *logical
+                    })
+                    .collect();
+                assert!(
+                    !reads.is_empty(),
+                    "missing actual {phase:?} reads for {logical}"
+                );
+                let mut bytes = Vec::new();
+                for event in &reads {
+                    assert_eq!(event.fd, Some(*id));
+                    if !event.injected && !event.bytes.is_empty() {
+                        assert_eq!(event.offset, Some(bytes.len() as u64));
+                        bytes.extend_from_slice(&event.bytes);
+                    }
+                }
+                assert_eq!(
+                    &bytes, origin,
+                    "complete actual FD bytes must equal the generator origin"
+                );
+                let eof = reads.last().unwrap();
+                assert!(
+                    !eof.injected
+                        && eof.bytes.is_empty()
+                        && eof.offset == Some(origin.len() as u64)
+                        && eof.requested == 1,
+                    "normal EOF must be a real one-byte probe at original length"
+                );
+                assert!(reads.iter().map(|e| e.bytes.len()).sum::<usize>() <= origin.len() + 1);
+            }
+        }
+        fn complete_health() {
+            assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+            assert_ne!(
+                rustix::process::getuid().as_raw(),
+                0,
+                "H2 health requires the admitted non-root UID"
+            );
+            assert_eq!(rustix::process::getuid(), rustix::process::geteuid());
+            let mut workspace = OwnedConfigWorkspace::create(generated())
+                .expect("legitimate actual producer health");
+            let expected = expected_files(&workspace);
+            let before = events().len();
+            assert!(matches!(
+                OwnedConfigWorkspace::create(generated()),
+                Err(OwnedWorkspaceError::Active)
+            ));
+            assert_eq!(
+                events().len(),
+                before,
+                "active refusal must precede extra production open/read"
+            );
+            let snapshot = workspace
+                .read_once()
+                .expect("actual original-FD read health");
+            assert_eq!(snapshot.files().len(), 3);
+            for (file, (logical, bytes, _)) in snapshot.files().iter().zip(&expected) {
+                assert_eq!(file.logical_id(), logical.as_str());
+                assert_eq!(file.bytes(), bytes.as_slice());
+                assert_eq!(file.format(), "json");
+            }
+            assert_phase_reads(&events(), Phase::Seal, &expected);
+            assert_phase_reads(&events(), Phase::Execute, &expected);
+            assert!(matches!(
+                workspace.read_once(),
+                Err(OwnedWorkspaceError::AlreadyRead)
+            ));
+            workspace.finish().expect("normal explicit finish");
+            assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+            let mut next = OwnedConfigWorkspace::create(generated())
+                .expect("next real workspace after finish");
+            next.read_once().expect("next read");
+            next.finish().expect("next finish");
+            assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+            report(
+                "healthy_complete_chain",
+                json!({"real_create_seal_read_finish":true,"next_workspace":true}),
+            );
+        }
+        fn fixture_writer(workspace: &OwnedConfigWorkspace, index: usize) -> File {
+            let state = workspace.state.as_ref().unwrap();
+            let member = &state.members[index];
+            let reader = member.read.as_ref().unwrap();
+            rfs::fchmod(reader, Mode::RUSR | Mode::WUSR).expect("fixture enables own write-open");
+            let writer = File::from(
+                rfs::openat(
+                    state.directory(member.parent).unwrap(),
+                    member.name.as_str(),
+                    OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .expect("fixture opens same owned inode"),
+            );
+            rfs::fchmod(&writer, Mode::RUSR).expect("restore sealed mode before target mutation");
+            assert_eq!(file_id(&writer), file_id(reader));
+            fixture(
+                "owned_writer_open_then_mode_restored",
+                json!({"fd":file_id(&writer),"sealed_mode":256}),
+            );
+            writer
+        }
+        fn no_external_reads(rows: &[IoEvent], sentinel: (u64, u64)) {
+            assert!(
+                rows.iter().all(|e| e.fd != Some(sentinel)),
+                "production must never target the actual external sentinel inode"
+            );
+            assert!(
+                rows.iter().all(|e| e.operation != "open"),
+                "execute interval must not reopen the replaced path"
+            );
+        }
+        fn first_root_path(workspace: &OwnedConfigWorkspace) -> PathBuf {
+            Path::new(if cfg!(target_os = "macos") {
+                "/private/tmp"
+            } else {
+                "/tmp"
+            })
+            .join(&workspace.state.as_ref().unwrap().directories[0].name)
+        }
+        fn remove_fixture_file(parent: &File, name: &str) {
+            let st = rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+                .expect("verify own extra before unlink");
+            fixture(
+                "unlink_own_extra",
+                json!({"name":name,"dev":st.st_dev,"ino":st.st_ino,"uid":st.st_uid}),
+            );
+            rfs::unlinkat(parent, name, AtFlags::empty()).expect("remove only own extra");
+        }
+        #[derive(Debug)]
+        struct RootInfo {
+            path: PathBuf,
+            id: (u64, u64),
+        }
+        fn root_from_events(rows: &[IoEvent]) -> RootInfo {
+            let event = rows
+                .iter()
+                .find(|e| {
+                    e.phase == Phase::Create
+                        && e.operation == "open"
+                        && e.completed
+                        && e.fd.is_some()
+                        && e.component.starts_with("rsia-ctw-v1-")
+                })
+                .expect("real successful root open");
+            RootInfo {
+                path: Path::new(if cfg!(target_os = "macos") {
+                    "/private/tmp"
+                } else {
+                    "/tmp"
+                })
+                .join(&event.component),
+                id: event.fd.unwrap(),
+            }
+        }
+        fn fixture_cleanup(root: &RootInfo) {
+            let m = std::fs::symlink_metadata(&root.path).expect("actual residual root");
+            assert!(m.is_dir());
+            assert_eq!((m.dev(), m.ino()), root.id);
+            assert_eq!(m.uid(), rustix::process::getuid().as_raw());
+            // A closed list of names created in this case, never a directory walk.
+            for name in [
+                "override/config.json",
+                "project/config.json",
+                "defaults/base.json",
+                "config/unsupported.toml",
+                "override/h2-displaced-original",
+                "project/h2-displaced-original",
+                "defaults/h2-displaced-original",
+                "h2-unknown",
+            ] {
+                let path = root.path.join(name);
+                match std::fs::symlink_metadata(&path) {
+                    Ok(m) => {
+                        assert!(!m.is_dir());
+                        assert_eq!(m.uid(), rustix::process::getuid().as_raw());
+                        fixture(
+                            "remove_own_known_residual",
+                            json!({"relative":name,"dev":m.dev(),"ino":m.ino(),"mode":m.mode()}),
+                        );
+                        std::fs::remove_file(path)
+                            .expect("fixture removes its explicit known member only");
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => panic!("residual metadata error: {e}"),
+                }
+            }
+            for name in ["override", "project", "defaults", "config"] {
+                let path = root.path.join(name);
+                match std::fs::symlink_metadata(&path) {
+                    Ok(m) => {
+                        assert!(m.is_dir());
+                        assert_eq!(m.uid(), rustix::process::getuid().as_raw());
+                        fixture(
+                            "remove_own_known_empty_directory",
+                            json!({"relative":name,"dev":m.dev(),"ino":m.ino()}),
+                        );
+                        std::fs::remove_dir(path)
+                            .expect("never recursively remove an unknown residual");
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => panic!("residual directory error: {e}"),
+                }
+            }
+            let m = std::fs::symlink_metadata(&root.path).unwrap();
+            assert_eq!((m.dev(), m.ino()), root.id);
+            std::fs::remove_dir(&root.path).expect("fixture final empty known root");
+            fixture(
+                "remove_own_empty_root",
+                json!({"dev":root.id.0,"ino":root.id.1}),
+            );
+        }
+        fn cleanup_zero() {
+            FD_SAMPLES.with(|s| {
+                let s = s.borrow();
+                let last = s.last().expect("actual cleanup sample");
+                assert_eq!(last.phase, Phase::Cleanup);
+                assert_eq!(
+                    (last.directories, last.reads, last.writes, last.total),
+                    (0, 0, 0, 0)
+                );
+            });
+        }
+        fn external() -> (tempfile::TempDir, PathBuf, (u64, u64)) {
+            let dir = tempfile::tempdir().expect("own external fixture directory");
+            let path = dir.path().join("sentinel");
+            std::fs::write(&path, SENTINEL).expect("own sentinel write");
+            let file = File::open(&path).unwrap();
+            let id = file_id(&file);
+            fixture(
+                "create_external_sentinel",
+                json!({"id":id,"bytes":SENTINEL}),
+            );
+            (dir, path, id)
+        }
+        fn sentinel_unchanged(path: &Path, id: (u64, u64)) {
+            let actual = std::fs::read(path).expect("fixture alone reads its external sentinel");
+            assert_eq!(actual, SENTINEL);
+            fixture(
+                "fixture_read_external_sentinel_after_product",
+                json!({"id":id,"actual_bytes":actual}),
+            );
+        }
+        fn assert_poisoned_without_new_os() {
+            assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 2);
+            let before = events().len();
+            let counter = ROOT_COUNTER.load(Ordering::SeqCst);
+            assert!(matches!(
+                OwnedConfigWorkspace::create(generated()),
+                Err(OwnedWorkspaceError::Poisoned)
+            ));
+            assert_eq!(events().len(), before);
+            assert_eq!(ROOT_COUNTER.load(Ordering::SeqCst), counter);
+        }
+        fn reject_layout_at_actual_create(layout: &[FileLayout<'_>]) -> OwnedWorkspaceError {
+            let supplied: Vec<_> = layout
+                .iter()
+                .map(|f| TestLayout {
+                    logical_id: f.logical_id.into(),
+                    components: f.components.iter().map(|c| (*c).into()).collect(),
+                    source_path: f.source_path.into(),
+                    bytes: f.bytes,
+                })
+                .collect();
+            let descriptor:Vec<_>=layout.iter().map(|f|json!({"logical_id":f.logical_id,"components":f.components,"source_path":f.source_path,"bytes":f.bytes})).collect();
+            H2_LAYOUT_OVERRIDE.with(|v| {
+                assert!(v.borrow().is_none());
+                *v.borrow_mut() = Some(supplied);
+            });
+            let counter = ROOT_COUNTER.load(Ordering::SeqCst);
+            let before = events().len();
+            assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+            let error = OwnedConfigWorkspace::create(generated())
+                .expect_err("actual producer must reject injected invalid plan before OS creation");
+            H2_LAYOUT_OVERRIDE.with(|v| {
+                assert!(
+                    v.borrow().is_none(),
+                    "real production preflight consumed one-shot layout"
+                )
+            });
+            LAYOUT_EVENTS.with(|v| {
+                let v = v.borrow();
+                let last = v.last().unwrap();
+                assert!(last.injected);
+                assert_eq!(last.members, layout.len());
+            });
+            assert_eq!(events().len(), before);
+            assert_eq!(ROOT_COUNTER.load(Ordering::SeqCst), counter);
+            assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+            fixture(
+                "negative_plan_at_actual_create_preflight",
+                json!({"layout":descriptor,"error":format!("{error:?}"),"production_os_events_added":0,"injected":true,"actual_16_file_FS_creation_claim":false}),
+            );
+            error
+        }
+
+        #[test]
+        fn uid_and_parent_policy_are_fixed() {
+            isolated(
+                "owned_config_workspace::tests::uid_and_parent_policy_are_fixed",
+                &[
+                    "real_uid_and_fixed_parent",
+                    "zero_uid_injected",
+                    "mismatched_uid_injected",
+                    "insecure_owned_ancestor",
+                ],
+                |case| {
+                    complete_health();
+                    match case {
+                        "real_uid_and_fixed_parent" => {
+                            let start = events().len();
+                            let workspace = OwnedConfigWorkspace::create(generated()).unwrap();
+                            let state = workspace.state.as_ref().unwrap();
+                            let parent = state.parent.as_ref().unwrap().metadata().unwrap();
+                            assert_eq!(parent.uid(), 0);
+                            assert_ne!(parent.mode() & 0o1000, 0);
+                            let root = state.directory(0).unwrap().metadata().unwrap();
+                            assert_eq!(root.uid(), rustix::process::getuid().as_raw());
+                            assert_eq!(root.mode() & 0o777, 0o700);
+                            let rows = events();
+                            let components: Vec<_> = rows[start..]
+                                .iter()
+                                .filter(|e| {
+                                    e.phase == Phase::Parent
+                                        && e.operation == "open"
+                                        && !e.completed
+                                })
+                                .map(|e| e.component.as_str())
+                                .collect();
+                            assert_eq!(
+                                components,
+                                if cfg!(target_os = "macos") {
+                                    vec!["/", "private", "tmp"]
+                                } else {
+                                    vec!["/", "tmp"]
+                                }
+                            );
+                            UID_EVENTS.with(|e| {
+                                assert!(e.borrow().iter().any(|u| !u.injected
+                                    && u.actual_real == u.selected_real
+                                    && u.actual_effective == u.selected_effective))
+                            });
+                            workspace.finish().unwrap();
+                            cleanup_zero();
+                        }
+                        "zero_uid_injected" | "mismatched_uid_injected" => {
+                            let uid = rustix::process::getuid().as_raw();
+                            let selected = if case == "zero_uid_injected" {
+                                (0, 0)
+                            } else {
+                                (uid, uid.checked_add(1).unwrap())
+                            };
+                            H2_HOOKS.with(|h| {
+                                h.borrow_mut().push_back((
+                                    HookPoint::UidPolicy,
+                                    TestAction::Uids {
+                                        real: selected.0,
+                                        effective: selected.1,
+                                    },
+                                ))
+                            });
+                            let before = events().len();
+                            let counter = ROOT_COUNTER.load(Ordering::SeqCst);
+                            assert!(matches!(
+                                OwnedConfigWorkspace::create(generated()),
+                                Err(OwnedWorkspaceError::Unsupported(
+                                    "real/effective UID must match and be nonzero"
+                                ))
+                            ));
+                            assert_eq!(events().len(), before);
+                            assert_eq!(ROOT_COUNTER.load(Ordering::SeqCst), counter);
+                            assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+                            UID_EVENTS.with(|e| {
+                                let e = e.borrow();
+                                let u = e.last().unwrap();
+                                assert!(u.injected);
+                                assert_eq!((u.selected_real, u.selected_effective), selected);
+                                assert_eq!(
+                                    (u.actual_real, u.actual_effective),
+                                    (uid, rustix::process::geteuid().as_raw())
+                                );
+                            });
+                        }
+                        "insecure_owned_ancestor" => {
+                            let dir = tempfile::tempdir().unwrap();
+                            std::fs::set_permissions(
+                                dir.path(),
+                                std::fs::Permissions::from_mode(0o700),
+                            )
+                            .unwrap();
+                            let fd = File::open(dir.path()).unwrap();
+                            check_ancestor(&fd, rustix::process::getuid().as_raw(), false)
+                                .expect("healthy actual owned ancestor");
+                            std::fs::set_permissions(
+                                dir.path(),
+                                std::fs::Permissions::from_mode(0o777),
+                            )
+                            .unwrap();
+                            assert!(matches!(
+                                check_ancestor(&fd, rustix::process::getuid().as_raw(), false),
+                                Err(OwnedWorkspaceError::Identity(
+                                    "insecure fixed parent or ancestor"
+                                ))
+                            ));
+                            fixture(
+                                "single_actual_ancestor_mode_mutation",
+                                json!({"id":file_id(&fd),"before":448,"after":511}),
+                            );
+                            std::fs::set_permissions(
+                                dir.path(),
+                                std::fs::Permissions::from_mode(0o700),
+                            )
+                            .unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    report(
+                        case,
+                        json!({"policy_fixed":true,"injected_uid_is_not_a_real_root_run":true}),
+                    );
+                },
+            );
+        }
+
+        #[test]
+        fn symlink_hardlink_special_objects_are_refused() {
+            isolated(
+                "owned_config_workspace::tests::symlink_hardlink_special_objects_are_refused",
+                &[
+                    "symlink_before_create",
+                    "symlink_before_preopen",
+                    "hardlink_before_create",
+                    "hardlink_after_seal",
+                    "fifo_before_create",
+                    "fifo_before_preopen",
+                    "directory_is_not_regular",
+                ],
+                |case| {
+                    complete_health();
+                    let (_sentinel_dir, sentinel, sentinel_id) = external();
+                    if case == "hardlink_after_seal" || case == "directory_is_not_regular" {
+                        let mut workspace = OwnedConfigWorkspace::create(generated()).unwrap();
+                        if case == "hardlink_after_seal" {
+                            let state = workspace.state.as_ref().unwrap();
+                            let member = &state.members[0];
+                            let parent = state.directory(member.parent).unwrap();
+                            rfs::linkat(
+                                parent,
+                                member.name.as_str(),
+                                parent,
+                                "h2-alias",
+                                AtFlags::empty(),
+                            )
+                            .unwrap();
+                            fixture(
+                                "hardlink_actual_original",
+                                json!({"id":file_id(member.read.as_ref().unwrap()),"nlink":2}),
+                            );
+                            assert!(matches!(
+                                workspace.read_once(),
+                                Err(OwnedWorkspaceError::Identity(
+                                    "original regular identity/link/mode/length differs"
+                                ))
+                            ));
+                            let state = workspace.state.as_ref().unwrap();
+                            remove_fixture_file(
+                                state.directory(state.members[0].parent).unwrap(),
+                                "h2-alias",
+                            );
+                        } else {
+                            let state = workspace.state.as_ref().unwrap();
+                            let directory = state.directory(0).unwrap();
+                            let id = identity(&directory.metadata().unwrap());
+                            assert!(matches!(
+                                check_regular(directory, id, state.uid, 0, 0o700),
+                                Err(OwnedWorkspaceError::Identity(
+                                    "original regular identity/link/mode/length differs"
+                                ))
+                            ));
+                            fixture(
+                                "actual_product_regular_guard_on_real_owned_directory_fd",
+                                json!({"id":(id.dev,id.ino),"not_a_fake_state":true}),
+                            );
+                        }
+                        workspace.finish().unwrap();
+                        cleanup_zero();
+                    } else {
+                        let point = if case.ends_with("preopen") {
+                            HookPoint::BeforePreopen
+                        } else {
+                            HookPoint::BeforeMemberCreate
+                        };
+                        let action = if case.starts_with("symlink") {
+                            TestAction::Symlink(sentinel.clone())
+                        } else if case.starts_with("hardlink") {
+                            TestAction::Hardlink(sentinel.clone())
+                        } else {
+                            TestAction::Fifo
+                        };
+                        H2_HOOKS.with(|h| h.borrow_mut().push_back((point, action)));
+                        let start = events().len();
+                        let result = OwnedConfigWorkspace::create(generated());
+                        assert!(
+                            matches!(
+                                &result,
+                                Err(OwnedWorkspaceError::ExecutionAndCleanup { .. })
+                            ),
+                            "real injected object must be refused and its unknown identity must remain a cleanup error: {result:?}"
+                        );
+                        let err = result.unwrap_err();
+                        let OwnedWorkspaceError::ExecutionAndCleanup { execution, cleanup } = err
+                        else {
+                            unreachable!()
+                        };
+                        if case.ends_with("create") {
+                            assert!(
+                                matches!(*execution,OwnedWorkspaceError::Io{source,..} if source.raw_os_error()==Some(rustix::io::Errno::EXIST.raw_os_error()))
+                            );
+                        } else if case.starts_with("symlink") {
+                            assert!(
+                                matches!(*execution,OwnedWorkspaceError::Io{operation:"openat",source} if source.raw_os_error()==Some(rustix::io::Errno::LOOP.raw_os_error()))
+                            );
+                        } else {
+                            assert!(matches!(
+                                *execution,
+                                OwnedWorkspaceError::Identity(
+                                    "original regular identity/link/mode/length differs"
+                                )
+                            ));
+                        }
+                        assert!(matches!(*cleanup, OwnedWorkspaceError::Cleanup(_)));
+                        let rows = events();
+                        assert!(
+                            rows[start..].iter().all(|e| e.fd != Some(sentinel_id)),
+                            "no product open/read may target the external sentinel"
+                        );
+                        assert!(
+                            rows[start..]
+                                .iter()
+                                .all(|e| !(e.operation == "read" && e.phase == Phase::Seal)),
+                            "refusal must precede content reads on an injected object"
+                        );
+                        cleanup_zero();
+                        assert_poisoned_without_new_os();
+                        let root = root_from_events(&rows[start..]);
+                        fixture_cleanup(&root);
+                        assert_poisoned_without_new_os();
+                    }
+                    sentinel_unchanged(&sentinel, sentinel_id);
+                    report(
+                        case,
+                        json!({"actual_os_object_refused":true,"external_sentinel_never_product_input":true}),
+                    );
+                },
+            );
+        }
+
+        #[test]
+        fn preopened_identity_survives_or_rejects_path_replacement() {
+            isolated(
+                "owned_config_workspace::tests::preopened_identity_survives_or_rejects_path_replacement",
+                &[
+                    "rename_only",
+                    "rename_then_external_symlink",
+                    "hook_after_preopen_external_symlink",
+                ],
+                |case| {
+                    complete_health();
+                    let (_sentinel_dir, sentinel, sentinel_id) = external();
+                    if case == "hook_after_preopen_external_symlink" {
+                        H2_HOOKS.with(|h| {
+                            h.borrow_mut().push_back((
+                                HookPoint::AfterPreopen,
+                                TestAction::Symlink(sentinel.clone()),
+                            ))
+                        });
+                    }
+                    let mut workspace = OwnedConfigWorkspace::create(generated())
+                        .expect("original preopened FD remains bound to the created inode");
+                    let expected = expected_files(&workspace);
+                    if case != "hook_after_preopen_external_symlink" {
+                        let state = workspace.state.as_ref().unwrap();
+                        let member = &state.members[0];
+                        let parent = state.directory(member.parent).unwrap();
+                        rfs::renameat(
+                            parent,
+                            member.name.as_str(),
+                            parent,
+                            "h2-displaced-original",
+                        )
+                        .unwrap();
+                        if case == "rename_then_external_symlink" {
+                            rfs::symlinkat(sentinel.as_path(), parent, member.name.as_str())
+                                .unwrap();
+                        }
+                        fixture(
+                            "rename_known_original_and_optional_external_symlink",
+                            json!({"original":expected[0].2,"external":sentinel_id,"relative":member.name}),
+                        );
+                    }
+                    let start = events().len();
+                    let snapshot = workspace
+                        .read_once()
+                        .expect("path changes must not change the original FD contents");
+                    let rows = events();
+                    no_external_reads(&rows[start..], sentinel_id);
+                    assert_phase_reads(&rows[start..], Phase::Execute, &expected);
+                    for (f, (_, bytes, _)) in snapshot.files().iter().zip(&expected) {
+                        assert_eq!(f.bytes(), bytes.as_slice());
+                    }
+                    let state = workspace.state.as_ref().unwrap();
+                    let member = &state.members[0];
+                    let parent = state.directory(member.parent).unwrap();
+                    if case != "rename_only" {
+                        remove_fixture_file(parent, &member.name);
+                    }
+                    rfs::renameat(
+                        parent,
+                        "h2-displaced-original",
+                        parent,
+                        member.name.as_str(),
+                    )
+                    .unwrap();
+                    fixture(
+                        "restore_own_original_before_finish",
+                        json!({"id":expected[0].2}),
+                    );
+                    workspace.finish().unwrap();
+                    cleanup_zero();
+                    assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+                    sentinel_unchanged(&sentinel, sentinel_id);
+                    report(
+                        case,
+                        json!({"actual_old_inode_read":true,"external_production_opens_and_reads":0,"fixture_restoration_before_finish":true}),
+                    );
+                },
+            );
+        }
+        #[test]
+        fn truncation_growth_and_origin_mismatch_are_detected() {
+            isolated(
+                "owned_config_workspace::tests::truncation_growth_and_origin_mismatch_are_detected",
+                &[
+                    "truncated",
+                    "grown",
+                    "one_byte_changed",
+                    "early_eof_injected",
+                    "interrupted_8_payload",
+                    "interrupted_9_payload",
+                    "interrupted_8_eof",
+                    "interrupted_9_eof",
+                    "interrupted_shared_limit",
+                    "actual_eof_growth_probe",
+                ],
+                |case| {
+                    complete_health();
+                    let mut workspace = OwnedConfigWorkspace::create(generated()).unwrap();
+                    let expected = expected_files(&workspace);
+                    let start = events().len();
+                    match case {
+                        "truncated" | "grown" | "one_byte_changed" => {
+                            let writer = fixture_writer(&workspace, 0);
+                            let len = expected[0].1.len();
+                            if case == "truncated" {
+                                writer.set_len((len - 1) as u64).unwrap();
+                            } else if case == "grown" {
+                                writer.write_all_at(b"!", len as u64).unwrap();
+                            } else {
+                                writer.write_all_at(&[expected[0].1[0] ^ 1], 0).unwrap();
+                            }
+                            writer.sync_all().unwrap();
+                            fixture(
+                                "single_owned_inode_content_mutation",
+                                json!({"kind":case,"id":file_id(&writer),"original":expected[0].1,"actual_len":writer.metadata().unwrap().len(),"sealed_mode":writer.metadata().unwrap().mode()&0o777}),
+                            );
+                            let result = workspace.read_once();
+                            if case == "one_byte_changed" {
+                                assert!(matches!(result, Err(OwnedWorkspaceError::OriginMismatch)));
+                                assert!(events()[start..].iter().any(|e| e.phase
+                                    == Phase::Execute
+                                    && e.operation == "read"
+                                    && !e.injected
+                                    && e.fd == Some(expected[0].2)
+                                    && !e.bytes.is_empty()));
+                            } else {
+                                assert!(matches!(
+                                    result,
+                                    Err(OwnedWorkspaceError::Identity(
+                                        "original regular identity/link/mode/length differs"
+                                    ))
+                                ));
+                                assert!(
+                                    events()[start..].iter().all(|e| e.phase != Phase::Execute)
+                                );
+                            }
+                            drop(writer);
+                        }
+                        "actual_eof_growth_probe" => {
+                            let state = workspace.state.as_ref().unwrap();
+                            let reader = state.members[0].read.as_ref().unwrap();
+                            assert!(matches!(
+                                bounded_read(
+                                    Phase::Execute,
+                                    reader,
+                                    &expected[0].0,
+                                    &expected[0].1[..expected[0].1.len() - 1]
+                                ),
+                                Err(OwnedWorkspaceError::Identity("original fd grew"))
+                            ));
+                            let rows = events();
+                            let reads: Vec<_> = rows[start..]
+                                .iter()
+                                .filter(|e| e.operation == "read")
+                                .collect();
+                            assert_eq!(reads.len(), 2);
+                            assert_eq!(reads[0].bytes, expected[0].1[..expected[0].1.len() - 1]);
+                            assert_eq!(reads[1].requested, 1);
+                            assert_eq!(reads[1].offset, Some((expected[0].1.len() - 1) as u64));
+                            assert_eq!(reads[1].bytes.len(), 1);
+                            assert!(
+                                reads
+                                    .iter()
+                                    .all(|e| !e.injected && e.fd == Some(expected[0].2))
+                            );
+                            fixture(
+                                "direct_real_bounded_read_boundary",
+                                json!({"expected_length":expected[0].1.len()-1,"actual_inode_length":expected[0].1.len(),"claim":"EOF growth guard on actual original FD; separate from the real file-growth snapshot case"}),
+                            );
+                        }
+                        _ => {
+                            let (faults, ok, errno_stage) = match case {
+                                "early_eof_injected" => (vec![ReadFault::EarlyEof], false, "early"),
+                                "interrupted_8_payload" => {
+                                    (vec![ReadFault::Interrupted; 8], true, "payload")
+                                }
+                                "interrupted_9_payload" => {
+                                    (vec![ReadFault::Interrupted; 9], false, "payload")
+                                }
+                                "interrupted_8_eof" => {
+                                    let mut v = vec![ReadFault::Actual];
+                                    v.extend([ReadFault::Interrupted; 8]);
+                                    (v, true, "EOF")
+                                }
+                                "interrupted_9_eof" => {
+                                    let mut v = vec![ReadFault::Actual];
+                                    v.extend([ReadFault::Interrupted; 9]);
+                                    (v, false, "EOF")
+                                }
+                                "interrupted_shared_limit" => {
+                                    let mut v = vec![ReadFault::Interrupted; 4];
+                                    v.push(ReadFault::Actual);
+                                    v.extend([ReadFault::Interrupted; 5]);
+                                    (v, false, "EOF")
+                                }
+                                _ => unreachable!(),
+                            };
+                            let requested: Vec<_> =
+                                faults.iter().map(|f| format!("{f:?}")).collect();
+                            READ_FAULTS.with(|f| f.borrow_mut().extend(faults));
+                            let result = workspace.read_once();
+                            if ok {
+                                let snapshot =
+                                    result.expect("exactly eight interruptions remain recoverable");
+                                assert_eq!(snapshot.files()[0].bytes(), expected[0].1.as_slice());
+                                assert_phase_reads(&events()[start..], Phase::Execute, &expected);
+                            } else if errno_stage == "early" {
+                                assert!(matches!(
+                                    result,
+                                    Err(OwnedWorkspaceError::Identity("truncated original fd"))
+                                ));
+                            } else {
+                                assert!(
+                                    matches!(result,Err(OwnedWorkspaceError::Io {operation,source}) if operation==(if errno_stage=="EOF" {"read_at EOF"} else {"read_at"}) && source.kind()==io::ErrorKind::Interrupted && source.raw_os_error()==Some(rustix::io::Errno::INTR.raw_os_error()))
+                                );
+                            }
+                            let rows = events();
+                            let injected = rows[start..]
+                                .iter()
+                                .filter(|e| e.operation == "read" && e.injected)
+                                .count();
+                            assert_eq!(
+                                injected,
+                                if errno_stage == "early" {
+                                    1
+                                } else if ok {
+                                    8
+                                } else {
+                                    9
+                                }
+                            );
+                            READ_FAULTS.with(|f| assert!(f.borrow().is_empty()));
+                            fixture(
+                                "declared_read_fault_queue",
+                                json!({"faults":requested,"injected_events":injected,"actual_reads_remain_distinguished":true}),
+                            );
+                        }
+                    }
+                    assert!(events()[start..].iter().all(|e| !(e.phase == Phase::Execute
+                        && matches!(e.operation, "open" | "write" | "unlink"))));
+                    workspace.finish().unwrap();
+                    cleanup_zero();
+                    assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+                    report(
+                        case,
+                        json!({"single_target_mutation":true,"precise_refusal_or_eight_interrupt_recovery":true,"explicit_finish":true}),
+                    );
+                },
+            );
+        }
+
+        #[test]
+        fn resource_preflight_and_each_stage_fd_peak_are_bounded() {
+            isolated(
+                "owned_config_workspace::tests::resource_preflight_and_each_stage_fd_peak_are_bounded",
+                &[
+                    "real_fd_buffer_memory_ledger",
+                    "layout_regular_count",
+                    "layout_file_bytes",
+                    "layout_total_bytes",
+                    "layout_depth",
+                    "layout_bad_components",
+                    "layout_duplicate",
+                    "layout_origin_mismatch",
+                    "layout_prefix_conflict",
+                    "layout_16_boundary",
+                    "name_counter_exhaustion",
+                    "concurrent_names",
+                    "eight_eexist_unchanged",
+                    "mkdir_non_eexist",
+                ],
+                |case| {
+                    complete_health();
+                    match case {
+                        "real_fd_buffer_memory_ledger" => {
+                            let start_fd = FD_SAMPLES.with(|s| s.borrow().len());
+                            let start_mem = MEMORY_SAMPLES.with(|s| s.borrow().len());
+                            let start_buf = BUFFER_SAMPLES.with(|s| s.borrow().len());
+                            let mut workspace = OwnedConfigWorkspace::create(generated()).unwrap();
+                            let expected = expected_files(&workspace);
+                            let snapshot = workspace.read_once().unwrap();
+                            let payload: usize = expected.iter().map(|(_, b, _)| b.len()).sum();
+                            assert_eq!(
+                                snapshot
+                                    .files()
+                                    .iter()
+                                    .map(|f| f.bytes().len())
+                                    .sum::<usize>(),
+                                payload
+                            );
+                            FD_SAMPLES.with(|s| {
+                                let s = s.borrow();
+                                let rows = &s[start_fd..];
+                                assert!(rows.iter().any(|s| s.phase == Phase::Parent));
+                                assert!(rows.iter().any(|s| s.phase == Phase::Create));
+                                assert!(rows.iter().any(|s| s.phase == Phase::Seal));
+                                assert!(rows.iter().any(|s| s.phase == Phase::Execute));
+                                for f in rows {
+                                    assert_eq!(f.total, f.directories + f.reads + f.writes);
+                                    assert!(
+                                        f.directories <= 50
+                                            && f.reads <= 16
+                                            && f.writes <= 1
+                                            && f.total <= 72
+                                    );
+                                }
+                                assert_eq!(rows.iter().map(|s| s.total).max(), Some(9));
+                            });
+                            BUFFER_SAMPLES.with(|s| {
+                                let s = s.borrow();
+                                for b in &s[start_buf..] {
+                                    assert!(b.capacity >= b.expected_len);
+                                    assert_eq!(b.eof_slot, 1);
+                                    assert!(
+                                        expected.iter().any(|(id, bytes, _)| id == &b.logical_id
+                                            && bytes.len() == b.expected_len)
+                                    );
+                                }
+                            });
+                            MEMORY_SAMPLES.with(|s| {
+                                let s = s.borrow();
+                                let rows = &s[start_mem..];
+                                assert!(
+                                    rows.iter().all(|m| m.origin_case_heap_capacity >= payload)
+                                );
+                                let final_q = rows
+                                    .iter()
+                                    .rev()
+                                    .find(|m| m.phase == Phase::Execute)
+                                    .unwrap();
+                                assert!(final_q.snapshot_bytes_capacity >= payload);
+                                assert!(
+                                    final_q.snapshot_vector_capacity
+                                        >= 3 * std::mem::size_of::<SnapshotFile>()
+                                );
+                                assert!(
+                                    final_q.query_vector_capacity >= std::mem::size_of::<&str>()
+                                );
+                                assert_eq!(
+                                    final_q.state_inline_bytes,
+                                    std::mem::size_of::<State>()
+                                );
+                            });
+                            drop(snapshot);
+                            workspace.finish().unwrap();
+                            cleanup_zero();
+                            let l2 = ClosedCaseSelector::Task {
+                                template: Template::F,
+                                layer_count: Layers::L2,
+                                key_type: KeyType::B,
+                                placement: Placement::E,
+                                seed: Seed::Zero,
+                            };
+                            let start = FD_SAMPLES.with(|s| s.borrow().len());
+                            let mut workspace =
+                                OwnedConfigWorkspace::create(generate_case(l2).unwrap()).unwrap();
+                            workspace.read_once().unwrap();
+                            workspace.finish().unwrap();
+                            FD_SAMPLES.with(|s| {
+                                assert_eq!(
+                                    s.borrow()[start..].iter().map(|s| s.total).max(),
+                                    Some(7)
+                                )
+                            });
+                            cleanup_zero();
+                            fixture(
+                                "resource_claim_boundary",
+                                json!({"real_L3_peak":9,"real_L2_peak":7,"general_layout_peak_67_is_not_a_16_file_FS_measurement":true,"allocator_RSS_and_harness_excluded_from_owned_counts":true}),
+                            );
+                        }
+                        "name_counter_exhaustion" => {
+                            let uid = rustix::process::getuid().as_raw();
+                            let pid = std::process::id();
+                            let counter = AtomicU64::new(u64::MAX - 1);
+                            let before = events().len();
+                            assert_eq!(
+                                next_root_name(uid, pid, &counter).unwrap(),
+                                format!("rsia-ctw-v1-{uid}-{pid}-{}", u64::MAX - 1)
+                            );
+                            assert_eq!(counter.load(Ordering::SeqCst), u64::MAX);
+                            assert!(matches!(
+                                next_root_name(uid, pid, &counter),
+                                Err(OwnedWorkspaceError::Capacity("root name counter exhausted"))
+                            ));
+                            assert_eq!(counter.load(Ordering::SeqCst), u64::MAX);
+                            assert_eq!(events().len(), before);
+                            fixture(
+                                "actual_production_name_allocator_local_atomic",
+                                json!({"start":u64::MAX-1,"after":u64::MAX,"wrap":false,"claim":"allocator boundary, not global counter reset or a new root"}),
+                            );
+                        }
+                        "concurrent_names" => {
+                            let uid = rustix::process::getuid().as_raw();
+                            let pid = std::process::id();
+                            let counter = Arc::new(AtomicU64::new(100));
+                            let threads: Vec<_> = (0..4)
+                                .map(|_| {
+                                    let counter = Arc::clone(&counter);
+                                    std::thread::spawn(move || {
+                                        (0..16)
+                                            .map(|_| next_root_name(uid, pid, &counter).unwrap())
+                                            .collect::<Vec<_>>()
+                                    })
+                                })
+                                .collect();
+                            let names: Vec<_> = threads
+                                .into_iter()
+                                .flat_map(|h| h.join().unwrap())
+                                .collect();
+                            let unique: BTreeSet<_> = names.iter().cloned().collect();
+                            assert_eq!(names.len(), 64);
+                            assert_eq!(unique.len(), 64);
+                            assert_eq!(counter.load(Ordering::SeqCst), 164);
+                            assert_eq!(
+                                unique,
+                                (100..164)
+                                    .map(|n| format!("rsia-ctw-v1-{uid}-{pid}-{n}"))
+                                    .collect()
+                            );
+                            fixture(
+                                "concurrent_actual_name_allocator",
+                                json!({"threads":4,"calls_each":16,"start":100,"after":164,"names":names,"actual_root_creation_claim":false}),
+                            );
+                        }
+                        "eight_eexist_unchanged" => {
+                            let uid = rustix::process::getuid().as_raw();
+                            let pid = std::process::id();
+                            let start = ROOT_COUNTER.load(Ordering::SeqCst);
+                            let parent = File::open(if cfg!(target_os = "macos") {
+                                "/private/tmp"
+                            } else {
+                                "/tmp"
+                            })
+                            .unwrap();
+                            let mut collisions = Vec::new();
+                            for n in start..start + 8 {
+                                let name = format!("rsia-ctw-v1-{uid}-{pid}-{n}");
+                                rfs::mkdirat(&parent, name.as_str(), Mode::RWXU).expect(
+                                    "fixture exclusively preoccupies its exact future name",
+                                );
+                                let directory = File::from(
+                                    rfs::openat(
+                                        &parent,
+                                        name.as_str(),
+                                        directory_flags(),
+                                        Mode::empty(),
+                                    )
+                                    .unwrap(),
+                                );
+                                let marker =
+                                    format!("independent-collision-{n}-untouched").into_bytes();
+                                let mut writer = File::from(
+                                    rfs::openat(
+                                        &directory,
+                                        "marker",
+                                        OFlags::WRONLY
+                                            | OFlags::CREATE
+                                            | OFlags::EXCL
+                                            | OFlags::NOFOLLOW
+                                            | OFlags::CLOEXEC,
+                                        Mode::RUSR | Mode::WUSR,
+                                    )
+                                    .unwrap(),
+                                );
+                                writer.write_all(&marker).unwrap();
+                                writer.sync_all().unwrap();
+                                drop(writer);
+                                fixture(
+                                    "preoccupy_own_collision",
+                                    json!({"name":name,"id":file_id(&directory),"marker":marker}),
+                                );
+                                collisions.push((name, directory, marker));
+                            }
+                            let before = events().len();
+                            let result = OwnedConfigWorkspace::create(generated());
+                            assert!(
+                                matches!(result,Err(OwnedWorkspaceError::Io {operation:"mkdirat collisions",source}) if source.raw_os_error()==Some(rustix::io::Errno::EXIST.raw_os_error()))
+                            );
+                            assert_eq!(ROOT_COUNTER.load(Ordering::SeqCst), start + 8);
+                            assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+                            assert!(events()[before..].iter().all(|e| e.phase == Phase::Parent));
+                            for (name, directory, marker) in collisions {
+                                let st =
+                                    rfs::statat(&parent, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                                        .unwrap();
+                                let stat_id = stat_identity(&st);
+                                assert_eq!((stat_id.dev, stat_id.ino), file_id(&directory));
+                                let reader = File::from(
+                                    rfs::openat(
+                                        &directory,
+                                        "marker",
+                                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                                        Mode::empty(),
+                                    )
+                                    .unwrap(),
+                                );
+                                let mut read = vec![0; marker.len()];
+                                assert_eq!(reader.read_at(&mut read, 0).unwrap(), marker.len());
+                                assert_eq!(read, marker);
+                                fixture(
+                                    "collision_after_product_refusal",
+                                    json!({"name":name,"id":file_id(&directory),"marker":read}),
+                                );
+                                drop(reader);
+                                rfs::unlinkat(&directory, "marker", AtFlags::empty()).unwrap();
+                                drop(directory);
+                                rfs::unlinkat(&parent, name.as_str(), AtFlags::REMOVEDIR).unwrap();
+                            }
+                            cleanup_zero();
+                        }
+                        "mkdir_non_eexist" => {
+                            H2_HOOKS.with(|h| {
+                                h.borrow_mut().push_back((
+                                    HookPoint::RootMkdir,
+                                    TestAction::MkdirError(rustix::io::Errno::ACCESS),
+                                ))
+                            });
+                            let counter = ROOT_COUNTER.load(Ordering::SeqCst);
+                            let start = events().len();
+                            assert!(
+                                matches!(OwnedConfigWorkspace::create(generated()),Err(OwnedWorkspaceError::Io {operation:"injected mkdirat",source}) if source.raw_os_error()==Some(rustix::io::Errno::ACCESS.raw_os_error()))
+                            );
+                            assert_eq!(ROOT_COUNTER.load(Ordering::SeqCst), counter + 1);
+                            assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+                            assert!(events()[start..].iter().all(|e| e.phase == Phase::Parent));
+                            cleanup_zero();
+                            fixture(
+                                "fault_injected_non_eexist",
+                                json!({"errno":rustix::io::Errno::ACCESS.raw_os_error(),"counter_consumed":1,"real_os_permission_denial_claim":false}),
+                            );
+                        }
+                        _ => {
+                            let names: Vec<_> = (0..17).map(|i| format!("f{i}")).collect();
+                            let paths: Vec<_> =
+                                names.iter().map(|n| format!("a/b/c/{n}")).collect();
+                            let components: Vec<_> = names
+                                .iter()
+                                .map(|n| vec!["a", "b", "c", n.as_str()])
+                                .collect();
+                            let base: Vec<_> = (0..16)
+                                .map(|i| FileLayout {
+                                    logical_id: &names[i],
+                                    components: &components[i],
+                                    source_path: &paths[i],
+                                    bytes: 0,
+                                })
+                                .collect();
+                            let budget = preflight_layout(&base)
+                                .expect("16 actual planner entries at depth four");
+                            assert_eq!(
+                                (
+                                    budget.directories,
+                                    budget.readers,
+                                    budget.writers,
+                                    budget.peak
+                                ),
+                                (50, 16, 1, 67)
+                            );
+                            let before = events().len();
+                            let counter = ROOT_COUNTER.load(Ordering::SeqCst);
+                            let outcome = match case {
+                                "layout_16_boundary" => {
+                                    let mut v = base.clone();
+                                    for f in &mut v[..4] {
+                                        f.bytes = 65_536;
+                                    }
+                                    let b = preflight_layout(&v).unwrap();
+                                    assert_eq!(b.payload, 262_144);
+                                    Ok(())
+                                }
+                                "layout_regular_count" => {
+                                    assert!(matches!(
+                                        reject_layout_at_actual_create(&[]),
+                                        OwnedWorkspaceError::Capacity("regular count")
+                                    ));
+                                    let mut v = base.clone();
+                                    v.push(FileLayout {
+                                        logical_id: &names[16],
+                                        components: &components[16],
+                                        source_path: &paths[16],
+                                        bytes: 0,
+                                    });
+                                    Err(reject_layout_at_actual_create(&v))
+                                }
+                                "layout_file_bytes" => {
+                                    let mut v = base.clone();
+                                    v[0].bytes = 65_537;
+                                    Err(reject_layout_at_actual_create(&v))
+                                }
+                                "layout_total_bytes" => {
+                                    let mut v = base.clone();
+                                    for f in &mut v[..5] {
+                                        f.bytes = 65_536;
+                                    }
+                                    Err(reject_layout_at_actual_create(&v))
+                                }
+                                "layout_depth" => {
+                                    Err(reject_layout_at_actual_create(&[FileLayout {
+                                        logical_id: "depth",
+                                        components: &["a", "b", "c", "d", "f"],
+                                        source_path: "a/b/c/d/f",
+                                        bytes: 1,
+                                    }]))
+                                }
+                                "layout_bad_components" => {
+                                    for bad in [".", "..", "", "a/b", "a\\b", "a\0b"] {
+                                        assert!(matches!(
+                                            reject_layout_at_actual_create(&[FileLayout {
+                                                logical_id: "bad",
+                                                components: &[bad],
+                                                source_path: bad,
+                                                bytes: 1
+                                            }]),
+                                            OwnedWorkspaceError::WorkspaceBoundary
+                                        ));
+                                    }
+                                    Err(OwnedWorkspaceError::WorkspaceBoundary)
+                                }
+                                "layout_duplicate" => {
+                                    let same_path = FileLayout {
+                                        logical_id: "other-logical-id",
+                                        ..base[0]
+                                    };
+                                    assert!(matches!(
+                                        reject_layout_at_actual_create(&[base[0], same_path]),
+                                        OwnedWorkspaceError::Identity("duplicate member")
+                                    ));
+                                    Err(reject_layout_at_actual_create(&[base[0], base[0]]))
+                                }
+                                "layout_origin_mismatch" => {
+                                    Err(reject_layout_at_actual_create(&[FileLayout {
+                                        logical_id: "origin",
+                                        components: &["a", "f"],
+                                        source_path: "different/f",
+                                        bytes: 1,
+                                    }]))
+                                }
+                                "layout_prefix_conflict" => Err(reject_layout_at_actual_create(&[
+                                    FileLayout {
+                                        logical_id: "file",
+                                        components: &["a"],
+                                        source_path: "a",
+                                        bytes: 1,
+                                    },
+                                    FileLayout {
+                                        logical_id: "child",
+                                        components: &["a", "f"],
+                                        source_path: "a/f",
+                                        bytes: 1,
+                                    },
+                                ])),
+                                _ => unreachable!(),
+                            };
+                            match case {
+                                "layout_16_boundary" => assert!(outcome.is_ok()),
+                                "layout_regular_count" => assert!(matches!(
+                                    outcome,
+                                    Err(OwnedWorkspaceError::Capacity("regular count"))
+                                )),
+                                "layout_file_bytes" => assert!(matches!(
+                                    outcome,
+                                    Err(OwnedWorkspaceError::Capacity("file bytes"))
+                                )),
+                                "layout_total_bytes" => assert!(matches!(
+                                    outcome,
+                                    Err(OwnedWorkspaceError::Capacity("workspace preflight"))
+                                )),
+                                "layout_duplicate" => assert!(matches!(
+                                    outcome,
+                                    Err(OwnedWorkspaceError::Identity("duplicate member"))
+                                )),
+                                "layout_origin_mismatch" => assert!(matches!(
+                                    outcome,
+                                    Err(OwnedWorkspaceError::OriginMismatch)
+                                )),
+                                _ => assert!(matches!(
+                                    outcome,
+                                    Err(OwnedWorkspaceError::WorkspaceBoundary)
+                                )),
+                            }
+                            assert_eq!(events().len(), before);
+                            assert_eq!(ROOT_COUNTER.load(Ordering::SeqCst), counter);
+                            assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+                            fixture(
+                                "production_preflight_layout_boundary",
+                                json!({"layout_case":case,"derived_16_boundary":{"directories":budget.directories,"readers":budget.readers,"writers":budget.writers,"peak":budget.peak},"actual_16_file_FS_creation_claim":false,"original_create_calls_this_preflight_before_any_OS_creation":true}),
+                            );
+                        }
+                    }
+                    report(
+                        case,
+                        json!({"real_FS_health_precedes_private_boundary_cases":true,"owned_fd_bounds":72,"real_stage_samples_separate_from_layout_arithmetic":true}),
+                    );
+                },
+            );
+        }
+
+        struct UnwindWitness {
+            case: String,
+            sender: std::sync::mpsc::Sender<(u8, Vec<IoEvent>, bool)>,
+        }
+        impl Drop for UnwindWitness {
+            fn drop(&mut self) {
+                let state = WORKSPACE_STATE.load(Ordering::SeqCst);
+                let zero = FD_SAMPLES.with(|s| {
+                    s.borrow().last().is_some_and(|s| {
+                        s.phase == Phase::Cleanup
+                            && s.directories == 0
+                            && s.reads == 0
+                            && s.writes == 0
+                            && s.total == 0
+                    })
+                });
+                report(
+                    &self.case,
+                    json!({"unwind_witness_after_product_drop":true,"workspace_state":state,"actual_owned_fd_final_sample_zero":zero,"close_errno_claim":false}),
+                );
+                let _ = self.sender.send((state, events(), zero));
+            }
+        }
+        fn unknown_member(workspace: &OwnedConfigWorkspace) {
+            let root = workspace.state.as_ref().unwrap().directory(0).unwrap();
+            let mut file = File::from(
+                rfs::openat(
+                    root,
+                    "h2-unknown",
+                    OFlags::WRONLY
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC,
+                    Mode::RUSR | Mode::WUSR,
+                )
+                .unwrap(),
+            );
+            file.write_all(b"fixture-owned-unknown-member").unwrap();
+            file.sync_all().unwrap();
+            fixture(
+                "create_unknown_member",
+                json!({"name":"h2-unknown","id":file_id(&file),"bytes":b"fixture-owned-unknown-member"}),
+            );
+        }
+        #[test]
+        fn partial_error_drop_unwind_and_residual_poison_are_fenced() {
+            isolated(
+                "owned_config_workspace::tests::partial_error_drop_unwind_and_residual_poison_are_fenced",
+                &[
+                    "partial_seal_read_failure",
+                    "partial_after_root_injected_errno",
+                    "drop_healthy",
+                    "unwind_after_create",
+                    "unwind_during_create",
+                    "finish_unknown_member_poison",
+                    "finish_identity_mismatch_poison",
+                    "drop_unknown_member_poison",
+                    "unwind_unknown_member_poison",
+                ],
+                |case| {
+                    complete_health();
+                    match case {
+                        "partial_seal_read_failure" => {
+                            READ_FAULTS.with(|f| f.borrow_mut().push_back(ReadFault::EarlyEof));
+                            let start = events().len();
+                            assert!(matches!(
+                                OwnedConfigWorkspace::create(generated()),
+                                Err(OwnedWorkspaceError::Identity("truncated original fd"))
+                            ));
+                            assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+                            cleanup_zero();
+                            let root = root_from_events(&events()[start..]);
+                            assert!(!root.path.exists());
+                            assert!(events()[start..].iter().any(|e| e.phase == Phase::Create
+                                && e.operation == "write"
+                                && !e.bytes.is_empty()));
+                            assert!(events()[start..].iter().any(|e| e.phase == Phase::Seal
+                                && e.operation == "read"
+                                && e.injected));
+                        }
+                        "partial_after_root_injected_errno" => {
+                            H2_HOOKS.with(|h| {
+                                h.borrow_mut().push_back((
+                                    HookPoint::RootCreated,
+                                    TestAction::MkdirError(rustix::io::Errno::ACCESS),
+                                ))
+                            });
+                            let start = events().len();
+                            assert!(
+                                matches!(OwnedConfigWorkspace::create(generated()),Err(OwnedWorkspaceError::Io{operation:"injected mkdirat",source}) if source.raw_os_error()==Some(rustix::io::Errno::ACCESS.raw_os_error()))
+                            );
+                            assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+                            cleanup_zero();
+                            let root = root_from_events(&events()[start..]);
+                            assert!(!root.path.exists());
+                            fixture(
+                                "post_root_injected_errno",
+                                json!({"actual_root_existed":true,"fault_injected":true,"real_permission_denial_claim":false}),
+                            );
+                        }
+                        "drop_healthy" => {
+                            let workspace = OwnedConfigWorkspace::create(generated()).unwrap();
+                            let root = RootInfo {
+                                path: first_root_path(&workspace),
+                                id: file_id(
+                                    workspace.state.as_ref().unwrap().directory(0).unwrap(),
+                                ),
+                            };
+                            drop(workspace);
+                            assert!(!root.path.exists());
+                            assert_eq!(WORKSPACE_STATE.load(Ordering::SeqCst), 0);
+                            cleanup_zero();
+                        }
+                        "unwind_after_create"
+                        | "unwind_during_create"
+                        | "unwind_unknown_member_poison" => {
+                            let label = case.to_string();
+                            let mode = case.to_string();
+                            let (sender, receiver) = std::sync::mpsc::channel();
+                            let worker: std::thread::JoinHandle<()> = std::thread::spawn(
+                                move || {
+                                    let _witness = UnwindWitness {
+                                        case: label,
+                                        sender,
+                                    };
+                                    if mode == "unwind_during_create" {
+                                        H2_HOOKS.with(|h| {
+                                            h.borrow_mut().push_back((
+                                                HookPoint::RootCreated,
+                                                TestAction::Panic,
+                                            ))
+                                        });
+                                    }
+                                    let workspace = OwnedConfigWorkspace::create(generated())
+                                        .expect("real creation before intentional test unwind");
+                                    if mode == "unwind_unknown_member_poison" {
+                                        unknown_member(&workspace);
+                                    }
+                                    let _owned = workspace;
+                                    panic!(
+                                        "H2 intentional default-stack test unwind after real creation"
+                                    );
+                                },
+                            );
+                            let payload=worker.join().expect_err("the test thread must actually unwind; no product catch is installed");
+                            let message = payload
+                                .downcast_ref::<&str>()
+                                .copied()
+                                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                                .expect("intentional string panic payload");
+                            assert_eq!(
+                                message,
+                                if case == "unwind_during_create" {
+                                    "injected owned workspace creation unwind"
+                                } else {
+                                    "H2 intentional default-stack test unwind after real creation"
+                                }
+                            );
+                            let (state, rows, zero) =
+                                receiver.recv().expect("witness follows real product Drop");
+                            assert!(
+                                zero,
+                                "actual worker cleanup must finish with zero owned FD sample"
+                            );
+                            let root = root_from_events(&rows);
+                            if case == "unwind_unknown_member_poison" {
+                                assert_eq!(state, 2);
+                                assert!(root.path.join("h2-unknown").is_file());
+                                assert_poisoned_without_new_os();
+                                fixture_cleanup(&root);
+                                assert_poisoned_without_new_os();
+                            } else {
+                                assert_eq!(state, 0);
+                                assert!(!root.path.exists());
+                                let mut next = OwnedConfigWorkspace::create(generated()).unwrap();
+                                next.read_once().unwrap();
+                                next.finish().unwrap();
+                            }
+                        }
+                        _ => {
+                            let workspace = OwnedConfigWorkspace::create(generated()).unwrap();
+                            let root = RootInfo {
+                                path: first_root_path(&workspace),
+                                id: file_id(
+                                    workspace.state.as_ref().unwrap().directory(0).unwrap(),
+                                ),
+                            };
+                            let protected = if case == "finish_identity_mismatch_poison" {
+                                let state = workspace.state.as_ref().unwrap();
+                                let member = &state.members[0];
+                                let parent = state.directory(member.parent).unwrap();
+                                let parent_id = file_id(parent);
+                                rfs::renameat(
+                                    parent,
+                                    member.name.as_str(),
+                                    parent,
+                                    "h2-displaced-original",
+                                )
+                                .unwrap();
+                                let mut replacement = File::from(
+                                    rfs::openat(
+                                        parent,
+                                        member.name.as_str(),
+                                        OFlags::WRONLY
+                                            | OFlags::CREATE
+                                            | OFlags::EXCL
+                                            | OFlags::NOFOLLOW
+                                            | OFlags::CLOEXEC,
+                                        Mode::RUSR | Mode::WUSR,
+                                    )
+                                    .unwrap(),
+                                );
+                                replacement
+                                    .write_all(state.case.files()[0].raw_utf8().as_bytes())
+                                    .unwrap();
+                                replacement.sync_all().unwrap();
+                                rfs::fchmod(&replacement, Mode::RUSR).unwrap();
+                                let id = file_id(&replacement);
+                                fixture(
+                                    "same_name_different_real_identity",
+                                    json!({"replacement":id,"original":member.identity.unwrap().ino}),
+                                );
+                                Some((parent_id, member.name.clone(), id))
+                            } else {
+                                unknown_member(&workspace);
+                                None
+                            };
+                            let start = events().len();
+                            if case == "drop_unknown_member_poison" {
+                                drop(workspace);
+                            } else {
+                                let OwnedWorkspaceError::Cleanup(failures) =
+                                    workspace.finish().expect_err(
+                                        "unknown/different identity requires cleanup failure",
+                                    )
+                                else {
+                                    panic!("exact cleanup error required");
+                                };
+                                if case == "finish_identity_mismatch_poison" {
+                                    assert!(failures.iter().any(|e| matches!(
+                                        e,
+                                        OwnedWorkspaceError::Identity(
+                                            "cleanup member identity differs"
+                                        )
+                                    )));
+                                } else {
+                                    assert!(failures.iter().any(|e|matches!(e,OwnedWorkspaceError::Io{operation:"cleanup unlinkat",source} if source.raw_os_error()==Some(rustix::io::Errno::NOTEMPTY.raw_os_error()))));
+                                }
+                            }
+                            cleanup_zero();
+                            assert!(root.path.is_dir());
+                            assert_poisoned_without_new_os();
+                            if let Some((parent, name, id)) = protected {
+                                let rows = events();
+                                assert!(rows[start..].iter().all(|e| !(e.phase == Phase::Cleanup
+                                    && e.operation == "unlink"
+                                    && e.parent == Some(parent)
+                                    && e.component == name
+                                    && e.errno.is_none())));
+                                let m = std::fs::symlink_metadata(
+                                    root.path.join("override/config.json"),
+                                )
+                                .unwrap();
+                                assert_eq!((m.dev(), m.ino()), id);
+                            } else {
+                                assert_eq!(
+                                    std::fs::read(root.path.join("h2-unknown")).unwrap(),
+                                    b"fixture-owned-unknown-member"
+                                );
+                                assert!(
+                                    events()[start..]
+                                        .iter()
+                                        .all(|e| e.component != "h2-unknown")
+                                );
+                            }
+                            fixture_cleanup(&root);
+                            assert_poisoned_without_new_os();
+                        }
+                    }
+                    if WORKSPACE_STATE.load(Ordering::SeqCst) == 0 {
+                        let mut next = OwnedConfigWorkspace::create(generated())
+                            .expect("real post-error/drop next workspace");
+                        next.read_once().unwrap();
+                        next.finish().unwrap();
+                        cleanup_zero();
+                    }
+                    report(
+                        case,
+                        json!({"actual_cleanup_or_unwind":true,"residual_poison_is_not_reset":true,"known_member_only_cleanup":true,"safe_RAII_not_close_errno_receipt":true}),
+                    );
+                },
+            );
+        }
+    }
+    // END RSIA AG174B INDEPENDENT H2
+}
