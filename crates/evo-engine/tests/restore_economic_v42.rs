@@ -68,6 +68,9 @@ use evo_storage::lifecycle::{
     read_control_plane_facts,
 };
 use serde_json::{Value, json};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1828,7 +1831,13 @@ async fn actual_parent_and_current_reports_remain_revoked_after_real_backup_rest
     // The existing restore CLI rejects symlinked path components on macOS.
     let root = directory.path().canonicalize().unwrap();
     let live = root.join("history-copy.sqlite3");
-    std::fs::write(&live, database_raw).unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&live).unwrap();
+    file.write_all(database_raw).unwrap();
+    drop(file);
     let store = Store::open(&live).await.unwrap();
     let administrator = Context::new("n", "admin", Role::Admin).unwrap();
     let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();

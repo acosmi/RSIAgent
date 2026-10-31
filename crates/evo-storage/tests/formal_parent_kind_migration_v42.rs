@@ -5,6 +5,8 @@ use evo_core::{Context, Error, Role};
 use evo_storage::Store;
 use serde_json::{Value, json};
 use sqlx::{Connection, Row, SqliteConnection, migrate::Migrator, sqlite::SqliteConnectOptions};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 const LEGACY_KINDS: [&str; 15] = [
@@ -63,9 +65,16 @@ fn approved_release_selection(id: &str) -> Value {
 }
 
 async fn connect(path: &Path, create: bool) -> SqliteConnection {
+    if create && !path.try_exists().unwrap() {
+        let mut file = std::fs::OpenOptions::new();
+        file.create_new(true).write(true);
+        #[cfg(unix)]
+        file.mode(0o600);
+        drop(file.open(path).unwrap());
+    }
     let options = SqliteConnectOptions::new()
         .filename(path)
-        .create_if_missing(create)
+        .create_if_missing(false)
         .foreign_keys(true);
     SqliteConnection::connect_with(&options).await.unwrap()
 }

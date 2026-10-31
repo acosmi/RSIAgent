@@ -11,13 +11,15 @@ crates/evo-storage/tests/restore_prefix_upgrade_v42.rs proves the upgraded
 database equal to `Store::open` on ledgers the real sqlx migrator wrote.
 """
 
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -77,6 +79,8 @@ def migration_file(version):
 
 
 def connect(path):
+    if not path.exists():
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
     con = sqlite3.connect(path, isolation_level=None)
     con.execute("PRAGMA foreign_keys=ON")
     return con
@@ -221,9 +225,12 @@ class Scenario:
     def anchor(self, name="live", upgrade=True):
         """The current control plane: the live database after the binary upgrade."""
         directory = self.base / name
-        directory.mkdir()
+        directory.mkdir(mode=0o700)
         path = directory / "rsia.sqlite3"
-        shutil.copyfile(self.history, path)
+        with self.history.open("rb") as reader, os.fdopen(
+            os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
+        ) as writer:
+            shutil.copyfileobj(reader, writer)
         if upgrade:
             con = connect(path)
             sqlx_migrate(con, [version for version in CURRENT if version not in self.versions])
@@ -236,8 +243,9 @@ class Scenario:
         `db_sql` changes the copied database after the manifest's migration and
         watermark lists were read; `manifest` mutates the document."""
         directory = self.base / name
-        directory.mkdir()
+        directory.mkdir(mode=0o700)
         database = directory / "rsia.sqlite3"
+        os.close(os.open(database, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
         con = connect(self.history)
         con.execute("VACUUM INTO ?", (str(database),))
         con.close()
@@ -267,7 +275,10 @@ class Scenario:
         }
         if manifest:
             manifest(document)
-        (directory / "backup-manifest.json").write_bytes(json.dumps(document, indent=2).encode())
+        with os.fdopen(os.open(
+            directory / "backup-manifest.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        ), "wb") as writer:
+            writer.write(json.dumps(document, indent=2).encode())
         return directory
 
     def delta(self, backup, events=None, latest=None):
@@ -1184,6 +1195,158 @@ class RustCurrentHostWireTests(unittest.TestCase):
                         restore.read_current_host_raw(damaged,"name-coverage","artifact",record["id"])
                     checks.assert_isolated(scenario,refused,result,"invalid current host raw JSON")
 
+
+
+def _permission_image(root):
+    result = {}
+    def visit(path):
+        info = path.lstat()
+        link = stat.S_ISLNK(info.st_mode)
+        result[path.relative_to(root).as_posix()] = (
+            stat.S_IFMT(info.st_mode), stat.S_IMODE(info.st_mode), info.st_uid,
+            info.st_nlink, info.st_dev, info.st_ino,
+            os.readlink(path) if link else None,
+            path.read_bytes() if stat.S_ISREG(info.st_mode) else None,
+        )
+        if stat.S_ISDIR(info.st_mode) and not link:
+            for child in path.iterdir():
+                visit(child)
+    visit(root)
+    return result
+
+
+class LocalPermissionsTests(unittest.TestCase):
+    def _healthy(self, versions=CURRENT):
+        scenario = Scenario(self, versions)
+        backup = scenario.backup()
+        anchor = scenario.anchor()
+        dest, result = scenario.restore(backup, anchor, "permission-healthy")
+        RestoreTests.assert_restored(self, dest, result, 0,
+            ",".join(str(v) for v in CURRENT if v not in versions) or "none")
+        self.assertEqual(database_image(dest / "rsia.sqlite3"), database_image(anchor))
+        return scenario, backup, anchor
+
+    def _refuse(self, scenario, backup, anchor, reason, dest=None):
+        dest = dest or scenario.base / "permission-refused"
+        delta = scenario.delta(backup)
+        argv = [str(SCRIPT), "--backup", str(backup), "--dest", str(dest),
+                "--revoke-delta", str(delta), "--trusted-revocations-db", str(anchor)]
+        before = _permission_image(scenario.base)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        # A regression reaching any SQLite reader is an actual test failure;
+        # this observer supplies no substitute data or successful result.
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(restore, "readonly", side_effect=AssertionError("permission refusal reached SQLite")), \
+             mock.patch.object(Path, "mkdir", side_effect=AssertionError("permission refusal created a temporary directory")), \
+             redirect_stdout(stdout), redirect_stderr(stderr):
+            code = restore.main()
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), f"ISOLATE {reason}; not mounting\n")
+        self.assertEqual(_permission_image(scenario.base), before)
+        self.assertFalse(dest.exists())
+        self.assertEqual(list(dest.parent.glob(f".{dest.name}.restore-*")), [])
+
+    def test_backup_root_ancestor_symlink_refuses_before_temp(self):
+        scenario, backup, anchor = self._healthy()
+        link = scenario.base / "backup-via-link"
+        link.symlink_to(scenario.base, target_is_directory=True)
+        self._refuse(scenario, link / backup.name, anchor, "symlink in supplied path ancestry")
+
+    def test_anchor_ancestor_symlink_refuses_before_temp(self):
+        scenario, backup, anchor = self._healthy()
+        link = scenario.base / "anchor-via-link"
+        link.symlink_to(anchor.parent, target_is_directory=True)
+        self._refuse(scenario, backup, link / anchor.name, "symlink in supplied path ancestry")
+
+    def test_destination_parent_symlink_refuses_before_temp(self):
+        scenario, backup, anchor = self._healthy()
+        link = scenario.base / "destination-via-link"
+        link.symlink_to(scenario.base, target_is_directory=True)
+        self._refuse(scenario, backup, anchor, "symlink in supplied path ancestry", link / "refused")
+
+    def test_writable_destination_parent_has_no_sticky_exception(self):
+        scenario, backup, anchor = self._healthy()
+        parent = scenario.base / "writable-publish-parent"
+        parent.mkdir(mode=0o700)
+        parent.chmod(0o1777)
+        self._refuse(scenario, backup, anchor, "data_directory_insecure", parent / "refused")
+
+    def test_group_readable_backup_member_refuses_before_temp(self):
+        scenario, backup, anchor = self._healthy()
+        (backup / "rsia.sqlite3").chmod(0o640)
+        self._refuse(scenario, backup, anchor, "data_directory_insecure")
+
+    def test_restore_outputs_private_directories_and_members_under_loose_umask(self):
+        scenario, backup, anchor = self._healthy([1, 2, 4, 5, 6])
+        dest = scenario.base / "wide-mask-restored"
+        delta = scenario.delta(backup)
+        child = r"""
+import importlib.util,json,os,sqlite3,sys
+script=sys.argv[1]
+spec=importlib.util.spec_from_file_location('permission_restore',script)
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+sys.argv=[script,*sys.argv[2:]]
+os.umask(0)
+code=module.main()
+mask=os.umask(0)
+with sqlite3.connect(':memory:') as con:
+    version,source_id=con.execute('SELECT sqlite_version(),sqlite_source_id()').fetchone()
+print('AG157_PY_SQLITE_V1 '+json.dumps({'version':version,'source_id':source_id,'umask_after_restore':mask},sort_keys=True))
+raise SystemExit(code)
+"""
+        result = subprocess.run([sys.executable, "-B", "-c", child, str(SCRIPT),
+            "--backup", str(backup), "--dest", str(dest), "--revoke-delta", str(delta),
+            "--trusted-revocations-db", str(anchor)], capture_output=True, text=True, timeout=120,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[0], "RESTORE_OK events=0 migrations_applied=7")
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[1].startswith("AG157_PY_SQLITE_V1 "))
+        observed = json.loads(lines[1].split(" ", 1)[1])
+        self.assertEqual(observed["umask_after_restore"], 0)
+        self.assertTrue(observed["version"])
+        self.assertTrue(observed["source_id"])
+        print(lines[1])  # Actual Python linkage; SQLx linkage has its own Rust evidence.
+        self.assertEqual(database_image(dest / "rsia.sqlite3"), database_image(anchor))
+        for path in [dest, *dest.rglob("*")]:
+            info = path.lstat()
+            self.assertFalse(stat.S_ISLNK(info.st_mode))
+            self.assertEqual(info.st_uid, os.geteuid())
+            self.assertEqual(stat.S_IMODE(info.st_mode), 0o700 if path.is_dir() else 0o600)
+        self.assertTrue((dest / "restore.json").is_file())
+        self.assertTrue((dest / "restore.migrations.json").is_file())
+
+    def test_restore_receipt_and_migration_side_record_are_0600(self):
+        scenario, backup, anchor = self._healthy([1, 2, 4, 5, 6])
+        dest, result = scenario.restore(backup, anchor, "receipts-private")
+        RestoreTests.assert_restored(self, dest, result, 0, "7")
+        receipt = json.loads((dest / "restore.json").read_text())
+        side = json.loads((dest / "restore.migrations.json").read_text())
+        self.assertEqual(receipt["schema_version"], "rsia.restore_receipt.v2")
+        self.assertEqual(side["schema"], "rsia.restore_migrations.v1")
+        self.assertEqual(side["source_versions"], [1, 2, 4, 5, 6])
+        self.assertEqual(side["current_versions"], CURRENT)
+        self.assertEqual([x["version"] for x in side["applied"]], [7])
+        self.assertEqual((dest / "restore.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((dest / "restore.migrations.json").stat().st_mode & 0o777, 0o600)
+
+    def test_permission_refusal_preserves_source_anchor_and_destination_snapshot(self):
+        scenario, backup, anchor = self._healthy()
+        parent = scenario.base / "destination-parent"
+        parent.mkdir(mode=0o700)
+        with os.fdopen(os.open(parent / "canary", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as writer:
+            writer.write(b"retained destination bytes")
+        anchor.chmod(0o640)
+        backup_before = _permission_image(backup)
+        anchor_before = _permission_image(anchor.parent)
+        parent_before = _permission_image(parent)
+        self._refuse(scenario, backup, anchor, "data_directory_insecure", parent / "refused")
+        self.assertEqual(_permission_image(backup), backup_before)
+        self.assertEqual(_permission_image(anchor.parent), anchor_before)
+        self.assertEqual(_permission_image(parent), parent_before)
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,9 @@ use evo_storage::Store;
 use evo_storage::budget::{
     BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization, UsageCharge,
 };
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::collections::BTreeSet;
 
 fn d(value: &str) -> String {
@@ -1151,7 +1154,13 @@ async fn actual_m33_history_copy() -> (
     assert_eq!(metadata["scope"]["current_v3_authority_claimed"], false);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("history-copy.sqlite3");
-    std::fs::write(&path, M33_HISTORY_DATABASE).unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path).unwrap();
+    file.write_all(M33_HISTORY_DATABASE).unwrap();
+    drop(file);
     let store = Store::open(&path).await.unwrap();
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();

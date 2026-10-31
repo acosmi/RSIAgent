@@ -24,6 +24,9 @@ use evo_storage::lifecycle::{
 };
 use serde_json::{Value, json};
 use sqlx::{Connection, Row, SqliteConnection, migrate::Migrator, sqlite::SqliteConnectOptions};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -90,10 +93,32 @@ fn digest_of(text: &str) -> String {
     hash(text.as_bytes())
 }
 
+fn private_directory(path: &std::path::Path) {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.recursive(true).create(path).unwrap();
+}
+
+fn private_member(path: &std::path::Path, bytes: &[u8]) {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path).unwrap().write_all(bytes).unwrap();
+}
+
 async fn connect(path: &Path, create: bool) -> SqliteConnection {
+    if create && !path.try_exists().unwrap() {
+        let mut file = std::fs::OpenOptions::new();
+        file.create_new(true).write(true);
+        #[cfg(unix)]
+        file.mode(0o600);
+        drop(file.open(path).unwrap());
+    }
     let options = SqliteConnectOptions::new()
         .filename(path)
-        .create_if_missing(create)
+        .create_if_missing(false)
         .foreign_keys(true);
     SqliteConnection::connect_with(&options).await.unwrap()
 }
@@ -404,7 +429,7 @@ impl Scenario {
     /// `upgrade` (the binary upgrade of a live control plane).
     async fn copy(&self, source: &Path, name: &str, upgrade: bool) -> PathBuf {
         let directory = self.root.join(name);
-        std::fs::create_dir(&directory).unwrap();
+        private_directory(&directory);
         let path = directory.join("rsia.sqlite3");
         std::fs::copy(source, &path).unwrap();
         if upgrade {
@@ -423,8 +448,9 @@ impl Scenario {
         mutate: impl FnOnce(&mut Value),
     ) -> PathBuf {
         let directory = self.root.join(name);
-        std::fs::create_dir(&directory).unwrap();
+        private_directory(&directory);
         let database = directory.join("rsia.sqlite3");
+        private_member(&database, b"");
         let mut connection = connect(&self.history, false).await;
         sqlx::query("VACUUM INTO ?")
             .bind(database.to_str().unwrap())
@@ -471,12 +497,8 @@ impl Scenario {
         }
         connection.close().await.unwrap();
         let blob_digest = hash(BLOB);
-        std::fs::create_dir_all(directory.join("blobs/legacy-a")).unwrap();
-        std::fs::write(
-            directory.join(format!("blobs/legacy-a/{blob_digest}")),
-            BLOB,
-        )
-        .unwrap();
+        private_directory(&directory.join("blobs/legacy-a"));
+        private_member(&directory.join(format!("blobs/legacy-a/{blob_digest}")), BLOB);
         let bytes = std::fs::read(database).unwrap();
         let manifest = BackupManifest {
             schema_version: BACKUP_SCHEMA.into(),
@@ -497,11 +519,7 @@ impl Scenario {
         };
         let mut document = serde_json::to_value(&manifest).unwrap();
         mutate(&mut document);
-        std::fs::write(
-            directory.join("backup-manifest.json"),
-            serde_json::to_vec_pretty(&document).unwrap(),
-        )
-        .unwrap();
+        private_member(&directory.join("backup-manifest.json"), &serde_json::to_vec_pretty(&document).unwrap());
         directory
     }
 

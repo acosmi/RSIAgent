@@ -4,6 +4,8 @@ use evo_storage::Store;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -61,12 +63,16 @@ fn formal(database: &Path, operation: &str) -> Output {
 }
 
 fn live_artifacts(root: &Path) {
-    fs::create_dir_all(root.join(".blob-staging/live-writer")).unwrap();
-    fs::write(
-        root.join(".blob-staging/live-writer/payload.tmp"),
-        b"in-progress payload",
-    )
-    .unwrap();
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.recursive(true).create(root.join(".blob-staging/live-writer")).unwrap();
+    let mut options = File::options();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(root.join(".blob-staging/live-writer/payload.tmp"))
+        .unwrap().write_all(b"in-progress payload").unwrap();
     fs::write(
         root.join("closed-facts-sentinel"),
         b"unchanged close and in-flight facts",
@@ -80,7 +86,11 @@ fn locked_formal_grade_and_finalize_leave_live_writer_bytes_unchanged() {
     for operation in ["grade", "finalize"] {
         let dir = tempfile::tempdir().unwrap();
         live_artifacts(dir.path());
-        let mut lock = File::create(dir.path().join(DATA_LOCK_FILE)).unwrap();
+        let mut options = File::options();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut lock = options.open(dir.path().join(DATA_LOCK_FILE)).unwrap();
         lock.write_all(b"live writer lock marker").unwrap();
         lock.try_lock().unwrap();
         let before = snapshot(dir.path());
@@ -101,11 +111,12 @@ fn restored_formal_commands_refuse_before_lock_or_database_writes() {
     for operation in ["grade", "finalize"] {
         let dir = tempfile::tempdir().unwrap();
         live_artifacts(dir.path());
-        fs::write(
-            dir.path().join(RESTORE_RECEIPT_FILE),
-            b"restore bytes have no admission or trusted anchor",
-        )
-        .unwrap();
+        let mut options = File::options();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        options.open(dir.path().join(RESTORE_RECEIPT_FILE)).unwrap()
+            .write_all(b"restore bytes have no admission or trusted anchor").unwrap();
         let before = snapshot(dir.path());
         let output = formal(&dir.path().join("database.sqlite3"), operation);
         assert!(!output.status.success());

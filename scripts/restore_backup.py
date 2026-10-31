@@ -438,6 +438,18 @@ def regular(path):
         raise IsolationError(f"linked or non-regular member: {path.name}")
     return info
 
+def private_metadata(info):
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise IsolationError("data_directory_insecure")
+
+def restore_ancestors(path):
+    reject_path_links(path)
+    for parent in Path(os.path.abspath(path)).parents:
+        info=parent.lstat()
+        sticky_root=info.st_uid==0 and info.st_mode & stat.S_ISVTX
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0,os.geteuid()) or (info.st_mode & 0o022 and not sticky_root):
+            raise IsolationError("data_directory_insecure")
+
 def safe_member(root, relative):
     reject_path_links(root)
     if not isinstance(relative, str) or not relative or "\\" in relative:
@@ -446,8 +458,10 @@ def safe_member(root, relative):
     if pure.is_absolute() or any(p in ("", ".", "..") for p in relative.split("/")) or str(pure) != relative:
         raise IsolationError("noncanonical member path")
     path = root
-    if not stat.S_ISDIR(root.lstat().st_mode):
+    root_info=root.lstat()
+    if not stat.S_ISDIR(root_info.st_mode):
         raise IsolationError("backup root is not a real directory")
+    private_metadata(root_info)
     for index, part in enumerate(pure.parts):
         path = path / part
         info = path.lstat()
@@ -456,6 +470,7 @@ def safe_member(root, relative):
                 raise IsolationError("linked or non-directory member ancestor")
         else:
             regular(path)
+        private_metadata(info)
     return path
 
 def open_member(root, relative):
@@ -776,6 +791,8 @@ def publish_exclusive(source,dest):
         raise OSError(ctypes.get_errno(),"exclusive directory publication failed")
 
 def main():
+    if sys.platform not in ("darwin","linux"):
+        print("ISOLATE unsupported; not mounting",file=sys.stderr);return 1
     parser=argparse.ArgumentParser()
     for name in ("backup","dest","revoke-delta"):
         parser.add_argument("--"+name,required=True)
@@ -785,16 +802,34 @@ def main():
         print("dest exists; refusing overwrite",file=sys.stderr);return 2
     temp=dest.parent/f".{dest.name}.restore-{uuid.uuid4().hex}"
     try:
-        reject_path_links(dest.parent)
+        restore_ancestors(dest.parent)
+        parent_info=dest.parent.lstat()
+        if not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid not in (0,os.geteuid()) or parent_info.st_mode & 0o022:
+            raise IsolationError("data_directory_insecure")
+        restore_ancestors(backup)
+        if args.trusted_revocations_db is not None:
+            anchor=Path(args.trusted_revocations_db)
+            restore_ancestors(anchor)
+            private_metadata(regular(anchor))
+            for suffix in ("-wal","-shm"):
+                member=Path(str(anchor)+suffix)
+                if os.path.lexists(member):
+                    info=member.lstat()
+                    if not stat.S_ISREG(info.st_mode):
+                        raise IsolationError("data_directory_insecure")
+                    private_metadata(info)
         manifest,raw,base=verify_manifest(backup)
         events,anchor_receipt=verify_delta(Path(args.revoke_delta),raw,base,args.trusted_revocations_db,backup)
-        temp.mkdir()
+        temp.mkdir(mode=0o700)
         for entry in [manifest["database"],*manifest["blobs"]]:
             source=safe_member(backup,entry["path"]);target=temp/entry["path"]
-            target.parent.mkdir(parents=True,exist_ok=True)
+            directory=temp
+            for part in PurePosixPath(entry["path"]).parts[:-1]:
+                directory=directory/part
+                if not directory.exists(): directory.mkdir(mode=0o700)
             # Open final component with O_NOFOLLOW and verify the copied bytes again.
             fd=open_member(backup,entry["path"])
-            with os.fdopen(fd,"rb") as reader, target.open("xb") as writer:
+            with os.fdopen(fd,"rb") as reader, os.fdopen(os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),"wb") as writer:
                 info=os.fstat(reader.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1:
                     raise IsolationError("member changed during copy")
@@ -811,12 +846,12 @@ def main():
             raise IsolationError("trusted anchor changed during restore")
         anchor_receipt=latest_anchor
         replay_delta(temp/"rsia.sqlite3",events)
-        with (temp/"restore.json").open("x") as receipt:
+        with os.fdopen(os.open(temp/"restore.json",os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),"w") as receipt:
             receipt.write(json.dumps({"schema_version":"rsia.restore_receipt.v2","backup_manifest_sha256":hashlib.sha256(raw).hexdigest(),"replayed_revoke_events":len(events),"isolated":False,"trusted_anchor":anchor_receipt,"receipt_scope":"local_only_not_for_export"})+"\n")
             receipt.flush();os.fsync(receipt.fileno())
         if applied:
             # Operator-facing side record; restore.json and the startup gate are unchanged.
-            with (temp/"restore.migrations.json").open("x") as record:
+            with os.fdopen(os.open(temp/"restore.migrations.json",os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),"w") as record:
                 record.write(json.dumps({"schema":MIGRATIONS_RECORD_SCHEMA,"source_versions":source_versions,"applied":applied,"current_versions":KNOWN_MIGRATIONS})+"\n")
                 record.flush();os.fsync(record.fileno())
         for directory,_,_ in os.walk(temp,topdown=False):
@@ -830,4 +865,5 @@ def main():
     print(f"RESTORE_OK events={len(events)} migrations_applied={','.join(str(m['version']) for m in applied) or 'none'}");return 0
 
 if __name__=="__main__":
+    os.umask(0o077)
     raise SystemExit(main())

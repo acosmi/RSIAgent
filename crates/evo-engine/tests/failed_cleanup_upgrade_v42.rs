@@ -16,6 +16,8 @@ use evo_storage::lifecycle::{
     BackupManifest, CleanupState, CleanupStatus, LifecycleStore, TypedObjectRef,
 };
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -97,7 +99,10 @@ print(json.dumps({k:[dict(r) for r in c.execute(v,(sys.argv[2],))] for k,v in q.
 }
 
 fn copy_tree(source: &Path, destination: &Path) {
-    std::fs::create_dir_all(destination).unwrap();
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.recursive(true).create(destination).unwrap();
     for entry in std::fs::read_dir(source).unwrap() {
         let entry = entry.unwrap();
         assert!(!entry.file_type().unwrap().is_symlink());
@@ -279,7 +284,10 @@ async fn failed_host_authorities_upgrade_through_explicit_admin_full_frontier_re
         );
         (namespace, native_ids, failed, store, true)
     } else {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.recursive(true).create(path.parent().unwrap()).unwrap();
         let store = Store::open(&path).await.unwrap();
         let records = new_authorities(&store, DEFAULT_NS).await;
         // A current-program fixture makes old unclassified shapes fail through

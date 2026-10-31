@@ -36,6 +36,9 @@ use evo_storage::replay::{
     load_live_replay_report, put_replay_report, register_replay_pool, seal_replay_world,
 };
 use serde_json::json;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::collections::BTreeSet;
 
 const COST: u64 = 10;
@@ -863,7 +866,13 @@ impl Persistent {
             serde_json::from_str(metadata["pool_utf8"].as_str().unwrap()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replay.sqlite3");
-        std::fs::write(&path, database).unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&path).unwrap();
+        file.write_all(database).unwrap();
+        drop(file);
         let store = Store::open(&path).await.unwrap();
         let worker = Context::new("ag103", "worker", Role::Worker).unwrap();
         let evaluator = Context::new("ag103", "evaluator", Role::Evaluator).unwrap();

@@ -38,6 +38,7 @@ use crate::capacity::{
 };
 use crate::executor::IsolationPolicy;
 use evo_core::{Error, hash};
+use evo_storage::{LocalPermissionTarget, check_local_permissions};
 use evo_storage::lifecycle::{
     ControlPlaneFacts, WatermarkFact, parse_strict_json, read_control_plane_facts,
 };
@@ -46,6 +47,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 pub const RESTORE_RECEIPT_FILE: &str = "restore.json";
@@ -127,10 +130,7 @@ pub fn deployment_config(trusted_revocations_db: Option<&Path>) -> DeploymentSec
 /// The data directory of a `--data` SQLite file: its parent, with the empty
 /// parent of a bare file name read as the current directory.
 pub fn data_directory(data: &Path) -> PathBuf {
-    match data.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => PathBuf::from("."),
-    }
+    evo_storage::local_data_directory(data)
 }
 
 /// `D/restore.admission.json`. Field order is the on-disk order.
@@ -230,6 +230,8 @@ impl StartupGate {
 
     /// Read-only. Never creates, modifies or removes anything.
     pub async fn evaluate(&self) -> Result<GateDecision, StartupGateError> {
+        check_local_permissions(LocalPermissionTarget::Database(&self.data))
+            .map_err(|error| StartupGateError::Rejected(error.to_string()))?;
         let dir = data_directory(&self.data);
         let isolation = IsolationPolicy::reference_host(dir.to_string_lossy().into_owned());
         let decision = |posture, pending| GateDecision {
@@ -300,6 +302,8 @@ impl StartupGate {
         validate_deployment_security(&deployment_config(Some(anchor)), isolation)
             .map_err(|error| quarantine(error_reason(&error)))?;
         check_anchor_independence(anchor, &self.data, dir).map_err(quarantine)?;
+        check_local_permissions(LocalPermissionTarget::IndependentAnchor(anchor))
+            .map_err(|error| StartupGateError::Rejected(error.to_string()))?;
 
         // (c) both databases, read-only, integrity- and migration-checked
         let data_facts = read_control_plane_facts(&self.data)
@@ -566,10 +570,11 @@ fn write_admission(dir: &Path, pending: &PendingAdmission) -> Result<(), Startup
     ));
     let target = dir.join(RESTORE_ADMISSION_FILE);
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temp)
         .map_err(|error| failed("cannot create the admission temp file", &error))?;
     let linked = file
         .write_all(&bytes)

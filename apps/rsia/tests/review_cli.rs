@@ -19,6 +19,8 @@ use evo_engine::service::{HostPrepareConfig, HostService};
 use evo_http::{AuthIdentity, AuthRegistry, HttpState};
 use evo_storage::Store;
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -238,7 +240,10 @@ async fn registered_review_bundle(
 
 async fn fixture(scratch: &Scratch) -> HttpState {
     let service_path = scratch.root.join("service");
-    std::fs::create_dir(&service_path).unwrap();
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(&service_path).unwrap();
     let store = Store::open(&service_path.join("stored.sqlite3"))
         .await
         .unwrap();
