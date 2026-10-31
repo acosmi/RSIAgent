@@ -1283,3 +1283,432 @@ async fn g_a_call_whose_reference_does_not_decode_is_isolated_and_the_rest_clean
     assert_eq!(micros(&store).await, money);
     assert_gate_internal(&store, &path, &bad, "after the cleanup").await;
 }
+
+// ---------------------------------------------------------------------------
+// H (AG-181): the cleanup trusts a reference only when it is the call's own
+// ---------------------------------------------------------------------------
+
+/// Test-only damage: stores `body` as the reference of `call_id`, as a damaged
+/// file would leave it. Nothing else is written (`damage_ref` stores a body that
+/// is no reference at all).
+async fn set_ref(path: &Path, call_id: &str, body: &str) {
+    let mut connection = writable(path).await;
+    let updated =
+        sqlx::query("UPDATE objects SET body=? WHERE namespace=? AND kind='artifact' AND id=?")
+            .bind(body)
+            .bind(NS)
+            .bind(ref_id(call_id))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
+    connection.close().await.unwrap();
+}
+
+/// The stored rows of the reference of `call_id`: the object (owner, body,
+/// revision) and its dependency edges.
+async fn ref_rows(path: &Path, call_id: &str) -> Vec<String> {
+    let id = ref_id(call_id);
+    let rows = all_rows(path).await;
+    let mut out = Vec::new();
+    for table in ["objects", "dependencies"] {
+        out.extend(rows[table].iter().filter(|row| row.contains(&id)).cloned());
+    }
+    out
+}
+
+/// H1. A reference that is the call's own decides which sources the call depends
+/// on, whatever its request says; the request is read only when the call has no
+/// reference. Four calls, each with a reference over one run and a model request
+/// that either names the other run or names a closure the reader cannot read (a
+/// valid JSON body of a known schema whose `source_closure` is not a list):
+/// the two calls whose reference holds `run-a` are redacted, the two whose
+/// reference holds `run-b` are left as they are, nothing is isolated and the job
+/// completes. The calls are read by the budget scan (reserved before the
+/// revocation) and by the recheck (reserved after the scan passed).
+#[tokio::test]
+async fn ag181_registered_ref_precedes_conflicting_and_unreadable_request() {
+    for late in [false, true] {
+        let what = if late { "recheck" } else { "scan" };
+        let (_dir, path, store) = database().await;
+        put_run(&store, RUN_A).await;
+        put_run(&store, RUN_B).await;
+        authorize(&store).await;
+        let mut clock = 30;
+        let early_job = if late {
+            Some(revoke_past_the_budget_scan(&store, &path, &mut clock).await)
+        } else {
+            None
+        };
+        let unreadable = |call_id: &str| {
+            BudgetArtifact::from_serializable(
+                MODEL_REQUEST_SCHEMA,
+                &json!({
+                    "request_id": call_id,
+                    "source_closure": 7,
+                    "input": [{"content": format!("BUDGET-SECRET-{call_id}")}],
+                }),
+            )
+            .unwrap()
+        };
+        // (call, the run its reference holds, its request, whether the cleanup redacts it)
+        let calls = [
+            ("call-1", RUN_A, model_request("call-1", &[RUN_B]), true),
+            ("call-2", RUN_B, model_request("call-2", &[RUN_A]), false),
+            ("call-3", RUN_A, unreadable("call-3"), true),
+            ("call-4", RUN_B, unreadable("call-4"), false),
+        ];
+        let mut before = BTreeMap::new();
+        for (call_id, source, request, _) in &calls {
+            // A call over a revoked run reaches the ledger late as in test C.
+            if late && *source == RUN_A {
+                reserve_bare(&store, call_id, request.clone()).await;
+            }
+            reserve(&store, call_id, request.clone(), &[*source]).await;
+            before.insert(
+                *call_id,
+                (
+                    call_row(&path, call_id).await,
+                    ledger_of(&path, call_id).await,
+                    object_body(&path, "artifact", &ref_id(call_id)).await,
+                ),
+            );
+        }
+        let money = micros(&store).await;
+        let job = match early_job {
+            Some(job) => job,
+            None => revoke(&store, RUN_A).await.job_id,
+        };
+
+        let done = drive(&store, &job, 8, &mut clock).await;
+
+        assert_complete(&path, &done, what).await;
+        for (call_id, _, _, redacted) in &calls {
+            let (row, ledger, reference) = &before[call_id];
+            assert_eq!(
+                &object_body(&path, "artifact", &ref_id(call_id)).await,
+                reference,
+                "{what}: {call_id}: its reference changed"
+            );
+            if *redacted {
+                let request = call_of(&store, call_id).await.request_artifact;
+                assert_redacted(request.as_ref(), MODEL_REQUEST_SCHEMA, call_id);
+                assert!(!request.unwrap().body.contains("BUDGET-SECRET"));
+                assert_eq!(
+                    &ledger_of(&path, call_id).await,
+                    ledger,
+                    "{what}: {call_id}"
+                );
+            } else {
+                assert_eq!(
+                    &call_row(&path, call_id).await,
+                    row,
+                    "{what}: {call_id}: its row changed"
+                );
+            }
+        }
+        assert_eq!(micros(&store).await, money, "{what}");
+        assert_eq!(
+            cleanup_events(&path, &job, "late_budget_calls_redacted").await,
+            if late {
+                vec![json!({"kind": null, "id": null, "details": {"count": 2}})]
+            } else {
+                Vec::<Value>::new()
+            },
+            "{what}"
+        );
+    }
+}
+
+/// H2. A reference that does not decode fails the job by itself, with no job row
+/// written by hand: the damaged call alone is isolated (it was settled, so its
+/// spend is booked), the calls on either side of it are cleaned, the row and the
+/// reference of the damaged call keep their bytes. Restoring the reference does
+/// not complete the job: a Worker step leaves it `Failed` and starts no retry;
+/// the explicit Admin step retries once and completes it, with the isolation
+/// kept in the history, the amounts as they were and the damaged call, which is
+/// unrelated to `run-a`, left as it is.
+#[tokio::test]
+async fn ag181_natural_formal_ref_failure_repairs_only_on_admin_retry() {
+    let (_dir, path, store) = database().await;
+    put_run(&store, RUN_A).await;
+    put_run(&store, RUN_B).await;
+    authorize(&store).await;
+    reserve(&store, "call-1-a", formal_request("call-1-a"), &[RUN_A]).await;
+    let bad = reserve(&store, "call-2-bad", formal_request("call-2-bad"), &[RUN_B]).await;
+    reserve(&store, "call-3-a", formal_request("call-3-a"), &[RUN_A]).await;
+    reserve(&store, "call-4-b", formal_request("call-4-b"), &[RUN_B]).await;
+    dispatch_and_settle(&store, &bad).await;
+    let original = object_body(&path, "artifact", &ref_id("call-2-bad")).await;
+    assert!(original.is_some());
+    damage_ref(&path, "call-2-bad").await;
+    let bad_row = call_row(&path, "call-2-bad").await;
+    let mut cleaned = BTreeMap::new();
+    for call_id in ["call-1-a", "call-3-a"] {
+        cleaned.insert(
+            call_id,
+            (
+                ledger_of(&path, call_id).await,
+                object_body(&path, "artifact", &ref_id(call_id)).await,
+            ),
+        );
+    }
+    let other = call_row(&path, "call-4-b").await;
+    let money = micros(&store).await;
+    assert_eq!(money.1, 9);
+
+    let status = revoke(&store, RUN_A).await;
+    let mut clock = 30;
+    let failed = drive(&store, &status.job_id, 8, &mut clock).await;
+
+    assert_eq!(failed.state, CleanupState::Failed, "{failed:?}");
+    assert_eq!(failed.last_error.as_deref(), Some(UNREADABLE_REF));
+    assert_eq!(
+        cleanup_events(&path, &status.job_id, "cleanup_retry_started").await,
+        Vec::<Value>::new()
+    );
+    assert_eq!(
+        cleanup_events(&path, &status.job_id, "blocked_unknown_scope").await,
+        vec![isolation_of("call-2-bad", UNREADABLE_REF)]
+    );
+    assert_eq!(call_row(&path, "call-2-bad").await, bad_row);
+    assert_eq!(
+        object_body(&path, "artifact", &ref_id("call-2-bad"))
+            .await
+            .as_deref(),
+        Some(r#"{"x":1}"#)
+    );
+    assert_eq!(micros(&store).await, money);
+
+    set_ref(&path, "call-2-bad", original.as_deref().unwrap()).await;
+    clock += 1;
+    let idle = LifecycleStore::cleanup_step(&worker(), &store, &status.job_id, 8, clock)
+        .await
+        .unwrap();
+    assert_eq!(idle.state, CleanupState::Failed, "{idle:?}");
+    assert_eq!(idle.last_error.as_deref(), Some(UNREADABLE_REF));
+    assert_eq!(
+        cleanup_events(&path, &status.job_id, "cleanup_retry_started").await,
+        Vec::<Value>::new()
+    );
+    let done = drive(&store, &status.job_id, 8, &mut clock).await;
+
+    assert_eq!(done.state, CleanupState::Complete, "{done:?}");
+    assert_eq!(done.last_error, None, "{done:?}");
+    assert_eq!(done.pending_nodes, 0, "{done:?}");
+    assert_eq!(
+        cleanup_events(&path, &status.job_id, "cleanup_retry_started")
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(
+        cleanup_events(&path, &status.job_id, "blocked_unknown_scope").await,
+        vec![isolation_of("call-2-bad", UNREADABLE_REF)]
+    );
+    for (call_id, (ledger, reference)) in &cleaned {
+        assert_formal_call_cleaned(&store, &path, call_id, ledger, reference).await;
+    }
+    assert_eq!(call_row(&path, "call-4-b").await, other);
+    assert_eq!(call_row(&path, "call-2-bad").await, bad_row);
+    assert_eq!(
+        object_body(&path, "artifact", &ref_id("call-2-bad")).await,
+        original
+    );
+    assert_eq!(micros(&store).await, money);
+}
+
+/// H3 and H4. Five formal calls in scan order: over `run-a`, over `run-b`, the
+/// bad call over `bad_sources` whose stored reference `tamper` makes someone
+/// else's or non-canonical while it still decodes, over `run-a`, over `run-b`.
+/// The cleanup isolates the bad call alone (`blocked_unknown_scope` on it,
+/// `last_error` = `UNREADABLE_REF`), whether the reference holds the revoked run
+/// or not, and does not read the request in its place; the calls on either side of
+/// it are cleaned or left as they are, the job is `Failed`, and the bad call's row,
+/// its reference (bytes, owner, revision) and its edges are not rewritten. The
+/// dispatch gate still reads the sources the reference names. Restoring the
+/// reference and the explicit Admin retry complete the job (a Worker step does
+/// not), and then the bad call is judged by its reference like any other. The
+/// calls are read by the budget scan, or by the recheck when `late`.
+async fn assert_tampered_ref_isolated_then_repaired(
+    late: bool,
+    bad_sources: &[&str],
+    tamper: fn(&mut Value),
+) {
+    let what = format!("late={late} bad closure={bad_sources:?}");
+    let related = bad_sources.contains(&RUN_A);
+    let (_dir, path, store) = database().await;
+    put_run(&store, RUN_A).await;
+    put_run(&store, RUN_B).await;
+    authorize(&store).await;
+    let mut clock = 30;
+    let early_job = if late {
+        Some(revoke_past_the_budget_scan(&store, &path, &mut clock).await)
+    } else {
+        None
+    };
+    let (over_a, over_b): (&[&str], &[&str]) = (&[RUN_A], &[RUN_B]);
+    let mut calls = Vec::new();
+    for (call_id, sources) in [
+        ("call-1-a", over_a),
+        ("call-2-b", over_b),
+        ("call-3-bad", bad_sources),
+        ("call-4-a", over_a),
+        ("call-5-b", over_b),
+    ] {
+        // A call over a revoked run reaches the ledger late as in test C.
+        if late && sources.contains(&RUN_A) {
+            reserve_bare(&store, call_id, formal_request(call_id)).await;
+        }
+        calls.push(reserve(&store, call_id, formal_request(call_id), sources).await);
+    }
+    if !late {
+        dispatch_and_settle(&store, &calls[0]).await;
+    }
+    let mut cleaned = BTreeMap::new();
+    for call_id in ["call-1-a", "call-4-a"] {
+        cleaned.insert(
+            call_id,
+            (
+                ledger_of(&path, call_id).await,
+                object_body(&path, "artifact", &ref_id(call_id)).await,
+            ),
+        );
+    }
+    let mut left = BTreeMap::new();
+    for call_id in ["call-2-b", "call-5-b"] {
+        left.insert(call_id, call_row(&path, call_id).await);
+    }
+    let bad_ledger = ledger_of(&path, "call-3-bad").await;
+    let bad_row = call_row(&path, "call-3-bad").await;
+    let original = object_body(&path, "artifact", &ref_id("call-3-bad"))
+        .await
+        .unwrap();
+    let healthy: Value = serde_json::from_str(&original).unwrap();
+    let mut reference = healthy.clone();
+    tamper(&mut reference);
+    assert_ne!(reference, healthy, "{what}");
+    assert!(
+        serde_json::from_value::<evo_storage::budget::BudgetCallRef>(reference.clone()).is_ok(),
+        "{what}: the tampered reference must still decode"
+    );
+    set_ref(&path, "call-3-bad", &reference.to_string()).await;
+    let bad_ref_rows = ref_rows(&path, "call-3-bad").await;
+    let money = micros(&store).await;
+    let job = match early_job {
+        Some(job) => job,
+        None => revoke(&store, RUN_A).await.job_id,
+    };
+    if related {
+        let before = all_rows(&path).await;
+        let refused = store
+            .begin_budget_dispatch_typed(&host(), &fence(&calls[2], 50))
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.map(|decision| decision.call.state),
+            Err(BudgetPreDispatchRefusal::SourceRevoked),
+            "{what}"
+        );
+        assert_nothing_written(&before, &all_rows(&path).await, &what);
+    }
+
+    let failed = drive(&store, &job, 8, &mut clock).await;
+
+    assert_eq!(failed.state, CleanupState::Failed, "{what}: {failed:?}");
+    assert_eq!(
+        failed.last_error.as_deref(),
+        Some(UNREADABLE_REF),
+        "{what}: {failed:?}"
+    );
+    assert_eq!(failed.pending_nodes, 0, "{what}: {failed:?}");
+    assert_eq!(
+        cleanup_events(&path, &job, "blocked_unknown_scope").await,
+        vec![isolation_of("call-3-bad", UNREADABLE_REF)],
+        "{what}"
+    );
+    for (call_id, (ledger, reference)) in &cleaned {
+        assert_formal_call_cleaned(&store, &path, call_id, ledger, reference).await;
+    }
+    for (call_id, row) in &left {
+        assert_eq!(&call_row(&path, call_id).await, row, "{what}: {call_id}");
+    }
+    assert_eq!(call_row(&path, "call-3-bad").await, bad_row, "{what}");
+    assert_eq!(ref_rows(&path, "call-3-bad").await, bad_ref_rows, "{what}");
+    assert_eq!(micros(&store).await, money, "{what}");
+
+    set_ref(&path, "call-3-bad", &original).await;
+    clock += 1;
+    let idle = LifecycleStore::cleanup_step(&worker(), &store, &job, 8, clock)
+        .await
+        .unwrap();
+    assert_eq!(idle.state, CleanupState::Failed, "{what}: {idle:?}");
+    assert_eq!(idle.last_error.as_deref(), Some(UNREADABLE_REF), "{what}");
+    assert_eq!(
+        cleanup_events(&path, &job, "cleanup_retry_started").await,
+        Vec::<Value>::new(),
+        "{what}"
+    );
+    let done = drive(&store, &job, 8, &mut clock).await;
+
+    assert_eq!(done.state, CleanupState::Complete, "{what}: {done:?}");
+    assert_eq!(done.last_error, None, "{what}: {done:?}");
+    assert_eq!(done.pending_nodes, 0, "{what}: {done:?}");
+    assert_eq!(
+        cleanup_events(&path, &job, "cleanup_retry_started")
+            .await
+            .len(),
+        1,
+        "{what}"
+    );
+    assert_eq!(
+        cleanup_events(&path, &job, "blocked_unknown_scope").await,
+        vec![isolation_of("call-3-bad", UNREADABLE_REF)],
+        "{what}: the isolation stays in the history"
+    );
+    for (call_id, (ledger, reference)) in &cleaned {
+        assert_formal_call_cleaned(&store, &path, call_id, ledger, reference).await;
+    }
+    for (call_id, row) in &left {
+        assert_eq!(&call_row(&path, call_id).await, row, "{what}: {call_id}");
+    }
+    if related {
+        assert_formal_call_cleaned(&store, &path, "call-3-bad", &bad_ledger, &Some(original)).await;
+    } else {
+        assert_eq!(call_row(&path, "call-3-bad").await, bad_row, "{what}");
+        assert_eq!(
+            object_body(&path, "artifact", &ref_id("call-3-bad")).await,
+            Some(original),
+            "{what}"
+        );
+    }
+    assert_eq!(micros(&store).await, money, "{what}");
+}
+
+/// H3. A reference whose namespace is another legal string, over `run-a` or over
+/// `run-b` only (a reference that is not the call's own proves nothing about the
+/// sources it names), is isolated by both scans.
+#[tokio::test]
+async fn ag181_bad_ref_namespace_isolated_and_healthy_neighbors_continue() {
+    for late in [false, true] {
+        for bad_sources in [[RUN_A], [RUN_B]] {
+            assert_tampered_ref_isolated_then_repaired(late, &bad_sources, |reference| {
+                reference["namespace"] = json!("other-namespace");
+            })
+            .await;
+        }
+    }
+}
+
+/// H4. A reference over `run-a` and `run-b` whose `source_ids` are listed in the
+/// other order is isolated by both scans: it is not sorted and accepted, and
+/// neither the reference nor its edges are rewritten.
+#[tokio::test]
+async fn ag181_unsorted_ref_sources_isolated_without_rewriting_history() {
+    for late in [false, true] {
+        assert_tampered_ref_isolated_then_repaired(late, &[RUN_A, RUN_B], |reference| {
+            reference["source_ids"] = json!([RUN_B, RUN_A]);
+        })
+        .await;
+    }
+}

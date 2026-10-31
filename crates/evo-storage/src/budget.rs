@@ -3894,8 +3894,17 @@ pub(crate) enum RegisteredCallSources {
     /// reference was lost or deleted, and the two cannot be told apart here.
     Missing,
     /// The `source_ids` of the reference: the closure registered when the call was
-    /// reserved, the authoritative closure of the call.
+    /// reserved, the authoritative closure of the call. The reference is the one
+    /// `ensure_budget_call_ref` writes for this call: the id it is stored under, the
+    /// schema, and the namespace, billing scope and call id of the call itself, and
+    /// source ids that are identifiers in ascending order without repeats.
     Named(Vec<String>),
+    /// A reference that decodes but is not the one `ensure_budget_call_ref` writes
+    /// for this call (it names another id, schema, namespace, billing scope or call,
+    /// or its `source_ids` are not identifiers in ascending order without repeats).
+    /// The revocation cleanup does not trust it and does not repair it; the legacy
+    /// gates read its `source_ids` as before.
+    Unqualified(Vec<String>),
     /// A reference is stored and does not decode: it is neither trusted nor guessed
     /// at. The decoding error is kept for the caller's diagnostic.
     Undecodable(serde_json::Error),
@@ -3912,6 +3921,8 @@ pub(crate) enum RegisteredCallSources {
 /// gates (`legacy_call_sources`) and for the revocation cleanup's budget scan and
 /// its recheck, so the gates and the cleanup judge a call by the same registered
 /// closure, and fall back to the persisted request only when there is no reference.
+/// It also tells the cleanup whether the stored reference is the call's own
+/// (`RegisteredCallSources::Unqualified`), before the cleanup reads its closure.
 pub(crate) async fn registered_call_source_ids(
     tx: &mut Transaction<'_, Sqlite>,
     namespace: &str,
@@ -3919,11 +3930,12 @@ pub(crate) async fn registered_call_source_ids(
     call_id: &str,
 ) -> Result<RegisteredCallSources> {
     let digest = fingerprint(&("rsia.budget_call_ref.v1", namespace, billing_scope, call_id))?;
+    let id = format!("budget-ref-{}", &digest[..32]);
     let body: Option<String> = sqlx::query_scalar(
         "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
     )
     .bind(namespace)
-    .bind(format!("budget-ref-{}", &digest[..32]))
+    .bind(&id)
     .fetch_optional(&mut **tx)
     .await
     .map_err(internal)?;
@@ -3931,7 +3943,18 @@ pub(crate) async fn registered_call_source_ids(
         return Ok(RegisteredCallSources::Missing);
     };
     Ok(match serde_json::from_str::<BudgetCallRef>(&body) {
-        Ok(reference) => RegisteredCallSources::Named(reference.source_ids),
+        Ok(reference)
+            if reference.id == id
+                && reference.schema_version == "rsia.budget_call_ref.v1"
+                && reference.namespace == namespace
+                && reference.billing_scope == billing_scope
+                && reference.call_id == call_id
+                && canonical_source_ids(&reference.source_ids)
+                    .is_ok_and(|canonical| canonical == reference.source_ids) =>
+        {
+            RegisteredCallSources::Named(reference.source_ids)
+        }
+        Ok(reference) => RegisteredCallSources::Unqualified(reference.source_ids),
         Err(error) => RegisteredCallSources::Undecodable(error),
     })
 }
@@ -3949,7 +3972,8 @@ async fn registered_source_ids(
         .await?
     {
         RegisteredCallSources::Missing => Ok(None),
-        RegisteredCallSources::Named(source_ids) => Ok(Some(source_ids)),
+        RegisteredCallSources::Named(source_ids)
+        | RegisteredCallSources::Unqualified(source_ids) => Ok(Some(source_ids)),
         RegisteredCallSources::Undecodable(error) => Err(internal(error)),
     }
 }
