@@ -10,8 +10,8 @@ use evo_core::{Context, Error, Result, fingerprint, hash, identifier, now, searc
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sqlx::{
-    ConnectOptions, Row, Sqlite, SqlitePool, Transaction,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    ConnectOptions, Row, Sqlite, Transaction, TransactionManager,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
 };
 use std::{
     fs::File,
@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, sync::RwLock};
+use tokio::sync::RwLock;
 
 pub const MVP_MAX_RUNS: u64 = 1_000;
 /// Storage-side mirrors of the E16.5 MVP capacity bounds enforced inside this
@@ -102,11 +102,21 @@ struct BlobFileIdentity {
     modified_nanoseconds: i64,
 }
 
-#[derive(Clone)]
 pub struct Store {
-    pool: SqlitePool,
+    backend: Arc<OwnedSqliteBackend>,
     root: PathBuf,
     blob_lock: Arc<RwLock<()>>,
+    inherited_admission: Option<Arc<OwnedBackendAdmission>>,
+}
+impl Clone for Store {
+    fn clone(&self) -> Self {
+        Self {
+            backend: Arc::clone(&self.backend),
+            root: self.root.clone(),
+            blob_lock: Arc::clone(&self.blob_lock),
+            inherited_admission: None,
+        }
+    }
 }
 
 /// A physical object row from the caller's current transaction. This is a
@@ -121,7 +131,7 @@ pub struct ObjectRowSnapshot {
 }
 
 pub struct Session {
-    tx: Transaction<'static, Sqlite>,
+    tx: OwnedSqliteTransaction,
 }
 
 /// Schema of the tombstone the revocation cleanup leaves in place of an artifact
@@ -270,15 +280,20 @@ async fn count_runs_all_namespaces(conn: &mut sqlx::SqliteConnection) -> Result<
 
 struct PrivateStagedBlob {
     path: Option<PathBuf>,
+    admission: Arc<OwnedBackendAdmission>,
 }
 
 struct PrivateStagedDirectory {
     path: Option<PathBuf>,
+    admission: Arc<OwnedBackendAdmission>,
 }
 
 impl PrivateStagedDirectory {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
+    fn new(path: PathBuf, admission: &Arc<OwnedBackendAdmission>) -> Self {
+        Self {
+            path: Some(path),
+            admission: Arc::clone(admission),
+        }
     }
 
     fn path(&self) -> &Path {
@@ -295,14 +310,22 @@ impl PrivateStagedDirectory {
 impl Drop for PrivateStagedDirectory {
     fn drop(&mut self) {
         if let Some(path) = self.path.take() {
-            let _ = std::fs::remove_dir_all(path);
+            self.admission.wait_filesystem();
+            if let Err(error) = std::fs::remove_dir_all(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    self.admission.mark_io_unacknowledged();
+                }
+            }
         }
     }
 }
 
 impl PrivateStagedBlob {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
+    fn new(path: PathBuf, admission: &Arc<OwnedBackendAdmission>) -> Self {
+        Self {
+            path: Some(path),
+            admission: Arc::clone(admission),
+        }
     }
 
     fn path(&self) -> &Path {
@@ -317,7 +340,12 @@ impl PrivateStagedBlob {
 impl Drop for PrivateStagedBlob {
     fn drop(&mut self) {
         if let Some(path) = self.path.take() {
-            let _ = std::fs::remove_file(path);
+            self.admission.wait_filesystem();
+            if let Err(error) = std::fs::remove_file(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    self.admission.mark_io_unacknowledged();
+                }
+            }
         }
     }
 }
@@ -469,99 +497,126 @@ fn validate_registered_blob_field(schema: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-async fn write_synced_temp(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
+async fn write_synced_temp(
+    path: &Path,
+    bytes: &[u8],
+    admission: &Arc<OwnedBackendAdmission>,
+) -> Result<()> {
+    let path = path.to_path_buf();
+    let bytes = bytes.to_vec();
+    admission
+        .spawn_blocking(move || -> Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path)
+                .map_err(internal)?;
+            std::io::Write::write_all(&mut file, &bytes).map_err(internal)?;
+            file.sync_all().map_err(internal)
+        })
         .await
-        .map_err(internal)?;
-    file.write_all(bytes).await.map_err(internal)?;
-    file.sync_all().await.map_err(internal)
+        .map_err(internal)?
 }
 
-async fn verify_blob_file(path: &Path, digest: &str, max_bytes: usize) -> Result<()> {
+async fn verify_blob_file(
+    path: &Path,
+    digest: &str,
+    max_bytes: usize,
+    admission: &Arc<OwnedBackendAdmission>,
+) -> Result<()> {
     let path = path.to_path_buf();
     let expected = digest.to_string();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let metadata = std::fs::symlink_metadata(&path).map_err(internal)?;
-        if !metadata.file_type().is_file()
-            || metadata.len() == 0
-            || metadata.len() > max_bytes as u64
-        {
-            return Err(Error::Conflict(
-                "published blob is linked, non-regular, empty, or oversized".into(),
-            ));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if metadata.nlink() != 1 {
-                return Err(Error::Conflict("published blob is hard-linked".into()));
+    admission
+        .spawn_blocking(move || -> Result<()> {
+            let metadata = std::fs::symlink_metadata(&path).map_err(internal)?;
+            if !metadata.file_type().is_file()
+                || metadata.len() == 0
+                || metadata.len() > max_bytes as u64
+            {
+                return Err(Error::Conflict(
+                    "published blob is linked, non-regular, empty, or oversized".into(),
+                ));
             }
-        }
-        let bytes = std::fs::read(&path).map_err(internal)?;
-        if bytes.len() > max_bytes || hash(&bytes) != expected {
-            return Err(Error::Conflict("published blob digest mismatch".into()));
-        }
-        Ok(())
-    })
-    .await
-    .map_err(internal)??;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() != 1 {
+                    return Err(Error::Conflict("published blob is hard-linked".into()));
+                }
+            }
+            let bytes = std::fs::read(&path).map_err(internal)?;
+            if bytes.len() > max_bytes || hash(&bytes) != expected {
+                return Err(Error::Conflict("published blob digest mismatch".into()));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)??;
     Ok(())
 }
 
-async fn blob_file_identity(path: &Path) -> Result<BlobFileIdentity> {
+async fn blob_file_identity(
+    path: &Path,
+    admission: &Arc<OwnedBackendAdmission>,
+) -> Result<BlobFileIdentity> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<BlobFileIdentity> {
-        let metadata = std::fs::symlink_metadata(path).map_err(internal)?;
-        if !metadata.file_type().is_file() {
-            return Err(Error::Conflict(
-                "dependency blob is not a regular file".into(),
-            ));
-        }
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-        Ok(BlobFileIdentity {
-            len: metadata.len(),
-            readonly: metadata.permissions().readonly(),
+    admission
+        .spawn_blocking(move || -> Result<BlobFileIdentity> {
+            let metadata = std::fs::symlink_metadata(path).map_err(internal)?;
+            if !metadata.file_type().is_file() {
+                return Err(Error::Conflict(
+                    "dependency blob is not a regular file".into(),
+                ));
+            }
             #[cfg(unix)]
-            links: metadata.nlink(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            modified_seconds: metadata.mtime(),
-            #[cfg(unix)]
-            modified_nanoseconds: metadata.mtime_nsec(),
+            use std::os::unix::fs::MetadataExt;
+            Ok(BlobFileIdentity {
+                len: metadata.len(),
+                readonly: metadata.permissions().readonly(),
+                #[cfg(unix)]
+                links: metadata.nlink(),
+                #[cfg(unix)]
+                device: metadata.dev(),
+                #[cfg(unix)]
+                inode: metadata.ino(),
+                #[cfg(unix)]
+                modified_seconds: metadata.mtime(),
+                #[cfg(unix)]
+                modified_nanoseconds: metadata.mtime_nsec(),
+            })
         })
-    })
-    .await
-    .map_err(internal)?
+        .await
+        .map_err(internal)?
 }
 
 async fn publish_or_verify_blob(
     temp: &Path,
     final_path: &Path,
     existing_preverified: Option<&BlobFileIdentity>,
+    admission: &Arc<OwnedBackendAdmission>,
 ) -> Result<bool> {
     let source = temp.to_path_buf();
     let destination = final_path.to_path_buf();
-    let published =
-        tokio::task::spawn_blocking(move || publish_blob_no_replace(&source, &destination))
-            .await
-            .map_err(internal)??;
+    let published = admission
+        .spawn_blocking(move || publish_blob_no_replace(&source, &destination))
+        .await
+        .map_err(internal)??;
     if !published {
         let expected_identity = existing_preverified.ok_or_else(|| {
             Error::Conflict("blob target appeared after preflight; retry publication".into())
         })?;
-        if blob_file_identity(final_path).await? != *expected_identity {
+        if blob_file_identity(final_path, admission).await? != *expected_identity {
             return Err(Error::Conflict(
                 "preverified blob identity changed before publication".into(),
             ));
         }
-        match tokio::fs::remove_file(temp).await {
+        match {
+            let path = (temp).to_path_buf();
+            admission
+                .spawn_blocking(move || std::fs::remove_file(path))
+                .await
+                .map_err(internal)?
+        } {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(internal(error)),
@@ -570,9 +625,10 @@ async fn publish_or_verify_blob(
     Ok(published)
 }
 
-async fn sync_directory(path: &Path) -> Result<()> {
+async fn sync_directory(path: &Path, admission: &Arc<OwnedBackendAdmission>) -> Result<()> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || File::open(path).and_then(|directory| directory.sync_all()))
+    admission
+        .spawn_blocking(move || File::open(path).and_then(|directory| directory.sync_all()))
         .await
         .map_err(internal)?
         .map_err(internal)
@@ -604,83 +660,91 @@ fn publish_blob_no_replace(source: &Path, destination: &Path) -> Result<bool> {
     }
 }
 
-async fn cleanup_private_blob_staging(root: &Path) -> Result<()> {
-    let staging = root.join(".blob-staging");
-    let metadata = match tokio::fs::symlink_metadata(&staging).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(internal(error)),
-    };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(Error::Conflict(
-            "private blob staging root is linked or non-directory".into(),
-        ));
-    }
-    let mut namespaces = tokio::fs::read_dir(&staging).await.map_err(internal)?;
-    while let Some(namespace) = namespaces.next_entry().await.map_err(internal)? {
-        let metadata = namespace.metadata().await.map_err(internal)?;
-        if !metadata.is_dir() || namespace.file_type().await.map_err(internal)?.is_symlink() {
-            return Err(Error::Conflict(
-                "private blob staging namespace is linked or non-directory".into(),
-            ));
-        }
-        let mut files = tokio::fs::read_dir(namespace.path())
-            .await
-            .map_err(internal)?;
-        while let Some(file) = files.next_entry().await.map_err(internal)? {
-            let metadata = file.metadata().await.map_err(internal)?;
-            if !metadata.is_file() || file.file_type().await.map_err(internal)?.is_symlink() {
+async fn cleanup_private_blob_staging(
+    root: &Path,
+    admission: &Arc<OwnedBackendAdmission>,
+) -> Result<()> {
+    let root = root.to_path_buf();
+    admission
+        .spawn_blocking(move || -> Result<()> {
+            let staging = root.join(".blob-staging");
+            let metadata = match std::fs::symlink_metadata(&staging) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(internal(error)),
+            };
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(Error::Conflict(
-                    "private blob staging member is linked or non-regular".into(),
+                    "private blob staging root is linked or non-directory".into(),
                 ));
             }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.nlink() != 1 {
+            for namespace in std::fs::read_dir(&staging).map_err(internal)? {
+                let namespace = namespace.map_err(internal)?;
+                let metadata = namespace.metadata().map_err(internal)?;
+                if !metadata.is_dir() || namespace.file_type().map_err(internal)?.is_symlink() {
                     return Err(Error::Conflict(
-                        "private blob staging member is hard-linked".into(),
+                        "private blob staging namespace is linked or non-directory".into(),
                     ));
                 }
+                for file in std::fs::read_dir(namespace.path()).map_err(internal)? {
+                    let file = file.map_err(internal)?;
+                    let metadata = file.metadata().map_err(internal)?;
+                    if !metadata.is_file() || file.file_type().map_err(internal)?.is_symlink() {
+                        return Err(Error::Conflict(
+                            "private blob staging member is linked or non-regular".into(),
+                        ));
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        if metadata.nlink() != 1 {
+                            return Err(Error::Conflict(
+                                "private blob staging member is hard-linked".into(),
+                            ));
+                        }
+                    }
+                    std::fs::remove_file(file.path()).map_err(internal)?;
+                }
+                std::fs::remove_dir(namespace.path()).map_err(internal)?;
             }
-            tokio::fs::remove_file(file.path())
-                .await
-                .map_err(internal)?;
-        }
-        tokio::fs::remove_dir(namespace.path())
-            .await
-            .map_err(internal)?;
-    }
-    tokio::fs::remove_dir(staging).await.map_err(internal)
+            std::fs::remove_dir(staging).map_err(internal)
+        })
+        .await
+        .map_err(internal)?
 }
 
-async fn cleanup_private_export_staging(root: &Path) -> Result<()> {
-    let staging = root.join(".export-staging");
-    let metadata = match tokio::fs::symlink_metadata(&staging).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(internal(error)),
-    };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(Error::Conflict(
-            "private export staging root is linked or non-directory".into(),
-        ));
-    }
-    let mut namespaces = tokio::fs::read_dir(&staging).await.map_err(internal)?;
-    while let Some(namespace) = namespaces.next_entry().await.map_err(internal)? {
-        let metadata = tokio::fs::symlink_metadata(namespace.path())
-            .await
-            .map_err(internal)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(Error::Conflict(
-                "private export staging namespace is linked or non-directory".into(),
-            ));
-        }
-        tokio::fs::remove_dir_all(namespace.path())
-            .await
-            .map_err(internal)?;
-    }
-    tokio::fs::remove_dir(staging).await.map_err(internal)
+async fn cleanup_private_export_staging(
+    root: &Path,
+    admission: &Arc<OwnedBackendAdmission>,
+) -> Result<()> {
+    let root = root.to_path_buf();
+    admission
+        .spawn_blocking(move || -> Result<()> {
+            let staging = root.join(".export-staging");
+            let metadata = match std::fs::symlink_metadata(&staging) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(internal(error)),
+            };
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(Error::Conflict(
+                    "private export staging root is linked or non-directory".into(),
+                ));
+            }
+            for namespace in std::fs::read_dir(&staging).map_err(internal)? {
+                let namespace = namespace.map_err(internal)?;
+                let metadata = std::fs::symlink_metadata(namespace.path()).map_err(internal)?;
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(Error::Conflict(
+                        "private export staging namespace is linked or non-directory".into(),
+                    ));
+                }
+                std::fs::remove_dir_all(namespace.path()).map_err(internal)?;
+            }
+            std::fs::remove_dir(staging).map_err(internal)
+        })
+        .await
+        .map_err(internal)?
 }
 
 async fn verify_registered_source_refs(
@@ -819,49 +883,71 @@ async fn verify_dependency_snapshot_in_session(
     Ok(())
 }
 
-async fn write_local_export_staging(root: &Path, files: &[LocalExportFile]) -> Result<()> {
-    for member in files {
-        let target = root.join(&member.path);
-        let parent = target.parent().ok_or(Error::Internal)?;
-        tokio::fs::create_dir_all(parent).await.map_err(internal)?;
-        let mut file = tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&target)
-            .await
-            .map_err(internal)?;
-        file.write_all(&member.bytes).await.map_err(internal)?;
-        file.sync_all().await.map_err(internal)?;
-        let mut permissions = file.metadata().await.map_err(internal)?.permissions();
-        permissions.set_readonly(true);
-        tokio::fs::set_permissions(&target, permissions)
-            .await
-            .map_err(internal)?;
-        sync_directory(parent).await?;
-    }
-    sync_directory(root).await
+async fn write_local_export_staging(
+    root: &Path,
+    files: &[LocalExportFile],
+    admission: &Arc<OwnedBackendAdmission>,
+) -> Result<()> {
+    let root = root.to_path_buf();
+    let files = files.to_vec();
+    admission
+        .spawn_blocking(move || -> Result<()> {
+            for member in &files {
+                let target = root.join(&member.path);
+                let parent = target.parent().ok_or(Error::Internal)?;
+                std::fs::create_dir_all(parent).map_err(internal)?;
+                let mut file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&target)
+                    .map_err(internal)?;
+                std::io::Write::write_all(&mut file, &member.bytes).map_err(internal)?;
+                file.sync_all().map_err(internal)?;
+                let mut permissions = file.metadata().map_err(internal)?.permissions();
+                permissions.set_readonly(true);
+                std::fs::set_permissions(&target, permissions).map_err(internal)?;
+                File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(internal)?;
+            }
+            File::open(root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(internal)
+        })
+        .await
+        .map_err(internal)?
 }
 
-async fn ensure_unlinked_directory(path: &Path) -> Result<()> {
-    match tokio::fs::symlink_metadata(path).await {
-        Ok(metadata) => {
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(Error::Conflict(
-                    "controlled export path is linked or non-directory".into(),
-                ));
+async fn ensure_unlinked_directory(
+    path: &Path,
+    admission: &Arc<OwnedBackendAdmission>,
+) -> Result<()> {
+    let path = path.to_path_buf();
+    admission
+        .spawn_blocking(move || -> Result<()> {
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        return Err(Error::Conflict(
+                            "controlled export path is linked or non-directory".into(),
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(path).map_err(internal)?;
+                }
+                Err(error) => return Err(internal(error)),
             }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            tokio::fs::create_dir(path).await.map_err(internal)?;
-        }
-        Err(error) => return Err(internal(error)),
-    }
-    Ok(())
+            Ok(())
+        })
+        .await
+        .map_err(internal)?
 }
 
 async fn verify_local_export_directory(
     root: &Path,
     expected: &[LocalExportFile],
+    admission: &Arc<OwnedBackendAdmission>,
 ) -> Result<(String, u64)> {
     let root = root.to_path_buf();
     let mut expected_map = std::collections::BTreeMap::new();
@@ -885,22 +971,57 @@ async fn verify_local_export_directory(
             parent = directory.parent();
         }
     }
-    tokio::task::spawn_blocking(move || -> Result<(String, u64)> {
-        let metadata = std::fs::symlink_metadata(&root).map_err(internal)?;
-        if !metadata.file_type().is_dir() {
-            return Err(Error::Conflict("local export is not a directory".into()));
-        }
-        let mut stack = vec![root.clone()];
-        let mut actual = Vec::new();
-        while let Some(directory) = stack.pop() {
-            for entry in std::fs::read_dir(&directory).map_err(internal)? {
-                let entry = entry.map_err(internal)?;
-                let metadata = entry.metadata().map_err(internal)?;
-                let file_type = entry.file_type().map_err(internal)?;
-                if file_type.is_symlink() {
-                    return Err(Error::Conflict("local export contains a symlink".into()));
-                }
-                if file_type.is_dir() {
+    admission
+        .spawn_blocking(move || -> Result<(String, u64)> {
+            let metadata = std::fs::symlink_metadata(&root).map_err(internal)?;
+            if !metadata.file_type().is_dir() {
+                return Err(Error::Conflict("local export is not a directory".into()));
+            }
+            let mut stack = vec![root.clone()];
+            let mut actual = Vec::new();
+            while let Some(directory) = stack.pop() {
+                for entry in std::fs::read_dir(&directory).map_err(internal)? {
+                    let entry = entry.map_err(internal)?;
+                    let metadata = entry.metadata().map_err(internal)?;
+                    let file_type = entry.file_type().map_err(internal)?;
+                    if file_type.is_symlink() {
+                        return Err(Error::Conflict("local export contains a symlink".into()));
+                    }
+                    if file_type.is_dir() {
+                        let relative = entry
+                            .path()
+                            .strip_prefix(&root)
+                            .map_err(internal)?
+                            .to_str()
+                            .ok_or_else(|| Error::Invalid("local export path is not UTF-8".into()))?
+                            .replace(std::path::MAIN_SEPARATOR, "/");
+                        if !expected_directories.contains(&relative) {
+                            return Err(Error::Conflict(
+                                "local export has an extra directory".into(),
+                            ));
+                        }
+                        stack.push(entry.path());
+                        continue;
+                    }
+                    if !file_type.is_file() {
+                        return Err(Error::Conflict(
+                            "local export contains a non-regular member".into(),
+                        ));
+                    }
+                    if !metadata.permissions().readonly() {
+                        return Err(Error::Conflict(
+                            "local export member is not read-only".into(),
+                        ));
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        if metadata.nlink() != 1 {
+                            return Err(Error::Conflict(
+                                "local export contains a hard-linked member".into(),
+                            ));
+                        }
+                    }
                     let relative = entry
                         .path()
                         .strip_prefix(&root)
@@ -908,61 +1029,27 @@ async fn verify_local_export_directory(
                         .to_str()
                         .ok_or_else(|| Error::Invalid("local export path is not UTF-8".into()))?
                         .replace(std::path::MAIN_SEPARATOR, "/");
-                    if !expected_directories.contains(&relative) {
-                        return Err(Error::Conflict(
-                            "local export has an extra directory".into(),
-                        ));
+                    validate_local_export_path(&relative)?;
+                    let bytes = std::fs::read(entry.path()).map_err(internal)?;
+                    let expected = expected_map.get(&relative).ok_or_else(|| {
+                        Error::Conflict("local export has an extra member".into())
+                    })?;
+                    if hash(&bytes) != expected.0 || bytes.len() as u64 != expected.1 {
+                        return Err(Error::Conflict("local export member changed".into()));
                     }
-                    stack.push(entry.path());
-                    continue;
+                    actual.push(LocalExportFile {
+                        path: relative,
+                        bytes,
+                    });
                 }
-                if !file_type.is_file() {
-                    return Err(Error::Conflict(
-                        "local export contains a non-regular member".into(),
-                    ));
-                }
-                if !metadata.permissions().readonly() {
-                    return Err(Error::Conflict(
-                        "local export member is not read-only".into(),
-                    ));
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    if metadata.nlink() != 1 {
-                        return Err(Error::Conflict(
-                            "local export contains a hard-linked member".into(),
-                        ));
-                    }
-                }
-                let relative = entry
-                    .path()
-                    .strip_prefix(&root)
-                    .map_err(internal)?
-                    .to_str()
-                    .ok_or_else(|| Error::Invalid("local export path is not UTF-8".into()))?
-                    .replace(std::path::MAIN_SEPARATOR, "/");
-                validate_local_export_path(&relative)?;
-                let bytes = std::fs::read(entry.path()).map_err(internal)?;
-                let expected = expected_map
-                    .get(&relative)
-                    .ok_or_else(|| Error::Conflict("local export has an extra member".into()))?;
-                if hash(&bytes) != expected.0 || bytes.len() as u64 != expected.1 {
-                    return Err(Error::Conflict("local export member changed".into()));
-                }
-                actual.push(LocalExportFile {
-                    path: relative,
-                    bytes,
-                });
             }
-        }
-        if actual.len() != expected_map.len() {
-            return Err(Error::Conflict("local export member is missing".into()));
-        }
-        local_export_tree_digest(&actual)
-    })
-    .await
-    .map_err(internal)?
+            if actual.len() != expected_map.len() {
+                return Err(Error::Conflict("local export member is missing".into()));
+            }
+            local_export_tree_digest(&actual)
+        })
+        .await
+        .map_err(internal)?
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -981,56 +1068,60 @@ struct LocalExportIdentityEntry {
     modified_nanoseconds: i64,
 }
 
-async fn local_export_identity(root: &Path) -> Result<Vec<LocalExportIdentityEntry>> {
+async fn local_export_identity(
+    root: &Path,
+    admission: &Arc<OwnedBackendAdmission>,
+) -> Result<Vec<LocalExportIdentityEntry>> {
     let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<Vec<LocalExportIdentityEntry>> {
-        let mut stack = vec![root.clone()];
-        let mut identity = Vec::new();
-        while let Some(path) = stack.pop() {
-            let metadata = std::fs::symlink_metadata(&path).map_err(internal)?;
-            if metadata.file_type().is_symlink()
-                || (!metadata.file_type().is_dir() && !metadata.file_type().is_file())
-            {
-                return Err(Error::Conflict(
-                    "local export identity contains a linked or special member".into(),
-                ));
-            }
-            let relative = if path == root {
-                ".".into()
-            } else {
-                path.strip_prefix(&root)
-                    .map_err(internal)?
-                    .to_str()
-                    .ok_or_else(|| Error::Invalid("local export path is not UTF-8".into()))?
-                    .replace(std::path::MAIN_SEPARATOR, "/")
-            };
-            #[cfg(unix)]
-            use std::os::unix::fs::MetadataExt;
-            identity.push(LocalExportIdentityEntry {
-                path: relative,
-                is_dir: metadata.file_type().is_dir(),
-                len: metadata.len(),
-                readonly: metadata.permissions().readonly(),
+    admission
+        .spawn_blocking(move || -> Result<Vec<LocalExportIdentityEntry>> {
+            let mut stack = vec![root.clone()];
+            let mut identity = Vec::new();
+            while let Some(path) = stack.pop() {
+                let metadata = std::fs::symlink_metadata(&path).map_err(internal)?;
+                if metadata.file_type().is_symlink()
+                    || (!metadata.file_type().is_dir() && !metadata.file_type().is_file())
+                {
+                    return Err(Error::Conflict(
+                        "local export identity contains a linked or special member".into(),
+                    ));
+                }
+                let relative = if path == root {
+                    ".".into()
+                } else {
+                    path.strip_prefix(&root)
+                        .map_err(internal)?
+                        .to_str()
+                        .ok_or_else(|| Error::Invalid("local export path is not UTF-8".into()))?
+                        .replace(std::path::MAIN_SEPARATOR, "/")
+                };
                 #[cfg(unix)]
-                device: metadata.dev(),
-                #[cfg(unix)]
-                inode: metadata.ino(),
-                #[cfg(unix)]
-                modified_seconds: metadata.mtime(),
-                #[cfg(unix)]
-                modified_nanoseconds: metadata.mtime_nsec(),
-            });
-            if metadata.file_type().is_dir() {
-                for entry in std::fs::read_dir(path).map_err(internal)? {
-                    stack.push(entry.map_err(internal)?.path());
+                use std::os::unix::fs::MetadataExt;
+                identity.push(LocalExportIdentityEntry {
+                    path: relative,
+                    is_dir: metadata.file_type().is_dir(),
+                    len: metadata.len(),
+                    readonly: metadata.permissions().readonly(),
+                    #[cfg(unix)]
+                    device: metadata.dev(),
+                    #[cfg(unix)]
+                    inode: metadata.ino(),
+                    #[cfg(unix)]
+                    modified_seconds: metadata.mtime(),
+                    #[cfg(unix)]
+                    modified_nanoseconds: metadata.mtime_nsec(),
+                });
+                if metadata.file_type().is_dir() {
+                    for entry in std::fs::read_dir(path).map_err(internal)? {
+                        stack.push(entry.map_err(internal)?.path());
+                    }
                 }
             }
-        }
-        identity.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(identity)
-    })
-    .await
-    .map_err(internal)?
+            identity.sort_by(|left, right| left.path.cmp(&right.path));
+            Ok(identity)
+        })
+        .await
+        .map_err(internal)?
 }
 
 async fn verify_export_source_refs(
@@ -1279,47 +1370,74 @@ pub(crate) async fn upstream_rows_in_tx(
 
 impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
+        let path = path.to_path_buf();
         let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        tokio::fs::create_dir_all(&root).await.map_err(internal)?;
-        cleanup_private_blob_staging(&root).await?;
-        cleanup_private_export_staging(&root).await?;
-        let opts = SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(true)
-            .foreign_keys(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Full)
-            .busy_timeout(Duration::from_secs(5))
-            .disable_statement_logging();
-        // One connection serializes state transitions, including read/modify/write budget transactions.
-        // Production entry points hold a shared data-directory OS lock until close.
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_lazy_with(opts);
-        // Retain the pool even when connecting/migrating fails. Dropping its
-        // last handle does not await background connection shutdown, so it
-        // must be explicitly closed before the caller releases its OS guard.
-        if let Err(error) = sqlx::migrate!("./migrations").run(&pool).await {
-            pool.close().await;
-            return Err(internal(error));
-        }
-        Ok(Self {
-            pool,
+        let store = Self {
+            backend: Arc::new(OwnedSqliteBackend::new()),
             root,
             blob_lock: Arc::new(RwLock::new(())),
+            inherited_admission: None,
+        };
+        // The owned task retains initialization/retirement even if its waiter is cancelled.
+        // Ordinary open issues no OS mount or private-maintenance capability.
+        tokio::spawn(async move {
+            let admission = store.admission()?;
+            let scoped = store.scoped_with(Arc::clone(&admission))?;
+            let initialized: Result<()> = async {
+                let root = scoped.root.clone();
+                admission
+                    .spawn_blocking(move || std::fs::create_dir_all(root))
+                    .await
+                    .map_err(internal)?
+                    .map_err(internal)?;
+                cleanup_private_blob_staging(&scoped.root, &admission).await?;
+                cleanup_private_export_staging(&scoped.root, &admission).await?;
+                let opts = SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true)
+                    .foreign_keys(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .synchronous(SqliteSynchronous::Full)
+                    .busy_timeout(Duration::from_secs(5))
+                    .disable_statement_logging();
+                let connection = <sqlx::SqliteConnection as sqlx::Connection>::connect_with(&opts)
+                    .await
+                    .map_err(internal)?;
+                *scoped.backend.state.connection.lock().await = Some(connection);
+                let mut connection = scoped.connection().await?;
+                sqlx::migrate!("./migrations")
+                    .run(&mut *connection)
+                    .await
+                    .map_err(internal)
+            }
+            .await;
+            drop(scoped);
+            drop(admission);
+            if let Err(error) = initialized {
+                store.close().await;
+                return Err(error);
+            }
+            Ok(store)
         })
+        .await
+        .map_err(internal)?
     }
     pub async fn session(&self) -> Result<Session> {
+        let connection = self.connection().await?;
         Ok(Session {
-            tx: self.pool.begin().await.map_err(internal)?,
+            tx: OwnedSqliteTransaction::begin(connection)
+                .await
+                .map_err(internal)?,
         })
     }
     pub async fn close(&self) {
-        self.pool.close().await;
+        self.backend.start_retirement();
+        let _ = self.backend.wait_retirement().await;
     }
     pub async fn integrity(&self) -> Result<String> {
+        let mut connection = self.connection().await?;
         sqlx::query_scalar("PRAGMA integrity_check")
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *connection)
             .await
             .map_err(internal)
     }
@@ -1340,31 +1458,50 @@ impl Store {
     ) -> Result<String> {
         ctx.require(&[evo_core::Role::Host, evo_core::Role::Admin])?;
         validate_blob_bound(bytes, max_bytes)?;
-        let _guard = self.blob_lock.write().await;
+        let admission = self.admission()?;
+        let scoped = self.scoped_with(Arc::clone(&admission))?;
+        admission.hold_blob_write(Arc::clone(&scoped.blob_lock).write_owned().await);
         let digest = hash(bytes);
-        let dir = self
+        let dir = scoped
             .root
             .join("blobs")
             .join(hash(ctx.namespace().as_bytes()));
-        tokio::fs::create_dir_all(&dir).await.map_err(internal)?;
+        {
+            let path = (&dir).to_path_buf();
+            admission
+                .spawn_blocking(move || std::fs::create_dir_all(path))
+                .await
+                .map_err(internal)?
+        }
+        .map_err(internal)?;
         let final_path = dir.join(&digest);
-        let existing_preverified = match tokio::fs::symlink_metadata(&final_path).await {
+        let existing_preverified = match {
+            let path = (&final_path).to_path_buf();
+            admission
+                .spawn_blocking(move || std::fs::symlink_metadata(path))
+                .await
+                .map_err(internal)?
+        } {
             Ok(_) => {
-                verify_blob_file(&final_path, &digest, max_bytes).await?;
-                Some(blob_file_identity(&final_path).await?)
+                verify_blob_file(&final_path, &digest, max_bytes, &admission).await?;
+                Some(blob_file_identity(&final_path, &admission).await?)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(internal(error)),
         };
         let temp = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-        let mut staged = PrivateStagedBlob::new(temp);
-        write_synced_temp(staged.path(), bytes).await?;
-        let published =
-            publish_or_verify_blob(staged.path(), &final_path, existing_preverified.as_ref())
-                .await?;
+        let mut staged = PrivateStagedBlob::new(temp, &admission);
+        write_synced_temp(staged.path(), bytes, &admission).await?;
+        let published = publish_or_verify_blob(
+            staged.path(),
+            &final_path,
+            existing_preverified.as_ref(),
+            &admission,
+        )
+        .await?;
         staged.disarm();
         if published {
-            sync_directory(&dir).await?;
+            sync_directory(&dir, &admission).await?;
         }
         Ok(digest)
     }
@@ -1380,8 +1517,19 @@ impl Store {
         bytes: &[u8],
         max_bytes: usize,
     ) -> Result<String> {
-        let plan = self
-            .preflight_registered_blob_publish(
+        validate_registered_blob_publish_inputs(
+            ctx,
+            artifact_id,
+            expected_schema,
+            payload_digest_field,
+            bytes,
+            max_bytes,
+        )?;
+        let admission = self.admission()?;
+        let scoped = self.scoped_with(admission)?;
+
+        let plan = scoped
+            .preflight_registered_blob_publish_in_scope(
                 ctx,
                 artifact_id,
                 expected_schema,
@@ -1390,15 +1538,15 @@ impl Store {
                 max_bytes,
             )
             .await?;
-        match self
+        match scoped
             .publish_preflighted_registered_blob(ctx, plan, bytes)
             .await
         {
             Err(Error::Conflict(message))
                 if message == "blob target appeared after preflight; retry publication" =>
             {
-                let retry = self
-                    .preflight_registered_blob_publish(
+                let retry = scoped
+                    .preflight_registered_blob_publish_in_scope(
                         ctx,
                         artifact_id,
                         expected_schema,
@@ -1407,7 +1555,8 @@ impl Store {
                         max_bytes,
                     )
                     .await?;
-                self.publish_preflighted_registered_blob(ctx, retry, bytes)
+                scoped
+                    .publish_preflighted_registered_blob(ctx, retry, bytes)
                     .await
             }
             result => result,
@@ -1424,23 +1573,55 @@ impl Store {
         bytes: &[u8],
         max_bytes: usize,
     ) -> Result<RegisteredBlobPublishPlan> {
-        ctx.require(&[evo_core::Role::Host, evo_core::Role::Admin])?;
-        identifier(artifact_id)?;
-        validate_registered_blob_field(expected_schema, payload_digest_field)?;
-        validate_blob_bound(bytes, max_bytes)?;
+        validate_registered_blob_publish_inputs(
+            ctx,
+            artifact_id,
+            expected_schema,
+            payload_digest_field,
+            bytes,
+            max_bytes,
+        )?;
+        self.preflight_registered_blob_publish_in_scope(
+            ctx,
+            artifact_id,
+            expected_schema,
+            payload_digest_field,
+            bytes,
+            max_bytes,
+        )
+        .await
+    }
+
+    async fn preflight_registered_blob_publish_in_scope(
+        &self,
+        ctx: &Context,
+        artifact_id: &str,
+        expected_schema: &str,
+        payload_digest_field: &str,
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> Result<RegisteredBlobPublishPlan> {
+        let admission = self.admission()?;
+        let scoped = self.scoped_with(Arc::clone(&admission))?;
         let digest = hash(bytes);
-        let dependency_plan = self
+        let dependency_plan = scoped
             .snapshot_registered_dependencies(ctx, artifact_id)
             .await?;
-        let dependencies = self
+        let dependencies = scoped
             .prevalidate_registered_dependency_blobs(ctx, dependency_plan, Some(digest.as_str()))
             .await?;
         let namespace_hash = hash(ctx.namespace().as_bytes());
-        let final_path = self.root.join("blobs").join(namespace_hash).join(&digest);
-        let existing_identity = match tokio::fs::symlink_metadata(&final_path).await {
+        let final_path = scoped.root.join("blobs").join(namespace_hash).join(&digest);
+        let existing_identity = match {
+            let path = (&final_path).to_path_buf();
+            admission
+                .spawn_blocking(move || std::fs::symlink_metadata(path))
+                .await
+                .map_err(internal)?
+        } {
             Ok(_) => {
-                verify_blob_file(&final_path, &digest, max_bytes).await?;
-                Some(blob_file_identity(&final_path).await?)
+                verify_blob_file(&final_path, &digest, max_bytes, &admission).await?;
+                Some(blob_file_identity(&final_path, &admission).await?)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(internal(error)),
@@ -1474,6 +1655,8 @@ impl Store {
                 "registered blob bytes changed after preflight".into(),
             ));
         }
+        let admission = self.admission()?;
+        let scoped = self.scoped_with(Arc::clone(&admission))?;
         let artifact_id = plan.artifact_id;
         let expected_schema = plan.expected_schema;
         let payload_digest_field = plan.payload_digest_field;
@@ -1482,25 +1665,44 @@ impl Store {
         let existing_preverified = plan.existing_identity;
         let dependencies = plan.dependencies;
         let namespace_hash = hash(ctx.namespace().as_bytes());
-        let staging_dir = self.root.join(".blob-staging").join(&namespace_hash);
-        tokio::fs::create_dir_all(&staging_dir)
-            .await
-            .map_err(internal)?;
+        let staging_dir = scoped.root.join(".blob-staging").join(&namespace_hash);
+        {
+            let path = (&staging_dir).to_path_buf();
+            admission
+                .spawn_blocking(move || std::fs::create_dir_all(path))
+                .await
+                .map_err(internal)?
+        }
+        .map_err(internal)?;
         let temp_path = staging_dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
-        let mut staged = PrivateStagedBlob::new(temp_path);
-        write_synced_temp(staged.path(), bytes).await?;
+        let mut staged = PrivateStagedBlob::new(temp_path, &admission);
+        write_synced_temp(staged.path(), bytes, &admission).await?;
 
-        verify_blob_file(staged.path(), &digest, max_bytes).await?;
-        let final_dir = self.root.join("blobs").join(namespace_hash);
-        tokio::fs::create_dir_all(&final_dir)
-            .await
-            .map_err(internal)?;
+        verify_blob_file(staged.path(), &digest, max_bytes, &admission).await?;
+        let final_dir = scoped.root.join("blobs").join(namespace_hash);
+        {
+            let path = (&final_dir).to_path_buf();
+            admission
+                .spawn_blocking(move || std::fs::create_dir_all(path))
+                .await
+                .map_err(internal)?
+        }
+        .map_err(internal)?;
         let final_path = final_dir.join(&digest);
 
-        let _guard = self.blob_lock.write().await;
-        self.verify_prevalidated_dependency_identities(ctx, &dependencies)
+        let owns_blob_write = {
+            let holds = admission.blob_holds.lock().expect("owned blob holds");
+            holds
+                .iter()
+                .any(|hold| matches!(hold, OwnedBackendBlobHold::Write { .. }))
+        };
+        if !owns_blob_write {
+            admission.hold_blob_write(Arc::clone(&scoped.blob_lock).write_owned().await);
+        }
+        scoped
+            .verify_prevalidated_dependency_identities(ctx, &dependencies)
             .await?;
-        let mut session = self.session().await?;
+        let mut session = scoped.session().await?;
         let fenced = sqlx::query(
             "UPDATE objects SET revision=revision
              WHERE namespace=? AND kind='artifact' AND id=?",
@@ -1566,14 +1768,18 @@ impl Store {
         verify_registered_source_refs(&mut session, ctx, &expected_schema, &artifact, &digest)
             .await?;
         verify_dependency_snapshot_in_session(&mut session, ctx, &dependencies).await?;
-        let published =
-            publish_or_verify_blob(staged.path(), &final_path, existing_preverified.as_ref())
-                .await?;
+        let published = publish_or_verify_blob(
+            staged.path(),
+            &final_path,
+            existing_preverified.as_ref(),
+            &admission,
+        )
+        .await?;
         staged.disarm();
         session.commit().await?;
-        drop(_guard);
+        // The actual IO owner retains the blob guard through backend completion.
         if published {
-            sync_directory(&final_dir).await?;
+            sync_directory(&final_dir, &admission).await?;
         }
         Ok(digest)
     }
@@ -1634,18 +1840,23 @@ impl Store {
         if plan.namespace != ctx.namespace() {
             return Err(Error::Forbidden);
         }
+        let admission = self.admission()?;
+        let scoped = self.scoped_with(Arc::clone(&admission))?;
         let mut blob_identities = Vec::new();
         for record in &plan.records {
             if record.kind != "blob" || excluded_digest == Some(record.id.as_str()) {
                 continue;
             }
-            let path = self
+            let path = scoped
                 .root
                 .join("blobs")
                 .join(hash(ctx.namespace().as_bytes()))
                 .join(&record.id);
-            verify_blob_file(&path, &record.id, 64 * 1024 * 1024).await?;
-            blob_identities.push((record.id.clone(), blob_file_identity(&path).await?));
+            verify_blob_file(&path, &record.id, 64 * 1024 * 1024, &admission).await?;
+            blob_identities.push((
+                record.id.clone(),
+                blob_file_identity(&path, &admission).await?,
+            ));
         }
         Ok(LocalExportDependencySnapshot {
             plan,
@@ -1658,13 +1869,15 @@ impl Store {
         ctx: &Context,
         dependencies: &LocalExportDependencySnapshot,
     ) -> Result<()> {
+        let admission = self.admission()?;
+        let scoped = self.scoped_with(Arc::clone(&admission))?;
         for (digest, expected_identity) in &dependencies.blob_identities {
-            let path = self
+            let path = scoped
                 .root
                 .join("blobs")
                 .join(hash(ctx.namespace().as_bytes()))
                 .join(digest);
-            if blob_file_identity(&path).await? != *expected_identity {
+            if blob_file_identity(&path, &admission).await? != *expected_identity {
                 return Err(Error::Conflict(
                     "registered dependency blob identity changed after preflight".into(),
                 ));
@@ -1692,65 +1905,89 @@ impl Store {
         let (tree_digest, delivered_bytes) = local_export_tree_digest(files)?;
         let receipt =
             local_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)?;
+        let admission = self.admission()?;
+        let scoped = self.scoped_with(Arc::clone(&admission))?;
         let namespace_hash = hash(ctx.namespace().as_bytes());
-        let staging_root = self.root.join(".export-staging");
-        ensure_unlinked_directory(&staging_root).await?;
+        let staging_root = scoped.root.join(".export-staging");
+        ensure_unlinked_directory(&staging_root, &admission).await?;
         let staging_parent = staging_root.join(&namespace_hash);
-        ensure_unlinked_directory(&staging_parent).await?;
+        ensure_unlinked_directory(&staging_parent, &admission).await?;
         let staging_path = staging_parent.join(uuid::Uuid::new_v4().to_string());
-        let mut staging = PrivateStagedDirectory::new(staging_path.clone());
-        tokio::fs::create_dir(&staging_path)
-            .await
-            .map_err(internal)?;
-        write_local_export_staging(staging.path(), files).await?;
-        if verify_local_export_directory(staging.path(), files).await?
+        let mut staging = PrivateStagedDirectory::new(staging_path.clone(), &admission);
+        {
+            let path = (&staging_path).to_path_buf();
+            admission
+                .spawn_blocking(move || std::fs::create_dir(path))
+                .await
+                .map_err(internal)?
+        }
+        .map_err(internal)?;
+        write_local_export_staging(staging.path(), files, &admission).await?;
+        if verify_local_export_directory(staging.path(), files, &admission).await?
             != (tree_digest.clone(), delivered_bytes)
         {
             return Err(Error::Conflict("staged local export tree changed".into()));
         }
-        let staging_identity = local_export_identity(staging.path()).await?;
+        let staging_identity = local_export_identity(staging.path(), &admission).await?;
 
-        let final_path = self.local_export_directory(ctx, export_id)?;
+        let final_path = scoped.local_export_directory(ctx, export_id)?;
         let final_parent = final_path.parent().ok_or(Error::Internal)?;
-        let export_root = self.root.join("exports");
-        ensure_unlinked_directory(&export_root).await?;
-        ensure_unlinked_directory(final_parent).await?;
-        let preverified_final = if tokio::fs::try_exists(&final_path).await.map_err(internal)? {
-            if verify_local_export_directory(&final_path, files).await?
+        let export_root = scoped.root.join("exports");
+        ensure_unlinked_directory(&export_root, &admission).await?;
+        ensure_unlinked_directory(final_parent, &admission).await?;
+        let preverified_final = if {
+            let path = (&final_path).to_path_buf();
+            admission
+                .spawn_blocking(move || path.try_exists())
+                .await
+                .map_err(internal)?
+        }
+        .map_err(internal)?
+        {
+            if verify_local_export_directory(&final_path, files, &admission).await?
                 != (tree_digest.clone(), delivered_bytes)
             {
                 return Err(Error::Conflict("existing local export differs".into()));
             }
-            Some(local_export_identity(&final_path).await?)
+            Some(local_export_identity(&final_path, &admission).await?)
         } else {
             None
         };
 
-        let _guard = self.blob_lock.write().await;
-        if local_export_identity(staging.path()).await? != staging_identity {
+        admission.hold_blob_write(Arc::clone(&scoped.blob_lock).write_owned().await);
+        if local_export_identity(staging.path(), &admission).await? != staging_identity {
             return Err(Error::Conflict(
                 "staged local export identity changed".into(),
             ));
         }
         match &preverified_final {
             Some(identity) => {
-                if local_export_identity(&final_path).await? != *identity {
+                if local_export_identity(&final_path, &admission).await? != *identity {
                     return Err(Error::Conflict(
                         "existing local export identity changed".into(),
                     ));
                 }
             }
             None => {
-                if tokio::fs::try_exists(&final_path).await.map_err(internal)? {
+                if {
+                    let path = (&final_path).to_path_buf();
+                    admission
+                        .spawn_blocking(move || path.try_exists())
+                        .await
+                        .map_err(internal)?
+                }
+                .map_err(internal)?
+                {
                     return Err(Error::Conflict(
                         "local export target appeared after preflight".into(),
                     ));
                 }
             }
         }
-        self.verify_prevalidated_dependency_identities(ctx, dependencies)
+        scoped
+            .verify_prevalidated_dependency_identities(ctx, dependencies)
             .await?;
-        let mut session = self.session().await?;
+        let mut session = scoped.session().await?;
         let fenced = sqlx::query(
             "UPDATE objects SET revision=revision WHERE namespace=? AND kind='artifact' AND id=?",
         )
@@ -1823,8 +2060,8 @@ impl Store {
                 ));
             }
             staging.disarm();
-            sync_directory(final_parent).await?;
-            if local_export_identity(&final_path).await? != staging_identity {
+            sync_directory(final_parent, &admission).await?;
+            if local_export_identity(&final_path, &admission).await? != staging_identity {
                 return Err(Error::Conflict(
                     "published local export identity changed".into(),
                 ));
@@ -1865,31 +2102,36 @@ impl Store {
     ) -> Result<LocalExportReceipt> {
         ctx.require(&[evo_core::Role::Admin])?;
         validate_export_id(export_id)?;
-        let dependency_plan = self
+        let admission = self.admission()?;
+        let scoped = self.scoped_with(Arc::clone(&admission))?;
+        let dependency_plan = scoped
             .snapshot_local_export_dependencies(ctx, export_id)
             .await?;
-        let dependencies = self
+        let dependencies = scoped
             .prevalidate_local_export_dependency_blobs(ctx, dependency_plan)
             .await?;
         let (tree_digest, delivered_bytes) = local_export_tree_digest(files)?;
         let receipt =
             local_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)?;
-        let path = self.local_export_directory(ctx, export_id)?;
-        if verify_local_export_directory(&path, files).await? != (tree_digest, delivered_bytes) {
+        let path = scoped.local_export_directory(ctx, export_id)?;
+        if verify_local_export_directory(&path, files, &admission).await?
+            != (tree_digest, delivered_bytes)
+        {
             return Err(Error::Conflict(
                 "completed local export is unavailable".into(),
             ));
         }
-        let identity = local_export_identity(&path).await?;
-        let _guard = self.blob_lock.read().await;
-        if local_export_identity(&path).await? != identity {
+        let identity = local_export_identity(&path, &admission).await?;
+        admission.hold_blob_read(Arc::clone(&scoped.blob_lock).read_owned().await);
+        if local_export_identity(&path, &admission).await? != identity {
             return Err(Error::Conflict(
                 "completed local export identity changed".into(),
             ));
         }
-        self.verify_prevalidated_dependency_identities(ctx, &dependencies)
+        scoped
+            .verify_prevalidated_dependency_identities(ctx, &dependencies)
             .await?;
-        let mut session = self.session().await?;
+        let mut session = scoped.session().await?;
         let fenced = sqlx::query(
             "UPDATE objects SET revision=revision WHERE namespace=? AND kind='artifact' AND id=?",
         )
@@ -1940,8 +2182,10 @@ impl Store {
     ) -> Result<()> {
         ctx.require(&[evo_core::Role::Admin])?;
         validate_export_id(export_id)?;
-        let _guard = self.blob_lock.write().await;
-        let mut session = self.session().await?;
+        let admission = self.admission()?;
+        let scoped = self.scoped_with(Arc::clone(&admission))?;
+        admission.hold_blob_write(Arc::clone(&scoped.blob_lock).write_owned().await);
+        let mut session = scoped.session().await?;
         let fenced = sqlx::query(
             "UPDATE objects SET revision=revision WHERE namespace=? AND kind='artifact' AND id=?",
         )
@@ -1969,8 +2213,16 @@ impl Store {
         if expected_abort != *aborted_attempt {
             return Err(Error::Conflict("aborted export content differs".into()));
         }
-        let path = self.local_export_directory(ctx, export_id)?;
-        if tokio::fs::try_exists(path).await.map_err(internal)? {
+        let path = scoped.local_export_directory(ctx, export_id)?;
+        if {
+            let path = (path).to_path_buf();
+            admission
+                .spawn_blocking(move || path.try_exists())
+                .await
+                .map_err(internal)?
+        }
+        .map_err(internal)?
+        {
             return Err(Error::Conflict(
                 "published local export must be recovered, not aborted".into(),
             ));
@@ -2007,61 +2259,64 @@ impl Store {
                 "blob read bound must be 1..=67108864 bytes".into(),
             ));
         }
-        let _guard = self.blob_lock.read().await;
-        let path = self
+        let admission = self.admission()?;
+        let scoped = self.scoped_with(Arc::clone(&admission))?;
+        admission.hold_blob_read(Arc::clone(&scoped.blob_lock).read_owned().await);
+        let path = scoped
             .root
             .join("blobs")
             .join(hash(ctx.namespace().as_bytes()))
             .join(digest);
-        let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    Error::NotFound
-                } else {
-                    internal(error)
+        let bytes = admission
+            .spawn_blocking(move || -> Result<Vec<u8>> {
+                let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Error::NotFound
+                    } else {
+                        internal(error)
+                    }
+                })?;
+                if !metadata.file_type().is_file() {
+                    return Err(Error::Conflict("blob is not a regular file".into()));
                 }
-            })?;
-            if !metadata.file_type().is_file() {
-                return Err(Error::Conflict("blob is not a regular file".into()));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.nlink() != 1 {
-                    return Err(Error::Conflict("linked blob is not trusted content".into()));
-                }
-            }
-            if metadata.len() == 0 || metadata.len() > max_bytes as u64 {
-                return Err(Error::Conflict(
-                    "blob exceeds the authorized read bound".into(),
-                ));
-            }
-            let file = File::open(&path).map_err(internal)?;
-            let opened = file.metadata().map_err(internal)?;
-            if !opened.is_file() || opened.len() != metadata.len() {
-                return Err(Error::Conflict("blob changed while being opened".into()));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if opened.nlink() != 1
-                    || opened.dev() != metadata.dev()
-                    || opened.ino() != metadata.ino()
+                #[cfg(unix)]
                 {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.nlink() != 1 {
+                        return Err(Error::Conflict("linked blob is not trusted content".into()));
+                    }
+                }
+                if metadata.len() == 0 || metadata.len() > max_bytes as u64 {
+                    return Err(Error::Conflict(
+                        "blob exceeds the authorized read bound".into(),
+                    ));
+                }
+                let file = File::open(&path).map_err(internal)?;
+                let opened = file.metadata().map_err(internal)?;
+                if !opened.is_file() || opened.len() != metadata.len() {
                     return Err(Error::Conflict("blob changed while being opened".into()));
                 }
-            }
-            let mut bytes = Vec::with_capacity(metadata.len() as usize);
-            file.take(max_bytes as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(internal)?;
-            if bytes.is_empty() || bytes.len() > max_bytes {
-                return Err(Error::Conflict("blob changed while being read".into()));
-            }
-            Ok(bytes)
-        })
-        .await
-        .map_err(internal)??;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if opened.nlink() != 1
+                        || opened.dev() != metadata.dev()
+                        || opened.ino() != metadata.ino()
+                    {
+                        return Err(Error::Conflict("blob changed while being opened".into()));
+                    }
+                }
+                let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                file.take(max_bytes as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(internal)?;
+                if bytes.is_empty() || bytes.len() > max_bytes {
+                    return Err(Error::Conflict("blob changed while being read".into()));
+                }
+                Ok(bytes)
+            })
+            .await
+            .map_err(internal)??;
         if hash(&bytes) != digest {
             return Err(Error::Conflict("blob content digest mismatch".into()));
         }
@@ -2072,13 +2327,21 @@ impl Store {
         if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(Error::Invalid("invalid content digest".into()));
         }
-        let _guard = self.blob_lock.write().await;
-        let path = self
+        let admission = self.admission()?;
+        let scoped = self.scoped_with(Arc::clone(&admission))?;
+        admission.hold_blob_write(Arc::clone(&scoped.blob_lock).write_owned().await);
+        let path = scoped
             .root
             .join("blobs")
             .join(hash(ctx.namespace().as_bytes()))
             .join(digest);
-        match tokio::fs::remove_file(path).await {
+        match {
+            let path = (path).to_path_buf();
+            admission
+                .spawn_blocking(move || std::fs::remove_file(path))
+                .await
+                .map_err(internal)?
+        } {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(internal(e)),
@@ -2086,11 +2349,12 @@ impl Store {
     }
     pub async fn verify_audit(&self, ctx: &Context) -> Result<usize> {
         ctx.require(&[evo_core::Role::Admin, evo_core::Role::Evaluator])?;
+        let mut connection = self.connection().await?;
         let rows = sqlx::query(
             "SELECT payload,previous_hash,digest FROM audit WHERE namespace=? ORDER BY seq",
         )
         .bind(ctx.namespace())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(internal)?;
         let mut previous = String::new();
@@ -7315,4 +7579,866 @@ mod owned_config_workspace {
         }
     }
     // END RSIA AG174B INDEPENDENT H2
+}
+
+// AG176 source stage A: data-only mirrors. These values do not establish
+// source authority, validation, candidate-before-registration order or permission.
+
+/// Data-only counterpart of the engine root opportunity, in its original field order.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetaRootOpportunity {
+    pub root_slot: u32,
+    pub branch_seq: u32,
+    pub action_seq: u32,
+    pub estimated_cost_upper_micros: u64,
+}
+
+/// Data-only counterpart of the engine exploration dependency.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetaExplorationDependency {
+    pub kind: String,
+    pub id: String,
+}
+
+/// Data-only counterpart of the engine world state, with the same wire names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaWorldState {
+    Collecting,
+    Sealed,
+    Stopped,
+}
+
+/// Complete data-only S0 snapshot; no authority or validation is implied.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetaS0Snapshot {
+    pub schema_version: String,
+    pub id: String,
+    pub approved_parent_digest: String,
+    pub context_signature: String,
+    pub parent_skill_digest: String,
+    pub parent_bundle_digest: String,
+    pub environment_digest: String,
+    pub model_digest: String,
+    pub tools_digest: String,
+    pub grader_digest: String,
+    pub rules_digest: String,
+    pub source_watermark: u64,
+    pub caps: evo_core::strategy::ExplorationCapsV1,
+    pub policy: evo_core::strategy::ElasticPolicyV1,
+    pub simulation: evo_core::strategy::SimulationContext,
+    pub root_opportunities: Vec<MetaRootOpportunity>,
+    pub dependencies: Vec<MetaExplorationDependency>,
+    pub successor_cost_upper_micros: u64,
+    pub initial_baseline_quality_micros: u32,
+    pub remaining_root_micros: u64,
+    pub remaining_recovery_dispatches: u8,
+    pub state: MetaWorldState,
+    pub node_ids: Vec<String>,
+    pub dispatch_ids: Vec<String>,
+    pub history_ids: Vec<String>,
+    pub current_branch_seq: Option<u32>,
+    pub current_branch_focus_actions: u8,
+    pub decision_round: u32,
+    pub waits: Vec<evo_core::strategy::OpportunityWait>,
+}
+
+/// Complete data-only stream limits, preserving the engine field order.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetaStreamLimits {
+    pub remaining_root_micros: u64,
+    pub root_opportunities: Vec<MetaRootOpportunity>,
+    pub successor_cost_upper_micros: u64,
+    pub remaining_recovery_dispatches: u8,
+}
+
+// AG176 source stage B: inline data and deterministic sampling only. A caller
+// must later bind these inputs to actual stored sources in the claim transaction.
+
+/// A physical source reference. Its fields do not authenticate the referenced row.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetaSourceRef {
+    pub namespace: String,
+    pub kind: String,
+    pub id: String,
+    pub owner: String,
+    pub schema_version: String,
+    pub raw_body_sha256: String,
+}
+
+/// The three closed purposes within one preregistered successor unit.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaSamplePurposeV1 {
+    S0TaskFamily,
+    DevelopmentEvidence,
+    HoldoutCluster,
+}
+
+/// Complete inline material. No debug representation exposes its private fields.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetaPoolMemberV1 {
+    pub identity: evo_core::evaluation::TaskIdentity,
+    pub material_utf8: String,
+    pub oracle_utf8: String,
+    pub source_refs: Vec<MetaSourceRef>,
+    pub source_watermark: Option<(i64, String)>,
+    pub eligible_purposes: Vec<MetaSamplePurposeV1>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetaPurposeCountsV1 {
+    pub s0_task_family: u32,
+    pub development_evidence: u32,
+    pub holdout_cluster: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaSamplerOrderingV1 {
+    PhysicalKeyThenHashRank,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetaSamplerRecipeV1 {
+    pub recipe_version: String,
+    pub purpose_counts: MetaPurposeCountsV1,
+    pub ordering: MetaSamplerOrderingV1,
+    pub without_replacement: bool,
+}
+
+/// One entry in the complete, consistent single-parent family lineage.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetaFamilyLineageV1 {
+    pub family_id: String,
+    pub parent_id: Option<String>,
+}
+
+/// Full selected members in rank order, without a qualification or authority flag.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetaSamplerSelectionV1 {
+    pub s0_task_family: Vec<MetaPoolMemberV1>,
+    pub development_evidence: Vec<MetaPoolMemberV1>,
+    pub holdout_cluster: Vec<MetaPoolMemberV1>,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+struct MetaSamplerMemberKey {
+    source_refs: Vec<MetaSourceRef>,
+    raw_hash: String,
+    normalized_digest: String,
+    task_id: String,
+    family_id: String,
+}
+
+fn meta_sampler_sha256_shape(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn meta_sampler_family_roots(
+    lineage: &[MetaFamilyLineageV1],
+) -> Result<std::collections::BTreeMap<String, (String, usize)>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut parents = BTreeMap::new();
+    for entry in lineage {
+        identifier(&entry.family_id)
+            .map_err(|_| Error::Invalid("meta_sampler_lineage_family_invalid".into()))?;
+        if let Some(parent) = &entry.parent_id {
+            identifier(parent)
+                .map_err(|_| Error::Invalid("meta_sampler_lineage_parent_invalid".into()))?;
+        }
+        if parents
+            .insert(entry.family_id.clone(), entry.parent_id.clone())
+            .is_some()
+        {
+            return Err(Error::Conflict("meta_sampler_lineage_ambiguous".into()));
+        }
+    }
+    let mut roots: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    for family in parents.keys() {
+        let mut cursor = family.as_str();
+        let mut path = Vec::new();
+        let mut visiting = BTreeSet::new();
+        let (root, mut depth) = loop {
+            if let Some((root, depth)) = roots.get(cursor) {
+                break (root.clone(), *depth);
+            }
+            if !visiting.insert(cursor.to_owned()) {
+                return Err(Error::Conflict("meta_sampler_lineage_cycle".into()));
+            }
+            path.push(cursor.to_owned());
+            match parents
+                .get(cursor)
+                .ok_or_else(|| Error::Conflict("meta_sampler_lineage_incomplete".into()))?
+            {
+                Some(parent) => cursor = parent,
+                None => break (cursor.to_owned(), 0),
+            }
+        };
+        for family in path.into_iter().rev() {
+            if family == root {
+                depth = 0;
+            } else {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Invalid("meta_sampler_lineage_depth_invalid".into()))?;
+            }
+            roots.insert(family, (root.clone(), depth));
+        }
+    }
+    Ok(roots)
+}
+
+/// Replays one closed sampling recipe over complete supplied material.
+///
+/// This pure function neither generates a seed nor verifies source authority.
+/// The future claim transaction must supply its actual seed, source rows, lineage
+/// and used identities, and must separately bound the complete I/T objects.
+pub fn sample_meta_pools_v1(
+    pool: &[MetaPoolMemberV1],
+    recipe: &MetaSamplerRecipeV1,
+    seed: &[u8],
+    used: &[evo_core::evaluation::TaskIdentity],
+    lineage: &[MetaFamilyLineageV1],
+) -> Result<MetaSamplerSelectionV1> {
+    use evo_core::evaluation::{DataUse, PartitionRegistry, TaskIdentity};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    if serde_json::to_vec(&(pool, recipe, seed, used, lineage))
+        .map_err(|_| Error::Internal)?
+        .len()
+        > 4 * 1024 * 1024
+    {
+        return Err(Error::Invalid("meta_sampler_input_exceeds_4_mib".into()));
+    }
+    if recipe.recipe_version != "rsia.meta_sampler.hash_rank.v1" || !recipe.without_replacement {
+        return Err(Error::Invalid("meta_sampler_recipe_invalid".into()));
+    }
+    if seed.is_empty() {
+        return Err(Error::Invalid("meta_sampler_seed_missing".into()));
+    }
+    let counts = [
+        recipe.purpose_counts.s0_task_family,
+        recipe.purpose_counts.development_evidence,
+        recipe.purpose_counts.holdout_cluster,
+    ];
+    if counts.contains(&0) {
+        return Err(Error::Invalid("meta_sampler_purpose_count_invalid".into()));
+    }
+    let total = counts.into_iter().try_fold(0u32, |sum, count| {
+        sum.checked_add(count)
+            .ok_or_else(|| Error::Invalid("meta_sampler_purpose_count_overflow".into()))
+    })?;
+    if u64::from(total) > pool.len() as u64 {
+        return Err(Error::Conflict("meta_sampler_pool_too_small".into()));
+    }
+    let roots = meta_sampler_family_roots(lineage)?;
+    let parents: BTreeMap<_, _> = lineage
+        .iter()
+        .map(|entry| (entry.family_id.clone(), entry.parent_id.clone()))
+        .collect();
+    let mut entries = Vec::with_capacity(pool.len());
+    let mut identities = Vec::with_capacity(pool.len() + used.len());
+    let mut pool_raw = BTreeSet::new();
+    let mut source_rows = BTreeMap::new();
+    for member in pool {
+        let actual = TaskIdentity::from_bytes(
+            &member.identity.task_id,
+            member.material_utf8.as_bytes(),
+            &member.identity.family_id,
+            member.identity.data_use,
+        )
+        .map_err(|_| Error::Invalid("meta_sampler_task_identity_invalid".into()))?;
+        if actual.raw_hash != member.identity.raw_hash {
+            return Err(Error::Conflict("meta_sampler_raw_material_mismatch".into()));
+        }
+        if actual.normalized_digest != member.identity.normalized_digest {
+            return Err(Error::Conflict(
+                "meta_sampler_normalized_material_mismatch".into(),
+            ));
+        }
+        if !pool_raw.insert(&member.identity.raw_hash) {
+            return Err(Error::Conflict("meta_sampler_repeated_pool_member".into()));
+        }
+        if member.source_refs.is_empty() || member.eligible_purposes.is_empty() {
+            return Err(Error::Invalid("meta_sampler_member_incomplete".into()));
+        }
+        let mut purposes = BTreeSet::new();
+        for purpose in &member.eligible_purposes {
+            if !purposes.insert(*purpose) {
+                return Err(Error::Invalid("meta_sampler_purpose_repeated".into()));
+            }
+            let expected_use = match purpose {
+                MetaSamplePurposeV1::S0TaskFamily | MetaSamplePurposeV1::DevelopmentEvidence => {
+                    DataUse::Development
+                }
+                MetaSamplePurposeV1::HoldoutCluster => DataUse::AcceptanceEpoch,
+            };
+            if member.identity.data_use != expected_use {
+                return Err(Error::Conflict(
+                    "meta_sampler_purpose_data_use_mismatch".into(),
+                ));
+            }
+        }
+        if let Some((sequence, watermark)) = &member.source_watermark {
+            if *sequence < 0 {
+                return Err(Error::Invalid(
+                    "meta_sampler_watermark_sequence_invalid".into(),
+                ));
+            }
+            identifier(watermark)
+                .map_err(|_| Error::Invalid("meta_sampler_watermark_invalid".into()))?;
+        }
+        let mut member_sources = BTreeSet::new();
+        for source in &member.source_refs {
+            for field in [
+                &source.namespace,
+                &source.kind,
+                &source.id,
+                &source.owner,
+                &source.schema_version,
+            ] {
+                identifier(field)
+                    .map_err(|_| Error::Invalid("meta_sampler_source_reference_invalid".into()))?;
+            }
+            if !meta_sampler_sha256_shape(&source.raw_body_sha256) {
+                return Err(Error::Invalid("meta_sampler_source_digest_invalid".into()));
+            }
+            let key = (&source.namespace, &source.kind, &source.id);
+            if !member_sources.insert(key) {
+                return Err(Error::Conflict(
+                    "meta_sampler_source_reference_repeated".into(),
+                ));
+            }
+            let content = (
+                &source.owner,
+                &source.schema_version,
+                &source.raw_body_sha256,
+            );
+            if let Some(existing) = source_rows.insert(key, content)
+                && existing != content
+            {
+                return Err(Error::Conflict(
+                    "meta_sampler_source_reference_conflict".into(),
+                ));
+            }
+        }
+        let mut source_refs = member.source_refs.clone();
+        source_refs.sort();
+        entries.push((
+            MetaSamplerMemberKey {
+                source_refs,
+                raw_hash: member.identity.raw_hash.clone(),
+                normalized_digest: member.identity.normalized_digest.clone(),
+                task_id: member.identity.task_id.clone(),
+                family_id: member.identity.family_id.clone(),
+            },
+            member,
+        ));
+    }
+    // Parent-first admission makes the existing registry's parent/DataUse rule
+    // independent of input vector order, while retaining the supplied metadata.
+    for identity in used
+        .iter()
+        .chain(pool.iter().map(|member| &member.identity))
+    {
+        identifier(&identity.task_id)
+            .map_err(|_| Error::Invalid("meta_sampler_task_identity_invalid".into()))?;
+        let (_, depth) = roots
+            .get(&identity.family_id)
+            .ok_or_else(|| Error::Conflict("meta_sampler_lineage_incomplete".into()))?;
+        if parents.get(&identity.family_id) != Some(&identity.parent_id) {
+            return Err(Error::Conflict(
+                "meta_sampler_identity_lineage_mismatch".into(),
+            ));
+        }
+        if !meta_sampler_sha256_shape(&identity.raw_hash)
+            || !meta_sampler_sha256_shape(&identity.normalized_digest)
+        {
+            return Err(Error::Invalid(
+                "meta_sampler_used_identity_digest_invalid".into(),
+            ));
+        }
+        identities.push((*depth, identity));
+    }
+    identities.sort_by(|left, right| {
+        left.0.cmp(&right.0).then_with(|| {
+            (
+                &left.1.family_id,
+                &left.1.task_id,
+                &left.1.raw_hash,
+                &left.1.normalized_digest,
+                &left.1.parent_id,
+                &left.1.source_repo,
+            )
+                .cmp(&(
+                    &right.1.family_id,
+                    &right.1.task_id,
+                    &right.1.raw_hash,
+                    &right.1.normalized_digest,
+                    &right.1.parent_id,
+                    &right.1.source_repo,
+                ))
+        })
+    });
+    let mut registry = PartitionRegistry::default();
+    let mut admitted_raw: BTreeMap<&str, &TaskIdentity> = BTreeMap::new();
+    for (_, identity) in identities {
+        if let Some(previous) = admitted_raw.get(identity.raw_hash.as_str()) {
+            if previous.task_id != identity.task_id
+                || previous.family_id != identity.family_id
+                || previous.normalized_digest != identity.normalized_digest
+                || previous.parent_id != identity.parent_id
+                || previous.source_repo != identity.source_repo
+                || previous.data_use != identity.data_use
+            {
+                return Err(Error::Conflict(
+                    "meta_sampler_used_identity_mismatch".into(),
+                ));
+            }
+            continue;
+        }
+        registry.admit(identity)?;
+        admitted_raw.insert(identity.raw_hash.as_str(), identity);
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut blocked_roots = BTreeSet::new();
+    let mut blocked_raw = BTreeSet::new();
+    let mut blocked_normalized = BTreeSet::new();
+    let mut selected_registry = PartitionRegistry::default();
+    for identity in used {
+        let (root, _) = roots
+            .get(&identity.family_id)
+            .ok_or_else(|| Error::Conflict("meta_sampler_lineage_incomplete".into()))?;
+        blocked_roots.insert(root.clone());
+        blocked_raw.insert(identity.raw_hash.clone());
+        blocked_normalized.insert(identity.normalized_digest.clone());
+        if identity.data_use.is_protected_holdout() {
+            selected_registry.mark_exposed(identity.raw_hash.clone());
+        }
+    }
+    let mut selection = MetaSamplerSelectionV1 {
+        s0_task_family: Vec::new(),
+        development_evidence: Vec::new(),
+        holdout_cluster: Vec::new(),
+    };
+    for (purpose, count, selected) in [
+        (
+            MetaSamplePurposeV1::S0TaskFamily,
+            recipe.purpose_counts.s0_task_family,
+            &mut selection.s0_task_family,
+        ),
+        (
+            MetaSamplePurposeV1::DevelopmentEvidence,
+            recipe.purpose_counts.development_evidence,
+            &mut selection.development_evidence,
+        ),
+        (
+            MetaSamplePurposeV1::HoldoutCluster,
+            recipe.purpose_counts.holdout_cluster,
+            &mut selection.holdout_cluster,
+        ),
+    ] {
+        let required = usize::try_from(count)
+            .map_err(|_| Error::Invalid("meta_sampler_purpose_count_invalid".into()))?;
+        let mut ranked = Vec::new();
+        for (key, member) in &entries {
+            if member.eligible_purposes.contains(&purpose) {
+                let rank = fingerprint(&(
+                    recipe.recipe_version.as_str(),
+                    recipe.ordering,
+                    purpose,
+                    seed,
+                    key,
+                ))?;
+                ranked.push((rank, key, *member));
+            }
+        }
+        ranked.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
+        for (_, _, member) in ranked {
+            let (root, _) = roots
+                .get(&member.identity.family_id)
+                .ok_or_else(|| Error::Conflict("meta_sampler_lineage_incomplete".into()))?;
+            if blocked_roots.contains(root)
+                || blocked_raw.contains(&member.identity.raw_hash)
+                || blocked_normalized.contains(&member.identity.normalized_digest)
+            {
+                continue;
+            }
+            selected_registry.admit(&member.identity)?;
+            blocked_roots.insert(root.clone());
+            blocked_raw.insert(member.identity.raw_hash.clone());
+            blocked_normalized.insert(member.identity.normalized_digest.clone());
+            selected.push((*member).clone());
+            if selected.len() == required {
+                break;
+            }
+        }
+        if selected.len() != required {
+            return Err(Error::Conflict(
+                "meta_sampler_distinct_material_insufficient".into(),
+            ));
+        }
+    }
+    Ok(selection)
+}
+
+// Ordinary owned backend only. Actual mounted OS/anchor authority is integrated
+// separately; neither ordinary open nor a cloned Store issues that authority.
+struct OwnedSqliteBackend {
+    state: Arc<OwnedBackendState>,
+    runtime: Option<tokio::runtime::Handle>,
+}
+struct OwnedBackendState {
+    connection: Arc<tokio::sync::Mutex<Option<sqlx::SqliteConnection>>>,
+    gate: std::sync::Mutex<OwnedBackendGate>,
+    changed: tokio::sync::Notify,
+}
+struct OwnedBackendGate {
+    closing: bool,
+    active: usize,
+    retirement_started: bool,
+    io_unacknowledged: bool,
+    driver_close_acknowledged: bool,
+    close_result: Option<std::result::Result<(), String>>,
+}
+struct OwnedBackendAdmission {
+    state: Arc<OwnedBackendState>,
+    fs_pending: std::sync::Mutex<usize>,
+    fs_changed: std::sync::Condvar,
+    blob_holds: std::sync::Mutex<Vec<OwnedBackendBlobHold>>,
+}
+enum OwnedBackendBlobHold {
+    Read {
+        _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    },
+    Write {
+        _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+    },
+}
+struct OwnedBackendFsWork {
+    admission: Arc<OwnedBackendAdmission>,
+    completed: bool,
+}
+struct OwnedBackendRetirement {
+    state: Option<Arc<OwnedBackendState>>,
+}
+impl Drop for OwnedBackendRetirement {
+    fn drop(&mut self) {
+        // No runtime, cancelled/never-polled retirement, Err and Drop are not
+        // resource ACKs. Keep the actual unacknowledged owner resident.
+        if let Some(state) = self.state.take() {
+            std::mem::forget(state);
+        }
+    }
+}
+impl OwnedSqliteBackend {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(OwnedBackendState {
+                connection: Arc::new(tokio::sync::Mutex::new(None)),
+                gate: std::sync::Mutex::new(OwnedBackendGate {
+                    closing: false,
+                    active: 0,
+                    retirement_started: false,
+                    io_unacknowledged: false,
+                    driver_close_acknowledged: false,
+                    close_result: None,
+                }),
+                changed: tokio::sync::Notify::new(),
+            }),
+            runtime: tokio::runtime::Handle::try_current().ok(),
+        }
+    }
+    fn admit(&self) -> Result<Arc<OwnedBackendAdmission>> {
+        let mut gate = self.state.gate.lock().expect("owned backend gate");
+        if gate.closing {
+            return Err(internal(sqlx::Error::PoolClosed));
+        }
+        gate.active = gate.active.checked_add(1).ok_or(Error::Internal)?;
+        Ok(Arc::new(OwnedBackendAdmission {
+            state: Arc::clone(&self.state),
+            fs_pending: std::sync::Mutex::new(0),
+            fs_changed: std::sync::Condvar::new(),
+            blob_holds: std::sync::Mutex::new(Vec::new()),
+        }))
+    }
+    fn start_retirement(&self) {
+        {
+            let mut gate = self.state.gate.lock().expect("owned backend gate");
+            gate.closing = true;
+            if gate.retirement_started {
+                return;
+            }
+            gate.retirement_started = true;
+        }
+        let mut retained = OwnedBackendRetirement {
+            state: Some(Arc::clone(&self.state)),
+        };
+        let Some(runtime) = &self.runtime else {
+            self.state
+                .gate
+                .lock()
+                .expect("owned backend gate")
+                .close_result = Some(Err("no runtime to observe connection retirement".into()));
+            self.state.changed.notify_waiters();
+            drop(retained);
+            return;
+        };
+        drop(runtime.spawn(async move {
+            let state = Arc::clone(retained.state.as_ref().expect("retirement owns state"));
+            loop {
+                let notified = state.changed.notified();
+                if state.gate.lock().expect("owned backend gate").active == 0 {
+                    break;
+                }
+                notified.await;
+            }
+            let connection = state.connection.lock().await.take();
+            let result = match connection {
+                Some(connection) => sqlx::Connection::close(connection)
+                    .await
+                    .map_err(|error| error.to_string()),
+                None => Err("no actual connection close acknowledgement".into()),
+            };
+            let acknowledged = {
+                let mut gate = state.gate.lock().expect("owned backend gate");
+                gate.driver_close_acknowledged = result.is_ok();
+                let result = if gate.driver_close_acknowledged && gate.io_unacknowledged {
+                    Err("filesystem work lacks completion acknowledgement".into())
+                } else {
+                    result
+                };
+                let acknowledged = result.is_ok();
+                gate.close_result = Some(result);
+                acknowledged
+            };
+            state.changed.notify_waiters();
+            if acknowledged {
+                retained.state = None;
+            }
+            drop(retained);
+        }));
+    }
+    async fn wait_retirement(&self) -> std::result::Result<(), String> {
+        loop {
+            let notified = self.state.changed.notified();
+            if let Some(result) = self
+                .state
+                .gate
+                .lock()
+                .expect("owned backend gate")
+                .close_result
+                .clone()
+            {
+                return result;
+            }
+            notified.await;
+        }
+    }
+}
+impl Drop for OwnedSqliteBackend {
+    fn drop(&mut self) {
+        self.start_retirement();
+    }
+}
+impl OwnedBackendAdmission {
+    fn spawn_blocking<T: Send + 'static>(
+        self: &Arc<Self>,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        *self.fs_pending.lock().expect("owned filesystem count") += 1;
+        let mut owner = OwnedBackendFsWork {
+            admission: Arc::clone(self),
+            completed: false,
+        };
+        tokio::task::spawn_blocking(move || {
+            let result = work();
+            owner.completed = true;
+            drop(owner);
+            result
+        })
+    }
+    fn wait_filesystem(&self) {
+        let mut pending = self.fs_pending.lock().expect("owned filesystem count");
+        while *pending != 0 {
+            pending = self
+                .fs_changed
+                .wait(pending)
+                .expect("owned filesystem completion");
+        }
+    }
+    fn hold_blob_read(&self, guard: tokio::sync::OwnedRwLockReadGuard<()>) {
+        self.blob_holds
+            .lock()
+            .expect("owned blob holds")
+            .push(OwnedBackendBlobHold::Read { _guard: guard });
+    }
+    fn hold_blob_write(&self, guard: tokio::sync::OwnedRwLockWriteGuard<()>) {
+        self.blob_holds
+            .lock()
+            .expect("owned blob holds")
+            .push(OwnedBackendBlobHold::Write { _guard: guard });
+    }
+    fn mark_io_unacknowledged(&self) {
+        self.state
+            .gate
+            .lock()
+            .expect("owned backend gate")
+            .io_unacknowledged = true;
+    }
+}
+impl Drop for OwnedBackendFsWork {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.admission.mark_io_unacknowledged();
+        }
+        let mut pending = self
+            .admission
+            .fs_pending
+            .lock()
+            .expect("owned filesystem count");
+        *pending -= 1;
+        self.admission.fs_changed.notify_all();
+    }
+}
+impl Drop for OwnedBackendAdmission {
+    fn drop(&mut self) {
+        self.blob_holds.lock().expect("owned blob holds").clear();
+        let mut gate = self.state.gate.lock().expect("owned backend gate");
+        gate.active -= 1;
+        drop(gate);
+        self.state.changed.notify_waiters();
+    }
+}
+struct OwnedConnectionGuard {
+    connection: tokio::sync::OwnedMutexGuard<Option<sqlx::SqliteConnection>>,
+    admission: Arc<OwnedBackendAdmission>,
+}
+impl std::ops::Deref for OwnedConnectionGuard {
+    type Target = sqlx::SqliteConnection;
+    fn deref(&self) -> &Self::Target {
+        self.connection
+            .as_ref()
+            .expect("admitted connection remains present")
+    }
+}
+impl std::ops::DerefMut for OwnedConnectionGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection
+            .as_mut()
+            .expect("admitted connection remains present")
+    }
+}
+struct OwnedSqliteTransaction {
+    connection: OwnedConnectionGuard,
+    open: bool,
+}
+impl OwnedSqliteTransaction {
+    async fn begin(mut connection: OwnedConnectionGuard) -> std::result::Result<Self, sqlx::Error> {
+        <sqlx::Sqlite as sqlx::Database>::TransactionManager::begin(&mut *connection, None).await?;
+        // No await between the begin ACK and this owned open frame.
+        Ok(Self {
+            connection,
+            open: true,
+        })
+    }
+    async fn commit(mut self) -> std::result::Result<(), sqlx::Error> {
+        <sqlx::Sqlite as sqlx::Database>::TransactionManager::commit(&mut *self.connection).await?;
+        self.open = false;
+        Ok(())
+    }
+}
+impl std::ops::Deref for OwnedSqliteTransaction {
+    type Target = sqlx::SqliteConnection;
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+impl std::ops::DerefMut for OwnedSqliteTransaction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+impl Drop for OwnedSqliteTransaction {
+    fn drop(&mut self) {
+        if self.open {
+            <sqlx::Sqlite as sqlx::Database>::TransactionManager::start_rollback(
+                &mut *self.connection,
+            );
+        }
+    }
+}
+impl Store {
+    fn admission(&self) -> Result<Arc<OwnedBackendAdmission>> {
+        match &self.inherited_admission {
+            Some(admission) if Arc::ptr_eq(&admission.state, &self.backend.state) => {
+                Ok(Arc::clone(admission))
+            }
+            Some(_) => Err(Error::Internal),
+            None => self.backend.admit(),
+        }
+    }
+    fn scoped_with(&self, admission: Arc<OwnedBackendAdmission>) -> Result<Self> {
+        if !Arc::ptr_eq(&admission.state, &self.backend.state) {
+            return Err(Error::Internal);
+        }
+        Ok(Self {
+            backend: Arc::clone(&self.backend),
+            root: self.root.clone(),
+            blob_lock: Arc::clone(&self.blob_lock),
+            inherited_admission: Some(admission),
+        })
+    }
+    async fn connection(&self) -> Result<OwnedConnectionGuard> {
+        self.connection_in(self.admission()?).await
+    }
+    async fn connection_in(
+        &self,
+        admission: Arc<OwnedBackendAdmission>,
+    ) -> Result<OwnedConnectionGuard> {
+        if !Arc::ptr_eq(&admission.state, &self.backend.state) {
+            return Err(Error::Internal);
+        }
+        let connection = Arc::clone(&self.backend.state.connection)
+            .lock_owned()
+            .await;
+        if connection.is_none() {
+            return Err(internal(sqlx::Error::PoolClosed));
+        }
+        Ok(OwnedConnectionGuard {
+            connection,
+            admission,
+        })
+    }
+}
+
+fn validate_registered_blob_publish_inputs(
+    ctx: &Context,
+    artifact_id: &str,
+    expected_schema: &str,
+    payload_digest_field: &str,
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<()> {
+    ctx.require(&[evo_core::Role::Host, evo_core::Role::Admin])?;
+    identifier(artifact_id)?;
+    validate_registered_blob_field(expected_schema, payload_digest_field)?;
+    validate_blob_bound(bytes, max_bytes)?;
+    Ok(())
 }

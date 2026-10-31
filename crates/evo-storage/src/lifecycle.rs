@@ -366,8 +366,12 @@ impl LifecycleStore {
                 "edge page limit must be 1..={MAX_CLEANUP_EDGE_PAGE}"
             )));
         }
-        let _blob_guard = store.blob_lock.write().await;
-        let mut tx = store.pool.begin().await.map_err(internal)?;
+        let admission = store.admission()?;
+        admission.hold_blob_write(std::sync::Arc::clone(&store.blob_lock).write_owned().await);
+        let mut connection = store.connection_in(admission).await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let status = load_status(&mut tx, ctx.namespace(), job_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -482,7 +486,10 @@ impl LifecycleStore {
     ) -> Result<CleanupStatus> {
         ctx.require(&[Role::Admin, Role::Worker])?;
         identifier(job_id)?;
-        let mut tx = store.pool.begin().await.map_err(internal)?;
+        let mut connection = store.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let status = load_status(&mut tx, ctx.namespace(), job_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -1019,35 +1026,41 @@ pub(crate) async fn backup_consistent(store: &Store, destination: &Path) -> Resu
         return Err(Error::Conflict("backup destination already exists".into()));
     }
     evo_core::now()?;
+    let admission = store.admission()?;
+    admission.hold_blob_write(std::sync::Arc::clone(&store.blob_lock).write_owned().await);
+    let mut connection = store
+        .connection_in(std::sync::Arc::clone(&admission))
+        .await?;
     let parent = destination.parent().unwrap_or(Path::new("."));
-    tokio::fs::create_dir_all(parent).await.map_err(internal)?;
+    std::fs::create_dir_all(parent).map_err(internal)?;
     let name = destination
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| Error::Invalid("backup destination needs a UTF-8 name".into()))?;
     let temp = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4()));
-    tokio::fs::create_dir(&temp).await.map_err(internal)?;
-    let result = backup_into_temp(store, &temp).await;
+    std::fs::create_dir(&temp).map_err(internal)?;
+    let result = backup_into_temp(store, &temp, &mut connection, &admission).await;
     if let Err(error) = result {
-        let _ = tokio::fs::remove_dir_all(&temp).await;
+        let _ = std::fs::remove_dir_all(&temp);
         return Err(error);
     }
     if destination.exists() {
-        let _ = tokio::fs::remove_dir_all(&temp).await;
+        let _ = std::fs::remove_dir_all(&temp);
         return Err(Error::Conflict(
             "backup destination appeared during backup".into(),
         ));
     }
     let source = temp.clone();
     let target = destination.to_path_buf();
-    let published = tokio::task::spawn_blocking(move || publish_backup_directory(&source, &target))
+    let published = admission
+        .spawn_blocking(move || publish_backup_directory(&source, &target))
         .await
         .map_err(internal)?;
     if let Err(error) = published {
-        let _ = tokio::fs::remove_dir_all(&temp).await;
+        let _ = std::fs::remove_dir_all(&temp);
         return Err(error);
     }
-    sync_directory(parent.to_path_buf()).await?;
+    sync_directory(parent.to_path_buf(), &admission).await?;
     Ok(())
 }
 
@@ -1074,9 +1087,13 @@ fn publish_backup_directory(source: &Path, destination: &Path) -> Result<()> {
     }
 }
 
-async fn backup_into_temp(store: &Store, temp: &Path) -> Result<()> {
-    let _blob_guard = store.blob_lock.write().await;
-    let mut connection = store.pool.acquire().await.map_err(internal)?;
+async fn backup_into_temp(
+    store: &Store,
+    temp: &Path,
+    connection: &mut super::OwnedConnectionGuard,
+    admission: &std::sync::Arc<super::OwnedBackendAdmission>,
+) -> Result<()> {
+    let mut connection: &mut sqlx::SqliteConnection = &mut **connection;
     let database_path = temp.join("rsia.sqlite3");
     sqlx::query("VACUUM INTO ?")
         .bind(database_path.to_string_lossy().as_ref())
@@ -1100,11 +1117,9 @@ async fn backup_into_temp(store: &Store, temp: &Path) -> Result<()> {
     };
     let manifest_path = temp.join("backup-manifest.json");
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(internal)?;
-    tokio::fs::write(&manifest_path, bytes)
-        .await
-        .map_err(internal)?;
+    std::fs::write(&manifest_path, bytes).map_err(internal)?;
     sync_file(&manifest_path).await?;
-    sync_directory(temp.to_path_buf()).await
+    sync_directory(temp.to_path_buf(), admission).await
 }
 
 async fn load_backup_migrations(
@@ -1187,8 +1202,7 @@ async fn copy_backup_blobs(store: &Store, temp: &Path) -> Result<Vec<BackupFileE
     if !source.exists() {
         return Ok(Vec::new());
     }
-    if !tokio::fs::symlink_metadata(&source)
-        .await
+    if !std::fs::symlink_metadata(&source)
         .map_err(internal)?
         .is_dir()
     {
@@ -1198,9 +1212,9 @@ async fn copy_backup_blobs(store: &Store, temp: &Path) -> Result<Vec<BackupFileE
     }
     let target_root = temp.join("blobs");
     let mut entries = Vec::new();
-    let mut namespaces = tokio::fs::read_dir(&source).await.map_err(internal)?;
-    while let Some(namespace) = namespaces.next_entry().await.map_err(internal)? {
-        if !namespace.file_type().await.map_err(internal)?.is_dir() {
+    for namespace in std::fs::read_dir(&source).map_err(internal)? {
+        let namespace = namespace.map_err(internal)?;
+        if !namespace.file_type().map_err(internal)?.is_dir() {
             return Err(Error::Conflict(
                 "unexpected non-directory in blob root".into(),
             ));
@@ -1210,17 +1224,15 @@ async fn copy_backup_blobs(store: &Store, temp: &Path) -> Result<Vec<BackupFileE
             .to_str()
             .ok_or_else(|| Error::Invalid("blob namespace path is not UTF-8".into()))?;
         let target_namespace = target_root.join(&namespace_name);
-        let mut files = tokio::fs::read_dir(namespace.path())
-            .await
-            .map_err(internal)?;
-        while let Some(file) = files.next_entry().await.map_err(internal)? {
-            if !file.file_type().await.map_err(internal)?.is_file() {
+        for file in std::fs::read_dir(namespace.path()).map_err(internal)? {
+            let file = file.map_err(internal)?;
+            if !file.file_type().map_err(internal)?.is_file() {
                 return Err(Error::Conflict("blob entry is not a regular file".into()));
             }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                if file.metadata().await.map_err(internal)?.nlink() != 1 {
+                if file.metadata().map_err(internal)?.nlink() != 1 {
                     return Err(Error::Conflict(
                         "hard-linked blob is not a backup member".into(),
                     ));
@@ -1231,18 +1243,16 @@ async fn copy_backup_blobs(store: &Store, temp: &Path) -> Result<Vec<BackupFileE
                 .to_str()
                 .ok_or_else(|| Error::Invalid("blob path is not UTF-8".into()))?;
             let relative = format!("blobs/{namespace_text}/{file_text}");
-            let bytes = tokio::fs::read(file.path()).await.map_err(internal)?;
+            let bytes = std::fs::read(file.path()).map_err(internal)?;
             if evo_core::hash(&bytes) != file_text {
                 return Err(Error::Conflict("blob filename digest mismatch".into()));
             }
-            tokio::fs::create_dir_all(&target_namespace)
-                .await
-                .map_err(internal)?;
+            std::fs::create_dir_all(&target_namespace).map_err(internal)?;
             let destination = target_namespace.join(&file_name);
-            tokio::fs::write(&destination, &bytes)
-                .await
+            std::fs::write(&destination, &bytes).map_err(internal)?;
+            std::fs::File::open(&destination)
+                .and_then(|file| file.sync_all())
                 .map_err(internal)?;
-            sync_file(&destination).await?;
             entries.push(BackupFileEntry {
                 path: relative,
                 sha256: evo_core::hash(&bytes),
@@ -1254,7 +1264,7 @@ async fn copy_backup_blobs(store: &Store, temp: &Path) -> Result<Vec<BackupFileE
 }
 
 async fn file_entry(path: &Path, relative: &str) -> Result<BackupFileEntry> {
-    let bytes = tokio::fs::read(path).await.map_err(internal)?;
+    let bytes = std::fs::read(path).map_err(internal)?;
     Ok(BackupFileEntry {
         path: relative.into(),
         sha256: evo_core::hash(&bytes),
@@ -1263,16 +1273,19 @@ async fn file_entry(path: &Path, relative: &str) -> Result<BackupFileEntry> {
 }
 
 async fn sync_file(path: &Path) -> Result<()> {
-    let file = tokio::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .open(path)
-        .await
         .map_err(internal)?;
-    file.sync_all().await.map_err(internal)
+    file.sync_all().map_err(internal)
 }
 
-async fn sync_directory(path: PathBuf) -> Result<()> {
-    tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
+async fn sync_directory(
+    path: PathBuf,
+    admission: &std::sync::Arc<super::OwnedBackendAdmission>,
+) -> Result<()> {
+    admission
+        .spawn_blocking(move || std::fs::File::open(path)?.sync_all())
         .await
         .map_err(internal)?
         .map_err(internal)
@@ -2482,7 +2495,7 @@ async fn remove_controlled_local_export(
     let export_root = store.root.join("exports");
     let namespace_root = export_root.join(evo_core::hash(ctx.namespace().as_bytes()));
     for ancestor in [&export_root, &namespace_root] {
-        match tokio::fs::symlink_metadata(ancestor).await {
+        match std::fs::symlink_metadata(ancestor) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => {
                 return mark_unknown_scope(
@@ -2512,7 +2525,7 @@ async fn remove_controlled_local_export(
         }
     }
     let path = namespace_root.join(&node.id);
-    match tokio::fs::symlink_metadata(&path).await {
+    match std::fs::symlink_metadata(&path) {
         Ok(metadata) => {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return mark_unknown_scope(
@@ -2525,9 +2538,11 @@ async fn remove_controlled_local_export(
                 )
                 .await;
             }
-            tokio::fs::remove_dir_all(&path).await.map_err(internal)?;
+            std::fs::remove_dir_all(&path).map_err(internal)?;
             if let Some(parent) = path.parent() {
-                sync_directory(parent.to_path_buf()).await?;
+                std::fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(internal)?;
             }
             insert_cleanup_event(
                 tx,
@@ -2629,7 +2644,7 @@ async fn remove_e16_blob_if_unreferenced(
         .join("blobs")
         .join(evo_core::hash(ctx.namespace().as_bytes()))
         .join(digest);
-    match tokio::fs::symlink_metadata(&path).await {
+    match std::fs::symlink_metadata(&path) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() {
                 return Err(Error::Conflict("refusing to remove linked E16 blob".into()));
@@ -2643,7 +2658,7 @@ async fn remove_e16_blob_if_unreferenced(
                     ));
                 }
             }
-            tokio::fs::remove_file(path).await.map_err(internal)?;
+            std::fs::remove_file(path).map_err(internal)?;
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),

@@ -12,7 +12,7 @@ use evo_core::evaluation::OptimizationStage;
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, text};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{Acquire, Row, Sqlite, Transaction};
+use sqlx::{Row, Sqlite, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -688,7 +688,10 @@ impl Store {
     ) -> Result<RootBudgetRecord> {
         ctx.require(&[Role::Admin])?;
         let namespaces = validate_authorization(ctx, authorization)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         if let Some(row) = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
             .bind(&authorization.billing_scope)
             .fetch_optional(&mut *tx)
@@ -763,7 +766,10 @@ impl Store {
         )
         .await?;
         tx.commit().await.map_err(internal)?;
-        self.root_budget(ctx, &authorization.billing_scope)
+        let scoped = self.scoped_with(std::sync::Arc::clone(&connection.admission))?;
+        drop(connection);
+        scoped
+            .root_budget(ctx, &authorization.billing_scope)
             .await?
             .ok_or(Error::Internal)
     }
@@ -775,7 +781,10 @@ impl Store {
     ) -> Result<Option<RootBudgetRecord>> {
         require_budget_reader(ctx)?;
         identifier(billing_scope)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let root = root_budget_in_tx(&mut tx, ctx, billing_scope).await?;
         tx.commit().await.map_err(internal)?;
         Ok(root)
@@ -853,7 +862,10 @@ impl Store {
             Ok(ids) => ids,
             Err(refusal) => return Ok(Err(refusal)),
         };
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         if let Some(existing) = load_call(&mut tx, &request.billing_scope, &request.call_id).await?
             && existing.namespace == ctx.namespace()
             && typed_budget::call_mode_in_tx(&mut tx, &existing).await? != E16CallMode::Legacy
@@ -908,7 +920,10 @@ impl Store {
                 other => other.into_reservation_error(),
             });
         }
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let existing = load_call(&mut tx, &request.billing_scope, &request.call_id).await?;
         if let Some(call) = &existing {
             require_call_access(&mut tx, ctx, call).await?;
@@ -969,7 +984,10 @@ impl Store {
         ctx.require(&[Role::Host, Role::Admin])?;
         identifier(billing_scope)?;
         identifier(call_id)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let call = load_call(&mut tx, billing_scope, call_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -996,7 +1014,10 @@ impl Store {
         request: &BudgetCallRefence,
     ) -> Result<BudgetCallRecord> {
         validate_budget_refence(ctx, request)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let updated = refence_reserved_budget_call_in_tx(&mut tx, ctx, request).await?;
         tx.commit().await.map_err(internal)?;
         Ok(updated)
@@ -1028,7 +1049,10 @@ impl Store {
         ctx: &Context,
         fence: &BudgetCallFence,
     ) -> BudgetPreDispatchResult<BudgetDispatchDecision> {
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let decision = begin_budget_dispatch_in_tx_typed(&mut tx, ctx, fence).await?;
         if decision.is_err() {
             return Ok(decision);
@@ -1045,7 +1069,10 @@ impl Store {
         billing_scope: &str,
         call_id: &str,
     ) -> BudgetPreDispatchResult<Option<BudgetCallRecord>> {
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let result = budget_call_in_tx_typed(&mut tx, ctx, billing_scope, call_id).await?;
         if result.is_err() {
             return Ok(result);
@@ -1063,7 +1090,10 @@ impl Store {
         require_budget_caller(ctx)?;
         validate_fence(fence)?;
         validate_charge(charge)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -1120,7 +1150,10 @@ impl Store {
                 "registered settlement differs from its fence and charge".into(),
             ));
         }
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -1283,7 +1316,10 @@ impl Store {
         validate_fence(fence)?;
         validate_charge(charge)?;
         validate_model_settlement_evidence(evidence)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -1512,7 +1548,10 @@ impl Store {
         require_budget_caller(ctx)?;
         validate_fence(fence)?;
         validate_reason(reason)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -1557,7 +1596,10 @@ impl Store {
         fence: &BudgetCallFence,
         reason: &str,
     ) -> Result<BudgetCallRecord> {
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let call = release_undispatched_in_tx(&mut tx, ctx, fence, reason).await?;
         tx.commit().await.map_err(internal)?;
         Ok(call)
@@ -1572,7 +1614,10 @@ impl Store {
         require_budget_caller(ctx)?;
         validate_fence(fence)?;
         validate_reason(reason)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -1635,7 +1680,10 @@ impl Store {
         identifier(call_id)?;
         valid_time(now)?;
         validate_charge(charge)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let call = load_call(&mut tx, billing_scope, call_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -1680,7 +1728,10 @@ impl Store {
         identifier(dispatch_id)?;
         validate_reason(reason)?;
         valid_time(now)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let call = load_call(&mut tx, billing_scope, call_id)
             .await?
             .ok_or(Error::NotFound)?;
@@ -1773,6 +1824,7 @@ impl Store {
         const PAGE: i64 = 128;
         ctx.require(&[Role::Admin])?;
         valid_time(now)?;
+        let scoped = self.scoped_with(self.admission()?)?;
         let mut recovery = SettledOpenRecovery::default();
         let mut cursor: Option<(String, String)> = None;
         loop {
@@ -1782,7 +1834,10 @@ impl Store {
             };
             // A page is read and released before anything is closed: the store has a
             // single connection, and every close takes it in a transaction of its own.
-            let mut tx = self.pool.begin().await.map_err(internal)?;
+            let mut connection = scoped.connection().await?;
+            let mut tx = sqlx::Connection::begin(&mut *connection)
+                .await
+                .map_err(internal)?;
             let rows = sqlx::query(
                 "SELECT billing_scope,call_id,dispatch_id,
                    response_artifact_body IS NOT NULL AS has_response
@@ -1806,6 +1861,7 @@ impl Store {
             .await
             .map_err(internal)?;
             tx.commit().await.map_err(internal)?;
+            drop(connection);
             if rows.is_empty() {
                 return Ok(recovery);
             }
@@ -1820,7 +1876,7 @@ impl Store {
                     continue;
                 }
                 let dispatch_id: String = row.try_get("dispatch_id").map_err(internal)?;
-                let call = self
+                let call = scoped
                     .close_budget_call_execution(
                         ctx,
                         &key.billing_scope,
@@ -1850,7 +1906,10 @@ impl Store {
         identifier(billing_scope)?;
         validate_reason(reason)?;
         valid_time(now)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let root = stop_root_budget_in_tx(&mut tx, ctx, billing_scope, reason, now).await?;
         tx.commit().await.map_err(internal)?;
         Ok(root)
@@ -1864,7 +1923,10 @@ impl Store {
         reason: &str,
         now: i64,
     ) -> Result<DispatchGroupRecord> {
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let updated =
             stop_dispatch_group_in_tx(&mut tx, ctx, billing_scope, dispatch_group_id, reason, now)
                 .await?;
@@ -1881,7 +1943,10 @@ impl Store {
         require_budget_reader(ctx)?;
         identifier(billing_scope)?;
         identifier(dispatch_group_id)?;
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         require_namespace(&mut tx, billing_scope, ctx.namespace()).await?;
         let group = load_dispatch_group(&mut tx, billing_scope, dispatch_group_id).await?;
         if let Some(group) = &group
@@ -1900,7 +1965,10 @@ impl Store {
         billing_scope: &str,
         call_id: &str,
     ) -> Result<Option<BudgetCallRecord>> {
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut connection = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection)
+            .await
+            .map_err(internal)?;
         let call = budget_call_in_tx(&mut tx, ctx, billing_scope, call_id).await?;
         tx.commit().await.map_err(internal)?;
         Ok(call)
@@ -1957,7 +2025,9 @@ impl Session {
         request: &BudgetCallReservation,
         source_ids: &[String],
     ) -> BudgetPreDispatchResult<BudgetCallRecord> {
-        let mut savepoint = (&mut self.tx).begin().await.map_err(internal)?;
+        let mut savepoint = sqlx::Connection::begin(&mut *self.tx)
+            .await
+            .map_err(internal)?;
         let result =
             reserve_budget_call_with_sources_in_tx_typed(&mut savepoint, ctx, request, source_ids)
                 .await;
@@ -1982,7 +2052,9 @@ impl Session {
         request: &BudgetCallRefence,
     ) -> Result<BudgetCallRecord> {
         validate_budget_refence(ctx, request)?;
-        let mut savepoint = (&mut self.tx).begin().await.map_err(internal)?;
+        let mut savepoint = sqlx::Connection::begin(&mut *self.tx)
+            .await
+            .map_err(internal)?;
         let result = refence_reserved_budget_call_in_tx(&mut savepoint, ctx, request).await;
         match result {
             Ok(call) => {

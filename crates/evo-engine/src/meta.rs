@@ -1876,3 +1876,176 @@ mod tests {
         ));
     }
 }
+
+// AG176 source stage A: lossless typed adapters only. Existing engine wire,
+// validation and digest paths remain unchanged and do not consume these mirrors.
+
+impl From<crate::exploration::RootOpportunity> for evo_storage::MetaRootOpportunity {
+    fn from(value: crate::exploration::RootOpportunity) -> Self {
+        Self {
+            root_slot: value.root_slot,
+            branch_seq: value.branch_seq,
+            action_seq: value.action_seq,
+            estimated_cost_upper_micros: value.estimated_cost_upper_micros,
+        }
+    }
+}
+
+impl From<evo_storage::MetaRootOpportunity> for crate::exploration::RootOpportunity {
+    fn from(value: evo_storage::MetaRootOpportunity) -> Self {
+        Self {
+            root_slot: value.root_slot,
+            branch_seq: value.branch_seq,
+            action_seq: value.action_seq,
+            estimated_cost_upper_micros: value.estimated_cost_upper_micros,
+        }
+    }
+}
+
+impl From<crate::exploration::ExplorationDependency> for evo_storage::MetaExplorationDependency {
+    fn from(value: crate::exploration::ExplorationDependency) -> Self {
+        Self {
+            kind: value.kind,
+            id: value.id,
+        }
+    }
+}
+
+impl From<evo_storage::MetaExplorationDependency> for crate::exploration::ExplorationDependency {
+    fn from(value: evo_storage::MetaExplorationDependency) -> Self {
+        Self {
+            kind: value.kind,
+            id: value.id,
+        }
+    }
+}
+
+impl From<crate::exploration::WorldState> for evo_storage::MetaWorldState {
+    fn from(value: crate::exploration::WorldState) -> Self {
+        match value {
+            crate::exploration::WorldState::Collecting => Self::Collecting,
+            crate::exploration::WorldState::Sealed => Self::Sealed,
+            crate::exploration::WorldState::Stopped => Self::Stopped,
+        }
+    }
+}
+
+impl From<evo_storage::MetaWorldState> for crate::exploration::WorldState {
+    fn from(value: evo_storage::MetaWorldState) -> Self {
+        match value {
+            evo_storage::MetaWorldState::Collecting => Self::Collecting,
+            evo_storage::MetaWorldState::Sealed => Self::Sealed,
+            evo_storage::MetaWorldState::Stopped => Self::Stopped,
+        }
+    }
+}
+
+impl From<crate::exploration::ExplorationWorldV1> for evo_storage::MetaS0Snapshot {
+    fn from(value: crate::exploration::ExplorationWorldV1) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            id: value.id,
+            approved_parent_digest: value.approved_parent_digest,
+            context_signature: value.context_signature,
+            parent_skill_digest: value.parent_skill_digest,
+            parent_bundle_digest: value.parent_bundle_digest,
+            environment_digest: value.environment_digest,
+            model_digest: value.model_digest,
+            tools_digest: value.tools_digest,
+            grader_digest: value.grader_digest,
+            rules_digest: value.rules_digest,
+            source_watermark: value.source_watermark,
+            caps: value.caps,
+            policy: value.policy,
+            simulation: value.simulation,
+            root_opportunities: value
+                .root_opportunities
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            dependencies: value.dependencies.into_iter().map(Into::into).collect(),
+            successor_cost_upper_micros: value.successor_cost_upper_micros,
+            initial_baseline_quality_micros: value.initial_baseline_quality_micros,
+            remaining_root_micros: value.remaining_root_micros,
+            remaining_recovery_dispatches: value.remaining_recovery_dispatches,
+            state: value.state.into(),
+            node_ids: value.node_ids,
+            dispatch_ids: value.dispatch_ids,
+            history_ids: value.history_ids,
+            current_branch_seq: value.current_branch_seq,
+            current_branch_focus_actions: value.current_branch_focus_actions,
+            decision_round: value.decision_round,
+            waits: value.waits,
+        }
+    }
+}
+
+impl From<evo_storage::MetaS0Snapshot> for crate::exploration::ExplorationWorldV1 {
+    fn from(value: evo_storage::MetaS0Snapshot) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            id: value.id,
+            approved_parent_digest: value.approved_parent_digest,
+            context_signature: value.context_signature,
+            parent_skill_digest: value.parent_skill_digest,
+            parent_bundle_digest: value.parent_bundle_digest,
+            environment_digest: value.environment_digest,
+            model_digest: value.model_digest,
+            tools_digest: value.tools_digest,
+            grader_digest: value.grader_digest,
+            rules_digest: value.rules_digest,
+            source_watermark: value.source_watermark,
+            caps: value.caps,
+            policy: value.policy,
+            simulation: value.simulation,
+            root_opportunities: value
+                .root_opportunities
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            dependencies: value.dependencies.into_iter().map(Into::into).collect(),
+            successor_cost_upper_micros: value.successor_cost_upper_micros,
+            initial_baseline_quality_micros: value.initial_baseline_quality_micros,
+            remaining_root_micros: value.remaining_root_micros,
+            remaining_recovery_dispatches: value.remaining_recovery_dispatches,
+            state: value.state.into(),
+            node_ids: value.node_ids,
+            dispatch_ids: value.dispatch_ids,
+            history_ids: value.history_ids,
+            current_branch_seq: value.current_branch_seq,
+            current_branch_focus_actions: value.current_branch_focus_actions,
+            decision_round: value.decision_round,
+            waits: value.waits,
+        }
+    }
+}
+
+impl From<StreamLimitsV1> for evo_storage::MetaStreamLimits {
+    fn from(value: StreamLimitsV1) -> Self {
+        Self {
+            remaining_root_micros: value.remaining_root_micros,
+            root_opportunities: value
+                .root_opportunities
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            successor_cost_upper_micros: value.successor_cost_upper_micros,
+            remaining_recovery_dispatches: value.remaining_recovery_dispatches,
+        }
+    }
+}
+
+impl From<evo_storage::MetaStreamLimits> for StreamLimitsV1 {
+    fn from(value: evo_storage::MetaStreamLimits) -> Self {
+        Self {
+            remaining_root_micros: value.remaining_root_micros,
+            root_opportunities: value
+                .root_opportunities
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            successor_cost_upper_micros: value.successor_cost_upper_micros,
+            remaining_recovery_dispatches: value.remaining_recovery_dispatches,
+        }
+    }
+}
