@@ -1688,6 +1688,13 @@ async fn absent_binding_keeps_legacy_late_invalidation_and_wire_absence() {
         true,
     )
     .await;
+    IndependentEvaluationControl::register_current_holdout(
+        &refused.evaluator,
+        &refused.store,
+        refused.current_holdout.as_ref().unwrap().clone(),
+    )
+    .await
+    .unwrap();
     assert_issue_refused_without_candidate(&refused).await;
     refused.store.close().await;
 

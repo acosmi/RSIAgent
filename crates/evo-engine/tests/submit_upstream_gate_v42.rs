@@ -1873,17 +1873,21 @@ async fn an_experiment_register_over_an_input_derived_from_a_revoked_run_is_refu
     .await;
 
     // `evaluation.start` and `evaluation.status` read only the control, the
-    // holdout and the ticket, which have no edge to a run: still accepted.
+    // holdout and the Current ticket. None of them is in the closure of
+    // `run-failure` (the ticket binds its candidate, whose only source is the
+    // separate e05 run), so both are accepted at submit. The ticket also binds
+    // the revoke watermark its candidate was staged at, which has moved since,
+    // so both jobs fail closed (plan v4.5 §7.4.2 L1178, §11 L1448).
     for (operation, request, expected) in [
         (
             "evaluation.start",
             e05.start_request("start-after-begin"),
-            ManagementJobState::Blocked,
+            ManagementJobState::Failed,
         ),
         (
             "evaluation.status",
             e05.status_request("status-after-begin"),
-            ManagementJobState::Succeeded,
+            ManagementJobState::Failed,
         ),
     ] {
         let queued = dispatcher
@@ -1892,7 +1896,26 @@ async fn an_experiment_register_over_an_input_derived_from_a_revoked_run_is_refu
             .unwrap_or_else(|error| panic!("{operation} was refused: {error:?}"));
         let done = wait_job(store, evaluator, &queued.id).await;
         assert_eq!(done.state, expected, "{operation}: {done:?}");
+        assert_eq!(
+            done.error_code.as_deref(),
+            Some("conflict"),
+            "{operation}: {done:?}"
+        );
     }
+    // A job keeps only its error code; a read of the ticket names the cause.
+    let reread = evo_engine::streaming_evaluator::IndependentEvaluationControl::status(
+        evaluator,
+        store,
+        &e05.ticket_id,
+    )
+    .await;
+    assert!(
+        matches!(
+            &reread,
+            Err(Error::Conflict(message)) if message == "source revoke watermark changed"
+        ),
+        "{reread:?}"
+    );
 
     let cleanup = drive(store, &admin, cleanup, 8).await;
     assert_eq!(cleanup.state, CleanupState::Complete, "{cleanup:?}");

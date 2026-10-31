@@ -2660,7 +2660,7 @@ struct HistoricalFixture {
     billing_scope: String,
     expected_formal: Value,
 }
-async fn historical_fixture(snapshot: &str) -> HistoricalFixture {
+async fn historical_fixture(snapshot: &str, namespace: &str) -> HistoricalFixture {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("rsia.sqlite3");
     let script = r#"import base64,hashlib,json,sys,zlib
@@ -2702,7 +2702,7 @@ print(json.dumps({k:material[k] for k in ('ticket_id','billing_scope','expected_
         _directory: directory,
         db,
         store,
-        evaluator: Context::new("n", "evaluator", Role::Evaluator).unwrap(),
+        evaluator: Context::new(namespace, "evaluator", Role::Evaluator).unwrap(),
         ticket_id: metadata["ticket_id"].as_str().unwrap().into(),
         billing_scope: metadata["billing_scope"].as_str().unwrap().into(),
         expected_formal: metadata["expected_formal"].clone(),
@@ -2766,7 +2766,7 @@ async fn historical_views(
 async fn historical_money(
     fixture: &HistoricalFixture,
 ) -> evo_storage::budget::RootBudgetMonetarySnapshot {
-    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let admin = Context::new(fixture.evaluator.namespace(), "admin", Role::Admin).unwrap();
     let mut session = fixture.store.session().await.unwrap();
     let snapshot = session
         .root_budget_monetary_snapshot(&admin, &fixture.billing_scope)
@@ -2783,7 +2783,7 @@ async fn assert_natural_none_original(kind: &str) {
         "early" => AG192_NONE_EARLY,
         _ => unreachable!(),
     };
-    let mut fixture = historical_fixture(snapshot).await;
+    let mut fixture = historical_fixture(snapshot, "ag192-ac-software").await;
     let before = catalog(&fixture.db);
     let status = historical_views(&fixture).await;
     assert_eq!(status.ticket.schema_version, "rsia.evaluation_ticket.v2");
@@ -2815,7 +2815,7 @@ async fn assert_bound_original_late(kind: &str) {
         "early" => AG192_BOUND_EARLY,
         _ => unreachable!(),
     };
-    let mut fixture = historical_fixture(snapshot).await;
+    let mut fixture = historical_fixture(snapshot, "n").await;
     let before = historical_views(&fixture).await;
     assert_eq!(before.ticket.schema_version, "rsia.evaluation_ticket.v3");
     assert!(before.ticket.candidate_dependency_binding.is_some());
@@ -2841,12 +2841,11 @@ async fn assert_bound_original_late(kind: &str) {
             _ => None,
         })
         .unwrap();
-    let receipt_id = format!("historical-{kind}-late-grader");
     IndependentEvaluationControl::record_grader_receipt(
         &fixture.evaluator,
         &fixture.store,
         GraderReceiptRequest {
-            receipt_id: receipt_id.clone(),
+            receipt_id: format!("historical-{kind}-late-grader"),
             ticket_id: fixture.ticket_id.clone(),
             target_id: target,
             candidate_execution_receipt_id: candidate,
@@ -2862,31 +2861,17 @@ async fn assert_bound_original_late(kind: &str) {
         fingerprint(&after.ticket.source_plan_binding).unwrap(),
         fingerprint(&before.ticket.source_plan_binding).unwrap()
     );
-    if kind == "early" {
-        assert_eq!(
-            fingerprint(&after.ticket.pending_certificate).unwrap(),
-            fingerprint(&before.ticket.pending_certificate).unwrap()
-        );
-        assert_eq!(
-            after.ticket.stop_member_terminal_digest,
-            before.ticket.stop_member_terminal_digest
-        );
-        assert!(after.ticket.late_grader_receipt_ids.contains(&receipt_id));
-        let mut actual = serde_json::to_value(after.formal.as_ref().unwrap()).unwrap();
-        let expected = serde_json::to_value(before.formal.as_ref().unwrap()).unwrap();
-        assert_eq!(actual["ticket_digest"], fingerprint(&after.ticket).unwrap());
-        actual["ticket_digest"] = expected["ticket_digest"].clone();
-        assert_eq!(actual, expected);
-    } else {
-        assert_eq!(
-            serde_json::to_value(&after.ticket).unwrap(),
-            serde_json::to_value(&before.ticket).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(&after.formal).unwrap(),
-            serde_json::to_value(&before.formal).unwrap()
-        );
-    }
+    // The chosen pair was scored before the final report in all three snapshots
+    // (early: r0..r12/a0 completed, the rest never dispatched), so AG-118 keeps
+    // the late grader as audit only and the ticket and report stay identical.
+    assert_eq!(
+        serde_json::to_value(&after.ticket).unwrap(),
+        serde_json::to_value(&before.ticket).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&after.formal).unwrap(),
+        serde_json::to_value(&before.formal).unwrap()
+    );
     assert_eq!(historical_money(&fixture).await, monetary);
     fixture.store.close().await;
     fixture.store = Store::open(&fixture.db).await.unwrap();

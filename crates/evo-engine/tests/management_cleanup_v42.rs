@@ -40,9 +40,13 @@
 //! - `experiment.register`: only through a holdout input artifact that is itself
 //!   derived from the run (its input ids are operator-supplied references; the
 //!   control and the holdout record have no edge to a run);
-//! - `evaluation.start` / `evaluation.status`: not reachable. Their inputs depend
-//!   on the registered control, the protected holdout and the ticket, none of
-//!   which has an edge to a run or an import source.
+//! - `evaluation.start` / `evaluation.status`: not reachable from these runs.
+//!   Their inputs depend on the registered control and the protected holdout,
+//!   which have no edge to a run or an import source, and on the Current
+//!   ticket, which binds its staged candidate and that candidate's own source
+//!   run (a separate e05 run) and revoke watermark. The cleanup leaves their
+//!   jobs and inputs unchanged, but once a revocation has moved that watermark
+//!   a new read of the ticket is refused (plan v4.5 §7.4.2 L1178, §11 L1448).
 //!
 //! The fixtures below are copied from `tests/curriculum_cleanup_v42.rs`,
 //! `tests/dispatch_management.rs` and `tests/streaming_evaluator.rs` (test crates
@@ -1348,14 +1352,14 @@ mod e05_fx {
         pub control: RegisteredEvaluationControl,
     }
 
-    /// A complete Current control, candidate, holdout and issued ticket. The first
+    /// A complete Current control, candidate, holdout and issued ticket in `store`.
+    /// The candidate pins the revoke watermark it is staged at, so every watermark
+    /// change of the caller's setup comes before this call. The first
     /// rotating input of the holdout names `first_input_artifact` (an
     /// operator-supplied reference to an input artifact); the others are opaque
     /// ids of artifacts that do not exist.
-    pub async fn fixture(first_input_artifact: &str) -> E05 {
+    pub async fn fixture(dir: tempfile::TempDir, store: Store, first_input_artifact: &str) -> E05 {
         let n = 5u32;
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("e05.sqlite3")).await.unwrap();
         let admin = Context::new("n", "admin", Role::Admin).unwrap();
         let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();
         store
@@ -2045,10 +2049,15 @@ async fn experiment_register_is_reached_through_a_run_derived_input_and_evaluati
     // The holdout's first protected input is the stored source selection, an
     // artifact that depends on the runs of its grant: the one way a run
     // revocation reaches an `experiment.register` input. The control, the holdout
-    // record and the ticket have no edge to any run, so `evaluation.start` and
-    // `evaluation.status` (which read only those) are outside every run closure.
-    let e05 = e05_fx::fixture(&exploration_fx::selection_id()).await;
-    exploration_fx::setup(&e05.store).await;
+    // record and the Current ticket are outside the closure of those runs: the
+    // ticket binds its staged candidate, whose only source is the separate e05
+    // run, so `evaluation.start` and `evaluation.status` (which read only those)
+    // stay outside it. The candidate pins the revoke watermark when it is staged,
+    // so the exploration setup and its watermark bump run first.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("e05.sqlite3")).await.unwrap();
+    exploration_fx::setup(&store).await;
+    let e05 = e05_fx::fixture(dir, store, &exploration_fx::selection_id()).await;
     let (store, evaluator) = (&e05.store, &e05.evaluator);
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![evaluator.clone()]).unwrap();
@@ -2131,8 +2140,9 @@ async fn experiment_register_is_reached_through_a_run_derived_input_and_evaluati
         "evaluation jobs, inputs and e05 records are unchanged"
     );
 
-    // `experiment.register` is refused with a named Conflict; the evaluation
-    // jobs are still served (no source-derived result is involved).
+    // `experiment.register` is refused with a Conflict naming the redaction; the
+    // Blocked `evaluation.start` job carries no source-derived result and is
+    // still returned.
     let message = expect_conflict(
         dispatcher.status(evaluator, &register.id).await,
         "experiment.register status after the cleanup",
@@ -2142,13 +2152,17 @@ async fn experiment_register_is_reached_through_a_run_derived_input_and_evaluati
         dispatcher.status(evaluator, &start.id).await.unwrap().state,
         ManagementJobState::Blocked
     );
-    assert_eq!(
-        dispatcher
-            .status(evaluator, &status.id)
-            .await
-            .unwrap()
-            .state,
-        ManagementJobState::Succeeded
+    // The Current ticket binds the revoke watermark its candidate was staged at;
+    // the revocation moved it first, so this new read of the Succeeded
+    // `evaluation.status` job is refused at once (plan v4.5 §7.4.2 L1178,
+    // §11 L1448).
+    let reread = dispatcher.status(evaluator, &status.id).await;
+    assert!(
+        matches!(
+            &reread,
+            Err(Error::Conflict(message)) if message == "source revoke watermark changed"
+        ),
+        "{reread:?}"
     );
 }
 
