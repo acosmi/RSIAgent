@@ -1279,12 +1279,14 @@ impl PersistentReplayEconomicCoordinator {
         }
         let report_lineage =
             economic_report_lineage_in_session(&mut session, ctx, report_id).await?;
-        let formal_source_legacy = paired_formal_read_in_session(&mut session, ctx, &experiment).await?
+        let formal_source_legacy = paired_formal_read_in_session(&mut session, ctx, &experiment)
+            .await?
             .is_some_and(|formal| formal.state() == evo_storage::PersistentContractState::Legacy);
         let result = ReplayEconomicReportAuditView {
             raw_payload: report.raw_payload()?,
             source_legacy: report.state() == evo_core::replay::ReplayRecordState::Legacy
-                || read.source_legacy || formal_source_legacy,
+                || read.source_legacy
+                || formal_source_legacy,
             lineage: read.lineage.clone(),
             replay_read_view: read,
             report_schema_version: report.schema_version().into(),
@@ -1300,23 +1302,47 @@ impl PersistentReplayEconomicCoordinator {
 /// Absence preserves that original fact; a present report must authenticate
 /// fully and match this experiment. No read error is converted into Legacy.
 async fn paired_formal_read_in_session(
-    session: &mut Session, ctx: &Context, experiment: &ReplayEconomicExperimentV1,
+    session: &mut Session,
+    ctx: &Context,
+    experiment: &ReplayEconomicExperimentV1,
 ) -> Result<Option<crate::streaming_evaluator::VerifiedFormalReportReadV1>> {
-    let physical = crate::streaming_evaluator::storage_id("formal_evaluation_v2", &experiment.paired_ticket_id)?;
-    if session.object_row(ctx, "artifact", &physical).await?.is_none() { return Ok(None); }
+    let physical = crate::streaming_evaluator::storage_id(
+        "formal_evaluation_v2",
+        &experiment.paired_ticket_id,
+    )?;
+    if session
+        .object_row(ctx, "artifact", &physical)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
     let read = crate::streaming_evaluator::read_verified_formal_report_in_session(
-        ctx, session, &experiment.paired_ticket_id,
-    ).await?;
+        ctx,
+        session,
+        &experiment.paired_ticket_id,
+    )
+    .await?;
     let view = read.historical_view();
     let ticket: crate::streaming_evaluator::ReadEvaluationTicket =
-        crate::streaming_evaluator::need_record(session, ctx, "evaluation_ticket_v2", &view.ticket_id).await?;
-    if view.ticket_id != experiment.paired_ticket_id || view.ticket_digest != experiment.paired_ticket_digest
+        crate::streaming_evaluator::need_record(
+            session,
+            ctx,
+            "evaluation_ticket_v2",
+            &view.ticket_id,
+        )
+        .await?;
+    if view.ticket_id != experiment.paired_ticket_id
+        || view.ticket_digest != experiment.paired_ticket_digest
         || view.candidate_bundle_digest != experiment.runtime.candidate_bundle_digest
         || view.baseline_bundle_digest != experiment.runtime.baseline_bundle_digest
         || view.environment_digest != experiment.runtime.environment_digest
         || view.evaluator_actor != experiment.evaluator_actor
         || ticket.executor_actor != experiment.executor_actor
-        || view.proposer_actor != experiment.proposer_actor || view.approver_actor != experiment.approver_actor
-    { return Err(Error::Conflict("paired_e05_ticket_binding_mismatch".into())); }
+        || view.proposer_actor != experiment.proposer_actor
+        || view.approver_actor != experiment.approver_actor
+    {
+        return Err(Error::Conflict("paired_e05_ticket_binding_mismatch".into()));
+    }
     Ok(Some(read))
 }

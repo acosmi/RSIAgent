@@ -5650,16 +5650,24 @@ pub(crate) fn validate_content_envelope(id: &str, body: &Value) -> Result<()> {
         FORMAL_KIND => {
             // Only the exact derived name selects the derived decoder; every
             // other payload keeps the original strict report decoder below.
-            if p.get("schema_version").and_then(Value::as_str) == Some(FORMAL_JUDGMENT_DERIVED_SCHEMA) {
+            if p.get("schema_version").and_then(Value::as_str)
+                == Some(FORMAL_JUDGMENT_DERIVED_SCHEMA)
+            {
                 let v: FormalJudgmentDerived = serde_json::from_value(p.clone())
                     .map_err(|_| Error::Conflict("formal_judgment_derived_unreadable".into()))?;
-                let version = evo_storage::lifecycle::formal_judgment_version_by_key(&v.judgment_version)?;
+                let version =
+                    evo_storage::lifecycle::formal_judgment_version_by_key(&v.judgment_version)?;
                 let identity = formal_judgment_identity(&v.input_snapshot, version)?;
                 if version.domain.2.as_deref() != Some(FORMAL_JUDGMENT_DERIVED_SCHEMA)
                     || v.source_ticket_id != v.input_snapshot.common.1
-                    || v.report_id != identity.logical_id || id != identity.physical_id
+                    || v.report_id != identity.logical_id
+                    || id != identity.physical_id
                     || v.input_digest != identity.input_digest
-                { return Err(Error::Conflict("formal_judgment_derived_identity_changed".into())); }
+                {
+                    return Err(Error::Conflict(
+                        "formal_judgment_derived_identity_changed".into(),
+                    ));
+                }
                 // Typed closure compatibility only. This pure check grants no
                 // source authority, Current state or promotion eligibility.
                 return Ok(());
@@ -9590,7 +9598,6 @@ mod source_plan_ticket_tests {
     }
 }
 
-
 // AG163 first batch: private input/identity math only. No caller can mint source
 // authentication through these types; same-Session extraction/writers are not
 // wired in this prepared change, and all original writers remain byte-identical.
@@ -9607,9 +9614,9 @@ struct FormalInputRef(
 );
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FormalCommonInput(
-    String, // namespace
-    String, // original source_ticket_id
-    String, // original ticket_schema, never overwritten by a target version
+    String,         // namespace
+    String,         // original source_ticket_id
+    String,         // original ticket_schema, never overwritten by a target version
     FormalInputRef, // control
     FormalInputRef, // holdout
     FormalInputRef, // original immutable ticket issue receipt
@@ -9618,8 +9625,8 @@ struct FormalCommonInput(
 );
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FormalCompleteUnit(
-    String, // target_id
-    String, // cluster_or_anchor_id
+    String,         // target_id
+    String,         // cluster_or_anchor_id
     FormalInputRef, // candidate execution
     FormalInputRef, // baseline execution
     FormalInputRef, // original independent grader
@@ -9628,7 +9635,7 @@ struct FormalCompleteUnit(
 struct FormalCompleteInput(
     Vec<FormalCompleteUnit>, // original holdout.rotating_inputs order
     Vec<FormalCompleteUnit>, // original holdout.anchor_inputs order
-    FormalInputRef, // original frozen ResourceEvidenceRecord, not later billing
+    FormalInputRef,          // original frozen ResourceEvidenceRecord, not later billing
 );
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FormalPrefixUnit(
@@ -9638,11 +9645,26 @@ struct FormalPrefixUnit(
 );
 
 const FORMAL_ORIGINAL_CERTIFICATE_FIELDS: [&str; 20] = [
-    "schema_version", "ticket_id", "v1_plan_snapshot_digest", "early_stop_plan_digest",
-    "alpha_plan_digest", "manifest_digest", "slice_id", "candidate_digest",
-    "baseline_digest", "grader_digest", "issuer_receipt_digest", "k", "lcb", "ucb",
-    "completed_prefix_digest", "member_terminal_digest", "stop_reason",
-    "stopped_at_unix_ms", "stop_sequence", "usage_uncertain",
+    "schema_version",
+    "ticket_id",
+    "v1_plan_snapshot_digest",
+    "early_stop_plan_digest",
+    "alpha_plan_digest",
+    "manifest_digest",
+    "slice_id",
+    "candidate_digest",
+    "baseline_digest",
+    "grader_digest",
+    "issuer_receipt_digest",
+    "k",
+    "lcb",
+    "ucb",
+    "completed_prefix_digest",
+    "member_terminal_digest",
+    "stop_reason",
+    "stopped_at_unix_ms",
+    "stop_sequence",
+    "usage_uncertain",
 ];
 
 /// Local sequence adapter for the existing certificate type, not a new public
@@ -9651,28 +9673,41 @@ const FORMAL_ORIGINAL_CERTIFICATE_FIELDS: [&str; 20] = [
 #[derive(Debug, Clone)]
 struct FormalOriginalCertificate(EarlyStopCertificate);
 impl Serialize for FormalOriginalCertificate {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let value = serde_json::to_value(&self.0)
-            .map_err(<S::Error as serde::ser::Error>::custom)?;
-        let object = value.as_object().ok_or_else(||
-            <S::Error as serde::ser::Error>::custom("original certificate is not an object"))?;
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let value =
+            serde_json::to_value(&self.0).map_err(<S::Error as serde::ser::Error>::custom)?;
+        let object = value.as_object().ok_or_else(|| {
+            <S::Error as serde::ser::Error>::custom("original certificate is not an object")
+        })?;
         let mut ordered = Vec::with_capacity(FORMAL_ORIGINAL_CERTIFICATE_FIELDS.len());
         for name in FORMAL_ORIGINAL_CERTIFICATE_FIELDS {
-            ordered.push(object.get(name).cloned().ok_or_else(||
-                <S::Error as serde::ser::Error>::custom("original certificate field is absent"))?);
+            ordered.push(object.get(name).cloned().ok_or_else(|| {
+                <S::Error as serde::ser::Error>::custom("original certificate field is absent")
+            })?);
         }
         ordered.serialize(serializer)
     }
 }
 impl<'de> Deserialize<'de> for FormalOriginalCertificate {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
         let ordered = Vec::<Value>::deserialize(deserializer)?;
         if ordered.len() != FORMAL_ORIGINAL_CERTIFICATE_FIELDS.len() {
-            return Err(<D::Error as serde::de::Error>::custom("original certificate field count changed"));
+            return Err(<D::Error as serde::de::Error>::custom(
+                "original certificate field count changed",
+            ));
         }
-        let object: Map<String, Value> = FORMAL_ORIGINAL_CERTIFICATE_FIELDS.into_iter()
-            .zip(ordered).map(|(name, value)| (name.to_owned(), value)).collect();
-        serde_json::from_value(Value::Object(object)).map(Self)
+        let object: Map<String, Value> = FORMAL_ORIGINAL_CERTIFICATE_FIELDS
+            .into_iter()
+            .zip(ordered)
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect();
+        serde_json::from_value(Value::Object(object))
+            .map(Self)
             .map_err(<D::Error as serde::de::Error>::custom)
     }
 }
@@ -9681,10 +9716,15 @@ struct FormalEarlyInput(
     FormalOriginalCertificate,
     Vec<FormalPrefixUnit>, // exact original registered continuous prefix order
     Vec<(FormalInputRef, FormalInputRef, FormalInputRef)>, // candidate/baseline/grader
-    FormalInputRef, // actual issuer matching issuer_receipt_digest
+    FormalInputRef,        // actual issuer matching issuer_receipt_digest
 );
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "variant", content = "input", deny_unknown_fields)]
+#[serde(
+    rename_all = "snake_case",
+    tag = "variant",
+    content = "input",
+    deny_unknown_fields
+)]
 enum FormalVariantInput {
     CompleteBatch(FormalCompleteInput),
     EarlyStopped(Box<FormalEarlyInput>),
@@ -9704,10 +9744,18 @@ impl FormalInputSnapshot {
     }
     fn input_digest(&self) -> Result<String> {
         match &self.variant {
-            FormalVariantInput::CompleteBatch(input) =>
-                canonical_fingerprint(&(FORMAL_JUDGMENT_INPUT_DOMAIN, &self.common, "complete_batch", input)),
-            FormalVariantInput::EarlyStopped(input) =>
-                canonical_fingerprint(&(FORMAL_JUDGMENT_INPUT_DOMAIN, &self.common, "early_stopped", input)),
+            FormalVariantInput::CompleteBatch(input) => canonical_fingerprint(&(
+                FORMAL_JUDGMENT_INPUT_DOMAIN,
+                &self.common,
+                "complete_batch",
+                input,
+            )),
+            FormalVariantInput::EarlyStopped(input) => canonical_fingerprint(&(
+                FORMAL_JUDGMENT_INPUT_DOMAIN,
+                &self.common,
+                "early_stopped",
+                input,
+            )),
         }
     }
 }
@@ -9756,7 +9804,9 @@ fn formal_judgment_identity(
     version: &evo_storage::lifecycle::FormalJudgmentVersion,
 ) -> Result<FormalJudgmentIdentity> {
     if version.domain.3.as_ref() != input.variant_tag() {
-        return Err(Error::Invalid("formal_judgment_input_variant_mismatch".into()));
+        return Err(Error::Invalid(
+            "formal_judgment_input_variant_mismatch".into(),
+        ));
     }
     let input_digest = input.input_digest()?;
     let version_key = version.domain.version_key()?;
@@ -9765,14 +9815,18 @@ fn formal_judgment_identity(
     let logical_id = match version.id_strategy {
         evo_storage::lifecycle::FormalJudgmentIdStrategy::SourceTicket => source_ticket_id.clone(),
         evo_storage::lifecycle::FormalJudgmentIdStrategy::VersionedInput => {
-            let identity = canonical_fingerprint(&(
-                namespace, source_ticket_id, &input_digest, &version_key,
-            ))?;
+            let identity =
+                canonical_fingerprint(&(namespace, source_ticket_id, &input_digest, &version_key))?;
             format!("e05j-{}", &identity[..32])
         }
     };
     let physical_id = storage_id(FORMAL_KIND, &logical_id)?;
-    Ok(FormalJudgmentIdentity { input_digest, version_key, logical_id, physical_id })
+    Ok(FormalJudgmentIdentity {
+        input_digest,
+        version_key,
+        logical_id,
+        physical_id,
+    })
 }
 
 // AG163 R2: original-report input extraction in the caller's already borrowed
@@ -9818,8 +9872,11 @@ fn original_input_ref<T: Serialize>(
     payload: &T,
 ) -> Result<FormalInputRef> {
     Ok(FormalInputRef(
-        "artifact".into(), record_kind.into(), logical_id.into(),
-        storage_id(record_kind, logical_id)?, canonical_fingerprint(payload)?,
+        "artifact".into(),
+        record_kind.into(),
+        logical_id.into(),
+        storage_id(record_kind, logical_id)?,
+        canonical_fingerprint(payload)?,
     ))
 }
 
@@ -9835,7 +9892,10 @@ async fn require_original_input_roots_live(
             return Err(Error::Forbidden);
         }
     }
-    if crate::revocation_gate::judge_upstream(ctx, session, roots).await?.is_some() {
+    if crate::revocation_gate::judge_upstream(ctx, session, roots)
+        .await?
+        .is_some()
+    {
         return Err(Error::Forbidden);
     }
     Ok(())
@@ -9850,39 +9910,50 @@ async fn load_original_complete_unit(
 ) -> Result<FormalLoadedCompleteUnit> {
     let target = ticket.target(&input.target_id)?;
     let kind_matches = match (&target.kind, anchor) {
-        (EvaluationTargetKind::Rotating { cluster_id }, false) =>
-            cluster_id == &input.cluster_or_anchor_id,
-        (EvaluationTargetKind::Anchor { anchor_id }, true) =>
-            anchor_id == &input.cluster_or_anchor_id,
+        (EvaluationTargetKind::Rotating { cluster_id }, false) => {
+            cluster_id == &input.cluster_or_anchor_id
+        }
+        (EvaluationTargetKind::Anchor { anchor_id }, true) => {
+            anchor_id == &input.cluster_or_anchor_id
+        }
         _ => false,
     };
     if !kind_matches
         || target.input_artifact_id != input.input_artifact_id
         || target.input_digest != input.input_digest
     {
-        return Err(Error::Conflict("formal_complete_input_member_identity_changed".into()));
+        return Err(Error::Conflict(
+            "formal_complete_input_member_identity_changed".into(),
+        ));
     }
     let TargetState::Completed {
-        candidate_receipt_id, baseline_receipt_id, grader_receipt_id, ..
-    } = &target.state else {
-        return Err(Error::Invalid("formal evidence target is not completed".into()));
+        candidate_receipt_id,
+        baseline_receipt_id,
+        grader_receipt_id,
+        ..
+    } = &target.state
+    else {
+        return Err(Error::Invalid(
+            "formal evidence target is not completed".into(),
+        ));
     };
     // read_verified_formal_report_core already ran the original
     // validate_completed_target_evidence for every member. Reuse that result;
     // do not introduce another grader/statistics implementation here.
-    let candidate = read_original_input_record(
-        ctx, session, EXECUTION_RECEIPT_KIND, candidate_receipt_id,
-    ).await?;
-    let baseline = read_original_input_record(
-        ctx, session, EXECUTION_RECEIPT_KIND, baseline_receipt_id,
-    ).await?;
-    let grader = read_original_input_record(
-        ctx, session, GRADER_RECEIPT_KIND, grader_receipt_id,
-    ).await?;
+    let candidate =
+        read_original_input_record(ctx, session, EXECUTION_RECEIPT_KIND, candidate_receipt_id)
+            .await?;
+    let baseline =
+        read_original_input_record(ctx, session, EXECUTION_RECEIPT_KIND, baseline_receipt_id)
+            .await?;
+    let grader =
+        read_original_input_record(ctx, session, GRADER_RECEIPT_KIND, grader_receipt_id).await?;
     Ok(FormalLoadedCompleteUnit {
         target_id: input.target_id.clone(),
         cluster_or_anchor_id: input.cluster_or_anchor_id.clone(),
-        candidate, baseline, grader,
+        candidate,
+        baseline,
+        grader,
     })
 }
 
@@ -9900,8 +9971,16 @@ impl FormalLoadedCompleteUnit {
         Ok(FormalCompleteUnit(
             self.target_id,
             self.cluster_or_anchor_id,
-            original_input_ref(EXECUTION_RECEIPT_KIND, &self.candidate.receipt_id, &self.candidate)?,
-            original_input_ref(EXECUTION_RECEIPT_KIND, &self.baseline.receipt_id, &self.baseline)?,
+            original_input_ref(
+                EXECUTION_RECEIPT_KIND,
+                &self.candidate.receipt_id,
+                &self.candidate,
+            )?,
+            original_input_ref(
+                EXECUTION_RECEIPT_KIND,
+                &self.baseline.receipt_id,
+                &self.baseline,
+            )?,
             original_input_ref(GRADER_RECEIPT_KIND, &self.grader.receipt_id, &self.grader)?,
         ))
     }
@@ -9920,33 +9999,49 @@ async fn original_source_plan_schema(
     match (&ticket.source_plan_binding, ticket.schema_version.as_str()) {
         (None, ReadEvaluationTicket::SCHEMA) => Ok(control.v1_plan_snapshot.schema_version.clone()),
         (Some(binding), ReadEvaluationTicket::SCHEMA_V3) => {
-            let candidate: ReadCandidate = session.need(ctx, "artifact", &ticket.candidate_digest).await?;
+            let candidate: ReadCandidate = session
+                .need(ctx, "artifact", &ticket.candidate_digest)
+                .await?;
             // The original full reader already ran validate_candidate_binding_in_session
             // (full source, witness, namespace, watermark, exact edges and actor).
             // Confirm the exact issue pin before feeding this reread typed record
             // to the original source-plan calculation.
-            let issued = ticket.candidate_dependency_binding.as_ref().ok_or_else(||
-                Error::Invalid("v3 ticket requires candidate dependency binding".into()))?;
+            let issued = ticket
+                .candidate_dependency_binding
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Invalid("v3 ticket requires candidate dependency binding".into())
+                })?;
             if fingerprint(&candidate)? != issued.candidate_record_digest {
                 return Err(Error::Conflict(CANDIDATE_CHANGED.into()));
             }
             candidate.current()?;
             validate_source_plan_binding_from_candidate(
-                ctx.namespace(), ticket, control, holdout, &candidate,
+                ctx.namespace(),
+                ticket,
+                control,
+                holdout,
+                &candidate,
             )?;
             let plan = ExperimentPlanV2::from_typed_candidate(
-                &control.v1_plan_snapshot, &candidate.id, &candidate,
+                &control.v1_plan_snapshot,
+                &candidate.id,
+                &candidate,
             )?;
             // These are the original full immutable binding fields, not a
             // schema inferred from ticket-v3 or a synthesized replacement.
             if plan.id != binding.plan_id
                 || plan.digest_against(&candidate.id, &candidate)? != binding.plan_digest
             {
-                return Err(Error::Conflict("ticket source-plan original changed".into()));
+                return Err(Error::Conflict(
+                    "ticket source-plan original changed".into(),
+                ));
             }
             Ok(plan.schema_version)
         }
-        _ => Err(Error::Invalid("unsupported evaluation-ticket source-plan pair".into())),
+        _ => Err(Error::Invalid(
+            "unsupported evaluation-ticket source-plan pair".into(),
+        )),
     }
 }
 
@@ -9962,27 +10057,60 @@ async fn original_formal_source_domain(
     formal: &FormalEvaluationV2,
 ) -> Result<evo_storage::lifecycle::FormalJudgmentDomain> {
     use evo_storage::lifecycle::{FormalEarlyPlanDomain, FormalJudgmentDomain};
-    let source_plan_schema = original_source_plan_schema(ctx, session, ticket, control, holdout).await?;
+    let source_plan_schema =
+        original_source_plan_schema(ctx, session, ticket, control, holdout).await?;
     let text = |value: &str| std::borrow::Cow::Owned(value.to_owned());
-    let early_plan_domain = control.early_stop_plan.as_ref().map(|plan| FormalEarlyPlanDomain(
-        text(&plan.schema_version), text(&plan.early_stop_version), text(&plan.cs_version),
-    ));
+    let early_plan_domain = control.early_stop_plan.as_ref().map(|plan| {
+        FormalEarlyPlanDomain(
+            text(&plan.schema_version),
+            text(&plan.early_stop_version),
+            text(&plan.cs_version),
+        )
+    });
     let (variant, scope, stats, certificate, route, rule) = match formal {
-        FormalEvaluationV2::CompleteBatch { evidence_scope, report, .. } => (
-            "complete_batch", *evidence_scope, Some(text(&report.stats_version)), None, None,
+        FormalEvaluationV2::CompleteBatch {
+            evidence_scope,
+            report,
+            ..
+        } => (
+            "complete_batch",
+            *evidence_scope,
+            Some(text(&report.stats_version)),
+            None,
+            None,
             match control.schema_version.as_str() {
                 RegisteredEvaluationControl::SCHEMA_V1 => "complete_control_v1_frozen",
                 RegisteredEvaluationControl::SCHEMA => "complete_control_v2_preserve_ucb0",
-                _ => return Err(Error::Invalid("formal_judgment_version_outside_table".into())),
+                _ => {
+                    return Err(Error::Invalid(
+                        "formal_judgment_version_outside_table".into(),
+                    ));
+                }
             },
         ),
-        FormalEvaluationV2::EarlyStopped { evidence_scope, certificate, .. } => (
-            "early_stopped", *evidence_scope, None, Some(text(EarlyStopCertificate::SCHEMA)),
-            Some(text(if certificate.k() == 0 { "critical_k0" } else { "sequential_reject_only" })),
+        FormalEvaluationV2::EarlyStopped {
+            evidence_scope,
+            certificate,
+            ..
+        } => (
+            "early_stopped",
+            *evidence_scope,
+            None,
+            Some(text(EarlyStopCertificate::SCHEMA)),
+            Some(text(if certificate.k() == 0 {
+                "critical_k0"
+            } else {
+                "sequential_reject_only"
+            })),
             "early_certificate_v1_first_stop",
         ),
         FormalEvaluationV2::Invalid { evidence_scope, .. } => (
-            "invalid", *evidence_scope, None, None, None, "invalid_actual_reason_order_v1",
+            "invalid",
+            *evidence_scope,
+            None,
+            None,
+            None,
+            "invalid_actual_reason_order_v1",
         ),
     };
     let evidence_scope = match scope {
@@ -9990,12 +10118,24 @@ async fn original_formal_source_domain(
         EvaluationEvidenceScope::RegisteredExternalHost => "registered_external_host",
     };
     let domain = FormalJudgmentDomain(
-        text(FORMAL_KIND), text(ENVELOPE_SCHEMA), None, text(variant), text(evidence_scope),
-        text(&control.schema_version), text(&ticket.schema_version), text(&source_plan_schema),
-        text(&control.formal_plan.schema_version), text(&control.alpha_plan.schema_version),
+        text(FORMAL_KIND),
+        text(ENVELOPE_SCHEMA),
+        None,
+        text(variant),
+        text(evidence_scope),
+        text(&control.schema_version),
+        text(&ticket.schema_version),
+        text(&source_plan_schema),
+        text(&control.formal_plan.schema_version),
+        text(&control.alpha_plan.schema_version),
         text(&control.optimizer_comparison.schema_version),
-        text(&control.optimization_budget.schema_version), text(&holdout.schema_version),
-        stats, certificate, early_plan_domain, route, text(rule),
+        text(&control.optimization_budget.schema_version),
+        text(&holdout.schema_version),
+        stats,
+        certificate,
+        early_plan_domain,
+        route,
+        text(rule),
     );
     evo_storage::lifecycle::formal_judgment_version(&domain)?;
     Ok(domain)
@@ -10006,40 +10146,45 @@ async fn original_formal_source_domain(
 /// this wire and fail closed in its strict decoder; this function never treats
 /// a derived report logical ID as an original ticket ID.
 async fn extract_original_formal_input_in_session(
-    ctx: &Context, session: &mut Session, source_report_id: &str,
+    ctx: &Context,
+    session: &mut Session,
+    source_report_id: &str,
 ) -> Result<FormalExtractedOriginalInput> {
     ctx.require(&[Role::Evaluator])?;
-    let original_read = read_verified_original_formal_report_core(ctx, session, source_report_id).await?;
+    let original_read =
+        read_verified_original_formal_report_core(ctx, session, source_report_id).await?;
     if ctx.actor() != original_read.historical_view().evaluator_actor.as_str() {
         return Err(Error::Forbidden);
     }
-    extract_original_formal_input_after_verified(ctx, session, source_report_id, original_read).await
+    extract_original_formal_input_after_verified(ctx, session, source_report_id, original_read)
+        .await
 }
 async fn extract_original_formal_input_core_in_session(
-    ctx: &Context, session: &mut Session, source_report_id: &str,
+    ctx: &Context,
+    session: &mut Session,
+    source_report_id: &str,
 ) -> Result<FormalExtractedOriginalInput> {
-    let original_read = read_verified_original_formal_report_core(ctx, session, source_report_id).await?;
-    extract_original_formal_input_after_verified(ctx, session, source_report_id, original_read).await
+    let original_read =
+        read_verified_original_formal_report_core(ctx, session, source_report_id).await?;
+    extract_original_formal_input_after_verified(ctx, session, source_report_id, original_read)
+        .await
 }
 async fn extract_original_formal_input_after_verified(
-    ctx: &Context, session: &mut Session, source_report_id: &str,
+    ctx: &Context,
+    session: &mut Session,
+    source_report_id: &str,
     original_read: VerifiedFormalReportReadV1,
 ) -> Result<FormalExtractedOriginalInput> {
-    let ticket: ReadEvaluationTicket = read_original_input_record(
-        ctx, session, TICKET_KIND, source_report_id,
-    ).await?;
-    let formal: FormalEvaluationV2 = read_original_input_record(
-        ctx, session, FORMAL_KIND, source_report_id,
-    ).await?;
-    let control: RegisteredEvaluationControl = read_original_input_record(
-        ctx, session, CONTROL_KIND, &ticket.registration_id,
-    ).await?;
-    let holdout: ProtectedHoldoutRecord = read_original_input_record(
-        ctx, session, HOLDOUT_KIND, &ticket.holdout_id,
-    ).await?;
-    let issue: TicketIssueReceipt = read_original_input_record(
-        ctx, session, TICKET_RECEIPT_KIND, &ticket.id,
-    ).await?;
+    let ticket: ReadEvaluationTicket =
+        read_original_input_record(ctx, session, TICKET_KIND, source_report_id).await?;
+    let formal: FormalEvaluationV2 =
+        read_original_input_record(ctx, session, FORMAL_KIND, source_report_id).await?;
+    let control: RegisteredEvaluationControl =
+        read_original_input_record(ctx, session, CONTROL_KIND, &ticket.registration_id).await?;
+    let holdout: ProtectedHoldoutRecord =
+        read_original_input_record(ctx, session, HOLDOUT_KIND, &ticket.holdout_id).await?;
+    let issue: TicketIssueReceipt =
+        read_original_input_record(ctx, session, TICKET_RECEIPT_KIND, &ticket.id).await?;
     let mut roots = vec![
         artifact_edge(FORMAL_KIND, source_report_id)?,
         artifact_edge(TICKET_KIND, &ticket.id)?,
@@ -10053,70 +10198,93 @@ async fn extract_original_formal_input_after_verified(
     match &formal {
         FormalEvaluationV2::EarlyStopped { .. } | FormalEvaluationV2::Invalid { .. } => {
             require_original_input_roots_live(ctx, session, &roots).await?;
-            let source_domain = original_formal_source_domain(
-                ctx, session, &ticket, &control, &holdout, &formal,
-            ).await?;
+            let source_domain =
+                original_formal_source_domain(ctx, session, &ticket, &control, &holdout, &formal)
+                    .await?;
             let reason = if matches!(&formal, FormalEvaluationV2::EarlyStopped { .. }) {
                 FormalInputUnavailable::OriginalStop
             } else {
                 FormalInputUnavailable::OriginalInvalid
             };
             Ok(FormalExtractedOriginalInput {
-                original_read, source_domain, input: FormalInputAvailability::Unavailable(reason),
+                original_read,
+                source_domain,
+                input: FormalInputAvailability::Unavailable(reason),
             })
         }
         FormalEvaluationV2::CompleteBatch { .. } => {
             // Load only the actual frozen record already authenticated by the
             // original report reader; never reconstruct it from current bills.
-            let resource: ResourceEvidenceRecord = read_original_input_record(
-                ctx, session, RESOURCE_KIND, &ticket.id,
-            ).await?;
+            let resource: ResourceEvidenceRecord =
+                read_original_input_record(ctx, session, RESOURCE_KIND, &ticket.id).await?;
             if holdout.rotating_inputs.len() + holdout.anchor_inputs.len() != ticket.targets.len() {
-                return Err(Error::Conflict("formal_complete_input_member_identity_changed".into()));
+                return Err(Error::Conflict(
+                    "formal_complete_input_member_identity_changed".into(),
+                ));
             }
             let mut rotating = Vec::with_capacity(holdout.rotating_inputs.len());
             let mut anchors = Vec::with_capacity(holdout.anchor_inputs.len());
             let mut covered = BTreeSet::new();
-            for (inputs, anchor) in [(&holdout.rotating_inputs, false), (&holdout.anchor_inputs, true)] {
+            for (inputs, anchor) in [
+                (&holdout.rotating_inputs, false),
+                (&holdout.anchor_inputs, true),
+            ] {
                 for input in inputs {
                     if !covered.insert(input.target_id.clone()) {
-                        return Err(Error::Conflict("formal_complete_input_member_identity_changed".into()));
+                        return Err(Error::Conflict(
+                            "formal_complete_input_member_identity_changed".into(),
+                        ));
                     }
-                    let loaded = load_original_complete_unit(ctx, session, &ticket, input, anchor).await?;
+                    let loaded =
+                        load_original_complete_unit(ctx, session, &ticket, input, anchor).await?;
                     roots.push(("artifact".into(), input.input_artifact_id.clone()));
                     roots.extend(loaded.input_roots()?);
-                    if anchor { anchors.push(loaded); } else { rotating.push(loaded); }
+                    if anchor {
+                        anchors.push(loaded);
+                    } else {
+                        rotating.push(loaded);
+                    }
                 }
             }
             roots.push(artifact_edge(RESOURCE_KIND, &ticket.id)?);
             require_original_input_roots_live(ctx, session, &roots).await?;
-            let source_domain = original_formal_source_domain(
-                ctx, session, &ticket, &control, &holdout, &formal,
-            ).await?;
+            let source_domain =
+                original_formal_source_domain(ctx, session, &ticket, &control, &holdout, &formal)
+                    .await?;
             // All full-original auth, real physical identities, exact original
             // member coverage and direct/upstream revocation checks precede math.
             let common = FormalCommonInput(
-                ctx.namespace().into(), ticket.id.clone(), ticket.schema_version.clone(),
+                ctx.namespace().into(),
+                ticket.id.clone(),
+                ticket.schema_version.clone(),
                 original_input_ref(CONTROL_KIND, &ticket.registration_id, &control)?,
                 original_input_ref(HOLDOUT_KIND, &ticket.holdout_id, &holdout)?,
                 original_input_ref(TICKET_RECEIPT_KIND, &ticket.id, &issue)?,
-                ticket.candidate_dependency_binding.clone(), ticket.source_plan_binding.clone(),
+                ticket.candidate_dependency_binding.clone(),
+                ticket.source_plan_binding.clone(),
             );
             let input = FormalInputSnapshot {
                 common,
                 variant: FormalVariantInput::CompleteBatch(FormalCompleteInput(
-                    rotating.into_iter().map(FormalLoadedCompleteUnit::into_snapshot).collect::<Result<_>>()?,
-                    anchors.into_iter().map(FormalLoadedCompleteUnit::into_snapshot).collect::<Result<_>>()?,
+                    rotating
+                        .into_iter()
+                        .map(FormalLoadedCompleteUnit::into_snapshot)
+                        .collect::<Result<_>>()?,
+                    anchors
+                        .into_iter()
+                        .map(FormalLoadedCompleteUnit::into_snapshot)
+                        .collect::<Result<_>>()?,
                     original_input_ref(RESOURCE_KIND, &ticket.id, &resource)?,
                 )),
             };
             Ok(FormalExtractedOriginalInput {
-                original_read, source_domain, input: FormalInputAvailability::Available(Box::new(input)),
+                original_read,
+                source_domain,
+                input: FormalInputAvailability::Available(Box::new(input)),
             })
         }
     }
 }
-
 
 // AG163 R3/R9: explicit derived complete payload and readonly append candidates.
 // The public old writer, old report type and all management/job bytes stay intact.
@@ -10160,8 +10328,9 @@ struct FormalCompleteAppendCandidate {
 
 fn complete_snapshots_equal(left: &FormalInputSnapshot, right: &FormalInputSnapshot) -> bool {
     match (&left.variant, &right.variant) {
-        (FormalVariantInput::CompleteBatch(a), FormalVariantInput::CompleteBatch(b)) =>
-            left.common == right.common && a == b,
+        (FormalVariantInput::CompleteBatch(a), FormalVariantInput::CompleteBatch(b)) => {
+            left.common == right.common && a == b
+        }
         _ => false,
     }
 }
@@ -10174,22 +10343,27 @@ async fn load_original_complete_judgment_source(
     session: &mut Session,
     original_report_id: &str,
 ) -> Result<FormalNormalizedCompleteSource> {
-    let extracted = extract_original_formal_input_in_session(ctx, session, original_report_id).await?;
+    let extracted =
+        extract_original_formal_input_in_session(ctx, session, original_report_id).await?;
     require_derived_source_authority(ctx, session, &extracted.original_read).await?;
     let input_snapshot = match extracted.input {
         FormalInputAvailability::Available(input)
-            if matches!(&input.variant, FormalVariantInput::CompleteBatch(_)) => *input,
+            if matches!(&input.variant, FormalVariantInput::CompleteBatch(_)) =>
+        {
+            *input
+        }
         _ => return Err(Error::Conflict(FORMAL_RECOMPUTE_INPUT_UNAVAILABLE.into())),
     };
     // One read of the complete original wire yields both source pins.
-    let original: FormalEvaluationV2 = read_original_input_record(
-        ctx, session, FORMAL_KIND, original_report_id,
-    ).await?;
+    let original: FormalEvaluationV2 =
+        read_original_input_record(ctx, session, FORMAL_KIND, original_report_id).await?;
     let source_report_ref = original_input_ref(FORMAL_KIND, original_report_id, &original)?;
     Ok(FormalNormalizedCompleteSource {
         evaluator_actor: ctx.actor().into(),
         original_read: extracted.original_read,
-        input_snapshot, source_domain: extracted.source_domain, source_report_ref,
+        input_snapshot,
+        source_domain: extracted.source_domain,
+        source_report_ref,
         source_raw_report_digest: fingerprint(&original)?,
     })
 }
@@ -10198,15 +10372,19 @@ fn select_complete_derived_target(
     source_domain: &evo_storage::lifecycle::FormalJudgmentDomain,
 ) -> Result<&'static evo_storage::lifecycle::FormalJudgmentVersion> {
     use evo_storage::lifecycle::{FORMAL_JUDGMENT_VERSIONS, FormalJudgmentIdStrategy};
-    let mut targets = FORMAL_JUDGMENT_VERSIONS.iter().filter(|entry|
+    let mut targets = FORMAL_JUDGMENT_VERSIONS.iter().filter(|entry| {
         entry.domain.2.as_deref() == Some(FORMAL_JUDGMENT_DERIVED_SCHEMA)
             && entry.domain.3.as_ref() == "complete_batch"
             && entry.id_strategy == FormalJudgmentIdStrategy::VersionedInput
-            && entry.domain.same_input_family(source_domain));
-    let target = targets.next().ok_or_else(||
-        Error::Invalid("formal_judgment_version_outside_table".into()))?;
+            && entry.domain.same_input_family(source_domain)
+    });
+    let target = targets
+        .next()
+        .ok_or_else(|| Error::Invalid("formal_judgment_version_outside_table".into()))?;
     if targets.next().is_some() {
-        return Err(Error::Conflict("formal_judgment_target_domain_ambiguous".into()));
+        return Err(Error::Conflict(
+            "formal_judgment_target_domain_ambiguous".into(),
+        ));
     }
     // This is selection for the actual private explicit recomputation below,
     // not a Current/promotion decision based on catalog membership or flags.
@@ -10223,21 +10401,23 @@ async fn recompute_original_complete_judgment(
     source: &FormalNormalizedCompleteSource,
 ) -> Result<FormalEvaluationV2> {
     let ticket_id = &source.input_snapshot.common.1;
-    let ticket: ReadEvaluationTicket = read_original_input_record(
-        ctx, session, TICKET_KIND, ticket_id,
-    ).await?;
-    let control: RegisteredEvaluationControl = read_original_input_record(
-        ctx, session, CONTROL_KIND, &ticket.registration_id,
-    ).await?;
-    let holdout: ProtectedHoldoutRecord = read_original_input_record(
-        ctx, session, HOLDOUT_KIND, &ticket.holdout_id,
-    ).await?;
-    let resource: ResourceEvidenceRecord = read_original_input_record(
-        ctx, session, RESOURCE_KIND, ticket_id,
-    ).await?;
+    let ticket: ReadEvaluationTicket =
+        read_original_input_record(ctx, session, TICKET_KIND, ticket_id).await?;
+    let control: RegisteredEvaluationControl =
+        read_original_input_record(ctx, session, CONTROL_KIND, &ticket.registration_id).await?;
+    let holdout: ProtectedHoldoutRecord =
+        read_original_input_record(ctx, session, HOLDOUT_KIND, &ticket.holdout_id).await?;
+    let resource: ResourceEvidenceRecord =
+        read_original_input_record(ctx, session, RESOURCE_KIND, ticket_id).await?;
     let report = recompute_bound_complete_report_in_session(
-        session, ctx, &ticket, &control, &holdout, &resource.calls,
-    ).await?;
+        session,
+        ctx,
+        &ticket,
+        &control,
+        &holdout,
+        &resource.calls,
+    )
+    .await?;
     // The original helper still rejects candidate_dependency_binding=None.
     // Rebuild the original closure pins from the actual same-Session facts,
     // never by copying the old report's judgment/result fields.
@@ -10280,8 +10460,10 @@ async fn complete_append_candidate_from_original(
         judgment,
     };
     Ok(FormalCompleteAppendCandidate {
-        physical_id: identity.physical_id, payload,
-        original_read: source.original_read, source_domain: source.source_domain,
+        physical_id: identity.physical_id,
+        payload,
+        original_read: source.original_read,
+        source_domain: source.source_domain,
         source_raw_report_digest: source.source_raw_report_digest,
     })
 }
@@ -10291,26 +10473,37 @@ async fn complete_append_candidate_from_original(
 /// edges. Current/promotion reads additionally compose the original issuer pins
 /// below; this intermediate result itself is not an issued-authority capability.
 struct FormalStoredDerivedReadParts {
-    payload: FormalJudgmentDerived, physical_id: String, owner: String,
+    payload: FormalJudgmentDerived,
+    physical_id: String,
+    owner: String,
 }
 /// Callers reach this only after the exact derived payload-schema class.
 async fn read_stored_derived_parts(
-    ctx: &Context, session: &mut Session, report_id: &str,
+    ctx: &Context,
+    session: &mut Session,
+    report_id: &str,
 ) -> Result<FormalStoredDerivedReadParts> {
     let physical_id = storage_id(FORMAL_KIND, report_id)?;
-    let row = session.object_row(ctx, "artifact", &physical_id).await?.ok_or(Error::NotFound)?;
+    let row = session
+        .object_row(ctx, "artifact", &physical_id)
+        .await?
+        .ok_or(Error::NotFound)?;
     // Parse the actual stored text first. Derived serde rejects duplicate named
     // keys; a Value projection must not erase a duplicate version/identity.
     let envelope: TypedArtifactEnvelope<FormalJudgmentDerived> = serde_json::from_str(&row.body)
         .map_err(|_| Error::Conflict("formal_judgment_derived_unreadable".into()))?;
     if envelope.schema_version != ENVELOPE_SCHEMA || envelope.record_kind != FORMAL_KIND {
-        return Err(Error::Invalid("formal_judgment_version_outside_table".into()));
+        return Err(Error::Invalid(
+            "formal_judgment_version_outside_table".into(),
+        ));
     }
     if envelope.id != physical_id
         || row.id != physical_id
         || envelope.payload.report_id != report_id
     {
-        return Err(Error::Conflict("formal_judgment_derived_identity_changed".into()));
+        return Err(Error::Conflict(
+            "formal_judgment_derived_identity_changed".into(),
+        ));
     }
     let payload = envelope.payload;
     // Public static registration check only: unknown versions are distinct
@@ -10319,21 +10512,38 @@ async fn read_stored_derived_parts(
     let raw: Value = serde_json::from_str(&row.body)
         .map_err(|_| Error::Conflict("formal_judgment_derived_unreadable".into()))?;
     crate::formal_authority::require_content_witness(
-        session, ctx, "artifact", &physical_id, &raw, Role::Evaluator,
-    ).await?;
-    require_original_input_roots_live(
-        ctx, session, &[("artifact".into(), physical_id.clone())],
-    ).await?;
+        session,
+        ctx,
+        "artifact",
+        &physical_id,
+        &raw,
+        Role::Evaluator,
+    )
+    .await?;
+    require_original_input_roots_live(ctx, session, &[("artifact".into(), physical_id.clone())])
+        .await?;
     if payload.source_report_ref.0 != "artifact" || payload.source_report_ref.1 != FORMAL_KIND {
-        return Err(Error::Conflict("formal_judgment_source_report_ref_changed".into()));
+        return Err(Error::Conflict(
+            "formal_judgment_source_report_ref_changed".into(),
+        ));
     }
-    Ok(FormalStoredDerivedReadParts { payload, physical_id, owner: row.owner })
+    Ok(FormalStoredDerivedReadParts {
+        payload,
+        physical_id,
+        owner: row.owner,
+    })
 }
 async fn verify_stored_derived_after_original(
-    ctx: &Context, session: &mut Session, parts: FormalStoredDerivedReadParts,
+    ctx: &Context,
+    session: &mut Session,
+    parts: FormalStoredDerivedReadParts,
     mut original: FormalNormalizedCompleteSource,
 ) -> Result<FormalCompleteAppendCandidate> {
-    let FormalStoredDerivedReadParts { payload, physical_id, owner } = parts;
+    let FormalStoredDerivedReadParts {
+        payload,
+        physical_id,
+        owner,
+    } = parts;
     // Original source authentication proves the actual Evaluator actor. Read-only
     // Admin/Host callers retain their roles; owner is compared to that original actor.
     if owner != original.evaluator_actor {
@@ -10342,10 +10552,14 @@ async fn verify_stored_derived_after_original(
     if payload.source_ticket_id != original.input_snapshot.common.1
         || payload.source_report_ref != original.source_report_ref
     {
-        return Err(Error::Conflict("formal_judgment_source_report_ref_changed".into()));
+        return Err(Error::Conflict(
+            "formal_judgment_source_report_ref_changed".into(),
+        ));
     }
     if !complete_snapshots_equal(&payload.input_snapshot, &original.input_snapshot) {
-        return Err(Error::Conflict("formal_judgment_input_snapshot_changed".into()));
+        return Err(Error::Conflict(
+            "formal_judgment_input_snapshot_changed".into(),
+        ));
     }
     let target = select_complete_derived_target(&original.source_domain)?;
     let identity = formal_judgment_identity(&original.input_snapshot, target)?;
@@ -10354,7 +10568,9 @@ async fn verify_stored_derived_after_original(
         || payload.report_id != identity.logical_id
         || physical_id != identity.physical_id
     {
-        return Err(Error::Conflict("formal_judgment_derived_identity_changed".into()));
+        return Err(Error::Conflict(
+            "formal_judgment_derived_identity_changed".into(),
+        ));
     }
     // Full typed equality and all original authentication came first. Reuse
     // exactly these now-authenticated original snapshot/ref fields; no self-ref
@@ -10365,33 +10581,46 @@ async fn verify_stored_derived_after_original(
     if serde_json::to_value(&payload.judgment).map_err(|_| Error::Internal)?
         != serde_json::to_value(&recomputed.payload.judgment).map_err(|_| Error::Internal)?
     {
-        return Err(Error::Conflict("formal_judgment_derived_judgment_changed".into()));
+        return Err(Error::Conflict(
+            "formal_judgment_derived_judgment_changed".into(),
+        ));
     }
     // An existing derived report must have exactly its authenticated input
     // edges. Missing/extra edges are errors, never an idempotent repair.
     require_exact_fact_edges(
-        session, ctx, &physical_id, derived_actual_dependency_edges(&payload)?,
-    ).await?;
+        session,
+        ctx,
+        &physical_id,
+        derived_actual_dependency_edges(&payload)?,
+    )
+    .await?;
     Ok(recomputed)
 }
 
 async fn read_complete_derived_for_recompute_in_session(
-    ctx: &Context, session: &mut Session, report_id: &str,
+    ctx: &Context,
+    session: &mut Session,
+    report_id: &str,
 ) -> Result<FormalCompleteAppendCandidate> {
     ctx.require(&[Role::Evaluator])?;
     let parts = read_stored_derived_parts(ctx, session, report_id).await?;
-    let original = load_original_complete_judgment_source(
-        ctx, session, &parts.payload.source_report_ref.2,
-    ).await?;
+    let original =
+        load_original_complete_judgment_source(ctx, session, &parts.payload.source_report_ref.2)
+            .await?;
     verify_stored_derived_after_original(ctx, session, parts, original).await
 }
 async fn read_complete_derived_core_in_session(
-    ctx: &Context, session: &mut Session, report_id: &str,
+    ctx: &Context,
+    session: &mut Session,
+    report_id: &str,
 ) -> Result<FormalCompleteAppendCandidate> {
     let parts = read_stored_derived_parts(ctx, session, report_id).await?;
     let original = load_original_complete_judgment_source_core(
-        ctx, session, &parts.payload.source_report_ref.2,
-    ).await?;
+        ctx,
+        session,
+        &parts.payload.source_report_ref.2,
+    )
+    .await?;
     verify_stored_derived_after_original(ctx, session, parts, original).await
 }
 
@@ -10406,36 +10635,49 @@ async fn prepare_complete_judgment_append_in_session(
     ctx.require(&[Role::Evaluator])?;
     match formal_payload_class_in_session(ctx, session, source_report_id).await? {
         FormalPayloadClass::Ordinary => {
-            let original = load_original_complete_judgment_source(ctx, session, source_report_id).await?;
+            let original =
+                load_original_complete_judgment_source(ctx, session, source_report_id).await?;
             complete_append_candidate_from_original(ctx, session, original).await
         }
-        FormalPayloadClass::Derived =>
-            read_complete_derived_for_recompute_in_session(ctx, session, source_report_id).await,
+        FormalPayloadClass::Derived => {
+            read_complete_derived_for_recompute_in_session(ctx, session, source_report_id).await
+        }
     }
 }
-
 
 // AG163 R4: real immutable append and query-only metadata. Read wrappers retain
 // their original caller roles; only recompute requires the original Evaluator.
 async fn load_original_complete_judgment_source_core(
-    ctx: &Context, session: &mut Session, original_report_id: &str,
+    ctx: &Context,
+    session: &mut Session,
+    original_report_id: &str,
 ) -> Result<FormalNormalizedCompleteSource> {
-    let extracted = extract_original_formal_input_core_in_session(ctx, session, original_report_id).await?;
+    let extracted =
+        extract_original_formal_input_core_in_session(ctx, session, original_report_id).await?;
     require_derived_source_authority(ctx, session, &extracted.original_read).await?;
-    let evaluator_actor = extracted.original_read.historical_view().evaluator_actor.clone();
+    let evaluator_actor = extracted
+        .original_read
+        .historical_view()
+        .evaluator_actor
+        .clone();
     let input_snapshot = match extracted.input {
         FormalInputAvailability::Available(input)
-            if matches!(&input.variant, FormalVariantInput::CompleteBatch(_)) => *input,
+            if matches!(&input.variant, FormalVariantInput::CompleteBatch(_)) =>
+        {
+            *input
+        }
         _ => return Err(Error::Conflict(FORMAL_RECOMPUTE_INPUT_UNAVAILABLE.into())),
     };
     // One read of the complete original wire yields both source pins.
-    let original: FormalEvaluationV2 = read_original_input_record(
-        ctx, session, FORMAL_KIND, original_report_id,
-    ).await?;
+    let original: FormalEvaluationV2 =
+        read_original_input_record(ctx, session, FORMAL_KIND, original_report_id).await?;
     let source_report_ref = original_input_ref(FORMAL_KIND, original_report_id, &original)?;
     Ok(FormalNormalizedCompleteSource {
-        evaluator_actor, original_read: extracted.original_read,
-        input_snapshot, source_domain: extracted.source_domain, source_report_ref,
+        evaluator_actor,
+        original_read: extracted.original_read,
+        input_snapshot,
+        source_domain: extracted.source_domain,
+        source_report_ref,
         source_raw_report_digest: fingerprint(&original)?,
     })
 }
@@ -10450,30 +10692,45 @@ enum FormalPayloadClass {
 }
 
 async fn formal_payload_class_in_session(
-    ctx: &Context, session: &mut Session, report_id: &str,
+    ctx: &Context,
+    session: &mut Session,
+    report_id: &str,
 ) -> Result<FormalPayloadClass> {
     let id = storage_id(FORMAL_KIND, report_id)?;
-    let row = session.object_row(ctx, "artifact", &id).await?.ok_or(Error::NotFound)?;
+    let row = session
+        .object_row(ctx, "artifact", &id)
+        .await?
+        .ok_or(Error::NotFound)?;
     let raw = evo_storage::lifecycle::parse_strict_json(&row.body)
         .map_err(|_| Error::Conflict("formal_judgment_unreadable".into()))?;
-    if raw["schema_version"] == "rsia.redacted.v1"
-        && raw["metadata"]["record_kind"] == FORMAL_KIND
-    { return Err(Error::Forbidden); }
-    match raw.get("payload").and_then(|payload| payload.get("schema_version")).map(Value::as_str) {
+    if raw["schema_version"] == "rsia.redacted.v1" && raw["metadata"]["record_kind"] == FORMAL_KIND
+    {
+        return Err(Error::Forbidden);
+    }
+    match raw
+        .get("payload")
+        .and_then(|payload| payload.get("schema_version"))
+        .map(Value::as_str)
+    {
         None | Some(Some(ORDINARY_FORMAL_EVALUATION_V3_SCHEMA)) => Ok(FormalPayloadClass::Ordinary),
         Some(Some(FORMAL_JUDGMENT_DERIVED_SCHEMA)) => Ok(FormalPayloadClass::Derived),
-        Some(_) => Err(Error::Invalid("formal_judgment_version_outside_table".into())),
+        Some(_) => Err(Error::Invalid(
+            "formal_judgment_version_outside_table".into(),
+        )),
     }
 }
 
 /// Version dispatch keeps derived report identity separate from the old ticket
 /// and issued authority. The derived path authenticates both actual records.
 async fn read_verified_formal_report_core(
-    ctx: &Context, session: &mut Session, report_id: &str,
+    ctx: &Context,
+    session: &mut Session,
+    report_id: &str,
 ) -> Result<VerifiedFormalReportReadV1> {
     match formal_payload_class_in_session(ctx, session, report_id).await? {
-        FormalPayloadClass::Ordinary =>
-            read_verified_original_formal_report_core(ctx, session, report_id).await,
+        FormalPayloadClass::Ordinary => {
+            read_verified_original_formal_report_core(ctx, session, report_id).await
+        }
         FormalPayloadClass::Derived => {
             let verified = read_derived_formal_input_in_session(ctx, session, report_id).await?;
             derived_formal_report_read(ctx, session, verified).await
@@ -10481,13 +10738,15 @@ async fn read_verified_formal_report_core(
     }
 }
 
-fn derived_actual_dependency_edges(payload: &FormalJudgmentDerived) -> Result<Vec<(String, String)>> {
+fn derived_actual_dependency_edges(
+    payload: &FormalJudgmentDerived,
+) -> Result<Vec<(String, String)>> {
     let mut edges = BTreeSet::new();
     let mut add = |reference: &FormalInputRef| -> Result<()> {
-        if reference.0 != "artifact"
-            || reference.3 != storage_id(&reference.1, &reference.2)?
-        {
-            return Err(Error::Conflict("formal_judgment_source_report_ref_changed".into()));
+        if reference.0 != "artifact" || reference.3 != storage_id(&reference.1, &reference.2)? {
+            return Err(Error::Conflict(
+                "formal_judgment_source_report_ref_changed".into(),
+            ));
         }
         edges.insert((reference.0.clone(), reference.3.clone()));
         Ok(())
@@ -10499,12 +10758,15 @@ fn derived_actual_dependency_edges(payload: &FormalJudgmentDerived) -> Result<Ve
     match &payload.input_snapshot.variant {
         FormalVariantInput::CompleteBatch(input) => {
             for unit in input.0.iter().chain(input.1.iter()) {
-                add(&unit.2)?; add(&unit.3)?; add(&unit.4)?;
+                add(&unit.2)?;
+                add(&unit.3)?;
+                add(&unit.4)?;
             }
             add(&input.2)?;
         }
-        FormalVariantInput::EarlyStopped(_) =>
-            return Err(Error::Conflict(FORMAL_RECOMPUTE_INPUT_UNAVAILABLE.into())),
+        FormalVariantInput::EarlyStopped(_) => {
+            return Err(Error::Conflict(FORMAL_RECOMPUTE_INPUT_UNAVAILABLE.into()));
+        }
     }
     edges.insert(artifact_edge(TICKET_KIND, &payload.source_ticket_id)?);
     Ok(edges.into_iter().collect())
@@ -10512,20 +10774,27 @@ fn derived_actual_dependency_edges(payload: &FormalJudgmentDerived) -> Result<Ve
 
 impl IndependentEvaluationControl {
     pub async fn recompute_judgment(
-        ctx: &Context, store: &Store, source_report_id: &str,
+        ctx: &Context,
+        store: &Store,
+        source_report_id: &str,
     ) -> Result<String> {
         ctx.require(&[Role::Evaluator])?;
         let mut session = store.session().await?;
         // Strict original-actor gates, full source auth, genuine recomputation,
         // unique target/ID/ref/closure construction all precede the first DML.
-        let candidate = prepare_complete_judgment_append_in_session(
-            ctx, &mut session, source_report_id,
-        ).await?;
+        let candidate =
+            prepare_complete_judgment_append_in_session(ctx, &mut session, source_report_id)
+                .await?;
         let edges = derived_actual_dependency_edges(&candidate.payload)?;
         let logical_id = candidate.payload.report_id.clone();
-        if let Some(row) = session.object_row(ctx, "artifact", &candidate.physical_id).await? {
-            let existing: TypedArtifactEnvelope<FormalJudgmentDerived> = serde_json::from_str(&row.body)
-                .map_err(|_| Error::Conflict("formal_judgment_same_id_different_content".into()))?;
+        if let Some(row) = session
+            .object_row(ctx, "artifact", &candidate.physical_id)
+            .await?
+        {
+            let existing: TypedArtifactEnvelope<FormalJudgmentDerived> =
+                serde_json::from_str(&row.body).map_err(|_| {
+                    Error::Conflict("formal_judgment_same_id_different_content".into())
+                })?;
             if row.owner != ctx.actor()
                 || existing.schema_version != ENVELOPE_SCHEMA
                 || existing.record_kind != FORMAL_KIND
@@ -10533,7 +10802,9 @@ impl IndependentEvaluationControl {
                 || serde_json::to_value(&existing.payload).map_err(|_| Error::Internal)?
                     != serde_json::to_value(&candidate.payload).map_err(|_| Error::Internal)?
             {
-                return Err(Error::Conflict("formal_judgment_same_id_different_content".into()));
+                return Err(Error::Conflict(
+                    "formal_judgment_same_id_different_content".into(),
+                ));
             }
             // Equality alone is not authority: authenticate the actual stored
             // identity/witness/root/owner/domain and rerun its judgment too.
@@ -10547,16 +10818,33 @@ impl IndependentEvaluationControl {
             record_kind: FORMAL_KIND.into(),
             payload: &candidate.payload,
         };
-        put_record(&mut session, ctx, FORMAL_KIND, &logical_id, ctx.actor(), &candidate.payload).await?;
+        put_record(
+            &mut session,
+            ctx,
+            FORMAL_KIND,
+            &logical_id,
+            ctx.actor(),
+            &candidate.payload,
+        )
+        .await?;
         put_fact_edges(&mut session, ctx, &candidate.physical_id, edges).await?;
         require_exact_fact_edges(
-            &mut session, ctx, &candidate.physical_id, derived_actual_dependency_edges(&candidate.payload)?,
-        ).await?;
+            &mut session,
+            ctx,
+            &candidate.physical_id,
+            derived_actual_dependency_edges(&candidate.payload)?,
+        )
+        .await?;
         // This is the existing real production witness over this new envelope,
         // using the same original caller and the same transaction.
         crate::formal_authority::attest_content(
-            &mut session, ctx, "artifact", &candidate.physical_id, &envelope,
-        ).await?;
+            &mut session,
+            ctx,
+            "artifact",
+            &candidate.physical_id,
+            &envelope,
+        )
+        .await?;
         session.commit().await?;
         Ok(logical_id)
     }
@@ -10572,23 +10860,33 @@ pub struct FormalReportReadMetadata {
 }
 
 async fn actual_formal_lineage_in_session(
-    ctx: &Context, session: &mut Session, input: &FormalInputSnapshot,
+    ctx: &Context,
+    session: &mut Session,
+    input: &FormalInputSnapshot,
     source_domain: &evo_storage::lifecycle::FormalJudgmentDomain,
 ) -> Result<FormalJudgmentLineage> {
     let input_digest = input.input_digest()?;
     let mut entries = Vec::new();
-    for version in evo_storage::lifecycle::FORMAL_JUDGMENT_VERSIONS.iter()
+    for version in evo_storage::lifecycle::FORMAL_JUDGMENT_VERSIONS
+        .iter()
         .filter(|entry| entry.domain.same_input_family(source_domain))
     {
         let candidate = formal_judgment_identity(input, version)?;
-        let exists = if session.object_row(ctx, "artifact", &candidate.physical_id).await?.is_none() {
+        let exists = if session
+            .object_row(ctx, "artifact", &candidate.physical_id)
+            .await?
+            .is_none()
+        {
             false // actually queried absent in this namespace and Session
         } else {
             match formal_payload_class_in_session(ctx, session, &candidate.logical_id).await? {
                 FormalPayloadClass::Ordinary => {
                     let actual = extract_original_formal_input_core_in_session(
-                        ctx, session, &candidate.logical_id,
-                    ).await?;
+                        ctx,
+                        session,
+                        &candidate.logical_id,
+                    )
+                    .await?;
                     actual.source_domain == version.domain
                         && matches!(actual.input,
                             FormalInputAvailability::Available(ref original)
@@ -10596,20 +10894,28 @@ async fn actual_formal_lineage_in_session(
                                 && original.input_digest()? == input_digest)
                 }
                 FormalPayloadClass::Derived => {
-                    let actual = read_complete_derived_core_in_session(ctx, session, &candidate.logical_id).await?;
+                    let actual =
+                        read_complete_derived_core_in_session(ctx, session, &candidate.logical_id)
+                            .await?;
                     actual.payload.judgment_version == version.domain.version_key()?
                         && actual.payload.input_digest == input_digest
                         && complete_snapshots_equal(&actual.payload.input_snapshot, input)
                 }
             }
         };
-        entries.push(FormalLineageEntry(candidate.version_key, candidate.logical_id, exists));
+        entries.push(FormalLineageEntry(
+            candidate.version_key,
+            candidate.logical_id,
+            exists,
+        ));
     }
     Ok(FormalJudgmentLineage::Known(input_digest, entries))
 }
 
 async fn formal_report_metadata_core_in_session(
-    ctx: &Context, session: &mut Session, report_id: &str,
+    ctx: &Context,
+    session: &mut Session,
+    report_id: &str,
 ) -> Result<FormalReportReadMetadata> {
     match formal_payload_class_in_session(ctx, session, report_id).await? {
         FormalPayloadClass::Ordinary => {}
@@ -10621,10 +10927,14 @@ async fn formal_report_metadata_core_in_session(
             let read = derived_formal_report_read(ctx, session, verified).await?;
             let state = formal_read_state_name(read.state());
             let input_digest = Some(input.input_digest()?);
-            let lineage = actual_formal_lineage_in_session(ctx, session, &input, &source_domain).await?;
+            let lineage =
+                actual_formal_lineage_in_session(ctx, session, &input, &source_domain).await?;
             return Ok(FormalReportReadMetadata {
-                schema_version: VerifiedFormalReportReadV1::SCHEMA, state,
-                version_key, input_digest, lineage,
+                schema_version: VerifiedFormalReportReadV1::SCHEMA,
+                state,
+                version_key,
+                input_digest,
+                lineage,
             });
         }
     }
@@ -10634,19 +10944,28 @@ async fn formal_report_metadata_core_in_session(
     let (input_digest, lineage) = match extracted.input {
         FormalInputAvailability::Available(input) => {
             let digest = input.input_digest()?;
-            let lineage = actual_formal_lineage_in_session(ctx, session, &input, &extracted.source_domain).await?;
+            let lineage =
+                actual_formal_lineage_in_session(ctx, session, &input, &extracted.source_domain)
+                    .await?;
             (Some(digest), lineage)
         }
-        FormalInputAvailability::Unavailable(reason) =>
-            (None, FormalJudgmentLineage::Unavailable(reason)),
+        FormalInputAvailability::Unavailable(reason) => {
+            (None, FormalJudgmentLineage::Unavailable(reason))
+        }
     };
     Ok(FormalReportReadMetadata {
-        schema_version: VerifiedFormalReportReadV1::SCHEMA, state, version_key, input_digest, lineage,
+        schema_version: VerifiedFormalReportReadV1::SCHEMA,
+        state,
+        version_key,
+        input_digest,
+        lineage,
     })
 }
 
 pub async fn formal_report_read_metadata(
-    ctx: &Context, store: &Store, report_id: &str,
+    ctx: &Context,
+    store: &Store,
+    report_id: &str,
 ) -> Result<FormalReportReadMetadata> {
     ctx.require(&[Role::Evaluator, Role::Admin])?;
     let mut session = store.session().await?;
@@ -10663,31 +10982,49 @@ pub(crate) struct VerifiedDerivedFormalInput {
 }
 
 async fn require_derived_source_authority(
-    ctx: &Context, session: &mut Session, original: &VerifiedFormalReportReadV1,
+    ctx: &Context,
+    session: &mut Session,
+    original: &VerifiedFormalReportReadV1,
 ) -> Result<()> {
     let view = original.historical_view();
     if view.evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
-        let candidate: ReadCandidate = session.need(ctx, "artifact", &view.candidate_digest).await?;
+        let candidate: ReadCandidate = session
+            .need(ctx, "artifact", &view.candidate_digest)
+            .await?;
         crate::formal_authority::verify_original_formal_authority_for_derived(
-            session, ctx, &view.report_id, &candidate,
-        ).await?;
+            session,
+            ctx,
+            &view.report_id,
+            &candidate,
+        )
+        .await?;
     }
     Ok(())
 }
 impl VerifiedDerivedFormalInput {
-    pub(crate) fn report_id(&self) -> &str { &self.candidate.payload.report_id }
-    pub(crate) fn source_report_id(&self) -> &str { &self.candidate.payload.source_report_ref.2 }
+    pub(crate) fn report_id(&self) -> &str {
+        &self.candidate.payload.report_id
+    }
+    pub(crate) fn source_report_id(&self) -> &str {
+        &self.candidate.payload.source_report_ref.2
+    }
     /// Typed digest of the complete original report wire; source_report_ref.4
     /// is the canonical digest of that same authenticated payload read.
-    pub(crate) fn source_raw_report_digest(&self) -> &str { &self.candidate.source_raw_report_digest }
+    pub(crate) fn source_raw_report_digest(&self) -> &str {
+        &self.candidate.source_raw_report_digest
+    }
     pub(crate) fn source_view(&self) -> &VerifiedFormalReportView {
         self.candidate.original_read.historical_view()
     }
-    pub(crate) fn raw_report_digest(&self) -> Result<String> { fingerprint(&self.candidate.payload) }
+    pub(crate) fn raw_report_digest(&self) -> Result<String> {
+        fingerprint(&self.candidate.payload)
+    }
 }
 
 async fn read_derived_formal_input_in_session(
-    ctx: &Context, session: &mut Session, report_id: &str,
+    ctx: &Context,
+    session: &mut Session,
+    report_id: &str,
 ) -> Result<VerifiedDerivedFormalInput> {
     let candidate = read_complete_derived_core_in_session(ctx, session, report_id).await?;
     Ok(VerifiedDerivedFormalInput { candidate })
@@ -10702,27 +11039,40 @@ fn formal_read_state_name(state: evo_storage::PersistentContractState) -> &'stat
 }
 
 async fn derived_formal_report_read(
-    ctx: &Context, session: &mut Session, verified: VerifiedDerivedFormalInput,
+    ctx: &Context,
+    session: &mut Session,
+    verified: VerifiedDerivedFormalInput,
 ) -> Result<VerifiedFormalReportReadV1> {
     let mut view = verified.source_view().clone();
-    let FormalEvaluationV2::CompleteBatch { verdict, evidence_scope, .. } =
-        &verified.candidate.payload.judgment else {
+    let FormalEvaluationV2::CompleteBatch {
+        verdict,
+        evidence_scope,
+        ..
+    } = &verified.candidate.payload.judgment
+    else {
         return Err(Error::Conflict(FORMAL_RECOMPUTE_INPUT_UNAVAILABLE.into()));
     };
     view.report_id = verified.report_id().into();
     view.verdict = Some(*verdict);
-    view.ineligibility_reasons.retain(|reason| reason != "formal_verdict_not_approvable");
+    view.ineligibility_reasons
+        .retain(|reason| reason != "formal_verdict_not_approvable");
     if !matches!(verdict, Verdict::Improved | Verdict::Noninferior) {
-        view.ineligibility_reasons.push("formal_verdict_not_approvable".into());
+        view.ineligibility_reasons
+            .push("formal_verdict_not_approvable".into());
     }
     if *evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
-        let candidate: ReadCandidate = session.need(ctx, "artifact", &view.candidate_digest).await?;
+        let candidate: ReadCandidate = session
+            .need(ctx, "artifact", &view.candidate_digest)
+            .await?;
         let authority = crate::formal_authority::verify_derived_formal_authority(
             session, ctx, &verified, &candidate,
-        ).await?;
+        )
+        .await?;
         if authority.report_id() != verified.report_id()
             || authority.raw_report_digest() != verified.raw_report_digest()?
-        { return Err(Error::Conflict("issued report/ticket bytes differ".into())); }
+        {
+            return Err(Error::Conflict("issued report/ticket bytes differ".into()));
+        }
         // The original signed authority is unchanged; this read digest binds
         // the authenticated new payload to those actual original issuer pins.
         view.report_digest = fingerprint(&(&verified.candidate.payload, authority.source()))?;
@@ -10733,7 +11083,8 @@ async fn derived_formal_report_read(
         view.promotion_eligible = false;
     }
     Ok(VerifiedFormalReportReadV1 {
-        state: verified.candidate.original_read.state(), original: view,
+        state: verified.candidate.original_read.state(),
+        original: view,
     })
 }
 
@@ -10742,14 +11093,23 @@ async fn derived_formal_report_read(
 /// derived branch jumps once to that original root and never calls this gate
 /// while verifying its derived authority.
 pub(crate) async fn verify_current_report_authority_in_session(
-    session: &mut Session, ctx: &Context, report_id: &str, candidate: &ReadCandidate,
+    session: &mut Session,
+    ctx: &Context,
+    report_id: &str,
+    candidate: &ReadCandidate,
 ) -> Result<()> {
     match formal_payload_class_in_session(ctx, session, report_id).await? {
         FormalPayloadClass::Ordinary => {
-            crate::formal_authority::verify_read_issued_authority(session, ctx, report_id, candidate).await?;
+            crate::formal_authority::verify_read_issued_authority(
+                session, ctx, report_id, candidate,
+            )
+            .await?;
         }
         FormalPayloadClass::Derived => {
-            let verified = Box::pin(read_derived_formal_input_in_session(ctx, session, report_id)).await?;
+            let verified = Box::pin(read_derived_formal_input_in_session(
+                ctx, session, report_id,
+            ))
+            .await?;
             let original = verified.candidate.original_read.current_view()?;
             candidate.current()?;
             if original.candidate_digest != candidate.id
@@ -10757,8 +11117,15 @@ pub(crate) async fn verify_current_report_authority_in_session(
                 || original.environment_digest != candidate.environment_digest
                 || original.baseline_parent_digest != candidate.parent_digest
                 || original.proposer_actor != candidate.proposer_actor
-            { return Err(Error::Conflict("verified report does not match release candidate".into())); }
-            crate::formal_authority::verify_derived_formal_authority(session, ctx, &verified, candidate).await?;
+            {
+                return Err(Error::Conflict(
+                    "verified report does not match release candidate".into(),
+                ));
+            }
+            crate::formal_authority::verify_derived_formal_authority(
+                session, ctx, &verified, candidate,
+            )
+            .await?;
         }
     }
     Ok(())

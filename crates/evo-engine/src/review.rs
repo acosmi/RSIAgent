@@ -947,12 +947,23 @@ async fn read_formal(
     // Only the exact derived wire needs its authenticated source-ticket identity
     // before collecting materials. Ordinary reports keep their original read order;
     // a schema field alone never selects derived identity or Current use.
-    let derived_view = if report_envelope.payload.get("schema_version").and_then(serde_json::Value::as_str)
+    let derived_view = if report_envelope
+        .payload
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
         == Some(crate::streaming_evaluator::FORMAL_JUDGMENT_DERIVED_SCHEMA)
     {
-        Some(verified_report_view_in_session(ctx, session, id).await.map_err(formal_review_error)?)
-    } else { None };
-    let source_ticket_id = derived_view.as_ref().map_or(id, |view| view.ticket_id.as_str());
+        Some(
+            verified_report_view_in_session(ctx, session, id)
+                .await
+                .map_err(formal_review_error)?,
+        )
+    } else {
+        None
+    };
+    let source_ticket_id = derived_view
+        .as_ref()
+        .map_or(id, |view| view.ticket_id.as_str());
     if derived_view.is_some() {
         envelope(ctx, session, set, "formal_evaluation_v2", source_ticket_id).await?;
     }
@@ -1042,10 +1053,19 @@ async fn read_formal(
     }
     let view = match derived_view {
         Some(view) => view,
-        None => verified_report_view_in_session(ctx, session, id).await.map_err(formal_review_error)?,
+        None => verified_report_view_in_session(ctx, session, id)
+            .await
+            .map_err(formal_review_error)?,
     };
     if view.variant == VerifiedReportVariant::CompleteBatch {
-        envelope(ctx, session, set, "evaluation_resource_evidence_v1", &view.ticket_id).await?;
+        envelope(
+            ctx,
+            session,
+            set,
+            "evaluation_resource_evidence_v1",
+            &view.ticket_id,
+        )
+        .await?;
     }
     let reasons = view
         .ineligibility_reasons

@@ -3085,28 +3085,63 @@ async fn ag163_history() -> Ag163History {
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let capture = include_bytes!("fixtures/ag163_formal_v2_history.json");
-    assert_eq!(evo_core::hash(capture), "2bc4ecd85ad308cd888067c797391473f43814a0a39988b6035de93dc84a2e79");
+    assert_eq!(
+        evo_core::hash(capture),
+        "2bc4ecd85ad308cd888067c797391473f43814a0a39988b6035de93dc84a2e79"
+    );
     let all: serde_json::Value = serde_json::from_slice(capture).unwrap();
-    assert_eq!(all["producer_commit"], "800eafc4ccaf39d5e4f3fb1b7891f9c142e6b482");
+    assert_eq!(
+        all["producer_commit"],
+        "800eafc4ccaf39d5e4f3fb1b7891f9c142e6b482"
+    );
     assert_eq!(all["software_fixture_only"], true);
     assert_eq!(all["real_provider_or_paid_or_OS_authority_proof"], false);
-    let original = all["cases"].as_array().unwrap().iter()
-        .find(|case| case["name"] == "ag163-old-complete-v2").unwrap().clone();
+    let original = all["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == "ag163-old-complete-v2")
+        .unwrap()
+        .clone();
     let raw = original["database_hex"].as_str().unwrap();
     assert_eq!(raw.len() % 2, 0);
-    let bytes: Vec<u8> = raw.as_bytes().chunks_exact(2).map(|pair|
-        u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect();
-    assert_eq!(bytes.len() as u64, original["database_bytes"].as_u64().unwrap());
-    assert_eq!(evo_core::hash(&bytes), original["database_sha256"].as_str().unwrap());
+    let bytes: Vec<u8> = raw
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    assert_eq!(
+        bytes.len() as u64,
+        original["database_bytes"].as_u64().unwrap()
+    );
+    assert_eq!(
+        evo_core::hash(&bytes),
+        original["database_sha256"].as_str().unwrap()
+    );
     let dir = tempfile::tempdir().unwrap();
     let private = dir.path().join("private");
-    std::fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&private)
+        .unwrap();
     let path = private.join("ag163.sqlite3");
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).unwrap();
-    file.write_all(&bytes).unwrap(); file.sync_all().unwrap(); drop(file);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    file.write_all(&bytes).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
     let store = Store::open(&path).await.unwrap();
     assert_eq!(store.integrity().await.unwrap(), "ok");
-    Ag163History { _dir: dir, path, store, original }
+    Ag163History {
+        _dir: dir,
+        path,
+        store,
+        original,
+    }
 }
 
 #[cfg(unix)]
@@ -3117,8 +3152,13 @@ fn ag163_sid(kind: &str, id: &str) -> String {
 #[cfg(unix)]
 async fn ag163_body(store: &Store, context: &Context, kind: &str, id: &str) -> String {
     let mut session = store.session().await.unwrap();
-    let row = session.object_row(context, kind, id).await.unwrap().unwrap();
-    session.commit().await.unwrap(); row.body
+    let row = session
+        .object_row(context, kind, id)
+        .await
+        .unwrap()
+        .unwrap();
+    session.commit().await.unwrap();
+    row.body
 }
 
 #[cfg(unix)]
@@ -3147,64 +3187,137 @@ for typ,n,_,_,ddl in schema:
 calls=c.execute('SELECT state,actual_cost_micros,execution_closed FROM root_budget_calls ORDER BY billing_scope,call_id').fetchall()
 c.execute('ROLLBACK');c.close();print(json.dumps({'schema':[[a.hex(),b.hex(),d.hex(),p,None if sql is None else sql.hex()] for a,b,d,p,sql in schema],'tables':tables,'calls':[[s.decode(),a,x] for s,a,x in calls]},sort_keys=True,separators=(',',':')))
 "#;
-    let output = std::process::Command::new("python3").args(["-I", "-B", "-c", program]).arg(path).output().unwrap();
-    assert!(output.status.success(), "owned readonly full database image failed");
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-B", "-c", program])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "owned readonly full database image failed"
+    );
     serde_json::from_slice(&output.stdout).unwrap()
 }
-
 
 /// The full image includes SQL storage classes, original TEXT/BLOB bytes,
 /// schema, physical rowids and sqlite_sequence. New action records may append;
 /// no pre-existing object, dependency, audit or accounting row may change.
 #[cfg(unix)]
 fn ag163_preserves_original_rows(before: &serde_json::Value, after: &serde_json::Value) {
-    assert!(before["schema"] == after["schema"], "AG163 changed original full schema");
+    assert!(
+        before["schema"] == after["schema"],
+        "AG163 changed original full schema"
+    );
     for old in before["tables"].as_array().unwrap() {
         let name = old["name"].as_str().unwrap();
-        let new = after["tables"].as_array().unwrap().iter().find(|v| v["name"] == name).unwrap();
+        let new = after["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == name)
+            .unwrap();
         if name == "sqlite_sequence" {
-            assert!(old["columns"] == new["columns"], "sqlite_sequence schema changed");
+            assert!(
+                old["columns"] == new["columns"],
+                "sqlite_sequence schema changed"
+            );
             for row in old["rows"].as_array().unwrap() {
-                let successor = new["rows"].as_array().unwrap().iter().find(|v| v[1][0] == row[1][0]).unwrap();
-                assert!(successor[0] == row[0] && successor[1][0] == row[1][0], "original sqlite_sequence identity changed");
-                assert_eq!(row[1][1][0], "integer"); assert_eq!(successor[1][1][0], "integer");
+                let successor = new["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|v| v[1][0] == row[1][0])
+                    .unwrap();
+                assert!(
+                    successor[0] == row[0] && successor[1][0] == row[1][0],
+                    "original sqlite_sequence identity changed"
+                );
+                assert_eq!(row[1][1][0], "integer");
+                assert_eq!(successor[1][1][0], "integer");
                 let before_seq: i64 = row[1][1][1].as_str().unwrap().parse().unwrap();
                 let after_seq: i64 = successor[1][1][1].as_str().unwrap().parse().unwrap();
-                assert!(after_seq >= before_seq, "actual append reset an original sqlite_sequence counter");
+                assert!(
+                    after_seq >= before_seq,
+                    "actual append reset an original sqlite_sequence counter"
+                );
             }
             continue;
         }
-        if ["revoke_watermark", "revoke_cleanup_jobs", "revoke_cleanup_frontier"].contains(&name) {
+        if [
+            "revoke_watermark",
+            "revoke_cleanup_jobs",
+            "revoke_cleanup_frontier",
+        ]
+        .contains(&name)
+        {
             continue; // Only these exact real cleanup state tables may advance.
         }
-        assert!(old["columns"] == new["columns"], "AG163 changed original columns");
-        let old_rows = old["rows"].as_array().unwrap(); let new_rows = new["rows"].as_array().unwrap();
-        assert!(old_rows.iter().all(|row| new_rows.contains(row)), "AG163 changed original rowid or typed bytes");
+        assert!(
+            old["columns"] == new["columns"],
+            "AG163 changed original columns"
+        );
+        let old_rows = old["rows"].as_array().unwrap();
+        let new_rows = new["rows"].as_array().unwrap();
+        assert!(
+            old_rows.iter().all(|row| new_rows.contains(row)),
+            "AG163 changed original rowid or typed bytes"
+        );
         if name.starts_with("root_budget") {
-            assert!(old_rows == new_rows, "AG163 changed original spent/None/late/closed budget facts");
+            assert!(
+                old_rows == new_rows,
+                "AG163 changed original spent/None/late/closed budget facts"
+            );
         }
     }
-    assert!(before["calls"] == after["calls"], "AG163 reopened execution or changed actual call facts");
+    assert!(
+        before["calls"] == after["calls"],
+        "AG163 reopened execution or changed actual call facts"
+    );
 }
 
 #[cfg(unix)]
 async fn ag163_legacy_health(fx: &Ag163History, evaluator: &Context) {
     let before = ag163_image(&fx.path);
     let ticket = fx.original["ticket_id"].as_str().unwrap();
-    let body = ag163_body(&fx.store, evaluator, "artifact", &ag163_sid("formal_evaluation_v2", ticket)).await;
-    assert_eq!(evo_core::hash(body.as_bytes()), fx.original["original_formal_body_sha256"].as_str().unwrap());
+    let body = ag163_body(
+        &fx.store,
+        evaluator,
+        "artifact",
+        &ag163_sid("formal_evaluation_v2", ticket),
+    )
+    .await;
+    assert_eq!(
+        evo_core::hash(body.as_bytes()),
+        fx.original["original_formal_body_sha256"].as_str().unwrap()
+    );
     let mut session = fx.store.session().await.unwrap();
-    let read = evo_engine::streaming_evaluator::read_verified_formal_report_in_session(evaluator, &mut session, ticket).await.unwrap();
+    let read = evo_engine::streaming_evaluator::read_verified_formal_report_in_session(
+        evaluator,
+        &mut session,
+        ticket,
+    )
+    .await
+    .unwrap();
     assert_eq!(read.state(), evo_storage::PersistentContractState::Legacy);
     assert!(!read.historical_view().promotion_eligible);
-    assert!(matches!(read.current_view(), Err(Error::Conflict(reason)) if reason == "source_legacy: formal report is not Current input"));
+    assert!(
+        matches!(read.current_view(), Err(Error::Conflict(reason)) if reason == "source_legacy: formal report is not Current input")
+    );
     session.commit().await.unwrap();
-    assert!(ag163_image(&fx.path) == before, "AG163 healthy public Legacy reader changed full database");
+    assert!(
+        ag163_image(&fx.path) == before,
+        "AG163 healthy public Legacy reader changed full database"
+    );
 }
 
 /// A real worker writes the original durable result. Only GET adds read metadata.
 #[cfg(unix)]
-async fn ag163_status_job(store: &Store, evaluator: &Context, ticket: &str, key: &str) -> (ManagementDispatcher, ManagementJob) {
+async fn ag163_status_job(
+    store: &Store,
+    evaluator: &Context,
+    ticket: &str,
+    key: &str,
+) -> (ManagementDispatcher, ManagementJob) {
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![evaluator.clone()]).unwrap();
     let accepted = dispatcher.submit(evaluator, "evaluation.status", json!({
         "schema_version":"rsia.management.evaluation_status.v1", "request_key":key, "ticket_id":ticket
@@ -3214,10 +3327,22 @@ async fn ag163_status_job(store: &Store, evaluator: &Context, ticket: &str, key:
         let durable: ManagementJob = session.need(evaluator, "job", &accepted.id).await.unwrap();
         session.commit().await.unwrap();
         if durable.state == ManagementJobState::Succeeded {
-            assert!(matches!(&durable.result, Some(ManagementResult::EvaluationStatus { .. })), "worker rewrote original durable result variant");
+            assert!(
+                matches!(
+                    &durable.result,
+                    Some(ManagementResult::EvaluationStatus { .. })
+                ),
+                "worker rewrote original durable result variant"
+            );
             return (dispatcher, durable);
         }
-        assert!(matches!(durable.state, ManagementJobState::Queued | ManagementJobState::Running), "real evaluation.status producer failed");
+        assert!(
+            matches!(
+                durable.state,
+                ManagementJobState::Queued | ManagementJobState::Running
+            ),
+            "real evaluation.status producer failed"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("real evaluation.status worker did not finish");
@@ -3227,24 +3352,50 @@ async fn ag163_status_job(store: &Store, evaluator: &Context, ticket: &str, key:
 #[tokio::test]
 async fn evaluation_status_exposes_read_version_and_lineage() {
     let fx = ag163_history().await;
-    let evaluator = Context::new(fx.original["namespace"].as_str().unwrap(), fx.original["evaluator_actor"].as_str().unwrap(), Role::Evaluator).unwrap();
+    let evaluator = Context::new(
+        fx.original["namespace"].as_str().unwrap(),
+        fx.original["evaluator_actor"].as_str().unwrap(),
+        Role::Evaluator,
+    )
+    .unwrap();
     ag163_legacy_health(&fx, &evaluator).await;
     let ticket = fx.original["ticket_id"].as_str().unwrap();
-    let old_body = ag163_body(&fx.store, &evaluator, "artifact", &ag163_sid("formal_evaluation_v2", ticket)).await;
+    let old_body = ag163_body(
+        &fx.store,
+        &evaluator,
+        "artifact",
+        &ag163_sid("formal_evaluation_v2", ticket),
+    )
+    .await;
     let original = ag163_image(&fx.path);
-    let successor = evo_engine::streaming_evaluator::IndependentEvaluationControl::recompute_judgment(&evaluator, &fx.store, ticket).await.unwrap();
+    let successor =
+        evo_engine::streaming_evaluator::IndependentEvaluationControl::recompute_judgment(
+            &evaluator, &fx.store, ticket,
+        )
+        .await
+        .unwrap();
     assert_ne!(successor, ticket);
-    let successor_body = ag163_body(&fx.store, &evaluator, "artifact", &ag163_sid("formal_evaluation_v2", &successor)).await;
+    let successor_body = ag163_body(
+        &fx.store,
+        &evaluator,
+        "artifact",
+        &ag163_sid("formal_evaluation_v2", &successor),
+    )
+    .await;
     let payload: Value = serde_json::from_str(&successor_body).unwrap();
     assert_eq!(payload["payload"]["source_ticket_id"], ticket);
     assert_eq!(payload["payload"]["report_id"], successor);
-    let (dispatcher, durable) = ag163_status_job(&fx.store, &evaluator, ticket, "ag163-status-lineage").await;
+    let (dispatcher, durable) =
+        ag163_status_job(&fx.store, &evaluator, ticket, "ag163-status-lineage").await;
     let before_get = ag163_image(&fx.path);
     let query = dispatcher.status(&evaluator, &durable.id).await.unwrap();
     let value = serde_json::to_value(query).unwrap();
     assert_eq!(value["result"]["result"], "evaluation_status_read_v2");
     let metadata = &value["result"]["report_read"];
-    assert_eq!(metadata["schema_version"], "rsia.verified_formal_report_read.v1");
+    assert_eq!(
+        metadata["schema_version"],
+        "rsia.verified_formal_report_read.v1"
+    );
     assert_eq!(metadata["state"], "legacy");
     let old_version = metadata["version_key"].as_str().unwrap();
     let descriptor = evo_storage::lifecycle::formal_judgment_version_by_key(old_version).unwrap();
@@ -3255,11 +3406,38 @@ async fn evaluation_status_exposes_read_version_and_lineage() {
     assert_eq!(details.len(), 2);
     assert_eq!(details[0], payload["payload"]["input_digest"]);
     let entries = details[1].as_array().unwrap();
-    assert_eq!(entries.iter().filter(|entry| entry[0] == old_version && entry[1] == ticket && entry[2] == true).count(), 1);
-    assert_eq!(entries.iter().filter(|entry| entry[0] == payload["payload"]["judgment_version"] && entry[1] == successor && entry[2] == true).count(), 1);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry[0] == old_version && entry[1] == ticket && entry[2] == true)
+            .count(),
+        1
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry[0] == payload["payload"]["judgment_version"]
+                && entry[1] == successor
+                && entry[2] == true)
+            .count(),
+        1
+    );
     assert_eq!(entries.iter().filter(|entry| entry[2] == true).count(), 2);
-    assert!(ag163_image(&fx.path) == before_get, "status GET wrote durable history or accounting facts");
-    assert!(ag163_body(&fx.store, &evaluator, "artifact", &ag163_sid("formal_evaluation_v2", ticket)).await == old_body, "status/recompute changed original report bytes");
+    assert!(
+        ag163_image(&fx.path) == before_get,
+        "status GET wrote durable history or accounting facts"
+    );
+    assert!(
+        ag163_body(
+            &fx.store,
+            &evaluator,
+            "artifact",
+            &ag163_sid("formal_evaluation_v2", ticket)
+        )
+        .await
+            == old_body,
+        "status/recompute changed original report bytes"
+    );
     ag163_preserves_original_rows(&original, &ag163_image(&fx.path));
 }
 
@@ -3267,15 +3445,27 @@ async fn evaluation_status_exposes_read_version_and_lineage() {
 #[tokio::test]
 async fn legacy_terminal_result_is_read_without_rewriting_old_job() {
     let fx = ag163_history().await;
-    let evaluator = Context::new(fx.original["namespace"].as_str().unwrap(), fx.original["evaluator_actor"].as_str().unwrap(), Role::Evaluator).unwrap();
+    let evaluator = Context::new(
+        fx.original["namespace"].as_str().unwrap(),
+        fx.original["evaluator_actor"].as_str().unwrap(),
+        Role::Evaluator,
+    )
+    .unwrap();
     ag163_legacy_health(&fx, &evaluator).await;
     let ticket = fx.original["ticket_id"].as_str().unwrap();
-    let (dispatcher, durable) = ag163_status_job(&fx.store, &evaluator, ticket, "ag163-durable-old-result").await;
+    let (dispatcher, durable) =
+        ag163_status_job(&fx.store, &evaluator, ticket, "ag163-durable-old-result").await;
     let original_job = ag163_body(&fx.store, &evaluator, "job", &durable.id).await;
     let original_value: Value = serde_json::from_str(&original_job).unwrap();
     assert_eq!(original_value["result"]["result"], "evaluation_status");
     assert!(original_value["result"].get("report_read").is_none());
-    let original_input = ag163_body(&fx.store, &evaluator, "artifact", &durable.private_input_ref).await;
+    let original_input = ag163_body(
+        &fx.store,
+        &evaluator,
+        "artifact",
+        &durable.private_input_ref,
+    )
+    .await;
     let before = ag163_image(&fx.path);
     for _ in 0..2 {
         let query = dispatcher.status(&evaluator, &durable.id).await.unwrap();
@@ -3283,17 +3473,46 @@ async fn legacy_terminal_result_is_read_without_rewriting_old_job() {
         let value = serde_json::to_value(query).unwrap();
         assert_eq!(value["result"]["result"], "evaluation_status_read_v2");
         assert_eq!(value["result"]["report_read"]["state"], "legacy");
-        assert!(serde_json::from_value::<ManagementJob>(value).is_err(), "query-only result was accepted as durable job input");
-        assert!(ag163_image(&fx.path) == before, "read projection changed full durable database");
+        assert!(
+            serde_json::from_value::<ManagementJob>(value).is_err(),
+            "query-only result was accepted as durable job input"
+        );
+        assert!(
+            ag163_image(&fx.path) == before,
+            "read projection changed full durable database"
+        );
     }
-    assert!(ag163_body(&fx.store, &evaluator, "job", &durable.id).await == original_job, "GET rewrote old job bytes");
-    assert!(ag163_body(&fx.store, &evaluator, "artifact", &durable.private_input_ref).await == original_input, "GET rewrote original private input bytes");
-    drop(dispatcher); fx.store.close().await;
+    assert!(
+        ag163_body(&fx.store, &evaluator, "job", &durable.id).await == original_job,
+        "GET rewrote old job bytes"
+    );
+    assert!(
+        ag163_body(
+            &fx.store,
+            &evaluator,
+            "artifact",
+            &durable.private_input_ref
+        )
+        .await
+            == original_input,
+        "GET rewrote original private input bytes"
+    );
+    drop(dispatcher);
+    fx.store.close().await;
     let reopened = Store::open(&fx.path).await.unwrap();
     let fresh = ManagementDispatcher::new(reopened.clone(), vec![evaluator.clone()]).unwrap();
     let reopened_before = ag163_image(&fx.path);
     let served = fresh.status(&evaluator, &durable.id).await.unwrap();
-    assert_eq!(serde_json::to_value(served).unwrap()["result"]["result"], "evaluation_status_read_v2");
-    assert!(ag163_body(&reopened, &evaluator, "job", &durable.id).await == original_job, "restart refreshed historical durable result");
-    assert!(ag163_image(&fx.path) == reopened_before, "restart status GET changed any full database fact");
+    assert_eq!(
+        serde_json::to_value(served).unwrap()["result"]["result"],
+        "evaluation_status_read_v2"
+    );
+    assert!(
+        ag163_body(&reopened, &evaluator, "job", &durable.id).await == original_job,
+        "restart refreshed historical durable result"
+    );
+    assert!(
+        ag163_image(&fx.path) == reopened_before,
+        "restart status GET changed any full database fact"
+    );
 }

@@ -433,10 +433,17 @@ impl ManagementDispatcher {
                     IndependentEvaluationControl::status(ctx, &self.store, &request.ticket_id)
                         .await?;
                 let report_read = if status.formal.is_some() {
-                    Some(crate::streaming_evaluator::formal_report_read_metadata(
-                        ctx, &self.store, &status.ticket.id,
-                    ).await?)
-                } else { None };
+                    Some(
+                        crate::streaming_evaluator::formal_report_read_metadata(
+                            ctx,
+                            &self.store,
+                            &status.ticket.id,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
                 job.result = Some(public_evaluation_status_read(&status, report_read));
             }
         }
@@ -954,8 +961,11 @@ impl JobOutcome {
                 | ManagementResult::ProbeScheduled { .. }
                 | ManagementResult::ExplorationStarted { .. },
             ) => true,
-            Some(ManagementResult::EvaluationStatus { .. }
-                | ManagementResult::EvaluationStatusReadV2 { .. }) | None => false,
+            Some(
+                ManagementResult::EvaluationStatus { .. }
+                | ManagementResult::EvaluationStatusReadV2 { .. },
+            )
+            | None => false,
         }
     }
 }
@@ -2326,11 +2336,14 @@ fn public_evaluation_status_read(
     report_read: Option<crate::streaming_evaluator::FormalReportReadMetadata>,
 ) -> ManagementResult {
     let lifecycle = serde_json::to_value(status.ticket.lifecycle)
-        .ok().and_then(|value| value.as_str().map(str::to_owned))
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unknown".into());
     ManagementResult::EvaluationStatusReadV2 {
-        ticket_id: status.ticket.id.clone(), lifecycle,
+        ticket_id: status.ticket.id.clone(),
+        lifecycle,
         planned_targets: status.ticket.targets.len(),
-        has_formal_terminal: status.formal.is_some(), report_read,
+        has_formal_terminal: status.formal.is_some(),
+        report_read,
     }
 }

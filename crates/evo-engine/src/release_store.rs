@@ -3417,16 +3417,26 @@ async fn revalidate_current_release(
 /// authority. Keep the release's actual report reference distinct from the
 /// original ticket; do not manufacture a ticket under the derived report ID.
 async fn validate_derived_report_storage_binding(
-    session: &mut Session, ctx: &Context,
+    session: &mut Session,
+    ctx: &Context,
     view: &crate::streaming_evaluator::VerifiedFormalReportView,
 ) -> Result<()> {
-    if view.report_id == view.ticket_id { return Ok(()); }
+    if view.report_id == view.ticket_id {
+        return Ok(());
+    }
     let ticket: crate::streaming_evaluator::ReadEvaluationTicket =
-        crate::streaming_evaluator::need_record(session, ctx, "evaluation_ticket_v2", &view.ticket_id).await?;
+        crate::streaming_evaluator::need_record(
+            session,
+            ctx,
+            "evaluation_ticket_v2",
+            &view.ticket_id,
+        )
+        .await?;
     if ticket.id != view.ticket_id || fingerprint(&ticket)? != view.ticket_digest {
         return Err(Error::Conflict("issued report/ticket bytes differ".into()));
     }
-    let physical_id = crate::streaming_evaluator::storage_id("formal_evaluation_v2", &view.report_id)?;
+    let physical_id =
+        crate::streaming_evaluator::storage_id("formal_evaluation_v2", &view.report_id)?;
     let raw: serde_json::Value = session.need(ctx, "artifact", &physical_id).await?;
     crate::streaming_evaluator::validate_content_envelope(&physical_id, &raw)
 }
