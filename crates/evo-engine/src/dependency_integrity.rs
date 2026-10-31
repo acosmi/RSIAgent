@@ -14,11 +14,12 @@
 use crate::import::{
     IMPORT_REGISTRATION_SCHEMA, IMPORT_RESULT_SCHEMA, IMPORT_SOURCE_SCHEMA, ImportEnvelope,
     ImportRegistrationRequest, ImportResultRecord, ImportResultState, ImportSourceReadStatus,
-    ImportSourceRecord, ImportSourceSpec, ImportTypedRef, SOURCE_SELECTION_SCHEMA,
-    SourceSelectionRecord,
+    ImportSourceRecord, ImportSourceSpec, ImportTypedRef, LegacyImportResultRecordV1,
+    SOURCE_SELECTION_SCHEMA, SourceSelectionRecord, StoredImportResult,
 };
 use evo_core::evidence::{
-    ExecutionAttestation, MAX_DISCOVERED_FILES, MAX_TOTAL_READ_BYTES, TaskOrigin,
+    ExecutionAttestation, LEGACY_IMPORT_RESULT_SCHEMA_V1, MAX_DISCOVERED_FILES,
+    MAX_TOTAL_READ_BYTES, TaskOrigin, import_result_id_v2, legacy_import_result_id_v1,
 };
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier};
 use evo_storage::dependency_read::{DirectEdge, MAX_DIRECT_EDGE_PAGE};
@@ -184,7 +185,8 @@ pub struct E16EdgeInspection {
 enum Record {
     Selection(SourceSelectionRecord),
     Source(ImportSourceRecord),
-    Result(Box<ImportResultRecord>),
+    /// Either known result version, dispatched by its exact schema.
+    Result(Box<StoredImportResult>),
 }
 
 struct Node {
@@ -289,6 +291,7 @@ pub async fn inspect_e16_content_edges(
             Some(Record::Result(result)) if node.report.declarations_checked => {
                 full.extend(
                     result
+                        .core()
                         .source_refs
                         .iter()
                         .map(|reference| reference.id.clone()),
@@ -424,7 +427,7 @@ impl Inspection<'_> {
                 let recorded = match record {
                     Record::Selection(value) => value.revoke_watermark,
                     Record::Source(value) => value.revoke_watermark,
-                    Record::Result(value) => value.revoke_watermark,
+                    Record::Result(value) => value.core().revoke_watermark,
                 };
                 match &self.watermark {
                     None => issues.push((
@@ -595,10 +598,10 @@ impl Inspection<'_> {
                     record: Some(Record::Selection(selection)),
                     report,
                     ..
-                }) = self.nodes.get(&result.payload.selection_id)
+                }) = self.nodes.get(result.core().selection_id)
                 && report.declarations_checked
-                && (result.source_refs.len() != selection.source_refs.len() + 1
-                    || result.source_refs[1..]
+                && (result.core().source_refs.len() != selection.source_refs.len() + 1
+                    || result.core().source_refs[1..]
                         .iter()
                         .map(|reference| &reference.id)
                         .ne(selection.payload.import_source_ids.iter()))
@@ -824,7 +827,12 @@ fn decode(ctx: &Context, node: &mut Node, value: Value) -> Result<()> {
         Some(IMPORT_RESULT_SCHEMA) => {
             node.report.wire = E16Wire::ImportResult;
             serde_json::from_value::<ImportResultRecord>(value)
-                .map(|record| Record::Result(Box::new(record)))
+                .map(|record| Record::Result(Box::new(StoredImportResult::V2(record))))
+        }
+        Some(LEGACY_IMPORT_RESULT_SCHEMA_V1) => {
+            node.report.wire = E16Wire::ImportResult;
+            serde_json::from_value::<LegacyImportResultRecordV1>(value)
+                .map(|record| Record::Result(Box::new(StoredImportResult::LegacyV1(record))))
         }
         _ => {
             node.issue(IssueClass::Unknown, IssueCode::UnknownSchema, None);
@@ -846,11 +854,18 @@ fn decode(ctx: &Context, node: &mut Node, value: Value) -> Result<()> {
             &source.source_refs,
             fingerprint(source)?,
         ),
-        Record::Result(result) => (
-            envelope_valid(result, &node.report.id),
-            &result.source_refs,
-            fingerprint(result)?,
-        ),
+        Record::Result(result) => match result.as_ref() {
+            StoredImportResult::V2(result) => (
+                envelope_valid(result, &node.report.id),
+                &result.source_refs,
+                fingerprint(result)?,
+            ),
+            StoredImportResult::LegacyV1(result) => (
+                envelope_valid(result, &node.report.id),
+                &result.source_refs,
+                fingerprint(result)?,
+            ),
+        },
     };
     node.report.typed_digest = Some(typed_digest);
     if !valid {
@@ -887,7 +902,9 @@ fn decode(ctx: &Context, node: &mut Node, value: Value) -> Result<()> {
             );
         } else {
             let input_matches = match &record {
-                Record::Result(result) => fingerprint(&result.source_refs)? == result.input_digest,
+                Record::Result(result) => {
+                    fingerprint(&result.core().source_refs)? == result.core().input_digest
+                }
                 Record::Source(source) => {
                     fingerprint(&(source_spec(source), source.payload.raw_digest.as_str()))?
                         == source.input_digest
@@ -978,24 +995,27 @@ fn source_valid(source: &ImportSourceRecord) -> bool {
     }
 }
 
-fn result_valid(result: &ImportResultRecord) -> bool {
-    identifier(&result.payload.selection_id).is_ok()
-        && result.id
-            == format!(
-                "e16res-{}",
-                &hash(result.payload.selection_id.as_bytes())[..24]
-            )
+fn result_valid(stored: &StoredImportResult) -> bool {
+    let result = stored.core();
+    identifier(result.selection_id).is_ok()
+        // A v2 id also binds the selection's input digest; it is checked
+        // against the selection authority itself.
+        && match stored {
+            StoredImportResult::LegacyV1(_) => {
+                result.id == legacy_import_result_id_v1(result.selection_id)
+            }
+            StoredImportResult::V2(_) => true,
+        }
         && result.source_refs.len() >= 2
         && result.source_refs[0].kind == "source_selection"
-        && result.source_refs[0].id == result.payload.selection_id
+        && result.source_refs[0].id == result.selection_id
         && result.source_refs[1..]
             .iter()
             .all(|reference| reference.kind == "import_source")
-        && result.payload.generation_status == "blocked_external_generation_conditions_unavailable"
-        && ((result.payload.state == ImportResultState::Failed)
-            == result.payload.evidence_set.is_none())
-        && result.payload.aggregate_summary.total_events == result.payload.event_records.len()
-        && result.payload.evidence_set.as_ref().is_none_or(|set| {
+        && result.generation_status == "blocked_external_generation_conditions_unavailable"
+        && ((result.state == ImportResultState::Failed) == result.evidence_set.is_none())
+        && result.total_events == result.event_records.len()
+        && result.evidence_set.is_none_or(|set| {
             set.members.iter().all(|member| {
                 member.task_origin == TaskOrigin::ImportedHistory
                     && member.execution_attestation == ExecutionAttestation::UnverifiedImport
@@ -1013,13 +1033,25 @@ fn relation_matches(node: &Node, authority: &Node) -> bool {
                 && source.revoke_watermark == selection.revoke_watermark
                 && source.payload.purpose == selection.payload.purpose
         }
-        (Some(Record::Result(result)), Some(Record::Selection(selection))) => {
-            result.payload.selection_id == selection.id
+        (Some(Record::Result(stored)), Some(Record::Selection(selection))) => {
+            let result = stored.core();
+            // The v1 id derives from the selection id alone and was checked
+            // structurally; the v2 id also binds the selection's input digest.
+            let id_matches = match stored.as_ref() {
+                StoredImportResult::V2(_) => {
+                    import_result_id_v2(&selection.id, &selection.input_digest)
+                        .is_ok_and(|id| id == result.id)
+                }
+                StoredImportResult::LegacyV1(_) => true,
+            };
+            result.selection_id == selection.id
+                && id_matches
                 && result.request_key == selection.request_key
                 && result.revoke_watermark == selection.revoke_watermark
         }
         (Some(Record::Result(result)), Some(Record::Source(source))) => {
-            source.payload.selection_id == result.payload.selection_id
+            let result = result.core();
+            source.payload.selection_id == result.selection_id
                 && result.request_key == source.request_key
                 && result.revoke_watermark == source.revoke_watermark
         }
@@ -1039,7 +1071,9 @@ fn decode_history(node: &mut Node, value: &Value) -> Result<()> {
     let (wire, expected_kind) = match value["original_schema"].as_str() {
         Some(SOURCE_SELECTION_SCHEMA) => (E16Wire::SourceSelection, "source_selection"),
         Some(IMPORT_SOURCE_SCHEMA) => (E16Wire::ImportSource, "import_source"),
-        Some(IMPORT_RESULT_SCHEMA) => (E16Wire::ImportResult, "import_result"),
+        Some(IMPORT_RESULT_SCHEMA | LEGACY_IMPORT_RESULT_SCHEMA_V1) => {
+            (E16Wire::ImportResult, "import_result")
+        }
         _ => {
             node.issue(IssueClass::Unknown, IssueCode::UnknownSchema, None);
             return Ok(());

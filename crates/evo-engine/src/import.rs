@@ -2,16 +2,18 @@
 //! Strict implementation of v4.1 §6.3, §5.6, §13.1 E16.1.
 use evo_core::evidence::{
     AggregateSummary, EvidenceLocator, EvidenceMember, EvidenceSet, ExecutionAttestation,
+    IMPORT_NORMALIZATION_V2, IMPORT_READER_SET_V2, IMPORT_RESULT_SCHEMA_V2, IMPORT_RESULT_VERSIONS,
     ImportArtifactRef, ImportArtifactSchema, ImportMaterialCursor, ImportMaterialDispatchPolicy,
     ImportMaterialPrivacyStatus, ImportMaterialReadRequest, ImportProjectionCoverage,
     ImportedDevelopmentMaterial, ImportedMaterialExcerpt, ImportedSourceBinding,
-    MAX_DISCOVERED_FILES, MAX_EVENT_BYTES, MAX_EXCERPTS, MAX_HEADER_PROBE_BYTES,
-    MAX_TOTAL_EXCERPT_BYTES, MAX_TOTAL_READ_BYTES, Purpose, SourceCoverage, SourceSelection,
-    TaskOrigin, assert_authorized_path,
+    LEGACY_IMPORT_RESULT_SCHEMA_V1, MAX_DISCOVERED_FILES, MAX_EVENT_BYTES, MAX_EXCERPTS,
+    MAX_HEADER_PROBE_BYTES, MAX_TOTAL_EXCERPT_BYTES, MAX_TOTAL_READ_BYTES, Purpose, SourceCoverage,
+    SourceSelection, TaskOrigin, TraceCoverage, assert_authorized_path, import_result_id_v2,
+    legacy_import_result_id_v1,
 };
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, now};
 use evo_storage::Store;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -101,6 +103,48 @@ pub struct ImportedEvent {
     pub byte_end: usize,
     #[serde(default)]
     pub raw_fragment_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTraceExporter {
+    pub name: String,
+    pub version: String,
+    pub commit: String,
+}
+
+/// The exporter's redaction claim. Recorded as an unverified declaration; it
+/// proves no privacy scan or human review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTraceRedactionReport {
+    pub schema_version: String,
+    pub scan_status: String,
+    pub review_status: String,
+    pub removed_items: u64,
+    pub redacted_items: u64,
+}
+
+/// The `rsia.trace.v1` header every record repeats in full.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTraceHeader {
+    pub exporter: NativeTraceExporter,
+    pub run_id: String,
+    pub redaction_report: NativeTraceRedactionReport,
+    /// Self-reported; kept apart from this import's own statistics and only able
+    /// to lower a result to partial.
+    pub coverage: TraceCoverage,
+}
+
+/// One Native source of a v2 result: its header and the original sequence of
+/// each persisted event (`event_index` remains the locator index).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTraceSource {
+    pub source_id: String,
+    pub header: NativeTraceHeader,
+    pub event_sequences: Vec<(usize, u64)>,
 }
 
 pub fn detect_format(label: &str) -> Result<SourceFormat> {
@@ -404,9 +448,11 @@ fn explicit_format(root: &JsonNode) -> Result<SourceFormat> {
     }
 }
 
+/// Closed exchange-format table. The internal authority schema
+/// `rsia.optimization.source.v1` is not an exchange format and stays unsupported.
 fn format_from_discriminator(value: &str) -> Result<SourceFormat> {
     match value {
-        "rsia.trace.v1" | "rsia.optimization.source.v1" => Ok(SourceFormat::RsiaTraceV1),
+        "rsia.trace.v1" => Ok(SourceFormat::RsiaTraceV1),
         "rsih.pi.fixture" => Ok(SourceFormat::RsihPiFixture),
         "claude.fixture" => Ok(SourceFormat::ClaudeFixture),
         value if value.contains("codex") => Err(Error::Invalid("unsupported_format:codex".into())),
@@ -679,25 +725,75 @@ pub fn parse_fixture_with_limits(
     body: &str,
     limits: &ImportForensicLimits,
 ) -> Result<Vec<ImportedEvent>> {
+    read_fixture(format, body, limits)
+        .map(|read| read.events)
+        .map_err(ReadFailure::into_error)
+}
+
+/// Private failure class of one source, so coverage never reads error text: a
+/// version outside the closed format table is unsupported; a recognized record
+/// that breaks its reader contract is invalid.
+enum ReadFailure {
+    Unsupported(Error),
+    Invalid(Error),
+}
+
+impl ReadFailure {
+    fn into_error(self) -> Error {
+        match self {
+            Self::Unsupported(error) | Self::Invalid(error) => error,
+        }
+    }
+}
+
+impl From<Error> for ReadFailure {
+    fn from(error: Error) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+/// One wholly parsed source. A Native trace also yields its validated header and
+/// the original sequence of each event, in event order.
+struct ReadSource {
+    events: Vec<ImportedEvent>,
+    native: Option<(NativeTraceHeader, Vec<u64>)>,
+}
+
+/// The one reader entry of both the detected and the pinned path.
+fn read_fixture(
+    format: SourceFormat,
+    body: &str,
+    limits: &ImportForensicLimits,
+) -> std::result::Result<ReadSource, ReadFailure> {
     if body.trim().is_empty() {
-        return Err(Error::Invalid(
-            "zero records is not empty history success".into(),
-        ));
+        return Err(Error::Invalid("zero records is not empty history success".into()).into());
     }
     if body.contains('\0') {
-        return Err(Error::Invalid("parse_error".into()));
+        return Err(Error::Invalid("parse_error".into()).into());
     }
     validate_strict_json_input(format, body)?;
     validate_reader_shape(format, body)?;
 
-    match format {
-        SourceFormat::RsihPiFixture => parse_rsih_pi(body, limits),
-        SourceFormat::RsiaTraceV1 => parse_rsia_trace(body, limits),
-        SourceFormat::ClaudeFixture => parse_claude_fixture(body, limits),
-    }
+    Ok(match format {
+        SourceFormat::RsihPiFixture => ReadSource {
+            events: parse_rsih_pi(body, limits)?,
+            native: None,
+        },
+        SourceFormat::RsiaTraceV1 => {
+            let (events, header, sequences) = parse_rsia_trace(body)?;
+            ReadSource {
+                events,
+                native: Some((header, sequences)),
+            }
+        }
+        SourceFormat::ClaudeFixture => ReadSource {
+            events: parse_claude_fixture(body, limits)?,
+            native: None,
+        },
+    })
 }
 
-fn validate_reader_shape(format: SourceFormat, body: &str) -> Result<()> {
+fn validate_reader_shape(format: SourceFormat, body: &str) -> std::result::Result<(), ReadFailure> {
     let full = serde_json::from_str::<Value>(body).ok();
     match format {
         SourceFormat::RsihPiFixture => {
@@ -754,7 +850,11 @@ fn validate_reader_shape(format: SourceFormat, body: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_jsonl_shapes(body: &str, fields: &[&str], format: SourceFormat) -> Result<()> {
+fn validate_jsonl_shapes(
+    body: &str,
+    fields: &[&str],
+    format: SourceFormat,
+) -> std::result::Result<(), ReadFailure> {
     for line in body.lines().filter(|line| !line.trim().is_empty()) {
         let value: Value =
             serde_json::from_str(line.trim()).map_err(|_| Error::Invalid("parse_error".into()))?;
@@ -764,12 +864,19 @@ fn validate_jsonl_shapes(body: &str, fields: &[&str], format: SourceFormat) -> R
     Ok(())
 }
 
-fn validate_value_discriminator(value: &Value, expected: SourceFormat) -> Result<()> {
+fn validate_value_discriminator(
+    value: &Value,
+    expected: SourceFormat,
+) -> std::result::Result<(), ReadFailure> {
     for field in ["schema_version", "format"] {
-        if let Some(discriminator) = validate_optional_string(value, field)?
-            && format_from_discriminator(discriminator)? != expected
-        {
-            return Err(Error::Conflict("format discriminator mismatch".into()));
+        if let Some(discriminator) = validate_optional_string(value, field)? {
+            match format_from_discriminator(discriminator) {
+                Err(error) => return Err(ReadFailure::Unsupported(error)),
+                Ok(found) if found != expected => {
+                    return Err(Error::Conflict("format discriminator mismatch".into()).into());
+                }
+                Ok(_) => {}
+            }
         }
     }
     Ok(())
@@ -958,113 +1065,33 @@ fn parse_rsih_pi(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<Impor
     Ok(events)
 }
 
-fn parse_rsia_trace(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<ImportedEvent>> {
-    // Check if JSON object or JSONL
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
-        if let Some(schema_ver) = parsed
-            .get("schema_version")
-            .and_then(|v| v.as_str())
-            .filter(|&ver| ver != "rsia.trace.v1" && ver != "rsia.optimization.source.v1")
-        {
-            return Err(Error::Invalid(format!(
-                "unknown schema_version: {}",
-                schema_ver
-            )));
-        }
-        if let Some(events_arr) = parsed.get("events").and_then(|v| v.as_array()) {
-            if parsed.get("schema_version").is_none() {
-                return Err(Error::Invalid(
-                    "missing schema_version for rsia.trace".into(),
-                ));
-            }
+/// Strict `rsia.trace.v1` reader (§11.2.1, V117.b), the same for the detected and
+/// the pinned path. Every record carries the complete header itself (nothing is
+/// inherited from another record) and every event an explicit sequence, role,
+/// kind and content; nothing defaults to `user`. Unknown non-authority fields
+/// are ignored. The header stays the exporter's unverified declaration.
+fn parse_rsia_trace(body: &str) -> Result<(Vec<ImportedEvent>, NativeTraceHeader, Vec<u64>)> {
+    let mut read = NativeTraceRead::default();
+    if let Ok(root) = serde_json::from_str::<Value>(body) {
+        read.header(&root)?;
+        if let Some(items) = root.get("events").and_then(Value::as_array) {
             let spans = find_json_array_element_spans(body, "events");
-            let mut events = Vec::new();
-            for (idx, item) in events_arr.iter().enumerate() {
+            for (index, item) in items.iter().enumerate() {
                 let (byte_start, byte_end) = spans
-                    .get(idx)
+                    .get(index)
                     .copied()
                     .ok_or_else(|| Error::Invalid("event_locator_mismatch".into()))?;
-                let role = item
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("user")
-                    .to_string();
-                let kind = item
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("chat")
-                    .to_string();
-                let content_raw = item
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let content = content_raw.to_string();
-
-                events.push(ImportedEvent {
-                    source_id: String::new(),
-                    origin_name: "rsia_trace".into(),
-                    role,
-                    format: SourceFormat::RsiaTraceV1,
-                    task_origin: TaskOrigin::ImportedHistory,
-                    attestation: ExecutionAttestation::UnverifiedImport,
-                    kind,
-                    content,
-                    event_index: idx,
-                    byte_start,
-                    byte_end,
-                    raw_fragment_digest: String::new(),
-                });
+                read.event(item, index, byte_start, byte_end)?;
             }
-            if !events.is_empty() {
-                return Ok(events);
-            }
-        } else if parsed.is_object() {
-            if let Some(schema_ver) = parsed
-                .get("schema_version")
-                .and_then(|v| v.as_str())
-                .filter(|&ver| ver != "rsia.trace.v1" && ver != "rsia.optimization.source.v1")
-            {
-                return Err(Error::Invalid(format!(
-                    "unknown schema_version: {}",
-                    schema_ver
-                )));
-            }
-            // Single object fixture fallback
-            let role = parsed
-                .get("role")
-                .and_then(|v| v.as_str())
-                .unwrap_or("user")
-                .to_string();
-            let content = parsed
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or(body);
-            let kind = parsed
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("chat")
-                .to_string();
-            return Ok(vec![ImportedEvent {
-                source_id: String::new(),
-                origin_name: "rsia_trace".into(),
-                role,
-                format: SourceFormat::RsiaTraceV1,
-                task_origin: TaskOrigin::ImportedHistory,
-                attestation: ExecutionAttestation::UnverifiedImport,
-                kind,
-                content: content.to_string(),
-                event_index: 0,
-                byte_start: 0,
-                byte_end: body.len(),
-                raw_fragment_digest: String::new(),
-            }]);
+        } else {
+            read.event(&root, 0, 0, body.len())?;
         }
+        return read.finish();
     }
 
-    // Line-delimited JSONL
-    let mut events = Vec::new();
+    // Line-delimited JSONL: each nonempty line is one complete record.
     let mut offset = 0;
-    for (idx, line) in body.split_inclusive('\n').enumerate() {
+    for (index, line) in body.split_inclusive('\n').enumerate() {
         let trimmed_end = line.trim_end_matches(&['\r', '\n'][..]);
         let ws_offset = trimmed_end.find(|c: char| !c.is_whitespace()).unwrap_or(0);
         let trimmed = trimmed_end.trim();
@@ -1075,36 +1102,97 @@ fn parse_rsia_trace(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<Im
         let byte_start = offset + ws_offset;
         let byte_end = byte_start + trimmed.len();
         offset += line.len();
-
-        let item: serde_json::Value =
+        let record: Value =
             serde_json::from_str(trimmed).map_err(|_| Error::Invalid("parse_error".into()))?;
-        if let Some(schema_ver) = item
-            .get("schema_version")
-            .and_then(|v| v.as_str())
-            .filter(|&ver| ver != "rsia.trace.v1" && ver != "rsia.optimization.source.v1")
-        {
-            return Err(Error::Invalid(format!(
-                "unknown schema_version: {}",
-                schema_ver
-            )));
-        }
-        let role = item
-            .get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("user")
-            .to_string();
-        let kind = item
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("chat")
-            .to_string();
-        let content_raw = item
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let content = content_raw.to_string();
+        read.header(&record)?;
+        read.event(&record, index, byte_start, byte_end)?;
+    }
+    read.finish()
+}
 
-        events.push(ImportedEvent {
+#[derive(Default)]
+struct NativeTraceRead {
+    header: Option<NativeTraceHeader>,
+    events: Vec<ImportedEvent>,
+    sequences: Vec<u64>,
+}
+
+impl NativeTraceRead {
+    fn header(&mut self, record: &Value) -> Result<()> {
+        if record.get("schema_version").is_none() {
+            return Err(Error::Invalid(
+                "missing schema_version for rsia.trace".into(),
+            ));
+        }
+        let header = NativeTraceHeader {
+            exporter: native_field(record, "exporter")?,
+            run_id: native_field(record, "run_id")?,
+            redaction_report: native_field(record, "redaction_report")?,
+            coverage: native_field(record, "coverage")?,
+        };
+        let exporter = &header.exporter;
+        if exporter.name != "rsia"
+            || identifier(&exporter.version).is_err()
+            || exporter.commit.len() != 40
+            || !exporter
+                .commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Error::Invalid("invalid exporter for rsia.trace".into()));
+        }
+        if identifier(&header.run_id).is_err() {
+            return Err(Error::Invalid("invalid run_id for rsia.trace".into()));
+        }
+        let report = &header.redaction_report;
+        if report.schema_version != "rsia.trace.redaction.v1"
+            || report.scan_status != "passed"
+            || report.review_status != "reviewed"
+        {
+            return Err(Error::Invalid(
+                "invalid redaction_report for rsia.trace".into(),
+            ));
+        }
+        match &self.header {
+            Some(first) if *first != header => {
+                Err(Error::Invalid("header mismatch for rsia.trace".into()))
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.header = Some(header);
+                Ok(())
+            }
+        }
+    }
+
+    // Field types were checked by the shape validator: an absent string field
+    // is missing, never a default.
+    fn event(
+        &mut self,
+        item: &Value,
+        event_index: usize,
+        byte_start: usize,
+        byte_end: usize,
+    ) -> Result<()> {
+        let sequence = item
+            .get("sequence")
+            .ok_or_else(|| Error::Invalid("missing sequence for rsia.trace".into()))?
+            .as_u64()
+            .ok_or_else(|| Error::Invalid("sequence must be an unsigned integer".into()))?;
+        if self.sequences.last().is_some_and(|last| *last >= sequence) {
+            return Err(Error::Invalid(
+                "sequence must strictly increase for rsia.trace".into(),
+            ));
+        }
+        let role = native_label(item, "role")?;
+        let kind = native_label(item, "kind")?;
+        let content = item
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Invalid("missing content for rsia.trace".into()))?
+            .to_string();
+        self.sequences.push(sequence);
+        self.events.push(ImportedEvent {
             source_id: String::new(),
             origin_name: "rsia_trace".into(),
             role,
@@ -1113,19 +1201,44 @@ fn parse_rsia_trace(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<Im
             attestation: ExecutionAttestation::UnverifiedImport,
             kind,
             content,
-            event_index: idx,
+            event_index,
             byte_start,
             byte_end,
             raw_fragment_digest: String::new(),
         });
+        Ok(())
     }
 
-    if events.is_empty() {
-        return Err(Error::Invalid(
-            "zero records is not empty history success".into(),
-        ));
+    fn finish(self) -> Result<(Vec<ImportedEvent>, NativeTraceHeader, Vec<u64>)> {
+        let header = self
+            .header
+            .filter(|_| !self.events.is_empty())
+            .ok_or_else(|| Error::Invalid("zero records is not empty history success".into()))?;
+        header
+            .coverage
+            .validate_declared(self.events.len() as u64)?;
+        Ok((self.events, header, self.sequences))
     }
-    Ok(events)
+}
+
+fn native_field<T: DeserializeOwned>(record: &Value, field: &str) -> Result<T> {
+    let value = record
+        .get(field)
+        .ok_or_else(|| Error::Invalid(format!("missing {field} for rsia.trace")))?;
+    serde_json::from_value(value.clone())
+        .map_err(|_| Error::Invalid(format!("invalid {field} for rsia.trace")))
+}
+
+/// Role and kind keep their original text and case; they are never empty and
+/// never carry NUL.
+fn native_label(item: &Value, field: &str) -> Result<String> {
+    match item.get(field).and_then(Value::as_str) {
+        None => Err(Error::Invalid(format!("missing {field} for rsia.trace"))),
+        Some(label) if label.is_empty() || label.contains('\0') => {
+            Err(Error::Invalid(format!("invalid {field} for rsia.trace")))
+        }
+        Some(label) => Ok(label.to_string()),
+    }
 }
 
 fn parse_claude_fixture(body: &str, _limits: &ImportForensicLimits) -> Result<Vec<ImportedEvent>> {
@@ -1228,6 +1341,7 @@ struct ImportAttempt {
     aggregate_summary: AggregateSummary,
     events: Vec<ImportedEvent>,
     locators: Vec<EvidenceLocator>,
+    native_traces: Vec<NativeTraceSource>,
 }
 
 impl ImportAttempt {
@@ -1324,6 +1438,7 @@ fn ingest_selected_sources(
     let mut failure_count = 0;
     let mut seen_sources = BTreeSet::new();
     let mut excerpt_bytes_used = 0usize;
+    let mut native_traces = Vec::new();
 
     for source in &sources[..count_to_process] {
         let source_name = source.source_name;
@@ -1382,13 +1497,20 @@ fn ingest_selected_sources(
             }
         };
 
-        let parsed_events = match parse_fixture_with_limits(format, body, &limits) {
-            Ok(evs) => evs,
+        // A source contributes whole or not at all. Pi/Claude keep their original
+        // parse-failure count; a Native version outside the table is unsupported.
+        let read = match read_fixture(format, body, &limits) {
+            Ok(read) => read,
+            Err(ReadFailure::Unsupported(_)) if format == SourceFormat::RsiaTraceV1 => {
+                coverage.unsupported_format += 1;
+                continue;
+            }
             Err(_) => {
                 coverage.parsed_fail += 1;
                 continue;
             }
         };
+        let parsed_events = read.events;
 
         if parsed_events.is_empty() {
             coverage.zero_records += 1;
@@ -1396,6 +1518,17 @@ fn ingest_selected_sources(
         }
 
         coverage.parsed_ok += 1;
+        if let Some((header, sequences)) = read.native {
+            native_traces.push(NativeTraceSource {
+                source_id: member_id.clone(),
+                header,
+                event_sequences: parsed_events
+                    .iter()
+                    .map(|event| event.event_index)
+                    .zip(sequences)
+                    .collect(),
+            });
+        }
 
         let content_digest = evo_core::hash(raw_bytes);
 
@@ -1529,13 +1662,15 @@ fn ingest_selected_sources(
         aggregate_summary: summary,
         events: all_events,
         locators: all_locators,
+        native_traces,
     })
 }
 
 pub const IMPORT_REGISTRATION_SCHEMA: &str = "rsia.e16.import_registration.v1";
 pub const SOURCE_SELECTION_SCHEMA: &str = "rsia.e16.source_selection.v1";
 pub const IMPORT_SOURCE_SCHEMA: &str = "rsia.e16.import_source.v1";
-pub const IMPORT_RESULT_SCHEMA: &str = "rsia.e16.import_result.v1";
+/// The current result schema; v1 results stay readable as legacy history.
+pub const IMPORT_RESULT_SCHEMA: &str = IMPORT_RESULT_SCHEMA_V2;
 const IMPORT_ARTIFACT_KIND: &str = "artifact";
 const IMPORT_EVENT_CAPACITY: u64 = 10_000;
 
@@ -1656,9 +1791,31 @@ pub enum ImportResultState {
     Failed,
 }
 
+/// Current (v2) result: the v1 fields plus the reader and normalization
+/// versions it was derived with, this import's own statistics in the complete
+/// coverage carrier, and each Native source's declared header and original
+/// event sequences.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportResultPayload {
+    pub selection_id: String,
+    pub reader_version: String,
+    pub normalization_version: String,
+    pub state: ImportResultState,
+    pub evidence_set: Option<EvidenceSet>,
+    pub aggregate_summary: AggregateSummary,
+    pub import_coverage: TraceCoverage,
+    pub locators: Vec<EvidenceLocator>,
+    pub event_records: Vec<PersistedImportEvent>,
+    pub native_traces: Vec<NativeTraceSource>,
+    pub generation_status: String,
+}
+
+/// Historical v1 result, field for field as PR44 wrote it. Statically readable
+/// and cleanable; never re-derived and never an input of a new derivation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyImportResultPayloadV1 {
     pub selection_id: String,
     pub state: ImportResultState,
     pub evidence_set: Option<EvidenceSet>,
@@ -1671,6 +1828,116 @@ pub struct ImportResultPayload {
 pub type SourceSelectionRecord = ImportEnvelope<SourceSelectionPayload>;
 pub type ImportSourceRecord = ImportEnvelope<ImportSourcePayload>;
 pub type ImportResultRecord = ImportEnvelope<ImportResultPayload>;
+pub type LegacyImportResultRecordV1 = ImportEnvelope<LegacyImportResultPayloadV1>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportResultReadState {
+    CurrentVerified,
+    Legacy,
+}
+
+/// Version-aware read projection of one stored result (§5.1.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportResultReadView {
+    pub schema_version: String,
+    pub state: ImportResultReadState,
+    pub selection_id: String,
+    /// Both lineage identities derive from the one selection.
+    pub legacy_v1_id: String,
+    pub current_v2_id: String,
+    /// The stored record text, byte for byte.
+    pub record: String,
+}
+
+/// A stored result after its static checks, by version. Static checks alone
+/// never make a record current. A short-lived value of one read, so the larger
+/// current variant is not boxed.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum StoredImportResult {
+    V2(ImportResultRecord),
+    LegacyV1(LegacyImportResultRecordV1),
+}
+
+/// What both stored result versions keep alike; every static read checks this.
+pub(crate) struct ResultCore<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) request_key: &'a str,
+    pub(crate) input_digest: &'a str,
+    pub(crate) source_refs: &'a [ImportTypedRef],
+    pub(crate) revoke_watermark: u64,
+    pub(crate) selection_id: &'a str,
+    pub(crate) state: ImportResultState,
+    pub(crate) evidence_set: Option<&'a EvidenceSet>,
+    pub(crate) total_events: usize,
+    pub(crate) locators: &'a [EvidenceLocator],
+    pub(crate) event_records: &'a [PersistedImportEvent],
+    pub(crate) generation_status: &'a str,
+}
+
+impl StoredImportResult {
+    /// Static version table dispatch (§5.1.1): a schema outside the table is
+    /// unsupported, never legacy or current; a known version that does not
+    /// decode is invalid.
+    fn decode(body: &str) -> Result<Self> {
+        let invalid = || Error::Conflict("import_result_invalid".into());
+        let value: Value = serde_json::from_str(body).map_err(|_| invalid())?;
+        let schema = value.get("schema_version").and_then(Value::as_str);
+        let version = IMPORT_RESULT_VERSIONS
+            .iter()
+            .find(|row| Some(row.schema_version) == schema)
+            .ok_or_else(|| Error::Invalid("import_result_version_unsupported".into()))?;
+        if version.retains_judge {
+            serde_json::from_value(value).map(Self::V2)
+        } else {
+            serde_json::from_value(value).map(Self::LegacyV1)
+        }
+        .map_err(|_| invalid())
+    }
+
+    pub(crate) fn core(&self) -> ResultCore<'_> {
+        match self {
+            Self::V2(record) => ResultCore {
+                id: &record.id,
+                request_key: &record.request_key,
+                input_digest: &record.input_digest,
+                source_refs: &record.source_refs,
+                revoke_watermark: record.revoke_watermark,
+                selection_id: &record.payload.selection_id,
+                state: record.payload.state,
+                evidence_set: record.payload.evidence_set.as_ref(),
+                total_events: record.payload.aggregate_summary.total_events,
+                locators: &record.payload.locators,
+                event_records: &record.payload.event_records,
+                generation_status: &record.payload.generation_status,
+            },
+            Self::LegacyV1(record) => ResultCore {
+                id: &record.id,
+                request_key: &record.request_key,
+                input_digest: &record.input_digest,
+                source_refs: &record.source_refs,
+                revoke_watermark: record.revoke_watermark,
+                selection_id: &record.payload.selection_id,
+                state: record.payload.state,
+                evidence_set: record.payload.evidence_set.as_ref(),
+                total_events: record.payload.aggregate_summary.total_events,
+                locators: &record.payload.locators,
+                event_records: &record.payload.event_records,
+                generation_status: &record.payload.generation_status,
+            },
+        }
+    }
+}
+
+/// One statically checked result with the stored text and live closure it was
+/// checked against.
+struct StaticImportResult {
+    stored: StoredImportResult,
+    body: String,
+    selection: SourceSelectionRecord,
+    sources: Vec<ImportSourceRecord>,
+}
 
 #[derive(Clone)]
 pub struct PersistentImportService {
@@ -2170,7 +2437,9 @@ impl PersistentImportService {
         ctx.require(&[Role::Admin])?;
         identifier(selection_id)?;
         let _guard = self.operation_lock.lock().await;
-        let result_id = format!("e16res-{}", &hash(selection_id.as_bytes())[..24]);
+        let (selection, source_records) = self.load_live_selection(ctx, selection_id).await?;
+        // A v1 result of this selection keeps its own id and stays legacy.
+        let result_id = import_result_id_v2(&selection.id, &selection.input_digest)?;
         let mut session = self.store.session().await?;
         let result_exists = session
             .get::<Value>(ctx, IMPORT_ARTIFACT_KIND, &result_id)
@@ -2185,7 +2454,6 @@ impl PersistentImportService {
             return Err(Error::Conflict("import result identity mismatch".into()));
         }
 
-        let (selection, source_records) = self.load_live_selection(ctx, selection_id).await?;
         let mut remaining = MAX_TOTAL_READ_BYTES;
         let mut ready_sources = Vec::new();
         let mut owned_bytes = Vec::new();
@@ -2276,6 +2544,7 @@ impl PersistentImportService {
                 },
                 events: Vec::new(),
                 locators: Vec::new(),
+                native_traces: Vec::new(),
             }
         } else {
             ingest_selected_sources(&logical_selection, &pinned, None, true)?
@@ -2292,21 +2561,8 @@ impl PersistentImportService {
                 set.independent_clusters,
             )?);
         }
-        let event_records: Vec<_> = ingest
-            .events
-            .iter()
-            .map(|event| PersistedImportEvent {
-                source_id: event.source_id.clone(),
-                event_index: event.event_index,
-                byte_start: event.byte_start,
-                byte_end: event.byte_end,
-                raw_fragment_digest: event.raw_fragment_digest.clone(),
-                normalized_content_digest: hash(event.content.as_bytes()),
-                role: event.role.clone(),
-                kind: event.kind.clone(),
-            })
-            .collect();
-        if ingest.aggregate_summary.total_events != event_records.len() {
+        let payload = import_result_payload_v2(&selection.id, &ingest);
+        if payload.aggregate_summary.total_events != payload.event_records.len() {
             return Err(Error::Conflict("import event count mismatch".into()));
         }
         let mut source_refs = vec![ImportTypedRef {
@@ -2322,13 +2578,6 @@ impl PersistentImportService {
             });
         }
         let timestamp = selection.created_at;
-        let state = if ingest.evidence_set.is_none() {
-            ImportResultState::Failed
-        } else if ingest.aggregate_summary.coverage.complete() {
-            ImportResultState::Complete
-        } else {
-            ImportResultState::Partial
-        };
         let result = ImportEnvelope {
             schema_version: IMPORT_RESULT_SCHEMA.into(),
             id: result_id,
@@ -2340,18 +2589,15 @@ impl PersistentImportService {
             updated_at: timestamp,
             source_refs,
             revoke_watermark: selection.revoke_watermark,
-            payload: ImportResultPayload {
-                selection_id: selection.id.clone(),
-                state,
-                evidence_set: ingest.evidence_set,
-                aggregate_summary: ingest.aggregate_summary,
-                locators: ingest.locators,
-                event_records,
-                generation_status: "blocked_external_generation_conditions_unavailable".into(),
-            },
+            payload,
         };
 
-        validate_import_evidence_sources(&result.payload, &selection, &source_records)?;
+        validate_import_evidence_sources(
+            result.payload.evidence_set.as_ref(),
+            &result.payload.locators,
+            &selection,
+            &source_records,
+        )?;
         let mut session = self.store.session().await?;
         validate_live_import_sources(&mut session, ctx, &selection, &source_records).await?;
         if let Some(existing) = session
@@ -2365,14 +2611,11 @@ impl PersistentImportService {
             return Ok(existing);
         }
         session
-            .put_new_below_json_sum_capacity(
+            .put_new_import_result_below_event_capacity(
                 ctx,
-                IMPORT_ARTIFACT_KIND,
                 &result.id,
                 ctx.actor(),
                 &result,
-                IMPORT_RESULT_SCHEMA,
-                "$.payload.aggregate_summary.total_events",
                 result.payload.aggregate_summary.total_events as u64,
                 IMPORT_EVENT_CAPACITY,
             )
@@ -2404,22 +2647,102 @@ impl PersistentImportService {
         Ok(result)
     }
 
+    /// The current (v2) result after its static checks. A v1 result is legacy
+    /// history: readable through `read_result_version`, never a current input.
     pub async fn load_live_result(
         &self,
         ctx: &Context,
         result_id: &str,
     ) -> Result<ImportResultRecord> {
+        match self.load_static_result(ctx, result_id).await? {
+            StoredImportResult::V2(record) => Ok(record),
+            StoredImportResult::LegacyV1(_) => Err(Error::Conflict("import_result_legacy".into())),
+        }
+    }
+
+    pub(crate) async fn load_static_result(
+        &self,
+        ctx: &Context,
+        result_id: &str,
+    ) -> Result<StoredImportResult> {
+        Ok(self.static_result(ctx, result_id).await?.stored)
+    }
+
+    /// Admin read projection through the static version table (§5.1.1): the
+    /// stored version, its read state, both lineage ids of its selection and the
+    /// stored text. A valid v1 record reads as legacy; a v2 record is
+    /// current_verified only when the fixed derivation recomputed from the exact
+    /// raw bytes equals it.
+    pub async fn read_result_version(
+        &self,
+        ctx: &Context,
+        result_id: &str,
+    ) -> Result<ImportResultReadView> {
+        ctx.require(&[Role::Admin])?;
+        let read = self.static_result(ctx, result_id).await?;
+        let (schema_version, state) = match &read.stored {
+            StoredImportResult::LegacyV1(_) => (
+                LEGACY_IMPORT_RESULT_SCHEMA_V1,
+                ImportResultReadState::Legacy,
+            ),
+            StoredImportResult::V2(record) => {
+                let rebuilt = self
+                    .reconstruct_local_import(ctx, &read.selection, &read.sources)
+                    .await?;
+                if fingerprint(&import_result_payload_v2(&read.selection.id, &rebuilt))?
+                    != fingerprint(&record.payload)?
+                {
+                    return Err(Error::Conflict(
+                        "persisted import derivation mismatch".into(),
+                    ));
+                }
+                (
+                    IMPORT_RESULT_SCHEMA_V2,
+                    ImportResultReadState::CurrentVerified,
+                )
+            }
+        };
+        self.static_result(ctx, result_id).await?;
+        Ok(ImportResultReadView {
+            schema_version: schema_version.into(),
+            state,
+            selection_id: read.selection.id.clone(),
+            legacy_v1_id: legacy_import_result_id_v1(&read.selection.id),
+            current_v2_id: import_result_id_v2(&read.selection.id, &read.selection.input_digest)?,
+            record: read.body,
+        })
+    }
+
+    /// Static identity, closure, live-source and watermark checks of a stored
+    /// result of either known version; for Admin also the raw bytes its evidence
+    /// binds. Nothing is re-derived here.
+    async fn static_result(&self, ctx: &Context, result_id: &str) -> Result<StaticImportResult> {
         ctx.require(&[Role::Admin, Role::Evaluator])?;
         identifier(result_id)?;
         let mut session = self.store.session().await?;
-        let result: ImportResultRecord = session.need(ctx, IMPORT_ARTIFACT_KIND, result_id).await?;
-        validate_result_record(ctx, &result)?;
+        let body = session
+            .object_row(ctx, IMPORT_ARTIFACT_KIND, result_id)
+            .await?
+            .ok_or(Error::NotFound)?
+            .body;
+        let stored = StoredImportResult::decode(&body)?;
+        validate_result_record(ctx, &stored)?;
+        let result = stored.core();
         let selection: SourceSelectionRecord = session
-            .need(ctx, IMPORT_ARTIFACT_KIND, &result.payload.selection_id)
+            .need(ctx, IMPORT_ARTIFACT_KIND, result.selection_id)
             .await?;
         let source_records =
             load_and_validate_source_records(&mut session, ctx, &selection).await?;
         validate_live_import_sources(&mut session, ctx, &selection, &source_records).await?;
+        let expected_id = match &stored {
+            StoredImportResult::V2(_) => {
+                import_result_id_v2(&selection.id, &selection.input_digest)?
+            }
+            StoredImportResult::LegacyV1(_) => legacy_import_result_id_v1(&selection.id),
+        };
+        if result.id != expected_id {
+            return Err(Error::Conflict("import_result_invalid".into()));
+        }
         let selection_digest = fingerprint(&selection)?;
         if result.revoke_watermark != selection.revoke_watermark
             || result.source_refs.first().is_none_or(|source| {
@@ -2428,7 +2751,7 @@ impl PersistentImportService {
                     || source.content_digest != selection_digest
             })
             || result.source_refs.len() != source_records.len() + 1
-            || result.payload.aggregate_summary.total_events != result.payload.event_records.len()
+            || result.total_events != result.event_records.len()
         {
             return Err(Error::Conflict("import result closure mismatch".into()));
         }
@@ -2442,7 +2765,12 @@ impl PersistentImportService {
         }
         // Evaluator access is a summary-only historical view, not a byte proof.
         if ctx.role() == Role::Admin {
-            validate_import_evidence_sources(&result.payload, &selection, &source_records)?;
+            validate_import_evidence_sources(
+                result.evidence_set,
+                result.locators,
+                &selection,
+                &source_records,
+            )?;
         }
         session.commit().await?;
         if ctx.role() == Role::Admin {
@@ -2461,13 +2789,18 @@ impl PersistentImportService {
                 if hash(&bytes) != source.payload.raw_digest {
                     return Err(Error::Conflict("source_changed".into()));
                 }
-                verify_import_evidence_bytes(&result.payload, &source.id, &bytes)?;
+                verify_import_evidence_bytes(&result, &source.id, &bytes)?;
             }
         }
         let mut session = self.store.session().await?;
         validate_live_import_sources(&mut session, ctx, &selection, &source_records).await?;
         session.commit().await?;
-        Ok(result)
+        Ok(StaticImportResult {
+            stored,
+            body,
+            selection,
+            sources: source_records,
+        })
     }
 
     pub async fn read_event_fragment(
@@ -2478,9 +2811,10 @@ impl PersistentImportService {
         event_index: usize,
     ) -> Result<Vec<u8>> {
         ctx.require(&[Role::Admin])?;
-        let result = self.load_live_result(ctx, result_id).await?;
+        // Bounded raw fragments of both known versions stay readable.
+        let result = self.load_static_result(ctx, result_id).await?;
         let event = result
-            .payload
+            .core()
             .event_records
             .iter()
             .find(|event| event.source_id == source_id && event.event_index == event_index)
@@ -2509,7 +2843,7 @@ impl PersistentImportService {
             &event.raw_fragment_digest,
         )?;
         let fragment = locator.verify_and_extract(&bytes)?.to_vec();
-        self.load_live_result(ctx, result_id).await?;
+        self.load_static_result(ctx, result_id).await?;
         Ok(fragment)
     }
 
@@ -2540,22 +2874,12 @@ impl PersistentImportService {
         let snapshot = self
             .load_local_material_snapshot(ctx, &request.result)
             .await?;
-        let rebuilt = self.reconstruct_local_import(ctx, &snapshot).await?;
-        let events: Vec<_> = rebuilt.events.iter().map(persisted_local_event).collect();
-        let state = import_attempt_state(&rebuilt);
-        if fingerprint(&(
-            &rebuilt.evidence_set,
-            &rebuilt.aggregate_summary,
-            &events,
-            &rebuilt.locators,
-            state,
-        ))? != fingerprint(&(
-            &snapshot.result.payload.evidence_set,
-            &snapshot.result.payload.aggregate_summary,
-            &snapshot.result.payload.event_records,
-            &snapshot.result.payload.locators,
-            snapshot.result.payload.state,
-        ))? {
+        let rebuilt = self
+            .reconstruct_local_import(ctx, &snapshot.selection, &snapshot.sources)
+            .await?;
+        if fingerprint(&import_result_payload_v2(&snapshot.selection.id, &rebuilt))?
+            != fingerprint(&snapshot.result.payload)?
+        {
             return Err(Error::Conflict(
                 "persisted import derivation mismatch".into(),
             ));
@@ -2618,9 +2942,17 @@ impl PersistentImportService {
         pinned: &ImportArtifactRef,
     ) -> Result<LocalImportSnapshot> {
         let mut session = self.store.session().await?;
-        let result: ImportResultRecord =
-            session.need(ctx, IMPORT_ARTIFACT_KIND, &pinned.id).await?;
-        validate_result_record(ctx, &result)?;
+        let body = session
+            .object_row(ctx, IMPORT_ARTIFACT_KIND, &pinned.id)
+            .await?
+            .ok_or(Error::NotFound)?
+            .body;
+        let stored = StoredImportResult::decode(&body)?;
+        validate_result_record(ctx, &stored)?;
+        // A v1 result is refused before any reconstruction or new derivation.
+        let StoredImportResult::V2(result) = stored else {
+            return Err(Error::Conflict("import_result_legacy".into()));
+        };
         if result.id != pinned.id
             || fingerprint(&result)? != pinned.object_digest
             || result.input_digest != fingerprint(&result.source_refs)?
@@ -2635,7 +2967,7 @@ impl PersistentImportService {
         validate_selection_record(ctx, &selection)?;
         if selection.id != result.payload.selection_id
             || selection.payload.purpose != Purpose::Development
-            || result.id != format!("e16res-{}", &hash(selection.id.as_bytes())[..24])
+            || result.id != import_result_id_v2(&selection.id, &selection.input_digest)?
             || result.owner_actor != selection.owner_actor
             || result.request_key != selection.request_key
             || result.revoke_watermark != selection.revoke_watermark
@@ -2746,10 +3078,12 @@ impl PersistentImportService {
         })
     }
 
+    /// Re-runs the pinned readers over the exact registered raw bytes.
     async fn reconstruct_local_import(
         &self,
         ctx: &Context,
-        snapshot: &LocalImportSnapshot,
+        selection: &SourceSelectionRecord,
+        sources: &[ImportSourceRecord],
     ) -> Result<ImportAttempt> {
         let mut remaining = MAX_TOTAL_READ_BYTES;
         let mut ready = Vec::new();
@@ -2759,7 +3093,7 @@ impl PersistentImportService {
             files_known: true,
             ..SourceCoverage::default()
         };
-        for source in &snapshot.sources {
+        for source in sources {
             match source.payload.status {
                 ImportSourceReadStatus::Prepared => {
                     return Err(Error::Conflict("import source is still Prepared".into()));
@@ -2821,13 +3155,13 @@ impl PersistentImportService {
                 cluster_hint: Some(&source.payload.logical_source_id),
             })
             .collect();
-        let selection = SourceSelection {
-            roots: snapshot.selection.payload.roots.clone(),
+        let logical_selection = SourceSelection {
+            roots: selection.payload.roots.clone(),
             run_ids: ready.iter().map(|source| source.id.clone()).collect(),
-            purpose: Purpose::Development,
-            allow_model_excerpts: snapshot.selection.payload.allow_model_excerpts
-                && snapshot.selection.payload.outbound_authorized
-                && snapshot.selection.payload.retention_scope
+            purpose: selection.payload.purpose,
+            allow_model_excerpts: selection.payload.allow_model_excerpts
+                && selection.payload.outbound_authorized
+                && selection.payload.retention_scope
                     == ImportRetentionScope::LocalWithAuthorizedExcerpts,
         };
         let mut rebuilt = if pinned.is_empty() {
@@ -2843,9 +3177,10 @@ impl PersistentImportService {
                 },
                 events: Vec::new(),
                 locators: Vec::new(),
+                native_traces: Vec::new(),
             }
         } else {
-            ingest_selected_sources(&selection, &pinned, None, true)?
+            ingest_selected_sources(&logical_selection, &pinned, None, true)?
         };
         merge_coverage(&mut rebuilt.aggregate_summary.coverage, &unavailable);
         if let Some(set) = rebuilt.evidence_set.take() {
@@ -2906,13 +3241,60 @@ fn persisted_local_event(event: &ImportedEvent) -> PersistedImportEvent {
     }
 }
 
-fn import_attempt_state(attempt: &ImportAttempt) -> ImportResultState {
-    if attempt.evidence_set.is_none() {
+/// The fixed v2 derivation (reader_set.v2, normalization.v2) of one import
+/// attempt: `execute` persists it and every current verification recomputes it
+/// from the exact raw bytes.
+fn import_result_payload_v2(selection_id: &str, attempt: &ImportAttempt) -> ImportResultPayload {
+    let coverage = &attempt.aggregate_summary.coverage;
+    let events = attempt.events.len() as u64;
+    // This import's own statistics: the readers drop or filter no event and
+    // render no tool parameters, so none are truncated.
+    let import_coverage = TraceCoverage {
+        discovery_exhausted: coverage.discovery_exhausted,
+        files_known: coverage.files_known,
+        bytes_read: coverage.bytes_read,
+        parsed_ok: coverage.parsed_ok,
+        parsed_fail: coverage.parsed_fail,
+        permission_denied: coverage.permission_denied,
+        missing: coverage.missing,
+        unsupported_format: coverage.unsupported_format,
+        zero_records: coverage.zero_records,
+        events_seen: events,
+        events_exported: events,
+        events_filtered: 0,
+        event_truncated: coverage.event_truncated,
+        char_truncated: coverage.char_truncated,
+        parameter_truncated_events: 0,
+        parameter_truncated_bytes: 0,
+        excerpt_truncated: coverage.excerpt_truncated,
+        outbound_truncated: coverage.outbound_truncated,
+    };
+    // A Native header's declared coverage can lower the result to partial,
+    // never raise it to complete.
+    let state = if attempt.evidence_set.is_none() {
         ImportResultState::Failed
-    } else if attempt.aggregate_summary.coverage.complete() {
+    } else if import_coverage.complete()
+        && attempt
+            .native_traces
+            .iter()
+            .all(|trace| trace.header.coverage.complete())
+    {
         ImportResultState::Complete
     } else {
         ImportResultState::Partial
+    };
+    ImportResultPayload {
+        selection_id: selection_id.into(),
+        reader_version: IMPORT_READER_SET_V2.into(),
+        normalization_version: IMPORT_NORMALIZATION_V2.into(),
+        state,
+        evidence_set: attempt.evidence_set.clone(),
+        aggregate_summary: attempt.aggregate_summary.clone(),
+        import_coverage,
+        locators: attempt.locators.clone(),
+        event_records: attempt.events.iter().map(persisted_local_event).collect(),
+        native_traces: attempt.native_traces.clone(),
+        generation_status: "blocked_external_generation_conditions_unavailable".into(),
     }
 }
 
@@ -3300,12 +3682,13 @@ fn validate_source_record(ctx: &Context, record: &ImportSourceRecord) -> Result<
 // Content checks within the existing Admin writer/reader. Imported history
 // remains unverified; these checks never manufacture source permissions.
 fn validate_import_evidence_sources(
-    payload: &ImportResultPayload,
+    evidence_set: Option<&EvidenceSet>,
+    locators: &[EvidenceLocator],
     selection: &SourceSelectionRecord,
     sources: &[ImportSourceRecord],
 ) -> Result<()> {
     let mut members = BTreeSet::new();
-    if let Some(set) = &payload.evidence_set {
+    if let Some(set) = evidence_set {
         let rebuilt = EvidenceSet::build(
             set.id.clone(),
             set.members.clone(),
@@ -3333,7 +3716,7 @@ fn validate_import_evidence_sources(
             }
         }
     }
-    for locator in &payload.locators {
+    for locator in locators {
         if !members.contains(locator.source_id.as_str()) {
             return Err(Error::Conflict(
                 "import locator source binding mismatch".into(),
@@ -3343,12 +3726,8 @@ fn validate_import_evidence_sources(
     Ok(())
 }
 
-fn verify_import_evidence_bytes(
-    payload: &ImportResultPayload,
-    source_id: &str,
-    raw: &[u8],
-) -> Result<()> {
-    if let Some(set) = &payload.evidence_set {
+fn verify_import_evidence_bytes(result: &ResultCore, source_id: &str, raw: &[u8]) -> Result<()> {
+    if let Some(set) = result.evidence_set {
         for member in set
             .members
             .iter()
@@ -3357,13 +3736,13 @@ fn verify_import_evidence_bytes(
             evo_core::evidence::verify_evidence_member_content_v3(member, raw)?;
         }
     }
-    for locator in payload
+    for locator in result
         .locators
         .iter()
         .filter(|locator| locator.source_id == source_id)
     {
         evo_core::evidence::verify_evidence_locator_content_v3(locator, raw)?;
-        let mut events = payload.event_records.iter().filter(|event| {
+        let mut events = result.event_records.iter().filter(|event| {
             event.source_id == source_id && event.event_index == locator.event_index
         });
         let event = events
@@ -3381,19 +3760,30 @@ fn verify_import_evidence_bytes(
     Ok(())
 }
 
-fn validate_result_record(ctx: &Context, record: &ImportResultRecord) -> Result<()> {
-    validate_envelope(ctx, record, IMPORT_RESULT_SCHEMA)?;
-    if record.payload.generation_status != "blocked_external_generation_conditions_unavailable"
-        || record.payload.evidence_set.as_ref().is_some_and(|set| {
+fn validate_result_record(ctx: &Context, stored: &StoredImportResult) -> Result<()> {
+    match stored {
+        StoredImportResult::V2(record) => {
+            validate_envelope(ctx, record, IMPORT_RESULT_SCHEMA_V2)?;
+            if record.payload.reader_version != IMPORT_READER_SET_V2
+                || record.payload.normalization_version != IMPORT_NORMALIZATION_V2
+            {
+                return Err(Error::Conflict("import_result_invalid".into()));
+            }
+        }
+        StoredImportResult::LegacyV1(record) => {
+            validate_envelope(ctx, record, LEGACY_IMPORT_RESULT_SCHEMA_V1)?;
+        }
+    }
+    let record = stored.core();
+    if record.generation_status != "blocked_external_generation_conditions_unavailable"
+        || record.evidence_set.is_some_and(|set| {
             set.members.iter().any(|member| {
                 member.task_origin != TaskOrigin::ImportedHistory
                     || member.execution_attestation != ExecutionAttestation::UnverifiedImport
             })
         })
-        || (record.payload.state == ImportResultState::Failed
-            && record.payload.evidence_set.is_some())
-        || (record.payload.state != ImportResultState::Failed
-            && record.payload.evidence_set.is_none())
+        || (record.state == ImportResultState::Failed && record.evidence_set.is_some())
+        || (record.state != ImportResultState::Failed && record.evidence_set.is_none())
     {
         return Err(Error::Conflict("invalid persisted import result".into()));
     }
@@ -3452,7 +3842,11 @@ mod tests {
 
     #[test]
     fn import_is_unverified() {
-        let ev = parse_fixture(SourceFormat::RsiaTraceV1, "{}").unwrap();
+        let ev = parse_fixture(
+            SourceFormat::RsiaTraceV1,
+            include_str!("../../../fixtures/imports/rsia.trace.v1.reader-golden.json"),
+        )
+        .unwrap();
         assert_eq!(ev[0].attestation, ExecutionAttestation::UnverifiedImport);
         assert_eq!(ev[0].task_origin, TaskOrigin::ImportedHistory);
         assert!(tool_result_is_not_preference("user", "chat"));

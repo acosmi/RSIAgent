@@ -1775,6 +1775,122 @@ async fn e16_import_source_revocation_cleans_full_result_closure_and_only_its_bl
     assert_eq!(reconnected.job_id, status.job_id);
 }
 
+/// AG-148 (§5.1.1): a legacy v1 and a current v2 result are both cleaned as
+/// import results; each keeps its version, original digest and the metadata
+/// history needs, and loses its content.
+#[tokio::test]
+async fn result_v2_cleanup_preserves_required_history() {
+    let (_dir, store) = database().await;
+    let admin = ctx("admin", Role::Admin);
+    let blob = store
+        .put_blob(&admin, b"AG148-SOURCE-SECRET")
+        .await
+        .unwrap();
+    let source = e16_import_envelope(
+        "rsia.e16.import_source.v1",
+        "ag148-source",
+        json!([]),
+        json!({"raw_blob_digest":blob}),
+    );
+    let refs = json!([{"kind":"artifact","id":"ag148-source","content_digest":hash(b"source")}]);
+    let results = [
+        (
+            "ag148-result-v1",
+            "rsia.e16.import_result.v1",
+            e16_import_envelope(
+                "rsia.e16.import_result.v1",
+                "ag148-result-v1",
+                refs.clone(),
+                json!({"aggregate_summary":{"total_events":2},"secret":"V1-RESULT-SECRET"}),
+            ),
+        ),
+        (
+            "ag148-result-v2",
+            "rsia.e16.import_result.v2",
+            e16_import_envelope(
+                "rsia.e16.import_result.v2",
+                "ag148-result-v2",
+                refs,
+                json!({"aggregate_summary":{"total_events":3},"reader_version":"rsia.e16.reader_set.v2","secret":"V2-RESULT-SECRET"}),
+            ),
+        ),
+    ];
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin, "artifact", "ag148-source", admin.actor(), &source)
+        .await
+        .unwrap();
+    session
+        .put_edge(&admin, "artifact", "ag148-source", "blob", &blob)
+        .await
+        .unwrap();
+    for (id, _, value) in &results {
+        session
+            .put(&admin, "artifact", id, admin.actor(), value)
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", id, "artifact", "ag148-source")
+            .await
+            .unwrap();
+    }
+    // Both versions count against the one event capacity.
+    assert_eq!(session.capacity_usage_v41(0).await.unwrap().events, 5);
+    session.commit().await.unwrap();
+
+    let mut status = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "artifact".into(),
+            id: "ag148-source".into(),
+        },
+        "ag148 source revoked",
+        2,
+    )
+    .await
+    .unwrap();
+    for now in 3..30 {
+        status = LifecycleStore::cleanup_step(&admin, &store, &status.job_id, 16, now)
+            .await
+            .unwrap();
+        if status.pending_nodes == 0 {
+            break;
+        }
+    }
+    assert_eq!(status.state, CleanupState::Complete);
+    let mut session = store.session().await.unwrap();
+    for (id, schema, original) in &results {
+        let body = session
+            .object_row(&admin, "artifact", id)
+            .await
+            .unwrap()
+            .unwrap()
+            .body;
+        let redacted: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(redacted["schema_version"], "rsia.redacted.v1");
+        assert_eq!(redacted["original_kind"], "import_result");
+        assert_eq!(redacted["original_schema"], *schema);
+        assert_eq!(
+            redacted["original_digest"],
+            hash(serde_json::to_string(original).unwrap().as_bytes())
+        );
+        for field in [
+            "owner_actor",
+            "request_key",
+            "input_digest",
+            "created_at",
+            "source_refs",
+            "revoke_watermark",
+        ] {
+            assert_eq!(redacted["metadata"][field], original[field], "{id} {field}");
+        }
+        assert!(!body.contains("RESULT-SECRET"), "{id}");
+    }
+    assert_eq!(session.capacity_usage_v41(0).await.unwrap().events, 0);
+    session.commit().await.unwrap();
+}
+
 #[tokio::test]
 async fn e16_shared_package_blob_is_deleted_only_after_every_source_closure_is_revoked() {
     let (_dir, store) = database().await;

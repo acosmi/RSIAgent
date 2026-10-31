@@ -25,6 +25,15 @@ use evo_engine::import::{
 use evo_storage::Store;
 use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
 
+/// The complete `rsia.trace.v1` header each Native record carries (AG-148),
+/// declaring `events` exported events. schema_version stays first so a short
+/// header probe still sees the discriminator.
+fn native_header(events: usize) -> String {
+    format!(
+        r#""schema_version":"rsia.trace.v1","exporter":{{"name":"rsia","version":"reader-golden.v1","commit":"7d22edb5dfe6ec84f7a3167aba02ae683e9941be"}},"run_id":"run1","redaction_report":{{"schema_version":"rsia.trace.redaction.v1","scan_status":"passed","review_status":"reviewed","removed_items":0,"redacted_items":0}},"coverage":{{"discovery_exhausted":true,"files_known":true,"bytes_read":0,"parsed_ok":1,"parsed_fail":0,"permission_denied":0,"missing":0,"unsupported_format":0,"zero_records":0,"events_seen":{events},"events_exported":{events},"events_filtered":0,"event_truncated":0,"char_truncated":0,"parameter_truncated_events":0,"parameter_truncated_bytes":0,"excerpt_truncated":0,"outbound_truncated":0}}"#
+    )
+}
+
 fn authorized_selection(roots: Vec<String>, run_ids: Vec<String>) -> SourceSelection {
     SourceSelection {
         roots,
@@ -208,8 +217,11 @@ fn test_v052_coverage_dimensions_and_resource_bounds_truncation() {
 #[test]
 fn test_v053_format_normalization_and_unsupported_rejection() {
     // 1. RSIA Native Trace format
-    let rsia_body = r#"{"schema_version":"rsia.trace.v1","run_id":"run1","events":[{"role":"user","kind":"chat","content":"solve problem"}]}"#;
-    let rsia_events = parse_fixture(SourceFormat::RsiaTraceV1, rsia_body).unwrap();
+    let rsia_body = format!(
+        r#"{{{},"events":[{{"sequence":0,"role":"user","kind":"chat","content":"solve problem"}}]}}"#,
+        native_header(1)
+    );
+    let rsia_events = parse_fixture(SourceFormat::RsiaTraceV1, &rsia_body).unwrap();
     assert_eq!(rsia_events[0].format, SourceFormat::RsiaTraceV1);
     assert_eq!(rsia_events[0].content, "solve problem");
 
@@ -359,8 +371,11 @@ fn test_v076_full_end_to_end_chain_from_history_import_to_revocation() {
     let claude_data =
         br#"{"format":"claude.fixture","role":"user","content":"pattern violation in parser"}
 {"type":"tool_result","role":"user","content":"test failure at parser.rs:42"}"#;
-    let rsia_data =
-        br#"{"schema_version":"rsia.trace.v1","role":"user","kind":"chat","content":"another parser violation observed"}"#;
+    let rsia_data = format!(
+        r#"{{{},"sequence":0,"role":"user","kind":"chat","content":"another parser violation observed"}}"#,
+        native_header(1)
+    );
+    let rsia_data = rsia_data.as_bytes();
 
     // 1. Authorized import
     let res = ingest_imported_sources(
@@ -591,7 +606,11 @@ fn test_f02_event_truncation_must_not_panic_inside_utf8() {
     let content = "x".repeat(evo_core::evidence::MAX_EVENT_BYTES - 1) + "中";
     let encoded = serde_json::to_string(&content).unwrap();
     let body = [
-        r#"{"schema_version":"rsia.trace.v1","events":[{"role":"user","content":"#,
+        format!(
+            r#"{{{},"events":[{{"sequence":0,"role":"user","kind":"chat","content":"#,
+            native_header(1)
+        )
+        .as_str(),
         encoded.as_str(),
         r#"}]}"#,
     ]
@@ -609,8 +628,11 @@ fn test_f02_event_truncation_must_not_panic_inside_utf8() {
 #[test]
 fn test_f03_generated_locator_must_extract_unchanged_source() {
     let selection = authorized_selection(vec!["/selected".into()], vec![]);
-    let body =
-        br#"{"schema_version":"rsia.trace.v1","events":[{"role":"user","content":"hello"}]}"#;
+    let body = format!(
+        r#"{{{},"events":[{{"sequence":0,"role":"user","kind":"chat","content":"hello"}}]}}"#,
+        native_header(1)
+    );
+    let body = body.as_bytes();
     let result = ingest_imported_sources(&selection, &[("/selected/one", body)], None).unwrap();
     assert!(!result.locators.is_empty());
     let extracted = result.locators[0].verify_and_extract(body);
@@ -623,7 +645,8 @@ fn test_f03_generated_locator_must_extract_unchanged_source() {
 #[test]
 fn large_json_probe_duplicate_keys_and_role_guessing_are_strict() {
     let large = format!(
-        r#"{{"schema_version":"rsia.trace.v1","padding":"{}","events":[{{"role":"user","content":"ok"}}]}}"#,
+        r#"{{{},"padding":"{}","events":[{{"sequence":0,"role":"user","kind":"chat","content":"ok"}}]}}"#,
+        native_header(1),
         "x".repeat(evo_core::evidence::MAX_HEADER_PROBE_BYTES + 1024)
     );
     assert_eq!(
@@ -676,7 +699,10 @@ fn large_json_probe_duplicate_keys_and_role_guessing_are_strict() {
 #[test]
 fn locator_uses_top_level_event_and_round_trips_utf8_bytes() {
     let selection = authorized_selection(vec!["/selected".into()], vec![]);
-    let body = r#"{"schema_version":"rsia.trace.v1","metadata":{"events":[{"role":"user","content":"decoy"}]},"events":[{"role":"user","content":"真实 event"}]}"#;
+    let body = format!(
+        r#"{{{},"metadata":{{"events":[{{"role":"user","content":"decoy"}}]}},"events":[{{"sequence":0,"role":"user","kind":"chat","content":"真实 event"}}]}}"#,
+        native_header(1)
+    );
     let result =
         ingest_imported_sources(&selection, &[("/selected/nested", body.as_bytes())], None)
             .unwrap();
@@ -686,14 +712,18 @@ fn locator_uses_top_level_event_and_round_trips_utf8_bytes() {
         .unwrap();
     assert_eq!(
         extracted,
-        r#"{"role":"user","content":"真实 event"}"#.as_bytes()
+        r#"{"sequence":0,"role":"user","kind":"chat","content":"真实 event"}"#.as_bytes()
     );
 }
 
 #[test]
 fn excerpt_limit_is_global_and_failed_reads_are_counted() {
     let selection = authorized_selection(vec!["/selected".into()], vec![]);
-    let valid = br#"{"schema_version":"rsia.trace.v1","events":[{"role":"user","content":"aaaaaaaaaaaaaaaaaaaa"},{"role":"user","content":"bbbbbbbbbbbbbbbbbbbb"},{"role":"user","content":"cccccccccccccccccccc"}]}"#;
+    let valid = format!(
+        r#"{{{},"events":[{{"sequence":0,"role":"user","kind":"chat","content":"aaaaaaaaaaaaaaaaaaaa"}},{{"sequence":1,"role":"user","kind":"chat","content":"bbbbbbbbbbbbbbbbbbbb"}},{{"sequence":2,"role":"user","kind":"chat","content":"cccccccccccccccccccc"}}]}}"#,
+        native_header(3)
+    );
+    let valid = valid.as_bytes();
     let invalid = b"{not-json";
     let limits = ImportForensicLimits {
         max_files: 4,
@@ -1050,7 +1080,10 @@ async fn persistent_import_rejects_namespace_event_capacity_atomically() {
     let artifacts: Vec<serde_json::Value> = session.list(&admin, "artifact").await.unwrap();
     session.commit().await.unwrap();
     assert!(artifacts.iter().all(|artifact| {
-        artifact["schema_version"].as_str() != Some("rsia.e16.import_result.v1")
+        !matches!(
+            artifact["schema_version"].as_str(),
+            Some("rsia.e16.import_result.v1" | "rsia.e16.import_result.v2")
+        )
     }));
 }
 
@@ -1300,7 +1333,8 @@ async fn f_service(directory: &tempfile::TempDir) -> (Store, Context, Persistent
 
 fn f_trace(content: &str) -> String {
     format!(
-        r#"{{"schema_version":"rsia.trace.v1","events":[{{"role":"user","content":"{content}"}}]}}"#
+        r#"{{{},"events":[{{"sequence":0,"role":"user","kind":"chat","content":"{content}"}}]}}"#,
+        native_header(1)
     )
 }
 

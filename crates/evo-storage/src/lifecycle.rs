@@ -2170,7 +2170,9 @@ fn e16_schema_kind(schema: &str) -> Option<&'static str> {
     match schema {
         "rsia.e16.source_selection.v1" => Some("source_selection"),
         "rsia.e16.import_source.v1" => Some("import_source"),
-        "rsia.e16.import_result.v1" => Some("import_result"),
+        // Both known result versions are cleaned alike; a v1 result is legacy
+        // history, never re-derived.
+        "rsia.e16.import_result.v1" | "rsia.e16.import_result.v2" => Some("import_result"),
         "rsia.e16.staged_asset.v1" => Some("staged_asset"),
         "rsia.e16.seed_install.v1" | "rsia.e16.seed_install.v2" => Some("seed_install"),
         "rsia.e16.export_attempt.v1" => Some("export_attempt"),

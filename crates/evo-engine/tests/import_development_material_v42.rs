@@ -26,13 +26,26 @@ struct Fixture {
     result: ImportResultRecord,
 }
 
+/// A complete `rsia.trace.v1` envelope (AG-148 header, coverage, sequences).
+fn native_trace(events: Vec<Value>) -> String {
+    let count = events.len();
+    serde_json::json!({
+        "schema_version":"rsia.trace.v1",
+        "exporter":{"name":"rsia","version":"reader-golden.v1","commit":"7d22edb5dfe6ec84f7a3167aba02ae683e9941be"},
+        "run_id":"material-run",
+        "redaction_report":{"schema_version":"rsia.trace.redaction.v1","scan_status":"passed","review_status":"reviewed","removed_items":0,"redacted_items":0},
+        "coverage":{"discovery_exhausted":true,"files_known":true,"bytes_read":0,"parsed_ok":1,"parsed_fail":0,"permission_denied":0,"missing":0,"unsupported_format":0,"zero_records":0,"events_seen":count,"events_exported":count,"events_filtered":0,"event_truncated":0,"char_truncated":0,"parameter_truncated_events":0,"parameter_truncated_bytes":0,"excerpt_truncated":0,"outbound_truncated":0},
+        "events":events,
+    })
+    .to_string()
+}
+
 fn body(format: SourceFormat, content: &str) -> String {
     let event = serde_json::json!({"role":"user", "content":content});
     match format {
-        SourceFormat::RsiaTraceV1 => serde_json::json!({
-            "schema_version":"rsia.trace.v1", "events":[event]
-        })
-        .to_string(),
+        SourceFormat::RsiaTraceV1 => native_trace(vec![serde_json::json!({
+            "sequence":0, "role":"user", "kind":"chat", "content":content
+        })]),
         SourceFormat::RsihPiFixture => serde_json::json!({
             "schema_version":"rsih.pi.fixture", "prompts":[event]
         })
@@ -719,9 +732,9 @@ async fn source_metadata_binding_rejects_changes_to_any_registered_source() {
 async fn projection_accounts_for_json_escaping_unicode_and_all_requested_keys() {
     let f = SourceFormat::RsiaTraceV1;
     let events: Vec<_> = (0..33)
-        .map(|index| serde_json::json!({"role":"user","content":format!("event {index} é中🦀")}))
+        .map(|index| serde_json::json!({"sequence":index,"role":"user","kind":"chat","content":format!("event {index} é中🦀")}))
         .collect();
-    let bytes = serde_json::json!({"schema_version":"rsia.trace.v1","events":events}).to_string();
+    let bytes = native_trace(events);
     let fixture = Fixture::new(
         vec![(f, "a.try1".into(), bytes)],
         false,

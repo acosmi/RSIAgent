@@ -1,0 +1,98 @@
+{
+  "label": "synthetic_derivative_not_observed_producer",
+  "statement": "Portable software regression input derived from one real parent capture. These rows are NOT the observed producer bytes: the observed rows embed a machine authorization path and stay private; only their SHA-256 are recorded here.",
+  "observed_producer": {
+    "commit": "2c23cf22154194931781d4dd0799d2ee622da236",
+    "api": "evo_engine::import::PersistentImportService::register then execute (public), Admin context, then Session::object_row original SQLite TEXT and Store::read_blob",
+    "namespace": "ag148-legacy",
+    "owner_actor": "legacy-admin",
+    "request_key": "ag148-legacy-capture",
+    "watermark": {
+      "digest_preimage": "ag148 legacy capture watermark",
+      "sequence": 1
+    },
+    "inputs": [
+      {
+        "logical_source_id": "native-trace",
+        "reader": "rsia_trace_v1",
+        "file": "fixtures/imports/rsia.trace.v1.jsonl",
+        "sha256": "b8d7f5187a765212afd651c0265559a3d8b1a6c6b69d52dad869527043f340b1"
+      },
+      {
+        "logical_source_id": "pi-fixture",
+        "reader": "rsih_pi_fixture",
+        "file": "fixtures/imports/rsih.pi.fixture.json",
+        "sha256": "0925270c90b7b1ef2f84a601c15fad98401edac32adce87753366234d2a66887"
+      },
+      {
+        "logical_source_id": "claude-fixture",
+        "reader": "claude_fixture",
+        "file": "fixtures/imports/claude.fixture.jsonl",
+        "sha256": "f1fb8ef66b698e63e88334e8a4bcbab7960198329fd9b1931a4a15c6082b8569"
+      }
+    ],
+    "row_sha256": {
+      "selection": "d4d6d88eda5f9b3916d22f17f9e2a8bfea2860ea55b28026d89ef4ef42182b5e",
+      "import_sources": [
+        "057add7b1403b73f0b27c721324c9bfec702ba7c91e1bb5d0cfeea5b26ebc748",
+        "b3c46ca2ef42b26866730825fe9f19b18c2c18cbc443788c8e7be2eb49868816",
+        "2f760fd76411cf6f67e08d207415737fda885cc667b6fe4c621f5e8ed04cbeb6"
+      ],
+      "result": "fca685af3f495622d6b6c6be8e3a39b02a97bc8710e14b6b9b8f89f54390df32"
+    }
+  },
+  "derivation": {
+    "virtual_root": "/ag148-portable/imports",
+    "replaced_pointers": {
+      "selection": [
+        "/payload/roots/0"
+      ],
+      "import_sources": [
+        "/payload/authorized_path"
+      ]
+    },
+    "recomputed_with_parent_public_formulas": {
+      "selection": [
+        "/input_digest = fingerprint(registration request)",
+        "/id = e16sel- + input_digest[..24]",
+        "/payload/import_source_ids",
+        "/source_refs/*/id",
+        "/source_refs/*/content_digest = fingerprint(import source)"
+      ],
+      "import_sources": [
+        "/id = e16src- + sha256(selection_id + LF + logical_source_id)[..24]",
+        "/input_digest = fingerprint((source spec, expected digest))",
+        "/payload/selection_id"
+      ],
+      "result": [
+        "/id = e16res- + sha256(selection_id)[..24]",
+        "/source_refs/*",
+        "/input_digest = fingerprint(source_refs)",
+        "/payload/selection_id",
+        "/payload/evidence_set (id from the logical selection, members/*/source_id, digest)",
+        "/payload/locators/*/source_id",
+        "/payload/event_records/*/source_id"
+      ]
+    },
+    "unchanged": "raw blobs and their digests, byte locators, event records except source_id, aggregate summary, coverage, state, timestamps and watermark",
+    "self_check": "inside the parent capture the same recomputation with the observed root unchanged reproduced the selection, all three import sources and the result byte for byte"
+  },
+  "rows": {
+    "selection": "{\"schema_version\":\"rsia.e16.source_selection.v1\",\"id\":\"e16sel-ec6c669fd2c9c251d671d33d\",\"namespace\":\"ag148-legacy\",\"owner_actor\":\"legacy-admin\",\"request_key\":\"ag148-legacy-capture\",\"input_digest\":\"ec6c669fd2c9c251d671d33dcf1610402477aaf3beba073e91fe416a83c4b3f1\",\"created_at\":1793472016,\"updated_at\":1793472016,\"source_refs\":[{\"kind\":\"import_source\",\"id\":\"e16src-f70bcf9eea55a78ef0ad352a\",\"content_digest\":\"dad1f57947f592963b114b377b2edb55b79c923519d9d61277f8664f79f3beec\"},{\"kind\":\"import_source\",\"id\":\"e16src-8673b0c71f6de4cda6cab2d2\",\"content_digest\":\"df4739075203f58c5bf211bf0eb72538d791c3b22889862c440281d34b4258e7\"},{\"kind\":\"import_source\",\"id\":\"e16src-1e4788f720eea82c75909cd2\",\"content_digest\":\"f62f624af5a93882d505535794d780220ef1ea46bf93e48018d3c83ea2999595\"}],\"revoke_watermark\":1,\"payload\":{\"purpose\":\"development\",\"allow_model_excerpts\":true,\"outbound_authorized\":true,\"retention_scope\":\"local_with_authorized_excerpts\",\"roots\":[\"/ag148-portable/imports\"],\"import_source_ids\":[\"e16src-f70bcf9eea55a78ef0ad352a\",\"e16src-8673b0c71f6de4cda6cab2d2\",\"e16src-1e4788f720eea82c75909cd2\"]}}",
+    "import_sources": [
+      "{\"schema_version\":\"rsia.e16.import_source.v1\",\"id\":\"e16src-f70bcf9eea55a78ef0ad352a\",\"namespace\":\"ag148-legacy\",\"owner_actor\":\"legacy-admin\",\"request_key\":\"ag148-legacy-capture\",\"input_digest\":\"0b39e545622426c68be5976320bab2691c349e9d65b62e3749918ea98b87ced3\",\"created_at\":1793472016,\"updated_at\":1793472016,\"source_refs\":[{\"kind\":\"blob\",\"id\":\"b8d7f5187a765212afd651c0265559a3d8b1a6c6b69d52dad869527043f340b1\",\"content_digest\":\"b8d7f5187a765212afd651c0265559a3d8b1a6c6b69d52dad869527043f340b1\"}],\"revoke_watermark\":1,\"payload\":{\"selection_id\":\"e16sel-ec6c669fd2c9c251d671d33d\",\"logical_source_id\":\"native-trace\",\"authorized_path\":\"/ag148-portable/imports/rsia.trace.v1.jsonl\",\"reader\":\"rsia_trace_v1\",\"reader_version\":\"rsia.trace.v1\",\"raw_digest\":\"b8d7f5187a765212afd651c0265559a3d8b1a6c6b69d52dad869527043f340b1\",\"observed_digest\":\"b8d7f5187a765212afd651c0265559a3d8b1a6c6b69d52dad869527043f340b1\",\"raw_blob_digest\":\"b8d7f5187a765212afd651c0265559a3d8b1a6c6b69d52dad869527043f340b1\",\"blob_published\":true,\"byte_len\":192,\"status\":\"ready\",\"task_origin\":\"imported_history\",\"execution_attestation\":\"unverified_import\",\"purpose\":\"development\"}}",
+      "{\"schema_version\":\"rsia.e16.import_source.v1\",\"id\":\"e16src-8673b0c71f6de4cda6cab2d2\",\"namespace\":\"ag148-legacy\",\"owner_actor\":\"legacy-admin\",\"request_key\":\"ag148-legacy-capture\",\"input_digest\":\"eb780237074a2f3830cec3d654d8a0ba6b2d7b2a4bb0df7f6d8a0a863407449e\",\"created_at\":1793472016,\"updated_at\":1793472016,\"source_refs\":[{\"kind\":\"blob\",\"id\":\"0925270c90b7b1ef2f84a601c15fad98401edac32adce87753366234d2a66887\",\"content_digest\":\"0925270c90b7b1ef2f84a601c15fad98401edac32adce87753366234d2a66887\"}],\"revoke_watermark\":1,\"payload\":{\"selection_id\":\"e16sel-ec6c669fd2c9c251d671d33d\",\"logical_source_id\":\"pi-fixture\",\"authorized_path\":\"/ag148-portable/imports/rsih.pi.fixture.json\",\"reader\":\"rsih_pi_fixture\",\"reader_version\":\"rsih.pi.fixture\",\"raw_digest\":\"0925270c90b7b1ef2f84a601c15fad98401edac32adce87753366234d2a66887\",\"observed_digest\":\"0925270c90b7b1ef2f84a601c15fad98401edac32adce87753366234d2a66887\",\"raw_blob_digest\":\"0925270c90b7b1ef2f84a601c15fad98401edac32adce87753366234d2a66887\",\"blob_published\":true,\"byte_len\":69,\"status\":\"ready\",\"task_origin\":\"imported_history\",\"execution_attestation\":\"unverified_import\",\"purpose\":\"development\"}}",
+      "{\"schema_version\":\"rsia.e16.import_source.v1\",\"id\":\"e16src-1e4788f720eea82c75909cd2\",\"namespace\":\"ag148-legacy\",\"owner_actor\":\"legacy-admin\",\"request_key\":\"ag148-legacy-capture\",\"input_digest\":\"5add015fb444f757cb6b4cfb90c5e3515fc4f46d8ceef97c06ade21ab234267a\",\"created_at\":1793472016,\"updated_at\":1793472016,\"source_refs\":[{\"kind\":\"blob\",\"id\":\"f1fb8ef66b698e63e88334e8a4bcbab7960198329fd9b1931a4a15c6082b8569\",\"content_digest\":\"f1fb8ef66b698e63e88334e8a4bcbab7960198329fd9b1931a4a15c6082b8569\"}],\"revoke_watermark\":1,\"payload\":{\"selection_id\":\"e16sel-ec6c669fd2c9c251d671d33d\",\"logical_source_id\":\"claude-fixture\",\"authorized_path\":\"/ag148-portable/imports/claude.fixture.jsonl\",\"reader\":\"claude_fixture\",\"reader_version\":\"claude.fixture\",\"raw_digest\":\"f1fb8ef66b698e63e88334e8a4bcbab7960198329fd9b1931a4a15c6082b8569\",\"observed_digest\":\"f1fb8ef66b698e63e88334e8a4bcbab7960198329fd9b1931a4a15c6082b8569\",\"raw_blob_digest\":\"f1fb8ef66b698e63e88334e8a4bcbab7960198329fd9b1931a4a15c6082b8569\",\"blob_published\":true,\"byte_len\":34,\"status\":\"ready\",\"task_origin\":\"imported_history\",\"execution_attestation\":\"unverified_import\",\"purpose\":\"development\"}}"
+    ],
+    "result": "{\"schema_version\":\"rsia.e16.import_result.v1\",\"id\":\"e16res-128670573a1952361da6eefd\",\"namespace\":\"ag148-legacy\",\"owner_actor\":\"legacy-admin\",\"request_key\":\"ag148-legacy-capture\",\"input_digest\":\"ea7628f70aa74462d1a0731715fd0a869698aa93216b29cbcd98061de4ca820d\",\"created_at\":1793472016,\"updated_at\":1793472016,\"source_refs\":[{\"kind\":\"source_selection\",\"id\":\"e16sel-ec6c669fd2c9c251d671d33d\",\"content_digest\":\"06b9a1add800270f1cd2379412d825d98a856b09c07a3441a3fc70e9d2b5545a\"},{\"kind\":\"import_source\",\"id\":\"e16src-f70bcf9eea55a78ef0ad352a\",\"content_digest\":\"dad1f57947f592963b114b377b2edb55b79c923519d9d61277f8664f79f3beec\"},{\"kind\":\"import_source\",\"id\":\"e16src-8673b0c71f6de4cda6cab2d2\",\"content_digest\":\"df4739075203f58c5bf211bf0eb72538d791c3b22889862c440281d34b4258e7\"},{\"kind\":\"import_source\",\"id\":\"e16src-1e4788f720eea82c75909cd2\",\"content_digest\":\"f62f624af5a93882d505535794d780220ef1ea46bf93e48018d3c83ea2999595\"}],\"revoke_watermark\":1,\"payload\":{\"selection_id\":\"e16sel-ec6c669fd2c9c251d671d33d\",\"state\":\"complete\",\"evidence_set\":{\"schema_version\":\"rsia.evidence_set.v2\",\"id\":\"es_imp_cceb273a40c4\",\"members\":[{\"source_id\":\"e16src-f70bcf9eea55a78ef0ad352a\",\"content_digest\":\"b8d7f5187a765212afd651c0265559a3d8b1a6c6b69d52dad869527043f340b1\",\"task_origin\":\"imported_history\",\"execution_attestation\":\"unverified_import\",\"purpose\":\"development\"},{\"source_id\":\"e16src-8673b0c71f6de4cda6cab2d2\",\"content_digest\":\"0925270c90b7b1ef2f84a601c15fad98401edac32adce87753366234d2a66887\",\"task_origin\":\"imported_history\",\"execution_attestation\":\"unverified_import\",\"purpose\":\"development\"},{\"source_id\":\"e16src-1e4788f720eea82c75909cd2\",\"content_digest\":\"f1fb8ef66b698e63e88334e8a4bcbab7960198329fd9b1931a4a15c6082b8569\",\"task_origin\":\"imported_history\",\"execution_attestation\":\"unverified_import\",\"purpose\":\"development\"}],\"coverage\":{\"discovery_exhausted\":true,\"files_known\":true,\"bytes_read\":295,\"parsed_ok\":3,\"parsed_fail\":0,\"permission_denied\":0,\"missing\":0,\"unsupported_format\":0,\"zero_records\":0,\"event_truncated\":0,\"char_truncated\":0,\"excerpt_truncated\":0,\"outbound_truncated\":0},\"independent_clusters\":[\"unverified_import_unknown\"],\"digest\":\"5a16337d34fead9244dce90afb39f3982ae04ec037a7faf53ae343813bf3ae62\"},\"aggregate_summary\":{\"total_sources\":3,\"total_events\":5,\"tool_calls_count\":1,\"failure_count\":0,\"unique_clusters\":1,\"counter_examples\":[],\"coverage\":{\"discovery_exhausted\":true,\"files_known\":true,\"bytes_read\":295,\"parsed_ok\":3,\"parsed_fail\":0,\"permission_denied\":0,\"missing\":0,\"unsupported_format\":0,\"zero_records\":0,\"event_truncated\":0,\"char_truncated\":0,\"excerpt_truncated\":0,\"outbound_truncated\":0}},\"locators\":[{\"source_id\":\"e16src-f70bcf9eea55a78ef0ad352a\",\"source_digest\":\"b8d7f5187a765212afd651c0265559a3d8b1a6c6b69d52dad869527043f340b1\",\"byte_start\":0,\"byte_end\":61,\"event_index\":0,\"excerpt_digest\":\"aea78df143b012456a4aefc3c03db8f423188e20408cd4937d2e3374f8d267c2\"},{\"source_id\":\"e16src-f70bcf9eea55a78ef0ad352a\",\"source_digest\":\"b8d7f5187a765212afd651c0265559a3d8b1a6c6b69d52dad869527043f340b1\",\"byte_start\":62,\"byte_end\":130,\"event_index\":1,\"excerpt_digest\":\"ce2a6e9b5ac7e0d71f934e0b7a8e4e51d9ae408d72cb5306775f7b267be91f03\"},{\"source_id\":\"e16src-f70bcf9eea55a78ef0ad352a\",\"source_digest\":\"b8d7f5187a765212afd651c0265559a3d8b1a6c6b69d52dad869527043f340b1\",\"byte_start\":131,\"byte_end\":191,\"event_index\":2,\"excerpt_digest\":\"c29c26bec1aeecff15ad242da115182c8d8e959cef823370cb7a0f5ba714abcb\"},{\"source_id\":\"e16src-8673b0c71f6de4cda6cab2d2\",\"source_digest\":\"0925270c90b7b1ef2f84a601c15fad98401edac32adce87753366234d2a66887\",\"byte_start\":39,\"byte_end\":66,\"event_index\":0,\"excerpt_digest\":\"1b0a09edd31484a31e977a2e266c127feba83b2f41061b6686bb61fa78b6edfc\"},{\"source_id\":\"e16src-1e4788f720eea82c75909cd2\",\"source_digest\":\"f1fb8ef66b698e63e88334e8a4bcbab7960198329fd9b1931a4a15c6082b8569\",\"byte_start\":0,\"byte_end\":33,\"event_index\":0,\"excerpt_digest\":\"b5344ebd07750817371cf4670e556b15a4babb975bde955ff4ce24bca09731ef\"}],\"event_records\":[{\"source_id\":\"e16src-f70bcf9eea55a78ef0ad352a\",\"event_index\":0,\"byte_start\":0,\"byte_end\":61,\"raw_fragment_digest\":\"aea78df143b012456a4aefc3c03db8f423188e20408cd4937d2e3374f8d267c2\",\"normalized_content_digest\":\"073cd589997643962522962a4278f9c933b8c67997762f4661b71961d953e7a3\",\"role\":\"user\",\"kind\":\"chat\"},{\"source_id\":\"e16src-f70bcf9eea55a78ef0ad352a\",\"event_index\":1,\"byte_start\":62,\"byte_end\":130,\"raw_fragment_digest\":\"ce2a6e9b5ac7e0d71f934e0b7a8e4e51d9ae408d72cb5306775f7b267be91f03\",\"normalized_content_digest\":\"2259afbab26f7322c771f0d932d9f7bec6d68c632fcfffdf7a70ae748cf92e92\",\"role\":\"assistant\",\"kind\":\"thought\"},{\"source_id\":\"e16src-f70bcf9eea55a78ef0ad352a\",\"event_index\":2,\"byte_start\":131,\"byte_end\":191,\"raw_fragment_digest\":\"c29c26bec1aeecff15ad242da115182c8d8e959cef823370cb7a0f5ba714abcb\",\"normalized_content_digest\":\"03f1b6cdc1f528ebed78ad6bb0973da4dabdb178907b1d8361de2596d91ca19b\",\"role\":\"user\",\"kind\":\"tool_result\"},{\"source_id\":\"e16src-8673b0c71f6de4cda6cab2d2\",\"event_index\":0,\"byte_start\":39,\"byte_end\":66,\"raw_fragment_digest\":\"1b0a09edd31484a31e977a2e266c127feba83b2f41061b6686bb61fa78b6edfc\",\"normalized_content_digest\":\"8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4\",\"role\":\"user\",\"kind\":\"chat\"},{\"source_id\":\"e16src-1e4788f720eea82c75909cd2\",\"event_index\":0,\"byte_start\":0,\"byte_end\":33,\"raw_fragment_digest\":\"b5344ebd07750817371cf4670e556b15a4babb975bde955ff4ce24bca09731ef\",\"normalized_content_digest\":\"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\",\"role\":\"user\",\"kind\":\"chat\"}],\"generation_status\":\"blocked_external_generation_conditions_unavailable\"}}"
+  },
+  "row_sha256": {
+    "selection": "06b9a1add800270f1cd2379412d825d98a856b09c07a3441a3fc70e9d2b5545a",
+    "import_sources": [
+      "dad1f57947f592963b114b377b2edb55b79c923519d9d61277f8664f79f3beec",
+      "df4739075203f58c5bf211bf0eb72538d791c3b22889862c440281d34b4258e7",
+      "f62f624af5a93882d505535794d780220ef1ea46bf93e48018d3c83ea2999595"
+    ],
+    "result": "065ec788e313d54a9475e95d23001c3dfc1da68e3ea47a1491900fe1d9db8ea5"
+  }
+}

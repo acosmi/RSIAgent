@@ -60,7 +60,14 @@ async fn fixture_with(reader: SourceFormat, missing: usize) -> Fixture {
         let bytes = match reader {
             SourceFormat::ClaudeFixture => serde_json::to_vec(&json!({"format":"claude.fixture","role":"user","content":content})),
             SourceFormat::RsihPiFixture => serde_json::to_vec(&json!({"format":"rsih.pi.fixture","prompts":[{"role":"user","content":content}]})),
-            SourceFormat::RsiaTraceV1 => serde_json::to_vec(&json!({"schema_version":"rsia.trace.v1","events":[{"role":"user","kind":"task","content":content}]})),
+            SourceFormat::RsiaTraceV1 => serde_json::to_vec(&json!({
+                "schema_version":"rsia.trace.v1",
+                "exporter":{"name":"rsia","version":"reader-golden.v1","commit":"7d22edb5dfe6ec84f7a3167aba02ae683e9941be"},
+                "run_id":"edge-run",
+                "redaction_report":{"schema_version":"rsia.trace.redaction.v1","scan_status":"passed","review_status":"reviewed","removed_items":0,"redacted_items":0},
+                "coverage":{"discovery_exhausted":true,"files_known":true,"bytes_read":0,"parsed_ok":1,"parsed_fail":0,"permission_denied":0,"missing":0,"unsupported_format":0,"zero_records":0,"events_seen":1,"events_exported":1,"events_filtered":0,"event_truncated":0,"char_truncated":0,"parameter_truncated_events":0,"parameter_truncated_bytes":0,"excerpt_truncated":0,"outbound_truncated":0},
+                "events":[{"sequence":0,"role":"user","kind":"task","content":content}]
+            })),
         }.unwrap();
         if index < 2 - missing {
             std::fs::write(&path, &bytes).unwrap();

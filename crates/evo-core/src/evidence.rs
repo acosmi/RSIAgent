@@ -223,6 +223,66 @@ impl SourceCoverage {
     }
 }
 
+/// Complete coverage carrier (§6.3, v4.5 Q-43): parameter truncation is counted
+/// apart from event and character truncation. A Native trace header declares one
+/// (unverified); a v2 import result records its own reader statistics in another.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceCoverage {
+    pub discovery_exhausted: bool,
+    pub files_known: bool,
+    pub bytes_read: u64,
+    pub parsed_ok: u64,
+    pub parsed_fail: u64,
+    pub permission_denied: u64,
+    pub missing: u64,
+    pub unsupported_format: u64,
+    pub zero_records: u64,
+    pub events_seen: u64,
+    pub events_exported: u64,
+    pub events_filtered: u64,
+    pub event_truncated: u64,
+    pub char_truncated: u64,
+    pub parameter_truncated_events: u64,
+    pub parameter_truncated_bytes: u64,
+    pub excerpt_truncated: u64,
+    pub outbound_truncated: u64,
+}
+
+impl TraceCoverage {
+    /// An unknown denominator, any failure or any truncation keeps it partial.
+    pub fn complete(&self) -> bool {
+        self.discovery_exhausted
+            && self.files_known
+            && self.parsed_fail == 0
+            && self.permission_denied == 0
+            && self.missing == 0
+            && self.unsupported_format == 0
+            && self.zero_records == 0
+            && self.event_truncated == 0
+            && self.char_truncated == 0
+            && self.parameter_truncated_events == 0
+            && self.parameter_truncated_bytes == 0
+            && self.excerpt_truncated == 0
+            && self.outbound_truncated == 0
+    }
+
+    /// Boundary check of an exporter's declaration: it exported exactly the
+    /// events present, and seen = exported + filtered + truncated without overflow.
+    pub fn validate_declared(&self, exported: u64) -> Result<()> {
+        let seen = self
+            .events_exported
+            .checked_add(self.events_filtered)
+            .and_then(|count| count.checked_add(self.event_truncated));
+        if self.events_exported != exported || seen != Some(self.events_seen) {
+            return Err(Error::Invalid(
+                "inconsistent coverage for rsia.trace".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceMember {
@@ -509,6 +569,52 @@ pub fn invalidate_jobs_if_source_revoked(
     Ok(pending.to_vec())
 }
 
+pub const LEGACY_IMPORT_RESULT_SCHEMA_V1: &str = "rsia.e16.import_result.v1";
+pub const IMPORT_RESULT_SCHEMA_V2: &str = "rsia.e16.import_result.v2";
+pub const IMPORT_READER_SET_V2: &str = "rsia.e16.reader_set.v2";
+pub const IMPORT_NORMALIZATION_V2: &str = "rsia.e16.import_normalization.v2";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportResultVersion {
+    pub schema_version: &'static str,
+    pub introduced_change: &'static str,
+    pub retains_judge: bool,
+}
+
+/// Reviewed static version table of persisted import results (§5.1.1). v1 keeps
+/// no judge: its readers are retired, so a valid v1 record reads as legacy. A
+/// schema outside this table is unsupported, never legacy or current.
+pub const IMPORT_RESULT_VERSIONS: [ImportResultVersion; 2] = [
+    ImportResultVersion {
+        schema_version: LEGACY_IMPORT_RESULT_SCHEMA_V1,
+        introduced_change: "PR44 readers: Native schema/role fallback to user and internal authority alias",
+        retains_judge: false,
+    },
+    ImportResultVersion {
+        schema_version: IMPORT_RESULT_SCHEMA_V2,
+        introduced_change: "AG-148 strict Native reader (reader_set.v2) and normalization.v2",
+        retains_judge: true,
+    },
+];
+
+/// Historical v1 result identity: the selection id alone.
+pub fn legacy_import_result_id_v1(selection_id: &str) -> String {
+    format!("e16res-{}", &crate::hash(selection_id.as_bytes())[..24])
+}
+
+/// Current result identity binds schema, reader and normalization versions to
+/// the selection input, so both lineage ids derive from one selection.
+pub fn import_result_id_v2(selection_id: &str, selection_input_digest: &str) -> Result<String> {
+    let digest = fingerprint(&(
+        IMPORT_RESULT_SCHEMA_V2,
+        IMPORT_READER_SET_V2,
+        IMPORT_NORMALIZATION_V2,
+        selection_id,
+        selection_input_digest,
+    ))?;
+    Ok(format!("e16res-{}", &digest[..24]))
+}
+
 /// E16 object identity. Every variant names an `artifact`, never a trusted run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImportArtifactSchema {
@@ -516,8 +622,12 @@ pub enum ImportArtifactSchema {
     SourceSelection,
     #[serde(rename = "rsia.e16.import_source.v1")]
     ImportSource,
-    #[serde(rename = "rsia.e16.import_result.v1")]
+    /// The current result version, the only one a new material request names.
+    #[serde(rename = "rsia.e16.import_result.v2")]
     ImportResult,
+    /// Statically readable history; refused as input of any new derivation.
+    #[serde(rename = "rsia.e16.import_result.v1")]
+    LegacyImportResultV1,
 }
 
 impl ImportArtifactSchema {
@@ -529,7 +639,8 @@ impl ImportArtifactSchema {
         match self {
             Self::SourceSelection => "rsia.e16.source_selection.v1",
             Self::ImportSource => "rsia.e16.import_source.v1",
-            Self::ImportResult => "rsia.e16.import_result.v1",
+            Self::ImportResult => IMPORT_RESULT_SCHEMA_V2,
+            Self::LegacyImportResultV1 => LEGACY_IMPORT_RESULT_SCHEMA_V1,
         }
     }
 }
@@ -560,7 +671,9 @@ impl ImportArtifactRef {
         let prefix = match self.schema {
             ImportArtifactSchema::SourceSelection => "e16sel-",
             ImportArtifactSchema::ImportSource => "e16src-",
-            ImportArtifactSchema::ImportResult => "e16res-",
+            ImportArtifactSchema::ImportResult | ImportArtifactSchema::LegacyImportResultV1 => {
+                "e16res-"
+            }
         };
         if self.id.strip_prefix(prefix).is_none_or(|suffix| {
             suffix.len() != 24
@@ -600,6 +713,9 @@ pub struct ImportMaterialReadRequest {
 impl ImportMaterialReadRequest {
     pub fn validate(&self) -> Result<()> {
         self.result.validate()?;
+        if self.result.schema == ImportArtifactSchema::LegacyImportResultV1 {
+            return Err(Error::Conflict("import_result_legacy".into()));
+        }
         if self.result.schema != ImportArtifactSchema::ImportResult
             || self.events.len() > MAX_EXCERPTS
         {

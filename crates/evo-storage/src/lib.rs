@@ -31,7 +31,11 @@ pub const MVP_MAX_ACTIVE_LEASES: u64 = 10;
 /// Schema identifiers the capacity measurement recognises. They mirror the
 /// engine's persisted schema versions; the engine asserts they stay equal.
 pub const CAPACITY_MANAGEMENT_JOB_SCHEMA: &str = "rsia.management_job.v1";
-pub const CAPACITY_IMPORT_RESULT_SCHEMA: &str = "rsia.e16.import_result.v1";
+pub const CAPACITY_IMPORT_RESULT_SCHEMA: &str = evo_core::evidence::IMPORT_RESULT_SCHEMA_V2;
+/// Legacy results keep counting: v1 and v2 share one event bound (§3.3.2).
+pub const CAPACITY_LEGACY_IMPORT_RESULT_SCHEMA_V1: &str =
+    evo_core::evidence::LEGACY_IMPORT_RESULT_SCHEMA_V1;
+const IMPORTED_EVENTS_PATH: &str = "$.payload.aggregate_summary.total_events";
 pub const CAPACITY_EXPLORATION_ENVELOPE_SCHEMA: &str = "rsia.exploration_artifact_envelope.v1";
 pub const CAPACITY_EXPLORATION_NODE_RECORD_KIND: &str = "exploration_node_v1";
 pub const CAPACITY_STAGED_ASSET_SCHEMA: &str = "rsia.e16.staged_asset.v1";
@@ -252,6 +256,23 @@ async fn count_objects_all_namespaces(
         .await
         .map_err(internal)?;
     count_to_u64(count)
+}
+
+/// Imported events of every known result version, v1 and v2 alike, across all
+/// namespaces: one E16.5 event count, never a separate quota per version.
+async fn sum_imported_events_all_namespaces(conn: &mut sqlx::SqliteConnection) -> Result<u64> {
+    let events: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(json_extract(body,?)),0) AS INTEGER)
+         FROM objects WHERE kind='artifact'
+           AND json_extract(body,'$.schema_version') IN (?,?)",
+    )
+    .bind(IMPORTED_EVENTS_PATH)
+    .bind(CAPACITY_LEGACY_IMPORT_RESULT_SCHEMA_V1)
+    .bind(CAPACITY_IMPORT_RESULT_SCHEMA)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(internal)?;
+    count_to_u64(events)
 }
 
 /// Runs across every namespace: `run` objects plus service runs (artifacts
@@ -2117,15 +2138,7 @@ impl Session {
         let now = i64::try_from(now_secs)
             .map_err(|_| Error::Invalid("capacity clock is out of range".into()))?;
         let runs = count_runs_all_namespaces(&mut self.tx).await?;
-        let imported_events: i64 = sqlx::query_scalar(
-            "SELECT CAST(COALESCE(SUM(json_extract(body,'$.payload.aggregate_summary.total_events')),0) AS INTEGER)
-             FROM objects WHERE kind='artifact'
-               AND json_extract(body,'$.schema_version')=?",
-        )
-        .bind(CAPACITY_IMPORT_RESULT_SCHEMA)
-        .fetch_one(&mut *self.tx)
-        .await
-        .map_err(internal)?;
+        let imported_events = sum_imported_events_all_namespaces(&mut self.tx).await?;
         let event_objects = count_objects_all_namespaces(&mut self.tx, "event").await?;
         let skills = count_objects_all_namespaces(&mut self.tx, "candidate").await?;
         let exploration_nodes: i64 = sqlx::query_scalar(
@@ -2152,7 +2165,7 @@ impl Session {
         let concurrent_dispatches = count_running_management_jobs(&mut self.tx, now).await?;
         Ok(CapacityUsageV41 {
             runs,
-            events: count_to_u64(imported_events)?
+            events: imported_events
                 .checked_add(event_objects)
                 .ok_or(Error::Internal)?,
             skills,
@@ -2285,6 +2298,68 @@ impl Session {
             )));
         }
         self.put(ctx, kind, id, owner, body).await
+    }
+
+    /// Create a new import result artifact only when the deployment-wide E16.5
+    /// event count stays within `limit` (§3.3.2): imported events of v1 and v2
+    /// results in every namespace plus event objects, the count
+    /// `capacity_usage_v41` reports. Count and insert share this transaction; a
+    /// stored count that is not a nonnegative integer fails closed.
+    pub async fn put_new_import_result_below_event_capacity<T: Serialize>(
+        &mut self,
+        ctx: &Context,
+        id: &str,
+        owner: &str,
+        body: &T,
+        delta: u64,
+        limit: u64,
+    ) -> Result<()> {
+        if limit == 0 || delta > limit {
+            return Err(Error::Invalid("invalid capacity limit or delta".into()));
+        }
+        let value = serde_json::to_value(body).map_err(internal)?;
+        if value.get("schema_version").and_then(Value::as_str)
+            != Some(CAPACITY_IMPORT_RESULT_SCHEMA)
+            || json_u64_at_path(&value, IMPORTED_EVENTS_PATH) != Some(delta)
+        {
+            return Err(Error::Invalid(
+                "created object does not match its capacity schema or delta".into(),
+            ));
+        }
+        if self.get::<Value>(ctx, "artifact", id).await?.is_some() {
+            return Err(Error::Conflict(
+                "bounded creation requires a new object identity".into(),
+            ));
+        }
+        let invalid: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objects WHERE kind='artifact'
+             AND json_extract(body,'$.schema_version') IN (?,?)
+             AND (json_type(body,?) IS NULL OR json_type(body,?)!='integer'
+                  OR json_extract(body,?)<0)",
+        )
+        .bind(CAPACITY_LEGACY_IMPORT_RESULT_SCHEMA_V1)
+        .bind(CAPACITY_IMPORT_RESULT_SCHEMA)
+        .bind(IMPORTED_EVENTS_PATH)
+        .bind(IMPORTED_EVENTS_PATH)
+        .bind(IMPORTED_EVENTS_PATH)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        if invalid != 0 {
+            return Err(Error::Conflict(
+                "existing capacity records contain an invalid numeric fact".into(),
+            ));
+        }
+        let used = sum_imported_events_all_namespaces(&mut self.tx)
+            .await?
+            .checked_add(count_objects_all_namespaces(&mut self.tx, "event").await?)
+            .ok_or(Error::Internal)?;
+        if used.checked_add(delta).is_none_or(|total| total > limit) {
+            return Err(Error::Conflict(format!(
+                "event capacity exceeded: {used} + {delta} > {limit}"
+            )));
+        }
+        self.put(ctx, "artifact", id, owner, body).await
     }
 
     pub async fn get<T: DeserializeOwned>(
