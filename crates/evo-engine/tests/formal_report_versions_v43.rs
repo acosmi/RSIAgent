@@ -307,16 +307,14 @@ fn preserves_old_facts(before: &Value, after: &Value) {
                 "sqlite_sequence schema changed"
             );
             for row in old["rows"].as_array().unwrap() {
+                // Identity is rowid plus name: the frozen-row restore leaves one
+                // name on two original rows, so a name alone is ambiguous.
                 let successor = new["rows"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .find(|v| v[1][0] == row[1][0])
-                    .unwrap();
-                assert!(
-                    successor[0] == row[0] && successor[1][0] == row[1][0],
-                    "original sqlite_sequence identity changed"
-                );
+                    .find(|v| v[0] == row[0] && v[1][0] == row[1][0])
+                    .expect("original sqlite_sequence identity changed");
                 assert_eq!(row[1][1][0], "integer");
                 assert_eq!(successor[1][1][0], "integer");
                 let before_seq: i64 = row[1][1][1].as_str().unwrap().parse().unwrap();
