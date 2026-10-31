@@ -1438,6 +1438,50 @@ pub(crate) fn authenticate_control_registration(
         })
         .map_err(|_| Error::Forbidden)?
 }
+fn current_control_request_digest(
+    control: &crate::streaming_evaluator::RegisteredEvaluationControlV3,
+) -> Result<String> {
+    FormalOperatorCommand::RegisterControlCurrent {
+        control: Box::new(control.clone()),
+    }
+    .authentication_digest()
+}
+fn read_control_request_digest(
+    control: &crate::streaming_evaluator::ReadRegisteredEvaluationControl,
+) -> Result<String> {
+    if control.schema_version == crate::streaming_evaluator::RegisteredEvaluationControlV3::SCHEMA {
+        current_control_request_digest(control.current()?)
+    } else {
+        control_request_digest(control)
+    }
+}
+pub(crate) fn authenticate_current_control_registration(
+    ctx: &Context,
+    control: &crate::streaming_evaluator::RegisteredEvaluationControlV3,
+) -> Result<()> {
+    if control.evidence_scope == crate::streaming_evaluator::EvaluationEvidenceScope::ProgramFixture
+    {
+        return Ok(());
+    }
+    let expected_digest = current_control_request_digest(control)?;
+    OPERATOR_CREDENTIAL
+        .try_with(|cap| {
+            if cap.role != Role::Evaluator
+                || ctx.role() != Role::Evaluator
+                || cap.actor != ctx.actor()
+                || cap.namespace != ctx.namespace()
+                || cap.principals.namespace != ctx.namespace()
+                || cap.actor != cap.principals.grader.actor
+                || cap.peer.uid() != cap.principals.grader.uid
+                || cap.operation != "register_control"
+                || cap.request_digest != expected_digest
+            {
+                return Err(Error::Forbidden);
+            }
+            Ok(())
+        })
+        .map_err(|_| Error::Forbidden)?
+}
 async fn persist_principal_action(
     s: &mut Session,
     ctx: &Context,
@@ -1521,10 +1565,11 @@ async fn require_principal_action<T: Serialize>(
                 Some(
                     crate::streaming_evaluator::RegisteredEvaluationControl::SCHEMA
                         | crate::streaming_evaluator::RegisteredEvaluationControl::SCHEMA_V1
+                        | crate::streaming_evaluator::RegisteredEvaluationControlV3::SCHEMA
                 )
             ) {
             Some(decode::<
-                crate::streaming_evaluator::RegisteredEvaluationControl,
+                crate::streaming_evaluator::ReadRegisteredEvaluationControl,
             >(body_value)?)
         } else {
             None
@@ -1587,7 +1632,7 @@ async fn require_principal_action<T: Serialize>(
         digest(&action.authenticated_request_digest)?;
         if let Some(control) = &control
             && (action.operation != "register_control"
-                || action.authenticated_request_digest != control_request_digest(control)?
+                || action.authenticated_request_digest != read_control_request_digest(control)?
                 || action.peer_gid.is_none())
         {
             return Err(Error::Conflict(
@@ -1655,7 +1700,7 @@ pub(crate) async fn verify_candidate_principals(
     ctx: &Context,
     host_id: &str,
     candidate: &crate::release_store::ReleaseCandidateRecord,
-    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
+    control: &crate::streaming_evaluator::ReadRegisteredEvaluationControl,
 ) -> Result<RegisteredPrincipalSet> {
     let host: RegisteredFormalHost =
         attested_read(s, ctx, "artifact", host_id, Role::Admin).await?;
@@ -1743,13 +1788,17 @@ pub(crate) async fn verify_release_principal(
 pub(crate) async fn bind_control_principals(
     s: &mut Session,
     ctx: &Context,
-    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
+    control: &crate::streaming_evaluator::ReadRegisteredEvaluationControl,
 ) -> Result<()> {
     if control.evidence_scope == crate::streaming_evaluator::EvaluationEvidenceScope::ProgramFixture
     {
         return Ok(());
     }
-    authenticate_control_registration(ctx, control)?;
+    if control.schema_version == crate::streaming_evaluator::RegisteredEvaluationControlV3::SCHEMA {
+        authenticate_current_control_registration(ctx, control.current()?)?;
+    } else {
+        authenticate_control_registration(ctx, control)?;
+    }
     // The registered control names a staged candidate indirectly only later;
     // the service's authenticated, observed host is the unique authority here.
     let host_id = OPERATOR_CREDENTIAL
@@ -1856,6 +1905,10 @@ pub enum FormalOperatorCommand {
     RegisterControl {
         control: Box<crate::streaming_evaluator::RegisteredEvaluationControl>,
     },
+    #[serde(rename = "register_control")]
+    RegisterControlCurrent {
+        control: Box<crate::streaming_evaluator::RegisteredEvaluationControlV3>,
+    },
     Approve {
         candidate_id: String,
         report_id: String,
@@ -1902,7 +1955,7 @@ impl<'de> Deserialize<'de> for FormalOperatorCommand {
                 request: Box<crate::release_store::StageRequestWire>,
             },
             RegisterControl {
-                control: Box<crate::streaming_evaluator::RegisteredEvaluationControl>,
+                control: Box<crate::streaming_evaluator::ControlRegistrationWire>,
             },
             Approve {
                 candidate_id: String,
@@ -1973,7 +2026,14 @@ impl<'de> Deserialize<'de> for FormalOperatorCommand {
                     request: Box::new(request),
                 },
             },
-            Wire::RegisterControl { control } => Self::RegisterControl { control },
+            Wire::RegisterControl { control } => match *control {
+                crate::streaming_evaluator::ControlRegistrationWire::Legacy(control) => {
+                    Self::RegisterControl { control }
+                }
+                crate::streaming_evaluator::ControlRegistrationWire::Current(control) => {
+                    Self::RegisterControlCurrent { control }
+                }
+            },
             Wire::Approve {
                 candidate_id,
                 report_id,
@@ -2008,7 +2068,7 @@ impl FormalOperatorCommand {
     fn role(&self) -> Role {
         match self {
             Self::Stage { .. } | Self::StageCurrent { .. } => Role::Worker,
-            Self::RegisterControl { .. } => Role::Evaluator,
+            Self::RegisterControl { .. } | Self::RegisterControlCurrent { .. } => Role::Evaluator,
             _ => Role::Admin,
         }
     }
@@ -2022,7 +2082,9 @@ impl FormalOperatorCommand {
             Self::FreezeProfile { .. } => "freeze_profile",
             Self::EmptyRoot { .. } => "empty_root",
             Self::Stage { .. } | Self::StageCurrent { .. } => "stage",
-            Self::RegisterControl { .. } => "register_control",
+            Self::RegisterControl { .. } | Self::RegisterControlCurrent { .. } => {
+                "register_control"
+            }
             Self::Approve { .. } => "approve",
             Self::Canary { .. } => "canary",
             Self::Activate { .. } => "activate",
@@ -2230,6 +2292,12 @@ impl PrincipalAuthorityService {
             .map_err(|_| Error::Internal),
             FormalOperatorCommand::RegisterControl { control } => Ok(Value::String(
                 crate::streaming_evaluator::IndependentEvaluationControl::register_control(
+                    ctx, store, *control,
+                )
+                .await?,
+            )),
+            FormalOperatorCommand::RegisterControlCurrent { control } => Ok(Value::String(
+                crate::streaming_evaluator::IndependentEvaluationControl::register_current_control(
                     ctx, store, *control,
                 )
                 .await?,
@@ -4249,7 +4317,7 @@ async fn validate_episode_meter_sources(
     profile: &FrozenCompilerProfile,
     host: &RegisteredFormalHost,
     ticket: &crate::streaming_evaluator::ReadEvaluationTicket,
-    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
+    control: &crate::streaming_evaluator::ReadRegisteredEvaluationControl,
     seal: &evo_storage::budget::SealedRootBudgetEvidence,
     measurements: &CompleteEpisodeCostMeasurements,
     sources: &[TypedContentRef],
@@ -4427,7 +4495,7 @@ impl FormalAuthorityIssuer {
         let ticket: crate::streaming_evaluator::ReadEvaluationTicket =
             crate::streaming_evaluator::need_record(&mut s, ctx, "evaluation_ticket_v2", ticket_id)
                 .await?;
-        let control: crate::streaming_evaluator::RegisteredEvaluationControl =
+        let control: crate::streaming_evaluator::ReadRegisteredEvaluationControl =
             crate::streaming_evaluator::need_record(
                 &mut s,
                 ctx,
@@ -4620,7 +4688,7 @@ impl FormalAuthorityIssuer {
         let ticket: crate::streaming_evaluator::ReadEvaluationTicket =
             crate::streaming_evaluator::need_record(s, ctx, "evaluation_ticket_v2", ticket_id)
                 .await?;
-        let control: crate::streaming_evaluator::RegisteredEvaluationControl =
+        let control: crate::streaming_evaluator::ReadRegisteredEvaluationControl =
             crate::streaming_evaluator::need_record(
                 s,
                 ctx,
@@ -4704,7 +4772,7 @@ pub(crate) async fn capture_independent_grade(
     )
     .await?;
     host.validate(ctx)?;
-    let control: crate::streaming_evaluator::RegisteredEvaluationControl =
+    let control: crate::streaming_evaluator::ReadRegisteredEvaluationControl =
         crate::streaming_evaluator::need_record(
             s,
             ctx,
@@ -4788,7 +4856,7 @@ async fn complete_authority_inputs_in_session(
         max_rounds: evo_core::contract::PatchOp::ResetToBaseline,
     };
     match (ticket.schema_version.as_str(), candidate.is_current()) {
-        (ReadEvaluationTicket::SCHEMA_V3, true) => {
+        (ReadEvaluationTicket::SCHEMA_V3 | ReadEvaluationTicket::SCHEMA_V4, true) => {
             let inputs = resolve_read_bundle_in_session(
                 s,
                 ctx,
@@ -4850,7 +4918,7 @@ pub(crate) async fn preflight_complete_authority_in_session(
     s: &mut Session,
     ctx: &Context,
     ticket: &crate::streaming_evaluator::ReadEvaluationTicket,
-    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
+    control: &crate::streaming_evaluator::ReadRegisteredEvaluationControl,
 ) -> Result<()> {
     complete_authority_material_in_session(s, ctx, ticket, control).await?;
     Ok(())
@@ -4860,7 +4928,7 @@ async fn complete_authority_material_in_session(
     s: &mut Session,
     ctx: &Context,
     ticket: &crate::streaming_evaluator::ReadEvaluationTicket,
-    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
+    control: &crate::streaming_evaluator::ReadRegisteredEvaluationControl,
 ) -> Result<CompleteAuthorityMaterial> {
     ctx.require(&[Role::Evaluator])?;
     if control.evidence_scope
@@ -5132,8 +5200,8 @@ pub(crate) async fn issue_complete_authority_in_session(
     s: &mut Session,
     ctx: &Context,
     ticket: &crate::streaming_evaluator::ReadEvaluationTicket,
-    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
-    formal: &crate::streaming_evaluator::FormalEvaluationV2,
+    control: &crate::streaming_evaluator::ReadRegisteredEvaluationControl,
+    formal: &crate::streaming_evaluator::ReadFormalEvaluation,
 ) -> Result<()> {
     ctx.require(&[Role::Evaluator])?;
     if control.evidence_scope
@@ -5153,6 +5221,8 @@ pub(crate) async fn issue_complete_authority_in_session(
         roots: mut capture_roots,
     } = complete_authority_material_in_session(s, ctx, ticket, control).await?;
     candidate.current()?;
+    ticket.require_current_new_use()?;
+    formal.validate_against(ticket)?;
     let observed = process_principal(ctx, &host, &set, Role::Evaluator)?;
     for r in &provider_captures {
         let capture: FormalProviderCaptureRecord =
@@ -5263,10 +5333,11 @@ pub async fn verify_issued_authority(
         ));
     }
     verify_typed_closure(s, ctx, &record.closure_roots, &record.closure).await?;
-    let formal: crate::streaming_evaluator::FormalEvaluationV2 =
+    let formal: crate::streaming_evaluator::ReadFormalEvaluation =
         crate::streaming_evaluator::need_record(s, ctx, "formal_evaluation_v2", report_id).await?;
     let ticket: crate::streaming_evaluator::ReadEvaluationTicket =
         crate::streaming_evaluator::need_record(s, ctx, "evaluation_ticket_v2", report_id).await?;
+    formal.validate_against(&ticket)?;
     if record.raw_report_digest != fingerprint(&formal)?
         || record.ticket_digest != fingerprint(&ticket)?
     {
@@ -5291,7 +5362,7 @@ pub async fn verify_issued_authority(
     if fingerprint(&cost)? != record.episode_cost_digest {
         return Err(Error::Conflict("episode cost changed".into()));
     }
-    let control: crate::streaming_evaluator::RegisteredEvaluationControl =
+    let control: crate::streaming_evaluator::ReadRegisteredEvaluationControl =
         crate::streaming_evaluator::need_record(
             s,
             ctx,
@@ -5537,6 +5608,340 @@ mod response_bound_tests {
             _ => unreachable!(),
         }
         set
+    }
+
+    fn current_audit_control(m: f64) -> crate::streaming_evaluator::RegisteredEvaluationControlV3 {
+        let old = audit_f02_control();
+        crate::streaming_evaluator::RegisteredEvaluationControlV3 {
+            schema_version: crate::streaming_evaluator::RegisteredEvaluationControlV3::SCHEMA
+                .into(),
+            id: old.id.clone(),
+            v1_plan_snapshot: old.v1_plan_snapshot.clone(),
+            formal_plan: old.formal_plan.clone(),
+            alpha_plan: old.alpha_plan.clone(),
+            optimizer_comparison: old.optimizer_comparison.clone(),
+            optimization_budget: old.optimization_budget.clone(),
+            early_stop_plan: old.early_stop_plan.clone(),
+            anchor_matrix: old.anchor_matrix.clone(),
+            attempt_id: old.attempt_id.clone(),
+            fixed_sample_claim_id: old.fixed_sample_claim_id.clone(),
+            billing_scope: old.billing_scope.clone(),
+            executor_actor: old.executor_actor.clone(),
+            evaluator_actor: old.evaluator_actor.clone(),
+            proposer_actor: old.proposer_actor.clone(),
+            approver_actor: old.approver_actor.clone(),
+            oracle_digest: old.oracle_digest.clone(),
+            grader_digest: old.grader_digest.clone(),
+            fixed_grader: old.fixed_grader.clone(),
+            evidence_scope: old.evidence_scope,
+            created_at_unix_seconds: old.created_at_unix_seconds,
+            max_regression: evo_core::evaluation::FixedRegressionThreshold::new(m).unwrap(),
+        }
+    }
+
+    #[test]
+    fn registration_request_digest_covers_threshold() {
+        let original = current_audit_control(0.125);
+        let digest = current_control_request_digest(&original).unwrap();
+        let mut changed = original.clone();
+        changed.max_regression = evo_core::evaluation::FixedRegressionThreshold::new(0.25).unwrap();
+        assert_ne!(digest, current_control_request_digest(&changed).unwrap());
+        for field in [
+            "attempt_id",
+            "executor_actor",
+            "billing_scope",
+            "oracle_digest",
+        ] {
+            let mut body = serde_json::to_value(&original).unwrap();
+            body[field] = serde_json::json!("changed-original-field");
+            let control: crate::streaming_evaluator::RegisteredEvaluationControlV3 =
+                serde_json::from_value(body).unwrap();
+            assert_ne!(digest, current_control_request_digest(&control).unwrap());
+        }
+        let command = FormalOperatorCommand::RegisterControlCurrent {
+            control: Box::new(original),
+        };
+        let wire = serde_json::to_string(&command).unwrap();
+        assert!(wire.starts_with("{\"operation\":\"register_control\",\"control\":{"));
+        let decoded: FormalOperatorCommand = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            command.authentication_digest().unwrap(),
+            decoded.authentication_digest().unwrap()
+        );
+        let duplicate = wire.replace(
+            "\"max_regression\":0.125",
+            "\"max_regression\":0.125,\"max_regression\":0.25",
+        );
+        assert!(serde_json::from_str::<FormalOperatorCommand>(&duplicate).is_err());
+        for changed in [
+            wire.replace("\"max_regression\":0.125,", ""),
+            wire.replace("\"max_regression\":0.125", "\"max_regression\":null"),
+            wire.replace(
+                "\"max_regression\":0.125",
+                "\"max_regression\":0.125,\"unknown\":true",
+            ),
+        ] {
+            assert!(serde_json::from_str::<FormalOperatorCommand>(&changed).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_evaluator_ingress_binds_current_body() {
+        const CHILD: &str = "RSIA_AG192_INGRESS_CHILD";
+        const KEY: &str = "RSIA_AG192_INGRESS_CREDENTIAL";
+        const SECRET: &str = "grader-private-fixture-credential-32-bytes";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            use std::os::unix::fs::PermissionsExt;
+            let directory = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","formal_authority::response_bound_tests::actual_evaluator_ingress_binds_current_body","--nocapture"])
+                .current_dir(directory.path()).env(CHILD,"1").env(KEY,SECRET).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("AG192-CURRENT-INGRESS-COMPLETE")
+            );
+            return;
+        }
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+        let peer = crate::executor::observe_kernel_peer(&server).unwrap();
+        let principals = audit_f02_principals(peer.uid(), Role::Evaluator);
+        let workspace = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let executable = hash(&std::fs::read(std::env::current_exe().unwrap()).unwrap());
+        let snapshot = SystemSnapshot {
+            schema_version: "rsia.system_snapshot.v1".into(),
+            profile_id: "ingress-profile".into(),
+            host_id: "ingress-host".into(),
+            host_version: "v1".into(),
+            model_id: "fixture-model".into(),
+            tools: vec![],
+            mandatory_context_digest: hash(b"fixture-context"),
+        };
+        let host = RegisteredFormalHost {
+            id: principals.host_registration_id.clone(),
+            schema_version: HOST_SCHEMA.into(),
+            namespace: "n".into(),
+            host_id: snapshot.host_id.clone(),
+            host_version: snapshot.host_version.clone(),
+            code_digest: hash(b"synthetic-other-principal-code"),
+            grader_code_digest: executable,
+            host_uid: principals.host.uid,
+            grader_uid: principals.grader.uid,
+            administrator_uid: principals.administrator.uid,
+            host_workspace: "/unavailable/synthetic-host".into(),
+            grader_workspace: workspace.clone(),
+            grader_credential_environment_key: KEY.into(),
+            host_principal: principals.host.principal.clone(),
+            grader_principal: principals.grader.principal.clone(),
+            administrator_principal: principals.administrator.principal.clone(),
+            worker_principal: principals.worker.principal.clone(),
+            credential_binding_digest: principals.binding_digest().unwrap(),
+            isolated_workspace_digest: hash(b"synthetic-host-workspace"),
+            grader_workspace_digest: hash(workspace.as_bytes()),
+            snapshot,
+            capabilities: HostCapabilities {
+                available: Default::default(),
+                granted: Default::default(),
+            },
+            host_surface_digest: hash(b"fixture-surface"),
+            adapter_digest: hash(b"fixture-adapter"),
+            authorized_by: "admin".into(),
+        };
+        let service = PrincipalAuthorityService::new(host, principals).unwrap();
+        let store = Store::open(&std::env::current_dir().unwrap().join("ingress.sqlite3"))
+            .await
+            .unwrap();
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        store
+            .authorize_root_budget(
+                &admin,
+                &evo_storage::budget::RootBudgetAuthorization {
+                    root_budget_id: "ingress-root".into(),
+                    billing_scope: "billing".into(),
+                    allowed_namespaces: vec!["n".into()],
+                    currency: "USD".into(),
+                    pricing_version: "pricing-v1".into(),
+                    payment_subject: "software-fixture".into(),
+                    authorization_receipt_digest: hash(b"authorization"),
+                    per_call_cap_micros: 100,
+                    total_limit_micros: 1000,
+                    created_at: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let mut control = current_audit_control(0.125);
+        // This invokes the existing ProgramFixture registration scope. The
+        // Evaluator service process/peer/credential are observed; other three
+        // fixture principals do not become external-host execution authority.
+        control.evidence_scope =
+            crate::streaming_evaluator::EvaluationEvidenceScope::ProgramFixture;
+        let command = FormalOperatorCommand::RegisterControlCurrent {
+            control: Box::new(control.clone()),
+        };
+        let request =
+            serde_json::to_vec(&serde_json::json!({"credential":SECRET,"command":command}))
+                .unwrap();
+        let serve = service.serve_connection(&store, server);
+        let caller = async {
+            client
+                .write_u32(u32::try_from(request.len()).unwrap())
+                .await
+                .unwrap();
+            client.write_all(&request).await.unwrap();
+            let size = client.read_u32().await.unwrap();
+            let mut response = vec![0; size as usize];
+            client.read_exact(&mut response).await.unwrap();
+            let response: Value = serde_json::from_slice(&response).unwrap();
+            assert_eq!(response["status"], "complete");
+        };
+        let (served, ()) = tokio::join!(serve, caller);
+        assert_eq!(served.unwrap(), Value::String(control.digest().unwrap()));
+        let grader = Context::new("n", "grader", Role::Evaluator).unwrap();
+        let mut session = store.session().await.unwrap();
+        let original: crate::streaming_evaluator::ReadRegisteredEvaluationControl =
+            crate::streaming_evaluator::need_record(
+                &mut session,
+                &grader,
+                "registered_evaluation_control_v41",
+                &control.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&original).unwrap(),
+            serde_json::to_vec(&control).unwrap()
+        );
+        session.commit().await.unwrap();
+        store.close().await;
+        println!("AG192-CURRENT-INGRESS-COMPLETE");
+    }
+
+    #[tokio::test]
+    async fn wrong_peer_actor_namespace_or_operation_is_refused() {
+        let (left, _right) = tokio::net::UnixStream::pair().unwrap();
+        let peer = crate::executor::observe_kernel_peer(&left).unwrap();
+        let set = audit_f02_principals(peer.uid(), Role::Evaluator);
+        let control = current_audit_control(0.125);
+        let command = FormalOperatorCommand::RegisterControlCurrent {
+            control: Box::new(control.clone()),
+        };
+        let principal = authenticate_operator_peer(
+            &set,
+            &peer,
+            "grader-private-fixture-credential-32-bytes",
+            &command,
+        )
+        .unwrap();
+        assert_eq!(principal.actor, control.evaluator_actor);
+        let mut wrong = set.clone();
+        wrong.grader.uid += 10;
+        assert!(matches!(
+            authenticate_operator_peer(
+                &wrong,
+                &peer,
+                "grader-private-fixture-credential-32-bytes",
+                &command
+            ),
+            Err(Error::Forbidden)
+        ));
+        assert!(matches!(
+            authenticate_operator_peer(
+                &set,
+                &peer,
+                "wrong-private-fixture-credential-32-bytes",
+                &command
+            ),
+            Err(Error::Forbidden)
+        ));
+        let ctx = Context::new("n", "grader", Role::Evaluator).unwrap();
+        for operation in ["register_control", "stage", "issue_report"] {
+            let cap = OperatorCredential {
+                namespace: "n".into(),
+                actor: "grader".into(),
+                role: Role::Evaluator,
+                host_digest: hash(b"test-host"),
+                principals: set.clone(),
+                peer: peer.clone(),
+                authority: crate::executor::ObservedProcessIdentity {
+                    pid: std::process::id(),
+                    uid: peer.uid(),
+                    executable_digest: hash(b"pure-preflight-authority"),
+                    workspace: "pure-preflight".into(),
+                },
+                operation: operation.into(),
+                request_digest: command.authentication_digest().unwrap(),
+            };
+            OPERATOR_CREDENTIAL
+                .scope(cap, async {
+                    for candidate in [
+                        ctx.clone(),
+                        Context::new("n", "other", Role::Evaluator).unwrap(),
+                        Context::new("other", "grader", Role::Evaluator).unwrap(),
+                        Context::new("n", "grader", Role::Worker).unwrap(),
+                    ] {
+                        let accepted =
+                            authenticate_current_control_registration(&candidate, &control).is_ok();
+                        assert_eq!(
+                            accepted,
+                            operation == "register_control"
+                                && candidate.namespace() == "n"
+                                && candidate.actor() == "grader"
+                                && candidate.role() == Role::Evaluator
+                        );
+                    }
+                    let mut changed = control.clone();
+                    changed.max_regression =
+                        evo_core::evaluation::FixedRegressionThreshold::new(0.25).unwrap();
+                    assert!(matches!(
+                        authenticate_current_control_registration(&ctx, &changed),
+                        Err(Error::Forbidden)
+                    ));
+                })
+                .await;
+        }
+    }
+
+    #[test]
+    fn legacy_authenticated_request_bytes_are_frozen() {
+        let control = audit_f02_control();
+        let command = FormalOperatorCommand::RegisterControl {
+            control: Box::new(control.clone()),
+        };
+        #[derive(Serialize)]
+        struct LegacyCommand<'a> {
+            operation: &'static str,
+            control: &'a crate::streaming_evaluator::RegisteredEvaluationControl,
+        }
+        let original = serde_json::to_vec(&LegacyCommand {
+            operation: "register_control",
+            control: &control,
+        })
+        .unwrap();
+        assert_eq!(serde_json::to_vec(&command).unwrap(), original);
+        assert_eq!(command.authentication_digest().unwrap(), hash(&original));
+        assert!(
+            !String::from_utf8(original.clone())
+                .unwrap()
+                .contains("max_regression")
+        );
+        let decoded: FormalOperatorCommand = serde_json::from_slice(&original).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), original);
+        assert_ne!(
+            command.authentication_digest().unwrap(),
+            current_control_request_digest(&current_audit_control(0.125)).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -6680,7 +7085,7 @@ pub(crate) async fn resolve_current_compiler_inputs_inner(
     if !visiting.insert(key.clone()) {
         return Err(Error::Conflict("cyclic compiler parent lineage".into()));
     }
-    let result = async {
+    let result = Box::pin(async {
         ctx.require(&[Role::Worker, Role::Host, Role::Admin, Role::Evaluator])?;
         // Current labels are content commitments, including all-Set patches.
         // Validate their format before a lookup or a full-original mismatch.
@@ -6868,7 +7273,7 @@ pub(crate) async fn resolve_current_compiler_inputs_inner(
         };
         verified.content()?;
         Ok(verified)
-    }
+    })
     .await;
     visiting.remove(&key);
     result
@@ -7363,7 +7768,7 @@ pub(crate) async fn verify_read_candidate_principals(
     ctx: &Context,
     host_id: &str,
     candidate: &crate::release_store::ReadCandidate,
-    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
+    control: &crate::streaming_evaluator::ReadRegisteredEvaluationControl,
 ) -> Result<RegisteredPrincipalSet> {
     let host: RegisteredFormalHost =
         attested_read(s, ctx, "artifact", host_id, Role::Admin).await?;
@@ -7405,7 +7810,7 @@ pub(crate) async fn verify_read_candidate_principals_from_binding(
     ctx: &Context,
     binding: &ReadCompilerBinding,
     candidate: &crate::release_store::ReadCandidate,
-    control: &crate::streaming_evaluator::RegisteredEvaluationControl,
+    control: &crate::streaming_evaluator::ReadRegisteredEvaluationControl,
 ) -> Result<()> {
     let profile: FrozenCompilerProfile = attested_read(
         s,
@@ -7687,10 +8092,11 @@ pub async fn verify_read_issued_authority(
         ));
     }
     verify_typed_closure(s, ctx, &record.closure_roots, &record.closure).await?;
-    let formal: crate::streaming_evaluator::FormalEvaluationV2 =
+    let formal: crate::streaming_evaluator::ReadFormalEvaluation =
         crate::streaming_evaluator::need_record(s, ctx, "formal_evaluation_v2", report_id).await?;
     let ticket: crate::streaming_evaluator::ReadEvaluationTicket =
         crate::streaming_evaluator::need_record(s, ctx, "evaluation_ticket_v2", report_id).await?;
+    formal.validate_against(&ticket)?;
     if record.raw_report_digest != fingerprint(&formal)?
         || record.ticket_digest != fingerprint(&ticket)?
     {
@@ -7715,7 +8121,7 @@ pub async fn verify_read_issued_authority(
     if fingerprint(&cost)? != record.episode_cost_digest {
         return Err(Error::Conflict("episode cost changed".into()));
     }
-    let control: crate::streaming_evaluator::RegisteredEvaluationControl =
+    let control: crate::streaming_evaluator::ReadRegisteredEvaluationControl =
         crate::streaming_evaluator::need_record(
             s,
             ctx,

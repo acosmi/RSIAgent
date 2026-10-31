@@ -3830,9 +3830,10 @@ pub struct PersistentContractVersion {
     pub current: bool,
 }
 macro_rules! contract_versions {
-    ($(($old:literal, $new:literal, $change:literal)),+ $(,)?) => {
+    ($(($old:literal, $new:literal, $change:literal $(, extra_legacy: $extra:literal)?)),+ $(,)?) => {
         pub const PERSISTENT_CONTRACT_VERSIONS: &[PersistentContractVersion] = &[
             $(PersistentContractVersion { schema: $old, introduced_change: "frozen historical wire", verifier_retained: true, current: false },
+              $(PersistentContractVersion { schema: $extra, introduced_change: "frozen historical wire", verifier_retained: true, current: false },)?
               PersistentContractVersion { schema: $new, introduced_change: $change, verifier_retained: true, current: true }),+
         ];
     };
@@ -3900,13 +3901,15 @@ contract_versions!(
     ),
     (
         "rsia.experiment_plan.v1",
-        "rsia.experiment_plan.v2",
-        "complete typed candidate pin"
+        "rsia.experiment_plan.v3",
+        "complete frozen fixed-sample regression configuration and candidate pin",
+        extra_legacy: "rsia.experiment_plan.v2"
     ),
     (
         "rsia.evaluation_ticket.v2",
-        "rsia.evaluation_ticket.v3",
-        "source plan and issuance identity"
+        "rsia.evaluation_ticket.v4",
+        "frozen regression configuration, source plan and issuance identity",
+        extra_legacy: "rsia.evaluation_ticket.v3"
     ),
 );
 pub fn persistent_contract_state(

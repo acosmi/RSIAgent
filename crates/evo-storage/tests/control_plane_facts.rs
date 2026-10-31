@@ -975,6 +975,31 @@ fn current_version_table_classifies_legacy_invalid_unknown_and_lineage() {
             evo_core::fingerprint(&("unknown-version", &input)).unwrap()
         );
     }
+    for schema in [
+        "rsia.experiment_plan.v1",
+        "rsia.experiment_plan.v2",
+        "rsia.evaluation_ticket.v2",
+        "rsia.evaluation_ticket.v3",
+    ] {
+        assert_eq!(
+            persistent_contract_state(schema, true).unwrap(),
+            PersistentContractState::Legacy
+        );
+        assert_eq!(
+            persistent_contract_state(schema, false).unwrap(),
+            PersistentContractState::Invalid
+        );
+    }
+    for schema in ["rsia.experiment_plan.v3", "rsia.evaluation_ticket.v4"] {
+        assert_eq!(
+            persistent_contract_state(schema, true).unwrap(),
+            PersistentContractState::CurrentVerified
+        );
+        assert_eq!(
+            persistent_contract_state(schema, false).unwrap(),
+            PersistentContractState::Invalid
+        );
+    }
     assert_eq!(
         persistent_contract_state("rsia.registered_external_provider.v2", true).unwrap(),
         PersistentContractState::Legacy

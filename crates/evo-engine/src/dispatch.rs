@@ -3,7 +3,8 @@ use crate::exploration::ExplorationWorldV1;
 use crate::revocation_gate;
 use crate::streaming_evaluator::{
     IndependentEvaluationControl, IssueTicketRequest, ProtectedHoldoutRecord,
-    RegisteredEvaluationControl, StreamingEvaluationStatus,
+    ProtectedHoldoutRecordV2, RegisteredEvaluationControl, RegisteredEvaluationControlV3,
+    StreamingEvaluationStatus,
 };
 use evo_core::contract::{MODEL_TOOLS, admin_ops, reject_admin_as_model_tool};
 use evo_core::curriculum::ProbeTerminal;
@@ -183,6 +184,15 @@ pub struct ExperimentRegisterRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ExperimentRegisterRequestV2 {
+    pub schema_version: String,
+    pub request_key: String,
+    pub control: RegisteredEvaluationControlV3,
+    pub holdout: ProtectedHoldoutRecordV2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluationStartRequest {
     pub schema_version: String,
     pub request_key: String,
@@ -257,16 +267,53 @@ pub struct BlockedManagementRequest {
     pub request_key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case", tag = "operation")]
 enum ParsedRequest {
     ExperimentRegister(Box<ExperimentRegisterRequest>),
+    #[serde(rename = "experiment_register")]
+    ExperimentRegisterCurrent(Box<ExperimentRegisterRequestV2>),
     EvaluationStart(EvaluationStartRequest),
     EvaluationStatus(EvaluationStatusRequest),
     ReplayRun(Box<ReplayRunRequest>),
     CurriculumStep(CurriculumStepRequest),
     ExplorationStart(Box<ExplorationStartRequest>),
     Blocked(BlockedManagementRequest),
+}
+
+impl<'de> Deserialize<'de> for ParsedRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let mut value = Value::deserialize(deserializer)?;
+        if value["operation"].as_str() == Some("experiment_register") {
+            value
+                .as_object_mut()
+                .ok_or_else(|| serde::de::Error::custom("invalid management payload"))?
+                .remove("operation");
+            return parse_request("experiment.register", value).map_err(serde::de::Error::custom);
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case", tag = "operation")]
+        enum Other {
+            EvaluationStart(EvaluationStartRequest),
+            EvaluationStatus(EvaluationStatusRequest),
+            ReplayRun(Box<ReplayRunRequest>),
+            CurriculumStep(CurriculumStepRequest),
+            ExplorationStart(Box<ExplorationStartRequest>),
+            Blocked(BlockedManagementRequest),
+        }
+        Ok(
+            match serde_json::from_value::<Other>(value).map_err(serde::de::Error::custom)? {
+                Other::EvaluationStart(value) => Self::EvaluationStart(value),
+                Other::EvaluationStatus(value) => Self::EvaluationStatus(value),
+                Other::ReplayRun(value) => Self::ReplayRun(value),
+                Other::CurriculumStep(value) => Self::CurriculumStep(value),
+                Other::ExplorationStart(value) => Self::ExplorationStart(value),
+                Other::Blocked(value) => Self::Blocked(value),
+            },
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -742,6 +789,7 @@ impl ParsedRequest {
     fn request_key(&self) -> &str {
         match self {
             Self::ExperimentRegister(request) => &request.request_key,
+            Self::ExperimentRegisterCurrent(request) => &request.request_key,
             Self::EvaluationStart(request) => &request.request_key,
             Self::EvaluationStatus(request) => &request.request_key,
             Self::ReplayRun(request) => &request.request_key,
@@ -908,6 +956,9 @@ async fn execute_request(
         ParsedRequest::ExperimentRegister(request) => {
             run_experiment_register(ctx, store, &mut job, *request).await
         }
+        ParsedRequest::ExperimentRegisterCurrent(request) => {
+            run_experiment_register_current(ctx, store, &mut job, *request).await
+        }
         ParsedRequest::EvaluationStart(request) => {
             run_evaluation_start(ctx, store, &mut job, request).await
         }
@@ -981,6 +1032,11 @@ async fn run_experiment_register(
             "registered experiment content differs".into(),
         ));
     }
+    if progress.control_digest.is_some() {
+        return Err(Error::Conflict(
+            "legacy registered control is not Current input".into(),
+        ));
+    }
     if progress.control_digest.is_none() {
         IndependentEvaluationControl::register_control(ctx, store, request.control.clone()).await?;
         job.step = "control_registered".into();
@@ -996,6 +1052,74 @@ async fn run_experiment_register(
     if progress.holdout_digest.is_none() {
         checkpoint_claim(ctx, store, job, "before_holdout_registration").await?;
         IndependentEvaluationControl::register_holdout(ctx, store, request.holdout.clone()).await?;
+    }
+    let final_progress = IndependentEvaluationControl::registration_progress(
+        ctx,
+        store,
+        &request.control.id,
+        &request.holdout.id,
+    )
+    .await?;
+    if final_progress.control_digest.as_deref() != Some(expected_control.as_str())
+        || final_progress.holdout_digest.as_deref() != Some(expected_holdout.as_str())
+    {
+        return Err(Error::Conflict(
+            "experiment registration did not converge".into(),
+        ));
+    }
+    job.state = ManagementJobState::Succeeded;
+    job.step = "experiment_registered".into();
+    job.result = Some(ManagementResult::ExperimentRegistered {
+        control_id: request.control.id,
+        control_digest: expected_control,
+        holdout_id: request.holdout.id,
+        holdout_digest: expected_holdout,
+    });
+    Ok(())
+}
+
+async fn run_experiment_register_current(
+    ctx: &Context,
+    store: &Store,
+    job: &mut ManagementJob,
+    request: ExperimentRegisterRequestV2,
+) -> Result<()> {
+    if request.control.evaluator_actor != ctx.actor()
+        || request.holdout.registration_id != request.control.id
+    {
+        return Err(Error::Forbidden);
+    }
+    let expected_control = request.control.digest()?;
+    let expected_holdout = request.holdout.digest(&request.control)?;
+    let progress = IndependentEvaluationControl::registration_progress(
+        ctx,
+        store,
+        &request.control.id,
+        &request.holdout.id,
+    )
+    .await?;
+    if progress
+        .control_digest
+        .as_deref()
+        .is_some_and(|digest| digest != expected_control)
+        || progress
+            .holdout_digest
+            .as_deref()
+            .is_some_and(|digest| digest != expected_holdout)
+    {
+        return Err(Error::Conflict(
+            "registered experiment content differs".into(),
+        ));
+    }
+    if progress.control_digest.is_none() {
+        return Err(Error::Conflict(
+            "current control must be registered before candidate binding".into(),
+        ));
+    }
+    if progress.holdout_digest.is_none() {
+        checkpoint_claim(ctx, store, job, "before_holdout_registration").await?;
+        IndependentEvaluationControl::register_current_holdout(ctx, store, request.holdout.clone())
+            .await?;
     }
     let final_progress = IndependentEvaluationControl::registration_progress(
         ctx,
@@ -1194,6 +1318,13 @@ async fn run_exploration_start(
 fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<()> {
     match request {
         ParsedRequest::ExperimentRegister(request) => {
+            if request.control.evaluator_actor != ctx.actor()
+                || request.holdout.registration_id != request.control.id
+            {
+                return Err(Error::Forbidden);
+            }
+        }
+        ParsedRequest::ExperimentRegisterCurrent(request) => {
             if request.control.evaluator_actor != ctx.actor()
                 || request.holdout.registration_id != request.control.id
             {
@@ -1456,9 +1587,21 @@ fn ensure_owner(ctx: &Context, job: &ManagementJob) -> Result<()> {
 fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
     let invalid = || Error::Invalid("invalid management payload".into());
     let parsed = match operation {
-        "experiment.register" => ParsedRequest::ExperimentRegister(Box::new(
-            serde_json::from_value(payload).map_err(|_| invalid())?,
-        )),
+        "experiment.register" => match payload["schema_version"].as_str() {
+            Some("rsia.management.experiment_register.v1") => ParsedRequest::ExperimentRegister(
+                Box::new(serde_json::from_value(payload).map_err(|_| invalid())?),
+            ),
+            Some("rsia.management.experiment_register.v2") => {
+                ParsedRequest::ExperimentRegisterCurrent(Box::new(
+                    serde_json::from_value(payload).map_err(|_| invalid())?,
+                ))
+            }
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
         "evaluation.start" => {
             ParsedRequest::EvaluationStart(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
@@ -1479,9 +1622,14 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         }
         _ => return Err(Error::Invalid("unknown management operation".into())),
     };
-    let expected = format!("rsia.management.{}.v1", operation.replace('.', "_"));
+    let expected = if matches!(&parsed, ParsedRequest::ExperimentRegisterCurrent(_)) {
+        "rsia.management.experiment_register.v2".into()
+    } else {
+        format!("rsia.management.{}.v1", operation.replace('.', "_"))
+    };
     let actual = match &parsed {
         ParsedRequest::ExperimentRegister(request) => &request.schema_version,
+        ParsedRequest::ExperimentRegisterCurrent(request) => &request.schema_version,
         ParsedRequest::EvaluationStart(request) => &request.schema_version,
         ParsedRequest::EvaluationStatus(request) => &request.schema_version,
         ParsedRequest::ReplayRun(request) => &request.schema_version,
@@ -1515,6 +1663,24 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
     let mut dependencies = Vec::new();
     match request {
         ParsedRequest::ExperimentRegister(request) => {
+            dependencies.push((
+                "artifact".into(),
+                e05_storage_id("registered_evaluation_control_v41", &request.control.id)?,
+            ));
+            dependencies.push((
+                "artifact".into(),
+                e05_storage_id("protected_holdout_v41", &request.holdout.id)?,
+            ));
+            for input in request
+                .holdout
+                .rotating_inputs
+                .iter()
+                .chain(&request.holdout.anchor_inputs)
+            {
+                dependencies.push(("artifact".into(), input.input_artifact_id.clone()));
+            }
+        }
+        ParsedRequest::ExperimentRegisterCurrent(request) => {
             dependencies.push((
                 "artifact".into(),
                 e05_storage_id("registered_evaluation_control_v41", &request.control.id)?,

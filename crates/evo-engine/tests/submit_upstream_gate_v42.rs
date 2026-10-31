@@ -1169,19 +1169,18 @@ mod e05_fx {
         OptimizerComparisonContract,
     };
     use evo_core::holdout::{
-        AnchorCoverageMatrix, CriticalCapabilityCoverage, ExposureLedger, FrozenCandidatePair,
-        HoldoutManifest, SequentialMode,
+        AnchorCoverageMatrix, CriticalCapabilityCoverage, FrozenCandidatePair, HoldoutManifest,
+        SequentialMode,
     };
     use evo_core::sequential::{AlphaAllocation, FormalClaimKind, ResearchFamilyAlphaPlan};
     use evo_engine::dispatch::{
-        EvaluationStartRequest, EvaluationStatusRequest, ExperimentRegisterRequest,
-        IssueTicketRequestWire,
+        EvaluationStartRequest, EvaluationStatusRequest,
+        ExperimentRegisterRequestV2 as ExperimentRegisterRequest, IssueTicketRequestWire,
     };
     use evo_engine::streaming_evaluator::{
-        EvaluationEvidenceScope, EvaluationTarget, EvaluationTargetKind, EvaluationTicketV2,
-        FixedGraderMethod, FixedGraderSpec, FrozenOracleEntry, IndependentEvaluationControl,
-        ProtectedHoldoutRecord, ProtectedInputRef, RegisteredEvaluationControl, TargetState,
-        TicketLifecycle,
+        EvaluationEvidenceScope, FixedGraderMethod, FixedGraderSpec, FrozenOracleEntry,
+        IndependentEvaluationControl, ProtectedHoldoutRecordV2 as ProtectedHoldoutRecord,
+        ProtectedInputRef, RegisteredEvaluationControlV3 as RegisteredEvaluationControl,
     };
     use evo_storage::budget::RootBudgetAuthorization;
 
@@ -1217,8 +1216,7 @@ mod e05_fx {
         pub control: RegisteredEvaluationControl,
     }
 
-    /// The control and the holdout, registered directly, and one ticket stored
-    /// as a pre-AG-100 issue stored it (`persist_legacy_ticket`). The first
+    /// A complete Current control, candidate, holdout and issued ticket. The first
     /// rotating input of the holdout names `first_input_artifact` (an
     /// operator-supplied reference to an input artifact); the others are opaque
     /// ids of artifacts that do not exist.
@@ -1246,6 +1244,41 @@ mod e05_fx {
             )
             .await
             .unwrap();
+
+        let host = Context::new("n", "e05-source-host", Role::Host).unwrap();
+        let source_body = "independent management evaluation candidate source";
+        let source = evo_engine::evidence::StoredTraceAuthority {
+            schema_version: "rsia.optimization.source.v1".into(),
+            record: evo_engine::evidence::StoredRunRecord {
+                id: "e05-current-source".into(),
+                body: source_body.as_bytes().to_vec(),
+                parent_family: "e05-current-source-family".into(),
+                task_origin: evo_core::evidence::TaskOrigin::TrustedRun,
+                execution_attestation: evo_core::evidence::ExecutionAttestation::TrustedHost,
+                purpose: evo_core::evidence::Purpose::Development,
+            },
+            trace: evo_core::optimization::OptimizationTrace {
+                run_id: "e05-current-source".into(),
+                parent_family: "e05-current-source-family".into(),
+                source_digest: evo_core::hash(source_body.as_bytes()),
+                purpose: evo_core::evidence::Purpose::Development,
+                outcome: evo_core::optimization::TraceOutcome::Success,
+                diagnosis: None,
+                excerpt: source_body.into(),
+                seed: 1,
+            },
+            excerpt_start: 0,
+            excerpt_end: source_body.len(),
+        };
+        evo_engine::evidence::store_trace_authority(&store, &host, &source)
+            .await
+            .unwrap();
+        let mut source_session = store.session().await.unwrap();
+        let watermark = source_session
+            .bump_watermark(&host, &d("e05-current-source-watermark"))
+            .await
+            .unwrap();
+        source_session.commit().await.unwrap();
 
         let mut v1 = ExperimentPlan::first_low_risk("formal-e05", 60).unwrap();
         v1.n_planned = n as usize;
@@ -1320,6 +1353,7 @@ mod e05_fx {
             schema_version: RegisteredEvaluationControl::SCHEMA.into(),
             id: "control-1".into(),
             v1_plan_snapshot: v1.clone(),
+            max_regression: evo_core::evaluation::FixedRegressionThreshold::new(0.125).unwrap(),
             formal_plan: formal,
             alpha_plan: alpha.clone(),
             optimizer_comparison: comparison,
@@ -1339,12 +1373,59 @@ mod e05_fx {
             evidence_scope: EvaluationEvidenceScope::ProgramFixture,
             created_at_unix_seconds: 2,
         };
-        IndependentEvaluationControl::register_control(&evaluator, &store, control.clone())
+        IndependentEvaluationControl::register_current_control(&evaluator, &store, control.clone())
             .await
             .unwrap();
 
-        let pair = FrozenCandidatePair::new(v1.digest().unwrap(), d("candidate"), d("baseline"), 3)
-            .unwrap();
+        let progress = IndependentEvaluationControl::registration_progress(
+            &evaluator,
+            &store,
+            &control.id,
+            "holdout-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            progress.control_digest.as_deref(),
+            Some(control.digest().unwrap().as_str())
+        );
+        // The first candidate content and compilation occur after the complete
+        // frozen control has committed and been reloaded.
+        let proposer = Context::new("n", "proposer", Role::Worker).unwrap();
+        let bundle = crate::trusted_compiler_inputs::software_candidate_current(
+            &store,
+            &proposer,
+            &d("environment"),
+            "management evaluation candidate",
+            watermark as u64,
+        )
+        .await
+        .unwrap();
+        let candidate = evo_engine::release_store::ReleaseStore::stage_current_bundle(
+            &proposer,
+            &store,
+            evo_engine::release_store::CurrentStageBundleRequest {
+                candidate_id: d("candidate"),
+                bundle,
+                environment_digest: d("environment"),
+                proposer_actor: proposer.actor().into(),
+                sources: vec![evo_engine::release_store::TypedSourceRef {
+                    kind: "run".into(),
+                    id: source.record.id,
+                    content_digest: source.trace.source_digest,
+                }],
+                revoke_watermark: watermark as u64,
+            },
+        )
+        .await
+        .unwrap();
+        let pair = FrozenCandidatePair::new(
+            v1.digest().unwrap(),
+            candidate.id.clone(),
+            candidate.parent_digest.clone(),
+            3,
+        )
+        .unwrap();
         let manifest = HoldoutManifest::issue_after_candidates_frozen(
             &pair,
             "family-e05",
@@ -1403,253 +1484,45 @@ mod e05_fx {
             schema_version: ProtectedHoldoutRecord::SCHEMA.into(),
             id: "holdout-1".into(),
             registration_id: "control-1".into(),
+            frozen_configuration_digest: control.frozen_configuration().unwrap().digest().unwrap(),
             pair,
             manifest,
-            candidate_bundle_digest: d("candidate-bundle"),
+            candidate_bundle_digest: candidate.bundle_digest.clone(),
             baseline_bundle_digest: d("baseline-bundle"),
             rotating_inputs,
             anchor_inputs,
             oracle_payload_digest: fingerprint(&oracle_entries).unwrap(),
             oracle_entries,
         };
-        IndependentEvaluationControl::register_holdout(&evaluator, &store, holdout.clone())
+        IndependentEvaluationControl::register_current_holdout(&evaluator, &store, holdout.clone())
             .await
             .unwrap();
-        persist_legacy_ticket(&store, &evaluator, &control, &holdout, "ticket-1", 5).await;
+        let ticket = IndependentEvaluationControl::issue_ticket(
+            &evaluator,
+            &store,
+            evo_engine::streaming_evaluator::IssueTicketRequest {
+                ticket_id: "ticket-1".into(),
+                registration_id: control.id.clone(),
+                holdout_id: holdout.id.clone(),
+                issued_at_unix_seconds: 5,
+            },
+        )
+        .await
+        .unwrap();
         E05 {
             _dir: dir,
             store,
             evaluator,
-            ticket_id: "ticket-1".into(),
+            ticket_id: ticket.id,
             holdout,
             control,
         }
     }
 
-    /// The issue receipt and alpha reservation the engine stores, mirrored in
-    /// their declared field order (the engine keeps both types private).
-    #[derive(serde::Serialize)]
-    struct TicketIssueReceipt {
-        schema_version: String,
-        ticket_id: String,
-        registration_digest: String,
-        manifest_digest: String,
-        evaluator_actor: String,
-        issued_at_unix_seconds: i64,
-    }
-
-    #[derive(serde::Serialize)]
-    struct AlphaClaimReservation {
-        schema_version: String,
-        research_family_id: String,
-        claim_id: String,
-        attempt_id: String,
-        ticket_id: String,
-    }
-
-    /// The product's typed artifact envelope, in its declared field order.
-    #[derive(serde::Serialize)]
-    struct Envelope<'a, T> {
-        schema_version: &'a str,
-        id: &'a str,
-        record_kind: &'a str,
-        payload: &'a T,
-    }
-
-    fn storage_id(record_kind: &str, id: &str) -> String {
-        format!("e05-{}", fingerprint(&(record_kind, id)).unwrap())
-    }
-
-    async fn put_record<T: serde::Serialize>(
-        session: &mut evo_storage::Session,
-        evaluator: &Context,
-        record_kind: &str,
-        id: &str,
-        payload: &T,
-    ) {
-        let storage = storage_id(record_kind, id);
-        let envelope = Envelope {
-            schema_version: "rsia.typed_artifact_envelope.v1",
-            id: &storage,
-            record_kind,
-            payload,
-        };
-        session
-            .put(
-                evaluator,
-                "artifact",
-                &storage,
-                evaluator.actor(),
-                &envelope,
-            )
-            .await
-            .unwrap();
-    }
-
-    /// The pre-AG-100 history (L696: a stored record keeps its original
-    /// interpretation and is never upgraded): the unbound ticket an issue
-    /// stored when no candidate was recorded. AG-100 refuses that issue and
-    /// this fixture stages no candidate, so it writes that issue's rows as the
-    /// issue wrote them, in one transaction: the alpha reservations, the
-    /// exposure ledger, the issue receipt, the ticket, its ticket -> holdout
-    /// edge and the audit entry. The control, the holdout and the ticket keep
-    /// having no edge to any run.
-    async fn persist_legacy_ticket(
-        store: &Store,
-        evaluator: &Context,
-        control: &RegisteredEvaluationControl,
-        holdout: &ProtectedHoldoutRecord,
-        ticket_id: &str,
-        issued_at_unix_seconds: i64,
-    ) {
-        let plan = &control.alpha_plan;
-        let mut ledger = ExposureLedger::new(
-            plan.research_family_id.clone(),
-            plan.digest().unwrap(),
-            control.v1_plan_snapshot.query_limit,
-        )
-        .unwrap();
-        ledger.reserve(ticket_id, &holdout.manifest).unwrap();
-        let mut session = store.session().await.unwrap();
-        for allocation in &plan.allocations {
-            if allocation.attempt_id != control.attempt_id {
-                continue;
-            }
-            let reservation = AlphaClaimReservation {
-                schema_version: "rsia.alpha_claim_reservation.v1".into(),
-                research_family_id: plan.research_family_id.clone(),
-                claim_id: allocation.claim_id.clone(),
-                attempt_id: allocation.attempt_id.clone(),
-                ticket_id: ticket_id.into(),
-            };
-            let id = format!("{}:{}", plan.research_family_id, allocation.claim_id);
-            put_record(
-                &mut session,
-                evaluator,
-                "alpha_claim_reservation_v1",
-                &id,
-                &reservation,
-            )
-            .await;
-        }
-        let registration_digest = control.digest().unwrap();
-        let manifest_digest = holdout.manifest.digest().unwrap();
-        let receipt = TicketIssueReceipt {
-            schema_version: "rsia.evaluation_ticket_issue_receipt.v1".into(),
-            ticket_id: ticket_id.into(),
-            registration_digest: registration_digest.clone(),
-            manifest_digest: manifest_digest.clone(),
-            evaluator_actor: evaluator.actor().into(),
-            issued_at_unix_seconds,
-        };
-        let mut bound_v1_plan = control.v1_plan_snapshot.clone();
-        bound_v1_plan
-            .bind_candidate(holdout.pair.candidate_digest.clone())
-            .unwrap();
-        let rotating = holdout
-            .rotating_inputs
-            .iter()
-            .map(|input| EvaluationTarget {
-                target_id: input.target_id.clone(),
-                kind: EvaluationTargetKind::Rotating {
-                    cluster_id: input.cluster_or_anchor_id.clone(),
-                },
-                input_artifact_id: input.input_artifact_id.clone(),
-                input_digest: input.input_digest.clone(),
-                state: TargetState::Planned,
-            });
-        let anchors = holdout.anchor_inputs.iter().map(|input| EvaluationTarget {
-            target_id: input.target_id.clone(),
-            kind: EvaluationTargetKind::Anchor {
-                anchor_id: input.cluster_or_anchor_id.clone(),
-            },
-            input_artifact_id: input.input_artifact_id.clone(),
-            input_digest: input.input_digest.clone(),
-            state: TargetState::Planned,
-        });
-        let ticket = EvaluationTicketV2 {
-            schema_version: EvaluationTicketV2::SCHEMA.into(),
-            id: ticket_id.into(),
-            registration_id: control.id.clone(),
-            registration_digest,
-            holdout_id: holdout.id.clone(),
-            manifest_digest,
-            v1_plan_snapshot_digest: control.formal_plan.v1_plan_snapshot_digest.clone(),
-            bound_v1_plan_digest: bound_v1_plan.digest().unwrap(),
-            formal_plan_digest: control.formal_plan.digest().unwrap(),
-            profile: control.formal_plan.profile,
-            n_planned: control.formal_plan.n_planned,
-            research_family_id: plan.research_family_id.clone(),
-            alpha_plan_digest: plan.digest().unwrap(),
-            candidate_digest: holdout.pair.candidate_digest.clone(),
-            baseline_digest: holdout.pair.baseline_digest.clone(),
-            candidate_bundle_digest: holdout.candidate_bundle_digest.clone(),
-            baseline_bundle_digest: holdout.baseline_bundle_digest.clone(),
-            environment_digest: holdout.manifest.environment_digest.clone(),
-            proposer_actor: control.proposer_actor.clone(),
-            evaluator_actor: control.evaluator_actor.clone(),
-            executor_actor: control.executor_actor.clone(),
-            approver_actor: control.approver_actor.clone(),
-            issue_receipt_digest: fingerprint(&receipt).unwrap(),
-            evidence_scope: control.evidence_scope,
-            attempt_id: control.attempt_id.clone(),
-            targets: rotating.chain(anchors).collect(),
-            lifecycle: TicketLifecycle::Reserved,
-            next_sequence: 1,
-            pending_certificate: None,
-            stop_member_terminal_digest: None,
-            late_execution_receipt_ids: Vec::new(),
-            late_grader_receipt_ids: Vec::new(),
-            unattributed_budget_call_ids: Vec::new(),
-            invalid_reasons: Vec::new(),
-            issued_at_unix_seconds,
-            candidate_dependency_binding: None,
-        };
-        put_record(
-            &mut session,
-            evaluator,
-            "exposure_ledger_v1",
-            &plan.research_family_id,
-            &ledger,
-        )
-        .await;
-        put_record(
-            &mut session,
-            evaluator,
-            "evaluation_ticket_issue_receipt_v1",
-            ticket_id,
-            &receipt,
-        )
-        .await;
-        put_record(
-            &mut session,
-            evaluator,
-            "evaluation_ticket_v2",
-            ticket_id,
-            &ticket,
-        )
-        .await;
-        session
-            .put_edge(
-                evaluator,
-                "artifact",
-                &storage_id("evaluation_ticket_v2", ticket_id),
-                "artifact",
-                &storage_id("protected_holdout_v41", &holdout.id),
-            )
-            .await
-            .unwrap();
-        session
-            .audit(evaluator, "issue_evaluation_ticket", ticket_id)
-            .await
-            .unwrap();
-        session.commit().await.unwrap();
-    }
-
     impl E05 {
         pub fn register_request(&self, request_key: &str) -> Value {
             serde_json::to_value(ExperimentRegisterRequest {
-                schema_version: "rsia.management.experiment_register.v1".into(),
+                schema_version: "rsia.management.experiment_register.v2".into(),
                 request_key: request_key.into(),
                 control: self.control.clone(),
                 holdout: self.holdout.clone(),

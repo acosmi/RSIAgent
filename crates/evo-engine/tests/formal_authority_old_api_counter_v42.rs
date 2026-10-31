@@ -37,8 +37,10 @@ use evo_engine::release_store::{
 use evo_engine::streaming_evaluator::{
     EvaluationEvidenceScope, ExecutionReceiptRequest, ExecutionSide, FixedGraderMethod,
     FixedGraderSpec, FormalEvaluationV2, FrozenOracleEntry, GraderReceiptRequest,
-    IndependentEvaluationControl, IssueTicketRequest, ProtectedHoldoutRecord, ProtectedInputRef,
-    RegisteredEvaluationControl, StartExecutionRequest, TicketLifecycle,
+    IndependentEvaluationControl, IssueTicketRequest,
+    ProtectedHoldoutRecordV2 as ProtectedHoldoutRecord, ProtectedInputRef,
+    RegisteredEvaluationControlV3 as RegisteredEvaluationControl, StartExecutionRequest,
+    TicketLifecycle,
 };
 use evo_storage::Store;
 use evo_storage::budget::{
@@ -50,7 +52,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 const V1: &str = "rsia.registered_evaluation_control.v1";
-const V2: &str = "rsia.registered_evaluation_control.v2";
+const V2: &str = "rsia.registered_evaluation_control.v3";
 
 fn d(label: &str) -> String {
     hash(label.as_bytes())
@@ -100,7 +102,7 @@ impl Fixture {
     }
 }
 
-async fn unregistered_fixture(schema: &str, profile: ProfileKind, candidate_cost: i64) -> Fixture {
+async fn unregistered_fixture(_schema: &str, profile: ProfileKind, candidate_cost: i64) -> Fixture {
     let n = 20;
     let sequential = false;
     let dir = tempfile::tempdir().unwrap();
@@ -127,6 +129,33 @@ async fn unregistered_fixture(schema: &str, profile: ProfileKind, candidate_cost
         )
         .await
         .unwrap();
+
+    let host = Context::new("n", "host", Role::Host).unwrap();
+    let body = "trusted release source";
+    let source = StoredTraceAuthority {
+        schema_version: "rsia.optimization.source.v1".into(),
+        record: StoredRunRecord {
+            id: "release-run".into(),
+            body: body.as_bytes().to_vec(),
+            parent_family: "release-family".into(),
+            task_origin: TaskOrigin::TrustedRun,
+            execution_attestation: ExecutionAttestation::TrustedHost,
+            purpose: Purpose::Development,
+        },
+        trace: OptimizationTrace {
+            run_id: "release-run".into(),
+            parent_family: "release-family".into(),
+            source_digest: hash(body.as_bytes()),
+            purpose: Purpose::Development,
+            outcome: TraceOutcome::Success,
+            diagnosis: None,
+            excerpt: body.into(),
+            seed: 1,
+        },
+        excerpt_start: 0,
+        excerpt_end: body.len(),
+    };
+    store_trace_authority(&store, &host, &source).await.unwrap();
 
     let mut v1 = ExperimentPlan::first_low_risk("formal-e05", 60).unwrap();
     v1.n_planned = n as usize;
@@ -217,9 +246,10 @@ async fn unregistered_fixture(schema: &str, profile: ProfileKind, candidate_cost
         method: FixedGraderMethod::ExactJsonAnswerV1,
     };
     let control = RegisteredEvaluationControl {
-        schema_version: schema.into(),
+        schema_version: RegisteredEvaluationControl::SCHEMA.into(),
         id: "control-1".into(),
         v1_plan_snapshot: v1.clone(),
+        max_regression: evo_core::evaluation::FixedRegressionThreshold::new(0.125).unwrap(),
         formal_plan: formal,
         alpha_plan: alpha.clone(),
         optimizer_comparison: comparison,
@@ -239,6 +269,21 @@ async fn unregistered_fixture(schema: &str, profile: ProfileKind, candidate_cost
         evidence_scope: EvaluationEvidenceScope::ProgramFixture,
         created_at_unix_seconds: 2,
     };
+    IndependentEvaluationControl::register_current_control(&evaluator, &store, control.clone())
+        .await
+        .unwrap();
+    let progress = IndependentEvaluationControl::registration_progress(
+        &evaluator,
+        &store,
+        &control.id,
+        "holdout-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        progress.control_digest.as_deref(),
+        Some(control.digest().unwrap().as_str())
+    );
     // The candidate pair binds the actual E01 snapshot, not an arbitrary label.
     let pair = FrozenCandidatePair::new(
         v1.digest().unwrap(),
@@ -307,6 +352,7 @@ async fn unregistered_fixture(schema: &str, profile: ProfileKind, candidate_cost
         schema_version: ProtectedHoldoutRecord::SCHEMA.into(),
         id: "holdout-1".into(),
         registration_id: "control-1".into(),
+        frozen_configuration_digest: control.frozen_configuration().unwrap().digest().unwrap(),
         pair,
         manifest,
         candidate_bundle_digest: release_bundle().digest,
@@ -509,14 +555,7 @@ async fn grade_target(
 
 async fn fixture(schema: &str, profile: ProfileKind, candidate_cost: i64) -> Fixture {
     let fixture = unregistered_fixture(schema, profile, candidate_cost).await;
-    IndependentEvaluationControl::register_control(
-        &fixture.evaluator,
-        &fixture.store,
-        fixture.control.clone(),
-    )
-    .await
-    .unwrap();
-    IndependentEvaluationControl::register_holdout(
+    IndependentEvaluationControl::register_current_holdout(
         &fixture.evaluator,
         &fixture.store,
         fixture.holdout.clone(),
