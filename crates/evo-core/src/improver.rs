@@ -102,7 +102,7 @@ fn classify_mechanism_class(value: &serde_json::Value) -> Result<()> {
         )),
         "acquisition_policy" => Err(Error::Invalid("acquisition_policy: no consumer".into())),
         "caps" | "exploration_caps" | "simulation_profile" | "holdout" | "oracle" | "grader"
-        | "budget" | "approval" | "goal" => Err(Error::Forbidden),
+        | "budget" | "approval" | "goal" | "direction_hint" => Err(Error::Forbidden),
         _ => Err(Error::Invalid("unknown improver mechanism class".into())),
     }
 }
