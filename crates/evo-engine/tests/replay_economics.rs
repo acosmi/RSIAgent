@@ -2255,7 +2255,9 @@ async fn ag163_history() -> Ag163History {
     assert_eq!(raw.len() % 2, 0);
     let bytes: Vec<u8> = raw
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect();
     assert_eq!(
@@ -2784,7 +2786,9 @@ async fn derived_economic_audit_propagates_real_formal_source_legacy() {
     assert_eq!(hex.len() % 2, 0);
     let original_database: Vec<u8> = hex
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect();
     assert_eq!(original_database.len(), 438_272);

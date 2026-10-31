@@ -1047,7 +1047,9 @@ async fn ag163_history(name: &str) -> Ag163History {
     assert_eq!(raw.len() % 2, 0);
     let bytes: Vec<u8> = raw
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect();
     assert_eq!(
@@ -1153,7 +1155,9 @@ fn ag163_preserves_original_rows(
         let raw = cell[1].as_str().unwrap();
         let bytes: Vec<u8> = raw
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect();
         String::from_utf8(bytes).unwrap()
