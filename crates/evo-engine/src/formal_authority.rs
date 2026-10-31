@@ -8989,16 +8989,14 @@ pub(crate) async fn verify_derived_formal_authority(
     // original issuer verifier in this same Session: full typed closure,
     // raw+ticket digests, principal actions, cost seal and provider sources.
     let source = verify_original_formal_authority_for_derived(s, ctx, input.source_report_id(), candidate).await?;
-    let original: crate::streaming_evaluator::FormalEvaluationV2 =
-        crate::streaming_evaluator::need_record(
-            s, ctx, "formal_evaluation_v2", input.source_report_id(),
-        ).await?;
     let view = input.source_view();
+    // The issuer's raw pin is compared with the typed digest of the same
+    // complete original report read whose canonical digest is the derived
+    // source_report_ref; no inner result is unwrapped and re-serialized.
     if source.report_id != input.source_report_id()
         || source.report_id != view.report_id || source.report_id != view.ticket_id
         || source.ticket_digest != view.ticket_digest
-        || source.raw_report_digest != fingerprint(&original)?
-        || evo_core::canonical_fingerprint(&original)? != input.source_report_payload_digest()
+        || source.raw_report_digest != input.source_raw_report_digest()
         || source.candidate_id != view.candidate_digest
         || source.candidate_bundle_digest != view.candidate_bundle_digest
         || source.environment_digest != view.environment_digest

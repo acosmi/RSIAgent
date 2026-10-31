@@ -1172,7 +1172,9 @@ fn ag163_preserves_original_rows(before: &serde_json::Value, after: &serde_json:
                 let original_text = text(column(old, row, "body"));
                 let original: serde_json::Value = serde_json::from_str(&original_text).unwrap();
                 if original["record_kind"] == "formal_evaluation_v2" {
-                    let ticket = original["payload"]["ticket_id"].as_str().unwrap();
+                    // The ordinary native wrapper keeps its ticket in result.ticket_id.
+                    let payload = &original["payload"];
+                    let ticket = payload.get("ticket_id").unwrap_or(&payload["result"]["ticket_id"]).as_str().unwrap();
                     let ticket_physical = ag163_sid("evaluation_ticket_v2", ticket);
                     assert_eq!(id, ag163_sid("formal_evaluation_v2", ticket));
                     assert!(row_namespace == namespace && scope.contains(&("artifact".into(), ticket_physical)),
@@ -1474,8 +1476,11 @@ async fn known_formal_history_is_cleanable_without_resetting_spend() {
 #[tokio::test]
 async fn unknown_inner_judgment_version_is_left_in_quarantine() {
     for old_running in [false, true] {
-    for fault in ["old_statistics", "old_certificate", "payload_schema"] {
-        let fx = ag163_history(if fault == "old_certificate" { "ag163-old-early-v2" } else { "ag163-old-complete-v2" }).await;
+    for fault in ["old_statistics", "old_certificate", "payload_schema", "native_wire"] {
+        // Early fixtures have no original formal->ticket edge: only the
+        // one-slot catch-up can reach their report.
+        let early = matches!(fault, "old_certificate" | "native_wire");
+        let fx = ag163_history(if early { "ag163-old-early-v2" } else { "ag163-old-complete-v2" }).await;
         let namespace = fx.original["namespace"].as_str().unwrap();
         let admin = Context::new(namespace, "admin", Role::Admin).unwrap();
         let ticket = fx.original["ticket_id"].as_str().unwrap();
@@ -1494,10 +1499,19 @@ async fn unknown_inner_judgment_version_is_left_in_quarantine() {
             assert_eq!(damaged["payload"]["certificate"]["schema_version"], "rsia.early_stop_certificate.v1");
             damaged["payload"]["certificate"]["schema_version"] = json!("rsia.early_stop_certificate.v999");
             "blocked_unknown_scope:formal_judgment_old_wire_or_domain"
-        } else {
-            // A separate unknown inner-wire fault; never a claimed v3 positive.
+        } else if fault == "payload_schema" {
+            // A separate unknown inner-wire fault: outside the table, never sent
+            // to the derived redactor and never a claimed positive.
             damaged["payload"]["schema_version"] = json!("rsia.formal_evaluation.v999");
-            "blocked_unknown_scope:formal_judgment_v3_wire_or_domain"
+            "blocked_unknown_scope:formal_judgment_version_outside_table"
+        } else {
+            // The exact ordinary native wrapper keeps its ticket in result.ticket_id.
+            // Catch-up must find that real relation (not an identity fault); with
+            // no native catalog row its domain stays quarantined, not derived-redacted.
+            let result = damaged["payload"].take();
+            damaged["payload"] = json!({"schema_version":"rsia.formal_evaluation.v3",
+                "decision_version":"rsia.fixed_sample_regression.v1","result":result});
+            "blocked_unknown_scope:formal_judgment_native_wire_or_domain"
         };
         let source_body: serde_json::Value = serde_json::from_str(&ag163_body(&fx.store, &admin, "run", "S2").await).unwrap();
         assert_eq!(source_body["schema_version"], "rsia.optimization.source.v1"); assert_eq!(source_body["record"]["id"], "S2");
@@ -1510,8 +1524,8 @@ async fn unknown_inner_judgment_version_is_left_in_quarantine() {
         assert!(session.dependents(&admin, "artifact", binding["candidate_id"].as_str().unwrap()).await.unwrap().contains(&("artifact".into(), ticket_physical.clone())));
         let original_report_edge = session.dependents(&admin, "artifact", &ticket_physical).await.unwrap()
             .contains(&("artifact".into(), physical.clone()));
-        assert_eq!(original_report_edge, fault != "old_certificate",
-            "unknown-certificate test must retain the genuine missing Early edge");
+        assert_eq!(original_report_edge, !early,
+            "Early fault tests must retain the genuine missing Early edge");
         session.commit().await.unwrap();
         fx.store.close().await;
         let mut connection = sqlx::sqlite::SqliteConnectOptions::new().filename(&fx.path)

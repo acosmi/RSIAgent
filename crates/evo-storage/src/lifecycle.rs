@@ -1554,8 +1554,15 @@ async fn discover_old_formal_cleanup_relation(
     let report = parse_strict_json(&report_body)?;
     let report_owner: String = report_row.try_get("owner").map_err(internal)?;
     let report_node = TypedObjectRef { kind: "artifact".into(), id: report_id };
+    // The ordinary native wire keeps its real ticket in result.ticket_id; only
+    // its exact schema and decision select that member. Every other payload
+    // keeps the original top-level ticket identity; a missing one fails closed.
+    let payload = &report["payload"];
+    let report_ticket = if payload["schema_version"] == "rsia.formal_evaluation.v3"
+        && payload["decision_version"] == "rsia.fixed_sample_regression.v1"
+    { &payload["result"]["ticket_id"] } else { &payload["ticket_id"] };
     if !envelope_matches(&report, "formal_evaluation_v2", &report_node.id)
-        || report_owner != owner || report["payload"]["ticket_id"].as_str() != Some(logical_id)
+        || report_owner != owner || report_ticket.as_str() != Some(logical_id)
     {
         return mark_unknown_scope(tx, ctx, job_id, &report_node,
             "blocked_unknown_scope:formal_legacy_cleanup_identity", now).await;
@@ -3305,18 +3312,26 @@ async fn cleanup_node_content(
     }
     if node.kind == "artifact" && schema == "rsia.typed_artifact_envelope.v1"
         && record_kind == "formal_evaluation_v2"
-        && value["payload"].get("schema_version").is_some()
     {
-        return redact_formal_judgment_v3(tx, ctx, job_id, node, &body, &value, now).await;
-    }
-    if node.kind == "artifact" && schema == "rsia.typed_artifact_envelope.v1"
-        && record_kind == "formal_evaluation_v2"
-        && !formal_old_inner_version_known(&value["payload"])
-    {
-        return mark_unknown_scope(
-            tx, ctx, job_id, node,
-            "blocked_unknown_scope:formal_judgment_old_wire_or_domain", now,
-        ).await;
+        // Exact payload-schema classes of the one catalog, never a shape guess:
+        // registered ordinary reports (no schema, or the native wrapper) stay
+        // under the original preservation policy below; only the exact derived
+        // name reaches the derived redactor; any other name is outside the table.
+        let payload = &value["payload"];
+        let error = match payload.get("schema_version").map(serde_json::Value::as_str) {
+            None if formal_ordinary_inner_version_known(None, payload) => None,
+            None => Some("blocked_unknown_scope:formal_judgment_old_wire_or_domain"),
+            Some(Some("rsia.formal_judgment.v1")) => {
+                return redact_formal_judgment_derived(tx, ctx, job_id, node, &body, &value, now).await;
+            }
+            Some(Some("rsia.formal_evaluation.v3")) if formal_native_wire_known(payload) => None,
+            Some(Some("rsia.formal_evaluation.v3")) =>
+                Some("blocked_unknown_scope:formal_judgment_native_wire_or_domain"),
+            Some(_) => Some("blocked_unknown_scope:formal_judgment_version_outside_table"),
+        };
+        if let Some(error) = error {
+            return mark_unknown_scope(tx, ctx, job_id, node, error, now).await;
+        }
     }
     let preserve = match (node.kind.as_str(), schema, record_kind) {
         // These historical accounting facts retain their consumer's schema and spent counters.
@@ -4619,8 +4634,12 @@ macro_rules! formal_judgment_version {
 }
 /// Explicit rows, in lineage order. No runtime schema Cartesian product or
 /// current=true shortcut. Engine must authenticate the full original closure
-/// in its Session before matching. Complete v3 has a retained source/derived
-/// verifier; Early v3 remains unavailable without the original stop snapshot.
+/// in its Session before matching. Derived Complete has a retained source and
+/// derived verifier; derived Early remains unavailable without the original
+/// stop snapshot. The ordinary native wire (payload schema
+/// `rsia.formal_evaluation.v3`) has no row until its actual legal source exists.
+/// One reviewed row per registered domain; kept unwrapped for row-by-row review.
+#[rustfmt::skip]
 pub const FORMAL_JUDGMENT_VERSIONS: &[FormalJudgmentVersion] = &[
     // Original writer: rsia.registered_evaluation_control.v1, rsia.evaluation_ticket.v2, program_fixture.
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "program_fixture",
@@ -4798,133 +4817,133 @@ pub const FORMAL_JUDGMENT_VERSIONS: &[FormalJudgmentVersion] = &[
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "registered_external_host",
         None, "invalid", formal_judgment_early_domain!(), None, None, None, "invalid_actual_reason_order_v1",
         "control-v2 preserves profile verdict; original early/invalid semantics retained", true, FormalJudgmentIdStrategy::SourceTicket),
-    // Explicit v3 target: rsia.registered_evaluation_control.v1, rsia.evaluation_ticket.v2, program_fixture.
+    // Explicit derived target (rsia.formal_judgment.v1): rsia.registered_evaluation_control.v1, rsia.evaluation_ticket.v2, program_fixture.
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
-        "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
-    formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
         "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
+        "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
+    formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "program_fixture",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
-    // Explicit v3 target: rsia.registered_evaluation_control.v1, rsia.evaluation_ticket.v2, registered_external_host.
+    // Explicit derived target (rsia.formal_judgment.v1): rsia.registered_evaluation_control.v1, rsia.evaluation_ticket.v2, registered_external_host.
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
-        "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
-    formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
         "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
+        "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
+    formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "registered_external_host",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
-    // Explicit v3 target: rsia.registered_evaluation_control.v2, rsia.evaluation_ticket.v2, program_fixture.
+    // Explicit derived target (rsia.formal_judgment.v1): rsia.registered_evaluation_control.v2, rsia.evaluation_ticket.v2, program_fixture.
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
-        "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
-    formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
         "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
+        "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
+    formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "program_fixture",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
-    // Explicit v3 target: rsia.registered_evaluation_control.v2, rsia.evaluation_ticket.v2, registered_external_host.
+    // Explicit derived target (rsia.formal_judgment.v1): rsia.registered_evaluation_control.v2, rsia.evaluation_ticket.v2, registered_external_host.
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
-        "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
-    formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
         "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
+        "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
+    formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "registered_external_host",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v2", "rsia.experiment_plan.v1", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
-    // Explicit v3 target: rsia.registered_evaluation_control.v1, rsia.evaluation_ticket.v3, program_fixture.
+    // Explicit derived target (rsia.formal_judgment.v1): rsia.registered_evaluation_control.v1, rsia.evaluation_ticket.v3, program_fixture.
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
-        "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
-    formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
         "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
+        "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
+    formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "program_fixture",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
-    // Explicit v3 target: rsia.registered_evaluation_control.v1, rsia.evaluation_ticket.v3, registered_external_host.
+    // Explicit derived target (rsia.formal_judgment.v1): rsia.registered_evaluation_control.v1, rsia.evaluation_ticket.v3, registered_external_host.
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
-        "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
-    formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
         "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v1_frozen",
+        "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
+    formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "registered_external_host",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v1", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
-    // Explicit v3 target: rsia.registered_evaluation_control.v2, rsia.evaluation_ticket.v3, program_fixture.
+    // Explicit derived target (rsia.formal_judgment.v1): rsia.registered_evaluation_control.v2, rsia.evaluation_ticket.v3, program_fixture.
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
         "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
         "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "program_fixture",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
-    // Explicit v3 target: rsia.registered_evaluation_control.v2, rsia.evaluation_ticket.v3, registered_external_host.
+    // Explicit derived target (rsia.formal_judgment.v1): rsia.registered_evaluation_control.v2, rsia.evaluation_ticket.v3, registered_external_host.
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
         "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v2_preserve_ucb0",
         "explicit canonical original-input snapshot and versioned judgment identity", true, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "registered_external_host",
-        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
 ];
 /// Semantic lookup only. Read state, authentication and key existence stay
@@ -4945,14 +4964,14 @@ pub fn formal_judgment_version_by_key(key: &str) -> Result<&'static FormalJudgme
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FormalCleanupV3Wire {
+struct FormalCleanupDerivedWire {
     schema_version: String, report_id: String, source_ticket_id: String,
     input_snapshot: serde_json::Value, input_digest: String, judgment_version: String,
     source_report_ref: [String; 5], judgment: serde_json::Value,
 }
 
 /// Structural cleanup classification only, never source authentication.
-fn formal_v3_cleanup_metadata(
+fn formal_derived_cleanup_metadata(
     ctx: &Context, node: &TypedObjectRef, value: &serde_json::Value,
 ) -> Result<serde_json::Value> {
     let outer = value.as_object().ok_or(Error::Internal)?;
@@ -4962,13 +4981,13 @@ fn formal_v3_cleanup_metadata(
         || ["schema_version", "id", "record_kind"].iter().any(|key| !outer[*key].is_string())
         || !outer["payload"].is_object()
     { return Err(Error::Internal); }
-    let payload: FormalCleanupV3Wire = serde_json::from_value(outer["payload"].clone()).map_err(internal)?;
+    let payload: FormalCleanupDerivedWire = serde_json::from_value(outer["payload"].clone()).map_err(internal)?;
     let version=formal_judgment_version_by_key(&payload.judgment_version)?;
-    if payload.schema_version!="rsia.formal_evaluation.v3"
+    if payload.schema_version!="rsia.formal_judgment.v1"
         || value["schema_version"]!="rsia.typed_artifact_envelope.v1"
         || value["record_kind"]!="formal_evaluation_v2" || value["id"]!=node.id
         || node.id!=format!("e05-{}",fingerprint(&("formal_evaluation_v2",&payload.report_id))?)
-        || version.domain.2.as_deref()!=Some("rsia.formal_evaluation.v3")
+        || version.domain.2.as_deref()!=Some("rsia.formal_judgment.v1")
         || version.domain.3.as_ref()!="complete_batch"
     {return Err(Error::Internal);}
     identifier(&payload.report_id)?;identifier(&payload.source_ticket_id)?;
@@ -5055,14 +5074,14 @@ fn formal_v3_cleanup_metadata(
         "judgment":retained,"formal_closure_invalidated":true}))
 }
 
-async fn redact_formal_judgment_v3(
+async fn redact_formal_judgment_derived(
     tx:&mut sqlx::Transaction<'_,sqlx::Sqlite>,ctx:&Context,job_id:&str,
     node:&TypedObjectRef,body:&str,value:&serde_json::Value,now:i64,
 )->Result<()> {
-    let metadata=match formal_v3_cleanup_metadata(ctx,node,value) {
+    let metadata=match formal_derived_cleanup_metadata(ctx,node,value) {
         Ok(metadata)=>metadata,
         Err(_)=>return mark_unknown_scope(tx,ctx,job_id,node,
-            "blocked_unknown_scope:formal_judgment_v3_wire_or_domain",now).await,
+            "blocked_unknown_scope:formal_judgment_derived_wire_or_domain",now).await,
     };
     let redacted=json!({"id":node.id,"schema_version":"rsia.redacted.v1","state":"source_revoked",
         "original_kind":node.kind,"original_schema":"rsia.typed_artifact_envelope.v1",
@@ -5071,7 +5090,7 @@ async fn redact_formal_judgment_v3(
         .bind(serde_json::to_string(&redacted).map_err(internal)?).bind(ctx.namespace())
         .bind(&node.kind).bind(&node.id).execute(&mut **tx).await.map_err(internal)?;
     insert_cleanup_event(tx,ctx.namespace(),job_id,Some(node),"node_redacted",now,
-        json!({"known_inner_schema":"rsia.formal_evaluation.v3","historical_facts_preserved":true})).await
+        json!({"known_inner_schema":"rsia.formal_judgment.v1","historical_facts_preserved":true})).await
 }
 
 
@@ -5130,10 +5149,20 @@ fn formal_cleanup_ticket_plan_binding_shape(value: &serde_json::Value) -> Result
     Ok(())
 }
 
-/// Old wire has no payload schema. Classify only its actual inner version
-/// combination against the one catalog; do not reinterpret/rejudge history or
-/// infer Current from this cleanup-only structural registration check.
-fn formal_old_inner_version_known(payload: &serde_json::Value) -> bool {
+/// The ordinary native wire is exactly schema/decision/result. Its result is
+/// classified like an original report against rows registered for the native
+/// payload schema; none exist until that wire has an actual legal source.
+fn formal_native_wire_known(payload: &serde_json::Value) -> bool {
+    payload.as_object().is_some_and(|wire| wire.len() == 3)
+        && payload["decision_version"] == "rsia.fixed_sample_regression.v1"
+        && formal_ordinary_inner_version_known(Some("rsia.formal_evaluation.v3"), &payload["result"])
+}
+
+/// Ordinary report judgment (the no-schema wire, or the native wrapper's result).
+/// Classify only its actual inner version combination for its exact payload
+/// schema against the one catalog; do not reinterpret/rejudge history or infer
+/// Current from this cleanup-only structural registration check.
+fn formal_ordinary_inner_version_known(payload_schema: Option<&str>, payload: &serde_json::Value) -> bool {
     let Some(variant) = payload.get("variant").and_then(serde_json::Value::as_str) else { return false; };
     let Some(scope) = payload.get("evidence_scope").and_then(serde_json::Value::as_str) else { return false; };
     let (stats, certificate, route) = match variant {
@@ -5152,7 +5181,7 @@ fn formal_old_inner_version_known(payload: &serde_json::Value) -> bool {
         _ => return false,
     };
     FORMAL_JUDGMENT_VERSIONS.iter().any(|entry|
-        entry.domain.2.is_none() && entry.domain.3.as_ref() == variant
+        entry.domain.2.as_deref() == payload_schema && entry.domain.3.as_ref() == variant
             && entry.domain.4.as_ref() == scope && entry.domain.13.as_deref() == stats
             && entry.domain.14.as_deref() == certificate && entry.domain.16.as_deref() == route)
 }

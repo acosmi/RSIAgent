@@ -5648,19 +5648,18 @@ pub(crate) fn validate_content_envelope(id: &str, body: &Value) -> Result<()> {
             (v.id.clone(), v.schema_version.clone())
         }
         FORMAL_KIND => {
-            if p.get("schema_version").is_some() {
-                let v: FormalJudgmentV3 = serde_json::from_value(p.clone())
-                    .map_err(|_| Error::Conflict("formal_judgment_v3_unreadable".into()))?;
-                if v.schema_version != FORMAL_JUDGMENT_V3_SCHEMA {
-                    return Err(Error::Invalid("formal_judgment_version_outside_table".into()));
-                }
+            // Only the exact derived name selects the derived decoder; every
+            // other payload keeps the original strict report decoder below.
+            if p.get("schema_version").and_then(Value::as_str) == Some(FORMAL_JUDGMENT_DERIVED_SCHEMA) {
+                let v: FormalJudgmentDerived = serde_json::from_value(p.clone())
+                    .map_err(|_| Error::Conflict("formal_judgment_derived_unreadable".into()))?;
                 let version = evo_storage::lifecycle::formal_judgment_version_by_key(&v.judgment_version)?;
                 let identity = formal_judgment_identity(&v.input_snapshot, version)?;
-                if version.domain.2.as_deref() != Some(FORMAL_JUDGMENT_V3_SCHEMA)
+                if version.domain.2.as_deref() != Some(FORMAL_JUDGMENT_DERIVED_SCHEMA)
                     || v.source_ticket_id != v.input_snapshot.common.1
                     || v.report_id != identity.logical_id || id != identity.physical_id
                     || v.input_digest != identity.input_digest
-                { return Err(Error::Conflict("formal_judgment_v3_identity_changed".into())); }
+                { return Err(Error::Conflict("formal_judgment_derived_identity_changed".into())); }
                 // Typed closure compatibility only. This pure check grants no
                 // source authority, Current state or promotion eligibility.
                 return Ok(());
@@ -9688,7 +9687,7 @@ struct FormalEarlyInput(
 #[serde(rename_all = "snake_case", tag = "variant", content = "input", deny_unknown_fields)]
 enum FormalVariantInput {
     CompleteBatch(FormalCompleteInput),
-    EarlyStopped(FormalEarlyInput),
+    EarlyStopped(Box<FormalEarlyInput>),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -9714,16 +9713,19 @@ impl FormalInputSnapshot {
 }
 #[derive(Debug, Clone, Copy, Serialize)]
 enum FormalInputUnavailable {
+    /// Registered literal only. The current Complete wire has no legal reachable
+    /// producer for it: a lost frozen resource stays NotFound, never Unavailable.
+    #[allow(dead_code)]
     #[serde(rename = "complete_input_snapshot_unavailable")]
-    CompleteInputSnapshot,
+    CompleteInput,
     #[serde(rename = "original_stop_snapshot_unavailable")]
-    OriginalStopSnapshot,
+    OriginalStop,
     #[serde(rename = "original_invalid_snapshot_unavailable")]
-    OriginalInvalidSnapshot,
+    OriginalInvalid,
 }
 #[derive(Debug, Clone)]
 enum FormalInputAvailability {
-    Available(FormalInputSnapshot),
+    Available(Box<FormalInputSnapshot>),
     Unavailable(FormalInputUnavailable),
 }
 
@@ -9772,26 +9774,6 @@ fn formal_judgment_identity(
     let physical_id = storage_id(FORMAL_KIND, &logical_id)?;
     Ok(FormalJudgmentIdentity { input_digest, version_key, logical_id, physical_id })
 }
-
-/// Deterministic candidate IDs, not Known entries and not existence proof.
-/// The source-domain parameter stays separate from immutable original input
-/// and from each target descriptor: no target schema is copied into Common.
-fn formal_lineage_candidates(
-    input: &FormalInputSnapshot,
-    source_domain: &evo_storage::lifecycle::FormalJudgmentDomain,
-) -> Result<Vec<FormalJudgmentIdentity>> {
-    evo_storage::lifecycle::formal_judgment_version(source_domain)?;
-    if source_domain.3.as_ref() != input.variant_tag()
-        || source_domain.6.as_ref() != input.common.2.as_str()
-    {
-        return Err(Error::Invalid("formal_judgment_source_domain_mismatch".into()));
-    }
-    evo_storage::lifecycle::FORMAL_JUDGMENT_VERSIONS.iter()
-        .filter(|entry| entry.domain.same_input_family(source_domain))
-        .map(|entry| formal_judgment_identity(input, entry))
-        .collect()
-}
-
 
 // AG163 R2: original-report input extraction in the caller's already borrowed
 // Session. This is not a public recompute endpoint and performs no DML.
@@ -10020,8 +10002,9 @@ async fn original_formal_source_domain(
 }
 
 /// Actual readonly extraction for the original no-payload-schema report reader.
-/// New v3-source normalization remains a separate future integration; this
-/// function never treats a new report logical ID as an original ticket ID.
+/// Ordinary native-wire sources (Control3/Ticket4 inputs) are not extracted on
+/// this wire and fail closed in its strict decoder; this function never treats
+/// a derived report logical ID as an original ticket ID.
 async fn extract_original_formal_input_in_session(
     ctx: &Context, session: &mut Session, source_report_id: &str,
 ) -> Result<FormalExtractedOriginalInput> {
@@ -10074,9 +10057,9 @@ async fn extract_original_formal_input_after_verified(
                 ctx, session, &ticket, &control, &holdout, &formal,
             ).await?;
             let reason = if matches!(&formal, FormalEvaluationV2::EarlyStopped { .. }) {
-                FormalInputUnavailable::OriginalStopSnapshot
+                FormalInputUnavailable::OriginalStop
             } else {
-                FormalInputUnavailable::OriginalInvalidSnapshot
+                FormalInputUnavailable::OriginalInvalid
             };
             Ok(FormalExtractedOriginalInput {
                 original_read, source_domain, input: FormalInputAvailability::Unavailable(reason),
@@ -10128,20 +10111,24 @@ async fn extract_original_formal_input_after_verified(
                 )),
             };
             Ok(FormalExtractedOriginalInput {
-                original_read, source_domain, input: FormalInputAvailability::Available(input),
+                original_read, source_domain, input: FormalInputAvailability::Available(Box::new(input)),
             })
         }
     }
 }
 
 
-// AG163 R3: explicit-v3 complete payload and readonly append candidates.
+// AG163 R3/R9: explicit derived complete payload and readonly append candidates.
 // The public old writer, old report type and all management/job bytes stay intact.
-const FORMAL_JUDGMENT_V3_SCHEMA: &str = "rsia.formal_evaluation.v3";
+// The derived wire has its own fresh schema name. The ordinary native wire
+// `rsia.formal_evaluation.v3` (decision `rsia.fixed_sample_regression.v1`) is a
+// different contract read only by the original report reader, never decoded here.
+pub(crate) const FORMAL_JUDGMENT_DERIVED_SCHEMA: &str = "rsia.formal_judgment.v1";
+const ORDINARY_FORMAL_EVALUATION_V3_SCHEMA: &str = "rsia.formal_evaluation.v3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FormalJudgmentV3 {
+struct FormalJudgmentDerived {
     schema_version: String,
     report_id: String,
     source_ticket_id: String,
@@ -10158,13 +10145,17 @@ struct FormalNormalizedCompleteSource {
     input_snapshot: FormalInputSnapshot,
     source_domain: evo_storage::lifecycle::FormalJudgmentDomain,
     source_report_ref: FormalInputRef,
+    // Typed digest of the same complete original report wire whose canonical
+    // digest is source_report_ref.4; the original issuer pins this raw digest.
+    source_raw_report_digest: String,
 }
 
 struct FormalCompleteAppendCandidate {
     physical_id: String,
-    payload: FormalJudgmentV3,
+    payload: FormalJudgmentDerived,
     original_read: VerifiedFormalReportReadV1,
     source_domain: evo_storage::lifecycle::FormalJudgmentDomain,
+    source_raw_report_digest: String,
 }
 
 fn complete_snapshots_equal(left: &FormalInputSnapshot, right: &FormalInputSnapshot) -> bool {
@@ -10175,7 +10166,7 @@ fn complete_snapshots_equal(left: &FormalInputSnapshot, right: &FormalInputSnaps
     }
 }
 
-/// Old-only root, not a recursive lineage resolver. A v3 report cannot be
+/// Old-only root, not a recursive lineage resolver. A derived report cannot be
 /// substituted here: the original reader still requires the actual original
 /// ticket/report wire, full source authority and original Evaluator actor.
 async fn load_original_complete_judgment_source(
@@ -10187,9 +10178,10 @@ async fn load_original_complete_judgment_source(
     require_derived_source_authority(ctx, session, &extracted.original_read).await?;
     let input_snapshot = match extracted.input {
         FormalInputAvailability::Available(input)
-            if matches!(&input.variant, FormalVariantInput::CompleteBatch(_)) => input,
+            if matches!(&input.variant, FormalVariantInput::CompleteBatch(_)) => *input,
         _ => return Err(Error::Conflict(FORMAL_RECOMPUTE_INPUT_UNAVAILABLE.into())),
     };
+    // One read of the complete original wire yields both source pins.
     let original: FormalEvaluationV2 = read_original_input_record(
         ctx, session, FORMAL_KIND, original_report_id,
     ).await?;
@@ -10198,15 +10190,16 @@ async fn load_original_complete_judgment_source(
         evaluator_actor: ctx.actor().into(),
         original_read: extracted.original_read,
         input_snapshot, source_domain: extracted.source_domain, source_report_ref,
+        source_raw_report_digest: fingerprint(&original)?,
     })
 }
 
-fn select_complete_v3_target(
+fn select_complete_derived_target(
     source_domain: &evo_storage::lifecycle::FormalJudgmentDomain,
 ) -> Result<&'static evo_storage::lifecycle::FormalJudgmentVersion> {
     use evo_storage::lifecycle::{FORMAL_JUDGMENT_VERSIONS, FormalJudgmentIdStrategy};
     let mut targets = FORMAL_JUDGMENT_VERSIONS.iter().filter(|entry|
-        entry.domain.2.as_deref() == Some(FORMAL_JUDGMENT_V3_SCHEMA)
+        entry.domain.2.as_deref() == Some(FORMAL_JUDGMENT_DERIVED_SCHEMA)
             && entry.domain.3.as_ref() == "complete_batch"
             && entry.id_strategy == FormalJudgmentIdStrategy::VersionedInput
             && entry.domain.same_input_family(source_domain));
@@ -10271,43 +10264,45 @@ async fn complete_append_candidate_from_original(
     session: &mut Session,
     source: FormalNormalizedCompleteSource,
 ) -> Result<FormalCompleteAppendCandidate> {
-    let target = select_complete_v3_target(&source.source_domain)?;
+    let target = select_complete_derived_target(&source.source_domain)?;
     let identity = formal_judgment_identity(&source.input_snapshot, target)?;
     let judgment = recompute_original_complete_judgment(ctx, session, &source).await?;
-    let payload = FormalJudgmentV3 {
-        schema_version: FORMAL_JUDGMENT_V3_SCHEMA.into(),
+    let payload = FormalJudgmentDerived {
+        schema_version: FORMAL_JUDGMENT_DERIVED_SCHEMA.into(),
         report_id: identity.logical_id,
         source_ticket_id: source.input_snapshot.common.1.clone(),
         input_snapshot: source.input_snapshot,
         input_digest: identity.input_digest,
         judgment_version: identity.version_key,
-        // Always the authenticated original no-schema root. Recomputing an
-        // already v3 source must never substitute its own report ID here.
+        // Always the authenticated original root. Recomputing an already
+        // derived source must never substitute its own report ID here.
         source_report_ref: source.source_report_ref,
         judgment,
     };
     Ok(FormalCompleteAppendCandidate {
         physical_id: identity.physical_id, payload,
         original_read: source.original_read, source_domain: source.source_domain,
+        source_raw_report_digest: source.source_raw_report_digest,
     })
 }
 
-/// Shared stored-v3 semantic verifier. It authenticates the actual new record
-/// and original source, reruns the judger and checks exact dependency edges.
-/// Current/promotion reads additionally compose the original issuer pins below;
-/// this intermediate result itself is not an issued-authority capability.
-struct FormalStoredV3ReadParts {
-    payload: FormalJudgmentV3, physical_id: String, owner: String,
+/// Shared stored-derived semantic verifier. It authenticates the actual new
+/// record and original source, reruns the judger and checks exact dependency
+/// edges. Current/promotion reads additionally compose the original issuer pins
+/// below; this intermediate result itself is not an issued-authority capability.
+struct FormalStoredDerivedReadParts {
+    payload: FormalJudgmentDerived, physical_id: String, owner: String,
 }
-async fn read_stored_v3_parts(
+/// Callers reach this only after the exact derived payload-schema class.
+async fn read_stored_derived_parts(
     ctx: &Context, session: &mut Session, report_id: &str,
-) -> Result<FormalStoredV3ReadParts> {
+) -> Result<FormalStoredDerivedReadParts> {
     let physical_id = storage_id(FORMAL_KIND, report_id)?;
     let row = session.object_row(ctx, "artifact", &physical_id).await?.ok_or(Error::NotFound)?;
     // Parse the actual stored text first. Derived serde rejects duplicate named
     // keys; a Value projection must not erase a duplicate version/identity.
-    let envelope: TypedArtifactEnvelope<FormalJudgmentV3> = serde_json::from_str(&row.body)
-        .map_err(|_| Error::Conflict("formal_judgment_v3_unreadable".into()))?;
+    let envelope: TypedArtifactEnvelope<FormalJudgmentDerived> = serde_json::from_str(&row.body)
+        .map_err(|_| Error::Conflict("formal_judgment_derived_unreadable".into()))?;
     if envelope.schema_version != ENVELOPE_SCHEMA || envelope.record_kind != FORMAL_KIND {
         return Err(Error::Invalid("formal_judgment_version_outside_table".into()));
     }
@@ -10315,17 +10310,14 @@ async fn read_stored_v3_parts(
         || row.id != physical_id
         || envelope.payload.report_id != report_id
     {
-        return Err(Error::Conflict("formal_judgment_v3_identity_changed".into()));
+        return Err(Error::Conflict("formal_judgment_derived_identity_changed".into()));
     }
     let payload = envelope.payload;
-    if payload.schema_version != FORMAL_JUDGMENT_V3_SCHEMA {
-        return Err(Error::Invalid("formal_judgment_version_outside_table".into()));
-    }
     // Public static registration check only: unknown versions are distinct
     // from authenticated known-key/input identity mismatches. No Known key grants authority.
     evo_storage::lifecycle::formal_judgment_version_by_key(&payload.judgment_version)?;
     let raw: Value = serde_json::from_str(&row.body)
-        .map_err(|_| Error::Conflict("formal_judgment_v3_unreadable".into()))?;
+        .map_err(|_| Error::Conflict("formal_judgment_derived_unreadable".into()))?;
     crate::formal_authority::require_content_witness(
         session, ctx, "artifact", &physical_id, &raw, Role::Evaluator,
     ).await?;
@@ -10335,13 +10327,13 @@ async fn read_stored_v3_parts(
     if payload.source_report_ref.0 != "artifact" || payload.source_report_ref.1 != FORMAL_KIND {
         return Err(Error::Conflict("formal_judgment_source_report_ref_changed".into()));
     }
-    Ok(FormalStoredV3ReadParts { payload, physical_id, owner: row.owner })
+    Ok(FormalStoredDerivedReadParts { payload, physical_id, owner: row.owner })
 }
-async fn verify_stored_v3_after_original(
-    ctx: &Context, session: &mut Session, parts: FormalStoredV3ReadParts,
+async fn verify_stored_derived_after_original(
+    ctx: &Context, session: &mut Session, parts: FormalStoredDerivedReadParts,
     mut original: FormalNormalizedCompleteSource,
 ) -> Result<FormalCompleteAppendCandidate> {
-    let FormalStoredV3ReadParts { payload, physical_id, owner } = parts;
+    let FormalStoredDerivedReadParts { payload, physical_id, owner } = parts;
     // Original source authentication proves the actual Evaluator actor. Read-only
     // Admin/Host callers retain their roles; owner is compared to that original actor.
     if owner != original.evaluator_actor {
@@ -10355,14 +10347,14 @@ async fn verify_stored_v3_after_original(
     if !complete_snapshots_equal(&payload.input_snapshot, &original.input_snapshot) {
         return Err(Error::Conflict("formal_judgment_input_snapshot_changed".into()));
     }
-    let target = select_complete_v3_target(&original.source_domain)?;
+    let target = select_complete_derived_target(&original.source_domain)?;
     let identity = formal_judgment_identity(&original.input_snapshot, target)?;
     if payload.input_digest != identity.input_digest
         || payload.judgment_version != identity.version_key
         || payload.report_id != identity.logical_id
         || physical_id != identity.physical_id
     {
-        return Err(Error::Conflict("formal_judgment_v3_identity_changed".into()));
+        return Err(Error::Conflict("formal_judgment_derived_identity_changed".into()));
     }
     // Full typed equality and all original authentication came first. Reuse
     // exactly these now-authenticated original snapshot/ref fields; no self-ref
@@ -10373,53 +10365,52 @@ async fn verify_stored_v3_after_original(
     if serde_json::to_value(&payload.judgment).map_err(|_| Error::Internal)?
         != serde_json::to_value(&recomputed.payload.judgment).map_err(|_| Error::Internal)?
     {
-        return Err(Error::Conflict("formal_judgment_v3_judgment_changed".into()));
+        return Err(Error::Conflict("formal_judgment_derived_judgment_changed".into()));
     }
     // An existing derived report must have exactly its authenticated input
     // edges. Missing/extra edges are errors, never an idempotent repair.
     require_exact_fact_edges(
-        session, ctx, &physical_id, v3_actual_dependency_edges(&payload)?,
+        session, ctx, &physical_id, derived_actual_dependency_edges(&payload)?,
     ).await?;
     Ok(recomputed)
 }
 
-async fn read_complete_v3_for_recompute_in_session(
+async fn read_complete_derived_for_recompute_in_session(
     ctx: &Context, session: &mut Session, report_id: &str,
 ) -> Result<FormalCompleteAppendCandidate> {
     ctx.require(&[Role::Evaluator])?;
-    let parts = read_stored_v3_parts(ctx, session, report_id).await?;
+    let parts = read_stored_derived_parts(ctx, session, report_id).await?;
     let original = load_original_complete_judgment_source(
         ctx, session, &parts.payload.source_report_ref.2,
     ).await?;
-    verify_stored_v3_after_original(ctx, session, parts, original).await
+    verify_stored_derived_after_original(ctx, session, parts, original).await
 }
-async fn read_complete_v3_core_in_session(
+async fn read_complete_derived_core_in_session(
     ctx: &Context, session: &mut Session, report_id: &str,
 ) -> Result<FormalCompleteAppendCandidate> {
-    let parts = read_stored_v3_parts(ctx, session, report_id).await?;
+    let parts = read_stored_derived_parts(ctx, session, report_id).await?;
     let original = load_original_complete_judgment_source_core(
         ctx, session, &parts.payload.source_report_ref.2,
     ).await?;
-    verify_stored_v3_after_original(ctx, session, parts, original).await
+    verify_stored_derived_after_original(ctx, session, parts, original).await
 }
 
 /// No write or attestation occurs here. The original-role writer below still
 /// performs its own same-Session immutable same-ID comparison/append.
-/// New v3 normalization is a single jump to an old-only root, not recursion.
+/// Derived normalization is a single jump to an old-only root, not recursion.
 async fn prepare_complete_judgment_append_in_session(
     ctx: &Context,
     session: &mut Session,
     source_report_id: &str,
 ) -> Result<FormalCompleteAppendCandidate> {
     ctx.require(&[Role::Evaluator])?;
-    match formal_payload_schema_in_session(ctx, session, source_report_id).await? {
-        None => {
+    match formal_payload_class_in_session(ctx, session, source_report_id).await? {
+        FormalPayloadClass::Ordinary => {
             let original = load_original_complete_judgment_source(ctx, session, source_report_id).await?;
             complete_append_candidate_from_original(ctx, session, original).await
         }
-        Some(schema) if schema == FORMAL_JUDGMENT_V3_SCHEMA =>
-            read_complete_v3_for_recompute_in_session(ctx, session, source_report_id).await,
-        Some(_) => Err(Error::Invalid("formal_judgment_version_outside_table".into())),
+        FormalPayloadClass::Derived =>
+            read_complete_derived_for_recompute_in_session(ctx, session, source_report_id).await,
     }
 }
 
@@ -10434,9 +10425,10 @@ async fn load_original_complete_judgment_source_core(
     let evaluator_actor = extracted.original_read.historical_view().evaluator_actor.clone();
     let input_snapshot = match extracted.input {
         FormalInputAvailability::Available(input)
-            if matches!(&input.variant, FormalVariantInput::CompleteBatch(_)) => input,
+            if matches!(&input.variant, FormalVariantInput::CompleteBatch(_)) => *input,
         _ => return Err(Error::Conflict(FORMAL_RECOMPUTE_INPUT_UNAVAILABLE.into())),
     };
+    // One read of the complete original wire yields both source pins.
     let original: FormalEvaluationV2 = read_original_input_record(
         ctx, session, FORMAL_KIND, original_report_id,
     ).await?;
@@ -10444,12 +10436,22 @@ async fn load_original_complete_judgment_source_core(
     Ok(FormalNormalizedCompleteSource {
         evaluator_actor, original_read: extracted.original_read,
         input_snapshot, source_domain: extracted.source_domain, source_report_ref,
+        source_raw_report_digest: fingerprint(&original)?,
     })
 }
 
-async fn formal_payload_schema_in_session(
+/// Exact payload-schema class of the one formal record kind; shapes are never
+/// guessed. The no-schema original wire and the ordinary native wire are read
+/// only by the original report reader and its strict decoder. Only the exact
+/// derived name reaches the derived reader. Any other name is outside the table.
+enum FormalPayloadClass {
+    Ordinary,
+    Derived,
+}
+
+async fn formal_payload_class_in_session(
     ctx: &Context, session: &mut Session, report_id: &str,
-) -> Result<Option<String>> {
+) -> Result<FormalPayloadClass> {
     let id = storage_id(FORMAL_KIND, report_id)?;
     let row = session.object_row(ctx, "artifact", &id).await?.ok_or(Error::NotFound)?;
     let raw = evo_storage::lifecycle::parse_strict_json(&row.body)
@@ -10457,9 +10459,9 @@ async fn formal_payload_schema_in_session(
     if raw["schema_version"] == "rsia.redacted.v1"
         && raw["metadata"]["record_kind"] == FORMAL_KIND
     { return Err(Error::Forbidden); }
-    match raw.get("payload").and_then(|payload| payload.get("schema_version")) {
-        None => Ok(None),
-        Some(Value::String(schema)) => Ok(Some(schema.clone())),
+    match raw.get("payload").and_then(|payload| payload.get("schema_version")).map(Value::as_str) {
+        None | Some(Some(ORDINARY_FORMAL_EVALUATION_V3_SCHEMA)) => Ok(FormalPayloadClass::Ordinary),
+        Some(Some(FORMAL_JUDGMENT_DERIVED_SCHEMA)) => Ok(FormalPayloadClass::Derived),
         Some(_) => Err(Error::Invalid("formal_judgment_version_outside_table".into())),
     }
 }
@@ -10469,17 +10471,17 @@ async fn formal_payload_schema_in_session(
 async fn read_verified_formal_report_core(
     ctx: &Context, session: &mut Session, report_id: &str,
 ) -> Result<VerifiedFormalReportReadV1> {
-    match formal_payload_schema_in_session(ctx, session, report_id).await? {
-        None => read_verified_original_formal_report_core(ctx, session, report_id).await,
-        Some(schema) if schema == FORMAL_JUDGMENT_V3_SCHEMA => {
+    match formal_payload_class_in_session(ctx, session, report_id).await? {
+        FormalPayloadClass::Ordinary =>
+            read_verified_original_formal_report_core(ctx, session, report_id).await,
+        FormalPayloadClass::Derived => {
             let verified = read_derived_formal_input_in_session(ctx, session, report_id).await?;
             derived_formal_report_read(ctx, session, verified).await
         }
-        Some(_) => Err(Error::Invalid("formal_judgment_version_outside_table".into())),
     }
 }
 
-fn v3_actual_dependency_edges(payload: &FormalJudgmentV3) -> Result<Vec<(String, String)>> {
+fn derived_actual_dependency_edges(payload: &FormalJudgmentDerived) -> Result<Vec<(String, String)>> {
     let mut edges = BTreeSet::new();
     let mut add = |reference: &FormalInputRef| -> Result<()> {
         if reference.0 != "artifact"
@@ -10519,10 +10521,10 @@ impl IndependentEvaluationControl {
         let candidate = prepare_complete_judgment_append_in_session(
             ctx, &mut session, source_report_id,
         ).await?;
-        let edges = v3_actual_dependency_edges(&candidate.payload)?;
+        let edges = derived_actual_dependency_edges(&candidate.payload)?;
         let logical_id = candidate.payload.report_id.clone();
         if let Some(row) = session.object_row(ctx, "artifact", &candidate.physical_id).await? {
-            let existing: TypedArtifactEnvelope<FormalJudgmentV3> = serde_json::from_str(&row.body)
+            let existing: TypedArtifactEnvelope<FormalJudgmentDerived> = serde_json::from_str(&row.body)
                 .map_err(|_| Error::Conflict("formal_judgment_same_id_different_content".into()))?;
             if row.owner != ctx.actor()
                 || existing.schema_version != ENVELOPE_SCHEMA
@@ -10535,7 +10537,7 @@ impl IndependentEvaluationControl {
             }
             // Equality alone is not authority: authenticate the actual stored
             // identity/witness/root/owner/domain and rerun its judgment too.
-            read_complete_v3_for_recompute_in_session(ctx, &mut session, &logical_id).await?;
+            read_complete_derived_for_recompute_in_session(ctx, &mut session, &logical_id).await?;
             session.commit().await?;
             return Ok(logical_id); // no put, edge, witness or budget write
         }
@@ -10548,7 +10550,7 @@ impl IndependentEvaluationControl {
         put_record(&mut session, ctx, FORMAL_KIND, &logical_id, ctx.actor(), &candidate.payload).await?;
         put_fact_edges(&mut session, ctx, &candidate.physical_id, edges).await?;
         require_exact_fact_edges(
-            &mut session, ctx, &candidate.physical_id, v3_actual_dependency_edges(&candidate.payload)?,
+            &mut session, ctx, &candidate.physical_id, derived_actual_dependency_edges(&candidate.payload)?,
         ).await?;
         // This is the existing real production witness over this new envelope,
         // using the same original caller and the same transaction.
@@ -10582,8 +10584,8 @@ async fn actual_formal_lineage_in_session(
         let exists = if session.object_row(ctx, "artifact", &candidate.physical_id).await?.is_none() {
             false // actually queried absent in this namespace and Session
         } else {
-            match formal_payload_schema_in_session(ctx, session, &candidate.logical_id).await? {
-                None => {
+            match formal_payload_class_in_session(ctx, session, &candidate.logical_id).await? {
+                FormalPayloadClass::Ordinary => {
                     let actual = extract_original_formal_input_core_in_session(
                         ctx, session, &candidate.logical_id,
                     ).await?;
@@ -10593,13 +10595,12 @@ async fn actual_formal_lineage_in_session(
                             if complete_snapshots_equal(original, input)
                                 && original.input_digest()? == input_digest)
                 }
-                Some(schema) if schema == FORMAL_JUDGMENT_V3_SCHEMA => {
-                    let actual = read_complete_v3_core_in_session(ctx, session, &candidate.logical_id).await?;
+                FormalPayloadClass::Derived => {
+                    let actual = read_complete_derived_core_in_session(ctx, session, &candidate.logical_id).await?;
                     actual.payload.judgment_version == version.domain.version_key()?
                         && actual.payload.input_digest == input_digest
                         && complete_snapshots_equal(&actual.payload.input_snapshot, input)
                 }
-                Some(_) => return Err(Error::Invalid("formal_judgment_version_outside_table".into())),
             }
         };
         entries.push(FormalLineageEntry(candidate.version_key, candidate.logical_id, exists));
@@ -10610,9 +10611,9 @@ async fn actual_formal_lineage_in_session(
 async fn formal_report_metadata_core_in_session(
     ctx: &Context, session: &mut Session, report_id: &str,
 ) -> Result<FormalReportReadMetadata> {
-    match formal_payload_schema_in_session(ctx, session, report_id).await? {
-        None => {}
-        Some(schema) if schema == FORMAL_JUDGMENT_V3_SCHEMA => {
+    match formal_payload_class_in_session(ctx, session, report_id).await? {
+        FormalPayloadClass::Ordinary => {}
+        FormalPayloadClass::Derived => {
             let verified = read_derived_formal_input_in_session(ctx, session, report_id).await?;
             let version_key = verified.candidate.payload.judgment_version.clone();
             let input = verified.candidate.payload.input_snapshot.clone();
@@ -10626,14 +10627,9 @@ async fn formal_report_metadata_core_in_session(
                 version_key, input_digest, lineage,
             });
         }
-        Some(_) => return Err(Error::Invalid("formal_judgment_version_outside_table".into())),
     }
     let extracted = extract_original_formal_input_core_in_session(ctx, session, report_id).await?;
-    let state = match extracted.original_read.state() {
-        evo_storage::PersistentContractState::CurrentVerified => "current_verified",
-        evo_storage::PersistentContractState::Legacy => "legacy",
-        evo_storage::PersistentContractState::Invalid => "invalid",
-    };
+    let state = formal_read_state_name(extracted.original_read.state());
     let version_key = extracted.source_domain.version_key()?;
     let (input_digest, lineage) = match extracted.input {
         FormalInputAvailability::Available(input) => {
@@ -10659,13 +10655,6 @@ pub async fn formal_report_read_metadata(
     Ok(metadata)
 }
 
-pub(crate) async fn formal_report_read_metadata_for_host_in_session(
-    ctx: &Context, session: &mut Session, report_id: &str,
-) -> Result<FormalReportReadMetadata> {
-    ctx.require(&[Role::Host])?;
-    formal_report_metadata_core_in_session(ctx, session, report_id).await
-}
-
 // AG163 R7: this non-serde carrier is constructed only after the actual new
 // row and its original root pass the full semantic/witness/owner/exact-edge
 // reader. Getters expose authenticated facts, never a construction capability.
@@ -10688,7 +10677,9 @@ async fn require_derived_source_authority(
 impl VerifiedDerivedFormalInput {
     pub(crate) fn report_id(&self) -> &str { &self.candidate.payload.report_id }
     pub(crate) fn source_report_id(&self) -> &str { &self.candidate.payload.source_report_ref.2 }
-    pub(crate) fn source_report_payload_digest(&self) -> &str { &self.candidate.payload.source_report_ref.4 }
+    /// Typed digest of the complete original report wire; source_report_ref.4
+    /// is the canonical digest of that same authenticated payload read.
+    pub(crate) fn source_raw_report_digest(&self) -> &str { &self.candidate.source_raw_report_digest }
     pub(crate) fn source_view(&self) -> &VerifiedFormalReportView {
         self.candidate.original_read.historical_view()
     }
@@ -10698,7 +10689,7 @@ impl VerifiedDerivedFormalInput {
 async fn read_derived_formal_input_in_session(
     ctx: &Context, session: &mut Session, report_id: &str,
 ) -> Result<VerifiedDerivedFormalInput> {
-    let candidate = read_complete_v3_core_in_session(ctx, session, report_id).await?;
+    let candidate = read_complete_derived_core_in_session(ctx, session, report_id).await?;
     Ok(VerifiedDerivedFormalInput { candidate })
 }
 
@@ -10753,11 +10744,11 @@ async fn derived_formal_report_read(
 pub(crate) async fn verify_current_report_authority_in_session(
     session: &mut Session, ctx: &Context, report_id: &str, candidate: &ReadCandidate,
 ) -> Result<()> {
-    match formal_payload_schema_in_session(ctx, session, report_id).await? {
-        None => {
+    match formal_payload_class_in_session(ctx, session, report_id).await? {
+        FormalPayloadClass::Ordinary => {
             crate::formal_authority::verify_read_issued_authority(session, ctx, report_id, candidate).await?;
         }
-        Some(schema) if schema == FORMAL_JUDGMENT_V3_SCHEMA => {
+        FormalPayloadClass::Derived => {
             let verified = Box::pin(read_derived_formal_input_in_session(ctx, session, report_id)).await?;
             let original = verified.candidate.original_read.current_view()?;
             candidate.current()?;
@@ -10769,7 +10760,6 @@ pub(crate) async fn verify_current_report_authority_in_session(
             { return Err(Error::Conflict("verified report does not match release candidate".into())); }
             crate::formal_authority::verify_derived_formal_authority(session, ctx, &verified, candidate).await?;
         }
-        Some(_) => return Err(Error::Invalid("formal_judgment_version_outside_table".into())),
     }
     Ok(())
 }

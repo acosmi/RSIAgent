@@ -944,9 +944,12 @@ async fn read_formal(
     let report_envelope = envelope(ctx, session, set, "formal_evaluation_v2", id)
         .await
         .map_err(primary_error)?;
-    // Only a new inner wire needs its authenticated source-ticket identity
-    // before collecting materials. Old reports keep their original read order.
-    let derived_view = if report_envelope.payload.get("schema_version").is_some() {
+    // Only the exact derived wire needs its authenticated source-ticket identity
+    // before collecting materials. Ordinary reports keep their original read order;
+    // a schema field alone never selects derived identity or Current use.
+    let derived_view = if report_envelope.payload.get("schema_version").and_then(serde_json::Value::as_str)
+        == Some(crate::streaming_evaluator::FORMAL_JUDGMENT_DERIVED_SCHEMA)
+    {
         Some(verified_report_view_in_session(ctx, session, id).await.map_err(formal_review_error)?)
     } else { None };
     let source_ticket_id = derived_view.as_ref().map_or(id, |view| view.ticket_id.as_str());

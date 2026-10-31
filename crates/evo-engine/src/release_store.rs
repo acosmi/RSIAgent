@@ -3407,9 +3407,10 @@ async fn revalidate_current_release(
     } else {
         verified_report_view_in_session(ctx, session, &release.report_id).await?
     };
-    validate_derived_report_storage_binding(session, ctx, &view).await?;
+    // Original identity diagnostics first; then the derived report's own row.
     validate_read_verified_report_identity(&candidate, &view)?;
-    validate_read_stored_release_identity(release, &candidate, &view)
+    validate_read_stored_release_identity(release, &candidate, &view)?;
+    validate_derived_report_storage_binding(session, ctx, &view).await
 }
 
 /// The engine has already authenticated the complete new wire and its source

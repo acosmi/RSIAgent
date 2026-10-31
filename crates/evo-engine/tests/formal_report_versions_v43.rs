@@ -617,7 +617,7 @@ fn closed_judgment_catalog_preserves_exact_existing_domains() {
                 old += 1; assert!(entry.domain.2.is_none()); assert!(entry.verifier_retained);
             }
             FormalJudgmentIdStrategy::VersionedInput => {
-                explicit += 1; assert_eq!(entry.domain.2.as_deref(), Some("rsia.formal_evaluation.v3"));
+                explicit += 1; assert_eq!(entry.domain.2.as_deref(), Some("rsia.formal_judgment.v1"));
                 assert_ne!(entry.domain.3.as_ref(), "invalid");
             }
         }
@@ -686,14 +686,22 @@ async fn new_wire_cannot_retag_legacy_payload_or_accept_future_versions() {
     assert!(image(&fx.path) == before, "future wire changed persistent facts");
     assert!(fx.body(&fx.ticket_id).await == old_body, "new wire rewrote original report");
     fx.store.close().await;
-    let mut fx = History::load(COMPLETE).await;
-    let mut old: Value = serde_json::from_str(&fx.body(&fx.ticket_id).await).unwrap();
-    old["payload"]["schema_version"] = json!("rsia.formal_evaluation.v3");
-    let ticket = fx.ticket_id.clone(); fx.replace_body(&ticket, &old).await; let before = image(&fx.path);
-    assert!(matches!(IndependentEvaluationControl::recompute_judgment(&fx.evaluator, &fx.store, &ticket).await,
-        Err(Error::Conflict(reason)) if reason == "formal_judgment_v3_unreadable"));
-    assert!(image(&fx.path) == before, "tag-only negative was migrated or refreshed");
-    fx.store.close().await;
+    // Tag-only negatives reach the exact decoder of the injected name: the
+    // ordinary native name keeps the original strict report decoder, and only
+    // the derived name reaches the derived decoder. Neither retags old history.
+    for (tag, expected) in [
+        ("rsia.formal_evaluation.v3", "typed envelope is unreadable"),
+        ("rsia.formal_judgment.v1", "formal_judgment_derived_unreadable"),
+    ] {
+        let mut fx = History::load(COMPLETE).await;
+        let mut old: Value = serde_json::from_str(&fx.body(&fx.ticket_id).await).unwrap();
+        old["payload"]["schema_version"] = json!(tag);
+        let ticket = fx.ticket_id.clone(); fx.replace_body(&ticket, &old).await; let before = image(&fx.path);
+        assert!(matches!(IndependentEvaluationControl::recompute_judgment(&fx.evaluator, &fx.store, &ticket).await,
+            Err(Error::Conflict(reason)) if reason == expected));
+        assert!(image(&fx.path) == before, "tag-only negative was migrated or refreshed");
+        fx.store.close().await;
+    }
 }
 
 #[tokio::test]
@@ -764,7 +772,7 @@ async fn unreadable_and_identity_invalid_are_distinct_from_legacy() {
         if missing { wire["payload"].as_object_mut().unwrap().remove("input_snapshot"); }
         else { wire["payload"]["report_id"] = json!("wrong-real-report-identity"); }
         fx.replace_body(&id, &wire).await; let before = image(&fx.path);
-        let expected = if missing { "formal_judgment_v3_unreadable" } else { "formal_judgment_v3_identity_changed" };
+        let expected = if missing { "formal_judgment_derived_unreadable" } else { "formal_judgment_derived_identity_changed" };
         assert!(matches!(IndependentEvaluationControl::recompute_judgment(&fx.evaluator, &fx.store, &id).await,
             Err(Error::Conflict(reason)) if reason == expected));
         assert!(image(&fx.path) == before, "invalid/unreadable record was treated as refreshable legacy");
@@ -846,8 +854,10 @@ async fn explicit_recompute_requires_original_evaluator_and_real_sources() {
     assert!(session.dependents(&fx.admin, "artifact", &binding.candidate_id).await.unwrap().contains(&("artifact".into(), sid("evaluation_ticket_v2", &fx.ticket_id))));
     session.commit().await.unwrap();
     assert!(image(&fx.path) == before, "real upstream identity/edge health checks wrote original facts");
+    // A real derived judgment by the original writer over the same healthy source.
+    let derived = fx.recompute(&fx.ticket_id).await; let derived_body = fx.body(&derived).await;
     let paid_before = before["calls"].clone(); let original_formal = fx.body(&fx.ticket_id).await;
-    LifecycleStore::begin_revoke(&fx.admin, &fx.store, TypedObjectRef {
+    let mut status = LifecycleStore::begin_revoke(&fx.admin, &fx.store, TypedObjectRef {
         kind:"run".into(), id:"S2".into(),
     }, "owned real upstream source-revocation negative", evo_core::now().unwrap()).await.unwrap();
     let revoked = image(&fx.path); assert!(revoked["calls"] == paid_before);
@@ -858,6 +868,21 @@ async fn explicit_recompute_requires_original_evaluator_and_real_sources() {
     assert!(fx.body(&fx.ticket_id).await == original_formal, "logical revocation rewrote original formal report");
     assert!(matches!(IndependentEvaluationControl::recompute_judgment(&fx.evaluator, &fx.store, &fx.ticket_id).await, Err(Error::Forbidden)));
     assert!(image(&fx.path) == revoked, "revoked original caused a new derivation");
+    // Real cleanup of that closure: only the exact derived name reaches the
+    // derived redactor; the ordinary original report and paid facts are kept.
+    for _ in 0..100 {
+        if matches!(status.state, evo_storage::lifecycle::CleanupState::Complete | evo_storage::lifecycle::CleanupState::Failed) { break; }
+        status = LifecycleStore::cleanup_step(&fx.admin, &fx.store, &status.job_id, 16, evo_core::now().unwrap()).await.unwrap();
+    }
+    assert_eq!(status.state, evo_storage::lifecycle::CleanupState::Complete);
+    assert!(status.last_error.is_none());
+    assert!(fx.body(&fx.ticket_id).await == original_formal, "cleanup changed the ordinary original report");
+    let redacted: Value = serde_json::from_str(&fx.body(&derived).await).unwrap();
+    assert_eq!(redacted["schema_version"], "rsia.redacted.v1");
+    assert_eq!(redacted["original_digest"], hash(derived_body.as_bytes()));
+    assert_eq!(redacted["metadata"]["report_id"], derived);
+    assert_eq!(redacted["metadata"]["source_ticket_id"], fx.ticket_id);
+    assert!(image(&fx.path)["calls"] == paid_before, "cleanup changed actual paid/None/closed facts");
     fx.store.close().await;
 }
 
@@ -869,7 +894,7 @@ async fn explicit_recompute_gets_new_id_and_queryable_lineage() {
     assert_ne!(new_id, fx.ticket_id); assert!(new_id.starts_with("e05j-"));
     let raw: Value = serde_json::from_str(&fx.body(&new_id).await).unwrap(); let p = &raw["payload"];
     assert_eq!(raw["id"], sid(FORMAL_KIND, &new_id)); assert_eq!(raw["record_kind"], FORMAL_KIND);
-    assert_eq!(p.as_object().unwrap().len(), 8); assert_eq!(p["schema_version"], "rsia.formal_evaluation.v3");
+    assert_eq!(p.as_object().unwrap().len(), 8); assert_eq!(p["schema_version"], "rsia.formal_judgment.v1");
     assert_eq!(p["source_ticket_id"], fx.ticket_id); assert_eq!(p["input_snapshot"]["common"][0], fx.evaluator.namespace());
     let input = &p["input_snapshot"];
     let expected_digest = canonical_fingerprint(&json!([
