@@ -108,7 +108,7 @@ pub enum ManagementResult {
         lifecycle: String,
         planned_targets: usize,
         has_formal_terminal: bool,
-        report_read: Option<crate::streaming_evaluator::FormalReportReadMetadata>,
+        report_read: crate::streaming_evaluator::FormalReportReadMetadata,
     },
     ReplayStored {
         report_id: String,
@@ -432,19 +432,19 @@ impl ManagementDispatcher {
                 let status =
                     IndependentEvaluationControl::status(ctx, &self.store, &request.ticket_id)
                         .await?;
-                let report_read = if status.formal.is_some() {
-                    Some(
-                        crate::streaming_evaluator::formal_report_read_metadata(
-                            ctx,
-                            &self.store,
-                            &status.ticket.id,
-                        )
-                        .await?,
+                // Only a formal terminal has report-read metadata to disclose;
+                // without one the original public result is served unchanged.
+                job.result = Some(if status.formal.is_some() {
+                    let report_read = crate::streaming_evaluator::formal_report_read_metadata(
+                        ctx,
+                        &self.store,
+                        &status.ticket.id,
                     )
+                    .await?;
+                    public_evaluation_status_read(&status, report_read)
                 } else {
-                    None
-                };
-                job.result = Some(public_evaluation_status_read(&status, report_read));
+                    public_evaluation_status(&status)
+                });
             }
         }
         if job.operation == "replay.run" && job.state == ManagementJobState::Succeeded {
@@ -2333,7 +2333,7 @@ mod late_cancel_tests;
 // The original public_evaluation_status and worker durable result stay unchanged.
 fn public_evaluation_status_read(
     status: &StreamingEvaluationStatus,
-    report_read: Option<crate::streaming_evaluator::FormalReportReadMetadata>,
+    report_read: crate::streaming_evaluator::FormalReportReadMetadata,
 ) -> ManagementResult {
     let lifecycle = serde_json::to_value(status.ticket.lifecycle)
         .ok()
