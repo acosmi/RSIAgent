@@ -101,6 +101,15 @@ pub enum ManagementResult {
         planned_targets: usize,
         has_formal_terminal: bool,
     },
+    // Query-only: this tag cannot be decoded as a durable ManagementResult.
+    #[serde(skip_deserializing)]
+    EvaluationStatusReadV2 {
+        ticket_id: String,
+        lifecycle: String,
+        planned_targets: usize,
+        has_formal_terminal: bool,
+        report_read: Option<crate::streaming_evaluator::FormalReportReadMetadata>,
+    },
     ReplayStored {
         report_id: String,
         pool_digest: String,
@@ -423,7 +432,12 @@ impl ManagementDispatcher {
                 let status =
                     IndependentEvaluationControl::status(ctx, &self.store, &request.ticket_id)
                         .await?;
-                job.result = Some(public_evaluation_status(&status));
+                let report_read = if status.formal.is_some() {
+                    Some(crate::streaming_evaluator::formal_report_read_metadata(
+                        ctx, &self.store, &status.ticket.id,
+                    ).await?)
+                } else { None };
+                job.result = Some(public_evaluation_status_read(&status, report_read));
             }
         }
         if job.operation == "replay.run" && job.state == ManagementJobState::Succeeded {
@@ -940,7 +954,8 @@ impl JobOutcome {
                 | ManagementResult::ProbeScheduled { .. }
                 | ManagementResult::ExplorationStarted { .. },
             ) => true,
-            Some(ManagementResult::EvaluationStatus { .. }) | None => false,
+            Some(ManagementResult::EvaluationStatus { .. }
+                | ManagementResult::EvaluationStatusReadV2 { .. }) | None => false,
         }
     }
 }
@@ -2304,3 +2319,18 @@ print(json.dumps(result,sort_keys=True))
 #[cfg(test)]
 #[path = "dispatch_late_cancel_tests.rs"]
 mod late_cancel_tests;
+
+// The original public_evaluation_status and worker durable result stay unchanged.
+fn public_evaluation_status_read(
+    status: &StreamingEvaluationStatus,
+    report_read: Option<crate::streaming_evaluator::FormalReportReadMetadata>,
+) -> ManagementResult {
+    let lifecycle = serde_json::to_value(status.ticket.lifecycle)
+        .ok().and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into());
+    ManagementResult::EvaluationStatusReadV2 {
+        ticket_id: status.ticket.id.clone(), lifecycle,
+        planned_targets: status.ticket.targets.len(),
+        has_formal_terminal: status.formal.is_some(), report_read,
+    }
+}

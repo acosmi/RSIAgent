@@ -2217,3 +2217,469 @@ async fn a_v1_report_reads_legacy_over_a_current_selection_and_new_reports_are_v
         Some(report.id.clone())
     );
 }
+
+// AG163 append-only prepared tests. The software fixture proves no provider,
+// paid-effect, independent-process or promotion authority.
+#[cfg(unix)]
+struct Ag163History {
+    store: Store,
+    path: std::path::PathBuf,
+    original: serde_json::Value,
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+async fn ag163_history() -> Ag163History {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let capture = include_bytes!("fixtures/ag163_formal_v2_history.json");
+    assert_eq!(evo_core::hash(capture), "2bc4ecd85ad308cd888067c797391473f43814a0a39988b6035de93dc84a2e79");
+    let all: serde_json::Value = serde_json::from_slice(capture).unwrap();
+    assert_eq!(all["producer_commit"], "800eafc4ccaf39d5e4f3fb1b7891f9c142e6b482");
+    assert_eq!(all["software_fixture_only"], true);
+    assert_eq!(all["real_provider_or_paid_or_OS_authority_proof"], false);
+    let original = all["cases"].as_array().unwrap().iter()
+        .find(|case| case["name"] == "ag163-old-complete-v2").unwrap().clone();
+    let raw = original["database_hex"].as_str().unwrap();
+    assert_eq!(raw.len() % 2, 0);
+    let bytes: Vec<u8> = raw.as_bytes().chunks_exact(2).map(|pair|
+        u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect();
+    assert_eq!(bytes.len() as u64, original["database_bytes"].as_u64().unwrap());
+    assert_eq!(evo_core::hash(&bytes), original["database_sha256"].as_str().unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    std::fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
+    let path = private.join("ag163.sqlite3");
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).unwrap();
+    file.write_all(&bytes).unwrap(); file.sync_all().unwrap(); drop(file);
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(store.integrity().await.unwrap(), "ok");
+    Ag163History { _dir: dir, path, store, original }
+}
+
+#[cfg(unix)]
+fn ag163_sid(kind: &str, id: &str) -> String {
+    format!("e05-{}", evo_core::fingerprint(&(kind, id)).unwrap())
+}
+
+#[cfg(unix)]
+async fn ag163_body(store: &Store, context: &Context, kind: &str, id: &str) -> String {
+    let mut session = store.session().await.unwrap();
+    let row = session.object_row(context, kind, id).await.unwrap().unwrap();
+    session.commit().await.unwrap(); row.body
+}
+
+#[cfg(unix)]
+fn ag163_image(path: &std::path::Path) -> serde_json::Value {
+    let program = r#"
+import json,sqlite3,struct,sys,urllib.parse
+def qi(s):return '"'+s.replace('"','""')+'"'
+def cell(k,v):
+ if k==b'null':return ['null']
+ if k==b'integer':return ['integer',str(v)]
+ if k==b'real':return ['real',struct.pack('>d',v).hex()]
+ if k in (b'text',b'blob'):return [k.decode(),v.hex()]
+ raise AssertionError(k)
+c=sqlite3.connect('file:'+urllib.parse.quote(sys.argv[1],safe='/')+'?mode=ro',uri=True,isolation_level=None);c.text_factory=bytes
+c.execute('PRAGMA query_only=ON');c.execute('BEGIN');assert c.execute('PRAGMA integrity_check').fetchall()==[(b'ok',)]
+schema=c.execute('SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type COLLATE BINARY,name COLLATE BINARY').fetchall();tables=[]
+for typ,n,_,_,ddl in schema:
+ if typ!=b'table':continue
+ name=n.decode();info=c.execute('PRAGMA table_xinfo('+qi(name)+')').fetchall();cols=[x[1].decode() for x in info if x[6]!=1]
+ rowid=b'WITHOUT ROWID' not in (ddl or b'').upper();fields=['_rowid_'] if rowid else []
+ for col in cols:fields.extend(['typeof('+qi(col)+')',qi(col)])
+ rows=[]
+ for v in c.execute('SELECT '+','.join(fields)+' FROM '+qi(name)):
+  off=1 if rowid else 0;rows.append([str(v[0]) if rowid else None,[cell(v[off+2*i],v[off+2*i+1]) for i in range(len(cols))]])
+ rows.sort(key=lambda v:json.dumps(v,separators=(',',':')));tables.append({'name':name,'columns':cols,'table_xinfo':[[cell(b'null',None) if item is None else cell(b'integer',item) if isinstance(item,int) else cell(b'text',item) for item in row] for row in info],'rowid':rowid,'rows':rows})
+calls=c.execute('SELECT state,actual_cost_micros,execution_closed FROM root_budget_calls ORDER BY billing_scope,call_id').fetchall()
+c.execute('ROLLBACK');c.close();print(json.dumps({'schema':[[a.hex(),b.hex(),d.hex(),p,None if sql is None else sql.hex()] for a,b,d,p,sql in schema],'tables':tables,'calls':[[s.decode(),a,x] for s,a,x in calls]},sort_keys=True,separators=(',',':')))
+"#;
+    let output = std::process::Command::new("python3").args(["-I", "-B", "-c", program]).arg(path).output().unwrap();
+    assert!(output.status.success(), "owned readonly full database image failed");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+
+/// The full image includes SQL storage classes, original TEXT/BLOB bytes,
+/// schema, physical rowids and sqlite_sequence. New action records may append;
+/// no pre-existing object, dependency, audit or accounting row may change.
+#[cfg(unix)]
+fn ag163_preserves_original_rows(before: &serde_json::Value, after: &serde_json::Value) {
+    assert!(before["schema"] == after["schema"], "AG163 changed original full schema");
+    for old in before["tables"].as_array().unwrap() {
+        let name = old["name"].as_str().unwrap();
+        let new = after["tables"].as_array().unwrap().iter().find(|v| v["name"] == name).unwrap();
+        if name == "sqlite_sequence" {
+            assert!(old["columns"] == new["columns"], "sqlite_sequence schema changed");
+            for row in old["rows"].as_array().unwrap() {
+                let successor = new["rows"].as_array().unwrap().iter().find(|v| v[1][0] == row[1][0]).unwrap();
+                assert!(successor[0] == row[0] && successor[1][0] == row[1][0], "original sqlite_sequence identity changed");
+                assert_eq!(row[1][1][0], "integer"); assert_eq!(successor[1][1][0], "integer");
+                let before_seq: i64 = row[1][1][1].as_str().unwrap().parse().unwrap();
+                let after_seq: i64 = successor[1][1][1].as_str().unwrap().parse().unwrap();
+                assert!(after_seq >= before_seq, "actual append reset an original sqlite_sequence counter");
+            }
+            continue;
+        }
+        if ["revoke_watermark", "revoke_cleanup_jobs", "revoke_cleanup_frontier"].contains(&name) {
+            continue; // Only these exact real cleanup state tables may advance.
+        }
+        assert!(old["columns"] == new["columns"], "AG163 changed original columns");
+        let old_rows = old["rows"].as_array().unwrap(); let new_rows = new["rows"].as_array().unwrap();
+        assert!(old_rows.iter().all(|row| new_rows.contains(row)), "AG163 changed original rowid or typed bytes");
+        if name.starts_with("root_budget") {
+            assert!(old_rows == new_rows, "AG163 changed original spent/None/late/closed budget facts");
+        }
+    }
+    assert!(before["calls"] == after["calls"], "AG163 reopened execution or changed actual call facts");
+}
+
+#[cfg(unix)]
+async fn ag163_legacy_health(fx: &Ag163History, evaluator: &Context) {
+    let before = ag163_image(&fx.path);
+    let ticket = fx.original["ticket_id"].as_str().unwrap();
+    let body = ag163_body(&fx.store, evaluator, "artifact", &ag163_sid("formal_evaluation_v2", ticket)).await;
+    assert_eq!(evo_core::hash(body.as_bytes()), fx.original["original_formal_body_sha256"].as_str().unwrap());
+    let mut session = fx.store.session().await.unwrap();
+    let read = evo_engine::streaming_evaluator::read_verified_formal_report_in_session(evaluator, &mut session, ticket).await.unwrap();
+    assert_eq!(read.state(), evo_storage::PersistentContractState::Legacy);
+    assert!(!read.historical_view().promotion_eligible);
+    assert!(matches!(read.current_view(), Err(Error::Conflict(reason)) if reason == "source_legacy: formal report is not Current input"));
+    session.commit().await.unwrap();
+    assert!(ag163_image(&fx.path) == before, "AG163 healthy public Legacy reader changed full database");
+}
+
+// Original setup public producers; no economic registration occurs here.
+#[cfg(unix)]
+async fn ag163_pairing_setup(fx: &Ag163History, evaluator: &Context, admin: &Context) -> ReplayEconomicExperimentV1 {
+    let store = fx.store.clone();
+    let evaluator = evaluator.clone();
+    let admin = admin.clone();
+    let train = world(
+        "world-train",
+        "cluster-train",
+        "run-train",
+        WorldPartition::Train,
+    );
+    let select = world(
+        "world-select",
+        "cluster-select",
+        "run-select",
+        WorldPartition::Select,
+    );
+    for (id, cluster, replay_world) in [
+        ("run-train", "family-train", &train),
+        ("run-select", "family-select", &select),
+    ] {
+        let body =
+            replay_observation_bytes(&replay_world.manifest, &replay_world.transitions[0]).unwrap();
+        store_trace_authority(
+            &store,
+            &Context::new(evaluator.namespace(), "host", Role::Host).unwrap(),
+            &StoredTraceAuthority {
+                schema_version: "rsia.optimization.source.v1".into(),
+                record: StoredRunRecord {
+                    id: id.into(),
+                    body: body.clone(),
+                    parent_family: cluster.into(),
+                    task_origin: TaskOrigin::TrustedRun,
+                    execution_attestation: ExecutionAttestation::TrustedHost,
+                    purpose: Purpose::Development,
+                },
+                trace: OptimizationTrace {
+                    run_id: id.into(),
+                    parent_family: cluster.into(),
+                    source_digest: hash(&body),
+                    purpose: Purpose::Development,
+                    outcome: TraceOutcome::Success,
+                    diagnosis: None,
+                    excerpt: String::from_utf8(body.clone()).unwrap(),
+                    seed: 1,
+                },
+                excerpt_start: 0,
+                excerpt_end: body.len(),
+            },
+        )
+        .await
+        .unwrap();
+        let baseline_id = replay_world.manifest.baseline_observation_source_id.clone();
+        let baseline_body = replay_baseline_observation_bytes(&replay_world.manifest).unwrap();
+        store_trace_authority(
+            &store,
+            &Context::new(evaluator.namespace(), "host", Role::Host).unwrap(),
+            &StoredTraceAuthority {
+                schema_version: "rsia.optimization.source.v1".into(),
+                record: StoredRunRecord {
+                    id: baseline_id.clone(),
+                    body: baseline_body.clone(),
+                    parent_family: cluster.into(),
+                    task_origin: TaskOrigin::TrustedRun,
+                    execution_attestation: ExecutionAttestation::TrustedHost,
+                    purpose: Purpose::Development,
+                },
+                trace: OptimizationTrace {
+                    run_id: baseline_id,
+                    parent_family: cluster.into(),
+                    source_digest: hash(&baseline_body),
+                    purpose: Purpose::Development,
+                    outcome: TraceOutcome::Success,
+                    diagnosis: None,
+                    excerpt: String::from_utf8(baseline_body.clone()).unwrap(),
+                    seed: 1,
+                },
+                excerpt_start: 0,
+                excerpt_end: baseline_body.len(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "artifact",
+            "source-1",
+            admin.actor(),
+            &economic_source_body(),
+        )
+        .await
+        .unwrap();
+    // The qualified formal source already owns watermark 1. Advancing it
+    // would change the frozen candidate binding, so retain its actual value.
+    assert_eq!(session.watermark(&admin).await.unwrap().unwrap().0, 1);
+    session.commit().await.unwrap();
+    for world in [&train, &select] {
+        let mut draft = world.clone();
+        draft.sealed_digest = None;
+        evo_storage::replay::put_replay_world_draft(&admin, &store, &draft)
+            .await
+            .unwrap();
+        evo_storage::replay::seal_replay_world(&admin, &store, world)
+            .await
+            .unwrap();
+    }
+    let pool = evo_storage::replay::register_replay_pool(
+        &admin,
+        &store,
+        &[
+            train.manifest.world_id.clone(),
+            select.manifest.world_id.clone(),
+        ],
+    )
+    .await
+    .unwrap();
+    let policy = ElasticPolicyV1::default();
+    let caps = ExplorationCapsV1::online();
+    let profile = ReplaySimulationProfile {
+        simulation_version: SIMULATION_VERSION.into(),
+        objective: ReplayObjective::ParetoAttainmentV2,
+        w_sim: 1,
+        probe_budget: 1,
+        horizon: 1,
+        lambda_work_micros: DEFAULT_LAMBDA_MICROS,
+        lambda_round_micros: DEFAULT_LAMBDA_MICROS,
+        fixed_seed: 7,
+        global_recovery_dispatch_limit: 1,
+        pool_digest: pool.pool_digest.clone(),
+        purpose: Purpose::Development,
+        target_runtime_profile: "online-w1".into(),
+    };
+    let replay = run_replay(
+        &select,
+        &policy,
+        &profile,
+        &caps,
+        &LiveWorldAuthority {
+            revoke_watermark: 1,
+            revoked_source_ids: BTreeSet::new(),
+        },
+    )
+    .unwrap();
+    let stored_report = StoredReplayReportV2::build(
+        evaluator.namespace(),
+        WorldPartition::Select,
+        &pool,
+        policy,
+        profile,
+        caps,
+        vec![replay],
+    )
+    .unwrap();
+    evo_storage::replay::put_current_replay_report(&admin, &store, &stored_report)
+        .await
+        .unwrap();
+    let mut experiment = experiment(&stored_report);
+    let status = evo_engine::streaming_evaluator::IndependentEvaluationControl::status(
+        &evaluator, &store, fx.original["ticket_id"].as_str().unwrap(),
+    ).await.unwrap();
+    let ticket = status.ticket;
+    experiment.id = "ag163-paired-legacy-economic".into();
+    experiment.paired_ticket_id = ticket.id.clone();
+    experiment.paired_ticket_digest = fingerprint(&ticket).unwrap();
+    experiment.evaluator_actor = ticket.evaluator_actor.clone();
+    experiment.executor_actor = ticket.executor_actor.clone();
+    experiment.proposer_actor = ticket.proposer_actor.clone();
+    experiment.approver_actor = ticket.approver_actor.clone();
+    experiment.runtime.candidate_bundle_digest = ticket.candidate_bundle_digest.clone();
+    experiment.runtime.baseline_bundle_digest = ticket.baseline_bundle_digest.clone();
+    experiment.runtime.environment_digest = ticket.environment_digest.clone();
+    experiment.validate().unwrap();
+    experiment
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn paired_legacy_formal_report_is_not_a_new_economic_input() {
+    let fx = ag163_history().await;
+    let namespace = fx.original["namespace"].as_str().unwrap();
+    let evaluator = Context::new(namespace, fx.original["evaluator_actor"].as_str().unwrap(), Role::Evaluator).unwrap();
+    let admin = Context::new(namespace, "admin", Role::Admin).unwrap();
+    ag163_legacy_health(&fx, &evaluator).await;
+    let original = ag163_image(&fx.path);
+    // Actual public source/world/pool/replay producers establish a Current
+    // selection. No paired economic fact is pre-created or imported by SQL.
+    let experiment = ag163_pairing_setup(&fx, &evaluator, &admin).await;
+    let selection = evo_engine::replay::query_replay_report_record(&evaluator, &fx.store, &experiment.replay_selection.report_artifact_id).await.unwrap();
+    assert_eq!(selection.record.state(), ReplayRecordState::CurrentVerified);
+    assert!(!selection.source_legacy);
+    let status = evo_engine::streaming_evaluator::IndependentEvaluationControl::status(&evaluator, &fx.store, &experiment.paired_ticket_id).await.unwrap();
+    let ticket = status.ticket;
+    assert_eq!(experiment.paired_ticket_id, ticket.id);
+    assert_eq!(experiment.paired_ticket_digest, fingerprint(&ticket).unwrap());
+    assert_eq!(experiment.evaluator_actor, ticket.evaluator_actor);
+    assert_eq!(experiment.executor_actor, ticket.executor_actor);
+    assert_eq!(experiment.proposer_actor, ticket.proposer_actor);
+    assert_eq!(experiment.approver_actor, ticket.approver_actor);
+    assert_eq!(experiment.runtime.candidate_bundle_digest, ticket.candidate_bundle_digest);
+    assert_eq!(experiment.runtime.baseline_bundle_digest, ticket.baseline_bundle_digest);
+    assert_eq!(experiment.runtime.environment_digest, ticket.environment_digest);
+    ag163_legacy_health(&fx, &evaluator).await;
+    let before = ag163_image(&fx.path);
+    let refused = PersistentReplayEconomicCoordinator::register(&evaluator, &fx.store, experiment).await;
+    assert!(matches!(refused, Err(Error::Conflict(reason)) if reason == "source_legacy: formal report is not Current input"), "known paired Legacy input was consumed or rejected by an unrelated setup failure");
+    assert!(ag163_image(&fx.path) == before, "paired Legacy registration wrote experiment/audit/budget or any other database fact");
+    ag163_preserves_original_rows(&original, &ag163_image(&fx.path));
+    fx.store.close().await;
+    let reopened = Store::open(&fx.path).await.unwrap();
+    let reopened_before = ag163_image(&fx.path);
+    let mut session = reopened.session().await.unwrap();
+    let read = evo_engine::streaming_evaluator::read_verified_formal_report_in_session(&evaluator, &mut session, fx.original["ticket_id"].as_str().unwrap()).await.unwrap();
+    assert_eq!(read.state(), evo_storage::PersistentContractState::Legacy);
+    assert!(!read.historical_view().promotion_eligible);
+    session.commit().await.unwrap();
+    assert!(ag163_image(&fx.path) == reopened_before, "rejected registration or restart refreshed original Legacy facts");
+}
+
+// Actual ee5 closed bytes, separate from the original 800e history domain.
+// Authored before independent 2c23 reader qualification; this source is not
+// evidence that that reader, this H test or any product gate has passed.
+#[cfg(unix)]
+#[tokio::test]
+async fn derived_economic_audit_propagates_real_formal_source_legacy() {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let bytes = include_bytes!("fixtures/ag163_formal_v2_history.json");
+    assert_eq!(evo_core::hash(bytes), "2bc4ecd85ad308cd888067c797391473f43814a0a39988b6035de93dc84a2e79");
+    let wrapper: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(wrapper["producer_commit"], "800eafc4ccaf39d5e4f3fb1b7891f9c142e6b482");
+    let sample = &wrapper["paired_economic_history"];
+    assert_eq!(sample["schema_version"], "ag163.real_paired_economic_history_fixture.v1");
+    assert_eq!(sample["producer_commit"], "ee5ecf35076476c396a804cf6c34227add695d49");
+    assert_eq!(sample["name"], "ag163-real-paired-economic-history");
+    let metadata = &sample["capture"];
+    assert!(metadata["producer_commit"] == sample["producer_commit"]);
+    assert_eq!(metadata["schema_version"], "ag163.real_paired_economic_history_capture.v1");
+    assert_eq!(metadata["software_fixture_only"], true);
+    assert_eq!(metadata["external_provider_calls"], 0);
+    assert_eq!(metadata["real_paid_or_4uid_authority_claimed"], false);
+    assert_eq!(metadata["formal_old_api_evidence"], "active_domain_full_public_verification_passed");
+    assert_eq!(metadata["formal_state_enum_available_at_producer"], false);
+    assert_eq!(metadata["old_economic_audit"]["report_state"], "current_verified");
+    assert_eq!(metadata["old_economic_audit"]["source_legacy"], false);
+    let hex = sample["database_hex"].as_str().unwrap();
+    assert_eq!(hex.len() % 2, 0);
+    let original_database: Vec<u8> = hex.as_bytes().chunks_exact(2).map(|pair|
+        u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect();
+    assert_eq!(original_database.len(), 438_272);
+    assert_eq!(original_database.len() as u64, sample["database_bytes"].as_u64().unwrap());
+    assert_eq!(evo_core::hash(&original_database), "48a20070638278b703dafa3acdbf4e132b06b2918821707137b2ce952b7e34cd");
+    assert!(sample["database_sha256"].as_str().unwrap() == evo_core::hash(&original_database));
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    std::fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
+    let path = private.join("ag163-economic.sqlite3");
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).unwrap();
+    file.write_all(&original_database).unwrap(); file.sync_all().unwrap(); drop(file);
+    assert!(std::fs::read(&path).unwrap() == original_database, "economic fixture was not the original closed database bytes");
+    let before = ag163_image(&path);
+    assert!(before == sample["all_tables_typed"], "original schema/table_xinfo/typed values/rowid/sequence/fees differ before Store open");
+    assert_eq!(before["tables"].as_array().unwrap().len(), 22);
+    assert!(before["tables"].as_array().unwrap().iter().any(|table| table["name"] == "sqlite_sequence"));
+    assert_eq!(before["calls"].as_array().unwrap().len(), 6);
+    assert!(before["calls"].as_array().unwrap().iter().all(|call|
+        call[0] == "finalized" && call[1] == 10 && call[2] == 1),
+        "original six paid software facts were not finalized/10/closed");
+    let namespace = metadata["namespace"].as_str().unwrap();
+    let actor = metadata["evaluator_actor"].as_str().unwrap();
+    let ticket_id = metadata["ticket_id"].as_str().unwrap();
+    let experiment_id = metadata["experiment"]["id"].as_str().unwrap();
+    let report_id = metadata["report"]["id"].as_str().unwrap();
+    let selection_id = metadata["selection"]["report_id"].as_str().unwrap();
+    let job_id = metadata["job"]["id"].as_str().unwrap();
+    assert!(metadata["experiment"]["paired_ticket_id"] == ticket_id
+        && metadata["report"]["paired_ticket_id"] == ticket_id
+        && metadata["report"]["experiment_id"] == experiment_id);
+    let evaluator = Context::new(namespace, actor, Role::Evaluator).unwrap();
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(store.integrity().await.unwrap(), "ok");
+    assert!(ag163_image(&path) == before, "opening the original economic history refreshed persistent facts");
+    let status = evo_engine::streaming_evaluator::IndependentEvaluationControl::status(
+        &evaluator, &store, ticket_id,
+    ).await.unwrap();
+    assert_eq!(status.ticket.schema_version, "rsia.evaluation_ticket.v2");
+    assert!(serde_json::to_value(&status.ticket).unwrap() == metadata["ticket"],
+        "current reader changed the original ticket payload");
+    assert!(status.ticket.candidate_dependency_binding.is_some() && status.ticket.source_plan_binding.is_none());
+    let mut session = store.session().await.unwrap();
+    let formal = evo_engine::streaming_evaluator::read_verified_formal_report_in_session(
+        &evaluator, &mut session, ticket_id,
+    ).await.unwrap();
+    assert_eq!(formal.state(), evo_storage::PersistentContractState::Legacy);
+    assert_eq!(formal.historical_view().variant, evo_engine::streaming_evaluator::VerifiedReportVariant::CompleteBatch);
+    assert_eq!(formal.historical_view().evidence_scope, evo_engine::streaming_evaluator::EvaluationEvidenceScope::ProgramFixture);
+    assert!(!formal.historical_view().promotion_eligible);
+    assert!(matches!(formal.current_view(), Err(Error::Conflict(reason))
+        if reason == "source_legacy: formal report is not Current input"));
+    assert_eq!(metadata["original_rows"].as_array().unwrap().len(), 6);
+    for original in metadata["original_rows"].as_array().unwrap() {
+        let row = session.object_row(&evaluator, original["kind"].as_str().unwrap(),
+            original["physical_id"].as_str().unwrap()).await.unwrap().unwrap();
+        assert!(row.id == original["physical_id"].as_str().unwrap()
+            && row.owner == original["owner"].as_str().unwrap(),
+            "a real original ticket/formal/selection/experiment/job/report identity changed");
+        assert!(row.body == original["body_utf8"].as_str().unwrap(), "one of six original raw TEXT records changed");
+        assert!(evo_core::hash(row.body.as_bytes()) == original["body_sha256"].as_str().unwrap(),
+            "one of six original raw TEXT hashes changed");
+    }
+    session.commit().await.unwrap();
+    let selection = evo_engine::replay::query_replay_report_record(&evaluator, &store, selection_id).await.unwrap();
+    assert_eq!(selection.record.state(), ReplayRecordState::CurrentVerified);
+    assert!(!selection.source_legacy);
+    assert!(serde_json::to_value(selection.record.current_report().unwrap()).unwrap() == metadata["selection"],
+        "the original Current selection payload changed");
+    let audit = PersistentReplayEconomicCoordinator::query_report(&evaluator, &store, report_id).await.unwrap();
+    assert_eq!(audit.report_state, ReplayRecordState::CurrentVerified);
+    assert_eq!(audit.report_schema_version, "rsia.replay_economic_report.v2");
+    assert_eq!(audit.replay_read_view.record.state(), ReplayRecordState::CurrentVerified);
+    assert!(!audit.replay_read_view.source_legacy);
+    assert!(audit.raw_payload == metadata["report"], "the original economic report payload was rewritten");
+    assert!(audit.source_legacy, "a real paired Legacy E05 source did not propagate to the existing economic audit");
+    let durable_status = PersistentReplayEconomicCoordinator::status(&evaluator, &store, job_id).await.unwrap();
+    assert!(serde_json::to_value(&durable_status).unwrap() == metadata["status"],
+        "economic audit changed the original indexed job, outcome or cost facts");
+    assert!(ag163_image(&path) == before, "public readers changed any original typed fact, raw TEXT, rowid, sequence or fee");
+    store.close().await;
+    assert!(ag163_image(&path) == before, "normal close changed any of the 22 original typed tables or accounting facts");
+}

@@ -8955,9 +8955,80 @@ async fn verify_current_issued_authority(
     ctx: &Context,
     report: &str,
     candidate: &crate::release_store::CurrentReleaseCandidateRecord,
-) -> Result<ReadIssuedAuthority> {
+) -> Result<()> {
     let candidate = crate::release_store::ReadCandidate::from_current(candidate.clone())?;
-    verify_read_issued_authority(s, ctx, report, &candidate).await
+    // The derived report's logical ID is never an old ticket/issuer ID.
+    // The boxed read composition preserves the existing recursive parent
+    // traversal boundary; its derived authority verifier calls only the
+    // original raw/issuer verifier, never this dispatcher.
+    Box::pin(crate::streaming_evaluator::verify_current_report_authority_in_session(
+        s, ctx, report, &candidate,
+    )).await
+}
+
+/// Read-only composition, not a signed/serializable authority record. The
+/// actual old issuer/raw/ticket pins remain unchanged inside `source`.
+pub(crate) struct VerifiedDerivedFormalAuthority {
+    source: ReadIssuedAuthority,
+    report_id: String,
+    raw_report_digest: String,
+}
+impl VerifiedDerivedFormalAuthority {
+    pub(crate) fn source(&self) -> &ReadIssuedAuthority { &self.source }
+    pub(crate) fn report_id(&self) -> &str { &self.report_id }
+    pub(crate) fn raw_report_digest(&self) -> &str { &self.raw_report_digest }
+}
+
+pub(crate) async fn verify_derived_formal_authority(
+    s: &mut Session, ctx: &Context,
+    input: &crate::streaming_evaluator::VerifiedDerivedFormalInput,
+    candidate: &crate::release_store::ReadCandidate,
+) -> Result<VerifiedDerivedFormalAuthority> {
+    // `input` can only be obtained from the actual derived row's complete
+    // semantic/snapshot/owner/content-witness/exact-edge verifier. Re-run the
+    // original issuer verifier in this same Session: full typed closure,
+    // raw+ticket digests, principal actions, cost seal and provider sources.
+    let source = verify_original_formal_authority_for_derived(s, ctx, input.source_report_id(), candidate).await?;
+    let original: crate::streaming_evaluator::FormalEvaluationV2 =
+        crate::streaming_evaluator::need_record(
+            s, ctx, "formal_evaluation_v2", input.source_report_id(),
+        ).await?;
+    let view = input.source_view();
+    if source.report_id != input.source_report_id()
+        || source.report_id != view.report_id || source.report_id != view.ticket_id
+        || source.ticket_digest != view.ticket_digest
+        || source.raw_report_digest != fingerprint(&original)?
+        || evo_core::canonical_fingerprint(&original)? != input.source_report_payload_digest()
+        || source.candidate_id != view.candidate_digest
+        || source.candidate_bundle_digest != view.candidate_bundle_digest
+        || source.environment_digest != view.environment_digest
+    { return Err(Error::Conflict("issued report/ticket bytes differ".into())); }
+    Ok(VerifiedDerivedFormalAuthority {
+        source, report_id: input.report_id().into(), raw_report_digest: input.raw_report_digest()?,
+    })
+}
+
+/// Additional source identity/edge binding used only by explicit derived
+/// judgments, before their first DML. Original historical reader behavior and
+/// its full issuer/raw/ticket verifier remain unchanged.
+pub(crate) async fn verify_original_formal_authority_for_derived(
+    s: &mut Session, ctx: &Context, report_id: &str,
+    candidate: &crate::release_store::ReadCandidate,
+) -> Result<ReadIssuedAuthority> {
+    let source = verify_read_issued_authority(s, ctx, report_id, candidate).await?;
+    let ticket: crate::streaming_evaluator::ReadEvaluationTicket =
+        crate::streaming_evaluator::need_record(s, ctx, "evaluation_ticket_v2", report_id).await?;
+    let issuer_id = format!("formal-authority-{report_id}");
+    let row = s.object_row(ctx, "artifact", &issuer_id).await?.ok_or(Error::NotFound)?;
+    if row.owner != ticket.evaluator_actor || source.issued_by != ticket.evaluator_actor {
+        return Err(Error::Forbidden);
+    }
+    if source.id != issuer_id { return Err(Error::Conflict("issued report/ticket bytes differ".into())); }
+    crate::streaming_evaluator::require_exact_fact_edges(
+        s, ctx, &issuer_id,
+        source.closure.nodes.iter().map(|node| (node.kind.clone(), node.id.clone())).collect(),
+    ).await?;
+    Ok(source)
 }
 
 /// Mandatory original bodies in authenticated_bundle.v2; data alone is no authority.

@@ -1009,3 +1009,551 @@ fn current_version_table_classifies_legacy_invalid_unknown_and_lineage() {
         Err(evo_core::Error::Invalid(message)) if message=="unknown persistent contract version; isolate")
     );
 }
+
+// AG163 append-only prepared tests. The software fixture proves no provider,
+// paid-effect, independent-process or promotion authority.
+#[cfg(unix)]
+struct Ag163History {
+    store: Store,
+    path: std::path::PathBuf,
+    original: serde_json::Value,
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+async fn ag163_history(name: &str) -> Ag163History {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let capture = include_bytes!("../../evo-engine/tests/fixtures/ag163_formal_v2_history.json");
+    assert_eq!(evo_core::hash(capture), "2bc4ecd85ad308cd888067c797391473f43814a0a39988b6035de93dc84a2e79");
+    let all: serde_json::Value = serde_json::from_slice(capture).unwrap();
+    assert_eq!(all["producer_commit"], "800eafc4ccaf39d5e4f3fb1b7891f9c142e6b482");
+    assert_eq!(all["software_fixture_only"], true);
+    assert_eq!(all["real_provider_or_paid_or_OS_authority_proof"], false);
+    let original = all["cases"].as_array().unwrap().iter()
+        .find(|case| case["name"] == name).unwrap().clone();
+    let raw = original["database_hex"].as_str().unwrap();
+    assert_eq!(raw.len() % 2, 0);
+    let bytes: Vec<u8> = raw.as_bytes().chunks_exact(2).map(|pair|
+        u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect();
+    assert_eq!(bytes.len() as u64, original["database_bytes"].as_u64().unwrap());
+    assert_eq!(evo_core::hash(&bytes), original["database_sha256"].as_str().unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    std::fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
+    let path = private.join("ag163.sqlite3");
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).unwrap();
+    file.write_all(&bytes).unwrap(); file.sync_all().unwrap(); drop(file);
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(store.integrity().await.unwrap(), "ok");
+    Ag163History { _dir: dir, path, store, original }
+}
+
+#[cfg(unix)]
+fn ag163_sid(kind: &str, id: &str) -> String {
+    format!("e05-{}", evo_core::fingerprint(&(kind, id)).unwrap())
+}
+
+#[cfg(unix)]
+async fn ag163_body(store: &Store, context: &Context, kind: &str, id: &str) -> String {
+    let mut session = store.session().await.unwrap();
+    let row = session.object_row(context, kind, id).await.unwrap().unwrap();
+    session.commit().await.unwrap(); row.body
+}
+
+#[cfg(unix)]
+fn ag163_image(path: &std::path::Path) -> serde_json::Value {
+    let program = r#"
+import json,sqlite3,struct,sys,urllib.parse
+def qi(s):return '"'+s.replace('"','""')+'"'
+def cell(k,v):
+ if k==b'null':return ['null']
+ if k==b'integer':return ['integer',str(v)]
+ if k==b'real':return ['real',struct.pack('>d',v).hex()]
+ if k in (b'text',b'blob'):return [k.decode(),v.hex()]
+ raise AssertionError(k)
+c=sqlite3.connect('file:'+urllib.parse.quote(sys.argv[1],safe='/')+'?mode=ro',uri=True,isolation_level=None);c.text_factory=bytes
+c.execute('PRAGMA query_only=ON');c.execute('BEGIN');assert c.execute('PRAGMA integrity_check').fetchall()==[(b'ok',)]
+schema=c.execute('SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type COLLATE BINARY,name COLLATE BINARY').fetchall();tables=[]
+for typ,n,_,_,ddl in schema:
+ if typ!=b'table':continue
+ name=n.decode();info=c.execute('PRAGMA table_xinfo('+qi(name)+')').fetchall();cols=[x[1].decode() for x in info if x[6]!=1]
+ rowid=b'WITHOUT ROWID' not in (ddl or b'').upper();fields=['_rowid_'] if rowid else []
+ for col in cols:fields.extend(['typeof('+qi(col)+')',qi(col)])
+ rows=[]
+ for v in c.execute('SELECT '+','.join(fields)+' FROM '+qi(name)):
+  off=1 if rowid else 0;rows.append([str(v[0]) if rowid else None,[cell(v[off+2*i],v[off+2*i+1]) for i in range(len(cols))]])
+ rows.sort(key=lambda v:json.dumps(v,separators=(',',':')));tables.append({'name':name,'columns':cols,'rowid':rowid,'rows':rows})
+calls=c.execute('SELECT state,actual_cost_micros,execution_closed FROM root_budget_calls ORDER BY billing_scope,call_id').fetchall()
+c.execute('ROLLBACK');c.close();print(json.dumps({'schema':[[a.hex(),b.hex(),d.hex(),p,None if sql is None else sql.hex()] for a,b,d,p,sql in schema],'tables':tables,'calls':[[s.decode(),a,x] for s,a,x in calls]},sort_keys=True,separators=(',',':')))
+"#;
+    let output = std::process::Command::new("python3").args(["-I", "-B", "-c", program]).arg(path).output().unwrap();
+    assert!(output.status.success(), "owned readonly full database image failed");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+
+/// The full image includes SQL storage classes, original TEXT/BLOB bytes,
+/// schema, physical rowids and sqlite_sequence. New action records may append;
+/// Only the existing S2 deletion, witnessed private redactions and specific
+/// cleanup state columns may change; every original budget/report fact is kept.
+#[cfg(unix)]
+fn ag163_preserves_original_rows(before: &serde_json::Value, after: &serde_json::Value)
+    -> BTreeMap<(String, String, String), Option<serde_json::Value>>
+{
+    fn text(cell: &serde_json::Value) -> String {
+        assert_eq!(cell[0], "text"); let raw = cell[1].as_str().unwrap();
+        let bytes: Vec<u8> = raw.as_bytes().chunks_exact(2).map(|pair|
+            u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect();
+        String::from_utf8(bytes).unwrap()
+    }
+    fn column<'a>(table: &serde_json::Value, row: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        let index = table["columns"].as_array().unwrap().iter().position(|value| value == name).unwrap(); &row[1][index]
+    }
+    fn get<'a>(image: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        image["tables"].as_array().unwrap().iter().find(|value| value["name"] == name).unwrap()
+    }
+    fn retained_call(value: &serde_json::Value) -> serde_json::Value {
+        let call: evo_storage::budget::BudgetCallRecord = serde_json::from_value(value.clone()).unwrap();
+        let normalized = serde_json::to_value(call).unwrap();
+        let mut expected = normalized.as_object().unwrap().clone();
+        expected.remove("lease_token");
+        for key in ["response_block_reason", "execution_close_reason", "terminal_reason"] {
+            let value = expected.remove(key).unwrap();
+            expected.insert(format!("{key}_digest"), value.as_str().map(|text| json!(hash(text.as_bytes()))).unwrap_or(serde_json::Value::Null));
+        }
+        for key in ["request_artifact", "transport_artifact", "response_artifact"] {
+            let value = expected.remove(key).unwrap();
+            let redacted = if value.is_null() { serde_json::Value::Null } else {
+                json!({"schema_version":value["schema_version"],"digest":value["digest"],"body_redacted":true})
+            };
+            expected.insert(key.into(), redacted);
+        }
+        serde_json::Value::Object(expected)
+    }
+    assert!(before["schema"] == after["schema"], "cleanup changed original full schema");
+    let objects = get(before, "objects");
+    let source = objects["rows"].as_array().unwrap().iter().find(|row|
+        text(column(objects, row, "kind")) == "run" && text(column(objects, row, "id")) == "S2").unwrap();
+    let namespace = text(column(objects, source, "namespace"));
+    let source_wire: serde_json::Value = serde_json::from_str(&text(column(objects, source, "body"))).unwrap();
+    assert_eq!(source_wire["schema_version"], "rsia.optimization.source.v1");
+    assert_eq!(source_wire["record"]["id"], "S2");
+    let dependencies = get(before, "dependencies");
+    let mut scope = std::collections::BTreeSet::from([("run".to_owned(), "S2".to_owned())]);
+    loop {
+        let mut added = false;
+        for row in dependencies["rows"].as_array().unwrap() {
+            if text(column(dependencies, row, "namespace")) != namespace { continue; }
+            let destination = (text(column(dependencies, row, "dst_kind")), text(column(dependencies, row, "dst_id")));
+            if scope.contains(&destination) {
+                added |= scope.insert((text(column(dependencies, row, "src_kind")), text(column(dependencies, row, "src_id"))));
+            }
+        }
+        if !added { break; }
+    }
+    let mut changed_protected = BTreeMap::new(); let mut actual_formal_in_scope = false;
+    for old in before["tables"].as_array().unwrap() {
+        let name = old["name"].as_str().unwrap(); let new = get(after, name);
+        assert!(old["columns"] == new["columns"], "cleanup changed original columns");
+        let old_rows = old["rows"].as_array().unwrap(); let new_rows = new["rows"].as_array().unwrap();
+        if name == "sqlite_sequence" {
+            for row in old_rows {
+                let successor = new_rows.iter().find(|value| value[1][0] == row[1][0]).unwrap();
+                assert!(successor[0] == row[0] && successor[1][0] == row[1][0], "cleanup changed original sequence identity");
+                assert_eq!(row[1][1][0], "integer"); assert_eq!(successor[1][1][0], "integer");
+                assert!(successor[1][1][1].as_str().unwrap().parse::<i64>().unwrap() >= row[1][1][1].as_str().unwrap().parse::<i64>().unwrap(), "cleanup reset an original sequence counter");
+            }
+            continue;
+        }
+        if name == "objects" {
+            for row in old_rows {
+                let row_namespace = text(column(old, row, "namespace")); let kind = text(column(old, row, "kind")); let id = text(column(old, row, "id"));
+                let original_text = text(column(old, row, "body"));
+                let original: serde_json::Value = serde_json::from_str(&original_text).unwrap();
+                if original["record_kind"] == "formal_evaluation_v2" {
+                    let ticket = original["payload"]["ticket_id"].as_str().unwrap();
+                    let ticket_physical = ag163_sid("evaluation_ticket_v2", ticket);
+                    assert_eq!(id, ag163_sid("formal_evaluation_v2", ticket));
+                    assert!(row_namespace == namespace && scope.contains(&("artifact".into(), ticket_physical)),
+                        "old report's actual ticket is outside the real revoked source closure");
+                    actual_formal_in_scope = true;
+                }
+                let successor = new_rows.iter().find(|value| value[0] == row[0]);
+                if kind == "run" && id == "S2" && row_namespace == namespace {
+                    assert!(successor.is_none(), "legal run source content was not deleted");
+                    changed_protected.insert((row_namespace, kind, id), None); continue;
+                }
+                let successor = successor.expect("cleanup deleted an unrelated original object");
+                if successor == row { continue; }
+                assert!(row_namespace == namespace && scope.contains(&(kind.clone(), id.clone())), "cleanup rewrote an object outside the actual original source closure");
+                for (index, key) in old["columns"].as_array().unwrap().iter().enumerate() {
+                    if key != "body" && key != "revision" { assert!(row[1][index] == successor[1][index], "cleanup changed original object identity/owner/typed bytes"); }
+                }
+                assert_eq!(column(old, row, "revision")[0], "integer");
+                assert_eq!(column(new, successor, "revision")[0], "integer");
+                assert_eq!(column(new, successor, "revision")[1].as_str().unwrap().parse::<i64>().unwrap(), column(old, row, "revision")[1].as_str().unwrap().parse::<i64>().unwrap() + 1);
+                let redacted: serde_json::Value = serde_json::from_str(&text(column(new, successor, "body"))).unwrap();
+                assert_eq!(redacted.as_object().unwrap().len(), 7);
+                assert_eq!(redacted["id"], id); assert_eq!(redacted["schema_version"], "rsia.redacted.v1");
+                assert_eq!(redacted["state"], "source_revoked"); assert_eq!(redacted["original_kind"], kind);
+                assert_eq!(redacted["original_schema"], original["schema_version"]);
+                assert_eq!(redacted["original_digest"], hash(original_text.as_bytes()));
+                let schema = original["schema_version"].as_str().unwrap();
+                let record = original["record_kind"].as_str().unwrap_or("");
+                let private = matches!(schema, "rsia.release_candidate.v1" | "rsia.release_candidate.v2"
+                    | "rsia.optimization.compiler_use.v1" | "rsia.optimization.compiler_use.v2"
+                    | "rsia.authenticated_bundle.v1" | "rsia.authenticated_bundle.v2" | "rsia.resolved_bundle.v2")
+                    || (schema == "rsia.typed_artifact_envelope.v1" && matches!(record,
+                        "registered_evaluation_control_v41" | "protected_holdout_v41" | "evaluation_execution_output_v1"));
+                if schema == "rsia.typed_artifact_envelope.v1" && record == "evaluation_resource_evidence_v1" {
+                    let payload = &original["payload"];
+                    let calls: Vec<_> = payload["calls"].as_array().unwrap().iter().map(retained_call).collect();
+                    let expected = json!({"record_kind":record,"ticket_id":payload["ticket_id"],"billing_scope":payload["billing_scope"],
+                        "cost_scope":payload["cost_scope"],"calls":calls,"formal_closure_invalidated":true});
+                    assert!(redacted["metadata"] == expected, "resource cleanup changed original complete retained call facts");
+                } else {
+                    assert!(private, "cleanup rewrote a protected historical report/receipt/accounting object");
+                    let expected = evo_storage::lifecycle::redacted_object_body(&kind, &id, &original, &original_text);
+                    assert!(redacted == expected, "private cleanup differs from the complete original redactor output");
+                }
+                changed_protected.insert((row_namespace, kind, id), Some(redacted));
+            }
+            assert_eq!(new_rows.len() + 1, old_rows.len(), "cleanup added objects or deleted more than its actual run source");
+            continue;
+        }
+        if name == "idempotency" || name == "revoke_cleanup_jobs" || name == "revoke_cleanup_frontier" {
+            for row in old_rows {
+                let successor = new_rows.iter().find(|value| value[0] == row[0]).unwrap();
+                if successor == row { continue; }
+                let allowed: &[&str] = match name {
+                    "idempotency" => {
+                        assert_eq!(text(column(old, row, "namespace")), namespace);
+                        let subject = text(column(old, row, "subject_id"));
+                        assert!(scope.iter().any(|(_, id)| id == &subject), "unrelated idempotency response was redacted");
+                        assert_eq!(text(column(new, successor, "response")), "null");
+                        assert_eq!(column(new, successor, "redacted"), &json!(["integer","1"]));
+                        &["response", "redacted"]
+                    }
+                    "revoke_cleanup_jobs" => &["state", "processed_nodes", "last_error", "updated_at"],
+                    _ => &["cursor_src_kind", "cursor_src_id", "expanded"],
+                };
+                for (index, key) in old["columns"].as_array().unwrap().iter().enumerate() {
+                    if !allowed.contains(&key.as_str().unwrap()) { assert!(row[1][index] == successor[1][index], "cleanup changed a stable original action/idempotency column"); }
+                }
+            }
+            if name != "revoke_cleanup_frontier" { assert_eq!(old_rows.len(), new_rows.len()); }
+            continue;
+        }
+        if name == "audit" || name == "revoke_cleanup_events" {
+            assert!(old_rows.iter().all(|row| new_rows.contains(row)), "cleanup rewrote an original audit or cleanup event");
+        } else {
+            assert!(old_rows == new_rows, "cleanup changed an unrelated table or complete original budget facts");
+        }
+    }
+    assert!(actual_formal_in_scope, "cleanup test never bound its actual old report to a reached source ticket");
+    assert!(before["calls"] == after["calls"], "cleanup changed original amount/None/late/closed facts");
+    changed_protected
+}
+
+#[cfg(unix)]
+fn ag163_original_report_was_expanded(image: &serde_json::Value, namespace: &str, job: &str, report: &str) {
+    let table = image["tables"].as_array().unwrap().iter().find(|table| table["name"] == "revoke_cleanup_frontier").unwrap();
+    let index = |name: &str| table["columns"].as_array().unwrap().iter().position(|column| column == name).unwrap();
+    let text = |value: &str| json!(["text", value.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>()]);
+    let rows: Vec<_> = table["rows"].as_array().unwrap().iter().filter(|row|
+        row[1][index("namespace")] == text(namespace) && row[1][index("job_id")] == text(job)
+            && row[1][index("node_kind")] == text("artifact") && row[1][index("node_id")] == text(report)).collect();
+    assert_eq!(rows.len(), 1, "the actual old report was not uniquely discovered in this cleanup job");
+    assert!(rows[0][1][index("expanded")] == json!(["integer","1"]),
+        "old report identity never reached the real cleanup classifier");
+}
+
+#[cfg(unix)]
+async fn ag163_old_running_checkpoint(
+    store: &mut Store, path: &Path, admin: &Context, job: &str, ticket: &str, report: &str,
+) -> evo_storage::lifecycle::CleanupStatus {
+    let mut view = sqlx::sqlite::SqliteConnectOptions::new().filename(path)
+        .read_only(true).create_if_missing(false).disable_statement_logging().connect().await.unwrap();
+    let mut status = LifecycleStore::cleanup_status(admin, store, job).await.unwrap();
+    let mut reached = false;
+    for _ in 0..512 {
+        let expanded: Option<i64> = sqlx::query_scalar(
+            "SELECT expanded FROM revoke_cleanup_frontier WHERE namespace=? AND job_id=? AND node_kind='artifact' AND node_id=?",
+        ).bind(admin.namespace()).bind(job).bind(ticket).fetch_optional(&mut view).await.unwrap();
+        if expanded == Some(1) { reached = true; break; }
+        assert!(matches!(status.state, evo_storage::lifecycle::CleanupState::Pending | evo_storage::lifecycle::CleanupState::Running));
+        status = LifecycleStore::cleanup_step(admin, store, job, 1, evo_core::now().unwrap()).await.unwrap();
+    }
+    view.close().await.unwrap();
+    assert!(reached, "public cleanup never reached its real ticket before checkpoint");
+    assert_eq!(status.state, evo_storage::lifecycle::CleanupState::Running);
+    store.close().await;
+    let before_projection = ag163_image(path);
+    let mut connection = sqlx::sqlite::SqliteConnectOptions::new().filename(path)
+        .create_if_missing(false).disable_statement_logging().connect().await.unwrap();
+    // An owned upgrade-compatibility projection: remove only metadata the old
+    // implementation did not write. Real Running job/expanded ticket, objects,
+    // source/edges/amounts and every old business fact stay as publicly produced.
+    sqlx::query("DELETE FROM revoke_cleanup_frontier WHERE namespace=? AND job_id=? AND node_kind='__formal_ticket_scan'")
+        .bind(admin.namespace()).bind(job).execute(&mut connection).await.unwrap();
+    sqlx::query(
+        "DELETE FROM revoke_cleanup_frontier WHERE namespace=? AND job_id=? AND node_kind='artifact' AND node_id=? AND expanded=0
+         AND NOT EXISTS (SELECT 1 FROM dependencies WHERE namespace=? AND src_kind='artifact' AND src_id=? AND dst_kind='artifact' AND dst_id=?)",
+    ).bind(admin.namespace()).bind(job).bind(report).bind(admin.namespace()).bind(report).bind(ticket)
+        .execute(&mut connection).await.unwrap();
+    let still_expanded: i64 = sqlx::query_scalar(
+        "SELECT expanded FROM revoke_cleanup_frontier WHERE namespace=? AND job_id=? AND node_kind='artifact' AND node_id=?",
+    ).bind(admin.namespace()).bind(job).bind(ticket).fetch_one(&mut connection).await.unwrap();
+    assert_eq!(still_expanded, 1);
+    connection.close().await.unwrap();
+    let after_projection = ag163_image(path);
+    assert!(before_projection["schema"] == after_projection["schema"]);
+    for old in before_projection["tables"].as_array().unwrap() {
+        if old["name"] == "revoke_cleanup_frontier" { continue; }
+        let unchanged = after_projection["tables"].as_array().unwrap().iter().find(|t| t["name"] == old["name"]).unwrap();
+        assert!(old == unchanged, "checkpoint projection changed real job/object/edge/sequence/accounting facts");
+    }
+    *store = Store::open(path).await.unwrap();
+    let resumed = LifecycleStore::cleanup_status(admin, store, job).await.unwrap();
+    assert_eq!(resumed.state, evo_storage::lifecycle::CleanupState::Running);
+    assert_eq!(resumed.processed_nodes, status.processed_nodes);
+    resumed
+}
+
+#[cfg(unix)]
+async fn ag163_non_ticket_raw_controls() {
+    use evo_core::contract::{HostSurfaceClassificationV2, HostSurfaceRegistrationV2,
+        ReviewedHostSourceEnvelopeV1, SurfaceCoverage, host_surface_upgrade_diff_v2, host_surface_v2_from_source};
+    struct DuplicatePractice;
+    impl serde::Serialize for DuplicatePractice {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeStruct;
+            let mut out = serializer.serialize_struct("OrdinaryRawControl", 4)?;
+            out.serialize_field("schema_version", "rsia.practice_registration.v1")?;
+            out.serialize_field("id", "raw-control")?;
+            out.serialize_field("echo", &1)?; out.serialize_field("echo", &2)?; out.end()
+        }
+    }
+    let nested = "[".repeat(200) + "0" + &"]".repeat(200);
+    let source = ReviewedHostSourceEnvelopeV1 {
+        schema_version:"rsia.host_source_envelope.v1".into(), source_kind:"reviewed_fixture".into(),
+        source_schema:"rsia.host_reviewed_declarations.v1".into(),
+        extractor_version:"rsia.host_reviewed_declarations.extractor.v1".into(),
+        original_utf8:r#"{"schema_version":"rsia.host_reviewed_declarations.v1","host":"reference","host_version":"1","declarations":[{"name":"option","value_type":"object","enum_values":[],"default":{"kind":"value","value":{"nested":DEPTH}}}]}"#.replace("DEPTH", &nested),
+    };
+    let registration = HostSurfaceRegistrationV2 { adapter_version:"1".into(), retired:vec![],
+        classifications:vec![HostSurfaceClassificationV2 { name:"option".into(), coverage:SurfaceCoverage::Unsupported,
+            mapped_field:None, consumer:None, reason:"raw cleanup control".into(), renamed_from:None, test_ref:None, capability:None }] };
+    let (manifest, typed) = host_surface_v2_from_source(&source, &registration).unwrap();
+    let host = json!({"id":"raw-control","schema_version":"rsia.host_surface_record.v2",
+        "manifest_digest":evo_core::fingerprint(&manifest).unwrap(),
+        "upgrade_diff":host_surface_upgrade_diff_v2(&manifest,None).unwrap(),
+        "manifest":manifest,"source":source,"extracted":["option"],"extracted_typed":typed,"predecessor_surface_id":null});
+    for current_host in [false, true] {
+        let (_dir, store, path) = database().await;
+        let admin = ctx("ag163-raw-cleanup", "admin", Role::Admin);
+        put_run(&store, admin.namespace(), "raw-source").await;
+        let mut session = store.session().await.unwrap();
+        if current_host {
+            session.put(&admin, "artifact", "raw-control", admin.actor(), &host).await.unwrap();
+        } else {
+            session.put(&admin, "artifact", "raw-control", admin.actor(), &DuplicatePractice).await.unwrap();
+        }
+        session.put_edge(&admin, "artifact", "raw-control", "run", "raw-source").await.unwrap();
+        // Public original read path accepts either ordinary last-key serde or
+        // the actual CurrentHost raw decoder's legal depth 200.
+        let parsed: serde_json::Value = session.need(&admin, "artifact", "raw-control").await.unwrap();
+        if !current_host { assert_eq!(parsed["echo"], 2); }
+        session.commit().await.unwrap();
+        let original = ag163_body(&store, &admin, "artifact", "raw-control").await;
+        let mut status = LifecycleStore::begin_revoke(&admin, &store, TypedObjectRef {
+            kind:"run".into(), id:"raw-source".into(),
+        }, "AG163 non-ticket raw compatibility", evo_core::now().unwrap()).await.unwrap();
+        let before = ag163_image(&path);
+        for _ in 0..16 {
+            if matches!(status.state, evo_storage::lifecycle::CleanupState::Complete | evo_storage::lifecycle::CleanupState::Failed) { break; }
+            status = LifecycleStore::cleanup_step(&admin, &store, &status.job_id, 8, evo_core::now().unwrap()).await.unwrap();
+        }
+        if current_host {
+            assert_eq!(status.state, evo_storage::lifecycle::CleanupState::Failed);
+            assert_eq!(status.last_error.as_deref(), Some("blocked_unknown_scope:artifact:rsia.host_surface_record.v2:"));
+        } else { assert_eq!(status.state, evo_storage::lifecycle::CleanupState::Complete); }
+        assert!(ag163_body(&store, &admin, "artifact", "raw-control").await == original,
+            "non-ticket old raw bytes were rewritten or routed through a new decoder");
+        let after = ag163_image(&path);
+        assert!(before["schema"] == after["schema"]);
+        for old in before["tables"].as_array().unwrap().iter().filter(|t|
+            t["name"].as_str().unwrap().starts_with("root_budget") || matches!(t["name"].as_str().unwrap(), "dependencies" | "revoke_watermark")) {
+            assert!(after["tables"].as_array().unwrap().iter().any(|new| new == old),
+                "non-ticket compatibility changed original typed dependency/watermark/accounting facts");
+        }
+        store.close().await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn known_formal_history_is_cleanable_without_resetting_spend() {
+    for old_running in [false, true] {
+    for name in ["ag163-old-complete-v2", "ag163-old-early-v2"] {
+    let mut fx = ag163_history(name).await;
+    let namespace = fx.original["namespace"].as_str().unwrap();
+    let admin = Context::new(namespace, "admin", Role::Admin).unwrap();
+    let ticket = fx.original["ticket_id"].as_str().unwrap();
+    let physical = ag163_sid("formal_evaluation_v2", ticket);
+    let original_body = ag163_body(&fx.store, &admin, "artifact", &physical).await;
+    assert_eq!(hash(original_body.as_bytes()), fx.original["original_formal_body_sha256"].as_str().unwrap());
+    let raw: serde_json::Value = serde_json::from_str(&original_body).unwrap();
+    assert_eq!(raw["payload"]["variant"], fx.original["expected_variant"]);
+    assert!(raw["payload"].get("schema_version").is_none());
+    if name == "ag163-old-complete-v2" {
+        assert_eq!(raw["payload"]["report"]["stats_version"], "rsia.empirical_bernstein.v2");
+    } else {
+        assert_eq!(raw["payload"]["certificate"]["schema_version"], "rsia.early_stop_certificate.v1");
+    }
+    let before = ag163_image(&fx.path);
+    assert_eq!(before["calls"].as_array().unwrap().len() as u64, fx.original["original_call_rows"].as_u64().unwrap());
+    assert!(before["calls"].as_array().unwrap().iter().all(|call| call[0] == "finalized" && call[2] == 1));
+    assert!(before["calls"].as_array().unwrap().iter().any(|call| call[1].as_i64().unwrap() > 0));
+    let source_body: serde_json::Value = serde_json::from_str(&ag163_body(&fx.store, &admin, "run", "S2").await).unwrap();
+    assert_eq!(source_body["schema_version"], "rsia.optimization.source.v1"); assert_eq!(source_body["record"]["id"], "S2");
+    let ticket_physical = ag163_sid("evaluation_ticket_v2", ticket);
+    let ticket_wire: serde_json::Value = serde_json::from_str(&ag163_body(&fx.store, &admin, "artifact", &ticket_physical).await).unwrap();
+    let binding = &ticket_wire["payload"]["candidate_dependency_binding"];
+    assert!(binding["sources"].as_array().unwrap().iter().any(|source| source["kind"] == "run" && source["id"] == "S2"));
+    let mut session = fx.store.session().await.unwrap();
+    assert!(session.dependents(&admin, "run", "S2").await.unwrap().contains(&("artifact".into(), binding["candidate_id"].as_str().unwrap().into())));
+    assert!(session.dependents(&admin, "artifact", binding["candidate_id"].as_str().unwrap()).await.unwrap().contains(&("artifact".into(), ticket_physical.clone())));
+    let original_report_edge = session.dependents(&admin, "artifact", &ticket_physical).await.unwrap()
+        .contains(&("artifact".into(), physical.clone()));
+    assert_eq!(original_report_edge, name == "ag163-old-complete-v2",
+        "qualified Early has no original formal edge; discovery must not backfill one");
+    session.commit().await.unwrap();
+    assert!(ag163_image(&fx.path) == before, "real original source/edge health checks changed history");
+    let mut status = LifecycleStore::begin_revoke(&admin, &fx.store, TypedObjectRef {
+        kind: "run".into(), id: "S2".into(),
+    }, "AG163 preserve history after revoking its actual S2 upstream", evo_core::now().unwrap()).await.unwrap();
+    let revoked_before = ag163_image(&fx.path);
+    for old in before["tables"].as_array().unwrap().iter().filter(|table| table["name"].as_str().unwrap().starts_with("root_budget")) {
+        let unchanged = revoked_before["tables"].as_array().unwrap().iter().find(|table| table["name"] == old["name"]).unwrap();
+        assert!(old == unchanged, "logical revocation changed original complete budget facts");
+    }
+    let original_facts = read_control_plane_facts(&fx.path).await.unwrap();
+    if old_running { status = ag163_old_running_checkpoint(&mut fx.store, &fx.path, &admin, &status.job_id, &ticket_physical, &physical).await; }
+    for _ in 0..100 {
+        if matches!(status.state, evo_storage::lifecycle::CleanupState::Complete | evo_storage::lifecycle::CleanupState::Failed) { break; }
+        status = LifecycleStore::cleanup_step(&admin, &fx.store, &status.job_id, 16, evo_core::now().unwrap()).await.unwrap();
+    }
+    assert_eq!(status.state, evo_storage::lifecycle::CleanupState::Complete);
+    assert!(status.last_error.is_none());
+    assert!(ag163_body(&fx.store, &admin, "artifact", &physical).await == original_body, "known old formal cleanup changed original wire bytes");
+    let after = ag163_image(&fx.path);
+    ag163_original_report_was_expanded(&after, namespace, &status.job_id, &physical);
+    let legal_changes = ag163_preserves_original_rows(&revoked_before, &after);
+    let after_facts = read_control_plane_facts(&fx.path).await.unwrap();
+    assert!(after_facts.watermarks == original_facts.watermarks && after_facts.tombstones == original_facts.tombstones, "cleanup changed committed original revoke facts");
+    assert!(after_facts.root_budget_tables == original_facts.root_budget_tables, "cleanup changed complete original paid/None/closed facts");
+    let mut expected_protected = original_facts.protected_objects.clone();
+    for (key, redacted) in legal_changes {
+        if PROTECTED_OBJECT_KINDS.contains(&key.1.as_str()) {
+            if let Some(value) = redacted { expected_protected.insert(key, value); } else { expected_protected.remove(&key); }
+        } else { expected_protected.remove(&key); }
+    }
+    assert!(after_facts.protected_objects == expected_protected, "cleanup changed protected history outside its exact validated private-content transitions");
+    let before_second = ag163_image(&fx.path);
+    let second = LifecycleStore::cleanup_step(&admin, &fx.store, &status.job_id, 16, evo_core::now().unwrap()).await.unwrap();
+    assert_eq!(second.state, evo_storage::lifecycle::CleanupState::Complete);
+    assert!(ag163_image(&fx.path) == before_second, "completed cleanup retry changed any full database fact");
+    }
+    }
+    ag163_non_ticket_raw_controls().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unknown_inner_judgment_version_is_left_in_quarantine() {
+    for old_running in [false, true] {
+    for fault in ["old_statistics", "old_certificate", "payload_schema"] {
+        let fx = ag163_history(if fault == "old_certificate" { "ag163-old-early-v2" } else { "ag163-old-complete-v2" }).await;
+        let namespace = fx.original["namespace"].as_str().unwrap();
+        let admin = Context::new(namespace, "admin", Role::Admin).unwrap();
+        let ticket = fx.original["ticket_id"].as_str().unwrap();
+        let physical = ag163_sid("formal_evaluation_v2", ticket);
+        let healthy = ag163_body(&fx.store, &admin, "artifact", &physical).await;
+        assert_eq!(hash(healthy.as_bytes()), fx.original["original_formal_body_sha256"].as_str().unwrap());
+        let mut damaged: serde_json::Value = serde_json::from_str(&healthy).unwrap();
+        assert!(damaged["payload"].get("schema_version").is_none());
+        let expected_error = if fault == "old_statistics" {
+            // One actual old judgment algorithm slot changes. All original
+            // outer ids, actor pins, bills, witness and payload shape stay old.
+            assert_eq!(damaged["payload"]["report"]["stats_version"], "rsia.empirical_bernstein.v2");
+            damaged["payload"]["report"]["stats_version"] = json!("rsia.empirical_bernstein.v999");
+            "blocked_unknown_scope:formal_judgment_old_wire_or_domain"
+        } else if fault == "old_certificate" {
+            assert_eq!(damaged["payload"]["certificate"]["schema_version"], "rsia.early_stop_certificate.v1");
+            damaged["payload"]["certificate"]["schema_version"] = json!("rsia.early_stop_certificate.v999");
+            "blocked_unknown_scope:formal_judgment_old_wire_or_domain"
+        } else {
+            // A separate unknown inner-wire fault; never a claimed v3 positive.
+            damaged["payload"]["schema_version"] = json!("rsia.formal_evaluation.v999");
+            "blocked_unknown_scope:formal_judgment_v3_wire_or_domain"
+        };
+        let source_body: serde_json::Value = serde_json::from_str(&ag163_body(&fx.store, &admin, "run", "S2").await).unwrap();
+        assert_eq!(source_body["schema_version"], "rsia.optimization.source.v1"); assert_eq!(source_body["record"]["id"], "S2");
+        let ticket_physical = ag163_sid("evaluation_ticket_v2", ticket);
+        let ticket_wire: serde_json::Value = serde_json::from_str(&ag163_body(&fx.store, &admin, "artifact", &ticket_physical).await).unwrap();
+        let binding = &ticket_wire["payload"]["candidate_dependency_binding"];
+        assert!(binding["sources"].as_array().unwrap().iter().any(|source| source["kind"] == "run" && source["id"] == "S2"));
+        let mut session = fx.store.session().await.unwrap();
+        assert!(session.dependents(&admin, "run", "S2").await.unwrap().contains(&("artifact".into(), binding["candidate_id"].as_str().unwrap().into())));
+        assert!(session.dependents(&admin, "artifact", binding["candidate_id"].as_str().unwrap()).await.unwrap().contains(&("artifact".into(), ticket_physical.clone())));
+        let original_report_edge = session.dependents(&admin, "artifact", &ticket_physical).await.unwrap()
+            .contains(&("artifact".into(), physical.clone()));
+        assert_eq!(original_report_edge, fault != "old_certificate",
+            "unknown-certificate test must retain the genuine missing Early edge");
+        session.commit().await.unwrap();
+        fx.store.close().await;
+        let mut connection = sqlx::sqlite::SqliteConnectOptions::new().filename(&fx.path)
+            .create_if_missing(false).disable_statement_logging().connect().await.unwrap();
+        let changed = sqlx::query("UPDATE objects SET body=? WHERE namespace=? AND kind='artifact' AND id=?")
+            .bind(serde_json::to_string(&damaged).unwrap()).bind(namespace).bind(&physical)
+            .execute(&mut connection).await.unwrap();
+        assert_eq!(changed.rows_affected(), 1);
+        connection.close().await.unwrap();
+        let mut owned = Store::open(&fx.path).await.unwrap();
+        let damaged_body = ag163_body(&owned, &admin, "artifact", &physical).await;
+        let before = ag163_image(&fx.path);
+        let mut status = LifecycleStore::begin_revoke(&admin, &owned, TypedObjectRef {
+            kind: "run".into(), id: "S2".into(),
+        }, "AG163 isolate unknown original inner judgment after real S2 revoke", evo_core::now().unwrap()).await.unwrap();
+        let revoked_before = ag163_image(&fx.path);
+        for old in before["tables"].as_array().unwrap().iter().filter(|table| table["name"].as_str().unwrap().starts_with("root_budget")) {
+            let unchanged = revoked_before["tables"].as_array().unwrap().iter().find(|table| table["name"] == old["name"]).unwrap();
+            assert!(old == unchanged, "logical revocation changed original complete budget facts");
+        }
+        let original_facts = read_control_plane_facts(&fx.path).await.unwrap();
+        if old_running { status = ag163_old_running_checkpoint(&mut owned, &fx.path, &admin, &status.job_id, &ticket_physical, &physical).await; }
+        for _ in 0..100 {
+            if matches!(status.state, evo_storage::lifecycle::CleanupState::Complete | evo_storage::lifecycle::CleanupState::Failed) { break; }
+            status = LifecycleStore::cleanup_step(&admin, &owned, &status.job_id, 16, evo_core::now().unwrap()).await.unwrap();
+        }
+        assert_eq!(status.state, evo_storage::lifecycle::CleanupState::Failed);
+        assert_eq!(status.last_error.as_deref(), Some(expected_error));
+        assert!(ag163_body(&owned, &admin, "artifact", &physical).await == damaged_body, "unknown inner version was rewritten or redacted");
+        let after = ag163_image(&fx.path);
+        ag163_original_report_was_expanded(&after, namespace, &status.job_id, &physical);
+        let legal_changes = ag163_preserves_original_rows(&revoked_before, &after);
+        let after_facts = read_control_plane_facts(&fx.path).await.unwrap();
+        assert!(after_facts.watermarks == original_facts.watermarks && after_facts.tombstones == original_facts.tombstones, "unknown-version cleanup changed committed revoke facts");
+        assert!(after_facts.root_budget_tables == original_facts.root_budget_tables, "unknown-version cleanup changed complete original paid/None/closed facts");
+        let mut expected_protected = original_facts.protected_objects.clone();
+        for (key, redacted) in legal_changes {
+            if PROTECTED_OBJECT_KINDS.contains(&key.1.as_str()) {
+                if let Some(value) = redacted { expected_protected.insert(key, value); } else { expected_protected.remove(&key); }
+            } else { expected_protected.remove(&key); }
+        }
+        assert!(after_facts.protected_objects == expected_protected, "unknown-version cleanup changed protected history beyond exact validated private-content transitions");
+    }
+    }
+}

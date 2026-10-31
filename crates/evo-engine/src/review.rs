@@ -281,6 +281,7 @@ pub struct StageView {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FormalIneligibilityReason {
+    SourceLegacy,
     ProgramFixtureNotProductionAuthority,
     IndependentProcessIsolationNotVerified,
     DependencyRevocationClosureUnverified,
@@ -940,11 +941,20 @@ async fn read_formal(
     projection: &mut Projection,
     id: &str,
 ) -> ReadResult<FormalView> {
-    envelope(ctx, session, set, "formal_evaluation_v2", id)
+    let report_envelope = envelope(ctx, session, set, "formal_evaluation_v2", id)
         .await
         .map_err(primary_error)?;
+    // Only a new inner wire needs its authenticated source-ticket identity
+    // before collecting materials. Old reports keep their original read order.
+    let derived_view = if report_envelope.payload.get("schema_version").is_some() {
+        Some(verified_report_view_in_session(ctx, session, id).await.map_err(formal_review_error)?)
+    } else { None };
+    let source_ticket_id = derived_view.as_ref().map_or(id, |view| view.ticket_id.as_str());
+    if derived_view.is_some() {
+        envelope(ctx, session, set, "formal_evaluation_v2", source_ticket_id).await?;
+    }
     let ticket: ReadEvaluationTicket = decode(
-        &envelope(ctx, session, set, "evaluation_ticket_v2", id)
+        &envelope(ctx, session, set, "evaluation_ticket_v2", source_ticket_id)
             .await?
             .payload,
     )?;
@@ -965,7 +975,7 @@ async fn read_formal(
             ticket.registration_id.as_str(),
         ),
         ("protected_holdout_v41", ticket.holdout_id.as_str()),
-        ("evaluation_ticket_issue_receipt_v1", id),
+        ("evaluation_ticket_issue_receipt_v1", source_ticket_id),
     ] {
         envelope(ctx, session, set, kind, reference).await?;
     }
@@ -1027,20 +1037,18 @@ async fn read_formal(
         )
         .await?;
     }
-    let view = verified_report_view_in_session(ctx, session, id)
-        .await
-        .map_err(|e| match e {
-            Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
-            Error::NotFound | Error::Forbidden => ReadFailure::Gap(ReviewGap::ReferenceUnavailable),
-            _ => ReadFailure::Gap(ReviewGap::MaterialInvalid),
-        })?;
+    let view = match derived_view {
+        Some(view) => view,
+        None => verified_report_view_in_session(ctx, session, id).await.map_err(formal_review_error)?,
+    };
     if view.variant == VerifiedReportVariant::CompleteBatch {
-        envelope(ctx, session, set, "evaluation_resource_evidence_v1", id).await?;
+        envelope(ctx, session, set, "evaluation_resource_evidence_v1", &view.ticket_id).await?;
     }
     let reasons = view
         .ineligibility_reasons
         .iter()
         .map(|r| match r.as_str() {
+            "source_legacy" => Ok(FormalIneligibilityReason::SourceLegacy),
             "program_fixture_not_production_authority" => {
                 Ok(FormalIneligibilityReason::ProgramFixtureNotProductionAuthority)
             }
@@ -1092,6 +1100,14 @@ async fn read_formal(
         promotion_eligible: view.promotion_eligible,
         ineligibility_reasons: reasons,
     })
+}
+
+fn formal_review_error(error: Error) -> ReadFailure {
+    match error {
+        Error::Internal | Error::ClockRegressed => ReadFailure::Internal,
+        Error::NotFound | Error::Forbidden => ReadFailure::Gap(ReviewGap::ReferenceUnavailable),
+        _ => ReadFailure::Gap(ReviewGap::MaterialInvalid),
+    }
 }
 
 fn unique_ids(values: &[String]) -> ReadResult<()> {
