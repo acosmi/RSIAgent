@@ -3895,13 +3895,14 @@ pub(crate) enum RegisteredCallSources {
     Missing,
     /// The `source_ids` of the reference: the closure registered when the call was
     /// reserved, the authoritative closure of the call. The reference is the one
-    /// `ensure_budget_call_ref` writes for this call: the id it is stored under, the
-    /// schema, and the namespace, billing scope and call id of the call itself, and
-    /// source ids that are identifiers in ascending order without repeats.
+    /// `ensure_budget_call_ref` writes for this call: its schema, the namespace,
+    /// billing scope and call id of the call itself, and source ids that are
+    /// identifiers in ascending order without repeats (its id is the key it is read
+    /// from, which the `objects` table checks against the body).
     Named(Vec<String>),
     /// A reference that decodes but is not the one `ensure_budget_call_ref` writes
-    /// for this call (it names another id, schema, namespace, billing scope or call,
-    /// or its `source_ids` are not identifiers in ascending order without repeats).
+    /// for this call (it names another schema, namespace, billing scope or call, or
+    /// its `source_ids` are not identifiers in ascending order without repeats).
     /// The revocation cleanup does not trust it and does not repair it; the legacy
     /// gates read its `source_ids` as before.
     Unqualified(Vec<String>),
@@ -3930,12 +3931,11 @@ pub(crate) async fn registered_call_source_ids(
     call_id: &str,
 ) -> Result<RegisteredCallSources> {
     let digest = fingerprint(&("rsia.budget_call_ref.v1", namespace, billing_scope, call_id))?;
-    let id = format!("budget-ref-{}", &digest[..32]);
     let body: Option<String> = sqlx::query_scalar(
         "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
     )
     .bind(namespace)
-    .bind(&id)
+    .bind(format!("budget-ref-{}", &digest[..32]))
     .fetch_optional(&mut **tx)
     .await
     .map_err(internal)?;
@@ -3944,8 +3944,7 @@ pub(crate) async fn registered_call_source_ids(
     };
     Ok(match serde_json::from_str::<BudgetCallRef>(&body) {
         Ok(reference)
-            if reference.id == id
-                && reference.schema_version == "rsia.budget_call_ref.v1"
+            if reference.schema_version == "rsia.budget_call_ref.v1"
                 && reference.namespace == namespace
                 && reference.billing_scope == billing_scope
                 && reference.call_id == call_id

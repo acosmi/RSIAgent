@@ -898,7 +898,7 @@ pub(crate) enum BudgetRequestSources {
 /// So is a call whose reference is stored but is not trusted
 /// (`unreadable_budget_call_ref:<schema>`): it does not decode, or it decodes and
 /// is not the call's own reference (`RegisteredCallSources::Unqualified`: another
-/// id, schema, namespace, billing scope or call, a source id that is not an
+/// schema, namespace, billing scope or call, a source id that is not an
 /// identifier, or `source_ids` not in ascending order without repeats). Its
 /// closure is neither trusted nor guessed at (whether it holds the revoked source
 /// is not asked) and the request is not read in its place (plan §11.5: isolate
