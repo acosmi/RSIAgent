@@ -5,17 +5,11 @@ use evo_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
-pub const MAX_RUNS: u64 = 1_000;
-pub const MAX_EVENTS: u64 = 10_000;
-pub const MAX_SKILLS: u64 = 1_000;
-pub const MAX_PREPARE: u64 = 5;
-
-// v4.1 capacity bounds
-pub const MAX_EXPLORATION_NODES: u64 = 500;
-pub const MAX_REPLAY_WORLDS: u64 = 100;
-pub const MAX_ACTIVE_LEASES: u64 = 10;
-pub const MAX_STAGED_PACKAGES: u64 = 20;
-pub const MAX_CONCURRENT_DISPATCH: u64 = 1;
+use evo_core::capacity::{CapacityConflict, CapacityItem};
+pub use evo_core::capacity::{
+    MAX_ACTIVE_LEASES, MAX_CONCURRENT_DISPATCH, MAX_EVENTS, MAX_EXPLORATION_NODES, MAX_PREPARE,
+    MAX_REPLAY_WORLDS, MAX_RUNS, MAX_SKILLS, MAX_STAGED_PACKAGES,
+};
 
 /// The 16-byte magic header every SQLite 3 database file starts with.
 const SQLITE_HEADER: [u8; 16] = *b"SQLite format 3\0";
@@ -29,14 +23,13 @@ pub struct Usage {
 }
 
 pub fn admit(u: Usage) -> Result<()> {
-    if u.runs >= MAX_RUNS
-        || u.events >= MAX_EVENTS
-        || u.skills >= MAX_SKILLS
-        || u.inflight_prepare >= MAX_PREPARE
-    {
-        return Err(Error::Conflict(
-            "MVP capacity exceeded; stop new derive and scale or clean up".into(),
-        ));
+    for (item, used) in [
+        (CapacityItem::Run, u.runs),
+        (CapacityItem::Event, u.events),
+        (CapacityItem::Skill, u.skills),
+        (CapacityItem::InflightPrepare, u.inflight_prepare),
+    ] {
+        item.admit(used, 1)?;
     }
     Ok(())
 }
@@ -152,12 +145,12 @@ impl CapacityField {
             CapacityField::Runs => "runs",
             CapacityField::Events => "events",
             CapacityField::Skills => "skills",
-            CapacityField::InflightPrepare => "in-flight prepare",
-            CapacityField::ExplorationNodes => "exploration nodes",
-            CapacityField::ReplayWorlds => "replay worlds",
-            CapacityField::ActiveLeases => "active leases",
-            CapacityField::StagedPackages => "staged packages",
-            CapacityField::ConcurrentDispatches => "concurrent dispatches",
+            CapacityField::InflightPrepare => "inflight_prepare",
+            CapacityField::ExplorationNodes => "exploration_nodes",
+            CapacityField::ReplayWorlds => "replay_worlds",
+            CapacityField::ActiveLeases => "active_leases",
+            CapacityField::StagedPackages => "staged_packages",
+            CapacityField::ConcurrentDispatches => "concurrent_dispatches",
         }
     }
 
@@ -199,18 +192,37 @@ impl CapacityField {
 /// The refusal is `Error::Conflict` (HTTP 409 / MCP `conflict` / job error
 /// code `conflict`) and names the counter and both numbers.
 pub fn admit_field(field: CapacityField, used: u64, limits: &CapacityLimits) -> Result<()> {
+    let item = match field {
+        CapacityField::Runs => CapacityItem::Run,
+        CapacityField::Events => CapacityItem::Event,
+        CapacityField::Skills => CapacityItem::Skill,
+        CapacityField::InflightPrepare => CapacityItem::InflightPrepare,
+        CapacityField::ExplorationNodes => CapacityItem::ExplorationNode,
+        CapacityField::ReplayWorlds => CapacityItem::ReplayWorld,
+        CapacityField::ActiveLeases => CapacityItem::ActiveLease,
+        CapacityField::StagedPackages => CapacityItem::StagingPackage,
+        CapacityField::ConcurrentDispatches => CapacityItem::ConcurrentManagementDispatch,
+    };
     let limit = field.limit(limits);
-    let label = field.label();
-    match field {
-        CapacityField::ConcurrentDispatches if used > limit => Err(Error::Conflict(format!(
-            "MVP capacity exceeded: {label} {used} > limit {limit}"
-        ))),
-        CapacityField::ConcurrentDispatches => Ok(()),
-        _ if used >= limit => Err(Error::Conflict(format!(
-            "MVP capacity exceeded: {label} {used} >= limit {limit}"
-        ))),
-        _ => Ok(()),
+    let existing = if field == CapacityField::ConcurrentDispatches {
+        used.saturating_sub(1)
+    } else {
+        used
+    };
+    let refused = if field == CapacityField::ConcurrentDispatches {
+        used > limit
+    } else {
+        used >= limit
+    };
+    if refused {
+        return Err(Error::Capacity(CapacityConflict {
+            item,
+            used: existing,
+            limit,
+            delta: 1,
+        }));
     }
+    Ok(())
 }
 
 /// Admit every counter of `usage` against `limits`.

@@ -144,6 +144,13 @@ fn decode<T: serde::de::DeserializeOwned>(v: Value) -> Result<T> {
     serde_json::from_value(v)
         .map_err(|_| Error::Conflict("stored authority schema is unreadable; quarantine".into()))
 }
+async fn admit_external_registration(s: &mut Session, ctx: &Context, id: &str) -> Result<()> {
+    if s.object_row(ctx, "artifact", id).await?.is_none() {
+        s.admit_capacity(&[(evo_core::capacity::CapacityItem::ExternalService, 1)])
+            .await?;
+    }
+    Ok(())
+}
 async fn immutable<T: Serialize>(
     s: &mut Session,
     ctx: &Context,
@@ -3475,6 +3482,7 @@ impl FormalRegistry {
         .await?;
         host.validate(ctx)?;
         require_registered_admin(&mut s, ctx, &host).await?;
+        admit_external_registration(&mut s, ctx, &meter.id).await?;
         immutable(&mut s, ctx, "artifact", &meter.id, &meter).await?;
         attest_content(&mut s, ctx, "artifact", &meter.id, &meter).await?;
         s.put_edge(ctx, "artifact", &meter.id, "artifact", &host.id)
@@ -3521,6 +3529,7 @@ impl FormalRegistry {
         if provider.credential_principal != host.host_principal {
             return Err(Error::Forbidden);
         }
+        admit_external_registration(&mut s, ctx, &provider.id).await?;
         immutable(&mut s, ctx, "artifact", &provider.id, &provider).await?;
         attest_content(&mut s, ctx, "artifact", &provider.id, &provider).await?;
         s.put_edge(ctx, "artifact", &provider.id, "artifact", &host.id)
@@ -9731,6 +9740,7 @@ impl ProviderSourceInSession<'_> {
         {
             return Err(Error::Forbidden);
         }
+        admit_external_registration(self.session, self.ctx, &record.id).await?;
         immutable(self.session, self.ctx, "artifact", &record.id, &record).await?;
         attest_content(self.session, self.ctx, "artifact", &record.id, &record).await?;
         self.session

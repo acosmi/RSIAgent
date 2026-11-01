@@ -647,16 +647,10 @@ pub struct MetaTrialCoordinator;
 impl MetaTrialCoordinator {
     /// Records the trial and registers its two worlds, old stream first.
     ///
-    /// Not one transaction. The trial record and its dependency edges are
-    /// written together; the worlds are then registered through the existing
-    /// registration, which opens its own transaction (the store has a single
-    /// connection, so it cannot be nested in another session) and whose
-    /// persistence stays in `exploration.rs` instead of being copied here. A
-    /// crash in between leaves a trial without all of its worlds, and
-    /// replaying the same request converges: the stored trial must equal the
-    /// request's, and each world is registered only when it is absent and
-    /// verified against the trial when it is present. A trial is never
-    /// reported live without both worlds ([`verified_meta_trial`]).
+    /// The trial, its missing worlds and dependency edges are admitted and
+    /// written in one Session. Legacy partial forks resume with only their
+    /// actual missing identities; existing worlds must match the registration.
+    /// A trial is never reported live without both worlds.
     ///
     /// The registration fingerprint excludes the budget counters `run_next`
     /// spends; idempotent registration checks the initial budget separately.
@@ -685,102 +679,108 @@ impl MetaTrialCoordinator {
             .await?
             .ok_or(Error::Budget)?;
         let coordinator = PersistentCoordinator::new(store.clone(), ctx.clone(), ctx.actor())?;
-        // A world id the trial derives may already be taken. It is only
-        // acceptable when it already is exactly this stream's world; anything
-        // else stops the fork before a trial is recorded over it.
-        for stream in MetaStream::BOTH {
-            let id = &plan.world(stream).id;
-            if world_is_stored(ctx, store, id).await? {
-                let stored = coordinator.registered_world(id).await?;
-                plan.trial.check_stream_world(stream, &stored)?;
+        let mut session = store.session().await?;
+        validate_stored_sources(
+            &mut session,
+            ctx,
+            &plan.trial.source_closure,
+            plan.trial.revoke_watermark,
+        )
+        .await?;
+        let existing = get_record::<MetaTrialV1>(
+            &mut session,
+            ctx,
+            META_TRIAL_RECORD_KIND,
+            &plan.trial.trial_id,
+        )
+        .await?;
+        if let Some(existing) = &existing {
+            existing.validate().map_err(stored_trial_invalid)?;
+            if existing.registration_fingerprint()? != plan.trial.registration_fingerprint()? {
+                return Err(Error::Conflict(
+                    "meta trial already exists with different content".into(),
+                ));
             }
         }
-        let trial = persist_trial(ctx, store, &plan.trial).await?;
+        let mut missing_worlds = Vec::new();
         for stream in MetaStream::BOTH {
-            let world = plan.world(stream);
-            if !world_is_stored(ctx, store, &world.id).await? {
-                coordinator.register_world_idempotent(world.clone()).await?;
+            let requested = plan.world(stream);
+            crate::exploration::check_world_live(&mut session, ctx, requested).await?;
+            match get_record::<ExplorationWorldV1>(
+                &mut session,
+                ctx,
+                "exploration_world_v1",
+                &requested.id,
+            )
+            .await?
+            {
+                Some(stored) => {
+                    stored.validate()?;
+                    plan.trial.check_stream_world(stream, &stored)?;
+                    crate::exploration::ensure_registered_as(&mut session, ctx, &stored, requested)
+                        .await?;
+                }
+                None => missing_worlds.push(requested),
             }
         }
+        session
+            .admit_capacity(&[
+                (
+                    evo_core::capacity::CapacityItem::MetaTrial,
+                    u64::from(existing.is_none()),
+                ),
+                (
+                    evo_core::capacity::CapacityItem::ExplorationWorld,
+                    missing_worlds.len() as u64,
+                ),
+            ])
+            .await?;
+        let new_trial = existing.is_none();
+        let trial = existing.unwrap_or_else(|| plan.trial.clone());
+        if missing_worlds.is_empty() && !new_trial {
+            session.commit().await?;
+            return Ok(trial);
+        }
+        if new_trial {
+            put_record(
+                &mut session,
+                ctx,
+                META_TRIAL_RECORD_KIND,
+                &trial.trial_id,
+                ctx.actor(),
+                &trial,
+            )
+            .await?;
+        }
+        for world in missing_worlds {
+            coordinator
+                .persist_world_registration(&mut session, world)
+                .await?;
+        }
+        let trial_storage_id = storage_id(META_TRIAL_RECORD_KIND, &trial.trial_id)?;
+        for run in &trial.source_closure {
+            session
+                .put_edge(ctx, "artifact", &trial_storage_id, "run", run)
+                .await?;
+        }
+        for stream in MetaStream::BOTH {
+            session
+                .put_edge(
+                    ctx,
+                    "artifact",
+                    &trial_storage_id,
+                    "artifact",
+                    &exploration_world_storage_id(trial.stream_world_id(stream))?,
+                )
+                .await?;
+        }
+        session.commit().await?;
         // What the fork returns is a trial whose record and both worlds read back
         // as the fork it made. The ledger is not read here: a stream billed
         // outside the trial's billing scope is refused by `verified_meta_trial`.
         load_verified(ctx, store, &trial.trial_id).await?;
         Ok(trial)
     }
-}
-
-async fn world_is_stored(ctx: &Context, store: &Store, world_id: &str) -> Result<bool> {
-    let mut session = store.session().await?;
-    let stored = session
-        .get::<serde_json::Value>(ctx, "artifact", &exploration_world_storage_id(world_id)?)
-        .await?
-        .is_some();
-    session.commit().await?;
-    Ok(stored)
-}
-
-/// Writes the trial record at most once and its dependency edges. A stored
-/// record must equal the request's registration (`created_at` aside) or the
-/// call is a `Conflict`. The edges (`trial -> each source run`, `trial -> each
-/// world`) are what carry a revoked run to the record: the cleanup walks
-/// dependents. They are written in the transaction of the record, and
-/// `put_edge` ignores a repeat.
-async fn persist_trial(ctx: &Context, store: &Store, trial: &MetaTrialV1) -> Result<MetaTrialV1> {
-    let mut session = store.session().await?;
-    // No trial is recorded over a closure that is already revoked or missing.
-    validate_stored_sources(
-        &mut session,
-        ctx,
-        &trial.source_closure,
-        trial.revoke_watermark,
-    )
-    .await?;
-    let stored =
-        match get_record::<MetaTrialV1>(&mut session, ctx, META_TRIAL_RECORD_KIND, &trial.trial_id)
-            .await?
-        {
-            Some(existing) => {
-                existing.validate().map_err(stored_trial_invalid)?;
-                if existing.registration_fingerprint()? != trial.registration_fingerprint()? {
-                    return Err(Error::Conflict(
-                        "meta trial already exists with different content".into(),
-                    ));
-                }
-                existing
-            }
-            None => {
-                put_record(
-                    &mut session,
-                    ctx,
-                    META_TRIAL_RECORD_KIND,
-                    &trial.trial_id,
-                    ctx.actor(),
-                    trial,
-                )
-                .await?;
-                trial.clone()
-            }
-        };
-    let trial_storage_id = storage_id(META_TRIAL_RECORD_KIND, &stored.trial_id)?;
-    for run in &stored.source_closure {
-        session
-            .put_edge(ctx, "artifact", &trial_storage_id, "run", run)
-            .await?;
-    }
-    for stream in MetaStream::BOTH {
-        session
-            .put_edge(
-                ctx,
-                "artifact",
-                &trial_storage_id,
-                "artifact",
-                &exploration_world_storage_id(stored.stream_world_id(stream))?,
-            )
-            .await?;
-    }
-    session.commit().await?;
-    Ok(stored)
 }
 
 /// Reloads the trial and both worlds and re-checks them: the record agrees with

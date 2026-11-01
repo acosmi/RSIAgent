@@ -395,6 +395,24 @@ impl FixtureJournal {
 
 #[async_trait]
 impl OptimizationJournal for FixtureJournal {
+    async fn claim_optimization_job(
+        &self,
+        intent: evo_engine::optimization::OptimizationJobIntent,
+    ) -> Result<Vec<StageFact>> {
+        let (store, context) = self.current_store.as_ref().ok_or(Error::Forbidden)?;
+        let journal = evo_engine::optimization::StoreOptimizationJournal::new(
+            store.clone(),
+            context.clone(),
+            context.actor(),
+        )?;
+        let facts = journal.claim_optimization_job(intent).await?;
+        self.recovery_facts
+            .lock()
+            .unwrap()
+            .extend(facts.iter().cloned());
+        Ok(facts)
+    }
+
     async fn current_compiler_inputs(
         &self,
         request: &evo_engine::formal_authority::CompilerInputRequest,
@@ -891,6 +909,22 @@ struct CrashJournal {
 }
 #[async_trait]
 impl OptimizationJournal for CrashJournal {
+    async fn claim_optimization_job(
+        &self,
+        intent: evo_engine::optimization::OptimizationJobIntent,
+    ) -> Result<Vec<StageFact>> {
+        if (self.kind == StageFactKind::StepPrepared
+            && self.stage == OptimizationJournalStage::Merge)
+            || self.failed.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(Error::Conflict(
+                "fixture crash before durable commit".into(),
+            ));
+        }
+        self.inner.claim_optimization_job(intent).await
+    }
+
     async fn current_compiler_inputs(
         &self,
         request: &evo_engine::formal_authority::CompilerInputRequest,
@@ -2043,4 +2077,550 @@ con.close();print(json.dumps(image,sort_keys=True))
             store.close().await;
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum CapacityStageCase {
+    Substitution,
+    Recovery,
+    Versions,
+}
+
+#[tokio::test]
+async fn server_job_scope_rejects_group_or_request_substitution_before_claim() {
+    exercise_capacity_stage(CapacityStageCase::Substitution).await;
+}
+#[tokio::test]
+async fn job_scope_reopen_reuses_claims_and_never_redispatches_unknown_work() {
+    exercise_capacity_stage(CapacityStageCase::Recovery).await;
+}
+#[tokio::test]
+async fn stage_v1_v2_history_preserves_original_ids_and_authority_split() {
+    exercise_capacity_stage(CapacityStageCase::Versions).await;
+}
+async fn exercise_capacity_stage(case: CapacityStageCase) {
+    let evidence = optimization_evidence();
+    let parent = SkillSnapshot {
+        content: "old".into(),
+        applicability: "applies".into(),
+        counterexample: "counter".into(),
+        required_capabilities: vec![],
+        dependencies: vec![],
+    };
+    let baseline = parent.clone();
+    let allowed = [
+        EvidenceRef {
+            id: "run-failure".into(),
+            digest: hash(b"run-failure"),
+        },
+        EvidenceRef {
+            id: "run-success".into(),
+            digest: hash(b"run-success"),
+        },
+    ];
+    let edit_context = TrustedEditContext::new(
+        "tenant",
+        "profile-a",
+        "skill-a",
+        "v1",
+        hash(b"parent"),
+        hash(b"baseline"),
+        &parent,
+        allowed.clone(),
+    )
+    .unwrap();
+    let edit_template = SkillEditBatch {
+        schema_version: SKILL_EDIT_SCHEMA.into(),
+        compiler_version: SKILL_EDIT_COMPILER_VERSION.into(),
+        namespace: "tenant".into(),
+        profile_id: "profile-a".into(),
+        skill_id: "skill-a".into(),
+        skill_version: "v1".into(),
+        input_digest: skill_snapshot_digest(&parent).unwrap(),
+        approved_parent_digest: hash(b"parent"),
+        safe_baseline_digest: hash(b"baseline"),
+        evidence: EvidenceClosure {
+            support: vec![],
+            counterexamples: vec![],
+            dependencies: vec![],
+        },
+        edits: vec![],
+    };
+    let profile = Profile {
+        id: "profile-a".into(),
+        evolution_enabled: true,
+        parent_digest: hash(b"parent"),
+        baseline_digest: hash(b"baseline"),
+    };
+    let parent_strategy = Strategy::default();
+    let baseline_strategy = Strategy::default();
+    let improver_patch = ImproverPatch::default();
+    let caps = HostCapabilities {
+        available: BTreeSet::new(),
+        granted: BTreeSet::new(),
+    };
+    let revoked = BTreeSet::new();
+    let directory = tempfile::tempdir().unwrap();
+    let current_store = Store::open(&directory.path().join("fixture-journal.sqlite3"))
+        .await
+        .unwrap();
+    let current_context = Context::new("tenant", "worker", Role::Worker).unwrap();
+    let journal = StoreOptimizationJournal::new(
+        current_store.clone(),
+        current_context.clone(),
+        current_context.actor(),
+    )
+    .unwrap();
+    let source_selection = SourceSelection {
+        roots: vec![],
+        run_ids: vec!["run-failure".into(), "run-success".into()],
+        purpose: Purpose::Development,
+        allow_model_excerpts: true,
+    };
+    let source_bindings = vec![
+        TrustedSourceBinding {
+            source_id: "run-failure".into(),
+            source_digest: hash(b"run-failure"),
+            parent_family: "family-a".into(),
+        },
+        TrustedSourceBinding {
+            source_id: "run-success".into(),
+            source_digest: hash(b"run-success"),
+            parent_family: "family-b".into(),
+        },
+    ];
+    let make_request = || {
+        trusted_compiler_inputs::request(OptimizationStepRequest {
+            evidence: &evidence,
+            source_selection: &source_selection,
+            source_bindings: &source_bindings,
+            traces: vec![
+                optimization_trace("run-failure", "family-a", TraceOutcome::TaskFailure),
+                optimization_trace("run-success", "family-b", TraceOutcome::Success),
+            ],
+            model_context: ModelRequestContext {
+                request_id: "optimizer-request".into(),
+                namespace: "tenant".into(),
+                purpose: Purpose::Development,
+                stage: ModelStage::ReflectFailure,
+                episode_id: "episode-a".into(),
+                step: 1,
+                attempt: 1,
+                parent_skill_digest: skill_snapshot_digest(&parent).unwrap(),
+                bundle_digest: hash(b"parent-bundle"),
+                source_closure: allowed.to_vec(),
+                model_digest: hash(b"fixture-model"),
+                tools_digest: hash(b"tools"),
+                rules_digest: hash(b"rules"),
+                sampling_digest: hash(b"sampling"),
+                revoke_watermark: 1,
+                max_suggestions: 4,
+            },
+            parent_skill: &parent,
+            edit_context: &edit_context,
+            edit_batch_template: edit_template.clone(),
+            protected_ranges: &[],
+            bundle_context: BundleCompileContext {
+                profile: &profile,
+                baseline: &baseline,
+                parent_strategy: &parent_strategy,
+                baseline_strategy: &baseline_strategy,
+                improver_patch: &improver_patch,
+                caps: &caps,
+                revoked: &revoked,
+            },
+            development_request: run_request(),
+            allow_rank_call: false,
+        })
+    };
+    // Install the real source/grant closure and advance its own durable
+    // watermark once, using the original fixture producer and Clock.
+    seed_authority(&current_store, &make_request()).await;
+    ag138_run_stage_case(
+        case,
+        &current_store,
+        &current_context,
+        &journal,
+        &make_request,
+        &directory.path().join("fixture-journal.sqlite3"),
+    )
+    .await;
+    drop(journal);
+    current_store.close().await;
+}
+
+fn ag138_stage_sql_image(path: &std::path::Path) -> serde_json::Value {
+    let script = r#"
+import json,sqlite3,sys
+c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+quote=lambda x:'"'+x.replace('"','""')+'"'
+r={}
+for (n,) in c.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+    width=len(c.execute('PRAGMA table_info('+quote(n)+')').fetchall())
+    r[n]=[[{'blob':v.hex()} if isinstance(v,bytes) else v for v in row] for row in c.execute('SELECT * FROM '+quote(n)+' ORDER BY '+','.join(str(i+1) for i in range(width)))]
+c.close();print(json.dumps(r,sort_keys=True))
+"#;
+    let output = std::process::Command::new("python3")
+        .args(["-B", "-c", script])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+async fn ag138_run_stage_case<'a>(
+    case: CapacityStageCase,
+    store: &Store,
+    worker: &Context,
+    journal: &StoreOptimizationJournal,
+    request: &impl Fn() -> OptimizationStepRequest<'a>,
+    path: &std::path::Path,
+) {
+    use evo_core::capacity::CapacityItem;
+    use evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2;
+    use std::sync::atomic::Ordering::SeqCst;
+    match case {
+        CapacityStageCase::Substitution => {
+            let crash = CrashJournal {
+                inner: StoreOptimizationJournal::new(store.clone(), worker.clone(), worker.actor())
+                    .unwrap(),
+                kind: StageFactKind::StepCompleted,
+                stage: OptimizationJournalStage::Merge,
+                failed: Default::default(),
+            };
+            let model = CountModel::default();
+            let runner = CountRunner::default();
+            assert!(
+                run_optimization_step(Some(&model), Some(&runner), Some(&crash), request())
+                    .await
+                    .is_err()
+            );
+            assert_eq!((model.0.load(SeqCst), runner.0.load(SeqCst)), (2, 1));
+            let mut s = store.session().await.unwrap();
+            let values: Vec<serde_json::Value> = s.list(worker, "artifact").await.unwrap();
+            let original = values
+                .into_iter()
+                .find(|v| v["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA_V2)
+                .unwrap();
+            s.commit().await.unwrap();
+            let mut forged: StageFact = serde_json::from_value(original.clone()).unwrap();
+            forged.payload["job_scope"]["groups"][0]["request_id"] =
+                serde_json::json!("substitute-request");
+            forged.output_digest = Some(evo_core::fingerprint(&forged.payload).unwrap());
+            let before = ag138_stage_sql_image(path);
+            assert!(matches!(journal.claim(forged).await, Err(Error::Forbidden)));
+            assert_eq!(ag138_stage_sql_image(path), before);
+            let mut changed = request();
+            changed.allow_rank_call = true;
+            assert!(matches!(
+                run_optimization_step(Some(&model), Some(&runner), Some(journal), changed).await,
+                Err(Error::Conflict(_))
+            ));
+            assert_eq!(ag138_stage_sql_image(path), before);
+            assert_eq!((model.0.load(SeqCst), runner.0.load(SeqCst)), (2, 1));
+            let mut s = store.session().await.unwrap();
+            assert_eq!(
+                s.need::<serde_json::Value>(
+                    worker,
+                    "artifact",
+                    original["artifact_id"].as_str().unwrap()
+                )
+                .await
+                .unwrap(),
+                original
+            );
+            s.commit().await.unwrap();
+        }
+        CapacityStageCase::Recovery => {
+            let crash = CrashJournal {
+                inner: StoreOptimizationJournal::new(store.clone(), worker.clone(), worker.actor())
+                    .unwrap(),
+                kind: StageFactKind::DispatchObserved,
+                stage: OptimizationJournalStage::ReflectFailure,
+                failed: Default::default(),
+            };
+            let model = CountModel::default();
+            let runner = CountRunner::default();
+            assert!(
+                run_optimization_step(Some(&model), Some(&runner), Some(&crash), request())
+                    .await
+                    .is_err()
+            );
+            assert_eq!((model.0.load(SeqCst), runner.0.load(SeqCst)), (1, 0));
+            let mut s = store.session().await.unwrap();
+            let values: Vec<serde_json::Value> = s.list(worker, "artifact").await.unwrap();
+            let prepared = values
+                .into_iter()
+                .find(|v| v["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA_V2)
+                .unwrap();
+            s.commit().await.unwrap();
+            drop(crash);
+            store.close().await;
+            let reopened = Store::open(path).await.unwrap();
+            let journal =
+                StoreOptimizationJournal::new(reopened.clone(), worker.clone(), worker.actor())
+                    .unwrap();
+            let model = CountModel::default();
+            let runner = CountRunner::default();
+            assert!(matches!(
+                run_optimization_step(Some(&model), Some(&runner), Some(&journal), request())
+                    .await
+                    .unwrap(),
+                OptimizationStepOutcome::Uncertain { .. }
+            ));
+            assert_eq!((model.0.load(SeqCst), runner.0.load(SeqCst)), (0, 0));
+            let mut s = reopened.session().await.unwrap();
+            assert_eq!(
+                s.need::<serde_json::Value>(
+                    worker,
+                    "artifact",
+                    prepared["artifact_id"].as_str().unwrap()
+                )
+                .await
+                .unwrap(),
+                prepared
+            );
+            assert_eq!(
+                s.capacity_used(CapacityItem::ConcurrentOptimizationJob)
+                    .await
+                    .unwrap(),
+                1
+            );
+            s.commit().await.unwrap();
+            let before = ag138_stage_sql_image(path);
+            assert!(matches!(
+                run_optimization_step(None, None, Some(&journal), request())
+                    .await
+                    .unwrap(),
+                OptimizationStepOutcome::Uncertain { .. }
+            ));
+            assert_eq!(ag138_stage_sql_image(path), before);
+            let admin = Context::new(worker.namespace(), "admin", Role::Admin).unwrap();
+            ag138_finish_source_cleanup(&reopened, &admin).await;
+            let mut check = reopened.session().await.unwrap();
+            assert_eq!(
+                check
+                    .capacity_used(CapacityItem::ConcurrentOptimizationJob)
+                    .await
+                    .unwrap(),
+                1,
+                "cleanup cannot release a group which actually dispatched with unknown outcome"
+            );
+            check.commit().await.unwrap();
+            drop(journal);
+            reopened.close().await;
+
+            let cancelled_path = path.with_file_name("cancelled.sqlite3");
+            let cancelled = Store::open(&cancelled_path).await.unwrap();
+            seed_authority(&cancelled, &request()).await;
+            let crash = CrashJournal {
+                inner: StoreOptimizationJournal::new(
+                    cancelled.clone(),
+                    worker.clone(),
+                    worker.actor(),
+                )
+                .unwrap(),
+                kind: StageFactKind::RequestPrepared,
+                stage: OptimizationJournalStage::ReflectFailure,
+                failed: Default::default(),
+            };
+            let model = CountModel::default();
+            let runner = CountRunner::default();
+            assert!(
+                run_optimization_step(Some(&model), Some(&runner), Some(&crash), request())
+                    .await
+                    .is_err()
+            );
+            assert_eq!((model.0.load(SeqCst), runner.0.load(SeqCst)), (0, 0));
+            let mut check = cancelled.session().await.unwrap();
+            let all: Vec<serde_json::Value> = check.list(worker, "artifact").await.unwrap();
+            let prepared = all
+                .into_iter()
+                .find(|v| v["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA_V2)
+                .unwrap();
+            let id = prepared["artifact_id"].as_str().unwrap();
+            let forged = evo_storage::lifecycle::redacted_object_body(
+                "artifact",
+                id,
+                &prepared,
+                &serde_json::to_string(&prepared).unwrap(),
+            );
+            check
+                .put(worker, "artifact", id, worker.actor(), &forged)
+                .await
+                .unwrap();
+            check.commit().await.unwrap();
+            let mut check = cancelled.session().await.unwrap();
+            assert_eq!(
+                check
+                    .capacity_used(CapacityItem::ConcurrentOptimizationJob)
+                    .await
+                    .unwrap(),
+                1,
+                "a redacted tag is not completed cleanup"
+            );
+            check
+                .put(worker, "artifact", id, worker.actor(), &prepared)
+                .await
+                .unwrap();
+            check.commit().await.unwrap();
+            ag138_finish_source_cleanup(&cancelled, &admin).await;
+            let mut check = cancelled.session().await.unwrap();
+            let clean: serde_json::Value = check.need(worker, "artifact", id).await.unwrap();
+            assert_eq!(clean["schema_version"], "rsia.redacted.v1");
+            assert_eq!(
+                check
+                    .capacity_used(CapacityItem::ConcurrentOptimizationJob)
+                    .await
+                    .unwrap(),
+                0,
+                "real no-dispatch source cancellation closes the slot"
+            );
+            let all: Vec<serde_json::Value> = check.list(worker, "artifact").await.unwrap();
+            assert!(!all.iter().any(
+                |v| v["kind"] == "step_completed" || v["metadata"]["kind"] == "step_completed"
+            ));
+            let mut changed = clean.clone();
+            changed["metadata"]["input_digest"] = serde_json::json!(hash(b"forged scope"));
+            changed["metadata"]["job_scope"]["groups"][0]["input_digest"] =
+                serde_json::json!(hash(b"forged scope"));
+            check
+                .put(worker, "artifact", id, worker.actor(), &changed)
+                .await
+                .unwrap();
+            check.commit().await.unwrap();
+            let mut check = cancelled.session().await.unwrap();
+            assert_eq!(
+                check
+                    .capacity_used(CapacityItem::ConcurrentOptimizationJob)
+                    .await
+                    .unwrap(),
+                1,
+                "cleanup evidence binds the original complete scope"
+            );
+            check
+                .put(worker, "artifact", id, worker.actor(), &clean)
+                .await
+                .unwrap();
+            check.commit().await.unwrap();
+            let mut check = cancelled.session().await.unwrap();
+            assert_eq!(
+                check
+                    .capacity_used(CapacityItem::ConcurrentOptimizationJob)
+                    .await
+                    .unwrap(),
+                0
+            );
+            check.commit().await.unwrap();
+            assert_eq!((model.0.load(SeqCst), runner.0.load(SeqCst)), (0, 0));
+            drop(crash);
+            cancelled.close().await;
+        }
+        CapacityStageCase::Versions => {
+            let legacy = StageFact {
+                schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+                artifact_id: String::new(),
+                namespace: worker.namespace().into(),
+                episode_id: "legacy-episode".into(),
+                step: 1,
+                attempt: 1,
+                stage: OptimizationJournalStage::ReflectFailure,
+                kind: StageFactKind::RequestPrepared,
+                request_id: "legacy-request".into(),
+                input_digest: hash(b"legacy input"),
+                output_digest: None,
+                dependencies: vec![],
+                payload: serde_json::json!({"original_legacy":"software_history"}),
+            }
+            .seal()
+            .unwrap();
+            journal.commit(legacy.clone()).await.unwrap();
+            let mut s = store.session().await.unwrap();
+            let raw = s
+                .object_row(worker, "artifact", &legacy.artifact_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .body;
+            s.commit().await.unwrap();
+            assert!(matches!(
+                run_optimization_step(
+                    Some(&EditingFixtureModelPort),
+                    Some(&FixtureDevRunner),
+                    Some(journal),
+                    request()
+                )
+                .await
+                .unwrap(),
+                OptimizationStepOutcome::CurrentCandidate { .. }
+            ));
+            let mut s = store.session().await.unwrap();
+            assert_eq!(
+                s.object_row(worker, "artifact", &legacy.artifact_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .body,
+                raw
+            );
+            let values: Vec<serde_json::Value> = s.list(worker, "artifact").await.unwrap();
+            let current = values
+                .iter()
+                .find(|v| v["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA_V2)
+                .unwrap();
+            assert_ne!(current["artifact_id"], legacy.artifact_id);
+            assert_eq!(current["kind"], "step_prepared");
+            assert_eq!(
+                current["payload"]["job_scope"]["groups"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                current["payload"]["job_scope"]["groups"][0]["request_id"],
+                request().model_context.request_id
+            );
+            assert_eq!(
+                s.capacity_used(CapacityItem::ConcurrentOptimizationJob)
+                    .await
+                    .unwrap(),
+                0
+            );
+            s.commit().await.unwrap();
+            let wire =
+                serde_json::to_value(journal.reload(&legacy.artifact_id).await.unwrap()).unwrap();
+            assert_eq!(wire["schema_version"], OPTIMIZATION_STAGE_FACT_SCHEMA);
+            assert_eq!(wire["payload"], legacy.payload);
+        }
+    }
+}
+
+async fn ag138_finish_source_cleanup(store: &Store, admin: &Context) {
+    use evo_engine::lifecycle::LifecycleCoordinator;
+    use evo_storage::lifecycle::CleanupState;
+    let now = evo_core::now().unwrap();
+    let mut status = LifecycleCoordinator::revoke_source(
+        admin,
+        store,
+        "run-failure",
+        "capacity source cancellation",
+        now,
+    )
+    .await
+    .unwrap();
+    for _ in 0..100 {
+        if status.state == CleanupState::Complete {
+            break;
+        }
+        status = LifecycleCoordinator::continue_cleanup(admin, store, &status.job_id, 64, now)
+            .await
+            .unwrap();
+    }
+    assert_eq!(status.state, CleanupState::Complete, "{status:?}");
 }

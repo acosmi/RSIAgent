@@ -1056,8 +1056,11 @@ async fn eleventh_live_lease_is_refused_and_released_or_expired_leases_do_not_co
         .reserve_budget_call(&worker, &reservation("lease-10", 10, 2))
         .await
     {
-        Err(Error::Conflict(msg)) => {
-            assert_eq!(msg, "MVP capacity exceeded: active leases 10 >= limit 10")
+        Err(Error::Capacity(detail)) => {
+            assert_eq!(
+                (detail.item, detail.used, detail.limit, detail.delta),
+                (evo_core::capacity::CapacityItem::ActiveLease, 10, 10, 1)
+            );
         }
         other => panic!("expected the MVP active lease conflict, got {other:?}"),
     }
@@ -1102,7 +1105,7 @@ async fn eleventh_live_lease_is_refused_and_released_or_expired_leases_do_not_co
         store
             .reserve_budget_call(&worker, &reservation("lease-11", 10, 4))
             .await,
-        Err(Error::Conflict(_))
+        Err(Error::Capacity(detail)) if detail.item==evo_core::capacity::CapacityItem::ActiveLease && (detail.used,detail.limit,detail.delta)==(10,10,1)
     ));
     let after_expiry = store
         .reserve_budget_call(&worker, &reservation("lease-11", 10, 500))
@@ -1139,8 +1142,11 @@ async fn lease_capacity_cannot_be_split_across_namespaces() {
         .reserve_budget_call(&worker_b, &reservation("split-b", 10, 2))
         .await
     {
-        Err(Error::Conflict(msg)) => {
-            assert_eq!(msg, "MVP capacity exceeded: active leases 10 >= limit 10")
+        Err(Error::Capacity(detail)) => {
+            assert_eq!(
+                (detail.item, detail.used, detail.limit, detail.delta),
+                (evo_core::capacity::CapacityItem::ActiveLease, 10, 10, 1)
+            );
         }
         other => panic!("ns-b must not get an eleventh lease, got {other:?}"),
     }
@@ -1432,9 +1438,12 @@ async fn ag054_reserve_root_group_namespace_revocation_and_capacity_keep_legacy_
                 Error::Conflict("dispatch_group_owned_by_different_namespace".into())
             }
             "source_revoked" => Error::Forbidden,
-            "active_lease_capacity" => {
-                Error::Conflict("MVP capacity exceeded: active leases 10 >= limit 10".into())
-            }
+            "active_lease_capacity" => Error::Capacity(evo_core::capacity::CapacityConflict {
+                item: evo_core::capacity::CapacityItem::ActiveLease,
+                used: 10,
+                limit: 10,
+                delta: 1,
+            }),
             _ => unreachable!(),
         };
         compare_reserve_refusal(&store, &worker, &request, &sources, mode, expected).await;

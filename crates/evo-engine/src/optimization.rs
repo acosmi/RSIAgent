@@ -466,6 +466,7 @@ pub async fn run_development(
 }
 
 pub const OPTIMIZATION_STAGE_FACT_SCHEMA: &str = "rsia.optimization.stage_fact.v1";
+pub const OPTIMIZATION_STAGE_FACT_SCHEMA_V2: &str = "rsia.optimization.stage_fact.v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -539,10 +540,32 @@ impl StageFact {
         Ok(self)
     }
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != OPTIMIZATION_STAGE_FACT_SCHEMA {
+        if !matches!(
+            self.schema_version.as_str(),
+            OPTIMIZATION_STAGE_FACT_SCHEMA | OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+        ) {
             return Err(Error::Invalid(
                 "unsupported optimization stage fact schema".into(),
             ));
+        }
+        if self.schema_version == OPTIMIZATION_STAGE_FACT_SCHEMA_V2 {
+            let scope: OptimizationJobScopeV2 =
+                serde_json::from_value(self.payload["job_scope"].clone())
+                    .map_err(|_| Error::Forbidden)?;
+            if scope.groups.is_empty()
+                || self.kind != StageFactKind::StepPrepared
+                || !scope.groups.iter().any(|g| {
+                    g.request_id == self.request_id
+                        && g.episode_id == self.episode_id
+                        && g.step == self.step
+                        && g.attempt == self.attempt
+                        && g.input_digest == self.input_digest
+                })
+            {
+                return Err(Error::Forbidden);
+            }
+            evo_core::capacity::CapacityItem::SkillGroupPerJob
+                .admit(0, scope.groups.len() as u64)?;
         }
         for value in [
             &self.artifact_id,
@@ -576,6 +599,21 @@ impl StageFact {
 }
 
 pub(crate) fn canonical_stage_artifact_id(fact: &StageFact) -> Result<String> {
+    if fact.schema_version == OPTIMIZATION_STAGE_FACT_SCHEMA_V2 {
+        return Ok(format!(
+            "optstage-{}",
+            fingerprint(&(
+                OPTIMIZATION_STAGE_FACT_SCHEMA_V2,
+                &fact.namespace,
+                &fact.episode_id,
+                fact.step,
+                fact.attempt,
+                fact.stage,
+                fact.kind,
+                &fact.request_id
+            ))?
+        ));
+    }
     Ok(format!(
         "optstage-{}",
         fingerprint(&(
@@ -588,6 +626,159 @@ pub(crate) fn canonical_stage_artifact_id(fact: &StageFact) -> Result<String> {
             &fact.request_id,
         ))?
     ))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct OptimizationGroupScopeV2 {
+    group_id: String,
+    episode_id: String,
+    request_id: String,
+    step: u32,
+    attempt: u32,
+    input_digest: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct OptimizationJobScopeV2 {
+    job_id: String,
+    groups: Vec<OptimizationGroupScopeV2>,
+}
+struct OptimizationJobMember {
+    fact: StageFact,
+    inputs: crate::model::CurrentCompilerInputUse,
+    selection: evo_core::evidence::SourceSelection,
+    evidence: evo_core::evidence::EvidenceSet,
+    bindings: Vec<TrustedSourceBinding>,
+    traces: Vec<OptimizationTrace>,
+}
+/// Constructed only from the real direct/group requests inside this module.
+/// It has no deserializer or public fields through which a caller can tag work.
+pub struct OptimizationJobIntent {
+    scope: OptimizationJobScopeV2,
+    members: Vec<OptimizationJobMember>,
+    entry: OptimizationJobEntry,
+}
+impl OptimizationJobIntent {
+    /// Read-only claims let journal wrappers keep their existing observation
+    /// and failure boundaries without constructing or replacing the intent.
+    pub fn members(
+        &self,
+    ) -> impl Iterator<Item = (&StageFact, &crate::model::CurrentCompilerInputUse)> {
+        self.members
+            .iter()
+            .map(|member| (&member.fact, &member.inputs))
+    }
+}
+enum OptimizationJobEntry {
+    Direct,
+    Groups,
+}
+
+fn optimization_job_member(
+    group_id: &str,
+    request: &OptimizationStepRequest<'_>,
+    inputs: crate::model::CurrentCompilerInputUse,
+) -> Result<(OptimizationGroupScopeV2, OptimizationJobMember)> {
+    let context = &request.model_context;
+    let input_digest = optimization_bound_request_digest(request, &inputs)?;
+    let group = OptimizationGroupScopeV2 {
+        group_id: group_id.into(),
+        episode_id: context.episode_id.clone(),
+        request_id: context.request_id.clone(),
+        step: context.step,
+        attempt: context.attempt,
+        input_digest: input_digest.clone(),
+    };
+    let mut input = optimization_request_input(request);
+    input["compiler_request"] =
+        serde_json::to_value(&inputs.request).map_err(|_| Error::Internal)?;
+    input["compiler_binding"] =
+        serde_json::to_value(&inputs.binding).map_err(|_| Error::Internal)?;
+    let mut fact = recovery_fact(
+        context,
+        OptimizationJournalStage::Merge,
+        StageFactKind::StepPrepared,
+        context.request_id.clone(),
+        input_digest,
+        input,
+    )?;
+    fact.schema_version = OPTIMIZATION_STAGE_FACT_SCHEMA_V2.into();
+    fact.dependencies.extend(
+        request
+            .source_selection
+            .run_ids
+            .iter()
+            .map(|id| dependency("run", id.clone())),
+    );
+    fact.dependencies.push(dependency(
+        "revoke_watermark",
+        context.revoke_watermark.to_string(),
+    ));
+    fact.dependencies.push(dependency(
+        "artifact",
+        format!("optgrant-{}", fingerprint(request.source_selection)?),
+    ));
+    Ok((
+        group,
+        OptimizationJobMember {
+            fact,
+            inputs,
+            selection: request.source_selection.clone(),
+            evidence: request.evidence.clone(),
+            bindings: request.source_bindings.to_vec(),
+            traces: request.traces.clone(),
+        },
+    ))
+}
+fn seal_job_intent(
+    job_id: String,
+    entry: OptimizationJobEntry,
+    mut members: Vec<(OptimizationGroupScopeV2, OptimizationJobMember)>,
+) -> Result<OptimizationJobIntent> {
+    let namespace = members[0].1.fact.namespace.clone();
+    let scope = OptimizationJobScopeV2 {
+        job_id: format!(
+            "optjob-{}",
+            fingerprint(&("rsia.optimization.job.v2", &namespace, job_id))?
+        ),
+        groups: members.iter().map(|(group, _)| group.clone()).collect(),
+    };
+    for (_, member) in &mut members {
+        member.fact.payload["job_scope"] =
+            serde_json::to_value(&scope).map_err(|_| Error::Internal)?;
+        member.fact = member.fact.clone().seal()?;
+    }
+    Ok(OptimizationJobIntent {
+        scope,
+        members: members.into_iter().map(|(_, member)| member).collect(),
+        entry,
+    })
+}
+pub(crate) async fn prepare_group_job(
+    journal: &dyn OptimizationJournal,
+    job_id: &str,
+    groups: &[(String, &OptimizationStepRequest<'_>)],
+) -> Result<()> {
+    let mut members = Vec::with_capacity(groups.len());
+    for (group_id, request) in groups {
+        let resolved = journal
+            .current_compiler_inputs(&request.compiler_input_request())
+            .await?;
+        let inputs = crate::model::CurrentCompilerInputUse::new(
+            request.compiler_input_request(),
+            resolved.binding().clone(),
+        );
+        members.push(optimization_job_member(group_id, request, inputs)?);
+    }
+    journal
+        .claim_optimization_job(seal_job_intent(
+            job_id.into(),
+            OptimizationJobEntry::Groups,
+            members,
+        )?)
+        .await?;
+    Ok(())
 }
 
 /// Canonical id of the `DevelopmentRequestPrepared` fact that pairs with a
@@ -671,6 +862,14 @@ pub trait OptimizationJournal: Send + Sync {
         &self,
         _request: &crate::formal_authority::CompilerInputRequest,
     ) -> Result<crate::formal_authority::CurrentVerifiedCompilerInputs> {
+        Err(Error::Forbidden)
+    }
+    /// The first claim receives only a server-built closed intent. Wrappers
+    /// must forward it; legacy fact data cannot stand in for this capability.
+    async fn claim_optimization_job(
+        &self,
+        _intent: OptimizationJobIntent,
+    ) -> Result<Vec<StageFact>> {
         Err(Error::Forbidden)
     }
     /// Must commit one typed artifact and all dependency edges atomically.
@@ -1226,6 +1425,65 @@ async fn prepare_fact_compiler_use(
         .dedup_by(|a, b| a.kind == b.kind && a.id == b.id);
     Ok(())
 }
+/// A follow-on fact inherits its actual persisted first claim; its context
+/// and compiler use cannot substitute another declared member or request.
+async fn match_registered_job_claim(
+    s: &mut Session,
+    ctx: &Context,
+    fact: &StageFact,
+    inputs: Option<&crate::model::CurrentCompilerInputUse>,
+) -> Result<()> {
+    for dependency in &fact.dependencies {
+        if dependency.kind != "artifact" {
+            continue;
+        }
+        let Some(row) = s.object_row(ctx, "artifact", &dependency.id).await? else {
+            continue;
+        };
+        let value = evo_storage::lifecycle::parse_strict_json(&row.body)?;
+        if value["schema_version"] != OPTIMIZATION_STAGE_FACT_SCHEMA_V2 {
+            continue;
+        }
+        let claim: StageFact = serde_json::from_value(value).map_err(|_| Error::Forbidden)?;
+        claim.validate()?;
+        if claim.artifact_id != dependency.id
+            || claim.namespace != ctx.namespace()
+            || claim.episode_id != fact.episode_id
+            || claim.step != fact.step
+            || claim.attempt != fact.attempt
+        {
+            return Err(Error::Conflict(
+                "optimization fact differs from its registered job member".into(),
+            ));
+        }
+        if matches!(
+            fact.kind,
+            StageFactKind::StepCompleted
+                | StageFactKind::TerminalNoChange
+                | StageFactKind::TerminalRejected
+                | StageFactKind::TerminalCandidate
+                | StageFactKind::TerminalUncertain
+        ) && fact.request_id != claim.request_id
+        {
+            return Err(Error::Conflict(
+                "optimization fact request differs from its first claim".into(),
+            ));
+        }
+        if let Some(inputs) = inputs {
+            if claim.payload["compiler_request"]
+                != serde_json::to_value(&inputs.request).map_err(|_| Error::Internal)?
+                || claim.payload["compiler_binding"]
+                    != serde_json::to_value(&inputs.binding).map_err(|_| Error::Internal)?
+            {
+                return Err(Error::Conflict(
+                    "optimization fact compiler request differs from its first claim".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn persist_fact_current_material(
     s: &mut Session,
     ctx: &Context,
@@ -1337,11 +1595,21 @@ impl StoreOptimizationJournal {
             return Err(Error::Forbidden);
         }
         let mut session = self.store.session().await?;
+        if fact.schema_version == OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+            && session
+                .object_row(&self.context, "artifact", &fact.artifact_id)
+                .await?
+                .is_none()
+        {
+            return Err(Error::Forbidden);
+        }
+
         if let Some(inputs) = inputs {
             verify_compiler_use_boxed(inputs, &mut session, &self.context).await?;
             prepare_fact_compiler_use(&mut session, &self.context, &mut fact, inputs).await?;
         }
         validate_live_fact(&mut session, &self.context, &fact, inputs).await?;
+        match_registered_job_claim(&mut session, &self.context, &fact, inputs).await?;
         if let Some(old) = session
             .get::<StageFact>(&self.context, "artifact", &fact.artifact_id)
             .await?
@@ -1497,6 +1765,15 @@ impl StoreOptimizationJournal {
         }
         let key = fact.artifact_id.clone();
         let mut session = self.store.session().await?;
+        if fact.schema_version == OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+            && session
+                .object_row(&self.context, "artifact", &fact.artifact_id)
+                .await?
+                .is_none()
+        {
+            return Err(Error::Forbidden);
+        }
+
         if let Some(inputs) = inputs {
             if let Err(error) = verify_compiler_use_boxed(inputs, &mut session, &self.context).await
             {
@@ -1538,6 +1815,7 @@ impl StoreOptimizationJournal {
             prepare_fact_compiler_use(&mut session, &self.context, &mut fact, inputs).await?;
         }
         validate_live_fact(&mut session, &self.context, &fact, inputs).await?;
+        match_registered_job_claim(&mut session, &self.context, &fact, inputs).await?;
         if let Some(claim) = &self.management {
             match fact.kind {
                 StageFactKind::RequestPrepared
@@ -1631,6 +1909,139 @@ impl StoreOptimizationJournal {
 
 #[async_trait]
 impl OptimizationJournal for StoreOptimizationJournal {
+    async fn claim_optimization_job(
+        &self,
+        mut intent: OptimizationJobIntent,
+    ) -> Result<Vec<StageFact>> {
+        self.context.require(&[Role::Worker, Role::Admin])?;
+        let mut session = self.store.session().await?;
+        let mut missing = Vec::new();
+        let mut facts = Vec::new();
+        let mut known_job = false;
+        for (index, member) in intent.members.iter_mut().enumerate() {
+            if member.fact.namespace != self.context.namespace() {
+                return Err(Error::Forbidden);
+            }
+            verify_optimization_sources_in_session(
+                &mut session,
+                &self.context,
+                &member.selection,
+                &member.evidence,
+                &member.bindings,
+                &member.traces,
+                member.inputs.request.revoke_watermark,
+            )
+            .await?;
+            verify_compiler_use_boxed(&member.inputs, &mut session, &self.context).await?;
+            prepare_fact_compiler_use(
+                &mut session,
+                &self.context,
+                &mut member.fact,
+                &member.inputs,
+            )
+            .await?;
+            if let Some(existing) =
+                read_stage_fact(&mut session, &self.context, &member.fact.artifact_id).await?
+            {
+                existing.validate()?;
+                let mut old_input = existing.payload.clone();
+                old_input
+                    .as_object_mut()
+                    .ok_or(Error::Forbidden)?
+                    .remove("job_scope");
+                let mut new_input = member.fact.payload.clone();
+                new_input
+                    .as_object_mut()
+                    .ok_or(Error::Forbidden)?
+                    .remove("job_scope");
+                if existing.input_digest != member.fact.input_digest
+                    || old_input != new_input
+                    || (matches!(intent.entry, OptimizationJobEntry::Groups)
+                        && existing.payload["job_scope"]
+                            != serde_json::to_value(&intent.scope).map_err(|_| Error::Internal)?)
+                {
+                    return Err(Error::Conflict("optimization job scope changed".into()));
+                }
+                known_job |= existing.payload["job_scope"]["job_id"] == intent.scope.job_id;
+                facts.push(existing);
+            } else {
+                missing.push(index);
+                facts.push(member.fact.clone());
+            }
+        }
+        if !missing.is_empty() {
+            // A different member list cannot reuse a completed/free job label.
+            let mut cursor = None;
+            loop {
+                let rows = session
+                    .object_rows_page(&self.context, "artifact", cursor)
+                    .await?;
+                if rows.is_empty() {
+                    break;
+                }
+                cursor = rows.last().map(|row| row.rowid);
+                for row in rows {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&row.body).map_err(|_| Error::Internal)?;
+                    if value["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+                        && value["payload"]["job_scope"]["job_id"] == intent.scope.job_id
+                        && value["payload"]["job_scope"]
+                            != serde_json::to_value(&intent.scope).map_err(|_| Error::Internal)?
+                    {
+                        return Err(Error::Conflict("optimization job members changed".into()));
+                    }
+                }
+            }
+            session
+                .admit_capacity(&[(
+                    evo_core::capacity::CapacityItem::ConcurrentOptimizationJob,
+                    u64::from(!known_job),
+                )])
+                .await?;
+            evo_core::capacity::CapacityItem::SkillGroupPerJob
+                .admit(0, intent.scope.groups.len() as u64)?;
+        }
+        for index in missing {
+            let member = &intent.members[index];
+            persist_fact_current_material(
+                &mut session,
+                &self.context,
+                &member.fact,
+                Some(&member.inputs),
+            )
+            .await?;
+            session
+                .put(
+                    &self.context,
+                    "artifact",
+                    &member.fact.artifact_id,
+                    &self.owner,
+                    &member.fact,
+                )
+                .await?;
+            put_stage_content_edges(&mut session, &self.context, &member.fact).await?;
+            session
+                .cache(
+                    &self.context,
+                    "optimization.stage",
+                    &member.fact.artifact_id,
+                    &member.fact,
+                    &member.fact.artifact_id,
+                    &member.fact,
+                )
+                .await?;
+            session
+                .audit(
+                    &self.context,
+                    "optimization.stage.claim",
+                    &member.fact.artifact_id,
+                )
+                .await?;
+        }
+        session.commit().await?;
+        Ok(facts)
+    }
+
     async fn claim_source_bound(
         &self,
         fact: StageFact,
@@ -1701,52 +2112,17 @@ impl OptimizationJournal for StoreOptimizationJournal {
         traces: &[OptimizationTrace],
         watermark: u64,
     ) -> Result<()> {
-        validate_outbound_grant(selection)?;
-        self.check_live(&selection.run_ids, watermark).await?;
         let mut session = self.store.session().await?;
-        let grant: evo_core::evidence::SourceSelection = session
-            .need(
-                &self.context,
-                "artifact",
-                &format!("optgrant-{}", fingerprint(selection)?),
-            )
-            .await?;
-        if fingerprint(&grant)? != fingerprint(selection)? {
-            return Err(Error::Forbidden);
-        }
-        let mut records = Vec::new();
-        for id in &selection.run_ids {
-            let stored =
-                crate::evidence::load_stored_source(&mut session, &self.context, id).await?;
-            let binding = bindings
-                .iter()
-                .find(|b| &b.source_id == id)
-                .ok_or(Error::Forbidden)?;
-            if binding.source_digest != stored.trace.source_digest
-                || binding.parent_family != stored.record.parent_family
-            {
-                return Err(Error::Forbidden);
-            }
-            for trace in traces.iter().filter(|t| &t.run_id == id) {
-                if fingerprint(trace)? != fingerprint(&stored.trace)? {
-                    return Err(Error::Forbidden);
-                }
-            }
-            records.push(stored.record);
-        }
-        if traces
-            .iter()
-            .any(|t| !selection.run_ids.contains(&t.run_id))
-        {
-            return Err(Error::Forbidden);
-        }
-        let actual = crate::evidence::ingest_trusted_run_records(selection, &records)?;
-        if fingerprint(&actual.members)? != fingerprint(&evidence.members)?
-            || actual.independent_clusters != evidence.independent_clusters
-            || fingerprint(&actual.coverage)? != fingerprint(&evidence.coverage)?
-        {
-            return Err(Error::Forbidden);
-        }
+        verify_optimization_sources_in_session(
+            &mut session,
+            &self.context,
+            selection,
+            evidence,
+            bindings,
+            traces,
+            watermark,
+        )
+        .await?;
         session.commit().await
     }
     async fn commit(&self, fact: StageFact) -> Result<()> {
@@ -2232,7 +2608,7 @@ impl From<&Error> for StepErrorKind {
             Error::Forbidden => Self::Forbidden,
             Error::NotFound => Self::NotFound,
             Error::Budget => Self::Budget,
-            Error::Conflict(_) => Self::Conflict,
+            Error::Conflict(_) | Error::Capacity(_) => Self::Conflict,
             Error::Cancelled => Self::Cancelled,
             Error::ClockRegressed | Error::Internal => Self::Internal,
         }
@@ -3021,6 +3397,63 @@ fn model_context_for_batch(
     }
 }
 
+async fn verify_optimization_sources_in_session(
+    session: &mut Session,
+    context: &Context,
+    selection: &evo_core::evidence::SourceSelection,
+    evidence: &evo_core::evidence::EvidenceSet,
+    bindings: &[TrustedSourceBinding],
+    traces: &[OptimizationTrace],
+    watermark: u64,
+) -> Result<()> {
+    validate_outbound_grant(selection)?;
+    crate::evidence::validate_stored_sources(session, context, &selection.run_ids, watermark)
+        .await?;
+    let grant: evo_core::evidence::SourceSelection = session
+        .need(
+            context,
+            "artifact",
+            &format!("optgrant-{}", fingerprint(selection)?),
+        )
+        .await?;
+    if fingerprint(&grant)? != fingerprint(selection)? {
+        return Err(Error::Forbidden);
+    }
+    let mut records = Vec::new();
+    for id in &selection.run_ids {
+        let stored = crate::evidence::load_stored_source(session, context, id).await?;
+        let binding = bindings
+            .iter()
+            .find(|b| &b.source_id == id)
+            .ok_or(Error::Forbidden)?;
+        if binding.source_digest != stored.trace.source_digest
+            || binding.parent_family != stored.record.parent_family
+        {
+            return Err(Error::Forbidden);
+        }
+        for trace in traces.iter().filter(|t| &t.run_id == id) {
+            if fingerprint(trace)? != fingerprint(&stored.trace)? {
+                return Err(Error::Forbidden);
+            }
+        }
+        records.push(stored.record);
+    }
+    if traces
+        .iter()
+        .any(|t| !selection.run_ids.contains(&t.run_id))
+    {
+        return Err(Error::Forbidden);
+    }
+    let actual = crate::evidence::ingest_trusted_run_records(selection, &records)?;
+    if fingerprint(&actual.members)? != fingerprint(&evidence.members)?
+        || actual.independent_clusters != evidence.independent_clusters
+        || fingerprint(&actual.coverage)? != fingerprint(&evidence.coverage)?
+    {
+        return Err(Error::Forbidden);
+    }
+    Ok(())
+}
+
 fn validate_outbound_grant(selection: &evo_core::evidence::SourceSelection) -> Result<()> {
     selection.validate()?;
     if selection.purpose != Purpose::Development || !selection.allow_model_excerpts {
@@ -3376,6 +3809,12 @@ struct RecoveryJournal<'a> {
 }
 #[async_trait]
 impl OptimizationJournal for RecoveryJournal<'_> {
+    async fn claim_optimization_job(
+        &self,
+        intent: OptimizationJobIntent,
+    ) -> Result<Vec<StageFact>> {
+        self.inner.claim_optimization_job(intent).await
+    }
     async fn compiler_inputs(
         &self,
         request: &crate::formal_authority::CompilerInputRequest,
@@ -4093,13 +4532,62 @@ async fn run_step_unboxed(
     {
         return Err(Error::Conflict("step/development scope differs".into()));
     }
+    let legacy_prepared = journal
+        .lookup_source_bound(&prepared.artifact_id, &compiler_use)
+        .await?;
+    let mut current_prepared = prepared.clone();
+    current_prepared.schema_version = OPTIMIZATION_STAGE_FACT_SCHEMA_V2.into();
+    let current_id = canonical_stage_artifact_id(&current_prepared)?;
+    let current_prepared = journal
+        .lookup_source_bound(&current_id, &compiler_use)
+        .await?;
+    let existing_prepared = legacy_prepared.or(current_prepared);
+    if let Some(old) = &existing_prepared
+        && old.input_digest != prepared.input_digest
+    {
+        return Err(Error::Conflict(
+            "same optimization key has different full input".into(),
+        ));
+    }
+    if let Some(old) = journal
+        .lookup_source_bound(&terminal.artifact_id, &compiler_use)
+        .await?
+    {
+        if old.input_digest != prepared.input_digest {
+            return Err(Error::Conflict("terminal input differs".into()));
+        }
+        return decode_current_outcome(old.payload);
+    }
+    // Existing v1 claims retain their original bytes and resume through their
+    // durable per-dispatch claims. Only a new step creates a v2 job intent.
+    let prepared = match existing_prepared {
+        Some(old) => old,
+        None => {
+            let group_id = context.request_id.clone();
+            let intent = seal_job_intent(
+                format!("direct-{}", context.request_id),
+                OptimizationJobEntry::Direct,
+                vec![optimization_job_member(
+                    &group_id,
+                    &request,
+                    compiler_use.clone(),
+                )?],
+            )?;
+            journal
+                .claim_optimization_job(intent)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or(Error::Internal)?
+        }
+    };
     let recovery = RecoveryJournal {
         inner: journal,
         sources: request.source_selection.run_ids.clone(),
         watermark: context.revoke_watermark,
         step_id: prepared.artifact_id.clone(),
         grant_id: format!("optgrant-{}", fingerprint(request.source_selection)?),
-        stage_ids: Default::default(),
+        stage_ids: std::sync::Mutex::new(BTreeSet::from([prepared.artifact_id.clone()])),
         compiler_use: compiler_use.clone(),
         fixed_consolidation_inputs,
     };
@@ -4116,7 +4604,6 @@ async fn run_step_unboxed(
         }
         return decode_current_outcome(old.payload);
     }
-    recovery.commit(prepared).await?;
     let uncertain = std::sync::Mutex::new(None);
     let model = RecoveryModel {
         port: model.ok_or(Error::NotFound)?,

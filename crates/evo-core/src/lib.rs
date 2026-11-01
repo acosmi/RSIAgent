@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 pub type Result<T> = std::result::Result<T, Error>;
+pub mod capacity;
 pub mod clock;
 pub mod contract;
 pub mod curriculum;
@@ -34,6 +35,8 @@ pub enum Error {
     NotFound,
     #[error("state conflict: {0}")]
     Conflict(String),
+    #[error("{0}")]
+    Capacity(capacity::CapacityConflict),
     #[error("budget exhausted or not configured")]
     Budget,
     #[error("execution cancelled or lease lost")]

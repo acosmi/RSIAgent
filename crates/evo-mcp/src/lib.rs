@@ -396,17 +396,21 @@ fn structured<T: Serialize>(value: T) -> CallToolResult {
 }
 
 fn structured_error(error: Error) -> CallToolResult {
-    let code = match error {
+    let code = match &error {
         Error::Invalid(_) => "invalid_input",
         Error::Forbidden => "forbidden",
         Error::NotFound => "not_found",
-        Error::Conflict(_) => "conflict",
+        Error::Conflict(_) | Error::Capacity(_) => "conflict",
         Error::Budget => "budget_unavailable",
         Error::Cancelled => "cancelled",
         Error::ClockRegressed => "clock_regressed",
         Error::Internal => "internal_error",
     };
-    CallToolResult::structured_error(json!({"error":{"code":code}}))
+    let mut body = json!({"error":{"code":code}});
+    if let Error::Capacity(details) = error {
+        body["error"]["details"] = json!(details);
+    }
+    CallToolResult::structured_error(body)
 }
 
 #[cfg(test)]
@@ -431,6 +435,27 @@ mod tests {
         assert_eq!(
             result.structured_content.unwrap(),
             json!({"error":{"code":"clock_regressed"}})
+        );
+    }
+    #[test]
+    fn capacity_conflict_keeps_mcp_code_and_typed_details() {
+        let detail = evo_core::capacity::CapacityConflict {
+            item: evo_core::capacity::CapacityItem::Skill,
+            used: 1000,
+            limit: 1000,
+            delta: 1,
+        };
+        let result = structured_error(Error::Capacity(detail.clone()));
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap(),
+            json!({"error":{"code":"conflict","details":detail}})
+        );
+        let old = structured_error(Error::Conflict("private conflict".into()));
+        assert_eq!(old.is_error, Some(true));
+        assert_eq!(
+            old.structured_content.unwrap(),
+            json!({"error":{"code":"conflict"}})
         );
     }
 }

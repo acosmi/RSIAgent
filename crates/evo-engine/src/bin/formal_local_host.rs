@@ -106,7 +106,7 @@ async fn async_main() -> std::process::ExitCode {
         }
         Err(error) => {
             // Error variants carry no credentials, protected inputs or oracle.
-            let code = match error {
+            let code = match &error {
                 Error::Forbidden => "forbidden",
                 Error::NotFound => "missing",
                 Error::Budget => "budget",
@@ -114,12 +114,16 @@ async fn async_main() -> std::process::ExitCode {
                     "data_directory_insecure"
                 }
                 Error::Invalid(_) => "invalid",
-                Error::Conflict(_) => "conflict",
+                Error::Conflict(_) | Error::Capacity(_) => "conflict",
                 Error::Cancelled => "cancelled",
                 Error::ClockRegressed => "clock_regressed",
                 Error::Internal => "internal",
             };
-            eprintln!("{{\"status\":\"refused\",\"reason\":\"{code}\"}}");
+            let mut body = serde_json::json!({"status":"refused","reason":code});
+            if let Error::Capacity(details) = error {
+                body["details"] = serde_json::json!(details);
+            }
+            eprintln!("{body}");
             std::process::ExitCode::from(2)
         }
     }

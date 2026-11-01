@@ -459,9 +459,10 @@ fn the_exported_selectors_are_the_restore_scripts() {
     // Pinned here; the engine's startup_gate_v42 test asserts these against the
     // script source itself.
     assert_eq!(PROTECTED_OBJECT_KINDS.len(), 4);
-    assert_eq!(PROTECTED_SCHEMA_VERSIONS.len(), 10);
+    assert_eq!(PROTECTED_SCHEMA_VERSIONS.len(), 11);
     assert_eq!(PROTECTED_SCHEMA_VERSIONS[9], "rsia.trace_export.v1");
-    assert_eq!(PROTECTED_ACTION_SCHEMA_VERSIONS.len(), 13);
+    assert_eq!(PROTECTED_SCHEMA_VERSIONS[10], "rsia.optimization.stage_fact.v2");
+    assert_eq!(PROTECTED_ACTION_SCHEMA_VERSIONS.len(), 14);
     assert_eq!(
         PROTECTED_ACTION_SCHEMA_VERSIONS[11],
         "rsia.monitoring.consolidation_proposal.v2"
@@ -2279,4 +2280,83 @@ async fn unknown_inner_judgment_version_is_left_in_quarantine() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn practice_v2_and_stage_v2_are_protected_and_cleanable() {
+    let (_dir, store, path) = database().await;
+    let admin = ctx("n", "admin", Role::Admin);
+    put_run(&store, "n", "wire-source").await;
+    let mut session = store.session().await.unwrap();
+    let mut original = BTreeMap::new();
+    for (id, schema) in [
+        ("practice-old", "rsia.practice_attempt_set.v1"),
+        ("practice-new", "rsia.practice_attempt_set.v2"),
+        ("stage-old", "rsia.optimization.stage_fact.v1"),
+        ("stage-new", "rsia.optimization.stage_fact.v2"),
+    ] {
+        // Conservative restore/cleanup selector fixtures, not usable authority.
+        let body = json!({"id":id,"schema_version":schema,"content":"private execution content","kind":"step_prepared","payload":{"job_scope":{"job_id":"server-job","groups":[{"request_id":"request","episode_id":"episode","step":0,"attempt":0,"input_digest":evo_core::hash(b"input")}]} }});
+        session
+            .put(&admin, "artifact", id, admin.actor(), &body)
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", id, "run", "wire-source")
+            .await
+            .unwrap();
+        original.insert(id.to_owned(), body);
+    }
+    session.commit().await.unwrap();
+    let status = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: "wire-source".into(),
+        },
+        "remove wire content",
+        evo_core::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    store.close().await;
+    let facts = read_control_plane_facts(&path).await.unwrap();
+    for (id, body) in &original {
+        assert_eq!(
+            &facts.protected_objects[&("n".into(), "artifact".into(), id.clone())],
+            body
+        );
+    }
+    let store = Store::open(&path).await.unwrap();
+    let mut status = status;
+    for _ in 0..20 {
+        if status.state == evo_storage::lifecycle::CleanupState::Complete {
+            break;
+        }
+        status = LifecycleStore::cleanup_step(
+            &admin,
+            &store,
+            &status.job_id,
+            16,
+            evo_core::now().unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(status.state, evo_storage::lifecycle::CleanupState::Complete);
+    let mut session = store.session().await.unwrap();
+    for (id, body) in &original {
+        let redacted: serde_json::Value = session.need(&admin, "artifact", id).await.unwrap();
+        assert_eq!(redacted["original_schema"], body["schema_version"]);
+        assert_eq!(redacted["schema_version"], "rsia.redacted.v1");
+        assert!(!redacted.to_string().contains("private execution content"));
+        if id == "stage-new" {
+            assert_eq!(
+                redacted["metadata"]["job_scope"],
+                body["payload"]["job_scope"]
+            );
+        }
+    }
+    session.commit().await.unwrap();
 }
