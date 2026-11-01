@@ -13,7 +13,9 @@
 //! it fails its cleanup job closed.
 
 use crate::broker::{BudgetPortBinding, ModelTransport, PersistentModelBroker};
-use crate::development::{RUN_RECEIPT_KIND, storage_id};
+use crate::development::{
+    CandidateConsumption, RUN_RECEIPT_KIND, run_receipt_candidate_consumption, storage_id,
+};
 use crate::evidence::{load_stored_source, validate_stored_sources};
 use crate::model::{ModelPort, ModelResponse, RejectedDispatch};
 use crate::optimization::{
@@ -1408,6 +1410,7 @@ impl MonitoringCoordinator {
                 let index: ConsolidationScopeIndex =
                     session.need(ctx, ARTIFACT_KIND, &claim.scope_id).await?;
                 validate_execution_binding(ctx, &claim, &index, &request)?;
+                require_content_cycles(&mut session, ctx, &claim).await?;
             }
             session.commit().await?;
         }
@@ -2942,6 +2945,31 @@ async fn validate_claim_sources(
         let stored = load_stored_source(session, ctx, &source.id).await?;
         if stored.trace.source_digest != source.content_digest {
             return Err(Error::Conflict("claim source content changed".into()));
+        }
+    }
+    Ok(())
+}
+
+/// §11.5 (Q-58, V121.e): the pair classes of a consolidation take Skill content
+/// evidence only from a `projection_consumed` runner. A verified cycle whose
+/// runner contract declares anything else (`identity_only`, or nothing for the
+/// frozen v1 contract) proves the chain and its closure, so it cannot start a
+/// consolidation. A fixture cycle keeps its own path: a proposal built on it stays
+/// `ProgramFixture`. Reads only.
+async fn require_content_cycles(
+    session: &mut Session,
+    ctx: &Context,
+    claim: &ConsolidationClaim,
+) -> Result<()> {
+    for cycle_id in &claim.cycle_ids {
+        let cycle = load_cycle(session, ctx, cycle_id).await?;
+        if cycle.provenance != DevelopmentExecutionProvenance::Fixture
+            && run_receipt_candidate_consumption(session, ctx, &cycle.execution_receipt_id).await?
+                != Some(CandidateConsumption::ProjectionConsumed)
+        {
+            return Err(Error::Conflict(
+                "identity_only development evidence cannot support Skill content".into(),
+            ));
         }
     }
     Ok(())
@@ -4848,6 +4876,7 @@ mod tests {
                     grader_receipt_digest: result.grader_receipt_digest.clone(),
                 })
                 .collect(),
+            candidate_consumption: Some(CandidateConsumption::IdentityOnly),
         };
         (view, fact, report, request, environment)
     }

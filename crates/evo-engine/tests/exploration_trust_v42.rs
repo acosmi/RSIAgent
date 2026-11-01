@@ -12,23 +12,29 @@
 //! * both refusals happen after the step was paid for and its dispatch claimed, so
 //!   they are terminal records, never errors: the dispatch is consumed, a reconnect
 //!   returns the same terminal state and the world goes on;
-//! * a report the gate verifies is a `Valid` node labelled `Trusted` whose quality
-//!   is the mean of the recomputed scores, and only such a node can be deepened and
-//!   proposed as a final candidate;
+//! * a report the gate verifies is Skill content evidence only when the runner
+//!   contract of its control declares that the candidate's projection was consumed
+//!   (§6.7.4 Q-29, AG-187). No registered contract does: the current one declares
+//!   `identity_only` and the frozen v1 one declares nothing, so a verified report is
+//!   a terminal `HardFailure` labelled `EvidenceRejected` as well, after the same
+//!   paid step, and the v1 contract registers no new control. Only a `Valid` node
+//!   labelled `Trusted` (a record stored before AG-187 keeps its label) can be
+//!   deepened and proposed as a final candidate;
 //! * an outcome that is no candidate (no change, a rejected selection, uncertain) is
 //!   not a verdict: its node and dispatch fact are `NotObserved`, as is every record
 //!   written before the label existed.
 //!
 //! The registered runner executes parent and candidate with the same pure function,
-//! so on its own it produces `KeepIncumbent`, never a candidate. The trusted path is
+//! so on its own it produces `KeepIncumbent`, never a candidate. The verified path is
 //! covered with `ContrastRunner`, which writes honest E03 evidence with chosen
 //! outputs, as `practice_v42` does: the budget rows, settlements, execution receipts
 //! and grader receipts through the public issuing functions, and the run receipt as
 //! a typed envelope (the registered runner's own issuer is private). Real SQLite
 //! store, no provider, zero monetary cost.
 //!
-//! Not covered (and not claimed): a trusted node from a runner that really executes
-//! the candidate bundle (none exists), the repairable-failure origins and the
+//! Not covered (and not claimed): a trusted node from a runner that consumes the
+//! candidate's projection (none exists), the `Trusted` nodes and `TrustedExecution`
+//! proposals stored before AG-187, the repairable-failure origins and the
 //! recovery end to end (E09 PR-B), optimization history in the request (PR-C), and a
 //! gate that fails on storage (the error mapping is unit-tested in `exploration.rs`).
 #[path = "support/trusted_compiler_inputs.rs"]
@@ -51,13 +57,14 @@ use evo_core::strategy::{BatchActionV1, ElasticPolicyV1, ExplorationCapsV1, Simu
 use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, hash};
 use evo_engine::curriculum_profiles::RegisteredPureFunctionProfileV1;
 use evo_engine::development::{
-    DEVELOPMENT_RUN_RECEIPT_SCHEMA, DevelopmentControlV1, DevelopmentEvidenceScope,
-    DevelopmentExecutionReceiptV1, DevelopmentRunReceiptV1, DevelopmentSide, DevelopmentTaskSpecV1,
-    EXECUTION_RECEIPT_KIND, ExecutionReceiptIssueRequest, GraderReceiptIssueRequest,
-    RUN_RECEIPT_KIND, RegisteredDevelopmentRunner, RegisteredExecutionRequestV1,
-    RegisteredTargetInputV1, execution_budget_call_id, execution_request_digest,
-    issue_execution_receipt, issue_grader_receipt, load_development_control,
-    register_development_control, registered_runner_digest, run_receipt_id, storage_id,
+    CONTROL_KIND, CandidateConsumption, DEVELOPMENT_RUN_RECEIPT_SCHEMA, DevelopmentControlV1,
+    DevelopmentEvidenceScope, DevelopmentExecutionReceiptV1, DevelopmentRunReceiptV1,
+    DevelopmentSide, DevelopmentTaskSpecV1, EXECUTION_RECEIPT_KIND, ExecutionReceiptIssueRequest,
+    GraderReceiptIssueRequest, RUN_RECEIPT_KIND, RegisteredDevelopmentRunner,
+    RegisteredExecutionRequestV1, RegisteredTargetInputV1, execution_budget_call_id,
+    execution_request_digest, issue_execution_receipt, issue_grader_receipt,
+    load_development_control, register_development_control, registered_runner_digest,
+    run_receipt_id, storage_id,
 };
 use evo_engine::evidence::{
     StoredRunRecord, StoredTraceAuthority, store_source_selection, store_trace_authority,
@@ -105,7 +112,6 @@ const WRONG_ANSWER: &str = "{\"answer\":{\"clamped\":12345}}";
 
 const FIXTURE_REASON: &str = "fixture_evidence_not_accepted";
 const REJECTED_REASON: &str = "development_evidence_rejected";
-const OBSERVED_REASON: &str = "candidate_observed";
 /// The fixed code a kept incumbent is recorded under (AG-048): the class says the
 /// selection did not improve the incumbent while every incumbent pass was kept.
 const KEEP_INCUMBENT_REASON: &str = "keep_incumbent_not_improved";
@@ -1229,16 +1235,6 @@ impl Fixture {
         self.parent(parent_skill(), d("parent-bundle"))
     }
 
-    /// The parent a `Deepen` of a first-step candidate is requested against: the
-    /// root skill with the fixture model's two edits applied, and the candidate
-    /// bundle the node recorded.
-    fn evolved_parent(&self, bundle: String) -> Parent {
-        let mut skill = parent_skill();
-        skill.content.push_str(" [repair]");
-        skill.applicability.push_str(" [repair]");
-        self.parent(skill, bundle)
-    }
-
     fn request<'a>(
         &'a self,
         parent: &'a Parent,
@@ -1808,32 +1804,49 @@ async fn the_registered_runner_executes_both_sides_alike_so_it_never_yields_a_ca
     );
 }
 
+/// AG-187 (§6.7.4 Q-29, V121.a): the receipts are real and E03's observation gate
+/// verifies them, but the registered runner contract declares `identity_only`: the
+/// comparison proves the receipt chain, not the content of the candidate. The node is
+/// the terminal content refusal of a paid step, the paid rows stay as they were, and
+/// nothing deepens or proposes it. (It replaces the test that took this comparison
+/// for a trusted valid node.)
 #[tokio::test]
-async fn a_candidate_with_real_receipts_is_a_trusted_valid_node_that_can_be_deepened_and_proposed()
-{
+async fn identity_only_candidate_is_refused_as_skill_content() {
+    // The rows the step settled and the root they were paid from.
+    async fn paid(
+        store: &Store,
+    ) -> (
+        Vec<evo_storage::budget::BudgetCallRecord>,
+        Option<evo_storage::budget::RootBudgetRecord>,
+    ) {
+        let mut session = store.session().await.unwrap();
+        let rows = session
+            .budget_calls_for_group(&worker(), SCOPE, "world-identity")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        (rows, store.root_budget(&worker(), SCOPE).await.unwrap())
+    }
+
     let env = Env::new(true).await;
-    env.register("world-trusted").await;
+    env.register("world-identity").await;
     // The candidate answers every task correctly, the parent none: a strict
     // improvement, backed by receipts the gate reloads.
     let runner = Spy::new(env.contrast_runner(|_| true));
     let first = env
-        .run("world-trusted", 1, "trusted-1", &env.root, &runner)
+        .run("world-identity", 1, "identity-1", &env.root, &runner)
         .await;
-    assert_eq!(first.outcome, OBSERVED_REASON);
+    assert_eq!(runner.calls(), 1, "the step ran and was paid for once");
     let first_seen = seen(&env, &first).await;
-    assert_eq!(
-        first_seen.status,
-        json!({"status": "valid", "quality_micros": 1_000_000})
+    assert_terminal_failure(&first_seen, "evidence_rejected", REJECTED_REASON);
+    assert!(
+        first_seen.names_candidate,
+        "the node still names the candidate it dispatched"
     );
-    assert_eq!(first_seen.node_evidence, json!("trusted"));
-    assert!(first_seen.names_candidate);
-    assert_eq!(first_seen.fact_state, json!("observed"));
-    assert_eq!(first_seen.fact_evidence, json!("trusted"));
-    assert_eq!(first_seen.fact_reason, json!(OBSERVED_REASON));
 
-    // E03's own gate verifies the very facts the coordinator's call used, and the
-    // recomputed scores are what the node's quality is the mean of.
-    let view = gate_verdict(&env.store, "world-trusted", 1).await.unwrap();
+    // E03's generic gate verifies the very facts the coordinator judged: the refusal
+    // is about what the evidence can support, not about the receipts.
+    let view = gate_verdict(&env.store, "world-identity", 1).await.unwrap();
     assert_eq!(view.outcomes.len(), 2);
     for outcome in &view.outcomes {
         assert_eq!(outcome.parent_score_micros, 0);
@@ -1841,56 +1854,113 @@ async fn a_candidate_with_real_receipts_is_a_trusted_valid_node_that_can_be_deep
     }
     let usage = env
         .coordinator
-        .verified_mechanism_usage("world-trusted")
+        .verified_mechanism_usage("world-identity")
         .await
         .unwrap();
-    assert_eq!(usage[0].evidence(), ExplorationEvidenceV1::Trusted);
-    // A reconnect returns the stored dispatch: same node, same outcome, no new call.
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].dispatch_state(), MechanismUsageState::Observed);
+    assert_eq!(usage[0].evidence(), ExplorationEvidenceV1::EvidenceRejected);
+
+    // The step was paid for: one settled row per side of each task.
+    let paid_rows = paid(&env.store).await;
+    assert_eq!(paid_rows.0.len(), 4);
+    assert!(
+        paid_rows
+            .0
+            .iter()
+            .all(|row| row.state == evo_storage::budget::BudgetCallState::Finalized)
+    );
+
+    // Nothing deepens the node: the only legal action is the other root.
+    let next = env.coordinator.decide_next("world-identity").await.unwrap();
+    assert_eq!(dispatched_seqs(&next.action), vec![2]);
+    // And it is no final candidate.
+    let node_id = first.node_id.clone().unwrap();
+    match env
+        .coordinator
+        .final_candidate_request("world-identity", &node_id)
+        .await
+    {
+        Err(Error::Conflict(message)) => {
+            assert_eq!(message, "selected node is not a valid observed candidate");
+        }
+        other => panic!("an identity-only candidate is no final candidate, got {other:?}"),
+    }
+
+    // A reconnect returns the stored refusal without reaching a port, and nothing
+    // after the refusal touched the paid rows or the root.
     let again = env
-        .reconnect(&env.coordinator, "world-trusted", 1, "trusted-1")
+        .reconnect(&env.coordinator, "world-identity", 1, "identity-1")
         .await;
     assert_eq!(again.node_id, first.node_id);
-    assert_eq!(again.outcome, OBSERVED_REASON);
+    assert_eq!(again.outcome, REJECTED_REASON);
     assert_eq!(runner.calls(), 1);
+    assert_eq!(paid(&env.store).await, paid_rows);
+    assert_eq!(seen(&env, &first).await, first_seen);
+}
 
-    // A trusted valid node is a final candidate ...
-    let node_id = first.node_id.clone().unwrap();
-    let node = payload(&env.store, NODE, &node_id).await;
-    let selected = env
-        .coordinator
-        .final_candidate_request("world-trusted", &node_id)
-        .await
-        .unwrap();
-    assert_eq!(selected.selected_node_id, node_id);
-    assert_eq!(
-        json!(selected.selected_bundle_digest),
-        node["candidate_bundle_digest"]
-    );
-    assert!(selected.requires_recompile_against_approved_parent);
-    assert!(selected.requires_independent_formal_evaluation);
+/// AG-187 (V121.a): the request of a refused identity-only candidate, sent again
+/// with every port at hand, from this coordinator and from a new one over the same
+/// store, returns the stored refusal: no new dispatch, no runner or model call, no
+/// budget row.
+#[tokio::test]
+async fn replayed_identity_candidate_stays_refused_without_new_spend() {
+    async fn paid(store: &Store) -> Vec<evo_storage::budget::BudgetCallRecord> {
+        let mut session = store.session().await.unwrap();
+        let rows = session
+            .budget_calls_for_group(&worker(), SCOPE, "world-replay")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        rows
+    }
 
-    // ... and the world deepens it: the gain over the baseline is significant.
-    let next = env.coordinator.decide_next("world-trusted").await.unwrap();
-    assert_eq!(dispatched_seqs(&next.action), vec![1_000_002]);
-    let evolved = env
-        .fixture
-        .evolved_parent(selected.selected_bundle_digest.clone());
-    let second = env
-        .run("world-trusted", 2, "trusted-2", &evolved, &runner)
+    let env = Env::new(true).await;
+    env.register("world-replay").await;
+    let runner = Spy::new(env.contrast_runner(|_| true));
+    let first = env
+        .run("world-replay", 1, "replay-1", &env.root, &runner)
         .await;
-    assert_eq!(second.outcome, OBSERVED_REASON);
-    let second_node = payload(&env.store, NODE, second.node_id.as_deref().unwrap()).await;
+    assert_eq!(first.outcome, REJECTED_REASON);
+    // What the gate read: the registered runner contract declares `identity_only`.
     assert_eq!(
-        second_node["node"]["status"],
-        json!({"status": "valid", "quality_micros": 1_000_000})
+        gate_verdict(&env.store, "world-replay", 1)
+            .await
+            .unwrap()
+            .candidate_consumption,
+        Some(CandidateConsumption::IdentityOnly)
     );
-    assert_eq!(second_node["evidence"], "trusted");
-    assert_eq!(second_node["node"]["search_parent_seq"], 1);
-    assert_eq!(second_node["node"]["depth"], 2);
-    env.coordinator
-        .final_candidate_request("world-trusted", second.node_id.as_deref().unwrap())
-        .await
-        .unwrap();
+    let first_seen = seen(&env, &first).await;
+    let paid_rows = paid(&env.store).await;
+    let model_calls = env.model.calls();
+
+    let resumed = PersistentCoordinator::new(env.store.clone(), worker(), "worker").unwrap();
+    for coordinator in [&env.coordinator, &resumed] {
+        let again = coordinator
+            .run_next(
+                Some(&env.model),
+                Some(&runner),
+                Some(&env.journal),
+                env.fixture
+                    .request(&env.root, "world-replay", 1, "replay-1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.node_id, first.node_id);
+        assert_eq!(again.dispatch_id, first.dispatch_id);
+        assert_eq!(again.outcome, REJECTED_REASON);
+    }
+    assert_eq!(runner.calls(), 1, "the runner is not reached again");
+    assert_eq!(
+        env.model.calls(),
+        model_calls,
+        "the model is not reached again"
+    );
+    assert_eq!(paid(&env.store).await, paid_rows, "no budget row moved");
+    let world = payload(&env.store, WORLD, "world-replay").await;
+    assert_eq!(world["dispatch_ids"], json!([first.dispatch_id]));
+    assert_eq!(world["node_ids"], json!([first.node_id]));
+    assert_eq!(seen(&env, &first).await, first_seen);
 }
 
 #[tokio::test]
@@ -1902,13 +1972,14 @@ async fn the_node_quality_is_the_mean_of_the_scores_the_gate_recomputed() {
     let step = env
         .run("world-partial", 1, "partial-1", &env.root, &runner)
         .await;
-    assert_eq!(step.outcome, OBSERVED_REASON);
-    let step_seen = seen(&env, &step).await;
-    assert_eq!(
-        step_seen.status,
-        json!({"status": "valid", "quality_micros": 500_000})
+    // AG-187: the comparison is identity-only, so it supports no Skill content and
+    // gives the node no quality: the node is the content refusal.
+    assert_terminal_failure(
+        &seen(&env, &step).await,
+        "evidence_rejected",
+        REJECTED_REASON,
     );
-    assert_eq!(step_seen.node_evidence, json!("trusted"));
+    // The gate still verifies it and recomputes the same mean.
     let view = gate_verdict(&env.store, "world-partial", 1).await.unwrap();
     let total: u64 = view
         .outcomes
@@ -1916,12 +1987,17 @@ async fn the_node_quality_is_the_mean_of_the_scores_the_gate_recomputed() {
         .map(|outcome| u64::from(outcome.candidate_score_micros))
         .sum();
     assert_eq!(total / view.outcomes.len() as u64, 500_000);
-    // The mean equals the world's baseline, so there is no gain: that does not matter
-    // for what the node is. It is valid and trusted, so it can be proposed.
-    env.coordinator
+    // It is no final candidate.
+    match env
+        .coordinator
         .final_candidate_request("world-partial", step.node_id.as_deref().unwrap())
         .await
-        .unwrap();
+    {
+        Err(Error::Conflict(message)) => {
+            assert_eq!(message, "selected node is not a valid observed candidate");
+        }
+        other => panic!("an identity-only candidate is no final candidate, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2084,7 +2160,8 @@ async fn step_with_or_without_a_crash(
 async fn a_recovered_step_carries_the_same_evidence_label_as_an_uninterrupted_one() {
     let env = Env::new(true).await;
 
-    // An honest candidate: trusted, with the same quality, after the crash.
+    // An honest identity-only candidate: the same content refusal (AG-187) after
+    // the crash, over evidence the gate verifies.
     let honest = || Spy::new(env.contrast_runner(|_| true));
     let straight =
         step_with_or_without_a_crash(&env, "world-honest-straight", &honest(), &honest(), false)
@@ -2093,11 +2170,7 @@ async fn a_recovered_step_carries_the_same_evidence_label_as_an_uninterrupted_on
         step_with_or_without_a_crash(&env, "world-honest-recovered", &honest(), &honest(), true)
             .await;
     let straight_seen = seen(&env, &straight).await;
-    assert_eq!(
-        straight_seen.status,
-        json!({"status": "valid", "quality_micros": 1_000_000})
-    );
-    assert_eq!(straight_seen.node_evidence, json!("trusted"));
+    assert_terminal_failure(&straight_seen, "evidence_rejected", REJECTED_REASON);
     assert_eq!(seen(&env, &recovered).await, straight_seen);
     gate_verdict(&env.store, "world-honest-recovered", 1)
         .await
@@ -2541,4 +2614,112 @@ async fn revoking_a_source_still_redacts_labelled_nodes_and_dispatch_facts() {
             other => panic!("expected a Conflict naming the redaction, got {other:?}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 8. The runner contract a control binds (AG-187)
+// ---------------------------------------------------------------------------
+
+/// AG-187 (§6.7.4 Q-29, V121.a): the frozen v1 runner contract declares nothing about
+/// the candidate, so it registers no new control. A healthy registration in the same
+/// store succeeds first; the refusal of the v1 contract is exact and writes nothing.
+#[tokio::test]
+async fn legacy_runner_contract_cannot_register_a_new_control() {
+    // The digest of the frozen v1 runner contract (pinned in `development.rs`).
+    const LEGACY_V1_RUNNER_DIGEST: &str =
+        "e1351fe9605e5ebe374bb83e6f1dbe5489021c0e81b2fa83d967010bdd3b5c21";
+    // Every stored object of the namespace and the length of its audit chain.
+    async fn stored(store: &Store) -> (Vec<Value>, usize) {
+        let mut session = store.session().await.unwrap();
+        let objects = session.list::<Value>(&admin(), "artifact").await.unwrap();
+        session.commit().await.unwrap();
+        (objects, store.verify_audit(&admin()).await.unwrap())
+    }
+
+    let env = Env::new(true).await;
+    let mut healthy = control();
+    healthy.id = "dev-control-healthy".into();
+    register_development_control(&admin(), &env.store, healthy.clone())
+        .await
+        .unwrap();
+
+    let before = stored(&env.store).await;
+    let mut legacy = healthy;
+    legacy.id = "dev-control-legacy".into();
+    legacy.runner_digest = LEGACY_V1_RUNNER_DIGEST.into();
+    match register_development_control(&admin(), &env.store, legacy).await {
+        Err(Error::Invalid(message)) => assert_eq!(
+            message,
+            "legacy development runner contract cannot register a new control"
+        ),
+        other => panic!("the v1 runner contract registered a new control: {other:?}"),
+    }
+    assert_eq!(
+        stored(&env.store).await,
+        before,
+        "the refusal wrote nothing"
+    );
+}
+
+/// AG-187 (§5.8, §6.7.4): a control registered before the change binds the frozen v1
+/// runner contract. It stays readable and keeps producing identity chains the gate
+/// verifies, but they support no Skill content (the contract declares no candidate
+/// consumption), and it cannot be registered again, not even under its own id.
+#[tokio::test]
+async fn legacy_v1_control_stays_readable_and_grants_no_skill_content() {
+    const LEGACY_V1_RUNNER_DIGEST: &str =
+        "e1351fe9605e5ebe374bb83e6f1dbe5489021c0e81b2fa83d967010bdd3b5c21";
+    let env = Env::new(true).await;
+    // The control as the build before AG-187 stored it, written at its canonical id
+    // (raw storage access: the registration refuses that contract now).
+    let control_id = storage_id(CONTROL_KIND, CONTROL_ID).unwrap();
+    let mut session = env.store.session().await.unwrap();
+    let mut stored: Value = session
+        .need(&admin(), "artifact", &control_id)
+        .await
+        .unwrap();
+    stored["payload"]["runner_digest"] = json!(LEGACY_V1_RUNNER_DIGEST);
+    session
+        .put(&admin(), "artifact", &control_id, "admin", &stored)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+
+    let legacy = load_development_control(&env.store, &admin(), CONTROL_ID)
+        .await
+        .unwrap();
+    assert_eq!(legacy.runner_digest, LEGACY_V1_RUNNER_DIGEST);
+    match register_development_control(&admin(), &env.store, legacy).await {
+        Err(Error::Invalid(message)) => assert_eq!(
+            message,
+            "legacy development runner contract cannot register a new control"
+        ),
+        other => panic!("the v1 control was registered again: {other:?}"),
+    }
+
+    // A step against it: the receipts bind the v1 contract and the gate verifies
+    // them, but the contract declares no candidate consumption, so the candidate is
+    // refused as Skill content.
+    env.register("world-legacy-runner").await;
+    let runner = Spy::new(env.contrast_runner(|_| true));
+    let step = env
+        .run(
+            "world-legacy-runner",
+            1,
+            "legacy-runner-1",
+            &env.root,
+            &runner,
+        )
+        .await;
+    assert_eq!(runner.calls(), 1);
+    assert_terminal_failure(
+        &seen(&env, &step).await,
+        "evidence_rejected",
+        REJECTED_REASON,
+    );
+    let view = gate_verdict(&env.store, "world-legacy-runner", 1)
+        .await
+        .unwrap();
+    assert_eq!(view.outcomes.len(), 2);
+    assert_eq!(view.candidate_consumption, None);
 }

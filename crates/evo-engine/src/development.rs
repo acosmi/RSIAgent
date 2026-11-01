@@ -43,7 +43,7 @@ pub const DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA: &str = "rsia.development_executi
 pub const DEVELOPMENT_GRADER_RECEIPT_SCHEMA: &str = "rsia.development_grader_receipt.v1";
 pub const DEVELOPMENT_EXECUTION_OUTPUT_SCHEMA: &str = "rsia.development_execution_output.v1";
 pub const DEVELOPMENT_RUN_RECEIPT_SCHEMA: &str = "rsia.development_run_receipt.v1";
-pub const REGISTERED_RUNNER_CONTRACT_SCHEMA: &str = "rsia.registered_development_runner.v1";
+pub const REGISTERED_RUNNER_CONTRACT_SCHEMA: &str = "rsia.registered_development_runner.v2";
 
 pub const CONTROL_KIND: &str = "development_control_v1";
 pub const EXECUTION_RECEIPT_KIND: &str = "development_execution_receipt_v1";
@@ -356,10 +356,15 @@ fn development_task_source_material(
         || t.target_id != profile.target_id
         || c.target_digest != profile.target_digest
         || c.oracle_digest != profile.oracle_digest
-        || c.runner_digest != registered_runner_digest()?
     {
         return Err(pair_source_changed());
     }
+    // The contract the control itself binds: a legacy control keeps its v1 body, so
+    // its pair material (and BoundPairV2) bytes stay what they always were.
+    let runner_contract = match runner_candidate_consumption(&c.runner_digest)? {
+        None => legacy_runner_contract_v1_body(),
+        Some(_) => registered_runner_contract_body(),
+    };
     let text = |v: &serde_json::Value| serde_json::to_string(v).map_err(|_| Error::Internal);
     Ok(TaskSourceMaterialV1 {
         domain: "rsia.development_task_source".into(),
@@ -374,7 +379,7 @@ fn development_task_source_material(
         input_digest: t.input_digest.clone(),
         expected_answer_json: t.expected_answer_json.clone(),
         fixed_grader: c.fixed_grader.clone(),
-        execution_runner_contract_body_utf8: text(&registered_runner_contract_body())?,
+        execution_runner_contract_body_utf8: text(&runner_contract)?,
         environment_digest: c.environment_digest.clone(),
         rules_digest: c.rules_digest.clone(),
         tools_digest: c.tools_digest.clone(),
@@ -483,6 +488,34 @@ pub(crate) async fn read_bound_development_pair_in_session(
     wire.to_legacy_pair(actual.task_material_utf8.as_bytes())
 }
 
+/// What a development runner's contract declares about the candidate it runs
+/// (§6.7.4 Q-29; §5.8 `RegisteredDevelopmentRunner.candidate_consumption`, closed
+/// to `projection_consumed` | `identity_only`). Only a `ProjectionConsumed`
+/// runner's comparison is Skill content evidence; an `IdentityOnly` one proves the
+/// identity, receipt, ledger and failure-closure chain and nothing more (V121.a/e).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateConsumption {
+    ProjectionConsumed,
+    IdentityOnly,
+}
+
+/// The v1 runner contract, frozen: every control registered before Q-29 binds its
+/// digest. It declares no `candidate_consumption`, so such a control stays
+/// readable (§5.1.1) and keeps producing its identity chain, but never registers.
+fn legacy_runner_contract_v1_body() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": "rsia.registered_development_runner.v1",
+        "runtime": "in_process_registered_pure_function",
+        "isolation": "none",
+        "provider_dispatch": false,
+        "model_execution": false,
+        "targets": ["reference_host.clamp_i64.v1"],
+    })
+}
+
+/// The current contract: v1's fields plus its declaration. The registered
+/// pure-function adapter's output never depends on the Skill or Bundle content,
+/// so the runner is `identity_only`.
 fn registered_runner_contract_body() -> serde_json::Value {
     serde_json::json!({
         "schema_version": REGISTERED_RUNNER_CONTRACT_SCHEMA,
@@ -491,12 +524,28 @@ fn registered_runner_contract_body() -> serde_json::Value {
         "provider_dispatch": false,
         "model_execution": false,
         "targets": [CLAMP_TARGET_ID],
+        "candidate_consumption": "identity_only",
     })
 }
 
 /// Digest of the fixed in-process runner contract. It names no sandbox.
 pub fn registered_runner_digest() -> Result<String> {
     fingerprint(&registered_runner_contract_body())
+}
+
+/// The candidate consumption a runner contract digest declares: `None` for the
+/// frozen v1 contract, which declares none. Any other digest is no registered
+/// runner.
+fn runner_candidate_consumption(runner_digest: &str) -> Result<Option<CandidateConsumption>> {
+    if runner_digest == fingerprint(&legacy_runner_contract_v1_body())? {
+        Ok(None)
+    } else if runner_digest == registered_runner_digest()? {
+        Ok(Some(CandidateConsumption::IdentityOnly))
+    } else {
+        Err(Error::Invalid(
+            "control does not bind the registered oracle, target, and runner".into(),
+        ))
+    }
 }
 
 /// Admin-registered control plane for one development episode family.
@@ -582,12 +631,13 @@ impl DevelopmentControlV1 {
         profile.validate()?;
         if self.oracle_digest != profile.oracle_digest
             || self.target_digest != profile.target_digest
-            || self.runner_digest != registered_runner_digest()?
         {
             return Err(Error::Invalid(
                 "control does not bind the registered oracle, target, and runner".into(),
             ));
         }
+        // The frozen v1 contract stays readable; registration refuses it separately.
+        runner_candidate_consumption(&self.runner_digest)?;
         if self.tasks.is_empty() {
             return Err(Error::Invalid("development control has no tasks".into()));
         }
@@ -1233,6 +1283,13 @@ pub async fn register_development_control(
 ) -> Result<String> {
     ctx.require(&[Role::Admin])?;
     control.validate()?;
+    // §6.7.4 Q-29: a runner contract without a `candidate_consumption` declaration
+    // cannot be registered, not even as a replay of a control stored before it.
+    if runner_candidate_consumption(&control.runner_digest)?.is_none() {
+        return Err(Error::Invalid(
+            "legacy development runner contract cannot register a new control".into(),
+        ));
+    }
     if control.namespace != ctx.namespace()
         || ctx.actor() == control.executor_actor
         || ctx.actor() == control.grader_actor
@@ -1851,9 +1908,8 @@ pub struct VerifiedDevelopmentTaskOutcome {
     pub grader_receipt_digest: String,
 }
 
-/// Verifies a DevelopmentObserved report against its typed receipts inside
-/// the caller's transaction. `report.provenance` never grants: the caller has
-/// already rejected Fixture, and everything else is reloaded here.
+/// [`verify_observed_report_with_consumption_in_session`] for a caller that does
+/// not consume the candidate's content.
 pub(crate) async fn verify_observed_report_in_session(
     ctx: &Context,
     session: &mut Session,
@@ -1861,6 +1917,33 @@ pub(crate) async fn verify_observed_report_in_session(
     request: &DevelopmentRunRequest,
     report: &DevelopmentRunReport,
 ) -> Result<Vec<VerifiedDevelopmentTaskOutcome>> {
+    let (outcomes, _) = verify_observed_report_with_consumption_in_session(
+        ctx,
+        session,
+        observed_fact,
+        request,
+        report,
+    )
+    .await?;
+    Ok(outcomes)
+}
+
+/// Verifies a DevelopmentObserved report against its typed receipts inside
+/// the caller's transaction. `report.provenance` never grants: the caller has
+/// already rejected Fixture, and everything else is reloaded here. Also returns
+/// what the runner contract of the receipts' control declares about the
+/// candidate (§6.7.4): a verified chain is Skill content evidence only when that
+/// is `ProjectionConsumed`.
+pub(crate) async fn verify_observed_report_with_consumption_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    observed_fact: &StageFact,
+    request: &DevelopmentRunRequest,
+    report: &DevelopmentRunReport,
+) -> Result<(
+    Vec<VerifiedDevelopmentTaskOutcome>,
+    Option<CandidateConsumption>,
+)> {
     if report.provenance == DevelopmentExecutionProvenance::Fixture || report.results.is_empty() {
         return Err(Error::Forbidden);
     }
@@ -2086,7 +2169,24 @@ pub(crate) async fn verify_observed_report_in_session(
         ));
     }
     require_live_sources(session, ctx, &control.source_ids, request.revoke_watermark).await?;
-    Ok(outcomes)
+    Ok((
+        outcomes,
+        runner_candidate_consumption(&control.runner_digest)?,
+    ))
+}
+
+/// The candidate consumption declared by the runner contract of the control
+/// behind a stored run receipt (E13's content gate reads it for a verified cycle,
+/// whose run receipt the E03 gate checked when the cycle was closed).
+pub(crate) async fn run_receipt_candidate_consumption(
+    session: &mut Session,
+    ctx: &Context,
+    run_receipt_id: &str,
+) -> Result<Option<CandidateConsumption>> {
+    let run: DevelopmentRunReceiptV1 =
+        need_record(session, ctx, RUN_RECEIPT_KIND, run_receipt_id).await?;
+    let control = need_control(session, ctx, &run.control_id).await?;
+    runner_candidate_consumption(&control.runner_digest)
 }
 
 /// Fixed trusted runner for registered pure-function targets. It is the
@@ -3084,5 +3184,64 @@ mod pre_dispatch_tests {
         ));
         assert_eq!(fixture.persisted().await, fixture.call);
         assert_eq!(fixture.reserved().await, 1);
+    }
+}
+
+#[cfg(test)]
+mod runner_contract_tests {
+    use super::*;
+
+    /// The frozen v1 body and its digest, as every pre-Q-29 control stores it.
+    const LEGACY_V1_BODY: &str = r#"{"isolation":"none","model_execution":false,"provider_dispatch":false,"runtime":"in_process_registered_pure_function","schema_version":"rsia.registered_development_runner.v1","targets":["reference_host.clamp_i64.v1"]}"#;
+    const LEGACY_V1_DIGEST: &str =
+        "e1351fe9605e5ebe374bb83e6f1dbe5489021c0e81b2fa83d967010bdd3b5c21";
+    const CURRENT_DIGEST: &str = "b9d2428678d492ca3d4fc42352e0492c0d318e7b418b7bc77a98191fe04e3a09";
+
+    #[test]
+    fn legacy_runner_v1_contract_is_frozen() {
+        let body = serde_json::to_string(&legacy_runner_contract_v1_body()).unwrap();
+        assert_eq!(body, LEGACY_V1_BODY);
+        assert_eq!(body.len(), 217);
+        assert_eq!(hash(LEGACY_V1_BODY.as_bytes()), LEGACY_V1_DIGEST);
+        assert_eq!(
+            fingerprint(&legacy_runner_contract_v1_body()).unwrap(),
+            LEGACY_V1_DIGEST
+        );
+        // §5.1.1: the old contract is read as what it was, and declares nothing.
+        assert_eq!(
+            runner_candidate_consumption(LEGACY_V1_DIGEST).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn current_runner_contract_declares_identity_only() {
+        let body = registered_runner_contract_body();
+        let legacy = legacy_runner_contract_v1_body();
+        assert_eq!(body.as_object().unwrap().len(), 7);
+        for field in [
+            "runtime",
+            "isolation",
+            "provider_dispatch",
+            "model_execution",
+            "targets",
+        ] {
+            assert_eq!(body[field], legacy[field], "{field}");
+        }
+        assert_eq!(
+            body["schema_version"],
+            "rsia.registered_development_runner.v2"
+        );
+        assert_eq!(body["candidate_consumption"], "identity_only");
+        assert_eq!(registered_runner_digest().unwrap(), CURRENT_DIGEST);
+        assert_eq!(
+            runner_candidate_consumption(CURRENT_DIGEST).unwrap(),
+            Some(CandidateConsumption::IdentityOnly)
+        );
+        assert!(matches!(
+            runner_candidate_consumption(&hash(b"an unregistered runner contract")),
+            Err(Error::Invalid(message))
+                if message == "control does not bind the registered oracle, target, and runner"
+        ));
     }
 }
