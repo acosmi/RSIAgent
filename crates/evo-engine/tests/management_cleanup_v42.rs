@@ -2480,8 +2480,8 @@ async fn a_queued_job_whose_input_was_redacted_fails_with_source_revoked_and_is_
         .await
         .map(current_management_job)
         .unwrap();
-    assert_eq!(observed.identity().state, ManagementJobState::Failed);
-    assert_eq!(observed.error_code(), Some("source_revoked"));
+    assert_eq!(observed.state, ManagementJobState::Failed);
+    assert_eq!(observed.error_code.as_deref(), Some("source_revoked"));
 }
 
 #[tokio::test]

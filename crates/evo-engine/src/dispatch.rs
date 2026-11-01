@@ -358,7 +358,11 @@ impl ManagementDispatcher {
         let count = pending.len();
         for (ctx, record) in pending {
             let identity = record.identity();
-            if identity.state == ManagementJobState::Queued {
+            if identity.state == ManagementJobState::Queued
+                && record.generation() == 0
+                && identity.lease_token.is_none()
+                && record.result().is_none()
+            {
                 self.spawn_job(identity.id.to_owned())?;
             } else {
                 // This fixed startup entry, not lease expiry or an empty call
@@ -812,15 +816,20 @@ impl ManagementDispatcher {
             // The physical read's Internal/Clock error propagates untouched.
             // Only an actually read missing/redacted/invalid private body is
             // the original private-input fault, not an inferred storage fault.
-            let body =
-                private_input_body_in_session(trusted, &mut session, identity.private_input_ref)
-                    .await?;
-            let private = match body {
-                None => Err(InputFault::Other(Error::NotFound)),
-                Some(body) if is_redacted(&body) => Err(InputFault::Redacted {
+            let private = match private_input_body_in_session(
+                trusted,
+                &mut session,
+                identity.private_input_ref,
+            )
+            .await
+            {
+                Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
+                Err(error) => Err(InputFault::Other(error)),
+                Ok(None) => Err(InputFault::Other(Error::NotFound)),
+                Ok(Some(body)) if is_redacted(&body) => Err(InputFault::Redacted {
                     id: identity.private_input_ref.into(),
                 }),
-                Some(body) => decode_private_request_fields(
+                Ok(Some(body)) => decode_private_request_fields(
                     body,
                     identity.private_input_ref,
                     identity.operation,
@@ -828,15 +837,28 @@ impl ManagementDispatcher {
                 )
                 .map_err(InputFault::Other),
             };
+            if record.generation() != 0
+                || identity.lease_token.is_some()
+                || record.result().is_some()
+            {
+                // A Queued label and unusable source cannot establish that an
+                // earlier generation ended. Preserve its fence and references;
+                // only the existing exit/startup reconciliation may close it.
+                let mut job = record.into_unfinished_v2()?;
+                now()?;
+                job.state = ManagementJobState::Draining;
+                session
+                    .put(trusted, "job", &job.id, trusted.actor(), &job)
+                    .await?;
+                session
+                    .audit(trusted, "management.job.unknown_continuation", &job.id)
+                    .await?;
+                session.commit().await?;
+                return Ok((trusted.clone(), None));
+            }
             let request = match private {
                 Ok(request) => request,
                 Err(fault) => {
-                    if record.generation() != 0
-                        || identity.lease_token.is_some()
-                        || record.result().is_some()
-                    {
-                        return Err(fault.into_error());
-                    }
                     let code = fault.error_code();
                     let phase = match fault {
                         InputFault::Redacted { .. } => "private_input_redacted",
@@ -869,11 +891,7 @@ impl ManagementDispatcher {
                 }
             };
             if let Err(error) = admission {
-                if matches!(error, Error::ClockRegressed | Error::Internal)
-                    || record.generation() != 0
-                    || identity.lease_token.is_some()
-                    || record.result().is_some()
-                {
+                if matches!(error, Error::ClockRegressed | Error::Internal) {
                     return Err(error);
                 }
                 let mut job = record.into_unfinished_v2()?;
@@ -932,20 +950,6 @@ impl ManagementDispatcher {
                 self.retry_claim_later(job.id);
                 return Ok((trusted.clone(), None));
             }
-            if job.generation != 0 || job.lease_token.is_some() || job.result.is_some() {
-                // A Queued label cannot prove that an earlier generation ended.
-                // Do not ordinary-dispatch a damaged/unknown continuation.
-                job.state = ManagementJobState::Draining;
-                now()?;
-                session
-                    .put(trusted, "job", &job.id, trusted.actor(), &job)
-                    .await?;
-                session
-                    .audit(trusted, "management.job.unknown_continuation", &job.id)
-                    .await?;
-                session.commit().await?;
-                return Ok((trusted.clone(), None));
-            }
             let claim_at = now()?;
             job.generation = job
                 .generation
@@ -987,8 +991,10 @@ impl ManagementDispatcher {
     // A diagnostic is not worker-exit evidence. Running jobs are closed only
     // by the owned JoinHandle path above; this preserves the old fault API.
     async fn record_background_error(&self, job_id: &str, error: &Error) -> Result<()> {
-        if matches!(error, Error::ClockRegressed) {
-            return Err(Error::ClockRegressed);
+        match error {
+            Error::ClockRegressed => return Err(Error::ClockRegressed),
+            Error::Internal => return Err(Error::Internal),
+            _ => {}
         }
         for context in self.trusted_contexts.iter() {
             let mut session = self.store.session().await?;
@@ -1036,15 +1042,15 @@ impl ManagementDispatcher {
                 observed_generation: job.generation,
                 recorded_at: at,
             });
-            if job.state == ManagementJobState::Queued
-                && job.generation == 0
-                && job.lease_token.is_none()
-                && job.result.is_none()
-            {
-                job.state = ManagementJobState::Failed;
-                job.step = "background_failed".into();
-                job.error_code = Some(code.into());
-                job.lease_until = 0;
+            if job.state == ManagementJobState::Queued {
+                if job.generation == 0 && job.lease_token.is_none() && job.result.is_none() {
+                    job.state = ManagementJobState::Failed;
+                    job.step = "background_failed".into();
+                    job.error_code = Some(code.into());
+                    job.lease_until = 0;
+                } else {
+                    job.state = ManagementJobState::Draining;
+                }
             }
             session
                 .put(context, "job", &job.id, context.actor(), &job)
@@ -2204,7 +2210,7 @@ async fn run_experiment_register_current(
     current.step = if already_registered {
         "experiment_already_registered"
     } else {
-        "experiment_registered"
+        "current_holdout_registered"
     }
     .into();
     current.result = Some(ManagementResultV2::Original(
@@ -3067,6 +3073,27 @@ async fn optimization_live_accounting_in_session(
                     .await?;
             }
         }
+        let budget_ref_id = optimization_budget_ref_id(
+            ctx.namespace(),
+            &reference.billing_scope,
+            &reference.call_id,
+        )?;
+        let budget_ref = session
+            .object_row(ctx, "artifact", &budget_ref_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        if budget_ref.owner != reference.producer_actor
+            || hash(budget_ref.body.as_bytes()) != reference.budget_ref_digest
+        {
+            return Ok(None);
+        }
+        validate_optimization_budget_ref(
+            &budget_ref.body,
+            &budget_ref_id,
+            ctx.namespace(),
+            &reference.billing_scope,
+            &reference.call_id,
+        )?;
         owned.push(OwnedOptimizationCall {
             reference: reference.clone(),
             call,
@@ -3665,6 +3692,42 @@ async fn consumer_progress(
     store: &Store,
     record: &VersionedManagementJob,
 ) -> Result<ConsumerProgress> {
+    if let VersionedManagementJob::V2(job) = record
+        && job.operation == "experiment.register"
+        && job.step == "current_holdout_registered"
+    {
+        let Some(ManagementResult::ExperimentRegistered {
+            control_id,
+            control_digest,
+            holdout_id,
+            holdout_digest,
+        }) = record.original_result()
+        else {
+            return Ok(ConsumerProgress::Unknown);
+        };
+        // This actual producer checkpoint saved the Full references with its
+        // H commit. Historical verification does not reuse the private source.
+        let mut session = store.session().await?;
+        let progress = IndependentEvaluationControl::registration_progress_in_session(
+            ctx,
+            &mut session,
+            control_id,
+            holdout_id,
+        )
+        .await?;
+        session.commit().await?;
+        if progress.control_digest.as_ref() != Some(control_digest)
+            || progress.holdout_digest.as_ref() != Some(holdout_digest)
+        {
+            return Ok(ConsumerProgress::Unknown);
+        }
+        return Ok(ConsumerProgress::Committed(JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: job.step.clone(),
+            result: job.result.clone(),
+            error_code: None,
+        }));
+    }
     if record.identity().operation == "optimization.step" {
         let mut session = store.session().await?;
         let current = load_job_record_in_session(ctx, &mut session, record.identity().id).await?;
@@ -5456,8 +5519,15 @@ impl ManagementDispatcher {
             }
             ConsumerProgress::Unknown => {
                 let prior = record.result();
-                let lower_bound = stored_result_has_side_effect(prior.as_ref())
-                    .then(|| committed_effects(prior.as_ref()));
+                let lower_bound = if matches!(record, VersionedManagementJob::V2(current)
+                    if current.operation == "experiment.register"
+                        && current.step == "current_holdout_registered")
+                {
+                    None
+                } else {
+                    stored_result_has_side_effect(prior.as_ref())
+                        .then(|| committed_effects(prior.as_ref()))
+                };
                 (lower_bound, ManagementFeeKnowledge::UnknownProvenance, None)
             }
             ConsumerProgress::NotCommitted => (
@@ -5465,6 +5535,20 @@ impl ManagementDispatcher {
                 ManagementFeeKnowledge::KnownNone,
                 Some(Vec::new()),
             ),
+            ConsumerProgress::Committed(ref outcome)
+                if matches!(record, VersionedManagementJob::V2(current)
+                    if current.operation == "experiment.register"
+                        && current.step == "current_holdout_registered") =>
+            {
+                let mut effects = committed_effects(outcome.result.as_ref());
+                effects
+                    .retain(|effect| matches!(effect, ManagementCommittedEffect::Holdout { .. }));
+                (
+                    Some(effects),
+                    ManagementFeeKnowledge::KnownNone,
+                    Some(Vec::new()),
+                )
+            }
             ConsumerProgress::Committed(ref outcome) => (
                 Some(if outcome.has_committed_side_effect() {
                     committed_effects(outcome.result.as_ref())

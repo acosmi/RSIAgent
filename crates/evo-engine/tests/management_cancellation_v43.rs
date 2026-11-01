@@ -301,6 +301,162 @@ async fn cancel_before_first_commit_has_no_business_side_effect() {
         .unwrap(),
         c_before
     );
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", fx.path.display()))
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER hold_current_finish BEFORE UPDATE OF body ON objects
+         WHEN NEW.kind='job'
+           AND json_extract(NEW.body,'$.request_key')='current-owned-holdout-true'
+           AND json_extract(NEW.body,'$.step')='current_holdout_registered'
+           AND json_extract(NEW.body,'$.state')='succeeded'
+         BEGIN SELECT RAISE(ABORT,'hold actual Current completion'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for cancel_after in [false, true] {
+        let mut produced = holdout.clone();
+        produced.id = format!("current-owned-holdout-{cancel_after}");
+        let payload = serde_json::to_value(ExperimentRegisterRequestV2 {
+            schema_version: "rsia.management.experiment_register.v2".into(),
+            request_key: produced.id.clone(),
+            control: control.clone(),
+            holdout: produced.clone(),
+        })
+        .unwrap();
+        let expected_result = json!({
+            "result": "experiment_registered",
+            "control_id": control.id,
+            "control_digest": control.digest().unwrap(),
+            "holdout_id": produced.id,
+            "holdout_digest": produced.digest(&control).unwrap(),
+        });
+        let expected_effects = json!([{
+            "kind": "holdout",
+            "holdout_id": produced.id,
+            "holdout_digest": produced.digest(&control).unwrap(),
+        }]);
+        let accepted = d
+            .submit(&fx.ctx, "experiment.register", payload)
+            .await
+            .unwrap();
+        let id = accepted.identity().id;
+        if cancel_after {
+            // The original producer committed H and the Full checkpoint. A
+            // single local completion-write fault leaves its real supervisor
+            // waiting, so the public cancel runs in the actual after window.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let record = d.status(&fx.ctx, id).await.unwrap();
+                    if record.step() == "current_holdout_registered" {
+                        assert_eq!(
+                            serde_json::to_value(record.result()).unwrap(),
+                            expected_result
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("actual Current H checkpoint was not committed");
+            let cancelled = d.cancel(&fx.ctx, id).await.unwrap();
+            assert_eq!(cancelled.identity().state, ManagementJobState::Draining);
+            assert_eq!(
+                cancelled.cancel_arrival(),
+                Some(evo_storage::ManagementCancelArrival::AfterSideEffect)
+            );
+            assert_eq!(
+                serde_json::to_value(cancelled.result()).unwrap(),
+                expected_result
+            );
+        } else {
+            let complete = legacy_terminal(&d, &fx, id).await;
+            assert_eq!(complete.identity().state, ManagementJobState::Succeeded);
+            assert_eq!(complete.step(), "current_holdout_registered");
+            assert_eq!(
+                serde_json::to_value(complete.result()).unwrap(),
+                expected_result
+            );
+        }
+        let view = d.status_view(&fx.ctx, id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(view.committed_side_effects).unwrap(),
+            expected_effects
+        );
+        assert_eq!(serde_json::to_value(view.result).unwrap(), expected_result);
+        if cancel_after {
+            let mut cleanup = LifecycleStore::begin_revoke(
+                &admin,
+                &fx.store,
+                TypedObjectRef {
+                    kind: "artifact".into(),
+                    id: accepted.identity().private_input_ref.into(),
+                },
+                "after actual Current H commit",
+                now().unwrap(),
+            )
+            .await
+            .unwrap();
+            for _ in 0..100 {
+                cleanup = LifecycleStore::cleanup_step(
+                    &admin,
+                    &fx.store,
+                    &cleanup.job_id,
+                    8,
+                    now().unwrap(),
+                )
+                .await
+                .unwrap();
+                if cleanup.state == CleanupState::Complete {
+                    break;
+                }
+            }
+            assert_eq!(cleanup.state, CleanupState::Complete);
+            let view = d.status_view(&fx.ctx, id).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(view.committed_side_effects).unwrap(),
+                expected_effects
+            );
+            assert_eq!(serde_json::to_value(view.result).unwrap(), expected_result);
+            assert_eq!(
+                view.cancel_arrival,
+                Some(evo_storage::ManagementCancelArrival::AfterSideEffect)
+            );
+            sqlx::query("DROP TRIGGER hold_current_finish")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let done = tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    let record =
+                        decode_management_job(&raw_record(&fx.store, &fx.ctx, id).await).unwrap();
+                    if record.identity().state == ManagementJobState::Succeeded {
+                        break record;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("actual observed Current worker did not finish");
+            assert_eq!(done.step(), "current_holdout_registered");
+            assert_eq!(
+                serde_json::to_value(done.result()).unwrap(),
+                expected_result
+            );
+            assert_eq!(
+                done.cancel_arrival(),
+                Some(evo_storage::ManagementCancelArrival::AfterSideEffect)
+            );
+            // Completed source-derived results keep the original public
+            // revocation refusal, while their durable references remain intact.
+            assert!(matches!(
+                d.status(&fx.ctx, id).await,
+                Err(Error::Conflict(_))
+            ));
+        }
+    }
     // Both C/H can already exist under a new business key. Returning the full
     // registration references is then a readonly workflow, not this job's DML.
     IndependentEvaluationControl::register_current_holdout(&fx.ctx, &fx.store, holdout.clone())
@@ -347,9 +503,6 @@ async fn cancel_before_first_commit_has_no_business_side_effect() {
         "known_none"
     );
     assert!(view.pending_fees.unwrap().is_empty());
-    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", fx.path.display()))
-        .await
-        .unwrap();
     sqlx::query("CREATE TRIGGER cancel_readonly_checkpoint AFTER UPDATE OF body ON objects WHEN NEW.kind='job' AND json_extract(NEW.body,'$.request_key')='existing-registration-cancel' AND json_extract(NEW.body,'$.step')='experiment_already_registered' AND json_extract(NEW.body,'$.cancel_requested')=0 BEGIN UPDATE objects SET body=json_set(NEW.body,'$.cancel_requested',json('true')) WHERE namespace=NEW.namespace AND kind=NEW.kind AND id=NEW.id; END").execute(&pool).await.unwrap();
     readonly["request_key"] = json!("existing-registration-cancel");
     let accepted = d
@@ -995,6 +1148,174 @@ async fn reconcile(fx: &PaidFixture) {
 
 #[tokio::test]
 async fn draining_recovery_never_claims_or_reexecutes_request() {
+    tokio::task::spawn_blocking(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for fault in ["missing", "redacted", "invalid"] {
+                let fx = legacy("control_committed_holdout_not_committed").await;
+                let id = fx.sample["job_id"].as_str().unwrap();
+                let cid = fx.sample["request"]["control"]["id"].as_str().unwrap();
+                let hid = fx.sample["request"]["holdout"]["id"].as_str().unwrap();
+                let progress = IndependentEvaluationControl::registration_progress(
+                    &fx.ctx, &fx.store, cid, hid,
+                )
+                .await
+                .unwrap();
+                let mut damaged = decode_management_job(&raw_record(&fx.store, &fx.ctx, id).await)
+                    .unwrap()
+                    .into_unfinished_v2()
+                    .unwrap();
+                // Explicit damaged-row fixtures derived from the actual old producer.
+                // Source loss cannot turn its C reference into a new ordinary claim.
+                damaged.state = ManagementJobState::Queued;
+                damaged.lease_token = None;
+                damaged.lease_until = 0;
+                if fault == "invalid" {
+                    damaged.generation = 0;
+                }
+                if fault != "redacted" {
+                    damaged.result = Some(evo_storage::ManagementResultV2::Partial(
+                        evo_storage::ManagementPartialResultV2::ControlRegistered {
+                            control_id: cid.into(),
+                            control_digest: progress.control_digest.clone().unwrap(),
+                        },
+                    ));
+                }
+                let mut s = fx.store.session().await.unwrap();
+                s.put(&fx.ctx, "job", id, fx.ctx.actor(), &damaged)
+                    .await
+                    .unwrap();
+                s.commit().await.unwrap();
+                let admin = Context::new("n", "admin", Role::Admin).unwrap();
+                let fresh = unclaimed(
+                    fx.store.clone(),
+                    admin.clone(),
+                    "meta.start",
+                    json!({
+                        "schema_version": "rsia.management.meta_start.v1",
+                        "request_key": format!("never-started-{fault}"),
+                    }),
+                )
+                .await;
+                let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", fx.path.display()))
+                    .await
+                    .unwrap();
+                for (ctx, identity, started) in [
+                    (&fx.ctx, damaged.id.clone(), true),
+                    (&admin, fresh.identity().id.to_owned(), false),
+                ] {
+                    let record = decode_management_job(&raw_record(&fx.store, ctx, &identity).await)
+                        .unwrap();
+                    let input = record.identity().private_input_ref;
+                    if fault == "missing" {
+                        sqlx::query(
+                            "DELETE FROM objects WHERE namespace='n' AND kind='artifact' AND id=?",
+                        )
+                        .bind(input)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    } else {
+                        let body = if fault == "redacted" {
+                            json!({
+                                "id": input,
+                                "schema_version": "rsia.redacted.v1",
+                                "state": "source_revoked",
+                            })
+                            .to_string()
+                        } else {
+                            "{".into()
+                        };
+                        sqlx::query(
+                            "UPDATE objects SET body=? WHERE namespace='n' AND kind='artifact' AND id=?",
+                        )
+                        .bind(body)
+                        .bind(input)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    }
+                    let mut s = fx.store.session().await.unwrap();
+                    assert_eq!(
+                        s.capacity_usage_v41(now().unwrap() as u64)
+                            .await
+                            .unwrap()
+                            .concurrent_dispatches,
+                        1,
+                    );
+                    s.commit().await.unwrap();
+                    let restart =
+                        ManagementDispatcher::new(fx.store.clone(), vec![ctx.clone()]).unwrap();
+                    assert_eq!(restart.recover_pending().await.unwrap(), 1);
+                    let expected = if started {
+                        ManagementJobState::Draining
+                    } else {
+                        ManagementJobState::Failed
+                    };
+                    let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let recovered = current(restart.status(ctx, &identity).await.unwrap());
+                            if recovered.state == expected {
+                                break recovered;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("source fault did not reach its evidence-backed state");
+                    if started {
+                        let mut expected = damaged.clone();
+                        expected.state = ManagementJobState::Draining;
+                        assert_eq!(
+                            serde_json::to_value(&recovered).unwrap(),
+                            serde_json::to_value(expected).unwrap(),
+                        );
+                        let view = restart.status_view(ctx, &identity).await.unwrap();
+                        assert_eq!(
+                            serde_json::to_value(view.fee_knowledge).unwrap()["state"],
+                            "unknown_provenance",
+                        );
+                        assert!(view.pending_fees.is_none());
+                    } else {
+                        assert_eq!(recovered.generation, 0);
+                        assert!(recovered.lease_token.is_none() && recovered.result.is_none());
+                        assert_eq!(
+                            recovered.error_code.as_deref(),
+                            Some(match fault {
+                                "redacted" => "source_revoked",
+                                "missing" => "not_found",
+                                _ => "invalid_input",
+                            }),
+                        );
+                    }
+                    let mut s = fx.store.session().await.unwrap();
+                    assert_eq!(
+                        s.capacity_usage_v41(now().unwrap() as u64)
+                            .await
+                            .unwrap()
+                            .concurrent_dispatches,
+                        1,
+                    );
+                    s.commit().await.unwrap();
+                }
+                pool.close().await;
+                assert_eq!(
+                    IndependentEvaluationControl::registration_progress(&fx.ctx, &fx.store, cid, hid)
+                        .await
+                        .unwrap(),
+                    progress,
+                );
+            }
+        });
+        // These explicit history/never-started fixtures own no consumer I/O;
+        // stop only their waiting reconciliation supervisors before returning.
+        drop(runtime);
+    })
+    .await
+    .unwrap();
     let (fx, claimed, draining) = tokio::task::spawn_blocking(|| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1104,15 +1425,20 @@ async fn partial_with_unknown_pending_stays_draining_before_blocked() {
 
 #[tokio::test]
 async fn missing_or_foreign_fee_binding_never_becomes_known_none() {
-    for (redact, foreign) in [(false, false), (true, true)] {
+    for (redact, fault) in [(false, "missing"), (true, "foreign"), (false, "digest")] {
         let fx = paid_fixture(1).await;
         let claimed = paid_start(&fx).await;
         let mut altered = claimed.clone();
-        if foreign {
-            altered.optimization.as_mut().unwrap().calls[0].producer_actor =
-                "foreign-producer".into();
-        } else {
-            altered.optimization.as_mut().unwrap().calls.clear();
+        match fault {
+            "foreign" => {
+                altered.optimization.as_mut().unwrap().calls[0].producer_actor =
+                    "foreign-producer".into()
+            }
+            "digest" => {
+                altered.optimization.as_mut().unwrap().calls[0].budget_ref_digest =
+                    hash(b"different-original-budget-ref")
+            }
+            _ => altered.optimization.as_mut().unwrap().calls.clear(),
         }
         let mut s = fx.store.session().await.unwrap();
         s.put(&fx.admin, "job", &claimed.id, fx.admin.actor(), &altered)

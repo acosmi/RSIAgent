@@ -183,6 +183,38 @@ async fn running_and_draining_capacity_preserves_existing_limits() {
         expired.concurrent_dispatches, 10,
         "expiry does not close either wire's execution"
     );
+    for (i, evidence) in ["none", "generation", "token", "result"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut value = job(&format!("queued-{evidence}"), ManagementJobState::Queued, 0);
+        value.generation = u64::from(evidence == "generation");
+        value.lease_token = (evidence == "token").then(|| "queued-original-token".into());
+        value.lease_until = if evidence == "token" { 100 } else { 0 };
+        value.result = (evidence == "result").then(|| {
+            evo_storage::ManagementResult::EvaluationTicketBlocked {
+                ticket_id: "queued-existing-ticket".into(),
+            }
+        });
+        if i % 2 == 0 {
+            s.put(&admin, "job", &value.id, admin.actor(), &value)
+                .await
+                .unwrap();
+        } else {
+            let current = VersionedManagementJob::V1(value)
+                .into_unfinished_v2()
+                .unwrap();
+            s.put(&admin, "job", &current.id, admin.actor(), &current)
+                .await
+                .unwrap();
+        }
+    }
+    let before_recovery = s.capacity_usage_v41(99).await.unwrap();
+    assert_eq!(before_recovery.concurrent_dispatches, 13);
+    assert_eq!(before_recovery.active_leases, 11);
+    let expired = s.capacity_usage_v41(100).await.unwrap();
+    assert_eq!(expired.concurrent_dispatches, 13);
+    assert_eq!(expired.active_leases, 0);
     s.put(
         &admin,
         "job",

@@ -807,7 +807,9 @@ async fn count_management_job_capacity(
         let unclosed = matches!(
             job.state,
             ManagementJobState::Running | ManagementJobState::Draining
-        ) || job.lease_token.is_some();
+        ) || job.lease_token.is_some()
+            || (job.state == ManagementJobState::Queued
+                && (record.generation() != 0 || record.result().is_some()));
         if unclosed {
             counts.concurrent_dispatches = counts
                 .concurrent_dispatches
