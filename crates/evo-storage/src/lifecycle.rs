@@ -3254,13 +3254,13 @@ async fn cleanup_node_content(
     if node.kind == "blob" {
         return cleanup_e16_blob(tx, store, ctx, job_id, node, now).await;
     }
-    let row: Option<(String, i64)> = sqlx::query_as(
+    let row: Option<(String, i64, String)> = sqlx::query_as(
         "SELECT body, CASE WHEN objects.kind='artifact' AND json_valid(objects.body)
          THEN EXISTS (
              SELECT 1 FROM json_each(objects.body) AS member
              WHERE member.key='schema_version' AND member.type='text'
                AND member.value='rsia.host_surface_record.v2'
-         ) ELSE 0 END
+         ) ELSE 0 END, owner
          FROM objects WHERE namespace=? AND kind=? AND id=?",
     )
     .bind(ctx.namespace())
@@ -3269,13 +3269,13 @@ async fn cleanup_node_content(
     .fetch_optional(&mut **tx)
     .await
     .map_err(internal)?;
-    let (body, value) = match row {
-        Some((body, current_host_surface)) => {
+    let (body, value, owner) = match row {
+        Some((body, current_host_surface, owner)) => {
             let value =
                 crate::decode_object_row_body::<serde_json::Value>(&body, current_host_surface)?;
-            (Some(body), Some(value))
+            (Some(body), Some(value), Some(owner))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
     let redacted_export = node.kind == "artifact"
         && value.as_ref().is_some_and(|value| {
@@ -3309,7 +3309,7 @@ async fn cleanup_node_content(
         }
         remove_controlled_local_export(store, ctx, node, job_id, tx, now).await?;
     }
-    let (Some(body), Some(value)) = (body, value) else {
+    let (Some(body), Some(value), Some(owner)) = (body, value, owner) else {
         return Ok(());
     };
     let schema = value
@@ -3391,13 +3391,17 @@ async fn cleanup_node_content(
         // name reaches the derived redactor; any other name is outside the table.
         let payload = &value["payload"];
         let error = match payload.get("schema_version").map(serde_json::Value::as_str) {
-            None if formal_ordinary_inner_version_known(None, payload) => None,
+            None if formal_ordinary_inner_version(None, payload).is_some() => None,
             None => Some("blocked_unknown_scope:formal_judgment_old_wire_or_domain"),
             Some(Some("rsia.formal_judgment.v1")) => {
                 return redact_formal_judgment_derived(tx, ctx, job_id, node, &body, &value, now)
                     .await;
             }
-            Some(Some("rsia.formal_evaluation.v3")) if formal_native_wire_known(payload) => None,
+            Some(Some("rsia.formal_evaluation.v3"))
+                if formal_native_wire_known(tx, ctx, node, &owner, &value).await? =>
+            {
+                None
+            }
             Some(Some("rsia.formal_evaluation.v3")) => {
                 Some("blocked_unknown_scope:formal_judgment_native_wire_or_domain")
             }
@@ -5535,56 +5539,88 @@ fn formal_cleanup_ticket_plan_binding_shape(value: &serde_json::Value) -> Result
 /// The ordinary native wire is exactly schema/decision/result. Its result is
 /// classified against the registered native payload domain without changing
 /// the frozen result or granting authority from a cleanup-only check.
-fn formal_native_wire_known(payload: &serde_json::Value) -> bool {
-    payload.as_object().is_some_and(|wire| wire.len() == 3)
-        && payload["decision_version"] == "rsia.fixed_sample_regression.v1"
-        && formal_ordinary_inner_version_known(
-            Some("rsia.formal_evaluation.v3"),
-            &payload["result"],
-        )
+async fn formal_native_wire_known(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ctx: &Context,
+    node: &TypedObjectRef,
+    report_owner: &str,
+    value: &serde_json::Value,
+) -> Result<bool> {
+    let payload = &value["payload"];
+    if identifier(report_owner).is_err()
+        || !value.as_object().is_some_and(|wire| wire.len() == 4)
+        || value["id"] != node.id
+        || !payload.as_object().is_some_and(|wire| wire.len() == 3)
+        || payload["decision_version"] != "rsia.fixed_sample_regression.v1"
+    {
+        return Ok(false);
+    }
+    let Some(version) =
+        formal_ordinary_inner_version(Some("rsia.formal_evaluation.v3"), &payload["result"])
+    else {
+        return Ok(false);
+    };
+    let Some(ticket_id) = payload["result"]["ticket_id"].as_str() else {
+        return Ok(false);
+    };
+    if identifier(ticket_id).is_err()
+        || node.id != format!("e05-{}", fingerprint(&("formal_evaluation_v2", ticket_id))?)
+    {
+        return Ok(false);
+    }
+    let ticket_physical = format!("e05-{}", fingerprint(&("evaluation_ticket_v2", ticket_id))?);
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT owner,body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+    )
+    .bind(ctx.namespace())
+    .bind(&ticket_physical)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(internal)?;
+    let Some((ticket_owner, body)) = row else {
+        return Ok(false);
+    };
+    let Ok(ticket) = parse_strict_json(&body) else {
+        return Ok(false);
+    };
+    // Cleanup identity only: a native label on an old ticket cannot reclassify
+    // its history, including when the report reached the frontier directly.
+    Ok(ticket.as_object().is_some_and(|wire| wire.len() == 4)
+        && ticket["schema_version"] == "rsia.typed_artifact_envelope.v1"
+        && ticket["record_kind"] == "evaluation_ticket_v2"
+        && ticket["id"] == ticket_physical
+        && ticket["payload"]["id"] == ticket_id
+        && ticket["payload"]["schema_version"].as_str() == Some(version.domain.6.as_ref())
+        && ticket["payload"]["evaluator_actor"].as_str() == Some(ticket_owner.as_str())
+        && ticket_owner == report_owner)
 }
 
 /// Ordinary report judgment (the no-schema wire, or the native wrapper's result).
 /// Classify only its actual inner version combination for its exact payload
 /// schema against the one catalog; do not reinterpret/rejudge history or infer
 /// Current from this cleanup-only structural registration check.
-fn formal_ordinary_inner_version_known(
+fn formal_ordinary_inner_version(
     payload_schema: Option<&str>,
     payload: &serde_json::Value,
-) -> bool {
-    let Some(variant) = payload.get("variant").and_then(serde_json::Value::as_str) else {
-        return false;
-    };
-    let Some(scope) = payload
+) -> Option<&'static FormalJudgmentVersion> {
+    let variant = payload.get("variant").and_then(serde_json::Value::as_str)?;
+    let scope = payload
         .get("evidence_scope")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return false;
-    };
+        .and_then(serde_json::Value::as_str)?;
     let (stats, certificate, route) = match variant {
         "complete_batch" => {
-            let Some(stats) = payload
+            let stats = payload
                 .get("report")
                 .and_then(|v| v.get("stats_version"))
-                .and_then(serde_json::Value::as_str)
-            else {
-                return false;
-            };
+                .and_then(serde_json::Value::as_str)?;
             (Some(stats), None, None)
         }
         "early_stopped" => {
-            let Some(certificate) = payload.get("certificate") else {
-                return false;
-            };
-            let Some(schema) = certificate
+            let certificate = payload.get("certificate")?;
+            let schema = certificate
                 .get("schema_version")
-                .and_then(serde_json::Value::as_str)
-            else {
-                return false;
-            };
-            let Some(k) = certificate.get("k").and_then(serde_json::Value::as_u64) else {
-                return false;
-            };
+                .and_then(serde_json::Value::as_str)?;
+            let k = certificate.get("k").and_then(serde_json::Value::as_u64)?;
             (
                 None,
                 Some(schema),
@@ -5596,9 +5632,9 @@ fn formal_ordinary_inner_version_known(
             )
         }
         "invalid" => (None, None, None),
-        _ => return false,
+        _ => return None,
     };
-    FORMAL_JUDGMENT_VERSIONS.iter().any(|entry| {
+    FORMAL_JUDGMENT_VERSIONS.iter().find(|entry| {
         entry.domain.2.as_deref() == payload_schema
             && entry.domain.3.as_ref() == variant
             && entry.domain.4.as_ref() == scope

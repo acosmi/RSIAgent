@@ -2050,9 +2050,9 @@ async fn unknown_inner_judgment_version_is_left_in_quarantine() {
                 damaged["payload"]["schema_version"] = json!("rsia.formal_evaluation.v999");
                 "blocked_unknown_scope:formal_judgment_version_outside_table"
             } else {
-                // The exact ordinary native wrapper keeps its ticket in result.ticket_id.
-                // Catch-up must find that real relation (not an identity fault); with
-                // no native catalog row its domain stays quarantined, not derived-redacted.
+                // Only the native wrapper changes: the actual original remains
+                // Control2/Ticket2/Holdout1/certificate1, not the native source domain.
+                // Catch-up must find its real relation, then quarantine that domain.
                 let result = damaged["payload"].take();
                 damaged["payload"] = json!({"schema_version":"rsia.formal_evaluation.v3",
                 "decision_version":"rsia.fixed_sample_regression.v1","result":result});
@@ -2067,6 +2067,50 @@ async fn unknown_inner_judgment_version_is_left_in_quarantine() {
                 &ag163_body(&fx.store, &admin, "artifact", &ticket_physical).await,
             )
             .unwrap();
+            if fault == "native_wire" {
+                assert_eq!(
+                    ticket_wire["payload"]["schema_version"],
+                    "rsia.evaluation_ticket.v2"
+                );
+                let control: serde_json::Value = serde_json::from_str(
+                    &ag163_body(
+                        &fx.store,
+                        &admin,
+                        "artifact",
+                        &ag163_sid(
+                            "registered_evaluation_control_v41",
+                            ticket_wire["payload"]["registration_id"].as_str().unwrap(),
+                        ),
+                    )
+                    .await,
+                )
+                .unwrap();
+                assert_eq!(
+                    control["payload"]["schema_version"],
+                    "rsia.registered_evaluation_control.v2"
+                );
+                let holdout: serde_json::Value = serde_json::from_str(
+                    &ag163_body(
+                        &fx.store,
+                        &admin,
+                        "artifact",
+                        &ag163_sid(
+                            "protected_holdout_v41",
+                            ticket_wire["payload"]["holdout_id"].as_str().unwrap(),
+                        ),
+                    )
+                    .await,
+                )
+                .unwrap();
+                assert_eq!(
+                    holdout["payload"]["schema_version"],
+                    "rsia.protected_holdout_record.v1"
+                );
+                assert_eq!(
+                    damaged["payload"]["result"]["certificate"]["schema_version"],
+                    "rsia.early_stop_certificate.v1"
+                );
+            }
             let binding = &ticket_wire["payload"]["candidate_dependency_binding"];
             assert!(
                 binding["sources"]

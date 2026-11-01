@@ -20,7 +20,7 @@ use evo_core::sequential::{
     AlphaAllocation, EarlyStopPlan, FormalClaimKind, ResearchFamilyAlphaPlan,
 };
 use evo_core::{Context, Error, Role, canonical_fingerprint, fingerprint, hash};
-use evo_engine::dispatch::{ManagementDispatcher, ManagementJobState};
+use evo_engine::dispatch::ManagementDispatcher;
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::release_store::{CurrentStageBundleRequest, ReleaseStore, TypedSourceRef};
 use evo_engine::streaming_evaluator::{
@@ -380,10 +380,12 @@ async fn status_metadata(fx: &History, key: &str) -> Value {
     let job = dispatcher.submit(&fx.evaluator, "evaluation.status", json!({
         "schema_version":"rsia.management.evaluation_status.v1","request_key":key,"ticket_id":fx.ticket_id
     })).await.unwrap();
+    let job = serde_json::to_value(job).unwrap();
+    let job_id = job["id"].as_str().unwrap();
     for _ in 0..500 {
-        let current = dispatcher.status(&fx.evaluator, &job.id).await.unwrap();
-        if current.state == ManagementJobState::Succeeded {
-            let value = serde_json::to_value(current).unwrap();
+        let current = dispatcher.status(&fx.evaluator, job_id).await.unwrap();
+        let value = serde_json::to_value(current).unwrap();
+        if value["state"] == "succeeded" {
             assert_eq!(value["result"]["result"], "evaluation_status_read_v2");
             let meta = value["result"]["report_read"].clone();
             assert_eq!(
@@ -393,10 +395,7 @@ async fn status_metadata(fx: &History, key: &str) -> Value {
             return meta;
         }
         assert!(
-            matches!(
-                current.state,
-                ManagementJobState::Queued | ManagementJobState::Running
-            ),
+            matches!(value["state"].as_str(), Some("queued" | "running")),
             "real status producer failed"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
