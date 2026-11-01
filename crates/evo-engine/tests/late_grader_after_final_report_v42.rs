@@ -2882,3 +2882,163 @@ async fn assert_bound_original_late(kind: &str) {
     assert_eq!(historical_money(&fixture).await, monetary);
     fixture.store.close().await;
 }
+
+// AG181: the first grader feedback of a ticket that arrives after its report is
+// final. The original fixture, helpers and every case above are untouched.
+// `reach_final_report` grades before it invalidates, so the exposure entry is
+// already `FeedbackUsed` there and cannot show the first use; this case executes
+// both sides of one target (paid and closed) and invalidates before anything is
+// graded. Local software APIs only: no provider, grader process or host authority.
+fn ag181_first_late_feedback() -> Boxed<'static, ()> {
+    Box::pin(async move {
+        let fixture = fixture(false).await;
+        issue(&fixture, true).await;
+        let pair = ScoredPair {
+            ticket_id: fixture.ticket_id().into(),
+            target: "r0".into(),
+            candidate: execute(&fixture, "r0", ExecutionSide::Candidate, "ok", 1).await,
+            baseline: execute(&fixture, "r0", ExecutionSide::Baseline, "wrong", 2).await,
+        };
+        IndependentEvaluationControl::invalidate(
+            &fixture.evaluator,
+            &fixture.store,
+            fixture.ticket_id(),
+            EXPLICIT_INVALID,
+            1_000,
+        )
+        .await
+        .unwrap();
+        let before = observe(&fixture, "final").await;
+        assert_final_shape(&before, Endpoint::InvalidUnscored, true);
+        // Both calls are finalized and closed, the money is final, the slice is
+        // dispatched: and no feedback has been used.
+        let calls = before.calls.as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            assert_eq!(call["state"], json!("finalized"));
+            assert_eq!(call["execution_closed"], json!(true));
+        }
+        let entries = before.ledger["payload"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["ticket_id"], json!(fixture.ticket_id()));
+        assert_eq!(entries[0]["state"]["state"], json!("dispatched"));
+        assert_eq!(entries[0]["monetary_state"], json!("finalized"));
+
+        let request = grader_request(&pair, LATE_ID, LATE_AT);
+        let late = IndependentEvaluationControl::record_grader_receipt(
+            &fixture.evaluator,
+            &fixture.store,
+            request.clone(),
+        )
+        .await
+        .expect("the first grader feedback after the report is final was refused");
+
+        // The receipt is the grading of the two stored outputs by the registered
+        // oracle and fixed grader.
+        let mut session = fixture.store.session().await.unwrap();
+        let candidate: Envelope<ExecutionReceiptV2> = session
+            .need(
+                &fixture.evaluator,
+                "artifact",
+                &physical_id("execution_receipt_v2", &pair.candidate),
+            )
+            .await
+            .unwrap();
+        let baseline: Envelope<ExecutionReceiptV2> = session
+            .need(
+                &fixture.evaluator,
+                "artifact",
+                &physical_id("execution_receipt_v2", &pair.baseline),
+            )
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        assert_eq!(
+            late.candidate_output_digest,
+            candidate.payload.output_digest
+        );
+        assert_eq!(late.baseline_output_digest, baseline.payload.output_digest);
+        assert_eq!(late.oracle_digest, fixture.control.oracle_digest);
+        assert_eq!(
+            late.grader_digest,
+            fingerprint(&fixture.control.fixed_grader).unwrap()
+        );
+        assert_eq!(
+            (late.candidate_score_micros, late.baseline_score_micros),
+            (1_000_000, 0)
+        );
+        assert_eq!(late.anchor_result, None);
+        assert_eq!(late.evaluator_actor, fixture.evaluator.actor());
+        assert_eq!(
+            late.scored_output_pair_digest,
+            fingerprint(&(
+                &late.candidate_output_digest,
+                &late.baseline_output_digest,
+                &late.oracle_digest,
+                &late.grader_digest,
+                late.candidate_score_micros,
+                late.baseline_score_micros,
+                None::<()>,
+            ))
+            .unwrap()
+        );
+
+        // The report, its ticket, every read, the billing and the edges are as they
+        // were. The one change is the exposure entry: used once, at the time of
+        // this first feedback.
+        let after = observe(&fixture, "after-first-late").await;
+        assert_eq!(after.formal, before.formal, "the final report changed");
+        assert_eq!(after.ticket, before.ticket, "the report's ticket changed");
+        assert_eq!(after.view, before.view);
+        assert_eq!(after.same_session_view, before.same_session_view);
+        assert_eq!(after.calls, before.calls);
+        assert_eq!(after.ticket_edges, before.ticket_edges);
+        let mut used = before.ledger.clone();
+        used["payload"]["entries"][0]["state"] =
+            json!({"state": "feedback_used", "used_at_unix_ms": LATE_AT * 1_000});
+        assert_eq!(after.ledger, used);
+        assert_late_receipt_audited(&fixture, &pair, &late).await;
+
+        // The same receipt again changes nothing at all.
+        let catalog_after = catalog(&fixture.db_path);
+        let same = IndependentEvaluationControl::record_grader_receipt(
+            &fixture.evaluator,
+            &fixture.store,
+            request.clone(),
+        )
+        .await
+        .expect("an identical late grader retry was refused");
+        assert_eq!(
+            serde_json::to_value(&same).unwrap(),
+            serde_json::to_value(&late).unwrap()
+        );
+        assert_eq!(observe(&fixture, "after-same-retry").await, after);
+        assert_eq!(catalog(&fixture.db_path), catalog_after);
+        assert_late_receipt_audited(&fixture, &pair, &late).await;
+
+        // The same id with other evidence (a later time) is refused and writes
+        // nothing; the first-use time stays.
+        let mut changed = request;
+        changed.issued_at_unix_seconds = LATE_AT + 1;
+        let refused = IndependentEvaluationControl::record_grader_receipt(
+            &fixture.evaluator,
+            &fixture.store,
+            changed,
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(Error::Conflict(message))
+            if message == "grader receipt id reused with different evidence"),
+            "{refused:?}"
+        );
+        assert_eq!(observe(&fixture, "after-changed-retry").await, after);
+        assert_eq!(catalog(&fixture.db_path), catalog_after);
+        assert_late_receipt_audited(&fixture, &pair, &late).await;
+        fixture.store.close().await;
+    })
+}
+
+#[tokio::test]
+async fn ag181_first_late_feedback_is_used_once_after_real_invalidation() {
+    ag181_first_late_feedback().await;
+}

@@ -737,10 +737,10 @@ async fn scan_e16_budget_call(
 /// request of every unredacted call of the namespace whose source closure
 /// (`budget_call_source_closure`) holds the source, index its budget call
 /// reference and queue that reference; a call whose closure cannot be read (a
-/// reference that does not decode, or no reference and a request whose schema or
-/// body cannot be read) is isolated (`mark_unknown_scope`, which fails the job) and
-/// left as it is. Redacts at most `limit` calls; returns whether it
-/// redacted or isolated any.
+/// reference that does not decode or is not the call's own, or no reference and a
+/// request whose schema or body cannot be read) is isolated (`mark_unknown_scope`,
+/// which fails the job) and left as it is. Redacts at most `limit` calls; returns
+/// whether it redacted or isolated any.
 async fn redact_late_budget_calls(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     ctx: &Context,
@@ -895,16 +895,22 @@ pub(crate) enum BudgetRequestSources {
 /// depends on it is redacted. A call without a reference whose request cannot be
 /// read is `Unknown`, and isolated (plan §11, §11.3, §11.5; E08).
 ///
-/// So is a call whose reference is stored but does not decode
-/// (`unreadable_budget_call_ref:<schema>`): its closure is neither trusted nor
-/// guessed at, and the request is not read in its place (plan §11.5: isolate what
-/// lacks the facts it is judged by; E16.2: a dependency source that cannot be
-/// resolved is isolated). The legacy gates refuse the same call with `Internal` and write
-/// nothing (`registered_source_ids`); the cleanup isolates it instead, records it
+/// So is a call whose reference is stored but is not trusted
+/// (`unreadable_budget_call_ref:<schema>`): it does not decode, or it decodes and
+/// is not the call's own reference (`RegisteredCallSources::Unqualified`: another
+/// schema, namespace, billing scope or call, a source id that is not an
+/// identifier, or `source_ids` not in ascending order without repeats). Its
+/// closure is neither trusted nor guessed at (whether it holds the revoked source
+/// is not asked) and the request is not read in its place (plan §11.5: isolate
+/// what lacks the facts it is judged by; E16.2: a dependency source that cannot be
+/// resolved is isolated); the reference is not sorted, repaired or indexed. The
+/// legacy gates refuse a reference that does not decode with `Internal` and write
+/// nothing, and read the `source_ids` of an unqualified one as before
+/// (`registered_source_ids`); the cleanup isolates both, records it
 /// (`mark_unknown_scope`: a `Failed` job an Admin can retry) and goes on with the
 /// rest of its namespace, because an error here would roll the whole step back and
 /// leave the job running with no diagnostic, unreachable by a retry (AG-096). The
-/// two answers differ on purpose.
+/// answers differ on purpose.
 async fn budget_call_source_closure(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     ctx: &Context,
@@ -922,9 +928,10 @@ async fn budget_call_source_closure(
         crate::budget::RegisteredCallSources::Missing => {
             Ok(budget_request_source_ids(schema, body))
         }
-        crate::budget::RegisteredCallSources::Undecodable(_) => Ok(BudgetRequestSources::Unknown(
-            format!("unreadable_budget_call_ref:{schema}"),
-        )),
+        crate::budget::RegisteredCallSources::Unqualified(_)
+        | crate::budget::RegisteredCallSources::Undecodable(_) => Ok(
+            BudgetRequestSources::Unknown(format!("unreadable_budget_call_ref:{schema}")),
+        ),
     }
 }
 
