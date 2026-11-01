@@ -964,3 +964,183 @@ fn f20_local_export_member_paths_are_validated_on_the_raw_string() {
         "tree without manifest.json accepted"
     );
 }
+
+fn q03_export_sql(path: &std::path::Path, sql: &str) {
+    let output = std::process::Command::new("python3").arg("-c")
+        .arg("import sqlite3,sys\nc=sqlite3.connect(sys.argv[1]);c.executescript(sys.argv[2]);c.close()")
+        .arg(path).arg(sql).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn q03_export_snapshot(path: &std::path::Path) -> Value {
+    let output = std::process::Command::new("python3").arg("-c").arg(r#"
+import json,sqlite3,struct,sys
+c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+def cell(v):
+    if v is None:return ['null']
+    if isinstance(v,int):return ['integer',str(v)]
+    if isinstance(v,float):return ['real',struct.pack('>d',v).hex()]
+    if isinstance(v,bytes):return ['blob',v.hex()]
+    return ['text',v.encode('utf-8').hex()]
+out={}
+for (name,) in c.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+    rows=[[cell(v) for v in r] for r in c.execute('SELECT * FROM "'+name.replace('"','""')+'"')]
+    out[name]=sorted(rows,key=lambda r:json.dumps(r,separators=(',',':')))
+print(json.dumps(out,separators=(',',':')))
+"#).arg(path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn q03_export_revoke_winner_precedes_first_fs_and_dml() {
+    for primitive in ["sql", "fs"] {
+        let (dir, store, admin, export_id, files, completed, audit) = prepared_fixture().await;
+        let path = dir.path().join("local-export.sqlite3");
+        let mut session = store.session().await.unwrap();
+        session.put(&admin, "run", "q03-upstream", admin.actor(), &json!({
+            "schema_version":"rsia.optimization.source.v1",
+            "record":{"id":"q03-upstream","body":b"q03-upstream".to_vec(),"parent_family":"q03-family","task_origin":"trusted_run","execution_attestation":"trusted_host","purpose":"development"},
+            "trace":{"run_id":"q03-upstream","parent_family":"q03-family","source_digest":hash(b"q03-upstream"),"purpose":"development","outcome":"success","diagnosis":null,"excerpt":"q03-upstream","seed":1},
+            "excerpt_start":0,"excerpt_end":12,
+        })).await.unwrap();
+        session
+            .put_edge(&admin, "artifact", "source-1", "run", "q03-upstream")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let plan = store
+            .snapshot_local_export_dependencies(&admin, &export_id)
+            .await
+            .unwrap();
+        let dependencies = store
+            .prevalidate_local_export_dependency_blobs(&admin, plan)
+            .await
+            .unwrap();
+        let triggers = "CREATE TRIGGER q03_no_insert BEFORE INSERT ON objects BEGIN SELECT RAISE(FAIL,'first-insert'); END; CREATE TRIGGER q03_no_update BEFORE UPDATE ON objects BEGIN SELECT RAISE(FAIL,'first-update'); END;";
+        if primitive == "sql" {
+            q03_export_sql(&path, triggers);
+        } else {
+            std::fs::write(dir.path().join(".export-staging"), b"q03-fs-blocker").unwrap();
+        }
+        let healthy = store
+            .publish_registered_local_export(
+                &admin,
+                &export_id,
+                &files,
+                &completed,
+                &audit,
+                &dependencies,
+            )
+            .await;
+        if primitive == "sql" {
+            assert!(
+                matches!(healthy, Err(Error::Internal)),
+                "healthy SQL: {healthy:?}"
+            );
+        } else {
+            assert!(
+                matches!(healthy, Err(Error::Conflict(ref message)) if message == "controlled export path is linked or non-directory"),
+                "healthy FS: {healthy:?}"
+            );
+        }
+        assert_eq!(store.integrity().await.unwrap(), "ok");
+        if primitive == "sql" {
+            q03_export_sql(
+                &path,
+                "DROP TRIGGER q03_no_insert; DROP TRIGGER q03_no_update;",
+            );
+        }
+        LifecycleStore::begin_revoke(
+            &admin,
+            &store,
+            TypedObjectRef {
+                kind: "run".into(),
+                id: "q03-upstream".into(),
+            },
+            "q03 fixture",
+            3,
+        )
+        .await
+        .unwrap();
+        if primitive == "sql" {
+            q03_export_sql(&path, triggers);
+        }
+        let before = q03_export_snapshot(&path);
+        let result = store
+            .publish_registered_local_export(
+                &admin,
+                &export_id,
+                &files,
+                &completed,
+                &audit,
+                &dependencies,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::Conflict(ref message)) if message == "export watermark changed"),
+            "{primitive}: {result:?}"
+        );
+        assert_eq!(q03_export_snapshot(&path), before);
+        if primitive == "fs" {
+            assert_eq!(
+                std::fs::read(dir.path().join(".export-staging")).unwrap(),
+                b"q03-fs-blocker"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn q03_completed_export_verification_is_kind_exact_and_read_only() {
+    let (dir, store, admin, export_id, files, completed, audit) = prepared_fixture().await;
+    let path = dir.path().join("local-export.sqlite3");
+    let mut session = store.session().await.unwrap();
+    for id in ["source-1", export_id.as_str()] {
+        session.put(&admin, "tombstone", id, admin.actor(), &json!({
+            "id":id,"schema_version":"rsia.revoke_tombstone.v1","source_kind":"run",
+            "reason":"another kind","watermark_seq":1,"watermark_digest":hash(b"watermark"),"created_at":1,
+        })).await.unwrap();
+    }
+    session.commit().await.unwrap();
+    let plan = store
+        .snapshot_local_export_dependencies(&admin, &export_id)
+        .await
+        .unwrap();
+    let dependencies = store
+        .prevalidate_local_export_dependency_blobs(&admin, plan)
+        .await
+        .unwrap();
+    let receipt = store
+        .publish_registered_local_export(
+            &admin,
+            &export_id,
+            &files,
+            &completed,
+            &audit,
+            &dependencies,
+        )
+        .await
+        .unwrap();
+    q03_export_sql(
+        &path,
+        "CREATE TRIGGER q03_read_only_insert BEFORE INSERT ON objects BEGIN SELECT RAISE(FAIL,'read-only'); END; CREATE TRIGGER q03_read_only_update BEFORE UPDATE ON objects BEGIN SELECT RAISE(FAIL,'read-only'); END;",
+    );
+    let before = q03_export_snapshot(&path);
+    assert_eq!(
+        store
+            .verify_registered_local_export(&admin, &export_id, &files)
+            .await
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(q03_export_snapshot(&path), before);
+}

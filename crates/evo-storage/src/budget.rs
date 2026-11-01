@@ -3,7 +3,7 @@
 //! Monetary values are integer micros in the root's authorized currency/pricing
 //! version. No floating-point conversion occurs here.
 
-use super::lifecycle::{BudgetRequestSources, RevokeTombstone, budget_request_source_ids};
+use super::lifecycle::{BudgetRequestSources, budget_request_source_ids};
 use super::{
     MVP_MAX_ACTIVE_LEASES, Session, Store, count_active_leases, internal, mvp_capacity_exceeded,
 };
@@ -1350,11 +1350,17 @@ impl Store {
                 !typed_budget::call_sources_live_in_tx(&mut tx, &call).await?,
             ),
             E16CallMode::Legacy => match legacy_call_sources(&mut tx, &call).await? {
-                LegacyCallSources::Named(source_ids) => (
-                    any_run_source_revoked(&mut tx, &call.namespace, &source_ids).await?,
-                    false,
-                    false,
-                ),
+                LegacyCallSources::Named(source_ids) => {
+                    let roots: Vec<_> = source_ids.iter().map(|id| ("run", id.as_str())).collect();
+                    let status =
+                        crate::revocation::status_in_tx(&mut tx, &call.namespace, &roots, false)
+                            .await?;
+                    (
+                        status == crate::revocation::RevocationStatus::Blocked,
+                        status == crate::revocation::RevocationStatus::Unverifiable,
+                        false,
+                    )
+                }
                 LegacyCallSources::Unverifiable => (false, true, false),
             },
         };
@@ -3821,6 +3827,11 @@ async fn ensure_budget_call_ref_typed(
         }
         return Ok(Ok(old));
     }
+    // A historical call with its existing ref remains a read. Repairing a lost
+    // ref is a new content-dependent write and must pass the same full gate.
+    if any_run_source_revoked(tx, &call.namespace, &reference.source_ids).await? {
+        return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
+    }
     sqlx::query("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,'artifact',?,?,?)")
         .bind(ctx.namespace())
         .bind(&reference.id)
@@ -3844,46 +3855,16 @@ async fn ensure_budget_call_ref_typed(
     Ok(Ok(reference))
 }
 
-/// Whether any of `source_ids` was revoked, in `namespace`, as a `run`.
-///
-/// `begin_revoke` writes the tombstone and the watermark in one transaction
-/// before the cleanup starts, so a source is revoked from the moment it commits.
-/// A tombstone is keyed by the id of its source alone and records the kind it was
-/// written for (`source_kind`, `run` or `artifact`). The sources of a budget call
-/// are runs (`ensure_budget_call_ref` writes `run` edges), so a tombstone decides
-/// one only when it was written for a run: a revoked artifact that shares the id
-/// is another object and does not refuse it. A tombstone that cannot be read as
-/// one `begin_revoke` writes (it does not decode, or its source kind is neither
-/// `run` nor `artifact`) cannot be matched to anything and fails closed, the
-/// same rule the other tombstone gates follow (`ensure_dependencies_live`).
+/// The legacy run roots and their complete typed upstream closure use the same
+/// raw judgement as dispatch, publication and E16 snapshots. An incomplete
+/// closure cannot authorize a new reservation or dispatch.
 async fn any_run_source_revoked(
     tx: &mut Transaction<'_, Sqlite>,
     namespace: &str,
     source_ids: &[String],
 ) -> Result<bool> {
-    for source_id in source_ids {
-        let body: Option<String> = sqlx::query_scalar(
-            "SELECT body FROM objects WHERE namespace=? AND kind='tombstone' AND id=?",
-        )
-        .bind(namespace)
-        .bind(source_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(internal)?;
-        let Some(body) = body else {
-            continue;
-        };
-        // `artifact`: the tombstone belongs to the other object that shares this id.
-        // `run`, a kind `begin_revoke` does not write, or a body that does not
-        // decode: revoked.
-        let source_kind = serde_json::from_str::<RevokeTombstone>(&body)
-            .ok()
-            .map(|tombstone| tombstone.source_kind);
-        if source_kind.as_deref() != Some("artifact") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let roots: Vec<(&str, &str)> = source_ids.iter().map(|id| ("run", id.as_str())).collect();
+    Ok(!crate::revocation::dependencies_live_in_tx(tx, namespace, &roots, false).await?)
 }
 
 /// What the budget call reference of a legacy call registers as its source

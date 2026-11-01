@@ -3,10 +3,8 @@
 //! the actual E16 records, purposes, materials and physical blobs.
 
 use crate::budget::{BudgetArtifact, BudgetCallRecord};
-use crate::lifecycle::{
-    REVOKE_TOMBSTONE_SCHEMA, RevokeTombstone, TypedObjectRef, parse_strict_json,
-};
-use crate::{Session, Store, internal, upstream_rows_in_tx};
+use crate::lifecycle::{TypedObjectRef, parse_strict_json};
+use crate::{Session, Store, internal};
 use evo_core::evidence::{
     IMPORT_NORMALIZATION_V2, IMPORT_READER_SET_V2, IMPORT_RESULT_SCHEMA_V2,
     LEGACY_IMPORT_RESULT_SCHEMA_V1, import_result_id_v2,
@@ -21,7 +19,6 @@ pub const E16_BUDGET_REF_SCHEMA: &str = "rsia.budget_call_e16_ref.v1";
 pub const E16_SOURCE_UNAVAILABLE: &str = "e16_source_unavailable";
 pub const MAX_E16_BUDGET_SOURCES: usize = 202;
 const MAX_SOURCE_BYTES: i64 = 4 * 1024 * 1024;
-const MAX_UPSTREAM_NODES: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -371,35 +368,7 @@ pub(crate) async fn snapshots_live_in_tx(
         .iter()
         .map(|r| (r.kind.as_str(), r.id.as_str()))
         .collect();
-    let Some(nodes) = upstream_rows_in_tx(tx, namespace, &seeds, MAX_UPSTREAM_NODES, true).await?
-    else {
-        return Ok(false);
-    };
-    for node in nodes {
-        if !node.exists || node.redacted {
-            return Ok(false);
-        }
-        if let Some(body) = node.tombstone {
-            let Some(tombstone) = parse_strict_json(&body)
-                .ok()
-                .and_then(|value| serde_json::from_value::<RevokeTombstone>(value).ok())
-            else {
-                return Ok(false);
-            };
-            if tombstone.schema_version != REVOKE_TOMBSTONE_SCHEMA
-                || tombstone.id != node.id
-                || !matches!(tombstone.source_kind.as_str(), "run" | "artifact")
-                || tombstone.watermark_seq == 0
-                || !valid_digest(&tombstone.watermark_digest)
-                || tombstone.created_at < 0
-                || text(&tombstone.reason, "reason", 512).is_err()
-                || tombstone.source_kind == node.kind
-            {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
+    crate::revocation::dependencies_live_in_tx(tx, namespace, &seeds, true).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
