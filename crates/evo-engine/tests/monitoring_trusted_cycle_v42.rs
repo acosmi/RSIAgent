@@ -1769,7 +1769,7 @@ async fn legacy_proposal_labels_stay_non_authoritative_and_fixture_staging_keeps
             .await
             .unwrap();
         session.commit().await.unwrap();
-        let audit = fixture.store.verify_audit(&fixture.worker).await.unwrap();
+        let audit = fixture.store.verify_audit(&fixture.admin).await.unwrap();
         let result = MonitoringCoordinator::stage_consolidation_candidate(
             &fixture.worker,
             &fixture.store,
@@ -1808,7 +1808,7 @@ async fn legacy_proposal_labels_stay_non_authoritative_and_fixture_staging_keeps
         );
         session.commit().await.unwrap();
         assert_eq!(
-            fixture.store.verify_audit(&fixture.worker).await.unwrap(),
+            fixture.store.verify_audit(&fixture.admin).await.unwrap(),
             audit
         );
         assert_eq!(

@@ -2749,23 +2749,29 @@ async fn records_without_an_evidence_label_read_as_not_observed_and_are_no_final
 
 #[tokio::test]
 async fn a_final_candidate_needs_a_valid_node_and_trusted_evidence() {
-    let env = Env::new(false).await;
-    env.register("world-guard").await;
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
+    let (env, runner) = config_content_env("world-guard").await;
+    let mut request = env.fixture.request(&env.root, "world-guard", 1, "guard-1");
+    request.development_request.grader_digest =
+        evo_engine::development::projection::config_projection_grader_digest().unwrap();
     let first = env
-        .run(
-            "world-guard",
-            1,
-            "guard-1",
-            &env.root,
-            &Spy::new(FixtureRunner),
+        .coordinator
+        .run_next(
+            Some(&ConfigEditingModel),
+            Some(&runner),
+            Some(&env.journal),
+            request,
         )
-        .await;
+        .await
+        .unwrap();
+    assert_eq!(first.outcome, "candidate_observed");
     let node_id = first.node_id.clone().unwrap();
-    let bundle = payload(&env.store, NODE, &node_id).await["candidate_bundle_digest"].clone();
+    let original = payload(&env.store, NODE, &node_id).await;
+    let bundle = original["candidate_bundle_digest"].clone();
 
     // Every combination of status and label. Only a valid node with trusted
     // evidence is proposed; the refusal names which of the two is missing.
-    let valid = json!({"status": "valid", "quality_micros": 900_000});
+    let valid = original["node"]["status"].clone();
     let failure = json!({"status": "hard_failure"});
     let cases = [
         (&failure, "trusted", Some("not a valid observed candidate")),
@@ -2781,8 +2787,11 @@ async fn a_final_candidate_needs_a_valid_node_and_trusted_evidence() {
     ];
     for (status, label, refusal) in cases {
         rewrite_node(&env.store, &node_id, |node| {
-            node["node"]["status"] = status.clone();
-            node["evidence"] = json!(label);
+            *node = original.clone();
+            if refusal.is_some() {
+                node["node"]["status"] = status.clone();
+                node["evidence"] = json!(label);
+            }
         })
         .await;
         let result = env
