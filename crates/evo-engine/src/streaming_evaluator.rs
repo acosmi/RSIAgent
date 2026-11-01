@@ -11098,6 +11098,7 @@ async fn derived_formal_report_read(
     Ok(VerifiedFormalReportReadV1 {
         state: verified.candidate.original_read.state(),
         original: view,
+        lineage: verified.candidate.original_read.lineage.clone(),
     })
 }
 

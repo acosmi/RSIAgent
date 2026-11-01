@@ -24,14 +24,17 @@ use evo_engine::dispatch::{ManagementDispatcher, ManagementJobState};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::release_store::{CurrentStageBundleRequest, ReleaseStore, TypedSourceRef};
 use evo_engine::streaming_evaluator::{
-    EvaluationEvidenceScope, FixedGraderMethod, FixedGraderSpec, FrozenOracleEntry,
-    IssueTicketRequest, ProtectedHoldoutRecordV2 as ProtectedHoldoutRecord, ProtectedInputRef,
-    RegisteredEvaluationControlV3 as RegisteredEvaluationControl,
+    EvaluationEvidenceScope, ExecutionReceiptRequest, ExecutionSide, FixedGraderMethod,
+    FixedGraderSpec, FrozenOracleEntry, GraderReceiptRequest, IssueTicketRequest,
+    ProtectedHoldoutRecordV2 as ProtectedHoldoutRecord, ProtectedInputRef,
+    RegisteredEvaluationControlV3 as RegisteredEvaluationControl, StartExecutionRequest,
 };
 use evo_engine::streaming_evaluator::{
     IndependentEvaluationControl, read_verified_formal_report_in_session,
 };
-use evo_storage::budget::RootBudgetAuthorization;
+use evo_storage::budget::{
+    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization, UsageCharge,
+};
 use evo_storage::lifecycle::{
     FORMAL_JUDGMENT_VERSIONS, FormalJudgmentDomain, FormalJudgmentIdStrategy, LifecycleStore,
     TypedObjectRef, formal_judgment_version,
@@ -640,7 +643,7 @@ async fn current_diagnostic_fixture(n: u32, sequential: bool) -> CurrentDiagnost
         evidence_scope: EvaluationEvidenceScope::ProgramFixture,
         created_at_unix_seconds: 2,
     };
-    IndependentEvaluationControl::register_control(&evaluator, &store, control.clone())
+    IndependentEvaluationControl::register_current_control(&evaluator, &store, control.clone())
         .await
         .unwrap();
 
@@ -744,7 +747,7 @@ async fn current_diagnostic_fixture(n: u32, sequential: bool) -> CurrentDiagnost
         oracle_payload_digest: evo_core::fingerprint(&oracle_entries).unwrap(),
         oracle_entries,
     };
-    IndependentEvaluationControl::register_holdout(&evaluator, &store, holdout.clone())
+    IndependentEvaluationControl::register_current_holdout(&evaluator, &store, holdout.clone())
         .await
         .unwrap();
     // True-source order (L288): the candidate is staged, then the ticket is
@@ -1227,6 +1230,286 @@ async fn current_diagnostic_semantics_do_not_grant_promotion_authority() {
         before["calls"].as_array().unwrap().is_empty(),
         "this diagnostic never executes a provider/model"
     );
+    fx.store.close().await;
+
+    // The native Complete path uses the same public software producer, including
+    // real dispatch records, fixed grading, finalized bills and closed execution.
+    let fx = current_diagnostic_fixture(2, false).await;
+    let worker = Context::new(CURRENT_NS, "executor", Role::Worker).unwrap();
+    for (member, target_id) in ["r0", "r1", "a0"].into_iter().enumerate() {
+        let mut receipts = Vec::new();
+        for (side, answer) in [
+            (ExecutionSide::Candidate, "ok"),
+            (
+                ExecutionSide::Baseline,
+                if target_id == "a0" { "ok" } else { "wrong" },
+            ),
+        ] {
+            let ordinal = member * 2 + receipts.len();
+            let task = IndependentEvaluationControl::broker_task(
+                &worker,
+                &fx.store,
+                &fx.ticket_id,
+                target_id,
+                side,
+            )
+            .await
+            .unwrap();
+            let call_id = format!("ag163-native-call-{ordinal}");
+            let now = 10 + ordinal as i64 * 5;
+            let fence = BudgetCallFence {
+                billing_scope: "billing-1".into(),
+                call_id: call_id.clone(),
+                actual_input_digest: task.request_digest.clone(),
+                lease_token: format!("ag163-native-lease-{ordinal}"),
+                lease_epoch: 1,
+                now: now + 1,
+            };
+            fx.store
+                .reserve_budget_call(
+                    &worker,
+                    &BudgetCallReservation {
+                        billing_scope: "billing-1".into(),
+                        call_id: call_id.clone(),
+                        dispatch_group_id: fx.ticket_id.clone(),
+                        stage: BudgetStage::TaskExecution,
+                        actual_input_digest: task.request_digest.clone(),
+                        request_artifact: None,
+                        max_cost_micros: 100,
+                        lease_token: fence.lease_token.clone(),
+                        lease_until: now + 1_000,
+                        now,
+                    },
+                )
+                .await
+                .unwrap();
+            let dispatched = IndependentEvaluationControl::start_execution(
+                &worker,
+                &fx.store,
+                StartExecutionRequest {
+                    ticket_id: fx.ticket_id.clone(),
+                    target_id: target_id.into(),
+                    side,
+                    fence: fence.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            let receipt_id = format!("ag163-native-receipt-{ordinal}");
+            let receipt = IndependentEvaluationControl::record_execution_receipt(
+                &worker,
+                &fx.store,
+                ExecutionReceiptRequest {
+                    receipt_id: receipt_id.clone(),
+                    ticket_id: fx.ticket_id.clone(),
+                    target_id: target_id.into(),
+                    side,
+                    request_digest: task.request_digest,
+                    output_artifact_id: format!("ag163-native-output-{ordinal}"),
+                    output_utf8: json!({"answer":answer}).to_string(),
+                    budget_call_id: call_id.clone(),
+                    latency_micros: 100,
+                    issued_at_unix_seconds: now + 2,
+                },
+            )
+            .await
+            .unwrap();
+            let mut settled_fence = fence;
+            settled_fence.now = now + 3;
+            fx.store
+                .finalize_budget_call(
+                    &worker,
+                    &settled_fence,
+                    &UsageCharge {
+                        amount_micros: 10,
+                        currency: "USD".into(),
+                        pricing_version: "pricing-v1".into(),
+                        provider_request_id: format!("software-provider-{ordinal}"),
+                        usage_record_id: format!("software-usage-{ordinal}"),
+                        output_digest: receipt.output_digest,
+                    },
+                )
+                .await
+                .unwrap();
+            fx.store
+                .close_budget_call_execution(
+                    &worker,
+                    "billing-1",
+                    &call_id,
+                    dispatched.call.dispatch_id.as_deref().unwrap(),
+                    "fixture_complete",
+                    now + 4,
+                )
+                .await
+                .unwrap();
+            receipts.push(receipt_id);
+        }
+        IndependentEvaluationControl::record_grader_receipt(
+            &fx.evaluator,
+            &fx.store,
+            GraderReceiptRequest {
+                receipt_id: format!("ag163-native-grade-{member}"),
+                ticket_id: fx.ticket_id.clone(),
+                target_id: target_id.into(),
+                candidate_execution_receipt_id: receipts[0].clone(),
+                baseline_execution_receipt_id: receipts[1].clone(),
+                issued_at_unix_seconds: 100 + member as i64,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let complete = IndependentEvaluationControl::finalize_complete(
+        &fx.evaluator,
+        &fx.store,
+        &fx.ticket_id,
+        1_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(complete).unwrap()["variant"],
+        "complete_batch"
+    );
+    let source_body = {
+        let mut session = fx.store.session().await.unwrap();
+        let row = session
+            .object_row(&fx.evaluator, "artifact", &sid(FORMAL_KIND, &fx.ticket_id))
+            .await
+            .unwrap()
+            .unwrap();
+        session.commit().await.unwrap();
+        row.body
+    };
+    let source: Value = serde_json::from_str(&source_body).unwrap();
+    assert_eq!(
+        source["payload"]["schema_version"],
+        "rsia.formal_evaluation.v3"
+    );
+    let before = image(&fx.db_path);
+    let derived =
+        IndependentEvaluationControl::recompute_judgment(&fx.evaluator, &fx.store, &fx.ticket_id)
+            .await
+            .unwrap();
+    let (derived_body, control_payload) = {
+        let mut session = fx.store.session().await.unwrap();
+        let read = read_verified_formal_report_in_session(&fx.evaluator, &mut session, &derived)
+            .await
+            .unwrap();
+        assert_eq!(read.state(), PersistentContractState::CurrentVerified);
+        assert!(!read.current_view().unwrap().promotion_eligible);
+        let row = session
+            .object_row(&fx.evaluator, "artifact", &sid(FORMAL_KIND, &derived))
+            .await
+            .unwrap()
+            .unwrap();
+        let control: Value = session
+            .need(
+                &fx.evaluator,
+                "artifact",
+                &sid("registered_evaluation_control_v41", "control-1"),
+            )
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        (row.body, control["payload"].clone())
+    };
+    let payload: Value = serde_json::from_str(&derived_body).unwrap();
+    let payload = &payload["payload"];
+    assert_eq!(payload["schema_version"], "rsia.formal_judgment.v1");
+    assert_eq!(
+        payload["source_report_ref"][4],
+        canonical_fingerprint(&source["payload"]).unwrap()
+    );
+    assert_eq!(
+        payload["input_snapshot"]["common"][2],
+        "rsia.evaluation_ticket.v4"
+    );
+    assert_eq!(
+        payload["input_snapshot"]["common"][3][4],
+        canonical_fingerprint(&control_payload).unwrap()
+    );
+    assert_eq!(payload["judgment"], source["payload"]["result"]);
+    preserves_old_facts(&before, &image(&fx.db_path));
+    let stable = image(&fx.db_path);
+    assert_eq!(
+        IndependentEvaluationControl::recompute_judgment(&fx.evaluator, &fx.store, &derived)
+            .await
+            .unwrap(),
+        derived
+    );
+    let metadata = evo_engine::streaming_evaluator::formal_report_read_metadata(
+        &fx.evaluator,
+        &fx.store,
+        &derived,
+    )
+    .await
+    .unwrap();
+    let metadata = serde_json::to_value(metadata).unwrap();
+    assert_eq!(metadata["state"], "current_verified");
+    assert_eq!(metadata["lineage"]["state"], "known");
+    assert_eq!(
+        metadata["lineage"]["details"][1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry[2] == true)
+            .count(),
+        2
+    );
+    assert!(image(&fx.db_path) == stable);
+    let admin = Context::new(CURRENT_NS, "admin", Role::Admin).unwrap();
+    let mut cleanup = LifecycleStore::begin_revoke(
+        &admin,
+        &fx.store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: "formal-fixture-source".into(),
+        },
+        "native source cleanup",
+        evo_core::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    for _ in 0..100 {
+        if matches!(
+            cleanup.state,
+            evo_storage::lifecycle::CleanupState::Complete
+                | evo_storage::lifecycle::CleanupState::Failed
+        ) {
+            break;
+        }
+        cleanup = LifecycleStore::cleanup_step(
+            &admin,
+            &fx.store,
+            &cleanup.job_id,
+            16,
+            evo_core::now().unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        cleanup.state,
+        evo_storage::lifecycle::CleanupState::Complete
+    );
+    assert!(cleanup.last_error.is_none());
+    let mut session = fx.store.session().await.unwrap();
+    let original = session
+        .object_row(&admin, "artifact", &sid(FORMAL_KIND, &fx.ticket_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.body, source_body);
+    let redacted: Value = session
+        .need(&admin, "artifact", &sid(FORMAL_KIND, &derived))
+        .await
+        .unwrap();
+    assert_eq!(redacted["schema_version"], "rsia.redacted.v1");
+    assert_eq!(redacted["original_digest"], hash(derived_body.as_bytes()));
+    assert_eq!(redacted["metadata"]["source_ticket_id"], fx.ticket_id);
+    session.commit().await.unwrap();
+    assert!(image(&fx.db_path)["calls"] == before["calls"]);
     fx.store.close().await;
 }
 
