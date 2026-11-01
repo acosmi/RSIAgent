@@ -1909,9 +1909,19 @@ impl AlgorithmMatrix {
         })
         .chain(world.transitions.iter().map(|transition| ReplaySourceRef {
             source_id: transition.observation_source_id.clone(),
-            content_digest: replay_observation_digest(&world.manifest, transition).unwrap(),
+            content_digest: String::new(),
         }))
         .collect();
+        for transition in &world.transitions {
+            let digest = replay_observation_digest(&world.manifest, transition).unwrap();
+            world
+                .manifest
+                .source_closure
+                .iter_mut()
+                .find(|source| source.source_id == transition.observation_source_id)
+                .unwrap()
+                .content_digest = digest;
+        }
         world.seal().unwrap();
         Self { world, legal }
     }
