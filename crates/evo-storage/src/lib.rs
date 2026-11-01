@@ -566,6 +566,47 @@ fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {
 pub const MAX_LOCAL_EXPORT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_LOCAL_EXPORT_FILES: usize = 101;
 
+/// Only bounded references to an actual successful service commit; no request text.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceSuccessFactV1 {
+    pub schema_version: String,
+    pub run_id: String,
+    pub sequence: u64,
+    pub role: evo_core::Role,
+    pub kind: String,
+    pub subject_id: String,
+    pub audit_digest: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ServiceSuccessKind {
+    Prepare,
+    Feedback,
+    Propose,
+}
+
+impl ServiceSuccessKind {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Prepare => "service.prepare",
+            Self::Feedback => "service.feedback",
+            Self::Propose => "service.propose",
+        }
+    }
+}
+
+enum AuditReadSubject<'a> {
+    RoleWitness {
+        role: evo_core::Role,
+        operation: &'a str,
+        entity: &'a str,
+    },
+    ServiceFacts {
+        run_id: &'a str,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalExportFile {
     pub path: String,
@@ -3230,6 +3271,38 @@ impl Session {
                 "audit witness entity must be a content digest".into(),
             ));
         }
+        let (matched, _) = self
+            .verified_audit_selection(
+                ctx,
+                AuditReadSubject::RoleWitness {
+                    role,
+                    operation,
+                    entity,
+                },
+            )
+            .await?;
+        Ok(matched)
+    }
+
+    /// Authenticated references only. A Host captures them; Admin export rechecks them.
+    pub async fn service_success_facts(
+        &mut self,
+        ctx: &Context,
+        run_id: &str,
+    ) -> Result<Vec<(String, ServiceSuccessFactV1)>> {
+        ctx.require(&[evo_core::Role::Host, evo_core::Role::Admin])?;
+        identifier(run_id)?;
+        let (_, facts) = self
+            .verified_audit_selection(ctx, AuditReadSubject::ServiceFacts { run_id })
+            .await?;
+        Ok(facts)
+    }
+
+    async fn verified_audit_selection(
+        &mut self,
+        ctx: &Context,
+        subject: AuditReadSubject<'_>,
+    ) -> Result<(bool, Vec<(String, ServiceSuccessFactV1)>)> {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct AuditPayload<'a> {
@@ -3261,6 +3334,8 @@ impl Session {
         let mut after = 0_i64;
         let mut previous = String::new();
         let mut latest_matches = false;
+        let mut service_facts = Vec::new();
+        let mut previous_row: Option<(i64, String, evo_core::Role, String, String, String)> = None;
         loop {
             // Only bounded metadata is fetched in a page. Payload allocation
             // is checked against the actual row's byte length; chunks prevent
@@ -3350,8 +3425,65 @@ impl Session {
                 if payload.timestamp < 0 || identifier(payload.actor.as_ref()).is_err() {
                     return Err(invalid_chain());
                 }
-                if payload.role == role && payload.operation.as_ref() == operation {
-                    latest_matches = payload.entity.as_ref() == entity;
+                match &subject {
+                    AuditReadSubject::RoleWitness {
+                        role,
+                        operation,
+                        entity,
+                    } => {
+                        if payload.role == *role && payload.operation.as_ref() == *operation {
+                            latest_matches = payload.entity.as_ref() == *entity;
+                        }
+                    }
+                    AuditReadSubject::ServiceFacts { run_id }
+                        if payload.operation == "service.success_fact.v1" =>
+                    {
+                        let fact: ServiceSuccessFactV1 = serde_json::from_value(
+                            lifecycle::parse_strict_json(payload.entity.as_ref())
+                                .map_err(|_| invalid_chain())?,
+                        )
+                        .map_err(|_| invalid_chain())?;
+                        let prior = previous_row.as_ref().ok_or_else(invalid_chain)?;
+                        if fact.schema_version != "rsia.service_success_fact.v1"
+                            || payload.role != evo_core::Role::Agent
+                            || fact.role != payload.role
+                            || prior.2 != payload.role
+                            || prior.3 != payload.actor.as_ref()
+                            || fact.sequence
+                                != u64::try_from(prior.0).map_err(|_| invalid_chain())?
+                            || fact.audit_digest != prior.1
+                            || fact.kind != prior.4
+                            || fact.subject_id != prior.5
+                            || !matches!(
+                                fact.kind.as_str(),
+                                "service.prepare" | "service.feedback" | "service.propose"
+                            )
+                            || identifier(&fact.run_id).is_err()
+                            || identifier(&fact.subject_id).is_err()
+                            || (fact.kind == "service.prepare" && fact.subject_id != fact.run_id)
+                        {
+                            return Err(invalid_chain());
+                        }
+                        if fact.run_id == *run_id {
+                            if service_facts.len() >= 10_000 {
+                                return Err(Error::Invalid(
+                                    "service fact capture exceeds the event bound".into(),
+                                ));
+                            }
+                            service_facts.push((payload.actor.to_string(), fact));
+                        }
+                    }
+                    AuditReadSubject::ServiceFacts { .. } => {}
+                }
+                if matches!(&subject, AuditReadSubject::ServiceFacts { .. }) {
+                    previous_row = Some((
+                        sequence,
+                        digest.clone(),
+                        payload.role,
+                        payload.actor.into_owned(),
+                        payload.operation.into_owned(),
+                        payload.entity.into_owned(),
+                    ));
                 }
                 previous = digest;
                 after = sequence;
@@ -3361,10 +3493,46 @@ impl Session {
         if scanned != count || after != watermark {
             return Err(invalid_chain());
         }
-        Ok(latest_matches)
+        Ok((latest_matches, service_facts))
     }
 
     pub async fn audit(&mut self, ctx: &Context, operation: &str, entity: &str) -> Result<()> {
+        self.append_audit(ctx, operation, entity).await?;
+        Ok(())
+    }
+
+    /// Called only at the successful service commit, after its result/cache writes.
+    pub async fn audit_service_success(
+        &mut self,
+        ctx: &Context,
+        run_id: &str,
+        kind: ServiceSuccessKind,
+        subject_id: &str,
+    ) -> Result<()> {
+        ctx.require(&[evo_core::Role::Agent])?;
+        identifier(run_id)?;
+        identifier(subject_id)?;
+        let operation = kind.operation();
+        let (sequence, digest) = self.append_audit(ctx, operation, subject_id).await?;
+        let fact = ServiceSuccessFactV1 {
+            schema_version: "rsia.service_success_fact.v1".into(),
+            run_id: run_id.into(),
+            sequence: u64::try_from(sequence).map_err(internal)?,
+            role: ctx.role(),
+            kind: operation.into(),
+            subject_id: subject_id.into(),
+            audit_digest: digest,
+        };
+        let entity = serde_json::to_string(&fact).map_err(internal)?;
+        self.audit(ctx, "service.success_fact.v1", &entity).await
+    }
+
+    async fn append_audit(
+        &mut self,
+        ctx: &Context,
+        operation: &str,
+        entity: &str,
+    ) -> Result<(i64, String)> {
         let timestamp = now()?;
         let prev: Option<String> = sqlx::query_scalar(
             "SELECT digest FROM audit WHERE namespace=? ORDER BY seq DESC LIMIT 1",
@@ -3376,15 +3544,17 @@ impl Session {
         let prev = prev.unwrap_or_default();
         let payload=json!({"actor":ctx.actor(),"role":ctx.role(),"operation":operation,"entity":entity,"timestamp":timestamp}).to_string();
         let digest = hash(format!("{prev}\n{payload}").as_bytes());
-        sqlx::query("INSERT INTO audit(namespace,payload,previous_hash,digest) VALUES(?,?,?,?)")
-            .bind(ctx.namespace())
-            .bind(payload)
-            .bind(prev)
-            .bind(digest)
-            .execute(&mut *self.tx)
-            .await
-            .map_err(internal)?;
-        Ok(())
+        let inserted = sqlx::query(
+            "INSERT INTO audit(namespace,payload,previous_hash,digest) VALUES(?,?,?,?)",
+        )
+        .bind(ctx.namespace())
+        .bind(payload)
+        .bind(prev)
+        .bind(&digest)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        Ok((inserted.last_insert_rowid(), digest))
     }
     pub async fn replace_search_index(
         &mut self,
