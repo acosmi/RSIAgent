@@ -1,3 +1,12 @@
+fn current_management_job(record: evo_storage::VersionedManagementJob) -> ManagementJobV2 {
+    match record {
+        evo_storage::VersionedManagementJob::V2(job) => job,
+        evo_storage::VersionedManagementJob::V1(_) => {
+            panic!("expected the actual current management producer wire")
+        }
+    }
+}
+
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 use evo_core::evaluation::{
@@ -18,7 +27,8 @@ use evo_core::{Context, Error, Role, fingerprint, hash};
 use evo_engine::dispatch::{
     EvaluationStartRequest, EvaluationStatusRequest,
     ExperimentRegisterRequestV2 as ExperimentRegisterRequest, IssueTicketRequestWire,
-    ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
+    ManagementDispatcher, ManagementJob, ManagementJobState, ManagementJobV2, ManagementResult,
+    VersionedManagementJob,
 };
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::release_store::{
@@ -48,9 +58,13 @@ async fn wait_management(
     dispatcher: &ManagementDispatcher,
     context: &Context,
     job_id: &str,
-) -> ManagementJob {
+) -> ManagementJobV2 {
     for _ in 0..100 {
-        let job = dispatcher.status(context, job_id).await.unwrap();
+        let job = dispatcher
+            .status(context, job_id)
+            .await
+            .map(current_management_job)
+            .unwrap();
         if matches!(
             job.state,
             ManagementJobState::Succeeded
@@ -1575,23 +1589,89 @@ async fn registration_progress_is_digest_only_actor_scoped_and_preserves_partial
 async fn management_dispatch_recovers_registered_inputs_and_existing_ticket_without_hidden_output()
 {
     let fixture = fixture(5, false).await;
-    let dispatcher =
-        ManagementDispatcher::new(fixture.store.clone(), vec![fixture.evaluator.clone()]).unwrap();
-    let queued = dispatcher
-        .submit(
-            &fixture.evaluator,
-            "experiment.register",
-            serde_json::to_value(ExperimentRegisterRequest {
-                schema_version: "rsia.management.experiment_register.v2".into(),
-                request_key: "register-recover".into(),
-                control: fixture.control.clone(),
-                holdout: fixture.holdout.clone(),
-            })
-            .unwrap(),
-        )
+    let holdout_storage_id = format!(
+        "e05-{}",
+        fingerprint(&("protected_holdout_v41", fixture.holdout.id.as_str())).unwrap()
+    );
+    let mut session = fixture.store.session().await.unwrap();
+    session
+        .delete(&fixture.evaluator, "artifact", &holdout_storage_id)
         .await
         .unwrap();
+    session.commit().await.unwrap();
+    let submit_store = fixture.store.clone();
+    let submit_context = fixture.evaluator.clone();
+    let registration = ExperimentRegisterRequest {
+        schema_version: "rsia.management.experiment_register.v2".into(),
+        request_key: "register-recover".into(),
+        control: fixture.control.clone(),
+        holdout: fixture.holdout.clone(),
+    };
+    let queued = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let accepted = runtime.block_on(async {
+            let dispatcher =
+                ManagementDispatcher::new(submit_store, vec![submit_context.clone()]).unwrap();
+            dispatcher
+                .submit(
+                    &submit_context,
+                    "experiment.register",
+                    serde_json::to_value(registration).unwrap(),
+                )
+                .await
+                .map(current_management_job)
+                .unwrap()
+        });
+        drop(runtime);
+        accepted
+    })
+    .await
+    .unwrap();
+    // Spawn is not synchronously polled. This physical full-row assertion
+    // proves the actual producer was still unclaimed when its runtime ended.
+    let mut session = fixture.store.session().await.unwrap();
+    let row = session
+        .object_row(&fixture.evaluator, "job", &queued.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let actual = match evo_storage::decode_management_job(&row.body).unwrap() {
+        VersionedManagementJob::V2(job) => job,
+        VersionedManagementJob::V1(_) => panic!("fresh producer returned legacy job"),
+    };
+    session.commit().await.unwrap();
+    assert_eq!(row.owner, fixture.evaluator.actor());
+    assert_eq!(
+        serde_json::to_value(&actual).unwrap(),
+        serde_json::to_value(&queued).unwrap()
+    );
+    assert_eq!(actual.state, ManagementJobState::Queued);
+    assert_eq!(actual.generation, 0);
+    assert_eq!(actual.lease_token, None);
+    assert_eq!(actual.request_key, "register-recover");
+    let before = IndependentEvaluationControl::registration_progress(
+        &fixture.evaluator,
+        &fixture.store,
+        &fixture.control.id,
+        &fixture.holdout.id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        before.control_digest,
+        Some(fixture.control.digest().unwrap())
+    );
+    assert_eq!(before.holdout_digest, None);
+    let dispatcher =
+        ManagementDispatcher::new(fixture.store.clone(), vec![fixture.evaluator.clone()]).unwrap();
+    dispatcher.recover_pending().await.unwrap();
     let registered = wait_management(&dispatcher, &fixture.evaluator, &queued.id).await;
+    assert_eq!(registered.id, queued.id);
+    assert_eq!(registered.request_key, queued.request_key);
+    assert_eq!(registered.private_input_ref, queued.private_input_ref);
     assert_eq!(registered.state, ManagementJobState::Succeeded);
     assert!(
         !serde_json::to_string(&registered)
@@ -1613,35 +1693,7 @@ async fn management_dispatch_recovers_registered_inputs_and_existing_ticket_with
         .unwrap();
     session.commit().await.unwrap();
     assert!(dependents.contains(&("artifact".into(), registered.private_input_ref.clone())));
-    let holdout_storage_id = format!(
-        "e05-{}",
-        fingerprint(&("protected_holdout_v41", fixture.holdout.id.as_str())).unwrap()
-    );
-    let mut session = fixture.store.session().await.unwrap();
-    session
-        .delete(&fixture.evaluator, "artifact", &holdout_storage_id)
-        .await
-        .unwrap();
-    let mut interrupted = registered.clone();
-    interrupted.state = ManagementJobState::Queued;
-    interrupted.step = "control_registered".into();
-    interrupted.result = None;
-    interrupted.error_code = None;
-    interrupted.lease_token = None;
-    interrupted.lease_until = 0;
-    session
-        .put(
-            &fixture.evaluator,
-            "job",
-            &interrupted.id,
-            fixture.evaluator.actor(),
-            &interrupted,
-        )
-        .await
-        .unwrap();
-    session.commit().await.unwrap();
-    dispatcher.recover_pending().await.unwrap();
-    let recovered = wait_management(&dispatcher, &fixture.evaluator, &interrupted.id).await;
+    let recovered = registered.clone();
     assert_eq!(recovered.state, ManagementJobState::Succeeded);
     let progress = IndependentEvaluationControl::registration_progress(
         &fixture.evaluator,
@@ -1671,6 +1723,7 @@ async fn management_dispatch_recovers_registered_inputs_and_existing_ticket_with
             .unwrap(),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let started = wait_management(&dispatcher, &fixture.evaluator, &queued.id).await;
     assert_eq!(started.state, ManagementJobState::Blocked);
@@ -1691,14 +1744,82 @@ async fn management_dispatch_recovers_registered_inputs_and_existing_ticket_with
             .unwrap(),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let status = wait_management(&dispatcher, &fixture.evaluator, &queued.id).await;
     assert_eq!(status.state, ManagementJobState::Succeeded);
     assert!(matches!(
         status.result,
-        Some(ManagementResult::EvaluationStatus { .. })
+        Some(evo_engine::dispatch::ManagementResultV2::Original(
+            ManagementResult::EvaluationStatus { .. }
+        ))
     ));
     let public = serde_json::to_string(&status).unwrap();
     assert!(!public.contains("expected_answer_json"));
     assert!(!public.contains("oracle_entries"));
+
+    // The original damaged Queued label, still at its actual nonzero generation,
+    // has no evidence of a fresh unclaimed producer and must not regenerate H.
+    let holdout_storage_id = format!(
+        "e05-{}",
+        fingerprint(&("protected_holdout_v41", fixture.holdout.id.as_str())).unwrap()
+    );
+    let mut session = fixture.store.session().await.unwrap();
+    session
+        .delete(&fixture.evaluator, "artifact", &holdout_storage_id)
+        .await
+        .unwrap();
+    let mut interrupted = registered.clone();
+    interrupted.state = ManagementJobState::Queued;
+    interrupted.step = "control_registered".into();
+    interrupted.result = None;
+    interrupted.error_code = None;
+    interrupted.lease_token = None;
+    interrupted.lease_until = 0;
+    session
+        .put(
+            &fixture.evaluator,
+            "job",
+            &interrupted.id,
+            fixture.evaluator.actor(),
+            &interrupted,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let unknown_dispatcher =
+        ManagementDispatcher::new(fixture.store.clone(), vec![fixture.evaluator.clone()]).unwrap();
+    unknown_dispatcher.recover_pending().await.unwrap();
+    let mut observed = None;
+    for _ in 0..100 {
+        let current = unknown_dispatcher
+            .status(&fixture.evaluator, &interrupted.id)
+            .await
+            .map(current_management_job)
+            .unwrap();
+        if current.state == ManagementJobState::Draining {
+            observed = Some(current);
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let held = observed.expect("unknown prior generation was not conservatively held");
+    assert_eq!(held.id, registered.id);
+    assert_eq!(held.request_key, registered.request_key);
+    assert_eq!(held.generation, registered.generation);
+    assert!(held.generation > 0);
+    assert_eq!(held.lease_token, None);
+    let damaged = IndependentEvaluationControl::registration_progress(
+        &fixture.evaluator,
+        &fixture.store,
+        &fixture.control.id,
+        &fixture.holdout.id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        damaged.control_digest,
+        Some(fixture.control.digest().unwrap())
+    );
+    assert_eq!(damaged.holdout_digest, None);
 }

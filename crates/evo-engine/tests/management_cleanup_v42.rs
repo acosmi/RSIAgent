@@ -57,7 +57,8 @@ mod trusted_compiler_inputs;
 
 use evo_core::{Context, Error, Role, fingerprint};
 use evo_engine::dispatch::{
-    ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
+    ManagementDispatcher, ManagementJob, ManagementJobState, ManagementJobV2, ManagementResult,
+    ManagementResultV2, VersionedManagementJob,
 };
 use evo_storage::Store;
 use evo_storage::lifecycle::{CleanupState, LifecycleStore};
@@ -69,6 +70,171 @@ use common::*;
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+fn current_management_job(record: VersionedManagementJob) -> ManagementJobV2 {
+    match record {
+        VersionedManagementJob::V2(job) => job,
+        VersionedManagementJob::V1(_) => panic!("expected actual current management producer"),
+    }
+}
+
+fn valid_legacy_fixture(mut job: ManagementJob, ctx: &Context) -> ManagementJob {
+    // Original stable_id bytes; identity math only. No Current/role/budget is minted.
+    let digest = evo_core::hash(
+        format!(
+            "{}\0{}\0{}\0{}",
+            ctx.namespace(),
+            ctx.actor(),
+            job.operation,
+            job.request_key
+        )
+        .as_bytes(),
+    );
+    job.id = format!("management-job-{}", &digest[..24]);
+    job.private_input_ref = format!("management-input-{}", &digest[..24]);
+    job
+}
+
+async fn submit_unclaimed(
+    store: &Store,
+    ctx: &Context,
+    operation: &str,
+    payload: Value,
+) -> ManagementJobV2 {
+    let submit_store = store.clone();
+    let submit_context = ctx.clone();
+    let operation = operation.to_owned();
+    let accepted = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let dispatcher =
+                ManagementDispatcher::new(submit_store, vec![submit_context.clone()]).unwrap();
+            dispatcher
+                .submit(&submit_context, &operation, payload)
+                .await
+                .map(current_management_job)
+                .unwrap()
+        });
+        drop(runtime);
+        result
+    })
+    .await
+    .unwrap();
+    let mut session = store.session().await.unwrap();
+    let row = session
+        .object_row(ctx, "job", &accepted.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.id, accepted.id);
+    assert_eq!(row.owner, ctx.actor());
+    let actual = current_management_job(evo_storage::decode_management_job(&row.body).unwrap());
+    session.commit().await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&actual).unwrap(),
+        serde_json::to_value(&accepted).unwrap()
+    );
+    assert_eq!(actual.state, ManagementJobState::Queued);
+    assert_eq!(actual.generation, 0);
+    assert_eq!(actual.lease_token, None);
+    actual
+}
+
+async fn submit_capacity_wait_unclaimed(
+    store: &Store,
+    ctx: &Context,
+    payload: Value,
+) -> ManagementJobV2 {
+    let submit_store = store.clone();
+    let submit_context = ctx.clone();
+    let (accepted, deferred) = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let accepted = runtime.block_on(async {
+            let dispatcher =
+                ManagementDispatcher::new(submit_store.clone(), vec![submit_context.clone()])
+                    .unwrap();
+            let accepted = dispatcher
+                .submit(&submit_context, "exploration.start", payload)
+                .await
+                .map(current_management_job)
+                .unwrap();
+            let mut deferred = None;
+            for _ in 0..2_000 {
+                let actual = job_record(&submit_store, &submit_context, &accepted.id).await;
+                if actual.step == ManagementDispatcher::CAPACITY_WAIT_STEP {
+                    deferred = Some(actual);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let actual = deferred.expect("real claim never reached the capacity gate");
+            assert_eq!(actual.state, ManagementJobState::Queued);
+            assert_eq!(actual.generation, 0);
+            assert_eq!(actual.lease_token, None);
+            assert_eq!(actual.diagnostics.len(), 1);
+            assert_eq!(actual.diagnostics[0].code, "conflict");
+            let mut expected = accepted.clone();
+            expected.step = actual.step.clone();
+            expected.diagnostics = actual.diagnostics.clone();
+            assert_eq!(
+                serde_json::to_value(&actual).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            (accepted, actual)
+        });
+        drop(runtime);
+        accepted
+    })
+    .await
+    .unwrap();
+    let mut session = store.session().await.unwrap();
+    let row = session
+        .object_row(ctx, "job", &accepted.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.id, accepted.id);
+    assert_eq!(row.owner, ctx.actor());
+    let actual = current_management_job(evo_storage::decode_management_job(&row.body).unwrap());
+    session.commit().await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&actual).unwrap(),
+        serde_json::to_value(&deferred).unwrap()
+    );
+    assert_eq!(actual.state, ManagementJobState::Queued);
+    assert_eq!(actual.step, ManagementDispatcher::CAPACITY_WAIT_STEP);
+    assert_eq!(actual.generation, 0);
+    assert_eq!(actual.lease_token, None);
+    accepted
+}
+
+async fn assert_draining_without_reclaim(store: &Store, ctx: &Context, before: &ManagementJobV2) {
+    let mut seen = None;
+    for _ in 0..2_000 {
+        let job = job_record(store, ctx, &before.id).await;
+        if job.state == ManagementJobState::Draining {
+            seen = Some(job);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let observed = seen.expect("unknown prior producer was not held Draining");
+    assert_eq!(observed.id, before.id);
+    assert_eq!(observed.request_key, before.request_key);
+    assert_eq!(observed.private_input_ref, before.private_input_ref);
+    assert_eq!(observed.generation, before.generation);
+    assert_eq!(observed.lease_token, before.lease_token);
+    assert_eq!(
+        serde_json::to_value(&observed.result).unwrap(),
+        serde_json::to_value(&before.result).unwrap()
+    );
+}
 
 mod common {
     use super::*;
@@ -115,18 +281,22 @@ mod common {
         session.commit().await.unwrap();
     }
 
-    pub async fn put_job(store: &Store, ctx: &Context, job: &ManagementJob) {
+    pub async fn put_job<T: serde::Serialize>(store: &Store, ctx: &Context, job: &T) {
+        let value = serde_json::to_value(job).unwrap();
+        let id = value["id"].as_str().unwrap();
         let mut session = store.session().await.unwrap();
-        session
-            .put(ctx, "job", &job.id, ctx.actor(), job)
-            .await
-            .unwrap();
+        session.put(ctx, "job", id, ctx.actor(), job).await.unwrap();
         session.commit().await.unwrap();
     }
 
-    pub async fn job_record(store: &Store, ctx: &Context, job_id: &str) -> ManagementJob {
+    pub async fn job_record(store: &Store, ctx: &Context, job_id: &str) -> ManagementJobV2 {
         let mut session = store.session().await.unwrap();
-        let job = session.need(ctx, "job", job_id).await.unwrap();
+        let row = session
+            .object_row(ctx, "job", job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let job = current_management_job(evo_storage::decode_management_job(&row.body).unwrap());
         session.commit().await.unwrap();
         job
     }
@@ -196,7 +366,7 @@ mod common {
 
     /// Polls the stored job (not `status`, which refuses after a revocation)
     /// until it is terminal.
-    pub async fn wait_job(store: &Store, ctx: &Context, job_id: &str) -> ManagementJob {
+    pub async fn wait_job(store: &Store, ctx: &Context, job_id: &str) -> ManagementJobV2 {
         for _ in 0..2_000 {
             let job = job_record(store, ctx, job_id).await;
             if matches!(
@@ -1718,16 +1888,25 @@ async fn curriculum_step_job_and_private_input_reach_the_cleanup_closure() {
     let queued = dispatcher
         .submit(admin, "curriculum.step", step_request("curriculum-step-1"))
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_job(store, admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
     assert_eq!(done.step, "probe_scheduled");
-    let Some(ManagementResult::ProbeScheduled { probe_job_id, .. }) = &done.result else {
+    let Some(ManagementResultV2::Original(ManagementResult::ProbeScheduled {
+        probe_job_id, ..
+    })) = &done.result
+    else {
         panic!("unexpected result: {:?}", done.result);
     };
     // Live: the read side agrees.
     assert_eq!(
-        dispatcher.status(admin, &done.id).await.unwrap().state,
+        dispatcher
+            .status(admin, &done.id)
+            .await
+            .map(current_management_job)
+            .unwrap()
+            .state,
         ManagementJobState::Succeeded
     );
 
@@ -1846,6 +2025,7 @@ async fn exploration_start_job_and_private_input_reach_the_cleanup_closure() {
             exploration_fx::start_request("exploration-start-1", &world),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_job(&store, &admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
@@ -1934,6 +2114,7 @@ async fn revoking_a_run_no_management_request_reads_leaves_its_job_and_input_unc
             ),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_job(&store, &admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded);
@@ -1976,11 +2157,14 @@ async fn replay_run_job_and_private_input_reach_the_cleanup_closure() {
             replay_fx::run_request("replay-run-1", &pool),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_job(&store, &admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
     assert_eq!(done.step, "replay_stored");
-    let Some(ManagementResult::ReplayStored { report_id, .. }) = &done.result else {
+    let Some(ManagementResultV2::Original(ManagementResult::ReplayStored { report_id, .. })) =
+        &done.result
+    else {
         panic!("unexpected result: {:?}", done.result);
     };
     assert!(dispatcher.status(&admin, &done.id).await.is_ok());
@@ -2071,10 +2255,11 @@ async fn experiment_register_is_reached_through_a_run_derived_input_and_evaluati
         let queued = dispatcher
             .submit(evaluator, operation, request)
             .await
+            .map(current_management_job)
             .unwrap();
         jobs.push(wait_job(store, evaluator, &queued.id).await);
     }
-    let [register, start, status] = <[ManagementJob; 3]>::try_from(jobs).unwrap();
+    let [register, start, status] = <[ManagementJobV2; 3]>::try_from(jobs).unwrap();
     assert_eq!(
         register.state,
         ManagementJobState::Succeeded,
@@ -2149,7 +2334,12 @@ async fn experiment_register_is_reached_through_a_run_derived_input_and_evaluati
     );
     assert_names_redaction(&message, &[&register.private_input_ref]);
     assert_eq!(
-        dispatcher.status(evaluator, &start.id).await.unwrap().state,
+        dispatcher
+            .status(evaluator, &start.id)
+            .await
+            .map(current_management_job)
+            .unwrap()
+            .state,
         ManagementJobState::Blocked
     );
     // The Current ticket binds the revoke watermark its candidate was staged at;
@@ -2199,20 +2389,15 @@ fn holding_job() -> ManagementJob {
 async fn a_queued_job_whose_input_was_redacted_fails_with_source_revoked_and_is_not_retried() {
     let (_dir, store, admin) = exploration_fx::open("queued.sqlite3").await;
     exploration_fx::setup(&store).await;
-    let holding = holding_job();
+    let holding = valid_legacy_fixture(holding_job(), &admin);
     put_job(&store, &admin, &holding).await;
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
-    let queued = dispatcher
-        .submit(
-            &admin,
-            "exploration.start",
-            exploration_fx::start_request(
-                "exploration-queued",
-                &exploration_fx::world("world-1", 1),
-            ),
-        )
-        .await
-        .unwrap();
+    let queued = submit_capacity_wait_unclaimed(
+        &store,
+        &admin,
+        exploration_fx::start_request("exploration-queued", &exploration_fx::world("world-1", 1)),
+    )
+    .await;
     assert_eq!(queued.state, ManagementJobState::Queued);
     // The spawned claim is deferred by the capacity bound: the job has not run.
     let mut waiting = job_record(&store, &admin, &queued.id).await;
@@ -2249,12 +2434,16 @@ async fn a_queued_job_whose_input_was_redacted_fails_with_source_revoked_and_is_
     finished.lease_token = None;
     finished.lease_until = 0;
     put_job(&store, &admin, &finished).await;
+    assert_eq!(dispatcher.recover_pending().await.unwrap(), 1);
     let failed = wait_job(&store, &admin, &queued.id).await;
     assert_eq!(failed.state, ManagementJobState::Failed, "{failed:?}");
     assert_eq!(failed.step, "private_input_redacted");
     assert_eq!(failed.error_code.as_deref(), Some("source_revoked"));
     assert!(failed.result.is_none());
-    assert_eq!(failed.generation, 1, "claimed once");
+    assert_eq!(
+        failed.generation, 0,
+        "source refusal precedes the first claim"
+    );
     assert!(failed.lease_token.is_none());
     assert_eq!(failed.lease_until, 0);
     // The request never ran: no world was registered.
@@ -2286,9 +2475,13 @@ async fn a_queued_job_whose_input_was_redacted_fails_with_source_revoked_and_is_
     );
     // A Failed job carries no result derived from its sources: status returns the
     // record of what happened, `source_revoked` included.
-    let observed = restarted.status(&admin, &queued.id).await.unwrap();
-    assert_eq!(observed.state, ManagementJobState::Failed);
-    assert_eq!(observed.error_code.as_deref(), Some("source_revoked"));
+    let observed = restarted
+        .status(&admin, &queued.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
+    assert_eq!(observed.identity().state, ManagementJobState::Failed);
+    assert_eq!(observed.error_code(), Some("source_revoked"));
 }
 
 #[tokio::test]
@@ -2301,20 +2494,22 @@ async fn a_running_job_with_an_expired_lease_fails_with_source_revoked_when_reco
     let queued = dispatcher
         .submit(admin, "curriculum.step", step_request("curriculum-crash"))
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_job(store, admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded);
 
     // A crash after the consumer committed, before `finish_claim` wrote the
     // terminal: the job is left Running with a dead lease.
-    let mut crashed = done.clone();
-    crashed.state = ManagementJobState::Running;
-    crashed.step = "before_curriculum_step".into();
-    crashed.result = None;
-    crashed.error_code = None;
-    crashed.lease_token = Some("dead-process-lease".into());
-    crashed.lease_until = 0;
-    put_job(store, admin, &crashed).await;
+    let committed = done;
+    let done = submit_unclaimed(
+        store,
+        admin,
+        "curriculum.step",
+        step_request("curriculum-crash-pending"),
+    )
+    .await;
+    let crashed = done.clone();
 
     let cleanup = revoke_and_clean(store, admin, "run-a").await;
     assert_eq!(cleanup.state, CleanupState::Complete, "{cleanup:?}");
@@ -2325,7 +2520,7 @@ async fn a_running_job_with_an_expired_lease_fails_with_source_revoked_when_reco
     assert_eq!(
         serde_json::to_value(job_record(store, admin, &done.id).await).unwrap(),
         serde_json::to_value(&crashed).unwrap(),
-        "the cleanup preserves a Running job as it is"
+        "the cleanup preserves the actual never-started Queued job as it is"
     );
 
     // Startup recovery re-runs it: the input is gone with its source, so the job
@@ -2337,7 +2532,11 @@ async fn a_running_job_with_an_expired_lease_fails_with_source_revoked_when_reco
     assert_eq!(failed.step, "private_input_redacted");
     assert_eq!(failed.error_code.as_deref(), Some("source_revoked"));
     assert!(failed.result.is_none());
-    assert_eq!(failed.generation, done.generation + 1, "claimed once more");
+    assert_eq!(
+        failed.generation, done.generation,
+        "no new claim after source refusal"
+    );
+    assert_eq!(failed.generation, 0);
 
     // Terminal: a second restart has nothing to recover and changes nothing.
     let again = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
@@ -2347,6 +2546,19 @@ async fn a_running_job_with_an_expired_lease_fails_with_source_revoked_when_reco
         serde_json::to_value(job_record(store, admin, &done.id).await).unwrap(),
         serde_json::to_value(&failed).unwrap()
     );
+    // Retain the original nonzero Running/cleared-ref damage as a negative.
+    // Source loss cannot prove its prior committed work disappeared.
+    let mut crashed = committed.clone();
+    crashed.state = ManagementJobState::Running;
+    crashed.step = "before_curriculum_step".into();
+    crashed.result = None;
+    crashed.error_code = None;
+    crashed.lease_token = Some("dead-process-lease".into());
+    crashed.lease_until = 0;
+    put_job(store, admin, &crashed).await;
+    let unknown = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    assert_eq!(unknown.recover_pending().await.unwrap(), 1);
+    assert_draining_without_reclaim(store, admin, &crashed).await;
 }
 
 /// A forged Queued job: for the tests that only care what its private input is.
@@ -2388,8 +2600,8 @@ async fn an_input_that_is_not_a_tombstone_and_does_not_decode_still_fails_the_jo
     .enumerate()
     {
         let input_id = format!("corrupt-input-{n}");
-        put_raw(&store, &admin, "artifact", &input_id, &body).await;
-        let job = queued_job(&format!("corrupt-job-{n}"), &input_id);
+        let job = valid_legacy_fixture(queued_job(&format!("corrupt-job-{n}"), &input_id), &admin);
+        put_raw(&store, &admin, "artifact", &job.private_input_ref, &body).await;
         put_job(&store, &admin, &job).await;
         let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
         assert_eq!(dispatcher.recover_pending().await.unwrap(), 1);
@@ -2407,7 +2619,7 @@ async fn an_input_that_is_not_a_tombstone_and_does_not_decode_still_fails_the_jo
         );
     }
     // An absent input keeps its code too.
-    let job = queued_job("absent-job", "absent-input");
+    let job = valid_legacy_fixture(queued_job("absent-job", "absent-input"), &admin);
     put_job(&store, &admin, &job).await;
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
     assert_eq!(dispatcher.recover_pending().await.unwrap(), 1);
@@ -2425,10 +2637,16 @@ async fn the_redaction_gate_names_one_state_and_passes_an_absent_input() {
     job.operation = "meta.start".into();
     job.state = ManagementJobState::Succeeded;
     job.step = "finished".into();
+    let job = valid_legacy_fixture(job, &admin);
     put_job(&store, &admin, &job).await;
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
     assert_eq!(
-        dispatcher.status(&admin, &job.id).await.unwrap().state,
+        dispatcher
+            .status(&admin, &job.id)
+            .await
+            .unwrap()
+            .identity()
+            .state,
         ManagementJobState::Succeeded
     );
 
@@ -2436,7 +2654,7 @@ async fn the_redaction_gate_names_one_state_and_passes_an_absent_input() {
         &store,
         &admin,
         "artifact",
-        "absent-input",
+        &job.private_input_ref,
         &json!({"schema_version": "rsia.redacted.v1", "state": "source_revoked"}),
     )
     .await;
@@ -2444,17 +2662,26 @@ async fn the_redaction_gate_names_one_state_and_passes_an_absent_input() {
         dispatcher.status(&admin, &job.id).await,
         "status with a redacted input",
     );
-    assert_names_redaction(&message, &["absent-input"]);
+    assert_names_redaction(&message, &[&job.private_input_ref]);
 
-    // A Failed job with the same input is still returned.
+    // A Failed job with the same redaction shape is still returned under its own stable private identity.
     let mut failed = queued_job("failed-with-redacted-input", "absent-input");
     failed.state = ManagementJobState::Failed;
     failed.step = "private_input_redacted".into();
     failed.error_code = Some("source_revoked".into());
+    let failed = valid_legacy_fixture(failed, &admin);
+    put_raw(
+        &store,
+        &admin,
+        "artifact",
+        &failed.private_input_ref,
+        &json!({"schema_version":"rsia.redacted.v1","state":"source_revoked"}),
+    )
+    .await;
     put_job(&store, &admin, &failed).await;
     let observed = dispatcher.status(&admin, &failed.id).await.unwrap();
-    assert_eq!(observed.state, ManagementJobState::Failed);
-    assert_eq!(observed.error_code.as_deref(), Some("source_revoked"));
+    assert_eq!(observed.identity().state, ManagementJobState::Failed);
+    assert_eq!(observed.error_code(), Some("source_revoked"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2540,18 +2767,20 @@ async fn a_recovered_curriculum_step_fails_closed_once_its_source_is_revoked() {
     let queued = dispatcher
         .submit(admin, "curriculum.step", step_request("curriculum-recover"))
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_job(store, admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded);
 
-    let mut crashed = done.clone();
-    crashed.state = ManagementJobState::Running;
-    crashed.step = "before_curriculum_step".into();
-    crashed.result = None;
-    crashed.error_code = None;
-    crashed.lease_token = Some("dead-process-lease".into());
-    crashed.lease_until = 0;
-    put_job(store, admin, &crashed).await;
+    let committed = done;
+    let done = submit_unclaimed(
+        store,
+        admin,
+        "curriculum.step",
+        step_request("curriculum-recover-pending"),
+    )
+    .await;
+    let crashed = done.clone();
     // The revocation is logically committed; its cleanup has not run yet.
     let cleanup = begin(store, admin, "run-a").await;
     assert_eq!(cleanup.state, CleanupState::Pending);
@@ -2562,7 +2791,21 @@ async fn a_recovered_curriculum_step_fails_closed_once_its_source_is_revoked() {
     assert_eq!(failed.state, ManagementJobState::Failed, "{failed:?}");
     assert_eq!(failed.error_code.as_deref(), Some("conflict"));
     assert!(failed.result.is_none());
-    assert_eq!(failed.generation, done.generation + 1);
+    assert_eq!(failed.generation, done.generation);
+    assert_eq!(failed.generation, 0);
+    // Retain the original nonzero Running/cleared-ref damage as a negative.
+    // Source loss cannot prove its prior committed work disappeared.
+    let mut crashed = committed.clone();
+    crashed.state = ManagementJobState::Running;
+    crashed.step = "before_curriculum_step".into();
+    crashed.result = None;
+    crashed.error_code = None;
+    crashed.lease_token = Some("dead-process-lease".into());
+    crashed.lease_until = 0;
+    put_job(store, admin, &crashed).await;
+    let unknown = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    assert_eq!(unknown.recover_pending().await.unwrap(), 1);
+    assert_draining_without_reclaim(store, admin, &crashed).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2856,7 +3099,11 @@ async fn cleanup_with_forged_node(
 #[tokio::test]
 async fn an_unknown_management_schema_or_object_kind_fails_the_cleanup_closed() {
     // Known schema under its own kind: the control, cleaned to Complete.
-    for (kind, schema) in [("job", JOB_SCHEMA), ("artifact", INPUT_SCHEMA)] {
+    for (kind, schema) in [
+        ("job", JOB_SCHEMA),
+        ("artifact", INPUT_SCHEMA),
+        ("job", "rsia.management_job.v2"),
+    ] {
         let status = cleanup_with_forged_node(kind, schema).await;
         assert_eq!(
             status.state,
@@ -2867,7 +3114,7 @@ async fn an_unknown_management_schema_or_object_kind_fails_the_cleanup_closed() 
     }
     // Any other version, or a known schema under the other kind, is unclassified.
     for (kind, schema) in [
-        ("job", "rsia.management_job.v2"),
+        ("job", "rsia.management_job.v3"),
         ("artifact", "rsia.management_private_input.v2"),
         ("artifact", JOB_SCHEMA),
         ("job", INPUT_SCHEMA),
@@ -2903,12 +3150,13 @@ async fn an_unknown_job_schema_on_the_chain_of_a_real_management_job_fails_the_c
             ),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_job(&store, &admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded);
     let mut forged = done.clone();
-    forged.id = "management-job-v2".into();
-    forged.schema_version = "rsia.management_job.v2".into();
+    forged.id = "management-job-v3".into();
+    forged.schema_version = "rsia.management_job.v3".into();
     put_raw(
         &store,
         &admin,
@@ -2934,7 +3182,7 @@ async fn an_unknown_job_schema_on_the_chain_of_a_real_management_job_fails_the_c
     assert_eq!(status.state, CleanupState::Failed, "{status:?}");
     assert_eq!(
         status.last_error.as_deref(),
-        Some("blocked_unknown_scope:job:rsia.management_job.v2:")
+        Some("blocked_unknown_scope:job:rsia.management_job.v3:")
     );
     // The job does not claim completion on a further step either.
     let again = LifecycleStore::cleanup_step(&admin, &store, &status.job_id, 8, 3_000)
@@ -2962,6 +3210,7 @@ async fn the_management_cleanup_is_paged_and_resumes_after_a_restart() {
             ),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_job(&store, &admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded);
@@ -3081,6 +3330,7 @@ async fn a_new_exploration_request_over_a_cleaned_run_is_refused_at_submit() {
             ),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(
         wait_job(&store, &admin, &first.id).await.state,
@@ -3135,6 +3385,7 @@ async fn a_new_exploration_request_over_a_cleaned_run_is_refused_at_submit() {
             exploration_fx::start_request("exploration-over-live-run", &live),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_job(&store, &admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
@@ -3158,6 +3409,7 @@ async fn a_new_exploration_request_over_a_cleaned_run_is_refused_at_submit() {
             exploration_fx::start_request("exploration-over-live-run", &live),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(
         replayed.id, queued.id,
@@ -3174,6 +3426,7 @@ async fn a_new_curriculum_request_over_a_redacted_learner_state_is_refused_at_su
     let first = dispatcher
         .submit(admin, "curriculum.step", step_request("curriculum-before"))
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(
         wait_job(store, admin, &first.id).await.state,
@@ -3219,6 +3472,7 @@ async fn a_new_replay_request_over_a_redacted_pool_is_refused_at_submit() {
             replay_fx::run_request("replay-before", &pool),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(
         wait_job(&store, &admin, &first.id).await.state,

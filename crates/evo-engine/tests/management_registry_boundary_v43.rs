@@ -216,7 +216,7 @@ async fn the_old_seven_handlers_keep_their_real_role_guards() {
         )
         .await
         .unwrap();
-    assert_eq!(queued.operation, "meta.start");
+    assert_eq!(queued.identity().operation, "meta.start");
 
     // evaluation.status is Evaluator-gated: an Admin submit is Forbidden,
     // the Evaluator submit passes the role gate (and then fails closed on its
@@ -401,8 +401,11 @@ async fn generic_submit_rejects_dedicated_routes_without_closing_their_consumers
         .unwrap();
     let done = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let job = dispatcher.status(&admin, &queued.id).await.unwrap();
-            if job.state == evo_engine::dispatch::ManagementJobState::Blocked {
+            let job = dispatcher
+                .status(&admin, queued.identity().id)
+                .await
+                .unwrap();
+            if job.identity().state == evo_engine::dispatch::ManagementJobState::Blocked {
                 break job;
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -410,11 +413,8 @@ async fn generic_submit_rejects_dedicated_routes_without_closing_their_consumers
     })
     .await
     .unwrap();
-    assert_eq!(done.step, "blocked_feature");
-    assert_eq!(
-        done.error_code.as_deref(),
-        Some("meta.start_consumer_unavailable")
-    );
+    assert_eq!(done.step(), "blocked_feature");
+    assert_eq!(done.error_code(), Some("meta.start_consumer_unavailable"));
     let path = dir.path().join("boundary.sqlite3");
     let before = management_sql_snapshot(&path);
     for name in ["job.status", "job.cancel", "control.review"] {
@@ -432,15 +432,16 @@ async fn generic_submit_rejects_dedicated_routes_without_closing_their_consumers
             .submit(&admin, "meta.start", payload)
             .await
             .unwrap()
+            .identity()
             .id,
-        done.id
+        done.identity().id
     );
     assert_eq!(
-        serde_json::to_value(dispatcher.status(&admin, &done.id).await.unwrap()).unwrap(),
+        serde_json::to_value(dispatcher.status(&admin, done.identity().id).await.unwrap()).unwrap(),
         serde_json::to_value(&done).unwrap()
     );
     assert_eq!(
-        serde_json::to_value(dispatcher.cancel(&admin, &done.id).await.unwrap()).unwrap(),
+        serde_json::to_value(dispatcher.cancel(&admin, done.identity().id).await.unwrap()).unwrap(),
         serde_json::to_value(&done).unwrap()
     );
     assert_eq!(management_sql_snapshot(&path), before);

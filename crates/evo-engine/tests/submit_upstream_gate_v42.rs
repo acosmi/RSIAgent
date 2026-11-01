@@ -36,11 +36,20 @@
 //! `tests/dispatch_management.rs` and `tests/streaming_evaluator.rs`); test
 //! crates cannot import each other, and the originals are untouched.
 
+fn current_management_job(record: evo_storage::VersionedManagementJob) -> ManagementJobV2 {
+    match record {
+        evo_storage::VersionedManagementJob::V2(job) => job,
+        evo_storage::VersionedManagementJob::V1(_) => {
+            panic!("expected the actual current management producer wire")
+        }
+    }
+}
+
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 
 use evo_core::{Context, Error, Role, fingerprint};
-use evo_engine::dispatch::{ManagementDispatcher, ManagementJob, ManagementJobState};
+use evo_engine::dispatch::{ManagementDispatcher, ManagementJobState, ManagementJobV2};
 use evo_storage::Store;
 use evo_storage::lifecycle::{CleanupState, CleanupStatus, LifecycleStore, TypedObjectRef};
 use serde_json::{Value, json};
@@ -147,10 +156,16 @@ mod common {
 
     /// Polls the stored job (not `status`, which refuses after a revocation)
     /// until it is terminal.
-    pub async fn wait_job(store: &Store, ctx: &Context, job_id: &str) -> ManagementJob {
+    pub async fn wait_job(store: &Store, ctx: &Context, job_id: &str) -> ManagementJobV2 {
         for _ in 0..2_000 {
             let mut session = store.session().await.unwrap();
-            let job: ManagementJob = session.need(ctx, "job", job_id).await.unwrap();
+            let row = session
+                .object_row(ctx, "job", job_id)
+                .await
+                .unwrap()
+                .expect("actual current job row");
+            let job =
+                current_management_job(evo_storage::decode_management_job(&row.body).unwrap());
             session.commit().await.unwrap();
             if matches!(
                 job.state,
@@ -219,10 +234,10 @@ mod common {
         ctx: &Context,
         operation: &str,
         key: &str,
-    ) -> Result<Option<ManagementJob>, Error> {
+    ) -> Result<Option<ManagementJobV2>, Error> {
         let mut session = store.session().await.unwrap();
         let row = session
-            .cached::<ManagementJob, _>(ctx, operation, key, &json!({}))
+            .cached::<ManagementJobV2, _>(ctx, operation, key, &json!({}))
             .await;
         session.commit().await.unwrap();
         row
@@ -1702,6 +1717,7 @@ async fn a_replay_run_over_a_pool_whose_source_run_is_revoked_is_refused_at_subm
             replay_fx::run_request("replay-live", &pool),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(
         wait_job(&store, &admin, &live.id).await.state,
@@ -1768,6 +1784,7 @@ async fn a_curriculum_step_over_a_learner_state_derived_from_a_revoked_run_is_re
     let live = dispatcher
         .submit(admin, "curriculum.step", step_request("curriculum-live"))
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(
         wait_job(store, admin, &live.id).await.state,
@@ -1832,6 +1849,7 @@ async fn an_experiment_register_over_an_input_derived_from_a_revoked_run_is_refu
             e05.register_request("register-live"),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let live = wait_job(store, evaluator, &live.id).await;
     assert_eq!(live.state, ManagementJobState::Succeeded, "{live:?}");
@@ -1931,6 +1949,7 @@ async fn a_recorded_request_key_returns_its_job_before_the_gate_runs() {
     let accepted = dispatcher
         .submit(&admin, "replay.run", request.clone())
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(
         wait_job(&store, &admin, &accepted.id).await.state,
@@ -1947,6 +1966,7 @@ async fn a_recorded_request_key_returns_its_job_before_the_gate_runs() {
     let replayed = dispatcher
         .submit(&admin, "replay.run", request)
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(replayed.id, accepted.id);
     assert_eq!(shape(&store, &admin, &nodes).await, before);
@@ -2392,6 +2412,7 @@ async fn overlapping_cleanups(name: &str, late: bool) -> Overlap {
             replay_fx::run_request("ctrl-q2-chain", &pool),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(
         wait_job(&store, &admin, &queued.id).await.state,

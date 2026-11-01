@@ -7,20 +7,21 @@ use crate::streaming_evaluator::{
     StreamingEvaluationStatus,
 };
 use evo_core::contract::{MODEL_TOOLS, admin_ops, reject_admin_as_model_tool};
+#[cfg(test)]
 use evo_core::curriculum::ProbeTerminal;
 use evo_core::replay::{ReplaySimulationProfile, WorldPartition};
-use evo_core::strategy::{BatchActionV1, ElasticPolicyV1, ExplorationCapsV1};
+use evo_core::strategy::{ElasticPolicyV1, ExplorationCapsV1};
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, now};
 use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 
-const JOB_SCHEMA: &str = "rsia.management_job.v1";
+const JOB_SCHEMA: &str = "rsia.management_job.v2";
 const INPUT_SCHEMA: &str = "rsia.management_private_input.v1";
 /// Schema of the tombstone the revocation cleanup leaves in place of a record
 /// whose source was revoked (plan §11.5, E08).
@@ -64,113 +65,19 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
         "experiment.register" | "evaluation.start" | "evaluation.status" => {
             ctx.require(&[Role::Evaluator])
         }
-        "exploration.start" | "replay.run" | "curriculum.step" | "meta.start" => {
-            ctx.require(&[Role::Admin])
-        }
+        "exploration.start" | "replay.run" | "curriculum.step" | "meta.start"
+        | "optimization.step" => ctx.require(&[Role::Admin]),
         _ => Err(Error::Invalid("management_operation_not_wired".into())),
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ManagementJobState {
-    Queued,
-    Running,
-    Draining,
-    Succeeded,
-    Failed,
-    Cancelled,
-    Blocked,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
-pub enum ManagementResult {
-    ExperimentRegistered {
-        control_id: String,
-        control_digest: String,
-        holdout_id: String,
-        holdout_digest: String,
-    },
-    EvaluationTicketBlocked {
-        ticket_id: String,
-    },
-    EvaluationStatus {
-        ticket_id: String,
-        lifecycle: String,
-        planned_targets: usize,
-        has_formal_terminal: bool,
-    },
-    // Query-only: this tag cannot be decoded as a durable ManagementResult.
-    #[serde(skip_deserializing)]
-    EvaluationStatusReadV2 {
-        ticket_id: String,
-        lifecycle: String,
-        planned_targets: usize,
-        has_formal_terminal: bool,
-        report_read: crate::streaming_evaluator::FormalReportReadMetadata,
-    },
-    ReplayStored {
-        report_id: String,
-        pool_digest: String,
-        semantic_reports_digest: String,
-    },
-    ProbeScheduled {
-        probe_job_id: String,
-        trigger_digest: String,
-        terminal: Option<ProbeTerminal>,
-    },
-    ExplorationStarted {
-        world_id: String,
-        context_signature: String,
-        prefix_digest: String,
-        legal_actions_digest: String,
-        /// Digest of the policy the first decision was taken with (E14). A
-        /// result stored before E14 has none and reads as an empty string:
-        /// the job still loads (startup recovery must not depend on it), and
-        /// `status` then fails that job closed with a `Conflict`, because the
-        /// re-run decision never has an empty digest.
-        #[serde(default)]
-        policy_digest: String,
-        /// Digest of the caps the first decision was taken with (E14); empty
-        /// for a pre-E14 result, like `policy_digest`.
-        #[serde(default)]
-        caps_digest: String,
-        action: BatchActionV1,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ManagementDiagnostic {
-    pub code: String,
-    pub observed_generation: u64,
-    pub recorded_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ManagementJob {
-    pub id: String,
-    pub schema_version: String,
-    pub operation: String,
-    pub request_key: String,
-    pub payload_digest: String,
-    pub owner_actor: String,
-    pub owner_role: Role,
-    pub state: ManagementJobState,
-    pub step: String,
-    pub private_input_ref: String,
-    pub result: Option<ManagementResult>,
-    pub error_code: Option<String>,
-    pub cancel_requested: bool,
-    pub lease_token: Option<String>,
-    pub lease_until: i64,
-    pub generation: u64,
-    #[serde(default)]
-    pub diagnostics: Vec<ManagementDiagnostic>,
-    pub created_at: i64,
-}
+pub use evo_storage::{
+    ManagementCancelArrival, ManagementDiagnostic, ManagementJob, ManagementJobState,
+    ManagementJobV2, ManagementOptimizationCallProducer, ManagementOptimizationCallRef,
+    ManagementOptimizationProgressV2, ManagementOptimizationResultV2,
+    ManagementOptimizationStageRef, ManagementPartialResultV2, ManagementPendingTerminalState,
+    ManagementResult, ManagementResultV2, VersionedManagementJob,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -276,6 +183,19 @@ pub struct BlockedManagementRequest {
     pub request_key: String,
 }
 
+/// Ordinary data and original references; never a decoded claim or Context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptimizationStepManagementRequest {
+    pub schema_version: String,
+    pub request_key: String,
+    pub compiler: crate::formal_authority::CompilerInputRequest,
+    pub source_selection_ref: String,
+    pub edit_template_ref: String,
+    pub improver_patch_ref: String,
+    pub development_control_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case", tag = "operation")]
 enum ParsedRequest {
@@ -288,6 +208,7 @@ enum ParsedRequest {
     CurriculumStep(CurriculumStepRequest),
     ExplorationStart(Box<ExplorationStartRequest>),
     Blocked(BlockedManagementRequest),
+    OptimizationStep(Box<OptimizationStepManagementRequest>),
 }
 
 impl<'de> Deserialize<'de> for ParsedRequest {
@@ -311,6 +232,7 @@ impl<'de> Deserialize<'de> for ParsedRequest {
             CurriculumStep(CurriculumStepRequest),
             ExplorationStart(Box<ExplorationStartRequest>),
             Blocked(BlockedManagementRequest),
+            OptimizationStep(Box<OptimizationStepManagementRequest>),
         }
         Ok(
             match serde_json::from_value::<Other>(value).map_err(serde::de::Error::custom)? {
@@ -320,6 +242,7 @@ impl<'de> Deserialize<'de> for ParsedRequest {
                 Other::CurriculumStep(value) => Self::CurriculumStep(value),
                 Other::ExplorationStart(value) => Self::ExplorationStart(value),
                 Other::Blocked(value) => Self::Blocked(value),
+                Other::OptimizationStep(value) => Self::OptimizationStep(value),
             },
         )
     }
@@ -330,10 +253,21 @@ pub struct ManagementDispatcher {
     store: Store,
     trusted_contexts: Arc<Vec<Context>>,
     recovery_started: Arc<AtomicBool>,
+    active_workers: Arc<Mutex<BTreeSet<String>>>,
+    optimization_runtime: Option<Arc<crate::optimization::ManagementOptimizationRuntime>>,
 }
 
 impl ManagementDispatcher {
     pub fn new(store: Store, trusted_contexts: Vec<Context>) -> Result<Self> {
+        Self::with_optimization_runtime(store, trusted_contexts, None)
+    }
+
+    /// Fixed by trusted startup, never selected by the public payload.
+    pub fn with_optimization_runtime(
+        store: Store,
+        trusted_contexts: Vec<Context>,
+        runtime: Option<crate::optimization::ManagementOptimizationRuntime>,
+    ) -> Result<Self> {
         let mut seen = BTreeSet::new();
         let mut unique = Vec::new();
         for context in trusted_contexts {
@@ -354,48 +288,86 @@ impl ManagementDispatcher {
             store,
             trusted_contexts: Arc::new(unique),
             recovery_started: Arc::new(AtomicBool::new(false)),
+            active_workers: Arc::new(Mutex::new(BTreeSet::new())),
+            optimization_runtime: runtime.map(Arc::new),
         })
     }
 
+    /// Called by the trusted startup path after its data-directory writer lock.
+    /// Running/Draining records are reconciled, never passed to execute_request.
     pub async fn recover_pending(&self) -> Result<usize> {
         if self.recovery_started.swap(true, Ordering::AcqRel) {
             return Ok(0);
         }
+        let result = self.recover_pending_once().await;
+        if result.is_err() {
+            self.recovery_started.store(false, Ordering::Release);
+        }
+        result
+    }
+
+    async fn recover_pending_once(&self) -> Result<usize> {
         let mut pending = Vec::new();
         for context in self.trusted_contexts.iter() {
             let mut session = self.store.session().await?;
-            let values = session.list::<Value>(context, "job").await?;
-            for value in values {
-                let schema = value.get("schema_version").and_then(Value::as_str);
-                if schema != Some(JOB_SCHEMA) {
-                    if schema.is_some_and(|schema| schema.starts_with("rsia.management_job.")) {
+            let mut cursor = None;
+            let mut seen = 0_usize;
+            loop {
+                let rows = session.object_rows_page(context, "job", cursor).await?;
+                if rows.is_empty() {
+                    break;
+                }
+                seen += rows.len();
+                if seen > 10000 {
+                    return Err(Error::Conflict("scope collection exceeds bounded scan; archive or add paginated query before continuing".into()));
+                }
+                for row in &rows {
+                    let Some(record) =
+                        evo_storage::decode_management_job_for_recovery(&row.id, &row.body)?
+                    else {
+                        continue;
+                    };
+                    let identity = record.identity();
+                    if identity.owner_actor != context.actor()
+                        || identity.owner_role != context.role()
+                    {
+                        continue;
+                    }
+                    if row.owner != identity.owner_actor || row.id != identity.id {
                         return Err(Error::Conflict(
-                            "unknown management job schema during recovery".into(),
+                            "management job physical binding differs".into(),
                         ));
                     }
-                    continue;
-                }
-                let mut job: ManagementJob = serde_json::from_value(value)
-                    .map_err(|_| Error::Conflict("damaged management job".into()))?;
-                if job.owner_actor != context.actor() || job.owner_role != context.role() {
-                    continue;
-                }
-                if !is_terminal(job.state) {
-                    if job.state == ManagementJobState::Running {
-                        job.lease_until = 0;
-                        session
-                            .put(context, "job", &job.id, context.actor(), &job)
-                            .await?;
+                    if is_terminal(identity.state) {
+                        continue;
                     }
-                    pending.push(job.id);
+                    if self
+                        .active_workers
+                        .lock()
+                        .map_err(|_| Error::Internal)?
+                        .contains(identity.id)
+                    {
+                        continue;
+                    }
+                    pending.push((context.clone(), record));
                 }
+                cursor = rows.last().map(|row| row.rowid);
             }
             session.commit().await?;
         }
-        for job_id in &pending {
-            self.spawn_job(job_id.clone());
+        let count = pending.len();
+        for (ctx, record) in pending {
+            let identity = record.identity();
+            if identity.state == ManagementJobState::Queued {
+                self.spawn_job(identity.id.to_owned())?;
+            } else {
+                // This fixed startup entry, not lease expiry or an empty call
+                // query, establishes that the previous process has ended.
+                let old = record.into_unfinished_v2()?;
+                self.spawn_reconciliation(ctx, old, ObservedWorkerExit::Restarted)?;
+            }
         }
-        Ok(pending.len())
+        Ok(count)
     }
 
     pub async fn submit(
@@ -403,29 +375,31 @@ impl ManagementDispatcher {
         ctx: &Context,
         operation: &str,
         payload: Value,
-    ) -> Result<ManagementJob> {
+    ) -> Result<VersionedManagementJob> {
         self.require_trusted(ctx)?;
         let job = persist_management(ctx, &self.store, operation, payload).await?;
-        if !is_terminal(job.state) {
-            self.spawn_job(job.id.clone());
+        if !is_terminal(job.identity().state) {
+            self.spawn_job(job.identity().id.to_owned())?;
         }
         Ok(job)
     }
 
-    pub async fn status(&self, ctx: &Context, job_id: &str) -> Result<ManagementJob> {
+    pub async fn status(&self, ctx: &Context, job_id: &str) -> Result<VersionedManagementJob> {
         self.require_trusted(ctx)?;
-        let mut job = load_job(ctx, &self.store, job_id).await?;
-        if job.state == ManagementJobState::Succeeded {
+        let mut job = load_job_record(ctx, &self.store, job_id).await?;
+        if job.identity().state == ManagementJobState::Succeeded {
             // A Succeeded job serves a result computed from its private input. If
             // the revocation cleanup redacted that input, a source of the request
             // was revoked (plan §11.5): the result is not served as live, whatever
             // the operation's own read-side check would make of the redacted
             // records behind it. The job itself is preserved as the record of the
             // action; only this read is refused.
-            ensure_private_input_not_redacted(ctx, &self.store, &job).await?;
+            ensure_private_input_not_redacted_record(ctx, &self.store, &job).await?;
         }
-        if job.operation == "evaluation.status" && job.state == ManagementJobState::Succeeded {
-            let request = load_private_request(ctx, &self.store, &job)
+        if job.identity().operation == "evaluation.status"
+            && job.identity().state == ManagementJobState::Succeeded
+        {
+            let request = load_private_request_record(ctx, &self.store, &job)
                 .await
                 .map_err(InputFault::into_error)?;
             if let ParsedRequest::EvaluationStatus(request) = request {
@@ -434,25 +408,30 @@ impl ManagementDispatcher {
                         .await?;
                 // Only a formal terminal has report-read metadata to disclose;
                 // without one the original public result is served unchanged.
-                job.result = Some(if status.formal.is_some() {
-                    let report_read = crate::streaming_evaluator::formal_report_read_metadata(
-                        ctx,
-                        &self.store,
-                        &status.ticket.id,
-                    )
-                    .await?;
-                    public_evaluation_status_read(&status, report_read)
-                } else {
-                    public_evaluation_status(&status)
-                });
+                replace_read_result(
+                    &mut job,
+                    if status.formal.is_some() {
+                        let report_read = crate::streaming_evaluator::formal_report_read_metadata(
+                            ctx,
+                            &self.store,
+                            &status.ticket.id,
+                        )
+                        .await?;
+                        public_evaluation_status_read(&status, report_read)?
+                    } else {
+                        public_evaluation_status(&status)
+                    },
+                );
             }
         }
-        if job.operation == "replay.run" && job.state == ManagementJobState::Succeeded {
+        if job.identity().operation == "replay.run"
+            && job.identity().state == ManagementJobState::Succeeded
+        {
             if let Some(ManagementResult::ReplayStored {
                 report_id,
                 pool_digest,
                 semantic_reports_digest,
-            }) = &job.result
+            }) = job.original_result()
             {
                 // A completed job is an audit fact. Legacy selection is refused
                 // by new consumers, while status still returns this exact result.
@@ -483,12 +462,14 @@ impl ManagementDispatcher {
                 ));
             }
         }
-        if job.operation == "curriculum.step" && job.state == ManagementJobState::Succeeded {
+        if job.identity().operation == "curriculum.step"
+            && job.identity().state == ManagementJobState::Succeeded
+        {
             if let Some(ManagementResult::ProbeScheduled {
                 probe_job_id,
                 trigger_digest,
                 terminal,
-            }) = &job.result
+            }) = job.original_result()
             {
                 let view =
                     crate::curriculum::verified_probe_job_view(ctx, &self.store, probe_job_id)
@@ -507,7 +488,9 @@ impl ManagementDispatcher {
                 ));
             }
         }
-        if job.operation == "exploration.start" && job.state == ManagementJobState::Succeeded {
+        if job.identity().operation == "exploration.start"
+            && job.identity().state == ManagementJobState::Succeeded
+        {
             if let Some(ManagementResult::ExplorationStarted {
                 world_id,
                 context_signature,
@@ -516,7 +499,7 @@ impl ManagementDispatcher {
                 policy_digest,
                 caps_digest,
                 action,
-            }) = &job.result
+            }) = job.original_result()
             {
                 // What a dispatch never changes is always compared: the world's
                 // id, context and the digests of its frozen policy and caps,
@@ -536,7 +519,7 @@ impl ManagementDispatcher {
                 // from the world this job requested, which its private input
                 // still holds.
                 let requested = if registration.started {
-                    let request = load_private_request(ctx, &self.store, &job)
+                    let request = load_private_request_record(ctx, &self.store, &job)
                         .await
                         .map_err(InputFault::into_error)?;
                     let ParsedRequest::ExplorationStart(request) = request else {
@@ -594,49 +577,180 @@ impl ManagementDispatcher {
         Ok(job)
     }
 
-    pub async fn cancel(&self, ctx: &Context, job_id: &str) -> Result<ManagementJob> {
+    pub async fn cancel(&self, ctx: &Context, job_id: &str) -> Result<VersionedManagementJob> {
         self.require_trusted(ctx)?;
-        cancel_job_atomic(ctx, &self.store, job_id).await
+        let record = cancel_job_atomic(ctx, &self.store, job_id).await?;
+        if record.identity().operation == "optimization.step"
+            && record.identity().state == ManagementJobState::Draining
+        {
+            self.optimization_budget_actions(ctx, job_id).await?;
+        }
+        Ok(record)
     }
 
-    fn spawn_job(&self, job_id: String) {
+    fn spawn_job(&self, job_id: String) -> Result<()> {
+        if !self
+            .active_workers
+            .lock()
+            .map_err(|_| Error::Internal)?
+            .insert(job_id.clone())
+        {
+            return Ok(());
+        }
         let dispatcher = self.clone();
         tokio::spawn(async move {
-            if let Err(error) = dispatcher.run_job(&job_id).await {
-                tracing::error!(job_id = %job_id, error = %error, "management background worker failed");
-                let _ = dispatcher.record_background_error(&job_id, &error).await;
+            loop {
+                match dispatcher.run_job(&job_id).await {
+                    Ok(()) => break,
+                    Err(error @ (Error::ClockRegressed | Error::Internal)) => {
+                        // A failed pre-claim storage/clock read has not proved
+                        // a corrupt private input or a stopped worker. Keep the
+                        // same supervisor alive and retry without a fake finish.
+                        tracing::error!(job_id = %job_id, error = %error, "management supervisor awaits storage or clock recovery");
+                        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    }
+                    Err(error) => {
+                        tracing::error!(job_id = %job_id, error = %error, "management background supervisor failed");
+                        if !matches!(&error, Error::Conflict(reason) if reason == "management job lease fence changed")
+                        {
+                            if let Err(record_error) =
+                                dispatcher.record_background_error(&job_id, &error).await
+                            {
+                                tracing::error!(job_id = %job_id, error = %record_error, "management supervisor diagnostic unavailable");
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            if let Ok(mut active) = dispatcher.active_workers.lock() {
+                active.remove(&job_id);
             }
         });
+        Ok(())
+    }
+
+    fn spawn_reconciliation(
+        &self,
+        ctx: Context,
+        job: ManagementJobV2,
+        observed: ObservedWorkerExit,
+    ) -> Result<()> {
+        if !self
+            .active_workers
+            .lock()
+            .map_err(|_| Error::Internal)?
+            .insert(job.id.clone())
+        {
+            return Ok(());
+        }
+        let dispatcher = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match dispatcher
+                    .finish_observed_worker(&ctx, &job, &observed)
+                    .await
+                {
+                    Ok(state) if is_terminal(state) => break,
+                    Ok(_) => {}
+                    Err(Error::ClockRegressed | Error::Internal) => {}
+                    Err(error) => {
+                        tracing::error!(job_id = %job.id, error = %error, "management reconciliation refused");
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            }
+            if let Ok(mut active) = dispatcher.active_workers.lock() {
+                active.remove(&job.id);
+            }
+        });
+        Ok(())
     }
 
     async fn run_job(&self, job_id: &str) -> Result<()> {
         let (ctx, claimed) = self.claim(job_id).await?;
         let Some(job) = claimed else { return Ok(()) };
-        let request = match load_private_request(&ctx, &self.store, &job).await {
-            Ok(request) => request,
-            Err(fault) => {
-                // A redacted input is a source revocation, not a damaged job: the
-                // job ends Failed (terminal, never retried) and says why.
-                let step = match fault {
-                    InputFault::Redacted { .. } => "private_input_redacted",
-                    InputFault::Other(_) => "private_input_invalid",
-                };
-                return finish_claim(
-                    &ctx,
-                    &self.store,
-                    &job,
-                    JobOutcome {
+        let store = self.store.clone();
+        let worker_ctx = ctx.clone();
+        let worker_job = job.clone();
+        let control = WorkerControl::new();
+        let worker_control = control.clone();
+        let optimization_runtime = self.optimization_runtime.clone();
+        let mut handle = tokio::spawn(async move {
+            let request = match load_private_request(&worker_ctx, &store, &worker_job).await {
+                Ok(request) => request,
+                Err(fault) => {
+                    let step = match &fault {
+                        InputFault::Redacted { .. } => "private_input_redacted",
+                        InputFault::Other(_) => "private_input_invalid",
+                    };
+                    return ObservedWorkerExit::BeforeConsumerFailed(JobOutcome {
                         state: ManagementJobState::Failed,
                         step: step.into(),
                         result: None,
                         error_code: Some(fault.error_code().into()),
-                    },
-                )
-                .await;
+                    });
+                }
+            };
+            match execute_request(
+                &worker_ctx,
+                &store,
+                &worker_job,
+                request,
+                &worker_control,
+                optimization_runtime.as_deref(),
+            )
+            .await
+            {
+                // A consumer error can follow a committed business transaction.
+                // Re-read its actual progress instead of treating result=None as
+                // proof that no side effect or pending execution exists.
+                Ok(outcome) if outcome.state == ManagementJobState::Failed => {
+                    ObservedWorkerExit::Failed(
+                        outcome
+                            .error_code
+                            .unwrap_or_else(|| "management_worker_failed".into()),
+                    )
+                }
+                Ok(outcome) => ObservedWorkerExit::Completed(outcome),
+                Err(error) => ObservedWorkerExit::Failed(error_code(&error).into()),
+            }
+        });
+        let mut ticks = tokio::time::interval(std::time::Duration::from_secs(20));
+        ticks.tick().await;
+        let observed = loop {
+            tokio::select! {
+                biased;
+                result = &mut handle => {
+                    break match result {
+                        Ok(observed) => observed,
+                        Err(_) => ObservedWorkerExit::Failed("management_worker_exited".into()),
+                    };
+                }
+                _ = ticks.tick() => {
+                    if let Err(error) = renew_claim(&ctx, &self.store, &job).await {
+                        // The same actual handle remains owned and awaited.
+                        // Time/storage failure stops future steps; it does not
+                        // prove network completion, refund money or abort work.
+                        tracing::error!(job_id = %job.id, error = %error, "management lease renewal refused; stopping new steps");
+                        control.stop_with_error(error);
+                    }
+                }
             }
         };
-        let outcome = execute_request(&ctx, &self.store, &job, request).await?;
-        finish_claim(&ctx, &self.store, &job, outcome).await
+        control.stop();
+        loop {
+            match self.finish_observed_worker(&ctx, &job, &observed).await {
+                Ok(state) if is_terminal(state) => return Ok(()),
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_secs(20)).await,
+                Err(error @ (Error::ClockRegressed | Error::Internal)) => {
+                    tracing::error!(job_id = %job.id, error = %error, "observed management exit awaiting healthy clock/storage");
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Step recorded on a Queued job whose claim was deferred by an E16.5
@@ -645,36 +759,143 @@ impl ManagementDispatcher {
     /// Delay before a capacity-deferred claim is retried.
     pub const CAPACITY_WAIT_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
 
-    async fn claim(&self, job_id: &str) -> Result<(Context, Option<ManagementJob>)> {
+    async fn claim(&self, job_id: &str) -> Result<(Context, Option<ManagementJobV2>)> {
         identifier(job_id)?;
         for trusted in self.trusted_contexts.iter() {
             let mut session = self.store.session().await?;
-            let Some(mut job) = session.get::<ManagementJob>(trusted, "job", job_id).await? else {
+            let Some(row) = session.object_row(trusted, "job", job_id).await? else {
                 session.commit().await?;
                 continue;
             };
-            if job.schema_version != JOB_SCHEMA
-                || job.owner_actor != trusted.actor()
-                || job.owner_role != trusted.role()
-            {
+            let record = evo_storage::decode_management_job(&row.body)?;
+            let identity = record.identity();
+            if identity.owner_actor != trusted.actor() || identity.owner_role != trusted.role() {
                 session.commit().await?;
                 continue;
             }
-            if is_terminal(job.state)
-                || (job.state == ManagementJobState::Running && job.lease_until > now()?)
-            {
+            if row.owner != identity.owner_actor || identity.id != job_id {
+                return Err(Error::Conflict(
+                    "management job physical binding differs".into(),
+                ));
+            }
+            if is_terminal(identity.state) {
                 session.commit().await?;
                 return Ok((trusted.clone(), None));
             }
-            // E16.5: claiming takes a lease and starts a dispatch. Measure in
-            // the claim session and refuse when this claim would exceed the
-            // one concurrent management dispatch or the live lease bound.
-            // A refused job stays Queued (retriable): the wait is recorded
-            // once on the job and the claim is retried after a short delay.
-            let usage: crate::capacity::V41CapacityUsage = session
-                .capacity_usage_v41(crate::capacity::unix_now_secs()?)
-                .await?
-                .into();
+            if identity.state != ManagementJobState::Queued {
+                let draining = identity.state == ManagementJobState::Draining;
+                session.commit().await?;
+                if draining {
+                    consumer_progress_or_unknown(trusted, &self.store, &record).await?;
+                }
+                // Without an observed exit/startup witness this caller may read
+                // provenance, but it cannot assume the old worker has stopped.
+                return Ok((trusted.clone(), None));
+            }
+            // Full stable physical/private identity is checked before any
+            // capacity-wait, v1 continuation or fresh claim write.
+            let record = load_job_record_in_session(trusted, &mut session, job_id).await?;
+            if record.cancel_requested()
+                && record.generation() == 0
+                && record.identity().lease_token.is_none()
+                && record.result().is_none()
+            {
+                // Proven never-started cancellation is closure, not new use of
+                // private content; revoked input cannot prevent this close.
+                let job = record.into_unfinished_v2()?;
+                session.commit().await?;
+                self.finish_observed_worker(trusted, &job, &ObservedWorkerExit::NeverStarted)
+                    .await?;
+                return Ok((trusted.clone(), None));
+            }
+            let identity = record.identity();
+            // The physical read's Internal/Clock error propagates untouched.
+            // Only an actually read missing/redacted/invalid private body is
+            // the original private-input fault, not an inferred storage fault.
+            let body =
+                private_input_body_in_session(trusted, &mut session, identity.private_input_ref)
+                    .await?;
+            let private = match body {
+                None => Err(InputFault::Other(Error::NotFound)),
+                Some(body) if is_redacted(&body) => Err(InputFault::Redacted {
+                    id: identity.private_input_ref.into(),
+                }),
+                Some(body) => decode_private_request_fields(
+                    body,
+                    identity.private_input_ref,
+                    identity.operation,
+                    identity.payload_digest,
+                )
+                .map_err(InputFault::Other),
+            };
+            let request = match private {
+                Ok(request) => request,
+                Err(fault) => {
+                    if record.generation() != 0
+                        || identity.lease_token.is_some()
+                        || record.result().is_some()
+                    {
+                        return Err(fault.into_error());
+                    }
+                    let code = fault.error_code();
+                    let phase = match fault {
+                        InputFault::Redacted { .. } => "private_input_redacted",
+                        InputFault::Other(_) => "private_input_invalid",
+                    };
+                    let mut job = record.into_unfinished_v2()?;
+                    now()?;
+                    job.state = ManagementJobState::Failed;
+                    job.step = phase.into();
+                    job.error_code = Some(code.into());
+                    session
+                        .put(trusted, "job", &job.id, trusted.actor(), &job)
+                        .await?;
+                    session
+                        .audit(trusted, "management.job.private_input_failed", &job.id)
+                        .await?;
+                    session.commit().await?;
+                    return Ok((trusted.clone(), None));
+                }
+            };
+            let admission = match validate_request_authority(trusted, &request) {
+                Err(error) => Err(error),
+                Ok(()) => {
+                    ensure_dependencies_live(
+                        trusted,
+                        &mut session,
+                        &private_dependencies(&request)?,
+                    )
+                    .await
+                }
+            };
+            if let Err(error) = admission {
+                if matches!(error, Error::ClockRegressed | Error::Internal)
+                    || record.generation() != 0
+                    || identity.lease_token.is_some()
+                    || record.result().is_some()
+                {
+                    return Err(error);
+                }
+                let mut job = record.into_unfinished_v2()?;
+                now()?;
+                job.state = ManagementJobState::Failed;
+                job.step = "failed".into();
+                job.error_code = Some(error_code(&error).into());
+                session
+                    .put(trusted, "job", &job.id, trusted.actor(), &job)
+                    .await?;
+                session
+                    .audit(trusted, "management.job.admission_failed", &job.id)
+                    .await?;
+                session.commit().await?;
+                return Ok((trusted.clone(), None));
+            }
+            let mut job = record.into_unfinished_v2()?;
+            // One trusted clock observation precedes every new timing write.
+            let at = now()?;
+            let capacity_at = u64::try_from(at).map_err(|_| Error::ClockRegressed)?;
+            let usage: crate::capacity::V41CapacityUsage =
+                session.capacity_usage_v41(capacity_at).await?.into();
             let limits = crate::capacity::CapacityLimits::default();
             let admitted = crate::capacity::admit_field(
                 crate::capacity::CapacityField::ConcurrentDispatches,
@@ -690,13 +911,14 @@ impl ManagementDispatcher {
             });
             if let Err(refusal) = admitted {
                 if job.step != Self::CAPACITY_WAIT_STEP {
+                    let recorded_at = now()?;
                     if job.diagnostics.len() >= 32 {
                         job.diagnostics.remove(0);
                     }
                     job.diagnostics.push(ManagementDiagnostic {
                         code: error_code(&refusal).into(),
                         observed_generation: job.generation,
-                        recorded_at: now()?,
+                        recorded_at,
                     });
                     job.step = Self::CAPACITY_WAIT_STEP.into();
                     session
@@ -707,17 +929,34 @@ impl ManagementDispatcher {
                         .await?;
                 }
                 session.commit().await?;
-                tracing::warn!(job_id = %job.id, error = %refusal, "management claim deferred by MVP capacity");
                 self.retry_claim_later(job.id);
                 return Ok((trusted.clone(), None));
             }
+            if job.generation != 0 || job.lease_token.is_some() || job.result.is_some() {
+                // A Queued label cannot prove that an earlier generation ended.
+                // Do not ordinary-dispatch a damaged/unknown continuation.
+                job.state = ManagementJobState::Draining;
+                now()?;
+                session
+                    .put(trusted, "job", &job.id, trusted.actor(), &job)
+                    .await?;
+                session
+                    .audit(trusted, "management.job.unknown_continuation", &job.id)
+                    .await?;
+                session.commit().await?;
+                return Ok((trusted.clone(), None));
+            }
+            let claim_at = now()?;
             job.generation = job
                 .generation
                 .checked_add(1)
                 .ok_or_else(|| Error::Conflict("management job generation overflow".into()))?;
-            let token = hash(format!("{}\0{}\0{}", job.id, job.generation, now()?).as_bytes());
-            job.lease_token = Some(token);
-            job.lease_until = now()?.saturating_add(60);
+            job.lease_token = Some(hash(
+                format!("{}\0{}\0{}", job.id, job.generation, claim_at).as_bytes(),
+            ));
+            job.lease_until = claim_at
+                .checked_add(60)
+                .ok_or_else(|| Error::Invalid("management lease clock exceeds i64".into()))?;
             job.state = ManagementJobState::Running;
             job.step = "claimed".into();
             session
@@ -739,54 +978,80 @@ impl ManagementDispatcher {
         let dispatcher = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Self::CAPACITY_WAIT_RETRY).await;
-            dispatcher.spawn_job(job_id);
+            if let Err(error) = dispatcher.spawn_job(job_id.clone()) {
+                tracing::error!(job_id = %job_id, error = %error, "management retry spawn failed");
+            }
         });
     }
 
+    // A diagnostic is not worker-exit evidence. Running jobs are closed only
+    // by the owned JoinHandle path above; this preserves the old fault API.
     async fn record_background_error(&self, job_id: &str, error: &Error) -> Result<()> {
         if matches!(error, Error::ClockRegressed) {
             return Err(Error::ClockRegressed);
         }
         for context in self.trusted_contexts.iter() {
             let mut session = self.store.session().await?;
-            let Some(value) = session.get::<Value>(context, "job", job_id).await? else {
+            let Some(row) = session.object_row(context, "job", job_id).await? else {
                 session.commit().await?;
                 continue;
             };
-            if value.get("schema_version").and_then(Value::as_str) != Some(JOB_SCHEMA) {
-                return Err(Error::Conflict(
-                    "background error belongs to an unreadable management job".into(),
-                ));
-            }
-            let mut job: ManagementJob = serde_json::from_value(value)
-                .map_err(|_| Error::Conflict("damaged management job".into()))?;
-            if job.owner_actor != context.actor() || job.owner_role != context.role() {
+            let record = evo_storage::decode_management_job(&row.body)?;
+            let identity = record.identity();
+            if identity.owner_actor != context.actor() || identity.owner_role != context.role() {
                 session.commit().await?;
                 continue;
             }
-            if !is_terminal(job.state) {
-                if job.diagnostics.len() >= 32 {
-                    job.diagnostics.remove(0);
-                }
-                job.diagnostics.push(ManagementDiagnostic {
-                    code: error_code(error).into(),
-                    observed_generation: job.generation,
-                    recorded_at: now()?,
-                });
-                if job.state == ManagementJobState::Queued {
-                    job.state = ManagementJobState::Failed;
-                    job.step = "background_failed".into();
-                    job.error_code = Some(error_code(error).into());
-                    job.lease_token = None;
-                    job.lease_until = 0;
-                }
-                session
-                    .put(context, "job", &job.id, context.actor(), &job)
-                    .await?;
-                session
-                    .audit(context, "management.job.background_failed", &job.id)
-                    .await?;
+            if is_terminal(identity.state) {
+                session.commit().await?;
+                return Ok(());
             }
+            if row.owner != identity.owner_actor || row.id != identity.id {
+                return Err(Error::Conflict(
+                    "management job physical binding differs".into(),
+                ));
+            }
+            // Error handling is a writer too: a rejected stable/private ID
+            // must not escape through a diagnostic or a fresh Queued failure.
+            let record = load_job_record_in_session(context, &mut session, job_id).await?;
+            let mut job = record.into_unfinished_v2()?;
+            let code = match error {
+                Error::Conflict(reason)
+                    if reason
+                        == &format!(
+                            "management private input {} was redacted because its source was revoked",
+                            job.private_input_ref
+                        ) =>
+                {
+                    SOURCE_REVOKED_CODE
+                }
+                _ => error_code(error),
+            };
+            let at = now()?;
+            if job.diagnostics.len() >= 32 {
+                job.diagnostics.remove(0);
+            }
+            job.diagnostics.push(ManagementDiagnostic {
+                code: code.into(),
+                observed_generation: job.generation,
+                recorded_at: at,
+            });
+            if job.state == ManagementJobState::Queued
+                && job.generation == 0
+                && job.lease_token.is_none()
+                && job.result.is_none()
+            {
+                job.state = ManagementJobState::Failed;
+                job.step = "background_failed".into();
+                job.error_code = Some(code.into());
+                job.lease_until = 0;
+            }
+            session
+                .put(context, "job", &job.id, context.actor(), &job)
+                .await?;
+            session
+                .audit(context, "management.job.background_failed", &job.id)
+                .await?;
             session.commit().await?;
             return Ok(());
         }
@@ -817,6 +1082,7 @@ impl ParsedRequest {
             Self::CurriculumStep(request) => &request.request_key,
             Self::ExplorationStart(request) => &request.request_key,
             Self::Blocked(request) => &request.request_key,
+            Self::OptimizationStep(request) => &request.request_key,
         }
     }
 }
@@ -826,7 +1092,7 @@ async fn persist_management(
     store: &Store,
     operation: &str,
     payload: Value,
-) -> Result<ManagementJob> {
+) -> Result<VersionedManagementJob> {
     let entry = evo_core::management_registry::lookup(operation)
         .ok_or_else(|| Error::Invalid("unknown_management_operation".into()))?;
     if entry.plane != evo_core::management_registry::Plane::Dispatch {
@@ -846,18 +1112,33 @@ async fn persist_management(
     let private_id = stable_id("management-input", ctx, operation, request.request_key());
     let mut session = store.session().await?;
     if let Some(cached) = session
-        .cached::<ManagementJob, _>(ctx, operation, request.request_key(), &request)
+        .cached_management_job(ctx, operation, request.request_key(), &request)
         .await?
     {
-        let current: ManagementJob = session.need(ctx, "job", &cached.id).await?;
-        ensure_owner(ctx, &current)?;
+        let old = cached.identity();
+        if old.id != job_id
+            || old.private_input_ref != private_id
+            || old.payload_digest != payload_digest
+        {
+            return Err(Error::Conflict(
+                "cached management job differs from its request".into(),
+            ));
+        }
+        let current = load_job_record_in_session(ctx, &mut session, &job_id).await?;
+        let actual = current.identity();
+        if actual.operation != operation
+            || actual.request_key != request.request_key()
+            || actual.payload_digest != payload_digest
+            || actual.private_input_ref != private_id
+        {
+            return Err(Error::Conflict(
+                "persisted management payload digest changed".into(),
+            ));
+        }
+        // Never rewrite an old terminal, its cached v1 response or its input.
         session.commit().await?;
         return Ok(current);
     }
-    // A new request is not accepted over a dependency whose source was revoked
-    // (plan §11: a revocation refuses new access at once). The check runs in this
-    // session, before anything is written, so a refusal leaves no private input,
-    // job, edge, idempotency row or audit record behind.
     let dependencies = private_dependencies(&request)?;
     ensure_dependencies_live(ctx, &mut session, &dependencies).await?;
     let private = PrivateManagementInput {
@@ -867,7 +1148,7 @@ async fn persist_management(
         payload_digest: payload_digest.clone(),
         payload: serde_json::to_value(&request).map_err(|_| Error::Internal)?,
     };
-    let job = ManagementJob {
+    let job = ManagementJobV2 {
         id: job_id.clone(),
         schema_version: JOB_SCHEMA.into(),
         operation: operation.into(),
@@ -886,6 +1167,9 @@ async fn persist_management(
         generation: 0,
         diagnostics: Vec::new(),
         created_at: now()?,
+        cancel_arrival: None,
+        pending_terminal_state: None,
+        optimization: None,
     };
     session
         .put(ctx, "artifact", &private_id, ctx.actor(), &private)
@@ -911,7 +1195,7 @@ async fn persist_management(
         .await?;
     session.audit(ctx, "management.accept", &job_id).await?;
     session.commit().await?;
-    Ok(job)
+    Ok(VersionedManagementJob::V2(job))
 }
 
 /// What the submit check of a new request calls the thing it refuses (the words of
@@ -932,72 +1216,789 @@ async fn ensure_dependencies_live(
     revocation_gate::ensure_dependencies_live(ctx, session, dependencies, SUBMIT_SUBJECT).await
 }
 
-async fn load_job(ctx: &Context, store: &Store, job_id: &str) -> Result<ManagementJob> {
+async fn load_job_record_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    job_id: &str,
+) -> Result<VersionedManagementJob> {
     identifier(job_id)?;
-    let mut session = store.session().await?;
-    let job: ManagementJob = session.need(ctx, "job", job_id).await?;
-    ensure_owner(ctx, &job)?;
-    session.commit().await?;
-    Ok(job)
+    let row = session
+        .object_row(ctx, "job", job_id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let record = evo_storage::decode_management_job(&row.body)?;
+    let job = record.identity();
+    if row.owner != ctx.actor() {
+        return Err(Error::NotFound);
+    }
+    match &record {
+        VersionedManagementJob::V1(original) => ensure_owner(ctx, original)?,
+        VersionedManagementJob::V2(current) => {
+            if current.owner_actor != ctx.actor() || current.owner_role != ctx.role() {
+                return Err(Error::NotFound);
+            }
+        }
+    }
+    if job.id != job_id
+        || job.id != stable_id("management-job", ctx, job.operation, job.request_key)
+        || job.private_input_ref
+            != stable_id("management-input", ctx, job.operation, job.request_key)
+    {
+        return Err(Error::Conflict(
+            "management job physical binding differs".into(),
+        ));
+    }
+    Ok(record)
 }
 
-#[derive(Debug)]
+async fn load_job_record(
+    ctx: &Context,
+    store: &Store,
+    job_id: &str,
+) -> Result<VersionedManagementJob> {
+    let mut session = store.session().await?;
+    let record = load_job_record_in_session(ctx, &mut session, job_id).await?;
+    session.commit().await?;
+    Ok(record)
+}
+
+fn replace_read_result(record: &mut VersionedManagementJob, result: ManagementResult) {
+    match record {
+        VersionedManagementJob::V1(job) => job.result = Some(result),
+        VersionedManagementJob::V2(job) => job.result = Some(ManagementResultV2::Original(result)),
+    }
+}
+
+#[derive(Debug, Clone)]
 struct JobOutcome {
     state: ManagementJobState,
     step: String,
-    result: Option<ManagementResult>,
+    result: Option<ManagementResultV2>,
     error_code: Option<String>,
 }
 
 impl JobOutcome {
     fn has_committed_side_effect(&self) -> bool {
-        // These private returned variants follow the consumer's actual commit.
-        // A read-only result or an absent result does not establish a commit.
+        if self.step == "experiment_already_registered" {
+            return false;
+        }
         match self.result.as_ref() {
-            Some(
+            Some(ManagementResultV2::Partial(ManagementPartialResultV2::ControlRegistered {
+                ..
+            })) => true,
+            Some(ManagementResultV2::Original(
                 ManagementResult::ExperimentRegistered { .. }
                 | ManagementResult::EvaluationTicketBlocked { .. }
                 | ManagementResult::ReplayStored { .. }
                 | ManagementResult::ProbeScheduled { .. }
                 | ManagementResult::ExplorationStarted { .. },
-            ) => true,
-            Some(
+            )) => true,
+            // This is an audit result; the operation's joined reader proves
+            // actual compiled or dispatched effects independently.
+            Some(ManagementResultV2::Optimization(_)) => false,
+            Some(ManagementResultV2::Original(
                 ManagementResult::EvaluationStatus { .. }
                 | ManagementResult::EvaluationStatusReadV2 { .. },
-            )
+            ))
             | None => false,
         }
     }
 }
 
+/// Private carrier minted only after this dispatcher's real successful claim.
+/// Its Context comes from authentication, never from the persisted request.
+#[derive(Clone)]
+pub(crate) struct ManagementOptimizationClaim {
+    caller: Context,
+    job: ManagementJobV2,
+    model_context: evo_core::optimization::ModelRequestContext,
+    billing_scope: String,
+    root_budget_id: String,
+    control: WorkerControl,
+}
+
+pub(crate) enum ManagementOptimizationCallSource<'a> {
+    Model(&'a crate::model::ReadBoundModelRequest),
+    Development(&'a crate::optimization::DevelopmentRunRequest),
+}
+
+impl ManagementOptimizationClaim {
+    pub(crate) async fn admit_new(&self, session: &mut Session) -> Result<ManagementJobV2> {
+        self.caller.require(&[Role::Admin])?;
+        let current =
+            begin_management_step(&self.caller, session, &self.job, &self.control).await?;
+        if current.operation != "optimization.step" {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        }
+        let root = session
+            .root_budget(&self.caller, &self.billing_scope)
+            .await?
+            .ok_or(Error::Budget)?;
+        if root.root_budget_id != self.root_budget_id {
+            return Err(Error::Conflict(
+                "management_optimization_root_changed".into(),
+            ));
+        }
+        // Original reserve/begin still decides stopped/root monetary refusals.
+        // This guard adds job provenance, never a replacement budget decision.
+        Ok(current)
+    }
+
+    fn check_stage_scope(&self, fact: &crate::optimization::StageFact) -> Result<()> {
+        fact.validate()?;
+        if fact.namespace != self.caller.namespace()
+            || fact.episode_id != self.model_context.episode_id
+            || fact.step != self.model_context.step
+            || fact.attempt != self.model_context.attempt
+        {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn require_stage(
+        &self,
+        session: &mut Session,
+        fact: &crate::optimization::StageFact,
+    ) -> Result<()> {
+        self.check_stage_scope(fact)?;
+        let record = load_job_record_in_session(&self.caller, session, &self.job.id).await?;
+        let VersionedManagementJob::V2(job) = record else {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        };
+        let fact_digest = optimization_stage_record_digest(fact)?;
+        let owned = job.optimization.as_ref().is_some_and(|progress| {
+            progress.stages.iter().any(|reference| {
+                reference.artifact_id == fact.artifact_id
+                    && reference.input_digest == fact.input_digest
+                    && reference.generation == self.job.generation
+                    && reference.record_digest == fact_digest
+            })
+        });
+        if !owned {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn require_observation_origin(
+        &self,
+        session: &mut Session,
+        fact: &crate::optimization::StageFact,
+    ) -> Result<()> {
+        self.check_stage_scope(fact)?;
+        let record = load_job_record_in_session(&self.caller, session, &self.job.id).await?;
+        let VersionedManagementJob::V2(job) = record else {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        };
+        let progress = job
+            .optimization
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("management_optimization_origin_unknown".into()))?;
+        for reference in &progress.stages {
+            if reference.generation != self.job.generation {
+                continue;
+            }
+            let row = session
+                .object_row(&self.caller, "artifact", &reference.artifact_id)
+                .await?
+                .ok_or(Error::NotFound)?;
+            if row.owner != progress.journal_actor
+                || !optimization_stage_reference_matches(
+                    &row.body,
+                    reference,
+                    self.caller.namespace(),
+                    &self.model_context.episode_id,
+                )?
+            {
+                continue;
+            }
+            let owns = match fact.kind {
+                crate::optimization::StageFactKind::DispatchObserved => {
+                    reference.kind == "dispatch_prepared"
+                        && reference.request_id == fact.request_id
+                        && reference.input_digest == fact.input_digest
+                }
+                crate::optimization::StageFactKind::StepCompleted => {
+                    reference.kind == "step_prepared"
+                        && reference.request_id == fact.request_id
+                        && reference.input_digest == fact.input_digest
+                }
+                _ => reference.kind == "step_prepared",
+            };
+            if owns {
+                return Ok(());
+            }
+        }
+        Err(Error::Conflict(
+            "management_optimization_origin_unknown".into(),
+        ))
+    }
+
+    async fn initialize_progress(
+        &self,
+        session: &mut Session,
+        job: &mut ManagementJobV2,
+        journal_actor: &str,
+    ) -> Result<()> {
+        let row = session
+            .object_row(&self.caller, "artifact", &job.private_input_ref)
+            .await?
+            .ok_or(Error::NotFound)?;
+        if row.owner != self.caller.actor() {
+            return Err(Error::NotFound);
+        }
+        let parsed = decode_private_request_fields(
+            evo_storage::lifecycle::parse_strict_json(&row.body)?,
+            &job.private_input_ref,
+            &job.operation,
+            &job.payload_digest,
+        )?;
+        let ParsedRequest::OptimizationStep(request) = parsed else {
+            return Err(Error::Internal);
+        };
+        let control = crate::development::management_control_in_session(
+            session,
+            &self.caller,
+            &request.development_control_id,
+        )
+        .await?;
+        if control.proposer_actor != journal_actor
+            || control.root_budget_id != self.root_budget_id
+            || control.billing_scope != self.billing_scope
+        {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        }
+        let digest = hash(row.body.as_bytes());
+        match &job.optimization {
+            Some(progress)
+                if progress.private_input_digest != digest
+                    || progress.journal_actor != journal_actor =>
+            {
+                Err(Error::Conflict(
+                    "management_optimization_origin_unknown".into(),
+                ))
+            }
+            Some(_) => Ok(()),
+            None => {
+                job.optimization = Some(ManagementOptimizationProgressV2 {
+                    private_input_digest: digest,
+                    journal_actor: journal_actor.into(),
+                    stages: Vec::new(),
+                    calls: Vec::new(),
+                });
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) async fn record_prepared_stage(
+        &self,
+        session: &mut Session,
+        fact: &crate::optimization::StageFact,
+        journal_actor: &str,
+    ) -> Result<()> {
+        self.check_stage_scope(fact)?;
+        let mut job = self.admit_new(session).await?;
+        self.initialize_progress(session, &mut job, journal_actor)
+            .await?;
+        let progress = job.optimization.as_mut().ok_or(Error::Internal)?;
+        if let Some(old) = progress
+            .stages
+            .iter()
+            .find(|old| old.artifact_id == fact.artifact_id)
+        {
+            if old.input_digest != fact.input_digest
+                || old.generation != self.job.generation
+                || old.record_digest != optimization_stage_record_digest(fact)?
+                || old.kind != optimization_stage_kind(fact.kind)?
+                || old.request_id != fact.request_id
+            {
+                return Err(Error::Conflict(
+                    "management_optimization_origin_unknown".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if session
+            .object_row(&self.caller, "artifact", &fact.artifact_id)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        }
+        progress.stages.push(ManagementOptimizationStageRef {
+            artifact_id: fact.artifact_id.clone(),
+            kind: optimization_stage_kind(fact.kind)?,
+            request_id: fact.request_id.clone(),
+            record_digest: optimization_stage_record_digest(fact)?,
+            dispatch_not_performed: optimization_stage_not_dispatched(fact),
+            input_digest: fact.input_digest.clone(),
+            generation: self.job.generation,
+        });
+        session
+            .put(&self.caller, "job", &job.id, self.caller.actor(), &job)
+            .await?;
+        session
+            .put_edge(&self.caller, "job", &job.id, "artifact", &fact.artifact_id)
+            .await?;
+        session
+            .audit(&self.caller, "management.optimization.stage", &job.id)
+            .await
+    }
+
+    pub(crate) async fn record_observed_stage(
+        &self,
+        session: &mut Session,
+        fact: &crate::optimization::StageFact,
+        journal_actor: &str,
+    ) -> Result<()> {
+        self.require_observation_origin(session, fact).await?;
+        let record = load_job_record_in_session(&self.caller, session, &self.job.id).await?;
+        if is_terminal(record.identity().state) {
+            return Ok(());
+        }
+        let mut job = record.into_unfinished_v2()?;
+        // A late observation is not a new use. It must still belong to the
+        // original physical generation and the real journal producer.
+        if !same_claim_fields(&job, &self.job) {
+            return Err(Error::Conflict("management job lease fence changed".into()));
+        }
+        let progress = job.optimization.as_mut().ok_or(Error::Internal)?;
+        if progress.journal_actor != journal_actor {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        }
+        let digest = optimization_stage_record_digest(fact)?;
+        if let Some(old) = progress
+            .stages
+            .iter()
+            .find(|old| old.artifact_id == fact.artifact_id)
+        {
+            if old.record_digest != digest || old.generation != self.job.generation {
+                return Err(Error::Conflict(
+                    "management_optimization_origin_unknown".into(),
+                ));
+            }
+        } else {
+            progress.stages.push(ManagementOptimizationStageRef {
+                artifact_id: fact.artifact_id.clone(),
+                kind: optimization_stage_kind(fact.kind)?,
+                request_id: fact.request_id.clone(),
+                record_digest: digest,
+                dispatch_not_performed: optimization_stage_not_dispatched(fact),
+                input_digest: fact.input_digest.clone(),
+                generation: self.job.generation,
+            });
+        }
+        if fact.kind == crate::optimization::StageFactKind::StepCompleted {
+            let has_compiled = progress
+                .stages
+                .iter()
+                .any(|reference| reference.kind == "edit_compiled");
+            let outcome = optimization_terminal_outcome_with_compiled(fact, has_compiled)?;
+            if !committed_result_is_preserved(job.result.as_ref(), outcome.result.as_ref())? {
+                return Err(Error::Conflict(
+                    "management_optimization_committed_result_changed".into(),
+                ));
+            }
+            job.pending_terminal_state = pending_terminal(outcome.state);
+            job.state = ManagementJobState::Draining;
+            job.step = outcome.step;
+            job.result = outcome.result;
+            job.error_code = outcome.error_code;
+        }
+        session
+            .put(&self.caller, "job", &job.id, self.caller.actor(), &job)
+            .await?;
+        session
+            .put_edge(&self.caller, "job", &job.id, "artifact", &fact.artifact_id)
+            .await?;
+        session
+            .audit(&self.caller, "management.optimization.observed", &job.id)
+            .await
+    }
+
+    async fn prepared_stage(
+        &self,
+        session: &mut Session,
+        job: &ManagementJobV2,
+        request_id: &str,
+        input_digest: &str,
+    ) -> Result<String> {
+        let progress = job
+            .optimization
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("management_optimization_origin_unknown".into()))?;
+        for reference in &progress.stages {
+            if reference.generation != self.job.generation || reference.input_digest != input_digest
+            {
+                continue;
+            }
+            let fact: crate::optimization::StageFact = session
+                .need(&self.caller, "artifact", &reference.artifact_id)
+                .await?;
+            self.check_stage_scope(&fact)?;
+            if fact.artifact_id == reference.artifact_id
+                && fact.input_digest == reference.input_digest
+                && fact.request_id == request_id
+                && fact.kind == crate::optimization::StageFactKind::DispatchPrepared
+            {
+                return Ok(fact.artifact_id);
+            }
+        }
+        Err(Error::Conflict(
+            "management_optimization_origin_unknown".into(),
+        ))
+    }
+
+    pub(crate) async fn compiled_stages(
+        &self,
+        session: &mut Session,
+    ) -> Result<Vec<crate::optimization::StageFact>> {
+        let record = load_job_record_in_session(&self.caller, session, &self.job.id).await?;
+        let VersionedManagementJob::V2(job) = record else {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        };
+        let progress = job
+            .optimization
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("management_optimization_origin_unknown".into()))?;
+        let mut compiled = Vec::new();
+        for reference in &progress.stages {
+            if reference.generation != self.job.generation {
+                continue;
+            }
+            let fact: crate::optimization::StageFact = session
+                .need(&self.caller, "artifact", &reference.artifact_id)
+                .await?;
+            self.check_stage_scope(&fact)?;
+            if fact.artifact_id != reference.artifact_id
+                || fact.input_digest != reference.input_digest
+            {
+                return Err(Error::Conflict(
+                    "management_optimization_origin_unknown".into(),
+                ));
+            }
+            if fact.kind == crate::optimization::StageFactKind::EditCompiled {
+                compiled.push(fact);
+            }
+        }
+        Ok(compiled)
+    }
+
+    pub(crate) async fn step_prepared(
+        &self,
+        session: &mut Session,
+    ) -> Result<crate::optimization::StageFact> {
+        let record = load_job_record_in_session(&self.caller, session, &self.job.id).await?;
+        let VersionedManagementJob::V2(job) = record else {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        };
+        let progress = job
+            .optimization
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("management_optimization_origin_unknown".into()))?;
+        for reference in &progress.stages {
+            if reference.generation != self.job.generation {
+                continue;
+            }
+            let fact: crate::optimization::StageFact = session
+                .need(&self.caller, "artifact", &reference.artifact_id)
+                .await?;
+            self.check_stage_scope(&fact)?;
+            if fact.artifact_id == reference.artifact_id
+                && fact.input_digest == reference.input_digest
+                && fact.kind == crate::optimization::StageFactKind::StepPrepared
+                && fact.request_id == self.model_context.request_id
+            {
+                return Ok(fact);
+            }
+        }
+        Err(Error::Conflict(
+            "management_optimization_origin_unknown".into(),
+        ))
+    }
+
+    pub(crate) async fn require_call(
+        &self,
+        session: &mut Session,
+        call: &evo_storage::budget::BudgetCallRecord,
+        artifact: &evo_storage::budget::BudgetArtifact,
+    ) -> Result<()> {
+        let record = load_job_record_in_session(&self.caller, session, &self.job.id).await?;
+        let VersionedManagementJob::V2(job) = record else {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        };
+        let reference = job
+            .optimization
+            .as_ref()
+            .and_then(|progress| {
+                progress.calls.iter().find(|reference| {
+                    reference.billing_scope == call.billing_scope
+                        && reference.call_id == call.call_id
+                })
+            })
+            .ok_or_else(|| Error::Conflict("management_optimization_origin_unknown".into()))?;
+        if call.namespace != self.caller.namespace()
+            || reference.generation != self.job.generation
+            || reference.root_budget_id != self.root_budget_id
+            || reference.billing_scope != self.billing_scope
+            || reference.actual_input_digest != call.actual_input_digest
+            || reference.request_schema != artifact.schema_version
+            || reference.request_digest != artifact.digest
+            || hash(artifact.body.as_bytes()) != artifact.digest
+        {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        }
+        let fact: crate::optimization::StageFact = session
+            .need(&self.caller, "artifact", &reference.prepared_stage_id)
+            .await?;
+        self.require_stage(session, &fact).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn record_call(
+        &self,
+        session: &mut Session,
+        producer_actor: &str,
+        source: ManagementOptimizationCallSource<'_>,
+        call: &evo_storage::budget::BudgetCallRecord,
+        root: &evo_storage::budget::RootBudgetRecord,
+        artifact: &evo_storage::budget::BudgetArtifact,
+    ) -> Result<()> {
+        let (producer, prepared_request_id, prepared_input_digest) = match source {
+            ManagementOptimizationCallSource::Model(bound) => {
+                if call.call_id != bound.request.request_id
+                    || call.actual_input_digest != bound.request.cache_key_digest
+                {
+                    return Err(Error::Conflict(
+                        "management_optimization_origin_unknown".into(),
+                    ));
+                }
+                (
+                    ManagementOptimizationCallProducer::Model,
+                    bound.request.request_id.as_str(),
+                    fingerprint(bound)?,
+                )
+            }
+            ManagementOptimizationCallSource::Development(request) => (
+                ManagementOptimizationCallProducer::Development,
+                request.request_id.as_str(),
+                fingerprint(request)?,
+            ),
+        };
+        let mut job = self.admit_new(session).await?;
+        if call.namespace != self.caller.namespace()
+            || call.billing_scope != self.billing_scope
+            || root.root_budget_id != self.root_budget_id
+            || root.billing_scope != self.billing_scope
+            || call.dispatch_group_id != self.model_context.episode_id
+            || hash(artifact.body.as_bytes()) != artifact.digest
+            || call.request_artifact.as_ref() != Some(artifact)
+        {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        }
+        let prepared_stage_id = self
+            .prepared_stage(session, &job, prepared_request_id, &prepared_input_digest)
+            .await?;
+        if job.optimization.as_ref().is_some_and(|progress| {
+            progress
+                .calls
+                .iter()
+                .any(|old| old.billing_scope == call.billing_scope && old.call_id == call.call_id)
+        }) {
+            self.require_call(session, call, artifact).await?;
+            let old = job
+                .optimization
+                .as_mut()
+                .and_then(|progress| {
+                    progress.calls.iter_mut().find(|old| {
+                        old.billing_scope == call.billing_scope && old.call_id == call.call_id
+                    })
+                })
+                .ok_or(Error::Internal)?;
+            if old.lease_token != call.lease_token || old.lease_epoch != call.lease_epoch {
+                old.lease_token = call.lease_token.clone();
+                old.lease_epoch = call.lease_epoch;
+                session
+                    .put(&self.caller, "job", &job.id, self.caller.actor(), &job)
+                    .await?;
+                session
+                    .audit(
+                        &self.caller,
+                        "management.optimization.call_refence",
+                        &job.id,
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+        let budget_ref_id = optimization_budget_ref_id(
+            self.caller.namespace(),
+            &call.billing_scope,
+            &call.call_id,
+        )?;
+        let budget_ref = session
+            .object_row(&self.caller, "artifact", &budget_ref_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        if budget_ref.owner != producer_actor {
+            return Err(Error::Conflict(
+                "management_optimization_origin_unknown".into(),
+            ));
+        }
+        validate_optimization_budget_ref(
+            &budget_ref.body,
+            &budget_ref_id,
+            self.caller.namespace(),
+            &call.billing_scope,
+            &call.call_id,
+        )?;
+        let reference = ManagementOptimizationCallRef {
+            producer_actor: producer_actor.into(),
+            budget_ref_digest: hash(budget_ref.body.as_bytes()),
+            producer,
+            prepared_stage_id,
+            generation: self.job.generation,
+            billing_scope: call.billing_scope.clone(),
+            root_budget_id: root.root_budget_id.clone(),
+            call_id: call.call_id.clone(),
+            actual_input_digest: call.actual_input_digest.clone(),
+            request_schema: artifact.schema_version.clone(),
+            request_digest: artifact.digest.clone(),
+            lease_token: call.lease_token.clone(),
+            lease_epoch: call.lease_epoch,
+        };
+        job.optimization
+            .as_mut()
+            .ok_or(Error::Internal)?
+            .calls
+            .push(reference);
+        session
+            .put(&self.caller, "job", &job.id, self.caller.actor(), &job)
+            .await?;
+        session
+            .audit(&self.caller, "management.optimization.call", &job.id)
+            .await
+    }
+}
+
+#[derive(Clone)]
+struct WorkerControl {
+    stop_new_steps: Arc<AtomicBool>,
+    stop_error: Arc<Mutex<Option<Error>>>,
+}
+
+impl WorkerControl {
+    fn new() -> Self {
+        Self {
+            stop_new_steps: Arc::new(AtomicBool::new(false)),
+            stop_error: Arc::new(Mutex::new(None)),
+        }
+    }
+    fn stop(&self) {
+        self.stop_new_steps.store(true, Ordering::Release);
+    }
+    fn stop_with_error(&self, error: Error) {
+        if let Ok(mut reason) = self.stop_error.lock() {
+            if reason.is_none() {
+                *reason = Some(error);
+            }
+        }
+        self.stop();
+    }
+    fn admit_step(&self) -> Result<()> {
+        if self.stop_new_steps.load(Ordering::Acquire) {
+            if let Some(error) = self.stop_error.lock().map_err(|_| Error::Internal)?.take() {
+                return Err(error);
+            }
+            return Err(Error::Cancelled);
+        }
+        Ok(())
+    }
+}
+
+// This evidence is private to an actually awaited handle or this startup's
+// post-lock recovery entry. It cannot be supplied by request JSON or caller bool.
+#[derive(Debug, Clone)]
+enum ObservedWorkerExit {
+    Completed(JobOutcome),
+    BeforeConsumerFailed(JobOutcome),
+    NeverStarted,
+    Failed(String),
+    Restarted,
+}
+
 async fn execute_request(
     ctx: &Context,
     store: &Store,
-    claimed: &ManagementJob,
+    claimed: &ManagementJobV2,
     request: ParsedRequest,
+    control: &WorkerControl,
+    optimization_runtime: Option<&crate::optimization::ManagementOptimizationRuntime>,
 ) -> Result<JobOutcome> {
     let mut job = claimed.clone();
     let result = match request {
         ParsedRequest::ExperimentRegister(request) => {
-            run_experiment_register(ctx, store, &mut job, *request).await
+            run_experiment_register(ctx, store, &mut job, *request, control).await
         }
         ParsedRequest::ExperimentRegisterCurrent(request) => {
-            run_experiment_register_current(ctx, store, &mut job, *request).await
+            run_experiment_register_current(ctx, store, &mut job, *request, control).await
         }
         ParsedRequest::EvaluationStart(request) => {
-            run_evaluation_start(ctx, store, &mut job, request).await
+            run_evaluation_start(ctx, store, &mut job, request, control).await
         }
         ParsedRequest::EvaluationStatus(request) => {
-            run_evaluation_status(ctx, store, &mut job, request).await
+            run_evaluation_status(ctx, store, &mut job, request, control).await
         }
-        ParsedRequest::ReplayRun(request) => run_replay(ctx, store, &mut job, *request).await,
+        ParsedRequest::ReplayRun(request) => {
+            run_replay(ctx, store, &mut job, *request, control).await
+        }
         ParsedRequest::CurriculumStep(request) => {
-            run_curriculum_step(ctx, store, &mut job, request).await
+            run_curriculum_step(ctx, store, &mut job, request, control).await
         }
         ParsedRequest::ExplorationStart(request) => {
-            run_exploration_start(ctx, store, &mut job, *request).await
+            run_exploration_start(ctx, store, &mut job, *request, control).await
+        }
+        ParsedRequest::OptimizationStep(request) => {
+            run_optimization_management(
+                ctx,
+                store,
+                &mut job,
+                *request,
+                control,
+                optimization_runtime,
+            )
+            .await
         }
         ParsedRequest::Blocked(_) => {
+            control.admit_step()?;
             job.state = ManagementJobState::Blocked;
             job.step = "blocked_feature".into();
             job.error_code = Some(format!("{}_consumer_unavailable", job.operation));
@@ -1007,7 +2008,43 @@ async fn execute_request(
     execution_outcome(job, result)
 }
 
-fn execution_outcome(mut job: ManagementJob, result: Result<()>) -> Result<JobOutcome> {
+async fn run_optimization_management(
+    ctx: &Context,
+    store: &Store,
+    job: &mut ManagementJobV2,
+    request: OptimizationStepManagementRequest,
+    control: &WorkerControl,
+    runtime: Option<&crate::optimization::ManagementOptimizationRuntime>,
+) -> Result<()> {
+    checkpoint_claim(ctx, store, job, "before_optimization_resolve", control).await?;
+    let Some(runtime) = runtime else {
+        job.state = ManagementJobState::Blocked;
+        job.step = "optimization_backend_unconfigured".into();
+        job.error_code = Some("optimization_backend_unconfigured".into());
+        return Ok(());
+    };
+    let (inputs, budget) = runtime
+        .resolve_inputs(ctx, store, &job.id, &request)
+        .await?;
+    let claim = Arc::new(ManagementOptimizationClaim {
+        caller: ctx.clone(),
+        job: job.clone(),
+        model_context: inputs.model_context().clone(),
+        billing_scope: budget.billing_scope,
+        root_budget_id: budget.root_budget_id,
+        control: control.clone(),
+    });
+    let (completed, compiled) = runtime.run_claimed(store, claim, &inputs).await?;
+    let outcome = optimization_terminal_outcome(&completed, &compiled)?;
+    job.state = outcome.state;
+    job.step = outcome.step;
+    job.result = outcome.result;
+    job.error_code = outcome.error_code;
+
+    Ok(())
+}
+
+fn execution_outcome(mut job: ManagementJobV2, result: Result<()>) -> Result<JobOutcome> {
     if matches!(&result, Err(Error::ClockRegressed)) {
         return Err(Error::ClockRegressed);
     }
@@ -1027,8 +2064,9 @@ fn execution_outcome(mut job: ManagementJob, result: Result<()>) -> Result<JobOu
 async fn run_experiment_register(
     ctx: &Context,
     store: &Store,
-    job: &mut ManagementJob,
+    job: &mut ManagementJobV2,
     request: ExperimentRegisterRequest,
+    control: &WorkerControl,
 ) -> Result<()> {
     if request.control.evaluator_actor != ctx.actor()
         || request.holdout.registration_id != request.control.id
@@ -1065,7 +2103,7 @@ async fn run_experiment_register(
     if progress.control_digest.is_none() {
         IndependentEvaluationControl::register_control(ctx, store, request.control.clone()).await?;
         job.step = "control_registered".into();
-        checkpoint_claim(ctx, store, job, "control_registered").await?;
+        checkpoint_claim(ctx, store, job, "control_registered", control).await?;
         progress = IndependentEvaluationControl::registration_progress(
             ctx,
             store,
@@ -1075,7 +2113,7 @@ async fn run_experiment_register(
         .await?;
     }
     if progress.holdout_digest.is_none() {
-        checkpoint_claim(ctx, store, job, "before_holdout_registration").await?;
+        checkpoint_claim(ctx, store, job, "before_holdout_registration", control).await?;
         IndependentEvaluationControl::register_holdout(ctx, store, request.holdout.clone()).await?;
     }
     let final_progress = IndependentEvaluationControl::registration_progress(
@@ -1094,20 +2132,23 @@ async fn run_experiment_register(
     }
     job.state = ManagementJobState::Succeeded;
     job.step = "experiment_registered".into();
-    job.result = Some(ManagementResult::ExperimentRegistered {
-        control_id: request.control.id,
-        control_digest: expected_control,
-        holdout_id: request.holdout.id,
-        holdout_digest: expected_holdout,
-    });
+    job.result = Some(ManagementResultV2::Original(
+        ManagementResult::ExperimentRegistered {
+            control_id: request.control.id,
+            control_digest: expected_control,
+            holdout_id: request.holdout.id,
+            holdout_digest: expected_holdout,
+        },
+    ));
     Ok(())
 }
 
 async fn run_experiment_register_current(
     ctx: &Context,
     store: &Store,
-    job: &mut ManagementJob,
+    job: &mut ManagementJobV2,
     request: ExperimentRegisterRequestV2,
+    control: &WorkerControl,
 ) -> Result<()> {
     if request.control.evaluator_actor != ctx.actor()
         || request.holdout.registration_id != request.control.id
@@ -1116,9 +2157,11 @@ async fn run_experiment_register_current(
     }
     let expected_control = request.control.digest()?;
     let expected_holdout = request.holdout.digest(&request.control)?;
-    let progress = IndependentEvaluationControl::registration_progress(
+    let mut session = store.session().await?;
+    let mut current = begin_management_step(ctx, &mut session, job, control).await?;
+    let progress = IndependentEvaluationControl::registration_progress_in_session(
         ctx,
-        store,
+        &mut session,
         &request.control.id,
         &request.holdout.id,
     )
@@ -1141,43 +2184,135 @@ async fn run_experiment_register_current(
             "current control must be registered before candidate binding".into(),
         ));
     }
-    if progress.holdout_digest.is_none() {
-        checkpoint_claim(ctx, store, job, "before_holdout_registration").await?;
-        IndependentEvaluationControl::register_current_holdout(ctx, store, request.holdout.clone())
-            .await?;
+    let already_registered = progress.holdout_digest.is_some();
+    if !already_registered {
+        let digest = IndependentEvaluationControl::register_current_holdout_in_session(
+            ctx,
+            &mut session,
+            request.holdout.clone(),
+        )
+        .await?;
+        if digest != expected_holdout {
+            return Err(Error::Conflict(
+                "experiment registration did not converge".into(),
+            ));
+        }
+        // A cancellation written by the transaction's actual producer hook
+        // must retain the H and its complete same-job result.
+        current = reload_same_claim_after_write(ctx, &mut session, job).await?;
     }
-    let final_progress = IndependentEvaluationControl::registration_progress(
-        ctx,
-        store,
-        &request.control.id,
-        &request.holdout.id,
-    )
-    .await?;
-    if final_progress.control_digest.as_deref() != Some(expected_control.as_str())
-        || final_progress.holdout_digest.as_deref() != Some(expected_holdout.as_str())
+    current.step = if already_registered {
+        "experiment_already_registered"
+    } else {
+        "experiment_registered"
+    }
+    .into();
+    current.result = Some(ManagementResultV2::Original(
+        ManagementResult::ExperimentRegistered {
+            control_id: request.control.id.clone(),
+            control_digest: expected_control.clone(),
+            holdout_id: request.holdout.id.clone(),
+            holdout_digest: expected_holdout.clone(),
+        },
+    ));
+    if current.cancel_requested && !already_registered {
+        current.cancel_arrival = Some(ManagementCancelArrival::AfterSideEffect);
+    }
+    session
+        .put(ctx, "job", &current.id, ctx.actor(), &current)
+        .await?;
+    session
+        .audit(ctx, "management.job.checkpoint", &current.id)
+        .await?;
+    session.commit().await?;
+    *job = current;
+    job.state = ManagementJobState::Succeeded;
+    Ok(())
+}
+
+/// Preserve the existing wire's real physical-ID lookup. Only a logical ID
+/// that has no physical row enters the owner's canonical identity reader.
+async fn evaluation_start_existing_status(
+    ctx: &Context,
+    store: &Store,
+    request: &EvaluationStartRequest,
+    stored_ticket_id: Option<&str>,
+) -> Result<Option<StreamingEvaluationStatus>> {
+    ctx.require(&[Role::Evaluator])?;
+    let mut session = store.session().await?;
+    let selected = if let Some(id) = stored_ticket_id {
+        if session
+            .object_row(
+                ctx,
+                "artifact",
+                &e05_storage_id("evaluation_ticket_v2", id)?,
+            )
+            .await?
+            .is_none()
+        {
+            return Err(Error::NotFound);
+        }
+        id.to_owned()
+    } else if session
+        .object_row(
+            ctx,
+            "artifact",
+            &e05_storage_id("evaluation_ticket_v2", &request.ticket.ticket_id)?,
+        )
+        .await?
+        .is_some()
+    {
+        request.ticket.ticket_id.clone()
+    } else {
+        let id = IndependentEvaluationControl::management_expected_ticket_id_in_session(
+            ctx,
+            &mut session,
+            &request.ticket.engine_request(),
+        )
+        .await?;
+        if session
+            .object_row(
+                ctx,
+                "artifact",
+                &e05_storage_id("evaluation_ticket_v2", &id)?,
+            )
+            .await?
+            .is_none()
+        {
+            session.commit().await?;
+            return Ok(None);
+        }
+        id
+    };
+    session.commit().await?;
+    let existing = IndependentEvaluationControl::status(ctx, store, &selected).await?;
+    if existing.ticket.id != selected
+        || existing.ticket.registration_id != request.ticket.registration_id
+        || existing.ticket.holdout_id != request.ticket.holdout_id
+        || existing.ticket.issued_at_unix_seconds != request.ticket.issued_at_unix_seconds
+        || existing.ticket.evaluator_actor != ctx.actor()
+        || (selected != request.ticket.ticket_id
+            && !existing
+                .ticket
+                .source_plan_binding
+                .as_ref()
+                .is_some_and(|binding| binding.logical_ticket_id == request.ticket.ticket_id))
     {
         return Err(Error::Conflict(
-            "experiment registration did not converge".into(),
+            "existing ticket differs from request".into(),
         ));
     }
-    job.state = ManagementJobState::Succeeded;
-    job.step = "experiment_registered".into();
-    job.result = Some(ManagementResult::ExperimentRegistered {
-        control_id: request.control.id,
-        control_digest: expected_control,
-        holdout_id: request.holdout.id,
-        holdout_digest: expected_holdout,
-    });
-    Ok(())
+    Ok(Some(existing))
 }
 
 async fn run_evaluation_start(
     ctx: &Context,
     store: &Store,
-    job: &mut ManagementJob,
+    job: &mut ManagementJobV2,
     request: EvaluationStartRequest,
+    control: &WorkerControl,
 ) -> Result<()> {
-    checkpoint_claim(ctx, store, job, "before_ticket_issue").await?;
+    checkpoint_claim(ctx, store, job, "before_ticket_issue", control).await?;
     let ticket = match IndependentEvaluationControl::issue_ticket(
         ctx,
         store,
@@ -1187,41 +2322,38 @@ async fn run_evaluation_start(
     {
         Ok(ticket) => ticket,
         Err(Error::Conflict(_)) => {
-            let existing =
-                IndependentEvaluationControl::status(ctx, store, &request.ticket.ticket_id).await?;
-            if existing.ticket.registration_id != request.ticket.registration_id
-                || existing.ticket.holdout_id != request.ticket.holdout_id
-                || existing.ticket.issued_at_unix_seconds != request.ticket.issued_at_unix_seconds
-                || existing.ticket.evaluator_actor != ctx.actor()
-            {
-                return Err(Error::Conflict(
-                    "existing ticket differs from request".into(),
-                ));
-            }
-            existing.ticket
+            evaluation_start_existing_status(ctx, store, &request, None)
+                .await?
+                .ok_or(Error::NotFound)?
+                .ticket
         }
         Err(error) => return Err(error),
     };
     job.state = ManagementJobState::Blocked;
     job.step = "ticket_issued_execution_blocked".into();
     job.error_code = Some("execution_provider_unconfigured".into());
-    job.result = Some(ManagementResult::EvaluationTicketBlocked {
-        ticket_id: ticket.id,
-    });
+    job.result = Some(ManagementResultV2::Original(
+        ManagementResult::EvaluationTicketBlocked {
+            ticket_id: ticket.id,
+        },
+    ));
     Ok(())
 }
 
 async fn run_evaluation_status(
     ctx: &Context,
     store: &Store,
-    job: &mut ManagementJob,
+    job: &mut ManagementJobV2,
     request: EvaluationStatusRequest,
+    control: &WorkerControl,
 ) -> Result<()> {
-    checkpoint_claim(ctx, store, job, "before_status_read").await?;
+    checkpoint_claim(ctx, store, job, "before_status_read", control).await?;
     let status = IndependentEvaluationControl::status(ctx, store, &request.ticket_id).await?;
     job.state = ManagementJobState::Succeeded;
     job.step = "status_read".into();
-    job.result = Some(public_evaluation_status(&status));
+    job.result = Some(ManagementResultV2::Original(public_evaluation_status(
+        &status,
+    )));
     Ok(())
 }
 
@@ -1241,10 +2373,11 @@ fn public_evaluation_status(status: &StreamingEvaluationStatus) -> ManagementRes
 async fn run_replay(
     ctx: &Context,
     store: &Store,
-    job: &mut ManagementJob,
+    job: &mut ManagementJobV2,
     request: ReplayRunRequest,
+    control: &WorkerControl,
 ) -> Result<()> {
-    checkpoint_claim(ctx, store, job, "before_replay_run").await?;
+    checkpoint_claim(ctx, store, job, "before_replay_run", control).await?;
     let stored = crate::replay::run_and_persist_pool_replay(
         ctx,
         store,
@@ -1257,21 +2390,24 @@ async fn run_replay(
     .await?;
     job.state = ManagementJobState::Succeeded;
     job.step = "replay_stored".into();
-    job.result = Some(ManagementResult::ReplayStored {
-        report_id: stored.report_id,
-        pool_digest: stored.pool_digest,
-        semantic_reports_digest: stored.semantic_reports_digest,
-    });
+    job.result = Some(ManagementResultV2::Original(
+        ManagementResult::ReplayStored {
+            report_id: stored.report_id,
+            pool_digest: stored.pool_digest,
+            semantic_reports_digest: stored.semantic_reports_digest,
+        },
+    ));
     Ok(())
 }
 
 async fn run_curriculum_step(
     ctx: &Context,
     store: &Store,
-    job: &mut ManagementJob,
+    job: &mut ManagementJobV2,
     request: CurriculumStepRequest,
+    control: &WorkerControl,
 ) -> Result<()> {
-    checkpoint_claim(ctx, store, job, "before_curriculum_step").await?;
+    checkpoint_claim(ctx, store, job, "before_curriculum_step", control).await?;
     let coordinator = crate::curriculum::PersistentCurriculumCoordinator::new(
         store.clone(),
         ctx.clone(),
@@ -1289,21 +2425,24 @@ async fn run_curriculum_step(
         .await?;
     job.state = ManagementJobState::Succeeded;
     job.step = "probe_scheduled".into();
-    job.result = Some(ManagementResult::ProbeScheduled {
-        probe_job_id: probe.id,
-        trigger_digest: probe.trigger_digest,
-        terminal: probe.terminal,
-    });
+    job.result = Some(ManagementResultV2::Original(
+        ManagementResult::ProbeScheduled {
+            probe_job_id: probe.id,
+            trigger_digest: probe.trigger_digest,
+            terminal: probe.terminal,
+        },
+    ));
     Ok(())
 }
 
 async fn run_exploration_start(
     ctx: &Context,
     store: &Store,
-    job: &mut ManagementJob,
+    job: &mut ManagementJobV2,
     request: ExplorationStartRequest,
+    control: &WorkerControl,
 ) -> Result<()> {
-    checkpoint_claim(ctx, store, job, "before_exploration_start").await?;
+    checkpoint_claim(ctx, store, job, "before_exploration_start", control).await?;
     let coordinator =
         crate::exploration::PersistentCoordinator::new(store.clone(), ctx.clone(), ctx.actor())?;
     let world_id = request.world.id.clone();
@@ -1328,15 +2467,17 @@ async fn run_exploration_start(
     }
     job.state = ManagementJobState::Succeeded;
     job.step = "exploration_started".into();
-    job.result = Some(ManagementResult::ExplorationStarted {
-        world_id,
-        context_signature,
-        prefix_digest: decision.prefix_digest,
-        legal_actions_digest: decision.legal_actions_digest,
-        policy_digest: decision.policy_digest,
-        caps_digest: decision.caps_digest,
-        action: decision.action,
-    });
+    job.result = Some(ManagementResultV2::Original(
+        ManagementResult::ExplorationStarted {
+            world_id,
+            context_signature,
+            prefix_digest: decision.prefix_digest,
+            legal_actions_digest: decision.legal_actions_digest,
+            policy_digest: decision.policy_digest,
+            caps_digest: decision.caps_digest,
+            action: decision.action,
+        },
+    ));
     Ok(())
 }
 
@@ -1356,7 +2497,8 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
                 return Err(Error::Forbidden);
             }
         }
-        ParsedRequest::ReplayRun(_)
+        ParsedRequest::OptimizationStep(_)
+        | ParsedRequest::ReplayRun(_)
         | ParsedRequest::CurriculumStep(_)
         | ParsedRequest::ExplorationStart(_) => {
             ctx.require(&[Role::Admin])?;
@@ -1415,17 +2557,34 @@ fn redacted_input_error(id: &str) -> Error {
 /// typed decoding; the tombstone is not an input, and decoding it as one would
 /// surface as `Internal` and raise the storage layer's "database operation
 /// failed" error log for an expected state.
-async fn private_input_body(
+async fn private_input_body_ref(
     ctx: &Context,
     store: &Store,
-    job: &ManagementJob,
+    private_input_ref: &str,
 ) -> Result<Option<Value>> {
     let mut session = store.session().await?;
-    let body = session
-        .get::<Value>(ctx, "artifact", &job.private_input_ref)
-        .await?;
+    let result = private_input_body_in_session(ctx, &mut session, private_input_ref).await?;
     session.commit().await?;
-    Ok(body)
+    Ok(result)
+}
+
+async fn private_input_body_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    private_input_ref: &str,
+) -> Result<Option<Value>> {
+    let Some(row) = session
+        .object_row(ctx, "artifact", private_input_ref)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if row.owner != ctx.actor() {
+        return Err(Error::NotFound);
+    }
+    let value = evo_storage::lifecycle::parse_strict_json(&row.body)
+        .map_err(|_| Error::Invalid("management_private_input_invalid_json".into()))?;
+    Ok(Some(value))
 }
 
 fn is_redacted(body: &Value) -> bool {
@@ -1435,23 +2594,47 @@ fn is_redacted(body: &Value) -> bool {
 /// `Conflict` when the job's private input was redacted by the cleanup. An
 /// absent or ordinary input passes: this gate names one expected state and
 /// decides nothing else.
-async fn ensure_private_input_not_redacted(
+async fn ensure_private_input_not_redacted_record(
     ctx: &Context,
     store: &Store,
-    job: &ManagementJob,
+    job: &VersionedManagementJob,
 ) -> Result<()> {
-    match private_input_body(ctx, store, job).await? {
-        Some(body) if is_redacted(&body) => Err(redacted_input_error(&job.private_input_ref)),
+    match private_input_body_ref(ctx, store, job.identity().private_input_ref).await? {
+        Some(body) if is_redacted(&body) => {
+            Err(redacted_input_error(job.identity().private_input_ref))
+        }
         _ => Ok(()),
     }
+}
+
+async fn load_private_request_record(
+    ctx: &Context,
+    store: &Store,
+    job: &VersionedManagementJob,
+) -> std::result::Result<ParsedRequest, InputFault> {
+    let identity = job.identity();
+    let body = private_input_body_ref(ctx, store, identity.private_input_ref)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if is_redacted(&body) {
+        return Err(InputFault::Redacted {
+            id: identity.private_input_ref.into(),
+        });
+    }
+    Ok(decode_private_request_fields(
+        body,
+        identity.private_input_ref,
+        identity.operation,
+        identity.payload_digest,
+    )?)
 }
 
 async fn load_private_request(
     ctx: &Context,
     store: &Store,
-    job: &ManagementJob,
+    job: &ManagementJobV2,
 ) -> std::result::Result<ParsedRequest, InputFault> {
-    let body = private_input_body(ctx, store, job)
+    let body = private_input_body_ref(ctx, store, &job.private_input_ref)
         .await?
         .ok_or(Error::NotFound)?;
     if is_redacted(&body) {
@@ -1463,18 +2646,35 @@ async fn load_private_request(
 }
 
 /// Decodes and cross-checks a stored (not redacted) private input against its job.
-fn decode_private_request(body: Value, job: &ManagementJob) -> Result<ParsedRequest> {
+fn decode_private_request(body: Value, job: &ManagementJobV2) -> Result<ParsedRequest> {
+    decode_private_request_fields(
+        body,
+        &job.private_input_ref,
+        &job.operation,
+        &job.payload_digest,
+    )
+}
+
+// Both raw versioned reads use the same original private-input/ParsedRequest
+// verifier, without converting an admitted job back through Value or inventing
+// a v1 job under the new schema.
+fn decode_private_request_fields(
+    body: Value,
+    private_input_ref: &str,
+    operation: &str,
+    payload_digest: &str,
+) -> Result<ParsedRequest> {
     let private: PrivateManagementInput = match serde_json::from_value(body) {
         Ok(private) => private,
         Err(error) => {
-            tracing::error!(%error, id = %job.private_input_ref, "stored management private input does not decode");
+            tracing::error!(%error, id = %private_input_ref, "stored management private input does not decode");
             return Err(Error::Internal);
         }
     };
-    if private.id != job.private_input_ref
+    if private.id != private_input_ref
         || private.schema_version != INPUT_SCHEMA
-        || private.operation != job.operation
-        || private.payload_digest != job.payload_digest
+        || private.operation != operation
+        || private.payload_digest != payload_digest
     {
         return Err(Error::Conflict(
             "private management input differs from job".into(),
@@ -1482,7 +2682,7 @@ fn decode_private_request(body: Value, job: &ManagementJob) -> Result<ParsedRequ
     }
     let request: ParsedRequest = serde_json::from_value(private.payload)
         .map_err(|_| Error::Invalid("invalid persisted management input".into()))?;
-    if fingerprint(&request)? != job.payload_digest {
+    if fingerprint(&request)? != payload_digest {
         return Err(Error::Conflict(
             "persisted management payload digest changed".into(),
         ));
@@ -1490,66 +2690,1599 @@ fn decode_private_request(body: Value, job: &ManagementJob) -> Result<ParsedRequ
     Ok(request)
 }
 
+fn same_claim_fields(current: &ManagementJobV2, claimed: &ManagementJobV2) -> bool {
+    current.id == claimed.id
+        && current.owner_actor == claimed.owner_actor
+        && current.owner_role == claimed.owner_role
+        && current.operation == claimed.operation
+        && current.request_key == claimed.request_key
+        && current.payload_digest == claimed.payload_digest
+        && current.private_input_ref == claimed.private_input_ref
+        && current.generation == claimed.generation
+        && current.lease_token == claimed.lease_token
+}
+
+async fn begin_management_step(
+    ctx: &Context,
+    session: &mut Session,
+    claimed: &ManagementJobV2,
+    control: &WorkerControl,
+) -> Result<ManagementJobV2> {
+    let record = load_job_record_in_session(ctx, session, &claimed.id).await?;
+    if is_terminal(record.identity().state) {
+        return Err(Error::Conflict("management job lease fence changed".into()));
+    }
+    let current = record.into_unfinished_v2()?;
+    ensure_fence(&current, claimed)?;
+    control.admit_step()?;
+    if current.cancel_requested {
+        return Err(Error::Cancelled);
+    }
+    let body = private_input_body_in_session(ctx, session, &current.private_input_ref)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if is_redacted(&body) {
+        return Err(redacted_input_error(&current.private_input_ref));
+    }
+    let request = decode_private_request(body, &current)?;
+    validate_request_authority(ctx, &request)?;
+    ensure_dependencies_live(ctx, session, &private_dependencies(&request)?).await?;
+    Ok(current)
+}
+
+async fn reload_same_claim_after_write(
+    ctx: &Context,
+    session: &mut Session,
+    claimed: &ManagementJobV2,
+) -> Result<ManagementJobV2> {
+    let record = load_job_record_in_session(ctx, session, &claimed.id).await?;
+    if is_terminal(record.identity().state) {
+        return Err(Error::Conflict("management job lease fence changed".into()));
+    }
+    let current = record.into_unfinished_v2()?;
+    if !same_claim_fields(&current, claimed) {
+        return Err(Error::Conflict("management job lease fence changed".into()));
+    }
+    Ok(current)
+}
+
 async fn checkpoint_claim(
     ctx: &Context,
     store: &Store,
-    claimed: &ManagementJob,
+    claimed: &ManagementJobV2,
     step: &str,
+    control: &WorkerControl,
 ) -> Result<()> {
     let mut session = store.session().await?;
-    let mut current: ManagementJob = session.need(ctx, "job", &claimed.id).await?;
-    ensure_owner(ctx, &current)?;
-    ensure_fence(&current, claimed)?;
-    if current.cancel_requested {
-        current.state = ManagementJobState::Cancelled;
-        current.step = "cancelled".into();
-        current.lease_token = None;
-        current.lease_until = 0;
-        session
-            .put(ctx, "job", &current.id, ctx.actor(), &current)
-            .await?;
-        session.commit().await?;
-        return Err(Error::Cancelled);
-    }
+    let mut current = begin_management_step(ctx, &mut session, claimed, control).await?;
     current.step = step.into();
     session
         .put(ctx, "job", &current.id, ctx.actor(), &current)
         .await?;
+    session
+        .audit(ctx, "management.job.checkpoint", &current.id)
+        .await?;
     session.commit().await
 }
 
-async fn finish_claim(
+#[derive(Clone)]
+struct OwnedOptimizationCall {
+    reference: ManagementOptimizationCallRef,
+    call: evo_storage::budget::BudgetCallRecord,
+}
+
+struct OptimizationAccounting {
+    calls: Vec<OwnedOptimizationCall>,
+    terminal: Option<crate::optimization::StageFact>,
+    compiled: Vec<crate::optimization::StageFact>,
+    historical_compiled: Vec<ManagementOptimizationStageRef>,
+    historical_terminal: bool,
+    known_none: bool,
+}
+
+impl OptimizationAccounting {
+    fn pending(&self) -> bool {
+        self.calls.iter().any(|owned| {
+            matches!(
+                owned.call.state,
+                evo_storage::budget::BudgetCallState::Reserved
+                    | evo_storage::budget::BudgetCallState::Dispatched
+                    | evo_storage::budget::BudgetCallState::Uncertain
+            ) || (owned.call.dispatch_id.is_some() && !owned.call.execution_closed)
+        })
+    }
+    fn dispatched(&self) -> bool {
+        self.calls
+            .iter()
+            .any(|owned| owned.call.dispatch_id.is_some())
+    }
+    fn has_business_side_effect(&self) -> bool {
+        self.dispatched() || !self.compiled.is_empty() || !self.historical_compiled.is_empty()
+    }
+    fn views(&self) -> Vec<ManagementFeeCallView> {
+        self.calls
+            .iter()
+            .map(|owned| ManagementFeeCallView {
+                billing_scope: owned.call.billing_scope.clone(),
+                call_id: owned.call.call_id.clone(),
+                state: owned.call.state,
+                actual_cost_micros: owned.call.actual_cost_micros,
+                reserved_micros: owned.call.reserved_micros,
+                actual_currency: owned.call.actual_currency.clone(),
+                actual_pricing_version: owned.call.actual_pricing_version.clone(),
+                execution_closed: owned.call.execution_closed,
+            })
+            .collect()
+    }
+    fn pending_views(&self) -> Vec<ManagementFeeCallView> {
+        self.calls
+            .iter()
+            .filter(|owned| {
+                matches!(
+                    owned.call.state,
+                    evo_storage::budget::BudgetCallState::Reserved
+                        | evo_storage::budget::BudgetCallState::Dispatched
+                        | evo_storage::budget::BudgetCallState::Uncertain
+                ) || (owned.call.dispatch_id.is_some() && !owned.call.execution_closed)
+            })
+            .map(|owned| ManagementFeeCallView {
+                billing_scope: owned.call.billing_scope.clone(),
+                call_id: owned.call.call_id.clone(),
+                state: owned.call.state,
+                actual_cost_micros: owned.call.actual_cost_micros,
+                reserved_micros: owned.call.reserved_micros,
+                actual_currency: owned.call.actual_currency.clone(),
+                actual_pricing_version: owned.call.actual_pricing_version.clone(),
+                execution_closed: owned.call.execution_closed,
+            })
+            .collect()
+    }
+}
+
+/// One read Session joins physical job/private input, original prepared facts,
+/// actual root and the full original ledger. No query result grants new work.
+async fn optimization_live_accounting_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    record: &VersionedManagementJob,
+) -> Result<Option<OptimizationAccounting>> {
+    let identity = record.identity();
+    if identity.operation != "optimization.step" {
+        return Ok(None);
+    }
+    let body = private_input_body_in_session(ctx, session, identity.private_input_ref)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if is_redacted(&body) {
+        return Ok(None);
+    }
+    let parsed = decode_private_request_fields(
+        body,
+        identity.private_input_ref,
+        identity.operation,
+        identity.payload_digest,
+    )?;
+    let ParsedRequest::OptimizationStep(request) = parsed else {
+        return Ok(None);
+    };
+    let VersionedManagementJob::V2(job) = record else {
+        return Ok(None);
+    };
+    let producer_identity = fingerprint(&(ctx.namespace(), ctx.actor(), &job.id))?;
+    let episode = format!("management-episode-{producer_identity}");
+    let step_request = format!("management-opt-{producer_identity}");
+    let scopes = session.budget_call_scopes_for_group(ctx, &episode).await?;
+    if job.optimization.is_none() {
+        // This is the real producer's never-entered phase, not an empty-query
+        // assertion: every later step/call must append its reference atomically.
+        let before = (job.state == ManagementJobState::Queued
+            && job.generation == 0
+            && job.lease_token.is_none())
+            || matches!(job.step.as_str(), "claimed" | "before_optimization_resolve")
+            || (job.state == ManagementJobState::Cancelled
+                && job.generation == 0
+                && job.lease_token.is_none()
+                && job.step == "cancelled_before_claim")
+            || (job.state == ManagementJobState::Blocked
+                && job.step == "optimization_backend_unconfigured"
+                && job.error_code.as_deref() == Some("optimization_backend_unconfigured"));
+        return Ok(
+            (before && scopes.is_empty()).then(|| OptimizationAccounting {
+                calls: Vec::new(),
+                terminal: None,
+                compiled: Vec::new(),
+                historical_compiled: Vec::new(),
+                historical_terminal: false,
+                known_none: true,
+            }),
+        );
+    }
+    let progress = job.optimization.as_ref().ok_or(Error::Internal)?;
+    let control = crate::development::management_control_in_session(
+        session,
+        ctx,
+        &request.development_control_id,
+    )
+    .await?;
+    let mut facts = std::collections::BTreeMap::new();
+    let mut step = None;
+    for reference in &progress.stages {
+        if reference.generation == 0 || reference.generation > job.generation {
+            return Ok(None);
+        }
+        let row = session
+            .object_row(ctx, "artifact", &reference.artifact_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        if row.owner != control.proposer_actor {
+            return Ok(None);
+        }
+        let fact: crate::optimization::StageFact =
+            serde_json::from_value(evo_storage::lifecycle::parse_strict_json(&row.body)?)
+                .map_err(|_| Error::Conflict("management_optimization_origin_unknown".into()))?;
+        fact.validate()?;
+        if fact.artifact_id != reference.artifact_id
+            || fact.input_digest != reference.input_digest
+            || fact.namespace != ctx.namespace()
+            || fact.episode_id != episode
+            || fact.step != 0
+            || fact.attempt != 0
+        {
+            return Ok(None);
+        }
+        if fact.kind == crate::optimization::StageFactKind::StepPrepared {
+            if fact.request_id != step_request || step.is_some() {
+                return Ok(None);
+            }
+            let original: crate::formal_authority::CompilerInputRequest = serde_json::from_value(
+                fact.payload
+                    .get("compiler_request")
+                    .cloned()
+                    .ok_or(Error::NotFound)?,
+            )
+            .map_err(|_| Error::Conflict("management_optimization_origin_unknown".into()))?;
+            let binding: crate::formal_authority::CurrentFormalCompilerInputBinding =
+                serde_json::from_value(
+                    fact.payload
+                        .get("compiler_binding")
+                        .cloned()
+                        .ok_or(Error::NotFound)?,
+                )
+                .map_err(|_| Error::Conflict("management_optimization_origin_unknown".into()))?;
+            if fingerprint(&original)? != fingerprint(&request.compiler)? {
+                return Ok(None);
+            }
+            let mut input = fact.payload.clone();
+            let object = input.as_object_mut().ok_or(Error::NotFound)?;
+            object.remove("compiler_request");
+            object.remove("compiler_binding");
+            if fact.input_digest != fingerprint(&(fingerprint(&input)?, &binding))? {
+                return Ok(None);
+            }
+            step = Some(fact.clone());
+        }
+        if facts.insert(fact.artifact_id.clone(), fact).is_some() {
+            return Ok(None);
+        }
+    }
+    let Some(step) = step else { return Ok(None) };
+    let terminal_id = crate::optimization::management_completed_stage_id(&step)?;
+    let terminal = if let Some(row) = session.object_row(ctx, "artifact", &terminal_id).await? {
+        if row.owner != control.proposer_actor {
+            return Ok(None);
+        }
+        let fact: crate::optimization::StageFact =
+            serde_json::from_value(evo_storage::lifecycle::parse_strict_json(&row.body)?)
+                .map_err(|_| Error::Conflict("management_optimization_origin_unknown".into()))?;
+        fact.validate()?;
+        if fact.artifact_id != terminal_id
+            || fact.input_digest != step.input_digest
+            || fact.namespace != ctx.namespace()
+            || fact.episode_id != episode
+            || fact.request_id != step_request
+        {
+            return Ok(None);
+        }
+        crate::optimization::management_completed_outcome(&fact)?;
+        Some(fact)
+    } else {
+        None
+    };
+    let mut owned = Vec::new();
+    let mut referenced = BTreeSet::new();
+    for reference in &progress.calls {
+        if reference.generation == 0
+            || reference.generation > job.generation
+            || !referenced.insert((reference.billing_scope.clone(), reference.call_id.clone()))
+        {
+            return Ok(None);
+        }
+        let root = session
+            .root_budget(ctx, &reference.billing_scope)
+            .await?
+            .ok_or(Error::Budget)?;
+        if root.root_budget_id != reference.root_budget_id
+            || root.root_budget_id != control.root_budget_id
+            || root.billing_scope != control.billing_scope
+        {
+            return Ok(None);
+        }
+        let call = session
+            .budget_call(ctx, &reference.billing_scope, &reference.call_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        let artifact = call.request_artifact.as_ref().ok_or(Error::NotFound)?;
+        let prepared = facts
+            .get(&reference.prepared_stage_id)
+            .ok_or(Error::NotFound)?;
+        let producer = progress
+            .stages
+            .iter()
+            .find(|stage| stage.artifact_id == reference.prepared_stage_id)
+            .ok_or(Error::NotFound)?;
+        if call.namespace != ctx.namespace()
+            || call.dispatch_group_id != episode
+            || call.actual_input_digest != reference.actual_input_digest
+            || artifact.schema_version != reference.request_schema
+            || artifact.digest != reference.request_digest
+            || hash(artifact.body.as_bytes()) != artifact.digest
+            || producer.generation != reference.generation
+            || prepared.kind != crate::optimization::StageFactKind::DispatchPrepared
+        {
+            return Ok(None);
+        }
+        match reference.producer {
+            ManagementOptimizationCallProducer::Model => {
+                let bound: crate::model::ReadBoundModelRequest = serde_json::from_value(
+                    evo_storage::lifecycle::parse_strict_json(&artifact.body)?,
+                )
+                .map_err(|_| Error::Conflict("management_optimization_origin_unknown".into()))?;
+                bound.validate()?;
+                if bound.schema_version != crate::model::CURRENT_BOUND_MODEL_SCHEMA
+                    || !bound.compiler_use.is_current()
+                    || bound.request.namespace != ctx.namespace()
+                    || bound.request.episode_id != episode
+                    || bound.request.request_id != call.call_id
+                    || bound.request.cache_key_digest != call.actual_input_digest
+                    || prepared.request_id != call.call_id
+                    || prepared.input_digest != fingerprint(&bound)?
+                    || fingerprint(&bound.compiler_use.request)? != fingerprint(&request.compiler)?
+                    || fingerprint(&prepared.payload)?
+                        != fingerprint(&serde_json::to_value(&bound).map_err(|_| Error::Internal)?)?
+                {
+                    return Ok(None);
+                }
+            }
+            ManagementOptimizationCallProducer::Development => {
+                let original: crate::optimization::DevelopmentRunRequest =
+                    serde_json::from_value(prepared.payload.clone()).map_err(|_| {
+                        Error::Conflict("management_optimization_origin_unknown".into())
+                    })?;
+                if prepared.request_id != original.request_id
+                    || prepared.input_digest != fingerprint(&original)?
+                {
+                    return Ok(None);
+                }
+                crate::development::verify_management_budget_call(session, ctx, &call, &original)
+                    .await?;
+            }
+        }
+        owned.push(OwnedOptimizationCall {
+            reference: reference.clone(),
+            call,
+        });
+    }
+    let mut actual = BTreeSet::new();
+    for scope in scopes {
+        for call in session
+            .budget_calls_for_group(ctx, &scope, &episode)
+            .await?
+        {
+            actual.insert((call.billing_scope, call.call_id));
+        }
+    }
+    if actual != referenced {
+        return Ok(None);
+    }
+    // A no-call completion also needs the actual terminal and every attempted
+    // model dispatch's original NotDispatched observation. Empty refs are insufficient.
+    let mut proved_no_dispatch = terminal.is_some();
+    for prepared in facts
+        .values()
+        .filter(|fact| fact.kind == crate::optimization::StageFactKind::DispatchPrepared)
+    {
+        if progress
+            .calls
+            .iter()
+            .any(|reference| reference.prepared_stage_id == prepared.artifact_id)
+        {
+            continue;
+        }
+        let observed_id = crate::optimization::management_observed_stage_id(prepared)?;
+        let Some(row) = session.object_row(ctx, "artifact", &observed_id).await? else {
+            proved_no_dispatch = false;
+            continue;
+        };
+        let observed: crate::optimization::StageFact =
+            serde_json::from_value(evo_storage::lifecycle::parse_strict_json(&row.body)?)
+                .map_err(|_| Error::Conflict("management_optimization_origin_unknown".into()))?;
+        observed.validate()?;
+        let response: crate::model::ModelResponse =
+            match serde_json::from_value(observed.payload.clone()) {
+                Ok(response) => response,
+                Err(_) => {
+                    proved_no_dispatch = false;
+                    continue;
+                }
+            };
+        if row.owner != control.proposer_actor
+            || observed.artifact_id != observed_id
+            || observed.input_digest != prepared.input_digest
+            || !matches!(
+                response,
+                crate::model::ModelResponse::Rejected {
+                    dispatch: crate::model::RejectedDispatch::NotDispatched,
+                    ..
+                }
+            )
+        {
+            proved_no_dispatch = false;
+        }
+    }
+    let known_none = owned.is_empty() && proved_no_dispatch;
+    if owned.is_empty() && !known_none {
+        return Ok(None);
+    }
+    let compiled = facts
+        .values()
+        .filter(|fact| fact.kind == crate::optimization::StageFactKind::EditCompiled)
+        .cloned()
+        .collect();
+    Ok(Some(OptimizationAccounting {
+        calls: owned,
+        terminal,
+        compiled,
+        historical_compiled: Vec::new(),
+        historical_terminal: false,
+        known_none,
+    }))
+}
+
+fn optimization_terminal_outcome(
+    fact: &crate::optimization::StageFact,
+    compiled: &[crate::optimization::StageFact],
+) -> Result<JobOutcome> {
+    optimization_terminal_outcome_with_compiled(fact, !compiled.is_empty())
+}
+
+fn optimization_terminal_outcome_with_compiled(
+    fact: &crate::optimization::StageFact,
+    has_compiled: bool,
+) -> Result<JobOutcome> {
+    let outcome = crate::optimization::management_completed_outcome(fact)?;
+    let stopped_after_compile = has_compiled
+        && match &outcome {
+            crate::optimization::OptimizationStepOutcome::Uncertain { .. } => true,
+            crate::optimization::OptimizationStepOutcome::Rejected { class } => !matches!(
+                class,
+                crate::optimization::StepTerminalClass::KeepIncumbentNotImproved { .. }
+                    | crate::optimization::StepTerminalClass::KeepIncumbentRetentionBroken { .. }
+            ),
+            _ => false,
+        };
+    if stopped_after_compile {
+        return Ok(optimization_partial_outcome());
+    }
+    let (state, error_code) = match outcome {
+        crate::optimization::OptimizationStepOutcome::Rejected { class }
+        | crate::optimization::OptimizationStepOutcome::Uncertain { class } => {
+            (ManagementJobState::Blocked, Some(class.code().into()))
+        }
+        _ => (ManagementJobState::Succeeded, None),
+    };
+    Ok(JobOutcome {
+        state,
+        step: "optimization_completed".into(),
+        result: Some(ManagementResultV2::Optimization(
+            ManagementOptimizationResultV2::OptimizationStepCompleted {
+                stage_fact_id: fact.artifact_id.clone(),
+                input_digest: fact.input_digest.clone(),
+            },
+        )),
+        error_code,
+    })
+}
+
+fn optimization_partial_outcome() -> JobOutcome {
+    JobOutcome {
+        state: ManagementJobState::Blocked,
+        step: "optimization_partial_commit".into(),
+        result: None,
+        error_code: Some("blocked_partial_commit".into()),
+    }
+}
+
+fn optimization_stage_kind(kind: crate::optimization::StageFactKind) -> Result<String> {
+    serde_json::to_value(kind)
+        .map_err(|_| Error::Internal)?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or(Error::Internal)
+}
+
+fn optimization_stage_not_dispatched(fact: &crate::optimization::StageFact) -> bool {
+    matches!(
+        fact.kind,
+        crate::optimization::StageFactKind::DispatchObserved
+    ) && matches!(
+        serde_json::from_value::<crate::model::ModelResponse>(fact.payload.clone()),
+        Ok(crate::model::ModelResponse::Rejected {
+            dispatch: crate::model::RejectedDispatch::NotDispatched,
+            ..
+        })
+    )
+}
+
+fn optimization_stage_record_digest(fact: &crate::optimization::StageFact) -> Result<String> {
+    // Exactly Session::put and commit_redacted's encoding, in original field order.
+    Ok(hash(
+        serde_json::to_string(fact)
+            .map_err(|_| Error::Internal)?
+            .as_bytes(),
+    ))
+}
+
+fn optimization_budget_ref_id(namespace: &str, scope: &str, call_id: &str) -> Result<String> {
+    let digest = fingerprint(&("rsia.budget_call_ref.v1", namespace, scope, call_id))?;
+    Ok(format!("budget-ref-{}", &digest[..32]))
+}
+
+fn validate_optimization_budget_ref(
+    body: &str,
+    id: &str,
+    namespace: &str,
+    scope: &str,
+    call_id: &str,
+) -> Result<()> {
+    let reference: evo_storage::budget::BudgetCallRef =
+        serde_json::from_value(evo_storage::lifecycle::parse_strict_json(body)?)
+            .map_err(|_| Error::Conflict("management_optimization_origin_unknown".into()))?;
+    if reference.id != id
+        || reference.schema_version != "rsia.budget_call_ref.v1"
+        || reference.namespace != namespace
+        || reference.billing_scope != scope
+        || reference.call_id != call_id
+        || reference
+            .source_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(Error::Conflict(
+            "management_optimization_origin_unknown".into(),
+        ));
+    }
+    Ok(())
+}
+
+// Exactly lifecycle's existing object redaction, with its original raw TEXT
+// digest. These checks authorize historical reads only, never a new source use.
+fn optimization_object_redaction_matches(
+    value: &Value,
+    id: &str,
+    schema: &str,
+    original_digest: &str,
+) -> bool {
+    value.as_object().is_some_and(|object| object.len() == 7)
+        && value["schema_version"].as_str() == Some(REDACTED_SCHEMA)
+        && value["state"].as_str() == Some("source_revoked")
+        && value["original_kind"].as_str() == Some("artifact")
+        && value["id"].as_str() == Some(id)
+        && value["original_schema"].as_str() == Some(schema)
+        && value["original_digest"].as_str() == Some(original_digest)
+        && value["metadata"].is_object()
+}
+
+fn optimization_stage_reference_matches(
+    body: &str,
+    reference: &ManagementOptimizationStageRef,
+    namespace: &str,
+    episode: &str,
+) -> Result<bool> {
+    let value = evo_storage::lifecycle::parse_strict_json(body)?;
+    if is_redacted(&value) {
+        return Ok(optimization_object_redaction_matches(
+            &value,
+            &reference.artifact_id,
+            crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA,
+            &reference.record_digest,
+        ) && value["metadata"]["artifact_id"].as_str()
+            == Some(reference.artifact_id.as_str())
+            && value["metadata"]["kind"].as_str() == Some(reference.kind.as_str())
+            && value["metadata"]["request_id"].as_str() == Some(reference.request_id.as_str())
+            && value["metadata"]["namespace"].as_str() == Some(namespace)
+            && value["metadata"]["episode_id"].as_str() == Some(episode)
+            && value["metadata"]["step"].as_u64() == Some(0)
+            && value["metadata"]["attempt"].as_u64() == Some(0)
+            && value["metadata"]["input_digest"].as_str()
+                == Some(reference.input_digest.as_str()));
+    }
+    let fact: crate::optimization::StageFact = serde_json::from_value(value)
+        .map_err(|_| Error::Conflict("management_optimization_origin_unknown".into()))?;
+    fact.validate()?;
+    Ok(hash(body.as_bytes()) == reference.record_digest
+        && fact.artifact_id == reference.artifact_id
+        && optimization_stage_kind(fact.kind)? == reference.kind
+        && fact.request_id == reference.request_id
+        && optimization_stage_not_dispatched(&fact) == reference.dispatch_not_performed
+        && fact.input_digest == reference.input_digest
+        && fact.namespace == namespace
+        && fact.episode_id == episode
+        && fact.step == 0
+        && fact.attempt == 0)
+}
+
+fn optimization_request_history_matches(
+    artifact: &evo_storage::budget::BudgetArtifact,
+    reference: &ManagementOptimizationCallRef,
+) -> Result<bool> {
+    if hash(artifact.body.as_bytes()) != artifact.digest {
+        return Ok(false);
+    }
+    if artifact.schema_version == reference.request_schema
+        && artifact.digest == reference.request_digest
+    {
+        return Ok(true);
+    }
+    let value = evo_storage::lifecycle::parse_strict_json(&artifact.body)?;
+    Ok(artifact.schema_version == REDACTED_SCHEMA
+        && value.as_object().is_some_and(|object| object.len() == 5)
+        && value["schema_version"].as_str() == Some(REDACTED_SCHEMA)
+        && value["state"].as_str() == Some("source_revoked")
+        && matches!(
+            value["reason"].as_str(),
+            Some("source_revoked" | "budget_sources_unverifiable" | "e16_source_unavailable")
+        )
+        && value["original_schema"].as_str() == Some(reference.request_schema.as_str())
+        && value["original_digest"].as_str() == Some(reference.request_digest.as_str()))
+}
+
+/// The same already-produced references after legal redaction. No request body,
+/// Current authority or money is reconstructed. A missing or changed witness is
+/// unknown; an empty call query cannot prove a no-call history here.
+async fn optimization_historical_accounting_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    record: &VersionedManagementJob,
+) -> Result<Option<OptimizationAccounting>> {
+    let VersionedManagementJob::V2(job) = record else {
+        return Ok(None);
+    };
+    if job.operation != "optimization.step" {
+        return Ok(None);
+    }
+    let Some(progress) = &job.optimization else {
+        return Ok(None);
+    };
+    if progress.private_input_digest.is_empty() || progress.journal_actor.is_empty() {
+        return Ok(None);
+    }
+    let private = session
+        .object_row(ctx, "artifact", &job.private_input_ref)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if private.owner != job.owner_actor || private.owner != ctx.actor() {
+        return Ok(None);
+    }
+    let body = evo_storage::lifecycle::parse_strict_json(&private.body)?;
+    if is_redacted(&body) {
+        if !optimization_object_redaction_matches(
+            &body,
+            &job.private_input_ref,
+            INPUT_SCHEMA,
+            &progress.private_input_digest,
+        ) {
+            return Ok(None);
+        }
+    } else {
+        if hash(private.body.as_bytes()) != progress.private_input_digest {
+            return Ok(None);
+        }
+        let parsed = decode_private_request_fields(
+            body,
+            &job.private_input_ref,
+            &job.operation,
+            &job.payload_digest,
+        )?;
+        if !matches!(parsed, ParsedRequest::OptimizationStep(_)) {
+            return Ok(None);
+        }
+    }
+    let producer = fingerprint(&(ctx.namespace(), ctx.actor(), &job.id))?;
+    let episode = format!("management-episode-{producer}");
+    let step_request = format!("management-opt-{producer}");
+    let mut facts = std::collections::BTreeMap::new();
+    let mut step = None;
+    let mut completed = None;
+    let mut compiled_refs = Vec::new();
+    for reference in &progress.stages {
+        if reference.generation == 0
+            || reference.generation > job.generation
+            || facts
+                .insert(reference.artifact_id.clone(), reference)
+                .is_some()
+        {
+            return Ok(None);
+        }
+        let row = session
+            .object_row(ctx, "artifact", &reference.artifact_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        if row.owner != progress.journal_actor
+            || !optimization_stage_reference_matches(
+                &row.body,
+                reference,
+                ctx.namespace(),
+                &episode,
+            )?
+        {
+            return Ok(None);
+        }
+        if reference.kind == "step_prepared" {
+            if reference.request_id != step_request || step.replace(reference).is_some() {
+                return Ok(None);
+            }
+        }
+        if reference.kind == "step_completed" {
+            if reference.request_id != step_request || completed.replace(reference).is_some() {
+                return Ok(None);
+            }
+        }
+        if reference.kind == "edit_compiled" {
+            compiled_refs.push(reference.clone());
+        }
+    }
+    let Some(step) = step else { return Ok(None) };
+    if let Some(completed) = completed {
+        if completed.generation != step.generation || completed.input_digest != step.input_digest {
+            return Ok(None);
+        }
+        // The original observational writer committed this result/target in
+        // the very transaction that retained this terminal's original digest.
+        if job.pending_terminal_state.is_none() {
+            return Ok(None);
+        }
+        match job.result.as_ref() {
+            Some(ManagementResultV2::Optimization(
+                ManagementOptimizationResultV2::OptimizationStepCompleted {
+                    stage_fact_id,
+                    input_digest,
+                },
+            )) if stage_fact_id == &completed.artifact_id
+                && input_digest == &completed.input_digest => {}
+            None if !compiled_refs.is_empty()
+                && job.step == "optimization_partial_commit"
+                && job.error_code.as_deref() == Some("blocked_partial_commit") => {}
+            _ => return Ok(None),
+        }
+    }
+    let mut owned = Vec::new();
+    let mut referenced = BTreeSet::new();
+    for reference in &progress.calls {
+        if reference.generation == 0
+            || reference.generation > job.generation
+            || !referenced.insert((reference.billing_scope.clone(), reference.call_id.clone()))
+        {
+            return Ok(None);
+        }
+        let prepared = facts
+            .get(&reference.prepared_stage_id)
+            .ok_or(Error::NotFound)?;
+        if prepared.kind != "dispatch_prepared"
+            || prepared.generation != reference.generation
+            || reference.generation != step.generation
+        {
+            return Ok(None);
+        }
+        let root = session
+            .root_budget(ctx, &reference.billing_scope)
+            .await?
+            .ok_or(Error::Budget)?;
+        if root.root_budget_id != reference.root_budget_id
+            || root.billing_scope != reference.billing_scope
+            || (root.authorizing_namespace != ctx.namespace()
+                && !root
+                    .allowed_namespaces
+                    .iter()
+                    .any(|ns| ns == ctx.namespace()))
+        {
+            return Ok(None);
+        }
+        let call = session
+            .budget_call(ctx, &reference.billing_scope, &reference.call_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        if call.namespace != ctx.namespace()
+            || call.call_id != reference.call_id
+            || call.billing_scope != reference.billing_scope
+            || call.dispatch_group_id != episode
+            || call.actual_input_digest != reference.actual_input_digest
+            || call.lease_token != reference.lease_token
+            || call.lease_epoch != reference.lease_epoch
+        {
+            return Ok(None);
+        }
+        if !optimization_request_history_matches(
+            call.request_artifact.as_ref().ok_or(Error::NotFound)?,
+            reference,
+        )? {
+            return Ok(None);
+        }
+        let budget_ref_id = optimization_budget_ref_id(
+            ctx.namespace(),
+            &reference.billing_scope,
+            &reference.call_id,
+        )?;
+        let budget_ref = session
+            .object_row(ctx, "artifact", &budget_ref_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        if budget_ref.owner != reference.producer_actor
+            || hash(budget_ref.body.as_bytes()) != reference.budget_ref_digest
+        {
+            return Ok(None);
+        }
+        validate_optimization_budget_ref(
+            &budget_ref.body,
+            &budget_ref_id,
+            ctx.namespace(),
+            &reference.billing_scope,
+            &reference.call_id,
+        )?;
+        owned.push(OwnedOptimizationCall {
+            reference: reference.clone(),
+            call,
+        });
+    }
+    let mut actual = BTreeSet::new();
+    for scope in session.budget_call_scopes_for_group(ctx, &episode).await? {
+        for call in session
+            .budget_calls_for_group(ctx, &scope, &episode)
+            .await?
+        {
+            actual.insert((call.billing_scope, call.call_id));
+        }
+    }
+    if actual != referenced {
+        return Ok(None);
+    }
+    // Exact immutable observational refs, recorded by the real journal in its
+    // producer transaction, prove every attempted dispatch never entered I/O.
+    // An empty call query alone never grants this historical fact.
+    let no_call_proof = completed.is_some()
+        && progress
+            .stages
+            .iter()
+            .filter(|reference| reference.kind == "dispatch_prepared")
+            .all(|prepared| {
+                progress.stages.iter().any(|observed| {
+                    observed.kind == "dispatch_observed"
+                        && observed.dispatch_not_performed
+                        && observed.generation == prepared.generation
+                        && observed.request_id == prepared.request_id
+                        && observed.input_digest == prepared.input_digest
+                })
+            });
+    let known_none = owned.is_empty() && no_call_proof;
+    if owned.is_empty() && !known_none {
+        return Ok(None);
+    }
+    Ok(Some(OptimizationAccounting {
+        calls: owned,
+        terminal: None,
+        compiled: Vec::new(),
+        historical_compiled: compiled_refs,
+        historical_terminal: completed.is_some(),
+        known_none,
+    }))
+}
+
+async fn optimization_accounting_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    record: &VersionedManagementJob,
+) -> Result<Option<OptimizationAccounting>> {
+    match optimization_live_accounting_in_session(ctx, session, record).await {
+        Ok(Some(facts)) => Ok(Some(facts)),
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+        Ok(None) | Err(_) => {
+            optimization_historical_accounting_in_session(ctx, session, record).await
+        }
+    }
+}
+
+fn optimization_accounting_progress(
+    facts: &OptimizationAccounting,
+    record: &VersionedManagementJob,
+) -> Result<ConsumerProgress> {
+    if let Some(terminal) = &facts.terminal {
+        return Ok(ConsumerProgress::Committed(optimization_terminal_outcome(
+            terminal,
+            &facts.compiled,
+        )?));
+    }
+    if facts.historical_terminal {
+        let VersionedManagementJob::V2(job) = record else {
+            return Ok(ConsumerProgress::Unknown);
+        };
+        let Some(target) = job.pending_terminal_state else {
+            return Ok(ConsumerProgress::Unknown);
+        };
+        return Ok(ConsumerProgress::Committed(JobOutcome {
+            state: restored_terminal(target),
+            step: job.step.clone(),
+            result: job.result.clone(),
+            error_code: job.error_code.clone(),
+        }));
+    }
+    if !facts.compiled.is_empty() || !facts.historical_compiled.is_empty() {
+        return Ok(ConsumerProgress::Committed(optimization_partial_outcome()));
+    }
+    Ok(ConsumerProgress::NotCommitted)
+}
+
+async fn optimization_accounting_or_unknown(
+    ctx: &Context,
+    session: &mut Session,
+    record: &VersionedManagementJob,
+) -> Result<Option<OptimizationAccounting>> {
+    match optimization_accounting_in_session(ctx, session, record).await {
+        Ok(facts) => Ok(facts),
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+#[derive(Debug)]
+enum ConsumerProgress {
+    NotCommitted,
+    Committed(JobOutcome),
+    Unknown,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagementCurriculumEnvelope<T> {
+    schema_version: String,
+    id: String,
+    record_kind: String,
+    payload: T,
+}
+
+/// Read the real existing seven adapters, not an operation-name/empty-call
+/// shortcut. No producer or method that can dispatch a model is invoked here.
+async fn consumer_progress(
     ctx: &Context,
     store: &Store,
-    claimed: &ManagementJob,
-    outcome: JobOutcome,
-) -> Result<()> {
-    let mut session = store.session().await?;
-    let mut current: ManagementJob = session.need(ctx, "job", &claimed.id).await?;
-    ensure_owner(ctx, &current)?;
-    if is_terminal(current.state) {
+    record: &VersionedManagementJob,
+) -> Result<ConsumerProgress> {
+    if record.identity().operation == "optimization.step" {
+        let mut session = store.session().await?;
+        let current = load_job_record_in_session(ctx, &mut session, record.identity().id).await?;
+        let facts = optimization_accounting_or_unknown(ctx, &mut session, &current).await?;
+        let progress = match facts {
+            Some(facts) => optimization_accounting_progress(&facts, &current)?,
+            None => ConsumerProgress::Unknown,
+        };
         session.commit().await?;
+        return Ok(progress);
+    }
+    let request = load_private_request_record(ctx, store, record)
+        .await
+        .map_err(InputFault::into_error)?;
+    validate_request_authority(ctx, &request)?;
+    let mut sources = store.session().await?;
+    ensure_dependencies_live(ctx, &mut sources, &private_dependencies(&request)?).await?;
+    sources.commit().await?;
+    match request {
+        ParsedRequest::ExperimentRegister(request) => {
+            let mut session = store.session().await?;
+            let progress = IndependentEvaluationControl::registration_progress_in_session(
+                ctx,
+                &mut session,
+                &request.control.id,
+                &request.holdout.id,
+            )
+            .await?;
+            let c = request.control.digest()?;
+            let h = request.holdout.digest(&request.control)?;
+            if progress.control_digest.as_deref().is_some_and(|v| v != c)
+                || progress.holdout_digest.as_deref().is_some_and(|v| v != h)
+            {
+                return Err(Error::Conflict(
+                    "registered experiment content differs".into(),
+                ));
+            }
+            session.commit().await?;
+            // In the known legacy writer these phases were reached only after
+            // this job's control commit. A bare matching pre-existing C does
+            // not prove that this request created it.
+            let recorded_control = record.generation() > 0
+                && matches!(
+                    record.step(),
+                    "control_registered" | "before_holdout_registration" | "experiment_registered"
+                );
+            let saved_control = match record.result() {
+                Some(ManagementResultV2::Partial(
+                    ManagementPartialResultV2::ControlRegistered {
+                        control_id,
+                        control_digest,
+                    },
+                )) => control_id == request.control.id && control_digest == c,
+                Some(ManagementResultV2::Original(ManagementResult::ExperimentRegistered {
+                    control_id,
+                    control_digest,
+                    ..
+                })) => control_id == request.control.id && control_digest == c,
+                _ => false,
+            };
+            if progress.control_digest.is_some() && !recorded_control && !saved_control {
+                return Ok(ConsumerProgress::Unknown);
+            }
+            match (progress.control_digest, progress.holdout_digest) {
+                (None, None) => Ok(ConsumerProgress::NotCommitted),
+                (Some(control_digest), None) => Ok(ConsumerProgress::Committed(JobOutcome {
+                    state: ManagementJobState::Blocked,
+                    step: "control_registered".into(),
+                    result: Some(ManagementResultV2::Partial(
+                        ManagementPartialResultV2::ControlRegistered {
+                            control_id: request.control.id,
+                            control_digest,
+                        },
+                    )),
+                    error_code: Some("blocked_partial_commit".into()),
+                })),
+                (Some(control_digest), Some(holdout_digest)) => {
+                    Ok(ConsumerProgress::Committed(JobOutcome {
+                        state: ManagementJobState::Succeeded,
+                        step: "experiment_registered".into(),
+                        result: Some(ManagementResultV2::Original(
+                            ManagementResult::ExperimentRegistered {
+                                control_id: request.control.id,
+                                control_digest,
+                                holdout_id: request.holdout.id,
+                                holdout_digest,
+                            },
+                        )),
+                        error_code: None,
+                    }))
+                }
+                _ => Err(Error::Conflict(
+                    "holdout exists without its registered control".into(),
+                )),
+            }
+        }
+        ParsedRequest::ExperimentRegisterCurrent(request) => {
+            let mut session = store.session().await?;
+            let progress = IndependentEvaluationControl::registration_progress_in_session(
+                ctx,
+                &mut session,
+                &request.control.id,
+                &request.holdout.id,
+            )
+            .await?;
+            let c = request.control.digest()?;
+            let h = request.holdout.digest(&request.control)?;
+            if progress.control_digest.as_deref().is_some_and(|v| v != c)
+                || progress.holdout_digest.as_deref().is_some_and(|v| v != h)
+            {
+                return Err(Error::Conflict(
+                    "registered experiment content differs".into(),
+                ));
+            }
+            session.commit().await?;
+            match (progress.control_digest, progress.holdout_digest) {
+                (None, None) => Ok(ConsumerProgress::NotCommitted),
+                // A Current registration input was admitted before this job.
+                // Its mere presence is not a side effect owned by this job.
+                (Some(_), None) => Ok(ConsumerProgress::NotCommitted),
+                (Some(control_digest), Some(holdout_digest)) => {
+                    let owned_result = matches!(record.original_result(),
+                        Some(ManagementResult::ExperimentRegistered {control_id,control_digest: saved_c,holdout_id,holdout_digest: saved_h})
+                        if control_id == &request.control.id && saved_c == &control_digest
+                            && holdout_id == &request.holdout.id && saved_h == &holdout_digest);
+                    if record.identity().schema_version == evo_storage::MANAGEMENT_JOB_V2_SCHEMA
+                        && record.identity().state == ManagementJobState::Cancelled
+                        && !owned_result
+                    {
+                        return Ok(ConsumerProgress::NotCommitted);
+                    }
+                    if !owned_result
+                        && !matches!(
+                            record.step(),
+                            "experiment_registered" | "experiment_already_registered"
+                        )
+                    {
+                        return Ok(ConsumerProgress::Unknown);
+                    }
+                    Ok(ConsumerProgress::Committed(JobOutcome {
+                        state: ManagementJobState::Succeeded,
+                        step: if record.identity().schema_version
+                            == evo_storage::MANAGEMENT_JOB_V2_SCHEMA
+                            && record.step() == "experiment_already_registered"
+                        {
+                            "experiment_already_registered"
+                        } else {
+                            "experiment_registered"
+                        }
+                        .into(),
+                        result: Some(ManagementResultV2::Original(
+                            ManagementResult::ExperimentRegistered {
+                                control_id: request.control.id,
+                                control_digest,
+                                holdout_id: request.holdout.id,
+                                holdout_digest,
+                            },
+                        )),
+                        error_code: None,
+                    }))
+                }
+                _ => Err(Error::Conflict(
+                    "holdout exists without its registered control".into(),
+                )),
+            }
+        }
+        ParsedRequest::EvaluationStart(request) => {
+            let stored_ticket_id = match record.original_result() {
+                Some(ManagementResult::EvaluationTicketBlocked { ticket_id }) => {
+                    Some(ticket_id.as_str())
+                }
+                _ => None,
+            };
+            let Some(current) =
+                evaluation_start_existing_status(ctx, store, &request, stored_ticket_id).await?
+            else {
+                return Ok(ConsumerProgress::NotCommitted);
+            };
+            Ok(ConsumerProgress::Committed(JobOutcome {
+                state: ManagementJobState::Blocked,
+                step: "ticket_issued_execution_blocked".into(),
+                result: Some(ManagementResultV2::Original(
+                    ManagementResult::EvaluationTicketBlocked {
+                        ticket_id: current.ticket.id,
+                    },
+                )),
+                error_code: Some("execution_provider_unconfigured".into()),
+            }))
+        }
+        ParsedRequest::EvaluationStatus(request) => {
+            // This is the real full read-only consumer. It does not claim the
+            // historical ticket's own provider calls for this management job.
+            IndependentEvaluationControl::status(ctx, store, &request.ticket_id).await?;
+            Ok(ConsumerProgress::NotCommitted)
+        }
+        ParsedRequest::ReplayRun(request) => {
+            let policy = fingerprint(&request.policy)?;
+            let profile = fingerprint(&request.profile)?;
+            let caps = fingerprint(&request.caps)?;
+            let ids = if let Some(ManagementResult::ReplayStored { report_id, .. }) =
+                record.original_result()
+            {
+                vec![report_id.clone()]
+            } else {
+                [
+                    evo_core::replay::ReplayReportIdentityVersion::LegacyV2,
+                    evo_core::replay::ReplayReportIdentityVersion::NextV3,
+                ]
+                .into_iter()
+                .map(|version| {
+                    evo_core::replay::replay_report_id_for_version(
+                        version,
+                        ctx.namespace(),
+                        request.partition,
+                        &request.pool_digest,
+                        &policy,
+                        &profile,
+                        &caps,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+            };
+            for id in ids {
+                let mut session = store.session().await?;
+                let present =
+                    evo_storage::replay::replay_report_version_in_session(&mut session, ctx, &id)
+                        .await
+                        .map_err(crate::replay::replay_read_isolation_for_existing_api)?
+                        .is_some();
+                session.commit().await?;
+                if !present {
+                    continue;
+                }
+                let read = crate::replay::query_replay_report_record(ctx, store, &id)
+                    .await
+                    .map_err(crate::replay::replay_read_isolation_for_existing_api)?;
+                let (actual_id, pool, semantic, actual_policy, actual_profile, actual_caps) =
+                    if let Some(old) = read.record.report() {
+                        (
+                            &old.report_id,
+                            &old.pool_digest,
+                            &old.semantic_reports_digest,
+                            &old.policy_digest,
+                            &old.profile_digest,
+                            &old.caps_digest,
+                        )
+                    } else if let Some(current) = read.record.current_report() {
+                        (
+                            &current.report_id,
+                            &current.pool_digest,
+                            &current.semantic_reports_digest,
+                            &current.policy_digest,
+                            &current.profile_digest,
+                            &current.caps_digest,
+                        )
+                    } else {
+                        return Err(Error::Invalid("invalid replay audit record".into()));
+                    };
+                if actual_id != &id
+                    || pool != &request.pool_digest
+                    || actual_policy != &policy
+                    || actual_profile != &profile
+                    || actual_caps != &caps
+                {
+                    return Err(Error::Conflict("replay report view digest mismatch".into()));
+                }
+                return Ok(ConsumerProgress::Committed(JobOutcome {
+                    state: ManagementJobState::Succeeded,
+                    step: "replay_stored".into(),
+                    result: Some(ManagementResultV2::Original(
+                        ManagementResult::ReplayStored {
+                            report_id: id,
+                            pool_digest: pool.clone(),
+                            semantic_reports_digest: semantic.clone(),
+                        },
+                    )),
+                    error_code: None,
+                }));
+            }
+            // Both exact producer report identities are absent after the real
+            // private request/source gate. This offline adapter has not stored
+            // its business effect; an absent pool is a producer failure, not a
+            // reason to invent an indefinitely in-flight provider execution.
+            Ok(ConsumerProgress::NotCommitted)
+        }
+        ParsedRequest::CurriculumStep(request) => {
+            let logical = crate::curriculum::probe_schedule_receipt_id(record.identity().id)?;
+            let physical = format!(
+                "e12-{}",
+                fingerprint(&("probe_schedule_receipt_v1", &logical))?
+            );
+            let mut session = store.session().await?;
+            let Some(row) = session.object_row(ctx, "artifact", &physical).await? else {
+                session.commit().await?;
+                return Ok(ConsumerProgress::NotCommitted);
+            };
+            if row.owner != ctx.actor() {
+                return Err(Error::Forbidden);
+            }
+            let value = evo_storage::lifecycle::parse_strict_json(&row.body)?;
+            let envelope: ManagementCurriculumEnvelope<crate::curriculum::ProbeScheduleReceiptV1> =
+                serde_json::from_value(value).map_err(|_| {
+                    Error::Conflict("probe schedule receipt differs from the request".into())
+                })?;
+            let receipt = envelope.payload;
+            if envelope.schema_version != "rsia.curriculum_artifact_envelope.v1"
+                || envelope.id != physical
+                || envelope.record_kind != "probe_schedule_receipt_v1"
+                || receipt.schema_version != crate::curriculum::ProbeScheduleReceiptV1::SCHEMA
+                || receipt.id != logical
+                || receipt.idempotency_key != record.identity().id
+                || receipt.profile_id != request.profile_id
+                || receipt.state_id != request.state_id
+                || receipt.root_budget_limit_micros != request.root_budget_limit_micros
+            {
+                return Err(Error::Conflict(
+                    "probe schedule receipt differs from the request".into(),
+                ));
+            }
+            let profile_id = crate::curriculum::curriculum_profile_storage_id(&receipt.profile_id)?;
+            let profile_row = session
+                .object_row(ctx, "artifact", &profile_id)
+                .await?
+                .ok_or(Error::NotFound)?;
+            let profile_value = evo_storage::lifecycle::parse_strict_json(&profile_row.body)?;
+            let profile_envelope: ManagementCurriculumEnvelope<
+                evo_core::curriculum::CurriculumControlProfileV1,
+            > = serde_json::from_value(profile_value)
+                .map_err(|_| Error::Conflict("curriculum artifact envelope mismatch".into()))?;
+            if profile_envelope.schema_version != "rsia.curriculum_artifact_envelope.v1"
+                || profile_envelope.id != profile_id
+                || profile_envelope.record_kind != "curriculum_profile_v1"
+            {
+                return Err(Error::Conflict(
+                    "curriculum artifact envelope mismatch".into(),
+                ));
+            }
+            if profile_envelope.payload.profile_id != receipt.profile_id {
+                return Err(Error::Conflict(
+                    "curriculum artifact envelope mismatch".into(),
+                ));
+            }
+            profile_envelope.payload.validate()?;
+            let expected_edges: BTreeSet<_> = [
+                (
+                    "artifact".into(),
+                    crate::curriculum::curriculum_probe_job_storage_id(&receipt.probe_job_id)?,
+                ),
+                (
+                    "artifact".into(),
+                    crate::curriculum::curriculum_state_storage_id(&receipt.state_id)?,
+                ),
+                ("artifact".into(), profile_id),
+            ]
+            .into_iter()
+            .collect();
+            if session
+                .dependency_edges(ctx, "artifact", &physical)
+                .await?
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                != expected_edges
+            {
+                return Err(Error::Conflict(
+                    "recorded probe job differs from its schedule receipt".into(),
+                ));
+            }
+            session.commit().await?;
+            let probe =
+                crate::curriculum::verified_probe_job_view(ctx, store, &receipt.probe_job_id)
+                    .await?;
+            if probe.profile_id != receipt.profile_id
+                || probe.state_id != receipt.state_id
+                || probe.trigger_digest != receipt.trigger_digest
+                || probe.root_budget_limit_micros != receipt.root_budget_limit_micros
+                || probe.effective_monetary_limit_micros != 0
+                || probe.provider_dispatch_count != 0
+                || !probe.attempts.is_empty()
+                || profile_envelope.payload.runtime_status
+                    != evo_core::curriculum::CurriculumRuntimeStatus::Disabled
+            {
+                return Ok(ConsumerProgress::Unknown);
+            }
+            Ok(ConsumerProgress::Committed(JobOutcome {
+                state: ManagementJobState::Succeeded,
+                step: "probe_scheduled".into(),
+                result: Some(ManagementResultV2::Original(
+                    ManagementResult::ProbeScheduled {
+                        probe_job_id: probe.id,
+                        trigger_digest: probe.trigger_digest,
+                        terminal: probe.terminal,
+                    },
+                )),
+                error_code: None,
+            }))
+        }
+        ParsedRequest::ExplorationStart(request) => {
+            let physical = crate::exploration::exploration_world_storage_id(&request.world.id)?;
+            let mut session = store.session().await?;
+            let present = session
+                .object_row(ctx, "artifact", &physical)
+                .await?
+                .is_some();
+            session.commit().await?;
+            if !present {
+                return Ok(ConsumerProgress::NotCommitted);
+            }
+            let registration =
+                crate::exploration::verified_world_registration_view(ctx, store, &request.world.id)
+                    .await?;
+            crate::exploration::ensure_world_registered_as(ctx, store, &request.world).await?;
+            let first = crate::exploration::first_decision(&request.world)?;
+            if registration.context_signature != request.world.context_signature
+                || registration.policy_digest != first.policy_digest
+                || registration.caps_digest != first.caps_digest
+            {
+                return Err(Error::Conflict(
+                    "exploration decision view differs from the stored result".into(),
+                ));
+            }
+            Ok(ConsumerProgress::Committed(JobOutcome {
+                state: ManagementJobState::Succeeded,
+                step: "exploration_started".into(),
+                result: Some(ManagementResultV2::Original(
+                    ManagementResult::ExplorationStarted {
+                        world_id: request.world.id,
+                        context_signature: request.world.context_signature,
+                        prefix_digest: first.prefix_digest,
+                        legal_actions_digest: first.legal_actions_digest,
+                        policy_digest: first.policy_digest,
+                        caps_digest: first.caps_digest,
+                        action: first.action,
+                    },
+                )),
+                error_code: None,
+            }))
+        }
+        ParsedRequest::OptimizationStep(_) => Err(Error::Internal),
+        ParsedRequest::Blocked(request) => {
+            if record.identity().operation != "meta.start"
+                || request.schema_version != "rsia.management.meta_start.v1"
+            {
+                return Ok(ConsumerProgress::Unknown);
+            }
+            Ok(ConsumerProgress::NotCommitted)
+        }
+    }
+}
+
+// A physical consumer may currently prove less than this authenticated job
+// already committed. That is uncertainty, never permission to erase refs.
+fn committed_result_is_preserved(
+    stored: Option<&ManagementResultV2>,
+    actual: Option<&ManagementResultV2>,
+) -> Result<bool> {
+    if !stored_result_has_side_effect(stored) {
+        return Ok(true);
+    }
+    let (Some(stored), Some(actual)) = (stored, actual) else {
+        return Ok(false);
+    };
+    if fingerprint(stored)? == fingerprint(actual)? {
+        return Ok(true);
+    }
+    match (stored, actual) {
+        (
+            ManagementResultV2::Partial(ManagementPartialResultV2::ControlRegistered {
+                control_id,
+                control_digest,
+            }),
+            ManagementResultV2::Original(ManagementResult::ExperimentRegistered {
+                control_id: actual_id,
+                control_digest: actual_digest,
+                ..
+            }),
+        ) => Ok(control_id == actual_id && control_digest == actual_digest),
+        _ => Ok(false),
+    }
+}
+
+fn progress_preserves_committed_result(
+    stored: Option<&ManagementResultV2>,
+    progress: &ConsumerProgress,
+) -> Result<bool> {
+    match progress {
+        ConsumerProgress::Unknown => Ok(true),
+        ConsumerProgress::NotCommitted => Ok(!stored_result_has_side_effect(stored)),
+        ConsumerProgress::Committed(outcome) => {
+            committed_result_is_preserved(stored, outcome.result.as_ref())
+        }
+    }
+}
+
+async fn consumer_progress_or_unknown(
+    ctx: &Context,
+    store: &Store,
+    record: &VersionedManagementJob,
+) -> Result<ConsumerProgress> {
+    match consumer_progress(ctx, store, record).await {
+        Ok(progress) => {
+            if progress_preserves_committed_result(record.result().as_ref(), &progress)? {
+                Ok(progress)
+            } else {
+                Ok(ConsumerProgress::Unknown)
+            }
+        }
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+        Err(
+            Error::Invalid(_)
+            | Error::Forbidden
+            | Error::NotFound
+            | Error::Conflict(_)
+            | Error::Budget
+            | Error::Cancelled,
+        ) => Ok(ConsumerProgress::Unknown),
+    }
+}
+
+fn pending_terminal(state: ManagementJobState) -> Option<ManagementPendingTerminalState> {
+    match state {
+        ManagementJobState::Succeeded => Some(ManagementPendingTerminalState::Succeeded),
+        ManagementJobState::Failed => Some(ManagementPendingTerminalState::Failed),
+        ManagementJobState::Cancelled => Some(ManagementPendingTerminalState::Cancelled),
+        ManagementJobState::Blocked => Some(ManagementPendingTerminalState::Blocked),
+        _ => None,
+    }
+}
+
+fn restored_terminal(state: ManagementPendingTerminalState) -> ManagementJobState {
+    match state {
+        ManagementPendingTerminalState::Succeeded => ManagementJobState::Succeeded,
+        ManagementPendingTerminalState::Failed => ManagementJobState::Failed,
+        ManagementPendingTerminalState::Cancelled => ManagementJobState::Cancelled,
+        ManagementPendingTerminalState::Blocked => ManagementJobState::Blocked,
+    }
+}
+
+fn apply_completed_outcome(current: &mut ManagementJobV2, outcome: &JobOutcome) -> Result<()> {
+    if pending_terminal(outcome.state).is_none() {
+        return Err(Error::Conflict(
+            "management worker did not return a terminal outcome".into(),
+        ));
+    }
+    if !committed_result_is_preserved(current.result.as_ref(), outcome.result.as_ref())? {
+        current.state = ManagementJobState::Draining;
         return Ok(());
     }
-    ensure_fence(&current, claimed)?;
-    let cancelled_after_side_effect =
-        current.cancel_requested && outcome.has_committed_side_effect();
-    if current.cancel_requested && !cancelled_after_side_effect {
+    let partial_control = matches!(
+        outcome.result.as_ref(),
+        Some(ManagementResultV2::Partial(_))
+    );
+    let partial =
+        partial_control || outcome.error_code.as_deref() == Some("blocked_partial_commit");
+    let committed = outcome.has_committed_side_effect()
+        || partial
+        || (current.operation == "optimization.step"
+            && current.cancel_arrival == Some(ManagementCancelArrival::AfterSideEffect));
+    if partial {
+        current.state = ManagementJobState::Blocked;
+        current.step = if partial_control {
+            "control_registered".into()
+        } else {
+            outcome.step.clone()
+        };
+        current.result = outcome.result.clone();
+        current.error_code = Some("blocked_partial_commit".into());
+    } else if current.cancel_requested && !committed {
         current.state = ManagementJobState::Cancelled;
         current.step = "cancelled".into();
-        current.result = None;
+        current.result = if current.operation == "optimization.step" {
+            outcome.result.clone()
+        } else {
+            None
+        };
         current.error_code = Some("cancelled".into());
     } else {
         current.state = outcome.state;
-        current.step = outcome.step;
-        if cancelled_after_side_effect {
-            current.step.push_str(":cancel_after_side_effect");
-        }
-        current.result = outcome.result;
-        current.error_code = outcome.error_code;
+        current.step = outcome
+            .step
+            .strip_suffix(":cancel_after_side_effect")
+            .unwrap_or(&outcome.step)
+            .to_owned();
+        current.result = outcome.result.clone();
+        current.error_code = outcome.error_code.clone();
     }
+    if current.cancel_requested {
+        current.cancel_arrival = Some(
+            if committed || current.cancel_arrival == Some(ManagementCancelArrival::AfterSideEffect)
+            {
+                ManagementCancelArrival::AfterSideEffect
+            } else {
+                ManagementCancelArrival::BeforeSideEffect
+            },
+        );
+    }
+    current.pending_terminal_state = None;
     current.lease_token = None;
     current.lease_until = 0;
+    Ok(())
+}
+
+/// The original live-fence writer is still strict, including terminal/stale
+/// early-return. Its sole production caller has actually awaited the worker.
+async fn finish_claim(
+    ctx: &Context,
+    store: &Store,
+    claimed: &ManagementJobV2,
+    outcome: JobOutcome,
+) -> Result<()> {
+    let mut session = store.session().await?;
+    let record = load_job_record_in_session(ctx, &mut session, &claimed.id).await?;
+    if is_terminal(record.identity().state) {
+        session.commit().await?;
+        return Ok(());
+    }
+    let mut current = record.into_unfinished_v2()?;
+    ensure_fence(&current, claimed)?;
+    apply_completed_outcome(&mut current, &outcome)?;
     session
         .put(ctx, "job", &current.id, ctx.actor(), &current)
         .await?;
@@ -1559,29 +4292,450 @@ async fn finish_claim(
     session.commit().await
 }
 
-async fn cancel_job_atomic(ctx: &Context, store: &Store, job_id: &str) -> Result<ManagementJob> {
-    identifier(job_id)?;
-    let mut session = store.session().await?;
-    let mut job: ManagementJob = session.need(ctx, "job", job_id).await?;
-    ensure_owner(ctx, &job)?;
-    if !is_terminal(job.state) {
-        job.cancel_requested = true;
-        if job.state == ManagementJobState::Queued {
-            job.state = ManagementJobState::Cancelled;
-            job.step = "cancelled_before_claim".into();
-            job.error_code = Some("cancelled".into());
+impl ManagementDispatcher {
+    /// Invoked after the job's cancel commit or after an actual worker exit.
+    /// The reader transaction is released before the original Store wrappers.
+    async fn optimization_budget_actions(&self, ctx: &Context, job_id: &str) -> Result<()> {
+        let mut session = self.store.session().await?;
+        let record = load_job_record_in_session(ctx, &mut session, job_id).await?;
+        let requested = record.cancel_requested();
+        let facts = optimization_accounting_or_unknown(ctx, &mut session, &record).await?;
+        session.commit().await?;
+        let Some(facts) = facts else { return Ok(()) };
+        for owned in facts.calls {
+            let call = &owned.call;
+            let cancel = match call.state {
+                evo_storage::budget::BudgetCallState::Reserved => {
+                    // A newer Reserved fence is not ours to release.
+                    call.lease_token == owned.reference.lease_token
+                        && call.lease_epoch == owned.reference.lease_epoch
+                }
+                evo_storage::budget::BudgetCallState::Dispatched
+                | evo_storage::budget::BudgetCallState::Uncertain => requested,
+                _ => false,
+            };
+            if !cancel {
+                continue;
+            }
+            let fence = evo_storage::budget::BudgetCallFence {
+                billing_scope: call.billing_scope.clone(),
+                call_id: call.call_id.clone(),
+                actual_input_digest: call.actual_input_digest.clone(),
+                lease_token: call.lease_token.clone(),
+                lease_epoch: call.lease_epoch,
+                now: now()?,
+            };
+            // Only original budget semantics: proven Reserved release;
+            // Dispatched -> Uncertain; no refund/re-dispatch/automatic charge.
+            self.store
+                .cancel_budget_call(ctx, &fence, "management_job_stopped")
+                .await?;
         }
-        session.put(ctx, "job", &job.id, ctx.actor(), &job).await?;
-        session.audit(ctx, "management.job.cancel", &job.id).await?;
+        Ok(())
     }
-    session.commit().await?;
-    Ok(job)
 }
 
-fn ensure_fence(current: &ManagementJob, claimed: &ManagementJob) -> Result<()> {
+impl ManagementDispatcher {
+    async fn finish_observed_worker(
+        &self,
+        ctx: &Context,
+        claimed: &ManagementJobV2,
+        observed: &ObservedWorkerExit,
+    ) -> Result<ManagementJobState> {
+        if claimed.operation == "optimization.step" {
+            let current = load_job_record(ctx, &self.store, &claimed.id).await?;
+            if is_terminal(current.identity().state) {
+                return Ok(current.identity().state);
+            }
+            // This entry owns a real exit/startup witness. Budget work happens
+            // outside the subsequent management writer transaction.
+            self.optimization_budget_actions(ctx, &claimed.id).await?;
+        }
+        if let ObservedWorkerExit::Completed(outcome) = observed
+            && claimed.operation != "optimization.step"
+        {
+            match finish_claim(ctx, &self.store, claimed, outcome.clone()).await {
+                Ok(()) => {
+                    return Ok(load_job_record(ctx, &self.store, &claimed.id)
+                        .await?
+                        .identity()
+                        .state);
+                }
+                Err(Error::Conflict(reason)) if reason == "management job lease fence changed" => {}
+                Err(error) => return Err(error),
+            }
+        }
+        // One actual worker has exited, or startup owns the data directory.
+        // Ordinary old workers never reach this expired-lease reconciliation.
+        let _at = now()?;
+        let record = load_job_record(ctx, &self.store, &claimed.id).await?;
+        if is_terminal(record.identity().state) {
+            return Ok(record.identity().state);
+        }
+        let progress = match observed {
+            // The real pre-consumer exit/new unclaimed queue has not entered a
+            // producer. This proof comes from the owned handle/claim path.
+            ObservedWorkerExit::BeforeConsumerFailed(_) | ObservedWorkerExit::NeverStarted => {
+                ConsumerProgress::NotCommitted
+            }
+            ObservedWorkerExit::Completed(_) => ConsumerProgress::NotCommitted,
+            ObservedWorkerExit::Failed(_) | ObservedWorkerExit::Restarted => {
+                consumer_progress_or_unknown(ctx, &self.store, &record).await?
+            }
+        };
+        let mut session = self.store.session().await?;
+        let actual = load_job_record_in_session(ctx, &mut session, &claimed.id).await?;
+        if is_terminal(actual.identity().state) {
+            let state = actual.identity().state;
+            session.commit().await?;
+            return Ok(state);
+        }
+        let mut current = actual.into_unfinished_v2()?;
+        let before = fingerprint(&current)?;
+        if !same_claim_fields(&current, claimed) {
+            return Err(Error::Conflict("management job lease fence changed".into()));
+        }
+        let progress = if progress_preserves_committed_result(current.result.as_ref(), &progress)? {
+            progress
+        } else {
+            ConsumerProgress::Unknown
+        };
+        if current.operation == "optimization.step" {
+            let current_record = VersionedManagementJob::V2(current.clone());
+            let accounting =
+                optimization_accounting_or_unknown(ctx, &mut session, &current_record).await?;
+            if current.cancel_requested
+                && accounting
+                    .as_ref()
+                    .is_some_and(|facts| facts.has_business_side_effect())
+            {
+                current.cancel_arrival = Some(ManagementCancelArrival::AfterSideEffect);
+            }
+            if let Some(facts) = &accounting {
+                let actual = optimization_accounting_progress(facts, &current_record)?;
+                if let ConsumerProgress::Committed(outcome) = actual {
+                    if progress_preserves_committed_result(
+                        current.result.as_ref(),
+                        &ConsumerProgress::Committed(outcome.clone()),
+                    )? && (facts.terminal.is_some() || facts.historical_terminal)
+                    {
+                        let original_token = current.lease_token.clone();
+                        let original_until = current.lease_until;
+                        apply_completed_outcome(&mut current, &outcome)?;
+                        if facts.pending() {
+                            current.pending_terminal_state = pending_terminal(current.state);
+                            current.state = ManagementJobState::Draining;
+                            current.lease_token = original_token;
+                            current.lease_until = original_until;
+                        }
+                        if fingerprint(&current)? != before {
+                            now()?;
+                            session
+                                .put(ctx, "job", &current.id, ctx.actor(), &current)
+                                .await?;
+                            session
+                                .audit(
+                                    ctx,
+                                    if current.state == ManagementJobState::Draining {
+                                        "management.job.draining"
+                                    } else {
+                                        "management.job.finish"
+                                    },
+                                    &current.id,
+                                )
+                                .await?;
+                        }
+                        let state = current.state;
+                        session.commit().await?;
+                        return Ok(state);
+                    }
+                }
+            }
+            let pre_consumer_exit = matches!(
+                observed,
+                ObservedWorkerExit::BeforeConsumerFailed(_) | ObservedWorkerExit::NeverStarted
+            ) && current.optimization.is_none();
+            let unresolved =
+                !pre_consumer_exit && accounting.as_ref().is_none_or(|facts| facts.pending());
+            if current.cancel_requested
+                && accounting
+                    .as_ref()
+                    .is_some_and(|facts| facts.has_business_side_effect())
+            {
+                current.cancel_arrival = Some(ManagementCancelArrival::AfterSideEffect);
+            }
+            if unresolved {
+                let original_token = current.lease_token.clone();
+                let original_until = current.lease_until;
+                if let ObservedWorkerExit::Completed(outcome)
+                | ObservedWorkerExit::BeforeConsumerFailed(outcome) = observed
+                {
+                    apply_completed_outcome(&mut current, outcome)?;
+                    if let Some(target) = pending_terminal(current.state) {
+                        current.pending_terminal_state = Some(target);
+                    }
+                    current.lease_token = original_token;
+                    current.lease_until = original_until;
+                }
+                if let ObservedWorkerExit::Failed(code) = observed {
+                    if let Some(facts) = &accounting {
+                        if !facts.compiled.is_empty() || !facts.historical_compiled.is_empty() {
+                            current.pending_terminal_state =
+                                Some(ManagementPendingTerminalState::Blocked);
+                            current.step = "optimization_partial_commit".into();
+                            current.error_code = Some("blocked_partial_commit".into());
+                        } else if facts.terminal.is_none()
+                            && !facts.historical_terminal
+                            && !stored_result_has_side_effect(current.result.as_ref())
+                        {
+                            current.pending_terminal_state = Some(if current.cancel_requested {
+                                ManagementPendingTerminalState::Cancelled
+                            } else {
+                                ManagementPendingTerminalState::Failed
+                            });
+                            current.step = if current.cancel_requested {
+                                "cancelled".into()
+                            } else {
+                                "worker_exited_before_commit".into()
+                            };
+                            current.error_code = Some(if current.cancel_requested {
+                                "cancelled".into()
+                            } else {
+                                code.clone()
+                            });
+                        }
+                    }
+                }
+                current.state = ManagementJobState::Draining;
+                if current.cancel_requested
+                    && accounting
+                        .as_ref()
+                        .is_some_and(|facts| facts.has_business_side_effect())
+                {
+                    current.cancel_arrival = Some(ManagementCancelArrival::AfterSideEffect);
+                }
+                if fingerprint(&current)? != before {
+                    now()?;
+                    session
+                        .put(ctx, "job", &current.id, ctx.actor(), &current)
+                        .await?;
+                    session
+                        .audit(ctx, "management.job.draining", &current.id)
+                        .await?;
+                }
+                session.commit().await?;
+                return Ok(ManagementJobState::Draining);
+            }
+        }
+        match observed {
+            ObservedWorkerExit::Completed(outcome)
+            | ObservedWorkerExit::BeforeConsumerFailed(outcome) => {
+                // These are the actual original seven no-dispatch adapters,
+                // not a request/body claim or an empty BudgetCall query.
+                apply_completed_outcome(&mut current, outcome)?;
+            }
+            _ => match progress {
+                ConsumerProgress::Unknown => {
+                    current.state = ManagementJobState::Draining;
+                    // Existing step/result/error/refs stay intact. No guessed
+                    // terminal, no new dispatch and no empty-fee completion.
+                    if let ObservedWorkerExit::Failed(code) = observed {
+                        if !current.diagnostics.last().is_some_and(|last| {
+                            last.code == *code && last.observed_generation == current.generation
+                        }) {
+                            if current.diagnostics.len() >= 32 {
+                                current.diagnostics.remove(0);
+                            }
+                            current.diagnostics.push(ManagementDiagnostic {
+                                code: code.clone(),
+                                observed_generation: current.generation,
+                                recorded_at: _at,
+                            });
+                        }
+                    }
+                }
+                ConsumerProgress::Committed(mut outcome) => {
+                    if let Some(state) = current.pending_terminal_state {
+                        outcome.state = restored_terminal(state);
+                        outcome.step = current.step.clone();
+                        outcome.result = current.result.clone();
+                        outcome.error_code = current.error_code.clone();
+                    }
+                    apply_completed_outcome(&mut current, &outcome)?;
+                }
+                ConsumerProgress::NotCommitted
+                    if current.step != "experiment_already_registered"
+                        && stored_result_has_side_effect(current.result.as_ref()) =>
+                {
+                    // Re-read current is authoritative even if it acquired a
+                    // committed reference after the earlier progress read.
+                    current.state = ManagementJobState::Draining;
+                }
+                ConsumerProgress::NotCommitted if current.pending_terminal_state.is_some() => {
+                    let outcome = JobOutcome {
+                        state: restored_terminal(
+                            current.pending_terminal_state.ok_or(Error::Internal)?,
+                        ),
+                        step: current.step.clone(),
+                        result: current.result.clone(),
+                        error_code: current.error_code.clone(),
+                    };
+                    apply_completed_outcome(&mut current, &outcome)?;
+                }
+                ConsumerProgress::NotCommitted => {
+                    let (step, code) = if current.cancel_requested {
+                        ("cancelled", "cancelled".to_owned())
+                    } else {
+                        let code = match observed {
+                            ObservedWorkerExit::Failed(code) => code.clone(),
+                            _ => "management_worker_exited".into(),
+                        };
+                        ("worker_exited_before_commit", code)
+                    };
+                    let outcome = JobOutcome {
+                        state: if current.cancel_requested {
+                            ManagementJobState::Cancelled
+                        } else {
+                            ManagementJobState::Failed
+                        },
+                        step: step.into(),
+                        result: None,
+                        error_code: Some(code),
+                    };
+                    apply_completed_outcome(&mut current, &outcome)?;
+                }
+            },
+        }
+        if fingerprint(&current)? == before {
+            let state = current.state;
+            session.commit().await?;
+            return Ok(state);
+        }
+        now()?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(
+                ctx,
+                if current.state == ManagementJobState::Draining {
+                    "management.job.draining"
+                } else {
+                    "management.job.finish"
+                },
+                &current.id,
+            )
+            .await?;
+        session.commit().await?;
+        Ok(current.state)
+    }
+}
+
+async fn cancel_job_atomic(
+    ctx: &Context,
+    store: &Store,
+    job_id: &str,
+) -> Result<VersionedManagementJob> {
+    identifier(job_id)?;
+    let mut session = store.session().await?;
+    let record = load_job_record_in_session(ctx, &mut session, job_id).await?;
+    if is_terminal(record.identity().state) || record.cancel_requested() {
+        // Includes old terminal v1 and already-requested Running/Draining:
+        // logical zero-write, no new audit/revision/arrival and no migration.
+        session.commit().await?;
+        return Ok(record);
+    }
+    let optimization_effect = if record.identity().operation == "optimization.step" {
+        optimization_accounting_or_unknown(ctx, &mut session, &record)
+            .await?
+            .map(|facts| facts.has_business_side_effect())
+    } else {
+        None
+    };
+    let mut job = record.into_unfinished_v2()?;
+    let _at = now()?;
+    let never_claimed = job.state == ManagementJobState::Queued
+        && job.generation == 0
+        && job.lease_token.is_none()
+        && job.result.is_none();
+    job.cancel_requested = true;
+    if never_claimed {
+        job.state = ManagementJobState::Cancelled;
+        job.step = "cancelled_before_claim".into();
+        job.error_code = Some("cancelled".into());
+        job.cancel_arrival = Some(ManagementCancelArrival::BeforeSideEffect);
+        job.lease_until = 0;
+    } else {
+        // Cancellation prevents future checkpoints. Execution or fees may
+        // still be in flight, so the actual worker exit/reconciler owns closure.
+        job.state = ManagementJobState::Draining;
+        if job.operation == "optimization.step" {
+            if let Some(after) = optimization_effect {
+                job.cancel_arrival = Some(
+                    if after || job.cancel_arrival == Some(ManagementCancelArrival::AfterSideEffect)
+                    {
+                        ManagementCancelArrival::AfterSideEffect
+                    } else {
+                        ManagementCancelArrival::BeforeSideEffect
+                    },
+                );
+            }
+        } else if job.step == "experiment_already_registered" {
+            job.cancel_arrival = Some(ManagementCancelArrival::BeforeSideEffect);
+        } else if stored_result_has_side_effect(job.result.as_ref()) {
+            job.cancel_arrival = Some(ManagementCancelArrival::AfterSideEffect);
+        }
+    }
+    session.put(ctx, "job", &job.id, ctx.actor(), &job).await?;
+    session.audit(ctx, "management.job.cancel", &job.id).await?;
+    session.commit().await?;
+    Ok(VersionedManagementJob::V2(job))
+}
+
+async fn renew_claim(ctx: &Context, store: &Store, claimed: &ManagementJobV2) -> Result<()> {
+    let mut session = store.session().await?;
+    let record = load_job_record_in_session(ctx, &mut session, &claimed.id).await?;
+    if is_terminal(record.identity().state) {
+        session.commit().await?;
+        return Ok(());
+    }
+    let at = now()?;
+    let mut current = record.into_unfinished_v2()?;
     if current.state != ManagementJobState::Running
-        || current.generation != claimed.generation
-        || current.lease_token != claimed.lease_token
+        || current.cancel_requested
+        || !same_claim_fields(&current, claimed)
+        || current.lease_until <= at
+    {
+        return Err(Error::Conflict("management job lease fence changed".into()));
+    }
+    current.lease_until = at
+        .checked_add(60)
+        .ok_or_else(|| Error::Invalid("management lease clock exceeds i64".into()))?;
+    session
+        .put(ctx, "job", &current.id, ctx.actor(), &current)
+        .await?;
+    session
+        .audit(ctx, "management.job.renew", &current.id)
+        .await?;
+    session.commit().await
+}
+
+fn stored_result_has_side_effect(result: Option<&ManagementResultV2>) -> bool {
+    match result {
+        Some(ManagementResultV2::Partial(_)) => true,
+        Some(ManagementResultV2::Optimization(_)) => true,
+        Some(ManagementResultV2::Original(
+            ManagementResult::EvaluationStatus { .. }
+            | ManagementResult::EvaluationStatusReadV2 { .. },
+        ))
+        | None => false,
+        Some(ManagementResultV2::Original(_)) => true,
+    }
+}
+
+fn ensure_fence(current: &ManagementJobV2, claimed: &ManagementJobV2) -> Result<()> {
+    if current.state != ManagementJobState::Running
+        || !same_claim_fields(current, claimed)
         || current.lease_until <= now()?
     {
         return Err(Error::Conflict("management job lease fence changed".into()));
@@ -1600,7 +4754,7 @@ fn is_terminal(state: ManagementJobState) -> bool {
 }
 
 fn ensure_owner(ctx: &Context, job: &ManagementJob) -> Result<()> {
-    if job.schema_version != JOB_SCHEMA
+    if job.schema_version != evo_storage::MANAGEMENT_JOB_V1_SCHEMA
         || job.owner_actor != ctx.actor()
         || job.owner_role != ctx.role()
     {
@@ -1642,6 +4796,9 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         "exploration.start" => ParsedRequest::ExplorationStart(Box::new(
             serde_json::from_value(payload).map_err(|_| invalid())?,
         )),
+        "optimization.step" => ParsedRequest::OptimizationStep(Box::new(
+            serde_json::from_value(payload).map_err(|_| invalid())?,
+        )),
         "meta.start" => {
             ParsedRequest::Blocked(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
@@ -1661,6 +4818,7 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::CurriculumStep(request) => &request.schema_version,
         ParsedRequest::ExplorationStart(request) => &request.schema_version,
         ParsedRequest::Blocked(request) => &request.schema_version,
+        ParsedRequest::OptimizationStep(request) => &request.schema_version,
     };
     if actual != &expected {
         return Err(Error::Invalid(
@@ -1774,6 +4932,27 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
                 crate::exploration::exploration_world_storage_id(&request.world.id)?,
             ));
         }
+        ParsedRequest::OptimizationStep(request) => {
+            for id in [
+                &request.source_selection_ref,
+                &request.edit_template_ref,
+                &request.improver_patch_ref,
+            ] {
+                identifier(id)?;
+                dependencies.push(("artifact".into(), id.clone()));
+            }
+            dependencies.push((
+                "artifact".into(),
+                crate::development::storage_id(
+                    crate::development::CONTROL_KIND,
+                    &request.development_control_id,
+                )?,
+            ));
+            dependencies.push((
+                "artifact".into(),
+                format!("formal-profile-{}", request.compiler.profile.id),
+            ));
+        }
         ParsedRequest::Blocked(_) => {}
     }
     dependencies.sort();
@@ -1841,18 +5020,30 @@ pub(crate) async fn management_replay_registration_images_in_session(
             if job_kind != "job" {
                 continue;
             }
-            let job: ManagementJob = session.need(ctx, "job", &job_id).await?;
-            if job.id != job_id
+            let row = session
+                .object_row(ctx, "job", &job_id)
+                .await?
+                .ok_or(Error::NotFound)?;
+            let record = evo_storage::decode_management_job(&row.body)?;
+            let job = record.identity();
+            if row.owner != job.owner_actor
+                || job.id != job_id
                 || job.private_input_ref != input_id
                 || job.operation != "exploration.start"
-                || job.id != stable_id("management-job", ctx, &job.operation, &job.request_key)
-                || input_id != stable_id("management-input", ctx, &job.operation, &job.request_key)
+                || job.id != stable_id("management-job", ctx, job.operation, job.request_key)
+                || input_id != stable_id("management-input", ctx, job.operation, job.request_key)
             {
                 return Err(Error::Conflict("replay_root_source_unproven".into()));
             }
-            ensure_owner(ctx, &job)?;
-            let ParsedRequest::ExplorationStart(request) =
-                decode_private_request(body.clone(), &job)?
+            if job.owner_actor != ctx.actor() || job.owner_role != ctx.role() {
+                return Err(Error::NotFound);
+            }
+            let ParsedRequest::ExplorationStart(request) = decode_private_request_fields(
+                body.clone(),
+                job.private_input_ref,
+                job.operation,
+                job.payload_digest,
+            )?
             else {
                 return Err(Error::Conflict("replay_root_source_unproven".into()));
             };
@@ -1872,7 +5063,7 @@ pub(crate) async fn management_replay_registration_images_in_session(
 #[derive(Debug, Clone, Serialize)]
 pub struct ManagementJobReadView {
     #[serde(flatten)]
-    pub job: ManagementJob,
+    pub job: VersionedManagementJob,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replay_read_view: Option<crate::replay::ReplayReportAuditView>,
 }
@@ -1885,32 +5076,31 @@ impl ManagementDispatcher {
         job_id: &str,
     ) -> Result<ManagementJobReadView> {
         let job = self.status(ctx, job_id).await?;
-        if job.operation != "replay.run" {
+        if job.identity().operation != "replay.run" {
             return Ok(ManagementJobReadView {
                 job,
                 replay_read_view: None,
             });
         }
         let mut session = self.store.session().await?;
-        let current: ManagementJob = session.need(ctx, "job", job_id).await?;
-        ensure_owner(ctx, &current)?;
+        let current = load_job_record_in_session(ctx, &mut session, job_id).await?;
         if fingerprint(&current)? != fingerprint(&job)? {
             return Err(Error::Conflict(
                 "replay job changed during read projection".into(),
             ));
         }
-        if current.state == ManagementJobState::Succeeded
+        if current.identity().state == ManagementJobState::Succeeded
             && let Some(row) = session
-                .object_row(ctx, "artifact", &current.private_input_ref)
+                .object_row(ctx, "artifact", current.identity().private_input_ref)
                 .await?
         {
             let body = evo_storage::lifecycle::parse_strict_json(&row.body)
                 .map_err(|_| Error::Invalid("management_private_input_invalid_json".into()))?;
             if is_redacted(&body) {
-                return Err(redacted_input_error(&current.private_input_ref));
+                return Err(redacted_input_error(current.identity().private_input_ref));
             }
         }
-        let replay_read_view = match &current.result {
+        let replay_read_view = match current.original_result() {
             Some(ManagementResult::ReplayStored {
                 report_id,
                 pool_digest,
@@ -1955,9 +5145,388 @@ impl ManagementDispatcher {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state", content = "calls")]
+pub enum ManagementFeeKnowledge {
+    KnownNone,
+    TrustedCalls(Vec<ManagementFeeCallView>),
+    UnknownProvenance,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManagementFeeCallView {
+    pub billing_scope: String,
+    pub call_id: String,
+    pub state: evo_storage::budget::BudgetCallState,
+    pub actual_cost_micros: Option<i64>,
+    pub reserved_micros: i64,
+    pub actual_currency: Option<String>,
+    pub actual_pricing_version: Option<String>,
+    pub execution_closed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ManagementCommittedEffect {
+    Control {
+        control_id: String,
+        control_digest: String,
+    },
+    OptimizationStep {
+        stage_fact_id: String,
+        input_digest: String,
+    },
+    OptimizationCompiled {
+        stage_fact_id: String,
+        input_digest: String,
+    },
+    Holdout {
+        holdout_id: String,
+        holdout_digest: String,
+    },
+    Ticket {
+        ticket_id: String,
+    },
+    ReplayReport {
+        report_id: String,
+        pool_digest: String,
+        semantic_reports_digest: String,
+    },
+    Probe {
+        probe_job_id: String,
+        trigger_digest: String,
+    },
+    World {
+        world_id: String,
+        context_signature: String,
+        prefix_digest: String,
+        legal_actions_digest: String,
+        policy_digest: String,
+        caps_digest: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManagementJobStatusV1 {
+    pub schema_version: &'static str,
+    pub job_schema_version: String,
+    pub id: String,
+    pub operation: String,
+    pub request_key: String,
+    pub payload_digest: String,
+    pub owner_actor: String,
+    pub owner_role: Role,
+    pub state: ManagementJobState,
+    pub step: String,
+    pub private_input_ref: String,
+    pub result: Option<ManagementResultV2>,
+    pub error_code: Option<String>,
+    pub cancel_requested: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_arrival: Option<ManagementCancelArrival>,
+    pub lease_until: i64,
+    pub generation: u64,
+    pub diagnostics: Vec<ManagementDiagnostic>,
+    pub created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_terminal_state: Option<ManagementPendingTerminalState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optimization_stage_refs: Option<Vec<ManagementOptimizationStageRef>>,
+    // None means unproven, not a proved empty list/zero amount.
+    pub committed_side_effects: Option<Vec<ManagementCommittedEffect>>,
+    pub fee_knowledge: ManagementFeeKnowledge,
+    pub pending_fees: Option<Vec<ManagementFeeCallView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_read_view: Option<crate::replay::ReplayReportAuditView>,
+}
+
+fn committed_effects(result: Option<&ManagementResultV2>) -> Vec<ManagementCommittedEffect> {
+    match result {
+        Some(ManagementResultV2::Partial(ManagementPartialResultV2::ControlRegistered {
+            control_id,
+            control_digest,
+        })) => vec![ManagementCommittedEffect::Control {
+            control_id: control_id.clone(),
+            control_digest: control_digest.clone(),
+        }],
+        Some(ManagementResultV2::Original(ManagementResult::ExperimentRegistered {
+            control_id,
+            control_digest,
+            holdout_id,
+            holdout_digest,
+        })) => vec![
+            ManagementCommittedEffect::Control {
+                control_id: control_id.clone(),
+                control_digest: control_digest.clone(),
+            },
+            ManagementCommittedEffect::Holdout {
+                holdout_id: holdout_id.clone(),
+                holdout_digest: holdout_digest.clone(),
+            },
+        ],
+        Some(ManagementResultV2::Original(ManagementResult::EvaluationTicketBlocked {
+            ticket_id,
+        })) => vec![ManagementCommittedEffect::Ticket {
+            ticket_id: ticket_id.clone(),
+        }],
+        Some(ManagementResultV2::Original(ManagementResult::ReplayStored {
+            report_id,
+            pool_digest,
+            semantic_reports_digest,
+        })) => vec![ManagementCommittedEffect::ReplayReport {
+            report_id: report_id.clone(),
+            pool_digest: pool_digest.clone(),
+            semantic_reports_digest: semantic_reports_digest.clone(),
+        }],
+        Some(ManagementResultV2::Original(ManagementResult::ProbeScheduled {
+            probe_job_id,
+            trigger_digest,
+            ..
+        })) => vec![ManagementCommittedEffect::Probe {
+            probe_job_id: probe_job_id.clone(),
+            trigger_digest: trigger_digest.clone(),
+        }],
+        Some(ManagementResultV2::Original(ManagementResult::ExplorationStarted {
+            world_id,
+            context_signature,
+            prefix_digest,
+            legal_actions_digest,
+            policy_digest,
+            caps_digest,
+            ..
+        })) => vec![ManagementCommittedEffect::World {
+            world_id: world_id.clone(),
+            context_signature: context_signature.clone(),
+            prefix_digest: prefix_digest.clone(),
+            legal_actions_digest: legal_actions_digest.clone(),
+            policy_digest: policy_digest.clone(),
+            caps_digest: caps_digest.clone(),
+        }],
+        Some(ManagementResultV2::Optimization(
+            ManagementOptimizationResultV2::OptimizationStepCompleted {
+                stage_fact_id,
+                input_digest,
+            },
+        )) => vec![ManagementCommittedEffect::OptimizationStep {
+            stage_fact_id: stage_fact_id.clone(),
+            input_digest: input_digest.clone(),
+        }],
+        Some(ManagementResultV2::Original(
+            ManagementResult::EvaluationStatus { .. }
+            | ManagementResult::EvaluationStatusReadV2 { .. },
+        ))
+        | None => Vec::new(),
+    }
+}
+
+fn project_management_status(
+    record: &VersionedManagementJob,
+    effects: Option<Vec<ManagementCommittedEffect>>,
+    fee_knowledge: ManagementFeeKnowledge,
+    pending_fees: Option<Vec<ManagementFeeCallView>>,
+    replay_read_view: Option<crate::replay::ReplayReportAuditView>,
+) -> ManagementJobStatusV1 {
+    let job = record.identity();
+    let (diagnostics, created_at) = match record {
+        VersionedManagementJob::V1(original) => (original.diagnostics.clone(), original.created_at),
+        VersionedManagementJob::V2(current) => (current.diagnostics.clone(), current.created_at),
+    };
+    ManagementJobStatusV1 {
+        schema_version: "rsia.management_job_status.v1",
+        job_schema_version: job.schema_version.into(),
+        id: job.id.into(),
+        operation: job.operation.into(),
+        request_key: job.request_key.into(),
+        payload_digest: job.payload_digest.into(),
+        owner_actor: job.owner_actor.into(),
+        owner_role: job.owner_role,
+        state: job.state,
+        step: record.step().into(),
+        private_input_ref: job.private_input_ref.into(),
+        result: record.result(),
+        error_code: record.error_code().map(str::to_owned),
+        cancel_requested: record.cancel_requested(),
+        cancel_arrival: record.cancel_arrival(),
+        lease_until: job.lease_until,
+        generation: record.generation(),
+        diagnostics,
+        created_at,
+        pending_terminal_state: record.pending_terminal_state(),
+        optimization_stage_refs: match record {
+            VersionedManagementJob::V2(current) => current
+                .optimization
+                .as_ref()
+                .map(|progress| progress.stages.clone()),
+            VersionedManagementJob::V1(_) => None,
+        },
+        committed_side_effects: effects,
+        fee_knowledge,
+        pending_fees,
+        replay_read_view,
+    }
+}
+
+impl ManagementDispatcher {
+    /// Render the real committed acceptance snapshot returned by submit. It
+    /// retains the original Queued acceptance contract; later GETs read current
+    /// worker state through the same one versioned projection below.
+    pub async fn submit_status_view(
+        &self,
+        ctx: &Context,
+        operation: &str,
+        payload: Value,
+    ) -> Result<ManagementJobStatusV1> {
+        let record = self.submit(ctx, operation, payload).await?;
+        let identity = record.identity();
+        if identity.state == ManagementJobState::Queued
+            && record.generation() == 0
+            && identity.lease_token.is_none()
+            && record.result().is_none()
+            && !record.cancel_requested()
+        {
+            return Ok(project_management_status(
+                &record,
+                Some(Vec::new()),
+                ManagementFeeKnowledge::KnownNone,
+                Some(Vec::new()),
+                None,
+            ));
+        }
+        self.status_view(ctx, identity.id).await
+    }
+
+    /// Shared projection of actual store-backed lifecycle reads. Never renews,
+    /// claims, audits, cancels calls or performs reconciliation as a side effect.
+    pub async fn status_view(&self, ctx: &Context, job_id: &str) -> Result<ManagementJobStatusV1> {
+        let read = self.status_with_replay_read_view(ctx, job_id).await?;
+        let record = &read.job;
+        let job = record.identity();
+        let optimization = if job.operation == "optimization.step" {
+            let mut session = self.store.session().await?;
+            let current = load_job_record_in_session(ctx, &mut session, job_id).await?;
+            if fingerprint(&current)? != fingerprint(record)? {
+                return Err(Error::Conflict(
+                    "management job changed during status projection".into(),
+                ));
+            }
+            let facts = optimization_accounting_or_unknown(ctx, &mut session, &current).await?;
+            session.commit().await?;
+            Some(facts)
+        } else {
+            None
+        };
+        let progress = if let Some(facts) = &optimization {
+            match facts {
+                Some(facts) => optimization_accounting_progress(facts, record)?,
+                _ => ConsumerProgress::Unknown,
+            }
+        } else if job.state == ManagementJobState::Queued
+            && record.generation() == 0
+            && record.result().is_none()
+            && job.lease_token.is_none()
+        {
+            // The fresh, never-claimed queue is producer phase evidence only
+            // after its real private request and source bindings are admitted.
+            let request = load_private_request_record(ctx, &self.store, record)
+                .await
+                .map_err(InputFault::into_error)?;
+            validate_request_authority(ctx, &request)?;
+            let mut session = self.store.session().await?;
+            ensure_dependencies_live(ctx, &mut session, &private_dependencies(&request)?).await?;
+            session.commit().await?;
+            ConsumerProgress::NotCommitted
+        } else {
+            consumer_progress_or_unknown(ctx, &self.store, record).await?
+        };
+        let progress = if progress_preserves_committed_result(record.result().as_ref(), &progress)?
+        {
+            progress
+        } else {
+            ConsumerProgress::Unknown
+        };
+        let (mut effects, mut fee_knowledge, mut pending_fees) = match progress {
+            _ if matches!(record, VersionedManagementJob::V2(current) if current.operation == "experiment.register"
+                && current.step == "experiment_already_registered") =>
+            {
+                (
+                    Some(Vec::new()),
+                    ManagementFeeKnowledge::KnownNone,
+                    Some(Vec::new()),
+                )
+            }
+            ConsumerProgress::Unknown => {
+                let prior = record.result();
+                let lower_bound = stored_result_has_side_effect(prior.as_ref())
+                    .then(|| committed_effects(prior.as_ref()));
+                (lower_bound, ManagementFeeKnowledge::UnknownProvenance, None)
+            }
+            ConsumerProgress::NotCommitted => (
+                Some(Vec::new()),
+                ManagementFeeKnowledge::KnownNone,
+                Some(Vec::new()),
+            ),
+            ConsumerProgress::Committed(ref outcome) => (
+                Some(if outcome.has_committed_side_effect() {
+                    committed_effects(outcome.result.as_ref())
+                } else {
+                    Vec::new()
+                }),
+                ManagementFeeKnowledge::KnownNone,
+                Some(Vec::new()),
+            ),
+        };
+        if let Some(facts) = &optimization {
+            match facts {
+                Some(facts) => {
+                    fee_knowledge = if facts.known_none {
+                        ManagementFeeKnowledge::KnownNone
+                    } else {
+                        ManagementFeeKnowledge::TrustedCalls(facts.views())
+                    };
+                    pending_fees = Some(facts.pending_views());
+                    for fact in &facts.compiled {
+                        effects.get_or_insert_with(Vec::new).push(
+                            ManagementCommittedEffect::OptimizationCompiled {
+                                stage_fact_id: fact.artifact_id.clone(),
+                                input_digest: fact.input_digest.clone(),
+                            },
+                        );
+                    }
+                    for reference in &facts.historical_compiled {
+                        effects.get_or_insert_with(Vec::new).push(
+                            ManagementCommittedEffect::OptimizationCompiled {
+                                stage_fact_id: reference.artifact_id.clone(),
+                                input_digest: reference.input_digest.clone(),
+                            },
+                        );
+                    }
+                }
+                None => {
+                    fee_knowledge = ManagementFeeKnowledge::UnknownProvenance;
+                    pending_fees = None;
+                }
+            }
+        }
+        Ok(project_management_status(
+            record,
+            effects,
+            fee_knowledge,
+            pending_fees,
+            read.replay_read_view,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unit_current_job(record: VersionedManagementJob) -> ManagementJobV2 {
+        match record {
+            VersionedManagementJob::V2(job) => job,
+            VersionedManagementJob::V1(_) => panic!("expected the current test job wire"),
+        }
+    }
 
     #[test]
     fn model_and_management_surfaces_remain_separate() {
@@ -1974,7 +5543,7 @@ mod tests {
 
     #[test]
     fn expired_lease_cannot_checkpoint_or_finish_without_a_new_claim() {
-        let job = ManagementJob {
+        let job = ManagementJobV2 {
             id: "management-job-expired".into(),
             schema_version: JOB_SCHEMA.into(),
             operation: "meta.start".into(),
@@ -1993,6 +5562,9 @@ mod tests {
             generation: 1,
             diagnostics: vec![],
             created_at: 1,
+            cancel_arrival: None,
+            pending_terminal_state: None,
+            optimization: None,
         };
         assert!(matches!(ensure_fence(&job, &job), Err(Error::Conflict(_))));
     }
@@ -2005,8 +5577,8 @@ mod tests {
             .unwrap();
         let admin = Context::new("n", "admin", Role::Admin).unwrap();
         let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
-        let mut job = ManagementJob {
-            id: "management-job-diagnostic".into(),
+        let mut job = ManagementJobV2 {
+            id: stable_id("management-job", &admin, "meta.start", "diagnostic"),
             schema_version: JOB_SCHEMA.into(),
             operation: "meta.start".into(),
             request_key: "diagnostic".into(),
@@ -2015,7 +5587,7 @@ mod tests {
             owner_role: Role::Admin,
             state: ManagementJobState::Running,
             step: "claimed".into(),
-            private_input_ref: "management-input-diagnostic".into(),
+            private_input_ref: stable_id("management-input", &admin, "meta.start", "diagnostic"),
             result: None,
             error_code: None,
             cancel_requested: false,
@@ -2024,6 +5596,9 @@ mod tests {
             generation: 2,
             diagnostics: vec![],
             created_at: 1,
+            cancel_arrival: None,
+            pending_terminal_state: None,
+            optimization: None,
         };
         let mut session = store.session().await.unwrap();
         session
@@ -2035,7 +5610,7 @@ mod tests {
             .record_background_error(&job.id, &Error::Conflict("stale fence".into()))
             .await
             .unwrap();
-        job = dispatcher.status(&admin, &job.id).await.unwrap();
+        job = unit_current_job(dispatcher.status(&admin, &job.id).await.unwrap());
         assert_eq!(job.state, ManagementJobState::Running);
         assert_eq!(job.lease_token.as_deref(), Some("active-lease"));
         assert_eq!(job.diagnostics.len(), 1);
@@ -2245,9 +5820,10 @@ print(json.dumps(result,sort_keys=True))
             .unwrap_err()
     }
 
-    fn ag129_unit_job(state: ManagementJobState) -> ManagementJob {
-        ManagementJob {
-            id: "management-clock-boundary".into(),
+    fn ag129_unit_job(state: ManagementJobState) -> ManagementJobV2 {
+        let ctx = Context::new("n", "admin", Role::Admin).unwrap();
+        ManagementJobV2 {
+            id: stable_id("management-job", &ctx, "meta.start", "clock-boundary"),
             schema_version: JOB_SCHEMA.into(),
             operation: "meta.start".into(),
             request_key: "clock-boundary".into(),
@@ -2256,7 +5832,7 @@ print(json.dumps(result,sort_keys=True))
             owner_role: Role::Admin,
             state,
             step: "claimed".into(),
-            private_input_ref: "management-clock-input".into(),
+            private_input_ref: stable_id("management-input", &ctx, "meta.start", "clock-boundary"),
             result: None,
             error_code: None,
             cancel_requested: false,
@@ -2265,6 +5841,9 @@ print(json.dumps(result,sort_keys=True))
             generation: 2,
             diagnostics: vec![],
             created_at: 1,
+            cancel_arrival: None,
+            pending_terminal_state: None,
+            optimization: None,
         }
     }
 
@@ -2315,7 +5894,7 @@ print(json.dumps(result,sort_keys=True))
             assert_eq!(error.to_string(), "clock_regressed");
             assert_eq!(ag129_r7_sqlite_snapshot(&path), before);
             let mut session = store.session().await.unwrap();
-            let after: ManagementJob = session.need(&admin, "job", &job.id).await.unwrap();
+            let after: ManagementJobV2 = session.need(&admin, "job", &job.id).await.unwrap();
             session.commit().await.unwrap();
             assert_eq!(
                 serde_json::to_value(after).unwrap(),
@@ -2334,16 +5913,16 @@ mod late_cancel_tests;
 fn public_evaluation_status_read(
     status: &StreamingEvaluationStatus,
     report_read: crate::streaming_evaluator::FormalReportReadMetadata,
-) -> ManagementResult {
+) -> Result<ManagementResult> {
     let lifecycle = serde_json::to_value(status.ticket.lifecycle)
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unknown".into());
-    ManagementResult::EvaluationStatusReadV2 {
+    Ok(ManagementResult::EvaluationStatusReadV2 {
         ticket_id: status.ticket.id.clone(),
         lifecycle,
         planned_targets: status.ticket.targets.len(),
         has_formal_terminal: status.formal.is_some(),
-        report_read,
-    }
+        report_read: serde_json::to_value(report_read).map_err(|_| Error::Internal)?,
+    })
 }

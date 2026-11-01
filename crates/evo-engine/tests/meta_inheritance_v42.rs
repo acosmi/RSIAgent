@@ -7,6 +7,15 @@
 //! Not covered (and not claimed): inherited benefit, the same-S0 old/new
 //! successor comparison, an Improver approval registry or job type, and
 //! `meta.start` (still blocked).
+fn current_management_job(record: evo_storage::VersionedManagementJob) -> ManagementJobV2 {
+    match record {
+        evo_storage::VersionedManagementJob::V2(job) => job,
+        evo_storage::VersionedManagementJob::V1(_) => {
+            panic!("expected the actual current management producer wire")
+        }
+    }
+}
+
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 use async_trait::async_trait;
@@ -35,7 +44,7 @@ use evo_engine::development::projection::{
     register_config_projection_control,
 };
 use evo_engine::dispatch::{
-    ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
+    ManagementDispatcher, ManagementJobState, ManagementJobV2, ManagementResult,
 };
 use evo_engine::evidence::{
     StoredRunRecord, StoredTraceAuthority, store_source_selection, store_trace_authority,
@@ -906,11 +915,13 @@ async fn exploration_start_result_carries_both_digests_and_status_rejects_tamper
     let done = start_job(&dispatcher, &admin, "meta-inheritance-start", &world).await;
     assert_eq!(done.state, ManagementJobState::Succeeded);
     let (policy_digest, caps_digest) = match &done.result {
-        Some(ManagementResult::ExplorationStarted {
-            policy_digest,
-            caps_digest,
-            ..
-        }) => (policy_digest.clone(), caps_digest.clone()),
+        Some(evo_engine::dispatch::ManagementResultV2::Original(
+            ManagementResult::ExplorationStarted {
+                policy_digest,
+                caps_digest,
+                ..
+            },
+        )) => (policy_digest.clone(), caps_digest.clone()),
         other => panic!("unexpected result: {other:?}"),
     };
     assert_eq!(policy_digest, world.policy.digest().unwrap());
@@ -921,7 +932,11 @@ async fn exploration_start_result_carries_both_digests_and_status_rejects_tamper
     assert_eq!(wire["policy_digest"], json!(policy_digest));
     assert_eq!(wire["caps_digest"], json!(caps_digest));
     // The read side re-verifies the stored result against the live world.
-    dispatcher.status(&admin, &done.id).await.unwrap();
+    dispatcher
+        .status(&admin, &done.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
 
     // Tampering with either digest in the stored result is a Conflict: the
     // status check compares the whole decision, not only the action.
@@ -939,7 +954,11 @@ async fn exploration_start_result_carries_both_digests_and_status_rejects_tamper
         );
     }
     put_raw_job(&store, &admin, &done.id, &original).await;
-    dispatcher.status(&admin, &done.id).await.unwrap();
+    dispatcher
+        .status(&admin, &done.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
 }
 
 /// A result stored before E14 has no digests. It must still load, because the
@@ -1003,14 +1022,16 @@ async fn a_pre_e14_exploration_result_loads_fails_status_closed_and_never_blocks
     }
     assert_eq!(raw_job(&store, &admin, &legacy_job.id).await, legacy_json);
     // It still deserializes, and the digests read as empty strings.
-    let typed: ManagementJob = serde_json::from_value(legacy_json.clone()).unwrap();
+    let typed: ManagementJobV2 = serde_json::from_value(legacy_json.clone()).unwrap();
     match &typed.result {
-        Some(ManagementResult::ExplorationStarted {
-            world_id,
-            policy_digest,
-            caps_digest,
-            ..
-        }) => {
+        Some(evo_engine::dispatch::ManagementResultV2::Original(
+            ManagementResult::ExplorationStarted {
+                world_id,
+                policy_digest,
+                caps_digest,
+                ..
+            },
+        )) => {
             assert_eq!(world_id, "world-legacy");
             assert!(policy_digest.is_empty(), "{policy_digest:?}");
             assert!(caps_digest.is_empty(), "{caps_digest:?}");
@@ -1019,13 +1040,15 @@ async fn a_pre_e14_exploration_result_loads_fails_status_closed_and_never_blocks
     }
 }
 
-fn assert_new_result_digests(job: &ManagementJob, world: &ExplorationWorldV1) {
+fn assert_new_result_digests(job: &ManagementJobV2, world: &ExplorationWorldV1) {
     match &job.result {
-        Some(ManagementResult::ExplorationStarted {
-            policy_digest,
-            caps_digest,
-            ..
-        }) => {
+        Some(evo_engine::dispatch::ManagementResultV2::Original(
+            ManagementResult::ExplorationStarted {
+                policy_digest,
+                caps_digest,
+                ..
+            },
+        )) => {
             assert_eq!(policy_digest.len(), 64);
             assert_eq!(caps_digest.len(), 64);
             assert_eq!(policy_digest, &world.policy.digest().unwrap());
@@ -1049,7 +1072,7 @@ async fn start_job(
     admin: &Context,
     request_key: &str,
     world: &ExplorationWorldV1,
-) -> ManagementJob {
+) -> ManagementJobV2 {
     let queued = dispatcher
         .submit(
             admin,
@@ -1057,6 +1080,7 @@ async fn start_job(
             exploration_start_payload(request_key, world),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     wait_terminal(dispatcher, admin, &queued.id).await
 }
@@ -1081,9 +1105,13 @@ async fn wait_terminal(
     dispatcher: &ManagementDispatcher,
     context: &Context,
     job_id: &str,
-) -> ManagementJob {
+) -> ManagementJobV2 {
     for _ in 0..400 {
-        let job = dispatcher.status(context, job_id).await.unwrap();
+        let job = dispatcher
+            .status(context, job_id)
+            .await
+            .map(current_management_job)
+            .unwrap();
         if matches!(
             job.state,
             ManagementJobState::Succeeded

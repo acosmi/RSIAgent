@@ -45,6 +45,15 @@
 //! monetary cost. Fixtures are copied from `exploration_postpaid_v42.rs`,
 //! `optimization.rs` and `consolidation_terminal_category_v42.rs`; those files are not
 //! used here.
+fn current_management_job(record: evo_storage::VersionedManagementJob) -> ManagementJobV2 {
+    match record {
+        evo_storage::VersionedManagementJob::V2(job) => job,
+        evo_storage::VersionedManagementJob::V1(_) => {
+            panic!("expected the actual current management producer wire")
+        }
+    }
+}
+
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 use async_trait::async_trait;
@@ -65,7 +74,7 @@ use evo_core::skill_edit::{
 use evo_core::strategy::{BatchActionV1, ElasticPolicyV1, ExplorationCapsV1, SimulationContext};
 use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, hash};
 use evo_engine::dispatch::{
-    ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
+    ManagementDispatcher, ManagementJobState, ManagementJobV2, ManagementResult,
 };
 use evo_engine::evidence::{
     StoredRunRecord, StoredTraceAuthority, store_source_selection, store_trace_authority,
@@ -1190,7 +1199,7 @@ impl Env {
             .await
     }
 
-    async fn start_job(&self, request_key: &str, world: &ExplorationWorldV1) -> ManagementJob {
+    async fn start_job(&self, request_key: &str, world: &ExplorationWorldV1) -> ManagementJobV2 {
         let queued = self
             .dispatcher
             .submit(
@@ -1203,9 +1212,15 @@ impl Env {
                 }),
             )
             .await
+            .map(current_management_job)
             .unwrap();
         for _ in 0..400 {
-            let job = self.dispatcher.status(&admin(), &queued.id).await.unwrap();
+            let job = self
+                .dispatcher
+                .status(&admin(), &queued.id)
+                .await
+                .map(current_management_job)
+                .unwrap();
             if matches!(
                 job.state,
                 ManagementJobState::Succeeded
@@ -1233,12 +1248,16 @@ fn dispatched_seqs(action: &BatchActionV1) -> Vec<u32> {
 }
 
 /// `status` on the job holds and serves the stored result unchanged.
-async fn expect_status_ok(env: &Env, job: &ManagementJob, when: &str) {
+async fn expect_status_ok(env: &Env, job: &ManagementJobV2, when: &str) {
     match env.dispatcher.status(&admin(), &job.id).await {
         Ok(status) => {
-            assert_eq!(status.state, ManagementJobState::Succeeded, "{when}");
             assert_eq!(
-                serde_json::to_value(&status.result).unwrap(),
+                status.identity().state,
+                ManagementJobState::Succeeded,
+                "{when}"
+            );
+            assert_eq!(
+                serde_json::to_value(status.result()).unwrap(),
                 serde_json::to_value(&job.result).unwrap(),
                 "{when}: the stored result is served unchanged"
             );
@@ -2702,7 +2721,9 @@ async fn nodes_and_dispatch_facts_written_before_the_classes_are_read_registered
     assert_eq!(job.state, ManagementJobState::Succeeded, "{job:?}");
     assert!(matches!(
         job.result,
-        Some(ManagementResult::ExplorationStarted { .. })
+        Some(evo_engine::dispatch::ManagementResultV2::Original(
+            ManagementResult::ExplorationStarted { .. }
+        ))
     ));
     // The two roots are spent by a step that changed nothing and by a transport that
     // failed, and both records are then rewritten as the previous version wrote them:

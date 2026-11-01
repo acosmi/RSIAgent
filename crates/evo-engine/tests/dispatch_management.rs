@@ -12,7 +12,8 @@ use evo_core::strategy::{
 use evo_core::{Context, Error, Job, JobState, Role, now};
 use evo_engine::capacity::MAX_ACTIVE_LEASES;
 use evo_engine::dispatch::{
-    ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
+    ManagementDispatcher, ManagementJob, ManagementJobState, ManagementJobV2, ManagementResult,
+    ManagementResultV2, VersionedManagementJob,
 };
 use evo_engine::evidence::{
     StoredRunRecord, StoredTraceAuthority, store_source_selection, store_trace_authority,
@@ -29,6 +30,30 @@ use evo_storage::replay::{register_replay_pool, replay_pool_storage_id, seal_rep
 use serde_json::{Value, json};
 use std::time::Duration;
 
+fn current_management_job(record: VersionedManagementJob) -> ManagementJobV2 {
+    match record {
+        VersionedManagementJob::V2(job) => job,
+        VersionedManagementJob::V1(_) => panic!("expected actual current management producer"),
+    }
+}
+
+fn valid_legacy_fixture(mut job: ManagementJob, ctx: &Context) -> ManagementJob {
+    // Original stable_id bytes; identity math only. No Current/role/budget is minted.
+    let digest = evo_core::hash(
+        format!(
+            "{}\0{}\0{}\0{}",
+            ctx.namespace(),
+            ctx.actor(),
+            job.operation,
+            job.request_key
+        )
+        .as_bytes(),
+    );
+    job.id = format!("management-job-{}", &digest[..24]);
+    job.private_input_ref = format!("management-input-{}", &digest[..24]);
+    job
+}
+
 async fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("management.sqlite3"))
@@ -41,9 +66,13 @@ async fn wait_terminal(
     dispatcher: &ManagementDispatcher,
     context: &Context,
     job_id: &str,
-) -> ManagementJob {
+) -> ManagementJobV2 {
     for _ in 0..100 {
-        let job = dispatcher.status(context, job_id).await.unwrap();
+        let job = dispatcher
+            .status(context, job_id)
+            .await
+            .map(current_management_job)
+            .unwrap();
         if matches!(
             job.state,
             ManagementJobState::Succeeded
@@ -62,26 +91,29 @@ async fn wait_terminal(
 async fn queued_cancel_persists_without_running_a_consumer() {
     let (_dir, store) = store().await;
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
-    let queued = ManagementJob {
-        id: "management-job-queued".into(),
-        schema_version: "rsia.management_job.v1".into(),
-        operation: "meta.start".into(),
-        request_key: "queued".into(),
-        payload_digest: "a".repeat(64),
-        owner_actor: "admin".into(),
-        owner_role: Role::Admin,
-        state: ManagementJobState::Queued,
-        step: "accepted".into(),
-        private_input_ref: "management-input-queued".into(),
-        result: None,
-        error_code: None,
-        cancel_requested: false,
-        lease_token: None,
-        lease_until: 0,
-        generation: 0,
-        diagnostics: vec![],
-        created_at: 1,
-    };
+    let queued = valid_legacy_fixture(
+        ManagementJob {
+            id: "management-job-queued".into(),
+            schema_version: "rsia.management_job.v1".into(),
+            operation: "meta.start".into(),
+            request_key: "queued".into(),
+            payload_digest: "a".repeat(64),
+            owner_actor: "admin".into(),
+            owner_role: Role::Admin,
+            state: ManagementJobState::Queued,
+            step: "accepted".into(),
+            private_input_ref: "management-input-queued".into(),
+            result: None,
+            error_code: None,
+            cancel_requested: false,
+            lease_token: None,
+            lease_until: 0,
+            generation: 0,
+            diagnostics: vec![],
+            created_at: 1,
+        },
+        &admin,
+    );
     let mut session = store.session().await.unwrap();
     session
         .put(&admin, "job", &queued.id, admin.actor(), &queued)
@@ -89,7 +121,11 @@ async fn queued_cancel_persists_without_running_a_consumer() {
         .unwrap();
     session.commit().await.unwrap();
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
-    let cancelled = dispatcher.cancel(&admin, &queued.id).await.unwrap();
+    let cancelled = dispatcher
+        .cancel(&admin, &queued.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert_eq!(cancelled.state, ManagementJobState::Cancelled);
     assert!(cancelled.cancel_requested);
 }
@@ -98,26 +134,29 @@ async fn queued_cancel_persists_without_running_a_consumer() {
 async fn cancelled_evaluation_status_stays_cancelled_without_reading_missing_ticket() {
     let (_dir, store) = store().await;
     let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();
-    let queued = ManagementJob {
-        id: "management-job-cancelled-status".into(),
-        schema_version: "rsia.management_job.v1".into(),
-        operation: "evaluation.status".into(),
-        request_key: "cancelled-status".into(),
-        payload_digest: "b".repeat(64),
-        owner_actor: "evaluator".into(),
-        owner_role: Role::Evaluator,
-        state: ManagementJobState::Queued,
-        step: "accepted".into(),
-        private_input_ref: "missing-private-status-input".into(),
-        result: None,
-        error_code: None,
-        cancel_requested: false,
-        lease_token: None,
-        lease_until: 0,
-        generation: 0,
-        diagnostics: vec![],
-        created_at: 1,
-    };
+    let queued = valid_legacy_fixture(
+        ManagementJob {
+            id: "management-job-cancelled-status".into(),
+            schema_version: "rsia.management_job.v1".into(),
+            operation: "evaluation.status".into(),
+            request_key: "cancelled-status".into(),
+            payload_digest: "b".repeat(64),
+            owner_actor: "evaluator".into(),
+            owner_role: Role::Evaluator,
+            state: ManagementJobState::Queued,
+            step: "accepted".into(),
+            private_input_ref: "missing-private-status-input".into(),
+            result: None,
+            error_code: None,
+            cancel_requested: false,
+            lease_token: None,
+            lease_until: 0,
+            generation: 0,
+            diagnostics: vec![],
+            created_at: 1,
+        },
+        &evaluator,
+    );
     let mut session = store.session().await.unwrap();
     session
         .put(&evaluator, "job", &queued.id, evaluator.actor(), &queued)
@@ -126,7 +165,11 @@ async fn cancelled_evaluation_status_stays_cancelled_without_reading_missing_tic
     session.commit().await.unwrap();
 
     let dispatcher = ManagementDispatcher::new(store, vec![evaluator.clone()]).unwrap();
-    let cancelled = dispatcher.cancel(&evaluator, &queued.id).await.unwrap();
+    let cancelled = dispatcher
+        .cancel(&evaluator, &queued.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert_eq!(cancelled.state, ManagementJobState::Cancelled);
     assert_eq!(cancelled.step, "cancelled_before_claim");
     assert_eq!(cancelled.error_code.as_deref(), Some("cancelled"));
@@ -134,7 +177,11 @@ async fn cancelled_evaluation_status_stays_cancelled_without_reading_missing_tic
     // The missing private input and ticket make any live E05 read fail. A
     // successful GET therefore also proves that terminal cancellation did
     // not re-enter the evaluation consumer.
-    let observed = dispatcher.status(&evaluator, &queued.id).await.unwrap();
+    let observed = dispatcher
+        .status(&evaluator, &queued.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert_eq!(observed.state, ManagementJobState::Cancelled);
     assert_eq!(observed.step, "cancelled_before_claim");
     assert_eq!(observed.error_code.as_deref(), Some("cancelled"));
@@ -153,6 +200,7 @@ async fn future_operations_persist_accurate_blocked_jobs_and_reconnect() {
     let queued = dispatcher
         .submit(&admin, "meta.start", request.clone())
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
     let first = wait_terminal(&dispatcher, &admin, &queued.id).await;
@@ -186,12 +234,14 @@ async fn future_operations_persist_accurate_blocked_jobs_and_reconnect() {
     let reconnect = reopened_dispatcher
         .submit(&admin, "meta.start", request)
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(reconnect.id, first.id);
     assert_eq!(
         reopened_dispatcher
             .status(&admin, &first.id)
             .await
+            .map(current_management_job)
             .unwrap()
             .id,
         first.id
@@ -200,6 +250,7 @@ async fn future_operations_persist_accurate_blocked_jobs_and_reconnect() {
         reopened_dispatcher
             .cancel(&admin, &first.id)
             .await
+            .map(current_management_job)
             .unwrap()
             .state,
         ManagementJobState::Blocked
@@ -219,10 +270,14 @@ async fn same_key_double_submit_claims_once_and_cancel_cannot_be_overwritten() {
         dispatcher.submit(&admin, "meta.start", request.clone()),
         dispatcher.submit(&admin, "meta.start", request)
     );
-    let left = left.unwrap();
-    let right = right.unwrap();
+    let left = current_management_job(left.unwrap());
+    let right = current_management_job(right.unwrap());
     assert_eq!(left.id, right.id);
-    let cancelled_or_done = dispatcher.cancel(&admin, &left.id).await.unwrap();
+    let cancelled_or_done = dispatcher
+        .cancel(&admin, &left.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     let final_job = wait_terminal(&dispatcher, &admin, &left.id).await;
     assert!(matches!(
         final_job.state,
@@ -232,7 +287,12 @@ async fn same_key_double_submit_claims_once_and_cancel_cannot_be_overwritten() {
     if cancelled_or_done.state == ManagementJobState::Cancelled {
         tokio::task::yield_now().await;
         assert_eq!(
-            dispatcher.status(&admin, &left.id).await.unwrap().state,
+            dispatcher
+                .status(&admin, &left.id)
+                .await
+                .map(current_management_job)
+                .unwrap()
+                .state,
             ManagementJobState::Cancelled
         );
     }
@@ -242,26 +302,29 @@ async fn same_key_double_submit_claims_once_and_cancel_cannot_be_overwritten() {
 async fn startup_recovery_without_bound_credential_fails_closed() {
     let (_dir, store) = store().await;
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
-    let queued = ManagementJob {
-        id: "management-job-no-credential".into(),
-        schema_version: "rsia.management_job.v1".into(),
-        operation: "meta.start".into(),
-        request_key: "missing-credential".into(),
-        payload_digest: "a".repeat(64),
-        owner_actor: "admin".into(),
-        owner_role: Role::Admin,
-        state: ManagementJobState::Queued,
-        step: "accepted".into(),
-        private_input_ref: "management-input-no-credential".into(),
-        result: None,
-        error_code: None,
-        cancel_requested: false,
-        lease_token: None,
-        lease_until: 0,
-        generation: 0,
-        diagnostics: vec![],
-        created_at: 1,
-    };
+    let queued = valid_legacy_fixture(
+        ManagementJob {
+            id: "management-job-no-credential".into(),
+            schema_version: "rsia.management_job.v1".into(),
+            operation: "meta.start".into(),
+            request_key: "missing-credential".into(),
+            payload_digest: "a".repeat(64),
+            owner_actor: "admin".into(),
+            owner_role: Role::Admin,
+            state: ManagementJobState::Queued,
+            step: "accepted".into(),
+            private_input_ref: "management-input-no-credential".into(),
+            result: None,
+            error_code: None,
+            cancel_requested: false,
+            lease_token: None,
+            lease_until: 0,
+            generation: 0,
+            diagnostics: vec![],
+            created_at: 1,
+        },
+        &admin,
+    );
     let mut session = store.session().await.unwrap();
     session
         .put(&admin, "job", &queued.id, admin.actor(), &queued)
@@ -296,26 +359,29 @@ async fn legacy_job_coexists_duplicate_context_recovers_once_and_damage_is_visib
         result_ids: vec![],
         error_code: None,
     };
-    let queued = ManagementJob {
-        id: "management-job-recovery".into(),
-        schema_version: "rsia.management_job.v1".into(),
-        operation: "meta.start".into(),
-        request_key: "recover".into(),
-        payload_digest: "a".repeat(64),
-        owner_actor: "admin".into(),
-        owner_role: Role::Admin,
-        state: ManagementJobState::Queued,
-        step: "accepted".into(),
-        private_input_ref: "missing-private-input".into(),
-        result: None,
-        error_code: None,
-        cancel_requested: false,
-        lease_token: None,
-        lease_until: 0,
-        generation: 0,
-        diagnostics: vec![],
-        created_at: 1,
-    };
+    let queued = valid_legacy_fixture(
+        ManagementJob {
+            id: "management-job-recovery".into(),
+            schema_version: "rsia.management_job.v1".into(),
+            operation: "meta.start".into(),
+            request_key: "recover".into(),
+            payload_digest: "a".repeat(64),
+            owner_actor: "admin".into(),
+            owner_role: Role::Admin,
+            state: ManagementJobState::Queued,
+            step: "accepted".into(),
+            private_input_ref: "missing-private-input".into(),
+            result: None,
+            error_code: None,
+            cancel_requested: false,
+            lease_token: None,
+            lease_until: 0,
+            generation: 0,
+            diagnostics: vec![],
+            created_at: 1,
+        },
+        &admin,
+    );
     let mut session = store.session().await.unwrap();
     session
         .put(&admin, "job", &legacy.id, admin.actor(), &legacy)
@@ -332,7 +398,8 @@ async fn legacy_job_coexists_duplicate_context_recovers_once_and_damage_is_visib
     assert_eq!(dispatcher.recover_pending().await.unwrap(), 0);
     let failed = wait_terminal(&dispatcher, &admin, &queued.id).await;
     assert_eq!(failed.state, ManagementJobState::Failed);
-    assert_eq!(failed.generation, 1);
+    assert_eq!(failed.generation, 0);
+    assert!(failed.lease_token.is_none());
 
     let mut session = store.session().await.unwrap();
     session
@@ -397,6 +464,7 @@ async fn role_owner_and_unknown_fields_are_enforced() {
             json!({"schema_version":"rsia.management.meta_start.v1","request_key":"ok"}),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert!(matches!(
         dispatcher.status(&other, &job.id).await,
@@ -420,16 +488,19 @@ async fn evaluator_job_same_key_different_ticket_conflicts_after_restart_safe_fa
             }),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     // The background consumer fails the job; poll the store (not `status`)
     // until it is terminal instead of assuming a fixed delay.
-    let mut first: Option<ManagementJob> = None;
+    let mut first: Option<ManagementJobV2> = None;
     for _ in 0..400 {
         let mut session = store.session().await.unwrap();
-        let job: ManagementJob = session
-            .need(&evaluator, "job", &first_queued.id)
+        let row = session
+            .object_row(&evaluator, "job", &first_queued.id)
             .await
+            .unwrap()
             .unwrap();
+        let job = current_management_job(evo_storage::decode_management_job(&row.body).unwrap());
         session.commit().await.unwrap();
         if job.state != ManagementJobState::Queued && job.state != ManagementJobState::Running {
             first = Some(job);
@@ -738,6 +809,7 @@ async fn replay_run_admin_e2e_and_idempotency() {
     let queued = dispatcher
         .submit(&admin, "replay.run", request.clone())
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
 
@@ -745,15 +817,19 @@ async fn replay_run_admin_e2e_and_idempotency() {
     assert_eq!(done.state, ManagementJobState::Succeeded);
     assert_eq!(done.step, "replay_stored");
 
-    let status = dispatcher.status(&admin, &done.id).await.unwrap();
+    let status = dispatcher
+        .status(&admin, &done.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert_eq!(status.state, ManagementJobState::Succeeded);
 
     let (report_id, pool_digest, semantic_reports_digest) = match status.result {
-        Some(ManagementResult::ReplayStored {
+        Some(ManagementResultV2::Original(ManagementResult::ReplayStored {
             report_id,
             pool_digest,
             semantic_reports_digest,
-        }) => (report_id, pool_digest, semantic_reports_digest),
+        })) => (report_id, pool_digest, semantic_reports_digest),
         other => panic!("unexpected result: {:?}", other),
     };
     assert_eq!(pool_digest, pool.pool_digest);
@@ -783,6 +859,7 @@ async fn replay_run_admin_e2e_and_idempotency() {
     let same = dispatcher
         .submit(&admin, "replay.run", request)
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(same.id, queued.id);
 
@@ -888,6 +965,7 @@ async fn replay_run_missing_pool_fails_cleanly() {
     let queued = dispatcher
         .submit(&admin, "replay.run", request)
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
 
@@ -918,6 +996,7 @@ async fn replay_run_status_revocation_gate_and_terminal_preservation() {
     let queued = dispatcher
         .submit(&admin, "replay.run", request)
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded);
@@ -938,8 +1017,13 @@ async fn replay_run_status_revocation_gate_and_terminal_preservation() {
     let queued_cancel = dispatcher
         .submit(&admin, "replay.run", request_cancel)
         .await
+        .map(current_management_job)
         .unwrap();
-    let cancelled = dispatcher.cancel(&admin, &queued_cancel.id).await.unwrap();
+    let cancelled = dispatcher
+        .cancel(&admin, &queued_cancel.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert!(matches!(
         cancelled.state,
         ManagementJobState::Cancelled | ManagementJobState::Succeeded
@@ -966,26 +1050,29 @@ async fn replay_run_status_revocation_gate_and_terminal_preservation() {
     ));
 
     // But if a job was cancelled before claim, reading its status does not revive or re-evaluate sources
-    let cancelled_direct = ManagementJob {
-        id: "management-job-cancelled-replay".into(),
-        schema_version: "rsia.management_job.v1".into(),
-        operation: "replay.run".into(),
-        request_key: "cancelled-replay-k".into(),
-        payload_digest: "c".repeat(64),
-        owner_actor: "admin".into(),
-        owner_role: Role::Admin,
-        state: ManagementJobState::Cancelled,
-        step: "cancelled_before_claim".into(),
-        private_input_ref: "missing-ref".into(),
-        result: None,
-        error_code: Some("cancelled".into()),
-        cancel_requested: true,
-        lease_token: None,
-        lease_until: 0,
-        generation: 0,
-        diagnostics: vec![],
-        created_at: 1,
-    };
+    let cancelled_direct = valid_legacy_fixture(
+        ManagementJob {
+            id: "management-job-cancelled-replay".into(),
+            schema_version: "rsia.management_job.v1".into(),
+            operation: "replay.run".into(),
+            request_key: "cancelled-replay-k".into(),
+            payload_digest: "c".repeat(64),
+            owner_actor: "admin".into(),
+            owner_role: Role::Admin,
+            state: ManagementJobState::Cancelled,
+            step: "cancelled_before_claim".into(),
+            private_input_ref: "missing-ref".into(),
+            result: None,
+            error_code: Some("cancelled".into()),
+            cancel_requested: true,
+            lease_token: None,
+            lease_until: 0,
+            generation: 0,
+            diagnostics: vec![],
+            created_at: 1,
+        },
+        &admin,
+    );
     let mut session = store.session().await.unwrap();
     session
         .put(
@@ -1003,8 +1090,11 @@ async fn replay_run_status_revocation_gate_and_terminal_preservation() {
         .status(&admin, &cancelled_direct.id)
         .await
         .unwrap();
-    assert_eq!(observed_cancelled.state, ManagementJobState::Cancelled);
-    assert_eq!(observed_cancelled.step, "cancelled_before_claim");
+    assert_eq!(
+        observed_cancelled.identity().state,
+        ManagementJobState::Cancelled
+    );
+    assert_eq!(observed_cancelled.step(), "cancelled_before_claim");
 }
 
 #[tokio::test]
@@ -1028,6 +1118,7 @@ async fn replay_run_crash_recovery_reuses_stored_report() {
     let queued = dispatcher
         .submit(&admin, "replay.run", request.clone())
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded);
@@ -1041,7 +1132,11 @@ async fn replay_run_crash_recovery_reuses_stored_report() {
         ManagementDispatcher::new(reopened.clone(), vec![admin.clone()]).unwrap();
     reopened_dispatcher.recover_pending().await.unwrap();
 
-    let recovered_status = reopened_dispatcher.status(&admin, &done.id).await.unwrap();
+    let recovered_status = reopened_dispatcher
+        .status(&admin, &done.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert_eq!(recovered_status.id, done.id);
     assert_eq!(recovered_status.state, ManagementJobState::Succeeded);
     assert_eq!(
@@ -1053,6 +1148,7 @@ async fn replay_run_crash_recovery_reuses_stored_report() {
     let resubmit = reopened_dispatcher
         .submit(&admin, "replay.run", request)
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(resubmit.id, done.id);
 }
@@ -1213,20 +1309,25 @@ async fn curriculum_records(
         .collect()
 }
 
-async fn raw_job(admin: &Context, store: &Store, job_id: &str) -> ManagementJob {
+async fn raw_job(admin: &Context, store: &Store, job_id: &str) -> ManagementJobV2 {
     let mut session = store.session().await.unwrap();
-    let job: ManagementJob = session.need(admin, "job", job_id).await.unwrap();
+    let row = session
+        .object_row(admin, "job", job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let job = current_management_job(evo_storage::decode_management_job(&row.body).unwrap());
     session.commit().await.unwrap();
     job
 }
 
-fn probe_scheduled(job: &ManagementJob) -> (String, String, Option<ProbeTerminal>) {
+fn probe_scheduled(job: &ManagementJobV2) -> (String, String, Option<ProbeTerminal>) {
     match &job.result {
-        Some(ManagementResult::ProbeScheduled {
+        Some(ManagementResultV2::Original(ManagementResult::ProbeScheduled {
             probe_job_id,
             trigger_digest,
             terminal,
-        }) => (probe_job_id.clone(), trigger_digest.clone(), *terminal),
+        })) => (probe_job_id.clone(), trigger_digest.clone(), *terminal),
         other => panic!("unexpected result: {other:?}"),
     }
 }
@@ -1243,6 +1344,7 @@ async fn curriculum_step_admin_e2e_and_idempotency() {
     let queued = dispatcher
         .submit(&admin, "curriculum.step", request.clone())
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
     assert_eq!(queued.step, "accepted");
@@ -1257,7 +1359,11 @@ async fn curriculum_step_admin_e2e_and_idempotency() {
     assert_eq!(trigger_digest.len(), 64);
 
     // The read side re-verifies against the live store and agrees.
-    let status = dispatcher.status(&admin, &done.id).await.unwrap();
+    let status = dispatcher
+        .status(&admin, &done.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert_eq!(status.state, ManagementJobState::Succeeded);
     assert_eq!(
         probe_scheduled(&status),
@@ -1319,6 +1425,7 @@ async fn curriculum_step_admin_e2e_and_idempotency() {
     let same = dispatcher
         .submit(&admin, "curriculum.step", request)
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(same.id, queued.id);
     assert_eq!(same.state, ManagementJobState::Succeeded);
@@ -1443,6 +1550,7 @@ async fn curriculum_step_missing_profile_or_state_fails_cleanly() {
     let queued = dispatcher
         .submit(&admin, "curriculum.step", missing_profile)
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
     let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
@@ -1456,6 +1564,7 @@ async fn curriculum_step_missing_profile_or_state_fails_cleanly() {
     let queued = dispatcher
         .submit(&admin, "curriculum.step", missing_state)
         .await
+        .map(current_management_job)
         .unwrap();
     let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
     assert_eq!(terminal.state, ManagementJobState::Failed);
@@ -1464,7 +1573,12 @@ async fn curriculum_step_missing_profile_or_state_fails_cleanly() {
 
     // Failed jobs are never re-verified and never mutated the learner state.
     assert_eq!(
-        dispatcher.status(&admin, &queued.id).await.unwrap().state,
+        dispatcher
+            .status(&admin, &queued.id)
+            .await
+            .map(current_management_job)
+            .unwrap()
+            .state,
         ManagementJobState::Failed
     );
     assert!(
@@ -1492,6 +1606,7 @@ async fn curriculum_step_status_revocation_gate_and_terminal_preservation() {
             curriculum_step_request("curriculum-revoke"),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded);
@@ -1587,26 +1702,29 @@ async fn curriculum_step_status_revocation_gate_and_terminal_preservation() {
     assert_eq!(store.verify_audit(&admin).await.unwrap(), audits);
 
     // A job cancelled before claim is never re-verified against sources.
-    let cancelled_direct = ManagementJob {
-        id: "management-job-cancelled-curriculum".into(),
-        schema_version: "rsia.management_job.v1".into(),
-        operation: "curriculum.step".into(),
-        request_key: "cancelled-curriculum-k".into(),
-        payload_digest: "c".repeat(64),
-        owner_actor: "admin".into(),
-        owner_role: Role::Admin,
-        state: ManagementJobState::Cancelled,
-        step: "cancelled_before_claim".into(),
-        private_input_ref: "missing-ref".into(),
-        result: None,
-        error_code: Some("cancelled".into()),
-        cancel_requested: true,
-        lease_token: None,
-        lease_until: 0,
-        generation: 0,
-        diagnostics: vec![],
-        created_at: 1,
-    };
+    let cancelled_direct = valid_legacy_fixture(
+        ManagementJob {
+            id: "management-job-cancelled-curriculum".into(),
+            schema_version: "rsia.management_job.v1".into(),
+            operation: "curriculum.step".into(),
+            request_key: "cancelled-curriculum-k".into(),
+            payload_digest: "c".repeat(64),
+            owner_actor: "admin".into(),
+            owner_role: Role::Admin,
+            state: ManagementJobState::Cancelled,
+            step: "cancelled_before_claim".into(),
+            private_input_ref: "missing-ref".into(),
+            result: None,
+            error_code: Some("cancelled".into()),
+            cancel_requested: true,
+            lease_token: None,
+            lease_until: 0,
+            generation: 0,
+            diagnostics: vec![],
+            created_at: 1,
+        },
+        &admin,
+    );
     let mut session = store.session().await.unwrap();
     session
         .put(
@@ -1623,8 +1741,8 @@ async fn curriculum_step_status_revocation_gate_and_terminal_preservation() {
         .status(&admin, &cancelled_direct.id)
         .await
         .unwrap();
-    assert_eq!(observed.state, ManagementJobState::Cancelled);
-    assert_eq!(observed.step, "cancelled_before_claim");
+    assert_eq!(observed.identity().state, ManagementJobState::Cancelled);
+    assert_eq!(observed.step(), "cancelled_before_claim");
 }
 
 #[tokio::test]
@@ -1637,6 +1755,7 @@ async fn curriculum_step_crash_recovery_reuses_probe_schedule_receipt() {
     let queued = dispatcher
         .submit(&admin, "curriculum.step", request.clone())
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded);
@@ -1670,7 +1789,9 @@ async fn curriculum_step_crash_recovery_reuses_probe_schedule_receipt() {
     assert_eq!(recovered.id, done.id);
     assert_eq!(recovered.state, ManagementJobState::Succeeded);
     assert_eq!(recovered.step, "probe_scheduled");
-    assert_eq!(recovered.generation, done.generation + 1);
+    assert_eq!(recovered.generation, done.generation);
+    assert_eq!(recovered.lease_token, None);
+    assert_eq!(recovered.lease_until, 0);
     assert_eq!(
         probe_scheduled(&recovered),
         (probe_job_id.clone(), trigger_digest.clone(), terminal)
@@ -1698,6 +1819,7 @@ async fn curriculum_step_crash_recovery_reuses_probe_schedule_receipt() {
     let resubmit = reopened_dispatcher
         .submit(&admin, "curriculum.step", request)
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(resubmit.id, done.id);
 
@@ -1710,6 +1832,7 @@ async fn curriculum_step_crash_recovery_reuses_probe_schedule_receipt() {
             curriculum_step_request("curriculum-crash-2"),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let next = wait_terminal(&reopened_dispatcher, &admin, &next.id).await;
     assert_eq!(next.state, ManagementJobState::Succeeded);
@@ -1740,9 +1863,14 @@ async fn curriculum_step_cancel_before_claim_creates_no_probe_job() {
             curriculum_step_request("curriculum-cancel"),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
-    let cancelled = dispatcher.cancel(&admin, &queued.id).await.unwrap();
+    let cancelled = dispatcher
+        .cancel(&admin, &queued.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert_eq!(cancelled.state, ManagementJobState::Cancelled);
     assert_eq!(cancelled.step, "cancelled_before_claim");
     assert_eq!(cancelled.error_code.as_deref(), Some("cancelled"));
@@ -1772,6 +1900,7 @@ async fn curriculum_step_cancel_before_claim_creates_no_probe_job() {
             curriculum_step_request("curriculum-cancel"),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(reconnect.id, queued.id);
     assert_eq!(reconnect.state, ManagementJobState::Cancelled);
@@ -1792,9 +1921,13 @@ async fn wait_terminal_slowly(
     dispatcher: &ManagementDispatcher,
     context: &Context,
     job_id: &str,
-) -> ManagementJob {
+) -> ManagementJobV2 {
     for _ in 0..200 {
-        let job = dispatcher.status(context, job_id).await.unwrap();
+        let job = dispatcher
+            .status(context, job_id)
+            .await
+            .map(current_management_job)
+            .unwrap();
         if matches!(
             job.state,
             ManagementJobState::Succeeded
@@ -1809,37 +1942,44 @@ async fn wait_terminal_slowly(
     panic!("management job did not finish after the capacity wait");
 }
 
-fn live_running_job() -> ManagementJob {
-    ManagementJob {
-        id: "management-job-holding-the-dispatch".into(),
-        schema_version: "rsia.management_job.v1".into(),
-        operation: "meta.start".into(),
-        request_key: "holding".into(),
-        payload_digest: "a".repeat(64),
-        owner_actor: "admin".into(),
-        owner_role: Role::Admin,
-        state: ManagementJobState::Running,
-        step: "claimed".into(),
-        private_input_ref: "management-input-holding".into(),
-        result: None,
-        error_code: None,
-        cancel_requested: false,
-        lease_token: Some("live-lease".into()),
-        lease_until: now().unwrap().saturating_add(60),
-        generation: 1,
-        diagnostics: vec![],
-        created_at: 1,
-    }
+fn live_running_job(context: &Context) -> ManagementJob {
+    valid_legacy_fixture(
+        ManagementJob {
+            id: "management-job-holding-the-dispatch".into(),
+            schema_version: "rsia.management_job.v1".into(),
+            operation: "meta.start".into(),
+            request_key: "holding".into(),
+            payload_digest: "a".repeat(64),
+            owner_actor: "admin".into(),
+            owner_role: Role::Admin,
+            state: ManagementJobState::Running,
+            step: "claimed".into(),
+            private_input_ref: "management-input-holding".into(),
+            result: None,
+            error_code: None,
+            cancel_requested: false,
+            lease_token: Some("live-lease".into()),
+            lease_until: now().unwrap().saturating_add(60),
+            generation: 1,
+            diagnostics: vec![],
+            created_at: 1,
+        },
+        context,
+    )
 }
 
 async fn assert_waiting_for_capacity(
     dispatcher: &ManagementDispatcher,
     admin: &Context,
     job_id: &str,
-) -> ManagementJob {
+) -> ManagementJobV2 {
     // Let the spawned claim (and a few retries) run.
     tokio::time::sleep(Duration::from_millis(60)).await;
-    let waiting = dispatcher.status(admin, job_id).await.unwrap();
+    let waiting = dispatcher
+        .status(admin, job_id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert_eq!(waiting.state, ManagementJobState::Queued);
     assert_eq!(waiting.step, ManagementDispatcher::CAPACITY_WAIT_STEP);
     assert!(waiting.lease_token.is_none());
@@ -1849,7 +1989,11 @@ async fn assert_waiting_for_capacity(
     assert_eq!(waiting.diagnostics[0].code, "conflict");
     // Retries keep the job Queued without piling up diagnostics.
     tokio::time::sleep(ManagementDispatcher::CAPACITY_WAIT_RETRY * 2).await;
-    let still_waiting = dispatcher.status(admin, job_id).await.unwrap();
+    let still_waiting = dispatcher
+        .status(admin, job_id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert_eq!(still_waiting.state, ManagementJobState::Queued);
     assert_eq!(still_waiting.diagnostics.len(), 1);
     still_waiting
@@ -1859,7 +2003,7 @@ async fn assert_waiting_for_capacity(
 async fn second_management_dispatch_waits_queued_until_the_live_lease_finishes() {
     let (_dir, store) = store().await;
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
-    let holding = live_running_job();
+    let holding = live_running_job(&admin);
     let mut session = store.session().await.unwrap();
     session
         .put(&admin, "job", &holding.id, admin.actor(), &holding)
@@ -1877,6 +2021,7 @@ async fn second_management_dispatch_waits_queued_until_the_live_lease_finishes()
             }),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
     assert_waiting_for_capacity(&dispatcher, &admin, &queued.id).await;
@@ -1905,7 +2050,7 @@ async fn second_management_dispatch_waits_queued_until_the_live_lease_finishes()
     assert_eq!(done.diagnostics[0].code, "conflict");
     // The job that held the dispatch was never touched.
     let untouched = dispatcher.status(&admin, &holding.id).await.unwrap();
-    assert_eq!(untouched.state, ManagementJobState::Succeeded);
+    assert_eq!(untouched.identity().state, ManagementJobState::Succeeded);
 }
 
 /// F24: the one concurrent management dispatch is per instance. A live lease
@@ -1915,7 +2060,7 @@ async fn management_dispatch_capacity_cannot_be_split_across_namespaces() {
     let (_dir, store) = store().await;
     let admin_a = Context::new("ns-a", "admin", Role::Admin).unwrap();
     let admin_b = Context::new("ns-b", "admin", Role::Admin).unwrap();
-    let holding = live_running_job();
+    let holding = live_running_job(&admin_a);
     let mut session = store.session().await.unwrap();
     session
         .put(&admin_a, "job", &holding.id, admin_a.actor(), &holding)
@@ -1933,6 +2078,7 @@ async fn management_dispatch_capacity_cannot_be_split_across_namespaces() {
             }),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
     assert_waiting_for_capacity(&dispatcher, &admin_b, &queued.id).await;
@@ -1967,7 +2113,7 @@ async fn management_dispatch_capacity_cannot_be_split_across_namespaces() {
 async fn capacity_deferred_job_can_still_be_cancelled_while_queued() {
     let (_dir, store) = store().await;
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
-    let holding = live_running_job();
+    let holding = live_running_job(&admin);
     let mut session = store.session().await.unwrap();
     session
         .put(&admin, "job", &holding.id, admin.actor(), &holding)
@@ -1981,15 +2127,23 @@ async fn capacity_deferred_job_can_still_be_cancelled_while_queued() {
             "meta.start",
             json!({"schema_version":"rsia.management.meta_start.v1","request_key":"cancel-while-waiting"}),
         )
-        .await
+        .await.map(current_management_job)
         .unwrap();
     assert_waiting_for_capacity(&dispatcher, &admin, &queued.id).await;
-    let cancelled = dispatcher.cancel(&admin, &queued.id).await.unwrap();
+    let cancelled = dispatcher
+        .cancel(&admin, &queued.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert_eq!(cancelled.state, ManagementJobState::Cancelled);
     assert_eq!(cancelled.step, "cancelled_before_claim");
     // The retry loop observes the terminal state and stops without a claim.
     tokio::time::sleep(ManagementDispatcher::CAPACITY_WAIT_RETRY * 2).await;
-    let observed = dispatcher.status(&admin, &queued.id).await.unwrap();
+    let observed = dispatcher
+        .status(&admin, &queued.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert_eq!(observed.state, ManagementJobState::Cancelled);
     assert_eq!(observed.generation, 0);
 }
@@ -2053,6 +2207,7 @@ async fn management_claim_waits_while_ten_budget_leases_are_live() {
             }),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_waiting_for_capacity(&dispatcher, &admin, &queued.id).await;
 
@@ -2263,9 +2418,9 @@ struct ExplorationStarted {
     action: Value,
 }
 
-fn exploration_started(job: &ManagementJob) -> ExplorationStarted {
+fn exploration_started(job: &ManagementJobV2) -> ExplorationStarted {
     match &job.result {
-        Some(ManagementResult::ExplorationStarted {
+        Some(ManagementResultV2::Original(ManagementResult::ExplorationStarted {
             world_id,
             context_signature,
             prefix_digest,
@@ -2273,7 +2428,7 @@ fn exploration_started(job: &ManagementJob) -> ExplorationStarted {
             policy_digest,
             caps_digest,
             action,
-        }) => ExplorationStarted {
+        })) => ExplorationStarted {
             world_id: world_id.clone(),
             context_signature: context_signature.clone(),
             prefix_digest: prefix_digest.clone(),
@@ -2299,6 +2454,7 @@ async fn exploration_start_admin_e2e_and_idempotency() {
     let queued = dispatcher
         .submit(&admin, "exploration.start", request.clone())
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
     assert_eq!(queued.step, "accepted");
@@ -2341,7 +2497,11 @@ async fn exploration_start_admin_e2e_and_idempotency() {
     );
 
     // The read side re-verifies against the live store and agrees.
-    let status = dispatcher.status(&admin, &done.id).await.unwrap();
+    let status = dispatcher
+        .status(&admin, &done.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert_eq!(status.state, ManagementJobState::Succeeded);
     assert_eq!(
         serde_json::to_value(&status.result).unwrap(),
@@ -2403,6 +2563,7 @@ async fn exploration_start_admin_e2e_and_idempotency() {
     let same = dispatcher
         .submit(&admin, "exploration.start", request)
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(same.id, queued.id);
     assert_eq!(same.state, ManagementJobState::Succeeded);
@@ -2439,6 +2600,7 @@ async fn exploration_start_same_world_id_converges_or_conflicts() {
             exploration_start_request("exploration-same-1", &world),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let first = wait_terminal(&dispatcher, &admin, &first.id).await;
     assert_eq!(first.state, ManagementJobState::Succeeded);
@@ -2452,6 +2614,7 @@ async fn exploration_start_same_world_id_converges_or_conflicts() {
             exploration_start_request("exploration-same-2", &world),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_ne!(again.id, first.id);
     let again = wait_terminal(&dispatcher, &admin, &again.id).await;
@@ -2475,6 +2638,7 @@ async fn exploration_start_same_world_id_converges_or_conflicts() {
             exploration_start_request("exploration-same-3", &other),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let conflicting = wait_terminal(&dispatcher, &admin, &conflicting.id).await;
     assert_eq!(conflicting.state, ManagementJobState::Failed);
@@ -2637,6 +2801,7 @@ async fn exploration_start_invalid_world_fails_cleanly_without_persisting() {
             exploration_start_request("exploration-empty-closure", &empty_closure),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
     let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
@@ -2654,6 +2819,7 @@ async fn exploration_start_invalid_world_fails_cleanly_without_persisting() {
             exploration_start_request("exploration-stale", &stale),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
     assert_eq!(terminal.state, ManagementJobState::Failed);
@@ -2669,6 +2835,7 @@ async fn exploration_start_invalid_world_fails_cleanly_without_persisting() {
             exploration_start_request("exploration-forged", &forged),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
     assert_eq!(terminal.state, ManagementJobState::Failed);
@@ -2685,6 +2852,7 @@ async fn exploration_start_invalid_world_fails_cleanly_without_persisting() {
             exploration_start_request("exploration-prefilled", &prefilled),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
     assert_eq!(terminal.state, ManagementJobState::Failed);
@@ -2698,6 +2866,7 @@ async fn exploration_start_invalid_world_fails_cleanly_without_persisting() {
             exploration_start_request("exploration-sealed", &sealed),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
     assert_eq!(terminal.state, ManagementJobState::Failed);
@@ -2705,7 +2874,12 @@ async fn exploration_start_invalid_world_fails_cleanly_without_persisting() {
 
     // Failed jobs are never re-verified and never persisted a world.
     assert_eq!(
-        dispatcher.status(&admin, &terminal.id).await.unwrap().state,
+        dispatcher
+            .status(&admin, &terminal.id)
+            .await
+            .map(current_management_job)
+            .unwrap()
+            .state,
         ManagementJobState::Failed
     );
     assert!(exploration_worlds(&admin, &store).await.is_empty());
@@ -2729,6 +2903,7 @@ async fn exploration_start_missing_dependency_run_fails_cleanly() {
             exploration_start_request("exploration-missing-run", &world),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
     let terminal = wait_terminal(&dispatcher, &admin, &queued.id).await;
@@ -2738,7 +2913,12 @@ async fn exploration_start_missing_dependency_run_fails_cleanly() {
     assert_eq!(terminal.error_code.as_deref(), Some("not_found"));
     assert!(terminal.result.is_none());
     assert_eq!(
-        dispatcher.status(&admin, &terminal.id).await.unwrap().state,
+        dispatcher
+            .status(&admin, &terminal.id)
+            .await
+            .map(current_management_job)
+            .unwrap()
+            .state,
         ManagementJobState::Failed
     );
     assert!(exploration_worlds(&admin, &store).await.is_empty());
@@ -2757,6 +2937,7 @@ async fn exploration_start_status_revocation_gate_and_terminal_preservation() {
             exploration_start_request("exploration-revoke", &exploration_world("world-1", 1)),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded);
@@ -2913,26 +3094,29 @@ async fn exploration_start_status_revocation_gate_and_terminal_preservation() {
     }
 
     // A job cancelled before claim is never re-verified against sources.
-    let cancelled_direct = ManagementJob {
-        id: "management-job-cancelled-exploration".into(),
-        schema_version: "rsia.management_job.v1".into(),
-        operation: "exploration.start".into(),
-        request_key: "cancelled-exploration-k".into(),
-        payload_digest: "d".repeat(64),
-        owner_actor: "admin".into(),
-        owner_role: Role::Admin,
-        state: ManagementJobState::Cancelled,
-        step: "cancelled_before_claim".into(),
-        private_input_ref: "missing-ref".into(),
-        result: None,
-        error_code: Some("cancelled".into()),
-        cancel_requested: true,
-        lease_token: None,
-        lease_until: 0,
-        generation: 0,
-        diagnostics: vec![],
-        created_at: 1,
-    };
+    let cancelled_direct = valid_legacy_fixture(
+        ManagementJob {
+            id: "management-job-cancelled-exploration".into(),
+            schema_version: "rsia.management_job.v1".into(),
+            operation: "exploration.start".into(),
+            request_key: "cancelled-exploration-k".into(),
+            payload_digest: "d".repeat(64),
+            owner_actor: "admin".into(),
+            owner_role: Role::Admin,
+            state: ManagementJobState::Cancelled,
+            step: "cancelled_before_claim".into(),
+            private_input_ref: "missing-ref".into(),
+            result: None,
+            error_code: Some("cancelled".into()),
+            cancel_requested: true,
+            lease_token: None,
+            lease_until: 0,
+            generation: 0,
+            diagnostics: vec![],
+            created_at: 1,
+        },
+        &admin,
+    );
     let mut session = store.session().await.unwrap();
     session
         .put(
@@ -2949,8 +3133,8 @@ async fn exploration_start_status_revocation_gate_and_terminal_preservation() {
         .status(&admin, &cancelled_direct.id)
         .await
         .unwrap();
-    assert_eq!(observed.state, ManagementJobState::Cancelled);
-    assert_eq!(observed.step, "cancelled_before_claim");
+    assert_eq!(observed.identity().state, ManagementJobState::Cancelled);
+    assert_eq!(observed.step(), "cancelled_before_claim");
 }
 
 #[tokio::test]
@@ -2964,6 +3148,7 @@ async fn exploration_start_crash_recovery_converges_on_registered_world() {
     let queued = dispatcher
         .submit(&admin, "exploration.start", request.clone())
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded);
@@ -2996,7 +3181,9 @@ async fn exploration_start_crash_recovery_converges_on_registered_world() {
     assert_eq!(recovered.id, done.id);
     assert_eq!(recovered.state, ManagementJobState::Succeeded);
     assert_eq!(recovered.step, "exploration_started");
-    assert_eq!(recovered.generation, done.generation + 1);
+    assert_eq!(recovered.generation, done.generation);
+    assert_eq!(recovered.lease_token, None);
+    assert_eq!(recovered.lease_until, 0);
     let again = exploration_started(&recovered);
     assert_eq!(again.world_id, started.world_id);
     assert_eq!(again.context_signature, started.context_signature);
@@ -3026,6 +3213,7 @@ async fn exploration_start_crash_recovery_converges_on_registered_world() {
     let resubmit = reopened_dispatcher
         .submit(&admin, "exploration.start", request)
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(resubmit.id, done.id);
     assert_eq!(resubmit.state, ManagementJobState::Succeeded);
@@ -3044,9 +3232,14 @@ async fn exploration_start_cancel_before_claim_creates_no_world() {
     let queued = dispatcher
         .submit(&admin, "exploration.start", request.clone())
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(queued.state, ManagementJobState::Queued);
-    let cancelled = dispatcher.cancel(&admin, &queued.id).await.unwrap();
+    let cancelled = dispatcher
+        .cancel(&admin, &queued.id)
+        .await
+        .map(current_management_job)
+        .unwrap();
     assert_eq!(cancelled.state, ManagementJobState::Cancelled);
     assert_eq!(cancelled.step, "cancelled_before_claim");
     assert_eq!(cancelled.error_code.as_deref(), Some("cancelled"));
@@ -3063,6 +3256,7 @@ async fn exploration_start_cancel_before_claim_creates_no_world() {
     let reconnect = dispatcher
         .submit(&admin, "exploration.start", request)
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(reconnect.id, queued.id);
     assert_eq!(reconnect.state, ManagementJobState::Cancelled);
@@ -3319,20 +3513,28 @@ async fn ag163_status_job(
     evaluator: &Context,
     ticket: &str,
     key: &str,
-) -> (ManagementDispatcher, ManagementJob) {
+) -> (ManagementDispatcher, ManagementJobV2) {
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![evaluator.clone()]).unwrap();
     let accepted = dispatcher.submit(evaluator, "evaluation.status", json!({
         "schema_version":"rsia.management.evaluation_status.v1", "request_key":key, "ticket_id":ticket
     })).await.unwrap();
     for _ in 0..500 {
         let mut session = store.session().await.unwrap();
-        let durable: ManagementJob = session.need(evaluator, "job", &accepted.id).await.unwrap();
+        let row = session
+            .object_row(evaluator, "job", accepted.identity().id)
+            .await
+            .unwrap()
+            .unwrap();
+        let durable =
+            current_management_job(evo_storage::decode_management_job(&row.body).unwrap());
         session.commit().await.unwrap();
         if durable.state == ManagementJobState::Succeeded {
             assert!(
                 matches!(
                     &durable.result,
-                    Some(ManagementResult::EvaluationStatus { .. })
+                    Some(ManagementResultV2::Original(
+                        ManagementResult::EvaluationStatus { .. }
+                    ))
                 ),
                 "worker rewrote original durable result variant"
             );
@@ -3471,13 +3673,16 @@ async fn legacy_terminal_result_is_read_without_rewriting_old_job() {
     let before = ag163_image(&fx.path);
     for _ in 0..2 {
         let query = dispatcher.status(&evaluator, &durable.id).await.unwrap();
-        assert_eq!(query.state, ManagementJobState::Succeeded);
+        assert_eq!(query.identity().state, ManagementJobState::Succeeded);
         let value = serde_json::to_value(query).unwrap();
         assert_eq!(value["result"]["result"], "evaluation_status_read_v2");
         assert_eq!(value["result"]["report_read"]["state"], "legacy");
         assert!(
-            serde_json::from_value::<ManagementJob>(value).is_err(),
+            serde_json::from_value::<ManagementJob>(value.clone()).is_err(),
             "query-only result was accepted as durable job input"
+        );
+        assert!(
+            evo_storage::decode_management_job(&serde_json::to_string(&value).unwrap()).is_err()
         );
         assert!(
             ag163_image(&fx.path) == before,

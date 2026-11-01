@@ -1724,7 +1724,26 @@ async fn actual_parent_http_reads_preserve_old_job_and_economic_payloads_and_rol
         .unwrap()
         .remove("replay_read_view")
         .unwrap();
-    assert_eq!(job_body, metadata["management_job"]);
+    let mut expected_status = metadata["management_job"].clone();
+    let expected = expected_status.as_object_mut().unwrap();
+    assert_eq!(expected.remove("lease_token").unwrap(), Value::Null);
+    expected.insert(
+        "job_schema_version".into(),
+        metadata["management_job"]["schema_version"].clone(),
+    );
+    expected.insert(
+        "schema_version".into(),
+        json!("rsia.management_job_status.v1"),
+    );
+    expected.insert("committed_side_effects".into(), json!([{
+        "kind": "replay_report",
+        "report_id": metadata["management_job"]["result"]["report_id"],
+        "pool_digest": metadata["management_job"]["result"]["pool_digest"],
+        "semantic_reports_digest": metadata["management_job"]["result"]["semantic_reports_digest"],
+    }]));
+    expected.insert("fee_knowledge".into(), json!({"state":"known_none"}));
+    expected.insert("pending_fees".into(), json!([]));
+    assert_eq!(job_body, expected_status);
     assert_eq!(replay_view["record"]["state"], "legacy");
     assert_eq!(replay_view["source_legacy"], true);
     assert_eq!(replay_view["raw_payload"], metadata["selection"]);

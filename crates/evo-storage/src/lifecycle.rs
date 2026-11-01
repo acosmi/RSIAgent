@@ -3505,7 +3505,7 @@ async fn cleanup_node_content(
         // source-derived text; the request payload lives in the private input,
         // redacted below), so a job survives a source revocation. Revocation must
         // not erase a performed action.
-        ("job", "rsia.management_job.v1", _) => true,
+        ("job", "rsia.management_job.v1" | "rsia.management_job.v2", _) => true,
         _ => false,
     };
     let redact = match (node.kind.as_str(), schema, record_kind) {
@@ -4088,7 +4088,7 @@ pub const PROTECTED_SCHEMA_VERSIONS: [&str; 9] = [
 ///
 /// Kept apart from [`PROTECTED_SCHEMA_VERSIONS`], the accounting set whose size
 /// `tests/control_plane_facts.rs` pins. The script lists both groups in one tuple.
-pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 12] = [
+pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 13] = [
     "rsia.monitoring.consolidation_claim.v1",
     "rsia.monitoring.consolidation_run.v1",
     "rsia.monitoring.consolidation_staging.v1",
@@ -4101,6 +4101,7 @@ pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 12] = [
     "rsia.management_job.v1",
     "rsia.replay_economic_artifact_envelope.v1",
     "rsia.monitoring.consolidation_proposal.v2",
+    "rsia.management_job.v2",
 ];
 
 fn is_protected_schema(schema: &str) -> bool {

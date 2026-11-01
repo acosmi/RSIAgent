@@ -736,6 +736,7 @@ pub struct StoreOptimizationJournal {
     store: Store,
     context: Context,
     owner: String,
+    management: Option<std::sync::Arc<crate::dispatch::ManagementOptimizationClaim>>,
 }
 
 pub use crate::development::VerifiedDevelopmentTaskOutcome;
@@ -1128,7 +1129,16 @@ impl StoreOptimizationJournal {
             store,
             context,
             owner,
+            management: None,
         })
+    }
+
+    pub(crate) fn for_management(
+        mut self,
+        claim: std::sync::Arc<crate::dispatch::ManagementOptimizationClaim>,
+    ) -> Self {
+        self.management = Some(claim);
+        self
     }
 
     pub async fn reload(&self, artifact_id: &str) -> Result<StageFact> {
@@ -1144,6 +1154,11 @@ impl StoreOptimizationJournal {
     /// no stored response holds its content. `session` is the transaction the
     /// decision was taken in.
     async fn commit_redacted(&self, mut session: Session, fact: &StageFact) -> Result<()> {
+        if let Some(claim) = &self.management {
+            claim
+                .record_observed_stage(&mut session, fact, &self.owner)
+                .await?;
+        }
         let value = serde_json::to_value(fact).map_err(|_| Error::Internal)?;
         let body = serde_json::to_string(fact).map_err(|_| Error::Internal)?;
         let redacted = redacted_object_body("artifact", &fact.artifact_id, &value, &body);
@@ -1335,6 +1350,10 @@ impl StoreOptimizationJournal {
             if fingerprint(&old)? != fingerprint(&fact)? {
                 return Err(Error::Conflict("prepared claim differs".into()));
             }
+            if let Some(claim) = &self.management {
+                claim.require_stage(&mut session, &fact).await?;
+                claim.admit_new(&mut session).await?;
+            }
             persist_fact_current_material(&mut session, &self.context, &fact, inputs).await?;
             session.commit().await?;
             return Ok(false);
@@ -1351,6 +1370,11 @@ impl StoreOptimizationJournal {
             .is_some()
         {
             return Err(Error::Conflict("prepared subject missing".into()));
+        }
+        if let Some(claim) = &self.management {
+            claim
+                .record_prepared_stage(&mut session, &fact, &self.owner)
+                .await?;
         }
         persist_fact_current_material(&mut session, &self.context, &fact, inputs).await?;
         session
@@ -1397,6 +1421,18 @@ impl StoreOptimizationJournal {
             let fact =
                 read_bound_stage_fact_in_session(&mut session, &self.context, artifact_id, inputs)
                     .await?;
+            if let (Some(claim), Some(fact)) = (&self.management, &fact) {
+                match fact.kind {
+                    StageFactKind::RequestPrepared
+                    | StageFactKind::DevelopmentRequestPrepared
+                    | StageFactKind::EditCompiled
+                    | StageFactKind::StepPrepared
+                    | StageFactKind::DispatchPrepared => {
+                        claim.require_stage(&mut session, fact).await?
+                    }
+                    _ => claim.require_observation_origin(&mut session, fact).await?,
+                }
+            }
             session.commit().await?;
             return Ok(fact);
         }
@@ -1424,6 +1460,18 @@ impl StoreOptimizationJournal {
                     w.id.parse().map_err(|_| Error::Internal)?,
                 )
                 .await?;
+            }
+        }
+        if let (Some(claim), Some(fact)) = (&self.management, &fact) {
+            match fact.kind {
+                StageFactKind::RequestPrepared
+                | StageFactKind::DevelopmentRequestPrepared
+                | StageFactKind::EditCompiled
+                | StageFactKind::StepPrepared
+                | StageFactKind::DispatchPrepared => {
+                    claim.require_stage(&mut session, fact).await?
+                }
+                _ => claim.require_observation_origin(&mut session, fact).await?,
             }
         }
         session.commit().await?;
@@ -1490,6 +1538,24 @@ impl StoreOptimizationJournal {
             prepare_fact_compiler_use(&mut session, &self.context, &mut fact, inputs).await?;
         }
         validate_live_fact(&mut session, &self.context, &fact, inputs).await?;
+        if let Some(claim) = &self.management {
+            match fact.kind {
+                StageFactKind::RequestPrepared
+                | StageFactKind::DevelopmentRequestPrepared
+                | StageFactKind::EditCompiled
+                | StageFactKind::StepPrepared
+                | StageFactKind::DispatchPrepared => {
+                    claim
+                        .record_prepared_stage(&mut session, &fact, &self.owner)
+                        .await?
+                }
+                _ => {
+                    claim
+                        .record_observed_stage(&mut session, &fact, &self.owner)
+                        .await?
+                }
+            }
+        }
         if session
             .cached::<StageFact, _>(&self.context, "optimization.stage", &key, &fact)
             .await?
@@ -1711,6 +1777,403 @@ pub struct OptimizationStepRequest<'a> {
     pub bundle_context: BundleCompileContext<'a>,
     pub development_request: DevelopmentRunRequest,
     pub allow_rank_call: bool,
+}
+
+/// Owned data backing for the borrowed optimization request used by one handler.
+/// These values retain their original types and order; source, Current and
+/// budget authority are checked by the actual consumers, independently of this
+/// in-memory data adapter. It contains no management claim or credential.
+#[derive(Clone)]
+pub(crate) struct OptimizationStepOwnedInputs {
+    evidence: evo_core::evidence::EvidenceSet,
+    source_selection: evo_core::evidence::SourceSelection,
+    source_bindings: Vec<TrustedSourceBinding>,
+    traces: Vec<OptimizationTrace>,
+    model_context: ModelRequestContext,
+    parent_skill: SkillSnapshot,
+    edit_context: TrustedEditContext,
+    edit_batch_template: SkillEditBatch,
+    protected_ranges: Vec<ProtectedTextRange>,
+    profile: Profile,
+    baseline: SkillSnapshot,
+    parent_strategy: Strategy,
+    baseline_strategy: Strategy,
+    improver_patch: ImproverPatch,
+    caps: HostCapabilities,
+    revoked: BTreeSet<String>,
+    development_request: DevelopmentRunRequest,
+    allow_rank_call: bool,
+}
+
+impl OptimizationStepOwnedInputs {
+    pub(crate) fn model_context(&self) -> &ModelRequestContext {
+        &self.model_context
+    }
+
+    /// Keep a complete existing library request after its borrowed owners leave
+    /// the resolver's scope. Existing owned fields move; borrowed values clone.
+    pub(crate) fn from_request(request: OptimizationStepRequest<'_>) -> Self {
+        let BundleCompileContext {
+            profile,
+            baseline,
+            parent_strategy,
+            baseline_strategy,
+            improver_patch,
+            caps,
+            revoked,
+        } = request.bundle_context;
+        Self {
+            evidence: request.evidence.clone(),
+            source_selection: request.source_selection.clone(),
+            source_bindings: request.source_bindings.to_vec(),
+            traces: request.traces,
+            model_context: request.model_context,
+            parent_skill: request.parent_skill.clone(),
+            edit_context: request.edit_context.clone(),
+            edit_batch_template: request.edit_batch_template,
+            protected_ranges: request.protected_ranges.to_vec(),
+            profile: profile.clone(),
+            baseline: baseline.clone(),
+            parent_strategy: parent_strategy.clone(),
+            baseline_strategy: baseline_strategy.clone(),
+            improver_patch: improver_patch.clone(),
+            caps: caps.clone(),
+            revoked: revoked.clone(),
+            development_request: request.development_request,
+            allow_rank_call: request.allow_rank_call,
+        }
+    }
+
+    /// Borrow the same complete inputs for the original library API. Its four
+    /// owned request fields clone because the backing remains alive across the
+    /// consumer's await; no original validation or dispatch path is replaced.
+    pub(crate) fn as_request(&self) -> OptimizationStepRequest<'_> {
+        OptimizationStepRequest {
+            evidence: &self.evidence,
+            source_selection: &self.source_selection,
+            source_bindings: &self.source_bindings,
+            traces: self.traces.clone(),
+            model_context: self.model_context.clone(),
+            parent_skill: &self.parent_skill,
+            edit_context: &self.edit_context,
+            edit_batch_template: self.edit_batch_template.clone(),
+            protected_ranges: &self.protected_ranges,
+            bundle_context: BundleCompileContext {
+                profile: &self.profile,
+                baseline: &self.baseline,
+                parent_strategy: &self.parent_strategy,
+                baseline_strategy: &self.baseline_strategy,
+                improver_patch: &self.improver_patch,
+                caps: &self.caps,
+                revoked: &self.revoked,
+            },
+            development_request: self.development_request.clone(),
+            allow_rank_call: self.allow_rank_call,
+        }
+    }
+}
+
+/// Startup configuration of the one existing optimization.step handler.
+/// These are existing data/backend choices, not request JSON or paid authority.
+#[derive(Clone)]
+pub struct ManagementOptimizationSettings {
+    pub model_digest: String,
+    pub sampling_digest: String,
+    pub max_suggestions: usize,
+    pub protected_ranges: Vec<ProtectedTextRange>,
+    pub allow_rank_call: bool,
+}
+
+#[derive(Clone)]
+pub struct ManagementOptimizationRuntime {
+    backend: std::sync::Arc<dyn ManagementOptimizationBackend>,
+    journal_context: Context,
+    settings: ManagementOptimizationSettings,
+}
+
+#[async_trait]
+trait ManagementOptimizationBackend: Send + Sync {
+    async fn budget_binding(&self, namespace: &str) -> Result<crate::broker::BudgetPortBinding>;
+    async fn development_control(&self) -> Result<crate::development::DevelopmentControlV1>;
+    fn model(
+        &self,
+        claim: std::sync::Arc<crate::dispatch::ManagementOptimizationClaim>,
+    ) -> std::sync::Arc<dyn ModelPort>;
+    fn runner(
+        &self,
+        claim: std::sync::Arc<crate::dispatch::ManagementOptimizationClaim>,
+    ) -> std::sync::Arc<dyn DevRunner>;
+}
+
+struct ManagementOptimizationBackends<T> {
+    broker: std::sync::Arc<crate::broker::PersistentModelBroker<T>>,
+    runner: std::sync::Arc<crate::development::RegisteredDevelopmentRunner>,
+}
+
+#[async_trait]
+impl<T: crate::broker::ModelTransport + 'static> ManagementOptimizationBackend
+    for ManagementOptimizationBackends<T>
+{
+    async fn budget_binding(&self, namespace: &str) -> Result<crate::broker::BudgetPortBinding> {
+        self.broker.budget_binding(namespace).await
+    }
+    async fn development_control(&self) -> Result<crate::development::DevelopmentControlV1> {
+        self.runner.management_control().await
+    }
+    fn model(
+        &self,
+        claim: std::sync::Arc<crate::dispatch::ManagementOptimizationClaim>,
+    ) -> std::sync::Arc<dyn ModelPort> {
+        std::sync::Arc::new(self.broker.for_management(claim))
+    }
+    fn runner(
+        &self,
+        claim: std::sync::Arc<crate::dispatch::ManagementOptimizationClaim>,
+    ) -> std::sync::Arc<dyn DevRunner> {
+        std::sync::Arc::new(self.runner.for_management(claim))
+    }
+}
+
+impl ManagementOptimizationRuntime {
+    /// Takes already configured ordinary backends and their real Context.
+    /// The private live claim is created later by the dispatcher, not here.
+    pub fn new<T: crate::broker::ModelTransport + 'static>(
+        broker: std::sync::Arc<crate::broker::PersistentModelBroker<T>>,
+        runner: std::sync::Arc<crate::development::RegisteredDevelopmentRunner>,
+        journal_context: Context,
+        settings: ManagementOptimizationSettings,
+    ) -> Result<Self> {
+        journal_context.require(&[Role::Worker, Role::Admin])?;
+        validate_digest(&settings.model_digest, "management model digest")?;
+        validate_digest(&settings.sampling_digest, "management sampling digest")?;
+        if settings.max_suggestions == 0 || settings.max_suggestions > MAX_SUGGESTIONS {
+            return Err(Error::Invalid(
+                "management optimization suggestion bound differs".into(),
+            ));
+        }
+        Ok(Self {
+            backend: std::sync::Arc::new(ManagementOptimizationBackends { broker, runner }),
+            journal_context,
+            settings,
+        })
+    }
+
+    pub(crate) async fn resolve_inputs(
+        &self,
+        caller: &Context,
+        store: &Store,
+        job_id: &str,
+        request: &crate::dispatch::OptimizationStepManagementRequest,
+    ) -> Result<(
+        OptimizationStepOwnedInputs,
+        crate::broker::BudgetPortBinding,
+    )> {
+        caller.require(&[Role::Admin])?;
+        if self.journal_context.namespace() != caller.namespace()
+            || request.compiler.purpose != Purpose::Development
+        {
+            return Err(Error::Forbidden);
+        }
+        // Store wrappers finish before the one resolver Session starts.
+        let control = self.backend.development_control().await?;
+        let budget = self.backend.budget_binding(caller.namespace()).await?;
+        if control.proposer_actor != self.journal_context.actor()
+            || control.id != request.development_control_id
+            || control.namespace != caller.namespace()
+            || control.billing_scope != budget.billing_scope
+            || control.root_budget_id != budget.root_budget_id
+            || control.environment_digest != request.compiler.environment_digest
+        {
+            return Err(Error::Conflict(
+                "management optimization runtime differs from original control".into(),
+            ));
+        }
+        let mut session = store.session().await?;
+        let current =
+            resolve_compiler_inputs_boxed(&mut session, caller, &request.compiler).await?;
+        let selection: evo_core::evidence::SourceSelection = session
+            .need(caller, "artifact", &request.source_selection_ref)
+            .await?;
+        if request.source_selection_ref != format!("optgrant-{}", fingerprint(&selection)?) {
+            return Err(Error::Forbidden);
+        }
+        validate_outbound_grant(&selection)?;
+        crate::evidence::validate_stored_sources(
+            &mut session,
+            caller,
+            &selection.run_ids,
+            request.compiler.revoke_watermark,
+        )
+        .await?;
+        let mut records = Vec::new();
+        let mut bindings = Vec::new();
+        let mut traces = Vec::new();
+        for id in &selection.run_ids {
+            let original = crate::evidence::load_stored_source(&mut session, caller, id).await?;
+            bindings.push(TrustedSourceBinding {
+                source_id: original.record.id.clone(),
+                source_digest: original.trace.source_digest.clone(),
+                parent_family: original.record.parent_family.clone(),
+            });
+            traces.push(original.trace);
+            records.push(original.record);
+        }
+        let evidence = crate::evidence::ingest_trusted_run_records(&selection, &records)?;
+        let template: SkillEditBatch = session
+            .need(caller, "artifact", &request.edit_template_ref)
+            .await?;
+        let improver: ImproverPatch = session
+            .need(caller, "artifact", &request.improver_patch_ref)
+            .await?;
+        let closure = traces
+            .iter()
+            .map(|trace| evo_core::skill_edit::EvidenceRef {
+                id: trace.run_id.clone(),
+                digest: trace.source_digest.clone(),
+            })
+            .collect::<Vec<_>>();
+        let parent = &request.compiler.search_parent;
+        let baseline = &request.compiler.baseline;
+        let edit_context = TrustedEditContext::new(
+            caller.namespace(),
+            &request.compiler.profile.id,
+            &template.skill_id,
+            &template.skill_version,
+            &request.compiler.profile.parent_digest,
+            &request.compiler.profile.baseline_digest,
+            parent,
+            closure.clone(),
+        )?;
+        let mut revoked = BTreeSet::new();
+        for id in parent.dependencies.iter().chain(&baseline.dependencies) {
+            if session
+                .get::<serde_json::Value>(caller, "tombstone", id)
+                .await?
+                .is_some()
+            {
+                revoked.insert(id.clone());
+            }
+        }
+        let root = session
+            .root_budget(caller, &budget.billing_scope)
+            .await?
+            .ok_or(Error::Budget)?;
+        if root.root_budget_id != budget.root_budget_id {
+            return Err(Error::Conflict(
+                "management optimization root differs".into(),
+            ));
+        }
+        let identity = fingerprint(&(caller.namespace(), caller.actor(), job_id))?;
+        let model_context = ModelRequestContext {
+            request_id: format!("management-opt-{identity}"),
+            namespace: caller.namespace().into(),
+            purpose: Purpose::Development,
+            stage: ModelStage::Merge,
+            episode_id: format!("management-episode-{identity}"),
+            step: 0,
+            attempt: 0,
+            parent_skill_digest: evo_core::skill_edit::skill_snapshot_digest(parent)?,
+            bundle_digest: request.compiler.profile.parent_digest.clone(),
+            source_closure: closure,
+            model_digest: self.settings.model_digest.clone(),
+            tools_digest: control.tools_digest.clone(),
+            rules_digest: control.rules_digest.clone(),
+            sampling_digest: self.settings.sampling_digest.clone(),
+            revoke_watermark: request.compiler.revoke_watermark,
+            max_suggestions: self.settings.max_suggestions,
+        };
+        let development = DevelopmentRunRequest {
+            request_id: format!("management-dev-{identity}"),
+            namespace: caller.namespace().into(),
+            purpose: Purpose::Development,
+            episode_id: model_context.episode_id.clone(),
+            step: model_context.step,
+            attempt: model_context.attempt,
+            manifest: control.manifest()?,
+            parent_bundle_digest: request.compiler.profile.parent_digest.clone(),
+            candidate_bundle_digest: request.compiler.profile.parent_digest.clone(),
+            environment_digest: control.environment_digest.clone(),
+            grader_digest: control.grader_digest.clone(),
+            rules_digest: control.rules_digest.clone(),
+            tools_digest: control.tools_digest.clone(),
+            revoke_watermark: request.compiler.revoke_watermark,
+            idempotency_key: format!("management-dev-{identity}"),
+        };
+        let borrowed = OptimizationStepRequest {
+            evidence: &evidence,
+            source_selection: &selection,
+            source_bindings: &bindings,
+            traces,
+            model_context,
+            parent_skill: parent,
+            edit_context: &edit_context,
+            edit_batch_template: template,
+            protected_ranges: &self.settings.protected_ranges,
+            bundle_context: BundleCompileContext {
+                profile: &request.compiler.profile,
+                baseline,
+                parent_strategy: &request.compiler.search_parent_strategy,
+                baseline_strategy: &request.compiler.baseline_strategy,
+                improver_patch: &improver,
+                caps: &request.compiler.capabilities,
+                revoked: &revoked,
+            },
+            development_request: development,
+            allow_rank_call: self.settings.allow_rank_call,
+        };
+        // Reject any field that the original borrowed API cannot preserve.
+        if fingerprint(&borrowed.compiler_input_request())? != fingerprint(&request.compiler)? {
+            return Err(Error::Conflict(
+                "management optimization complete compiler input differs".into(),
+            ));
+        }
+        let resolved = OptimizationStepOwnedInputs::from_request(borrowed);
+        let expected = crate::model::CurrentCompilerInputUse::new(
+            request.compiler.clone(),
+            current.binding().clone(),
+        );
+        optimization_bound_request_digest(&resolved.as_request(), &expected)?;
+        session.commit().await?;
+        Ok((resolved, budget))
+    }
+
+    pub(crate) async fn run_claimed(
+        &self,
+        store: &Store,
+        claim: std::sync::Arc<crate::dispatch::ManagementOptimizationClaim>,
+        inputs: &OptimizationStepOwnedInputs,
+    ) -> Result<(StageFact, Vec<StageFact>)> {
+        let model = self.backend.model(claim.clone());
+        let runner = self.backend.runner(claim.clone());
+        let journal = StoreOptimizationJournal::new(
+            store.clone(),
+            self.journal_context.clone(),
+            self.journal_context.actor(),
+        )?
+        .for_management(claim.clone());
+        let outcome = run_optimization_step(
+            Some(model.as_ref()),
+            Some(runner.as_ref()),
+            Some(&journal),
+            inputs.as_request(),
+        )
+        .await?;
+        let mut session = store.session().await?;
+        let mut completed = claim.step_prepared(&mut session).await?;
+        let compiled = claim.compiled_stages(&mut session).await?;
+        completed.kind = StageFactKind::StepCompleted;
+        completed.artifact_id = canonical_stage_artifact_id(&completed)?;
+        session.commit().await?;
+        let actual = journal.reload(&completed.artifact_id).await?;
+        if actual.input_digest != completed.input_digest
+            || fingerprint(&actual.payload)? != fingerprint(&encode_outcome(&outcome)?)?
+        {
+            return Err(Error::Conflict(
+                "management optimization terminal differs from actual outcome".into(),
+            ));
+        }
+        Ok((actual, compiled))
+    }
 }
 
 impl OptimizationStepRequest<'_> {
@@ -3316,6 +3779,40 @@ fn decode_outcome(value: serde_json::Value) -> Result<OptimizationStepOutcome> {
             "invalid durable optimization outcome".into(),
         )),
     }
+}
+
+pub(crate) fn management_completed_stage_id(prepared: &StageFact) -> Result<String> {
+    prepared.validate()?;
+    if prepared.kind != StageFactKind::StepPrepared {
+        return Err(Error::Conflict(
+            "management_optimization_origin_unknown".into(),
+        ));
+    }
+    let mut identity = prepared.clone();
+    identity.kind = StageFactKind::StepCompleted;
+    canonical_stage_artifact_id(&identity)
+}
+
+pub(crate) fn management_observed_stage_id(prepared: &StageFact) -> Result<String> {
+    prepared.validate()?;
+    if prepared.kind != StageFactKind::DispatchPrepared {
+        return Err(Error::Conflict(
+            "management_optimization_origin_unknown".into(),
+        ));
+    }
+    let mut identity = prepared.clone();
+    identity.kind = StageFactKind::DispatchObserved;
+    canonical_stage_artifact_id(&identity)
+}
+
+pub(crate) fn management_completed_outcome(fact: &StageFact) -> Result<OptimizationStepOutcome> {
+    fact.validate()?;
+    if fact.kind != StageFactKind::StepCompleted {
+        return Err(Error::Conflict(
+            "management_optimization_origin_unknown".into(),
+        ));
+    }
+    decode_current_outcome(fact.payload.clone())
 }
 
 fn decode_current_outcome(value: serde_json::Value) -> Result<OptimizationStepOutcome> {

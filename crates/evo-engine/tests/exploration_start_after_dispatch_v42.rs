@@ -37,6 +37,15 @@
 //!
 //! Fixtures are copied from `dispatch_management.rs`, `exploration_trust_v42.rs`
 //! and `meta_inheritance_v42.rs`; those files are unchanged.
+fn current_management_job(record: evo_storage::VersionedManagementJob) -> ManagementJobV2 {
+    match record {
+        evo_storage::VersionedManagementJob::V2(job) => job,
+        evo_storage::VersionedManagementJob::V1(_) => {
+            panic!("expected the actual current management producer wire")
+        }
+    }
+}
+
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 use async_trait::async_trait;
@@ -62,7 +71,7 @@ use evo_engine::development::projection::{
     register_config_projection_control,
 };
 use evo_engine::dispatch::{
-    ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
+    ManagementDispatcher, ManagementJobState, ManagementJobV2, ManagementResult,
 };
 use evo_engine::evidence::{
     StoredRunRecord, StoredTraceAuthority, store_source_selection, store_trace_authority,
@@ -967,7 +976,7 @@ impl Env {
         vec![widen, deepen]
     }
 
-    async fn start_job(&self, request_key: &str, world: &ExplorationWorldV1) -> ManagementJob {
+    async fn start_job(&self, request_key: &str, world: &ExplorationWorldV1) -> ManagementJobV2 {
         start_job(&self.dispatcher, &admin(), request_key, world).await
     }
 
@@ -1033,11 +1042,13 @@ fn set_selected_cost(fact: &mut Value, micros: u64) {
 }
 
 /// The result a succeeded `exploration.start` job carries, as the wire shows it.
-fn started_result(job: &ManagementJob) -> Value {
+fn started_result(job: &ManagementJobV2) -> Value {
     assert!(
         matches!(
             job.result,
-            Some(ManagementResult::ExplorationStarted { .. })
+            Some(evo_engine::dispatch::ManagementResultV2::Original(
+                ManagementResult::ExplorationStarted { .. }
+            ))
         ),
         "not an exploration.start result: {job:?}"
     );
@@ -1059,12 +1070,16 @@ fn expect_conflict(result: Result<RegisterWorldOutcome>, what: &str) {
 }
 
 /// `status` on the job holds and serves the stored result unchanged.
-async fn expect_status_ok(dispatcher: &ManagementDispatcher, job: &ManagementJob, when: &str) {
+async fn expect_status_ok(dispatcher: &ManagementDispatcher, job: &ManagementJobV2, when: &str) {
     match dispatcher.status(&admin(), &job.id).await {
         Ok(status) => {
-            assert_eq!(status.state, ManagementJobState::Succeeded, "{when}");
             assert_eq!(
-                serde_json::to_value(&status.result).unwrap(),
+                status.identity().state,
+                ManagementJobState::Succeeded,
+                "{when}"
+            );
+            assert_eq!(
+                serde_json::to_value(status.result()).unwrap(),
                 serde_json::to_value(&job.result).unwrap(),
                 "{when}: the stored result is served unchanged"
             );
@@ -1075,7 +1090,7 @@ async fn expect_status_ok(dispatcher: &ManagementDispatcher, job: &ManagementJob
 
 async fn expect_status_conflict(
     dispatcher: &ManagementDispatcher,
-    job: &ManagementJob,
+    job: &ManagementJobV2,
     what: &str,
 ) {
     let result = dispatcher.status(&admin(), &job.id).await;
@@ -1150,7 +1165,7 @@ async fn start_job(
     admin: &Context,
     request_key: &str,
     world: &ExplorationWorldV1,
-) -> ManagementJob {
+) -> ManagementJobV2 {
     let queued = dispatcher
         .submit(
             admin,
@@ -1158,6 +1173,7 @@ async fn start_job(
             exploration_start_payload(request_key, world),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     wait_terminal(dispatcher, admin, &queued.id).await
 }
@@ -1182,9 +1198,13 @@ async fn wait_terminal(
     dispatcher: &ManagementDispatcher,
     context: &Context,
     job_id: &str,
-) -> ManagementJob {
+) -> ManagementJobV2 {
     for _ in 0..400 {
-        let job = dispatcher.status(context, job_id).await.unwrap();
+        let job = dispatcher
+            .status(context, job_id)
+            .await
+            .map(current_management_job)
+            .unwrap();
         if matches!(
             job.state,
             ManagementJobState::Succeeded
@@ -1500,6 +1520,7 @@ async fn status_of_an_exploration_start_job_holds_after_the_world_dispatched() {
             exploration_start_payload("start-1", &world),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(again.id, done.id);
     assert_eq!(started_result(&again), result);
@@ -2521,7 +2542,7 @@ async fn a_world_whose_facts_do_not_account_for_its_counters_is_not_the_register
 async fn expect_refused_everywhere(
     env: &Env,
     world: &ExplorationWorldV1,
-    done: &ManagementJob,
+    done: &ManagementJobV2,
     records: &DispatchedRecords,
     key: &str,
     label: &str,

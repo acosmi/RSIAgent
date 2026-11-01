@@ -35,6 +35,15 @@
 //! where no cleanup job is driven to the end, or where nothing was submitted
 //! before the revocation).
 
+fn current_management_job(record: evo_storage::VersionedManagementJob) -> ManagementJobV2 {
+    match record {
+        evo_storage::VersionedManagementJob::V2(job) => job,
+        evo_storage::VersionedManagementJob::V1(_) => {
+            panic!("expected the actual current management producer wire")
+        }
+    }
+}
+
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 
@@ -61,7 +70,7 @@ use evo_engine::development::{
     RegisteredDevelopmentRunner, RegisteredTargetInputV1, register_development_control,
     registered_runner_digest, typed_receipt_closure,
 };
-use evo_engine::dispatch::{ManagementDispatcher, ManagementJob, ManagementJobState};
+use evo_engine::dispatch::{ManagementDispatcher, ManagementJobState, ManagementJobV2};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::optimization::{
     DevRunner, DevelopmentRunReport, DevelopmentRunRequest, OPTIMIZATION_STAGE_FACT_SCHEMA,
@@ -1365,7 +1374,7 @@ async fn a_revoked_curriculum_fails_closed_before_and_after_the_cleanup() {
             "a refused submission writes no private input"
         );
         let row = session
-            .cached::<ManagementJob, _>(
+            .cached::<ManagementJobV2, _>(
                 ctx,
                 "curriculum.step",
                 "curriculum-after-revocation",
@@ -1401,9 +1410,13 @@ async fn wait_terminal(
     dispatcher: &ManagementDispatcher,
     ctx: &Context,
     job_id: &str,
-) -> ManagementJob {
+) -> ManagementJobV2 {
     for _ in 0..400 {
-        let job = dispatcher.status(ctx, job_id).await.unwrap();
+        let job = dispatcher
+            .status(ctx, job_id)
+            .await
+            .map(current_management_job)
+            .unwrap();
         if matches!(
             job.state,
             ManagementJobState::Succeeded
@@ -1435,6 +1448,7 @@ async fn a_management_curriculum_step_status_fails_closed_once_its_source_is_rev
             step_request("curriculum-before-revocation"),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_terminal(&dispatcher, ctx, &queued.id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");

@@ -515,12 +515,15 @@ async fn add_original(fixture: &Fixture, key: &str) -> String {
         .await
         .unwrap();
     for _ in 0..1000 {
-        let current = dispatcher.status(&fixture.admin, &job.id).await.unwrap();
-        if current.state == ManagementJobState::Succeeded {
-            return job.id;
+        let current = dispatcher
+            .status(&fixture.admin, job.identity().id)
+            .await
+            .unwrap();
+        if current.identity().state == ManagementJobState::Succeeded {
+            return job.identity().id.to_owned();
         }
         assert!(!matches!(
-            current.state,
+            current.identity().state,
             ManagementJobState::Failed | ManagementJobState::Cancelled
         ));
         tokio::task::yield_now().await;

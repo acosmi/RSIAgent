@@ -1025,6 +1025,16 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
         &self,
         bound: crate::model::ReadBoundModelRequest,
     ) -> Result<ModelResponse> {
+        self.dispatch_management_bound(bound, None).await
+    }
+}
+
+impl<T: ModelTransport> PersistentModelBroker<T> {
+    async fn dispatch_management_bound(
+        &self,
+        bound: crate::model::ReadBoundModelRequest,
+        management: Option<&crate::dispatch::ManagementOptimizationClaim>,
+    ) -> Result<ModelResponse> {
         bound.validate()?;
         let request = bound.request.clone();
         let ctx = self.broker_context(&request.namespace)?;
@@ -1095,6 +1105,9 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
                     &BudgetPreDispatchRefusal::CallIdReused,
                 ));
             }
+            if let Some(claim) = management {
+                claim.require_call(&mut session, &call, &artifact).await?;
+            }
             if call.state != BudgetCallState::Reserved {
                 let response = bound_existing_response(&request, &root, &call)?;
                 session.commit().await?;
@@ -1134,7 +1147,7 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
             dispatch_group_id: request.episode_id.clone(),
             stage: model_stage_budget(request.stage),
             actual_input_digest: request.cache_key_digest.clone(),
-            request_artifact: Some(artifact),
+            request_artifact: Some(artifact.clone()),
             max_cost_micros: self.config.max_cost_micros,
             lease_token: fingerprint(&(
                 self.config.actor.as_str(),
@@ -1144,6 +1157,14 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
             lease_until,
             now,
         };
+        if let Some(claim) = management {
+            if let Err(error) = claim.admit_new(&mut session).await {
+                if let Some(response) = management_pre_commit_refusal(&request, &error) {
+                    return Ok(response);
+                }
+                return Err(error);
+            }
+        }
         let mut call = match session
             .reserve_budget_call_with_sources_typed(&ctx, &reservation, &source_ids)
             .await?
@@ -1190,6 +1211,24 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
                     &format!("{PRE_DISPATCH_REASON_PREFIX}{reason}"),
                 )
                 .await?;
+            if let Some(claim) = management {
+                if let Err(error) = claim
+                    .record_call(
+                        &mut session,
+                        ctx.actor(),
+                        crate::dispatch::ManagementOptimizationCallSource::Model(&bound),
+                        &released,
+                        &root,
+                        &artifact,
+                    )
+                    .await
+                {
+                    if let Some(response) = management_pre_commit_refusal(&request, &error) {
+                        return Ok(response);
+                    }
+                    return Err(error);
+                }
+            }
             session.commit().await?;
             return Ok(undispatched_terminal_response(&request, &released));
         } else {
@@ -1203,11 +1242,48 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
                             &format!("{PRE_DISPATCH_REASON_PREFIX}{}", refusal.code()),
                         )
                         .await?;
+                    if let Some(claim) = management {
+                        if let Err(error) = claim
+                            .record_call(
+                                &mut session,
+                                ctx.actor(),
+                                crate::dispatch::ManagementOptimizationCallSource::Model(&bound),
+                                &released,
+                                &root,
+                                &artifact,
+                            )
+                            .await
+                        {
+                            if let Some(response) = management_pre_commit_refusal(&request, &error)
+                            {
+                                return Ok(response);
+                            }
+                            return Err(error);
+                        }
+                    }
                     session.commit().await?;
                     return Ok(undispatched_terminal_response(&request, &released));
                 }
             }
         };
+        if let Some(claim) = management {
+            if let Err(error) = claim
+                .record_call(
+                    &mut session,
+                    ctx.actor(),
+                    crate::dispatch::ManagementOptimizationCallSource::Model(&bound),
+                    &decision.call,
+                    &root,
+                    &artifact,
+                )
+                .await
+            {
+                if let Some(response) = management_pre_commit_refusal(&request, &error) {
+                    return Ok(response);
+                }
+                return Err(error);
+            }
+        }
         // This commit is the single authorization linearization point: profile,
         // P/B, complete request, sources, lease and dispatch fence are one snapshot.
         session.commit().await?;
@@ -1244,6 +1320,54 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
         }
         current.commit().await?;
         Ok(response)
+    }
+}
+
+// Only before the authorization commit and transport I/O. This actual phase
+// observation is preserved by the existing recovery journal, not a caller bool.
+fn management_pre_commit_refusal(request: &ModelRequest, error: &Error) -> Option<ModelResponse> {
+    match error {
+        Error::Cancelled => {}
+        Error::Conflict(reason) if reason == "management job lease fence changed" => {}
+        _ => return None, // Clock/storage/source keep their original class.
+    }
+    Some(ModelResponse::Rejected {
+        request_id: request.request_id.clone(),
+        kind: ModelRejectionKind::CancelledBeforeDispatch,
+        reason: "management_job_stopped".into(),
+        dispatch: RejectedDispatch::NotDispatched,
+    })
+}
+
+/// Only an actual management claim can construct this closed operation port.
+/// Ordinary broker constructors and public ModelPort signatures are unchanged.
+pub(crate) struct ManagementOptimizationModelPort<T> {
+    broker: Arc<PersistentModelBroker<T>>,
+    claim: Arc<crate::dispatch::ManagementOptimizationClaim>,
+}
+impl<T: ModelTransport> PersistentModelBroker<T> {
+    pub(crate) fn for_management(
+        self: &Arc<Self>,
+        claim: Arc<crate::dispatch::ManagementOptimizationClaim>,
+    ) -> ManagementOptimizationModelPort<T> {
+        ManagementOptimizationModelPort {
+            broker: self.clone(),
+            claim,
+        }
+    }
+}
+#[async_trait]
+impl<T: ModelTransport> ModelPort for ManagementOptimizationModelPort<T> {
+    async fn dispatch(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        Err(Error::Forbidden)
+    }
+    async fn dispatch_compiler_bound(
+        &self,
+        bound: crate::model::ReadBoundModelRequest,
+    ) -> Result<ModelResponse> {
+        self.broker
+            .dispatch_management_bound(bound, Some(&self.claim))
+            .await
     }
 }
 

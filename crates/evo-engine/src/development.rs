@@ -2229,6 +2229,70 @@ pub(crate) async fn run_receipt_candidate_consumption(
     runner_candidate_consumption(&control.runner_digest)
 }
 
+pub(crate) async fn management_control_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    id: &str,
+) -> Result<DevelopmentControlV1> {
+    need_control(session, ctx, id).await
+}
+
+/// Read-only identity check of the actual registered producer's complete wire.
+/// Parsing this existing data record grants no Current or execution authority.
+pub(crate) async fn verify_management_budget_call(
+    session: &mut Session,
+    ctx: &Context,
+    call: &BudgetCallRecord,
+    request: &DevelopmentRunRequest,
+) -> Result<()> {
+    let artifact = call.request_artifact.as_ref().ok_or(Error::NotFound)?;
+    if artifact.schema_version != REGISTERED_EXECUTION_REQUEST_SCHEMA
+        || evo_core::hash(artifact.body.as_bytes()) != artifact.digest
+    {
+        return Err(Error::Conflict(
+            "management_optimization_origin_unknown".into(),
+        ));
+    }
+    let value = evo_storage::lifecycle::parse_strict_json(&artifact.body)?;
+    let original: RegisteredExecutionRequestV1 = serde_json::from_value(value)
+        .map_err(|_| Error::Conflict("management_optimization_origin_unknown".into()))?;
+    let control = need_control(session, ctx, &original.control_id).await?;
+    validate_control_request_binding(&control, request)?;
+    let task = registered_task(&control, request, &original.task_id)?;
+    let digest = execution_request_digest(&control, request, task, original.side)?;
+    let expected = RegisteredExecutionRequestV1 {
+        schema_version: REGISTERED_EXECUTION_REQUEST_SCHEMA.into(),
+        control_id: control.id.clone(),
+        request_id: request.request_id.clone(),
+        episode_id: request.episode_id.clone(),
+        task_id: task.task_id.clone(),
+        side: original.side,
+        input: task.input,
+        input_digest: task.input_digest.clone(),
+        bundle_digest: side_bundle_digest(request, original.side).into(),
+        environment_digest: request.environment_digest.clone(),
+        request_digest: digest.clone(),
+        target_id: task.target_id.clone(),
+        target_digest: control.target_digest.clone(),
+        runner_digest: control.runner_digest.clone(),
+        source_ids: control.source_ids.clone(),
+    };
+    if fingerprint(&original)? != fingerprint(&expected)?
+        || call.namespace != request.namespace
+        || call.dispatch_group_id != request.episode_id
+        || call.billing_scope != control.billing_scope
+        || call.actual_input_digest != digest
+        || call.call_id
+            != execution_budget_call_id(&request.request_id, &task.task_id, original.side)?
+        || call.stage != BudgetStage::DevelopmentExecution
+    {
+        return Err(Error::Conflict(
+            "management_optimization_origin_unknown".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Fixed trusted runner for registered pure-function targets. It is the
 /// executor actor for budget rows and execution receipts and uses a separate
 /// grader context for scoring. It never dispatches a provider or a model.
@@ -2239,6 +2303,7 @@ pub struct RegisteredDevelopmentRunner {
     control_id: String,
     lease_seconds: i64,
     clock: Arc<dyn Fn() -> Result<i64> + Send + Sync>,
+    management: Option<Arc<crate::dispatch::ManagementOptimizationClaim>>,
 }
 
 impl RegisteredDevelopmentRunner {
@@ -2302,7 +2367,27 @@ impl RegisteredDevelopmentRunner {
             control_id,
             lease_seconds,
             clock,
+            management: None,
         })
+    }
+
+    pub(crate) fn for_management(
+        &self,
+        claim: Arc<crate::dispatch::ManagementOptimizationClaim>,
+    ) -> Self {
+        Self {
+            store: self.store.clone(),
+            executor: self.executor.clone(),
+            grader: self.grader.clone(),
+            control_id: self.control_id.clone(),
+            lease_seconds: self.lease_seconds,
+            clock: self.clock.clone(),
+            management: Some(claim),
+        }
+    }
+
+    pub(crate) async fn management_control(&self) -> Result<DevelopmentControlV1> {
+        load_development_control(&self.store, &self.executor, &self.control_id).await
     }
 
     fn now(&self) -> Result<i64> {
@@ -2344,6 +2429,17 @@ impl RegisteredDevelopmentRunner {
                 ));
             }
             validate_execution_receipt_binding(receipt, control, request, task, side)?;
+            if let Some(claim) = &self.management {
+                let call_id = execution_budget_call_id(&request.request_id, &task.task_id, side)?;
+                let call = session
+                    .budget_call(&self.executor, &control.billing_scope, &call_id)
+                    .await?
+                    .ok_or(Error::NotFound)?;
+                let artifact = call.request_artifact.as_ref().ok_or_else(|| {
+                    Error::Conflict("management_optimization_origin_unknown".into())
+                })?;
+                claim.require_call(&mut session, &call, artifact).await?;
+            }
         }
         session.commit().await?;
         Ok(existing)
@@ -2413,6 +2509,24 @@ impl RegisteredDevelopmentRunner {
         // immutable bundle record and refuses it if its authority is now stale.
         let reserved_inputs =
             verify_development_bundle_inputs(&mut session, &self.executor, request).await?;
+        if let Some(claim) = &self.management {
+            let artifact = reservation
+                .request_artifact
+                .as_ref()
+                .ok_or(Error::Internal)?;
+            let existing = session
+                .budget_call(&self.executor, &control.billing_scope, &call_id)
+                .await?;
+            if let Some(call) = &existing {
+                claim.require_call(&mut session, call, artifact).await?;
+            }
+            if existing
+                .as_ref()
+                .is_none_or(|call| call.state == BudgetCallState::Reserved)
+            {
+                claim.admit_new(&mut session).await?;
+            }
+        }
         let call = session
             .reserve_budget_call_with_sources_typed(
                 &self.executor,
@@ -2421,6 +2535,26 @@ impl RegisteredDevelopmentRunner {
             )
             .await?
             .map_err(evo_storage::budget::BudgetPreDispatchRefusal::into_reservation_error)?;
+        if let Some(claim) = &self.management {
+            let artifact = reservation
+                .request_artifact
+                .as_ref()
+                .ok_or(Error::Internal)?;
+            if call.state == BudgetCallState::Reserved {
+                claim
+                    .record_call(
+                        &mut session,
+                        self.executor.actor(),
+                        crate::dispatch::ManagementOptimizationCallSource::Development(request),
+                        &call,
+                        root,
+                        artifact,
+                    )
+                    .await?;
+            } else {
+                claim.require_call(&mut session, &call, artifact).await?;
+            }
+        }
         session.commit().await?;
         if matches!(
             call.state,
@@ -2619,6 +2753,40 @@ impl RegisteredDevelopmentRunner {
                 session.commit().await?;
             }
             return Err(error);
+        }
+        if let Some(claim) = &self.management {
+            let artifact = original_call
+                .request_artifact
+                .as_ref()
+                .ok_or_else(|| Error::Conflict("management_optimization_origin_unknown".into()))?;
+            let admission = async {
+                claim
+                    .require_call(&mut session, original_call, artifact)
+                    .await?;
+                if original_call.state == BudgetCallState::Reserved {
+                    claim.admit_new(&mut session).await?;
+                }
+                Ok::<(), Error>(())
+            }
+            .await;
+            if let Err(error) = admission {
+                if original_call.state == BudgetCallState::Reserved
+                    && matches!(
+                        &error,
+                        Error::Conflict(_) | Error::Forbidden | Error::NotFound | Error::Cancelled
+                    )
+                {
+                    session
+                        .release_undispatched_budget_call(
+                            &self.executor,
+                            fence,
+                            "management_pre_dispatch_v1.job_stopped",
+                        )
+                        .await?;
+                    session.commit().await?;
+                }
+                return Err(error);
+            }
         }
         let result = self
             .begin_execution_in_session(&mut session, original_call, fence)

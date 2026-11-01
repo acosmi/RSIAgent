@@ -27,6 +27,15 @@
 //!   production reducer `apply_cycle_to_failure_records` and persisted with
 //!   `overwrite_state`.
 
+fn current_management_job(record: evo_storage::VersionedManagementJob) -> ManagementJobV2 {
+    match record {
+        evo_storage::VersionedManagementJob::V2(job) => job,
+        evo_storage::VersionedManagementJob::V1(_) => {
+            panic!("expected the actual current management producer wire")
+        }
+    }
+}
+
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 
@@ -62,7 +71,7 @@ use evo_engine::development::{
     registered_runner_digest,
 };
 use evo_engine::dispatch::{
-    ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
+    ManagementDispatcher, ManagementJobState, ManagementJobV2, ManagementResult,
 };
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::formal_authority::content_digest;
@@ -2077,9 +2086,13 @@ async fn wait_terminal(
     dispatcher: &ManagementDispatcher,
     ctx: &Context,
     job_id: &str,
-) -> ManagementJob {
+) -> ManagementJobV2 {
     for _ in 0..400 {
-        let job = dispatcher.status(ctx, job_id).await.unwrap();
+        let job = dispatcher
+            .status(ctx, job_id)
+            .await
+            .map(current_management_job)
+            .unwrap();
         if matches!(
             job.state,
             ManagementJobState::Succeeded
@@ -2160,17 +2173,20 @@ async fn a_failure_gap_without_a_registered_bucket_ends_in_a_queryable_unsupport
             }),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let done = wait_terminal(&dispatcher, &fixture.admin, &queued.id).await;
     // I4: the management job succeeds with the queryable unsupported_scope
     // terminal instead of failing on an error string.
     assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
     assert_eq!(done.step, "probe_scheduled");
-    let Some(ManagementResult::ProbeScheduled {
-        probe_job_id,
-        terminal,
-        ..
-    }) = &done.result
+    let Some(evo_engine::dispatch::ManagementResultV2::Original(
+        ManagementResult::ProbeScheduled {
+            probe_job_id,
+            terminal,
+            ..
+        },
+    )) = &done.result
     else {
         panic!("unexpected result: {:?}", done.result);
     };

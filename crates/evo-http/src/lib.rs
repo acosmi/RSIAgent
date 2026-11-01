@@ -374,7 +374,7 @@ async fn management(
     reject_body_identity(&body)?;
     let result = state
         .management
-        .submit(&caller, &operation, body)
+        .submit_status_view(&caller, &operation, body)
         .await
         .map_err(|error| match error {
             Error::Invalid(message) if message == "unknown_management_operation" => {
@@ -400,12 +400,7 @@ async fn management_status(
     headers: HeaderMap,
 ) -> std::result::Result<Json<Value>, HttpError> {
     let caller = state.auth.authenticate(&headers)?;
-    to_json(
-        state
-            .management
-            .status_with_replay_read_view(&caller, &job_id)
-            .await?,
-    )
+    to_json(state.management.status_view(&caller, &job_id).await?)
 }
 
 async fn management_cancel(
@@ -423,7 +418,8 @@ async fn management_cancel(
             "invalid_management_cancel_payload",
         ));
     }
-    to_json(state.management.cancel(&caller, &job_id).await?)
+    state.management.cancel(&caller, &job_id).await?;
+    to_json(state.management.status_view(&caller, &job_id).await?)
 }
 
 fn reject_body_identity(body: &Value) -> std::result::Result<(), HttpError> {
