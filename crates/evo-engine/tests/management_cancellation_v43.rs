@@ -41,7 +41,7 @@ use evo_storage::budget::{
     BudgetCallRecord, BudgetCallState, RootBudgetAuthorization, UsageCharge,
 };
 use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
-use evo_storage::{Store, decode_management_job};
+use evo_storage::{Store, decode_management_job, sqlx};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::PathBuf;

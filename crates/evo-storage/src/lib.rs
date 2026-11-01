@@ -5,6 +5,7 @@ pub mod dependency_read;
 pub mod lifecycle;
 pub mod replay;
 pub mod typed_budget;
+pub use sqlx;
 
 use evo_core::curriculum::ProbeTerminal;
 use evo_core::strategy::BatchActionV1;

@@ -25,7 +25,7 @@ use evo_core::sequential::{
 use evo_core::{Context, Error, Role, fingerprint, hash};
 use evo_engine::dispatch::{
     ExperimentRegisterRequest, ManagementDispatcher, ManagementJob, ManagementJobState,
-    ManagementJobV2, ManagementResult, VersionedManagementJob,
+    ManagementJobV2, VersionedManagementJob,
 };
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::release_store::{
