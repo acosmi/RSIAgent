@@ -1966,10 +1966,44 @@ fn live_running_job(context: &Context) -> ManagementJob {
     )
 }
 
+fn capacity_wait_image(directory: &std::path::Path) -> Value {
+    let script = r#"
+import hashlib,json,pathlib,sqlite3,sys
+root=pathlib.Path(sys.argv[1]); databases=sorted(root.glob('*.sqlite3')); assert len(databases)==1
+c=sqlite3.connect('file:'+str(databases[0])+'?mode=ro',uri=True)
+rows={}
+for (name,) in c.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
+    q='"'+name.replace('"','""')+'"'
+    rows[name]=sorted([[{'blob':x.hex()} if isinstance(x,bytes) else x for x in row] for row in c.execute('SELECT * FROM '+q)],key=repr)
+c.close()
+files=[]
+for path in sorted(root.rglob('*')):
+    rel=str(path.relative_to(root))
+    if path.is_symlink(): files.append([rel,'symlink',str(path.readlink())])
+    elif path.is_dir(): files.append([rel,'directory'])
+    elif not path.name.endswith('-shm'):
+        b=path.read_bytes(); files.append([rel,len(b),hashlib.sha256(b).hexdigest()])
+print(json.dumps({'tables':rows,'files':files},sort_keys=True))
+"#;
+    let output = std::process::Command::new("python3")
+        .args(["-B", "-c", script])
+        .arg(directory)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 async fn assert_waiting_for_capacity(
     dispatcher: &ManagementDispatcher,
     admin: &Context,
     job_id: &str,
+    directory: &std::path::Path,
+    before: &Value,
 ) -> ManagementJobV2 {
     // Let the spawned claim (and a few retries) run.
     tokio::time::sleep(Duration::from_millis(60)).await;
@@ -1984,6 +2018,7 @@ async fn assert_waiting_for_capacity(
     assert_eq!(waiting.lease_until, 0);
     assert_eq!(waiting.generation, 0);
     assert_eq!(waiting.diagnostics.len(), 0);
+    assert_eq!(&capacity_wait_image(directory), before);
     // Retries keep the job Queued without piling up diagnostics.
     tokio::time::sleep(ManagementDispatcher::CAPACITY_WAIT_RETRY * 2).await;
     let still_waiting = dispatcher
@@ -1993,12 +2028,13 @@ async fn assert_waiting_for_capacity(
         .unwrap();
     assert_eq!(still_waiting.state, ManagementJobState::Queued);
     assert_eq!(still_waiting.diagnostics.len(), 0);
+    assert_eq!(&capacity_wait_image(directory), before);
     still_waiting
 }
 
 #[tokio::test]
 async fn second_management_dispatch_waits_queued_until_the_live_lease_finishes() {
-    let (_dir, store) = store().await;
+    let (dir, store) = store().await;
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let holding = live_running_job(&admin);
     let mut session = store.session().await.unwrap();
@@ -2020,8 +2056,10 @@ async fn second_management_dispatch_waits_queued_until_the_live_lease_finishes()
         .await
         .map(current_management_job)
         .unwrap();
+    // submit is Ready; synchronous capture precedes the spawned task's first poll.
+    let before = capacity_wait_image(dir.path());
     assert_eq!(queued.state, ManagementJobState::Queued);
-    assert_waiting_for_capacity(&dispatcher, &admin, &queued.id).await;
+    assert_waiting_for_capacity(&dispatcher, &admin, &queued.id, dir.path(), &before).await;
 
     // The running job finishes and releases its lease: the deferred claim
     // proceeds on its own and the job runs to its normal terminal state.
@@ -2044,7 +2082,6 @@ async fn second_management_dispatch_waits_queued_until_the_live_lease_finishes()
     );
     assert_eq!(done.generation, 1);
     assert_eq!(done.diagnostics.len(), 0);
-    assert_eq!(done.diagnostics[0].code, "conflict");
     // The job that held the dispatch was never touched.
     let untouched = dispatcher.status(&admin, &holding.id).await.unwrap();
     assert_eq!(untouched.identity().state, ManagementJobState::Succeeded);
@@ -2054,7 +2091,7 @@ async fn second_management_dispatch_waits_queued_until_the_live_lease_finishes()
 /// held by a job in ns-a defers a claim in ns-b until that lease is released.
 #[tokio::test]
 async fn management_dispatch_capacity_cannot_be_split_across_namespaces() {
-    let (_dir, store) = store().await;
+    let (dir, store) = store().await;
     let admin_a = Context::new("ns-a", "admin", Role::Admin).unwrap();
     let admin_b = Context::new("ns-b", "admin", Role::Admin).unwrap();
     let holding = live_running_job(&admin_a);
@@ -2077,8 +2114,10 @@ async fn management_dispatch_capacity_cannot_be_split_across_namespaces() {
         .await
         .map(current_management_job)
         .unwrap();
+    // submit is Ready; synchronous capture precedes the spawned task's first poll.
+    let before = capacity_wait_image(dir.path());
     assert_eq!(queued.state, ManagementJobState::Queued);
-    assert_waiting_for_capacity(&dispatcher, &admin_b, &queued.id).await;
+    assert_waiting_for_capacity(&dispatcher, &admin_b, &queued.id, dir.path(), &before).await;
 
     let mut finished = holding.clone();
     finished.state = ManagementJobState::Succeeded;
@@ -2108,7 +2147,7 @@ async fn management_dispatch_capacity_cannot_be_split_across_namespaces() {
 
 #[tokio::test]
 async fn capacity_deferred_job_can_still_be_cancelled_while_queued() {
-    let (_dir, store) = store().await;
+    let (dir, store) = store().await;
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let holding = live_running_job(&admin);
     let mut session = store.session().await.unwrap();
@@ -2126,7 +2165,9 @@ async fn capacity_deferred_job_can_still_be_cancelled_while_queued() {
         )
         .await.map(current_management_job)
         .unwrap();
-    assert_waiting_for_capacity(&dispatcher, &admin, &queued.id).await;
+    // submit is Ready; synchronous capture precedes the spawned task's first poll.
+    let before = capacity_wait_image(dir.path());
+    assert_waiting_for_capacity(&dispatcher, &admin, &queued.id, dir.path(), &before).await;
     let cancelled = dispatcher
         .cancel(&admin, &queued.id)
         .await
@@ -2147,7 +2188,7 @@ async fn capacity_deferred_job_can_still_be_cancelled_while_queued() {
 
 #[tokio::test]
 async fn management_claim_waits_while_ten_budget_leases_are_live() {
-    let (_dir, store) = store().await;
+    let (dir, store) = store().await;
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let worker = Context::new("n", "worker", Role::Worker).unwrap();
     store
@@ -2206,7 +2247,9 @@ async fn management_claim_waits_while_ten_budget_leases_are_live() {
         .await
         .map(current_management_job)
         .unwrap();
-    assert_waiting_for_capacity(&dispatcher, &admin, &queued.id).await;
+    // submit is Ready; synchronous capture precedes the spawned task's first poll.
+    let before = capacity_wait_image(dir.path());
+    assert_waiting_for_capacity(&dispatcher, &admin, &queued.id, dir.path(), &before).await;
 
     // Releasing one lease is enough: the claim then holds the tenth lease.
     let released = &calls[0];

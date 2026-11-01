@@ -2288,7 +2288,6 @@ mod monitoring {
 
     struct Fixture {
         _dir: tempfile::TempDir,
-        database: std::path::PathBuf,
         store: Store,
         admin: Context,
         host: Context,
@@ -2395,7 +2394,6 @@ mod monitoring {
                 .unwrap();
             Self {
                 _dir: dir,
-                database,
                 store,
                 admin,
                 host,
