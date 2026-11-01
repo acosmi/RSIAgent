@@ -159,14 +159,7 @@ pub(crate) async fn lawfully_redacted(
     Ok(false)
 }
 
-fn registered_record(
-    schema: &str,
-    namespace: &str,
-    id: &str,
-    owner: &str,
-    value: &Value,
-    raw: &str,
-) -> bool {
+fn registered_record(schema: &str, namespace: &str, id: &str, owner: &str, value: &Value) -> bool {
     match schema {
         "rsia.e16.staged_asset.v1" | "rsia.e16.import_result.v1" | "rsia.e16.import_result.v2" => {
             let node = crate::lifecycle::TypedObjectRef {
@@ -222,9 +215,6 @@ fn registered_record(
                 && value["extracted"].is_array()
                 && digest(&value["manifest_digest"])
         }
-        "rsia.host_surface_record.v2" => {
-            evo_core::contract::decode_host_surface_record_v2_json(raw).is_ok()
-        }
         "rsia.registered_external_provider.v1"
         | "rsia.registered_external_provider.v2"
         | "rsia.registered_external_provider.v3"
@@ -278,7 +268,7 @@ pub(crate) async fn counts(
     let mut jobs = BTreeMap::<(String, String), Value>::new();
     let mut cursor = 0i64;
     loop {
-        let rows=sqlx::query("SELECT rowid,namespace,kind,id,owner,body FROM objects WHERE rowid>? ORDER BY rowid LIMIT 64")
+        let rows=sqlx::query("SELECT rowid,namespace,kind,id,owner,body,CASE WHEN json_type(body,'$.schema_version')='text' THEN json_extract(body,'$.schema_version') END AS object_schema,CASE WHEN json_type(body,'$.original_schema')='text' THEN json_extract(body,'$.original_schema') END AS original_schema,CASE WHEN json_type(body,'$.source')='text' THEN json_extract(body,'$.source') END AS source,CAST(COALESCE(json_extract(body,'$.metadata.record_kind'),json_extract(body,'$.record_kind'),'') AS TEXT) AS record_kind FROM objects WHERE rowid>? ORDER BY rowid LIMIT 64")
             .bind(cursor).fetch_all(&mut **tx).await.map_err(internal)?;
         if rows.is_empty() {
             break;
@@ -296,7 +286,84 @@ pub(crate) async fn counts(
                 continue;
             }
             let raw: String = row.try_get("body").map_err(internal)?;
-            let value = crate::lifecycle::parse_strict_json(&raw)?;
+            let stored_schema: Option<String> = row.try_get("object_schema").map_err(internal)?;
+            let original_schema: Option<String> =
+                row.try_get("original_schema").map_err(internal)?;
+            let effective_schema = if stored_schema.as_deref() == Some("rsia.redacted.v1") {
+                original_schema.as_deref().unwrap_or("")
+            } else {
+                stored_schema.as_deref().unwrap_or("")
+            };
+            if kind == "artifact"
+                && !matches!(
+                    effective_schema,
+                    "rsia.optimization.stage_fact.v1"
+                        | "rsia.optimization.stage_fact.v2"
+                        | "rsia.e16.import_result.v1"
+                        | "rsia.e16.import_result.v2"
+                        | "rsia.release_candidate.v1"
+                        | "rsia.release_candidate.v2"
+                        | "rsia.e16.staged_asset.v1"
+                        | "rsia.practice_attempt_set.v1"
+                        | "rsia.practice_attempt_set.v2"
+                        | "rsia.monitoring.development_cycle.v1"
+                        | "rsia.monitoring.development_cycle.v2"
+                        | "rsia.monitoring.consolidation_claim.v1"
+                        | "rsia.host_surface_record.v1"
+                        | "rsia.host_surface_record.v2"
+                        | "rsia.registered_external_provider.v1"
+                        | "rsia.registered_external_provider.v2"
+                        | "rsia.registered_external_provider.v3"
+                        | "rsia.registered_resource_instrumentation.v1"
+                        | "rsia.meta_trial_artifact_envelope.v1"
+                        | "rsia.typed_artifact_envelope.v1"
+                        | "rsia.replay_economic_artifact_envelope.v1"
+                        | "rsia.exploration_artifact_envelope.v1"
+                        | "rsia.curriculum_artifact_envelope.v1"
+                )
+            {
+                let source: Option<String> = row.try_get("source").map_err(internal)?;
+                if !effective_schema.is_empty()
+                    || source.as_deref() != Some("trusted_host_snapshot")
+                {
+                    continue;
+                }
+            }
+            if kind == "artifact" {
+                let record_kind: String = row.try_get("record_kind").map_err(internal)?;
+                let counted = match effective_schema {
+                    "rsia.meta_trial_artifact_envelope.v1" | "rsia.typed_artifact_envelope.v1" => {
+                        record_kind == "meta_trial_v1"
+                    }
+                    "rsia.replay_economic_artifact_envelope.v1" => {
+                        record_kind == "replay_economic_experiment_v1"
+                    }
+                    "rsia.exploration_artifact_envelope.v1" => matches!(
+                        record_kind.as_str(),
+                        "exploration_world_v1"
+                            | "optimization_history_v1"
+                            | "exploration_node_v1"
+                            | "exploration_dispatch_v1"
+                            | "meta_trial_v1"
+                    ),
+                    "rsia.curriculum_artifact_envelope.v1" => matches!(
+                        record_kind.as_str(),
+                        "development_cycle_receipt_v1"
+                            | "coverage_probe_job_v1"
+                            | "curriculum_selection_v1"
+                            | "learner_state_v2"
+                    ),
+                    _ => true,
+                };
+                if !counted {
+                    continue;
+                }
+            }
+            let value = if stored_schema.as_deref() == Some("rsia.host_surface_record.v2") {
+                evo_core::contract::decode_host_surface_record_v2_json(&raw)?
+            } else {
+                crate::lifecycle::parse_strict_json(&raw)?
+            };
             let redacted = value["schema_version"] == "rsia.redacted.v1";
             let schema = if redacted {
                 value["original_schema"].as_str()
@@ -393,7 +460,7 @@ pub(crate) async fn counts(
             if kind != "artifact" || identity != Some(id.as_str()) {
                 continue;
             }
-            if !redacted && !registered_record(schema, &namespace, &id, &owner, &value, &raw) {
+            if !redacted && !registered_record(schema, &namespace, &id, &owner, &value) {
                 continue;
             }
             let metadata = if redacted { &value["metadata"] } else { &value };
@@ -588,14 +655,14 @@ async fn optimization_job_closed(
         if !group_ids.insert(group_id) || !episodes.insert(episode) || !requests.insert(request) {
             return Ok(false);
         }
-        let prepared = if current {
-            let Some(step) = group["step"].as_u64() else {
-                return Ok(false);
-            };
-            let Some(attempt) = group["attempt"].as_u64() else {
-                return Ok(false);
-            };
-            let id = format!(
+        let Some(step) = group["step"].as_u64() else {
+            return Ok(false);
+        };
+        let Some(attempt) = group["attempt"].as_u64() else {
+            return Ok(false);
+        };
+        let prepared_id = if current {
+            format!(
                 "optstage-{}",
                 evo_core::fingerprint(&(
                     "rsia.optimization.stage_fact.v2",
@@ -607,7 +674,23 @@ async fn optimization_job_closed(
                     "step_prepared",
                     request,
                 ))?
-            );
+            )
+        } else {
+            format!(
+                "optstage-{}",
+                evo_core::fingerprint(&(
+                    namespace,
+                    episode,
+                    step,
+                    attempt,
+                    "merge",
+                    "step_prepared",
+                    request,
+                ))?
+            )
+        };
+        let prepared = if current {
+            let id = prepared_id.clone();
             let Some(row) = sqlx::query(
                 "SELECT owner,body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
             )
@@ -655,6 +738,72 @@ async fn optimization_job_closed(
         } else {
             None
         };
+        // Recovery facts retain the exact first Prepared as an edge. Episode
+        // alone also contains earlier/later steps and cannot establish ownership.
+        let rows: Vec<String> = sqlx::query_scalar(r#"SELECT f.body FROM dependencies d
+            JOIN objects f ON f.namespace=d.namespace AND f.kind=d.src_kind AND f.id=d.src_id
+            WHERE d.namespace=? AND d.src_kind='artifact' AND d.dst_kind='artifact' AND d.dst_id=?
+              AND COALESCE(json_extract(f.body,'$.schema_version'), '') IN ('rsia.optimization.stage_fact.v1','rsia.optimization.stage_fact.v2','rsia.redacted.v1')
+              AND COALESCE(json_extract(f.body,'$.kind'),json_extract(f.body,'$.metadata.kind')) IN ('dispatch_prepared','dispatch_observed','development_observed')"#)
+            .bind(namespace).bind(&prepared_id).fetch_all(&mut **tx).await.map_err(internal)?;
+        let mut facts = Vec::with_capacity(rows.len());
+        let mut member_requests = BTreeSet::new();
+        let mut member_calls = BTreeSet::new();
+        let mut member_usage = BTreeSet::new();
+        for raw in rows {
+            let value = crate::lifecycle::parse_strict_json(&raw)?;
+            let redacted = value["schema_version"] == "rsia.redacted.v1";
+            let header = if redacted { &value["metadata"] } else { &value };
+            if header["namespace"] != namespace
+                || header["episode_id"] != episode
+                || header["step"] != group["step"]
+                || header["attempt"] != group["attempt"]
+            {
+                return Ok(false);
+            }
+            let Some(id) = header["request_id"].as_str() else {
+                return Ok(false);
+            };
+            member_requests.insert(id.to_owned());
+            let payload = if redacted {
+                &header["historical_facts"]
+            } else {
+                &value["payload"]
+            };
+            for receipt in [
+                &payload["execution_receipt"],
+                &payload["dispatch"]["receipt"],
+            ] {
+                if let Some(id) = receipt["call_id"].as_str() {
+                    member_calls.insert(id.to_owned());
+                }
+                if let Some(id) = receipt["usage_record_id"].as_str() {
+                    member_usage.insert(id.to_owned());
+                }
+            }
+            if let Some(ids) = payload["usage_record_ids"].as_array() {
+                for id in ids {
+                    if let Some(id) = id.as_str() {
+                        member_usage.insert(id.to_owned());
+                    }
+                }
+            }
+            facts.push(value);
+        }
+        let requests_json = serde_json::to_string(&member_requests).map_err(internal)?;
+        let calls_json = serde_json::to_string(&member_calls).map_err(internal)?;
+        let usage_json = serde_json::to_string(&member_usage).map_err(internal)?;
+        let accounting = sqlx::query(r#"SELECT COUNT(*) AS calls,COALESCE(SUM(CASE WHEN state IN ('reserved','dispatched','uncertain') OR execution_closed=0
+            OR (state='finalized' AND (actual_cost_micros IS NULL OR usage_record_id IS NULL)) THEN 1 ELSE 0 END),0) AS unfinished
+            FROM root_budget_calls WHERE namespace=?1 AND (
+                call_id IN (SELECT value FROM json_each(?2))
+                OR COALESCE(json_extract(request_artifact_body,'$.request_id'),json_extract(request_artifact_body,'$.request.request_id'),json_extract(request_artifact_body,'$.metadata.request_id')) IN (SELECT value FROM json_each(?2))
+                OR call_id IN (SELECT value FROM json_each(?3))
+                OR usage_record_id IN (SELECT value FROM json_each(?4)))"#)
+            .bind(namespace).bind(&requests_json).bind(&calls_json).bind(&usage_json)
+            .fetch_one(&mut **tx).await.map_err(internal)?;
+        let calls: i64 = accounting.try_get("calls").map_err(internal)?;
+        let unfinished: i64 = accounting.try_get("unfinished").map_err(internal)?;
         let terminal=sqlx::query("SELECT id,body FROM objects WHERE namespace=? AND kind='artifact' AND (
           (json_extract(body,'$.schema_version') IN ('rsia.optimization.stage_fact.v1','rsia.optimization.stage_fact.v2') AND json_extract(body,'$.kind')='step_completed' AND json_extract(body,'$.episode_id')=? AND json_extract(body,'$.request_id')=? AND json_extract(body,'$.input_digest')=? AND json_extract(body,'$.step')=? AND json_extract(body,'$.attempt')=?) OR
           (json_extract(body,'$.schema_version')='rsia.redacted.v1' AND json_extract(body,'$.original_schema') IN ('rsia.optimization.stage_fact.v1','rsia.optimization.stage_fact.v2') AND json_extract(body,'$.metadata.kind')='step_completed' AND json_extract(body,'$.metadata.episode_id')=? AND json_extract(body,'$.metadata.request_id')=? AND json_extract(body,'$.metadata.input_digest')=? AND json_extract(body,'$.metadata.step')=? AND json_extract(body,'$.metadata.attempt')=?))")
@@ -670,24 +819,7 @@ async fn optimization_job_closed(
             {
                 return Ok(false);
             }
-            let traces:i64=sqlx::query_scalar(r#"SELECT COUNT(*) FROM objects WHERE namespace=?1 AND kind='artifact' AND (
-                (json_extract(body,'$.schema_version') IN ('rsia.optimization.stage_fact.v1','rsia.optimization.stage_fact.v2')
-                 AND json_extract(body,'$.episode_id')=?2 AND json_extract(body,'$.kind') IN ('dispatch_prepared','dispatch_observed','development_observed')) OR
-                (json_extract(body,'$.schema_version')='rsia.redacted.v1'
-                 AND json_extract(body,'$.original_schema') IN ('rsia.optimization.stage_fact.v1','rsia.optimization.stage_fact.v2')
-                 AND json_extract(body,'$.metadata.episode_id')=?2 AND json_extract(body,'$.metadata.kind') IN ('dispatch_prepared','dispatch_observed','development_observed')) OR
-                (json_extract(body,'$.record_kind') IN ('development_execution_receipt_v1','development_run_receipt_v1','development_execution_output_v1')
-                 AND (json_extract(body,'$.payload.episode_id')=?2 OR json_extract(body,'$.payload.request.episode_id')=?2)))"#)
-                .bind(namespace).bind(episode).fetch_one(&mut **tx).await.map_err(internal)?;
-            let calls: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM root_budget_calls WHERE namespace=? AND dispatch_group_id=?",
-            )
-            .bind(namespace)
-            .bind(episode)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(internal)?;
-            if traces != 0 || calls != 0 {
+            if !facts.is_empty() || calls != 0 {
                 return Ok(false);
             }
             continue;
@@ -705,16 +837,18 @@ async fn optimization_job_closed(
         ) {
             return Ok(false);
         }
-        let unfinished:i64=sqlx::query_scalar("SELECT COUNT(*) FROM root_budget_calls WHERE namespace=? AND dispatch_group_id=? AND (state IN ('reserved','dispatched','uncertain') OR (state='finalized' AND (execution_closed=0 OR actual_cost_micros IS NULL OR usage_record_id IS NULL)))")
-          .bind(namespace).bind(episode).fetch_one(&mut **tx).await.map_err(internal)?;
         if unfinished != 0 {
             return Ok(false);
         }
-        let terminal_id: String = terminal.try_get("id").map_err(internal)?;
-        let observations:Vec<String>=sqlx::query_scalar("SELECT o.body FROM dependencies d JOIN objects o ON o.namespace=d.namespace AND o.kind=d.dst_kind AND o.id=d.dst_id WHERE d.namespace=? AND d.src_kind='artifact' AND d.src_id=? AND d.dst_kind='artifact' AND (json_extract(o.body,'$.kind')='dispatch_observed' OR json_extract(o.body,'$.metadata.kind')='dispatch_observed')")
-          .bind(namespace).bind(&terminal_id).fetch_all(&mut **tx).await.map_err(internal)?;
-        for raw in observations {
-            let value = crate::lifecycle::parse_strict_json(&raw)?;
+        for value in facts {
+            let header = if value["schema_version"] == "rsia.redacted.v1" {
+                &value["metadata"]
+            } else {
+                &value
+            };
+            if header["kind"] != "dispatch_observed" {
+                continue;
+            }
             let payload = if value["schema_version"] == "rsia.redacted.v1" {
                 &value["metadata"]["historical_facts"]
             } else {

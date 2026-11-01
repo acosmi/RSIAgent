@@ -51,6 +51,31 @@ struct OperatorClockRefusal {
     error: TypedOperatorRefusal,
 }
 
+#[derive(Serialize, Deserialize)]
+enum CapacityOperatorRefusalCode {
+    #[serde(rename = "capacity_conflict")]
+    CapacityConflict,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedCapacityOperatorRefusal {
+    schema_version: OperatorRefusalSchema,
+    code: CapacityOperatorRefusalCode,
+    details: evo_core::capacity::CapacityConflict,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapacityOperatorRefusal {
+    status: OperatorRefusalStatus,
+    error: TypedCapacityOperatorRefusal,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReadOperatorRefusal {
+    Clock(OperatorClockRefusal),
+    Capacity(CapacityOperatorRefusal),
+}
+
 // Only an authenticated execute result chooses this private refusal packet.
 fn operator_response(result: &Result<Value>) -> Result<Value> {
     match result {
@@ -60,6 +85,15 @@ fn operator_response(result: &Result<Value>) -> Result<Value> {
             error: TypedOperatorRefusal {
                 schema_version: OperatorRefusalSchema::V1,
                 code: OperatorRefusalCode::ClockRegressed,
+            },
+        })
+        .map_err(|_| Error::Internal),
+        Err(Error::Capacity(details)) => serde_json::to_value(CapacityOperatorRefusal {
+            status: OperatorRefusalStatus::Refused,
+            error: TypedCapacityOperatorRefusal {
+                schema_version: OperatorRefusalSchema::V1,
+                code: CapacityOperatorRefusalCode::CapacityConflict,
+                details: details.clone(),
             },
         })
         .map_err(|_| Error::Internal),
@@ -103,11 +137,15 @@ pub fn decode_formal_operator_response(bytes: &[u8]) -> Result<Value> {
     if response["status"] == "complete" {
         return Ok(response);
     }
-    // Decode the special packet from bytes: Value would have lost duplicate keys.
-    if serde_json::from_slice::<OperatorClockRefusal>(bytes).is_ok() {
-        return Err(Error::ClockRegressed);
+    // Decode the closed refusal once from bytes; Value routing above does not
+    // validate it and cannot preserve duplicate fields for this boundary.
+    match serde_json::from_slice::<ReadOperatorRefusal>(bytes) {
+        Ok(ReadOperatorRefusal::Clock(packet)) => match packet.error.code {
+            OperatorRefusalCode::ClockRegressed => Err(Error::ClockRegressed),
+        },
+        Ok(ReadOperatorRefusal::Capacity(packet)) => Err(Error::Capacity(packet.error.details)),
+        Err(_) => Err(Error::Forbidden),
     }
-    Err(Error::Forbidden)
 }
 
 fn digest(value: &str) -> Result<()> {
@@ -7109,6 +7147,35 @@ mod principal_and_meter_repair_tests {
                 .to_string(),
             "clock_regressed"
         );
+        let details = evo_core::capacity::CapacityConflict {
+            item: evo_core::capacity::CapacityItem::ExternalService,
+            used: 50,
+            limit: 50,
+            delta: 1,
+        };
+        let capacity = operator_response(&Err(Error::Capacity(details.clone()))).unwrap();
+        assert_eq!(
+            capacity,
+            serde_json::json!({"status":"refused","error":{
+                "schema_version":"rsia.formal_operator_refusal.v1","code":"capacity_conflict",
+                "details":{"item":"external_services","used":50,"limit":50,"delta":1}
+            }})
+        );
+        assert!(
+            matches!(decode_formal_operator_response(&serde_json::to_vec(&capacity).unwrap()),
+            Err(Error::Capacity(actual)) if actual == details)
+        );
+        for malformed in [
+            r#"{"status":"refused","error":{"schema_version":"rsia.formal_operator_refusal.v1","code":"capacity_conflict"}}"#,
+            r#"{"status":"refused","error":{"schema_version":"rsia.formal_operator_refusal.v1","code":"capacity_conflict","details":{"item":"external_services","used":50,"used":49,"limit":50,"delta":1}}}"#,
+            r#"{"status":"refused","error":{"schema_version":"rsia.formal_operator_refusal.v1","code":"capacity_conflict","details":{"item":"external_services","used":50,"limit":50,"delta":1,"role":"admin"}}}"#,
+            r#"{"status":"refused","error":{"schema_version":"rsia.formal_operator_refusal.v1","code":"capacity_conflict","details":{"item":"unknown","used":50,"limit":50,"delta":1}}}"#,
+        ] {
+            assert!(matches!(
+                decode_formal_operator_response(malformed.as_bytes()),
+                Err(Error::Forbidden)
+            ));
+        }
         let value = serde_json::json!({"old":"value","counter":7});
         let healthy = operator_response(&Ok(value.clone())).unwrap();
         assert_eq!(

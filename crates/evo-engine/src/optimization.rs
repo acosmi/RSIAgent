@@ -1981,8 +1981,21 @@ impl OptimizationJournal for StoreOptimizationJournal {
                 }
                 cursor = rows.last().map(|row| row.rowid);
                 for row in rows {
-                    let value: serde_json::Value =
+                    if !row.id.starts_with("optstage-") {
+                        continue;
+                    }
+                    #[derive(Deserialize)]
+                    struct StageSchema {
+                        schema_version: Option<String>,
+                    }
+                    // Header routing skips unrelated payloads; only actual
+                    // Stage candidates go through the full strict decoder.
+                    let header: StageSchema =
                         serde_json::from_str(&row.body).map_err(|_| Error::Internal)?;
+                    if header.schema_version.as_deref() != Some(OPTIMIZATION_STAGE_FACT_SCHEMA_V2) {
+                        continue;
+                    }
+                    let value = evo_storage::lifecycle::parse_strict_json(&row.body)?;
                     if value["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA_V2
                         && value["payload"]["job_scope"]["job_id"] == intent.scope.job_id
                         && value["payload"]["job_scope"]

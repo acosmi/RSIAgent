@@ -2395,6 +2395,105 @@ async fn job_terminal_requires_all_declared_groups_and_execution_close() {
     session.commit().await.unwrap();
     drop(journal);
     cancelled.store.close().await;
+    // Later work may share an episode while owning a different step and request.
+    // Its pending ledger must not reopen the earlier completed member.
+    for cancel_before_dispatch in [false, true] {
+        let (sequential, first_broker, _) = budget_world(100).await;
+        let runner = ScriptedRunner::default();
+        assert!(matches!(
+            evo_engine::optimization::run_optimization_step(
+                Some(&first_broker),
+                Some(&runner),
+                Some(&sequential.journal),
+                sequential.groups[0].request()
+            )
+            .await
+            .unwrap(),
+            OptimizationStepOutcome::CurrentCandidate { .. }
+        ));
+        let mut request = sequential.groups[1].request();
+        request.model_context.episode_id = sequential.groups[0].episode_id.clone();
+        request.development_request.episode_id = request.model_context.episode_id.clone();
+        request.model_context.step = 2;
+        request.development_request.step = 2;
+        if cancel_before_dispatch {
+            let journal = CancelUnstartedGroup {
+                inner: &sequential.journal,
+                store: sequential.store.clone(),
+                admin: sequential.admin.clone(),
+                cancelled: std::sync::atomic::AtomicBool::new(false),
+            };
+            assert!(
+                evo_engine::optimization::run_optimization_step(
+                    Some(&first_broker),
+                    Some(&runner),
+                    Some(&journal),
+                    request
+                )
+                .await
+                .is_err()
+            );
+            assert!(journal.cancelled.load(SeqCst));
+        } else {
+            let later = PersistentModelBroker::with_clock(
+                sequential.store.clone(),
+                UnknownSecondStepTransport(EditingTransport {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+                BrokerConfig {
+                    billing_scope: "scope-1".into(),
+                    actor: "trusted-broker".into(),
+                    currency: "USD".into(),
+                    pricing_version: "price-v1".into(),
+                    max_cost_micros: 20,
+                    lease_seconds: 60,
+                },
+                Arc::new(|| 10),
+            )
+            .unwrap();
+            assert!(matches!(
+                evo_engine::optimization::run_optimization_step(
+                    Some(&later),
+                    Some(&runner),
+                    Some(&sequential.journal),
+                    request
+                )
+                .await
+                .unwrap(),
+                OptimizationStepOutcome::Uncertain { .. }
+            ));
+        }
+        let mut session = sequential.store.session().await.unwrap();
+        assert_eq!(
+            session
+                .capacity_used(evo_core::capacity::CapacityItem::ConcurrentOptimizationJob)
+                .await
+                .unwrap(),
+            u64::from(!cancel_before_dispatch)
+        );
+        let calls = session
+            .budget_calls_for_group(
+                &sequential.admin,
+                "scope-1",
+                &sequential.groups[0].episode_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(calls.len(), if cancel_before_dispatch { 2 } else { 3 });
+        assert_eq!(
+            calls
+                .iter()
+                .filter(
+                    |c| c.state == evo_storage::budget::BudgetCallState::Finalized
+                        && c.execution_closed
+                )
+                .count(),
+            2
+        );
+        session.commit().await.unwrap();
+        drop(first_broker);
+        sequential.store.close().await;
+    }
 }
 
 struct CancelUnstartedGroup<'a> {
@@ -2421,7 +2520,12 @@ impl OptimizationJournal for CancelUnstartedGroup<'_> {
         &self,
         intent: evo_engine::optimization::OptimizationJobIntent,
     ) -> Result<Vec<StageFact>> {
-        self.inner.claim_optimization_job(intent).await
+        let later_step = intent.members().any(|(fact, _)| fact.step == 2);
+        let facts = self.inner.claim_optimization_job(intent).await?;
+        if later_step && !self.cancelled.swap(true, SeqCst) {
+            self.cancel_b().await?;
+        }
+        Ok(facts)
     }
     async fn commit_source_bound(
         &self,
@@ -2432,29 +2536,7 @@ impl OptimizationJournal for CancelUnstartedGroup<'_> {
             fact.kind == StageFactKind::StepCompleted && fact.episode_id == "episode-a";
         self.inner.commit_source_bound(fact, inputs).await?;
         if first_done && !self.cancelled.swap(true, SeqCst) {
-            let now = evo_core::now()?;
-            let mut status = LifecycleCoordinator::revoke_source(
-                &self.admin,
-                &self.store,
-                "b-failure",
-                "cancel before first dispatch",
-                now,
-            )
-            .await?;
-            for _ in 0..100 {
-                if status.state == CleanupState::Complete {
-                    break;
-                }
-                status = LifecycleCoordinator::continue_cleanup(
-                    &self.admin,
-                    &self.store,
-                    &status.job_id,
-                    64,
-                    now,
-                )
-                .await?;
-            }
-            assert_eq!(status.state, CleanupState::Complete, "{status:?}");
+            self.cancel_b().await?;
         }
         Ok(())
     }
@@ -2495,5 +2577,51 @@ impl OptimizationJournal for CancelUnstartedGroup<'_> {
         self.inner
             .verify_sources(selection, evidence, bindings, traces, watermark)
             .await
+    }
+}
+
+impl CancelUnstartedGroup<'_> {
+    async fn cancel_b(&self) -> Result<()> {
+        let now = evo_core::now()?;
+        let mut status = LifecycleCoordinator::revoke_source(
+            &self.admin,
+            &self.store,
+            "b-failure",
+            "cancel before first dispatch",
+            now,
+        )
+        .await?;
+        for _ in 0..100 {
+            if status.state == CleanupState::Complete {
+                break;
+            }
+            status = LifecycleCoordinator::continue_cleanup(
+                &self.admin,
+                &self.store,
+                &status.job_id,
+                64,
+                now,
+            )
+            .await?;
+        }
+        assert_eq!(status.state, CleanupState::Complete, "{status:?}");
+        Ok(())
+    }
+}
+struct UnknownSecondStepTransport(EditingTransport);
+#[async_trait]
+impl ModelTransport for UnknownSecondStepTransport {
+    fn provenance(&self) -> Option<ModelExecutionProvenance> {
+        Some(ModelExecutionProvenance::Fixture)
+    }
+    async fn execute(
+        &self,
+        request: &ModelRequest,
+        dispatch_id: &str,
+    ) -> Result<TransportCompletion> {
+        if request.step == 2 {
+            return Err(Error::Internal);
+        }
+        self.0.execute(request, dispatch_id).await
     }
 }

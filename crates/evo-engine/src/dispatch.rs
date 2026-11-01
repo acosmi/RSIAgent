@@ -2095,7 +2095,7 @@ async fn run_optimization_management(
 
 fn execution_outcome(mut job: ManagementJobV2, result: Result<()>) -> Result<JobOutcome> {
     let result = match result {
-        Err(error @ (Error::ClockRegressed | Error::Capacity(_))) => return Err(error),
+        Err(error @ Error::ClockRegressed) => return Err(error),
         result => result,
     };
     if let Err(error) = result {
