@@ -257,7 +257,7 @@ impl LifecycleStore {
             let value = existing_source.ok_or(Error::NotFound)?;
             if value.get("schema_version").and_then(|item| item.as_str())
                 != Some("rsia.e16.import_source.v1")
-                || validate_e16_envelope(ctx, &source, &value).is_err()
+                || validate_e16_envelope(ctx.namespace(), &source, &value).is_err()
             {
                 return Err(Error::Invalid(
                     "only a strict E16 import_source artifact is a revocable source".into(),
@@ -2387,7 +2387,7 @@ async fn redact_replay_store_envelope(
     .await
 }
 
-fn e16_schema_kind(schema: &str) -> Option<&'static str> {
+pub(crate) fn e16_schema_kind(schema: &str) -> Option<&'static str> {
     match schema {
         "rsia.e16.source_selection.v1" => Some("source_selection"),
         "rsia.e16.import_source.v1" => Some("import_source"),
@@ -2404,8 +2404,8 @@ fn e16_schema_kind(schema: &str) -> Option<&'static str> {
     }
 }
 
-fn validate_e16_envelope(
-    ctx: &Context,
+pub(crate) fn validate_e16_envelope(
+    namespace: &str,
     node: &TypedObjectRef,
     value: &serde_json::Value,
 ) -> Result<&'static str> {
@@ -2434,8 +2434,36 @@ fn validate_e16_envelope(
         .as_str()
         .and_then(e16_schema_kind)
         .ok_or_else(|| Error::Conflict("unknown E16 schema".into()))?;
-    if object["id"].as_str() != Some(node.id.as_str())
-        || object["namespace"].as_str() != Some(ctx.namespace())
+    if object["id"].as_str() != Some(node.id.as_str()) {
+        return Err(Error::Conflict("invalid E16 envelope identity".into()));
+    }
+    validate_e16_metadata(namespace, object, schema)?;
+    Ok(schema)
+}
+
+/// Authority fields retained by canonical E16 cleanup, shared with the live envelope.
+pub(crate) fn validate_e16_metadata(
+    namespace: &str,
+    object: &serde_json::Map<String, serde_json::Value>,
+    schema: &str,
+) -> Result<()> {
+    if [
+        "namespace",
+        "owner_actor",
+        "request_key",
+        "input_digest",
+        "created_at",
+        "updated_at",
+        "source_refs",
+        "revoke_watermark",
+        "payload",
+    ]
+    .iter()
+    .any(|key| !object.contains_key(*key))
+    {
+        return Err(Error::Conflict("missing E16 authority field".into()));
+    }
+    if object["namespace"].as_str() != Some(namespace)
         || object["owner_actor"].as_str().is_none()
         || object["request_key"].as_str().is_none()
         || !is_lower_hex_digest(&object["input_digest"])
@@ -2476,7 +2504,7 @@ fn validate_e16_envelope(
             ));
         }
     }
-    Ok(schema)
+    Ok(())
 }
 
 fn is_lower_hex_digest(value: &serde_json::Value) -> bool {
@@ -2487,6 +2515,42 @@ fn is_lower_hex_digest(value: &serde_json::Value) -> bool {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     })
 }
+
+pub(crate) const E16_RETAINED_PAYLOAD_FIELDS: &[&str] = &[
+    "publisher",
+    "asset_id",
+    "package_kind",
+    "kind",
+    "manifest_digest",
+    "content_blob_digest",
+    "content_bytes",
+    "baseline_blob_digest",
+    "baseline_digest",
+    "local_blob_digest",
+    "local_digest",
+    "upstream_blob_digest",
+    "upstream_digest",
+    "environment_digest",
+    "package_schema_version",
+    "compiler_version",
+    "candidate_ref",
+    "final_projection_digest",
+    "output_blob_digest",
+    "output_bytes",
+    "projection_blob_digest",
+    "projection_blob_bytes",
+    "package_tree_digest",
+    "delivered_bytes",
+    "delivery_kind",
+    "local_export_ref",
+    "completion_receipt_digest",
+    "destination_scope",
+    "delivery_audit_id",
+    "budget_ref",
+    "root_budget_id",
+    "billing_scope",
+    "payment_subject",
+];
 
 #[allow(clippy::too_many_arguments)]
 async fn cleanup_e16_envelope(
@@ -2500,7 +2564,7 @@ async fn cleanup_e16_envelope(
     export_directory_rechecked: bool,
     now: i64,
 ) -> Result<()> {
-    let kind = match validate_e16_envelope(ctx, node, value) {
+    let kind = match validate_e16_envelope(ctx.namespace(), node, value) {
         Ok(kind) => kind,
         Err(_) => {
             return mark_unknown_scope(
@@ -2568,41 +2632,7 @@ async fn cleanup_e16_envelope(
     }
 
     let mut retained_payload = serde_json::Map::new();
-    for field in [
-        "publisher",
-        "asset_id",
-        "package_kind",
-        "kind",
-        "manifest_digest",
-        "content_blob_digest",
-        "content_bytes",
-        "baseline_blob_digest",
-        "baseline_digest",
-        "local_blob_digest",
-        "local_digest",
-        "upstream_blob_digest",
-        "upstream_digest",
-        "environment_digest",
-        "package_schema_version",
-        "compiler_version",
-        "candidate_ref",
-        "final_projection_digest",
-        "output_blob_digest",
-        "output_bytes",
-        "projection_blob_digest",
-        "projection_blob_bytes",
-        "package_tree_digest",
-        "delivered_bytes",
-        "delivery_kind",
-        "local_export_ref",
-        "completion_receipt_digest",
-        "destination_scope",
-        "delivery_audit_id",
-        "budget_ref",
-        "root_budget_id",
-        "billing_scope",
-        "payment_subject",
-    ] {
+    for &field in E16_RETAINED_PAYLOAD_FIELDS {
         if let Some(item) = payload.get(field) {
             retained_payload.insert(field.into(), item.clone());
         }
@@ -2980,7 +3010,7 @@ async fn e16_payload_has_live_blob_reference(
             kind: "artifact".into(),
             id: value["id"].as_str().unwrap_or_default().into(),
         };
-        validate_e16_envelope(ctx, &node, &value)?;
+        validate_e16_envelope(ctx.namespace(), &node, &value)?;
         let schema = value["schema_version"].as_str().unwrap_or_default();
         let payload = &value["payload"];
         if !e16_record_keeps_blobs_alive(schema, payload) {
@@ -3290,7 +3320,7 @@ async fn cleanup_node_content(
             // before touching its controlled directory. Absent historical nodes
             // still require the path check; no user-supplied path is consulted.
             if (value["schema_version"] == "rsia.e16.export_attempt.v2"
-                && validate_e16_envelope(ctx, node, value).is_err())
+                && validate_e16_envelope(ctx.namespace(), node, value).is_err())
                 || (redacted_export
                     && (value["id"].as_str() != Some(node.id.as_str())
                         || value["original_kind"] != "export_attempt"
@@ -3512,24 +3542,26 @@ async fn cleanup_node_content(
         (_, "rsia.redacted.v1", _) => return Ok(()),
         // Only complete native Host authorities qualify, bound to this closure node.
         ("run", "rsia.optimization.source.v1", _) => valid_native_trace_authority(node, &value),
-        ("artifact", "rsia.optimization.stage_fact.v1", _) => matches!(
-            value["kind"].as_str(),
-            Some(
-                "request_prepared"
-                    | "response_observed"
-                    | "edit_compiled"
-                    | "development_request_prepared"
-                    | "development_observed"
-                    | "terminal_no_change"
-                    | "terminal_rejected"
-                    | "terminal_candidate"
-                    | "step_prepared"
-                    | "step_completed"
-                    | "dispatch_prepared"
-                    | "dispatch_observed"
-                    | "terminal_uncertain"
+        ("artifact", "rsia.optimization.stage_fact.v1" | "rsia.optimization.stage_fact.v2", _) => {
+            matches!(
+                value["kind"].as_str(),
+                Some(
+                    "request_prepared"
+                        | "response_observed"
+                        | "edit_compiled"
+                        | "development_request_prepared"
+                        | "development_observed"
+                        | "terminal_no_change"
+                        | "terminal_rejected"
+                        | "terminal_candidate"
+                        | "step_prepared"
+                        | "step_completed"
+                        | "dispatch_prepared"
+                        | "dispatch_observed"
+                        | "terminal_uncertain"
+                )
             )
-        ),
+        }
         (
             "artifact",
             "rsia.typed_artifact_envelope.v1",
@@ -3609,7 +3641,7 @@ async fn cleanup_node_content(
             | "curriculum_selection_v1",
         ) => true,
         // E09 practice attempt sets carry source-derived scores and output digests.
-        ("artifact", "rsia.practice_attempt_set.v1", _) => true,
+        ("artifact", "rsia.practice_attempt_set.v1" | "rsia.practice_attempt_set.v2", _) => true,
         // Service Run is bare content; exact keys and its declared type bound this case.
         ("artifact", "", _)
             if value.as_object().is_some_and(|m| {
@@ -3673,6 +3705,10 @@ async fn cleanup_node_content(
         return Ok(());
     }
     let redacted = redacted_object_body(&node.kind, &node.id, &value, &body);
+    let mut details = json!({"original_digest":evo_core::hash(body.as_bytes())});
+    if schema == "rsia.optimization.stage_fact.v2" {
+        details["job_scope_digest"] = json!(fingerprint(&value["payload"]["job_scope"])?);
+    }
     sqlx::query(
         "UPDATE objects SET body=?,revision=revision+1 WHERE namespace=? AND kind=? AND id=?",
     )
@@ -3690,7 +3726,7 @@ async fn cleanup_node_content(
         Some(node),
         "content_redacted",
         now,
-        json!({"original_digest":evo_core::hash(body.as_bytes())}),
+        details,
     )
     .await
 }
@@ -3751,9 +3787,13 @@ pub fn redacted_object_body(
         .unwrap_or("");
     let mut metadata = minimal_metadata(value);
     if schema == "rsia.optimization.stage_fact.v1"
+        || schema == "rsia.optimization.stage_fact.v2"
         || schema == "rsia.exploration_artifact_envelope.v1"
     {
         metadata["historical_facts"] = historical_stage_facts(&value["payload"]);
+    }
+    if schema == "rsia.optimization.stage_fact.v2" {
+        metadata["job_scope"] = value["payload"]["job_scope"].clone();
     }
     json!({
         "id": id,
@@ -3814,6 +3854,8 @@ fn minimal_metadata(value: &serde_json::Value) -> serde_json::Value {
         "run_id",
         "release_id",
         "candidate_id",
+        "claim_id",
+        "proposal_id",
         "profile_id",
         "bundle_digest",
         "parent_digest",
@@ -4037,7 +4079,7 @@ pub const PROTECTED_OBJECT_KINDS: [&str; 4] = ["budget", "reservation", "evaluat
 
 /// Body `schema_version` values `restore_backup.py::protected_facts` treats as
 /// consumed accounting regardless of the object kind.
-pub const PROTECTED_SCHEMA_VERSIONS: [&str; 9] = [
+pub const PROTECTED_SCHEMA_VERSIONS: [&str; 10] = [
     "rsia.typed_artifact_envelope.v1",
     "rsia.exploration_artifact_envelope.v1",
     "rsia.optimization.stage_fact.v1",
@@ -4047,6 +4089,7 @@ pub const PROTECTED_SCHEMA_VERSIONS: [&str; 9] = [
     "rsia.e16.delivery_audit.v1",
     "rsia.e16.export_attempt.v2",
     "rsia.e16.delivery_audit.v2",
+    "rsia.optimization.stage_fact.v2",
 ];
 
 /// Body `schema_version` values of the durable facts of an action that already
@@ -4088,7 +4131,7 @@ pub const PROTECTED_SCHEMA_VERSIONS: [&str; 9] = [
 ///
 /// Kept apart from [`PROTECTED_SCHEMA_VERSIONS`], the accounting set whose size
 /// `tests/control_plane_facts.rs` pins. The script lists both groups in one tuple.
-pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 13] = [
+pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 14] = [
     "rsia.monitoring.consolidation_claim.v1",
     "rsia.monitoring.consolidation_run.v1",
     "rsia.monitoring.consolidation_staging.v1",
@@ -4102,6 +4145,7 @@ pub const PROTECTED_ACTION_SCHEMA_VERSIONS: [&str; 13] = [
     "rsia.replay_economic_artifact_envelope.v1",
     "rsia.monitoring.consolidation_proposal.v2",
     "rsia.management_job.v2",
+    "rsia.practice_attempt_set.v2",
 ];
 
 fn is_protected_schema(schema: &str) -> bool {

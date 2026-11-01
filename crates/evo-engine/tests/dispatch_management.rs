@@ -1979,12 +1979,11 @@ async fn assert_waiting_for_capacity(
         .map(current_management_job)
         .unwrap();
     assert_eq!(waiting.state, ManagementJobState::Queued);
-    assert_eq!(waiting.step, ManagementDispatcher::CAPACITY_WAIT_STEP);
+    assert_eq!(waiting.step, "accepted");
     assert!(waiting.lease_token.is_none());
     assert_eq!(waiting.lease_until, 0);
     assert_eq!(waiting.generation, 0);
-    assert_eq!(waiting.diagnostics.len(), 1);
-    assert_eq!(waiting.diagnostics[0].code, "conflict");
+    assert_eq!(waiting.diagnostics.len(), 0);
     // Retries keep the job Queued without piling up diagnostics.
     tokio::time::sleep(ManagementDispatcher::CAPACITY_WAIT_RETRY * 2).await;
     let still_waiting = dispatcher
@@ -1993,7 +1992,7 @@ async fn assert_waiting_for_capacity(
         .map(current_management_job)
         .unwrap();
     assert_eq!(still_waiting.state, ManagementJobState::Queued);
-    assert_eq!(still_waiting.diagnostics.len(), 1);
+    assert_eq!(still_waiting.diagnostics.len(), 0);
     still_waiting
 }
 
@@ -2044,7 +2043,7 @@ async fn second_management_dispatch_waits_queued_until_the_live_lease_finishes()
         Some("meta.start_consumer_unavailable")
     );
     assert_eq!(done.generation, 1);
-    assert_eq!(done.diagnostics.len(), 1);
+    assert_eq!(done.diagnostics.len(), 0);
     assert_eq!(done.diagnostics[0].code, "conflict");
     // The job that held the dispatch was never touched.
     let untouched = dispatcher.status(&admin, &holding.id).await.unwrap();
@@ -2099,7 +2098,7 @@ async fn management_dispatch_capacity_cannot_be_split_across_namespaces() {
         Some("meta.start_consumer_unavailable")
     );
     assert_eq!(done.generation, 1);
-    assert_eq!(done.diagnostics.len(), 1);
+    assert_eq!(done.diagnostics.len(), 0);
     // ns-b never saw the ns-a job as content; only its lease counted.
     assert!(matches!(
         dispatcher.status(&admin_b, &holding.id).await,

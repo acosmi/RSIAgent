@@ -458,7 +458,11 @@ impl World {
         self.artifacts()
             .await
             .into_iter()
-            .filter(|value| value["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA)
+            .filter(|value| {
+                value["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA
+                    || value["schema_version"]
+                        == evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+            })
             .collect()
     }
 
@@ -1311,7 +1315,11 @@ async fn an_invalid_job_is_refused_whole_before_any_model_or_runner_call() {
             job_id: "job-1".into(),
             groups: vec![a.spec(), b.spec(), c.spec()],
         },
-        invalid("one or two groups"),
+        |error| {
+            matches!(error, Error::Capacity(detail)
+            if detail.item == evo_core::capacity::CapacityItem::SkillGroupPerJob
+                && detail.used == 0 && detail.limit == 2 && detail.delta == 3)
+        },
     )
     .await;
     refused(
@@ -2131,4 +2139,361 @@ async fn ag129_two_groups_stop_on_real_broker_clock_refusal_before_second_group(
     assert_eq!(root.spent_micros, 0);
     assert_eq!(ag129_r7_sqlite_snapshot(&world.path), before);
     world.store.close().await;
+}
+
+#[tokio::test]
+async fn one_job_owns_both_groups_and_direct_entry_cannot_bypass_limit() {
+    use evo_core::capacity::CapacityItem;
+    let mut specs = two_specs();
+    specs.push(Spec::new("c", "c-failure"));
+    let world = World::new(&specs).await;
+    for group in &world.groups {
+        world
+            .journal
+            .current_compiler_inputs(&group.request().compiler_input_request())
+            .await
+            .unwrap();
+    }
+    let model = ScriptedModel::default()
+        .script("episode-a", ModelScript::Uncertain)
+        .script("episode-b", ModelScript::NoSuggestions);
+    let runner = ScriptedRunner::default();
+    let both = [&world.groups[0], &world.groups[1]];
+    let outcome = world.run(&model, &runner, &both).await.unwrap();
+    assert_eq!(group(&outcome, "group-a").kind, GroupOutcomeKind::Uncertain);
+    assert_eq!(group(&outcome, "group-b").kind, GroupOutcomeKind::NoChange);
+    let prepared = world
+        .artifacts()
+        .await
+        .into_iter()
+        .filter(|v| {
+            v["schema_version"] == evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prepared.len(), 2);
+    assert_eq!(
+        prepared[0]["payload"]["job_scope"],
+        prepared[1]["payload"]["job_scope"]
+    );
+    assert_eq!(
+        prepared[0]["payload"]["job_scope"]["groups"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let mut session = world.store.session().await.unwrap();
+    assert_eq!(
+        session
+            .capacity_used(CapacityItem::ConcurrentOptimizationJob)
+            .await
+            .unwrap(),
+        1
+    );
+    session.commit().await.unwrap();
+    let before = ag129_r7_sqlite_snapshot(&world.path);
+    let calls = (model.calls(), runner.calls());
+    let error = evo_engine::optimization::run_optimization_step(
+        Some(&model),
+        Some(&runner),
+        Some(&world.journal),
+        world.groups[2].request(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error,Error::Capacity(ref c) if c.item==CapacityItem::ConcurrentOptimizationJob && c.used==1 && c.limit==1 && c.delta==1),
+        "{error:?}"
+    );
+    assert_eq!(ag129_r7_sqlite_snapshot(&world.path), before);
+    assert_eq!((model.calls(), runner.calls()), calls);
+    assert_eq!(
+        as_json(&world.run(&model, &runner, &both).await.unwrap()),
+        as_json(&outcome)
+    );
+    assert_eq!(ag129_r7_sqlite_snapshot(&world.path), before);
+    assert_eq!((model.calls(), runner.calls()), calls);
+    let mut changed = job(both);
+    changed.job_id = "changed-job".into();
+    assert!(matches!(
+        run_skill_group_job(Some(&model), Some(&runner), Some(&world.journal), changed).await,
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(ag129_r7_sqlite_snapshot(&world.path), before);
+    world.store.close().await;
+}
+
+struct CapacityBetweenGroups<'a> {
+    inner: &'a dyn ModelPort,
+    store: Store,
+    worker: Context,
+    admin: Context,
+    observations: AtomicUsize,
+}
+#[async_trait]
+impl ModelPort for CapacityBetweenGroups<'_> {
+    async fn dispatch(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        Err(Error::Forbidden)
+    }
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> Result<ModelResponse> {
+        if request.request.episode_id == "episode-b" {
+            let mut session = self.store.session().await?;
+            let all: Vec<Value> = session.list(&self.worker, "artifact").await?;
+            assert!(
+                all.iter()
+                    .any(|v| v["episode_id"] == "episode-a" && v["kind"] == "step_completed")
+            );
+            assert!(
+                !all.iter()
+                    .any(|v| v["episode_id"] == "episode-b" && v["kind"] == "step_completed")
+            );
+            let claims = all
+                .iter()
+                .filter(|v| {
+                    v["schema_version"]
+                        == evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+                        && v["kind"] == "step_prepared"
+                })
+                .count();
+            assert_eq!(claims, 2);
+            assert_eq!(
+                session
+                    .capacity_used(evo_core::capacity::CapacityItem::ConcurrentOptimizationJob)
+                    .await?,
+                1
+            );
+            let first_calls = session
+                .budget_calls_for_group(&self.admin, "scope-1", "episode-a")
+                .await?;
+            assert_eq!(first_calls.len(), 2);
+            assert!(first_calls.iter().all(|c| c.state
+                == evo_storage::budget::BudgetCallState::Finalized
+                && c.execution_closed
+                && c.actual_cost_micros == Some(10)
+                && c.usage_record_id.is_some()));
+            session.commit().await?;
+            self.observations.fetch_add(1, SeqCst);
+        }
+        self.inner.dispatch_compiler_bound(request).await
+    }
+}
+
+#[tokio::test]
+async fn job_terminal_requires_all_declared_groups_and_execution_close() {
+    let (world, broker, transport) = budget_world(100).await;
+    let model = CapacityBetweenGroups {
+        inner: &broker,
+        store: world.store.clone(),
+        worker: world.worker.clone(),
+        admin: world.admin.clone(),
+        observations: AtomicUsize::new(0),
+    };
+    let runner = ScriptedRunner::default();
+    let both = [&world.groups[0], &world.groups[1]];
+    let outcome = run_skill_group_job(Some(&model), Some(&runner), Some(&world.journal), job(both))
+        .await
+        .unwrap();
+    assert!(
+        outcome
+            .groups
+            .iter()
+            .all(|g| g.kind == GroupOutcomeKind::Candidate)
+    );
+    assert_eq!(model.observations.load(SeqCst), 2);
+    assert_eq!(transport.load(SeqCst), 4);
+    let mut session = world.store.session().await.unwrap();
+    assert_eq!(
+        session
+            .capacity_used(evo_core::capacity::CapacityItem::ConcurrentOptimizationJob)
+            .await
+            .unwrap(),
+        0
+    );
+    for episode in ["episode-a", "episode-b"] {
+        let calls = session
+            .budget_calls_for_group(&world.admin, "scope-1", episode)
+            .await
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(
+            |c| c.state == evo_storage::budget::BudgetCallState::Finalized
+                && c.execution_closed
+                && c.actual_cost_micros == Some(10)
+                && c.usage_record_id.is_some()
+        ));
+    }
+    let root = session
+        .root_budget(&world.admin, "scope-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((root.spent_micros, root.reserved_micros), (40, 0));
+    session.commit().await.unwrap();
+    let before = ag129_r7_sqlite_snapshot(&world.path);
+    assert_eq!(
+        as_json(
+            &run_skill_group_job(None, None, Some(&world.journal), job(both))
+                .await
+                .unwrap()
+        ),
+        as_json(&outcome)
+    );
+    assert_eq!(ag129_r7_sqlite_snapshot(&world.path), before);
+    assert_eq!(transport.load(SeqCst), 4);
+    drop(model);
+    drop(broker);
+    world.store.close().await;
+
+    let cancelled = World::new(&two_specs()).await;
+    let journal = CancelUnstartedGroup {
+        inner: &cancelled.journal,
+        store: cancelled.store.clone(),
+        admin: cancelled.admin.clone(),
+        cancelled: std::sync::atomic::AtomicBool::new(false),
+    };
+    let model = ScriptedModel::default();
+    let runner = ScriptedRunner::default();
+    let both = [&cancelled.groups[0], &cancelled.groups[1]];
+    let outcome = run_skill_group_job(Some(&model), Some(&runner), Some(&journal), job(both))
+        .await
+        .unwrap();
+    assert_eq!(group(&outcome, "group-a").kind, GroupOutcomeKind::Candidate);
+    assert_eq!(group(&outcome, "group-b").kind, GroupOutcomeKind::Failed);
+    assert!(journal.cancelled.load(SeqCst));
+    assert_eq!(model.calls_for("episode-a"), 2);
+    assert_eq!(model.calls_for("episode-b"), 0);
+    let mut session = cancelled.store.session().await.unwrap();
+    assert_eq!(
+        session
+            .capacity_used(evo_core::capacity::CapacityItem::ConcurrentOptimizationJob)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        session
+            .budget_call_scopes_for_group(&cancelled.admin, "episode-b")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let facts: Vec<Value> = session.list(&cancelled.worker, "artifact").await.unwrap();
+    assert!(
+        facts
+            .iter()
+            .any(|v| v["metadata"]["episode_id"] == "episode-b"
+                && v["original_schema"]
+                    == evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2)
+    );
+    assert!(!facts.iter().any(|v| (v["episode_id"] == "episode-b"
+        && v["kind"] == "step_completed")
+        || (v["metadata"]["episode_id"] == "episode-b"
+            && v["metadata"]["kind"] == "step_completed")));
+    session.commit().await.unwrap();
+    drop(journal);
+    cancelled.store.close().await;
+}
+
+struct CancelUnstartedGroup<'a> {
+    inner: &'a dyn OptimizationJournal,
+    store: Store,
+    admin: Context,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+#[async_trait]
+impl OptimizationJournal for CancelUnstartedGroup<'_> {
+    async fn compiler_inputs(
+        &self,
+        r: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> Result<evo_engine::formal_authority::VerifiedCompilerInputs> {
+        self.inner.compiler_inputs(r).await
+    }
+    async fn current_compiler_inputs(
+        &self,
+        r: &evo_engine::formal_authority::CompilerInputRequest,
+    ) -> Result<evo_engine::formal_authority::CurrentVerifiedCompilerInputs> {
+        self.inner.current_compiler_inputs(r).await
+    }
+    async fn claim_optimization_job(
+        &self,
+        intent: evo_engine::optimization::OptimizationJobIntent,
+    ) -> Result<Vec<StageFact>> {
+        self.inner.claim_optimization_job(intent).await
+    }
+    async fn commit_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<()> {
+        let first_done =
+            fact.kind == StageFactKind::StepCompleted && fact.episode_id == "episode-a";
+        self.inner.commit_source_bound(fact, inputs).await?;
+        if first_done && !self.cancelled.swap(true, SeqCst) {
+            let now = evo_core::now()?;
+            let mut status = LifecycleCoordinator::revoke_source(
+                &self.admin,
+                &self.store,
+                "b-failure",
+                "cancel before first dispatch",
+                now,
+            )
+            .await?;
+            for _ in 0..100 {
+                if status.state == CleanupState::Complete {
+                    break;
+                }
+                status = LifecycleCoordinator::continue_cleanup(
+                    &self.admin,
+                    &self.store,
+                    &status.job_id,
+                    64,
+                    now,
+                )
+                .await?;
+            }
+            assert_eq!(status.state, CleanupState::Complete, "{status:?}");
+        }
+        Ok(())
+    }
+    async fn claim_source_bound(
+        &self,
+        fact: StageFact,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<bool> {
+        self.inner.claim_source_bound(fact, inputs).await
+    }
+    async fn lookup_source_bound(
+        &self,
+        id: &str,
+        inputs: &evo_engine::model::CurrentCompilerInputUse,
+    ) -> Result<Option<StageFact>> {
+        self.inner.lookup_source_bound(id, inputs).await
+    }
+    async fn commit(&self, fact: StageFact) -> Result<()> {
+        self.inner.commit(fact).await
+    }
+    async fn lookup(&self, id: &str) -> Result<Option<StageFact>> {
+        self.inner.lookup(id).await
+    }
+    async fn claim(&self, fact: StageFact) -> Result<bool> {
+        self.inner.claim(fact).await
+    }
+    async fn check_live(&self, ids: &[String], watermark: u64) -> Result<()> {
+        self.inner.check_live(ids, watermark).await
+    }
+    async fn verify_sources(
+        &self,
+        selection: &SourceSelection,
+        evidence: &EvidenceSet,
+        bindings: &[TrustedSourceBinding],
+        traces: &[OptimizationTrace],
+        watermark: u64,
+    ) -> Result<()> {
+        self.inner
+            .verify_sources(selection, evidence, bindings, traces, watermark)
+            .await
+    }
 }

@@ -613,6 +613,10 @@ impl ManagementDispatcher {
                         tracing::error!(job_id = %job_id, error = %error, "management supervisor awaits storage or clock recovery");
                         tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                     }
+                    Err(Error::Capacity(_)) => {
+                        dispatcher.retry_claim_later(job_id.clone());
+                        break;
+                    }
                     Err(error) => {
                         tracing::error!(job_id = %job_id, error = %error, "management background supervisor failed");
                         if !matches!(&error, Error::Conflict(reason) if reason == "management job lease fence changed")
@@ -671,7 +675,13 @@ impl ManagementDispatcher {
     }
 
     async fn run_job(&self, job_id: &str) -> Result<()> {
-        let (ctx, claimed) = self.claim(job_id).await?;
+        let (ctx, claimed) = match self.claim(job_id).await {
+            Err(Error::Capacity(_)) => {
+                self.retry_claim_later(job_id.to_owned());
+                return Ok(());
+            }
+            result => result?,
+        };
         let Some(job) = claimed else { return Ok(()) };
         let store = self.store.clone();
         let worker_ctx = ctx.clone();
@@ -919,29 +929,7 @@ impl ManagementDispatcher {
                     &limits,
                 )
             });
-            if let Err(refusal) = admitted {
-                if job.step != Self::CAPACITY_WAIT_STEP {
-                    let recorded_at = now()?;
-                    if job.diagnostics.len() >= 32 {
-                        job.diagnostics.remove(0);
-                    }
-                    job.diagnostics.push(ManagementDiagnostic {
-                        code: error_code(&refusal).into(),
-                        observed_generation: job.generation,
-                        recorded_at,
-                    });
-                    job.step = Self::CAPACITY_WAIT_STEP.into();
-                    session
-                        .put(trusted, "job", &job.id, trusted.actor(), &job)
-                        .await?;
-                    session
-                        .audit(trusted, "management.job.capacity_wait", &job.id)
-                        .await?;
-                }
-                session.commit().await?;
-                self.retry_claim_later(job.id);
-                return Ok((trusted.clone(), None));
-            }
+            admitted?;
             let claim_at = now()?;
             job.generation = job
                 .generation
@@ -983,6 +971,9 @@ impl ManagementDispatcher {
     // A diagnostic is not worker-exit evidence. Running jobs are closed only
     // by the owned JoinHandle path above; this preserves the old fault API.
     async fn record_background_error(&self, job_id: &str, error: &Error) -> Result<()> {
+        if matches!(error, Error::Capacity(_)) {
+            return Ok(());
+        }
         match error {
             Error::ClockRegressed => return Err(Error::ClockRegressed),
             Error::Internal => return Err(Error::Internal),
@@ -1139,6 +1130,9 @@ async fn persist_management(
     }
     let dependencies = private_dependencies(&request)?;
     ensure_dependencies_live(ctx, &mut session, &dependencies).await?;
+    session
+        .admit_capacity(&[(evo_core::capacity::CapacityItem::ManagementJobRecord, 1)])
+        .await?;
     let private = PrivateManagementInput {
         id: private_id.clone(),
         schema_version: INPUT_SCHEMA.into(),
@@ -2046,9 +2040,10 @@ async fn run_optimization_management(
 }
 
 fn execution_outcome(mut job: ManagementJobV2, result: Result<()>) -> Result<JobOutcome> {
-    if matches!(&result, Err(Error::ClockRegressed)) {
-        return Err(Error::ClockRegressed);
-    }
+    let result = match result {
+        Err(error @ (Error::ClockRegressed | Error::Capacity(_))) => return Err(error),
+        result => result,
+    };
     if let Err(error) = result {
         job.state = ManagementJobState::Failed;
         job.step = "failed".into();
@@ -5146,7 +5141,7 @@ fn error_code(error: &Error) -> &'static str {
         Error::Invalid(_) => "invalid_input",
         Error::Forbidden => "forbidden",
         Error::NotFound => "not_found",
-        Error::Conflict(_) => "conflict",
+        Error::Conflict(_) | Error::Capacity(_) => "conflict",
         Error::Budget => "budget_unavailable",
         Error::Cancelled => "cancelled",
         Error::ClockRegressed => "clock_regressed",

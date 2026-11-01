@@ -458,6 +458,13 @@ struct CrashAfterDispatchJournal {
 
 #[async_trait]
 impl OptimizationJournal for CrashAfterDispatchJournal {
+    async fn claim_optimization_job(
+        &self,
+        intent: evo_engine::optimization::OptimizationJobIntent,
+    ) -> Result<Vec<StageFact>> {
+        self.inner.claim_optimization_job(intent).await
+    }
+
     async fn current_compiler_inputs(
         &self,
         request: &evo_engine::formal_authority::CompilerInputRequest,
@@ -1347,7 +1354,7 @@ async fn seed_exploration_nodes(store: &Store, count: u64) {
     let worker = Context::new("n", "worker", Role::Worker).unwrap();
     let mut session = store.session().await.unwrap();
     for index in 0..count {
-        let node_id = format!("seed-node-{index:04}");
+        let node_id = format!("node-seed-world-{index}");
         let storage_id = format!(
             "e09-{}",
             fingerprint(&("exploration_node_v1", node_id.as_str())).unwrap()
@@ -1362,7 +1369,9 @@ async fn seed_exploration_nodes(store: &Store, count: u64) {
                     "schema_version": "rsia.exploration_artifact_envelope.v1",
                     "id": storage_id,
                     "record_kind": "exploration_node_v1",
-                    "payload": {"schema_version": "rsia.exploration_node.v1", "seed": index}
+                    "payload": {"schema_version":"rsia.exploration_node.v1","world_id":"seed-world",
+                        "node":{"node_seq":index,"branch_seq":index,"search_parent_seq":null,"approved_parent_digest":hash(b"parent"),"depth":0,"status":"hard_failure","best_valid_ancestor_micros":null,"recent_valid_gains_micros":[],"repair_failures_dispatched":0},
+                        "candidate_bundle_digest":null,"candidate_skill_digest":null,"selection_digest":null,"intermediate_only":true,"evidence":"not_observed","terminal_class":null}
                 }),
             )
             .await
@@ -1604,10 +1613,13 @@ async fn run_next_refuses_a_new_node_at_capacity_before_any_model_call() {
         )
         .await
     {
-        Err(Error::Conflict(msg)) => assert_eq!(
-            msg,
-            format!(
-                "MVP capacity exceeded: exploration nodes {MAX_EXPLORATION_NODES} >= limit {MAX_EXPLORATION_NODES}"
+        Err(Error::Capacity(detail)) => assert_eq!(
+            (detail.item, detail.used, detail.limit, detail.delta),
+            (
+                evo_core::capacity::CapacityItem::ExplorationNode,
+                MAX_EXPLORATION_NODES,
+                MAX_EXPLORATION_NODES,
+                1
             )
         ),
         other => panic!("expected the MVP exploration node conflict, got {other:?}"),

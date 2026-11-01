@@ -984,6 +984,9 @@ impl ReleaseStore {
             session.commit().await?;
             return Ok(existing);
         }
+        session
+            .admit_capacity(&[(evo_core::capacity::CapacityItem::HostSurface, 1)])
+            .await?;
         // Every new source/typed/upgrade guard above precedes this first DML.
         validate_host_surface_v2_new_use(&record.manifest)?;
         session
@@ -3149,6 +3152,11 @@ impl ReleaseStore {
             ));
         }
 
+        if existing.is_none() {
+            session
+                .admit_capacity(&[(evo_core::capacity::CapacityItem::Skill, 1)])
+                .await?;
+        }
         crate::compiler::persist_current_authenticated_bundle(
             session,
             ctx,

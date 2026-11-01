@@ -1562,6 +1562,11 @@ impl PersistentPackageStore {
                 usage.staged_packages,
                 &CapacityLimits::default(),
             )?;
+            if request.manifest.kind == PackageKind::Skill {
+                session
+                    .admit_capacity(&[(evo_core::capacity::CapacityItem::Skill, 1)])
+                    .await?;
+            }
             let timestamp = now()?;
             let envelope = E16Envelope {
                 schema_version: E16_STAGED_ASSET_SCHEMA.into(),

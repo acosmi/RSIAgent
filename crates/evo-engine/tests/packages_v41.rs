@@ -1998,23 +1998,16 @@ async fn persistent_shared_dependency_edges_block_uninstall() {
 // shared projection blob alive once its last live referrer is revoked.
 // =========================================================================
 
-async fn f17_run_source(store: &Store, id: &str) -> E16SourceRef {
-    let host = Context::new("n", "host", Role::Host).unwrap();
-    let body = serde_json::json!({
-        "id": id,
-        "schema_version": "rsia.optimization.source.v1",
-        "body": format!("evidence-{id}"),
-    });
-    let mut session = store.session().await.unwrap();
-    session
-        .put(&host, "run", id, host.actor(), &body)
+async fn f17_run_source(store: &Store, ctx: &Context, id: &str) -> E16SourceRef {
+    let host = Context::new(ctx.namespace(), "host", Role::Host).unwrap();
+    let authority = trusted_authority(id, &format!("evidence-{id}"));
+    store_trace_authority(store, &host, &authority)
         .await
         .unwrap();
-    session.commit().await.unwrap();
     E16SourceRef {
         kind: "run".into(),
         id: id.into(),
-        digest: fingerprint(&body).unwrap(),
+        digest: fingerprint(&authority).unwrap(),
     }
 }
 
@@ -2050,8 +2043,8 @@ async fn f17_revoke_run_and_drain(
 #[tokio::test]
 async fn f17_aborted_staged_asset_does_not_keep_shared_projection_blob_alive() {
     let (directory, store, admin, _sources) = persistent_store().await;
-    let source_a = f17_run_source(&store, "f17-src-a").await;
-    let source_b = f17_run_source(&store, "f17-src-b").await;
+    let source_a = f17_run_source(&store, &admin, "f17-src-a").await;
+    let source_b = f17_run_source(&store, &admin, "f17-src-b").await;
     let first = PersistentPackageStore::stage_package(
         &admin,
         &store,
@@ -2120,9 +2113,9 @@ async fn f17_aborted_staged_asset_does_not_keep_shared_projection_blob_alive() {
 #[tokio::test]
 async fn f17_live_staged_asset_still_keeps_shared_projection_blob_beside_aborted_one() {
     let (directory, store, admin, _sources) = persistent_store().await;
-    let source_a = f17_run_source(&store, "f17-live-src-a").await;
-    let source_b = f17_run_source(&store, "f17-live-src-b").await;
-    let source_c = f17_run_source(&store, "f17-live-src-c").await;
+    let source_a = f17_run_source(&store, &admin, "f17-live-src-a").await;
+    let source_b = f17_run_source(&store, &admin, "f17-live-src-b").await;
+    let source_c = f17_run_source(&store, &admin, "f17-live-src-c").await;
     let mut staged = Vec::new();
     for (key, source) in [
         ("f17-live-key-a", &source_a),
@@ -2202,36 +2195,45 @@ async fn f17_live_staged_asset_still_keeps_shared_projection_blob_beside_aborted
 // E16.5 AG-014: staged package capacity at the stage entry point
 // ---------------------------------------------------------------------------
 
-fn seeded_staged_asset(owner: &Context, index: u64, state: &str) -> serde_json::Value {
-    serde_json::json!({
-        "schema_version": E16_STAGED_ASSET_SCHEMA,
-        "id": format!("seed-staged-asset-{index:03}"),
-        "namespace": owner.namespace(),
-        "owner_actor": owner.actor(),
-        "request_key": format!("seed-{index}"),
-        "input_digest": hash(format!("seed-{index}").as_bytes()),
-        "created_at": 1,
-        "updated_at": 1,
-        "source_refs": [],
-        "revoke_watermark": 1,
-        "payload": {"state": state, "seed": index}
-    })
-}
-
 async fn put_seeded_staged_asset(store: &Store, admin: &Context, index: u64, state: &str) {
-    let mut session = store.session().await.unwrap();
-    let body = seeded_staged_asset(admin, index, state);
-    session
-        .put(
+    let key = format!("capacity-seed-{index}");
+    if state == "staged" {
+        let source = f17_run_source(store, admin, &format!("capacity-source-{index}")).await;
+        let files = valid_files();
+        PersistentPackageStore::stage_package(
             admin,
-            "artifact",
-            body["id"].as_str().unwrap(),
-            admin.actor(),
-            &body,
+            store,
+            persistent_stage_request(
+                &key,
+                manifest_for_files(&format!("seed-asset-{index}"), &files),
+                files,
+                vec![source],
+            ),
         )
         .await
         .unwrap();
-    session.commit().await.unwrap();
+    } else {
+        let mut session = store.session().await.unwrap();
+        let values: Vec<serde_json::Value> = session.list(admin, "artifact").await.unwrap();
+        let mut body = values
+            .into_iter()
+            .find(|body| {
+                body["schema_version"] == E16_STAGED_ASSET_SCHEMA && body["request_key"] == key
+            })
+            .unwrap();
+        body["payload"]["state"] = serde_json::json!(state);
+        session
+            .put(
+                admin,
+                "artifact",
+                body["id"].as_str().unwrap(),
+                admin.actor(),
+                &body,
+            )
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+    }
 }
 
 async fn staged_package_usage(store: &Store, admin: &Context) -> (u64, u64) {
@@ -2268,8 +2270,11 @@ async fn staged_package_capacity_cannot_be_split_across_namespaces() {
     )
     .await
     {
-        Err(Error::Conflict(msg)) => {
-            assert_eq!(msg, "MVP capacity exceeded: staged packages 20 >= limit 20")
+        Err(Error::Capacity(detail)) => {
+            assert_eq!(
+                (detail.item, detail.used, detail.limit, detail.delta),
+                (evo_core::capacity::CapacityItem::StagingPackage, 20, 20, 1)
+            );
         }
         other => panic!("expected the MVP staged package conflict, got {other:?}"),
     }
@@ -2315,8 +2320,11 @@ async fn twenty_first_staged_package_is_refused_and_aborted_or_failed_records_do
     )
     .await
     {
-        Err(Error::Conflict(msg)) => {
-            assert_eq!(msg, "MVP capacity exceeded: staged packages 20 >= limit 20")
+        Err(Error::Capacity(detail)) => {
+            assert_eq!(
+                (detail.item, detail.used, detail.limit, detail.delta),
+                (evo_core::capacity::CapacityItem::StagingPackage, 20, 20, 1)
+            );
         }
         other => panic!("expected the MVP staged package conflict, got {other:?}"),
     }
@@ -2340,9 +2348,74 @@ async fn twenty_first_staged_package_is_refused_and_aborted_or_failed_records_do
         twentieth.id
     );
 
-    // Aborted and failed records are not live staged packages.
+    // A terminal state alone retains the full staged record and its capacity.
+    // Only completed source cleanup with a canonical redacted body frees it.
     put_seeded_staged_asset(&store, &admin, 0, "aborted").await;
     put_seeded_staged_asset(&store, &admin, 1, "failed").await;
+    assert_eq!(staged_package_usage(&store, &admin).await.0, 20);
+    match PersistentPackageStore::stage_package(
+        &admin,
+        &store,
+        persistent_stage_request(
+            "stage-21",
+            manifest_for_files("asset-21", &files),
+            files.clone(),
+            sources.clone(),
+        ),
+    )
+    .await
+    {
+        Err(Error::Capacity(detail)) => assert_eq!(
+            (detail.item, detail.used, detail.limit, detail.delta),
+            (evo_core::capacity::CapacityItem::StagingPackage, 20, 20, 1)
+        ),
+        other => panic!("terminal state must retain its slot: {other:?}"),
+    }
+    for index in 0..2 {
+        let status = f17_revoke_run_and_drain(
+            &store,
+            &admin,
+            &format!("capacity-source-{index}"),
+            100 + index as i64 * 100,
+        )
+        .await;
+        assert_eq!(status.state, CleanupState::Complete);
+        let mut session = store.session().await.unwrap();
+        let values: Vec<serde_json::Value> = session.list(&admin, "artifact").await.unwrap();
+        let redacted = values
+            .iter()
+            .find(|value| {
+                value["schema_version"] == "rsia.redacted.v1"
+                    && value["original_schema"] == E16_STAGED_ASSET_SCHEMA
+                    && value["metadata"]["request_key"] == format!("capacity-seed-{index}")
+            })
+            .unwrap();
+        assert_eq!(redacted["original_kind"], "staged_asset");
+        assert_eq!(redacted["metadata"]["namespace"], admin.namespace());
+        assert_eq!(redacted.as_object().unwrap().len(), 7);
+        assert_eq!(redacted["metadata"].as_object().unwrap().len(), 9);
+        assert!(
+            !redacted["metadata"]["payload"]
+                .as_object()
+                .unwrap()
+                .contains_key("state")
+        );
+        assert!(
+            session
+                .get::<serde_json::Value>(&admin, "run", "capacity-source-2")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            session
+                .get::<serde_json::Value>(&admin, "tombstone", "capacity-source-2")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        session.commit().await.unwrap();
+    }
     assert_eq!(staged_package_usage(&store, &admin).await.0, 18);
     let admitted = PersistentPackageStore::stage_package(
         &admin,
@@ -2369,12 +2442,31 @@ async fn twenty_first_staged_package_is_refused_and_aborted_or_failed_records_do
     let quarantined = PersistentPackageStore::stage_package(
         &admin,
         &store,
-        persistent_stage_request("stage-22", quarantined_manifest, files, sources),
+        persistent_stage_request("stage-22", quarantined_manifest, files, sources.clone()),
     )
     .await
     .unwrap();
     assert_eq!(quarantined.payload.state, StagedAssetState::Quarantined);
     assert_eq!(staged_package_usage(&store, &admin).await.0, 20);
+    let files = valid_files();
+    match PersistentPackageStore::stage_package(
+        &admin,
+        &store,
+        persistent_stage_request(
+            "stage-23",
+            manifest_for_files("asset-23", &files),
+            files,
+            sources.clone(),
+        ),
+    )
+    .await
+    {
+        Err(Error::Capacity(detail)) => assert_eq!(
+            (detail.item, detail.used, detail.limit, detail.delta),
+            (evo_core::capacity::CapacityItem::StagingPackage, 20, 20, 1)
+        ),
+        other => panic!("quarantined records still occupy capacity: {other:?}"),
+    }
 }
 
 fn handoff_full_image(directory: &Path) -> serde_json::Value {

@@ -18,15 +18,14 @@ use evo_core::contract::{AppliedReceipt, CapabilityLevel};
 pub use evo_core::prepare_contract::{CompleteHostPrepareConfig, HostPrepareConfig};
 use evo_core::prepare_contract::{CompletePrepareOperation, PrepareOperation};
 use evo_core::{
-    Candidate, CandidateState, Context, EntityKind, Error, Feedback, FeedbackRecord, Improvement,
-    Inspect, Job, Prepared, Proposal, Receipt, Release, Result, Role, Run, Skill, Validate,
-    fingerprint, hash, identifier, now,
+    ArtifactKind, Candidate, CandidateState, Context, EntityKind, Error, Feedback, FeedbackRecord,
+    Improvement, Inspect, Job, Prepared, Proposal, Receipt, Release, Result, Role, Run, Skill,
+    Validate, fingerprint, hash, identifier, now,
 };
 use evo_storage::{Session, Store};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 // E03 owns Store kind=`run` for its trusted authority envelope. Service runs
@@ -39,24 +38,10 @@ pub struct HostService {
     store: Store,
     trusted_host: Context,
     application_lock: Arc<Mutex<()>>,
-    // In-flight prepare is never persisted: like `application_lock` it is a
-    // process-local fact shared by every clone of this service.
-    inflight_prepare: Arc<AtomicU64>,
 }
 
-/// One admitted in-flight prepare slot. Dropping it releases the slot on every
-/// exit path of `HostService::prepare`, including errors.
-#[derive(Debug)]
-#[must_use = "dropping the guard releases the in-flight prepare slot"]
-pub struct InflightPrepareGuard {
-    counter: Arc<AtomicU64>,
-}
-
-impl Drop for InflightPrepareGuard {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
-    }
-}
+/// Store-owned RAII slot shared by all services of this deployment instance.
+pub use evo_storage::capacity::InflightPrepareGuard;
 
 impl HostService {
     pub fn new(store: Store, trusted_host: Context) -> Result<Self> {
@@ -65,7 +50,6 @@ impl HostService {
             store,
             trusted_host,
             application_lock: Arc::new(Mutex::new(())),
-            inflight_prepare: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -95,31 +79,11 @@ impl HostService {
 
     /// Prepares currently in flight in this process.
     pub fn inflight_prepare(&self) -> u64 {
-        self.inflight_prepare.load(Ordering::Acquire)
+        self.store.inflight_prepare()
     }
 
-    /// Take one in-flight prepare slot, or refuse with the typed MVP capacity
-    /// conflict once `MAX_PREPARE` prepares are already in flight. Tests use
-    /// this to saturate the slots; `prepare` takes one for its whole duration.
     pub fn begin_inflight_prepare(&self) -> Result<InflightPrepareGuard> {
-        let limits = CapacityLimits::default();
-        let mut current = self.inflight_prepare.load(Ordering::Acquire);
-        loop {
-            admit_field(CapacityField::InflightPrepare, current, &limits)?;
-            match self.inflight_prepare.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Ok(InflightPrepareGuard {
-                        counter: Arc::clone(&self.inflight_prepare),
-                    });
-                }
-                Err(observed) => current = observed,
-            }
-        }
+        self.store.begin_inflight_prepare()
     }
 
     /// E16.5 / plan §3.3.1: a prepare derives a new run. Refuse it, inside the
@@ -533,6 +497,11 @@ impl HostService {
             "candidate",
             &[caller.namespace(), caller.actor(), &request.request_key],
         );
+        if request.kind == ArtifactKind::Skill {
+            session
+                .admit_capacity(&[(evo_core::capacity::CapacityItem::Skill, 1)])
+                .await?;
+        }
         let candidate = Candidate {
             id: id.clone(),
             owner: caller.actor().into(),

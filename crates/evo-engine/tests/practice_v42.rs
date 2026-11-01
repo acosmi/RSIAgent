@@ -42,11 +42,12 @@ use evo_engine::optimization::{
     verify_development_observation,
 };
 use evo_engine::practice::{
-    PRACTICE_ATTEMPT_SET_SCHEMA, PRACTICE_REGISTRATION_BINDING_SCHEMA,
-    PRACTICE_REGISTRATION_SCHEMA, PracticeAttemptSetV1, PracticeOutcomeV1, PracticeRegistrationV1,
-    PracticeRunRequest, load_practice_attempt_set, load_practice_registration,
-    load_practice_registration_binding, practice_attempt_request, practice_attempt_request_id,
-    practice_attempt_set_storage_id, practice_registration_binding_storage_id,
+    PRACTICE_ATTEMPT_SET_SCHEMA, PRACTICE_ATTEMPT_SET_SCHEMA_V2,
+    PRACTICE_REGISTRATION_BINDING_SCHEMA, PRACTICE_REGISTRATION_SCHEMA, PracticeAttemptSetV1,
+    PracticeOutcomeV1, PracticeRegistrationV1, PracticeRunRequest, load_practice_attempt_set,
+    load_practice_registration, load_practice_registration_binding, practice_attempt_request,
+    practice_attempt_request_id, practice_attempt_set_storage_id,
+    practice_attempt_set_storage_id_v2, practice_registration_binding_storage_id,
     practice_registration_storage_id, register_practice, run_practice_set, select_contrast,
 };
 use evo_engine::streaming_evaluator::{FixedGraderMethod, FixedGraderSpec};
@@ -1001,9 +1002,9 @@ async fn k1_runs_exactly_once_is_no_contrast_and_needs_no_registration() {
     assert_eq!(fingerprint(&stored).unwrap(), fingerprint(&set).unwrap());
     assert_eq!(
         fixture
-            .raw_artifact(&practice_attempt_set_storage_id("set-k1").unwrap())
+            .raw_artifact(&practice_attempt_set_storage_id_v2("set-k1").unwrap())
             .await["schema_version"],
-        PRACTICE_ATTEMPT_SET_SCHEMA
+        PRACTICE_ATTEMPT_SET_SCHEMA_V2
     );
 }
 
@@ -1298,7 +1299,7 @@ async fn registered_k3_with_the_deterministic_runner_keeps_every_attempt_and_no_
 
     // Edges: the control's sources, every attempt's run receipt and Candidate
     // receipts, and the registration reach the set.
-    let set_storage = practice_attempt_set_storage_id("set-k3").unwrap();
+    let set_storage = practice_attempt_set_storage_id_v2("set-k3").unwrap();
     let edge = ("artifact".to_string(), set_storage.clone());
     let mut session = fixture.store.session().await.unwrap();
     for source in ["run-a", "run-b"] {
@@ -1837,7 +1838,7 @@ async fn practice_sets_write_no_stage_fact_and_add_no_e12_or_e13_cycle() {
         assert_eq!(count(&artifacts_after), 1);
     }
     assert_eq!(
-        count_schema(&artifacts_after, PRACTICE_ATTEMPT_SET_SCHEMA),
+        count_schema(&artifacts_after, PRACTICE_ATTEMPT_SET_SCHEMA_V2),
         2
     );
     assert_eq!(
@@ -1862,7 +1863,7 @@ async fn practice_sets_write_no_stage_fact_and_add_no_e12_or_e13_cycle() {
         before_state.development_fact_ids
     );
     // A practice set is not a development fact: E12 cannot record it.
-    let set_storage = practice_attempt_set_storage_id("set-cycles-k3").unwrap();
+    let set_storage = practice_attempt_set_storage_id_v2("set-cycles-k3").unwrap();
     let run_storage =
         storage_id(RUN_RECEIPT_KIND, &set_k3.attempts[0].execution_receipt_id).unwrap();
     assert!(
@@ -2229,13 +2230,13 @@ async fn revoking_a_source_redacts_the_set_and_keeps_the_registration() {
     assert!(empty.attempts.is_empty());
     assert_eq!(runner.calls(), 3);
 
-    let set_storage = practice_attempt_set_storage_id("set-revoke").unwrap();
-    let empty_storage = practice_attempt_set_storage_id("set-revoke-empty").unwrap();
+    let set_storage = practice_attempt_set_storage_id_v2("set-revoke").unwrap();
+    let empty_storage = practice_attempt_set_storage_id_v2("set-revoke-empty").unwrap();
     let registration_storage = practice_registration_storage_id(&registration.id).unwrap();
     let registration_before = fixture.raw_artifact(&registration_storage).await;
     assert_eq!(
         fixture.raw_artifact(&set_storage).await["schema_version"],
-        PRACTICE_ATTEMPT_SET_SCHEMA
+        PRACTICE_ATTEMPT_SET_SCHEMA_V2
     );
     // Each registration is bound to the set it was spent on.
     let binding_storages = [
@@ -2325,7 +2326,7 @@ async fn revoking_a_source_redacts_the_set_and_keeps_the_registration() {
     for storage in [&set_storage, &empty_storage] {
         let redacted = fixture.raw_artifact(storage).await;
         assert_eq!(redacted["schema_version"], "rsia.redacted.v1");
-        assert_eq!(redacted["original_schema"], PRACTICE_ATTEMPT_SET_SCHEMA);
+        assert_eq!(redacted["original_schema"], PRACTICE_ATTEMPT_SET_SCHEMA_V2);
         assert!(redacted.get("attempts").is_none());
         assert!(redacted.get("outcome").is_none());
     }
@@ -2745,6 +2746,11 @@ async fn a_set_is_never_stored_next_to_a_binding_of_another_set() {
         count_schema(&fixture.artifacts().await, PRACTICE_ATTEMPT_SET_SCHEMA),
         0
     );
+    let prepared = fixture
+        .raw_artifact(&practice_attempt_set_storage_id_v2("set-rebound").unwrap())
+        .await;
+    assert!(prepared["result"].is_null());
+    assert_eq!(prepared["state"], "running");
 }
 
 // ---------------------------------------------------------------------------
@@ -2815,10 +2821,12 @@ async fn a_set_never_counts_as_independent_samples_and_a_forged_body_is_refused(
     assert!(foreign.validate().is_err());
 
     // A forged body written over the stored set is refused when read back.
-    let storage = practice_attempt_set_storage_id("set-forge").unwrap();
+    let storage = practice_attempt_set_storage_id_v2("set-forge").unwrap();
+    let mut raw = fixture.raw_artifact(&storage).await;
+    raw["result"] = serde_json::to_value(&independent).unwrap();
     let mut session = fixture.store.session().await.unwrap();
     session
-        .put(&fixture.admin, "artifact", &storage, "admin", &independent)
+        .put(&fixture.admin, "artifact", &storage, "admin", &raw)
         .await
         .unwrap();
     session.commit().await.unwrap();
@@ -2975,4 +2983,286 @@ async fn ag129_practice_propagates_registered_clock_refusal_without_terminal_wri
     ));
     assert_eq!(ag129_r6_sqlite_snapshot(&path), before);
     fixture.store.close().await;
+}
+
+async fn fill_practice_v2(fixture: &Fixture, prefix: &str, count: u32) {
+    let runner = fixture.counting();
+    for index in 0..count {
+        let set = run_practice_set(
+            &fixture.admin,
+            &fixture.store,
+            &runner,
+            practice_request(&format!("{prefix}-{index}"), plan_k1()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(set.attempts.len(), 1);
+    }
+    assert_eq!(runner.calls(), count as usize);
+}
+
+#[tokio::test]
+async fn practice_v2_prepared_admission_precedes_claim_runner_and_budget() {
+    let fixture = Fixture::new().await;
+    fill_practice_v2(&fixture, "capacity", 200).await;
+    let plan = registered_plan(&fixture, "capacity-refusal").await;
+    let registration = PracticeRegistrationV1::for_plan(&plan, "admin", 5).unwrap();
+    let runner = fixture.counting();
+    let before = ag129_r6_sqlite_snapshot(&fixture._dir.path().join("practice.sqlite3"));
+    for plan in [plan, plan_k1()] {
+        match run_practice_set(
+            &fixture.admin,
+            &fixture.store,
+            &runner,
+            practice_request("capacity-next", plan),
+        )
+        .await
+        {
+            Err(Error::Capacity(detail)) => assert_eq!(
+                (detail.item, detail.used, detail.limit, detail.delta),
+                (
+                    evo_core::capacity::CapacityItem::PracticeAttemptSet,
+                    200,
+                    200,
+                    1
+                )
+            ),
+            other => panic!("capacity must precede the runner: {other:?}"),
+        }
+    }
+    assert_eq!(runner.calls(), 0);
+    assert_eq!(
+        ag129_r6_sqlite_snapshot(&fixture._dir.path().join("practice.sqlite3")),
+        before
+    );
+    assert!(matches!(
+        load_practice_registration_binding(&fixture.store, &fixture.admin, &registration.id).await,
+        Err(Error::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn practice_v2_resume_uses_verified_receipts_without_second_execution() {
+    let fixture = Fixture::new().await;
+    let request = practice_request("receipt-resume", plan_k1());
+    let first = run_practice_set(
+        &fixture.admin,
+        &fixture.store,
+        &fixture.counting(),
+        request.clone(),
+    )
+    .await
+    .unwrap();
+    let development = practice_attempt_request(&fixture.control, &request, 1).unwrap();
+    let storage = practice_attempt_set_storage_id_v2(&request.set_id).unwrap();
+    let mut raw = fixture.raw_artifact(&storage).await;
+    raw["result"] = serde_json::Value::Null;
+    raw["state"] = serde_json::json!("running");
+    raw["attempts"] = serde_json::json!([]);
+    raw["started"] = serde_json::json!({"attempt":1,"request_id":development.request_id,"request_digest":fingerprint(&development).unwrap(),"receipt_id":run_receipt_id(&development.request_id).unwrap()});
+    let mut session = fixture.store.session().await.unwrap();
+    session
+        .put(
+            &fixture.admin,
+            "artifact",
+            &storage,
+            fixture.admin.actor(),
+            &raw,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let calls_before = fixture.group_calls(&development.episode_id).await;
+    let root_before = fixture
+        .store
+        .root_budget(&fixture.admin, SCOPE)
+        .await
+        .unwrap()
+        .unwrap();
+    let runner = fixture.counting();
+    let resumed = run_practice_set(&fixture.admin, &fixture.store, &runner, request)
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.attempts[0].execution_receipt_id,
+        first.attempts[0].execution_receipt_id
+    );
+    assert!(resumed.attempts[0].cache_hit);
+    assert_eq!(runner.calls(), 1); // Existing registered runner receipt read, no execution.
+    assert_eq!(
+        fixture.group_calls(&development.episode_id).await,
+        calls_before
+    );
+    assert_eq!(
+        serde_json::to_value(
+            fixture
+                .store
+                .root_budget(&fixture.admin, SCOPE)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(root_before).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn practice_v2_unknown_started_attempt_stays_draining_without_resend() {
+    let fixture = Fixture::new().await;
+    let request = practice_request("unknown-started", plan_k1());
+    let runner = fixture.counting().failing(1, || Error::Internal);
+    let first = run_practice_set(&fixture.admin, &fixture.store, &runner, request.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        first.outcome,
+        PracticeOutcomeV1::Incomplete { .. }
+    ));
+    let storage = practice_attempt_set_storage_id_v2(&request.set_id).unwrap();
+    let mut raw = fixture.raw_artifact(&storage).await;
+    assert_eq!(raw["state"], "draining");
+    assert!(!raw["started"].is_null());
+    // A completed draining result is readable, and a crash before its final
+    // result has the same no-resend rule through the persisted started binding.
+    run_practice_set(&fixture.admin, &fixture.store, &runner, request.clone())
+        .await
+        .unwrap();
+    assert_eq!(runner.calls(), 1);
+    raw["result"] = serde_json::Value::Null;
+    let mut session = fixture.store.session().await.unwrap();
+    session
+        .put(
+            &fixture.admin,
+            "artifact",
+            &storage,
+            fixture.admin.actor(),
+            &raw,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let before = ag129_r6_sqlite_snapshot(&fixture._dir.path().join("practice.sqlite3"));
+    assert!(
+        matches!(run_practice_set(&fixture.admin,&fixture.store,&runner,request).await,Err(Error::Conflict(message)) if message=="practice attempt remains draining without a receipt")
+    );
+    assert_eq!(runner.calls(), 1);
+    assert_eq!(
+        ag129_r6_sqlite_snapshot(&fixture._dir.path().join("practice.sqlite3")),
+        before
+    );
+}
+
+#[tokio::test]
+async fn practice_v2_full_capacity_allows_same_set_terminal_close() {
+    let fixture = Fixture::new().await;
+    let request = practice_request("full-close", plan_k1());
+    let set = run_practice_set(
+        &fixture.admin,
+        &fixture.store,
+        &fixture.counting(),
+        request.clone(),
+    )
+    .await
+    .unwrap();
+    fill_practice_v2(&fixture, "other", 199).await;
+    let storage = practice_attempt_set_storage_id_v2(&request.set_id).unwrap();
+    let mut raw = fixture.raw_artifact(&storage).await;
+    // Exact durable state after the final verified receipt, before final view.
+    raw["attempts"] = serde_json::to_value(&set.attempts).unwrap();
+    raw["result"] = serde_json::Value::Null;
+    raw["state"] = serde_json::json!("prepared");
+    let mut session = fixture.store.session().await.unwrap();
+    session
+        .put(
+            &fixture.admin,
+            "artifact",
+            &storage,
+            fixture.admin.actor(),
+            &raw,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let runner = fixture.counting();
+    let closed = run_practice_set(&fixture.admin, &fixture.store, &runner, request.clone())
+        .await
+        .unwrap();
+    assert_eq!(fingerprint(&closed).unwrap(), fingerprint(&set).unwrap());
+    assert_eq!(runner.calls(), 0);
+    assert_eq!(fixture.raw_artifact(&storage).await["state"], "completed");
+    assert_eq!(
+        run_practice_set(&fixture.admin, &fixture.store, &runner, request)
+            .await
+            .unwrap()
+            .attempts
+            .len(),
+        1
+    );
+    assert_eq!(runner.calls(), 0);
+}
+
+#[tokio::test]
+async fn practice_v1_v2_legacy_and_redaction_keep_registration_spent() {
+    let fixture = Fixture::new().await;
+    let plan = registered_plan(&fixture, "v2-retains-spend").await;
+    let registration = PracticeRegistrationV1::for_plan(&plan, "admin", 5).unwrap();
+    let set = run_practice_set(
+        &fixture.admin,
+        &fixture.store,
+        &fixture.counting(),
+        practice_request("wire-history", plan.clone()),
+    )
+    .await
+    .unwrap();
+    let current = practice_attempt_set_storage_id_v2(&set.set_id).unwrap();
+    let legacy = practice_attempt_set_storage_id(&set.set_id).unwrap();
+    assert_ne!(legacy, current);
+    // Explicit old-wire history fixture; the producer never rewrites v1 IDs.
+    let mut old = set.clone();
+    old.schema_version = PRACTICE_ATTEMPT_SET_SCHEMA.into();
+    old.id = legacy.clone();
+    old.validate().unwrap();
+    let old_raw = serde_json::to_value(&old).unwrap();
+    let mut session = fixture.store.session().await.unwrap();
+    session
+        .put(
+            &fixture.admin,
+            "artifact",
+            &legacy,
+            fixture.admin.actor(),
+            &old,
+        )
+        .await
+        .unwrap();
+    session
+        .put_edge(&fixture.admin, "artifact", &legacy, "run", "run-a")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(fixture.raw_artifact(&legacy).await, old_raw);
+    assert_eq!(
+        fixture.raw_artifact(&current).await["schema_version"],
+        PRACTICE_ATTEMPT_SET_SCHEMA_V2
+    );
+    let binding = practice_registration_binding_storage_id(&registration.id).unwrap();
+    let before = fixture.raw_artifact(&binding).await;
+    assert_eq!(
+        finish_cleanup(&fixture, "run-a").await,
+        CleanupState::Complete
+    );
+    for (id, schema) in [
+        (&legacy, PRACTICE_ATTEMPT_SET_SCHEMA),
+        (&current, PRACTICE_ATTEMPT_SET_SCHEMA_V2),
+    ] {
+        let body = fixture.raw_artifact(id).await;
+        assert_eq!(body["schema_version"], "rsia.redacted.v1");
+        assert_eq!(body["original_schema"], schema);
+        assert!(body.get("result").is_none());
+        assert!(body.get("attempts").is_none());
+    }
+    assert_eq!(fixture.raw_artifact(&binding).await, before);
+    assert!(
+        matches!(run_practice_set(&fixture.admin,&fixture.store,&fixture.counting(),practice_request("wire-history-other",plan)).await,Err(Error::Conflict(message)) if message==spent_message(&registration.id,"wire-history"))
+    );
 }

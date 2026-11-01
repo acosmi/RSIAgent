@@ -650,6 +650,9 @@ impl PersistentCoordinator {
         {
             return Err(Error::Conflict("exploration world already exists".into()));
         }
+        session
+            .admit_capacity(&[(evo_core::capacity::CapacityItem::ExplorationWorld, 1)])
+            .await?;
         self.persist_world_registration(&mut session, &world)
             .await?;
         session.commit().await
@@ -695,13 +698,16 @@ impl PersistentCoordinator {
             session.commit().await?;
             return Ok(RegisterWorldOutcome::AlreadyRegistered);
         }
+        session
+            .admit_capacity(&[(evo_core::capacity::CapacityItem::ExplorationWorld, 1)])
+            .await?;
         self.persist_world_registration(&mut session, &world)
             .await?;
         session.commit().await?;
         Ok(RegisterWorldOutcome::Registered)
     }
 
-    async fn persist_world_registration(
+    pub(crate) async fn persist_world_registration(
         &self,
         session: &mut Session,
         world: &ExplorationWorldV1,
@@ -913,6 +919,9 @@ impl PersistentCoordinator {
         {
             return Err(Error::Conflict("history entry already exists".into()));
         }
+        session
+            .admit_capacity(&[(evo_core::capacity::CapacityItem::OptimizationHistory, 1)])
+            .await?;
         world.history_ids.push(entry.entry_id.clone());
         put_record(
             &mut session,
@@ -2943,7 +2952,7 @@ fn update_waits(
     world.waits.sort_by_key(|wait| wait.action_seq);
 }
 
-async fn check_world_live(
+pub(crate) async fn check_world_live(
     session: &mut Session,
     context: &Context,
     world: &ExplorationWorldV1,
@@ -3320,7 +3329,7 @@ async fn registered_budget(
 /// was registered with, rebuilt from its dispatch facts (`registered_budget`),
 /// is the one `requested` declares. Anything else is a `Conflict` with a fixed
 /// message, and so are facts that do not account for the world.
-async fn ensure_registered_as(
+pub(crate) async fn ensure_registered_as(
     session: &mut Session,
     ctx: &Context,
     stored: &ExplorationWorldV1,

@@ -1,6 +1,7 @@
 //! Transactional typed documents, idempotency, audit and disposable FTS5 indexes.
 //! This crate never connects to a model or executes candidate content.
 pub mod budget;
+pub mod capacity;
 pub mod dependency_read;
 pub mod lifecycle;
 pub mod replay;
@@ -25,12 +26,14 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 
-pub const MVP_MAX_RUNS: u64 = 1_000;
+pub use evo_core::capacity::{
+    MAX_ACTIVE_LEASES as MVP_MAX_ACTIVE_LEASES, MAX_REPLAY_WORLDS as MVP_MAX_REPLAY_WORLDS,
+    MAX_RUNS as MVP_MAX_RUNS,
+};
 /// Storage-side mirrors of the E16.5 MVP capacity bounds enforced inside this
 /// crate (`Session::put_world`, `Store::reserve_budget_call_with_sources`).
 /// The engine's `capacity` module pins the same values and asserts equality.
-pub const MVP_MAX_REPLAY_WORLDS: u64 = 100;
-pub const MVP_MAX_ACTIVE_LEASES: u64 = 10;
+
 /// Schema identifiers the capacity measurement recognises. They mirror the
 /// engine's persisted schema versions; the engine asserts they stay equal.
 pub const CAPACITY_MANAGEMENT_JOB_SCHEMA: &str = "rsia.management_job.v1";
@@ -635,6 +638,7 @@ pub struct Store {
     pool: SqlitePool,
     root: PathBuf,
     blob_lock: Arc<RwLock<()>>,
+    inflight_prepare: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A physical object row from the caller's current transaction. This is a
@@ -718,9 +722,25 @@ pub struct CapacityUsageV41 {
 /// Build the typed refusal every MVP capacity gate reports. The message names
 /// the exhausted counter and both numbers; it never truncates anything.
 pub fn mvp_capacity_exceeded(label: &str, used: u64, limit: u64) -> Error {
-    Error::Conflict(format!(
-        "MVP capacity exceeded: {label} {used} >= limit {limit}"
-    ))
+    use evo_core::capacity::{CapacityConflict, CapacityItem};
+    let item = match label {
+        "runs" => CapacityItem::Run,
+        "events" => CapacityItem::Event,
+        "skills" => CapacityItem::Skill,
+        "active leases" => CapacityItem::ActiveLease,
+        "replay worlds" => CapacityItem::ReplayWorld,
+        _ => {
+            return Error::Conflict(format!(
+                "MVP capacity exceeded: {label} {used} >= limit {limit}"
+            ));
+        }
+    };
+    Error::Capacity(CapacityConflict {
+        item,
+        used,
+        limit,
+        delta: 1,
+    })
 }
 
 fn count_to_u64(count: i64) -> Result<u64> {
@@ -823,50 +843,6 @@ async fn count_management_job_capacity(
         }
     }
     Ok(counts)
-}
-
-/// Objects of `kind` across every namespace (a capacity count, never content).
-async fn count_objects_all_namespaces(
-    conn: &mut sqlx::SqliteConnection,
-    kind: &str,
-) -> Result<u64> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objects WHERE kind=?")
-        .bind(kind)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(internal)?;
-    count_to_u64(count)
-}
-
-/// Imported events of every known result version, v1 and v2 alike, across all
-/// namespaces: one E16.5 event count, never a separate quota per version.
-async fn sum_imported_events_all_namespaces(conn: &mut sqlx::SqliteConnection) -> Result<u64> {
-    let events: i64 = sqlx::query_scalar(
-        "SELECT CAST(COALESCE(SUM(json_extract(body,?)),0) AS INTEGER)
-         FROM objects WHERE kind='artifact'
-           AND json_extract(body,'$.schema_version') IN (?,?)",
-    )
-    .bind(IMPORTED_EVENTS_PATH)
-    .bind(CAPACITY_LEGACY_IMPORT_RESULT_SCHEMA_V1)
-    .bind(CAPACITY_IMPORT_RESULT_SCHEMA)
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(internal)?;
-    count_to_u64(events)
-}
-
-/// Runs across every namespace: `run` objects plus service runs (artifacts
-/// whose `$.source` is `trusted_host_snapshot`).
-async fn count_runs_all_namespaces(conn: &mut sqlx::SqliteConnection) -> Result<u64> {
-    let runs: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM objects WHERE
-           kind='run' OR
-           (kind='artifact' AND json_extract(body,'$.source')='trusted_host_snapshot')",
-    )
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(internal)?;
-    count_to_u64(runs)
 }
 
 struct PrivateStagedBlob {
@@ -1908,6 +1884,7 @@ impl Store {
             pool,
             root,
             blob_lock: Arc::new(RwLock::new(())),
+            inflight_prepare: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
     pub async fn session(&self) -> Result<Session> {
@@ -2717,57 +2694,32 @@ impl Session {
     pub async fn capacity_usage_v41(&mut self, now_secs: u64) -> Result<CapacityUsageV41> {
         let now = i64::try_from(now_secs)
             .map_err(|_| Error::Invalid("capacity clock is out of range".into()))?;
-        let runs = count_runs_all_namespaces(&mut self.tx).await?;
-        let imported_events = sum_imported_events_all_namespaces(&mut self.tx).await?;
-        let event_objects = count_objects_all_namespaces(&mut self.tx, "event").await?;
-        let skills = count_objects_all_namespaces(&mut self.tx, "candidate").await?;
-        let exploration_nodes: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM objects WHERE kind='artifact'
-               AND json_extract(body,'$.schema_version')=?
-               AND json_extract(body,'$.record_kind')=?",
-        )
-        .bind(CAPACITY_EXPLORATION_ENVELOPE_SCHEMA)
-        .bind(CAPACITY_EXPLORATION_NODE_RECORD_KIND)
-        .fetch_one(&mut *self.tx)
-        .await
-        .map_err(internal)?;
+        use evo_core::capacity::CapacityItem::*;
+        let counts = capacity::counts(&mut self.tx).await?;
+        let used = |item| counts.get(&item).copied().unwrap_or(0);
         let replay_worlds = self.replay_world_count().await?;
         let management_jobs = count_management_job_capacity(&mut self.tx, now).await?;
         let active_leases = count_budget_active_leases(&mut self.tx, now)
             .await?
             .checked_add(management_jobs.active_leases)
             .ok_or(Error::Internal)?;
-        let staged_packages: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM objects WHERE kind='artifact'
-               AND json_extract(body,'$.schema_version')=?
-               AND json_extract(body,'$.payload.state') IN ('prepared','staged','quarantined')",
-        )
-        .bind(CAPACITY_STAGED_ASSET_SCHEMA)
-        .fetch_one(&mut *self.tx)
-        .await
-        .map_err(internal)?;
         let concurrent_dispatches = management_jobs.concurrent_dispatches;
         Ok(CapacityUsageV41 {
-            runs,
-            events: imported_events
-                .checked_add(event_objects)
-                .ok_or(Error::Internal)?,
-            skills,
-            exploration_nodes: count_to_u64(exploration_nodes)?,
+            runs: used(Run),
+            events: used(Event),
+            skills: used(Skill),
+            exploration_nodes: used(ExplorationNode),
             replay_worlds,
             active_leases,
-            staged_packages: count_to_u64(staged_packages)?,
+            staged_packages: used(StagingPackage),
             concurrent_dispatches,
         })
     }
 
     /// Count replay worlds (drafts and sealed) across every namespace.
     pub async fn replay_world_count(&mut self) -> Result<u64> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM replay_worlds")
-            .fetch_one(&mut *self.tx)
+        self.capacity_used(evo_core::capacity::CapacityItem::ReplayWorld)
             .await
-            .map_err(internal)?;
-        count_to_u64(count)
     }
 
     /// Count persisted objects in the authenticated namespace inside this
@@ -2934,14 +2886,16 @@ impl Session {
                 "existing capacity records contain an invalid numeric fact".into(),
             ));
         }
-        let used = sum_imported_events_all_namespaces(&mut self.tx)
-            .await?
-            .checked_add(count_objects_all_namespaces(&mut self.tx, "event").await?)
-            .ok_or(Error::Internal)?;
-        if used.checked_add(delta).is_none_or(|total| total > limit) {
-            return Err(Error::Conflict(format!(
-                "event capacity exceeded: {used} + {delta} > {limit}"
-            )));
+        let used = self
+            .capacity_used(evo_core::capacity::CapacityItem::Event)
+            .await?;
+        if delta != 0 && (used > limit || delta > limit - used) {
+            return Err(Error::Capacity(evo_core::capacity::CapacityConflict {
+                item: evo_core::capacity::CapacityItem::Event,
+                used,
+                limit,
+                delta,
+            }));
         }
         self.put(ctx, "artifact", id, owner, body).await
     }
@@ -3086,11 +3040,17 @@ impl Session {
             if exists == 0 {
                 // E16.5 / F24: the run bound is instance-wide, like every other
                 // MVP counter; a new run id anywhere counts against it.
-                let used = count_runs_all_namespaces(&mut self.tx).await?;
+                let used = self
+                    .capacity_used(evo_core::capacity::CapacityItem::Run)
+                    .await?;
                 if used >= MVP_MAX_RUNS {
                     return Err(mvp_capacity_exceeded("runs", used, MVP_MAX_RUNS));
                 }
             }
+        }
+        if kind == "event" && self.object_row(ctx, kind, id).await?.is_none() {
+            self.admit_capacity(&[(evo_core::capacity::CapacityItem::Event, 1)])
+                .await?;
         }
         let body = serde_json::to_string(body).map_err(internal)?;
         if body.len() > 4 * 1024 * 1024 {
