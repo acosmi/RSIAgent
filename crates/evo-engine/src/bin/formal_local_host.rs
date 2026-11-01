@@ -86,8 +86,19 @@ enum Command {
     },
 }
 
+fn main() -> std::process::ExitCode {
+    match evo_storage::initialize_private_process_umask() {
+        Ok(()) => async_main(),
+        // The initializer performs no I/O; its only error is Unsupported.
+        Err(_) => {
+            eprintln!("{{\"status\":\"refused\",\"reason\":\"unsupported\"}}");
+            std::process::ExitCode::from(2)
+        }
+    }
+}
+
 #[tokio::main]
-async fn main() -> std::process::ExitCode {
+async fn async_main() -> std::process::ExitCode {
     match run().await {
         Ok(value) => {
             println!("{value}");
@@ -99,6 +110,9 @@ async fn main() -> std::process::ExitCode {
                 Error::Forbidden => "forbidden",
                 Error::NotFound => "missing",
                 Error::Budget => "budget",
+                Error::Invalid(ref reason) if reason == "data_directory_insecure" => {
+                    "data_directory_insecure"
+                }
                 Error::Invalid(_) => "invalid",
                 Error::Conflict(_) => "conflict",
                 Error::Cancelled => "cancelled",
@@ -193,11 +207,24 @@ async fn run() -> Result<serde_json::Value> {
     let ctx = Context::new(namespace, actor, role)?;
     let (_data_lock, gate) = mount_gate(std::path::Path::new(database), None)
         .await
-        .map_err(|error| Error::Conflict(error.to_string()))?;
+        .map_err(|error| match error {
+            evo_engine::startup_gate::StartupGateError::Rejected(reason)
+                if reason == "data_directory_insecure" =>
+            {
+                Error::Invalid(reason)
+            }
+            other => Error::Conflict(other.to_string()),
+        })?;
     let store = Store::open(std::path::Path::new(database)).await?;
     let result = async {
-        gate.admit()
-            .map_err(|error| Error::Conflict(error.to_string()))?;
+        gate.admit().map_err(|error| match error {
+            evo_engine::startup_gate::StartupGateError::Rejected(reason)
+                if reason == "data_directory_insecure" =>
+            {
+                Error::Invalid(reason)
+            }
+            other => Error::Conflict(other.to_string()),
+        })?;
         execute(&ctx, &store, command).await
     }
     .await;
