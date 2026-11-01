@@ -25,7 +25,8 @@ use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_au
 use evo_engine::release_store::{CurrentStageBundleRequest, ReleaseStore, TypedSourceRef};
 use evo_engine::streaming_evaluator::{
     EvaluationEvidenceScope, FixedGraderMethod, FixedGraderSpec, FrozenOracleEntry,
-    IssueTicketRequest, ProtectedHoldoutRecord, ProtectedInputRef, RegisteredEvaluationControl,
+    IssueTicketRequest, ProtectedHoldoutRecordV2 as ProtectedHoldoutRecord, ProtectedInputRef,
+    RegisteredEvaluationControlV3 as RegisteredEvaluationControl,
 };
 use evo_engine::streaming_evaluator::{
     IndependentEvaluationControl, read_verified_formal_report_in_session,
@@ -614,6 +615,12 @@ async fn current_diagnostic_fixture(n: u32, sequential: bool) -> CurrentDiagnost
         schema_version: RegisteredEvaluationControl::SCHEMA.into(),
         id: "control-1".into(),
         v1_plan_snapshot: v1.clone(),
+        max_regression: evo_core::evaluation::FixedRegressionThreshold::new(if sequential {
+            0.01
+        } else {
+            0.125
+        })
+        .unwrap(),
         formal_plan: formal,
         alpha_plan: alpha.clone(),
         optimizer_comparison: comparison,
@@ -727,6 +734,7 @@ async fn current_diagnostic_fixture(n: u32, sequential: bool) -> CurrentDiagnost
         schema_version: ProtectedHoldoutRecord::SCHEMA.into(),
         id: "holdout-1".into(),
         registration_id: "control-1".into(),
+        frozen_configuration_digest: control.frozen_configuration().unwrap().digest().unwrap(),
         pair,
         manifest,
         candidate_bundle_digest: candidate.digest.clone(),
@@ -816,7 +824,10 @@ fn closed_judgment_catalog_preserves_exact_existing_domains() {
         match entry.id_strategy {
             FormalJudgmentIdStrategy::SourceTicket => {
                 old += 1;
-                assert!(entry.domain.2.is_none());
+                assert!(
+                    entry.domain.2.is_none()
+                        || entry.domain.2.as_deref() == Some("rsia.formal_evaluation.v3")
+                );
                 assert!(entry.verifier_retained);
             }
             FormalJudgmentIdStrategy::VersionedInput => {
@@ -826,7 +837,7 @@ fn closed_judgment_catalog_preserves_exact_existing_domains() {
             }
         }
     }
-    assert_eq!((old, explicit), (56, 40));
+    assert_eq!((old, explicit), (70, 44));
 }
 
 #[test]
@@ -1194,6 +1205,20 @@ async fn current_diagnostic_semantics_do_not_grant_promotion_authority() {
             .any(|reason| reason == "program_fixture_not_production_authority")
     );
     session.commit().await.unwrap();
+    let metadata = evo_engine::streaming_evaluator::formal_report_read_metadata(
+        &fx.evaluator,
+        &fx.store,
+        &fx.ticket_id,
+    )
+    .await
+    .unwrap();
+    let metadata = serde_json::to_value(metadata).unwrap();
+    assert_eq!(metadata["state"], "current_verified");
+    assert_eq!(metadata["lineage"]["state"], "unavailable");
+    assert_eq!(
+        metadata["lineage"]["details"],
+        "original_invalid_snapshot_unavailable"
+    );
     assert!(
         image(&fx.db_path) == before,
         "current diagnostic read changed records or granted a paid action"

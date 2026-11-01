@@ -9621,7 +9621,7 @@ struct FormalCommonInput(
     FormalInputRef, // holdout
     FormalInputRef, // original immutable ticket issue receipt
     Option<FormalCandidateDependencyBinding>,
-    Option<TicketSourcePlanBinding>,
+    Option<ReadTicketSourcePlanBinding>,
 );
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FormalCompleteUnit(
@@ -9993,12 +9993,12 @@ async fn original_source_plan_schema(
     ctx: &Context,
     session: &mut Session,
     ticket: &ReadEvaluationTicket,
-    control: &RegisteredEvaluationControl,
-    holdout: &ProtectedHoldoutRecord,
+    control: &ReadRegisteredEvaluationControl,
+    holdout: &ReadProtectedHoldoutRecord,
 ) -> Result<String> {
     match (&ticket.source_plan_binding, ticket.schema_version.as_str()) {
         (None, ReadEvaluationTicket::SCHEMA) => Ok(control.v1_plan_snapshot.schema_version.clone()),
-        (Some(binding), ReadEvaluationTicket::SCHEMA_V3) => {
+        (Some(binding), ReadEvaluationTicket::SCHEMA_V3 | ReadEvaluationTicket::SCHEMA_V4) => {
             let candidate: ReadCandidate = session
                 .need(ctx, "artifact", &ticket.candidate_digest)
                 .await?;
@@ -10023,21 +10023,30 @@ async fn original_source_plan_schema(
                 holdout,
                 &candidate,
             )?;
-            let plan = ExperimentPlanV2::from_typed_candidate(
-                &control.v1_plan_snapshot,
-                &candidate.id,
-                &candidate,
-            )?;
-            // These are the original full immutable binding fields, not a
-            // schema inferred from ticket-v3 or a synthesized replacement.
-            if plan.id != binding.plan_id
-                || plan.digest_against(&candidate.id, &candidate)? != binding.plan_digest
-            {
+            let (plan_id, plan_digest, schema) =
+                if ticket.schema_version == ReadEvaluationTicket::SCHEMA_V4 {
+                    let plan = ExperimentPlanV3::from_typed_candidate(
+                        &control.frozen_configuration()?,
+                        &candidate.id,
+                        &candidate,
+                    )?;
+                    let digest = plan.digest_against(&candidate.id, &candidate)?;
+                    (plan.id, digest, plan.schema_version)
+                } else {
+                    let plan = ExperimentPlanV2::from_typed_candidate(
+                        &control.v1_plan_snapshot,
+                        &candidate.id,
+                        &candidate,
+                    )?;
+                    let digest = plan.digest_against(&candidate.id, &candidate)?;
+                    (plan.id, digest, plan.schema_version)
+                };
+            if plan_id != binding.plan_id || plan_digest != binding.plan_digest {
                 return Err(Error::Conflict(
                     "ticket source-plan original changed".into(),
                 ));
             }
-            Ok(plan.schema_version)
+            Ok(schema)
         }
         _ => Err(Error::Invalid(
             "unsupported evaluation-ticket source-plan pair".into(),
@@ -10052,9 +10061,9 @@ async fn original_formal_source_domain(
     ctx: &Context,
     session: &mut Session,
     ticket: &ReadEvaluationTicket,
-    control: &RegisteredEvaluationControl,
-    holdout: &ProtectedHoldoutRecord,
-    formal: &FormalEvaluationV2,
+    control: &ReadRegisteredEvaluationControl,
+    holdout: &ReadProtectedHoldoutRecord,
+    formal: &ReadFormalEvaluation,
 ) -> Result<evo_storage::lifecycle::FormalJudgmentDomain> {
     use evo_storage::lifecycle::{FormalEarlyPlanDomain, FormalJudgmentDomain};
     let source_plan_schema =
@@ -10067,7 +10076,7 @@ async fn original_formal_source_domain(
             text(&plan.cs_version),
         )
     });
-    let (variant, scope, stats, certificate, route, rule) = match formal {
+    let (variant, scope, stats, certificate, route, rule) = match formal.result() {
         FormalEvaluationV2::CompleteBatch {
             evidence_scope,
             report,
@@ -10081,6 +10090,9 @@ async fn original_formal_source_domain(
             match control.schema_version.as_str() {
                 RegisteredEvaluationControl::SCHEMA_V1 => "complete_control_v1_frozen",
                 RegisteredEvaluationControl::SCHEMA => "complete_control_v2_preserve_ucb0",
+                RegisteredEvaluationControlV3::SCHEMA => {
+                    "complete_control_v3_fixed_sample_regression"
+                }
                 _ => {
                     return Err(Error::Invalid(
                         "formal_judgment_version_outside_table".into(),
@@ -10120,7 +10132,10 @@ async fn original_formal_source_domain(
     let domain = FormalJudgmentDomain(
         text(FORMAL_KIND),
         text(ENVELOPE_SCHEMA),
-        None,
+        match formal {
+            ReadFormalEvaluation::Current(current) => Some(text(&current.schema_version)),
+            ReadFormalEvaluation::Legacy(_) => None,
+        },
         text(variant),
         text(evidence_scope),
         text(&control.schema_version),
@@ -10141,10 +10156,8 @@ async fn original_formal_source_domain(
     Ok(domain)
 }
 
-/// Actual readonly extraction for the original no-payload-schema report reader.
-/// Ordinary native-wire sources (Control3/Ticket4 inputs) are not extracted on
-/// this wire and fail closed in its strict decoder; this function never treats
-/// a derived report logical ID as an original ticket ID.
+/// Readonly extraction preserves the complete original wire for both native
+/// and historical reports; a derived logical ID is never an original ticket ID.
 async fn extract_original_formal_input_in_session(
     ctx: &Context,
     session: &mut Session,
@@ -10177,11 +10190,11 @@ async fn extract_original_formal_input_after_verified(
 ) -> Result<FormalExtractedOriginalInput> {
     let ticket: ReadEvaluationTicket =
         read_original_input_record(ctx, session, TICKET_KIND, source_report_id).await?;
-    let formal: FormalEvaluationV2 =
+    let formal: ReadFormalEvaluation =
         read_original_input_record(ctx, session, FORMAL_KIND, source_report_id).await?;
-    let control: RegisteredEvaluationControl =
+    let control: ReadRegisteredEvaluationControl =
         read_original_input_record(ctx, session, CONTROL_KIND, &ticket.registration_id).await?;
-    let holdout: ProtectedHoldoutRecord =
+    let holdout: ReadProtectedHoldoutRecord =
         read_original_input_record(ctx, session, HOLDOUT_KIND, &ticket.holdout_id).await?;
     let issue: TicketIssueReceipt =
         read_original_input_record(ctx, session, TICKET_RECEIPT_KIND, &ticket.id).await?;
@@ -10195,13 +10208,13 @@ async fn extract_original_formal_input_after_verified(
     if let Some(binding) = &ticket.candidate_dependency_binding {
         roots.push(("artifact".into(), binding.candidate_id.clone()));
     }
-    match &formal {
+    match formal.result() {
         FormalEvaluationV2::EarlyStopped { .. } | FormalEvaluationV2::Invalid { .. } => {
             require_original_input_roots_live(ctx, session, &roots).await?;
             let source_domain =
                 original_formal_source_domain(ctx, session, &ticket, &control, &holdout, &formal)
                     .await?;
-            let reason = if matches!(&formal, FormalEvaluationV2::EarlyStopped { .. }) {
+            let reason = if matches!(formal.result(), FormalEvaluationV2::EarlyStopped { .. }) {
                 FormalInputUnavailable::OriginalStop
             } else {
                 FormalInputUnavailable::OriginalInvalid
@@ -10355,7 +10368,7 @@ async fn load_original_complete_judgment_source(
         _ => return Err(Error::Conflict(FORMAL_RECOMPUTE_INPUT_UNAVAILABLE.into())),
     };
     // One read of the complete original wire yields both source pins.
-    let original: FormalEvaluationV2 =
+    let original: ReadFormalEvaluation =
         read_original_input_record(ctx, session, FORMAL_KIND, original_report_id).await?;
     let source_report_ref = original_input_ref(FORMAL_KIND, original_report_id, &original)?;
     Ok(FormalNormalizedCompleteSource {
@@ -10403,9 +10416,9 @@ async fn recompute_original_complete_judgment(
     let ticket_id = &source.input_snapshot.common.1;
     let ticket: ReadEvaluationTicket =
         read_original_input_record(ctx, session, TICKET_KIND, ticket_id).await?;
-    let control: RegisteredEvaluationControl =
+    let control: ReadRegisteredEvaluationControl =
         read_original_input_record(ctx, session, CONTROL_KIND, &ticket.registration_id).await?;
-    let holdout: ProtectedHoldoutRecord =
+    let holdout: ReadProtectedHoldoutRecord =
         read_original_input_record(ctx, session, HOLDOUT_KIND, &ticket.holdout_id).await?;
     let resource: ResourceEvidenceRecord =
         read_original_input_record(ctx, session, RESOURCE_KIND, ticket_id).await?;
@@ -10669,7 +10682,7 @@ async fn load_original_complete_judgment_source_core(
         _ => return Err(Error::Conflict(FORMAL_RECOMPUTE_INPUT_UNAVAILABLE.into())),
     };
     // One read of the complete original wire yields both source pins.
-    let original: FormalEvaluationV2 =
+    let original: ReadFormalEvaluation =
         read_original_input_record(ctx, session, FORMAL_KIND, original_report_id).await?;
     let source_report_ref = original_input_ref(FORMAL_KIND, original_report_id, &original)?;
     Ok(FormalNormalizedCompleteSource {

@@ -4700,6 +4700,28 @@ macro_rules! formal_judgment_version {
     ($control:literal, $ticket:literal, $plan:literal, $scope:literal,
      $payload:expr, $variant:literal, $early:expr, $stats:expr, $certificate:expr,
      $route:expr, $rule:literal, $change:literal, $retained:expr, $id:expr) => {
+        formal_judgment_version!(
+            $control,
+            $ticket,
+            $plan,
+            $scope,
+            $payload,
+            $variant,
+            $early,
+            $stats,
+            $certificate,
+            $route,
+            $rule,
+            $change,
+            $retained,
+            $id,
+            "rsia.protected_holdout_record.v1"
+        )
+    };
+    ($control:literal, $ticket:literal, $plan:literal, $scope:literal,
+     $payload:expr, $variant:literal, $early:expr, $stats:expr, $certificate:expr,
+     $route:expr, $rule:literal, $change:literal, $retained:expr, $id:expr,
+     $holdout:literal) => {
         FormalJudgmentVersion {
             domain: FormalJudgmentDomain(
                 std::borrow::Cow::Borrowed("formal_evaluation_v2"),
@@ -4714,7 +4736,7 @@ macro_rules! formal_judgment_version {
                 std::borrow::Cow::Borrowed("rsia.research_family_alpha_plan.v1"),
                 std::borrow::Cow::Borrowed("rsia.optimizer_comparison_contract.v1"),
                 std::borrow::Cow::Borrowed("rsia.optimization_budget_plan.v1"),
-                std::borrow::Cow::Borrowed("rsia.protected_holdout_record.v1"),
+                std::borrow::Cow::Borrowed($holdout),
                 $stats,
                 $certificate,
                 $early,
@@ -4731,8 +4753,8 @@ macro_rules! formal_judgment_version {
 /// current=true shortcut. Engine must authenticate the full original closure
 /// in its Session before matching. Derived Complete has a retained source and
 /// derived verifier; derived Early remains unavailable without the original
-/// stop snapshot. The ordinary native wire (payload schema
-/// `rsia.formal_evaluation.v3`) has no row until its actual legal source exists.
+/// stop snapshot. Native rows preserve the actual Control3/Ticket4/Plan3 and
+/// Holdout2 domain introduced by the fixed-sample regression decision.
 /// One reviewed row per registered domain; kept unwrapped for row-by-row review.
 #[rustfmt::skip]
 pub const FORMAL_JUDGMENT_VERSIONS: &[FormalJudgmentVersion] = &[
@@ -5040,6 +5062,64 @@ pub const FORMAL_JUDGMENT_VERSIONS: &[FormalJudgmentVersion] = &[
     formal_judgment_version!("rsia.registered_evaluation_control.v2", "rsia.evaluation_ticket.v3", "rsia.experiment_plan.v2", "registered_external_host",
         formal_judgment_some_text!("rsia.formal_judgment.v1"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
         "explicit canonical original-input snapshot and versioned judgment identity", false, FormalJudgmentIdStrategy::VersionedInput),
+    // AG192 native fixed-sample domain: program_fixture.
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "program_fixture",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v3_fixed_sample_regression",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "program_fixture",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v3_fixed_sample_regression",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "program_fixture",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "program_fixture",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "program_fixture",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "program_fixture",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "invalid", None, None, None, None, "invalid_actual_reason_order_v1",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "program_fixture",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "invalid", formal_judgment_early_domain!(), None, None, None, "invalid_actual_reason_order_v1",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    // AG192 native fixed-sample domain: registered_external_host.
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "registered_external_host",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v3_fixed_sample_regression",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "registered_external_host",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v3_fixed_sample_regression",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "registered_external_host",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", None, None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "registered_external_host",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("critical_k0"), "early_certificate_v1_first_stop",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "registered_external_host",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "early_stopped", formal_judgment_early_domain!(), None, formal_judgment_some_text!("rsia.early_stop_certificate.v1"), formal_judgment_some_text!("sequential_reject_only"), "early_certificate_v1_first_stop",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "registered_external_host",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "invalid", None, None, None, None, "invalid_actual_reason_order_v1",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "registered_external_host",
+        formal_judgment_some_text!("rsia.formal_evaluation.v3"), "invalid", formal_judgment_early_domain!(), None, None, None, "invalid_actual_reason_order_v1",
+        "frozen max-regression decision and complete native wire", true, FormalJudgmentIdStrategy::SourceTicket, "rsia.protected_holdout_record.v2"),
+    // Explicit derived complete target over the same native inputs: program_fixture.
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "program_fixture",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v3_fixed_sample_regression",
+        "explicit judgment over frozen native max-regression inputs", true, FormalJudgmentIdStrategy::VersionedInput, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "program_fixture",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v3_fixed_sample_regression",
+        "explicit judgment over frozen native max-regression inputs", true, FormalJudgmentIdStrategy::VersionedInput, "rsia.protected_holdout_record.v2"),
+    // Explicit derived complete target over the same native inputs: registered_external_host.
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "registered_external_host",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", None, formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v3_fixed_sample_regression",
+        "explicit judgment over frozen native max-regression inputs", true, FormalJudgmentIdStrategy::VersionedInput, "rsia.protected_holdout_record.v2"),
+    formal_judgment_version!("rsia.registered_evaluation_control.v3", "rsia.evaluation_ticket.v4", "rsia.experiment_plan.v3", "registered_external_host",
+        formal_judgment_some_text!("rsia.formal_judgment.v1"), "complete_batch", formal_judgment_early_domain!(), formal_judgment_some_text!("rsia.empirical_bernstein.v2"), None, None, "complete_control_v3_fixed_sample_regression",
+        "explicit judgment over frozen native max-regression inputs", true, FormalJudgmentIdStrategy::VersionedInput, "rsia.protected_holdout_record.v2"),
 ];
 /// Semantic lookup only. Read state, authentication and key existence stay
 /// separate engine checks and are never inferred from membership.
@@ -5453,8 +5533,8 @@ fn formal_cleanup_ticket_plan_binding_shape(value: &serde_json::Value) -> Result
 }
 
 /// The ordinary native wire is exactly schema/decision/result. Its result is
-/// classified like an original report against rows registered for the native
-/// payload schema; none exist until that wire has an actual legal source.
+/// classified against the registered native payload domain without changing
+/// the frozen result or granting authority from a cleanup-only check.
 fn formal_native_wire_known(payload: &serde_json::Value) -> bool {
     payload.as_object().is_some_and(|wire| wire.len() == 3)
         && payload["decision_version"] == "rsia.fixed_sample_regression.v1"
