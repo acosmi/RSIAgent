@@ -720,13 +720,7 @@ impl ManagementDispatcher {
     }
 
     async fn run_job(&self, job_id: &str) -> Result<()> {
-        let (ctx, claimed) = match self.claim(job_id).await {
-            Err(Error::Capacity(_)) => {
-                self.retry_claim_later(job_id.to_owned());
-                return Ok(());
-            }
-            result => result?,
-        };
+        let (ctx, claimed) = self.claim(job_id).await?;
         let Some(job) = claimed else { return Ok(()) };
         let store = self.store.clone();
         let worker_ctx = ctx.clone();
@@ -802,8 +796,8 @@ impl ManagementDispatcher {
         }
     }
 
-    /// Step recorded on a Queued job whose claim was deferred by an E16.5
-    /// capacity bound; the job stays retriable and is claimed later.
+    /// Legacy step name retained for reading previously capacity-deferred jobs.
+    /// New capacity refusals leave the job, diagnostics and audit unchanged.
     pub const CAPACITY_WAIT_STEP: &'static str = "capacity_wait";
     /// Delay before a capacity-deferred claim is retried.
     pub const CAPACITY_WAIT_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
@@ -1016,9 +1010,6 @@ impl ManagementDispatcher {
     // A diagnostic is not worker-exit evidence. Running jobs are closed only
     // by the owned JoinHandle path above; this preserves the old fault API.
     async fn record_background_error(&self, job_id: &str, error: &Error) -> Result<()> {
-        if matches!(error, Error::Capacity(_)) {
-            return Ok(());
-        }
         match error {
             Error::ClockRegressed => return Err(Error::ClockRegressed),
             Error::Internal => return Err(Error::Internal),
