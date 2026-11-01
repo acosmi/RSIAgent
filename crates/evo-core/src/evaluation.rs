@@ -1746,7 +1746,8 @@ pub fn assess_plan_feasibility_v1(
     }
     match input.units.kind {
         FormalStatisticalUnit::IndependentTaskCluster
-        | FormalStatisticalUnit::IndependentCompleteStratifiedBlock => {}
+        | FormalStatisticalUnit::IndependentCompleteStratifiedBlock
+        | FormalStatisticalUnit::IndependentSuccessorStream => {}
     }
     identifier(input.fixed_claim_id)?;
     identifier(input.attempt_id)?;
@@ -2409,6 +2410,9 @@ impl OptimizerComparisonContract {
 pub enum FormalStatisticalUnit {
     IndependentTaskCluster,
     IndependentCompleteStratifiedBlock,
+    /// One paired MetaTrial repetition unit (plan §3.4.2): the unit of the meta
+    /// experiment's n only. A per-pair formal plan cannot use it.
+    IndependentSuccessorStream,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2518,6 +2522,13 @@ impl FormalExperimentPlanV41 {
         if self.n_planned < 2 {
             return Err(Error::Invalid(
                 "formal n_planned must be supplied explicitly and be at least two".into(),
+            ));
+        }
+        // A successor pair is evaluated over independent task clusters; it is
+        // not a meta-experiment stream and never adds to the meta n (§3.4.2).
+        if self.statistical_unit == FormalStatisticalUnit::IndependentSuccessorStream {
+            return Err(Error::Invalid(
+                "a per-pair formal plan cannot use the independent successor stream unit".into(),
             ));
         }
         Ok(())
@@ -3579,6 +3590,24 @@ impl ControlledTaskProfileV1 {
             .map(|task| controlled_task_cluster_digest(&self.profile_id, task))
             .collect::<Result<BTreeSet<_>>>()
             .map(|clusters| clusters.len())
+    }
+
+    /// Each registered semantic triple once, sorted by id, with its single data use.
+    pub fn registered_clusters_against(
+        &self,
+        materials: &ControlledTaskProfileMaterialsV1,
+    ) -> Result<Vec<(String, DataUse)>> {
+        self.validate_against(materials)?;
+        self.task_commitments
+            .iter()
+            .map(|task| {
+                Ok((
+                    controlled_task_cluster_digest(&self.profile_id, task)?,
+                    task.data_use,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()
+            .map(|clusters| clusters.into_iter().collect())
     }
 
     /// Reads the validated triple identity; seeds, task ids and payloads do not mint clusters.
